@@ -1,119 +1,23 @@
-//! The test that defines M1: a hub, a runner and a requester in one process,
-//! a real command, real output, the real outcome (invariant 5).
+//! The test that defines M1, now running against the store M2 put on disk:
+//! a hub, a runner and a requester in one process, a real command, real
+//! output, the real outcome (invariant 5). Everything M1 asserted must keep
+//! being true of a hub whose state is files.
 //!
-//! Everything binds port 0 and discovers the port it got, so the suite never
-//! collides with a port in use. Every spawned task is aborted when its
-//! harness drops, and jobs are spawned with `kill_on_drop`, so no test leaves
-//! a process or a bound port behind.
+//! The scaffolding — a hub on a free port, a state root that is removed
+//! afterwards — is in `support`.
 
-use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use futures_util::{SinkExt, StreamExt};
-use herd_hub::{Hub, JobState, JobStore, MemoryJobStore};
+use herd_hub::{JobState, JobStore};
 use herd_proto::{
     from_frame, to_frame, FromHub, JobOutcome, LogStream, Role, ToHub, PROTOCOL_VERSION,
 };
-use tokio::task::JoinHandle;
 use tokio_tungstenite::tungstenite::Message;
 
-/// A hub, optionally a runner, and the means to reach them.
-struct Harness {
-    hub_url: String,
-    store: Arc<MemoryJobStore>,
-    tasks: Vec<JoinHandle<()>>,
-}
+mod support;
 
-impl Harness {
-    /// A hub on a free loopback port, with nothing connected to it yet.
-    async fn with_hub() -> Self {
-        let store = Arc::new(MemoryJobStore::new());
-        let hub = Hub::bind(
-            "127.0.0.1:0".parse().expect("a literal loopback address"),
-            Arc::clone(&store) as Arc<dyn JobStore>,
-        )
-        .await
-        .expect("the hub binds a free port");
-        let hub_url = format!("ws://{}", hub.local_addr());
-        let handle = hub.handle();
-        let serving = tokio::spawn(async move {
-            let _ = hub.serve().await;
-        });
-        let harness = Self {
-            hub_url,
-            store,
-            tasks: vec![serving],
-        };
-        // Nothing else can be asked of the hub until it is actually serving,
-        // but a handle proves the test holds the same state the server does.
-        assert!(!handle.runner_connected());
-        harness
-    }
-
-    /// A hub with one runner joined and ready to be dispatched to.
-    async fn with_hub_and_runner() -> Self {
-        let store = Arc::new(MemoryJobStore::new());
-        let hub = Hub::bind(
-            "127.0.0.1:0".parse().expect("a literal loopback address"),
-            Arc::clone(&store) as Arc<dyn JobStore>,
-        )
-        .await
-        .expect("the hub binds a free port");
-        let hub_url = format!("ws://{}", hub.local_addr());
-        let handle = hub.handle();
-        let serving = tokio::spawn(async move {
-            let _ = hub.serve().await;
-        });
-        let running = tokio::spawn({
-            let config = herd_runner::Config {
-                hub_url: hub_url.clone(),
-                name: Some("test-runner".to_owned()),
-                // Carried, not checked: M15 gives tokens meaning.
-                token: Some("not-validated-in-m1".to_owned()),
-            };
-            async move {
-                let _ = herd_runner::run(config).await;
-            }
-        });
-        // Wait on the hub's own state, not on a sleep: the submission below is
-        // only meaningful once the runner is registered.
-        let deadline = Instant::now() + Duration::from_secs(10);
-        while !handle.runner_connected() {
-            assert!(Instant::now() < deadline, "the runner never joined the hub");
-            tokio::time::sleep(Duration::from_millis(5)).await;
-        }
-        Self {
-            hub_url,
-            store,
-            tasks: vec![serving, running],
-        }
-    }
-
-    /// What the hub itself believes became of a job.
-    fn state_of(&self, job_id: &herd_proto::JobId) -> JobState {
-        self.store
-            .job(job_id)
-            .expect("the store reads")
-            .expect("the hub knows this job")
-            .state
-    }
-
-    fn requester(&self) -> herdctl::Config {
-        herdctl::Config {
-            hub_url: self.hub_url.clone(),
-            token: Some("not-validated-in-m1".to_owned()),
-            name: Some("test-requester".to_owned()),
-        }
-    }
-}
-
-impl Drop for Harness {
-    fn drop(&mut self) {
-        for task in &self.tasks {
-            task.abort();
-        }
-    }
-}
+use support::{shell, Harness};
 
 /// What a requester saw, in arrival order.
 #[derive(Default)]
@@ -130,10 +34,6 @@ impl Seen {
             .map(|(_, data)| data.as_str())
             .collect()
     }
-}
-
-fn shell(script: &str) -> Vec<String> {
-    vec!["/bin/sh".to_owned(), "-c".to_owned(), script.to_owned()]
 }
 
 #[tokio::test]
