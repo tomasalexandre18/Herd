@@ -280,7 +280,7 @@ pub fn reclaim_a_past_life(root: &DataRoot, ceiling: &Ceiling) -> Vec<String> {
     if let Ok(entries) = fs::read_dir(&jobs) {
         for entry in entries.flatten() {
             let path = entry.path();
-            match reclaim_directory(&path) {
+            match reclaim_directory(&path, root.path()) {
                 Ok(()) => said.push(format!(
                     "reclaimed the workspace {} left by a previous life",
                     path.display()

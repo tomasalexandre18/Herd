@@ -215,7 +215,7 @@ impl DataRoot {
         // A leftover from a previous life of the same id would make the disk
         // budget and the measurements lie, so the workspace starts empty.
         if base.exists() {
-            reclaim_directory(&base).map_err(|error| {
+            reclaim_directory(&base, &self.path).map_err(|error| {
                 format!(
                     "the workspace {} is left over and cannot be cleared: {error}",
                     base.display()
@@ -234,6 +234,7 @@ impl DataRoot {
             })?;
         }
         Ok(Workspace {
+            root: self.path.clone(),
             base,
             work,
             home,
@@ -245,6 +246,9 @@ impl DataRoot {
 /// One job's private corner of the data root, removed when the job ends.
 #[derive(Debug, Clone)]
 pub struct Workspace {
+    /// The data root this workspace lives in: the boundary above which the
+    /// runner owns nothing and restores nothing.
+    root: PathBuf,
     base: PathBuf,
     work: PathBuf,
     home: PathBuf,
@@ -284,7 +288,7 @@ impl Workspace {
     /// called a success (D23's "absent rather than zero", applied to the one
     /// figure a job can interfere with).
     pub fn measure(&self) -> Result<u64, String> {
-        measure_tree(&self.base)
+        measure_tree(&self.base, &self.root)
     }
 
     /// Remove the workspace, restoring whatever access the job took away.
@@ -295,17 +299,17 @@ impl Workspace {
     /// swallowed — a workspace that will not go away is a disk filling up,
     /// which is the one thing invariant 2 forbids above all.
     pub fn reclaim(&self) -> Result<(), String> {
-        reclaim_directory(&self.base)
+        reclaim_directory(&self.base, &self.root)
     }
 }
 
 /// Sum the apparent size of every regular file under a directory, restoring
 /// the access the walk needs, and refusing to call an unreadable tree empty.
-fn measure_tree(path: &Path) -> Result<u64, String> {
+fn measure_tree(path: &Path, up_to: &Path) -> Result<u64, String> {
     let mut total = 0u64;
     let mut pending = vec![path.to_path_buf()];
     while let Some(directory) = pending.pop() {
-        let entries = match read_dir_restoring(&directory) {
+        let entries = match read_dir_restoring(&directory, up_to) {
             Ok(Some(entries)) => entries,
             // Gone while we walked: a job deleting its own files as it goes is
             // ordinary, and what is no longer there holds no bytes.
@@ -339,14 +343,17 @@ fn measure_tree(path: &Path) -> Result<u64, String> {
 /// Read a directory the runner owns, putting back the access a job removed.
 ///
 /// `Ok(None)` means the directory is gone, which is not a failure to measure.
-fn read_dir_restoring(directory: &Path) -> Result<Option<Vec<fs::DirEntry>>, String> {
+fn read_dir_restoring(directory: &Path, up_to: &Path) -> Result<Option<Vec<fs::DirEntry>>, String> {
     match collect_dir(directory) {
         Ok(entries) => return Ok(Some(entries)),
         Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
         Err(_) => {}
     }
-    // The runner created this directory, so it can always take its own access
-    // back. A job that chmods its way out of being measured gets measured.
+    // The runner created this directory and every directory above it up to
+    // its data root, so it can always take its own access back. A job that
+    // chmods its way out of being measured — its own files, or the parents
+    // they sit in — gets measured anyway.
+    restore_ancestors(directory, up_to);
     restore_access(directory);
     match collect_dir(directory) {
         Ok(entries) => Ok(Some(entries)),
@@ -367,7 +374,13 @@ fn collect_dir(directory: &Path) -> io::Result<Vec<fs::DirEntry>> {
 }
 
 /// Remove a directory the runner owns, whatever a job did to its modes.
-pub(crate) fn reclaim_directory(base: &Path) -> Result<(), String> {
+///
+/// `up_to` is the data root: the modes are restored inside `base` and on
+/// every directory between `base` and `up_to`, because a job can `chmod 000`
+/// its workspace's *parent* just as easily as its own files, and the runner
+/// owns every one of those directories. Nothing above `up_to` is ever
+/// touched — the runner owns its data root and nothing else on the host.
+pub(crate) fn reclaim_directory(base: &Path, up_to: &Path) -> Result<(), String> {
     let mut last = match remove_tree(base) {
         Ok(()) => return Ok(()),
         Err(error) => error,
@@ -375,6 +388,7 @@ pub(crate) fn reclaim_directory(base: &Path) -> Result<(), String> {
     // Two passes, because restoring the modes top-down can only reach what it
     // can already open: the first pass opens the way for the second.
     for _ in 0..2 {
+        restore_ancestors(base, up_to);
         restore_tree(base);
         match remove_tree(base) {
             Ok(()) => return Ok(()),
@@ -391,6 +405,23 @@ fn remove_tree(base: &Path) -> io::Result<()> {
     match fs::remove_dir_all(base) {
         Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
         other => other,
+    }
+}
+
+/// Put the runner's access back on every directory from `base`'s parent up
+/// to `up_to` inclusive, deepest first. Does nothing unless `up_to` really is
+/// an ancestor of `base`: this must never walk out of the data root.
+fn restore_ancestors(base: &Path, up_to: &Path) {
+    if !base.starts_with(up_to) {
+        return;
+    }
+    let mut here = base.parent();
+    while let Some(directory) = here {
+        restore_access(directory);
+        if directory == up_to {
+            return;
+        }
+        here = directory.parent();
     }
 }
 
@@ -705,10 +736,13 @@ mod tests {
         fs::write(&file, b"x").expect("the fixture writes");
         // A file where a directory is expected: read_dir fails with ENOTDIR,
         // which no chmod can fix, so the figure must be absent.
-        let error = measure_tree(&file).expect_err("a file is not a tree to walk");
+        let error = measure_tree(&file, temp.path()).expect_err("a file is not a tree to walk");
         assert!(error.contains(&file.display().to_string()), "{error}");
         // A path that is simply not there holds nothing, which is a real zero.
-        assert_eq!(measure_tree(&temp.path().join("never-made")), Ok(0));
+        assert_eq!(
+            measure_tree(&temp.path().join("never-made"), temp.path()),
+            Ok(0)
+        );
     }
 
     /// One runner per data root, so that the startup reaper can tell what a

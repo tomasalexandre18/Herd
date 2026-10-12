@@ -542,6 +542,39 @@ async fn a_workspace_a_job_locked_shut_is_still_reclaimed() {
     );
 }
 
+/// The same defect one directory up: a job can `chmod 000` its workspace's
+/// *parents* — the `jobs/` directory and the data root itself — as easily as
+/// its own files. The runner owns those too, so neither the reclaim nor the
+/// next job may be stopped by them.
+#[tokio::test]
+async fn a_job_cannot_lock_the_runner_out_of_its_own_data_root() {
+    let harness = Harness::new("locked-root", |_| {}).await;
+    let ran = harness
+        .run("echo payload > ./f; chmod 000 ../..; chmod 000 ../../..; exit 0")
+        .await;
+    assert_eq!(
+        ran.outcome,
+        JobOutcome::Exited { code: 0 },
+        "{:?} / {}",
+        ran.outcome,
+        ran.err
+    );
+    // The jobs directory is readable again, so this call is itself part of
+    // the assertion: it panics if the runner left it shut.
+    let left = nothing_left_in(harness.root());
+    assert!(left.is_empty(), "the job kept its workspace: {left:?}");
+
+    // And the runner can still be given work.
+    let after = harness.run("echo the runner lived").await;
+    assert_eq!(
+        after.outcome,
+        JobOutcome::Exited { code: 0 },
+        "{}",
+        after.err
+    );
+    assert_eq!(after.out.trim(), "the runner lived");
+}
+
 /// Defect 3, the worst of them: a job that breaches the log cap and exits
 /// promptly was reported `Exited { code: 0 }` with the log silently cut. A
 /// truncated build reported green is the worst thing a build service can do.
