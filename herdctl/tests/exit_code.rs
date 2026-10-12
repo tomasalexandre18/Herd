@@ -126,7 +126,7 @@ fn stderr(output: &Output) -> String {
 #[tokio::test]
 async fn herdctl_wears_the_job_s_own_exit_code() {
     let harness = Harness::new().await;
-    for code in [0, 1, 42, 75, 125, 127] {
+    for code in [0, 1, 42, 75, 125, 127, 255] {
         let output = harness
             .herdctl_shell(&format!("printf 'done\\n'; exit {code}"))
             .await;
@@ -153,13 +153,15 @@ async fn herdctl_wears_the_job_s_own_exit_code() {
 #[tokio::test]
 async fn herdctl_exits_a_hundred_and_twenty_eight_plus_the_signal() {
     let harness = Harness::new().await;
-    let output = harness.herdctl_shell("kill -TERM $$").await;
-    assert_eq!(
-        status_code(&output),
-        143,
-        "SIGTERM is 15, so herdctl must exit 143: {}",
-        stderr(&output)
-    );
+    for (signal, number, code) in [("TERM", 15, 143), ("KILL", 9, 137)] {
+        let output = harness.herdctl_shell(&format!("kill -{signal} $$")).await;
+        assert_eq!(
+            status_code(&output),
+            code,
+            "SIG{signal} is {number}, so herdctl must exit {code}: {}",
+            stderr(&output)
+        );
+    }
 }
 
 /// Herd failing to run the job is 125, the wrapper's own code, and the reason
