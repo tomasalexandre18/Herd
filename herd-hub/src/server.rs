@@ -175,8 +175,54 @@ impl State {
         self.with_peers(|peers| peers.followers.entry(id).or_default().push(outbox.clone()));
     }
 
-    fn followers(&self, id: &JobId) -> Vec<Outbox> {
-        self.with_peers(|peers| peers.followers.get(id).cloned().unwrap_or_default())
+    /// Record one chunk of a job's output and take the list of who is
+    /// following that job, in one breath.
+    ///
+    /// The two happen under one lock on purpose. A requester attaching to a
+    /// running job is given the output recorded so far and registered as a
+    /// follower under the same lock ([`State::attach`]), so every chunk is
+    /// carried by exactly one of the two paths: it is in the log a waiter
+    /// reads, or it is relayed to it, never both and never neither.
+    fn record_chunk(
+        &self,
+        id: &JobId,
+        stream: herd_proto::LogStream,
+        seq: u64,
+        data: &[u8],
+    ) -> (crate::job::Result<()>, Vec<Outbox>) {
+        self.with_peers(|peers| {
+            let written = self.store.append_log(id, stream, seq, data);
+            let followers = peers.followers.get(id).cloned().unwrap_or_default();
+            (written, followers)
+        })
+    }
+
+    /// Attach a requester to a job by its id: its record, the output recorded
+    /// so far, and — unless the job is already over — a place in the list of
+    /// followers, all under one lock.
+    ///
+    /// Reading the record and registering have to be one step too: between
+    /// them the job could reach its end, and a requester that registered
+    /// afterwards would wait for a frame that has already been sent.
+    fn attach(
+        &self,
+        id: &JobId,
+        outbox: &Outbox,
+    ) -> crate::job::Result<Option<(crate::job::JobRecord, Vec<u8>)>> {
+        self.with_peers(|peers| {
+            let Some(record) = self.store.job(id)? else {
+                return Ok(None);
+            };
+            let log = self.store.job_log(id)?.unwrap_or_default();
+            if !record.state.is_terminal() {
+                peers
+                    .followers
+                    .entry(id.clone())
+                    .or_default()
+                    .push(outbox.clone());
+            }
+            Ok(Some((record, log)))
+        })
     }
 
     fn stop_following(&self, id: &JobId) -> Vec<Outbox> {
@@ -315,10 +361,11 @@ async fn relay_from_runner(state: &State, outbox: &Outbox, source: &mut Source) 
     while let Some(message) = next_message(source).await? {
         match message {
             ToHub::JobStarted { job_id } => {
-                state
-                    .store
-                    .record_state(&job_id, JobState::Running)
-                    .with_context(|| format!("recording {job_id} as running"))?;
+                // A failure here is the hub's disk, not the runner's doing, so
+                // it is said out loud and the connection goes on (D19).
+                if let Err(error) = state.store.record_state(&job_id, JobState::Running) {
+                    eprintln!("herd-hub: recording {job_id} as running failed: {error}");
+                }
             }
             ToHub::LogChunk {
                 job_id,
@@ -326,11 +373,14 @@ async fn relay_from_runner(state: &State, outbox: &Outbox, source: &mut Source) 
                 seq,
                 data,
             } => {
-                state
-                    .store
-                    .append_log(&job_id, stream, seq, &data)
-                    .with_context(|| format!("recording a log chunk of {job_id}"))?;
-                for follower in state.followers(&job_id) {
+                let (written, followers) = state.record_chunk(&job_id, stream, seq, &data);
+                if let Err(error) = written {
+                    eprintln!("herd-hub: recording a log chunk of {job_id} failed: {error}");
+                }
+                // Relayed whether or not it could be recorded: a requester
+                // watching the job must not go blind because the hub's disk
+                // did.
+                for follower in followers {
                     let _ = follower.send(FromHub::LogChunk {
                         job_id: job_id.clone(),
                         stream,
@@ -345,33 +395,35 @@ async fn relay_from_runner(state: &State, outbox: &Outbox, source: &mut Source) 
                 // it to, and refusing it would wedge the runner, which would
                 // redeliver it on every connection for ever. So it is
                 // acknowledged and said out loud.
-                if state
-                    .store
-                    .job(&job_id)
-                    .with_context(|| format!("reading the record of {job_id}"))?
-                    .is_none()
-                {
-                    eprintln!(
-                        "herd-hub: a runner reported how {job_id} ended, and this hub \
-                         has no record of that job: {outcome:?} is dropped"
-                    );
-                    let _ = outbox.send(FromHub::JobResultAck { job_id });
-                    continue;
+                match state.store.job(&job_id) {
+                    Ok(None) => {
+                        eprintln!(
+                            "herd-hub: a runner reported how {job_id} ended, and this hub \
+                             has no record of that job: {outcome:?} is dropped"
+                        );
+                        let _ = outbox.send(FromHub::JobResultAck { job_id });
+                        continue;
+                    }
+                    // Not knowing whether there is a record is not knowing
+                    // anything: the result stays with the runner (D19).
+                    Err(error) => {
+                        eprintln!("herd-hub: reading the record of {job_id} failed: {error}");
+                        continue;
+                    }
+                    Ok(Some(_)) => {}
                 }
                 // Recorded first, acknowledged second. The runner is holding
                 // this result until the acknowledgement arrives, so the order
                 // of these two steps is the whole of E-44's promise: nothing
                 // tells the runner to forget a result that is not yet on a
                 // disk.
-                state
-                    .store
-                    .record_state(
-                        &job_id,
-                        JobState::Finished {
-                            outcome: outcome.clone(),
-                        },
-                    )
-                    .with_context(|| format!("recording the outcome of {job_id}"))?;
+                if !record_the_end(state, &job_id, &outcome).await {
+                    // The hub could not write it. Nothing is acknowledged, so
+                    // the runner keeps holding it and redelivers it on its
+                    // next connection; the job stalls, and a stalled job is
+                    // recoverable where a destroyed outcome is not (D19).
+                    continue;
+                }
                 let _ = outbox.send(FromHub::JobResultAck {
                     job_id: job_id.clone(),
                 });
@@ -391,6 +443,48 @@ async fn relay_from_runner(state: &State, outbox: &Outbox, source: &mut Source) 
         }
     }
     Ok(())
+}
+
+/// How many times the hub tries to write a result before leaving it with the
+/// runner, and how long it waits between tries.
+///
+/// Deliberately short and dumb: the point is to ride out the kind of failure
+/// that passes — a directory being replaced, a brief ENOSPC — and then to stop
+/// and say so, rather than to turn one unwritable result into a connection
+/// that stalls for ever. Nothing here decides a job is lost; that is M3's.
+const RECORDING_ATTEMPTS: u32 = 4;
+const BETWEEN_ATTEMPTS: std::time::Duration = std::time::Duration::from_millis(250);
+
+/// Write a job's end to the disk, retrying, and say whether it is written.
+///
+/// A result is the one thing a runner cannot reproduce, and the hub failing to
+/// store it is the hub's problem, never the runner's: it is never acknowledged
+/// unless it is written, the runner is never dropped for it, and the reason is
+/// said in full so that an operator can act on it (D19).
+async fn record_the_end(state: &State, job_id: &JobId, outcome: &herd_proto::JobOutcome) -> bool {
+    let end = JobState::Finished {
+        outcome: outcome.clone(),
+    };
+    for attempt in 1..=RECORDING_ATTEMPTS {
+        match state.store.record_state(job_id, end.clone()) {
+            Ok(()) => return true,
+            Err(error) => {
+                eprintln!(
+                    "herd-hub: recording the outcome of {job_id} failed \
+                     (attempt {attempt} of {RECORDING_ATTEMPTS}): {error}"
+                );
+                if attempt < RECORDING_ATTEMPTS {
+                    tokio::time::sleep(BETWEEN_ATTEMPTS).await;
+                }
+            }
+        }
+    }
+    eprintln!(
+        "herd-hub: {job_id} ended with {outcome:?} and this hub cannot write it. \
+         The result is NOT acknowledged: the runner still holds it and will \
+         redeliver it. Make the state root writable."
+    );
+    false
 }
 
 async fn serve_requester(state: &State, outbox: &Outbox, source: &mut Source) -> Result<()> {
@@ -444,11 +538,10 @@ async fn accept_submissions(state: &State, outbox: &Outbox, source: &mut Source)
                 }
             }
             ToHub::WaitForJob { job_id } => {
-                let record = state
-                    .store
-                    .job(&job_id)
+                let attached = state
+                    .attach(&job_id, outbox)
                     .with_context(|| format!("reading the record of {job_id}"))?;
-                let Some(record) = record else {
+                let Some((record, log)) = attached else {
                     // A terminal no, as D13 means it: this id will not come
                     // into being by waiting for it.
                     let _ = outbox.send(FromHub::Refused {
@@ -456,6 +549,15 @@ async fn accept_submissions(state: &State, outbox: &Outbox, source: &mut Source)
                     });
                     return Ok(());
                 };
+                // The output the job has already produced, before anything
+                // else about it. A detached requester has no other way to get
+                // a job's log through the CLI (D22).
+                if !log.is_empty() {
+                    let _ = outbox.send(FromHub::JobLog {
+                        job_id: job_id.clone(),
+                        data: log,
+                    });
+                }
                 match record.state {
                     // Answered from the record, which is the point of writing
                     // one: a wait works an hour later, on another machine,
@@ -463,7 +565,22 @@ async fn accept_submissions(state: &State, outbox: &Outbox, source: &mut Source)
                     JobState::Finished { outcome } => {
                         let _ = outbox.send(FromHub::JobFinished { job_id, outcome });
                     }
-                    _ => state.follow(job_id, outbox),
+                    // Waiting for a job whose attempt was interrupted is
+                    // waiting for a runner that may never come back, so the
+                    // wait says so rather than being silent (D17). It is not a
+                    // refusal: the runner may still redeliver, and then this
+                    // same connection carries the result.
+                    JobState::Interrupted { reason } => {
+                        let _ = outbox.send(FromHub::JobNote {
+                            job_id,
+                            note: format!(
+                                "this job is not over and its last attempt was \
+                                 interrupted: {reason}. If the runner comes back, \
+                                 its result arrives here."
+                            ),
+                        });
+                    }
+                    _ => {}
                 }
             }
             other => {

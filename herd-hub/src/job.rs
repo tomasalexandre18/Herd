@@ -71,6 +71,15 @@ pub enum JobState {
     Assigned,
     /// The runner reported that the process is running.
     Running,
+    /// An attempt was under way and this hub stopped seeing it: the hub was
+    /// killed or restarted while the job was assigned or running.
+    ///
+    /// Not terminal. The runner that holds the result may come back and
+    /// redeliver it, which resolves the record normally (E-44); until then the
+    /// job is unfinished, and what this state forbids is a job sitting in
+    /// `running` for ever with nothing on its record saying why (D17). Deciding
+    /// that the attempt is lost and requeueing it once is M3's.
+    Interrupted { reason: String },
     /// The runner reported how the job ended. The outcome is kept whole, not
     /// flattened to a number: a persisted number would have to be migrated the
     /// first time a job ends some other way (D15).
@@ -90,6 +99,7 @@ impl JobState {
             JobState::Queued => "queued",
             JobState::Assigned => "assigned",
             JobState::Running => "running",
+            JobState::Interrupted { .. } => "interrupted",
             JobState::Finished { .. } => "finished",
         }
     }

@@ -4,7 +4,10 @@ use std::process::ExitCode;
 use anyhow::Result;
 use clap::{Parser, Subcommand};
 use herd_proto::{JobId, JobOutcome, LogStream};
-use herdctl::{could_not_start_message, exit_code_for, Config, DEFAULT_HUB_URL};
+use herdctl::{
+    could_not_start_message, exit_code_for, no_verdict_message, Config, DEFAULT_HUB_URL,
+    NO_VERDICT_CODE,
+};
 
 /// The requester CLI: submit a job, follow its log, exit with its code.
 #[derive(Debug, Parser)]
@@ -67,9 +70,12 @@ async fn main() -> ExitCode {
             ExitCode::from(exit_code_for(&outcome))
         }
         Ok(Done::Said) => ExitCode::SUCCESS,
+        // Nothing ran, or nothing came back: Herd has no verdict to give, and
+        // saying so with 1 would be indistinguishable from a job whose tests
+        // failed (D20). One code, one meaning, and the reason on stderr.
         Err(error) => {
-            eprintln!("herdctl: {error:#}");
-            ExitCode::FAILURE
+            eprintln!("herdctl: {}", no_verdict_message(&format!("{error:#}")));
+            ExitCode::from(NO_VERDICT_CODE)
         }
     }
 }
@@ -99,7 +105,21 @@ async fn run(args: Args) -> Result<Done> {
             Ok(Done::Said)
         }
         Action::Wait { job_id } => {
-            let finished = herdctl::wait_for_job(&config, JobId::new(job_id)).await?;
+            // A wait prints the job's output exactly as `run` does: the log
+            // the hub had recorded before this wait attached, then whatever
+            // arrives afterwards. Without it a detached requester could only
+            // read a job's output by reading the hub's state directory, which
+            // a requester on another machine cannot do (D22).
+            let finished = herdctl::wait_for_job(
+                &config,
+                JobId::new(job_id),
+                |stream, data| match stream {
+                    LogStream::Stdout => write_now(&mut std::io::stdout(), data),
+                    LogStream::Stderr => write_now(&mut std::io::stderr(), data),
+                },
+                |note| eprintln!("herdctl: {note}"),
+            )
+            .await?;
             Ok(Done::Job(finished.outcome))
         }
     }

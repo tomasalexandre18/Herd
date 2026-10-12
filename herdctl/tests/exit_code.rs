@@ -26,6 +26,16 @@ struct Harness {
 
 impl Harness {
     async fn new() -> Self {
+        Self::start(true).await
+    }
+
+    /// A hub with nothing to run jobs on, for the refusals that are Herd's own
+    /// failure rather than a job's verdict (D20).
+    async fn with_no_runner() -> Self {
+        Self::start(false).await
+    }
+
+    async fn start(with_runner: bool) -> Self {
         let state = tempfile::tempdir().expect("a temporary state directory");
         let store = JobDirStore::open(state.path()).expect("the state root opens");
         let hub = Hub::bind(
@@ -39,26 +49,29 @@ impl Harness {
         let serving = tokio::spawn(async move {
             let _ = hub.serve().await;
         });
-        let running = tokio::spawn({
-            let config = herd_runner::Config {
-                hub_url: hub_url.clone(),
-                name: Some("exit-code-runner".to_owned()),
-                token: None,
-            };
-            async move {
-                let _ = herd_runner::run(config).await;
+        let mut tasks = vec![serving];
+        if with_runner {
+            tasks.push(tokio::spawn({
+                let config = herd_runner::Config {
+                    hub_url: hub_url.clone(),
+                    name: Some("exit-code-runner".to_owned()),
+                    token: None,
+                };
+                async move {
+                    let _ = herd_runner::run(config).await;
+                }
+            }));
+            // Wait on the hub's own state, not on a sleep.
+            let deadline = Instant::now() + Duration::from_secs(10);
+            while !handle.runner_connected() {
+                assert!(Instant::now() < deadline, "the runner never joined the hub");
+                tokio::time::sleep(Duration::from_millis(5)).await;
             }
-        });
-        // Wait on the hub's own state, not on a sleep.
-        let deadline = Instant::now() + Duration::from_secs(10);
-        while !handle.runner_connected() {
-            assert!(Instant::now() < deadline, "the runner never joined the hub");
-            tokio::time::sleep(Duration::from_millis(5)).await;
         }
         Self {
             hub_url,
             _state: state,
-            tasks: vec![serving, running],
+            tasks,
         }
     }
 
@@ -220,15 +233,63 @@ async fn submit_prints_an_id_and_wait_exits_with_the_job_s_code() {
 }
 
 /// Waiting on an id that was never minted is a refusal naming it, not a wait
-/// that never ends.
+/// that never ends — and it is 125, because there is no verdict to give (D20).
 #[tokio::test]
 async fn waiting_for_a_job_that_does_not_exist_says_so() {
     let harness = Harness::new().await;
     let output = harness.herdctl_args(&["wait", "j0000009999"]).await;
-    assert_eq!(status_code(&output), 1);
+    assert_eq!(status_code(&output), 125, "{}", stderr(&output));
     assert!(
         stderr(&output).contains("no such job: j0000009999"),
         "the refusal must name the id: {}",
         stderr(&output)
     );
+}
+
+/// D20: every way Herd itself can fail to produce a verdict exits 125, with
+/// the reason on stderr and nothing on stdout. A script that cannot tell "the
+/// tests failed" from "the hub was down" would read the second as the first,
+/// which is exactly what E-02 and E-43 rest on not happening.
+#[tokio::test]
+async fn herd_s_own_failures_exit_125_and_never_1() {
+    // A hub that cannot be reached at all.
+    let nowhere = Command::new(env!("CARGO_BIN_EXE_herdctl"))
+        .args(["--hub", "ws://127.0.0.1:1", "run", "--", "/bin/true"])
+        .output()
+        .await
+        .expect("herdctl runs");
+    assert_eq!(
+        status_code(&nowhere),
+        125,
+        "a hub that cannot be dialled is not a job that failed: {}",
+        stderr(&nowhere)
+    );
+    assert_eq!(stdout(&nowhere), "", "stdout belongs to the job");
+    assert!(
+        stderr(&nowhere).contains(&herdctl::no_verdict_message("")),
+        "the reason must blame Herd: {}",
+        stderr(&nowhere)
+    );
+
+    // A hub with nothing to run the job on.
+    let harness = Harness::with_no_runner().await;
+    for arguments in [
+        vec!["run", "--", "/bin/true"],
+        vec!["submit", "--", "/bin/true"],
+    ] {
+        let output = harness.herdctl_args(&arguments).await;
+        assert_eq!(
+            status_code(&output),
+            125,
+            "`{}` with no runner must not look like a failing job: {}",
+            arguments.join(" "),
+            stderr(&output)
+        );
+        assert_eq!(stdout(&output), "", "stdout belongs to the job");
+        assert!(
+            stderr(&output).contains("no runner is connected"),
+            "the reason must say what Herd could not do: {}",
+            stderr(&output)
+        );
+    }
 }
