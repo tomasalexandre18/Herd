@@ -290,18 +290,17 @@ impl Herd {
         serde_json::from_str(&text).unwrap_or_else(|e| panic!("{} is json: {e}", path.display()))
     }
 
+    /// The transitions on a job's record, in order. A line of `events.jsonl`
+    /// that records something else — output that never arrived — is not one.
     fn states_of(&self, job_id: &str) -> Vec<String> {
         let path = self.job_dir(job_id).join("events.jsonl");
         std::fs::read_to_string(&path)
             .unwrap_or_default()
             .lines()
-            .map(|line| {
+            .filter_map(|line| {
                 let event: serde_json::Value =
                     serde_json::from_str(line).unwrap_or_else(|e| panic!("{line} is json: {e}"));
-                event["state"]["type"]
-                    .as_str()
-                    .expect("a state has a type")
-                    .to_owned()
+                event["state"]["type"].as_str().map(str::to_owned)
             })
             .collect()
     }
@@ -499,6 +498,165 @@ async fn a_result_the_hub_cannot_write_is_kept_until_it_can() {
     );
 
     second.signal(rustix::process::Signal::TERM).await;
+    runner.signal(rustix::process::Signal::TERM).await;
+}
+
+/// D29, and the one thing a record may never do: a log that is short of
+/// output says so, at the place where the output is missing.
+///
+/// Twelve `kill -9`s of the hub during one job is how the defect was found.
+/// The hub came back each time, the runner redialled and went on streaming,
+/// and everything the job had printed while there was no hub was simply gone —
+/// a quarter of the lines, with the record reading `finished{exited 5}` and
+/// nothing anywhere saying a byte was missing. Getting those chunks back is
+/// M3's work; saying they are not there is M2's, and that is what the chunk
+/// numbers have been carried for since D4.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_log_that_lost_chunks_to_twelve_killed_hubs_says_where() {
+    const KILLS: u32 = 12;
+
+    let herd = Herd::new();
+    let mut hub = herd.start_hub("hub-0").await;
+    let mut runner = herd.start_runner();
+    herd.wait_for_runner().await;
+
+    // A line every 50 ms until the test says stop, so output is always being
+    // produced when a hub is killed and always resumes when one comes back.
+    // `END` makes a whole line recognisable: a lost chunk can cut a line in
+    // half, and a half line must not be mistaken for a line of its own.
+    let stop = herd.logs.path().join("stop");
+    let job = herd
+        .submit(&format!(
+            "i=0; while [ ! -f '{}' ]; do i=$((i+1)); printf 'line %s END\\n' \"$i\"; \
+             sleep 0.05; done; exit 5",
+            stop.display()
+        ))
+        .await;
+    herd.wait_until("the job is running and its output is arriving", || {
+        herd.record(&job)["state"]["type"] == "running" && herd.log(&job).contains("line 1 END")
+    })
+    .await;
+
+    // A whole line of the job's own, as the log keeps it. A line a lost chunk
+    // cut in half is not one.
+    let whole_lines = || herd.log(&job).matches(" END\n").count();
+
+    for round in 1..=KILLS {
+        // Enough output between two kills that the log has substance on both
+        // sides of every gap, as the job that found this had.
+        let so_far = whole_lines();
+        herd.wait_until("more of the job's output reaches the hub", || {
+            whole_lines() >= so_far + 5
+        })
+        .await;
+        hub.signal(rustix::process::Signal::KILL).await;
+        hub = herd.start_hub(&format!("hub-{round}")).await;
+    }
+    // The output resuming is what makes the last gap visible: the first chunk
+    // after a gap is the one whose number does not follow.
+    let before_the_end = whole_lines();
+    herd.wait_until("the output resumes on the hub that came back", || {
+        whole_lines() > before_the_end
+    })
+    .await;
+
+    // The job ends, on the twelfth hub, and keeps its own exit code.
+    File::create(&stop).expect("the stop file");
+    let waited = herd.herdctl(&["wait", &job]).await;
+    assert_eq!(
+        waited.status.code(),
+        Some(5),
+        "the job's own code must survive twelve kills: {}",
+        String::from_utf8_lossy(&waited.stderr)
+    );
+    assert_eq!(herd.record(&job)["state"]["type"], "finished");
+
+    // ---- What the log says about itself. Every jump in the job's own line
+    // numbers must have a marker between the two lines that name the jump:
+    // that is the whole of it, a log that is short is a log that says so.
+    let log = herd.log(&job);
+    let mut last: Option<u64> = None;
+    let mut announced = false;
+    let mut gaps = 0u32;
+    let mut lines = 0u32;
+    for line in log.lines() {
+        if line.contains("never reached this log") {
+            announced = true;
+            continue;
+        }
+        let Some(number) = line
+            .strip_prefix("line ")
+            .and_then(|rest| rest.strip_suffix(" END"))
+            .and_then(|digits| digits.parse::<u64>().ok())
+        else {
+            // A line a lost chunk cut in half, or the blank line the marker
+            // stands on. Neither is one of the job's lines.
+            continue;
+        };
+        lines += 1;
+        if let Some(last) = last {
+            assert!(number > last, "the log went backwards at {number}: {log}");
+            if number != last + 1 {
+                assert!(
+                    announced,
+                    "lines {} to {} are missing from the log and nothing says so: \
+                     a record that is short of output and silent about it is the \
+                     defect this test exists for",
+                    last + 1,
+                    number - 1
+                );
+                gaps += 1;
+            }
+        }
+        announced = false;
+        last = Some(number);
+    }
+    assert!(lines > 0, "the log holds none of the job's lines: {log}");
+    assert!(
+        gaps > 0,
+        "twelve killed hubs cost this job no output at all, so nothing was \
+         proved; {lines} lines, log: {log}"
+    );
+
+    // And the record carries the gaps too, as events of their own kind: a
+    // reader of the record alone must not have to parse the log to learn that
+    // it is incomplete.
+    let markers = log.matches("never reached this log").count();
+    assert!(
+        markers >= gaps as usize,
+        "{gaps} gap(s) in the job's lines and only {markers} marker(s)"
+    );
+    let path = herd.job_dir(&job).join("events.jsonl");
+    let events = std::fs::read_to_string(&path).expect("the events read");
+    let recorded = events
+        .lines()
+        .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+        .filter(|event| event["event"] == "log_gap")
+        .count();
+    assert_eq!(
+        recorded, markers,
+        "every marker in the log is an event on the record: {events}"
+    );
+    assert_eq!(
+        herd.states_of(&job).first().map(String::as_str),
+        Some("queued"),
+        "and the transitions are still the transitions: {events}"
+    );
+
+    // Twelve kills, and nothing half written left behind in the job's
+    // directory either.
+    let litter: Vec<String> = std::fs::read_dir(herd.job_dir(&job))
+        .expect("the job directory lists")
+        .filter_map(|entry| entry.ok())
+        .map(|entry| entry.file_name().to_string_lossy().into_owned())
+        .filter(|name| name.contains(".tmp-"))
+        .collect();
+    assert!(
+        litter.is_empty(),
+        "a kill left a temporary behind: {litter:?}"
+    );
+
+    hub.signal(rustix::process::Signal::TERM).await;
     runner.signal(rustix::process::Signal::TERM).await;
 }
 
