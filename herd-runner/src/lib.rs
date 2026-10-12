@@ -8,7 +8,7 @@
 
 use std::process::{ExitStatus, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use anyhow::{anyhow, bail, Context, Result};
 use futures_util::stream::{SplitSink, SplitStream};
@@ -57,11 +57,75 @@ impl Default for Config {
     }
 }
 
-/// Join the hub and serve it until the connection ends.
+/// The results this runner has produced and the hub has not acknowledged.
+///
+/// A job's result is the one thing a runner cannot reproduce: the process is
+/// gone, and if the result is dropped the work is lost. So a result is kept
+/// here from the moment the job ends until `JobResultAck` says the hub has it
+/// on a disk, and every connection starts by redelivering what is left
+/// (E-44). The hub records the same end twice as the same end, so a
+/// redelivery that was in fact received is harmless.
+///
+/// This lives outside [`run`] so that it survives the connection: the caller
+/// holds it, hands it to the next `run`, and M3 — which owns reconnection —
+/// only has to put the loop around it. It is memory, not a file: a runner that
+/// is itself killed loses the result, and that is M3's lost-attempt case, not
+/// this one.
+#[derive(Debug, Clone, Default)]
+pub struct HeldResults {
+    held: Arc<Mutex<Vec<(JobId, JobOutcome)>>>,
+}
+
+impl HeldResults {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// How many results are waiting to be acknowledged.
+    pub fn len(&self) -> usize {
+        self.with(|held| held.len())
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    fn hold(&self, job_id: JobId, outcome: JobOutcome) {
+        self.with(|held| {
+            held.retain(|(id, _)| id != &job_id);
+            held.push((job_id, outcome));
+        });
+    }
+
+    fn release(&self, job_id: &JobId) {
+        self.with(|held| held.retain(|(id, _)| id != job_id));
+    }
+
+    fn all(&self) -> Vec<(JobId, JobOutcome)> {
+        self.with(|held| held.clone())
+    }
+
+    fn with<T>(&self, f: impl FnOnce(&mut Vec<(JobId, JobOutcome)>) -> T) -> T {
+        let mut held = self
+            .held
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        f(&mut held)
+    }
+}
+
+/// Join the hub and serve it until the connection ends, holding nothing from
+/// an earlier connection.
 ///
 /// M1 returns on the first disconnection; M3 adds reconnection with bounded
-/// backoff.
+/// backoff, around [`run_holding`].
 pub async fn run(config: Config) -> Result<()> {
+    run_holding(config, HeldResults::new()).await
+}
+
+/// Join the hub and serve it, carrying results an earlier connection could not
+/// deliver.
+pub async fn run_holding(config: Config, held: HeldResults) -> Result<()> {
     let (socket, _response) = tokio_tungstenite::connect_async(&config.hub_url)
         .await
         .with_context(|| format!("dialling {}", config.hub_url))?;
@@ -86,21 +150,28 @@ pub async fn run(config: Config) -> Result<()> {
 
     let (outbox, inbox) = mpsc::unbounded_channel();
     let writer = tokio::spawn(write_frames(sink, inbox));
-    let outcome = serve_hub(&outbox, &mut source).await;
+    // Before anything else on this connection: what the last one could not
+    // deliver. A job finished while the hub was away is still a job that ran.
+    for (job_id, outcome) in held.all() {
+        let _ = outbox.send(ToHub::JobFinished { job_id, outcome });
+    }
+    let outcome = serve_hub(&outbox, &mut source, &held).await;
     drop(outbox);
     let _ = writer.await;
     outcome
 }
 
-async fn serve_hub(outbox: &Outbox, source: &mut Source) -> Result<()> {
+async fn serve_hub(outbox: &Outbox, source: &mut Source, held: &HeldResults) -> Result<()> {
     while let Some(message) = next_message(source).await? {
         match message {
             FromHub::AssignJob { job_id, command } => {
                 let outbox = outbox.clone();
+                let held = held.clone();
                 // One task per job: a long job must not stop the runner from
                 // hearing the hub.
-                tokio::spawn(async move { execute(job_id, command, outbox).await });
+                tokio::spawn(async move { execute(job_id, command, outbox, held).await });
             }
+            FromHub::JobResultAck { job_id } => held.release(&job_id),
             FromHub::Refused { reason } => bail!("the hub refused this runner: {reason}"),
             other => {
                 eprintln!(
@@ -114,9 +185,16 @@ async fn serve_hub(outbox: &Outbox, source: &mut Source) -> Result<()> {
 }
 
 /// Run one job: announce it, stream both streams, report how it ended.
-async fn execute(job_id: JobId, command: Vec<String>, outbox: Outbox) {
+async fn execute(job_id: JobId, command: Vec<String>, outbox: Outbox, held: HeldResults) {
     let Some((program, arguments)) = command.split_first() else {
-        report_could_not_start(&job_id, &outbox, "a job needs a command to run".to_owned());
+        report(
+            &job_id,
+            &outbox,
+            &held,
+            JobOutcome::CouldNotStart {
+                reason: "a job needs a command to run".to_owned(),
+            },
+        );
         return;
     };
 
@@ -132,7 +210,14 @@ async fn execute(job_id: JobId, command: Vec<String>, outbox: Outbox) {
         Err(error) => {
             // Names the executable, so the reason reads as Herd failing to run
             // this command rather than the command failing.
-            report_could_not_start(&job_id, &outbox, format!("{program}: {error}"));
+            report(
+                &job_id,
+                &outbox,
+                &held,
+                JobOutcome::CouldNotStart {
+                    reason: format!("{program}: {error}"),
+                },
+            );
             return;
         }
     };
@@ -172,7 +257,7 @@ async fn execute(job_id: JobId, command: Vec<String>, outbox: Outbox) {
             reason: format!("{program}: waiting for the process failed: {error}"),
         },
     };
-    let _ = outbox.send(ToHub::JobFinished { job_id, outcome });
+    report(&job_id, &outbox, &held, outcome);
 }
 
 /// How a finished process ended, in the protocol's terms. A unix status is an
@@ -199,13 +284,18 @@ fn outcome_of(status: ExitStatus) -> JobOutcome {
     }
 }
 
-/// Report a job that never ran. No `JobStarted`, because nothing started, and
-/// no log chunk: the job wrote nothing, and Herd's own failure belongs in the
-/// outcome rather than in the job's output.
-fn report_could_not_start(job_id: &JobId, outbox: &Outbox, reason: String) {
+/// Report how a job ended, and hold on to it until the hub says it has it.
+///
+/// The holding comes first, on purpose: between the send and an
+/// acknowledgement the result exists nowhere else, and the hub may be gone.
+/// A job that never ran sends no `JobStarted` and no log chunk — it wrote
+/// nothing, and Herd's own failure belongs in the outcome rather than in the
+/// job's output — but its end is held exactly like any other.
+fn report(job_id: &JobId, outbox: &Outbox, held: &HeldResults, outcome: JobOutcome) {
+    held.hold(job_id.clone(), outcome.clone());
     let _ = outbox.send(ToHub::JobFinished {
         job_id: job_id.clone(),
-        outcome: JobOutcome::CouldNotStart { reason },
+        outcome,
     });
 }
 
@@ -289,5 +379,6 @@ fn message_kind(message: &FromHub) -> &'static str {
         FromHub::AssignJob { .. } => "assign_job",
         FromHub::LogChunk { .. } => "log_chunk",
         FromHub::JobFinished { .. } => "job_finished",
+        FromHub::JobResultAck { .. } => "job_result_ack",
     }
 }
