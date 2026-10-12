@@ -22,6 +22,24 @@ fn every_outcome() -> Vec<JobOutcome> {
     outcomes
 }
 
+/// Every shape of log payload a job can produce. A compiler's output is not
+/// text: it can hold a NUL, a byte sequence that is no UTF-8 at all, or a
+/// multi-byte character cut in half by a chunk boundary. None of it may be
+/// rewritten on the way through (D18, E-15).
+fn every_payload() -> Vec<Vec<u8>> {
+    vec![
+        Vec::new(),
+        b"a line\n".to_vec(),
+        b"a\0b\xff\xfec\n".to_vec(),
+        vec![0, 1, 2, 253, 254, 255],
+        // The first two bytes of "é" in UTF-8, with the third in the chunk
+        // that follows: lossy decoding would turn this into U+FFFD.
+        vec![b'e', 0xc3],
+        "accents é, a sheep 🐑".as_bytes().to_vec(),
+        (0u8..=255).collect(),
+    ]
+}
+
 fn round_trip_to_hub(message: ToHub) {
     let frame = to_frame(&message).expect("message encodes");
     let back: ToHub = from_frame(&frame).unwrap_or_else(|e| panic!("{frame} decodes: {e}"));
@@ -62,18 +80,20 @@ fn every_message_to_the_hub_round_trips() {
         job_id: JobId::new("j1"),
     });
     for stream in [LogStream::Stdout, LogStream::Stderr] {
-        round_trip_to_hub(ToHub::LogChunk {
-            job_id: JobId::new("j1"),
-            stream,
-            seq: 0,
-            data: "a line\n".to_owned(),
-        });
+        for data in every_payload() {
+            round_trip_to_hub(ToHub::LogChunk {
+                job_id: JobId::new("j1"),
+                stream,
+                seq: 0,
+                data,
+            });
+        }
     }
     round_trip_to_hub(ToHub::LogChunk {
         job_id: JobId::new("j1"),
         stream: LogStream::Stdout,
         seq: u64::MAX,
-        data: "quotes \" braces {} newline \n tab \t accents eau emoji sheep".to_owned(),
+        data: b"quotes \" braces {} newline \n tab \t".to_vec(),
     });
     for outcome in every_outcome() {
         round_trip_to_hub(ToHub::JobFinished {
@@ -103,13 +123,25 @@ fn every_message_from_the_hub_round_trips() {
         command: vec!["true".to_owned()],
     });
     for stream in [LogStream::Stdout, LogStream::Stderr] {
-        round_trip_from_hub(FromHub::LogChunk {
+        for data in every_payload() {
+            round_trip_from_hub(FromHub::LogChunk {
+                job_id: JobId::new("j1"),
+                stream,
+                seq: 7,
+                data,
+            });
+        }
+    }
+    for data in every_payload() {
+        round_trip_from_hub(FromHub::JobLog {
             job_id: JobId::new("j1"),
-            stream,
-            seq: 7,
-            data: String::new(),
+            data,
         });
     }
+    round_trip_from_hub(FromHub::JobNote {
+        job_id: JobId::new("j1"),
+        note: "its attempt was interrupted".to_owned(),
+    });
     for outcome in every_outcome() {
         round_trip_from_hub(FromHub::JobFinished {
             job_id: JobId::new("j1"),
@@ -171,6 +203,37 @@ fn an_unknown_message_type_is_a_decode_error_not_a_panic() {
     let err = from_frame::<ToHub>(r#"{"type":"deploy_to_production"}"#)
         .expect_err("unknown types must be rejected");
     assert!(err.to_string().contains("deploy_to_production"), "{err}");
+}
+
+/// A log payload's wire shape, pinned: base64 in a JSON string, so that bytes
+/// no JSON string could hold travel whole (D18).
+#[test]
+fn a_log_payload_is_base64_in_the_frame_and_comes_back_byte_for_byte() {
+    // What `printf 'a\000b\377c\n'` writes.
+    let written = b"a\0b\xffc\n".to_vec();
+    let frame = to_frame(&ToHub::LogChunk {
+        job_id: JobId::new("j1"),
+        stream: LogStream::Stdout,
+        seq: 3,
+        data: written.clone(),
+    })
+    .expect("encodes");
+    assert_eq!(
+        frame,
+        r#"{"type":"log_chunk","job_id":"j1","stream":"stdout","seq":3,"data":"YQBi/2MK"}"#
+    );
+    let ToHub::LogChunk { data, .. } = from_frame(&frame).expect("decodes") else {
+        panic!("a log chunk decodes as a log chunk");
+    };
+    assert_eq!(data, written, "the bytes the process wrote were rewritten");
+
+    // And a payload that is not base64 at all is a decode error, not an empty
+    // log: a chunk Herd cannot read is never read as nothing.
+    let error = from_frame::<ToHub>(
+        r#"{"type":"log_chunk","job_id":"j1","stream":"stdout","seq":0,"data":"not base64!"}"#,
+    )
+    .expect_err("a payload that is no base64 must be refused");
+    assert!(!error.to_string().is_empty(), "{error}");
 }
 
 /// The two frames M2 added, pinned on the wire. The acknowledgement is what a

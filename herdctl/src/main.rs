@@ -105,7 +105,7 @@ async fn run(args: Args) -> Result<Done> {
     }
 }
 
-fn write_now(out: &mut impl Write, data: &str) {
-    let _ = out.write_all(data.as_bytes());
+fn write_now(out: &mut impl Write, data: &[u8]) {
+    let _ = out.write_all(data);
     let _ = out.flush();
 }

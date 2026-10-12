@@ -22,17 +22,19 @@ use support::{shell, Harness};
 /// What a requester saw, in arrival order.
 #[derive(Default)]
 struct Seen {
-    chunks: Vec<(LogStream, String)>,
+    chunks: Vec<(LogStream, Vec<u8>)>,
     first_chunk_at: Option<Instant>,
 }
 
 impl Seen {
     fn text(&self, stream: LogStream) -> String {
-        self.chunks
+        let bytes: Vec<u8> = self
+            .chunks
             .iter()
             .filter(|(seen, _)| *seen == stream)
-            .map(|(_, data)| data.as_str())
-            .collect()
+            .flat_map(|(_, data)| data.iter().copied())
+            .collect();
+        String::from_utf8(bytes).expect("this test's jobs write text")
     }
 }
 
@@ -43,7 +45,7 @@ async fn a_job_streams_its_output_and_succeeds() {
     let finished = herdctl::run_job(
         &harness.requester(),
         shell("printf 'out of the runner\\n'; printf 'and its stderr\\n' >&2"),
-        |stream, data| seen.chunks.push((stream, data.to_owned())),
+        |stream, data| seen.chunks.push((stream, data.to_vec())),
     )
     .await
     .expect("the job runs to its end");
@@ -57,11 +59,14 @@ async fn a_job_streams_its_output_and_succeeds() {
     assert_eq!(seen.text(LogStream::Stderr), "and its stderr\n");
 
     // The hub kept the same bytes it relayed, and knows how the job ended.
-    let log = harness
-        .store
-        .job_log(&finished.job_id)
-        .expect("the store reads")
-        .expect("the hub knows this job");
+    let log = String::from_utf8(
+        harness
+            .store
+            .job_log(&finished.job_id)
+            .expect("the store reads")
+            .expect("the hub knows this job"),
+    )
+    .expect("this job wrote text");
     assert!(log.contains("out of the runner\n"), "hub log: {log:?}");
     assert!(log.contains("and its stderr\n"), "hub log: {log:?}");
     let record = harness
@@ -84,7 +89,7 @@ async fn a_failing_job_reports_its_own_exit_code() {
     let finished = herdctl::run_job(
         &harness.requester(),
         shell("printf 'it went wrong\\n' >&2; exit 42"),
-        |stream, data| seen.chunks.push((stream, data.to_owned())),
+        |stream, data| seen.chunks.push((stream, data.to_vec())),
     )
     .await
     .expect("a failing job is still a job that ran");
@@ -117,7 +122,7 @@ async fn a_job_killed_by_a_signal_is_reported_as_signalled() {
     let finished = herdctl::run_job(
         &harness.requester(),
         shell("printf 'about to die\\n'; kill -TERM $$"),
-        |stream, data| seen.chunks.push((stream, data.to_owned())),
+        |stream, data| seen.chunks.push((stream, data.to_vec())),
     )
     .await
     .expect("a signalled job is still a job that ran");
@@ -147,7 +152,7 @@ async fn a_command_that_does_not_exist_is_reported_as_could_not_start() {
     let finished = herdctl::run_job(
         &harness.requester(),
         vec![NO_SUCH_COMMAND.to_owned(), "--whatever".to_owned()],
-        |stream, data| seen.chunks.push((stream, data.to_owned())),
+        |stream, data| seen.chunks.push((stream, data.to_vec())),
     )
     .await
     .expect("a job that cannot start is still an answer, not an error");
@@ -175,7 +180,7 @@ async fn a_command_that_does_not_exist_is_reported_as_could_not_start() {
             .job_log(&finished.job_id)
             .expect("the store reads")
             .as_deref(),
-        Some("")
+        Some(&b""[..])
     );
     assert_eq!(
         harness.state_of(&finished.job_id),
@@ -198,7 +203,7 @@ async fn output_arrives_while_the_job_is_still_running() {
         shell("printf 'first\\n'; sleep 0.5; printf 'second\\n'"),
         |stream, data| {
             seen.first_chunk_at.get_or_insert_with(Instant::now);
-            seen.chunks.push((stream, data.to_owned()));
+            seen.chunks.push((stream, data.to_vec()));
         },
     )
     .await
@@ -214,7 +219,7 @@ async fn output_arrives_while_the_job_is_still_running() {
         first_chunk_at.duration_since(submitted_at)
     );
     assert!(
-        seen.chunks[0].1.starts_with("first"),
+        seen.chunks[0].1.starts_with(b"first"),
         "the first chunk should be the first line, not the whole log: {:?}",
         seen.chunks[0].1
     );

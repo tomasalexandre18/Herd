@@ -6,6 +6,12 @@
 //!
 //! Framing (D4): one message per WebSocket **text** frame, a serde-tagged
 //! JSON object carrying its variant in `"type"`.
+//!
+//! One payload in here is not text: a job's output. A compiler may write
+//! anything at all — a NUL byte, a stray latin-1 byte in a filename — and the
+//! record Herd keeps has to be the bytes the process wrote, not a rewriting of
+//! them (D18, E-15). Log payloads are therefore `Vec<u8>`, carried as base64
+//! inside the JSON frame by [`bytes_as_base64`].
 
 use std::fmt;
 
@@ -24,6 +30,28 @@ pub enum Role {
     Runner,
     /// Submits jobs and follows them.
     Requester,
+}
+
+/// How a log payload travels inside the JSON frame: standard base64, padded.
+///
+/// JSON cannot carry an arbitrary byte, and a JSON string cannot carry one
+/// either: serialising a job's output as text would turn every invalid UTF-8
+/// sequence into U+FFFD and lose it for good. So the bytes are encoded, and
+/// what comes back out is byte for byte what went in (D18).
+pub mod bytes_as_base64 {
+    use data_encoding::BASE64;
+    use serde::{Deserialize, Deserializer, Serializer};
+
+    pub fn serialize<S: Serializer>(bytes: &[u8], serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(&BASE64.encode(bytes))
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Vec<u8>, D::Error> {
+        let text = String::deserialize(deserializer)?;
+        BASE64
+            .decode(text.as_bytes())
+            .map_err(serde::de::Error::custom)
+    }
 }
 
 /// Which of a job's two output streams a log chunk came from.
@@ -116,11 +144,14 @@ pub enum ToHub {
     JobStarted { job_id: JobId },
     /// Runner reports output. `seq` counts chunks per job, across both
     /// streams, from 0 — so a reader can restore the order the runner saw.
+    ///
+    /// `data` is the bytes the process wrote, unaltered (D18).
     LogChunk {
         job_id: JobId,
         stream: LogStream,
         seq: u64,
-        data: String,
+        #[serde(with = "bytes_as_base64")]
+        data: Vec<u8>,
     },
     /// Runner reports how the job ended.
     JobFinished { job_id: JobId, outcome: JobOutcome },
@@ -141,13 +172,36 @@ pub enum FromHub {
     JobAccepted { job_id: JobId },
     /// The runner is asked to execute this job.
     AssignJob { job_id: JobId, command: Vec<String> },
-    /// Output relayed to the requester that submitted the job.
+    /// Output relayed to the requester that submitted the job, as bytes (D18).
     LogChunk {
         job_id: JobId,
         stream: LogStream,
         seq: u64,
-        data: String,
+        #[serde(with = "bytes_as_base64")]
+        data: Vec<u8>,
     },
+    /// The output a job had already produced when a requester attached to it.
+    ///
+    /// `herdctl wait` attaches to a job by its id alone, often long after the
+    /// job ran, so the stream it would have followed is over. This frame is
+    /// what the hub has on its disk: both streams in the order they arrived,
+    /// which is how the `log` file keeps them, so the split between stdout and
+    /// stderr is not in it. Sent once, before anything else about that job
+    /// (D22).
+    JobLog {
+        job_id: JobId,
+        #[serde(with = "bytes_as_base64")]
+        data: Vec<u8>,
+    },
+    /// Something a requester following a job should know, on a connection that
+    /// stays open.
+    ///
+    /// Not a refusal: `Refused` is terminal (D13), and a note is the opposite
+    /// — the job is still there and this connection goes on. M2 sends exactly
+    /// one note, for a job whose attempt was interrupted and whose runner has
+    /// not come back (D17), so that waiting for such a job is never silent.
+    /// M8's explained waits are this frame's real home.
+    JobNote { job_id: JobId, note: String },
     /// How the job ended, relayed to the requester that submitted it.
     JobFinished { job_id: JobId, outcome: JobOutcome },
     /// The hub has the job's outcome on its disk, and the runner may forget it.

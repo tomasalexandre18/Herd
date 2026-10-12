@@ -299,7 +299,7 @@ fn report(job_id: &JobId, outbox: &Outbox, held: &HeldResults, outcome: JobOutco
     });
 }
 
-fn send_chunk(job_id: &JobId, outbox: &Outbox, seq: &AtomicU64, stream: LogStream, data: String) {
+fn send_chunk(job_id: &JobId, outbox: &Outbox, seq: &AtomicU64, stream: LogStream, data: Vec<u8>) {
     let _ = outbox.send(ToHub::LogChunk {
         job_id: job_id.clone(),
         stream,
@@ -323,9 +323,9 @@ async fn stream_output<R>(
         match pipe.read(&mut buffer).await {
             Ok(0) => break,
             Ok(read) => {
-                // Lossy, as D4 says: a chunk boundary may split a character.
-                let data = String::from_utf8_lossy(&buffer[..read]).into_owned();
-                send_chunk(&job_id, &outbox, &seq, stream, data);
+                // The bytes as they were read: a job's output is not text, and a
+                // chunk boundary may fall in the middle of a character (D18).
+                send_chunk(&job_id, &outbox, &seq, stream, buffer[..read].to_vec());
             }
             Err(error) => {
                 send_chunk(
@@ -333,7 +333,7 @@ async fn stream_output<R>(
                     &outbox,
                     &seq,
                     LogStream::Stderr,
-                    format!("herd-runner: reading the job's output failed: {error}\n"),
+                    format!("herd-runner: reading the job's output failed: {error}\n").into_bytes(),
                 );
                 break;
             }
@@ -378,6 +378,8 @@ fn message_kind(message: &FromHub) -> &'static str {
         FromHub::JobAccepted { .. } => "job_accepted",
         FromHub::AssignJob { .. } => "assign_job",
         FromHub::LogChunk { .. } => "log_chunk",
+        FromHub::JobLog { .. } => "job_log",
+        FromHub::JobNote { .. } => "job_note",
         FromHub::JobFinished { .. } => "job_finished",
         FromHub::JobResultAck { .. } => "job_result_ack",
     }
