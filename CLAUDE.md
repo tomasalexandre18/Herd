@@ -117,6 +117,9 @@ One decision at a time, always with a recommendation.
 - Iterative: small increments that actually run.
 - Claude works alone. A sub-agent only for one long, isolated task, never
   several in parallel, and never without Alexa's agreement.
+- The principal working directory `/mnt/ssd_980/herd-project` belongs to the
+  orchestrator. A sub-agent always works in its own git worktree on its own
+  branch, never there. That is what keeps parallel work safe.
 - Read what is needed, not the whole repo. Short reports.
 - chatOnS requests arrive as GitHub issues: triage them, propose where they
   fit in the plan, do not start them unprompted.
