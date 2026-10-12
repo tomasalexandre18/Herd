@@ -388,6 +388,79 @@ mod tests {
         assert!(!tag.as_str().contains(".."), "{}", tag.as_str());
     }
 
+    /// The startup reaper, asserted on a real process: a job process whose
+    /// runner is gone is killed, and one whose runner is alive is not.
+    ///
+    /// The dead runner is played by a pid that really has exited, which is
+    /// exactly what the reaper has to recognise; the live one is this test
+    /// process. Deterministic, because neither claim depends on what any
+    /// other runner on this host happens to be doing.
+    #[test]
+    #[cfg(unix)]
+    fn the_reaper_kills_a_job_whose_runner_is_gone_and_spares_one_whose_runner_is_not() {
+        let gone = std::process::Command::new("/bin/sh")
+            .arg("-c")
+            .arg("exit 0")
+            .spawn()
+            .expect("the fixture starts");
+        let dead_pid = gone.id();
+        let mut gone = gone;
+        let _ = gone.wait();
+        assert!(minter_is_gone(dead_pid), "the fixture's pid is still there");
+        assert!(
+            !minter_is_gone(std::process::id()),
+            "this process is alive, so its jobs are nobody else's to take"
+        );
+
+        // Two processes carrying a marker each: one minted by a runner that is
+        // gone, one by this one.
+        let mut orphan = spawn_marked(&format!("{JOB_PREFIX}{dead_pid}-0-orphan"));
+        let mut watched = spawn_marked(JobTag::mint(&JobId::new("watched")).as_str());
+
+        let found = orphaned_job_processes();
+        assert!(
+            found.iter().any(|(pid, _)| *pid == orphan.id()),
+            "the orphan {} was not found among {found:?}",
+            orphan.id()
+        );
+        assert!(
+            !found.iter().any(|(pid, _)| *pid == watched.id()),
+            "a live runner's job was taken for an orphan: {found:?}"
+        );
+
+        for (pid, _) in found {
+            kill_pid(pid);
+        }
+        // These are this test's own children, so their exit has to be waited
+        // for; a real orphan belongs to init, which reaps it.
+        let ended = orphan.wait().expect("the orphan's exit is readable");
+        assert!(!ended.success(), "the orphan was not killed: {ended:?}");
+        assert!(
+            fs::metadata(format!("/proc/{}", watched.id())).is_ok(),
+            "the watched job was killed with the orphan"
+        );
+        kill_pid(watched.id());
+        let _ = watched.wait();
+    }
+
+    #[cfg(unix)]
+    fn spawn_marked(marker: &str) -> std::process::Child {
+        let child = std::process::Command::new("/bin/sh")
+            .arg("-c")
+            .arg("sleep 20")
+            .env_clear()
+            .env(MARKER_VARIABLE, marker)
+            // PATH, so that the shell can find `sleep`: a built environment
+            // with no PATH is a shell that exits at once.
+            .env("PATH", std::env::var("PATH").unwrap_or_default())
+            .stdout(std::process::Stdio::null())
+            .spawn()
+            .expect("the fixture starts");
+        // The environment is readable as soon as the process exists.
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        child
+    }
+
     /// The sweep is the whole of the fallback's new strength, so it is
     /// asserted against a real process that has left its process group.
     #[test]
