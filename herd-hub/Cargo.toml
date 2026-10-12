@@ -10,10 +10,13 @@ herd-proto.workspace = true
 anyhow.workspace = true
 clap.workspace = true
 futures-util.workspace = true
+serde.workspace = true
 serde_json.workspace = true
+time.workspace = true
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "net", "sync", "time"] }
 tokio-tungstenite.workspace = true
 
 [dev-dependencies]
 herd-runner.workspace = true
 herdctl.workspace = true
+tempfile.workspace = true
