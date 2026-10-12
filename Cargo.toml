@@ -1,0 +1,23 @@
+[workspace]
+members = ["herd-proto", "herd-hub", "herd-runner", "herdctl"]
+resolver = "2"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+# One version per dependency for the whole workspace: the hub, a runner and
+# herdctl must never speak slightly different versions of the same library.
+[workspace.dependencies]
+herd-proto = { path = "herd-proto" }
+herd-hub = { path = "herd-hub" }
+herd-runner = { path = "herd-runner" }
+herdctl = { path = "herdctl" }
+anyhow = "1.0.104"
+clap = { version = "4.6.7", features = ["derive"] }
+futures-util = "0.3.34"
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.154"
+tokio = "1.53.2"
+tokio-tungstenite = "0.30.0"
