@@ -16,7 +16,8 @@ Documentation only:
   8 invariants, commands, git rules.
 - `docs/decisions.md` — D1 Rust, D2 vocabulary, D3 four crates, D4 WebSocket +
   JSON, D5 deployment shape, D6 what was left open, **D7** blob channel over
-  plain HTTP amending D4, **D8** hub persistence as a directory per job.
+  plain HTTP amending D4, **D8** hub persistence as a directory per job,
+  **D9** warm caches (Herd carries one, Herd is not one).
 - `docs/plan.md` — **M1..M18**, each one session, with the critical path, the
   parallel tracks, 13 decisions to settle before the code that depends on
   them, and the conflicts and risks.
@@ -35,10 +36,9 @@ fixture tests stand in until then.
 - **No toolchain yet.** Rust is not installed; it arrives with the Nix flake
   in M1, so every command in `CLAUDE.md` is still the agreed contract rather
   than a verified one. `docker`, `nix` and `gh` are present and working.
-- **Two decisions are Alexa's**, and both are in the plan's table: Q5 (do we
-  store the consumer's ~11 GB warm caches, or only their packs — this changes
-  what Herd *is*) and Q10 (the licence, being outward-facing). Q1..Q4, Q6..Q9,
-  Q11..Q13 are mine to take; D7 and D8 are the first two taken.
+- **One decision is Alexa's**, in the plan's table: Q10 (the licence, being
+  outward-facing). Q5 (the warm caches) was hers and is settled as D9. Q1..Q4,
+  Q6..Q9, Q11..Q13 are mine; D7, D8 and D9 are taken.
 - **Nothing is deployed and no runner exists.** First exposure over `wss://`
   is M16, on purpose: deploying earlier would freeze the public formats
   (the `ran on:` line, the status JSON, the event payloads) on a surface still

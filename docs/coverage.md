@@ -22,7 +22,7 @@ closes in M18.
 | E-11 | must | consumer-declared commands, nix develop | M10 | gated: their real declaration file (M18) |
 | E-12 | must | packs stored by (commit, key) | M11 | gated: `0 crates compiled` needs their pack (M18) |
 | E-13 | should | content-addressed, complete or absent | M11 | done with the store: retrofitting CAS would force a migration |
-| E-14 | must | warm caches ready before job | M12 | Q5: consumer prepare step, duration recorded; gated on their replication (M18) |
+| E-14 | must | warm caches ready before job | M12 | Q5/D9: no cache engine in Herd, but a declared prepare step, key-aware placement, and cache diffs publishable as packs; gated on their replication (M18) |
 | E-15 | must | full job record on disk | M2 | resource metrics in M4, retention in M12 |
 | E-16 | must | budgets, gc with pinning | M12 | |
 | E-17 | must | atomic publication everywhere | M11 | job-record atomicity already in M2 (Q1) |

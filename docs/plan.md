@@ -115,7 +115,8 @@ metal trial never overlaps a build on its host.
 
 ### M10 — Command declaration contract (`m10-command-contract`)
 The consumer declares commands in one file in its own tree: name, command
-line, labels, resources, declared outputs, optional prepare step (Q5). A
+line, labels, resources, declared outputs, and a prepare step declaring the
+cache keys it needs and leaves (Q5). A
 submission names a declared command and a commit of a configured bare
 repository — a branch resolves to a recorded hash, never a machine (E-01);
 dirty or unpushed trees refused naming the files (E-08). The runner
@@ -148,14 +149,21 @@ fetch) second.
 Per-host budgets shown as use against budget; gc never removes what a queued
 or running job references and pins the N most recent packs per key family
 (N = 5, configurable) (E-16). Result retention by priority class — 14/90 days,
-configurable (closes E-15). Warm caches per Q5: packs only; the consumer's
-prepare step runs before the job, duration recorded (E-14). Placement
-preference among available eligible runners: pack held / shortest prepare,
-then most free memory, reference last (E-23); E-19 still governs waiting.
+configurable (closes E-15).
+Warm caches per Q5 — Herd carries no cache engine, it carries the consumer's:
+the prepare step runs before the job with its declared cache keys, its
+duration recorded against the job (E-14); a runner reports the keys it holds
+in its health report; and because the artefact store is generic and addressed
+per file (Q4), the consumer may publish cache diffs through it as ordinary
+packs, so a 57-700 MB diff between mains transfers only its missing blobs.
+Placement preference among available eligible runners: keys already held /
+shortest prepare, then most free memory, reference last (E-23); E-19 still
+governs waiting.
 **Done when** gc under a budget 10 GiB below use comes in under it keeping
 every pinned item; a step result past retention is gone while a 60-day merger
-result reads fine; prepare time is recorded; placement prefers the holder and
-picks reference last.
+result reads fine; prepare duration is recorded per job; a fixture cache diff
+published as a pack transfers only the blobs the target runner lacks; and
+placement prefers the runner already holding the key, picking reference last.
 
 ### M13 — Status and events (`m13-status-events`)
 One status document, JSON with a format version (Q7), carrying the queue,
@@ -282,7 +290,7 @@ spine.
 | Q2 | Blob transfer channel | Packs of hundreds of MB do not belong in JSON text frames (D4): plain HTTP(S) GET/PUT on the hub beside the WebSocket, same proxy, same token. Recorded as D7, amending D4. | M11 |
 | Q3 | Resource algebra shape | One Capability type {name, kind: exclusive / counted(n) / shared, excludes, busy-probe}; memory and tmpfs are numeric admissions, not labels; a lease is counted(1) with an external probe. | M5 |
 | Q4 | Artefact addressing | Per file, not per archive: inter-pack dedup (E-13) and GC pinning fall out of it. | M11 |
-| Q5 | Warm caches | Herd stores packs only; the declaration contract gains a prepare step whose duration is recorded — E-14's second option. Storing caches would make Herd a chatOnS cache replicator. | M10, M12 |
+| Q5 | Warm caches | Herd grows no cache engine of its own, but must actively *carry* one: (a) the artefact store is generic, so the consumer may publish cache diffs through it as ordinary packs — per-file addressing (Q4) means a 57-700 MB diff costs only its missing blobs; (b) the declaration contract has a first-class **prepare step** with declared cache keys and a recorded duration; (c) a runner reports which keys it holds, and placement prefers a holder (E-23). Herd never knows what a cache *is*. | M10, M11, M12 |
 | Q6 | WSL memory ceiling | All job processes in one cgroup v2 subtree with MemoryMax (WSL2 ships systemd); documented fallback; verified on the real PC in M17. | M4 |
 | Q7 | Public format versioning | `ran on:` line, status JSON and event payloads each carry a format version; v1 freezes at M16. | M10, M13 |
 | Q8 | Authentication | Per-runner token minted at approval, hashed at the hub; no mTLS (the proxy terminates TLS); one shared requester token to start. | M15 |
@@ -304,8 +312,12 @@ spine.
   fallback is a consumer-side cron submitting via herdctl. E-42 is entirely
   the consumer's hook. E-26's busy probes stay configuration strings; the
   moment they grow an API they are plugins — refuse.
-- **E-14 option A rejected** (Q5): replicating ~27 GiB of warm caches per
-  runner would shape Herd around chatOnS's cache engine.
+- **E-14, the cache (Alexa, 2026-10-12).** The cache is load-bearing for the
+  first consumer — few build machines, and a cold build is over 30 minutes —
+  so "Herd does not manage it" must not become "Herd ignores it". Herd grows
+  no cache engine (that would shape it around one consumer), but the generic
+  artefact store, the declared prepare step and key-aware placement must be
+  good enough to carry theirs. See D9.
 - **Timing vocabulary.** Invariant 2's ≤ 5 s stop, E-06's 10 s job kill,
   E-33's 10 s switch and E-27's 15 min metal drain are four different things;
   M9 specifies all four.

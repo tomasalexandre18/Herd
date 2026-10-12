@@ -174,3 +174,44 @@ files, never the source of truth.
 **Reversibility.** The on-disk layout becomes a compatibility surface the
 moment the consumer reads it; the record format therefore carries a version
 from the start.
+
+---
+
+## 2026-10-12 — D9 Warm caches: Herd carries one, Herd is not one
+
+**Context.** E-14 asks that the consumer's warm caches (one immutable built
+tree per main commit, ~11 GB, 57-700 MB of unique content between consecutive
+mains, ~27 GiB for the five kept) be available on a build runner before its
+job starts, and offers two options: Herd carries them as artefacts, or Herd
+lets the consumer's own replication run as a preparation step and reports its
+time. Alexa's ruling (2026-10-12): the cache is load-bearing for the first
+consumer — there are few build machines and a cold build is over 30 minutes —
+so "Herd does not manage it" must not degrade into "Herd ignores it"; Herd
+must be able to *carry* a cache system even if it does not own one.
+
+**Choice.** Herd grows no cache engine, and no concept of "a cache", but three
+mechanisms must be good enough to carry someone else's:
+
+1. **The artefact store is generic.** Content-addressed per file (D7's channel,
+   per-file addressing), so a consumer may publish cache diffs through it as
+   ordinary packs and a 57-700 MB diff transfers only the blobs the target
+   runner lacks. We do not model caches; we make the store good enough that a
+   cache rides it.
+2. **The prepare step is first class.** A declared command may carry a prepare
+   step naming the cache keys it needs and leaves; it runs before the job on
+   the chosen runner, under the same confinement, and its duration is recorded
+   against the job.
+3. **Placement is key-aware.** A runner reports the keys it holds in its health
+   report; among runners that are eligible and available, the hub prefers one
+   that already holds the key or has the shortest prepare (E-23). This never
+   overrides E-19: a job still waits for its machine rather than moving to a
+   colder one.
+
+**Alternative rejected.** Herd replicating the caches itself — rejected because
+a bespoke 27 GiB replication engine, with its own diffing and eviction, is the
+consumer's cache engine living inside a scheduler. If mechanism 1 proves too
+slow in practice, the fix is to measure it and improve the store, not to grow
+a second subsystem.
+
+**Reversibility.** High: all three mechanisms are useful regardless, and none
+assumes a cache exists.
