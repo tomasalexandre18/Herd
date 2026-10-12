@@ -151,16 +151,24 @@ fn kill_pid(_pid: u32) -> bool {
     false
 }
 
-/// Whether a pid is a live runner. A dead runner's leftovers are reclaimable;
-/// a live one's are not. The command name is checked as well as the pid,
-/// because a pid alone may have been reused by something else entirely.
-fn is_a_live_runner(pid: u32) -> bool {
+/// Whether the process that minted a name is still there.
+///
+/// This is the whole test for "left behind", and it is deliberately the
+/// weakest possible claim: a *live* pid means somebody may still be watching
+/// that job, so its processes and its cgroup are not this runner's to take.
+/// Nothing is inferred from the command name — a runner may be started
+/// through a wrapper, under a different argv0, or be a test binary, and a
+/// reaper that killed what it merely failed to recognise would be far worse
+/// than one that waits for the next restart.
+///
+/// The cost is pid reuse: a dead runner's pid taken over by something else
+/// makes its leftovers survive one more life. A leftover that lingers is a
+/// nuisance; a live job killed by a stranger is a lost build.
+fn minter_is_gone(pid: u32) -> bool {
     if pid == std::process::id() {
-        return true;
+        return false;
     }
-    fs::read_to_string(format!("/proc/{pid}/comm"))
-        .map(|comm| comm.trim() == "herd-runner")
-        .unwrap_or(false)
+    fs::metadata(format!("/proc/{pid}")).is_err()
 }
 
 /// Everything one running job can leave behind, kept so that a runner being
@@ -294,7 +302,7 @@ pub fn reclaim_a_past_life(root: &DataRoot, ceiling: &Ceiling) -> Vec<String> {
                 if !is_ours || !entry.path().is_dir() {
                     continue;
                 }
-                let stale = pid_in(&name).is_none_or(|pid| !is_a_live_runner(pid));
+                let stale = pid_in(&name).is_some_and(minter_is_gone);
                 if !stale {
                     continue;
                 }
@@ -328,7 +336,7 @@ fn orphaned_job_processes() -> Vec<(u32, String)> {
         let Some(marker) = marker else { continue };
         // A marker whose runner is still alive belongs to a job that runner is
         // still watching, and is none of this runner's business.
-        if pid_in(marker).is_some_and(is_a_live_runner) {
+        if !pid_in(marker).is_some_and(minter_is_gone) {
             continue;
         }
         orphans.push((pid, marker.to_owned()));

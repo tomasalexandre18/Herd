@@ -146,16 +146,25 @@ pub fn root_equivalent_warnings() -> Vec<String> {
              matters to you."
         ));
     }
+    // Canonical, so that /var/run/docker.sock and /run/docker.sock — the same
+    // socket through a symlink on most hosts — are one warning and not two.
+    let mut seen = Vec::new();
     for socket in RUNTIME_SOCKETS {
         let path = std::path::Path::new(socket);
-        if path.exists() && writable_by_this_user(path) {
-            warnings.push(format!(
-                "this runner's user can write {socket}, which is a container runtime \
-                 and therefore root on this host: a job could start a privileged \
-                 container and escape every cap. E-46's \"unprivileged\" is not true \
-                 of this deployment."
-            ));
+        if !path.exists() || !writable_by_this_user(path) {
+            continue;
         }
+        let real = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+        if seen.contains(&real) {
+            continue;
+        }
+        seen.push(real);
+        warnings.push(format!(
+            "this runner's user can write {socket}, which is a container or VM \
+             runtime and therefore root on this host: a job could start a \
+             privileged container and escape every cap. E-46's \"unprivileged\" is \
+             not true of this deployment."
+        ));
     }
     warnings
 }
@@ -360,27 +369,81 @@ mod tests {
         assert!(error.contains("empty"), "{error}");
     }
 
-    /// Rule 2 is a rule about the list too: a list containing sudo is a list
-    /// that allows everything.
+    /// Rule 2 is a rule about the list too: a list containing an escalation
+    /// tool is a list that allows everything.
+    ///
+    /// The old check was `path.contains("sudo")`, which accepted
+    /// `/usr/bin/doas` — and `pkexec`, and `run0`, and `setpriv`. Every one of
+    /// them is refused by its own name now, whether or not this host has it.
     #[test]
-    fn sudo_may_not_be_a_helper() {
-        let error = PrivilegedHelpers::new(vec!["/run/wrappers/bin/sudo".to_owned()])
-            .expect_err("sudo is not a fixed list");
-        assert!(error.contains("sudo"), "{error}");
+    fn no_escalation_tool_may_be_a_helper() {
+        for tool in ESCALATION_TOOLS {
+            for directory in ["/run/wrappers/bin", "/usr/bin", "/nix/store/abc-x/bin"] {
+                let path = format!("{directory}/{tool}");
+                let error = PrivilegedHelpers::new(vec![path.clone()])
+                    .expect_err("an escalation tool is not a fixed list");
+                assert!(
+                    error.contains(tool) && error.contains("escalation tool"),
+                    "the refusal must name the tool: {error}"
+                );
+            }
+        }
+        // A path that merely contains the letters is an ordinary path: the
+        // old substring check refused this one and allowed /usr/bin/doas.
+        let temp = crate::testing::TempDir::new("not-an-escalator");
+        let innocent = temp.path().join("sudoers-lint");
+        std::fs::write(&innocent, b"#!/bin/sh\n").expect("the fixture writes");
+        PrivilegedHelpers::new(vec![innocent.display().to_string()])
+            .expect("a tool whose name merely contains those letters is allowed");
+    }
+
+    /// A file that is setuid or setgid *is* an escalation tool, whatever it is
+    /// called, and that is checked on the file rather than on its name.
+    #[test]
+    #[cfg(unix)]
+    fn a_setuid_helper_is_refused_whatever_it_is_called() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = crate::testing::TempDir::new("setuid-helper");
+        let innocent = temp.path().join("my-very-own-helper");
+        std::fs::write(&innocent, b"#!/bin/sh\n").expect("the fixture writes");
+        std::fs::set_permissions(&innocent, std::fs::Permissions::from_mode(0o755))
+            .expect("chmod 755");
+        PrivilegedHelpers::new(vec![innocent.display().to_string()])
+            .expect("an ordinary file this user owns is a usable helper");
+
+        std::fs::set_permissions(&innocent, std::fs::Permissions::from_mode(0o4755))
+            .expect("chmod 4755");
+        let error = PrivilegedHelpers::new(vec![innocent.display().to_string()])
+            .expect_err("a setuid file is an escalation tool");
+        assert!(error.contains("setuid or setgid"), "{error}");
+
+        std::fs::set_permissions(&innocent, std::fs::Permissions::from_mode(0o2755))
+            .expect("chmod 2755");
+        let error = PrivilegedHelpers::new(vec![innocent.display().to_string()])
+            .expect_err("a setgid file is an escalation tool");
+        assert!(error.contains("setuid or setgid"), "{error}");
+    }
+
+    /// A helper that is not there cannot be checked, so it is not a helper.
+    #[test]
+    fn a_helper_that_does_not_exist_is_refused_naming_it() {
+        let error = PrivilegedHelpers::new(vec!["/nowhere/at/all/helper".to_owned()])
+            .expect_err("a path that is not there cannot be checked");
+        assert!(error.contains("/nowhere/at/all/helper"), "{error}");
+        assert!(error.contains("cannot be checked"), "{error}");
     }
 
     #[test]
     fn only_a_listed_helper_resolves_and_a_refusal_names_the_command() {
-        let helpers = PrivilegedHelpers::new(vec![
-            "/run/current-system/sw/bin/mount".to_owned(),
-            "/run/current-system/sw/bin/mount".to_owned(),
-        ])
-        .expect("a valid list");
+        let temp = crate::testing::TempDir::new("helper-list");
+        let helper = temp.path().join("fixture-helper");
+        std::fs::write(&helper, b"#!/bin/sh\n").expect("the fixture writes");
+        let path = helper.display().to_string();
+        let helpers =
+            PrivilegedHelpers::new(vec![path.clone(), path.clone()]).expect("a valid list");
         assert_eq!(helpers.allowed().len(), 1, "a repeated entry is one entry");
-        assert_eq!(
-            helpers.resolve("/run/current-system/sw/bin/mount"),
-            Ok("/run/current-system/sw/bin/mount")
-        );
+        assert_eq!(helpers.resolve(&path), Ok(path.as_str()));
         let error = helpers
             .resolve("/bin/rm")
             .expect_err("an unlisted command is refused");
