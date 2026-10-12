@@ -112,6 +112,17 @@ impl Confined {
             return Err("a time cap of 0 s would stop every job before it ran".to_owned());
         }
         let ceiling = Ceiling::detect(confinement.memory_max, confinement.cgroup_root.as_deref());
+        // D23's loud fallback is for a host that cannot give the real ceiling.
+        // An operator who named `--cgroup-root` asked for a specific subtree:
+        // falling back there would answer a precise request with something
+        // else, so it is a refusal at startup naming what the subtree lacks.
+        if let (Some(asked), Some(why)) = (&confinement.cgroup_root, ceiling.fallback_reason()) {
+            return Err(format!(
+                "--cgroup-root {} cannot be used: {why}. Remove the option to let this \
+                 runner use its own cgroup, or make that subtree usable.",
+                asked.display()
+            ));
+        }
         // Before the first job and before the hub: a runner that was killed
         // left processes, cgroups and workspaces nothing else will collect.
         let reclaimed = reclaim_a_past_life(&root, &ceiling);
@@ -427,15 +438,25 @@ mod tests {
 
     /// A fallback has to be impossible to miss in the report, because the
     /// report is the only place an operator sees it before a job misbehaves.
+    ///
+    /// Only a host that really falls back can be asked this, and a host that
+    /// enforces the real ceiling says so loudly instead — which is the
+    /// assertion in `the_runner_says_which_memory_ceiling_it_enforces`.
     #[test]
     fn a_fallback_is_shouted_not_mentioned() {
         let temp = TempDir::new("confine-fallback");
-        let mut confinement = Confinement::with_data_root(temp.path());
-        confinement.cgroup_root = Some(PathBuf::from("/sys/fs/cgroup/herd-no-such-cgroup-m4"));
-        let confined = Confined::prepare(confinement).expect("a missing cgroup is not fatal");
+        let confined = Confined::prepare(Confinement::with_data_root(temp.path()))
+            .expect("an unprivileged process with a writable root can confine");
         let report = confined.report().join("\n");
+        if confined.ceiling().fallback_reason().is_none() {
+            crate::testing::skipped(
+                "a_fallback_is_shouted_not_mentioned",
+                "this host enforces the real cgroup ceiling, so there is no fallback \
+                 line to assert here",
+            );
+            return;
+        }
         assert!(report.contains("FALLING BACK"), "{report}");
-        assert!(report.contains("herd-no-such-cgroup-m4"), "{report}");
         // D23 named two weaknesses of the fallback and left out the one that
         // matters most: without a cgroup there is no handle on the job's whole
         // tree. The startup report names all three or it is lying.
@@ -446,6 +467,24 @@ mod tests {
         assert!(
             report.contains("new session") && report.contains("marker"),
             "{report}"
+        );
+    }
+
+    /// An operator who names `--cgroup-root` asked for one subtree in
+    /// particular. A runner that could not use it says so and stops, naming
+    /// what the subtree lacks — it does not quietly enforce something else.
+    #[test]
+    fn an_unusable_cgroup_root_refuses_the_startup_naming_what_it_lacks() {
+        let temp = TempDir::new("confine-bad-cgroup-root");
+        let mut confinement = Confinement::with_data_root(temp.path());
+        confinement.cgroup_root = Some(PathBuf::from("/sys/fs/cgroup/herd-no-such-cgroup-m4"));
+        let error = Confined::prepare(confinement)
+            .expect_err("a cgroup root that is not there cannot be used");
+        assert!(error.contains("--cgroup-root"), "{error}");
+        assert!(error.contains("herd-no-such-cgroup-m4"), "{error}");
+        assert!(
+            error.contains("does not exist"),
+            "the refusal must name what is wrong with the subtree: {error}"
         );
     }
 

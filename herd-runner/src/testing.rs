@@ -8,6 +8,37 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 static NEXT: AtomicU64 = AtomicU64::new(0);
 
+/// Where a skipped assertion writes itself down, so that the command people
+/// actually run can print a summary of what it did not check.
+///
+/// `cargo test` swallows the stdout of a passing test, which made D27's
+/// `HERD-SKIPPED` line invisible under `cargo test --workspace`: the suite
+/// read as 75 green assertions when some of them had not run at all. A file
+/// survives that, and `scripts/test.sh` prints what is in it.
+pub const SKIP_LOG_VARIABLE: &str = "HERD_SKIP_LOG";
+
+/// Record an assertion that could not be made on this host.
+///
+/// Three places at once, on purpose: stdout and stderr for a human reading
+/// the run and for `scripts/report-skips.sh` in CI, and the skip log for
+/// `scripts/test.sh`, which is the only one `cargo test` cannot hide.
+pub fn skipped(test: &str, why: &str) {
+    let line = format!("HERD-SKIPPED: {test}: {why}");
+    println!("{line}");
+    eprintln!("{line}");
+    let Some(path) = std::env::var_os(SKIP_LOG_VARIABLE) else {
+        return;
+    };
+    use std::io::Write;
+    if let Ok(mut file) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+    {
+        let _ = writeln!(file, "{line}");
+    }
+}
+
 /// A directory under the system temporary directory, removed on drop.
 #[derive(Debug)]
 pub struct TempDir {

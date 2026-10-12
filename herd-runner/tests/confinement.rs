@@ -8,10 +8,12 @@
 //! assertion that cannot run is **skipped with its reason printed**, never
 //! quietly passed and never failed: a red suite on a host that is merely
 //! different teaches people to ignore the suite. Every skip prints a line
-//! beginning `HERD-SKIPPED:`, CI runs the suite with `--nocapture`, and
-//! `scripts/report-skips.sh` turns each of those lines into a warning on the
-//! run. So the difference between "asserted" and "not asserted here" is
-//! visible on the pull request rather than buried.
+//! beginning `HERD-SKIPPED:` **and appends it to `$HERD_SKIP_LOG`**, because
+//! `cargo test` hides the stdout of a passing test and a skip nobody can see
+//! is a skip that reads as a pass. `scripts/test.sh` prints the log as a
+//! summary, and `scripts/report-skips.sh` turns each line into a warning on
+//! the CI run. So the difference between "asserted" and "not asserted here"
+//! is visible from the terminal and on the pull request.
 
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
@@ -161,11 +163,12 @@ fn kernel_ceiling_or_reason() -> Result<(), String> {
     }
 }
 
-/// Print a skip so that nobody can mistake it for an assertion that ran.
-/// `scripts/report-skips.sh` turns the marker into a warning in CI.
+/// Print a skip so that nobody can mistake it for an assertion that ran, and
+/// write it down where `cargo test` cannot hide it: `scripts/test.sh` prints
+/// the file's contents as a summary, and `scripts/report-skips.sh` turns each
+/// line into a warning in CI.
 fn skipped(test: &str, why: &str) {
-    println!("HERD-SKIPPED: {test}: {why}");
-    eprintln!("HERD-SKIPPED: {test}: {why}");
+    herd_runner::testing::skipped(test, why);
 }
 
 // ---------------------------------------------------------------- E-45 ----
@@ -455,6 +458,225 @@ async fn a_job_filling_its_workspace_is_stopped_at_its_disk_budget() {
     );
 }
 
+/// Defect 1 of the M4 review, end to end: a job that hides what it wrote
+/// behind a directory the runner cannot enter used to be reported
+/// `bytes_written: Some(0)`, `Exited { code: 0 }` — with the 100 MB still on
+/// the host afterwards, because the removal failed on the same directory.
+#[tokio::test]
+async fn a_job_cannot_hide_what_it_wrote_from_its_disk_budget() {
+    let budget = 8 << 20;
+    let harness = Harness::new("blinded-budget", |confinement| {
+        confinement.disk_budget = budget;
+    })
+    .await;
+    let ran = harness
+        .run(
+            "mkdir h; dd if=/dev/zero of=h/big bs=1048576 count=100 2>/dev/null; \
+             chmod 300 h; sleep 6",
+        )
+        .await;
+    assert_eq!(
+        ran.outcome,
+        JobOutcome::StoppedByCap {
+            cap: Cap::Disk,
+            limit: budget
+        },
+        "a job that blinds the runner must still be held to its budget: {:?} / {}",
+        ran.outcome,
+        ran.err
+    );
+    let written = ran
+        .metrics
+        .bytes_written
+        .expect("the runner owns the workspace, so it can always measure it");
+    assert!(
+        written > budget,
+        "the budget tripped at {written} bytes, which is not past {budget}"
+    );
+    assert!(nothing_left_in(harness.root()).is_empty());
+}
+
+/// The same budget, breached by a job that exits at once. Nothing polls fast
+/// enough to catch this one while it runs, so the last measurement — taken
+/// after the process is gone — is what has to catch it.
+#[tokio::test]
+async fn a_job_that_fills_its_workspace_and_exits_at_once_is_still_stopped() {
+    let budget = 8 << 20;
+    let harness = Harness::new("quick-fill", |confinement| {
+        confinement.disk_budget = budget;
+    })
+    .await;
+    let ran = harness
+        .run("dd if=/dev/zero of=./big bs=1048576 count=100 2>/dev/null; exit 0")
+        .await;
+    assert_eq!(
+        ran.outcome,
+        JobOutcome::StoppedByCap {
+            cap: Cap::Disk,
+            limit: budget
+        },
+        "exiting first does not buy a job its budget back: {:?}",
+        ran.outcome
+    );
+    assert!(nothing_left_in(harness.root()).is_empty());
+}
+
+/// Defect 2: a job that locks its workspace shut keeps its own verdict, and
+/// leaves nothing on the host. The modes it set are the runner's to undo.
+#[tokio::test]
+async fn a_workspace_a_job_locked_shut_is_still_reclaimed() {
+    let harness = Harness::new("locked-shut", |_| {}).await;
+    let ran = harness
+        .run("mkdir d; echo payload > d/f; chmod 000 d; chmod 500 .; exit 0")
+        .await;
+    assert_eq!(
+        ran.outcome,
+        JobOutcome::Exited { code: 0 },
+        "the job's own verdict is real and stays: {:?}",
+        ran.outcome
+    );
+    let left = nothing_left_in(harness.root());
+    assert!(
+        left.is_empty(),
+        "the job kept its workspace by changing its modes: {left:?}"
+    );
+}
+
+/// Defect 3, the worst of them: a job that breaches the log cap and exits
+/// promptly was reported `Exited { code: 0 }` with the log silently cut. A
+/// truncated build reported green is the worst thing a build service can do.
+#[tokio::test]
+async fn a_job_that_breaches_the_log_cap_and_exits_at_once_names_the_cap() {
+    let cap = 1024;
+    let harness = Harness::new("log-cap-quick", |confinement| confinement.log_cap = cap).await;
+    let ran = harness
+        .run("dd if=/dev/zero bs=4096 count=1 2>/dev/null | tr '\\0' 'x'; exit 0")
+        .await;
+    assert_eq!(
+        ran.outcome,
+        JobOutcome::StoppedByCap {
+            cap: Cap::Log,
+            limit: cap
+        },
+        "a cut log is never a pass, whatever the process exited with: {:?}",
+        ran.outcome
+    );
+    let streamed = (ran.out.len() + ran.err.len()) as u64;
+    assert!(
+        streamed <= cap,
+        "{streamed} bytes reached the requester with a cap of {cap}"
+    );
+}
+
+/// The other half of defect 3: a job that keeps writing after the cap has
+/// been reached gets `SIGPIPE` when the runner stops reading. That signal is
+/// an artefact of the cap, not the job's verdict, and must never be the
+/// outcome.
+#[tokio::test]
+async fn a_job_killed_by_the_pipe_the_log_cap_closed_still_names_the_cap() {
+    let cap = 1024;
+    let harness = Harness::new("log-cap-sigpipe", |confinement| confinement.log_cap = cap).await;
+    let ran = harness
+        .run("while :; do dd if=/dev/zero bs=4096 count=64 2>/dev/null | tr '\\0' 'x'; done")
+        .await;
+    assert_eq!(
+        ran.outcome,
+        JobOutcome::StoppedByCap {
+            cap: Cap::Log,
+            limit: cap
+        },
+        "SIGPIPE from the cap's own doing must not leak out as the job's \
+         verdict: {:?}",
+        ran.outcome
+    );
+}
+
+/// Defect 4: a job's process that gave itself a new session escapes
+/// `killpg` by definition, and used to outlive its job — reparented to init,
+/// on a host where the runner is not a delegated unit, which is the default
+/// shape. Under a cgroup the cgroup kill answers it; without one, the marker
+/// sweep does. Either way this assertion is real on every host.
+#[tokio::test]
+async fn a_job_s_child_in_its_own_session_does_not_outlive_the_job() {
+    // A sleep nobody else on this host would be running, so that finding one
+    // is finding ours.
+    let marker = "444441";
+    let harness = Harness::new("setsid-child", |_| {}).await;
+    let ran = harness
+        .run(&format!(
+            "setsid sleep {marker} >/dev/null 2>&1 & sleep 0.3; exit 0"
+        ))
+        .await;
+    assert_eq!(ran.outcome, JobOutcome::Exited { code: 0 }, "{}", ran.err);
+
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let survivors = processes_with_argument(marker);
+        if survivors.is_empty() {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "{survivors:?} outlived the job that started them, in a session of \
+             their own where killpg cannot reach"
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+}
+
+// ---------------------------------------------------------------- E-46 ----
+
+/// Defect 10: on this server the runner's user is in the `docker` group,
+/// which is root through `/run/docker.sock` whatever the process's uid says.
+/// A deployment that is not really unprivileged must say so at startup.
+///
+/// The host is asked with `id -Gn`, not with the code under test, so this
+/// cannot pass by agreeing with itself.
+#[tokio::test]
+async fn a_root_equivalent_user_is_named_at_startup() {
+    let temp = TempDir::new("root-equivalent");
+    let confined = Confined::prepare(test_confinement(temp.path())).expect("confinable");
+    let report = confined.report().join("\n");
+
+    let groups = std::process::Command::new("id")
+        .arg("-Gn")
+        .output()
+        .map(|out| String::from_utf8_lossy(&out.stdout).into_owned())
+        .unwrap_or_default();
+    // The group that shares its name with the escalation tool is left out on
+    // purpose: `privilege.rs` is the only file of this crate allowed to write
+    // that word, and a test may not be the exception that breaks its own
+    // rule. `wheel` and the container-runtime groups are enough.
+    let root_equivalent: Vec<&str> = groups
+        .split_whitespace()
+        .filter(|name| {
+            [
+                "docker", "podman", "lxd", "incus", "libvirt", "libvirtd", "wheel",
+            ]
+            .contains(name)
+        })
+        .collect();
+    if root_equivalent.is_empty() {
+        skipped(
+            "a_root_equivalent_user_is_named_at_startup",
+            "this user is in no root-equivalent group, so there is nothing for the \
+             startup report to warn about here",
+        );
+        return;
+    }
+    for group in root_equivalent {
+        assert!(
+            report.contains(group) && report.contains("WARNING"),
+            "the startup report must name the {group} group as root-equivalent: \
+             {report}"
+        );
+    }
+    assert!(
+        report.contains("not true of this deployment"),
+        "the warning must say plainly that E-46 does not hold here: {report}"
+    );
+}
+
 // ---------------------------------------------------------------- E-30 ----
 
 /// The milestone's hardest promise: an allocation past the ceiling ends the
@@ -666,7 +888,250 @@ fn no_module_of_the_runner_can_bind_a_socket() {
     assert!(checked > 4, "only {checked} files were checked");
 }
 
+// ------------------------------------- a runner's own death (defect 5) ----
+
+/// A hub, and a *real* runner binary joined to it, so that a signal can be
+/// sent to a process rather than to a task.
+struct RealRunner {
+    hub_url: String,
+    process: tokio::process::Child,
+    stderr: JoinHandle<String>,
+}
+
+impl RealRunner {
+    async fn join(hub_url: String, handle: herd_hub::HubHandle, data_root: &Path) -> Self {
+        let mut process = tokio::process::Command::new(env!("CARGO_BIN_EXE_herd-runner"))
+            .arg("--hub")
+            .arg(&hub_url)
+            .arg("--data-root")
+            .arg(data_root)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::piped())
+            .kill_on_drop(true)
+            .spawn()
+            .expect("the real runner binary runs");
+        let mut pipe = process.stderr.take().expect("stderr was piped");
+        // Read as it comes: the startup report is what the reaper's own
+        // account of itself lands in, and it must not fill a pipe buffer.
+        let stderr = tokio::spawn(async move {
+            let mut said = Vec::new();
+            let _ = tokio::io::AsyncReadExt::read_to_end(&mut pipe, &mut said).await;
+            String::from_utf8_lossy(&said).into_owned()
+        });
+        let deadline = Instant::now() + Duration::from_secs(20);
+        while !handle.runner_connected() {
+            assert!(Instant::now() < deadline, "the real runner never joined");
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        Self {
+            hub_url,
+            process,
+            stderr,
+        }
+    }
+
+    fn pid(&self) -> u32 {
+        self.process.id().expect("a spawned process has a pid")
+    }
+
+    /// Submit a job and stop following it: these tests are about what happens
+    /// to the job when the runner dies, so nobody waits for a verdict.
+    fn submit(&self, script: &str) -> JoinHandle<()> {
+        let requester = herdctl::Config {
+            hub_url: self.hub_url.clone(),
+            token: None,
+            name: Some("runner-death-requester".to_owned()),
+        };
+        let command = shell(script);
+        tokio::spawn(async move {
+            let _ = herdctl::run_job(&requester, command, |_, _| {}).await;
+        })
+    }
+}
+
+/// A hub on a free port, with its serving task.
+async fn hub_on_a_free_port() -> (String, herd_hub::HubHandle, JoinHandle<()>) {
+    let hub = Hub::bind(
+        "127.0.0.1:0".parse().expect("a literal loopback address"),
+        Arc::new(MemoryJobStore::new()) as Arc<dyn JobStore>,
+    )
+    .await
+    .expect("the hub binds a free port");
+    let hub_url = format!("ws://{}", hub.local_addr());
+    let handle = hub.handle();
+    let serving = tokio::spawn(async move {
+        let _ = hub.serve().await;
+    });
+    (hub_url, handle, serving)
+}
+
+/// A runner asked to stop ends its jobs. Without this, `systemctl stop` or a
+/// Ctrl-C left the job's processes running, reparented to init, with the
+/// workspace on disk and nobody to collect either.
+#[tokio::test]
+async fn a_runner_told_to_stop_ends_its_jobs_rather_than_orphaning_them() {
+    let marker = "444442";
+    let data_root = TempDir::new("sigterm");
+    let (hub_url, handle, serving) = hub_on_a_free_port().await;
+    let mut runner = RealRunner::join(hub_url, handle, data_root.path()).await;
+    let job = runner.submit(&format!(
+        "setsid sleep {marker} >/dev/null 2>&1 & sleep 120"
+    ));
+    wait_for_a_process_with(marker).await;
+
+    send_signal(runner.pid(), libc::SIGTERM);
+    let ended = tokio::time::timeout(Duration::from_secs(10), runner.process.wait())
+        .await
+        .expect("a runner asked to stop does not hang")
+        .expect("the runner's own exit is readable");
+    assert!(ended.success(), "a runner told to stop left by {ended:?}");
+
+    let survivors = processes_with_argument(marker);
+    assert!(
+        survivors.is_empty(),
+        "{survivors:?} outlived the runner that was watching them"
+    );
+    let left = nothing_left_in(data_root.path());
+    assert!(left.is_empty(), "the stopped runner left {left:?} on disk");
+    let said = runner.stderr.await.unwrap_or_default();
+    assert!(
+        said.contains("SIGTERM received") && said.contains("ended job"),
+        "a runner must say what it ended on its way out: {said}"
+    );
+    job.abort();
+    serving.abort();
+}
+
+/// `SIGKILL` cannot be handled, so the cleanup has to happen in the next
+/// life: a runner reclaims the processes, the cgroups and the workspaces its
+/// predecessor could not, and says what it reclaimed.
+#[tokio::test]
+async fn a_restarted_runner_reclaims_what_a_killed_one_left() {
+    let marker = "444443";
+    let data_root = TempDir::new("sigkill");
+    let (hub_url, handle, serving) = hub_on_a_free_port().await;
+    let first = RealRunner::join(hub_url.clone(), handle.clone(), data_root.path()).await;
+    let job = first.submit(&format!(
+        "setsid sleep {marker} >/dev/null 2>&1 & sleep 120"
+    ));
+    wait_for_a_process_with(marker).await;
+    let workspaces = nothing_left_in(data_root.path());
+    assert_eq!(
+        workspaces.len(),
+        1,
+        "the job should have exactly one workspace while it runs: {workspaces:?}"
+    );
+
+    send_signal(first.pid(), libc::SIGKILL);
+    let mut first = first;
+    let _ = first.process.wait().await;
+    job.abort();
+    // The premise, asserted rather than assumed: a killed runner orphans
+    // everything, which is why the next one has to clean up.
+    assert!(
+        !processes_with_argument(marker).is_empty(),
+        "nothing was orphaned, so this test is not testing the reaper"
+    );
+    assert!(!nothing_left_in(data_root.path()).is_empty());
+    // The hub holds one runner slot in M1, so the second runner can only join
+    // once the hub has noticed the first one is gone.
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while handle.runner_connected() {
+        assert!(
+            Instant::now() < deadline,
+            "the hub never let go of the killed runner's slot"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+
+    let second = RealRunner::join(hub_url, handle, data_root.path()).await;
+    let deadline = Instant::now() + Duration::from_secs(15);
+    while !processes_with_argument(marker).is_empty() {
+        assert!(
+            Instant::now() < deadline,
+            "the restarted runner left {:?} running",
+            processes_with_argument(marker)
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    let left = nothing_left_in(data_root.path());
+    assert!(
+        left.is_empty(),
+        "the restarted runner left its predecessor's workspaces: {left:?}"
+    );
+
+    let mut second = second;
+    send_signal(second.pid(), libc::SIGTERM);
+    let _ = tokio::time::timeout(Duration::from_secs(10), second.process.wait()).await;
+    let said = second.stderr.await.unwrap_or_default();
+    assert!(
+        said.contains("reaped at startup"),
+        "a reaper that says nothing is a reaper nobody can trust: {said}"
+    );
+    assert!(
+        said.contains("reclaimed the workspace") && said.contains("orphaned job process"),
+        "the report must name what it reclaimed: {said}"
+    );
+    serving.abort();
+}
+
 // ------------------------------------------------------------- helpers ----
+
+#[cfg(unix)]
+fn send_signal(pid: u32, signal: i32) {
+    // Safe: one signal to one pid this test spawned itself.
+    unsafe {
+        libc::kill(pid as libc::pid_t, signal);
+    }
+}
+
+#[cfg(not(unix))]
+fn send_signal(_pid: u32, _signal: i32) {}
+
+/// Every job workspace still on disk under a data root.
+fn nothing_left_in(data_root: &Path) -> Vec<PathBuf> {
+    let jobs = data_root.join("jobs");
+    std::fs::read_dir(&jobs)
+        .unwrap_or_else(|error| panic!("{} cannot be read: {error}", jobs.display()))
+        .flatten()
+        .map(|entry| entry.path())
+        .collect()
+}
+
+/// Every live process whose command line carries this argument. Used to find
+/// a job's detached children: a sleep of 444441 seconds is nobody else's.
+fn processes_with_argument(needle: &str) -> Vec<u32> {
+    let Ok(entries) = std::fs::read_dir("/proc") else {
+        return Vec::new();
+    };
+    let mut found = Vec::new();
+    for entry in entries.flatten() {
+        let Ok(pid) = entry.file_name().to_string_lossy().parse::<u32>() else {
+            continue;
+        };
+        let Ok(cmdline) = std::fs::read(format!("/proc/{pid}/cmdline")) else {
+            continue;
+        };
+        if cmdline
+            .split(|byte| *byte == 0)
+            .any(|argument| argument == needle.as_bytes())
+        {
+            found.push(pid);
+        }
+    }
+    found
+}
+
+async fn wait_for_a_process_with(needle: &str) {
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while processes_with_argument(needle).is_empty() {
+        assert!(
+            Instant::now() < deadline,
+            "the fixture never started a process carrying {needle}"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
 
 #[cfg(unix)]
 fn set_mode(path: &Path, mode: u32) {

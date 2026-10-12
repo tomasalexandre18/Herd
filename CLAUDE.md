@@ -70,15 +70,17 @@ Toolchain comes from the Nix flake added in M1; nothing is installed globally.
 ```sh
 nix develop                 # dev shell: rust stable, cargo, clippy, rustfmt
 cargo build --workspace
-cargo test --workspace      # unit tests + end-to-end test
+./scripts/test.sh           # the suite, plus the skips it could not run
 cargo clippy --workspace --all-targets -- -D warnings
 cargo fmt --all --check
 cargo run -p herd-hub       # local hub on 127.0.0.1, plain ws
 cargo run -p herd-runner    # local runner pointing at it
 ```
 
-Rule: `cargo test --workspace` and `cargo clippy` must be green before any
-commit. No other suite is required per commit.
+Rule: `./scripts/test.sh` and `cargo clippy` must be green before any
+commit. The script runs `cargo test --workspace` and then prints every
+assertion this host could not make, so a skip is never read as a pass
+(D27). No other suite is required per commit.
 
 ## Git
 
