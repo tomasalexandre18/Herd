@@ -23,3 +23,5 @@ tokio-tungstenite.workspace = true
 herd-runner.workspace = true
 herdctl.workspace = true
 tempfile.workspace = true
+# The killed-hub test runs the real binaries and signals them.
+rustix = { version = "1.1.5", features = ["process"] }
