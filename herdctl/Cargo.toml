@@ -1,0 +1,14 @@
+[package]
+name = "herdctl"
+description = "The requester CLI: submit a job, follow its log, exit with its code"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[dependencies]
+herd-proto.workspace = true
+anyhow.workspace = true
+clap.workspace = true
+futures-util.workspace = true
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "io-util"] }
+tokio-tungstenite.workspace = true
