@@ -120,6 +120,15 @@ struct State {
     peers: Mutex<Peers>,
 }
 
+/// What a requester gets when it attaches to a job by its id.
+struct Attached {
+    record: crate::job::JobRecord,
+    /// The output the job had already produced.
+    log: Vec<u8>,
+    /// Why the job is not moving, if this hub knows that it is not (D19).
+    stalled: Option<String>,
+}
+
 #[derive(Default)]
 struct Peers {
     /// M1 accepts exactly one runner. M5 onwards holds a set.
@@ -227,12 +236,7 @@ impl State {
     /// Reading the record and registering have to be one step too: between
     /// them the job could reach its end, and a requester that registered
     /// afterwards would wait for a frame that has already been sent.
-    #[allow(clippy::type_complexity)]
-    fn attach(
-        &self,
-        id: &JobId,
-        outbox: &Outbox,
-    ) -> crate::job::Result<Option<(crate::job::JobRecord, Vec<u8>, Option<String>)>> {
+    fn attach(&self, id: &JobId, outbox: &Outbox) -> crate::job::Result<Option<Attached>> {
         self.with_peers(|peers| {
             let Some(record) = self.store.job(id)? else {
                 return Ok(None);
@@ -246,7 +250,11 @@ impl State {
                     .or_default()
                     .push(outbox.clone());
             }
-            Ok(Some((record, log, stalled)))
+            Ok(Some(Attached {
+                record,
+                log,
+                stalled,
+            }))
         })
     }
 
@@ -607,7 +615,12 @@ async fn accept_submissions(state: &State, outbox: &Outbox, source: &mut Source)
                 let attached = state
                     .attach(&job_id, outbox)
                     .with_context(|| format!("reading the record of {job_id}"))?;
-                let Some((record, log, stalled)) = attached else {
+                let Some(Attached {
+                    record,
+                    log,
+                    stalled,
+                }) = attached
+                else {
                     // A terminal no, as D13 means it: this id will not come
                     // into being by waiting for it.
                     let _ = outbox.send(FromHub::Refused {
