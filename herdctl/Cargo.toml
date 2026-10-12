@@ -10,5 +10,5 @@ herd-proto.workspace = true
 anyhow.workspace = true
 clap.workspace = true
 futures-util.workspace = true
-tokio = { workspace = true, features = ["rt-multi-thread", "macros", "io-util"] }
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "net", "io-util"] }
 tokio-tungstenite.workspace = true
