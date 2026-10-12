@@ -1,70 +1,68 @@
-# Status — 2026-10-12
+# Status — 2026-10-13
 
 State of the project right now. Replaced every session, never appended to.
 
 ## Where we are
 
-M0 (method) done and approved. The first consumer's requirement sheet arrived
-as **issue #1** the same day; the plan has been rebuilt against it. Still no
-code, by design. Branch `plan-rework` pushed, awaiting approval to move `main`.
+**M1 is written and green on branch `m1-end-to-end`, awaiting a merge.**
+CI and the pull-request flow are live on `main`. The first consumer's
+requirement sheet (issue #1) is mapped end to end in `docs/coverage.md`.
 
 ## What works
 
-Documentation only:
+Verified by the orchestrator, not taken on report: `cargo fmt --all --check`,
+`cargo clippy --workspace --all-targets -- -D warnings` and
+`cargo test --workspace` all green through `nix develop` — 13 tests, no
+failures. Driven by hand with the three real binaries: a job streams its
+output incrementally, exit code 0 and exit code 7 both reach `herdctl`
+unchanged, and neither a process nor a bound port is left behind.
 
-- `CLAUDE.md` — roles, vocabulary (+ the consumer's word-for-word translation),
-  8 invariants, commands, git rules.
-- `docs/decisions.md` — D1 Rust, D2 vocabulary, D3 four crates, D4 WebSocket +
-  JSON, D5 deployment shape, D6 what was left open, D7 (superseded), **D8**
-  hub persistence as a directory per job, **D9** warm caches (Herd carries
-  one, Herd is not one), **D10** the data path (Herd is never in the byte
-  path), **D11** what "no inbound" means (the tailnet is approved; a runner
-  binds its fetch endpoint to the mesh interface only).
-- `docs/plan.md` — **M1..M18**, each one session, with the critical path, the
-  parallel tracks, 13 decisions to settle before the code that depends on
-  them, and the conflicts and risks.
-- `docs/coverage.md` — every expectation E-01..E-55 mapped to a milestone.
-
-## The requirement sheet, in figures
-
-55 expectations: **44 must**, 9 should, 2 could (recounted from the sheet).
-All 44 musts are placed in a milestone; nothing is unplaced. Only E-38 and E-39
-(should) are deliberately unscheduled, with reasons; E-55 (could) was promoted
-to the default by D10.
-Nine acceptances are gated on chatOnS's own deliverables and close in M18;
-fixture tests stand in until then.
+- A hub accepting a runner and requesters over `ws://`, dispatching a job,
+  relaying its log and its outcome.
+- A runner that dials out, executes, streams stdout and stderr as produced.
+- `herdctl run -- <cmd>` printing the log live and wearing the job's code.
+- `herd-proto` v1: two tagged enums (`ToHub`, `FromHub`), a versioned `Hello`,
+  per-job log sequence numbers, framing in the contract crate.
+- A `JobStore` trait with a memory implementation, so M2 swaps in disk.
+- CI on every pull request: `check` (nix, fmt, clippy, test) and `docs` (the
+  wrapping and length rules, and every `must` in `coverage.md` having a home).
+  `main` requires a green pull request; direct pushes are a discipline, not a
+  barrier, by Alexa's choice (`enforce_admins` is off).
 
 ## What is not done, and why
 
-- **No toolchain yet.** Rust is not installed; it arrives with the Nix flake
-  in M1, so every command in `CLAUDE.md` is still the agreed contract rather
-  than a verified one. `docker`, `nix` and `gh` are present and working.
-- **One decision is Alexa's**: Q10, the licence (outward-facing). The E-34
-  question D10 raised is settled as D11 — the tailnet is approved as the
-  network layer, "no inbound" means no port opened on a router, and a runner
-  binds its fetch endpoint to the mesh interface only. Invariant 3 was
-  rewritten accordingly. Q5 (the warm caches) was hers and is settled as D9;
-  Q1..Q4, Q6..Q9, Q11..Q13 are mine, and D8..D11 are taken.
-- **Nothing is deployed and no runner exists.** First exposure over `wss://`
-  is M16, on purpose: deploying earlier would freeze the public formats
-  (the `ran on:` line, the status JSON, the event payloads) on a surface still
-  moving.
-- **Issue #1 is unanswered.** Replying on GitHub is outward-facing and waits
-  for Alexa's go.
+- **One finding to settle before merging M1** (see "Next action"): the
+  protocol reports a job's end as a bare `exit_code: i32`, with 127 meaning
+  "could not start" and -1 meaning "signalled". Sentinel numbers inside a
+  field that must carry the consumer's own codes untouched (E-02 relies on 0,
+  1 and 75) will collide, and M3's "lost", M9's "cancelled (deadline)" and
+  M8's refusals all need to live there too.
+- **M1's own limits, by design.** One runner at a time; a restarted runner is
+  refused until the hub's socket dies (M3's heartbeat fixes it); no
+  reconnection, no persistence, no capabilities, no admission, and the
+  handshake's `token` is carried but not validated.
+- **The requester never learns that a job started** — `JobStarted` is
+  runner-to-hub only. Fine for now, worth knowing before M13's status.
+- **Nothing is deployed.** First exposure over `wss://` is M16, so that the
+  public formats do not freeze on a surface still moving.
+- **Q10, the licence**, is still Alexa's to decide; it blocks nothing before
+  M16.
 
 ## Environment facts
 
-- Server: NixOS, kernel 6.18, i5-10600K, 12 threads, 31 GB RAM (~11 GB free),
-  no swap, `/dev/kvm` present, Intel iGPU at `/dev/dri/renderD128`, nix with
-  flakes, docker 29.7.
-- GitHub: `tomasalexandre18` authenticated via `gh` (scopes `repo`, `workflow`,
-  `read:org`). One open issue (#1) with two comments carrying the full sheet.
-- Caution: this machine's SSH key is a deploy key for another repository
-  (`torgaddon`); git uses the HTTPS remote with the `gh` credential helper.
+- Server: NixOS, kernel 6.18, i5-10600K, 12 threads, 31 GB RAM, no swap,
+  `/dev/kvm`, Intel iGPU at `/dev/dri/renderD128`, nix with flakes, docker
+  29.7. Rust 1.98.1 comes from the flake (D12); nothing is installed globally.
+- GitHub: `tomasalexandre18` via `gh`. `main` protected (a pull request,
+  `check` + `docs` green, no force push, no deletion). Issue #1 open and
+  unanswered — replying is outward-facing and waits for Alexa.
+- This machine's SSH key is a deploy key for another repository; git uses the
+  HTTPS remote with the `gh` credential helper.
 
 ## Next action
 
-Alexa approves the plan and answers Q5 (warm caches). Then **M1** on branch
-`m1-end-to-end`: Nix flake dev shell, the workspace's four crates, herd-proto
-v1, and the in-process hub+runner+requester test that runs a command and
-propagates its exit code.
+Alexa rules on the exit-code finding above. Recommended: fix it inside M1's
+pull request — replace the bare exit code with an outcome (`exited`,
+`signalled`, `could-not-start`) so later states have somewhere to go and the
+consumer's codes stay untouched. Then merge M1 and start **M2** on branch
+`m2-job-store`: the hub's state on disk, a directory per job (D8).

@@ -322,3 +322,58 @@ asserts the binding rule above regardless of which it is.
 **Invariant amended.** CLAUDE.md invariant 3 was "no inbound port, no relay,
 no tunnel on client machines; the hub is the only thing that listens". That is
 now false and has been rewritten (Alexa's approval, 2026-10-12).
+
+---
+
+## 2026-10-12 — D12 Toolchain pinning: nixpkgs' stable rust, no overlay
+
+**Context.** M1 had to make `nix develop` the only source of tools (Alexa,
+2026-10-12). Rust can come from nixpkgs directly or from an overlay (fenix,
+oxalica) that offers exact versions, nightlies and extra components.
+
+**Choice.** nixpkgs' stable rust, pinned by `flake.lock`. The current pin
+resolves to rust **1.98.1**. No overlay, no `rust-toolchain.toml`, no rustup.
+
+**Alternative rejected.** An overlay — rejected for the first commit: it adds
+an input to trust and a second binary cache to depend on, in exchange for
+version control we do not need. We build on stable and have no component that
+nixpkgs lacks. If we ever need a pinned exact version or a nightly, the
+overlay goes in then, as one input and one line.
+
+**Reversibility.** High. `flake.lock` is the pin; moving it is a commit.
+
+---
+
+## 2026-10-13 — D13 One refusal frame, always last
+
+**Context.** M1 needed a way to say "no" for a version mismatch, and then the
+same shape turned out to fit "no runner is connected", "a runner is already
+connected" and protocol misuse.
+
+**Choice.** `Refused { reason }` is the hub's single, general "no", and it is
+always the last frame on that connection: after a refusal the hub closes. The
+reason is a sentence meant for a human, carrying its figures.
+
+**Consequence to watch.** This is a *terminal* no. E-04's explained waits are
+the opposite — a job that waits is not refused, and it must keep receiving
+reasons on an open connection. M8 therefore needs a distinct, non-terminal
+message and must not reach for `Refused`. Noted here so that it is not
+discovered by abuse of this frame.
+
+---
+
+## 2026-10-13 — D14 The hub's endpoint and the CLI surface
+
+**Context.** The hub needs a default listen address, and nothing in the
+requirement sheet specifies one.
+
+**Choice.** `127.0.0.1:8787` by default, overridden by one `--listen` option
+or `HERD_LISTEN` — one address-and-port value, never a separate host and port.
+Loopback by default on purpose: the hub is exposed by the reverse proxy in
+M16, never by binding a public interface itself. Clients take `--hub <url>`
+with a `ws://` or `wss://` scheme, so the transport is explicit at the call
+site rather than inferred.
+
+**Alternative rejected.** Defaulting to `0.0.0.0` for convenience in
+development — rejected because a default that listens publicly is the kind of
+thing that reaches a server once and stays.

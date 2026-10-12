@@ -35,31 +35,16 @@ jobs:
           key: cargo-${{ runner.os }}-${{ hashFiles('**/Cargo.lock') }}
           restore-keys: cargo-${{ runner.os }}-
 
-      # Transitional: main carries documentation only until M1 lands.
-      # Delete this step and the `if:` guards below in M1's pull request.
-      - id: probe
-        run: |
-          if [ -f flake.nix ] && [ -f Cargo.toml ]; then
-            echo "rust=yes" >> "$GITHUB_OUTPUT"
-          else
-            echo "rust=no" >> "$GITHUB_OUTPUT"
-            echo "::notice::No flake.nix or Cargo.toml yet, Rust checks skipped. Remove this guard when M1 lands."
-          fi
-
       - name: nix flake check
-        if: steps.probe.outputs.rust == 'yes'
         run: nix flake check --no-build
 
       - name: cargo fmt
-        if: steps.probe.outputs.rust == 'yes'
         run: nix develop --command cargo fmt --all --check
 
       - name: cargo clippy
-        if: steps.probe.outputs.rust == 'yes'
         run: nix develop --command cargo clippy --workspace --all-targets -- -D warnings
 
       - name: cargo test
-        if: steps.probe.outputs.rust == 'yes'
         run: nix develop --command cargo test --workspace
 
   docs:
