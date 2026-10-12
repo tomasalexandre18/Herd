@@ -3,7 +3,7 @@ use std::process::ExitCode;
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};
-use herd_proto::{JobOutcome, LogStream};
+use herd_proto::{JobId, JobOutcome, LogStream};
 use herdctl::{could_not_start_message, exit_code_for, Config, DEFAULT_HUB_URL};
 
 /// The requester CLI: submit a job, follow its log, exit with its code.
@@ -30,13 +30,35 @@ enum Action {
         #[arg(trailing_var_arg = true, required = true, num_args = 1..)]
         command: Vec<String>,
     },
+    /// Submit a command and print its job id, without waiting for it.
+    ///
+    /// The job runs and is recorded whether anyone is following it or not, so
+    /// `herdctl wait <id>` works any time afterwards.
+    Submit {
+        /// The command, after `--`.
+        #[arg(trailing_var_arg = true, required = true, num_args = 1..)]
+        command: Vec<String>,
+    },
+    /// Wait for a job that already exists, and exit with its code.
+    Wait {
+        /// The id a submission printed.
+        job_id: String,
+    },
+}
+
+/// What a subcommand leaves the process to exit with.
+enum Done {
+    /// A job ended, and its end decides the exit code (D16).
+    Job(JobOutcome),
+    /// The command did its own job; nothing ran.
+    Said,
 }
 
 #[tokio::main]
 async fn main() -> ExitCode {
     let args = Args::parse();
     match run(args).await {
-        Ok(outcome) => {
+        Ok(Done::Job(outcome)) => {
             // The reason goes to stderr, never to stdout: stdout carried the
             // job's own output and must stay the job's alone.
             if let JobOutcome::CouldNotStart { reason } = &outcome {
@@ -44,6 +66,7 @@ async fn main() -> ExitCode {
             }
             ExitCode::from(exit_code_for(&outcome))
         }
+        Ok(Done::Said) => ExitCode::SUCCESS,
         Err(error) => {
             eprintln!("herdctl: {error:#}");
             ExitCode::FAILURE
@@ -51,27 +74,38 @@ async fn main() -> ExitCode {
     }
 }
 
-async fn run(args: Args) -> Result<JobOutcome> {
+async fn run(args: Args) -> Result<Done> {
     let config = Config {
         hub_url: args.hub,
         token: args.token,
         name: None,
     };
-    let Action::Run { command } = args.command;
-    // Each stream is written to its own, so a caller's pipes and redirections
-    // behave as if the command had run here.
-    let finished = herdctl::run_job(&config, command, |stream, data| match stream {
-        LogStream::Stdout => {
-            let mut out = std::io::stdout();
-            let _ = out.write_all(data.as_bytes());
-            let _ = out.flush();
+    match args.command {
+        Action::Run { command } => {
+            // Each stream is written to its own, so a caller's pipes and
+            // redirections behave as if the command had run here.
+            let finished = herdctl::run_job(&config, command, |stream, data| match stream {
+                LogStream::Stdout => write_now(&mut std::io::stdout(), data),
+                LogStream::Stderr => write_now(&mut std::io::stderr(), data),
+            })
+            .await?;
+            Ok(Done::Job(finished.outcome))
         }
-        LogStream::Stderr => {
-            let mut err = std::io::stderr();
-            let _ = err.write_all(data.as_bytes());
-            let _ = err.flush();
+        Action::Submit { command } => {
+            let job_id = herdctl::submit_job(&config, command).await?;
+            // The id alone on stdout, so that `id=$(herdctl submit -- ...)`
+            // is all a hook needs (E-42).
+            println!("{job_id}");
+            Ok(Done::Said)
         }
-    })
-    .await?;
-    Ok(finished.outcome)
+        Action::Wait { job_id } => {
+            let finished = herdctl::wait_for_job(&config, JobId::new(job_id)).await?;
+            Ok(Done::Job(finished.outcome))
+        }
+    }
+}
+
+fn write_now(out: &mut impl Write, data: &str) {
+    let _ = out.write_all(data.as_bytes());
+    let _ = out.flush();
 }

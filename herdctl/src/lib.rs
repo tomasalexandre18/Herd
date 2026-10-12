@@ -1,8 +1,9 @@
 //! The requester side: submit a job, follow its log, learn how it ended.
 //!
 //! A requester never names a machine (invariant 6): it says what to run and
-//! the hub decides where. M1's CLI surface is `run` only; `wait` arrives with
-//! M2 and `cancel` with M3.
+//! the hub decides where. The surface is `run` to submit and follow, `submit`
+//! to fire and leave with the id, and `wait` to come back to an id later;
+//! `cancel` arrives with M3.
 
 use anyhow::{anyhow, bail, Context, Result};
 use futures_util::{SinkExt, StreamExt};
@@ -88,29 +89,7 @@ pub async fn run_job(
     if command.is_empty() {
         bail!("a job needs a command to run");
     }
-    let (mut socket, _response) = tokio_tungstenite::connect_async(&config.hub_url)
-        .await
-        .with_context(|| format!("dialling {}", config.hub_url))?;
-
-    send(
-        &mut socket,
-        &ToHub::Hello {
-            protocol_version: PROTOCOL_VERSION,
-            role: Role::Requester,
-            token: config.token.clone(),
-            name: config.name.clone(),
-        },
-    )
-    .await
-    .context("sending hello")?;
-
-    match next_message(&mut socket).await? {
-        Some(FromHub::Welcome { .. }) => {}
-        Some(FromHub::Refused { reason }) => bail!("the hub refused this requester: {reason}"),
-        Some(other) => bail!("the hub answered hello with {}", message_kind(&other)),
-        None => bail!("the hub closed the connection during the handshake"),
-    }
-
+    let mut socket = join(config).await?;
     send(&mut socket, &ToHub::SubmitJob { command })
         .await
         .context("submitting the job")?;
@@ -134,6 +113,93 @@ pub async fn run_job(
     match job_id {
         Some(job_id) => bail!("the hub closed the connection while {job_id} was still running"),
         None => bail!("the hub closed the connection without accepting the job"),
+    }
+}
+
+/// Submit one command and leave, with the id the hub minted.
+///
+/// The job runs whether anyone is listening or not — the hub records it — so
+/// this is how a push hook or a script fires work and gets on with its day
+/// (E-03, E-42). The id is the only handle needed afterwards:
+/// [`wait_for_job`] takes it, and so does the job's directory on the hub's
+/// disk.
+pub async fn submit_job(config: &Config, command: Vec<String>) -> Result<JobId> {
+    if command.is_empty() {
+        bail!("a job needs a command to run");
+    }
+    let mut socket = join(config).await?;
+    send(&mut socket, &ToHub::SubmitJob { command })
+        .await
+        .context("submitting the job")?;
+    match next_message(&mut socket).await? {
+        Some(FromHub::JobAccepted { job_id }) => {
+            let _ = socket.close(None).await;
+            Ok(job_id)
+        }
+        Some(FromHub::Refused { reason }) => bail!("the hub refused the job: {reason}"),
+        Some(other) => bail!(
+            "the hub answered a submission with {}",
+            message_kind(&other)
+        ),
+        None => bail!("the hub closed the connection without accepting the job"),
+    }
+}
+
+/// Wait for a job that already exists, by id, and learn how it ended.
+///
+/// Works on a job that is still queued, one that is running, and one that
+/// ended before this call was made: the answer comes from the hub's record
+/// either way. Log chunks that arrive meanwhile are not printed — the whole
+/// log is a file in the job's directory, and half of one is worse than none.
+pub async fn wait_for_job(config: &Config, job_id: JobId) -> Result<Finished> {
+    let mut socket = join(config).await?;
+    send(
+        &mut socket,
+        &ToHub::WaitForJob {
+            job_id: job_id.clone(),
+        },
+    )
+    .await
+    .context("asking to be told how the job ends")?;
+
+    while let Some(message) = next_message(&mut socket).await? {
+        match message {
+            FromHub::JobFinished { job_id, outcome } => {
+                let _ = socket.close(None).await;
+                return Ok(Finished { job_id, outcome });
+            }
+            FromHub::LogChunk { .. } => {}
+            FromHub::Refused { reason } => bail!("the hub refused the wait: {reason}"),
+            other => bail!(
+                "the hub sent {}, which a requester cannot use",
+                message_kind(&other)
+            ),
+        }
+    }
+    bail!("the hub closed the connection while {job_id} was still running")
+}
+
+/// Dial the hub and get through the handshake.
+async fn join(config: &Config) -> Result<Socket> {
+    let (mut socket, _response) = tokio_tungstenite::connect_async(&config.hub_url)
+        .await
+        .with_context(|| format!("dialling {}", config.hub_url))?;
+    send(
+        &mut socket,
+        &ToHub::Hello {
+            protocol_version: PROTOCOL_VERSION,
+            role: Role::Requester,
+            token: config.token.clone(),
+            name: config.name.clone(),
+        },
+    )
+    .await
+    .context("sending hello")?;
+    match next_message(&mut socket).await? {
+        Some(FromHub::Welcome { .. }) => Ok(socket),
+        Some(FromHub::Refused { reason }) => bail!("the hub refused this requester: {reason}"),
+        Some(other) => bail!("the hub answered hello with {}", message_kind(&other)),
+        None => bail!("the hub closed the connection during the handshake"),
     }
 }
 
@@ -166,6 +232,7 @@ fn message_kind(message: &FromHub) -> &'static str {
         FromHub::AssignJob { .. } => "assign_job",
         FromHub::LogChunk { .. } => "log_chunk",
         FromHub::JobFinished { .. } => "job_finished",
+        FromHub::JobResultAck { .. } => "job_result_ack",
     }
 }
 
