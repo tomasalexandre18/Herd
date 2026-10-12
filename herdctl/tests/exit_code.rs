@@ -31,16 +31,22 @@ struct Harness {
 
 impl Harness {
     async fn new() -> Self {
-        Self::start(true).await
+        Self::with_caps(|_| {}).await
+    }
+
+    /// A harness whose runner confines jobs as the caller asks, so that a cap
+    /// can be made small enough to trip in a test.
+    async fn with_caps(shape: impl FnOnce(&mut herd_runner::Confinement)) -> Self {
+        Self::start(Some(shape)).await
     }
 
     /// A hub with nothing to run jobs on, for the refusals that are Herd's own
     /// failure rather than a job's verdict (D20).
     async fn with_no_runner() -> Self {
-        Self::start(false).await
+        Self::start(None::<fn(&mut herd_runner::Confinement)>).await
     }
 
-    async fn start(with_runner: bool) -> Self {
+    async fn start(shape: Option<impl FnOnce(&mut herd_runner::Confinement)>) -> Self {
         let state = tempfile::tempdir().expect("a temporary state directory");
         let store = JobDirStore::open(state.path()).expect("the state root opens");
         let hub = Hub::bind(
@@ -56,17 +62,19 @@ impl Harness {
         });
         let mut tasks = vec![serving];
         let mut data_root = None;
-        if with_runner {
+        if let Some(shape) = shape {
             // One data root per runner, thrown away with the harness: a
             // runner locks its root for the life of the process (E-45), so
             // two tests sharing one would refuse to start.
             let root = DataRootDir::new("exit-code");
+            let mut confinement = herd_runner::Confinement::with_data_root(root.path());
+            shape(&mut confinement);
             tasks.push(tokio::spawn({
                 let config = herd_runner::Config {
                     hub_url: hub_url.clone(),
                     name: Some("exit-code-runner".to_owned()),
                     token: None,
-                    confinement: herd_runner::Confinement::with_data_root(root.path()),
+                    confinement,
                 };
                 async move {
                     let _ = herd_runner::run(config).await;
@@ -346,4 +354,54 @@ async fn herd_s_own_failures_exit_125_and_never_1() {
             stderr(&output)
         );
     }
+}
+
+/// A cap breach is 124 — `timeout(1)`'s code, generalised (D25) — with the
+/// cap named on stderr, and this is read off the real binary because a
+/// requester's script reads it.
+///
+/// Three of the four caps can be made to trip on any host. The memory
+/// ceiling's named outcome needs cgroup v2 delegation and is asserted in
+/// `herd-runner`'s own suite, which skips it loudly where it cannot run.
+#[tokio::test]
+async fn herdctl_exits_124_for_every_cap_a_test_can_trip() {
+    // The log cap, breached by a job that then exits 0 straight away: the
+    // cap has to outrank the job's own status, or a truncated log reads as a
+    // build that passed.
+    let harness = Harness::with_caps(|caps| caps.log_cap = 1024).await;
+    let output = harness
+        .herdctl_shell("dd if=/dev/zero bs=4096 count=1 2>/dev/null | tr '\\0' 'x'; exit 0")
+        .await;
+    assert_eq!(
+        status_code(&output),
+        124,
+        "a job whose log was cut is not a job that passed: {}",
+        stderr(&output)
+    );
+    assert!(stderr(&output).contains("log cap"), "{}", stderr(&output));
+    assert_eq!(
+        stdout(&output).len(),
+        1024,
+        "the log the requester got must be exactly the cap"
+    );
+    drop(harness);
+
+    // The time cap.
+    let harness = Harness::with_caps(|caps| caps.timeout = Duration::from_secs(1)).await;
+    let output = harness.herdctl_shell("sleep 120").await;
+    assert_eq!(status_code(&output), 124, "{}", stderr(&output));
+    assert!(stderr(&output).contains("time cap"), "{}", stderr(&output));
+    drop(harness);
+
+    // The disk budget, breached behind a directory the job made unreadable:
+    // a budget the runner cannot measure is still a budget it enforces.
+    let harness = Harness::with_caps(|caps| caps.disk_budget = 8 << 20).await;
+    let output = harness
+        .herdctl_shell(
+            "mkdir h; dd if=/dev/zero of=h/big bs=1048576 count=40 2>/dev/null; \
+             chmod 300 h; exit 0",
+        )
+        .await;
+    assert_eq!(status_code(&output), 124, "{}", stderr(&output));
+    assert!(stderr(&output).contains("disk cap"), "{}", stderr(&output));
 }
