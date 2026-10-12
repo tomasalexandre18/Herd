@@ -11,21 +11,26 @@ use std::process::Output;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use herd_hub::{Hub, JobStore, MemoryJobStore};
+use herd_hub::{Hub, JobDirStore, JobStore};
+use tempfile::TempDir;
 use tokio::process::Command;
 use tokio::task::JoinHandle;
 
 /// A hub with one runner joined, and the means to run `herdctl` against it.
 struct Harness {
     hub_url: String,
+    /// The hub's state, removed with the harness: a test leaves no files.
+    _state: TempDir,
     tasks: Vec<JoinHandle<()>>,
 }
 
 impl Harness {
     async fn new() -> Self {
+        let state = tempfile::tempdir().expect("a temporary state directory");
+        let store = JobDirStore::open(state.path()).expect("the state root opens");
         let hub = Hub::bind(
             "127.0.0.1:0".parse().expect("a literal loopback address"),
-            Arc::new(MemoryJobStore::new()) as Arc<dyn JobStore>,
+            Arc::new(store) as Arc<dyn JobStore>,
         )
         .await
         .expect("the hub binds a free port");
@@ -52,6 +57,7 @@ impl Harness {
         }
         Self {
             hub_url,
+            _state: state,
             tasks: vec![serving, running],
         }
     }
@@ -62,12 +68,17 @@ impl Harness {
     }
 
     async fn herdctl(&self, command: &[&str]) -> Output {
+        let mut arguments = vec!["run", "--"];
+        arguments.extend_from_slice(command);
+        self.herdctl_args(&arguments).await
+    }
+
+    /// Run `herdctl` with whatever arguments, as a caller would.
+    async fn herdctl_args(&self, arguments: &[&str]) -> Output {
         Command::new(env!("CARGO_BIN_EXE_herdctl"))
             .arg("--hub")
             .arg(&self.hub_url)
-            .arg("run")
-            .arg("--")
-            .args(command)
+            .args(arguments)
             .output()
             .await
             .expect("herdctl runs")
@@ -165,5 +176,59 @@ async fn herdctl_exits_125_and_says_on_stderr_that_herd_could_not_run_the_job() 
         stdout(&output),
         "",
         "stdout belongs to the job, which never ran"
+    );
+}
+
+/// A detached submission prints the id and nothing else, and a later `wait`
+/// exits with the job's own code — the same code `run` would have exited
+/// with (D16). This is the pair a push hook uses (E-03, E-42).
+#[tokio::test]
+async fn submit_prints_an_id_and_wait_exits_with_the_job_s_code() {
+    let harness = Harness::new().await;
+    for code in [0, 1, 75] {
+        let submitted = harness
+            .herdctl_args(&[
+                "submit",
+                "--",
+                "/bin/sh",
+                "-c",
+                &format!("printf 'detached\\n'; exit {code}"),
+            ])
+            .await;
+        assert_eq!(
+            status_code(&submitted),
+            0,
+            "a submission that was accepted is a success: {}",
+            stderr(&submitted)
+        );
+        let job_id = stdout(&submitted).trim().to_owned();
+        assert!(!job_id.is_empty(), "submit must print the job's id");
+        assert_eq!(
+            stdout(&submitted),
+            format!("{job_id}\n"),
+            "stdout carries the id alone, so a script can read it"
+        );
+
+        let waited = harness.herdctl_args(&["wait", &job_id]).await;
+        assert_eq!(
+            status_code(&waited),
+            code,
+            "a wait must wear the job's own code: {}",
+            stderr(&waited)
+        );
+    }
+}
+
+/// Waiting on an id that was never minted is a refusal naming it, not a wait
+/// that never ends.
+#[tokio::test]
+async fn waiting_for_a_job_that_does_not_exist_says_so() {
+    let harness = Harness::new().await;
+    let output = harness.herdctl_args(&["wait", "j0000009999"]).await;
+    assert_eq!(status_code(&output), 1);
+    assert!(
+        stderr(&output).contains("no such job: j0000009999"),
+        "the refusal must name the id: {}",
+        stderr(&output)
     );
 }
