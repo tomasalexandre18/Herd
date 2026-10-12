@@ -24,6 +24,9 @@ fits and returns a result plus logs. First consumer: the chatOnS OS project.
 - **job** — one unit of requested work with requirements, a priority, an exit
   code and logs.
 
+The first consumer's issues say "client" where we say "runner", and "agent"
+where we say "requester". Translate when triaging; do not adopt their words.
+
 ## Invariants (do not break; changing one needs Alexa's approval)
 
 1. **Stay specialized.** No workflow language, no plugin system, no cloud, no
@@ -43,7 +46,8 @@ fits and returns a result plus logs. First consumer: the chatOnS OS project.
    given at startup.
 8. **Docs discipline.** `docs/status.md` is *state*, replaced every session,
    never a journal. `docs/decisions.md` is append-only, one dated entry per
-   decision. `docs/plan.md` holds the milestones.
+   decision. `docs/plan.md` holds the milestones and `docs/coverage.md` maps
+   the first consumer's numbered expectations to them.
 
 ## Layout
 
@@ -52,7 +56,7 @@ herd-proto/   message types, serde, protocol version      (library)
 herd-hub/     the service: accepts runners, dispatches     (binary)
 herd-runner/  the client: executes jobs, streams logs      (binary)
 herdctl/      the requester CLI: submit, follow, cancel    (binary)
-docs/         status.md, decisions.md, plan.md
+docs/         status.md, decisions.md, plan.md, coverage.md
 ```
 
 ## Commands

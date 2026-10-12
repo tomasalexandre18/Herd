@@ -120,3 +120,57 @@ in M1–M3 may assume an answer, and no heavy dependency may be added for them.
   whether a result is retrievable after the requester disconnects.
 - **Job input model**: how a commit reaches the runner (git fetch by the
   runner, archive pushed through the hub, shared cache).
+
+---
+
+## 2026-10-12 — D7 Blob transfer channel (amends D4)
+
+**Context.** Issue #1 arrived with the first consumer's requirement sheet.
+E-12 asks Herd to store *packs*: build artefact sets of hundreds of megabytes,
+up to about 1.5 GB, fetched by a runner on another machine. D4 says every
+message is a JSON text frame on the WebSocket, which would mean base64 through
+the control channel — tens of percent of overhead, a head-of-line block on the
+connection that also carries heartbeats, and no resumable transfer. The sheet
+explicitly leaves "the transport's details beyond `wss://`" to the Herd
+project, so this is ours to settle.
+
+**Choice.** Keep the WebSocket as the control channel exactly as D4 describes
+it, and add a plain HTTP channel on the hub for blob `GET` and `PUT`, behind
+the same reverse proxy, authenticated by the same per-runner token. The
+WebSocket carries references (manifest hashes, pack keys), never payloads.
+
+**Alternative rejected.** Binary WebSocket frames with a chunking protocol —
+rejected because it reimplements range requests, resumption and caching that
+HTTP already has, on the one connection whose liveness we depend on.
+
+**Reversibility.** Easy to extend (a direct runner-to-runner path, E-55, is a
+later addition on top), hard to remove once runners depend on the endpoint.
+
+---
+
+## 2026-10-12 — D8 Hub persistence: a directory per job, no database
+
+**Context.** E-44 requires that a service restart lose no job and no result,
+with the queue intact and runners delivering results of jobs that were running
+across the restart. E-15 requires the full job record on disk — fields, state
+transitions with timestamps, log, kept files — and E-53 requires the consumer
+to be able to read a job's record while it runs. This is the single most
+load-bearing structural choice: if the hub starts life with its state in
+memory, every scheduling milestone built on top gets rewritten.
+
+**Choice.** The hub's state is files from the first commit of M2. One directory
+per job: `job.json` written by write-to-temp-then-rename, `events.jsonl`
+appended for transitions, the log as a file, kept files beside it. The queue is
+rebuilt by scanning at startup. A runner holds a finished result until the hub
+acknowledges it, and redelivers after a restart.
+
+**Alternative rejected.** SQLite — rejected because the records must be plain
+readable files for the consumer (E-53) and for after-the-fact inspection
+(E-54), atomic rename is already the primitive E-17 demands for artefacts, and
+the expected volume (hundreds of jobs a day) does not need a query engine.
+If search (E-39) later justifies one, it can be an index *derived* from the
+files, never the source of truth.
+
+**Reversibility.** The on-disk layout becomes a compatibility surface the
+moment the consumer reads it; the record format therefore carries a version
+from the start.
