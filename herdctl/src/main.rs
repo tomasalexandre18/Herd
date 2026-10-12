@@ -3,8 +3,8 @@ use std::process::ExitCode;
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};
-use herd_proto::LogStream;
-use herdctl::{Config, DEFAULT_HUB_URL};
+use herd_proto::{JobOutcome, LogStream};
+use herdctl::{could_not_start_message, exit_code_for, Config, DEFAULT_HUB_URL};
 
 /// The requester CLI: submit a job, follow its log, exit with its code.
 #[derive(Debug, Parser)]
@@ -36,9 +36,14 @@ enum Action {
 async fn main() -> ExitCode {
     let args = Args::parse();
     match run(args).await {
-        // The job's own code is what a requester cares about, so herdctl wears
-        // it. Codes outside 0..=255 cannot be worn; they become 1.
-        Ok(exit_code) => ExitCode::from(u8::try_from(exit_code).unwrap_or(1)),
+        Ok(outcome) => {
+            // The reason goes to stderr, never to stdout: stdout carried the
+            // job's own output and must stay the job's alone.
+            if let JobOutcome::CouldNotStart { reason } = &outcome {
+                eprintln!("herdctl: {}", could_not_start_message(reason));
+            }
+            ExitCode::from(exit_code_for(&outcome))
+        }
         Err(error) => {
             eprintln!("herdctl: {error:#}");
             ExitCode::FAILURE
@@ -46,7 +51,7 @@ async fn main() -> ExitCode {
     }
 }
 
-async fn run(args: Args) -> Result<i32> {
+async fn run(args: Args) -> Result<JobOutcome> {
     let config = Config {
         hub_url: args.hub,
         token: args.token,
@@ -55,7 +60,7 @@ async fn run(args: Args) -> Result<i32> {
     let Action::Run { command } = args.command;
     // Each stream is written to its own, so a caller's pipes and redirections
     // behave as if the command had run here.
-    let outcome = herdctl::run_job(&config, command, |stream, data| match stream {
+    let finished = herdctl::run_job(&config, command, |stream, data| match stream {
         LogStream::Stdout => {
             let mut out = std::io::stdout();
             let _ = out.write_all(data.as_bytes());
@@ -68,5 +73,5 @@ async fn run(args: Args) -> Result<i32> {
         }
     })
     .await?;
-    Ok(outcome.exit_code)
+    Ok(finished.outcome)
 }

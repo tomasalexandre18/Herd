@@ -1,5 +1,5 @@
 //! The test that defines M1: a hub, a runner and a requester in one process,
-//! a real command, real output, the real exit code (invariant 5).
+//! a real command, real output, the real outcome (invariant 5).
 //!
 //! Everything binds port 0 and discovers the port it got, so the suite never
 //! collides with a port in use. Every spawned task is aborted when its
@@ -11,7 +11,9 @@ use std::time::{Duration, Instant};
 
 use futures_util::{SinkExt, StreamExt};
 use herd_hub::{Hub, JobState, JobStore, MemoryJobStore};
-use herd_proto::{from_frame, to_frame, FromHub, LogStream, Role, ToHub, PROTOCOL_VERSION};
+use herd_proto::{
+    from_frame, to_frame, FromHub, JobOutcome, LogStream, Role, ToHub, PROTOCOL_VERSION,
+};
 use tokio::task::JoinHandle;
 use tokio_tungstenite::tungstenite::Message;
 
@@ -87,6 +89,15 @@ impl Harness {
         }
     }
 
+    /// What the hub itself believes became of a job.
+    fn state_of(&self, job_id: &herd_proto::JobId) -> JobState {
+        self.store
+            .job(job_id)
+            .expect("the store reads")
+            .expect("the hub knows this job")
+            .state
+    }
+
     fn requester(&self) -> herdctl::Config {
         herdctl::Config {
             hub_url: self.hub_url.clone(),
@@ -129,7 +140,7 @@ fn shell(script: &str) -> Vec<String> {
 async fn a_job_streams_its_output_and_succeeds() {
     let harness = Harness::with_hub_and_runner().await;
     let mut seen = Seen::default();
-    let outcome = herdctl::run_job(
+    let finished = herdctl::run_job(
         &harness.requester(),
         shell("printf 'out of the runner\\n'; printf 'and its stderr\\n' >&2"),
         |stream, data| seen.chunks.push((stream, data.to_owned())),
@@ -137,31 +148,40 @@ async fn a_job_streams_its_output_and_succeeds() {
     .await
     .expect("the job runs to its end");
 
-    assert_eq!(outcome.exit_code, 0, "a successful command exits 0");
+    assert_eq!(
+        finished.outcome,
+        JobOutcome::Exited { code: 0 },
+        "a successful command exits 0"
+    );
     assert_eq!(seen.text(LogStream::Stdout), "out of the runner\n");
     assert_eq!(seen.text(LogStream::Stderr), "and its stderr\n");
 
     // The hub kept the same bytes it relayed, and knows how the job ended.
     let log = harness
         .store
-        .job_log(&outcome.job_id)
+        .job_log(&finished.job_id)
         .expect("the store reads")
         .expect("the hub knows this job");
     assert!(log.contains("out of the runner\n"), "hub log: {log:?}");
     assert!(log.contains("and its stderr\n"), "hub log: {log:?}");
     let record = harness
         .store
-        .job(&outcome.job_id)
+        .job(&finished.job_id)
         .expect("the store reads")
         .expect("the hub knows this job");
-    assert_eq!(record.state, JobState::Finished { exit_code: 0 });
+    assert_eq!(
+        record.state,
+        JobState::Finished {
+            outcome: JobOutcome::Exited { code: 0 }
+        }
+    );
 }
 
 #[tokio::test]
 async fn a_failing_job_reports_its_own_exit_code() {
     let harness = Harness::with_hub_and_runner().await;
     let mut seen = Seen::default();
-    let outcome = herdctl::run_job(
+    let finished = herdctl::run_job(
         &harness.requester(),
         shell("printf 'it went wrong\\n' >&2; exit 42"),
         |stream, data| seen.chunks.push((stream, data.to_owned())),
@@ -170,18 +190,99 @@ async fn a_failing_job_reports_its_own_exit_code() {
     .expect("a failing job is still a job that ran");
 
     assert_eq!(
-        outcome.exit_code, 42,
+        finished.outcome,
+        JobOutcome::Exited { code: 42 },
         "the job's own code reaches the requester"
     );
     assert_eq!(seen.text(LogStream::Stderr), "it went wrong\n");
     assert_eq!(
+        harness.state_of(&finished.job_id),
+        JobState::Finished {
+            outcome: JobOutcome::Exited { code: 42 }
+        }
+    );
+}
+
+/// A command a shell could not execute. 127 is what a shell would exit with
+/// here, and that is exactly what must not be reported: 127 belongs to the
+/// job, this failure belongs to Herd.
+const NO_SUCH_COMMAND: &str = "herd-no-such-executable-in-m1";
+
+#[tokio::test]
+async fn a_job_killed_by_a_signal_is_reported_as_signalled() {
+    let harness = Harness::with_hub_and_runner().await;
+    let mut seen = Seen::default();
+    // The shell kills itself, so the runner's own child dies by the signal
+    // rather than reporting a shell's 128 + 15. SIGTERM is 15 everywhere.
+    let finished = herdctl::run_job(
+        &harness.requester(),
+        shell("printf 'about to die\\n'; kill -TERM $$"),
+        |stream, data| seen.chunks.push((stream, data.to_owned())),
+    )
+    .await
+    .expect("a signalled job is still a job that ran");
+
+    assert_eq!(
+        finished.outcome,
+        JobOutcome::Signalled { signal: 15 },
+        "a killed process has no exit code to report"
+    );
+    assert_eq!(
+        seen.text(LogStream::Stdout),
+        "about to die\n",
+        "what the job printed before dying still reaches the requester"
+    );
+    assert_eq!(
+        harness.state_of(&finished.job_id),
+        JobState::Finished {
+            outcome: JobOutcome::Signalled { signal: 15 }
+        }
+    );
+}
+
+#[tokio::test]
+async fn a_command_that_does_not_exist_is_reported_as_could_not_start() {
+    let harness = Harness::with_hub_and_runner().await;
+    let mut seen = Seen::default();
+    let finished = herdctl::run_job(
+        &harness.requester(),
+        vec![NO_SUCH_COMMAND.to_owned(), "--whatever".to_owned()],
+        |stream, data| seen.chunks.push((stream, data.to_owned())),
+    )
+    .await
+    .expect("a job that cannot start is still an answer, not an error");
+
+    let JobOutcome::CouldNotStart { reason } = &finished.outcome else {
+        panic!(
+            "a missing executable must not be an exit code: {:?}",
+            finished.outcome
+        );
+    };
+    assert!(
+        reason.contains(NO_SUCH_COMMAND),
+        "the reason must name what could not be started: {reason}"
+    );
+    // The job wrote nothing, so neither did Herd on the job's behalf: the
+    // reason travels in the outcome, not in the job's log.
+    assert!(
+        seen.chunks.is_empty(),
+        "a job that never started has no output: {:?}",
+        seen.chunks
+    );
+    assert_eq!(
         harness
             .store
-            .job(&outcome.job_id)
+            .job_log(&finished.job_id)
             .expect("the store reads")
-            .expect("the hub knows this job")
-            .state,
-        JobState::Finished { exit_code: 42 }
+            .as_deref(),
+        Some("")
+    );
+    assert_eq!(
+        harness.state_of(&finished.job_id),
+        JobState::Finished {
+            outcome: finished.outcome.clone()
+        },
+        "the hub records the reason as it was reported"
     );
 }
 
@@ -190,7 +291,7 @@ async fn output_arrives_while_the_job_is_still_running() {
     let harness = Harness::with_hub_and_runner().await;
     let mut seen = Seen::default();
     let submitted_at = Instant::now();
-    let outcome = herdctl::run_job(
+    let finished = herdctl::run_job(
         &harness.requester(),
         // Writes, waits, writes: if the log were delivered at exit, the first
         // chunk and the outcome would arrive together.
@@ -204,7 +305,7 @@ async fn output_arrives_while_the_job_is_still_running() {
     .expect("the job runs to its end");
     let finished_at = Instant::now();
 
-    assert_eq!(outcome.exit_code, 0);
+    assert_eq!(finished.outcome, JobOutcome::Exited { code: 0 });
     assert_eq!(seen.text(LogStream::Stdout), "first\nsecond\n");
     let first_chunk_at = seen.first_chunk_at.expect("some output arrived");
     assert!(

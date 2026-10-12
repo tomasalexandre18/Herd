@@ -278,13 +278,18 @@ async fn relay_from_runner(state: &State, outbox: &Outbox, source: &mut Source) 
                     });
                 }
             }
-            ToHub::JobFinished { job_id, exit_code } => {
+            ToHub::JobFinished { job_id, outcome } => {
                 state
                     .store
-                    .record_state(&job_id, JobState::Finished { exit_code })
+                    .record_state(
+                        &job_id,
+                        JobState::Finished {
+                            outcome: outcome.clone(),
+                        },
+                    )
                     .with_context(|| format!("recording the outcome of {job_id}"))?;
                 if let Some(follower) = state.stop_following(&job_id) {
-                    let _ = follower.send(FromHub::JobFinished { job_id, exit_code });
+                    let _ = follower.send(FromHub::JobFinished { job_id, outcome });
                 }
             }
             other => {

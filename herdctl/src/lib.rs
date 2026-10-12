@@ -1,4 +1,4 @@
-//! The requester side: submit a job, follow its log, learn its exit code.
+//! The requester side: submit a job, follow its log, learn how it ended.
 //!
 //! A requester never names a machine (invariant 6): it says what to run and
 //! the hub decides where. M1's CLI surface is `run` only; `wait` arrives with
@@ -6,7 +6,9 @@
 
 use anyhow::{anyhow, bail, Context, Result};
 use futures_util::{SinkExt, StreamExt};
-use herd_proto::{from_frame, to_frame, FromHub, JobId, LogStream, Role, ToHub, PROTOCOL_VERSION};
+use herd_proto::{
+    from_frame, to_frame, FromHub, JobId, JobOutcome, LogStream, Role, ToHub, PROTOCOL_VERSION,
+};
 use tokio::net::TcpStream;
 use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::{MaybeTlsStream, WebSocketStream};
@@ -36,11 +38,42 @@ impl Default for Config {
     }
 }
 
-/// How a followed job ended.
+/// How a followed job ended, and which job it was.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Outcome {
+pub struct Finished {
     pub job_id: JobId,
-    pub exit_code: i32,
+    pub outcome: JobOutcome,
+}
+
+/// `herdctl`'s exit code when Herd could not run the job at all. 125 is the
+/// convention of a tool that wraps another one (`env`, `timeout`): the wrapper
+/// failed, not the command. A job could exit 125 by itself, which is why the
+/// reason is also printed, and why the wire carries the variant rather than a
+/// number.
+pub const COULD_NOT_START_CODE: u8 = 125;
+
+/// What `herdctl` exits with for a job that ended this way.
+///
+/// An exit code is worn untouched — 0, 1 and 75 included, as E-02 needs. A
+/// signal becomes `128 + signal`, exactly as a shell reports one, so no
+/// sentinel value is spent on it.
+pub fn exit_code_for(outcome: &JobOutcome) -> u8 {
+    match outcome {
+        // A real process code is 0..=255. Anything else came from a peer
+        // inventing one, and cannot be worn.
+        JobOutcome::Exited { code } => u8::try_from(*code).unwrap_or(1),
+        JobOutcome::Signalled { signal } => {
+            128u8.saturating_add(u8::try_from(*signal).unwrap_or(127))
+        }
+        JobOutcome::CouldNotStart { .. } => COULD_NOT_START_CODE,
+    }
+}
+
+/// The one sentence `herdctl` prints on stderr when Herd could not run the
+/// job. Herd is the subject on purpose: the job did not fail, it never ran.
+/// A function, so the wording lives in one place and a test can rely on it.
+pub fn could_not_start_message(reason: &str) -> String {
+    format!("herd could not run this job, so it never started: {reason}")
 }
 
 /// Submit one command and follow it to its end.
@@ -51,7 +84,7 @@ pub async fn run_job(
     config: &Config,
     command: Vec<String>,
     mut on_log: impl FnMut(LogStream, &str),
-) -> Result<Outcome> {
+) -> Result<Finished> {
     if command.is_empty() {
         bail!("a job needs a command to run");
     }
@@ -87,9 +120,9 @@ pub async fn run_job(
         match message {
             FromHub::JobAccepted { job_id: accepted } => job_id = Some(accepted),
             FromHub::LogChunk { stream, data, .. } => on_log(stream, &data),
-            FromHub::JobFinished { job_id, exit_code } => {
+            FromHub::JobFinished { job_id, outcome } => {
                 let _ = socket.close(None).await;
-                return Ok(Outcome { job_id, exit_code });
+                return Ok(Finished { job_id, outcome });
             }
             FromHub::Refused { reason } => bail!("the hub refused the job: {reason}"),
             other => bail!(
@@ -133,5 +166,49 @@ fn message_kind(message: &FromHub) -> &'static str {
         FromHub::AssignJob { .. } => "assign_job",
         FromHub::LogChunk { .. } => "log_chunk",
         FromHub::JobFinished { .. } => "job_finished",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn an_exit_code_is_worn_untouched() {
+        // E-02 reads these three: pass, fail, absent or leased. 127 is a code
+        // a command may choose, and it must not mean anything to herdctl.
+        for code in [0, 1, 42, 75, 125, 127, 255] {
+            assert_eq!(
+                exit_code_for(&JobOutcome::Exited { code }),
+                u8::try_from(code).expect("a code in range"),
+                "exit code {code} was not worn as it was"
+            );
+        }
+    }
+
+    #[test]
+    fn a_signal_becomes_the_shell_s_hundred_and_twenty_eight_plus_it() {
+        assert_eq!(exit_code_for(&JobOutcome::Signalled { signal: 15 }), 143);
+        assert_eq!(exit_code_for(&JobOutcome::Signalled { signal: 9 }), 137);
+    }
+
+    #[test]
+    fn a_job_that_never_started_is_the_wrapper_s_own_code() {
+        assert_eq!(
+            exit_code_for(&JobOutcome::CouldNotStart {
+                reason: "no-such-tool: not found".to_owned()
+            }),
+            125
+        );
+    }
+
+    #[test]
+    fn the_could_not_start_sentence_blames_herd_and_carries_the_reason() {
+        let message = could_not_start_message("no-such-tool: not found");
+        assert!(
+            message.starts_with("herd could not run this job"),
+            "{message}"
+        );
+        assert!(message.contains("no-such-tool: not found"), "{message}");
     }
 }

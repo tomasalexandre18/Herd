@@ -34,6 +34,34 @@ pub enum LogStream {
     Stderr,
 }
 
+/// How a job ended.
+///
+/// A job's end is not an integer. A process can exit with a code, be killed by
+/// a signal, or never start at all — and later milestones add ends that are
+/// none of those: M3's lost runner, M8's refusals, M9's deadline. So the end
+/// travels as a tagged object, exactly as a message does, and a new way for a
+/// job to end is a new variant: purely additive, since no existing frame
+/// changes shape. Every variant carries named fields for the same reason, so
+/// that one of them can gain a field without breaking the others.
+///
+/// What this type must never do is fold Herd's own failures into the
+/// consumer's exit code. The code in [`JobOutcome::Exited`] is the command's
+/// own, untouched, so that 0 means pass, 1 means fail and 75 means "absent or
+/// leased" (E-02) — and 127 means whatever the command meant by it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum JobOutcome {
+    /// The process ran and exited with this code, reported verbatim.
+    Exited { code: i32 },
+    /// The process was killed by this signal, and so has no exit code.
+    Signalled { signal: i32 },
+    /// Herd never got an outcome out of the process: it could not be spawned,
+    /// or waiting for it failed. `reason` is one sentence for a human naming
+    /// what failed — the executable that was not found, say. This is Herd
+    /// failing to run the job, never the job failing.
+    CouldNotStart { reason: String },
+}
+
 /// A job's identity, minted by the hub.
 ///
 /// Opaque on purpose: M1 numbers jobs in memory, M2 makes each one a directory
@@ -85,8 +113,8 @@ pub enum ToHub {
         seq: u64,
         data: String,
     },
-    /// Runner reports the job's outcome.
-    JobFinished { job_id: JobId, exit_code: i32 },
+    /// Runner reports how the job ended.
+    JobFinished { job_id: JobId, outcome: JobOutcome },
 }
 
 /// Sent by the hub to a runner or a requester.
@@ -111,8 +139,8 @@ pub enum FromHub {
         seq: u64,
         data: String,
     },
-    /// Outcome relayed to the requester that submitted the job.
-    JobFinished { job_id: JobId, exit_code: i32 },
+    /// How the job ended, relayed to the requester that submitted it.
+    JobFinished { job_id: JobId, outcome: JobOutcome },
 }
 
 /// The wording of a version refusal, so that every peer reads one sentence and
