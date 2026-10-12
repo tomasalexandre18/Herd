@@ -4,8 +4,15 @@
 //! `Hello` whose protocol version must match. A requester's `SubmitJob` is
 //! minted into a job, handed to the connected runner, and everything the
 //! runner says about that job is relayed back to the requester that submitted
-//! it. M1 has no queue and no scheduling: with no runner connected, a
-//! submission is refused by name.
+//! it. There is no scheduling yet: with no runner connected, a submission is
+//! refused by name (M6 gives the hub a queue to put it in instead).
+//!
+//! Everything the hub knows is on its disk before it is acted on, through the
+//! [`JobStore`] it was given. Two consequences run through this file. A result
+//! is acknowledged to the runner only once it is recorded, because the runner
+//! is holding it until then (E-44). And a job that is still queued when a
+//! runner joins is handed to it, whether that job was submitted a second ago
+//! or inherited from the hub that ran before this one.
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
@@ -117,8 +124,11 @@ struct State {
 struct Peers {
     /// M1 accepts exactly one runner. M5 onwards holds a set.
     runner: Option<Outbox>,
-    /// Who to relay a job's logs and outcome to.
-    followers: HashMap<JobId, Outbox>,
+    /// Who to relay a job's logs and outcome to. More than one is possible
+    /// from M2: a `herdctl run` follows the job it submitted, and a
+    /// `herdctl wait` on the same id attaches beside it rather than taking
+    /// its place.
+    followers: HashMap<JobId, Vec<Outbox>>,
 }
 
 impl State {
@@ -153,7 +163,7 @@ impl State {
                 return Vec::new();
             }
             peers.runner = None;
-            peers.followers.drain().map(|(_, f)| f).collect()
+            peers.followers.drain().flat_map(|(_, f)| f).collect()
         })
     }
 
@@ -162,21 +172,24 @@ impl State {
     }
 
     fn follow(&self, id: JobId, outbox: &Outbox) {
-        self.with_peers(|peers| peers.followers.insert(id, outbox.clone()));
+        self.with_peers(|peers| peers.followers.entry(id).or_default().push(outbox.clone()));
     }
 
-    fn follower(&self, id: &JobId) -> Option<Outbox> {
-        self.with_peers(|peers| peers.followers.get(id).cloned())
+    fn followers(&self, id: &JobId) -> Vec<Outbox> {
+        self.with_peers(|peers| peers.followers.get(id).cloned().unwrap_or_default())
     }
 
-    fn stop_following(&self, id: &JobId) -> Option<Outbox> {
-        self.with_peers(|peers| peers.followers.remove(id))
+    fn stop_following(&self, id: &JobId) -> Vec<Outbox> {
+        self.with_peers(|peers| peers.followers.remove(id).unwrap_or_default())
     }
 
     /// A requester went away: nobody is waiting for its jobs any more.
     fn forget_follower(&self, outbox: &Outbox) {
         self.with_peers(|peers| {
-            peers.followers.retain(|_, f| !f.same_channel(outbox));
+            for following in peers.followers.values_mut() {
+                following.retain(|f| !f.same_channel(outbox));
+            }
+            peers.followers.retain(|_, following| !following.is_empty());
         });
     }
 }
@@ -241,6 +254,7 @@ async fn serve_runner(state: &State, outbox: &Outbox, source: &mut Source) -> Re
         let _ = outbox.send(FromHub::Refused { reason });
         return Ok(());
     }
+    dispatch_recovered_jobs(state, outbox)?;
     let outcome = relay_from_runner(state, outbox, source).await;
     for follower in state.release_runner(outbox) {
         let _ = follower.send(FromHub::Refused {
@@ -248,6 +262,48 @@ async fn serve_runner(state: &State, outbox: &Outbox, source: &mut Source) -> Re
         });
     }
     outcome
+}
+
+/// Hand a newly joined runner the jobs that are still queued.
+///
+/// After a restart the queue is whatever the job directories say it is, and a
+/// job that was queued when the hub went down is simply a job waiting for a
+/// runner. Nobody follows these: the requester that submitted them is long
+/// gone, which is exactly the detached case (E-03), and the result is recorded
+/// whether anyone is listening or not.
+///
+/// Only *queued* jobs are dispatched. A job that was already assigned or
+/// running belongs to an attempt this hub did not see end; deciding that such
+/// an attempt is lost, and requeueing it once, is M3's — doing it here would
+/// risk running a job twice.
+fn dispatch_recovered_jobs(state: &State, runner: &Outbox) -> Result<()> {
+    let waiting = state
+        .store
+        .unfinished_jobs()
+        .context("reading the queue the hub recovered")?;
+    for record in waiting {
+        if record.state != JobState::Queued {
+            continue;
+        }
+        state
+            .store
+            .record_state(&record.id, JobState::Assigned)
+            .with_context(|| format!("recording {} as assigned", record.id))?;
+        if runner
+            .send(FromHub::AssignJob {
+                job_id: record.id.clone(),
+                command: record.command,
+            })
+            .is_err()
+        {
+            return Ok(());
+        }
+        println!(
+            "herd-hub: {} was still queued and has been handed to the runner",
+            record.id
+        );
+    }
+    Ok(())
 }
 
 async fn relay_from_runner(state: &State, outbox: &Outbox, source: &mut Source) -> Result<()> {
@@ -269,16 +325,21 @@ async fn relay_from_runner(state: &State, outbox: &Outbox, source: &mut Source) 
                     .store
                     .append_log(&job_id, stream, seq, &data)
                     .with_context(|| format!("recording a log chunk of {job_id}"))?;
-                if let Some(follower) = state.follower(&job_id) {
+                for follower in state.followers(&job_id) {
                     let _ = follower.send(FromHub::LogChunk {
-                        job_id,
+                        job_id: job_id.clone(),
                         stream,
                         seq,
-                        data,
+                        data: data.clone(),
                     });
                 }
             }
             ToHub::JobFinished { job_id, outcome } => {
+                // Recorded first, acknowledged second. The runner is holding
+                // this result until the acknowledgement arrives, so the order
+                // of these two steps is the whole of E-44's promise: nothing
+                // tells the runner to forget a result that is not yet on a
+                // disk.
                 state
                     .store
                     .record_state(
@@ -288,8 +349,14 @@ async fn relay_from_runner(state: &State, outbox: &Outbox, source: &mut Source) 
                         },
                     )
                     .with_context(|| format!("recording the outcome of {job_id}"))?;
-                if let Some(follower) = state.stop_following(&job_id) {
-                    let _ = follower.send(FromHub::JobFinished { job_id, outcome });
+                let _ = outbox.send(FromHub::JobResultAck {
+                    job_id: job_id.clone(),
+                });
+                for follower in state.stop_following(&job_id) {
+                    let _ = follower.send(FromHub::JobFinished {
+                        job_id: job_id.clone(),
+                        outcome: outcome.clone(),
+                    });
                 }
             }
             other => {
@@ -353,6 +420,29 @@ async fn accept_submissions(state: &State, outbox: &Outbox, source: &mut Source)
                     return Ok(());
                 }
             }
+            ToHub::WaitForJob { job_id } => {
+                let record = state
+                    .store
+                    .job(&job_id)
+                    .with_context(|| format!("reading the record of {job_id}"))?;
+                let Some(record) = record else {
+                    // A terminal no, as D13 means it: this id will not come
+                    // into being by waiting for it.
+                    let _ = outbox.send(FromHub::Refused {
+                        reason: format!("no such job: {job_id}"),
+                    });
+                    return Ok(());
+                };
+                match record.state {
+                    // Answered from the record, which is the point of writing
+                    // one: a wait works an hour later, on another machine,
+                    // across a restart of the hub.
+                    JobState::Finished { outcome } => {
+                        let _ = outbox.send(FromHub::JobFinished { job_id, outcome });
+                    }
+                    _ => state.follow(job_id, outbox),
+                }
+            }
             other => {
                 let _ = outbox.send(FromHub::Refused {
                     reason: format!("a requester may not send {}", message_kind(&other)),
@@ -413,6 +503,7 @@ fn message_kind(message: &ToHub) -> &'static str {
     match message {
         ToHub::Hello { .. } => "hello",
         ToHub::SubmitJob { .. } => "submit_job",
+        ToHub::WaitForJob { .. } => "wait_for_job",
         ToHub::JobStarted { .. } => "job_started",
         ToHub::LogChunk { .. } => "log_chunk",
         ToHub::JobFinished { .. } => "job_finished",
