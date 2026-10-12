@@ -175,6 +175,39 @@ impl Link {
         }
     }
 
+    /// Send one log chunk, numbering it inside the lock that enqueues it.
+    ///
+    /// The number and the enqueueing are one step on purpose. Two pumps —
+    /// stdout and stderr — take their numbers from one counter, and if a
+    /// chunk could be numbered before another and enqueued after it, the hub
+    /// would see `seq` go backwards and read a reordering as output that
+    /// never arrived. Numbering here makes the order on the wire the order of
+    /// the numbers, so a jump in `seq` means one thing only: chunks that are
+    /// gone, which is what the hub's gap marker names (D29).
+    ///
+    /// A chunk produced while there is no link is dropped, and its number is
+    /// spent all the same: that spent number is exactly how the hub learns
+    /// afterwards that something is missing.
+    fn send_chunk(
+        &self,
+        job_id: &JobId,
+        stream: LogStream,
+        seq: &AtomicU64,
+        data: Vec<u8>,
+    ) -> bool {
+        let link = self.lock();
+        let message = ToHub::LogChunk {
+            job_id: job_id.clone(),
+            stream,
+            seq: seq.fetch_add(1, Ordering::SeqCst),
+            data,
+        };
+        match link.as_ref() {
+            Some(outbox) => outbox.send(message).is_ok(),
+            None => false,
+        }
+    }
+
     fn lock(&self) -> std::sync::MutexGuard<'_, Option<Outbox>> {
         self.current
             .lock()
@@ -324,8 +357,9 @@ async fn execute(job_id: JobId, command: Vec<String>, session: Session) {
         job_id: job_id.clone(),
     });
 
-    // One counter for both streams, so the hub can restore the order this
-    // runner saw the output in.
+    // One counter for both streams, and it outlives every connection this job
+    // reports on: the hub counts chunks per job, so a number must not start
+    // again at 0 because the link was redialled under a running job (D17).
     let seq = Arc::new(AtomicU64::new(0));
     let stdout = child.stdout.take().expect("stdout was piped");
     let stderr = child.stderr.take().expect("stderr was piped");
@@ -405,15 +439,6 @@ fn report(job_id: &JobId, session: &Session, outcome: JobOutcome) {
     }
 }
 
-fn send_chunk(job_id: &JobId, link: &Link, seq: &AtomicU64, stream: LogStream, data: Vec<u8>) {
-    link.send(ToHub::LogChunk {
-        job_id: job_id.clone(),
-        stream,
-        seq: seq.fetch_add(1, Ordering::SeqCst),
-        data,
-    });
-}
-
 /// Forward one pipe to the hub as it fills, never waiting for the process.
 async fn stream_output<R>(
     mut pipe: R,
@@ -431,14 +456,13 @@ async fn stream_output<R>(
             Ok(read) => {
                 // The bytes as they were read: a job's output is not text, and a
                 // chunk boundary may fall in the middle of a character (D18).
-                send_chunk(&job_id, &link, &seq, stream, buffer[..read].to_vec());
+                link.send_chunk(&job_id, stream, &seq, buffer[..read].to_vec());
             }
             Err(error) => {
-                send_chunk(
+                link.send_chunk(
                     &job_id,
-                    &link,
-                    &seq,
                     LogStream::Stderr,
+                    &seq,
                     format!("herd-runner: reading the job's output failed: {error}\n").into_bytes(),
                 );
                 break;

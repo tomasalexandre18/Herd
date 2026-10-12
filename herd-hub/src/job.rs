@@ -136,11 +136,72 @@ pub struct JobRecord {
     pub metrics: JobMetrics,
 }
 
-/// One transition, as a line of `events.jsonl` carries it.
+/// One line of `events.jsonl`: a moment, and what happened at it.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct JobEvent {
     pub at: Timestamp,
-    pub state: JobState,
+    #[serde(flatten)]
+    pub what: JobEventKind,
+}
+
+impl JobEvent {
+    /// A transition, which is what most lines are.
+    pub fn transition(at: Timestamp, state: JobState) -> Self {
+        Self {
+            at,
+            what: JobEventKind::Transition { state },
+        }
+    }
+
+    /// Output that is missing from the job's log, named on the record.
+    pub fn log_gap(at: Timestamp, first_missing: u64, last_missing: u64) -> Self {
+        Self {
+            at,
+            what: JobEventKind::LogGap {
+                first_missing,
+                last_missing,
+            },
+        }
+    }
+
+    /// The state the job moved to, when this line is a transition, and `None`
+    /// when it records something else.
+    pub fn state(&self) -> Option<&JobState> {
+        match &self.what {
+            JobEventKind::Transition { state } => Some(state),
+            JobEventKind::LogGap { .. } => None,
+        }
+    }
+}
+
+/// What one line of `events.jsonl` records.
+///
+/// A job's history is not only its transitions. Output that never reached the
+/// hub is part of what happened to the job, and a log that is a quarter short
+/// with nothing on the record saying so is a record that lies by omission. So
+/// a line says which kind it is, in a `event` field, and a reader that wants
+/// the transitions reads the `transition` lines.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "event", rename_all = "snake_case")]
+pub enum JobEventKind {
+    /// The job moved to a new state.
+    Transition { state: JobState },
+    /// Chunks of the job's output never made it into the log, and the log
+    /// names the gap at the point where they are missing.
+    ///
+    /// Every chunk carries a per-job sequence number (D4), which is there for
+    /// exactly this: a number that is not the successor of the last one the
+    /// hub wrote means the chunks in between are gone — the control
+    /// connection dropped under a running job, or the hub could not write
+    /// one. Getting them back is M3's (the runner would have to hold its
+    /// output as it holds a result); saying they are missing is M2's, because
+    /// a silently short log is worse than a short log that says so.
+    LogGap {
+        /// The number of the first chunk that is missing.
+        first_missing: u64,
+        /// The number of the last one, inclusive.
+        last_missing: u64,
+    },
 }
 
 /// A job store failed, with the path or the id that failed in the message: the
@@ -182,6 +243,12 @@ pub trait JobStore: Send + Sync + 'static {
 
     /// Append one chunk of a job's output in the order the runner produced it,
     /// as the bytes the process wrote (D18): a job's output is not text.
+    ///
+    /// `seq` is the runner's per-job chunk number, and the store uses it to
+    /// notice that chunks are missing: a number that is not the successor of
+    /// the last one written leaves a named gap in the log and a
+    /// [`JobEventKind::LogGap`] on the record. A store that threw `seq` away
+    /// would make a quarter of a log disappear in silence.
     fn append_log(&self, id: &JobId, stream: LogStream, seq: u64, data: &[u8]) -> Result<()>;
 
     /// The job's record, if the store has one.

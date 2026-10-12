@@ -143,7 +143,16 @@ pub enum ToHub {
     /// Runner reports that it has spawned the job's process.
     JobStarted { job_id: JobId },
     /// Runner reports output. `seq` counts chunks per job, across both
-    /// streams, from 0 — so a reader can restore the order the runner saw.
+    /// streams, from 0, and the runner numbers a chunk as it enqueues it, so
+    /// the numbers arrive in the order they were given out.
+    ///
+    /// What `seq` is for is **gap detection**, not reordering: the hub knows
+    /// the number of the last chunk it wrote, and a number that is not its
+    /// successor means the chunks in between never arrived — a control
+    /// connection that dropped, most often. The hub says so in the job's log
+    /// rather than leaving the log quietly short (D29). The single `log` file
+    /// is arrival-ordered and promises nothing about which stream a byte came
+    /// from, so nothing anywhere reorders by `seq`.
     ///
     /// `data` is the bytes the process wrote, unaltered (D18).
     LogChunk {
@@ -172,7 +181,9 @@ pub enum FromHub {
     JobAccepted { job_id: JobId },
     /// The runner is asked to execute this job.
     AssignJob { job_id: JobId, command: Vec<String> },
-    /// Output relayed to the requester that submitted the job, as bytes (D18).
+    /// Output relayed to the requester that submitted the job, as bytes
+    /// (D18). `seq` is the runner's own numbering, carried through for the
+    /// same reason as in [`ToHub::LogChunk`]: telling a gap from a reordering.
     LogChunk {
         job_id: JobId,
         stream: LogStream,
@@ -197,10 +208,12 @@ pub enum FromHub {
     /// stays open.
     ///
     /// Not a refusal: `Refused` is terminal (D13), and a note is the opposite
-    /// — the job is still there and this connection goes on. M2 sends exactly
-    /// one note, for a job whose attempt was interrupted and whose runner has
-    /// not come back (D17), so that waiting for such a job is never silent.
-    /// M8's explained waits are this frame's real home.
+    /// — the job is still there and this connection goes on. M2 sends a note
+    /// for each of the two ways a job that is waited for can be going
+    /// nowhere: an attempt that was interrupted and whose runner has not come
+    /// back (D17), and an attempt whose end the hub cannot write to its disk
+    /// (D19). Waiting for such a job is never silent. M8's explained waits are
+    /// this frame's real home.
     JobNote { job_id: JobId, note: String },
     /// How the job ended, relayed to the requester that submitted it.
     JobFinished { job_id: JobId, outcome: JobOutcome },

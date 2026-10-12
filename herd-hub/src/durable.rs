@@ -82,6 +82,32 @@ pub fn append_bytes(path: &Path, bytes: &[u8]) -> io::Result<()> {
     file.write_all(bytes)
 }
 
+/// Write a fixed-width value over a small file, in place, without waiting for
+/// the disk.
+///
+/// For the one thing the hub rewrites on the byte path: the number of the last
+/// log chunk it wrote, which is what lets it see that chunks are missing. The
+/// atomic-rename discipline above costs a temporary, two syncs and a directory
+/// sync per write — which the log's own appends deliberately do not pay — and
+/// a rename per chunk would also leave a temporary behind every time a `kill
+/// -9` landed in the middle of one.
+///
+/// So this is one write at offset 0, and every caller writes the same number
+/// of bytes, so there is nothing to truncate and no shorter old value can show
+/// through. The value is in the page cache when this returns, which is what a
+/// killed hub needs: the kernel keeps it. A machine that loses power can lose
+/// it, and then the hub has no number to compare with — which it says, rather
+/// than assuming nothing is missing.
+pub fn write_fixed_in_place(path: &Path, bytes: &[u8]) -> io::Result<()> {
+    let mut file = OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(false)
+        .open(path)?;
+    file.rewind()?;
+    file.write_all(bytes)
+}
+
 /// Put an existing file's contents on the disk.
 pub fn sync_file(path: &Path) -> io::Result<()> {
     File::open(path)?.sync_data()

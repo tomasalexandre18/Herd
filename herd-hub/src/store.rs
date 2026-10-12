@@ -7,8 +7,9 @@
 //!   jobs/
 //!     j0000000001/
 //!       job.json            the record: fields, current state, timestamps
-//!       events.jsonl         one transition per line, in the order they happened
+//!       events.jsonl         one line per thing that happened, in order
 //!       log                 the job's output, both streams in arrival order
+//!       log.seq             how many chunks of that log the hub has written
 //!       files/              room for what a job keeps (M11's artefacts)
 //!   index/
 //!     state.json            derived: which jobs are not over yet
@@ -20,8 +21,20 @@
 //! rebuildable, and the hub checks it rather than believing it — see
 //! [`JobDirStore::open`]. Every write goes through [`crate::durable`]; this
 //! module never touches `std::fs` itself.
+//!
+//! **`log` is arrival-ordered, and that is all it promises (D29).** It is the
+//! job's output as a terminal would have shown it: the chunks in the order
+//! they reached the hub, byte for byte, both streams in one file. It does not
+//! promise per-stream exactness — `echo OUT1; echo ERR1 >&2; echo OUT2` may
+//! legitimately record `OUT1 OUT2 ERR1`, because the two pipes are drained
+//! independently and a chunk's place in the file is the moment it arrived.
+//! That is chosen, not accidental: a build log is read as a terminal
+//! transcript, and reconstructing the true interleaving would cost a second
+//! index on every chunk of a three-million-line job. The chunk numbers serve
+//! gap detection — `log.seq` and the marker in [`log_gap_marker`] — and
+//! nothing anywhere reorders by them.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashMap};
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
@@ -51,6 +64,15 @@ const INDEX_FILE: &str = "state.json";
 const RECORD_FILE: &str = "job.json";
 const EVENTS_FILE: &str = "events.jsonl";
 const LOG_FILE: &str = "log";
+/// How many chunks of a job's `log` the hub has written — which is also the
+/// number it expects the next chunk to carry. The hub's own bookkeeping, not
+/// part of the record: one fixed-width decimal, rewritten in place beside the
+/// log it counts, so that a hub starting on this state root can still tell
+/// whether the chunks that follow are the ones that follow.
+const LOG_SEQ_FILE: &str = "log.seq";
+/// The width of that number, in digits: a `u64` never needs more, and a fixed
+/// width is what lets the file be written in place with nothing to truncate.
+const LOG_SEQ_DIGITS: usize = 20;
 const KEPT_FILES_DIR: &str = "files";
 const LOCK_FILE: &str = "hub.lock";
 
@@ -82,6 +104,11 @@ struct Live {
     jobs_accounted: u64,
     /// The jobs that have not reached a terminal state: the queue.
     pending: BTreeSet<u64>,
+    /// Per job that is still producing output, how many chunks of its log the
+    /// hub has written — the number the next chunk should carry. Read from
+    /// `log.seq` the first time this hub sees a chunk of a job, written
+    /// through to it afterwards, and forgotten when the job is over.
+    log_chunks: HashMap<JobId, u64>,
 }
 
 /// `store.json`.
@@ -187,6 +214,7 @@ impl JobDirStore {
                 next_sequence: 1,
                 jobs_accounted: 0,
                 pending: BTreeSet::new(),
+                log_chunks: HashMap::new(),
             }),
         };
         store.recover()?;
@@ -391,6 +419,56 @@ impl JobDirStore {
         )
     }
 
+    /// How many chunks of this job's log the hub has written, which is the
+    /// number the next chunk should carry.
+    ///
+    /// `None` means the hub has nothing to compare with — `log.seq` is gone or
+    /// unreadable — and then a gap cannot be claimed, because a marker naming
+    /// chunks that are in fact there would be its own kind of lie. The number
+    /// is read from the disk once per job per hub, so that a hub which has
+    /// just started on a state root still knows where the log it inherited got
+    /// to, and is carried in memory from then on.
+    fn log_chunks_written(
+        &self,
+        live: &mut std::sync::MutexGuard<'_, Live>,
+        id: &JobId,
+    ) -> Result<Option<u64>> {
+        if let Some(written) = live.log_chunks.get(id) {
+            return Ok(Some(*written));
+        }
+        let path = self.job_dir(id).join(LOG_SEQ_FILE);
+        let Some(text) = read_optional(&path)? else {
+            eprintln!(
+                "herd-hub: {} is not there, so this hub cannot tell whether chunks of \
+                 {id}'s log are missing",
+                path.display()
+            );
+            return Ok(None);
+        };
+        match text.trim().parse::<u64>() {
+            Ok(written) => {
+                live.log_chunks.insert(id.clone(), written);
+                Ok(Some(written))
+            }
+            Err(error) => {
+                eprintln!(
+                    "herd-hub: {} does not hold a number ({error}), so this hub cannot tell \
+                     whether chunks of {id}'s log are missing",
+                    path.display()
+                );
+                Ok(None)
+            }
+        }
+    }
+
+    /// Write that count down, in place and in a fixed width.
+    fn write_log_chunks(&self, id: &JobId, written: u64) -> Result<()> {
+        let path = self.job_dir(id).join(LOG_SEQ_FILE);
+        let line = format!("{written:0>width$}\n", width = LOG_SEQ_DIGITS);
+        durable::write_fixed_in_place(&path, line.as_bytes())
+            .map_err(|error| failed("writing", &path, &error))
+    }
+
     fn append_event(&self, id: &JobId, event: &JobEvent) -> Result<()> {
         let path = self.job_dir(id).join(EVENTS_FILE);
         let line = serde_json::to_string(&EventLine {
@@ -427,6 +505,11 @@ impl JobStore for JobDirStore {
         // find an empty file, not ENOENT (D22).
         let log = self.job_dir(&id).join(LOG_FILE);
         durable::touch(&log).map_err(|error| failed("creating", &log, &error))?;
+        // And it is counted from its first moment too: "no chunk written yet"
+        // has to be a number the hub can compare against, so that a first
+        // chunk numbered 3 is seen for what it is — chunks 0 to 2 gone — and
+        // not mistaken for a hub that has nothing to compare with.
+        self.write_log_chunks(&id, 0)?;
 
         let at = Timestamp::now();
         let record = JobRecord {
@@ -438,13 +521,7 @@ impl JobStore for JobDirStore {
             metrics: JobMetrics::default(),
         };
         self.write_record(&record)?;
-        self.append_event(
-            &id,
-            &JobEvent {
-                at,
-                state: JobState::Queued,
-            },
-        )?;
+        self.append_event(&id, &JobEvent::transition(at, JobState::Queued))?;
         // The index is written after the record it describes, always: an index
         // that has fallen behind is detected and rebuilt, while an index that
         // ran ahead would claim a job that is not there.
@@ -480,7 +557,7 @@ impl JobStore for JobDirStore {
         // The record first, so that the moment a transition is readable in
         // `events.jsonl` the record agrees with it.
         self.write_record(&record)?;
-        self.append_event(id, &JobEvent { at, state })?;
+        self.append_event(id, &JobEvent::transition(at, state))?;
 
         if record.state.is_terminal() {
             let log = self.job_dir(id).join(LOG_FILE);
@@ -490,19 +567,53 @@ impl JobStore for JobDirStore {
             if let Some(sequence) = sequence_of(id.as_str()) {
                 live.pending.remove(&sequence);
             }
+            // Nothing more will be appended to this log, so the hub stops
+            // carrying its chunk count. `log.seq` keeps it on the disk.
+            live.log_chunks.remove(id);
             self.write_index(&live)?;
         }
         Ok(())
     }
 
-    fn append_log(&self, id: &JobId, _stream: LogStream, _seq: u64, data: &[u8]) -> Result<()> {
-        let _live = self.lock()?;
+    /// Append one chunk, and name whatever is missing before it.
+    ///
+    /// `stream` is not written down: the log is one file in arrival order
+    /// (D29, and the module's own words). `seq` is, because it is the only way
+    /// the hub can tell that chunks are gone — a control connection that
+    /// dropped under a running job takes with it everything the runner wrote
+    /// while there was no hub, and the runner spends those numbers all the
+    /// same. A number that is not the one expected is therefore a gap, and it
+    /// is named in the log at the place where the bytes are missing, and on
+    /// the record. Either side of the marker the log stays byte for byte what
+    /// the job wrote.
+    fn append_log(&self, id: &JobId, _stream: LogStream, seq: u64, data: &[u8]) -> Result<()> {
+        let mut live = self.lock()?;
         let dir = self.job_dir(id);
         if !dir.is_dir() {
             return Err(StoreError::new(format!("no such job: {id}")));
         }
         let path = dir.join(LOG_FILE);
-        durable::append_bytes(&path, data).map_err(|error| failed("appending to", &path, &error))
+        let expected = self.log_chunks_written(&mut live, id)?;
+        if let Some(expected) = expected.filter(|expected| seq > *expected) {
+            let (first, last) = (expected, seq - 1);
+            let marker = log_gap_marker(first, last);
+            durable::append_bytes(&path, marker.as_bytes())
+                .map_err(|error| failed("appending to", &path, &error))?;
+            self.append_event(id, &JobEvent::log_gap(Timestamp::now(), first, last))?;
+            eprintln!(
+                "herd-hub: {} log chunk(s) of {id} never reached its log (chunks {first} to \
+                 {last}); the gap is named in the log and on the record",
+                last - first + 1
+            );
+        }
+        durable::append_bytes(&path, data)
+            .map_err(|error| failed("appending to", &path, &error))?;
+        // Counted only now, and only if the bytes went in. A chunk the hub
+        // could not write is a chunk that is missing, and the next one must
+        // show it missing rather than paper over it.
+        let written = expected.unwrap_or(0).max(seq.saturating_add(1));
+        live.log_chunks.insert(id.clone(), written);
+        self.write_log_chunks(id, written)
     }
 
     fn job(&self, id: &JobId) -> Result<Option<JobRecord>> {
@@ -572,6 +683,23 @@ impl JobStore for JobDirStore {
         }
         Ok(records)
     }
+}
+
+/// What the log says at the place where chunks are missing.
+///
+/// One line, on its own, unmistakably the hub speaking rather than the job.
+/// It names how many chunks are gone and which, so that a log short of a
+/// quarter of its lines is a log that says it is short of a quarter of its
+/// lines — the point of the whole exercise. Nothing either side of it is
+/// touched, so the bytes before and after are still exactly what the job
+/// wrote (D29).
+pub fn log_gap_marker(first_missing: u64, last_missing: u64) -> String {
+    let chunks = last_missing - first_missing + 1;
+    format!(
+        "\n[herd-hub] {chunks} log chunk(s) never reached this log and are missing here: \
+         chunks {first_missing} to {last_missing} of this job's output. Everything before \
+         and after this line is byte for byte what the job wrote.\n"
+    )
 }
 
 /// What a transition from one state to another is.
@@ -753,7 +881,10 @@ mod tests {
         let job_dir = dir.path().join(JOBS_DIR).join(job.id.as_str());
         let mut names = durable::names_in(&job_dir).expect("the job directory lists");
         names.sort();
-        assert_eq!(names, vec!["events.jsonl", "files", "job.json", "log"]);
+        assert_eq!(
+            names,
+            vec!["events.jsonl", "files", "job.json", "log", "log.seq"]
+        );
         assert!(job_dir.join(KEPT_FILES_DIR).is_dir(), "room for kept files");
 
         let record: serde_json::Value =
@@ -833,6 +964,87 @@ mod tests {
         );
     }
 
+    /// A log that is missing chunks says so, in the log, at the place where
+    /// they are missing — and the record says so too.
+    ///
+    /// This is the mechanism; `killed_hub.rs` drives it through twelve real
+    /// `kill -9`s, which is how its absence was found.
+    #[test]
+    fn chunks_that_never_arrived_leave_a_named_gap_in_the_log() {
+        use crate::job::JobEventKind;
+
+        let (dir, store) = store();
+        let job = store.create_job(vec!["true".to_owned()]).expect("minted");
+        store
+            .append_log(&job.id, LogStream::Stdout, 0, b"first\n")
+            .expect("appended");
+        // Chunks 1, 2 and 3 are gone: the link dropped under the running job,
+        // and the runner spent those numbers on output no hub ever saw.
+        store
+            .append_log(&job.id, LogStream::Stdout, 4, b"fifth\n")
+            .expect("appended");
+
+        let log = String::from_utf8(
+            store
+                .job_log(&job.id)
+                .expect("readable")
+                .expect("there is a log"),
+        )
+        .expect("this job's output is text");
+        assert!(
+            log.starts_with("first\n") && log.ends_with("fifth\n"),
+            "the bytes either side of the marker are the job's own: {log:?}"
+        );
+        assert!(
+            log.contains("3 log chunk(s) never reached this log"),
+            "the log must say how much is missing: {log:?}"
+        );
+        assert!(
+            log.contains("chunks 1 to 3"),
+            "and which chunks they were: {log:?}"
+        );
+
+        let events = store
+            .job_events(&job.id)
+            .expect("readable")
+            .expect("still there");
+        let gap = events
+            .iter()
+            .find_map(|event| match &event.what {
+                JobEventKind::LogGap { .. } => Some(&event.what),
+                JobEventKind::Transition { .. } => None,
+            })
+            .expect("the gap is on the record, not only in the log");
+        assert_eq!(
+            gap,
+            &JobEventKind::LogGap {
+                first_missing: 1,
+                last_missing: 3
+            }
+        );
+
+        // And the count is on the disk, so the hub that starts next on this
+        // state root still knows where the log it inherited got to — which is
+        // the whole of the killed-hub case.
+        drop(store);
+        let store = JobDirStore::open(dir.path()).expect("the state root opens again");
+        store
+            .append_log(&job.id, LogStream::Stdout, 7, b"eighth\n")
+            .expect("appended");
+        let log = String::from_utf8(
+            store
+                .job_log(&job.id)
+                .expect("readable")
+                .expect("there is a log"),
+        )
+        .expect("text");
+        assert!(
+            log.contains("chunks 5 to 6"),
+            "a hub that has just started must still see the gap: {log:?}"
+        );
+        assert!(log.ends_with("eighth\n"), "{log:?}");
+    }
+
     /// Transitions are present, ordered and timestamped — the order being the
     /// order of the lines, not an ordering of the clock.
     #[test]
@@ -852,13 +1064,16 @@ mod tests {
             .job_events(&job.id)
             .expect("readable")
             .expect("still there");
-        let names: Vec<&str> = events.iter().map(|event| event.state.name()).collect();
+        let names: Vec<&str> = events
+            .iter()
+            .map(|event| event.state().expect("a transition").name())
+            .collect();
         assert_eq!(names, ["queued", "assigned", "running", "finished"]);
         assert_eq!(
-            events.last().expect("four events").state,
-            JobState::Finished {
+            events.last().expect("four events").state(),
+            Some(&JobState::Finished {
                 outcome: JobOutcome::Exited { code: 0 }
-            },
+            }),
             "the end is recorded whole, outcome included"
         );
 
@@ -898,7 +1113,7 @@ mod tests {
             .expect("readable")
             .expect("still there");
         assert_eq!(events.len(), 1, "only the whole line is an event");
-        assert_eq!(events[0].state, JobState::Queued);
+        assert_eq!(events[0].state(), Some(&JobState::Queued));
     }
 
     #[test]
