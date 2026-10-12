@@ -12,3 +12,10 @@ clap.workspace = true
 futures-util.workspace = true
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "net", "io-util"] }
 tokio-tungstenite.workspace = true
+
+# The exit code is outward-facing, so the test that pins it runs the real
+# binary against a real hub and a real runner.
+[dev-dependencies]
+herd-hub.workspace = true
+herd-runner.workspace = true
+tokio = { workspace = true, features = ["process", "time"] }

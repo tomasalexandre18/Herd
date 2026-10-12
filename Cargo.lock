@@ -290,7 +290,9 @@ dependencies = [
  "anyhow",
  "clap",
  "futures-util",
+ "herd-hub",
  "herd-proto",
+ "herd-runner",
  "tokio",
  "tokio-tungstenite",
 ]
