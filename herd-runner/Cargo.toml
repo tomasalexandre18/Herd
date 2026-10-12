@@ -12,3 +12,13 @@ clap.workspace = true
 futures-util.workspace = true
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "net", "process", "sync", "time", "io-util"] }
 tokio-tungstenite.workspace = true
+
+[target.'cfg(unix)'.dependencies]
+libc.workspace = true
+
+# The confinement tests need a real hub to dispatch through and a real
+# requester to follow a job, and the "binds no listening socket" test needs
+# the real runner binary rather than this library in-process.
+[dev-dependencies]
+herd-hub.workspace = true
+herdctl.workspace = true

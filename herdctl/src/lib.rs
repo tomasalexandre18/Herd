@@ -8,7 +8,8 @@
 use anyhow::{anyhow, bail, Context, Result};
 use futures_util::{SinkExt, StreamExt};
 use herd_proto::{
-    from_frame, to_frame, FromHub, JobId, JobOutcome, LogStream, Role, ToHub, PROTOCOL_VERSION,
+    cap_exceeded_reason, from_frame, to_frame, Cap, FromHub, JobId, JobMetrics, JobOutcome,
+    LogStream, Role, ToHub, PROTOCOL_VERSION,
 };
 use tokio::net::TcpStream;
 use tokio_tungstenite::tungstenite::Message;
@@ -39,11 +40,12 @@ impl Default for Config {
     }
 }
 
-/// How a followed job ended, and which job it was.
+/// How a followed job ended, which job it was, and what the runner measured.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Finished {
     pub job_id: JobId,
     pub outcome: JobOutcome,
+    pub metrics: JobMetrics,
 }
 
 /// `herdctl`'s exit code when there is no verdict to report: Herd could not
@@ -60,6 +62,14 @@ pub struct Finished {
 /// printed on stderr, and why the wire carries a typed outcome rather than a
 /// number.
 pub const NO_VERDICT_CODE: u8 = 125;
+
+/// `herdctl`'s exit code when a runner stopped the job at one of its caps
+/// (M4): the time cap, the memory ceiling, the log cap or the disk budget.
+/// 124 is `timeout(1)`'s code for exactly this, generalised to the other
+/// three because they are the same event — the machine said no, so the job
+/// has no verdict of its own. Which cap it was travels in the outcome and is
+/// printed on stderr; 124 alone is never meant to say.
+pub const STOPPED_BY_CAP_CODE: u8 = 124;
 
 /// What `herdctl` exits with for a job that ended this way.
 ///
@@ -78,7 +88,17 @@ pub fn exit_code_for(outcome: &JobOutcome) -> u8 {
             128u8.saturating_add(u8::try_from(*signal).unwrap_or(127))
         }
         JobOutcome::CouldNotStart { .. } => NO_VERDICT_CODE,
+        JobOutcome::StoppedByCap { .. } => STOPPED_BY_CAP_CODE,
     }
+}
+
+/// The one sentence `herdctl` prints on stderr for a job a runner stopped at
+/// a cap. The runner is the subject: the job did not fail, it was stopped.
+pub fn stopped_by_cap_message(cap: Cap, limit: u64) -> String {
+    format!(
+        "this job has no verdict of its own: {}",
+        cap_exceeded_reason(cap, limit)
+    )
 }
 
 /// The one sentence `herdctl` prints on stderr when Herd could not run the
@@ -144,9 +164,17 @@ pub async fn run_job(
             FromHub::JobNote { note, .. } => {
                 on_log(LogStream::Stderr, format!("herdctl: {note}\n").as_bytes())
             }
-            FromHub::JobFinished { job_id, outcome } => {
+            FromHub::JobFinished {
+                job_id,
+                outcome,
+                metrics,
+            } => {
                 let _ = socket.close(None).await;
-                return Ok(Finished { job_id, outcome });
+                return Ok(Finished {
+                    job_id,
+                    outcome,
+                    metrics,
+                });
             }
             FromHub::Refused { reason } => bail!("the hub refused the job: {reason}"),
             other => bail!(
@@ -225,9 +253,17 @@ pub async fn wait_for_job(
 
     while let Some(message) = next_message(&mut socket).await? {
         match message {
-            FromHub::JobFinished { job_id, outcome } => {
+            FromHub::JobFinished {
+                job_id,
+                outcome,
+                metrics,
+            } => {
                 let _ = socket.close(None).await;
-                return Ok(Finished { job_id, outcome });
+                return Ok(Finished {
+                    job_id,
+                    outcome,
+                    metrics,
+                });
             }
             FromHub::JobLog { data, .. } => on_log(LogStream::Stdout, &data),
             FromHub::LogChunk { stream, data, .. } => on_log(stream, &data),
@@ -359,6 +395,31 @@ mod tests {
                 reason: "no-such-tool: not found".to_owned()
             }),
             125
+        );
+    }
+
+    /// A job the machine stopped is not a job that failed, so it does not get
+    /// a verdict code. 124 is `timeout`'s, and every cap shares it.
+    #[test]
+    fn a_job_stopped_at_a_cap_is_the_wrapper_s_cap_code() {
+        for cap in [Cap::Time, Cap::Memory, Cap::Log, Cap::Disk] {
+            assert_eq!(
+                exit_code_for(&JobOutcome::StoppedByCap { cap, limit: 600 }),
+                124,
+                "cap {} did not get the cap code",
+                cap.name()
+            );
+        }
+    }
+
+    #[test]
+    fn the_cap_sentence_names_the_cap_and_its_figure() {
+        let message = stopped_by_cap_message(Cap::Memory, 2_147_483_648);
+        assert!(message.contains("memory"), "{message}");
+        assert!(message.contains("2147483648"), "{message}");
+        assert!(
+            message.contains("no verdict of its own"),
+            "a stopped job must not read as a failing one: {message}"
         );
     }
 

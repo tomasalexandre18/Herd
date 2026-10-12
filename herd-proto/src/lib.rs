@@ -88,6 +88,82 @@ pub enum JobOutcome {
     /// what failed — the executable that was not found, say. This is Herd
     /// failing to run the job, never the job failing.
     CouldNotStart { reason: String },
+    /// The runner ended the job because it broke one of the caps its owner
+    /// configured (M4). Which cap, and what its figure was, so that a human
+    /// reads "stopped at its time cap of 600 s" and never just "killed".
+    ///
+    /// This is neither the job failing nor Herd failing: the job asked for
+    /// more than the machine was willing to give it. A runner must say this
+    /// rather than let a job hang or grow without end (invariant 2).
+    StoppedByCap { cap: Cap, limit: u64 },
+}
+
+/// Which cap a runner enforced against a job.
+///
+/// A new cap is a new variant here rather than a new [`JobOutcome`] variant,
+/// because every cap ends a job the same way — the runner killed it — and
+/// only the figure and the sentence differ. An unknown variant is a decode
+/// error naming it, never a job silently read as having exited.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Cap {
+    /// The job ran longer than the time cap. Its limit is in seconds.
+    Time,
+    /// A job process allocated past the memory ceiling. Its limit is in bytes.
+    Memory,
+    /// The job wrote more log than the cap allows. Its limit is in bytes.
+    Log,
+    /// The job's workspace grew past its disk budget. Its limit is in bytes.
+    Disk,
+}
+
+impl Cap {
+    /// The cap's name, as it reads in a sentence and on the wire.
+    pub fn name(self) -> &'static str {
+        match self {
+            Cap::Time => "time",
+            Cap::Memory => "memory",
+            Cap::Log => "log",
+            Cap::Disk => "disk",
+        }
+    }
+
+    /// The unit the cap's limit is expressed in.
+    pub fn unit(self) -> &'static str {
+        match self {
+            Cap::Time => "s",
+            Cap::Memory | Cap::Log | Cap::Disk => "bytes",
+        }
+    }
+}
+
+/// What a runner measured while a job ran, reported with the outcome and kept
+/// in the job's record (E-15).
+///
+/// A figure a host does not expose is absent, never zero: nobody may read
+/// "0 bytes written" as a measurement that was taken. The two figures the
+/// runner always knows itself are not optional.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct JobMetrics {
+    /// The host's one-minute load average when the job ended, times 1000.
+    /// An integer on purpose: it lands in a record a consumer compares, and
+    /// a float would print two equal measurements differently.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub host_load_milli: Option<u64>,
+    /// The most memory the job's processes held at once, in bytes. Read from
+    /// the job's cgroup where there is one, and otherwise sampled from the
+    /// job's own process, which undercounts a process tree.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub peak_memory_bytes: Option<u64>,
+    /// The high-water mark of the job's workspace, in bytes: the most the job
+    /// had written and not deleted. This is the figure the disk budget is
+    /// enforced against, not a block-layer counter.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bytes_written: Option<u64>,
+    /// Bytes of log the job produced, as the runner counted them.
+    pub log_bytes: u64,
+    /// Wall-clock milliseconds from the spawn to the outcome.
+    pub wall_time_ms: u64,
 }
 
 /// A job's identity, minted by the hub.
@@ -162,8 +238,15 @@ pub enum ToHub {
         #[serde(with = "bytes_as_base64")]
         data: Vec<u8>,
     },
-    /// Runner reports how the job ended.
-    JobFinished { job_id: JobId, outcome: JobOutcome },
+    /// Runner reports how the job ended, and what it measured while it ran.
+    JobFinished {
+        job_id: JobId,
+        outcome: JobOutcome,
+        /// Default for a peer that measured nothing; never silently zero for
+        /// a figure that was simply not readable (see [`JobMetrics`]).
+        #[serde(default)]
+        metrics: JobMetrics,
+    },
 }
 
 /// Sent by the hub to a runner or a requester.
@@ -215,8 +298,14 @@ pub enum FromHub {
     /// (D19). Waiting for such a job is never silent. M8's explained waits are
     /// this frame's real home.
     JobNote { job_id: JobId, note: String },
-    /// How the job ended, relayed to the requester that submitted it.
-    JobFinished { job_id: JobId, outcome: JobOutcome },
+    /// How the job ended, relayed to the requester that submitted it, with
+    /// what the runner measured while it ran.
+    JobFinished {
+        job_id: JobId,
+        outcome: JobOutcome,
+        #[serde(default)]
+        metrics: JobMetrics,
+    },
     /// The hub has the job's outcome on its disk, and the runner may forget it.
     ///
     /// A result is the one thing a runner cannot simply resend from its
@@ -227,6 +316,17 @@ pub enum FromHub {
     /// acknowledgement of something still in memory would be a lie the next
     /// power cut collects on.
     JobResultAck { job_id: JobId },
+}
+
+/// The one sentence a cap refusal reads as, so that the runner, the record
+/// and `herdctl` all say the same thing and a test can rely on it. It names
+/// the cap and its figure, as every Herd refusal must.
+pub fn cap_exceeded_reason(cap: Cap, limit: u64) -> String {
+    format!(
+        "the runner stopped this job at its {} cap of {limit} {}",
+        cap.name(),
+        cap.unit()
+    )
 }
 
 /// The wording of a version refusal, so that every peer reads one sentence and

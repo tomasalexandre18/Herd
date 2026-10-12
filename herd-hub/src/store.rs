@@ -563,6 +563,22 @@ impl JobStore for JobDirStore {
         Ok(record)
     }
 
+    /// Write what the runner measured, and nothing else about the job.
+    ///
+    /// Separate from the transition because the figures are the runner's and
+    /// the state is the hub's, and because the hub writes these *before* it
+    /// writes `finished`: a reader that sees the terminal state is entitled to
+    /// find the measurements beside it (E-15). Fsynced like every other write
+    /// here, so an acknowledgement that follows it is not a lie (D19).
+    fn record_metrics(&self, id: &JobId, metrics: JobMetrics) -> Result<()> {
+        let _live = self.lock()?;
+        let Some(mut record) = self.read_record(id)? else {
+            return Err(StoreError::new(format!("no such job: {id}")));
+        };
+        record.metrics = metrics;
+        self.write_record(&record)
+    }
+
     fn record_state(&self, id: &JobId, state: JobState) -> Result<()> {
         let mut live = self.lock()?;
         let Some(mut record) = self.read_record(id)? else {
@@ -932,16 +948,12 @@ mod tests {
             "timestamps are RFC 3339 in UTC: {}",
             record["submitted_at"]
         );
-        // M4's fields are in the shape from the start, and say "not measured".
-        for field in [
-            "load_before",
-            "load_after",
-            "memory_peak_bytes",
-            "bytes_written",
-        ] {
+        // The runner's figures (M4) say "not measured" on a job that has not
+        // run: a figure nobody took is absent, never a zero (D23, E-15).
+        for field in ["host_load_milli", "peak_memory_bytes", "bytes_written"] {
             assert!(
                 record["metrics"][field].is_null(),
-                "metrics.{field} should be present and unset: {}",
+                "metrics.{field} should be unset, not zero: {}",
                 record["metrics"]
             );
         }
@@ -1177,6 +1189,44 @@ mod tests {
         }
     }
 
+    /// E-15 wants the runner's measurements in the record, on the disk, where
+    /// the first consumer reads them. A job that has not ended has none, and
+    /// that is "not measured", never zero (D23).
+    #[test]
+    fn a_runner_s_measurements_land_on_the_record() {
+        let (_dir, store) = store();
+        let job = store.create_job(vec!["true".to_owned()]).expect("minted");
+        assert_eq!(
+            job.metrics,
+            JobMetrics::default(),
+            "a job that has not run has nothing measured"
+        );
+        let metrics = JobMetrics {
+            host_load_milli: Some(1_500),
+            peak_memory_bytes: Some(64 * 1024 * 1024),
+            bytes_written: Some(4_096),
+            log_bytes: 19,
+            wall_time_ms: 250,
+        };
+        store
+            .record_metrics(&job.id, metrics.clone())
+            .expect("recorded");
+        assert_eq!(
+            store
+                .job(&job.id)
+                .expect("readable")
+                .expect("still there")
+                .metrics,
+            metrics,
+            "the figures must survive the trip through job.json"
+        );
+        // And nothing else about the job moved.
+        assert_eq!(
+            store.job(&job.id).expect("readable").expect("there").state,
+            JobState::Queued
+        );
+    }
+
     #[test]
     fn an_unknown_job_is_an_error_not_a_silent_no_op() {
         let (_dir, store) = store();
@@ -1185,6 +1235,7 @@ mod tests {
         assert!(store
             .append_log(&ghost, LogStream::Stdout, 0, b"x")
             .is_err());
+        assert!(store.record_metrics(&ghost, JobMetrics::default()).is_err());
         assert_eq!(store.job(&ghost).expect("readable"), None);
         assert_eq!(store.job_log(&ghost).expect("readable"), None);
         assert_eq!(store.job_events(&ghost).expect("readable"), None);

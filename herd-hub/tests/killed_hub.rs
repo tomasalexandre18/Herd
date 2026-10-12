@@ -123,6 +123,11 @@ fn free_port() -> u16 {
 struct Herd {
     state: TempDir,
     logs: TempDir,
+    /// The data root the runner of this herd is given (E-45). One per herd,
+    /// because a runner locks its root for the life of the process: two of
+    /// these tests running at once would otherwise be two runners fighting
+    /// over one directory, and the second would refuse to start.
+    data_root: TempDir,
     port: u16,
 }
 
@@ -131,6 +136,7 @@ impl Herd {
         Self {
             state: tempfile::tempdir().expect("a temporary state directory"),
             logs: tempfile::tempdir().expect("a temporary directory for the logs"),
+            data_root: tempfile::tempdir().expect("a temporary data root"),
             port: free_port(),
         }
     }
@@ -184,6 +190,10 @@ impl Herd {
             .arg(self.url())
             .arg("--name")
             .arg("the-real-runner")
+            // Its own data root, and the real one: this is the binary the
+            // server runs, confinement included (M4).
+            .arg("--data-root")
+            .arg(self.data_root.path())
             .stdout(Stdio::from(
                 File::create(self.logs.path().join("runner-out")).expect("a file"),
             ))

@@ -2,11 +2,15 @@
 //! the contract: a field that silently fails to round-trip is a lost field.
 
 use herd_proto::{
-    from_frame, to_frame, FromHub, JobId, JobOutcome, LogStream, Role, ToHub, PROTOCOL_VERSION,
+    cap_exceeded_reason, from_frame, to_frame, Cap, FromHub, JobId, JobMetrics, JobOutcome,
+    LogStream, Role, ToHub, PROTOCOL_VERSION,
 };
 
-/// Every way a job can end in M1, including the codes E-02 depends on and the
-/// 127 a command may produce on its own.
+/// Every cap a runner can stop a job at (M4).
+pub const EVERY_CAP: [Cap; 4] = [Cap::Time, Cap::Memory, Cap::Log, Cap::Disk];
+
+/// Every way a job can end, including the codes E-02 depends on and the 127 a
+/// command may produce on its own.
 fn every_outcome() -> Vec<JobOutcome> {
     let mut outcomes: Vec<JobOutcome> = [0, 1, 42, 75, 127, -1, i32::MIN, i32::MAX]
         .into_iter()
@@ -19,6 +23,15 @@ fn every_outcome() -> Vec<JobOutcome> {
     outcomes.push(JobOutcome::CouldNotStart {
         reason: String::new(),
     });
+    outcomes.extend(
+        EVERY_CAP
+            .into_iter()
+            .map(|cap| JobOutcome::StoppedByCap { cap, limit: 0 }),
+    );
+    outcomes.extend(EVERY_CAP.into_iter().map(|cap| JobOutcome::StoppedByCap {
+        cap,
+        limit: u64::MAX,
+    }));
     outcomes
 }
 
@@ -37,6 +50,28 @@ fn every_payload() -> Vec<Vec<u8>> {
         vec![b'e', 0xc3],
         "accents é, a sheep 🐑".as_bytes().to_vec(),
         (0u8..=255).collect(),
+    ]
+}
+
+/// Every shape a measurement set can have: nothing readable, everything
+/// readable, and the extremes of the two figures that are never optional.
+fn every_metrics() -> Vec<JobMetrics> {
+    vec![
+        JobMetrics::default(),
+        JobMetrics {
+            host_load_milli: Some(12_340),
+            peak_memory_bytes: Some(1_073_741_824),
+            bytes_written: Some(4_096),
+            log_bytes: 65_536,
+            wall_time_ms: 1_234,
+        },
+        JobMetrics {
+            host_load_milli: Some(0),
+            peak_memory_bytes: Some(0),
+            bytes_written: Some(0),
+            log_bytes: u64::MAX,
+            wall_time_ms: u64::MAX,
+        },
     ]
 }
 
@@ -96,10 +131,13 @@ fn every_message_to_the_hub_round_trips() {
         data: b"quotes \" braces {} newline \n tab \t".to_vec(),
     });
     for outcome in every_outcome() {
-        round_trip_to_hub(ToHub::JobFinished {
-            job_id: JobId::new("j1"),
-            outcome,
-        });
+        for metrics in every_metrics() {
+            round_trip_to_hub(ToHub::JobFinished {
+                job_id: JobId::new("j1"),
+                outcome: outcome.clone(),
+                metrics,
+            });
+        }
     }
 }
 
@@ -143,10 +181,13 @@ fn every_message_from_the_hub_round_trips() {
         note: "its attempt was interrupted".to_owned(),
     });
     for outcome in every_outcome() {
-        round_trip_from_hub(FromHub::JobFinished {
-            job_id: JobId::new("j1"),
-            outcome,
-        });
+        for metrics in every_metrics() {
+            round_trip_from_hub(FromHub::JobFinished {
+                job_id: JobId::new("j1"),
+                outcome: outcome.clone(),
+                metrics,
+            });
+        }
     }
 }
 
@@ -168,23 +209,82 @@ fn each_outcome_is_a_tagged_object_inside_the_frame() {
         to_frame(&ToHub::JobFinished {
             job_id: JobId::new("j1"),
             outcome,
+            metrics: JobMetrics::default(),
         })
         .expect("encodes")
     };
+    // No measurement was taken, so every optional figure is absent from the
+    // frame rather than present as a zero.
+    let empty = r#","metrics":{"log_bytes":0,"wall_time_ms":0}}"#;
     assert_eq!(
         frame(JobOutcome::Exited { code: 42 }),
-        r#"{"type":"job_finished","job_id":"j1","outcome":{"type":"exited","code":42}}"#
+        format!(
+            r#"{{"type":"job_finished","job_id":"j1","outcome":{{"type":"exited","code":42}}{empty}"#
+        )
     );
     assert_eq!(
         frame(JobOutcome::Signalled { signal: 15 }),
-        r#"{"type":"job_finished","job_id":"j1","outcome":{"type":"signalled","signal":15}}"#
+        format!(
+            r#"{{"type":"job_finished","job_id":"j1","outcome":{{"type":"signalled","signal":15}}{empty}"#
+        )
     );
     assert_eq!(
         frame(JobOutcome::CouldNotStart {
             reason: "no-such-tool: not found".to_owned()
         }),
-        r#"{"type":"job_finished","job_id":"j1","outcome":{"type":"could_not_start","reason":"no-such-tool: not found"}}"#
+        format!(
+            r#"{{"type":"job_finished","job_id":"j1","outcome":{{"type":"could_not_start","reason":"no-such-tool: not found"}}{empty}"#
+        )
     );
+    assert_eq!(
+        frame(JobOutcome::StoppedByCap {
+            cap: Cap::Memory,
+            limit: 2_147_483_648
+        }),
+        format!(
+            r#"{{"type":"job_finished","job_id":"j1","outcome":{{"type":"stopped_by_cap","cap":"memory","limit":2147483648}}{empty}"#
+        )
+    );
+}
+
+/// A measurement that was taken appears; one that could not be read does not.
+/// E-15's record is read by a consumer, so "absent" and "zero" must not be
+/// the same bytes on the wire.
+#[test]
+fn a_figure_that_was_not_measured_is_absent_rather_than_zero() {
+    let frame = to_frame(&ToHub::JobFinished {
+        job_id: JobId::new("j1"),
+        outcome: JobOutcome::Exited { code: 0 },
+        metrics: JobMetrics {
+            host_load_milli: None,
+            peak_memory_bytes: Some(0),
+            bytes_written: Some(4_096),
+            log_bytes: 12,
+            wall_time_ms: 34,
+        },
+    })
+    .expect("encodes");
+    assert!(
+        !frame.contains("host_load_milli"),
+        "an unread figure must not be in the frame at all: {frame}"
+    );
+    assert!(
+        frame.contains(r#""peak_memory_bytes":0"#),
+        "a figure measured as zero must be in the frame: {frame}"
+    );
+    assert!(frame.contains(r#""bytes_written":4096"#), "{frame}");
+}
+
+/// Every cap's sentence names the cap and carries its figure, so a human
+/// reading a record never sees a bare "killed".
+#[test]
+fn every_cap_s_sentence_names_the_cap_and_its_figure() {
+    for cap in EVERY_CAP {
+        let reason = cap_exceeded_reason(cap, 600);
+        assert!(reason.contains(cap.name()), "{reason}");
+        assert!(reason.contains("600"), "{reason}");
+        assert!(reason.contains(cap.unit()), "{reason}");
+    }
 }
 
 /// A peer from a later milestone reporting an end this one does not know is a

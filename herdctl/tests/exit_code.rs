@@ -12,6 +12,9 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use herd_hub::{Hub, JobDirStore, JobStore};
+// Two throwaway directories with the same name: the hub's state root and the
+// runner's data root are different things and a test must not share them.
+use herd_runner::testing::TempDir as DataRootDir;
 use tempfile::TempDir;
 use tokio::process::Command;
 use tokio::task::JoinHandle;
@@ -22,6 +25,8 @@ struct Harness {
     /// The hub's state, removed with the harness: a test leaves no files.
     _state: TempDir,
     tasks: Vec<JoinHandle<()>>,
+    /// The runner's data root (E-45), removed when the harness drops.
+    _data_root: Option<DataRootDir>,
 }
 
 impl Harness {
@@ -50,17 +55,24 @@ impl Harness {
             let _ = hub.serve().await;
         });
         let mut tasks = vec![serving];
+        let mut data_root = None;
         if with_runner {
+            // One data root per runner, thrown away with the harness: a
+            // runner locks its root for the life of the process (E-45), so
+            // two tests sharing one would refuse to start.
+            let root = DataRootDir::new("exit-code");
             tasks.push(tokio::spawn({
                 let config = herd_runner::Config {
                     hub_url: hub_url.clone(),
                     name: Some("exit-code-runner".to_owned()),
                     token: None,
+                    confinement: herd_runner::Confinement::with_data_root(root.path()),
                 };
                 async move {
                     let _ = herd_runner::run(config).await;
                 }
             }));
+            data_root = Some(root);
             // Wait on the hub's own state, not on a sleep.
             let deadline = Instant::now() + Duration::from_secs(10);
             while !handle.runner_connected() {
@@ -72,6 +84,7 @@ impl Harness {
             hub_url,
             _state: state,
             tasks,
+            _data_root: data_root,
         }
     }
 

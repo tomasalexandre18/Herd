@@ -428,7 +428,11 @@ async fn relay_from_runner(state: &State, outbox: &Outbox, source: &mut Source) 
                     });
                 }
             }
-            ToHub::JobFinished { job_id, outcome } => {
+            ToHub::JobFinished {
+                job_id,
+                outcome,
+                metrics,
+            } => {
                 // A result for a job this hub has no record of — a state root
                 // that was replaced under it, say. There is nothing to write
                 // it to, and refusing it would wedge the runner, which would
@@ -456,7 +460,7 @@ async fn relay_from_runner(state: &State, outbox: &Outbox, source: &mut Source) 
                 // of these two steps is the whole of E-44's promise: nothing
                 // tells the runner to forget a result that is not yet on a
                 // disk.
-                if !record_the_end(state, &job_id, &outcome).await {
+                if !record_the_end(state, &job_id, &outcome, &metrics).await {
                     // The hub could not write it. Nothing is acknowledged, so
                     // the runner keeps holding it and redelivers it on its
                     // next connection; the job stalls, and a stalled job is
@@ -470,6 +474,7 @@ async fn relay_from_runner(state: &State, outbox: &Outbox, source: &mut Source) 
                     let _ = follower.send(FromHub::JobFinished {
                         job_id: job_id.clone(),
                         outcome: outcome.clone(),
+                        metrics: metrics.clone(),
                     });
                 }
             }
@@ -500,13 +505,28 @@ const BETWEEN_ATTEMPTS: std::time::Duration = std::time::Duration::from_millis(2
 /// store it is the hub's problem, never the runner's: it is never acknowledged
 /// unless it is written, the runner is never dropped for it, and the reason is
 /// said in full so that an operator can act on it (D19).
-async fn record_the_end(state: &State, job_id: &JobId, outcome: &herd_proto::JobOutcome) -> bool {
+async fn record_the_end(
+    state: &State,
+    job_id: &JobId,
+    outcome: &herd_proto::JobOutcome,
+    metrics: &herd_proto::JobMetrics,
+) -> bool {
     let end = JobState::Finished {
         outcome: outcome.clone(),
     };
     let mut why = String::new();
     for attempt in 1..=RECORDING_ATTEMPTS {
-        match state.store.record_state(job_id, end.clone()) {
+        // The measurements go down before the transition, so that a reader
+        // who sees `finished` is entitled to find the figures beside it
+        // (E-15) — and inside the same retry, because a hub that could not
+        // write what a runner measured must not acknowledge the result
+        // either. Failing to store either half is the hub's problem, never
+        // the runner's, and never a reason to drop it (D19).
+        match state
+            .store
+            .record_metrics(job_id, metrics.clone())
+            .and_then(|()| state.store.record_state(job_id, end.clone()))
+        {
             Ok(()) => {
                 state.stall_is_over(job_id);
                 return true;
@@ -637,12 +657,19 @@ async fn accept_submissions(state: &State, outbox: &Outbox, source: &mut Source)
                         data: log,
                     });
                 }
+                let metrics = record.metrics.clone();
                 match record.state {
                     // Answered from the record, which is the point of writing
                     // one: a wait works an hour later, on another machine,
-                    // across a restart of the hub.
+                    // across a restart of the hub. The measurements come from
+                    // the record too, so a wait an hour later reads the same
+                    // figures the requester that followed the job read (E-15).
                     JobState::Finished { outcome } => {
-                        let _ = outbox.send(FromHub::JobFinished { job_id, outcome });
+                        let _ = outbox.send(FromHub::JobFinished {
+                            job_id,
+                            outcome,
+                            metrics,
+                        });
                     }
                     // Waiting for a job whose attempt was interrupted is
                     // waiting for a runner that may never come back, so the
