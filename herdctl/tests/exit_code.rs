@@ -232,6 +232,45 @@ async fn submit_prints_an_id_and_wait_exits_with_the_job_s_code() {
     }
 }
 
+/// D22: a wait prints the job's output, the way `run` does. Without this a
+/// requester on another machine cannot get a detached job's log through the
+/// CLI at all — only by reading the hub's state directory, which it cannot
+/// reach.
+#[tokio::test]
+async fn wait_prints_the_job_s_log() {
+    let harness = Harness::new().await;
+    let submitted = harness
+        .herdctl_args(&[
+            "submit",
+            "--",
+            "/bin/sh",
+            "-c",
+            "printf 'on stdout\\n'; printf 'on stderr\\n' >&2; exit 4",
+        ])
+        .await;
+    let job_id = stdout(&submitted).trim().to_owned();
+
+    let waited = harness.herdctl_args(&["wait", &job_id]).await;
+    assert_eq!(status_code(&waited), 4, "{}", stderr(&waited));
+    // A wait that attaches while the job is still running gets whatever was
+    // recorded before it arrived, and then the live chunks on their own
+    // streams — so between the two, all of the job's output.
+    let said = format!("{}{}", stdout(&waited), stderr(&waited));
+    assert!(said.contains("on stdout\n"), "stdout is missing: {said:?}");
+    assert!(said.contains("on stderr\n"), "stderr is missing: {said:?}");
+
+    // And again, on a job that was over before this wait began. Now it all
+    // comes from the record, whose `log` keeps both streams in arrival order
+    // and does not say which was which, so it is reported as the job's output.
+    let again = harness.herdctl_args(&["wait", &job_id]).await;
+    assert_eq!(status_code(&again), 4, "{}", stderr(&again));
+    let recorded = stdout(&again);
+    assert!(
+        recorded.contains("on stdout\n") && recorded.contains("on stderr\n"),
+        "a wait on a job that is over must still print its log: {recorded:?}"
+    );
+}
+
 /// Waiting on an id that was never minted is a refusal naming it, not a wait
 /// that never ends — and it is 125, because there is no verdict to give (D20).
 #[tokio::test]

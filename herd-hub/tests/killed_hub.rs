@@ -257,6 +257,28 @@ impl Herd {
         }
     }
 
+    /// Start a `herdctl wait` and leave it running, with what it says kept in
+    /// a file: a wait that is *meant* not to end cannot be run to completion.
+    fn start_wait(&self, job_id: &str) -> Process {
+        let child = Command::new(binary("herdctl"))
+            .arg("--hub")
+            .arg(self.url())
+            .args(["wait", job_id])
+            .stdout(Stdio::from(
+                File::create(self.logs.path().join("wait-out")).expect("a file"),
+            ))
+            .stderr(Stdio::from(
+                File::create(self.logs.path().join("wait-err")).expect("a file"),
+            ))
+            .kill_on_drop(true)
+            .spawn()
+            .expect("herdctl starts");
+        Process {
+            what: "wait",
+            child,
+        }
+    }
+
     fn job_dir(&self, job_id: &str) -> PathBuf {
         self.state.path().join("jobs").join(job_id)
     }
@@ -478,4 +500,66 @@ async fn a_result_the_hub_cannot_write_is_kept_until_it_can() {
 
     second.signal(rustix::process::Signal::TERM).await;
     runner.signal(rustix::process::Signal::TERM).await;
+}
+
+/// D17's other half: when nothing comes back, the job stays unfinished but is
+/// *named* as interrupted, and a wait on it says so instead of hanging mutely
+/// for ever.
+///
+/// The hub and the runner are both killed, so the result exists nowhere: the
+/// runner held it in memory and the runner is gone. M2 does not decide that
+/// such an attempt is lost — the ~60 s silence threshold and the requeue are
+/// M3's — so the wait does go on waiting. What it may not do is wait in
+/// silence, which is what it did.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_wait_on_an_interrupted_job_says_so_rather_than_hanging_mutely() {
+    let herd = Herd::new();
+    let mut hub = herd.start_hub("first").await;
+    let mut runner = herd.start_runner();
+    herd.wait_for_runner().await;
+
+    let job = herd.submit("printf 'working\\n'; sleep 30").await;
+    herd.wait_until("the job is running", || {
+        herd.record(&job)["state"]["type"] == "running"
+    })
+    .await;
+
+    // Both ends of the attempt, gone. Nothing can report this job's end.
+    hub.signal(rustix::process::Signal::KILL).await;
+    runner.signal(rustix::process::Signal::KILL).await;
+
+    let mut second = herd.start_hub("second").await;
+    let mut waiting = herd.start_wait(&job);
+    let said = async {
+        loop {
+            if herd.said("wait").contains("interrupted") {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    };
+    tokio::time::timeout(Duration::from_secs(10), said)
+        .await
+        .unwrap_or_else(|_| {
+            panic!(
+                "the wait said nothing about a job whose attempt was interrupted: {:?}",
+                herd.said("wait")
+            )
+        });
+    assert!(
+        herd.said("wait")
+            .contains("the hub stopped while this job was"),
+        "the note must carry the reason the record holds: {:?}",
+        herd.said("wait")
+    );
+    // Still waiting, as M2 means it to: no verdict has been invented.
+    assert!(waiting.alive(), "the wait must not have answered anything");
+    assert_eq!(
+        herd.record(&job)["state"]["type"],
+        "interrupted",
+        "the record names the interruption rather than reading `running`"
+    );
+
+    waiting.signal(rustix::process::Signal::TERM).await;
+    second.signal(rustix::process::Signal::TERM).await;
 }

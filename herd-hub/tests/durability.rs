@@ -261,6 +261,31 @@ async fn a_job_s_output_reaches_the_record_byte_for_byte() {
     );
 }
 
+/// D22: the log is always there. A job that prints nothing used to leave no
+/// `log` file at all, so a consumer reading the record got ENOENT for a
+/// perfectly ordinary job.
+#[tokio::test]
+async fn a_job_that_prints_nothing_still_has_a_log_file() {
+    let harness = Harness::with_hub_and_runner().await;
+    let job_id = herdctl::submit_job(&harness.requester(), shell("exit 0"))
+        .await
+        .expect("the job is accepted");
+    let log = job_dir(harness.state_dir(), &job_id).join("log");
+    // From the job's first moment, not from its first byte of output.
+    assert!(
+        log.is_file(),
+        "{} must exist as soon as the job does",
+        log.display()
+    );
+    assert_eq!(std::fs::read(&log).expect("it reads").len(), 0);
+
+    let finished = herdctl::wait_for_job(&harness.requester(), job_id, |_, _| {}, |_| {})
+        .await
+        .expect("the job ends");
+    assert_eq!(finished.outcome, JobOutcome::Exited { code: 0 });
+    assert!(log.is_file(), "and it is still there afterwards");
+}
+
 /// E-15's core and E-53: while the job is still running, its directory is
 /// plain files that mean something — the record, the transitions so far, and
 /// the output so far.
