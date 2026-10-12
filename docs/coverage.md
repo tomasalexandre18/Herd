@@ -20,12 +20,12 @@ closes in M18.
 | E-09 | should | deadline cancels unstarted job | M9 | pulled forward: E-41 (must) needs it |
 | E-10 | should | depend on one other job | M9 | capped: one parent, no conditions (invariant 1) |
 | E-11 | must | consumer-declared commands, nix develop | M10 | gated: their real declaration file (M18) |
-| E-12 | must | packs stored by (commit, key) | M11 | gated: `0 crates compiled` needs their pack (M18) |
-| E-13 | should | content-addressed, complete or absent | M11 | done with the store: retrofitting CAS would force a migration |
+| E-12 | must | packs by (commit, key), no shared build trees | M11 | D10: hub registers, peers transfer; gated on their pack (M18) |
+| E-13 | should | content-addressed, complete or absent | M11 | done with the store: retrofitting CAS would force a migration, and D10 needs it for free diffs |
 | E-14 | must | warm caches ready before job | M12 | Q5/D9: no cache engine in Herd, but a declared prepare step, key-aware placement, and cache diffs publishable as packs; gated on their replication (M18) |
 | E-15 | must | full job record on disk | M2 | resource metrics in M4, retention in M12 |
-| E-16 | must | budgets, gc with pinning | M12 | |
-| E-17 | must | atomic publication everywhere | M11 | job-record atomicity already in M2 (Q1) |
+| E-16 | must | budgets, gc with pinning | M12 | per runner, not central (D10); keepers pin |
+| E-17 | must | atomic publication everywhere | M11 | a manifest registers only once every blob is held; job-record atomicity already in M2 (Q1) |
 | E-18 | must | four priorities with aging | M6 | |
 | E-19 | must | no fallback while available | M7 | switch-off case retested with E-33 in M9 |
 | E-20 | must | one queue for everything | M6 | |
@@ -63,7 +63,7 @@ closes in M18.
 | E-52 | should | restarts with its host | M16, M17 | server in M16, the PC's logon task in M17 |
 | E-53 | should | records readable during run | M2 | plain files by Q1 |
 | E-54 | could | offline re-judging | M2 | no Herd work beyond E-15's kept files; the judge is their tool |
-| E-55 | could | peer-to-peer artefact exchange | — | not scheduled; a second transfer path before the first is measured |
+| E-55 | could | peer-to-peer artefact exchange | M11 | **promoted to the default** by D10: direct transfer is the only path, the hub never carries bytes |
 
 ## Musts per milestone
 
@@ -96,8 +96,6 @@ E-11, E-12, E-14, E-41, E-42 above) against chatOnS's real deliverables.
   until after M18 on purpose: they only read records that M2/M4 already write,
   so nothing is lost by waiting, and no must depends on them. E-38 is also
   gated on chatOnS's results.json for the load-vs-real failure split.
-- **E-55 (could)** — peer-to-peer artefact exchange. Not scheduled: it adds a
-  second transfer path before the hub path (Q2) has been measured as too slow.
 
 Every must is placed; no must is deferred or partial beyond the gated and
 real-hardware notes in the table, each of which names its closing milestone.

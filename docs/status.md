@@ -15,9 +15,10 @@ Documentation only:
 - `CLAUDE.md` — roles, vocabulary (+ the consumer's word-for-word translation),
   8 invariants, commands, git rules.
 - `docs/decisions.md` — D1 Rust, D2 vocabulary, D3 four crates, D4 WebSocket +
-  JSON, D5 deployment shape, D6 what was left open, **D7** blob channel over
-  plain HTTP amending D4, **D8** hub persistence as a directory per job,
-  **D9** warm caches (Herd carries one, Herd is not one).
+  JSON, D5 deployment shape, D6 what was left open, D7 (superseded), **D8**
+  hub persistence as a directory per job, **D9** warm caches (Herd carries
+  one, Herd is not one), **D10** the data path (Herd is never in the byte
+  path).
 - `docs/plan.md` — **M1..M18**, each one session, with the critical path, the
   parallel tracks, 13 decisions to settle before the code that depends on
   them, and the conflicts and risks.
@@ -26,8 +27,9 @@ Documentation only:
 ## The requirement sheet, in figures
 
 55 expectations: **44 must**, 9 should, 2 could (recounted from the sheet).
-All 44 musts are placed in a milestone; nothing is unplaced. Only E-38, E-39
-(should) and E-55 (could) are deliberately unscheduled, with reasons.
+All 44 musts are placed in a milestone; nothing is unplaced. Only E-38 and E-39
+(should) are deliberately unscheduled, with reasons; E-55 (could) was promoted
+to the default by D10.
 Nine acceptances are gated on chatOnS's own deliverables and close in M18;
 fixture tests stand in until then.
 
@@ -36,9 +38,12 @@ fixture tests stand in until then.
 - **No toolchain yet.** Rust is not installed; it arrives with the Nix flake
   in M1, so every command in `CLAUDE.md` is still the agreed contract rather
   than a verified one. `docker`, `nix` and `gh` are present and working.
-- **One decision is Alexa's**, in the plan's table: Q10 (the licence, being
-  outward-facing). Q5 (the warm caches) was hers and is settled as D9. Q1..Q4,
-  Q6..Q9, Q11..Q13 are mine; D7, D8 and D9 are taken.
+- **Two decisions are Alexa's.** Q10, the licence (outward-facing). And one
+  raised by D10: her PC's rule is "accepts no inbound connection" (E-34), but
+  serving a blob to a peer means listening on the mesh interface — until she
+  rules, the PC is outbound-only (pushes to and pulls from a keeper, never
+  serves). Q5 (the warm caches) was hers and is settled as D9; Q1..Q4, Q6..Q9,
+  Q11..Q13 are mine, and D8, D9, D10 are taken.
 - **Nothing is deployed and no runner exists.** First exposure over `wss://`
   is M16, on purpose: deploying earlier would freeze the public formats
   (the `ran on:` line, the status JSON, the event payloads) on a surface still

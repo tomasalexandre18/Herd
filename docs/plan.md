@@ -130,39 +130,55 @@ changes nothing on Herd's side; e2e asserts the `ran on:` line, the verbatim
 verdict, exit codes 0/1/75; a dirty submission is refused naming the files.
 The real chatOnS declaration closes in M18.
 
-### M11 — Artefact store (`m11-artefact-store`)
-Per-file content-addressed store on the hub volume (Q4); a pack = a manifest
-of hashes keyed by (commit, key). Publication staged then renamed: complete or
-absent; shared files stored once (E-17, E-13). Transfer over a plain HTTP blob
-channel beside the WebSocket, same token (Q2 — a D4 amendment). Declared
-outputs become the job's pack; a test job fetches by (commit, key), never
-another runner's build tree (E-12).
-**Done when** killing an upload mid-flight leaves no listed pack; two packs
-sharing files store each once; e2e builds a fixture pack on runner A, consumes
-it on runner B, manifest hashes match. chatOnS's `0 crates compiled`
-acceptance closes in M18. This is the milestone most likely to overflow one
-session; if it does, split at the channel boundary — blob endpoint plus the
-content-addressed store first, pack semantics (manifest, keying, cross-runner
-fetch) second.
+### M11 — Content registry, direct transfer (`m11-content-registry`)
+The hub is the registry and the authority, never the byte path (D10). It holds
+manifests — a pack is a list of content hashes keyed by (commit, key) — and
+which runners hold which blobs; it issues a short-lived, scoped fetch
+capability for a (blob, peer) pair. The bytes move **runner to runner**: each
+runner keeps a per-file content-addressed store under its data root and
+advertises a fetch endpoint (Q2); a runner needing a pack asks the hub who
+holds it and fetches directly, only the hashes it lacks. Three paths, in
+order: **same host** — hardlink or reflink inside the local store, zero bytes
+on any network; **peer reachable** — direct fetch from a holder; **outbound
+only** (a runner that accepts no inbound connection, E-34) — it pushes to and
+pulls from a keeper, never serves. A pack is complete or absent: the manifest
+is registered only once every blob is held and fsynced (E-17, E-13, E-12).
+**Done when** a two-runner e2e produces a fixture pack on runner A and
+consumes it on runner B with the hub seeing no payload byte (asserted by
+counting bytes on the hub's sockets); a same-host fetch moves zero network
+bytes and no second copy on disk; a second pack sharing files with the first
+transfers only the new blobs; killing a transfer mid-flight leaves the pack
+unregistered and no partial blob readable; an outbound-only runner completes
+both directions without listening; a fetch without a valid capability is
+refused. chatOnS's `0 crates compiled` acceptance closes in M18.
+Most likely milestone to overflow one session; if it does, split at the
+registry boundary — local CAS plus the same-host and keeper paths first,
+peer-to-peer fetch and capabilities second.
 
-### M12 — Budgets, GC, caches, locality (`m12-artefact-gc`)
-Per-host budgets shown as use against budget; gc never removes what a queued
-or running job references and pins the N most recent packs per key family
-(N = 5, configurable) (E-16). Result retention by priority class — 14/90 days,
-configurable (closes E-15).
-Warm caches per Q5 — Herd carries no cache engine, it carries the consumer's:
+### M12 — Custody, budgets, GC, locality (`m12-custody-gc`)
+Custody (D10): a key family names one or more **keepers** — runners that pin
+what the retention policy keeps, so a pack outlives the machine that built it
+and survives its owner switching that machine off. The server's runner is the
+default keeper; a pack with no reachable holder is a named, visible state, not
+a silent failure. Per-runner budgets shown as use against budget, gc on each
+runner never removing what a queued or running job references nor what its
+keeper role pins (N = 5 most recent per key family, configurable) (E-16).
+Result retention by priority class — 14/90 days, configurable (closes E-15).
+Warm caches per D9 — Herd carries no cache engine, it carries the consumer's:
 the prepare step runs before the job with its declared cache keys, its
 duration recorded against the job (E-14); a runner reports the keys it holds
-in its health report; and because the artefact store is generic and addressed
-per file (Q4), the consumer may publish cache diffs through it as ordinary
-packs, so a 57-700 MB diff between mains transfers only its missing blobs.
+in its health report; and because content is addressed per file, the consumer
+may register cache diffs as ordinary packs, so a 57-700 MB diff between mains
+moves only the blobs the target lacks — directly, peer to peer.
 Placement preference among available eligible runners: keys already held /
 shortest prepare, then most free memory, reference last (E-23); E-19 still
 governs waiting.
-**Done when** gc under a budget 10 GiB below use comes in under it keeping
-every pinned item; a step result past retention is gone while a 60-day merger
-result reads fine; prepare duration is recorded per job; a fixture cache diff
-published as a pack transfers only the blobs the target runner lacks; and
+**Done when** a pack whose only non-keeper holder goes offline is still
+fetchable from its keeper; a pack with no holder at all reports that state by
+name; gc on a runner with a budget 10 GiB below use comes in under it keeping
+every pinned and referenced item; a step result past retention is gone while a
+60-day merger result reads fine; prepare duration is recorded per job; a
+fixture cache diff registered as a pack moves only the missing blobs; and
 placement prefers the runner already holding the key, picking reference last.
 
 ### M13 — Status and events (`m13-status-events`)
@@ -287,14 +303,14 @@ spine.
 | Q | Decision | Recommendation | Blocks |
 |---|---|---|---|
 | Q1 | Hub persistence model | Directory per job: `job.json` by atomic rename, `events.jsonl` appended; no database. Atomicity is E-17's primitive reused; records stay plain files the consumer can read (E-53). | M2 |
-| Q2 | Blob transfer channel | Packs of hundreds of MB do not belong in JSON text frames (D4): plain HTTP(S) GET/PUT on the hub beside the WebSocket, same proxy, same token. Recorded as D7, amending D4. | M11 |
+| Q2 | The data path | **Herd is never in the byte path (D10).** The hub registers manifests and who holds what, and issues scoped fetch capabilities; runners move blobs directly. A runner advertises a fetch endpoint; Herd does not build, manage or require a network — a tailnet address, a LAN address or a hostname are all just an endpoint to it. Same host: hardlink/reflink, zero network. Outbound-only runners (E-34) push to and pull from a keeper and never serve. | M11, M12 |
 | Q3 | Resource algebra shape | One Capability type {name, kind: exclusive / counted(n) / shared, excludes, busy-probe}; memory and tmpfs are numeric admissions, not labels; a lease is counted(1) with an external probe. | M5 |
-| Q4 | Artefact addressing | Per file, not per archive: inter-pack dedup (E-13) and GC pinning fall out of it. | M11 |
+| Q4 | Content addressing | Per file, not per archive. It buys three things at once: inter-pack dedup (E-13), GC pinning (E-16), and "fetch the diff" for free — a peer fetches only the hashes it lacks, so no delta protocol and no rsync is ever needed. | M11 |
 | Q5 | Warm caches | Herd grows no cache engine of its own, but must actively *carry* one: (a) the artefact store is generic, so the consumer may publish cache diffs through it as ordinary packs — per-file addressing (Q4) means a 57-700 MB diff costs only its missing blobs; (b) the declaration contract has a first-class **prepare step** with declared cache keys and a recorded duration; (c) a runner reports which keys it holds, and placement prefers a holder (E-23). Herd never knows what a cache *is*. | M10, M11, M12 |
 | Q6 | WSL memory ceiling | All job processes in one cgroup v2 subtree with MemoryMax (WSL2 ships systemd); documented fallback; verified on the real PC in M17. | M4 |
 | Q7 | Public format versioning | `ran on:` line, status JSON and event payloads each carry a format version; v1 freezes at M16. | M10, M13 |
 | Q8 | Authentication | Per-runner token minted at approval, hashed at the hub; no mTLS (the proxy terminates TLS); one shared requester token to start. | M15 |
-| Q9 | State and artefact location, budgets | One hub volume; artefact budget 80 GiB on the server (their offer); per-runner disk budgets in runner config (PC: 900 GiB). | M2, M11 |
+| Q9 | Where state and content live, budgets | Hub volume: job records and manifests only — kilobytes, no payloads. Content lives in each runner's store under its data root, with a per-runner budget (the server's keeper share of their 80 GiB offer; the PC's 900 GiB). | M2, M11, M12 |
 | Q10 | Name and licence | Keep "Herd"; the licence is outward-facing — ask Alexa before M16. | M16 |
 | Q11 | Runner packaging | A flake output (binary via nix profile or copied); semver carried in Hello (E-51). | M16, M17 |
 | Q12 | Local foreground mode | Do not build one: local hub plus runner via `cargo run` is the debug path; chatOnS keeps its own local path. | — |
@@ -302,10 +318,23 @@ spine.
 
 ## Conflicts and risks
 
-- **D4 vs pack sizes.** D4 says JSON text frames; packs are hundreds of MB.
-  Base64 through the socket would be walked back — hence Q2. The transport
-  beyond `wss://` is explicitly ours to settle, so this is decided and
-  recorded as D7 amending D4, not an open question.
+- **Herd must not become a data mover (Alexa, 2026-10-12).** D7 fixed the
+  wrong half of the problem: it moved packs off the JSON frames but kept them
+  going through the hub. Orchestrating and relaying bytes are different jobs,
+  and routing 1.5 GB through a container and a reverse proxy to reach a disk
+  on the same machine is the clearest case against it. D10 supersedes D7: the
+  hub registers content and authorises fetches, runners move the bytes.
+- **The mesh is not ours.** Herd must never depend on a VPN product: a
+  coordination service we do not run would breach invariant 1 (no cloud), and
+  a network layer inside Herd would breach invariant 1 twice over. Herd
+  consumes an advertised endpoint and nothing more. A tailnet is an excellent
+  deployment choice for the owner — it is not a Herd dependency, and Herd
+  works on a bare LAN with no mesh at all.
+- **Direct transfer costs something.** Peer liveness, partial holders, and
+  "who actually has this blob" are harder to debug than one central store;
+  custody (D10, M12) and a visible no-holder state exist to pay that cost
+  honestly. Their own E-55 already asks for peer exchange, so this is the
+  spec simplified, not stretched.
 - **Invariant 1 judgements.** E-10 stays inside the line capped at one parent,
   start-after-success, no conditions — a primitive, not a graph. E-41 is a
   timer plus one predicate (Q13), not a workflow; if the predicate creeps, the

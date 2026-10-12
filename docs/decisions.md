@@ -125,6 +125,10 @@ in M1–M3 may assume an answer, and no heavy dependency may be added for them.
 
 ## 2026-10-12 — D7 Blob transfer channel (amends D4)
 
+> **Superseded the same day by D10.** D7 was right that payloads do not belong
+> in JSON control frames and wrong about the topology: it still routed them
+> through the hub. Kept for the record.
+
 **Context.** Issue #1 arrived with the first consumer's requirement sheet.
 E-12 asks Herd to store *packs*: build artefact sets of hundreds of megabytes,
 up to about 1.5 GB, fetched by a runner on another machine. D4 says every
@@ -215,3 +219,64 @@ a second subsystem.
 
 **Reversibility.** High: all three mechanisms are useful regardless, and none
 assumes a cache exists.
+
+---
+
+## 2026-10-12 — D10 The data path: Herd is never in the byte path
+### (supersedes D7's topology)
+
+**Context.** Alexa, 2026-10-12: *data must not transit between runners through
+Herd — that is not its role, it orchestrates; the exchange should be direct,
+over something like a tailnet; HTTP through the hub crosses too many layers
+and is counterproductive locally.* He is right, and D7 only fixed half the
+problem: it moved packs off the JSON control frames but left them going
+through the hub. Three cases make it plain. The hub would become a bandwidth
+bottleneck and a disk sink for content it has no use for. Every transfer would
+cost two hops instead of one. And on the server — which hosts both the hub
+container and a runner — fetching a pack would mean pushing 1.5 GB through a
+container boundary and a reverse proxy to reach a file already on that disk.
+Their own E-55 asks for peer exchange as a "could"; this makes it the default.
+
+**Choice.** Three things that D7 conflated are now separate:
+
+1. **Control plane — Herd's.** The hub holds manifests (a pack is a list of
+   content hashes keyed by (commit, key)), knows which runner holds which
+   blobs, decides placement, and issues a short-lived scoped capability for a
+   (blob, peer) pair. All of it metadata: kilobytes.
+2. **Data plane — not Herd's.** Each runner keeps a per-file content-addressed
+   store under its data root and advertises a fetch endpoint. A runner needing
+   a pack asks the hub who holds it and fetches **directly from that peer**,
+   only the hashes it lacks. Three paths in order: *same host* — hardlink or
+   reflink in the local store, zero bytes on any network; *peer reachable* —
+   direct fetch; *outbound only* — a runner that accepts no inbound connection
+   (E-34) pushes to and pulls from a keeper and never serves.
+3. **Custody — Herd's policy, a runner's disk.** A key family names one or
+   more **keepers** that pin what retention keeps, so a pack outlives the
+   machine that built it and survives that machine being switched off. The
+   server's runner is the default keeper. A pack with no reachable holder is a
+   named, visible state, never a silent failure.
+
+**The network is not ours.** Herd must not depend on a VPN product. A
+coordination service we do not run would breach invariant 1 (no cloud), and a
+network layer inside Herd would breach it again. Herd consumes an advertised
+endpoint — a tailnet address, a LAN address, a hostname are all the same
+string to it. A tailnet is an excellent deployment choice for these machines;
+it is not a Herd dependency, and Herd works on a bare LAN with no mesh at all.
+
+**What this costs.** Peer liveness, partial holders and "who actually holds
+this blob" are harder to debug than one central store. Custody and the visible
+no-holder state are what pays for it. Content addressing per file (Q4) is what
+makes "fetch the diff" free: a peer fetches the hashes it lacks, so no delta
+protocol and no rsync is ever needed.
+
+**Alternative rejected.** The hub as a relay of last resort for peers that
+cannot reach each other — deliberately not built. It is the design we just
+removed, it would be used quietly whenever the direct path broke, and it would
+hide exactly the failures we need to see. An outbound-only runner reaches a
+keeper instead; if two runners genuinely cannot reach any common keeper, that
+is a network fact to fix, reported by name.
+
+**Open, for Alexa (E-34).** The owner's rule is that her PC "accepts no
+inbound connection". On a tailnet, serving a blob means listening on the mesh
+interface. Until she rules otherwise, her PC is treated as outbound-only: it
+pushes its packs to a keeper and pulls what it needs, and never serves a peer.
