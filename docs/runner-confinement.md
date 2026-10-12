@@ -258,6 +258,15 @@ nobody reads a missing measurement as a measured nothing. That applies to
 figure at all *and* ends the job at its disk cap, while a job that genuinely
 wrote nothing reports zero.
 
+**The workspace figure is sampled**, every 200 ms and once more after the
+job's last process is gone. So the high-water mark is the highest the runner
+*saw*, and a job that writes and deletes faster than one sample can hold more
+than its budget for less than a sample without being stopped. The final
+measurement is what catches a job that writes and exits at once, which is the
+case that matters: what a job leaves is always measured, what it held for an
+instant may not be. Making that exact needs filesystem quotas, which is not
+M4.
+
 ## Tests, and which of them a host can make
 
 `./scripts/test.sh` runs the workspace suite — all of the above against the

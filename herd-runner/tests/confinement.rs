@@ -624,6 +624,50 @@ async fn a_job_s_child_in_its_own_session_does_not_outlive_the_job() {
     }
 }
 
+/// Defect 9: the whole metric path, so that a measured zero and a figure
+/// that could not be taken can never be confused.
+///
+/// A job that wrote nothing reports `Some(0)` — it was measured, and it was
+/// nothing. A job that wrote and then deleted reports the high-water mark,
+/// which is what the disk budget is about. The unmeasurable case reports
+/// `None`, and is asserted in `root.rs`'s unit tests, where a tree can be
+/// made genuinely unreadable rather than merely locked.
+#[tokio::test]
+async fn a_measured_zero_is_not_an_unmeasured_figure() {
+    let harness = Harness::new("metrics", |_| {}).await;
+
+    let quiet = harness.run("exit 0").await;
+    assert_eq!(quiet.outcome, JobOutcome::Exited { code: 0 });
+    assert_eq!(
+        quiet.metrics.bytes_written,
+        Some(0),
+        "a job that wrote nothing was measured, and the measurement is zero"
+    );
+    assert!(
+        quiet.metrics.host_load_milli.is_some(),
+        "/proc/loadavg is readable on Linux"
+    );
+
+    // Written, held long enough for the watchdog to see it, then deleted.
+    let deleted = harness
+        .run("dd if=/dev/zero of=./big bs=1048576 count=20 2>/dev/null; sleep 1; rm ./big")
+        .await;
+    assert_eq!(
+        deleted.outcome,
+        JobOutcome::Exited { code: 0 },
+        "{}",
+        deleted.err
+    );
+    let written = deleted
+        .metrics
+        .bytes_written
+        .expect("a measurable workspace is never absent");
+    assert!(
+        written >= 20 << 20,
+        "the high-water mark lost what the job deleted: {written} bytes"
+    );
+}
+
 // ---------------------------------------------------------------- E-46 ----
 
 /// Defect 10: on this server the runner's user is in the `docker` group,
