@@ -82,12 +82,18 @@ commit. No other suite is required per commit.
 
 ## Git
 
-- One branch per milestone: `m1-end-to-end`, `m2-link-robustness`, …
+- One branch per milestone, named for it: `m1-end-to-end`,
+  `m2-link-robustness`, …
 - Small commits, imperative English subject, ≤ 72 chars, no scope prefixes
   required: `add job dispatch state machine`.
 - Push the branch to GitHub as work progresses.
-- **`main` only moves on Alexa's explicit approval.** Never merge or
-  force-push `main` without it.
+- Every change to `main` goes through a pull request, filled in from
+  `.github/pull_request_template.md`. Direct pushes are blocked by branch
+  protection: `git push origin <branch>:main` no longer works.
+- CI must be green before merge: job `check` (flake check, fmt, clippy,
+  test) and job `docs` (`scripts/check-docs.sh`).
+- **`main` only moves on Alexa's explicit approval.** He gives the word
+  before any merge. Never force-push, and never merge `main` by hand.
 
 ## When to ask Alexa
 
