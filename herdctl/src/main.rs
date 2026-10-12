@@ -5,8 +5,8 @@ use anyhow::Result;
 use clap::{Parser, Subcommand};
 use herd_proto::{JobId, JobOutcome, LogStream};
 use herdctl::{
-    could_not_start_message, exit_code_for, no_verdict_message, Config, DEFAULT_HUB_URL,
-    NO_VERDICT_CODE,
+    could_not_start_message, exit_code_for, impossible_exit_code_reason, no_verdict_message,
+    Config, DEFAULT_HUB_URL, NO_VERDICT_CODE,
 };
 
 /// The requester CLI: submit a job, follow its log, exit with its code.
@@ -66,6 +66,12 @@ async fn main() -> ExitCode {
             // job's own output and must stay the job's alone.
             if let JobOutcome::CouldNotStart { reason } = &outcome {
                 eprintln!("herdctl: {}", could_not_start_message(reason));
+            }
+            // An exit code outside 0..=255 is one no process can have worn,
+            // so there is no verdict to report and the reason is said as
+            // Herd's own failure, never as the job's (D20).
+            if let Some(reason) = impossible_exit_code_reason(&outcome) {
+                eprintln!("herdctl: {}", no_verdict_message(&reason));
             }
             ExitCode::from(exit_code_for(&outcome))
         }

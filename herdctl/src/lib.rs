@@ -69,8 +69,11 @@ pub const NO_VERDICT_CODE: u8 = 125;
 pub fn exit_code_for(outcome: &JobOutcome) -> u8 {
     match outcome {
         // A real process code is 0..=255. Anything else came from a peer
-        // inventing one, and cannot be worn.
-        JobOutcome::Exited { code } => u8::try_from(*code).unwrap_or(1),
+        // inventing one, and cannot be worn — so this is Herd with no verdict
+        // to give, exactly like the cases below, and never 1: 1 is the code
+        // that means "the job failed" (D20), and a lying peer must not be able
+        // to make a caller read a failure that nothing established.
+        JobOutcome::Exited { code } => u8::try_from(*code).unwrap_or(NO_VERDICT_CODE),
         JobOutcome::Signalled { signal } => {
             128u8.saturating_add(u8::try_from(*signal).unwrap_or(127))
         }
@@ -92,6 +95,22 @@ pub fn could_not_start_message(reason: &str) -> String {
 /// wear (D20).
 pub fn no_verdict_message(reason: &str) -> String {
     format!("herd cannot give you a verdict for this job: {reason}")
+}
+
+/// Why an `exited` outcome cannot be worn as an exit code, when it cannot.
+///
+/// A unix process exits with 0 to 255, so this is unreachable from a real
+/// one; what it guards against is a peer reporting something else. The caller
+/// gets [`NO_VERDICT_CODE`] and this sentence on stderr, because an exit code
+/// Herd had to invent must never be mistaken for the job's own.
+pub fn impossible_exit_code_reason(outcome: &JobOutcome) -> Option<String> {
+    match outcome {
+        JobOutcome::Exited { code } if u8::try_from(*code).is_err() => Some(format!(
+            "the exit code reported for this job is {code}, which no process can exit with \
+             (an exit code is 0 to 255)"
+        )),
+        _ => None,
+    }
 }
 
 /// Submit one command and follow it to its end.
@@ -303,6 +322,34 @@ mod tests {
     fn a_signal_becomes_the_shell_s_hundred_and_twenty_eight_plus_it() {
         assert_eq!(exit_code_for(&JobOutcome::Signalled { signal: 15 }), 143);
         assert_eq!(exit_code_for(&JobOutcome::Signalled { signal: 9 }), 137);
+    }
+
+    /// D20: 1 is the code that means "the job failed". An exit code no
+    /// process can have worn is Herd with no verdict to give, said as such,
+    /// and never a failure a caller would act on. Unreachable from a real unix
+    /// process; reachable from a peer that lies.
+    #[test]
+    fn an_exit_code_no_process_could_wear_gives_no_verdict_rather_than_a_failure() {
+        for code in [-1, 256, 1000, i32::MIN, i32::MAX] {
+            let outcome = JobOutcome::Exited { code };
+            assert_eq!(
+                exit_code_for(&outcome),
+                NO_VERDICT_CODE,
+                "exit code {code} must not be read as a verdict"
+            );
+            let reason = impossible_exit_code_reason(&outcome).expect("the reason is said");
+            assert!(
+                reason.contains(&code.to_string()),
+                "the reason must name the code: {reason}"
+            );
+        }
+        // A code a process really can wear is still its own, 125 included.
+        for code in [0, 1, 125, 255] {
+            assert!(
+                impossible_exit_code_reason(&JobOutcome::Exited { code }).is_none(),
+                "{code} is a code a process can exit with"
+            );
+        }
     }
 
     #[test]
