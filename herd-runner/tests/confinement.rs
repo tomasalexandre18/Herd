@@ -18,7 +18,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use herd_hub::{Hub, JobStore, MemoryJobStore};
+use herd_hub::{Hub, JobDirStore, JobStore};
 use herd_proto::{Cap, JobOutcome, LogStream};
 use herd_runner::testing::TempDir;
 use herd_runner::{Confined, Confinement};
@@ -28,17 +28,22 @@ use tokio::task::JoinHandle;
 struct Harness {
     hub_url: String,
     data_root: TempDir,
+    /// The hub's state root, which M2 made files: one per harness, removed
+    /// with it, so no confinement test reads another's records.
+    _state: TempDir,
     tasks: Vec<JoinHandle<()>>,
 }
 
 impl Harness {
     async fn new(label: &str, shape: impl FnOnce(&mut Confinement)) -> Self {
         let data_root = TempDir::new(label);
+        let state = TempDir::new(&format!("{label}-state"));
         let mut confinement = test_confinement(data_root.path());
         shape(&mut confinement);
         let hub = Hub::bind(
             "127.0.0.1:0".parse().expect("a literal loopback address"),
-            Arc::new(MemoryJobStore::new()) as Arc<dyn JobStore>,
+            Arc::new(JobDirStore::open(state.path()).expect("the state root opens"))
+                as Arc<dyn JobStore>,
         )
         .await
         .expect("the hub binds a free port");
@@ -68,6 +73,7 @@ impl Harness {
         Self {
             hub_url,
             data_root,
+            _state: state,
             tasks: vec![serving, running],
         }
     }
@@ -89,8 +95,8 @@ impl Harness {
                 &self.requester(),
                 shell(script),
                 |stream, data| match stream {
-                    LogStream::Stdout => out.push_str(data),
-                    LogStream::Stderr => err.push_str(data),
+                    LogStream::Stdout => out.push_str(&String::from_utf8_lossy(data)),
+                    LogStream::Stderr => err.push_str(&String::from_utf8_lossy(data)),
                 },
             )
             .await
@@ -142,9 +148,12 @@ fn test_confinement(data_root: &Path) -> Confinement {
 }
 
 /// Whether this host enforces the real kernel ceiling, and why not if it
-/// does not. Asked by preparing a confinement exactly as a runner does.
-fn kernel_ceiling_or_reason(data_root: &Path) -> Result<(), String> {
-    let confined = Confined::prepare(test_confinement(data_root))
+/// does not. Asked by preparing a confinement exactly as a runner does, in a
+/// data root of its own: a root belongs to one runner at a time, so this must
+/// never borrow the root a harness is using.
+fn kernel_ceiling_or_reason() -> Result<(), String> {
+    let temp = TempDir::new("ceiling-question");
+    let confined = Confined::prepare(test_confinement(temp.path()))
         .expect("an unprivileged process with a writable root can confine");
     match confined.ceiling().fallback_reason() {
         None => Ok(()),
@@ -463,7 +472,7 @@ async fn an_allocation_past_the_ceiling_kills_the_job_and_only_the_job() {
         confinement.timeout = Duration::from_secs(30);
     })
     .await;
-    let real_ceiling = kernel_ceiling_or_reason(harness.root());
+    let real_ceiling = kernel_ceiling_or_reason();
 
     // The hog doubles a shell variable, which is an allocation in the job's
     // own process and reaches gibibytes in a few dozen turns.
@@ -563,7 +572,8 @@ async fn the_runner_binds_no_listening_socket() {
         return;
     }
     let data_root = TempDir::new("no-listener");
-    let store = Arc::new(MemoryJobStore::new());
+    let state = TempDir::new("no-listener-state");
+    let store = Arc::new(JobDirStore::open(state.path()).expect("the state root opens"));
     let hub = Hub::bind(
         "127.0.0.1:0".parse().expect("a literal loopback address"),
         Arc::clone(&store) as Arc<dyn JobStore>,

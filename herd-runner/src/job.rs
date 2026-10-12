@@ -3,16 +3,28 @@
 //! The order matters and is the whole of E-34 and E-30:
 //!
 //! 1. A workspace inside the data root, empty, and the job's working
-//!    directory. Removed when the job ends, whatever the job did in it.
+//!    directory. Reclaimed when the job ends, whatever the job did to it —
+//!    including the modes it left behind.
 //! 2. A cgroup with the memory ceiling set **before** any process is in it.
-//! 3. The job's own session, so every process it starts shares one group.
+//! 3. The job's own session, so every process it starts shares one group, and
+//!    one marker in its environment, so the ones that leave that group can
+//!    still be found.
 //! 4. Nice on CPU and the idle class on IO.
 //! 5. A time cap, a log cap and a disk budget, each ending the job with a
 //!    named reason rather than letting it hang, flood or fill a disk.
-//! 6. A kill of the whole group and the whole cgroup when the job's own
-//!    process is gone — so a job that leaves a background child behind does
-//!    not outlive itself.
+//! 6. A kill of the whole cgroup, the whole process group and every process
+//!    still carrying the job's marker, when the job's own process is gone —
+//!    so a job that leaves a background child behind does not outlive itself.
 //! 7. What was measured, reported with the outcome (E-15).
+//!
+//! ## A cap outranks the job's own exit status
+//!
+//! A breached cap is the end of the job, whatever the process did afterwards.
+//! A job whose log was cut at the cap may still exit 0 a millisecond later,
+//! and a job whose output pipe was closed under it exits on `SIGPIPE`: both
+//! used to be reported as the job's own verdict, which made a truncated build
+//! look green. So the cap is checked once more after the process has gone,
+//! and whatever it says wins (D24, D25).
 
 use std::process::Stdio;
 use std::sync::atomic::{AtomicU64, AtomicU8, Ordering};
@@ -26,6 +38,7 @@ use tokio::process::{Child, Command};
 use crate::cgroup::JobCgroup;
 use crate::confine::{job_environment, kill_process_group, ChildSetup, Confined, POLL_INTERVAL};
 use crate::metrics::{host_load_milli, process_rss_bytes};
+use crate::reclaim::{kill_by_marker, JobTag};
 use crate::root::Workspace;
 use crate::{Link, Session};
 
@@ -55,6 +68,14 @@ pub async fn execute(
         return;
     };
 
+    // One chunk counter for both streams, minted before anything can be sent
+    // about this job and outliving every connection the job reports on: the
+    // hub counts chunks per job and reads a number that is not the expected
+    // successor as output that never arrived (D29). So every chunk of this
+    // job — the pumps' and the runner's own — takes its number from here, and
+    // nothing invents one.
+    let seq = Arc::new(AtomicU64::new(0));
+
     // E-45: the job gets one place to work, inside the one data root. A root
     // that will not give one is a refusal naming the path, not a job that
     // runs in the runner's own directory.
@@ -66,19 +87,18 @@ pub async fn execute(
         }
     };
 
-    let cgroup_name = workspace
-        .base_dir()
-        .file_name()
-        .map(|name| name.to_string_lossy().into_owned())
-        .unwrap_or_else(|| job_id.to_string());
-    let cgroup = confined.ceiling().open_for_job(&cgroup_name);
+    // One name for this job's cgroup, its marker and the runner's own log
+    // lines about it. Unique per runner process, so one job's kill can never
+    // reach another job's processes.
+    let tag = JobTag::mint(&job_id);
+    let cgroup = confined.ceiling().open_for_job(&tag);
     // The descriptor is opened here, in the runner, and written by the job's
     // own process before it execs: that is what leaves no instant in which a
     // job process exists outside its ceiling.
     let procs = match cgroup.as_ref().map(JobCgroup::procs_file).transpose() {
         Ok(procs) => procs,
         Err(error) => {
-            let _ = workspace.remove();
+            reclaim_or_say(&workspace, &job_id, &session, &seq);
             report_could_not_start(
                 &job_id,
                 &session,
@@ -113,7 +133,7 @@ pub async fn execute(
         .current_dir(workspace.work_dir())
         // Nothing of the runner's environment is a job's business.
         .env_clear()
-        .envs(job_environment(&workspace))
+        .envs(job_environment(&workspace, &tag))
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -130,7 +150,7 @@ pub async fn execute(
     let mut child = match builder.spawn() {
         Ok(child) => child,
         Err(error) => {
-            let _ = workspace.remove();
+            reclaim_or_say(&workspace, &job_id, &session, &seq);
             // Names the executable, so the reason reads as Herd failing to
             // run this command rather than the command failing.
             report_could_not_start(&job_id, &session, format!("{program}: {error}"));
@@ -141,13 +161,19 @@ pub async fn execute(
     drop(procs);
     let started = Instant::now();
     let pid = child.id().unwrap_or(0);
+    // On the list of live jobs from here on: a runner that is stopped, or
+    // that dies, must not leave this process, this cgroup or this workspace
+    // to nobody.
+    let token = confined.live().add(
+        tag.clone(),
+        pid,
+        cgroup.as_ref().map(|cgroup| cgroup.dir().to_path_buf()),
+        workspace.clone(),
+    );
     session.link.send(ToHub::JobStarted {
         job_id: job_id.clone(),
     });
 
-    // One counter for both streams, so the hub can restore the order this
-    // runner saw the output in, and one byte counter for the log cap.
-    let seq = Arc::new(AtomicU64::new(0));
     let log_bytes = Arc::new(AtomicU64::new(0));
     let tripped = Arc::new(AtomicU8::new(NO_CAP));
     let stdout = child.stdout.take().expect("stdout was piped");
@@ -203,10 +229,26 @@ pub async fn execute(
     // Whatever the job left behind dies with it, every time: the job's own
     // process being gone is not the same thing as the job being over
     // (E-34, E-06's kill hardened).
-    if let Some(cgroup) = &cgroup {
-        let _ = cgroup.kill();
+    match &cgroup {
+        // One write takes the whole tree, whatever it did to detach itself.
+        Some(cgroup) => {
+            let _ = cgroup.kill();
+            kill_process_group(pid);
+        }
+        // No cgroup, so no handle on the tree: the process group, and then
+        // every process still carrying this job's marker — which is how a
+        // `setsid` child, a double fork and a `nohup` are reached without one.
+        None => {
+            kill_process_group(pid);
+            let swept = kill_by_marker(&tag);
+            if swept > 0 {
+                eprintln!(
+                    "herd-runner: job {job_id} left {swept} process(es) outside its \
+                     process group; they were killed by marker"
+                );
+            }
+        }
     }
-    kill_process_group(pid);
 
     // Both pipes are drained before the outcome is reported, so no output can
     // arrive after JobFinished — bounded, because a descriptor held by
@@ -215,7 +257,36 @@ pub async fn execute(
         eprintln!("herd-runner: job {job_id} left a pipe open after being killed");
     }
 
-    let outcome = if let Some(cap) = watched.cap {
+    // The last measurement, taken once nothing of the job is running: this is
+    // the figure a job that wrote and exited at once is caught by.
+    let final_disk = workspace.measure();
+    let mut cap = watched.cap;
+    let mut unmeasurable = watched.unmeasurable;
+    if let Err(reason) = &final_disk {
+        unmeasurable = Some(reason.clone());
+    }
+    if cap.is_none() {
+        if unmeasurable.is_some() {
+            // A workspace the runner cannot measure is a disk budget it
+            // cannot enforce, and an unenforced budget must never read as a
+            // job that passed. The figure is absent and the job is stopped by
+            // the cap it could not be held to.
+            cap = Some(Cap::Disk);
+        } else if final_disk
+            .as_ref()
+            .is_ok_and(|used| *used > caps.disk_budget)
+        {
+            cap = Some(Cap::Disk);
+        }
+    }
+    if let Some(reason) = &unmeasurable {
+        eprintln!(
+            "herd-runner: job {job_id} could not be held to its disk budget, because \
+             its workspace could not be measured: {reason}"
+        );
+    }
+
+    let outcome = if let Some(cap) = cap {
         JobOutcome::StoppedByCap {
             cap,
             limit: limit_of(cap, confined.caps()),
@@ -232,30 +303,57 @@ pub async fn execute(
         watched.outcome
     };
 
-    let final_disk = workspace.size_bytes();
+    // A figure the runner could not take is absent, never zero (D23): a
+    // measured zero and "the job hid what it wrote" must never read alike.
+    let bytes_written = match (unmeasurable.is_some(), final_disk) {
+        (true, _) => None,
+        (false, Ok(used)) => Some(watched.peak_disk.unwrap_or(0).max(used)),
+        (false, Err(_)) => None,
+    };
     let metrics = JobMetrics {
         host_load_milli: host_load_milli(),
         peak_memory_bytes,
-        bytes_written: Some(watched.peak_disk.max(final_disk)),
+        bytes_written,
         log_bytes: log_bytes.load(Ordering::SeqCst),
         wall_time_ms: u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
     };
 
-    // The cgroup goes away with its guard; the workspace is removed here, and
-    // a workspace that will not go away is said out loud: it is a disk
-    // filling up, which is exactly what a runner must not do to its host.
+    // The cgroup goes away with its guard; the workspace is reclaimed here.
+    // A workspace that will not go away is a disk filling up, which is
+    // exactly what a runner must not do to its host — so it is said in the
+    // job's own record and not only in the runner's log.
     drop(cgroup);
-    if let Err(error) = workspace.remove() {
-        eprintln!(
-            "herd-runner: the workspace {} of job {job_id} could not be removed: {error}",
-            workspace.base_dir().display()
-        );
-    }
+    reclaim_or_say(&workspace, &job_id, &session, &seq);
+    confined.live().remove(token);
 
     // Held until the hub acknowledges it, and redelivered on every
     // connection until it does: a result is the one thing a runner cannot
     // reproduce (E-44, D17, D19).
     session.report(&job_id, outcome, metrics);
+}
+
+/// Reclaim a job's workspace, saying so in the job's record if it will not go.
+///
+/// The runner owns every inode under there, so this failing means something
+/// stranger than a mode — and whatever it is, the requester reading the job's
+/// log must be able to see that this host now carries bytes nobody collected.
+fn reclaim_or_say(workspace: &Workspace, job_id: &JobId, session: &Session, seq: &AtomicU64) {
+    let Err(error) = workspace.reclaim() else {
+        return;
+    };
+    let said = format!(
+        "herd-runner: the workspace {} of job {job_id} could not be reclaimed and is \
+         left on this host: {error}\n",
+        workspace.base_dir().display()
+    );
+    eprintln!("{}", said.trim_end());
+    // Into the job's log, which is part of its record: the runner's own
+    // stderr is not somewhere a requester can read. Numbered from the job's
+    // own counter like any other chunk — a number of its own invention would
+    // read, at the hub, as every chunk in between having been lost (D29).
+    session
+        .link
+        .send_chunk(job_id, LogStream::Stderr, seq, said.into_bytes());
 }
 
 /// What the watchdog needs to know about the job it is watching.
@@ -273,7 +371,11 @@ struct Watch<'a> {
 struct Watched {
     outcome: JobOutcome,
     cap: Option<Cap>,
-    peak_disk: u64,
+    /// The high-water mark of the workspace, or `None` if no measurement
+    /// could be taken at all.
+    peak_disk: Option<u64>,
+    /// Why a measurement could not be taken, if one could not.
+    unmeasurable: Option<String>,
     peak_rss: Option<u64>,
 }
 
@@ -282,25 +384,39 @@ struct Watched {
 /// Every cap ends the same way: kill the job's whole group and cgroup, then
 /// go on waiting for the process so that it is reaped rather than left as a
 /// zombie, and report the cap by name.
+///
+/// The process ending does **not** end this function's duty: the cap is
+/// examined one last time, because a job can breach a cap and exit in the
+/// same breath, and the breach is what the job ended of.
 async fn watch(child: &mut Child, watch: Watch<'_>) -> Watched {
     let deadline = watch.started + watch.timeout;
     let mut cap: Option<Cap> = None;
-    let mut peak_disk = 0u64;
+    let mut peak_disk: Option<u64> = None;
+    let mut unmeasurable: Option<String> = None;
     let mut peak_rss: Option<u64> = None;
 
     let outcome = loop {
         // `Child::wait` is cancel-safe, so losing this race costs nothing.
         tokio::select! {
-            status = child.wait() => break match status {
-                Ok(status) => outcome_of(status),
-                // The process started but Herd never learned how it ended,
-                // so it has no code and no signal to report. M3's "lost" is
-                // where this belongs; until then it is Herd failing to run
-                // the job, said in full.
-                Err(error) => JobOutcome::CouldNotStart {
-                    reason: format!("waiting for the job's process failed: {error}"),
-                },
-            },
+            status = child.wait() => {
+                let ended = match status {
+                    Ok(status) => outcome_of(status),
+                    // The process started but Herd never learned how it
+                    // ended, so it has no code and no signal to report. M3's
+                    // "lost" is where this belongs; until then it is Herd
+                    // failing to run the job, said in full.
+                    Err(error) => JobOutcome::CouldNotStart {
+                        reason: format!("waiting for the job's process failed: {error}"),
+                    },
+                };
+                // The last word on the caps, before the child's status is
+                // allowed to be the answer. The log cap above all: the pump
+                // trips it and the process may well exit 0 right after.
+                if cap.is_none() && watch.tripped.load(Ordering::SeqCst) == LOG_CAP {
+                    cap = Some(Cap::Log);
+                }
+                break ended;
+            }
             _ = tokio::time::sleep(POLL_INTERVAL) => {}
         }
 
@@ -309,10 +425,13 @@ async fn watch(child: &mut Child, watch: Watch<'_>) -> Watched {
             // runtime: a job with a large workspace must not stall the
             // runner's connection to the hub.
             let workspace = watch.workspace.clone();
-            let used = tokio::task::spawn_blocking(move || workspace.size_bytes())
+            let measured = tokio::task::spawn_blocking(move || workspace.measure())
                 .await
-                .unwrap_or(0);
-            peak_disk = peak_disk.max(used);
+                .unwrap_or_else(|error| Err(format!("the measuring task failed: {error}")));
+            match &measured {
+                Ok(used) => peak_disk = Some(peak_disk.unwrap_or(0).max(*used)),
+                Err(reason) => unmeasurable = Some(reason.clone()),
+            }
             if watch.cgroup.is_none() {
                 if let Some(rss) = process_rss_bytes(watch.pid) {
                     peak_rss = Some(peak_rss.unwrap_or(0).max(rss));
@@ -321,7 +440,11 @@ async fn watch(child: &mut Child, watch: Watch<'_>) -> Watched {
 
             cap = if watch.tripped.load(Ordering::SeqCst) == LOG_CAP {
                 Some(Cap::Log)
-            } else if used > watch.disk_budget {
+            } else if measured.is_err() || measured.is_ok_and(|used| used > watch.disk_budget) {
+                // Either the job is past its budget, or the runner cannot
+                // tell any more — and a budget that cannot be measured
+                // cannot be enforced, which ends the job by name rather than
+                // letting it run on unbounded.
                 Some(Cap::Disk)
             } else if Instant::now() >= deadline {
                 Some(Cap::Time)
@@ -341,6 +464,7 @@ async fn watch(child: &mut Child, watch: Watch<'_>) -> Watched {
         outcome,
         cap,
         peak_disk,
+        unmeasurable,
         peak_rss,
     }
 }

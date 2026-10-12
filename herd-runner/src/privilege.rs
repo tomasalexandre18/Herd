@@ -16,6 +16,16 @@
 //! M4 needs no helper, so none is invoked here. What exists is the refusal
 //! and the shape of the list, so that the first thing that needs privilege
 //! finds a gate rather than inventing one.
+//!
+//! ## What "unprivileged" does not cover
+//!
+//! A uid is not the whole of E-46. A user in the `docker` group is
+//! root-equivalent through the daemon's socket; a user in `wheel` can become
+//! root with one password. The runner cannot refuse those without refusing to
+//! run on the machines Herd exists for — the owner's own server is one — so it
+//! **names them at startup as a warning** and lets the machine's owner decide.
+//! Saying nothing would be the failure: it would let a deployment read as
+//! unprivileged when it is not.
 
 /// The effective user id, or `None` where there is no such notion.
 #[cfg(unix)]
@@ -55,6 +65,149 @@ pub fn refuse_if_privileged() -> Result<(), String> {
     }
 }
 
+/// Whether a file carries the set-user-id or set-group-id bit, asked of the
+/// file itself. This is the real check behind the names in
+/// [`ESCALATION_TOOLS`]: a setuid binary runs as its owner whatever it is
+/// called, and a tool named after nothing on that list is just as dangerous
+/// if it is setuid-root.
+#[cfg(unix)]
+fn set_user_or_group_id(path: &std::path::Path) -> std::io::Result<bool> {
+    use std::os::unix::fs::MetadataExt;
+
+    // Resolved, not the symlink: a link to sudo is sudo.
+    let metadata = std::fs::metadata(path)?;
+    Ok(metadata.mode() & (libc::S_ISUID | libc::S_ISGID) != 0)
+}
+
+#[cfg(not(unix))]
+fn set_user_or_group_id(path: &std::path::Path) -> std::io::Result<bool> {
+    std::fs::metadata(path)?;
+    Ok(false)
+}
+
+/// Whether this user may write a path, asked of the kernel rather than
+/// guessed from the mode bits. Lives here because "may this user" is a
+/// privilege question; `cgroup` uses it for the one file cgroup v2 needs
+/// writable before a job's process can be moved.
+#[cfg(unix)]
+pub(crate) fn writable_by_this_user(path: &std::path::Path) -> bool {
+    use std::os::unix::ffi::OsStrExt;
+
+    let Ok(c_path) = std::ffi::CString::new(path.as_os_str().as_bytes()) else {
+        return false;
+    };
+    // Safe: access(2) reads one path and returns an integer.
+    unsafe { libc::access(c_path.as_ptr(), libc::W_OK) == 0 }
+}
+
+#[cfg(not(unix))]
+pub(crate) fn writable_by_this_user(_path: &std::path::Path) -> bool {
+    false
+}
+
+/// Group memberships that make a user root in all but name.
+///
+/// `docker` and the container runtimes are the clearest: the daemon runs as
+/// root and will mount the host's filesystem wherever its client asks.
+/// `wheel`, `sudo` and `admin` are one password away from root.
+#[cfg(unix)]
+const ROOT_EQUIVALENT_GROUPS: &[&str] = &[
+    "docker", "podman", "lxd", "incus", "libvirt", "libvirtd", "wheel", "sudo", "admin",
+];
+
+/// Sockets that hand out root to whoever can write to them.
+#[cfg(unix)]
+const RUNTIME_SOCKETS: &[&str] = &[
+    "/run/docker.sock",
+    "/var/run/docker.sock",
+    "/run/podman/podman.sock",
+    "/run/containerd/containerd.sock",
+    "/run/crio/crio.sock",
+    "/var/run/libvirt/libvirt-sock",
+];
+
+/// Everything about this deployment that makes E-46's "unprivileged" less
+/// than true, each as one sentence naming the specific reason.
+///
+/// A warning, never a refusal: the first machine Herd runs on is the owner's
+/// own server, whose user is in `docker` because that server runs the hub in
+/// docker compose. Refusing there would make Herd unusable on exactly the
+/// hosts it was built for, and that trade is the machine owner's to make —
+/// not ours. What is not his to lose is knowing.
+#[cfg(unix)]
+pub fn root_equivalent_warnings() -> Vec<String> {
+    let mut warnings = Vec::new();
+    for group in root_equivalent_memberships() {
+        warnings.push(format!(
+            "this runner's user is in the {group:?} group, which is root-equivalent on \
+             most hosts, so a job could leave every cap behind by asking something \
+             else to run as root. E-46's \"unprivileged\" is not true of this \
+             deployment. Run the runner as a user that is in no such group if that \
+             matters to you."
+        ));
+    }
+    for socket in RUNTIME_SOCKETS {
+        let path = std::path::Path::new(socket);
+        if path.exists() && writable_by_this_user(path) {
+            warnings.push(format!(
+                "this runner's user can write {socket}, which is a container runtime \
+                 and therefore root on this host: a job could start a privileged \
+                 container and escape every cap. E-46's \"unprivileged\" is not true \
+                 of this deployment."
+            ));
+        }
+    }
+    warnings
+}
+
+#[cfg(not(unix))]
+pub fn root_equivalent_warnings() -> Vec<String> {
+    Vec::new()
+}
+
+/// The names of this process's groups that are root-equivalent.
+#[cfg(unix)]
+fn root_equivalent_memberships() -> Vec<String> {
+    let mut named = Vec::new();
+    let mine = own_group_ids();
+    let Ok(text) = std::fs::read_to_string("/etc/group") else {
+        return named;
+    };
+    for line in text.lines() {
+        // name:password:gid:members
+        let mut fields = line.split(':');
+        let Some(name) = fields.next() else { continue };
+        if !ROOT_EQUIVALENT_GROUPS.contains(&name) {
+            continue;
+        }
+        let gid: Option<u32> = fields.nth(1).and_then(|gid| gid.parse().ok());
+        if gid.is_some_and(|gid| mine.contains(&gid)) {
+            named.push(name.to_owned());
+        }
+    }
+    named
+}
+
+/// This process's real, effective and supplementary group ids.
+#[cfg(unix)]
+fn own_group_ids() -> Vec<u32> {
+    // Safe: getgid and getegid read one integer each.
+    let mut ids = unsafe { vec![libc::getgid(), libc::getegid()] };
+    // Safe: getgroups with a null pointer and 0 only asks for the count, then
+    // the buffer is sized to that count before it is filled.
+    let count = unsafe { libc::getgroups(0, std::ptr::null_mut()) };
+    if count > 0 {
+        let mut buffer = vec![0 as libc::gid_t; count as usize];
+        // Safe: the buffer holds `count` gid_t, which is what is announced.
+        let filled = unsafe { libc::getgroups(count, buffer.as_mut_ptr()) };
+        if filled > 0 {
+            buffer.truncate(filled as usize);
+            ids.extend(buffer);
+        }
+    }
+    ids
+}
+
 /// The fixed list of helper commands this runner may call with privilege.
 ///
 /// Empty on every machine until something actually needs one. A list, never
@@ -65,11 +218,46 @@ pub struct PrivilegedHelpers {
     allowed: Vec<String>,
 }
 
+/// The tools whose whole purpose is to run something as somebody else. A
+/// fixed list that contains one of these is not a fixed list: it allows
+/// everything, through one entry that looks like one command.
+///
+/// Matched on the file's own name, never as a substring of the path — a
+/// directory called `/opt/sudoers-docs/bin/mytool` is not an escalation tool,
+/// and the earlier substring check refused it while accepting `/usr/bin/doas`.
+const ESCALATION_TOOLS: &[&str] = &[
+    "sudo",
+    "sudoedit",
+    "doas",
+    "pkexec",
+    "run0",
+    "su",
+    "runuser",
+    "setpriv",
+    "machinectl",
+    "systemd-run",
+    "nsenter",
+    "unshare",
+    "chroot",
+    "capsh",
+];
+
 impl PrivilegedHelpers {
-    /// Build the list, refusing an entry that is not an absolute path.
+    /// Build the list, refusing anything that is not one named, ordinary,
+    /// unprivileged file that the machine's owner wrote down.
     ///
-    /// Relative entries are refused because they would be resolved against
-    /// `PATH`, and a helper chosen by `PATH` is not a fixed list.
+    /// Four refusals, each about a different way a "fixed list" stops being
+    /// one:
+    ///
+    /// 1. a relative path, which `PATH` would resolve — so the list would not
+    ///    decide what runs;
+    /// 2. a general-purpose escalation tool, which turns one entry into
+    ///    permission to run anything;
+    /// 3. a file that does not exist, because then nothing about it can be
+    ///    checked and the entry is a promise rather than a path;
+    /// 4. a **setuid or setgid** file, checked on the file itself and not on
+    ///    its name: that is what an escalation tool actually is, and it
+    ///    catches the ones this list has never heard of.
     pub fn new(entries: Vec<String>) -> Result<Self, String> {
         let mut allowed = Vec::with_capacity(entries.len());
         for entry in entries {
@@ -83,12 +271,33 @@ impl PrivilegedHelpers {
                      helper found through PATH is not a fixed list"
                 ));
             }
-            if trimmed.contains("sudo") {
+            let path = std::path::Path::new(&trimmed);
+            let name = path
+                .file_name()
+                .map(|name| name.to_string_lossy().into_owned())
+                .unwrap_or_default();
+            if ESCALATION_TOOLS.contains(&name.as_str()) {
                 return Err(format!(
-                    "the privileged helper {trimmed:?} names sudo: a runner escalates \
-                     through the fixed list itself, never through a general-purpose \
-                     escalation tool (E-46)"
+                    "the privileged helper {trimmed:?} is {name}, a general-purpose \
+                     escalation tool: a list containing one allows everything, and a \
+                     runner escalates through the fixed list itself (E-46)"
                 ));
+            }
+            match set_user_or_group_id(path) {
+                Ok(false) => {}
+                Ok(true) => {
+                    return Err(format!(
+                        "the privileged helper {trimmed:?} is setuid or setgid, so it \
+                         runs as somebody else by itself: that is an escalation tool \
+                         whatever it is called (E-46)"
+                    ))
+                }
+                Err(error) => {
+                    return Err(format!(
+                        "the privileged helper {trimmed:?} cannot be checked: {error}. A \
+                         helper this runner cannot look at is not a helper it may call."
+                    ))
+                }
             }
             if !allowed.contains(&trimmed) {
                 allowed.push(trimmed);

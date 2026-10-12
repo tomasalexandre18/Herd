@@ -11,6 +11,7 @@ use std::time::Duration;
 
 use crate::cgroup::Ceiling;
 use crate::privilege::PrivilegedHelpers;
+use crate::reclaim::{reclaim_a_past_life, JobTag, LiveJobs, MARKER_VARIABLE};
 use crate::root::{DataRoot, Workspace};
 use crate::size::show_bytes;
 
@@ -89,6 +90,9 @@ pub struct Confined {
     ceiling: Ceiling,
     helpers: PrivilegedHelpers,
     confinement: Confinement,
+    live: LiveJobs,
+    /// What the startup reaper found of a previous life, for the report.
+    reclaimed: Vec<String>,
 }
 
 impl Confined {
@@ -108,11 +112,16 @@ impl Confined {
             return Err("a time cap of 0 s would stop every job before it ran".to_owned());
         }
         let ceiling = Ceiling::detect(confinement.memory_max, confinement.cgroup_root.as_deref());
+        // Before the first job and before the hub: a runner that was killed
+        // left processes, cgroups and workspaces nothing else will collect.
+        let reclaimed = reclaim_a_past_life(&root, &ceiling);
         Ok(Self {
             root,
             ceiling,
             helpers,
             confinement,
+            live: LiveJobs::default(),
+            reclaimed,
         })
     }
 
@@ -136,11 +145,27 @@ impl Confined {
             None => lines.push(
                 "memory ceiling: one cgroup v2 subtree per job, enforced by the kernel".to_owned(),
             ),
-            Some(why) => lines.push(format!(
-                "memory ceiling: FALLING BACK to a per-process address-space limit, \
-                 which bounds each process instead of the job's tree and makes an \
-                 allocation fail instead of killing the job. Reason: {why}"
-            )),
+            Some(why) => {
+                lines.push(format!(
+                    "memory ceiling: FALLING BACK to a per-process address-space limit, \
+                     which bounds each process instead of the job's tree and makes an \
+                     allocation fail instead of killing the job. Reason: {why}"
+                ));
+                // The third weakness, and the one that matters most: without a
+                // cgroup there is no handle on the job's whole tree, so the
+                // kill is a process-group kill plus a sweep of /proc for this
+                // job's marker. It reaches a double fork, a nohup and a
+                // setsid; it does not reach a process that scrubs its own
+                // environment.
+                lines.push(
+                    "kill without a cgroup: FALLING BACK to killing the job's process \
+                     group and then sweeping /proc for processes still carrying this \
+                     job's marker. That reaches a job that gave itself a new session; \
+                     it cannot reach one that erases its own environment, which a \
+                     cgroup kill would still catch."
+                        .to_owned(),
+                );
+            }
         }
         if self.helpers.allowed().is_empty() {
             lines.push("privileged helpers: none configured".to_owned());
@@ -150,7 +175,23 @@ impl Confined {
                 self.helpers.allowed().join(", ")
             ));
         }
+        // E-46 is about more than this process's uid: a user who can reach a
+        // container runtime, or who is in a group that can become root, is
+        // root-equivalent whatever its uid says. Said as a warning, never a
+        // refusal: whether a machine's own owner accepts that is his call.
+        for warning in crate::privilege::root_equivalent_warnings() {
+            lines.push(format!("WARNING: {warning}"));
+        }
+        for reclaimed in &self.reclaimed {
+            lines.push(format!("reaped at startup: {reclaimed}"));
+        }
         lines
+    }
+
+    /// The jobs running right now, so that a runner being stopped can end
+    /// them rather than orphan them.
+    pub fn live(&self) -> &LiveJobs {
+        &self.live
     }
 
     pub fn root(&self) -> &DataRoot {
@@ -177,8 +218,14 @@ impl Confined {
 /// credentials, and none of that is a job's business. `PATH` is carried
 /// through because a command needs to find its tools, and the consumer's real
 /// environment arrives in M10 inside `nix develop`.
-pub fn job_environment(workspace: &Workspace) -> Vec<(String, String)> {
+///
+/// One variable is Herd's own: the job's marker. Because the environment is
+/// built rather than inherited, the marker is carried by exactly the job's
+/// processes and by nothing else on the host, which is what lets the runner
+/// find a process that left the job's process group (see [`crate::reclaim`]).
+pub fn job_environment(workspace: &Workspace, tag: &JobTag) -> Vec<(String, String)> {
     let mut environment = vec![
+        (MARKER_VARIABLE.to_owned(), tag.as_str().to_owned()),
         ("HOME".to_owned(), path_string(workspace.home_dir())),
         ("TMPDIR".to_owned(), path_string(workspace.tmp_dir())),
         ("TMP".to_owned(), path_string(workspace.tmp_dir())),
@@ -389,6 +436,17 @@ mod tests {
         let report = confined.report().join("\n");
         assert!(report.contains("FALLING BACK"), "{report}");
         assert!(report.contains("herd-no-such-cgroup-m4"), "{report}");
+        // D23 named two weaknesses of the fallback and left out the one that
+        // matters most: without a cgroup there is no handle on the job's whole
+        // tree. The startup report names all three or it is lying.
+        assert!(
+            report.contains("kill without a cgroup: FALLING BACK"),
+            "the fallback's weakest point is the kill, and it must be named: {report}"
+        );
+        assert!(
+            report.contains("new session") && report.contains("marker"),
+            "{report}"
+        );
     }
 
     #[test]
@@ -430,12 +488,21 @@ mod tests {
     fn a_job_s_environment_is_built_not_inherited_and_points_inside_the_root() {
         let temp = TempDir::new("confine-env");
         let root = DataRoot::open(temp.path()).expect("usable");
-        let workspace = root
-            .open_workspace(&herd_proto::JobId::new("j1"))
-            .expect("made");
-        let environment = job_environment(&workspace);
+        let job = herd_proto::JobId::new("j1");
+        let workspace = root.open_workspace(&job).expect("made");
+        let tag = JobTag::mint(&job);
+        let environment = job_environment(&workspace, &tag);
         let names: Vec<&str> = environment.iter().map(|(name, _)| name.as_str()).collect();
         assert!(!names.contains(&"HERD_TOKEN"), "{names:?}");
+        // The marker is the one variable Herd puts there on purpose.
+        assert_eq!(
+            environment
+                .iter()
+                .find(|(name, _)| name == MARKER_VARIABLE)
+                .map(|(_, value)| value.as_str()),
+            Some(tag.as_str()),
+            "a job must carry its own marker: {names:?}"
+        );
         for writable in [
             "HOME",
             "TMPDIR",
