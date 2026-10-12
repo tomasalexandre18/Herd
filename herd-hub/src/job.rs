@@ -12,6 +12,15 @@ use std::fmt;
 use herd_proto::{JobId, JobOutcome, LogStream};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
+/// What a runner measured while a job ran.
+///
+/// There is one such type and it lives in `herd-proto` (invariant 4): the
+/// figures travel from the runner to the hub in [`herd_proto::ToHub::JobFinished`]
+/// and are written to the record unchanged. M2 reserved the field in the
+/// record's shape and measured nothing; M4 fills it. A figure a host does not
+/// expose stays `None` — never zero (D23).
+pub use herd_proto::JobMetrics;
+
 /// The version of the shape of a job's recorded data: `job.json` and every
 /// line of `events.jsonl`. Bumped whenever an older reader could not read
 /// what a newer Herd writes.
@@ -105,23 +114,6 @@ impl JobState {
     }
 }
 
-/// What a job cost the machine it ran on.
-///
-/// The fields are part of the record's shape from M2 so that the layout the
-/// consumer reads does not change when M4 starts filling them; M2 collects
-/// nothing, so they are written as nulls and mean "not measured".
-#[derive(Debug, Clone, Copy, Default, PartialEq, Serialize, Deserialize)]
-pub struct JobMetrics {
-    /// The runner's load average just before the job started.
-    pub load_before: Option<f64>,
-    /// The runner's load average just after it ended.
-    pub load_after: Option<f64>,
-    /// The highest memory the job's process tree held, in bytes.
-    pub memory_peak_bytes: Option<u64>,
-    /// How much the job wrote under the runner's data root, in bytes.
-    pub bytes_written: Option<u64>,
-}
-
 /// What the hub knows about one job: the contents of its `job.json`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct JobRecord {
@@ -132,7 +124,9 @@ pub struct JobRecord {
     pub submitted_at: Timestamp,
     /// When its state last changed.
     pub updated_at: Timestamp,
-    /// Filled in by M4. Present and unset here on purpose.
+    /// What the runner measured while the job ran (E-15). Reserved in the
+    /// record's shape by M2 and filled by M4: every figure is unset until the
+    /// runner reports it, which it does once, with the outcome.
     pub metrics: JobMetrics,
 }
 
@@ -240,6 +234,11 @@ pub trait JobStore: Send + Sync + 'static {
     /// that is a runner redelivering a result whose acknowledgement it never
     /// saw, not a second ending.
     fn record_state(&self, id: &JobId, state: JobState) -> Result<()>;
+
+    /// Record what the runner measured (E-15). Separate from the transition
+    /// because a runner reports figures the hub never computes, and because a
+    /// store that keeps no measurements is still a correct store.
+    fn record_metrics(&self, id: &JobId, metrics: JobMetrics) -> Result<()>;
 
     /// Append one chunk of a job's output in the order the runner produced it,
     /// as the bytes the process wrote (D18): a job's output is not text.

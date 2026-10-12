@@ -6,6 +6,8 @@
 //! read as files, with no tool but a file read, because that is how the
 //! consumer reads them (E-15, E-53).
 
+use std::sync::Arc;
+
 use herd_hub::{JobDirStore, JobState, JobStore};
 use herd_proto::{JobOutcome, LogStream};
 use herd_runner::Session;
@@ -16,11 +18,12 @@ use support::{
     events_of, file_state_of, job_dir, log_of, record_of, shell, wait_until, Harness, HubProcess,
 };
 
-fn runner_config(hub_url: &str) -> herd_runner::Config {
+fn runner_config(hub_url: &str, data_root: &support::DataRootDir) -> herd_runner::Config {
     herd_runner::Config {
         hub_url: hub_url.to_owned(),
         name: Some("durable-runner".to_owned()),
         token: None,
+        confinement: support::confinement(data_root),
     }
 }
 
@@ -38,9 +41,14 @@ async fn a_hub_that_restarts_loses_no_result_and_no_queued_job() {
     // lets it redeliver after the hub comes back. M3 puts the reconnection
     // loop around this; here the test dials the second connection itself.
     let session = Session::new();
+    let (data_root, confined) = support::prepared_runner("durable-runner");
     let first_link = tokio::spawn({
-        let (config, session) = (runner_config(&first_hub.hub_url), session.clone());
-        async move { herd_runner::serve_once(config, session).await }
+        let (config, session) = (
+            runner_config(&first_hub.hub_url, &data_root),
+            session.clone(),
+        );
+        let confined = Arc::clone(&confined);
+        async move { herd_runner::serve_once(config, session, confined).await }
     });
     first_hub.wait_for_runner().await;
 
@@ -122,8 +130,12 @@ async fn a_hub_that_restarts_loses_no_result_and_no_queued_job() {
     // ---- The hub comes back on the same state root, and the runner with it.
     let second_hub = HubProcess::start(state.path());
     let second_link = tokio::spawn({
-        let (config, session) = (runner_config(&second_hub.hub_url), session.clone());
-        async move { herd_runner::serve_once(config, session).await }
+        let (config, session) = (
+            runner_config(&second_hub.hub_url, &data_root),
+            session.clone(),
+        );
+        let confined = Arc::clone(&confined);
+        async move { herd_runner::serve_once(config, session, confined).await }
     });
 
     // The result is redelivered and recorded: the work is not lost.
@@ -313,8 +325,8 @@ async fn a_job_s_record_is_readable_while_it_is_still_running() {
     assert_eq!(record["command"][0], "/bin/sh");
     assert!(record["submitted_at"].is_string(), "{record}");
     assert!(
-        record["metrics"]["memory_peak_bytes"].is_null(),
-        "M4's fields are in the shape and unset: {}",
+        record["metrics"]["peak_memory_bytes"].is_null(),
+        "a job that is still running has no final figures: {}",
         record["metrics"]
     );
     assert_eq!(
@@ -473,9 +485,14 @@ async fn a_result_for_a_job_the_hub_never_heard_of_does_not_wedge_the_runner() {
 
     let first_hub = HubProcess::start(first_root.path());
     let session = Session::new();
+    let (data_root, confined) = support::prepared_runner("durable-runner");
     let first_link = tokio::spawn({
-        let (config, session) = (runner_config(&first_hub.hub_url), session.clone());
-        async move { herd_runner::serve_once(config, session).await }
+        let (config, session) = (
+            runner_config(&first_hub.hub_url, &data_root),
+            session.clone(),
+        );
+        let confined = Arc::clone(&confined);
+        async move { herd_runner::serve_once(config, session, confined).await }
     });
     first_hub.wait_for_runner().await;
 
@@ -504,8 +521,12 @@ async fn a_result_for_a_job_the_hub_never_heard_of_does_not_wedge_the_runner() {
     // A hub on a state root that knows nothing of that job at all.
     let second_hub = HubProcess::start(second_root.path());
     let second_link = tokio::spawn({
-        let (config, session) = (runner_config(&second_hub.hub_url), session.clone());
-        async move { herd_runner::serve_once(config, session).await }
+        let (config, session) = (
+            runner_config(&second_hub.hub_url, &data_root),
+            session.clone(),
+        );
+        let confined = Arc::clone(&confined);
+        async move { herd_runner::serve_once(config, session, confined).await }
     });
     wait_until("the stale result is acknowledged", || {
         session.holds_nothing()

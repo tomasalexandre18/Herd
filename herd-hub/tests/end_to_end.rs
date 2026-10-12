@@ -11,13 +11,13 @@ use std::time::{Duration, Instant};
 use futures_util::{SinkExt, StreamExt};
 use herd_hub::{JobState, JobStore};
 use herd_proto::{
-    from_frame, to_frame, FromHub, JobOutcome, LogStream, Role, ToHub, PROTOCOL_VERSION,
+    from_frame, to_frame, FromHub, JobMetrics, JobOutcome, LogStream, Role, ToHub, PROTOCOL_VERSION,
 };
 use tokio_tungstenite::tungstenite::Message;
 
 mod support;
 
-use support::{shell, Harness};
+use support::{confinement, shell, DataRootDir, Harness};
 
 /// What a requester saw, in arrival order.
 #[derive(Default)]
@@ -80,6 +80,68 @@ async fn a_job_streams_its_output_and_succeeds() {
             outcome: JobOutcome::Exited { code: 0 }
         }
     );
+}
+
+/// E-15's resource fields, filled by M4: the runner measures, the hub keeps
+/// the figures on the record, and the requester gets the same ones. A job
+/// that wrote a known number of bytes is the only way to assert the disk
+/// figure is a measurement and not a constant.
+#[tokio::test]
+async fn a_job_s_record_carries_what_the_runner_measured() {
+    let harness = Harness::with_hub_and_runner().await;
+    let written = 256 * 1024;
+    let finished = herdctl::run_job(
+        &harness.requester(),
+        shell(&format!(
+            "dd if=/dev/zero of=./payload bs=1024 count={} 2>/dev/null; printf 'wrote it\\n'; \
+             sleep 0.3",
+            written / 1024
+        )),
+        |_, _| {},
+    )
+    .await
+    .expect("the job runs to its end");
+    assert_eq!(finished.outcome, JobOutcome::Exited { code: 0 });
+
+    let record = harness
+        .store
+        .job(&finished.job_id)
+        .expect("the store reads")
+        .expect("the hub knows this job");
+    let measured = record.metrics.clone();
+    assert_eq!(
+        measured, finished.metrics,
+        "the requester and the record must hold the same figures"
+    );
+    assert_ne!(
+        measured,
+        JobMetrics::default(),
+        "nothing was measured at all: {measured:?}"
+    );
+    assert_eq!(
+        measured.log_bytes, 9,
+        "the log cap counts the bytes the job wrote: {measured:?}"
+    );
+    assert!(
+        measured.wall_time_ms >= 300,
+        "the job slept 300 ms, so its wall time cannot be {} ms",
+        measured.wall_time_ms
+    );
+    let bytes_written = measured
+        .bytes_written
+        .expect("the workspace is always measurable");
+    assert!(
+        bytes_written >= written,
+        "the job wrote {written} bytes and the record says {bytes_written}"
+    );
+    assert!(
+        measured.host_load_milli.is_some(),
+        "a Linux host always has a load average: {measured:?}"
+    );
+    let peak = measured
+        .peak_memory_bytes
+        .expect("a peak is readable from the cgroup or from /proc");
+    assert!(peak > 0, "a process that ran held some memory");
 }
 
 #[tokio::test]
@@ -289,10 +351,12 @@ async fn a_submission_with_no_runner_is_refused_by_name() {
 #[tokio::test]
 async fn a_second_runner_is_refused_in_m1() {
     let harness = Harness::with_hub_and_runner().await;
+    let data_root = DataRootDir::new("second-runner");
     let error = herd_runner::run(herd_runner::Config {
         hub_url: harness.hub_url.clone(),
         name: Some("the-second-runner".to_owned()),
         token: None,
+        confinement: confinement(&data_root),
     })
     .await
     .expect_err("M1 accepts one runner");

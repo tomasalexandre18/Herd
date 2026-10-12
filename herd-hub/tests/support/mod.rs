@@ -22,8 +22,37 @@ use std::time::{Duration, Instant};
 
 use herd_hub::{Hub, HubHandle, JobDirStore, JobStore};
 use herd_proto::JobId;
+pub use herd_runner::testing::TempDir as DataRootDir;
 use tempfile::TempDir;
 use tokio::task::JoinHandle;
+
+/// The confinement a runner in these tests gets: a throwaway data root, its
+/// own, and M4's defaults for every cap.
+///
+/// A runner locks its data root for the life of the process (E-45), so every
+/// runner a test starts needs one of its own; and the caps have to be out of
+/// the way of the trivial commands these tests run, which M4's defaults are.
+/// What the caps do when they are reached is asserted in
+/// `herd-runner/tests/confinement.rs`.
+pub fn confinement(data_root: &DataRootDir) -> herd_runner::Confinement {
+    herd_runner::Confinement::with_data_root(data_root.path())
+}
+
+/// A data root and the confinement prepared on it, for a test that drives
+/// [`herd_runner::serve_once`] itself rather than letting
+/// [`herd_runner::run`] redial.
+///
+/// Prepared once and shared by every connection that test makes, because that
+/// is what a real runner does: the data root is locked for the life of the
+/// process, so preparing it again for the second connection would refuse
+/// itself (E-45). The caller keeps the directory alive; dropping it removes
+/// the root.
+pub fn prepared_runner(label: &str) -> (DataRootDir, Arc<herd_runner::Confined>) {
+    let data_root = DataRootDir::new(label);
+    let confined = herd_runner::Confined::prepare(confinement(&data_root))
+        .expect("a throwaway data root is confinable");
+    (data_root, Arc::new(confined))
+}
 
 /// How long any wait in these tests may take before it is a failure. Generous
 /// because CI is slow, never a substitute for waiting on a real condition.
@@ -42,6 +71,8 @@ pub struct Harness {
     pub state: TempDir,
     handle: HubHandle,
     tasks: Vec<JoinHandle<()>>,
+    /// The data root of the runner this harness started, removed with it.
+    _data_root: Option<DataRootDir>,
 }
 
 impl Harness {
@@ -58,15 +89,18 @@ impl Harness {
     /// A hub with one runner joined and ready to be dispatched to.
     pub async fn with_hub_and_runner() -> Self {
         let mut harness = Self::start().await;
+        let data_root = DataRootDir::new("hub-end-to-end");
         let config = herd_runner::Config {
             hub_url: harness.hub_url.clone(),
             name: Some("test-runner".to_owned()),
             // Carried, not checked: M15 gives tokens meaning.
             token: Some("not-validated-yet".to_owned()),
+            confinement: confinement(&data_root),
         };
         harness.tasks.push(tokio::spawn(async move {
             let _ = herd_runner::run(config).await;
         }));
+        harness._data_root = Some(data_root);
         // Wait on the hub's own state, not on a sleep: a submission is only
         // meaningful once the runner is registered.
         let deadline = Instant::now() + PATIENCE;
@@ -97,6 +131,7 @@ impl Harness {
             state,
             handle,
             tasks: vec![serving],
+            _data_root: None,
         }
     }
 
