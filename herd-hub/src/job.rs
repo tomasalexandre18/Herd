@@ -170,14 +170,16 @@ pub trait JobStore: Send + Sync + 'static {
     /// saw, not a second ending.
     fn record_state(&self, id: &JobId, state: JobState) -> Result<()>;
 
-    /// Append one chunk of a job's output in the order the runner produced it.
-    fn append_log(&self, id: &JobId, stream: LogStream, seq: u64, data: &str) -> Result<()>;
+    /// Append one chunk of a job's output in the order the runner produced it,
+    /// as the bytes the process wrote (D18): a job's output is not text.
+    fn append_log(&self, id: &JobId, stream: LogStream, seq: u64, data: &[u8]) -> Result<()>;
 
     /// The job's record, if the store has one.
     fn job(&self, id: &JobId) -> Result<Option<JobRecord>>;
 
-    /// The job's output so far, both streams interleaved as they arrived.
-    fn job_log(&self, id: &JobId) -> Result<Option<String>>;
+    /// The job's output so far, both streams interleaved as they arrived, and
+    /// byte for byte what the process wrote.
+    fn job_log(&self, id: &JobId) -> Result<Option<Vec<u8>>>;
 
     /// The job's transitions, in the order they were recorded.
     fn job_events(&self, id: &JobId) -> Result<Option<Vec<JobEvent>>>;

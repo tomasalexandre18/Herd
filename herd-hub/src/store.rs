@@ -446,15 +446,14 @@ impl JobStore for JobDirStore {
         Ok(())
     }
 
-    fn append_log(&self, id: &JobId, _stream: LogStream, _seq: u64, data: &str) -> Result<()> {
+    fn append_log(&self, id: &JobId, _stream: LogStream, _seq: u64, data: &[u8]) -> Result<()> {
         let _live = self.lock()?;
         let dir = self.job_dir(id);
         if !dir.is_dir() {
             return Err(StoreError::new(format!("no such job: {id}")));
         }
         let path = dir.join(LOG_FILE);
-        durable::append_bytes(&path, data.as_bytes())
-            .map_err(|error| failed("appending to", &path, &error))
+        durable::append_bytes(&path, data).map_err(|error| failed("appending to", &path, &error))
     }
 
     fn job(&self, id: &JobId) -> Result<Option<JobRecord>> {
@@ -462,13 +461,13 @@ impl JobStore for JobDirStore {
         self.read_record(id)
     }
 
-    fn job_log(&self, id: &JobId) -> Result<Option<String>> {
+    fn job_log(&self, id: &JobId) -> Result<Option<Vec<u8>>> {
         let _live = self.lock()?;
         if !self.job_dir(id).is_dir() {
             return Ok(None);
         }
         let path = self.job_dir(id).join(LOG_FILE);
-        Ok(Some(read_optional(&path)?.unwrap_or_default()))
+        Ok(Some(read_optional_bytes(&path)?.unwrap_or_default()))
     }
 
     fn job_events(&self, id: &JobId) -> Result<Option<Vec<JobEvent>>> {
@@ -588,6 +587,14 @@ fn read_optional(path: &Path) -> Result<Option<String>> {
     }
 }
 
+fn read_optional_bytes(path: &Path) -> Result<Option<Vec<u8>>> {
+    match fs::read(path) {
+        Ok(bytes) => Ok(Some(bytes)),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(failed("reading", path, &error)),
+    }
+}
+
 fn write_json<T: Serialize>(path: &Path, value: &T) -> Result<()> {
     let text = serde_json::to_vec(value).map_err(|error| failed("writing", path, &error))?;
     durable::write_file(path, &text).map_err(|error| failed("writing", path, &error))
@@ -644,7 +651,7 @@ mod tests {
             ])
             .expect("minted");
         store
-            .append_log(&job.id, LogStream::Stdout, 0, "half a line")
+            .append_log(&job.id, LogStream::Stdout, 0, b"half a line")
             .expect("appended");
 
         let job_dir = dir.path().join(JOBS_DIR).join(job.id.as_str());
@@ -698,10 +705,10 @@ mod tests {
             .record_state(&job.id, JobState::Running)
             .expect("transition");
         store
-            .append_log(&job.id, LogStream::Stdout, 0, "first")
+            .append_log(&job.id, LogStream::Stdout, 0, b"first")
             .expect("append");
         store
-            .append_log(&job.id, LogStream::Stderr, 1, "-second")
+            .append_log(&job.id, LogStream::Stderr, 1, b"-second")
             .expect("append");
         store
             .record_state(
@@ -721,7 +728,7 @@ mod tests {
         );
         assert_eq!(
             store.job_log(&job.id).expect("readable").as_deref(),
-            Some("first-second"),
+            Some(&b"first-second"[..]),
             "both streams interleave in arrival order"
         );
         assert!(
@@ -833,7 +840,9 @@ mod tests {
         let (_dir, store) = store();
         let ghost = JobId::new("j0000000404");
         assert!(store.record_state(&ghost, JobState::Running).is_err());
-        assert!(store.append_log(&ghost, LogStream::Stdout, 0, "x").is_err());
+        assert!(store
+            .append_log(&ghost, LogStream::Stdout, 0, b"x")
+            .is_err());
         assert_eq!(store.job(&ghost).expect("readable"), None);
         assert_eq!(store.job_log(&ghost).expect("readable"), None);
         assert_eq!(store.job_events(&ghost).expect("readable"), None);

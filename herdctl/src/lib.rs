@@ -80,11 +80,12 @@ pub fn could_not_start_message(reason: &str) -> String {
 /// Submit one command and follow it to its end.
 ///
 /// `on_log` is called with each chunk as it arrives, in the order the runner
-/// produced it; the binary prints them, a test times them.
+/// produced it, carrying the bytes the process wrote (D18); the binary prints
+/// them, a test times them.
 pub async fn run_job(
     config: &Config,
     command: Vec<String>,
-    mut on_log: impl FnMut(LogStream, &str),
+    mut on_log: impl FnMut(LogStream, &[u8]),
 ) -> Result<Finished> {
     if command.is_empty() {
         bail!("a job needs a command to run");
@@ -231,6 +232,8 @@ fn message_kind(message: &FromHub) -> &'static str {
         FromHub::JobAccepted { .. } => "job_accepted",
         FromHub::AssignJob { .. } => "assign_job",
         FromHub::LogChunk { .. } => "log_chunk",
+        FromHub::JobLog { .. } => "job_log",
+        FromHub::JobNote { .. } => "job_note",
         FromHub::JobFinished { .. } => "job_finished",
         FromHub::JobResultAck { .. } => "job_result_ack",
     }

@@ -6,5 +6,8 @@ edition.workspace = true
 publish.workspace = true
 
 [dependencies]
+# Log payloads are bytes on the wire, carried as base64 inside the JSON frame
+# (D18). data-encoding is already in the tree, under the WebSocket stack.
+data-encoding = "2.11.1"
 serde.workspace = true
 serde_json.workspace = true

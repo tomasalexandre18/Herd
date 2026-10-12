@@ -195,12 +195,12 @@ async fn a_detached_submission_can_be_waited_for_and_its_log_read_as_a_file() {
 #[tokio::test]
 async fn the_log_file_equals_what_the_stream_delivered() {
     let harness = Harness::with_hub_and_runner().await;
-    let mut streamed = String::new();
+    let mut streamed: Vec<u8> = Vec::new();
     let finished = herdctl::run_job(
         &harness.requester(),
         // Enough output, in enough chunks, that a difference would show.
         shell("for i in $(seq 1 200); do printf 'line %s\\n' \"$i\"; printf 'err %s\\n' \"$i\" >&2; done"),
-        |_stream, data| streamed.push_str(data),
+        |_stream, data| streamed.extend_from_slice(data),
     )
     .await
     .expect("the job runs to its end");
@@ -208,10 +208,45 @@ async fn the_log_file_equals_what_the_stream_delivered() {
 
     let log = log_of(harness.state_dir(), &finished.job_id);
     assert_eq!(
-        log, streamed,
+        log.as_bytes(),
+        streamed,
         "the log on disk is not the log that was streamed"
     );
     assert!(log.contains("line 200\n"), "the log is complete");
+}
+
+/// D18: a job's output is bytes. A NUL survives, a byte that is no UTF-8 at
+/// all survives, and the `log` file is byte for byte what the process wrote —
+/// on the wire, in the stream a requester follows, and on the hub's disk.
+#[tokio::test]
+async fn a_job_s_output_reaches_the_record_byte_for_byte() {
+    let harness = Harness::with_hub_and_runner().await;
+    let mut streamed: Vec<u8> = Vec::new();
+    // Three bytes no JSON string could have carried: a NUL, 0xff, 0xfe.
+    let finished = herdctl::run_job(
+        &harness.requester(),
+        shell(r"printf 'a\000b\377\376c\n'"),
+        |_stream, data| streamed.extend_from_slice(data),
+    )
+    .await
+    .expect("the job runs to its end");
+    assert_eq!(finished.outcome, JobOutcome::Exited { code: 0 });
+
+    let written: &[u8] = b"a\0b\xff\xfec\n";
+    assert_eq!(
+        streamed, written,
+        "the stream a requester follows was rewritten"
+    );
+    let on_disk = std::fs::read(job_dir(harness.state_dir(), &finished.job_id).join("log"))
+        .expect("the log file reads");
+    assert_eq!(
+        on_disk, written,
+        "the log on the hub's disk is not what the process wrote"
+    );
+    assert!(
+        !on_disk.windows(3).any(|w| w == [0xef, 0xbf, 0xbd]),
+        "an invalid byte was replaced by U+FFFD: {on_disk:?}"
+    );
 }
 
 /// E-15's core and E-53: while the job is still running, its directory is
@@ -302,7 +337,7 @@ async fn deleting_the_derived_index_loses_nothing() {
             )
             .expect("transition");
         store
-            .append_log(&queued, LogStream::Stdout, 0, "a queued job's log")
+            .append_log(&queued, LogStream::Stdout, 0, b"a queued job's log")
             .expect("appended");
         (finished, queued)
     };
@@ -340,7 +375,7 @@ async fn deleting_the_derived_index_loses_nothing() {
         );
         assert_eq!(
             store.job_log(&queued).expect("readable").as_deref(),
-            Some("a queued job's log")
+            Some(&b"a queued job's log"[..])
         );
     }
 }
