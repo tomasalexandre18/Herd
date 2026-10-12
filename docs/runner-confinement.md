@@ -22,7 +22,7 @@ variable, in the style of `--hub` / `HERD_HUB_URL`.
 | `--job-log-cap` | `HERD_JOB_LOG_CAP` | `64MiB` | Log one job may produce |
 | `--job-disk-budget` | `HERD_JOB_DISK_BUDGET` | `20GiB` | Workspace one job may hold |
 | `--job-nice` | `HERD_JOB_NICE` | `10` | CPU niceness floor for a job |
-| `--cgroup-root` | `HERD_CGROUP_ROOT` | the runner's own cgroup | Delegated cgroup v2 directory to hang job cgroups under |
+| `--cgroup-root` | `HERD_CGROUP_ROOT` | the runner's own cgroup | Delegated cgroup v2 directory to hang job cgroups under. Must contain this runner |
 | `--privileged-helper` | `HERD_PRIVILEGED_HELPERS` | empty | Absolute path of a command allowed to need privilege; repeat the flag, or separate with `:` |
 
 Sizes accept a plain number of bytes or a suffix: `B`, `KiB`, `MiB`, `GiB`,
@@ -31,21 +31,47 @@ refused at startup naming itself.
 
 A runner prints what it will enforce on its own stderr before it dials the
 hub, so that the answer to "what is this machine doing to my job" never has
-to be inferred from a job that behaved oddly.
+to be inferred from a job that behaved oddly. That report also carries, in
+capitals, every fallback it has had to take and every way this deployment is
+less confined than the expectations ask.
 
 ## The data root (E-45)
 
 One directory, validated at startup: created if absent, refused if it is a
 file, not writable, or the filesystem root — every refusal naming the path.
 Inside it, `jobs/<job>/` holds `work` (the job's working directory), `home`
-(its `HOME`) and `tmp` (its `TMPDIR`), and the whole directory is removed when
-the job ends.
+(its `HOME`) and `tmp` (its `TMPDIR`).
+
+**One runner per data root.** A runner takes an exclusive lock on
+`<root>/.herd-runner.lock` and refuses to start if another runner holds it,
+naming that runner's pid. The lock dies with the process, so a runner that
+was killed leaves the root free. This is what gives "left behind" a meaning
+for the reaper below, and it is the same choice D21 made for the hub's state
+root.
+
+**A job cannot blind the runner about its own workspace.** A job runs as the
+runner's own user, so it can `chmod 000` a directory it made. Every walk the
+runner does over a workspace therefore restores the access it needs first —
+those directories are its own — so:
+
+- the disk budget is measured on what the job wrote, not on what it let the
+  runner see;
+- a figure that still cannot be taken is **absent**, and the job ends at its
+  disk cap: a budget that cannot be measured cannot be enforced, and an
+  unenforced cap must never read as a job that passed;
+- the workspace is reclaimed when the job ends whatever its modes are. If a
+  reclaim still fails, that is said in the **job's own record** — a line on
+  the job's stderr the requester reads — and not only in the runner's log,
+  because bytes left on a host nobody collects are exactly what invariant 2
+  forbids.
 
 The job's environment is built from scratch rather than inherited: `HOME`,
 `TMPDIR`, `TMP`, `TEMP` and the `XDG_*` directories all point inside the
 workspace, and only `PATH`, `LANG`, `LC_ALL`, `TZ` and `TERM` are carried
 through. So nothing in the runner's own environment — a token, a `TMPDIR` on
-the host's disk — reaches a job.
+the host's disk — reaches a job. One variable is Herd's own: `HERD_JOB_MARKER`
+carries the job's unique tag, which is how the runner finds the job's
+processes again (see the kill, below).
 
 **The limit, stated plainly.** Herd writes nowhere but the data root, and a
 job is given nowhere else to write. A job that names an absolute path outside
@@ -57,19 +83,44 @@ its own paths.
 
 A runner refuses to start if its real or effective user id is 0, and says so.
 It invokes no escalation tool; a test walks the crate's own sources and fails
-if any module but `privilege.rs` so much as names one. Anything that ever
-needs privilege must go through the configured fixed list of absolute helper
-paths: a command not on the list is refused by name, and a list containing an
-escalation tool is itself refused. Nothing in M4 needs a helper, so no helper
-is invoked — what exists is the refusal and the shape of the list.
+if any module but `privilege.rs` so much as names one.
+
+Anything that ever needs privilege must go through the configured fixed list
+of absolute helper paths. An entry is refused unless it is **an absolute
+path**, **an existing file**, **not setuid and not setgid** — checked on the
+file's mode, not on its name — and **not one of the known escalation tools**,
+matched on the file's own name: `sudo`, `doas`, `pkexec`, `run0`, `su`,
+`runuser`, `setpriv`, `machinectl`, `systemd-run`, `nsenter`, `unshare`,
+`chroot`, `capsh` and `sudoedit`. So a list containing an escalation tool is
+itself refused, and so is a tool nobody listed that happens to be
+setuid-root. A command not on the list is refused by name. Nothing in M4
+needs a helper, so no helper is invoked.
+
+### Honest limits of "unprivileged"
+
+A uid is not the whole of E-46, and on the first host Herd runs on it is not
+even the interesting part:
+
+- a user in `docker`, `podman`, `lxd`, `incus` or `libvirt` is
+  **root-equivalent**: the daemon runs as root and will mount the host's
+  filesystem wherever its client asks;
+- a user in `wheel`, `sudo` or `admin` is one password away from root;
+- a user who can write `/run/docker.sock` (or the podman, containerd, CRI-O
+  or libvirt socket) has the same power whether or not it is in the group.
+
+The runner **warns** about each of these at startup, naming the specific
+group or socket, and runs anyway. It does not refuse: the owner's own server
+is in `docker` because that is where the hub runs in docker compose, and a
+runner that would not start there would be useless on exactly the machines
+Herd was built for. Whether to accept that is the machine owner's call; what
+is not his to lose is knowing. So on that server E-46 holds for the process
+and **not** for the deployment, and the startup report says so every time.
 
 ## Caps (E-34)
 
-- **Workspace** per job, inside the data root, removed afterwards.
+- **Workspace** per job, inside the data root, reclaimed afterwards.
 - **One session per job**, so every process it starts shares one process
-  group. When the job's own process is gone the runner kills that group and
-  the job's cgroup, every time: a job that leaves a background child behind
-  does not outlive itself.
+  group, plus one marker in the job's environment.
 - **Nice** on CPU as a floor — the configured value is what the job runs at,
   unless the runner is itself niced beyond it, which an unprivileged process
   cannot undo. IO goes to the idle class in the same breath.
@@ -77,10 +128,56 @@ is invoked — what exists is the refusal and the shape of the list.
   `stopped_by_cap` naming the cap and its figure. `herdctl` exits 124 for all
   four, which is `timeout(1)`'s code, with the sentence on stderr.
 
+**A breached cap outranks the job's own exit status.** A job whose log was cut
+at the cap can still exit 0 a millisecond later, and a job that keeps writing
+into the pipe the cap closed dies of `SIGPIPE`. Neither is the job's verdict:
+the runner checks the caps once more after the process is gone, and the cap
+wins. A truncated build reported green is the worst thing a build service can
+do, so the log cap is checked last and loudest.
+
+**The kill.** When the job's own process is gone, everything it started goes
+with it — a job that leaves a background child behind does not outlive
+itself. How that is done depends on what the host gives:
+
+- **with a cgroup**, one write to `cgroup.kill` takes the whole tree,
+  whatever it did to detach itself, followed by a process-group kill for good
+  measure;
+- **without one**, the runner kills the job's process group and then sweeps
+  `/proc` for every process still carrying the job's `HERD_JOB_MARKER`. A
+  process keeps its environment across `fork` and `exec`, so a double fork, a
+  `nohup` and a `setsid` are all still found — and `setsid` is precisely what
+  a process-group kill cannot reach.
+
 **No inbound socket.** A runner binds nothing in M4, asserted two ways: the
 real binary is inspected through `/proc` while running a job, and a test reads
 the crate's sources for anything that could bind. The mesh-bound fetch
 endpoint of D10 and D11 arrives in M11.
+
+## A runner's own death
+
+A job must not outlive the runner that was watching it, in any of the three
+ways a runner can go:
+
+- **asked to stop** (`SIGTERM`, `SIGINT`): the runner ends every running job
+  — cgroup kill, process-group kill, marker sweep — reclaims each workspace,
+  names what it ended on its stderr, and leaves. M3 owns the orderly drain
+  that invariant 2's ≤ 5 s is about; this is the part that must never be
+  missing, which is that nothing survives.
+- **killed** (`SIGKILL`): nothing can be handled, so the cleanup happens in
+  the next life. At startup, before it dials the hub, a runner **reaps what a
+  previous life left**: every process carrying a job marker whose runner is
+  gone, every workspace under its own `jobs/` (safe because it holds the
+  root's lock), and every `herd-job-*` cgroup under its base whose runner pid
+  is gone. Each reclaimed thing is named in the startup report.
+- **crashed in a job's task**: the job's own path reclaims its workspace and
+  kills its processes on every exit path.
+
+The reaper's test for "left behind" is deliberately weak: the pid that minted
+the name must be **gone**. Nothing is inferred from a command name, so a
+runner started through a wrapper, under another argv0, or as a test binary is
+never mistaken for a dead one. The cost is pid reuse — a leftover can then
+survive one more life. A leftover that lingers is a nuisance; a live job
+killed by a stranger is a lost build.
 
 ## The memory ceiling, and its fallback (E-30, Q6)
 
@@ -93,24 +190,54 @@ only the job: the runner sits in a sibling cgroup and so does every other job.
 The runner then reports `stopped_by_cap { memory }` rather than a bare signal,
 because it reads `memory.events`.
 
-This needs the runner's base cgroup to be **delegated**. The deployment that
-gives it is a systemd unit with `Delegate=yes` (D5); `--cgroup-root` points at
-a delegated subtree where the runner is not a unit. The runner moves its own
-processes into a `herd-runner.leaf` child of its base first, because cgroup v2
-forbids a cgroup from holding processes once a controller is enabled for its
-children.
+### The deployment this needs
 
-**Where delegation is unavailable** — no `memory` controller, a base the
-runner may not create cgroups in, a base that still holds somebody else's
-processes, or no cgroup v2 at all — the runner falls back to `RLIMIT_AS` on
-each job process, and says so at startup with `FALLING BACK` and the reason.
-This is documented behaviour, not a silence, and it is weaker in two ways
-that the fallback line names:
+Creating a cgroup and *putting a process into one* are two different rights.
+cgroup v2 requires write access to the `cgroup.procs` of the **common
+ancestor** of the process's current cgroup and its destination — so a runner
+that owns a delegated directory it is standing outside of can make job
+cgroups it could never move a job into. The runner tests that ancestor at
+startup and refuses rather than discovering it on the first job.
+
+What works, therefore:
+
+- a **systemd unit with `Delegate=yes`** (D5), with no `--cgroup-root` at
+  all: the runner's own cgroup is the delegated scope, it moves its own
+  processes into a `herd-runner.leaf` child of it — cgroup v2 forbids a
+  cgroup from holding processes once a controller is enabled for its children
+  — and hangs one cgroup per job beside that leaf;
+- the same shape started by hand:
+  `systemd-run --user --scope -p Delegate=yes herd-runner …`;
+- `--cgroup-root <dir>` where `<dir>` **contains this runner**: its own
+  cgroup, or an ancestor of its own cgroup, inside a delegated subtree.
+
+What does not work, and is refused at startup naming the exact
+`cgroup.procs` the operator would have to grant: `--cgroup-root` pointing at
+a subtree the runner is not inside, however thoroughly that subtree is
+chowned to the runner's user. A runner that falls back leaves no leaf cgroup
+behind.
+
+Because `--cgroup-root` is an explicit request for one subtree, a runner that
+cannot use the one it was given **refuses to start** and says what the
+subtree lacks. It does not quietly enforce something else instead.
+
+### Where delegation is unavailable
+
+No `memory` controller, a base the runner may not create cgroups in, a base
+whose common ancestor it may not write, a base that still holds somebody
+else's processes, or no cgroup v2 at all: the runner falls back to `RLIMIT_AS`
+on each job process and says so at startup with `FALLING BACK` and the
+reason. This is documented behaviour, not a silence, and it is weaker in
+**three** ways that the startup report names:
 
 - it bounds each process's address space rather than the job's whole tree, so
   a job of many processes can hold more in total than the ceiling;
 - an allocation past it **fails** rather than killing, so the job reports its
-  own failure instead of `stopped_by_cap { memory }`.
+  own failure instead of `stopped_by_cap { memory }`;
+- and — the one that matters most — there is no handle on the job's tree to
+  kill, so the kill is a process-group kill plus the marker sweep described
+  above. That reaches a job that gave itself a new session; it cannot reach
+  one that erases its own environment, which a cgroup kill would still catch.
 
 Invariant 2 still holds either way: every job runs under an explicit memory
 cap enforced by the kernel. The WSL replay of the 2026-10-12 out-of-memory
@@ -121,21 +248,33 @@ event is a manual check in M17, against the real ceiling on the owner's PC.
 Reported with the outcome and kept on the job's record: the host's one-minute
 load average (recorded, never a gate — E-32), the job's peak memory, the
 high-water mark of its workspace, the bytes of log it produced, and its wall
-time. A figure a host does not expose is **absent** rather than zero, so that
-nobody reads a missing measurement as a measured nothing. Peak memory comes
-from the job's cgroup where there is one, and from sampling the job's own
-process where there is not, which undercounts a process tree.
+time. Peak memory comes from the job's cgroup where there is one, and from
+sampling the job's own process where there is not, which undercounts a
+process tree.
+
+A figure the runner could not take is **absent** rather than zero, so that
+nobody reads a missing measurement as a measured nothing. That applies to
+`bytes_written` too: a workspace the runner could not measure reports no
+figure at all *and* ends the job at its disk cap, while a job that genuinely
+wrote nothing reports zero.
 
 ## Tests, and which of them a host can make
 
-`cargo test --workspace` asserts all of the above against the real kernel. The
-memory ceiling's *named* outcome needs cgroup v2 delegation, which a GitHub
-Actions runner does not have; on such a host that one assertion is **skipped
-with its reason** rather than failed or quietly passed. A skip prints a
-`HERD-SKIPPED:` line, CI runs the suite with `--nocapture`, and
-`scripts/report-skips.sh` turns each line into a warning on the run and into
-its summary. A green check is not the same claim on every host, and that
-difference is meant to be visible on the pull request.
+`./scripts/test.sh` runs the workspace suite — all of the above against the
+real kernel, the real binaries and a real hub — and then prints every
+assertion this host could not make.
+
+Two assertions need cgroup v2 delegation, which a GitHub Actions runner and a
+plain login session do not have: the *named* memory outcome, and the cgroup
+branch of the startup report. On such a host they are **skipped with their
+reason** rather than failed or quietly passed. A skip prints a
+`HERD-SKIPPED:` line and appends it to `$HERD_SKIP_LOG`, because `cargo test`
+hides the stdout of a passing test — so `cargo test --workspace` alone would
+show a green run with no hint that part of it did not run.
+`scripts/test.sh` prints the log; `scripts/report-skips.sh` turns each line
+into a warning on the CI run and into its summary. A green check is not the
+same claim on every host, and that difference is meant to be visible from the
+terminal and on the pull request.
 
 To make every assertion on a machine whose login session is not delegated,
 run the test binary inside a delegated scope:
@@ -145,3 +284,9 @@ cargo test --workspace --no-run
 systemd-run --user --scope -p Delegate=yes \
   target/debug/deps/confinement-<hash> --nocapture
 ```
+
+Everything else — the disk budget against a job that hides its files, the log
+cap against a job that exits at once, the reclaim of a workspace a job locked
+shut, the kill of a `setsid` child, the end of a job when its runner is
+stopped, the reaping of what a killed runner left, and the root-equivalence
+warning — is asserted on every host, delegated or not.
