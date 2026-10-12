@@ -4,4 +4,4 @@ pub mod job;
 pub mod server;
 
 pub use job::{JobRecord, JobState, JobStore, MemoryJobStore, StoreError};
-pub use server::{hub_version, Hub, DEFAULT_LISTEN_ADDR};
+pub use server::{hub_version, Hub, HubHandle, DEFAULT_LISTEN_ADDR};
