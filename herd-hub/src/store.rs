@@ -3,6 +3,7 @@
 //! ```text
 //! <state root>/
 //!   store.json              the layout's version; rewritten at every start
+//!   hub.lock                held by the one hub using this root (D21)
 //!   jobs/
 //!     j0000000001/
 //!       job.json            the record: fields, current state, timestamps
@@ -51,6 +52,7 @@ const RECORD_FILE: &str = "job.json";
 const EVENTS_FILE: &str = "events.jsonl";
 const LOG_FILE: &str = "log";
 const KEPT_FILES_DIR: &str = "files";
+const LOCK_FILE: &str = "hub.lock";
 
 /// Digits in a job id, after the `j`. Zero-padded so that the directory
 /// listing of `jobs/` is in the order the jobs were minted.
@@ -60,6 +62,10 @@ const ID_DIGITS: usize = 10;
 #[derive(Debug)]
 pub struct JobDirStore {
     root: PathBuf,
+    /// The claim on the state root, held open for as long as the store is
+    /// (D21). Never read: holding it *is* the point, and the kernel takes it
+    /// back the moment this process ends, however it ends.
+    _lock: fs::File,
     live: Mutex<Live>,
 }
 
@@ -140,6 +146,18 @@ impl JobDirStore {
         let index = root.join(INDEX_DIR);
         durable::create_dir(&index).map_err(|error| failed("creating", &index, &error))?;
 
+        // One hub per state root (D21), claimed before anything is written.
+        let lock = claim(&root)?;
+        // And a root the hub can actually use. Writing `store.json` below
+        // proves the root itself is writable; the job directories and the
+        // index are where every later write lands, and a hub that cannot
+        // write them would start and then fail every submission with nothing
+        // but its own log to say why.
+        for directory in [&jobs, &index] {
+            durable::probe_writable(directory)
+                .map_err(|error| failed("writing in", directory, &error))?;
+        }
+
         let store_file = root.join(STORE_FILE);
         if let Some(text) = read_optional(&store_file)? {
             let found: StoreFile = serde_json::from_str(&text)
@@ -164,6 +182,7 @@ impl JobDirStore {
 
         let store = Self {
             root,
+            _lock: lock,
             live: Mutex::new(Live {
                 next_sequence: 1,
                 jobs_accounted: 0,
@@ -579,6 +598,44 @@ fn sequence_of(name: &str) -> Option<u64> {
     digits.parse().ok()
 }
 
+/// Claim a state root for this hub, or refuse naming who holds it.
+///
+/// Two hubs on one state root are two hubs minting ids from the same
+/// directories and two derived indexes disagreeing about the queue — a
+/// corruption with no error message, which is the worst kind. The claim is
+/// `flock` on `hub.lock`, so it costs nothing to hold and is released by the
+/// kernel even when a hub is killed; the file's contents say who is holding
+/// it, because a lock that cannot name its holder leaves an operator with
+/// nothing to act on (D21).
+fn claim(root: &Path) -> Result<fs::File> {
+    let path = root.join(LOCK_FILE);
+    let mut file = match durable::lock_exclusive(&path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+            let holder = read_optional(&path)
+                .ok()
+                .flatten()
+                .map(|text| text.trim().to_owned())
+                .filter(|text| !text.is_empty())
+                .unwrap_or_else(|| "another herd-hub, which left no name".to_owned());
+            return Err(StoreError::new(format!(
+                "the state root {} is already in use by {holder}; \
+                 one hub per state root",
+                root.display()
+            )));
+        }
+        Err(error) => return Err(failed("locking", &path, &error)),
+    };
+    let holder = format!(
+        "herd-hub, process {} since {}\n",
+        std::process::id(),
+        Timestamp::now()
+    );
+    durable::write_in_place(&mut file, holder.as_bytes())
+        .map_err(|error| failed("writing", &path, &error))?;
+    Ok(file)
+}
+
 fn read_optional(path: &Path) -> Result<Option<String>> {
     match fs::read_to_string(path) {
         Ok(text) => Ok(Some(text)),
@@ -955,6 +1012,58 @@ mod tests {
             .job(&job.id)
             .expect_err("version 2 is not readable here");
         assert!(error.to_string().contains("record version 2"), "{error}");
+    }
+
+    /// D21: two hubs on one state root would mint ids from the same
+    /// directories and write two disagreeing indexes. The second one is
+    /// refused, naming the root and the hub that holds it.
+    #[test]
+    fn a_second_hub_on_one_state_root_is_refused_naming_the_holder() {
+        let dir = tempfile::tempdir().expect("a temporary directory");
+        let first = JobDirStore::open(dir.path()).expect("the first hub claims the root");
+        let error = JobDirStore::open(dir.path()).expect_err("the second hub is refused");
+        let said = error.to_string();
+        assert!(
+            said.contains(&dir.path().display().to_string()),
+            "the refusal must name the state root: {said}"
+        );
+        assert!(
+            said.contains(&format!("process {}", std::process::id())),
+            "the refusal must name who holds it: {said}"
+        );
+
+        // And the claim is given back when the hub that held it is gone, so a
+        // restart never has to break a lock by hand.
+        drop(first);
+        let _again = JobDirStore::open(dir.path()).expect("the root is free again");
+    }
+
+    /// A state root whose `jobs/` cannot be written used to start a hub that
+    /// then failed every submission, with only its own log to say why (D21).
+    #[test]
+    fn a_state_root_whose_jobs_directory_cannot_be_written_is_refused() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().expect("a temporary directory");
+        {
+            let _store = JobDirStore::open(dir.path()).expect("the state root opens");
+        }
+        let jobs = dir.path().join(JOBS_DIR);
+        fs::set_permissions(&jobs, fs::Permissions::from_mode(0o500)).expect("read-only");
+        if durable::probe_writable(&jobs).is_ok() {
+            // Running as a user permissions do not apply to; there is nothing
+            // to refuse and nothing to assert.
+            fs::set_permissions(&jobs, fs::Permissions::from_mode(0o700)).expect("writable again");
+            return;
+        }
+
+        let error = JobDirStore::open(dir.path()).expect_err("a hub cannot work in that root");
+        let said = error.to_string();
+        fs::set_permissions(&jobs, fs::Permissions::from_mode(0o700)).expect("writable again");
+        assert!(
+            said.contains(&jobs.display().to_string()),
+            "the refusal must name the directory it cannot write: {said}"
+        );
     }
 
     /// Nothing but the job directories decides which ids exist, so a store

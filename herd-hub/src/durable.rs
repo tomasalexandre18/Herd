@@ -12,7 +12,7 @@
 //! artefacts, so it is written once and tested once here.
 
 use std::fs::{self, File, OpenOptions};
-use std::io::{self, ErrorKind, Write};
+use std::io::{self, ErrorKind, Seek, Write};
 use std::path::{Path, PathBuf};
 use std::process;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -85,6 +85,67 @@ pub fn append_bytes(path: &Path, bytes: &[u8]) -> io::Result<()> {
 /// Put an existing file's contents on the disk.
 pub fn sync_file(path: &Path) -> io::Result<()> {
     File::open(path)?.sync_data()
+}
+
+/// Make sure a file exists, even empty.
+///
+/// A job's `log` is created the moment the job starts, so that a consumer
+/// reading the record of a job that printed nothing finds an empty file rather
+/// than `ENOENT` (D22). Nothing is written and an existing file is left
+/// exactly as it is.
+pub fn touch(path: &Path) -> io::Result<()> {
+    if path.exists() {
+        return Ok(());
+    }
+    OpenOptions::new().create(true).append(true).open(path)?;
+    sync_dir(parent_of(path)?)
+}
+
+/// Take the exclusive lock on `path`, creating the file, without waiting.
+///
+/// This is `flock(2)`, which means the kernel owns the lock: it is released
+/// when the holding process dies, however it dies, so a hub that was killed
+/// never leaves a lock behind for the next one to break by hand. A lock
+/// another holder has is reported as [`ErrorKind::WouldBlock`], and holding it
+/// is holding the returned file open.
+pub fn lock_exclusive(path: &Path) -> io::Result<File> {
+    let file = OpenOptions::new()
+        .create(true)
+        .read(true)
+        .write(true)
+        .truncate(false)
+        .open(path)?;
+    rustix::fs::flock(&file, rustix::fs::FlockOperation::NonBlockingLockExclusive)
+        .map_err(io::Error::from)?;
+    Ok(file)
+}
+
+/// Replace a held file's contents in place, without renaming it.
+///
+/// The lock of [`lock_exclusive`] belongs to that file, so the atomic-rename
+/// discipline cannot be used on it: a rename would leave the lock on an inode
+/// nobody can find. The file says who holds the lock, which no reader needs to
+/// see whole, so writing it in place is the honest exception.
+pub fn write_in_place(file: &mut File, bytes: &[u8]) -> io::Result<()> {
+    file.set_len(0)?;
+    file.rewind()?;
+    file.write_all(bytes)?;
+    file.sync_data()
+}
+
+/// Whether a directory can be written in, said now rather than at the first
+/// job that needs it.
+///
+/// A state root whose `jobs/` cannot be written is a hub that starts happily
+/// and then fails every submission, with only its own log to explain why
+/// (D21). The probe is a file created and removed again, because permission is
+/// not the only way a directory refuses a write — a full or read-only
+/// filesystem refuses one too.
+pub fn probe_writable(dir: &Path) -> io::Result<()> {
+    let probe = dir.join(format!(".probe-{}", process::id()));
+    let written = File::create(&probe).and_then(|mut file| file.write_all(b"herd"));
+    let _ = fs::remove_file(&probe);
+    written
 }
 
 /// Create one directory, and make its existence survive a power cut. An

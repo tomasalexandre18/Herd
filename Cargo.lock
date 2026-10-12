@@ -279,6 +279,7 @@ dependencies = [
  "herd-proto",
  "herd-runner",
  "herdctl",
+ "rustix",
  "serde",
  "serde_json",
  "tempfile",
