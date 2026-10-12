@@ -376,3 +376,66 @@ impl Wreck {
         }
     }
 }
+
+/// A result whose job the hub has no record of — the state root was replaced
+/// under it — is acknowledged and reported, not refused. Refusing it would
+/// wedge the runner: it would hold that result for ever and redeliver it on
+/// every connection it ever made.
+#[tokio::test]
+async fn a_result_for_a_job_the_hub_never_heard_of_does_not_wedge_the_runner() {
+    let first_root = tempfile::tempdir().expect("a temporary state directory");
+    let second_root = tempfile::tempdir().expect("another one");
+
+    let first_hub = HubProcess::start(first_root.path());
+    let held = HeldResults::new();
+    let first_link = tokio::spawn({
+        let (config, held) = (runner_config(&first_hub.hub_url), held.clone());
+        async move { herd_runner::run_holding(config, held).await }
+    });
+    first_hub.wait_for_runner().await;
+
+    // Three jobs first, so that the one that matters has an id a fresh state
+    // root has not minted — the ids of two different state roots are two
+    // different sequences, and this test is about an unknown id, not a
+    // collision.
+    for _ in 0..3 {
+        herdctl::run_job(&first_hub.requester(), shell("true"), |_, _| {})
+            .await
+            .expect("a trivial job runs");
+    }
+    let lost = herdctl::submit_job(&first_hub.requester(), shell("sleep 0.3; exit 3"))
+        .await
+        .expect("the job is accepted");
+    let first_dir = first_root.path().to_path_buf();
+    wait_until("the job is running", || {
+        file_state_of(&first_dir, &lost) == "running"
+    })
+    .await;
+
+    first_hub.kill();
+    let _ = first_link.await.expect("the link to the dead hub ends");
+    wait_until("the runner holds the result", || !held.is_empty()).await;
+
+    // A hub on a state root that knows nothing of that job at all.
+    let second_hub = HubProcess::start(second_root.path());
+    let second_link = tokio::spawn({
+        let (config, held) = (runner_config(&second_hub.hub_url), held.clone());
+        async move { herd_runner::run_holding(config, held).await }
+    });
+    wait_until("the stale result is acknowledged", || held.is_empty()).await;
+    assert!(
+        !job_dir(second_root.path(), &lost).exists(),
+        "a job the new hub never minted must not appear on its state root"
+    );
+
+    // And the runner is still a working runner.
+    let finished = herdctl::run_job(
+        &second_hub.requester(),
+        shell("printf 'still working\\n'"),
+        |_, _| {},
+    )
+    .await
+    .expect("the runner still runs jobs");
+    assert_eq!(finished.outcome, JobOutcome::Exited { code: 0 });
+    second_link.abort();
+}

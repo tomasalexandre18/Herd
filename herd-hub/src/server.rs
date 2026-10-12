@@ -254,8 +254,13 @@ async fn serve_runner(state: &State, outbox: &Outbox, source: &mut Source) -> Re
         let _ = outbox.send(FromHub::Refused { reason });
         return Ok(());
     }
-    dispatch_recovered_jobs(state, outbox)?;
-    let outcome = relay_from_runner(state, outbox, source).await;
+    // Whatever happens from here, the runner slot is given back before this
+    // returns: a failure that kept the slot would mean no runner could ever
+    // join this hub again.
+    let outcome = match dispatch_recovered_jobs(state, outbox) {
+        Ok(()) => relay_from_runner(state, outbox, source).await,
+        Err(error) => Err(error),
+    };
     for follower in state.release_runner(outbox) {
         let _ = follower.send(FromHub::Refused {
             reason: "the runner was lost while the job was running".to_owned(),
@@ -335,6 +340,24 @@ async fn relay_from_runner(state: &State, outbox: &Outbox, source: &mut Source) 
                 }
             }
             ToHub::JobFinished { job_id, outcome } => {
+                // A result for a job this hub has no record of — a state root
+                // that was replaced under it, say. There is nothing to write
+                // it to, and refusing it would wedge the runner, which would
+                // redeliver it on every connection for ever. So it is
+                // acknowledged and said out loud.
+                if state
+                    .store
+                    .job(&job_id)
+                    .with_context(|| format!("reading the record of {job_id}"))?
+                    .is_none()
+                {
+                    eprintln!(
+                        "herd-hub: a runner reported how {job_id} ended, and this hub \
+                         has no record of that job: {outcome:?} is dropped"
+                    );
+                    let _ = outbox.send(FromHub::JobResultAck { job_id });
+                    continue;
+                }
                 // Recorded first, acknowledged second. The runner is holding
                 // this result until the acknowledgement arrives, so the order
                 // of these two steps is the whole of E-44's promise: nothing
