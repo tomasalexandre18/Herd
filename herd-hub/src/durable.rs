@@ -1,0 +1,302 @@
+//! The one place in Herd that writes to the filesystem.
+//!
+//! The hub's state is plain files (D8), and the first consumer reads them
+//! while a job runs (E-53) and re-judges them much later (E-54). A reader must
+//! therefore never see a record that is half written, which means exactly one
+//! discipline for replacing a file: write a temporary beside it, fsync the
+//! temporary, rename it over the destination, fsync the directory. Rename is
+//! atomic, so a reader sees the whole old file or the whole new one.
+//!
+//! Every writer in the hub goes through this module; nothing calls
+//! `fs::write` on its own. The same primitive is what E-17 needs for
+//! artefacts, so it is written once and tested once here.
+
+use std::fs::{self, File, OpenOptions};
+use std::io::{self, ErrorKind, Write};
+use std::path::{Path, PathBuf};
+use std::process;
+use std::sync::atomic::{AtomicU64, Ordering};
+
+/// Makes every temporary name in a process unique, so two writers to the same
+/// path never share one, however they are scheduled.
+static TEMPORARIES: AtomicU64 = AtomicU64::new(0);
+
+/// Replace `path` with `bytes`, atomically.
+pub fn write_file(path: &Path, bytes: &[u8]) -> io::Result<()> {
+    write_file_with(path, |file| file.write_all(bytes))
+}
+
+/// Replace `path` with whatever `fill` writes, atomically.
+///
+/// `fill` writes into a temporary file; only once it has returned `Ok` and the
+/// bytes are on the disk does the temporary take the destination's name. If
+/// `fill` fails, the destination keeps the contents it had and no temporary is
+/// left behind — a failed write is a write that did not happen.
+pub fn write_file_with(
+    path: &Path,
+    fill: impl FnOnce(&mut File) -> io::Result<()>,
+) -> io::Result<()> {
+    let parent = parent_of(path)?;
+    let temporary = temporary_beside(path);
+    let written = (|| -> io::Result<()> {
+        let mut file = File::create(&temporary)?;
+        fill(&mut file)?;
+        // The bytes, before the name: a rename that beats its own contents to
+        // the disk would publish an empty file.
+        file.sync_all()?;
+        drop(file);
+        fs::rename(&temporary, path)
+    })();
+    if written.is_err() {
+        let _ = fs::remove_file(&temporary);
+        return written;
+    }
+    // The name, too, has to survive: without this the rename itself can be
+    // lost while the file's contents are safe.
+    sync_dir(parent)
+}
+
+/// Append one line, as one write, and put it on the disk before returning.
+///
+/// Used for `events.jsonl`, where a transition must be readable the moment it
+/// is recorded. `line` must not contain a newline of its own; the terminator
+/// is added here so that a line is never published without one.
+pub fn append_line(path: &Path, line: &str) -> io::Result<()> {
+    debug_assert!(!line.contains('\n'), "one line per append");
+    let mut record = String::with_capacity(line.len() + 1);
+    record.push_str(line);
+    record.push('\n');
+    let mut file = OpenOptions::new().create(true).append(true).open(path)?;
+    file.write_all(record.as_bytes())?;
+    file.sync_data()
+}
+
+/// Append bytes to a job's log, without waiting for the disk.
+///
+/// A log is a stream, not a record: it is appended to thousands of times while
+/// a job runs, and E-53 asks only that a reader can follow it. The bytes are
+/// visible to any reader as soon as this returns; [`sync_file`] is what makes
+/// them survive the machine, and the store calls it when the job ends.
+pub fn append_bytes(path: &Path, bytes: &[u8]) -> io::Result<()> {
+    let mut file = OpenOptions::new().create(true).append(true).open(path)?;
+    file.write_all(bytes)
+}
+
+/// Put an existing file's contents on the disk.
+pub fn sync_file(path: &Path) -> io::Result<()> {
+    File::open(path)?.sync_data()
+}
+
+/// Create one directory, and make its existence survive a power cut. An
+/// already existing directory is not an error: creating a job's directory is
+/// how an id is claimed, so [`create_dir_exclusive`] is what minting uses.
+pub fn create_dir(path: &Path) -> io::Result<()> {
+    match fs::create_dir(path) {
+        Ok(()) => sync_dir(parent_of(path)?),
+        Err(error) if error.kind() == ErrorKind::AlreadyExists => Ok(()),
+        Err(error) => Err(error),
+    }
+}
+
+/// Create one directory, failing if it already exists.
+///
+/// `mkdir` is atomic and exclusive, which is what lets the job directories
+/// themselves arbitrate job ids: a claim either wins or is told it lost, with
+/// no window in between.
+pub fn create_dir_exclusive(path: &Path) -> io::Result<()> {
+    fs::create_dir(path)?;
+    sync_dir(parent_of(path)?)
+}
+
+/// Create a directory and every parent it needs.
+pub fn create_dir_all(path: &Path) -> io::Result<()> {
+    fs::create_dir_all(path)?;
+    sync_dir(path)
+}
+
+/// Put a directory's list of names on the disk.
+pub fn sync_dir(path: &Path) -> io::Result<()> {
+    File::open(path)?.sync_all()
+}
+
+/// The names in a directory, with anything this module could have left behind
+/// filtered out, so a caller never has to know what a temporary looks like.
+pub fn names_in(path: &Path) -> io::Result<Vec<String>> {
+    let mut names = Vec::new();
+    for entry in fs::read_dir(path)? {
+        let entry = entry?;
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if !name.starts_with('.') {
+            names.push(name);
+        }
+    }
+    Ok(names)
+}
+
+fn parent_of(path: &Path) -> io::Result<&Path> {
+    path.parent().ok_or_else(|| {
+        io::Error::new(
+            ErrorKind::InvalidInput,
+            format!("{} has no directory to write it in", path.display()),
+        )
+    })
+}
+
+/// A temporary in the destination's own directory — rename is only atomic
+/// within one filesystem — hidden by a leading dot so that a reader listing
+/// the directory never trips over it.
+fn temporary_beside(path: &Path) -> PathBuf {
+    let name = path
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let unique = TEMPORARIES.fetch_add(1, Ordering::Relaxed);
+    path.with_file_name(format!(".{name}.tmp-{}-{unique}", process::id()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Read;
+    use std::sync::atomic::AtomicBool;
+    use std::sync::Arc;
+
+    /// Everything a reader could see at `path`, as bytes.
+    fn read(path: &Path) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        File::open(path)
+            .expect("the destination exists")
+            .read_to_end(&mut bytes)
+            .expect("the destination reads");
+        bytes
+    }
+
+    #[test]
+    fn a_written_file_holds_exactly_what_was_written() {
+        let dir = tempfile::tempdir().expect("a temporary directory");
+        let path = dir.path().join("record.json");
+        write_file(&path, b"{\"first\":true}").expect("written");
+        assert_eq!(read(&path), b"{\"first\":true}");
+        // A rewrite replaces, and a shorter one leaves no tail of the longer.
+        write_file(&path, b"{}").expect("rewritten");
+        assert_eq!(read(&path), b"{}");
+    }
+
+    /// The property the whole store rests on: a write that fails partway
+    /// leaves the previous record whole. The destination is never opened for
+    /// writing, so there is no moment at which it is half a record.
+    #[test]
+    fn a_write_that_fails_partway_leaves_the_previous_record_intact() {
+        let dir = tempfile::tempdir().expect("a temporary directory");
+        let path = dir.path().join("record.json");
+        write_file(&path, b"{\"state\":\"running\"}").expect("written");
+
+        let error = write_file_with(&path, |file| {
+            file.write_all(b"{\"state\":\"fin")?;
+            Err(io::Error::other("the writer was interrupted here"))
+        })
+        .expect_err("an interrupted write is reported");
+        assert!(error.to_string().contains("interrupted"), "{error}");
+
+        assert_eq!(
+            read(&path),
+            b"{\"state\":\"running\"}",
+            "the half-written record was published"
+        );
+        assert_eq!(
+            names_in(dir.path()).expect("the directory lists"),
+            vec!["record.json".to_owned()],
+            "a failed write left litter behind"
+        );
+    }
+
+    /// A reader racing writers only ever sees one whole version. The contents
+    /// differ in length on purpose: a torn read would almost certainly land
+    /// between two of these sizes and be caught.
+    #[test]
+    fn a_reader_racing_writers_never_sees_a_half_written_record() {
+        let dir = tempfile::tempdir().expect("a temporary directory");
+        let path = dir.path().join("record.json");
+        let versions: Vec<Vec<u8>> = (0..4)
+            .map(|n| {
+                format!("{{\"n\":{n},\"pad\":\"{}\"}}", "x".repeat(1 << (12 + n))).into_bytes()
+            })
+            .collect();
+        write_file(&path, &versions[0]).expect("written");
+
+        let stop = Arc::new(AtomicBool::new(false));
+        let writer = std::thread::spawn({
+            let (path, versions, stop) = (path.clone(), versions.clone(), Arc::clone(&stop));
+            move || {
+                for _ in 0..50 {
+                    for version in &versions {
+                        write_file(&path, version).expect("written");
+                    }
+                }
+                stop.store(true, Ordering::SeqCst);
+            }
+        });
+
+        let mut reads = 0u32;
+        while !stop.load(Ordering::SeqCst) {
+            let seen = read(&path);
+            assert!(
+                versions.contains(&seen),
+                "a reader saw {} bytes that are no version of the record",
+                seen.len()
+            );
+            reads += 1;
+        }
+        writer.join().expect("the writer finished");
+        assert!(reads > 0, "the reader never got to look");
+    }
+
+    #[test]
+    fn appended_lines_arrive_whole_and_in_order() {
+        let dir = tempfile::tempdir().expect("a temporary directory");
+        let path = dir.path().join("events.jsonl");
+        for n in 0..3 {
+            append_line(&path, &format!("{{\"n\":{n}}}")).expect("appended");
+        }
+        assert_eq!(
+            String::from_utf8(read(&path)).expect("utf-8"),
+            "{\"n\":0}\n{\"n\":1}\n{\"n\":2}\n"
+        );
+    }
+
+    #[test]
+    fn a_claimed_directory_cannot_be_claimed_twice() {
+        let dir = tempfile::tempdir().expect("a temporary directory");
+        let claim = dir.path().join("j0000000001");
+        create_dir_exclusive(&claim).expect("the first claim wins");
+        assert_eq!(
+            create_dir_exclusive(&claim)
+                .expect_err("the second claim loses")
+                .kind(),
+            ErrorKind::AlreadyExists
+        );
+        // Creating it as a directory that may already exist is not a claim.
+        create_dir(&claim).expect("already there is not a failure");
+    }
+
+    #[test]
+    fn listing_a_directory_hides_what_the_writer_left_in_it() {
+        let dir = tempfile::tempdir().expect("a temporary directory");
+        write_file(&dir.path().join("job.json"), b"{}").expect("written");
+        File::create(dir.path().join(".job.json.tmp-1-1")).expect("a leftover temporary");
+        assert_eq!(
+            names_in(dir.path()).expect("the directory lists"),
+            vec!["job.json".to_owned()]
+        );
+    }
+
+    /// Writing where no directory exists is an error carrying the path, not a
+    /// panic: the hub refuses to start on a state root it cannot write.
+    #[test]
+    fn writing_into_a_missing_directory_names_the_path() {
+        let dir = tempfile::tempdir().expect("a temporary directory");
+        let path = dir.path().join("no-such-directory/job.json");
+        let error = write_file(&path, b"{}").expect_err("there is nowhere to write it");
+        assert_eq!(error.kind(), ErrorKind::NotFound);
+    }
+}
