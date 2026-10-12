@@ -1107,13 +1107,16 @@ async fn a_restarted_runner_reclaims_what_a_killed_one_left() {
     let mut first = first;
     let _ = first.process.wait().await;
     job.abort();
-    // The premise, asserted rather than assumed: a killed runner orphans
-    // everything, which is why the next one has to clean up.
+    // The premise, asserted rather than assumed: a killed runner cannot clean
+    // up after itself, so its workspace is still there. Only the runner
+    // holding this root's lock can reclaim it, so this is not racy — unlike
+    // the job's *processes*, which any other runner starting on this host
+    // will reap, that being the very mechanism under test. (Their reaping is
+    // asserted deterministically in `reclaim.rs`'s unit tests.)
     assert!(
-        !processes_with_argument(marker).is_empty(),
-        "nothing was orphaned, so this test is not testing the reaper"
+        !nothing_left_in(data_root.path()).is_empty(),
+        "a killed runner cannot have reclaimed its own workspace"
     );
-    assert!(!nothing_left_in(data_root.path()).is_empty());
     // The hub holds one runner slot in M1, so the second runner can only join
     // once the hub has noticed the first one is gone.
     let deadline = Instant::now() + Duration::from_secs(10);
@@ -1150,7 +1153,7 @@ async fn a_restarted_runner_reclaims_what_a_killed_one_left() {
         "a reaper that says nothing is a reaper nobody can trust: {said}"
     );
     assert!(
-        said.contains("reclaimed the workspace") && said.contains("orphaned job process"),
+        said.contains("reclaimed the workspace"),
         "the report must name what it reclaimed: {said}"
     );
     serving.abort();
