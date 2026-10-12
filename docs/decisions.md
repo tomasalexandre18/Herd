@@ -344,7 +344,7 @@ overlay goes in then, as one input and one line.
 
 ---
 
-## 2026-10-13 — D13 One refusal frame, always last
+## 2026-10-12 — D13 One refusal frame, always last
 
 **Context.** M1 needed a way to say "no" for a version mismatch, and then the
 same shape turned out to fit "no runner is connected", "a runner is already
@@ -362,7 +362,7 @@ discovered by abuse of this frame.
 
 ---
 
-## 2026-10-13 — D14 The hub's endpoint and the CLI surface
+## 2026-10-12 — D14 The hub's endpoint and the CLI surface
 
 **Context.** The hub needs a default listen address, and nothing in the
 requirement sheet specifies one.
@@ -377,3 +377,49 @@ site rather than inferred.
 **Alternative rejected.** Defaulting to `0.0.0.0` for convenience in
 development — rejected because a default that listens publicly is the kind of
 thing that reaches a server once and stays.
+
+---
+
+## 2026-10-12 — D15 A job's end is an outcome, not an exit code
+
+**Context.** M1 first reported a job's end as `exit_code: i32`, with 127 for
+"could not be started" and -1 for "signalled". That field has to carry the
+consumer's own code untouched — E-02 relies on 0, 1 and 75 — and 127 is a
+shell convention a consumer's command can produce itself. Worse, a job can end
+in ways that are not an exit code at all: M3's lost runner, M8's refusals,
+M9's deadline.
+
+**Choice.** `JobFinished` carries a tagged `outcome`, today `exited { code }`,
+`signalled { signal }` and `could_not_start { reason }`. **A new way for a job
+to end is a new variant, never a magic number.** Every variant has named
+fields so adding one stays additive on the wire; an unknown variant is a
+decode error naming it, never a job silently read as having exited.
+`JobStore` keeps the outcome whole, so M2 persists it as it is.
+
+**Alternative rejected.** Keeping the integer and documenting the sentinels —
+rejected because the collision is undetectable by construction, and because
+M2 would have persisted it before M3 forced the change anyway.
+
+**`PROTOCOL_VERSION` stays at 1.** The shape changed incompatibly, but the
+version exists to catch a mismatch between deployed peers and nothing has ever
+been deployed. Bumping would record a break against no peer and make the first
+shipped version 2 for nothing.
+
+---
+
+## 2026-10-12 — D16 herdctl's exit code
+
+**Context.** E-02 requires the consumer's verdict and exit code to reach the
+caller unchanged, while Herd still needs a way to say "I could not run this".
+
+**Choice.** `exited` — that exact code, including 0, 1, 75 and 127. `signalled`
+— `128 + signal`, the shell convention, so no sentinel is needed. `could_not
+_start` — **125**, with the reason on **stderr** worded as Herd failing rather
+than the job failing; stdout carries only the job's own output, and is left
+empty when the job never ran.
+
+**The one imperfection, accepted.** 125 is not collision-free: a job may exit
+125 itself. What separates them is the outcome on the wire, and in the terminal
+the stderr sentence — a test asserts that a job exiting 125 does *not* get it.
+A reserved code that no program can produce does not exist, so the honest fix
+is the typed outcome above, not a cleverer number.
