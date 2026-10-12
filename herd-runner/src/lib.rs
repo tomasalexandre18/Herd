@@ -1,19 +1,21 @@
 //! A Herd runner: dials the hub, executes what it is assigned, streams the
-//! output as it is produced, reports the exit code.
+//! output as it is produced, reports how the job ended.
 //!
 //! The runner opens the connection and needs nothing inbound (invariant 3).
 //! M1 runs a job with no caps of any kind; confinement, memory and time caps
 //! are M4's, and until they exist a runner must only be pointed at a hub its
 //! owner trusts.
 
-use std::process::Stdio;
+use std::process::{ExitStatus, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use anyhow::{anyhow, bail, Context, Result};
 use futures_util::stream::{SplitSink, SplitStream};
 use futures_util::{SinkExt, StreamExt};
-use herd_proto::{from_frame, to_frame, FromHub, JobId, LogStream, Role, ToHub, PROTOCOL_VERSION};
+use herd_proto::{
+    from_frame, to_frame, FromHub, JobId, JobOutcome, LogStream, Role, ToHub, PROTOCOL_VERSION,
+};
 use tokio::io::{AsyncRead, AsyncReadExt};
 use tokio::net::TcpStream;
 use tokio::process::Command;
@@ -27,10 +29,6 @@ pub const DEFAULT_HUB_URL: &str = "ws://127.0.0.1:8787";
 /// Output is read in chunks this size; a chunk is sent as soon as the process
 /// has written anything, which is what makes a log arrive while it is running.
 const READ_CHUNK: usize = 8 * 1024;
-
-/// A runner's exit code when the command could not be started at all, as a
-/// shell reports it.
-const COULD_NOT_START: i32 = 127;
 
 type Socket = WebSocketStream<MaybeTlsStream<TcpStream>>;
 type Sink = SplitSink<Socket, Message>;
@@ -115,10 +113,10 @@ async fn serve_hub(outbox: &Outbox, source: &mut Source) -> Result<()> {
     Ok(())
 }
 
-/// Run one job: announce it, stream both streams, report the exit code.
+/// Run one job: announce it, stream both streams, report how it ended.
 async fn execute(job_id: JobId, command: Vec<String>, outbox: Outbox) {
     let Some((program, arguments)) = command.split_first() else {
-        report_failure_to_start(&job_id, &outbox, "a job needs a command to run");
+        report_could_not_start(&job_id, &outbox, "a job needs a command to run".to_owned());
         return;
     };
 
@@ -132,7 +130,9 @@ async fn execute(job_id: JobId, command: Vec<String>, outbox: Outbox) {
     {
         Ok(child) => child,
         Err(error) => {
-            report_failure_to_start(&job_id, &outbox, &format!("{program}: {error}"));
+            // Names the executable, so the reason reads as Herd failing to run
+            // this command rather than the command failing.
+            report_could_not_start(&job_id, &outbox, format!("{program}: {error}"));
             return;
         }
     };
@@ -163,38 +163,49 @@ async fn execute(job_id: JobId, command: Vec<String>, outbox: Outbox) {
     // no output can arrive after JobFinished.
     tokio::join!(pump_out, pump_err);
 
-    let exit_code = match child.wait().await {
-        // A signalled process has no code; M4 owns killing, and will map one.
-        Ok(status) => status.code().unwrap_or(-1),
-        Err(error) => {
-            send_chunk(
-                &job_id,
-                &outbox,
-                &seq,
-                LogStream::Stderr,
-                format!("herd-runner: waiting for the process failed: {error}\n"),
-            );
-            -1
-        }
+    let outcome = match child.wait().await {
+        Ok(status) => outcome_of(status),
+        // The process started but Herd never learned how it ended, so it has
+        // no code and no signal to report. M3's "lost" is where this belongs;
+        // until then it is Herd failing to run the job, said in full.
+        Err(error) => JobOutcome::CouldNotStart {
+            reason: format!("{program}: waiting for the process failed: {error}"),
+        },
     };
-    let _ = outbox.send(ToHub::JobFinished { job_id, exit_code });
+    let _ = outbox.send(ToHub::JobFinished { job_id, outcome });
 }
 
-fn report_failure_to_start(job_id: &JobId, outbox: &Outbox, reason: &str) {
-    let seq = AtomicU64::new(0);
-    let _ = outbox.send(ToHub::JobStarted {
-        job_id: job_id.clone(),
-    });
-    send_chunk(
-        job_id,
-        outbox,
-        &seq,
-        LogStream::Stderr,
-        format!("herd-runner: cannot start the job: {reason}\n"),
-    );
+/// How a finished process ended, in the protocol's terms. A unix status is an
+/// exit code or a signal, never both.
+#[cfg(unix)]
+fn outcome_of(status: ExitStatus) -> JobOutcome {
+    use std::os::unix::process::ExitStatusExt;
+
+    match status.code() {
+        Some(code) => JobOutcome::Exited { code },
+        // Killed, and `signal` is then set. Signal 0 is one no platform ever
+        // delivers, so it reads as "killed, by something unnamed".
+        None => JobOutcome::Signalled {
+            signal: status.signal().unwrap_or(0),
+        },
+    }
+}
+
+/// Elsewhere a process only ever has an exit code.
+#[cfg(not(unix))]
+fn outcome_of(status: ExitStatus) -> JobOutcome {
+    JobOutcome::Exited {
+        code: status.code().unwrap_or(0),
+    }
+}
+
+/// Report a job that never ran. No `JobStarted`, because nothing started, and
+/// no log chunk: the job wrote nothing, and Herd's own failure belongs in the
+/// outcome rather than in the job's output.
+fn report_could_not_start(job_id: &JobId, outbox: &Outbox, reason: String) {
     let _ = outbox.send(ToHub::JobFinished {
         job_id: job_id.clone(),
-        exit_code: COULD_NOT_START,
+        outcome: JobOutcome::CouldNotStart { reason },
     });
 }
 

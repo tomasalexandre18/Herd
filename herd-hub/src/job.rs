@@ -10,10 +10,10 @@ use std::error::Error;
 use std::fmt;
 use std::sync::Mutex;
 
-use herd_proto::{JobId, LogStream};
+use herd_proto::{JobId, JobOutcome, LogStream};
 
 /// Where a job is in its life. M2 gives each transition a timestamp.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum JobState {
     /// Accepted by the hub, not yet handed to a runner.
     Queued,
@@ -21,8 +21,10 @@ pub enum JobState {
     Assigned,
     /// The runner reported that the process is running.
     Running,
-    /// The runner reported the outcome.
-    Finished { exit_code: i32 },
+    /// The runner reported how the job ended. The outcome is kept whole, not
+    /// flattened to a number: M2 persists this record, and a persisted number
+    /// would have to be migrated the first time a job ends some other way.
+    Finished { outcome: JobOutcome },
 }
 
 /// What the hub knows about one job.
@@ -186,16 +188,58 @@ mod tests {
             .append_log(&job.id, LogStream::Stderr, 1, "-second")
             .expect("append");
         store
-            .record_state(&job.id, JobState::Finished { exit_code: 3 })
+            .record_state(
+                &job.id,
+                JobState::Finished {
+                    outcome: JobOutcome::Exited { code: 3 },
+                },
+            )
             .expect("transition");
 
         let record = store.job(&job.id).expect("readable").expect("still there");
-        assert_eq!(record.state, JobState::Finished { exit_code: 3 });
+        assert_eq!(
+            record.state,
+            JobState::Finished {
+                outcome: JobOutcome::Exited { code: 3 }
+            }
+        );
         assert_eq!(
             store.job_log(&job.id).expect("readable").as_deref(),
             Some("first-second"),
             "both streams interleave in arrival order"
         );
+    }
+
+    /// M2 persists these records, so the store must keep an outcome as it was
+    /// reported — a signal and a reason included, not folded into a number.
+    #[test]
+    fn every_way_a_job_can_end_is_recorded_whole() {
+        let store = MemoryJobStore::new();
+        for outcome in [
+            JobOutcome::Exited { code: 42 },
+            JobOutcome::Signalled { signal: 15 },
+            JobOutcome::CouldNotStart {
+                reason: "no-such-tool: not found".to_owned(),
+            },
+        ] {
+            let job = store.create_job(vec!["true".to_owned()]).expect("minted");
+            store
+                .record_state(
+                    &job.id,
+                    JobState::Finished {
+                        outcome: outcome.clone(),
+                    },
+                )
+                .expect("transition");
+            assert_eq!(
+                store
+                    .job(&job.id)
+                    .expect("readable")
+                    .expect("still there")
+                    .state,
+                JobState::Finished { outcome }
+            );
+        }
     }
 
     #[test]
