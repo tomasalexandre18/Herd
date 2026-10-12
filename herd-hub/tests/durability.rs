@@ -385,6 +385,7 @@ async fn deleting_the_derived_index_loses_nothing() {
         Wreck::Corrupt,
         Wreck::Stale,
         Wreck::FromTheFuture,
+        Wreck::Short,
     ] {
         wreck.apply(state.path());
         let store = JobDirStore::open(state.path()).expect("a useless index is not a dead hub");
@@ -425,6 +426,13 @@ enum Wreck {
     /// Parses, but describes a store that no longer exists.
     Stale,
     FromTheFuture,
+    /// Well formed, right about how many jobs there are, and short of a job
+    /// that is not over. This is the one no count catches: believed, it would
+    /// make the unfinished job vanish — out of the queue, never dispatched,
+    /// never asked about again — and the hub would report "0 job(s) not over"
+    /// with a straight face. Only a hand-edit reaches it today, which is
+    /// exactly what a rule of "checked, never believed" is for.
+    Short,
 }
 
 impl Wreck {
@@ -445,6 +453,11 @@ impl Wreck {
                 br#"{"index_version":99,"jobs_accounted":2,"pending":[]}"#,
             )
             .expect("from the future"),
+            Wreck::Short => std::fs::write(
+                &index,
+                br#"{"index_version":1,"jobs_accounted":2,"pending":[]}"#,
+            )
+            .expect("short of a job"),
         }
     }
 }

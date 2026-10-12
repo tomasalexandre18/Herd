@@ -162,8 +162,9 @@ impl JobDirStore {
     /// comes from — and then reads only the records the index says are
     /// unfinished. The index is used only if it parses, carries a version this
     /// Herd knows, accounts for exactly as many job directories as there are,
-    /// and names only jobs that exist. Otherwise it is ignored and every
-    /// record is read, which is what rebuilds it.
+    /// names only jobs that exist, and leaves out no job whose record is not
+    /// over. Otherwise it is ignored and every record is read, which is what
+    /// rebuilds it.
     pub fn open(root: impl AsRef<Path>) -> Result<Self> {
         let root = root.as_ref().to_path_buf();
         durable::create_dir_all(&root)
@@ -363,12 +364,42 @@ impl JobDirStore {
             ));
         }
         let mut pending = Vec::with_capacity(index.pending.len());
+        let mut listed = BTreeSet::new();
         for id in &index.pending {
             match sequence_of(id.as_str()) {
                 Some(sequence) if sequences.binary_search(&sequence).is_ok() => {
-                    pending.push(sequence)
+                    pending.push(sequence);
+                    listed.insert(sequence);
                 }
                 _ => return rebuild(format!("it lists {id}, which is not a job here")),
+            }
+        }
+        // The last way an index can hide a job, and the one no count catches:
+        // the right number of directories, and a `pending` list that is short.
+        // Such an index would make an unfinished job vanish — out of the
+        // queue, never dispatched, never asked about again — so every
+        // directory it leaves out must hold a record that is over.
+        //
+        // Answering that costs a read of the records the index omits, which is
+        // most of the history. That is the price of the rule: this index is
+        // checked, never believed, and "could it be hiding a job?" is not a
+        // question a file can answer about itself. Only a hand-edit can get
+        // here today, which is exactly the case the rule exists for.
+        for sequence in sequences.iter().copied().filter(|s| !listed.contains(s)) {
+            let id = id_of(sequence);
+            match self.read_record(&id) {
+                Ok(Some(record)) if !record.state.is_terminal() => {
+                    return rebuild(format!(
+                        "it leaves out {id}, whose record is {} and so not over",
+                        describe(&record.state)
+                    ))
+                }
+                // No record at all is a mint that never finished, which the
+                // full read reports on its own.
+                Ok(_) => {}
+                // A record this hub cannot read is not a record it may call
+                // terminal. Rebuilding reads it again and refuses out loud.
+                Err(error) => return rebuild(format!("{id} cannot be read: {error}")),
             }
         }
         Some(pending)
