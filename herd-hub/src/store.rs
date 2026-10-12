@@ -215,7 +215,13 @@ impl JobDirStore {
         let jobs_accounted = sequences.len() as u64;
         let next_sequence = sequences.last().copied().unwrap_or(0) + 1;
 
-        let trusted = self.usable_index(jobs_accounted, &sequences);
+        // With no job directories there is nothing to read and nothing to
+        // rebuild, so a brand new state root says nothing about its index.
+        let trusted = if sequences.is_empty() {
+            Some(Vec::new())
+        } else {
+            self.usable_index(jobs_accounted, &sequences)
+        };
         let to_read: Vec<u64> = match trusted {
             Some(pending) => pending,
             None => sequences.clone(),
