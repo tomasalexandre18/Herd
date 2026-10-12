@@ -46,12 +46,20 @@ pub struct Finished {
     pub outcome: JobOutcome,
 }
 
-/// `herdctl`'s exit code when Herd could not run the job at all. 125 is the
-/// convention of a tool that wraps another one (`env`, `timeout`): the wrapper
-/// failed, not the command. A job could exit 125 by itself, which is why the
-/// reason is also printed, and why the wire carries the variant rather than a
+/// `herdctl`'s exit code when there is no verdict to report: Herd could not
+/// run the job, lost it before it finished, refused it, or could not be
+/// reached at all.
+///
+/// 125 is the convention of a tool that wraps another one (`env`, `timeout`):
+/// the wrapper failed, not the command. It is one code for one meaning —
+/// *Herd cannot tell you whether this job passed* — because a script that
+/// cannot tell "the tests failed" from "the hub was down" will read a Herd
+/// failure as a verdict, which is the one mistake E-02 and E-43 cannot
+/// survive (D20). The job's own code is worn only when there is a real
+/// verdict. A job could exit 125 by itself, which is why the reason is also
+/// printed on stderr, and why the wire carries a typed outcome rather than a
 /// number.
-pub const COULD_NOT_START_CODE: u8 = 125;
+pub const NO_VERDICT_CODE: u8 = 125;
 
 /// What `herdctl` exits with for a job that ended this way.
 ///
@@ -66,7 +74,7 @@ pub fn exit_code_for(outcome: &JobOutcome) -> u8 {
         JobOutcome::Signalled { signal } => {
             128u8.saturating_add(u8::try_from(*signal).unwrap_or(127))
         }
-        JobOutcome::CouldNotStart { .. } => COULD_NOT_START_CODE,
+        JobOutcome::CouldNotStart { .. } => NO_VERDICT_CODE,
     }
 }
 
@@ -75,6 +83,15 @@ pub fn exit_code_for(outcome: &JobOutcome) -> u8 {
 /// A function, so the wording lives in one place and a test can rely on it.
 pub fn could_not_start_message(reason: &str) -> String {
     format!("herd could not run this job, so it never started: {reason}")
+}
+
+/// The one sentence `herdctl` prints on stderr when it has no verdict to give:
+/// the hub could not be reached, it refused the job, or the job was lost
+/// before it finished. Herd is the subject, as above, and the exit code is
+/// [`NO_VERDICT_CODE`] — never the job's, because there is no job's code to
+/// wear (D20).
+pub fn no_verdict_message(reason: &str) -> String {
+    format!("herd cannot give you a verdict for this job: {reason}")
 }
 
 /// Submit one command and follow it to its end.
@@ -100,6 +117,14 @@ pub async fn run_job(
         match message {
             FromHub::JobAccepted { job_id: accepted } => job_id = Some(accepted),
             FromHub::LogChunk { stream, data, .. } => on_log(stream, &data),
+            // A job this requester has just submitted has produced nothing
+            // before it attached, so neither of these is expected here; both
+            // are still shown rather than swallowed, the recorded log as the
+            // job's own output and a note as Herd's own words (stderr).
+            FromHub::JobLog { data, .. } => on_log(LogStream::Stdout, &data),
+            FromHub::JobNote { note, .. } => {
+                on_log(LogStream::Stderr, format!("herdctl: {note}\n").as_bytes())
+            }
             FromHub::JobFinished { job_id, outcome } => {
                 let _ = socket.close(None).await;
                 return Ok(Finished { job_id, outcome });
@@ -150,9 +175,25 @@ pub async fn submit_job(config: &Config, command: Vec<String>) -> Result<JobId> 
 ///
 /// Works on a job that is still queued, one that is running, and one that
 /// ended before this call was made: the answer comes from the hub's record
-/// either way. Log chunks that arrive meanwhile are not printed — the whole
-/// log is a file in the job's directory, and half of one is worse than none.
-pub async fn wait_for_job(config: &Config, job_id: JobId) -> Result<Finished> {
+/// either way.
+///
+/// The job's output comes with it (D22). `on_log` is called with whatever the
+/// job had already written when this wait attached — one call, both streams
+/// interleaved as the hub's `log` file keeps them, so it is reported as
+/// stdout — and then with every chunk that arrives afterwards on its own
+/// stream. A remote requester has no other way to read a detached job's
+/// output.
+///
+/// `on_note` is called with anything the hub says about the job itself: in M2
+/// exactly one sentence, for a job whose attempt was interrupted and whose
+/// result may never come back (D17). It is Herd speaking, not the job, so the
+/// binary puts it on stderr.
+pub async fn wait_for_job(
+    config: &Config,
+    job_id: JobId,
+    mut on_log: impl FnMut(LogStream, &[u8]),
+    mut on_note: impl FnMut(&str),
+) -> Result<Finished> {
     let mut socket = join(config).await?;
     send(
         &mut socket,
@@ -169,7 +210,9 @@ pub async fn wait_for_job(config: &Config, job_id: JobId) -> Result<Finished> {
                 let _ = socket.close(None).await;
                 return Ok(Finished { job_id, outcome });
             }
-            FromHub::LogChunk { .. } => {}
+            FromHub::JobLog { data, .. } => on_log(LogStream::Stdout, &data),
+            FromHub::LogChunk { stream, data, .. } => on_log(stream, &data),
+            FromHub::JobNote { note, .. } => on_note(&note),
             FromHub::Refused { reason } => bail!("the hub refused the wait: {reason}"),
             other => bail!(
                 "the hub sent {}, which a requester cannot use",

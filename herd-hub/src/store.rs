@@ -247,11 +247,18 @@ impl JobDirStore {
         };
 
         let mut pending = BTreeSet::new();
+        let mut interrupted = Vec::new();
         for sequence in to_read {
             match self.read_record(&id_of(sequence))? {
                 Some(record) => {
                     if !record.state.is_terminal() {
                         pending.insert(sequence);
+                    }
+                    // An attempt was under way when the hub that ran before
+                    // this one stopped. It is named on the record below, never
+                    // left reading `running` for ever (D17).
+                    if matches!(record.state, JobState::Assigned | JobState::Running) {
+                        interrupted.push((record.id, record.state.name()));
                     }
                 }
                 // A directory with no record is a mint that was interrupted
@@ -264,11 +271,29 @@ impl JobDirStore {
             }
         }
 
-        let mut live = self.lock()?;
-        live.next_sequence = next_sequence;
-        live.jobs_accounted = jobs_accounted;
-        live.pending = pending;
-        self.write_index(&live)
+        {
+            let mut live = self.lock()?;
+            live.next_sequence = next_sequence;
+            live.jobs_accounted = jobs_accounted;
+            live.pending = pending;
+            self.write_index(&live)?;
+        }
+        // After the index, and with the lock given back: naming an
+        // interruption is an ordinary transition, recorded the ordinary way.
+        for (id, was) in interrupted {
+            let reason = format!(
+                "the hub stopped while this job was {was}; the runner has not \
+                 reported how it ended"
+            );
+            self.record_state(
+                &id,
+                JobState::Interrupted {
+                    reason: reason.clone(),
+                },
+            )?;
+            eprintln!("herd-hub: {id} is unfinished: {reason}");
+        }
+        Ok(())
     }
 
     /// The pending sequences the index can be believed about, or `None` if the
@@ -397,6 +422,11 @@ impl JobStore for JobDirStore {
         };
         let kept = self.job_dir(&id).join(KEPT_FILES_DIR);
         durable::create_dir(&kept).map_err(|error| failed("creating", &kept, &error))?;
+        // The log exists from the job's first moment, even if the job never
+        // writes a byte: a consumer reading the record of a silent job must
+        // find an empty file, not ENOENT (D22).
+        let log = self.job_dir(&id).join(LOG_FILE);
+        durable::touch(&log).map_err(|error| failed("creating", &log, &error))?;
 
         let at = Timestamp::now();
         let record = JobRecord {
@@ -558,14 +588,23 @@ enum Transition {
 /// M3 adds a second attempt after a lost runner, which is a new edge recorded
 /// here rather than a record quietly overwritten.
 fn transition(from: &JobState, to: &JobState) -> Transition {
-    use JobState::{Assigned, Finished, Queued, Running};
+    use JobState::{Assigned, Finished, Interrupted, Queued, Running};
     match (from, to) {
         (Queued, Assigned | Running | Finished { .. })
         | (Assigned, Running | Finished { .. })
-        | (Running, Finished { .. }) => Transition::Allowed,
+        | (Running, Finished { .. })
+        // An attempt the hub stopped seeing (D17). A queued job is not in it:
+        // nothing was under way, so nothing was interrupted.
+        | (Assigned | Running, Interrupted { .. })
+        // And the way out of it: the runner comes back, and the result it was
+        // holding resolves the record exactly as it would have before.
+        | (Interrupted { .. }, Running | Finished { .. }) => Transition::Allowed,
         (Finished { outcome: had }, Finished { outcome: got }) if had == got => {
             Transition::AlreadyThere
         }
+        // A second restart with the same attempt still missing says nothing
+        // new, and a record is not a journal of the hub's own restarts.
+        (Interrupted { .. }, Interrupted { .. }) => Transition::AlreadyThere,
         _ => Transition::Refused,
     }
 }

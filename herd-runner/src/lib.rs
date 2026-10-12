@@ -57,7 +57,38 @@ impl Default for Config {
     }
 }
 
-/// The results this runner has produced and the hub has not acknowledged.
+/// How long the runner waits before dialling the hub again, and how many
+/// times it tries before giving up.
+///
+/// Deliberately dumb: one fixed delay, a count, no jitter and no growth. The
+/// *policy* — backoff, health reports every 15 s, 60 s of silence meaning the
+/// runner is lost — is M3's, and a provisional policy here would be a thing
+/// M3 has to undo. What M2 needs is only that a hub going away does not kill a
+/// runner and its running job with it (D17).
+const REDIAL_DELAY: std::time::Duration = std::time::Duration::from_millis(500);
+const REDIAL_ATTEMPTS: u32 = 120;
+
+/// How long a dead connection's writer is given to finish before it is
+/// dropped. The link is over by then; what matters is not waiting for the jobs
+/// that are still running, because their frames go to the next link.
+const FLUSH_GRACE: std::time::Duration = std::time::Duration::from_millis(500);
+
+/// The hub said no. Terminal for this runner (D13), so it is never retried: a
+/// version mismatch or a refused runner does not become true by dialling
+/// again.
+#[derive(Debug)]
+pub struct Refusal(pub String);
+
+impl std::fmt::Display for Refusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "the hub refused this runner: {}", self.0)
+    }
+}
+
+impl std::error::Error for Refusal {}
+
+/// What a runner keeps across connections: the results the hub has not
+/// acknowledged, and the link its running jobs report on.
 ///
 /// A job's result is the one thing a runner cannot reproduce: the process is
 /// gone, and if the result is dropped the work is lost. So a result is kept
@@ -66,28 +97,27 @@ impl Default for Config {
 /// (E-44). The hub records the same end twice as the same end, so a
 /// redelivery that was in fact received is harmless.
 ///
-/// This lives outside [`run`] so that it survives the connection: the caller
-/// holds it, hands it to the next `run`, and M3 — which owns reconnection —
-/// only has to put the loop around it. It is memory, not a file: a runner that
-/// is itself killed loses the result, and that is M3's lost-attempt case, not
-/// this one.
+/// It is memory, not a file: a runner that is itself killed loses what it
+/// holds, and that is M3's lost-attempt case, not this one.
 #[derive(Debug, Clone, Default)]
-pub struct HeldResults {
+pub struct Session {
     held: Arc<Mutex<Vec<(JobId, JobOutcome)>>>,
+    link: Link,
 }
 
-impl HeldResults {
+impl Session {
     pub fn new() -> Self {
         Self::default()
     }
 
     /// How many results are waiting to be acknowledged.
-    pub fn len(&self) -> usize {
+    pub fn results_held(&self) -> usize {
         self.with(|held| held.len())
     }
 
-    pub fn is_empty(&self) -> bool {
-        self.len() == 0
+    /// Whether every result this runner has produced is on the hub's disk.
+    pub fn holds_nothing(&self) -> bool {
+        self.results_held() == 0
     }
 
     fn hold(&self, job_id: JobId, outcome: JobOutcome) {
@@ -114,18 +144,81 @@ impl HeldResults {
     }
 }
 
-/// Join the hub and serve it until the connection ends, holding nothing from
-/// an earlier connection.
+/// Whichever connection to the hub is up now.
 ///
-/// M1 returns on the first disconnection; M3 adds reconnection with bounded
-/// backoff, around [`run_holding`].
-pub async fn run(config: Config) -> Result<()> {
-    run_holding(config, HeldResults::new()).await
+/// A job outlives the connection it was assigned on (D17), so it must not hold
+/// that connection's own channel: a job that ends after the runner has
+/// redialled has to report on the link that is up, not into the one that
+/// broke. With no link at all a frame is dropped — a log chunk written while
+/// no hub existed is gone, which is M2's line and M3's problem — while a
+/// *result* is held by [`Session`] until it is acknowledged, so it is
+/// redelivered rather than dropped.
+#[derive(Debug, Clone, Default)]
+struct Link {
+    current: Arc<Mutex<Option<Outbox>>>,
 }
 
-/// Join the hub and serve it, carrying results an earlier connection could not
-/// deliver.
-pub async fn run_holding(config: Config, held: HeldResults) -> Result<()> {
+impl Link {
+    fn attach(&self, outbox: Outbox) {
+        *self.lock() = Some(outbox);
+    }
+
+    fn detach(&self) {
+        *self.lock() = None;
+    }
+
+    /// Send on the link that is up, and say whether there was one.
+    fn send(&self, message: ToHub) -> bool {
+        match self.lock().as_ref() {
+            Some(outbox) => outbox.send(message).is_ok(),
+            None => false,
+        }
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, Option<Outbox>> {
+        self.current
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+}
+
+/// Join the hub and keep serving it, across the hub going away and coming
+/// back.
+///
+/// The connection dropping is not the end of the runner (D17): a job that is
+/// running keeps running, the runner dials again on a fixed delay, and the
+/// result of a job that ended while there was no hub is redelivered on the new
+/// connection until the hub acknowledges it. A *refusal* is different and
+/// ends here: the hub said no, and dialling again would not change its mind.
+pub async fn run(config: Config) -> Result<()> {
+    let session = Session::new();
+    let mut failures = 0u32;
+    loop {
+        match serve_once(config.clone(), session.clone()).await {
+            // The hub closed the connection. Nothing says the runner is done,
+            // so it waits and joins the hub that comes back.
+            Ok(()) => failures = 0,
+            Err(error) if error.downcast_ref::<Refusal>().is_some() => return Err(error),
+            Err(error) => {
+                failures += 1;
+                eprintln!("herd-runner: the link to the hub ended: {error:#}");
+                if failures >= REDIAL_ATTEMPTS {
+                    return Err(error.context(format!(
+                        "giving up on {} after {REDIAL_ATTEMPTS} attempts",
+                        config.hub_url
+                    )));
+                }
+            }
+        }
+        tokio::time::sleep(REDIAL_DELAY).await;
+    }
+}
+
+/// Join the hub and serve it until this one connection ends.
+///
+/// Public because a test needs one connection it can watch, and because
+/// [`run`] is only this in a loop.
+pub async fn serve_once(config: Config, session: Session) -> Result<()> {
     let (socket, _response) = tokio_tungstenite::connect_async(&config.hub_url)
         .await
         .with_context(|| format!("dialling {}", config.hub_url))?;
@@ -143,36 +236,44 @@ pub async fn run_holding(config: Config, held: HeldResults) -> Result<()> {
 
     match next_message(&mut source).await? {
         Some(FromHub::Welcome { .. }) => {}
-        Some(FromHub::Refused { reason }) => bail!("the hub refused this runner: {reason}"),
+        Some(FromHub::Refused { reason }) => return Err(Refusal(reason).into()),
         Some(other) => bail!("the hub answered hello with {}", message_kind(&other)),
         None => bail!("the hub closed the connection during the handshake"),
     }
 
     let (outbox, inbox) = mpsc::unbounded_channel();
-    let writer = tokio::spawn(write_frames(sink, inbox));
+    let mut writer = tokio::spawn(write_frames(sink, inbox));
+    session.link.attach(outbox);
     // Before anything else on this connection: what the last one could not
     // deliver. A job finished while the hub was away is still a job that ran.
-    for (job_id, outcome) in held.all() {
-        let _ = outbox.send(ToHub::JobFinished { job_id, outcome });
+    for (job_id, outcome) in session.all() {
+        session.link.send(ToHub::JobFinished { job_id, outcome });
     }
-    let outcome = serve_hub(&outbox, &mut source, &held).await;
-    drop(outbox);
-    let _ = writer.await;
+    let outcome = serve_hub(&session, &mut source).await;
+    session.link.detach();
+    // The writer is holding a queue for a hub that may be gone, and the jobs
+    // still running hold senders of their own, so waiting for it to end by
+    // itself would mean waiting for those jobs. They report on the next link.
+    if tokio::time::timeout(FLUSH_GRACE, &mut writer)
+        .await
+        .is_err()
+    {
+        writer.abort();
+    }
     outcome
 }
 
-async fn serve_hub(outbox: &Outbox, source: &mut Source, held: &HeldResults) -> Result<()> {
+async fn serve_hub(session: &Session, source: &mut Source) -> Result<()> {
     while let Some(message) = next_message(source).await? {
         match message {
             FromHub::AssignJob { job_id, command } => {
-                let outbox = outbox.clone();
-                let held = held.clone();
+                let session = session.clone();
                 // One task per job: a long job must not stop the runner from
-                // hearing the hub.
-                tokio::spawn(async move { execute(job_id, command, outbox, held).await });
+                // hearing the hub, and must not end when the link does.
+                tokio::spawn(async move { execute(job_id, command, session).await });
             }
-            FromHub::JobResultAck { job_id } => held.release(&job_id),
-            FromHub::Refused { reason } => bail!("the hub refused this runner: {reason}"),
+            FromHub::JobResultAck { job_id } => session.release(&job_id),
+            FromHub::Refused { reason } => return Err(Refusal(reason).into()),
             other => {
                 eprintln!(
                     "herd-runner: ignoring {}, which is not a runner's business",
@@ -185,12 +286,11 @@ async fn serve_hub(outbox: &Outbox, source: &mut Source, held: &HeldResults) -> 
 }
 
 /// Run one job: announce it, stream both streams, report how it ended.
-async fn execute(job_id: JobId, command: Vec<String>, outbox: Outbox, held: HeldResults) {
+async fn execute(job_id: JobId, command: Vec<String>, session: Session) {
     let Some((program, arguments)) = command.split_first() else {
         report(
             &job_id,
-            &outbox,
-            &held,
+            &session,
             JobOutcome::CouldNotStart {
                 reason: "a job needs a command to run".to_owned(),
             },
@@ -212,8 +312,7 @@ async fn execute(job_id: JobId, command: Vec<String>, outbox: Outbox, held: Held
             // this command rather than the command failing.
             report(
                 &job_id,
-                &outbox,
-                &held,
+                &session,
                 JobOutcome::CouldNotStart {
                     reason: format!("{program}: {error}"),
                 },
@@ -221,7 +320,7 @@ async fn execute(job_id: JobId, command: Vec<String>, outbox: Outbox, held: Held
             return;
         }
     };
-    let _ = outbox.send(ToHub::JobStarted {
+    session.link.send(ToHub::JobStarted {
         job_id: job_id.clone(),
     });
 
@@ -235,14 +334,14 @@ async fn execute(job_id: JobId, command: Vec<String>, outbox: Outbox, held: Held
         LogStream::Stdout,
         job_id.clone(),
         Arc::clone(&seq),
-        outbox.clone(),
+        session.link.clone(),
     );
     let pump_err = stream_output(
         stderr,
         LogStream::Stderr,
         job_id.clone(),
         Arc::clone(&seq),
-        outbox.clone(),
+        session.link.clone(),
     );
     // Both pipes are drained to end of file before the outcome is reported, so
     // no output can arrive after JobFinished.
@@ -257,7 +356,7 @@ async fn execute(job_id: JobId, command: Vec<String>, outbox: Outbox, held: Held
             reason: format!("{program}: waiting for the process failed: {error}"),
         },
     };
-    report(&job_id, &outbox, &held, outcome);
+    report(&job_id, &session, outcome);
 }
 
 /// How a finished process ended, in the protocol's terms. A unix status is an
@@ -291,16 +390,23 @@ fn outcome_of(status: ExitStatus) -> JobOutcome {
 /// A job that never ran sends no `JobStarted` and no log chunk — it wrote
 /// nothing, and Herd's own failure belongs in the outcome rather than in the
 /// job's output — but its end is held exactly like any other.
-fn report(job_id: &JobId, outbox: &Outbox, held: &HeldResults, outcome: JobOutcome) {
-    held.hold(job_id.clone(), outcome.clone());
-    let _ = outbox.send(ToHub::JobFinished {
+fn report(job_id: &JobId, session: &Session, outcome: JobOutcome) {
+    session.hold(job_id.clone(), outcome.clone());
+    if !session.link.send(ToHub::JobFinished {
         job_id: job_id.clone(),
         outcome,
-    });
+    }) {
+        // No hub to tell. The result is held, and the next connection begins
+        // by redelivering it (E-44, D17).
+        eprintln!(
+            "herd-runner: {job_id} ended while there was no hub to tell; \
+             its result is held until a hub acknowledges it"
+        );
+    }
 }
 
-fn send_chunk(job_id: &JobId, outbox: &Outbox, seq: &AtomicU64, stream: LogStream, data: Vec<u8>) {
-    let _ = outbox.send(ToHub::LogChunk {
+fn send_chunk(job_id: &JobId, link: &Link, seq: &AtomicU64, stream: LogStream, data: Vec<u8>) {
+    link.send(ToHub::LogChunk {
         job_id: job_id.clone(),
         stream,
         seq: seq.fetch_add(1, Ordering::SeqCst),
@@ -314,7 +420,7 @@ async fn stream_output<R>(
     stream: LogStream,
     job_id: JobId,
     seq: Arc<AtomicU64>,
-    outbox: Outbox,
+    link: Link,
 ) where
     R: AsyncRead + AsyncReadExt + Unpin,
 {
@@ -325,12 +431,12 @@ async fn stream_output<R>(
             Ok(read) => {
                 // The bytes as they were read: a job's output is not text, and a
                 // chunk boundary may fall in the middle of a character (D18).
-                send_chunk(&job_id, &outbox, &seq, stream, buffer[..read].to_vec());
+                send_chunk(&job_id, &link, &seq, stream, buffer[..read].to_vec());
             }
             Err(error) => {
                 send_chunk(
                     &job_id,
-                    &outbox,
+                    &link,
                     &seq,
                     LogStream::Stderr,
                     format!("herd-runner: reading the job's output failed: {error}\n").into_bytes(),

@@ -8,7 +8,7 @@
 
 use herd_hub::{JobDirStore, JobState, JobStore};
 use herd_proto::{JobOutcome, LogStream};
-use herd_runner::HeldResults;
+use herd_runner::Session;
 
 mod support;
 
@@ -37,10 +37,10 @@ async fn a_hub_that_restarts_loses_no_result_and_no_queued_job() {
     // The runner holds its results outside any one connection, which is what
     // lets it redeliver after the hub comes back. M3 puts the reconnection
     // loop around this; here the test dials the second connection itself.
-    let held = HeldResults::new();
+    let session = Session::new();
     let first_link = tokio::spawn({
-        let (config, held) = (runner_config(&first_hub.hub_url), held.clone());
-        async move { herd_runner::run_holding(config, held).await }
+        let (config, session) = (runner_config(&first_hub.hub_url), session.clone());
+        async move { herd_runner::serve_once(config, session).await }
     });
     first_hub.wait_for_runner().await;
 
@@ -69,20 +69,9 @@ async fn a_hub_that_restarts_loses_no_result_and_no_queued_job() {
         .expect("the runner's link to the dead hub ends")
         .expect_err("a hub that vanished is not a connection that ended well");
 
-    // A job that was accepted and never dispatched: the queue the new hub
-    // inherits. M6 is what lets a requester put one there while no runner is
-    // free; until then it is minted the way the hub itself mints one.
-    let queued = {
-        let store = JobDirStore::open(state.path()).expect("the state root opens");
-        store
-            .create_job(shell("printf 'from the queue\\n'"))
-            .expect("minted")
-            .id
-    };
-
     // The job finishes with no hub to tell. The runner holds the result.
     wait_until("the runner holds the result of the finished job", || {
-        !held.is_empty()
+        !session.holds_nothing()
     })
     .await;
     assert_eq!(
@@ -92,29 +81,49 @@ async fn a_hub_that_restarts_loses_no_result_and_no_queued_job() {
     );
 
     // ---- What a hub starting on this state root recovers, before one does.
-    let recovered: Vec<(String, String)> = {
+    // A job that was accepted and never dispatched is minted here too: it is
+    // the queue the new hub inherits. M6 is what lets a requester put one
+    // there while no runner is free; until then it is minted the way the hub
+    // itself mints one.
+    let (queued, recovered) = {
         let store = JobDirStore::open(state.path()).expect("the state root opens");
-        store
+        let queued = store
+            .create_job(shell("printf 'from the queue\\n'"))
+            .expect("minted")
+            .id;
+        let recovered: Vec<(String, String)> = store
             .unfinished_jobs()
             .expect("the queue reads")
             .into_iter()
             .map(|record| (record.id.to_string(), record.state.name().to_owned()))
-            .collect()
+            .collect();
+        (queued, recovered)
     };
     assert_eq!(
         recovered,
         vec![
-            (running.to_string(), "running".to_owned()),
+            (running.to_string(), "interrupted".to_owned()),
             (queued.to_string(), "queued".to_owned()),
         ],
-        "the queue a restarted hub inherits is what the directories say"
+        "the queue a restarted hub inherits is what the directories say, with \
+         the interrupted attempt named rather than left reading `running`"
+    );
+    let events = events_of(state.path(), &running);
+    let named = events.last().expect("the interruption is a transition");
+    assert_eq!(named["state"]["type"], "interrupted");
+    assert!(
+        named["state"]["reason"]
+            .as_str()
+            .expect("an interruption says what happened")
+            .contains("the hub stopped"),
+        "the record must name the interruption: {named}"
     );
 
     // ---- The hub comes back on the same state root, and the runner with it.
     let second_hub = HubProcess::start(state.path());
     let second_link = tokio::spawn({
-        let (config, held) = (runner_config(&second_hub.hub_url), held.clone());
-        async move { herd_runner::run_holding(config, held).await }
+        let (config, session) = (runner_config(&second_hub.hub_url), session.clone());
+        async move { herd_runner::serve_once(config, session).await }
     });
 
     // The result is redelivered and recorded: the work is not lost.
@@ -139,7 +148,10 @@ async fn a_hub_that_restarts_loses_no_result_and_no_queued_job() {
         "the log the hub had recorded before it died must not have changed"
     );
     // And the runner is told it may forget it.
-    wait_until("the hub acknowledges the result", || held.is_empty()).await;
+    wait_until("the hub acknowledges the result", || {
+        session.holds_nothing()
+    })
+    .await;
 
     // The inherited queue is dispatched to the runner that joined the new hub.
     wait_until("the queued job runs and ends", || {
@@ -168,7 +180,7 @@ async fn a_detached_submission_can_be_waited_for_and_its_log_read_as_a_file() {
     .await
     .expect("the job is accepted");
 
-    let finished = herdctl::wait_for_job(&harness.requester(), job_id.clone())
+    let finished = herdctl::wait_for_job(&harness.requester(), job_id.clone(), |_, _| {}, |_| {})
         .await
         .expect("the wait ends with the job");
     assert_eq!(finished.job_id, job_id);
@@ -184,7 +196,7 @@ async fn a_detached_submission_can_be_waited_for_and_its_log_read_as_a_file() {
 
     // Waiting again, on a job that is already over, is answered from the
     // record: that is what makes an id enough, an hour or a restart later.
-    let again = herdctl::wait_for_job(&harness.requester(), job_id.clone())
+    let again = herdctl::wait_for_job(&harness.requester(), job_id.clone(), |_, _| {}, |_| {})
         .await
         .expect("a job that is over is still waitable");
     assert_eq!(again.outcome, finished.outcome);
@@ -303,7 +315,7 @@ async fn a_job_s_record_is_readable_while_it_is_still_running() {
     // And room beside them for what a job keeps later (M11's artefacts).
     assert!(job_dir(&state_dir, &job_id).join("files").is_dir());
 
-    let finished = herdctl::wait_for_job(&harness.requester(), job_id.clone())
+    let finished = herdctl::wait_for_job(&harness.requester(), job_id.clone(), |_, _| {}, |_| {})
         .await
         .expect("the job ends");
     assert_eq!(finished.outcome, JobOutcome::Exited { code: 0 });
@@ -422,10 +434,10 @@ async fn a_result_for_a_job_the_hub_never_heard_of_does_not_wedge_the_runner() {
     let second_root = tempfile::tempdir().expect("another one");
 
     let first_hub = HubProcess::start(first_root.path());
-    let held = HeldResults::new();
+    let session = Session::new();
     let first_link = tokio::spawn({
-        let (config, held) = (runner_config(&first_hub.hub_url), held.clone());
-        async move { herd_runner::run_holding(config, held).await }
+        let (config, session) = (runner_config(&first_hub.hub_url), session.clone());
+        async move { herd_runner::serve_once(config, session).await }
     });
     first_hub.wait_for_runner().await;
 
@@ -449,15 +461,18 @@ async fn a_result_for_a_job_the_hub_never_heard_of_does_not_wedge_the_runner() {
 
     first_hub.kill();
     let _ = first_link.await.expect("the link to the dead hub ends");
-    wait_until("the runner holds the result", || !held.is_empty()).await;
+    wait_until("the runner holds the result", || !session.holds_nothing()).await;
 
     // A hub on a state root that knows nothing of that job at all.
     let second_hub = HubProcess::start(second_root.path());
     let second_link = tokio::spawn({
-        let (config, held) = (runner_config(&second_hub.hub_url), held.clone());
-        async move { herd_runner::run_holding(config, held).await }
+        let (config, session) = (runner_config(&second_hub.hub_url), session.clone());
+        async move { herd_runner::serve_once(config, session).await }
     });
-    wait_until("the stale result is acknowledged", || held.is_empty()).await;
+    wait_until("the stale result is acknowledged", || {
+        session.holds_nothing()
+    })
+    .await;
     assert!(
         !job_dir(second_root.path(), &lost).exists(),
         "a job the new hub never minted must not appear on its state root"

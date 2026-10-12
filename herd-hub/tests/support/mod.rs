@@ -164,8 +164,7 @@ impl HubProcess {
                 .build()
                 .expect("a runtime for the hub");
             runtime.block_on(async move {
-                let store = JobDirStore::open(&state_dir)
-                    .unwrap_or_else(|e| panic!("{} opens: {e}", state_dir.display()));
+                let store = open_when_free(&state_dir);
                 let hub = Hub::bind(
                     "127.0.0.1:0".parse().expect("a literal loopback address"),
                     Arc::new(store),
@@ -236,6 +235,30 @@ impl HubProcess {
 impl Drop for HubProcess {
     fn drop(&mut self) {
         self.stop_now();
+    }
+}
+
+/// Open a state root, waiting for the hub that held it to let go.
+///
+/// One hub owns a state root at a time (D21). A real restart is a new process
+/// and the kernel has already dropped the dead one's lock; two hubs on one
+/// runtime in one test process are not that, and the lock is given back only
+/// once the tasks of the hub that was killed have finished being dropped. So
+/// this waits for it, rather than racing it.
+fn open_when_free(state_dir: &Path) -> JobDirStore {
+    let deadline = Instant::now() + PATIENCE;
+    loop {
+        match JobDirStore::open(state_dir) {
+            Ok(store) => return store,
+            Err(error) => {
+                assert!(
+                    Instant::now() < deadline,
+                    "{} never became free: {error}",
+                    state_dir.display()
+                );
+                thread::sleep(Duration::from_millis(20));
+            }
+        }
     }
 }
 
