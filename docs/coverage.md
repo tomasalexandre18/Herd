@@ -7,63 +7,74 @@ needs a chatOnS deliverable (their declaration file, `cargo xtask pack` /
 automated test against the fixture consumer stands in, and the real check
 closes in M18.
 
-| E | Prio | What | Milestone | Note |
-|---|---|---|---|---|
-| E-01 | must | submit by commit, never machine | M10 | |
-| E-02 | must | ran-on line, verdict unchanged | M10 | format frozen per Q7; real verdict gated (M18) |
-| E-03 | must | stream, detached mode, wait | M2 | foreground streaming itself lands in M1 |
-| E-04 | must | waits explained with figures | M8 | |
-| E-05 | must | identical submissions deduplicated | M6 | |
-| E-06 | must | cancel kills process tree | M3 | kill mechanics hardened in M4 |
-| E-07 | must | dry run shows placement | M9 | |
-| E-08 | must | refuse dirty or unpushed | M10 | |
-| E-09 | should | deadline cancels unstarted job | M9 | pulled forward: E-41 (must) needs it |
-| E-10 | should | depend on one other job | M9 | capped: one parent, no conditions (invariant 1) |
-| E-11 | must | consumer-declared commands, nix develop | M10 | gated: their real declaration file (M18) |
-| E-12 | must | packs by (commit, key), no shared build trees | M11 | D10: hub registers, peers transfer; gated on their pack (M18) |
-| E-13 | should | content-addressed, complete or absent | M11 | done with the store: retrofitting CAS would force a migration, and D10 needs it for free diffs |
-| E-14 | must | warm caches ready before job | M12 | Q5/D9: no cache engine in Herd, but a declared prepare step, key-aware placement, and cache diffs publishable as packs; gated on their replication (M18) |
-| E-15 | must | full job record on disk | M2 | resource metrics in M4, retention in M12 |
-| E-16 | must | budgets, gc with pinning | M12 | per runner, not central (D10); keepers pin |
-| E-17 | must | atomic publication everywhere | M11 | a manifest registers only once every blob is held; job-record atomicity already in M2 (Q1) |
-| E-18 | must | four priorities with aging | M6 | |
-| E-19 | must | no fallback while available | M7 | switch-off case retested with E-33 in M9 |
-| E-20 | must | one queue for everything | M6 | |
-| E-21 | must | lost runner, requeue once | M3 | |
-| E-22 | must | build slots, derived -j | M7 | |
-| E-23 | should | placement prefers cache locality | M12 | preference only; E-19 governs waiting |
-| E-24 | must | probed/declared/denied labels | M5 | |
-| E-25 | must | capability kinds and exclusion | M7 | model in M5; contention enforcement tested in M7 |
-| E-26 | must | externally busy capability | M5 | wait-reason wording polished by M8 |
-| E-27 | must | metal lease, drain first | M9 | lease model in M5; drain-first in M9 |
-| E-28 | must | reference label carried | M5 | |
-| E-29 | must | memory admission with floor | M8 | |
-| E-30 | must | kernel memory ceiling | M4 | WSL OOM replay is a manual M17 check |
-| E-31 | must | tmpfs reservation, wait | M8 | |
-| E-32 | must | host-wide bound, load recorded | M8 | p90 < 12 figure read after adoption (M18+) |
-| E-33 | must | owner switch in 10 s | M9 | desktop shortcut on the real PC in M17 |
-| E-34 | must | niced, no inbound, disk budget | M4 | D11: "no inbound" = no port on a router; a mesh-bound fetch endpoint is allowed. Windows logon task in M17 |
-| E-35 | must | machine-readable status | M13 | format versioned per Q7 |
-| E-36 | must | every decision explained | M7 | refusal figures completed in M8 |
-| E-37 | must | events routable to ntfy | M13 | |
-| E-38 | should | statistics over a period | — | deferred past M18; raw data already written by M2/M4 records |
-| E-39 | should | results searchable | — | deferred past M18; on-disk records are greppable meanwhile |
-| E-40 | should | health every 15 s | M3 | ages surfaced in status in M13 |
-| E-41 | must | scheduled nightly, exclusive | M14 | gated: their nightly command, live at M18 |
-| E-42 | must | push hook submits producer | M14 | Herd side = scriptable detached submit; the hook is theirs |
-| E-43 | must | merger jobs start first | M6 | |
-| E-44 | must | restart loses nothing | M2 | re-asserted across reconnects in M3 |
-| E-45 | must | one data root only | M4 | |
-| E-46 | must | unprivileged, root via helper | M4 | |
-| E-47 | must | server runner runs natively | M16 | |
-| E-48 | must | per-runner approval | M15 | |
-| E-49 | must | join in thirty minutes | M17 | the timing is a manual check on real hardware |
-| E-50 | must | WSL2 supported platform | M17 | |
-| E-51 | must | version pin and refusal | M15 | protocol-version refusal exists since M1 |
-| E-52 | should | restarts with its host | M16, M17 | server in M16, the PC's logon task in M17 |
-| E-53 | should | records readable during run | M2 | plain files by Q1 |
-| E-54 | could | offline re-judging | M2 | no Herd work beyond E-15's kept files; the judge is their tool |
-| E-55 | could | peer-to-peer artefact exchange | M11 | **promoted to the default** by D10: direct transfer is the only path, the hub never carries bytes |
+| E | Prio | What | Milestone | State | Note |
+|---|---|---|---|---|---|
+| E-01 | must | submit by commit, never machine | M10 | planned |  |
+| E-02 | must | ran-on line, verdict unchanged | M10 | planned | format frozen per Q7; real verdict gated (M18) |
+| E-03 | must | stream, detached mode, wait | M2 | in review (PR #4) | foreground streaming itself lands in M1 |
+| E-04 | must | waits explained with figures | M8 | planned |  |
+| E-05 | must | identical submissions deduplicated | M6 | planned |  |
+| E-06 | must | cancel kills process tree | M3 | planned | kill mechanics hardened in M4 |
+| E-07 | must | dry run shows placement | M9 | planned |  |
+| E-08 | must | refuse dirty or unpushed | M10 | planned |  |
+| E-09 | should | deadline cancels unstarted job | M9 | planned | pulled forward: E-41 (must) needs it |
+| E-10 | should | depend on one other job | M9 | planned | capped: one parent, no conditions (invariant 1) |
+| E-11 | must | consumer-declared commands, nix develop | M10 | planned | gated: their real declaration file (M18) |
+| E-12 | must | packs by (commit, key), no shared build trees | M11 | planned | D10: hub registers, peers transfer; gated on their pack (M18) |
+| E-13 | should | content-addressed, complete or absent | M11 | planned | done with the store: retrofitting CAS would force a migration, and D10 needs it for free diffs |
+| E-14 | must | warm caches ready before job | M12 | planned | Q5/D9: no cache engine in Herd, but a declared prepare step, key-aware placement, and cache diffs publishable as packs; gated on their replication (M18) |
+| E-15 | must | full job record on disk | M2 | in review (PR #4) | resource metrics in M4, retention in M12; byte-faithful logs only after D18 |
+| E-16 | must | budgets, gc with pinning | M12 | planned | per runner, not central (D10); keepers pin |
+| E-17 | must | atomic publication everywhere | M11 | planned | a manifest registers only once every blob is held; job-record atomicity already in M2 (Q1) |
+| E-18 | must | four priorities with aging | M6 | planned |  |
+| E-19 | must | no fallback while available | M7 | planned | switch-off case retested with E-33 in M9 |
+| E-20 | must | one queue for everything | M6 | planned |  |
+| E-21 | must | lost runner, requeue once | M3 | planned |  |
+| E-22 | must | build slots, derived -j | M7 | planned |  |
+| E-23 | should | placement prefers cache locality | M12 | planned | preference only; E-19 governs waiting |
+| E-24 | must | probed/declared/denied labels | M5 | planned |  |
+| E-25 | must | capability kinds and exclusion | M7 | planned | model in M5; contention enforcement tested in M7 |
+| E-26 | must | externally busy capability | M5 | planned | wait-reason wording polished by M8 |
+| E-27 | must | metal lease, drain first | M9 | planned | lease model in M5; drain-first in M9 |
+| E-28 | must | reference label carried | M5 | planned |  |
+| E-29 | must | memory admission with floor | M8 | planned |  |
+| E-30 | must | kernel memory ceiling | M4 | in review (PR #5) | WSL OOM replay is a manual M17 check; real ceiling asserted only under a delegated cgroup; RLIMIT_AS fallback per D23 |
+| E-31 | must | tmpfs reservation, wait | M8 | planned |  |
+| E-32 | must | host-wide bound, load recorded | M8 | planned | p90 < 12 figure read after adoption (M18+) |
+| E-33 | must | owner switch in 10 s | M9 | planned | desktop shortcut on the real PC in M17 |
+| E-34 | must | niced, no inbound, disk budget | M4 | in review (PR #5) | D11: "no inbound" = no port on a router; a mesh-bound fetch endpoint is allowed. Windows logon task in M17 |
+| E-35 | must | machine-readable status | M13 | planned | format versioned per Q7 |
+| E-36 | must | every decision explained | M7 | planned | refusal figures completed in M8 |
+| E-37 | must | events routable to ntfy | M13 | planned |  |
+| E-38 | should | statistics over a period | — | planned | deferred past M18; raw data already written by M2/M4 records |
+| E-39 | should | results searchable | — | planned | deferred past M18; on-disk records are greppable meanwhile |
+| E-40 | should | health every 15 s | M3 | planned | ages surfaced in status in M13 |
+| E-41 | must | scheduled nightly, exclusive | M14 | planned | gated: their nightly command, live at M18 |
+| E-42 | must | push hook submits producer | M14 | planned | Herd side = scriptable detached submit; the hook is theirs |
+| E-43 | must | merger jobs start first | M6 | planned |  |
+| E-44 | must | restart loses nothing | M2 | in review (PR #4) | re-asserted across reconnects in M3; failed real-binary verification 2026-10-12; fix in flight (D17) |
+| E-45 | must | one data root only | M4 | in review (PR #5) | cooperative confinement only — full containment needs a mount namespace E-46 forbids (D28) |
+| E-46 | must | unprivileged, root via helper | M4 | in review (PR #5) |  |
+| E-47 | must | server runner runs natively | M16 | planned |  |
+| E-48 | must | per-runner approval | M15 | planned |  |
+| E-49 | must | join in thirty minutes | M17 | planned | the timing is a manual check on real hardware |
+| E-50 | must | WSL2 supported platform | M17 | planned |  |
+| E-51 | must | version pin and refusal | M15 | planned | protocol-version refusal exists since M1 |
+| E-52 | should | restarts with its host | M16, M17 | planned | server in M16, the PC's logon task in M17 |
+| E-53 | should | records readable during run | M2 | in review (PR #4) | plain files by Q1 |
+| E-54 | could | offline re-judging | M2 | planned | no Herd work beyond E-15's kept files; the judge is their tool |
+| E-55 | could | peer-to-peer artefact exchange | M11 | planned | **promoted to the default** by D10: direct transfer is the only path, the hub never carries bytes |
+
+## State of play (2026-10-12)
+
+Nothing beyond M1's substrate is merged; M1 carries no `must` of its own,
+so no row above is `merged` yet. Two milestones are in review — M2 (PR #4)
+and M4 (PR #5), 8 musts between them. **0 of 44 musts verified on `main`.**
+
+Not to mistake for done: **E-44** is currently failing real-binary
+verification, fix in flight (D17); **E-45** is partial by design (D28) —
+cooperative confinement only, not full containment; **E-30**'s kernel
+ceiling is unasserted without cgroup delegation (`RLIMIT_AS` fallback, D23).
 
 ## Musts per milestone
 

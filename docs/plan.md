@@ -23,26 +23,32 @@ non-zero); proto round-trips pass; a version mismatch is refused naming both
 versions. Substrate only; satisfies no E alone.
 
 ### M2 — Durable job store (`m2-job-store`)
-Hub state on disk from birth (Q1): one directory per job — `job.json` by
-atomic rename, `events.jsonl` appended, log, kept files. Record fields; state
-machine with timestamped transitions; queue rebuilt at startup; a runner holds
-a finished result until acknowledged, redelivering after a hub restart.
-Detached submission, `herdctl wait <id>`, log readable as a file afterwards.
-**Done when** a test restarts the in-process hub mid-job and the job finishes
-on its runner, result recorded, queue intact (E-44); a detached wait returns
-the exit code and the log file equals the stream (E-03); the record is plain
-files readable while the job runs (E-15 core, E-53). Metric fields exist,
-filled in M4.
+Hub state on disk from birth (Q1): one directory per job — `job.json`
+by atomic rename, `events.jsonl` appended, log, kept files. Record fields;
+state machine with timestamped transitions; queue rebuilt at startup; a
+runner holds a finished result until acknowledged, redelivering after a hub
+restart. Detached submission, `herdctl wait <id>`, log readable as a file
+afterwards. The minimum reconnect (D17): a runner that loses its control
+connection redials with a simple bounded retry and keeps its running job
+alive across the gap, so the held-result machinery above is reachable;
+an attempt interrupted by the drop is recorded as interrupted by name,
+never left silently `running`.
+**Done when** a test kills the hub mid-job against the real binaries and
+the job finishes on its runner, redials, redelivers its held result, result
+recorded, queue intact (E-44); a detached wait returns the exit code and
+the log file equals the stream (E-03); the record is plain files readable
+while the job runs (E-15 core, E-53). Metric fields exist, filled in M4.
 
 ### M3 — The link survives reality (`m3-link-robustness`)
-Reconnect with bounded backoff; health report every ~15 s; ~60 s of silence =
-lost: running jobs requeued once at priority, the record naming both attempts,
-a returning runner finishing nothing of the old attempt. Cancel propagates
-hub → runner. Drain ≤ 5 s (invariant 2).
-**Done when** killing the runner mid-job requeues within 90 s with a
-two-attempt record (E-21); cancel ends the job within 10 s while a sibling job
-continues (E-06; kill hardened in M4); a draining busy runner exits ≤ 5 s;
-heartbeat ages land in hub state (E-40 partial, surfaced in M13).
+M2's minimum reconnect (D17) gets a backoff policy; health report every ~15 s;
+~60 s of silence = genuinely lost: running jobs requeued once at priority,
+the record naming both attempts, a returning runner finishing nothing of
+the old attempt. Cancel propagates hub → runner. Drain ≤ 5 s (invariant 2).
+**Done when** killing the runner mid-job past the lost threshold requeues
+within 90 s with a two-attempt record (E-21); cancel ends the job within
+10 s while a sibling job continues (E-06; kill hardened in M4); a draining
+busy runner exits ≤ 5 s; heartbeat ages land in hub state (E-40 partial,
+surfaced in M13).
 
 ### M4 — Runner confinement (`m4-runner-confinement`)
 One configured data root: a bad root refused, nothing written outside it

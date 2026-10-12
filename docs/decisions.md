@@ -423,3 +423,198 @@ empty when the job never ran.
 the stderr sentence — a test asserts that a job exiting 125 does *not* get it.
 A reserved code that no program can produce does not exist, so the honest fix
 is the typed outcome above, not a cleverer number.
+
+
+---
+
+## 2026-10-12 — D17 The minimum reconnect belongs to M2, not M3
+
+**Context.** M2's own test suite was green while the real binaries lost
+the job entirely: killing the hub mid-job made the runner process exit,
+its job child die, and the record sit in `running` forever with `herdctl
+wait` hanging. A runner that dies on disconnect can never redeliver, so
+M2's held-result-until-acknowledged machinery was unreachable and E-44
+was untestable.
+
+**Choice.** M2 gains exactly the minimum: the runner survives a dropped control
+connection, redials with a simple bounded retry, keeps its running job alive
+across the gap, and redelivers a held result until acknowledged. M3 keeps
+the backoff policy, the ~15 s health report, the ~60 s silence-means-lost
+threshold, requeue-once at priority, cancel propagation and drain ≤ 5
+s. A job whose attempt was interrupted is recorded as interrupted by name,
+never left silently `running`.
+
+**Alternative rejected.** Merging M2 and letting M3 close E-44 — that
+would have put a milestone documented as done, and a permanently wedged
+record, on `main`.
+
+---
+
+## 2026-10-12 — D18 Log chunks carry bytes, not a string
+
+**Context.** A job printing `0xFF` had it rewritten to U+FFFD on the wire
+and on disk, while NUL survived; a compiler can emit non-UTF-8 and E-15
+promises the full record.
+
+**Choice.** Log payloads travel as bytes (base64 inside the JSON frame), so the
+on-disk log is byte-identical to what the process wrote. `PROTOCOL_VERSION`
+stays 1 because nothing is deployed — this is the cheapest moment this
+change will ever cost.
+
+**Alternative rejected.** Declaring logs UTF-8 with replacement, which
+silently falsifies a job's output.
+
+---
+
+## 2026-10-12 — D19 A result the hub cannot persist is never destroyed
+
+**Context.** A job directory the hub could not write made it log the failure,
+drop the runner's connection and lose the outcome permanently; a full disk
+would have killed every runner at once.
+
+**Choice.** The hub acknowledges only what it has fsynced, never acknowledges
+what it failed to write, retries, and never drops a runner because of its own
+storage failure — the runner keeps holding. A stalled job is recoverable;
+a destroyed verdict is not.
+
+**Alternative rejected.** Failing the job, which converts a hub problem
+into a false verdict.
+
+---
+
+## 2026-10-12 — D20 Exit 1 means the job failed
+
+**Context.** "No runner is connected", "the runner was lost while the job
+was running", "the hub closed the connection without accepting the job"
+and a dial failure all exited 1, indistinguishable from a job whose tests
+failed — breaking the promise E-02 and E-43 rest on.
+
+**Choice.** D16's single sentinel widens from "could not start" to "Herd
+cannot give you a verdict": every Herd-level failure exits **125** with
+the reason on stderr and stdout empty; the job's own code is worn only when
+there is a real verdict.
+
+**Alternative rejected.** A distinct code per failure mode, which multiplies
+sentinels colliding with real exit codes.
+
+---
+
+## 2026-10-12 — D21 One hub per state root
+
+**Context.** Two hubs shared a state root happily and the derived index
+went stale; and a state root whose `jobs/` was unwritable started fine,
+then failed every submission with the reason only in the hub's log.
+
+**Choice.** Lock the state root at startup, refusing a second hub by naming
+the holder, and extend the startup write probe to `jobs/` so the refusal
+happens at startup with the path named.
+
+**Alternative rejected.** Trusting operators not to point two hubs at
+one directory.
+
+---
+
+## 2026-10-12 — D22 The log file exists from the start, and `wait` prints it
+
+**Context.** A job producing no output left no log file at all, so
+a consumer reading the record got ENOENT; and `herdctl wait` printed no
+output whatsoever, so a detached requester could only retrieve a log by
+reading the hub's state directory — impossible for a remote requester.
+
+**Choice.** Create the log when the job starts, even empty, and make `wait`
+print the job's log the way `run` does.
+
+**Alternative rejected.** Documenting the state directory as the retrieval
+path, which assumes every requester shares the hub's filesystem.
+
+---
+
+## 2026-10-12 — D23 The memory ceiling falls back to RLIMIT_AS, loudly
+
+**Context.** cgroup v2 `MemoryMax` needs a delegated subtree, which a plain
+login session does not have.
+
+**Choice.** Where delegation is unavailable the runner sets `RLIMIT_AS`
+instead and announces the fallback and its reason at startup — a real
+kernel cap, so invariant 2 still holds. It is weaker on purpose and the
+weakness is named: per process rather than per tree, and it makes an
+allocation fail rather than killing the job.
+
+**Alternative rejected.** A silent fallback, or refusing to run — a
+runner that will not start on an undelegated host is useless on exactly
+the machines Herd targets.
+
+---
+
+## 2026-10-12 — D24 A cap breach is one outcome variant
+
+**Context.** D15 made a job's end a tagged outcome so a new way to end is
+a new variant.
+
+**Choice.** Every cap ends a job as `StoppedByCap { cap, limit }` with a
+nested `Cap` value naming which one — memory, time, log, disk. A new cap
+is a new `Cap`, never a new way to end.
+
+**Alternative rejected.** One outcome variant per cap, which would reopen
+the magic-number problem D15 closed.
+
+---
+
+## 2026-10-12 — D25 A cap breach exits 124
+
+**Context.** D16 and D20 fix the exit-code table, and "Herd stopped your
+job at a limit" is neither the job's verdict nor an absence of verdict.
+
+**Choice.** `herdctl` exits **124** for every cap breach — `timeout(1)`'s
+code, generalised — with the cap in the typed outcome and named on
+stderr. The table is now: the job's own code when there is a verdict,
+128+signal when signalled, 124 stopped by a cap, 125 when Herd cannot give
+a verdict.
+
+**Alternative rejected.** A code per cap.
+
+---
+
+## 2026-10-12 — D26 `herd-runner` depends on `libc`
+
+**Context.** Confinement needs `setsid`, `setpriority`, `ioprio_set`,
+`setrlimit` and a write to `cgroup.procs` between fork and exec.
+
+**Choice.** Take `libc` directly rather than a confinement crate, so what
+the runner does to a host is visible in our own code.
+
+**Alternative rejected.** A sandboxing crate, which would hide the host
+contract behind someone else's abstraction.
+
+---
+
+## 2026-10-12 — D27 A skipped assertion is never a quiet pass
+
+**Context.** The cgroup ceiling cannot be asserted without delegation, so
+some assertions are real on a delegated host and impossible on GitHub Actions.
+
+**Choice.** Such an assertion prints a `HERD-SKIPPED` line that a script
+lifts into a CI warning and the run summary. Invariant 5 says done means
+a passing test, so a test that did not really run must be impossible to
+mistake for one that did.
+
+**Alternative rejected.** Failing on an undelegated host, which would make
+CI red for a host property rather than a defect.
+
+---
+
+## 2026-10-12 — D28 E-45 is the cooperative version, and the limit is recorded
+
+**Context.** "Nothing a job writes lands outside the data root" cannot be
+enforced without a mount namespace, and a mount namespace needs privilege
+that E-46 forbids the runner to hold. The two expectations genuinely conflict.
+
+**Choice.** Herd confines what it directs — the job's working directory,
+`HOME`, `TMPDIR` and `XDG_*` all inside the data root, the job's environment
+built rather than inherited, any escaping path refused by name, a disk
+budget on the workspace — and states plainly that a job determined to write
+elsewhere with the runner's own permissions can. This is a recorded limit,
+not an oversight, and it is the first thing to raise with the first consumer.
+
+**Alternative rejected.** Holding privilege to build a namespace, which
+breaks E-46 and invariant 2's spirit.
