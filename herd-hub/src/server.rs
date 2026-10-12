@@ -71,6 +71,15 @@ impl Hub {
             .expect("a bound listener has a local address")
     }
 
+    /// A read-only handle on the hub's live peers, kept by the caller after
+    /// [`Hub::serve`] has taken the hub. M13 grows this into the status
+    /// surface; M1 needs only "is the runner here yet".
+    pub fn handle(&self) -> HubHandle {
+        HubHandle {
+            state: Arc::clone(&self.state),
+        }
+    }
+
     /// Serve until the listener fails. Dropping the returned future releases
     /// the port.
     pub async fn serve(self) -> Result<()> {
@@ -83,6 +92,19 @@ impl Hub {
                 }
             });
         }
+    }
+}
+
+/// What can still be asked of a hub that `serve` has taken ownership of.
+#[derive(Clone)]
+pub struct HubHandle {
+    state: Arc<State>,
+}
+
+impl HubHandle {
+    /// Whether a runner has finished its handshake and can be dispatched to.
+    pub fn runner_connected(&self) -> bool {
+        self.state.with_peers(|peers| peers.runner.is_some())
     }
 }
 
