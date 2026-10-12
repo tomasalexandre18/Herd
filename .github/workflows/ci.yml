@@ -44,8 +44,19 @@ jobs:
       - name: cargo clippy
         run: nix develop --command cargo clippy --workspace --all-targets -- -D warnings
 
+      # --nocapture so that M4's skipped assertions reach the log: a host
+      # without cgroup v2 delegation cannot make some of them, and the next
+      # step turns each one into a warning on this run. A green check is not
+      # the same claim on every host, and that difference must be visible.
       - name: cargo test
-        run: nix develop --command cargo test --workspace
+        run: |
+          set -o pipefail
+          nix develop --command cargo test --workspace -- --nocapture \
+            2>&1 | tee test-output.txt
+
+      - name: report the assertions this host could not make
+        if: always()
+        run: ./scripts/report-skips.sh test-output.txt
 
   docs:
     name: docs

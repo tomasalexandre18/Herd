@@ -15,3 +15,5 @@ Herd stays specialized on purpose: no workflow language, no plugins, no cloud.
 - Current state: [`docs/status.md`](docs/status.md)
 - Decisions: [`docs/decisions.md`](docs/decisions.md)
 - Plan: [`docs/plan.md`](docs/plan.md)
+- Runner confinement and its configuration:
+  [`docs/runner-confinement.md`](docs/runner-confinement.md)
