@@ -660,6 +660,94 @@ async fn a_log_that_lost_chunks_to_twelve_killed_hubs_says_where() {
     runner.signal(rustix::process::Signal::TERM).await;
 }
 
+/// D19's other half, with the real binaries: a wait on a job the hub cannot
+/// write down says so, instead of saying nothing at all.
+///
+/// The record of such a job reads `running` and stays there — the runner holds
+/// the result, this hub has stopped trying to store it — and a `herdctl wait`
+/// on it used to print absolutely nothing, with no way for a requester to tell
+/// a stalled job from a slow one. How long a hub tries before giving up is
+/// M3's policy; being mute about it was never a policy.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_wait_on_a_job_the_hub_cannot_write_down_says_so() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let herd = Herd::new();
+    let mut hub = herd.start_hub("first").await;
+    let mut runner = herd.start_runner();
+    herd.wait_for_runner().await;
+
+    let job = herd.submit("printf 'working\\n'; sleep 1; exit 3").await;
+    herd.wait_until("the job is running", || {
+        herd.record(&job)["state"]["type"] == "running"
+    })
+    .await;
+
+    // Nothing can be written in the job's directory from here, so the outcome
+    // the runner is about to report has nowhere to go.
+    let dir = herd.job_dir(&job);
+    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o500)).expect("read-only");
+    if herd_hub::durable::probe_writable(&dir).is_ok() {
+        // Running as a user permissions do not apply to; there is nothing to
+        // keep from being written.
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).expect("writable");
+        return;
+    }
+
+    herd.wait_until("the hub has given up writing the outcome", || {
+        herd.said("first").contains("cannot write it")
+    })
+    .await;
+    assert_eq!(
+        herd.record(&job)["state"]["type"],
+        "running",
+        "the record cannot have moved on"
+    );
+
+    // A requester comes back to the job by its id. The job is not over, and
+    // nothing is going to happen to it: the wait has to say that much.
+    let mut waiting = herd.start_wait(&job);
+    let said = async {
+        loop {
+            if herd.said("wait").contains("cannot write it down") {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    };
+    tokio::time::timeout(Duration::from_secs(10), said)
+        .await
+        .unwrap_or_else(|_| {
+            panic!(
+                "the wait said nothing about a job the hub cannot write down: {:?}",
+                herd.said("wait")
+            )
+        });
+    assert!(
+        herd.said("wait").contains(&job),
+        "the note must carry the reason, which names the file: {:?}",
+        herd.said("wait")
+    );
+    assert!(
+        herd.said("wait").contains("redelivers it"),
+        "and what happens next: {:?}",
+        herd.said("wait")
+    );
+    // Still waiting: no verdict has been invented for a job that has one, in
+    // the runner's memory, that the hub could not store.
+    assert!(waiting.alive(), "the wait must not have answered anything");
+    assert_eq!(
+        String::from_utf8_lossy(&std::fs::read(herd.logs.path().join("wait-out")).unwrap()),
+        "working\n",
+        "stdout stays the job's own output; the note is Herd speaking, on stderr"
+    );
+
+    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).expect("writable again");
+    waiting.signal(rustix::process::Signal::TERM).await;
+    hub.signal(rustix::process::Signal::TERM).await;
+    runner.signal(rustix::process::Signal::TERM).await;
+}
+
 /// D17's other half: when nothing comes back, the job stays unfinished but is
 /// *named* as interrupted, and a wait on it says so instead of hanging mutely
 /// for ever.

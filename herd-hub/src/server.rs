@@ -129,6 +129,15 @@ struct Peers {
     /// `herdctl wait` on the same id attaches beside it rather than taking
     /// its place.
     followers: HashMap<JobId, Vec<Outbox>>,
+    /// Per job, why the hub could not write down what it was told about it.
+    ///
+    /// A job whose end the hub cannot store keeps a record that reads
+    /// `running` while nothing at all is happening to it (D19): the runner is
+    /// holding the result, and this hub has stopped trying. Nothing about that
+    /// is visible from the outside, which is why the reason is kept here —
+    /// what a wait on such a job may not do is say nothing. Cleared the moment
+    /// the hub does write the job down.
+    stalled: HashMap<JobId, String>,
 }
 
 impl State {
@@ -197,23 +206,39 @@ impl State {
         })
     }
 
+    /// Remember that the hub cannot write a job down, and take the list of who
+    /// is waiting for it.
+    fn note_a_stall(&self, id: &JobId, reason: String) -> Vec<Outbox> {
+        self.with_peers(|peers| {
+            peers.stalled.insert(id.clone(), reason);
+            peers.followers.get(id).cloned().unwrap_or_default()
+        })
+    }
+
+    /// The hub wrote the job down after all: it is moving again.
+    fn stall_is_over(&self, id: &JobId) {
+        self.with_peers(|peers| peers.stalled.remove(id));
+    }
+
     /// Attach a requester to a job by its id: its record, the output recorded
-    /// so far, and — unless the job is already over — a place in the list of
-    /// followers, all under one lock.
+    /// so far, why the job is not moving if it is not, and — unless the job is
+    /// already over — a place in the list of followers, all under one lock.
     ///
     /// Reading the record and registering have to be one step too: between
     /// them the job could reach its end, and a requester that registered
     /// afterwards would wait for a frame that has already been sent.
+    #[allow(clippy::type_complexity)]
     fn attach(
         &self,
         id: &JobId,
         outbox: &Outbox,
-    ) -> crate::job::Result<Option<(crate::job::JobRecord, Vec<u8>)>> {
+    ) -> crate::job::Result<Option<(crate::job::JobRecord, Vec<u8>, Option<String>)>> {
         self.with_peers(|peers| {
             let Some(record) = self.store.job(id)? else {
                 return Ok(None);
             };
             let log = self.store.job_log(id)?.unwrap_or_default();
+            let stalled = peers.stalled.get(id).cloned();
             if !record.state.is_terminal() {
                 peers
                     .followers
@@ -221,7 +246,7 @@ impl State {
                     .or_default()
                     .push(outbox.clone());
             }
-            Ok(Some((record, log)))
+            Ok(Some((record, log, stalled)))
         })
     }
 
@@ -362,9 +387,15 @@ async fn relay_from_runner(state: &State, outbox: &Outbox, source: &mut Source) 
         match message {
             ToHub::JobStarted { job_id } => {
                 // A failure here is the hub's disk, not the runner's doing, so
-                // it is said out loud and the connection goes on (D19).
-                if let Err(error) = state.store.record_state(&job_id, JobState::Running) {
-                    eprintln!("herd-hub: recording {job_id} as running failed: {error}");
+                // it is said out loud and the connection goes on (D19) — and
+                // whoever is waiting for the job is told, because a record
+                // that cannot move is not something a wait can see by itself.
+                match state.store.record_state(&job_id, JobState::Running) {
+                    Ok(()) => state.stall_is_over(&job_id),
+                    Err(error) => {
+                        eprintln!("herd-hub: recording {job_id} as running failed: {error}");
+                        say_it_is_stalled(state, &job_id, error.to_string());
+                    }
                 }
             }
             ToHub::LogChunk {
@@ -465,10 +496,15 @@ async fn record_the_end(state: &State, job_id: &JobId, outcome: &herd_proto::Job
     let end = JobState::Finished {
         outcome: outcome.clone(),
     };
+    let mut why = String::new();
     for attempt in 1..=RECORDING_ATTEMPTS {
         match state.store.record_state(job_id, end.clone()) {
-            Ok(()) => return true,
+            Ok(()) => {
+                state.stall_is_over(job_id);
+                return true;
+            }
             Err(error) => {
+                why = error.to_string();
                 eprintln!(
                     "herd-hub: recording the outcome of {job_id} failed \
                      (attempt {attempt} of {RECORDING_ATTEMPTS}): {error}"
@@ -484,7 +520,37 @@ async fn record_the_end(state: &State, job_id: &JobId, outcome: &herd_proto::Job
          The result is NOT acknowledged: the runner still holds it and will \
          redeliver it. Make the state root writable."
     );
+    // The record will go on reading `running`, or `assigned`, with nothing
+    // happening to it at all. Whoever is waiting for this job hears why, and
+    // so does whoever waits for it later: being mute about a job that is
+    // going nowhere is not a policy (D19).
+    say_it_is_stalled(state, job_id, why);
     false
+}
+
+/// Keep the reason a job cannot be written down, and tell whoever is waiting.
+fn say_it_is_stalled(state: &State, job_id: &JobId, why: String) {
+    let note = stalled_note(&why);
+    for follower in state.note_a_stall(job_id, why) {
+        let _ = follower.send(FromHub::JobNote {
+            job_id: job_id.clone(),
+            note: note.clone(),
+        });
+    }
+}
+
+/// What a wait is told about a job the hub cannot write down.
+///
+/// Neither a refusal nor a verdict: the result exists, the runner is holding
+/// it, and this hub cannot put it on its disk (D19). How long a hub tries
+/// before leaving it there is M3's policy; saying nothing at all never was
+/// one. One sentence in one place, so a test can rely on it.
+fn stalled_note(why: &str) -> String {
+    format!(
+        "this job is not over and the hub cannot write it down: {why}. \
+         Nothing is happening to its record until that is fixed; the runner \
+         holds the result and redelivers it on its next connection."
+    )
 }
 
 async fn serve_requester(state: &State, outbox: &Outbox, source: &mut Source) -> Result<()> {
@@ -541,7 +607,7 @@ async fn accept_submissions(state: &State, outbox: &Outbox, source: &mut Source)
                 let attached = state
                     .attach(&job_id, outbox)
                     .with_context(|| format!("reading the record of {job_id}"))?;
-                let Some((record, log)) = attached else {
+                let Some((record, log, stalled)) = attached else {
                     // A terminal no, as D13 means it: this id will not come
                     // into being by waiting for it.
                     let _ = outbox.send(FromHub::Refused {
@@ -580,7 +646,18 @@ async fn accept_submissions(state: &State, outbox: &Outbox, source: &mut Source)
                             ),
                         });
                     }
-                    _ => {}
+                    // Queued, assigned or running — and if this hub knows that
+                    // the attempt is not progressing because it cannot write
+                    // the job down, the wait is told so rather than left
+                    // watching a record that says `running` and never moves.
+                    _ => {
+                        if let Some(why) = stalled {
+                            let _ = outbox.send(FromHub::JobNote {
+                                job_id,
+                                note: stalled_note(&why),
+                            });
+                        }
+                    }
                 }
             }
             other => {
