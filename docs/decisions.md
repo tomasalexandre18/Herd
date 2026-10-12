@@ -276,7 +276,49 @@ hide exactly the failures we need to see. An outbound-only runner reaches a
 keeper instead; if two runners genuinely cannot reach any common keeper, that
 is a network fact to fix, reported by name.
 
-**Open, for Alexa (E-34).** The owner's rule is that her PC "accepts no
-inbound connection". On a tailnet, serving a blob means listening on the mesh
-interface. Until she rules otherwise, her PC is treated as outbound-only: it
-pushes its packs to a keeper and pulls what it needs, and never serves a peer.
+**Resolved the same day by D11.** The question was: the owner's rule is that
+her PC "accepts no inbound connection", yet on a tailnet serving a blob means
+listening on the mesh interface — so is the PC a serving peer or
+outbound-only? Answered: a serving peer, bound to the mesh interface only.
+
+---
+
+## 2026-10-12 — D11 What "no inbound connection" means (resolves D10)
+
+**Context.** D10 left one question for Alexa: E-34 says the owner's PC
+"accepts no inbound connection", but serving a blob to a peer means listening
+on a socket. His ruling (2026-10-12): *the tailnet is fine — the rule is no
+port opened on a home router; that would be too much. If the network layer can
+go through a tailnet, it is approved.*
+
+**Choice.** E-34 is read as **no port opened on a router, nothing reachable
+from the public internet, no port forwarding** — not as "no socket at all". A
+runner may therefore serve content to peers, under three conditions that are
+tested, not documented:
+
+1. The fetch endpoint binds to **one named interface or address** given in the
+   runner's configuration — the mesh address. Never `0.0.0.0`, never `::`,
+   never a default-route interface. A configuration that would bind a public
+   or default interface is refused at startup, the way a bad data root is
+   (E-45).
+2. Herd still builds and requires no network. The mesh is the machine owner's,
+   set up outside Herd; Herd only receives the address to bind and the address
+   to advertise. With no mesh, a runner is outbound-only and nothing breaks.
+3. The owner's switch (E-33) stops the fetch endpoint too: `off` means the
+   machine serves nothing, not just claims nothing.
+
+**Consequence.** The owner's PC becomes a serving peer rather than
+outbound-only, so a laptop wanting a pack built on the PC fetches it straight
+from the PC instead of detouring through the keeper. The outbound-only path
+stays in the design for any machine without a mesh.
+
+**To verify on the real machine (M17), not assumed.** Whether the mesh is
+reachable from inside WSL2 by running the mesh daemon in WSL (needs
+`/dev/net/tun`, and their WSL has kernel 6.18 and systemd) or by WSL's
+mirrored networking mode sharing the Windows interface. Both are plausible;
+the join recipe records whichever actually works, and the automated test
+asserts the binding rule above regardless of which it is.
+
+**Invariant amended.** CLAUDE.md invariant 3 was "no inbound port, no relay,
+no tunnel on client machines; the hub is the only thing that listens". That is
+now false and has been rewritten (Alexa's approval, 2026-10-12).

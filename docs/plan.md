@@ -108,7 +108,8 @@ Deadline (E-09; needed by E-41). Dependency: at most one named parent, start
 after its success, else cancelled with the reason — one edge, no conditions
 (E-10; needed by E-12's flow). Metal drain-first: a `metal-<m>` job drains its
 host's build slot before starting, bounded 15 min (completes E-27).
-**Done when** `off` stops claims within 10 s, reason visible; dry run lists
+**Done when** `off` stops claims within 10 s and stops serving content too
+(D11), reason visible; dry run lists
 eligible runners and the queue ahead, runs nothing; a past-deadline job shows
 `cancelled (deadline)`; a dependent starts only after its parent; a simulated
 metal trial never overlaps a build on its host.
@@ -140,17 +141,20 @@ advertises a fetch endpoint (Q2); a runner needing a pack asks the hub who
 holds it and fetches directly, only the hashes it lacks. Three paths, in
 order: **same host** — hardlink or reflink inside the local store, zero bytes
 on any network; **peer reachable** — direct fetch from a holder; **outbound
-only** (a runner that accepts no inbound connection, E-34) — it pushes to and
-pulls from a keeper, never serves. A pack is complete or absent: the manifest
-is registered only once every blob is held and fsynced (E-17, E-13, E-12).
+only** (a runner with no mesh) — it pushes to and pulls from a keeper, never
+serves. A fetch endpoint binds to the one configured mesh interface and is
+refused at startup if it would bind a default or public one (D11). A pack is
+complete or absent: the manifest is registered only once every blob is held
+and fsynced (E-17, E-13, E-12).
 **Done when** a two-runner e2e produces a fixture pack on runner A and
 consumes it on runner B with the hub seeing no payload byte (asserted by
 counting bytes on the hub's sockets); a same-host fetch moves zero network
 bytes and no second copy on disk; a second pack sharing files with the first
 transfers only the new blobs; killing a transfer mid-flight leaves the pack
 unregistered and no partial blob readable; an outbound-only runner completes
-both directions without listening; a fetch without a valid capability is
-refused. chatOnS's `0 crates compiled` acceptance closes in M18.
+both directions without listening; a configuration that would bind a default
+or public interface is refused at startup; a fetch without a valid capability
+is refused. chatOnS's `0 crates compiled` acceptance closes in M18.
 Most likely milestone to overflow one session; if it does, split at the
 registry boundary — local CAS plus the same-host and keeper paths first,
 peer-to-peer fetch and capabilities second.
@@ -229,6 +233,10 @@ login shell for Nix, the documented WSL checklist, a Windows logon task, no
 inbound socket, the disk budget (E-50, E-52, E-34 on real hardware). The join
 recipe written and walked by a person, under 30 minutes (E-49). The owner's
 switch reachable from her side by a desktop shortcut (E-33 on real hardware).
+The mesh path verified rather than assumed (D11): either the mesh daemon
+inside WSL (needs `/dev/net/tun`; their WSL has kernel 6.18 and systemd) or
+WSL mirrored networking sharing the Windows interface — whichever works goes
+in the recipe.
 **Done when** the PC joins by the recipe alone and runs a fixture job from the
 server's hub; the timing of the walk is recorded. Three checks are manual on
 real hardware and recorded in `docs/status.md`: the 30-minute join, the
@@ -303,7 +311,7 @@ spine.
 | Q | Decision | Recommendation | Blocks |
 |---|---|---|---|
 | Q1 | Hub persistence model | Directory per job: `job.json` by atomic rename, `events.jsonl` appended; no database. Atomicity is E-17's primitive reused; records stay plain files the consumer can read (E-53). | M2 |
-| Q2 | The data path | **Herd is never in the byte path (D10).** The hub registers manifests and who holds what, and issues scoped fetch capabilities; runners move blobs directly. A runner advertises a fetch endpoint; Herd does not build, manage or require a network — a tailnet address, a LAN address or a hostname are all just an endpoint to it. Same host: hardlink/reflink, zero network. Outbound-only runners (E-34) push to and pull from a keeper and never serve. | M11, M12 |
+| Q2 | The data path | **Herd is never in the byte path (D10).** The hub registers manifests and who holds what, and issues scoped fetch capabilities; runners move blobs directly. A runner advertises a fetch endpoint and binds it to one configured mesh interface only, never a default or public one (D11). Same host: hardlink/reflink, zero network. A runner with no mesh is outbound-only: it pushes to and pulls from a keeper and never serves. | M11, M12 |
 | Q3 | Resource algebra shape | One Capability type {name, kind: exclusive / counted(n) / shared, excludes, busy-probe}; memory and tmpfs are numeric admissions, not labels; a lease is counted(1) with an external probe. | M5 |
 | Q4 | Content addressing | Per file, not per archive. It buys three things at once: inter-pack dedup (E-13), GC pinning (E-16), and "fetch the diff" for free — a peer fetches only the hashes it lacks, so no delta protocol and no rsync is ever needed. | M11 |
 | Q5 | Warm caches | Herd grows no cache engine of its own, but must actively *carry* one: (a) the artefact store is generic, so the consumer may publish cache diffs through it as ordinary packs — per-file addressing (Q4) means a 57-700 MB diff costs only its missing blobs; (b) the declaration contract has a first-class **prepare step** with declared cache keys and a recorded duration; (c) a runner reports which keys it holds, and placement prefers a holder (E-23). Herd never knows what a cache *is*. | M10, M11, M12 |
@@ -324,12 +332,14 @@ spine.
   and routing 1.5 GB through a container and a reverse proxy to reach a disk
   on the same machine is the clearest case against it. D10 supersedes D7: the
   hub registers content and authorises fetches, runners move the bytes.
-- **The mesh is not ours.** Herd must never depend on a VPN product: a
-  coordination service we do not run would breach invariant 1 (no cloud), and
-  a network layer inside Herd would breach invariant 1 twice over. Herd
-  consumes an advertised endpoint and nothing more. A tailnet is an excellent
-  deployment choice for the owner — it is not a Herd dependency, and Herd
-  works on a bare LAN with no mesh at all.
+- **The mesh is the owner's, not ours** (D11, approved 2026-10-12). A tailnet
+  is validated as the network layer, and that is a deployment choice: Herd
+  must never depend on a VPN product, because a coordination service we do not
+  run would breach invariant 1 (no cloud) and a network layer inside Herd
+  would breach it again. Herd receives one address to bind and one to
+  advertise. With no mesh a runner is outbound-only and nothing breaks.
+  Invariant 3 was rewritten for this: runners dial out for control and may
+  listen on a private mesh interface, but no port is ever opened on a router.
 - **Direct transfer costs something.** Peer liveness, partial holders, and
   "who actually has this blob" are harder to debug than one central store;
   custody (D10, M12) and a visible no-holder state exist to pay that cost

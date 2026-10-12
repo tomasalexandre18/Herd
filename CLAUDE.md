@@ -34,8 +34,12 @@ where we say "requester". Translate when triaging; do not adopt their words.
 2. **A runner never destabilizes its host.** Every job runs under an explicit
    memory cap and time cap. A runner stops cleanly in **≤ 5 s** when its owner
    asks, and refuses new jobs while draining.
-3. **Runners dial out.** No inbound port, no relay, no tunnel on client
-   machines. The hub is the only thing that listens.
+3. **Runners dial out for control; no port is ever opened on a router.** A
+   runner opens the control connection to the hub and needs nothing inbound to
+   work. It may listen on a **private mesh interface** to serve content to
+   peers (D10, D11) — bound to that interface only, never on a default or
+   public one, and never behind a port forwarded on someone's box. Herd itself
+   builds and requires no network.
 4. **The protocol is the contract.** All messages live in `herd-proto`, the
    handshake carries a protocol version, nothing is sent ad hoc.
 5. **Done means a passing test.** "It compiles" is not done. Every milestone

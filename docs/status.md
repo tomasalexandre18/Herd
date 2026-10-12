@@ -18,7 +18,8 @@ Documentation only:
   JSON, D5 deployment shape, D6 what was left open, D7 (superseded), **D8**
   hub persistence as a directory per job, **D9** warm caches (Herd carries
   one, Herd is not one), **D10** the data path (Herd is never in the byte
-  path).
+  path), **D11** what "no inbound" means (the tailnet is approved; a runner
+  binds its fetch endpoint to the mesh interface only).
 - `docs/plan.md` — **M1..M18**, each one session, with the critical path, the
   parallel tracks, 13 decisions to settle before the code that depends on
   them, and the conflicts and risks.
@@ -38,12 +39,12 @@ fixture tests stand in until then.
 - **No toolchain yet.** Rust is not installed; it arrives with the Nix flake
   in M1, so every command in `CLAUDE.md` is still the agreed contract rather
   than a verified one. `docker`, `nix` and `gh` are present and working.
-- **Two decisions are Alexa's.** Q10, the licence (outward-facing). And one
-  raised by D10: her PC's rule is "accepts no inbound connection" (E-34), but
-  serving a blob to a peer means listening on the mesh interface — until she
-  rules, the PC is outbound-only (pushes to and pulls from a keeper, never
-  serves). Q5 (the warm caches) was hers and is settled as D9; Q1..Q4, Q6..Q9,
-  Q11..Q13 are mine, and D8, D9, D10 are taken.
+- **One decision is Alexa's**: Q10, the licence (outward-facing). The E-34
+  question D10 raised is settled as D11 — the tailnet is approved as the
+  network layer, "no inbound" means no port opened on a router, and a runner
+  binds its fetch endpoint to the mesh interface only. Invariant 3 was
+  rewritten accordingly. Q5 (the warm caches) was hers and is settled as D9;
+  Q1..Q4, Q6..Q9, Q11..Q13 are mine, and D8..D11 are taken.
 - **Nothing is deployed and no runner exists.** First exposure over `wss://`
   is M16, on purpose: deploying earlier would freeze the public formats
   (the `ran on:` line, the status JSON, the event payloads) on a surface still

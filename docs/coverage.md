@@ -42,7 +42,7 @@ closes in M18.
 | E-31 | must | tmpfs reservation, wait | M8 | |
 | E-32 | must | host-wide bound, load recorded | M8 | p90 < 12 figure read after adoption (M18+) |
 | E-33 | must | owner switch in 10 s | M9 | desktop shortcut on the real PC in M17 |
-| E-34 | must | niced, no inbound, disk budget | M4 | Windows logon task in M17 |
+| E-34 | must | niced, no inbound, disk budget | M4 | D11: "no inbound" = no port on a router; a mesh-bound fetch endpoint is allowed. Windows logon task in M17 |
 | E-35 | must | machine-readable status | M13 | format versioned per Q7 |
 | E-36 | must | every decision explained | M7 | refusal figures completed in M8 |
 | E-37 | must | events routable to ntfy | M13 | |
