@@ -309,7 +309,7 @@ fn migration_is_possible(own: &Path, base: &Path) -> Result<(), String> {
          this runner's own cgroup ({}) and that base. Creating cgroups there is not \
          enough. Either run the runner inside the subtree it points at — a systemd \
          unit with Delegate=yes, or systemd-run --user --scope -p Delegate=yes — or \
-         grant this user write access to that file.",
+         grant this user write access to that file",
         base.display(),
         procs.display(),
         own.display()

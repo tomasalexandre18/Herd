@@ -949,11 +949,15 @@ impl RealRunner {
     }
 }
 
-/// A hub on a free port, with its serving task.
-async fn hub_on_a_free_port() -> (String, herd_hub::HubHandle, JoinHandle<()>) {
+/// A hub on a free port, with its serving task and the state root it keeps
+/// its records in (M2). The caller holds the directory: dropping it removes
+/// the records, so no test of confinement leaves a state root behind.
+async fn hub_on_a_free_port() -> (String, herd_hub::HubHandle, JoinHandle<()>, TempDir) {
+    let state = TempDir::new("hub-state");
     let hub = Hub::bind(
         "127.0.0.1:0".parse().expect("a literal loopback address"),
-        Arc::new(MemoryJobStore::new()) as Arc<dyn JobStore>,
+        Arc::new(JobDirStore::open(state.path()).expect("the state root opens"))
+            as Arc<dyn JobStore>,
     )
     .await
     .expect("the hub binds a free port");
@@ -962,7 +966,7 @@ async fn hub_on_a_free_port() -> (String, herd_hub::HubHandle, JoinHandle<()>) {
     let serving = tokio::spawn(async move {
         let _ = hub.serve().await;
     });
-    (hub_url, handle, serving)
+    (hub_url, handle, serving, state)
 }
 
 /// A runner asked to stop ends its jobs. Without this, `systemctl stop` or a
@@ -972,7 +976,7 @@ async fn hub_on_a_free_port() -> (String, herd_hub::HubHandle, JoinHandle<()>) {
 async fn a_runner_told_to_stop_ends_its_jobs_rather_than_orphaning_them() {
     let marker = "444442";
     let data_root = TempDir::new("sigterm");
-    let (hub_url, handle, serving) = hub_on_a_free_port().await;
+    let (hub_url, handle, serving, _hub_state) = hub_on_a_free_port().await;
     let mut runner = RealRunner::join(hub_url, handle, data_root.path()).await;
     let job = runner.submit(&format!(
         "setsid sleep {marker} >/dev/null 2>&1 & sleep 120"
@@ -1009,7 +1013,7 @@ async fn a_runner_told_to_stop_ends_its_jobs_rather_than_orphaning_them() {
 async fn a_restarted_runner_reclaims_what_a_killed_one_left() {
     let marker = "444443";
     let data_root = TempDir::new("sigkill");
-    let (hub_url, handle, serving) = hub_on_a_free_port().await;
+    let (hub_url, handle, serving, _hub_state) = hub_on_a_free_port().await;
     let first = RealRunner::join(hub_url.clone(), handle.clone(), data_root.path()).await;
     let job = first.submit(&format!(
         "setsid sleep {marker} >/dev/null 2>&1 & sleep 120"
