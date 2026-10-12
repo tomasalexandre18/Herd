@@ -24,6 +24,7 @@ pub mod confine;
 pub mod job;
 pub mod metrics;
 pub mod privilege;
+pub mod reclaim;
 pub mod root;
 pub mod size;
 #[doc(hidden)]
@@ -96,6 +97,16 @@ const REDIAL_ATTEMPTS: u32 = 120;
 /// dropped. The link is over by then; what matters is not waiting for the jobs
 /// that are still running, because their frames go to the next link.
 const FLUSH_GRACE: std::time::Duration = std::time::Duration::from_millis(500);
+
+/// How long a runner that has been asked to stop waits for the jobs it just
+/// ended to report, and for a hub that is still there to acknowledge them,
+/// before it writes what is left to its data root (see [`stop`]).
+///
+/// Well inside invariant 2's ≤ 5 s, and short on purpose: the point is not to
+/// get the result delivered, it is not to lose it. M3 owns the stop's real
+/// budget and the drain.
+const STOP_GRACE: std::time::Duration = std::time::Duration::from_millis(2_000);
+const STOP_POLL: std::time::Duration = std::time::Duration::from_millis(20);
 
 /// The hub said no. Terminal for this runner (D13), so it is never retried: a
 /// version mismatch or a refused runner does not become true by dialling
@@ -177,6 +188,67 @@ impl Session {
                  its result is held until a hub acknowledges it"
             );
         }
+    }
+
+    /// Write every result the hub has not acknowledged into the data root,
+    /// and say where each one went.
+    ///
+    /// Called when the runner is leaving and a held result would otherwise go
+    /// with it (see [`stop`]). What is written is the `job_finished` frame
+    /// itself, verbatim — the protocol is the contract (invariant 4), so the
+    /// file needs no shape of its own and M3 can replay it as it stands.
+    ///
+    /// Every line it returns is meant to be loud: this is a verdict that did
+    /// not reach the hub, and the one thing that must never happen to it is
+    /// for it to disappear quietly.
+    pub fn spool(&self, root: &root::DataRoot) -> Vec<String> {
+        let held = self.all();
+        if held.is_empty() {
+            return Vec::new();
+        }
+        let mut said = vec![format!(
+            "{} result(s) were never acknowledged by a hub; they are NOT lost, \
+             they are being written under {}",
+            held.len(),
+            root.held_results_dir().display()
+        )];
+        for result in held {
+            let frame = to_frame(&ToHub::JobFinished {
+                job_id: result.job_id.clone(),
+                outcome: result.outcome.clone(),
+                metrics: result.metrics.clone(),
+            });
+            // Whatever goes wrong, the outcome itself goes on stderr: a
+            // verdict in a log a human can read beats a verdict nowhere.
+            match (root.held_result_path(&result.job_id), frame) {
+                (Ok(path), Ok(frame)) => match std::fs::write(&path, frame.as_bytes())
+                    .and_then(|()| std::fs::File::open(&path).and_then(|file| file.sync_all()))
+                {
+                    Ok(()) => said.push(format!(
+                        "the result of {} is held in {} and has not reached a hub: {:?}",
+                        result.job_id,
+                        path.display(),
+                        result.outcome
+                    )),
+                    Err(error) => said.push(format!(
+                        "COULD NOT write the unacknowledged result of {} to {}: {error}. \
+                         It ended with {:?} and that is the only record of it",
+                        result.job_id,
+                        path.display(),
+                        result.outcome
+                    )),
+                },
+                (path, frame) => said.push(format!(
+                    "COULD NOT write the unacknowledged result of {} ({}{}). It ended \
+                     with {:?} and that is the only record of it",
+                    result.job_id,
+                    path.err().unwrap_or_default(),
+                    frame.err().map(|e| e.to_string()).unwrap_or_default(),
+                    result.outcome
+                )),
+            }
+        }
+        said
     }
 
     fn hold(&self, result: HeldResult) {
@@ -299,26 +371,45 @@ pub async fn run(config: Config) -> Result<()> {
     }
 
     let session = Session::new();
-    let mut failures = 0u32;
-    loop {
-        match serve_once(config.clone(), session.clone(), Arc::clone(&confined)).await {
-            // The hub closed the connection. Nothing says the runner is done,
-            // so it waits and joins the hub that comes back.
-            Ok(()) => failures = 0,
-            Err(error) if error.downcast_ref::<Refusal>().is_some() => return Err(error),
-            Err(error) => {
-                failures += 1;
-                eprintln!("herd-runner: the link to the hub ended: {error:#}");
-                if failures >= REDIAL_ATTEMPTS {
-                    return Err(error.context(format!(
-                        "giving up on {} after {REDIAL_ATTEMPTS} attempts",
-                        config.hub_url
-                    )));
+    // The stop is watched around the whole redial loop, not inside one
+    // connection: a runner asked to stop while there is no hub at all still
+    // has jobs to end and, possibly, a verdict nobody has taken yet.
+    let serving = async {
+        let mut failures = 0u32;
+        loop {
+            match serve_once(config.clone(), session.clone(), Arc::clone(&confined)).await {
+                // The hub closed the connection. Nothing says the runner is
+                // done, so it waits and joins the hub that comes back.
+                Ok(()) => failures = 0,
+                Err(error) if error.downcast_ref::<Refusal>().is_some() => return Err(error),
+                Err(error) => {
+                    failures += 1;
+                    eprintln!("herd-runner: the link to the hub ended: {error:#}");
+                    if failures >= REDIAL_ATTEMPTS {
+                        return Err(error.context(format!(
+                            "giving up on {} after {REDIAL_ATTEMPTS} attempts",
+                            config.hub_url
+                        )));
+                    }
                 }
             }
+            tokio::time::sleep(REDIAL_DELAY).await;
         }
-        tokio::time::sleep(REDIAL_DELAY).await;
+    };
+    let ended = tokio::select! {
+        ended = serving => ended,
+        signal = stop_requested() => {
+            stop(signal?, &session, &confined).await;
+            Ok(())
+        }
+    };
+    // Whichever way the runner is leaving, nothing it holds goes with it. A
+    // refusal and a run out of redials end the process just as a signal does,
+    // and a result that exists nowhere else is not allowed to end with it.
+    for line in session.spool(confined.root()) {
+        eprintln!("herd-runner: {line}");
     }
+    ended
 }
 
 /// Join the hub and serve it until this one connection ends.
@@ -374,6 +465,69 @@ pub async fn serve_once(config: Config, session: Session, confined: Arc<Confined
         writer.abort();
     }
     outcome
+}
+
+/// Wait for the signals that mean "stop": the one `systemctl stop` and docker
+/// send, and the one a terminal sends. `SIGKILL` cannot be waited for at all,
+/// which is why there is also a reaper at startup ([`reclaim`]).
+#[cfg(unix)]
+async fn stop_requested() -> Result<&'static str> {
+    use tokio::signal::unix::{signal, SignalKind};
+
+    let mut terminate = signal(SignalKind::terminate()).context("listening for SIGTERM")?;
+    let mut interrupt = signal(SignalKind::interrupt()).context("listening for SIGINT")?;
+    tokio::select! {
+        _ = terminate.recv() => Ok("SIGTERM"),
+        _ = interrupt.recv() => Ok("SIGINT"),
+    }
+}
+
+#[cfg(not(unix))]
+async fn stop_requested() -> Result<&'static str> {
+    std::future::pending().await
+}
+
+/// End the running jobs, then make sure no verdict leaves with the process.
+///
+/// Two promises meet here and they pull in opposite directions. M4 says a
+/// runner that is asked to stop ends its jobs: not doing so is how a `sleep`
+/// survives its runner, reparented to init, with its cgroup and its workspace
+/// left for nobody. M2 says a result is held until the hub acknowledges it,
+/// because a destroyed verdict is the one thing Herd never does (D19, E-44) —
+/// and the jobs this stop ends produce exactly such results, a second before
+/// the process goes away.
+///
+/// So the order is: end the jobs, give their ends a bounded moment to reach a
+/// hub that is still there and be acknowledged, and then write whatever is
+/// still held to the data root, one file per job, naming each path on stderr.
+/// A verdict on a disk is recoverable; a verdict in the memory of a process
+/// that has exited is not.
+///
+/// **What M3 owns.** The ≤ 5 s stop of invariant 2, refusing new jobs while
+/// draining, and *reading these files back* on the next start so the hub is
+/// told without a human in the loop. This is the minimum honest thing: the
+/// verdict survives and says where it is.
+async fn stop(signal: &'static str, session: &Session, confined: &Arc<Confined>) {
+    eprintln!(
+        "herd-runner: {signal} received, ending {} running job(s) before leaving",
+        confined.live().count()
+    );
+    for line in confined.live().end_all() {
+        eprintln!("herd-runner: {line}");
+    }
+    // The ended jobs are still reporting: each one's task has to notice its
+    // process is gone, measure, and hold its outcome. Bounded, and short,
+    // because invariant 2 is about leaving quickly.
+    let deadline = tokio::time::Instant::now() + STOP_GRACE;
+    while tokio::time::Instant::now() < deadline {
+        if confined.live().count() == 0 && session.holds_nothing() {
+            return;
+        }
+        tokio::time::sleep(STOP_POLL).await;
+    }
+    // Whatever is still held is written by [`run`], on the way out: one place
+    // for it, so that a refusal and a stop lose a verdict in exactly the same
+    // way — which is to say, not at all.
 }
 
 async fn serve_hub(session: &Session, source: &mut Source, confined: &Arc<Confined>) -> Result<()> {

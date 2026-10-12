@@ -10,7 +10,7 @@ herd-proto.workspace = true
 anyhow.workspace = true
 clap.workspace = true
 futures-util.workspace = true
-tokio = { workspace = true, features = ["rt-multi-thread", "macros", "net", "process", "sync", "time", "io-util"] }
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "net", "process", "signal", "sync", "time", "io-util"] }
 tokio-tungstenite.workspace = true
 
 [target.'cfg(unix)'.dependencies]

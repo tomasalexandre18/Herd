@@ -14,10 +14,20 @@
 //! names an absolute path outside the root: that needs a mount namespace, and
 //! until one exists the promise is "Herd writes nowhere else, and a job is
 //! given nowhere else to write", which is the promise the tests assert.
+//!
+//! ## The runner owns the workspace, and a job cannot blind it
+//!
+//! A job runs as the runner's own user, so it can `chmod 000` a directory it
+//! made. Two things must never follow from that: a measurement the runner
+//! takes as zero, and a tree the runner then fails to delete. So every walk
+//! here **restores the access the runner needs** before giving up — the
+//! directories are the runner's own — and a figure that still cannot be taken
+//! is returned as an error, never as a zero (D23).
 
 use std::fs;
 use std::io;
 use std::path::{Component, Path, PathBuf};
+use std::sync::Arc;
 
 use herd_proto::JobId;
 
@@ -27,11 +37,29 @@ const DEFAULT_DIR: &str = "herd-runner";
 /// The directory holding one subdirectory per job.
 const JOBS: &str = "jobs";
 
+/// The file one runner holds a lock on for as long as it owns the root.
+const LOCK: &str = ".herd-runner.lock";
+
+/// Where a result the hub never acknowledged is left when the runner stops.
+///
+/// Deliberately *not* under `jobs/`: the startup reaper clears `jobs/` of
+/// everything a previous life left ([`crate::reclaim`]), and a verdict has to
+/// survive exactly the restart that reaper runs in.
+const HELD: &str = "held-results";
+
 /// One validated data root. Holding this value is the proof that the
-/// directory exists, is a directory, and is writable by this runner.
+/// directory exists, is a directory, is writable by this runner, and that no
+/// other runner owns it.
+///
+/// The lock is held for the life of the process: the startup reaper reclaims
+/// everything left under `jobs/`, which is only safe because exactly one
+/// runner owns a root at a time.
 #[derive(Debug, Clone)]
 pub struct DataRoot {
     path: PathBuf,
+    /// Kept open and flocked. Dropping the last clone releases the lock,
+    /// which is also what a runner's death does for free.
+    _lock: Arc<fs::File>,
 }
 
 impl DataRoot {
@@ -108,12 +136,43 @@ impl DataRoot {
                 path.display()
             )
         })?;
-        Ok(Self { path })
+        let lock = lock_exclusively(&path.join(LOCK))?;
+        Ok(Self {
+            path,
+            _lock: Arc::new(lock),
+        })
     }
 
     /// The validated root itself.
     pub fn path(&self) -> &Path {
         &self.path
+    }
+
+    /// Where one directory per job lives. The startup reaper reads it.
+    pub fn jobs_dir(&self) -> PathBuf {
+        self.path.join(JOBS)
+    }
+
+    /// Where results the hub never acknowledged are left when this runner is
+    /// told to stop.
+    pub fn held_results_dir(&self) -> PathBuf {
+        self.path.join(HELD)
+    }
+
+    /// The file one unacknowledged result is written to, named for its job.
+    ///
+    /// The directory is created on the way, because this is called at the one
+    /// moment where failing to write would destroy a verdict.
+    pub fn held_result_path(&self, job_id: &JobId) -> Result<PathBuf, String> {
+        let name = directory_name(job_id)?;
+        let directory = self.held_results_dir();
+        fs::create_dir_all(&directory).map_err(|error| {
+            format!(
+                "the directory {} for unacknowledged results cannot be created: {error}",
+                directory.display()
+            )
+        })?;
+        self.resolve(Path::new(HELD).join(format!("{name}.json")))
     }
 
     /// Resolve a path that must stay inside the root, refusing anything that
@@ -156,7 +215,7 @@ impl DataRoot {
         // A leftover from a previous life of the same id would make the disk
         // budget and the measurements lie, so the workspace starts empty.
         if base.exists() {
-            fs::remove_dir_all(&base).map_err(|error| {
+            reclaim_directory(&base).map_err(|error| {
                 format!(
                     "the workspace {} is left over and cannot be cleared: {error}",
                     base.display()
@@ -214,37 +273,58 @@ impl Workspace {
         &self.tmp
     }
 
-    /// How many bytes the job has written and not deleted. Apparent sizes,
-    /// summed, following no symlink: the figure the disk budget is about is
-    /// what the job put there, not how the filesystem stores it.
-    pub fn size_bytes(&self) -> u64 {
-        directory_size(&self.base)
+    /// How many bytes the job has written and not deleted, or why the figure
+    /// could not be taken. Apparent sizes, summed, following no symlink: the
+    /// figure the disk budget is about is what the job put there, not how the
+    /// filesystem stores it.
+    ///
+    /// An error here is not a detail. The disk budget is enforced against
+    /// this number, so a workspace that cannot be measured is a budget that
+    /// cannot be enforced, and the job ends at the cap instead of being
+    /// called a success (D23's "absent rather than zero", applied to the one
+    /// figure a job can interfere with).
+    pub fn measure(&self) -> Result<u64, String> {
+        measure_tree(&self.base)
     }
 
-    /// Remove the workspace. A failure is reported to the caller rather than
-    /// swallowed: a workspace that will not go away is a disk filling up.
-    pub fn remove(&self) -> io::Result<()> {
-        match fs::remove_dir_all(&self.base) {
-            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
-            other => other,
-        }
+    /// Remove the workspace, restoring whatever access the job took away.
+    ///
+    /// The runner made this tree and owns every inode in it, so "permission
+    /// denied" is never the last word: the modes are put back and the removal
+    /// is tried again. A failure is still reported to the caller rather than
+    /// swallowed — a workspace that will not go away is a disk filling up,
+    /// which is the one thing invariant 2 forbids above all.
+    pub fn reclaim(&self) -> Result<(), String> {
+        reclaim_directory(&self.base)
     }
 }
 
-/// Sum the apparent size of every regular file under a directory.
-fn directory_size(path: &Path) -> u64 {
+/// Sum the apparent size of every regular file under a directory, restoring
+/// the access the walk needs, and refusing to call an unreadable tree empty.
+fn measure_tree(path: &Path) -> Result<u64, String> {
     let mut total = 0u64;
     let mut pending = vec![path.to_path_buf()];
     while let Some(directory) = pending.pop() {
-        let Ok(entries) = fs::read_dir(&directory) else {
-            continue;
+        let entries = match read_dir_restoring(&directory) {
+            Ok(Some(entries)) => entries,
+            // Gone while we walked: a job deleting its own files as it goes is
+            // ordinary, and what is no longer there holds no bytes.
+            Ok(None) => continue,
+            Err(error) => return Err(error),
         };
-        for entry in entries.flatten() {
+        for entry in entries {
             // DirEntry::metadata does not follow symlinks, so a link to a
             // huge file outside the root counts as the link it is, and a
             // link loop cannot be walked.
-            let Ok(metadata) = entry.metadata() else {
-                continue;
+            let metadata = match entry.metadata() {
+                Ok(metadata) => metadata,
+                Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+                Err(error) => {
+                    return Err(format!(
+                        "{} cannot be measured: {error}",
+                        entry.path().display()
+                    ))
+                }
             };
             if metadata.is_dir() {
                 pending.push(entry.path());
@@ -253,7 +333,155 @@ fn directory_size(path: &Path) -> u64 {
             }
         }
     }
-    total
+    Ok(total)
+}
+
+/// Read a directory the runner owns, putting back the access a job removed.
+///
+/// `Ok(None)` means the directory is gone, which is not a failure to measure.
+fn read_dir_restoring(directory: &Path) -> Result<Option<Vec<fs::DirEntry>>, String> {
+    match collect_dir(directory) {
+        Ok(entries) => return Ok(Some(entries)),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(_) => {}
+    }
+    // The runner created this directory, so it can always take its own access
+    // back. A job that chmods its way out of being measured gets measured.
+    restore_access(directory);
+    match collect_dir(directory) {
+        Ok(entries) => Ok(Some(entries)),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(format!(
+            "{} cannot be read even after its mode was restored: {error}",
+            directory.display()
+        )),
+    }
+}
+
+fn collect_dir(directory: &Path) -> io::Result<Vec<fs::DirEntry>> {
+    let mut entries = Vec::new();
+    for entry in fs::read_dir(directory)? {
+        entries.push(entry?);
+    }
+    Ok(entries)
+}
+
+/// Remove a directory the runner owns, whatever a job did to its modes.
+pub(crate) fn reclaim_directory(base: &Path) -> Result<(), String> {
+    let mut last = match remove_tree(base) {
+        Ok(()) => return Ok(()),
+        Err(error) => error,
+    };
+    // Two passes, because restoring the modes top-down can only reach what it
+    // can already open: the first pass opens the way for the second.
+    for _ in 0..2 {
+        restore_tree(base);
+        match remove_tree(base) {
+            Ok(()) => return Ok(()),
+            Err(error) => last = error,
+        }
+    }
+    Err(format!(
+        "{} could not be removed even after its modes were restored: {last}",
+        base.display()
+    ))
+}
+
+fn remove_tree(base: &Path) -> io::Result<()> {
+    match fs::remove_dir_all(base) {
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+        other => other,
+    }
+}
+
+/// Put back, on every directory under `base`, the access the runner needs to
+/// walk it and to unlink what is in it. Best effort and top-down: a directory
+/// has to be opened before its children can be reached.
+fn restore_tree(base: &Path) {
+    let mut pending = vec![base.to_path_buf()];
+    while let Some(directory) = pending.pop() {
+        restore_access(&directory);
+        let Ok(entries) = fs::read_dir(&directory) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            // Directories only, by lstat: a file needs no mode of its own to
+            // be unlinked, and a symlink's target is none of our business.
+            if entry.metadata().map(|data| data.is_dir()).unwrap_or(false) {
+                pending.push(entry.path());
+            }
+        }
+    }
+}
+
+/// Give the runner read, write and search on one directory it owns.
+#[cfg(unix)]
+fn restore_access(directory: &Path) {
+    use std::os::unix::fs::PermissionsExt;
+
+    let Ok(metadata) = fs::symlink_metadata(directory) else {
+        return;
+    };
+    if !metadata.is_dir() {
+        return;
+    }
+    let mode = metadata.permissions().mode();
+    let _ = fs::set_permissions(directory, fs::Permissions::from_mode(mode | 0o700));
+}
+
+#[cfg(not(unix))]
+fn restore_access(_directory: &Path) {}
+
+/// Take the root's lock, or refuse naming the runner that holds it.
+///
+/// One runner per data root, for the same reason as one hub per state root
+/// (D21): the startup reaper reclaims everything left under `jobs/`, and
+/// "left" can only mean "left by a runner that is gone" if no second runner
+/// is using the same directory. The lock dies with the process, so a runner
+/// that was killed leaves the root free.
+#[cfg(unix)]
+fn lock_exclusively(path: &Path) -> Result<fs::File, String> {
+    use std::io::Write;
+    use std::os::fd::AsRawFd;
+
+    let mut file = fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(path)
+        .map_err(|error| format!("the lock file {} cannot be opened: {error}", path.display()))?;
+    // Safe: flock on an open descriptor, with no allocation involved.
+    let locked = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0;
+    if !locked {
+        let holder = fs::read_to_string(path).unwrap_or_default();
+        let holder = holder.trim();
+        let holder = if holder.is_empty() {
+            "another runner".to_owned()
+        } else {
+            format!("the runner with pid {holder}")
+        };
+        return Err(format!(
+            "the data root {} is already owned by {holder}: one runner per data \
+             root, so that a restarted runner can reclaim what a dead one left \
+             behind. Give this runner its own --data-root.",
+            path.parent().unwrap_or(path).display()
+        ));
+    }
+    let _ = file.set_len(0);
+    let _ = write!(file, "{}", std::process::id());
+    let _ = file.flush();
+    Ok(file)
+}
+
+#[cfg(not(unix))]
+fn lock_exclusively(path: &Path) -> Result<fs::File, String> {
+    fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(path)
+        .map_err(|error| format!("the lock file {} cannot be opened: {error}", path.display()))
 }
 
 /// A job's id as one directory name.
@@ -395,17 +623,108 @@ mod tests {
             assert!(directory.is_dir(), "{}", directory.display());
             assert!(directory.starts_with(root.path()));
         }
-        assert_eq!(workspace.size_bytes(), 0, "a fresh workspace is empty");
+        assert_eq!(workspace.measure(), Ok(0), "a fresh workspace is empty");
 
         fs::write(workspace.work_dir().join("output"), vec![0u8; 5_000]).expect("the job writes");
-        assert!(workspace.size_bytes() >= 5_000);
+        assert!(workspace.measure().expect("measurable") >= 5_000);
 
         // A second workspace for the same id starts empty again.
         let again = root.open_workspace(&job).expect("made again");
-        assert_eq!(again.size_bytes(), 0);
+        assert_eq!(again.measure(), Ok(0));
 
-        again.remove().expect("removed");
+        again.reclaim().expect("reclaimed");
         assert!(!again.base_dir().exists());
-        again.remove().expect("removing twice is not a failure");
+        again.reclaim().expect("reclaiming twice is not a failure");
+    }
+
+    /// Defect 1 of the M4 review, as a unit: a job that hides what it wrote
+    /// behind a directory the runner cannot enter is measured anyway, and a
+    /// tree that truly cannot be read is an error rather than a zero.
+    #[test]
+    #[cfg(unix)]
+    fn a_directory_a_job_made_unreadable_is_still_measured() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = TempDir::new("blinded");
+        let root = DataRoot::open(temp.path()).expect("usable");
+        let workspace = root.open_workspace(&JobId::new("blinded")).expect("made");
+        let hidden = workspace.work_dir().join("hidden");
+        fs::create_dir(&hidden).expect("the job makes a directory");
+        fs::write(hidden.join("big"), vec![7u8; 300_000]).expect("the job writes in it");
+        // Write and search but no read: `read_dir` fails with EACCES, which is
+        // exactly what used to be counted as zero bytes.
+        fs::set_permissions(&hidden, fs::Permissions::from_mode(0o300)).expect("chmod");
+
+        let measured = workspace
+            .measure()
+            .expect("the runner owns the directory, so it can take its access back");
+        assert!(
+            measured >= 300_000,
+            "the hidden file was not counted: {measured} bytes"
+        );
+        // And the mode the walk restored does not stop the removal either.
+        fs::set_permissions(&hidden, fs::Permissions::from_mode(0o000)).expect("chmod");
+        workspace
+            .reclaim()
+            .expect("an owned tree is always reclaimable");
+        assert!(!workspace.base_dir().exists());
+    }
+
+    /// Defect 2: the modes a job leaves behind never keep a workspace alive.
+    #[test]
+    #[cfg(unix)]
+    fn a_workspace_a_job_locked_shut_is_still_reclaimed() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = TempDir::new("locked-shut");
+        let root = DataRoot::open(temp.path()).expect("usable");
+        let workspace = root.open_workspace(&JobId::new("locked")).expect("made");
+        let deep = workspace.work_dir().join("d");
+        fs::create_dir(&deep).expect("the job makes a directory");
+        fs::write(deep.join("f"), b"payload").expect("the job writes");
+        fs::set_permissions(&deep, fs::Permissions::from_mode(0o000)).expect("chmod 000 d");
+        fs::set_permissions(workspace.work_dir(), fs::Permissions::from_mode(0o500))
+            .expect("chmod 500 .");
+
+        workspace
+            .reclaim()
+            .expect("the runner owns the workspace unconditionally");
+        assert!(
+            !workspace.base_dir().exists(),
+            "{} survived",
+            workspace.base_dir().display()
+        );
+    }
+
+    /// A measurement is taken, or it is an error. It is never a zero that
+    /// means "could not look" (D23).
+    #[test]
+    fn a_tree_that_cannot_be_read_is_an_error_not_a_zero() {
+        let temp = TempDir::new("unmeasurable");
+        let file = temp.path().join("i-am-a-file");
+        fs::write(&file, b"x").expect("the fixture writes");
+        // A file where a directory is expected: read_dir fails with ENOTDIR,
+        // which no chmod can fix, so the figure must be absent.
+        let error = measure_tree(&file).expect_err("a file is not a tree to walk");
+        assert!(error.contains(&file.display().to_string()), "{error}");
+        // A path that is simply not there holds nothing, which is a real zero.
+        assert_eq!(measure_tree(&temp.path().join("never-made")), Ok(0));
+    }
+
+    /// One runner per data root, so that the startup reaper can tell what a
+    /// dead runner left from what a live one is using.
+    #[test]
+    fn a_second_runner_is_refused_the_same_data_root_naming_the_holder() {
+        let temp = TempDir::new("one-owner");
+        let first = DataRoot::open(temp.path()).expect("the first runner owns it");
+        let error = DataRoot::open(temp.path()).expect_err("the second is refused");
+        assert!(
+            error.contains(&std::process::id().to_string()),
+            "the refusal must name the holder: {error}"
+        );
+        assert!(error.contains("--data-root"), "{error}");
+        drop(first);
+        // The lock dies with its holder, so the root is free again.
+        DataRoot::open(temp.path()).expect("a released root is usable again");
     }
 }

@@ -31,13 +31,11 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
+use crate::reclaim::{remove_cgroup, JobTag};
+
 /// Counts delegation probes, so that two runners preparing at the same moment
 /// cannot collide on one probe directory.
 static PROBES: AtomicU64 = AtomicU64::new(0);
-
-/// Counts job cgroups, so that no two job cgroups in this process can ever
-/// have the same name.
-static JOBS: AtomicU64 = AtomicU64::new(0);
 
 /// Where cgroup v2 is mounted on every system that has it.
 const MOUNT_POINT: &str = "/sys/fs/cgroup";
@@ -88,20 +86,30 @@ impl Ceiling {
         }
     }
 
+    /// The prepared base, where there is one. The startup reaper reads it to
+    /// find the job cgroups a dead runner left under it.
+    pub fn base(&self) -> Option<&Path> {
+        match self {
+            Ceiling::Cgroups { base, .. } => Some(base),
+            Ceiling::Rlimit { .. } => None,
+        }
+    }
+
     /// Make this job's cgroup, or `None` on a host that fell back.
-    pub fn open_for_job(&self, name: &str) -> Option<JobCgroup> {
+    pub fn open_for_job(&self, tag: &JobTag) -> Option<JobCgroup> {
         let Ceiling::Cgroups { base, memory_max } = self else {
             return None;
         };
-        match JobCgroup::create(base, name, *memory_max) {
+        match JobCgroup::create(base, tag, *memory_max) {
             Ok(cgroup) => Some(cgroup),
             Err(error) => {
                 // Detection succeeded and creation failed, which means the
                 // subtree changed under us. Say so; the job then runs under
                 // the rlimit fallback rather than uncapped.
                 eprintln!(
-                    "herd-runner: the cgroup for job {name} could not be made under {}: \
+                    "herd-runner: the cgroup for job {} could not be made under {}: \
                      {error}; this job falls back to an address-space limit",
+                    tag.as_str(),
                     base.display()
                 );
                 None
@@ -118,19 +126,15 @@ pub struct JobCgroup {
 }
 
 impl JobCgroup {
-    fn create(base: &Path, name: &str, memory_max: u64) -> io::Result<Self> {
-        // The job's id is in the name for a human reading `/sys/fs/cgroup`,
-        // but what makes the name unique is the process and the counter. Two
-        // runners may share a base — two runners on one machine pointed at
-        // the same `--cgroup-root`, or a test suite running several in one
-        // process — and ids are only unique per hub. A name that collided
-        // would mean one job's cgroup kill reaching another job's processes,
-        // which is exactly the thing E-30 promises cannot happen.
-        let dir = base.join(format!(
-            "herd-job-{}-{}-{name}",
-            std::process::id(),
-            JOBS.fetch_add(1, Ordering::SeqCst)
-        ));
+    fn create(base: &Path, tag: &JobTag, memory_max: u64) -> io::Result<Self> {
+        // The job's id is in the tag for a human reading `/sys/fs/cgroup`, but
+        // what makes it unique is the runner's pid and a counter. Two runners
+        // may share a base — two runners on one machine pointed at the same
+        // `--cgroup-root`, or a test suite running several in one process —
+        // and ids are only unique per hub. A name that collided would mean one
+        // job's cgroup kill reaching another job's processes, which is exactly
+        // the thing E-30 promises cannot happen.
+        let dir = base.join(tag.as_str());
         // Unique, so this cannot be a leftover: if it exists, something is
         // wrong enough that the job should fall back rather than inherit
         // somebody else's oom counter.
@@ -185,21 +189,17 @@ impl JobCgroup {
     }
 }
 
-impl Drop for JobCgroup {
-    fn drop(&mut self) {
-        kill_and_remove(&self.dir);
+impl JobCgroup {
+    /// Where this cgroup lives, so that a runner being stopped can kill it
+    /// without holding the guard.
+    pub fn dir(&self) -> &Path {
+        &self.dir
     }
 }
 
-fn kill_and_remove(dir: &Path) {
-    let _ = fs::write(dir.join("cgroup.kill"), "1");
-    // rmdir refuses a cgroup that still has members, and the kill above is
-    // asynchronous, so a few tries beat one.
-    for _ in 0..50 {
-        if fs::remove_dir(dir).is_ok() || !dir.exists() {
-            return;
-        }
-        std::thread::sleep(std::time::Duration::from_millis(10));
+impl Drop for JobCgroup {
+    fn drop(&mut self) {
+        remove_cgroup(&self.dir);
     }
 }
 
@@ -247,16 +247,102 @@ fn prepare_base(explicit: Option<&Path>) -> Result<PathBuf, String> {
     fs::create_dir(&probe).map_err(|error| {
         format!(
             "cgroup v2 delegation is unavailable: this runner cannot create a cgroup \
-             under {} ({error}). Run it as a systemd unit with Delegate=yes, or point \
-             --cgroup-root at a delegated subtree.",
+             under {} ({error}). Run it as a systemd unit with Delegate=yes, or inside \
+             a delegated scope, and point --cgroup-root inside that subtree.",
             base.display()
         )
     })?;
     let _ = fs::remove_dir(&probe);
 
-    // The runner's own processes move out of the base, so that `memory` can
-    // be enabled for the base's children (cgroup v2 forbids a cgroup from
-    // holding both processes and controller-enabled children).
+    // Creating a cgroup is not the same right as putting a process in one.
+    // cgroup v2 requires write access to `cgroup.procs` of the **common
+    // ancestor** of the process's current cgroup and its destination, so a
+    // runner standing outside the subtree it was pointed at can make job
+    // cgroups it could never move a job into. That has to be a refusal here,
+    // naming what the operator must grant, rather than a job that fails.
+    let own = own_cgroup()?;
+    migration_is_possible(&own, &base)?;
+
+    // Where the runner's own processes sit in the base, they move out of it,
+    // so that `memory` can be enabled for the base's children (cgroup v2
+    // forbids a cgroup from holding both processes and controller-enabled
+    // children). Where the runner is elsewhere there is nothing to move, and
+    // no leaf is made: a cgroup created for nothing is a cgroup left behind.
+    let leaf = if own == base {
+        Some(enter_leaf(&base)?)
+    } else {
+        None
+    };
+
+    if !memory_is_enabled_for_children(&base) {
+        if let Err(error) = fs::write(base.join("cgroup.subtree_control"), "+memory") {
+            // Undo the move: a runner that falls back must leave the host as
+            // it found it, including the leaf it was about to stand in.
+            if let Some(leaf) = &leaf {
+                let _ = fs::write(base.join("cgroup.procs"), "0");
+                let _ = fs::remove_dir(leaf);
+            }
+            return Err(format!(
+                "the memory controller cannot be enabled for the children of {}: \
+                 {error}. Either this runner may not write {}/cgroup.subtree_control, \
+                 or something other than this runner still has processes directly in \
+                 that cgroup.",
+                base.display(),
+                base.display()
+            ));
+        }
+    }
+    Ok(base)
+}
+
+/// Whether this runner could move a process from `own` into a child of `base`,
+/// which needs write access to the common ancestor's `cgroup.procs`.
+fn migration_is_possible(own: &Path, base: &Path) -> Result<(), String> {
+    let ancestor = common_ancestor(own, base);
+    let procs = ancestor.join("cgroup.procs");
+    if crate::privilege::writable_by_this_user(&procs) {
+        return Ok(());
+    }
+    Err(format!(
+        "this runner cannot move a job's process into a cgroup under {}: cgroup v2 \
+         requires write access to {}, the cgroup.procs of the common ancestor of \
+         this runner's own cgroup ({}) and that base. Creating cgroups there is not \
+         enough. Either run the runner inside the subtree it points at — a systemd \
+         unit with Delegate=yes, or systemd-run --user --scope -p Delegate=yes — or \
+         grant this user write access to that file.",
+        base.display(),
+        procs.display(),
+        own.display()
+    ))
+}
+
+/// The deepest directory that is an ancestor of both paths, or the mount point.
+fn common_ancestor(one: &Path, other: &Path) -> PathBuf {
+    let mut shared = PathBuf::new();
+    let mut theirs = other.components();
+    for component in one.components() {
+        match theirs.next() {
+            Some(same) if same == component => shared.push(component),
+            _ => break,
+        }
+    }
+    if shared.as_os_str().is_empty() {
+        PathBuf::from(MOUNT_POINT)
+    } else {
+        shared
+    }
+}
+
+/// Whether the base already hands the memory controller to its children, in
+/// which case the runner needs no write to `cgroup.subtree_control` at all.
+fn memory_is_enabled_for_children(base: &Path) -> bool {
+    fs::read_to_string(base.join("cgroup.subtree_control"))
+        .map(|text| text.split_whitespace().any(|name| name == "memory"))
+        .unwrap_or(false)
+}
+
+/// Move this runner's processes into a leaf of the base, and say where.
+fn enter_leaf(base: &Path) -> Result<PathBuf, String> {
     let leaf = base.join(RUNNER_LEAF);
     match fs::create_dir(&leaf) {
         Ok(()) => {}
@@ -272,22 +358,15 @@ fn prepare_base(explicit: Option<&Path>) -> Result<PathBuf, String> {
         }
     }
     // "0" means "the process writing this", which is the only form that does
-    // not need write access to the ancestor of someone else's cgroup.
+    // not need write access over anybody else's processes.
     fs::write(leaf.join("cgroup.procs"), "0").map_err(|error| {
+        let _ = fs::remove_dir(&leaf);
         format!(
             "this runner cannot move itself into {}: {error}",
             leaf.display()
         )
     })?;
-    fs::write(base.join("cgroup.subtree_control"), "+memory").map_err(|error| {
-        format!(
-            "the memory controller cannot be enabled for the children of {}: {error}. \
-             Something other than this runner still has processes directly in that \
-             cgroup.",
-            base.display()
-        )
-    })?;
-    Ok(base)
+    Ok(leaf)
 }
 
 /// This process's own cgroup, as a path under the cgroup v2 mount point.
@@ -362,7 +441,49 @@ mod tests {
             .fallback_reason()
             .expect("a missing cgroup cannot enforce a ceiling");
         assert!(why.contains("herd-no-such-cgroup-m4"), "{why}");
-        assert!(ceiling.open_for_job("j1").is_none());
+        assert!(ceiling.base().is_none());
+        assert!(ceiling
+            .open_for_job(&JobTag::mint(&herd_proto::JobId::new("j1")))
+            .is_none());
+    }
+
+    /// Defect 6 of the M4 review: creating a cgroup under a delegated subtree
+    /// is not the same right as moving a process into one. The refusal has to
+    /// name the file the operator must grant, and the runner must not have
+    /// relocated itself on the way to finding out.
+    #[test]
+    fn a_base_this_runner_stands_outside_of_is_refused_naming_the_file() {
+        let own = Path::new("/sys/fs/cgroup/user.slice/some-other-session.scope");
+        let base = Path::new("/sys/fs/cgroup/user.slice/a-delegated.scope");
+        let error = migration_is_possible(own, base)
+            .expect_err("no unprivileged user may write /sys/fs/cgroup/user.slice/cgroup.procs");
+        assert!(
+            error.contains("/sys/fs/cgroup/user.slice/cgroup.procs"),
+            "the refusal must name the common ancestor's cgroup.procs: {error}"
+        );
+        assert!(
+            error.contains("Delegate=yes"),
+            "the refusal must name what to grant: {error}"
+        );
+        // Its own cgroup is always a possible destination's ancestor.
+        assert_eq!(
+            common_ancestor(own, base),
+            Path::new("/sys/fs/cgroup/user.slice")
+        );
+        assert_eq!(common_ancestor(own, own), own);
+    }
+
+    /// A prepare that ends in a fallback leaves nothing behind — in
+    /// particular not the leaf the runner would have stood in.
+    #[test]
+    fn a_fallback_leaves_no_leaf_cgroup_behind() {
+        let ceiling = Ceiling::detect(1 << 20, Some(Path::new(MOUNT_POINT)));
+        if ceiling.fallback_reason().is_some() {
+            assert!(
+                !Path::new(MOUNT_POINT).join(RUNNER_LEAF).exists(),
+                "a runner that fell back left {RUNNER_LEAF} in the cgroup root"
+            );
+        }
     }
 
     #[test]
