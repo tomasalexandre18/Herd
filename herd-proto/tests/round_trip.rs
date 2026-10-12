@@ -55,6 +55,9 @@ fn every_message_to_the_hub_round_trips() {
         command: vec!["sh".to_owned(), "-c".to_owned(), "echo hi".to_owned()],
     });
     round_trip_to_hub(ToHub::SubmitJob { command: vec![] });
+    round_trip_to_hub(ToHub::WaitForJob {
+        job_id: JobId::new("j0000000001"),
+    });
     round_trip_to_hub(ToHub::JobStarted {
         job_id: JobId::new("j1"),
     });
@@ -90,6 +93,9 @@ fn every_message_from_the_hub_round_trips() {
         reason: herd_proto::version_mismatch_reason(PROTOCOL_VERSION + 1),
     });
     round_trip_from_hub(FromHub::JobAccepted {
+        job_id: JobId::new("j1"),
+    });
+    round_trip_from_hub(FromHub::JobResultAck {
         job_id: JobId::new("j1"),
     });
     round_trip_from_hub(FromHub::AssignJob {
@@ -165,4 +171,26 @@ fn an_unknown_message_type_is_a_decode_error_not_a_panic() {
     let err = from_frame::<ToHub>(r#"{"type":"deploy_to_production"}"#)
         .expect_err("unknown types must be rejected");
     assert!(err.to_string().contains("deploy_to_production"), "{err}");
+}
+
+/// The two frames M2 added, pinned on the wire. The acknowledgement is what a
+/// runner waits for before forgetting a result (E-44), and the wait is what
+/// makes a submission detachable (E-03); both are read by the other side from
+/// their tag alone.
+#[test]
+fn the_durability_frames_are_tagged_json_objects() {
+    assert_eq!(
+        to_frame(&ToHub::WaitForJob {
+            job_id: JobId::new("j0000000042")
+        })
+        .expect("encodes"),
+        r#"{"type":"wait_for_job","job_id":"j0000000042"}"#
+    );
+    assert_eq!(
+        to_frame(&FromHub::JobResultAck {
+            job_id: JobId::new("j0000000042")
+        })
+        .expect("encodes"),
+        r#"{"type":"job_result_ack","job_id":"j0000000042"}"#
+    );
 }

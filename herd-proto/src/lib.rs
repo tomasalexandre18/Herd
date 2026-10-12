@@ -103,6 +103,15 @@ pub enum ToHub {
     },
     /// Requester asks for work to be done.
     SubmitJob { command: Vec<String> },
+    /// Requester asks to be told how a job that already exists ends.
+    ///
+    /// This is what makes a submission detachable: `herdctl submit` leaves
+    /// with the id and nothing else, and a later `herdctl wait <id>` — or
+    /// another machine, or the same script an hour afterwards — attaches to the
+    /// job by its id alone. A job that is already over is answered at once
+    /// from the hub's record, which is why the hub's state has to be durable
+    /// for this message to mean anything.
+    WaitForJob { job_id: JobId },
     /// Runner reports that it has spawned the job's process.
     JobStarted { job_id: JobId },
     /// Runner reports output. `seq` counts chunks per job, across both
@@ -141,6 +150,16 @@ pub enum FromHub {
     },
     /// How the job ended, relayed to the requester that submitted it.
     JobFinished { job_id: JobId, outcome: JobOutcome },
+    /// The hub has the job's outcome on its disk, and the runner may forget it.
+    ///
+    /// A result is the one thing a runner cannot simply resend from its
+    /// memory of the world: the process is gone, so if the result is lost the
+    /// work is lost. A runner therefore holds a finished job's outcome until
+    /// this frame arrives and redelivers it otherwise (E-44). The hub sends it
+    /// only after the record is written and fsynced, never before: an
+    /// acknowledgement of something still in memory would be a lie the next
+    /// power cut collects on.
+    JobResultAck { job_id: JobId },
 }
 
 /// The wording of a version refusal, so that every peer reads one sentence and
