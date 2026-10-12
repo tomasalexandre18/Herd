@@ -29,6 +29,15 @@
 use std::fs::{self, File, OpenOptions};
 use std::io;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
+
+/// Counts delegation probes, so that two runners preparing at the same moment
+/// cannot collide on one probe directory.
+static PROBES: AtomicU64 = AtomicU64::new(0);
+
+/// Counts job cgroups, so that no two job cgroups in this process can ever
+/// have the same name.
+static JOBS: AtomicU64 = AtomicU64::new(0);
 
 /// Where cgroup v2 is mounted on every system that has it.
 const MOUNT_POINT: &str = "/sys/fs/cgroup";
@@ -110,12 +119,21 @@ pub struct JobCgroup {
 
 impl JobCgroup {
     fn create(base: &Path, name: &str, memory_max: u64) -> io::Result<Self> {
-        let dir = base.join(format!("herd-job-{name}"));
-        // A leftover from a previous life of the same name would carry its
-        // own oom counter, which would then be read as this job's.
-        if dir.exists() {
-            kill_and_remove(&dir);
-        }
+        // The job's id is in the name for a human reading `/sys/fs/cgroup`,
+        // but what makes the name unique is the process and the counter. Two
+        // runners may share a base — two runners on one machine pointed at
+        // the same `--cgroup-root`, or a test suite running several in one
+        // process — and ids are only unique per hub. A name that collided
+        // would mean one job's cgroup kill reaching another job's processes,
+        // which is exactly the thing E-30 promises cannot happen.
+        let dir = base.join(format!(
+            "herd-job-{}-{}-{name}",
+            std::process::id(),
+            JOBS.fetch_add(1, Ordering::SeqCst)
+        ));
+        // Unique, so this cannot be a leftover: if it exists, something is
+        // wrong enough that the job should fall back rather than inherit
+        // somebody else's oom counter.
         fs::create_dir(&dir)?;
         let cgroup = Self { dir };
         // memory.max before anything is in the cgroup: a process must never
@@ -218,9 +236,14 @@ fn prepare_base(explicit: Option<&Path>) -> Result<PathBuf, String> {
         ));
     }
     // Delegation, tested by doing it: a probe directory is the only honest
-    // answer to "may this runner create cgroups here".
-    let probe = base.join("herd-delegation-probe");
-    let _ = fs::remove_dir(&probe);
+    // answer to "may this runner create cgroups here". The name is unique per
+    // attempt, so two runners preparing at once never read each other's probe
+    // as a refusal.
+    let probe = base.join(format!(
+        "herd-delegation-probe-{}-{}",
+        std::process::id(),
+        PROBES.fetch_add(1, Ordering::SeqCst)
+    ));
     fs::create_dir(&probe).map_err(|error| {
         format!(
             "cgroup v2 delegation is unavailable: this runner cannot create a cgroup \
@@ -235,13 +258,18 @@ fn prepare_base(explicit: Option<&Path>) -> Result<PathBuf, String> {
     // be enabled for the base's children (cgroup v2 forbids a cgroup from
     // holding both processes and controller-enabled children).
     let leaf = base.join(RUNNER_LEAF);
-    if !leaf.is_dir() {
-        fs::create_dir(&leaf).map_err(|error| {
-            format!(
+    match fs::create_dir(&leaf) {
+        Ok(()) => {}
+        // Already there, from an earlier prepare in this process or from
+        // another runner sharing the base. Either is fine: the leaf is a
+        // place to stand, not a claim.
+        Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
+        Err(error) => {
+            return Err(format!(
                 "this runner cannot make its own leaf cgroup {}: {error}",
                 leaf.display()
-            )
-        })?;
+            ))
+        }
     }
     // "0" means "the process writing this", which is the only form that does
     // not need write access to the ancestor of someone else's cgroup.
@@ -280,7 +308,18 @@ fn own_cgroup() -> Result<PathBuf, String> {
         .trim()
         .trim_start_matches('/')
         .to_owned();
-    Ok(Path::new(MOUNT_POINT).join(relative))
+    let own = Path::new(MOUNT_POINT).join(relative);
+    // A runner that has already prepared once is sitting in its own leaf, and
+    // the base it must keep using is that leaf's parent. Without this,
+    // preparing twice in one process — which a test suite does, and which a
+    // reconnecting runner would do in M3 — would nest a leaf inside a leaf
+    // and read the result as "no delegation".
+    if own.file_name().is_some_and(|name| name == RUNNER_LEAF) {
+        if let Some(parent) = own.parent() {
+            return Ok(parent.to_path_buf());
+        }
+    }
+    Ok(own)
 }
 
 fn read_number(path: &Path) -> Option<u64> {

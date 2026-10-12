@@ -275,10 +275,19 @@ impl ChildSetup {
         //    guest on someone's machine. Lowering one's own IO priority to
         //    the idle class needs no privilege.
         if self.nice != 0 {
-            // nice() returning -1 is ambiguous with a legitimate -1 priority,
-            // so errno is cleared first.
+            // The configured value is the niceness the job ends up with, not
+            // an increment: a runner that is itself niced must not multiply
+            // it. And it is a floor, never a ceiling — an unprivileged
+            // process cannot lower its niceness, and a runner started niced
+            // beyond this is a choice of its owner to respect.
             *libc::__errno_location() = 0;
-            if libc::nice(self.nice) == -1 && *libc::__errno_location() != 0 {
+            let current = libc::getpriority(libc::PRIO_PROCESS, 0);
+            let current = if *libc::__errno_location() == 0 {
+                current
+            } else {
+                0
+            };
+            if self.nice > current && libc::setpriority(libc::PRIO_PROCESS, 0, self.nice) == -1 {
                 return Err(std::io::Error::last_os_error());
             }
             // IOPRIO_WHO_PROCESS = 1, and a priority is (class << 13) | data,
