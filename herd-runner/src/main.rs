@@ -97,6 +97,12 @@ struct Args {
     /// be held alongside, and an optional external busy probe — a lock-file
     /// path or a command whose exit code means busy (E-24, E-26).
     ///
+    /// Read strictly: an unknown key, or a key written twice, refuses this
+    /// runner's startup naming the key and the capability. A `probe` where
+    /// `busy_probe` was meant, or a second `busy_probe` overwriting the
+    /// first, would otherwise offer a capability something outside Herd is
+    /// holding (E-26).
+    ///
     /// Data, not code: there is no plugin here and never will be (invariant
     /// 1). Secrets stay out of the repo by this being a path given at
     /// startup (invariant 7).
