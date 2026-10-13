@@ -2638,6 +2638,25 @@ unpinned. The unit test above failed in six of six `./scripts/test.sh` runs
 pinned to two cores on unmodified `main` — and in none of five runs of its
 own target alone, which is why nobody had seen it — and passes there now.
 
+**The one left alone, and why.** `capabilities.rs`'s
+`a_label_no_runner_offers_leaves_the_job_queued` failed once in three runs
+last round and is not touched here, because it did not reproduce: twenty runs
+of that file on two pinned cores under the same load, and three whole suite
+runs pinned, all green. What was found instead is a mechanism that fits the
+symptom exactly, and it is arithmetic rather than a guess. That test kills its
+runner and starts a replacement under the **same name** with a different
+instance id. While the hub still holds the dead connection — it has to notice
+the close first, and that is a race a loaded host loses — the replacement is a
+twin, and a twin is told to **stand by for `lost_after / 2`, which is 30 s**;
+`reports_seen > 0` gates the escape hatch, and at that harness's default
+cadence of 15 s the dead runner had sent none. The file's own patience is
+**30 s**. The two figures are equal, so the test fails the moment the race is
+lost. Proved out of band, by freezing a joined runner with `SIGSTOP` and
+dialling a second under its name: `the hub asked this runner to stand by for
+30s`. The answer is therefore not a bigger patience — it is for the test to
+wait until the hub has let go of the old connection, or for that harness to
+pass a short `--lost-after`. Named here, and left to whoever owns that file.
+
 **What is not proved.** `until_the_state_root_is_quiet` — for the dry run that
 has no single file to watch — is two identical readings 200 ms apart, which is
 a heuristic and is written down as one. The `events.jsonl` line of a
