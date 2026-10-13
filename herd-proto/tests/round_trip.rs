@@ -557,3 +557,59 @@ fn every_link_frame_round_trips() {
         from_seq: 0,
     });
 }
+
+/// The arithmetic both sides refuse a configuration on, and the figures the
+/// refusal has to carry.
+///
+/// A silence threshold is only about silence if it can outlast a few health
+/// reports. `--lost-after 8` against the 15 s cadence of E-40 burnt both
+/// attempts of a live, healthy job in nineteen seconds and ended it `lost` —
+/// so the figure that cannot work is refused where it is configured, with
+/// both figures and the margin in the sentence.
+#[test]
+fn a_silence_threshold_shorter_than_three_health_reports_is_refused_by_its_figures() {
+    use std::time::Duration;
+
+    let refusal = herd_proto::silence_threshold_refusal(
+        "the hub's silence threshold",
+        Duration::from_secs(8),
+        "the cadence it expects",
+        herd_proto::HEALTH_EVERY,
+    )
+    .expect("eight seconds cannot outlast three reports fifteen seconds apart");
+    for figure in ["8s", "15s", "45s", "3 health reports"] {
+        assert!(
+            refusal.contains(figure),
+            "the refusal must name {figure}: {refusal}"
+        );
+    }
+
+    // Exactly the margin is enough; a hair under it is not. The boundary is
+    // part of the contract, because it is the number an operator will sit on.
+    let margin = herd_proto::HEALTH_EVERY * herd_proto::SILENCE_MARGIN;
+    assert!(
+        herd_proto::silence_threshold_refusal("t", margin, "i", herd_proto::HEALTH_EVERY).is_none()
+    );
+    assert!(herd_proto::silence_threshold_refusal(
+        "t",
+        margin - Duration::from_millis(1),
+        "i",
+        herd_proto::HEALTH_EVERY
+    )
+    .is_some());
+
+    // The deployment's own figures: 60 s against a report every 15 s.
+    assert!(herd_proto::silence_threshold_refusal(
+        "t",
+        Duration::from_secs(60),
+        "i",
+        herd_proto::HEALTH_EVERY
+    )
+    .is_none());
+
+    // And a cadence of nothing is not a cadence to judge anything against: it
+    // is refused where it is configured, not reinterpreted here.
+    assert!(
+        herd_proto::silence_threshold_refusal("t", Duration::ZERO, "i", Duration::ZERO).is_none()
+    );
+}
