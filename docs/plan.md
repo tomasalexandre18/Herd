@@ -115,8 +115,10 @@ when room frees; a 10-minute simulated wait leaves periodic reasons.
 ### M9 — Owner control (`m9-owner-control`)
 Owner switch per runner — off-with-reason, drain, on — honoured in 10 s, set
 from the runner's host or via herdctl, state visible (E-33). Dry run (E-07).
-Deadline (E-09; needed by E-41). Dependency: at most one named parent, start
-after its success, else cancelled with the reason — one edge, no conditions
+Deadline (E-09; needed by E-41 — and, since D88, the **only** bound on a job
+that no connected runner could ever fit, which otherwise waits for ever).
+Dependency: at most one named parent, start after its success, else cancelled
+with the reason — one edge, no conditions
 (E-10; needed by E-12's flow). Metal drain-first: a `metal-<m>` job drains its
 host's build slot before starting, bounded 15 min (completes E-27). A
 `metal-*` capability's lease file is read as a busy probe (D48, D51): a job

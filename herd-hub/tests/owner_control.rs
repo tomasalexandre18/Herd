@@ -94,12 +94,7 @@ async fn until_nothing_is_claimed(herd: &Herd, began: Instant) -> (Duration, Str
 async fn a_switch_off_on_the_machine_stops_claims_in_ten_seconds_and_spares_the_job() {
     let herd = Herd::new();
     let _hub = herd.start_hub("hub").await;
-    let _runner = herd.start_runner_with(
-        "wsl-pc",
-        "runner",
-        "runner",
-        &["--switch-poll", "100"],
-    );
+    let _runner = herd.start_runner_with("wsl-pc", "runner", "runner", &["--switch-poll", "100"]);
     herd.wait_for_runner().await;
 
     // Something real is running on the machine when its owner wants it back.
@@ -202,7 +197,9 @@ async fn a_switch_off_through_herdctl_stops_claims_in_ten_seconds_and_is_written
     assert!(written.contains("a reboot is due"), "{written}");
 
     // A runner nobody is connected as is named rather than silently ignored.
-    let missing = herd.herdctl(&["switch", "nowhere", "off", "--reason", "x"]).await;
+    let missing = herd
+        .herdctl(&["switch", "nowhere", "off", "--reason", "x"])
+        .await;
     assert!(
         String::from_utf8_lossy(&missing.stdout).contains("no runner called nowhere"),
         "{}",
@@ -229,7 +226,8 @@ async fn a_runner_restarted_while_switched_off_comes_back_switched_off() {
     let herd = Herd::new();
     let _hub = herd.start_hub("hub").await;
     {
-        let _runner = herd.start_runner_with("wsl-pc", "first", "runner", &["--switch-poll", "100"]);
+        let _runner =
+            herd.start_runner_with("wsl-pc", "first", "runner", &["--switch-poll", "100"]);
         herd.wait_for_runner().await;
     }
     herd.switch_on_the_machine("runner", &["off", "--reason", "she is gaming"])
@@ -260,7 +258,8 @@ async fn a_runner_restarted_while_switched_off_comes_back_switched_off() {
 async fn a_drain_finishes_its_job_and_then_the_runner_leaves() {
     let herd = Herd::new();
     let _hub = herd.start_hub("hub").await;
-    let mut runner = herd.start_runner_with("wsl-pc", "runner", "runner", &["--switch-poll", "100"]);
+    let mut runner =
+        herd.start_runner_with("wsl-pc", "runner", "runner", &["--switch-poll", "100"]);
     herd.wait_for_runner().await;
 
     let running = herd.submit_ok(&[], "sleep 2; printf finished").await;
@@ -343,8 +342,10 @@ async fn a_job_assigned_as_the_switch_moves_is_handed_back_naming_the_switch() {
         .submit_with(&["--label", "build"], "printf built")
         .await;
     let build = String::from_utf8_lossy(&build.stdout).trim().to_owned();
-    herd.wait_until("the build is over", || state_of(&herd, &build) == "finished")
-        .await;
+    herd.wait_until("the build is over", || {
+        state_of(&herd, &build) == "finished"
+    })
+    .await;
     let ran_on = herd.record(&build)["attempts"][0]["runner"]
         .as_str()
         .unwrap_or_default()
@@ -390,7 +391,15 @@ async fn a_dry_run_changes_nothing_and_says_what_the_real_pass_would_say() {
 
     let before = herd.state_bytes();
     let said = herd
-        .herdctl(&["would-run", "--label", "build", "--", "/bin/sh", "-c", "printf hi"])
+        .herdctl(&[
+            "would-run",
+            "--label",
+            "build",
+            "--",
+            "/bin/sh",
+            "-c",
+            "printf hi",
+        ])
         .await;
     assert!(
         said.status.success(),
@@ -436,9 +445,7 @@ async fn a_dry_run_changes_nothing_and_says_what_the_real_pass_would_say() {
     );
     // **Not lying.** The real submission gets the same verdict, in the same
     // words, out of the same function: it waits, for the same reason.
-    let real = herd
-        .submit_ok(&["--label", "build"], "printf hi")
-        .await;
+    let real = herd.submit_ok(&["--label", "build"], "printf hi").await;
     herd.wait_until("the real job has been judged", || {
         !herd.waiting_for(&real).is_empty()
     })
@@ -650,9 +657,7 @@ async fn a_dependent_waits_for_its_parent_and_is_cancelled_when_it_fails() {
 
     // A parent that takes its time, and a child that must not start first.
     let parent = herd.submit_ok(&[], "sleep 2; printf parent").await;
-    let child = herd
-        .submit_ok(&["--after", &parent], "printf child")
-        .await;
+    let child = herd.submit_ok(&["--after", &parent], "printf child").await;
     herd.wait_until("the child has been judged", || {
         herd.waiting_for(&child).contains(&parent)
     })
@@ -667,8 +672,10 @@ async fn a_dependent_waits_for_its_parent_and_is_cancelled_when_it_fails() {
         "",
         "a child must not run before its parent (E-10)"
     );
-    herd.wait_until("the child has run", || state_of(&herd, &child) == "finished")
-        .await;
+    herd.wait_until("the child has run", || {
+        state_of(&herd, &child) == "finished"
+    })
+    .await;
     assert_eq!(outcome_of(&herd, &child)["code"], 0);
     // The parent really did finish first, which is the only thing E-10 asks.
     assert_eq!(state_of(&herd, &parent), "finished");
@@ -755,7 +762,9 @@ async fn a_parent_must_already_exist_so_no_cycle_can_be_written() {
     herd.wait_for_runner().await;
 
     // A parent that is not there.
-    let refused = herd.submit_with(&["--after", "j0000000099"], "printf never").await;
+    let refused = herd
+        .submit_with(&["--after", "j0000000099"], "printf never")
+        .await;
     assert!(!refused.status.success());
     let said = String::from_utf8_lossy(&refused.stderr).into_owned();
     assert!(said.contains("j0000000099"), "{said}");
@@ -771,7 +780,9 @@ async fn a_parent_must_already_exist_so_no_cycle_can_be_written() {
         "j{:010}",
         next.trim_start_matches('j').parse::<u64>().unwrap_or(0) + 1
     );
-    let refused = herd.submit_with(&["--after", &guessed], "printf itself").await;
+    let refused = herd
+        .submit_with(&["--after", &guessed], "printf itself")
+        .await;
     assert!(
         !refused.status.success(),
         "a job must not be able to name the id it is about to be given"
@@ -827,8 +838,10 @@ async fn a_leased_metal_job_waits_and_runs_when_the_lease_clears() {
 
     // The lease clears, and the job runs — with nothing having failed.
     std::fs::remove_file(&lease).expect("the lease is released");
-    herd.wait_until("the trial has run", || state_of(&herd, &trial) == "finished")
-        .await;
+    herd.wait_until("the trial has run", || {
+        state_of(&herd, &trial) == "finished"
+    })
+    .await;
     assert_eq!(outcome_of(&herd, &trial)["code"], 0);
     assert_eq!(herd.log(&trial), "trial");
 }
@@ -894,8 +907,10 @@ async fn a_metal_job_drains_the_build_slot_first_and_no_build_overlaps_it() {
     );
 
     // The trial runs once the host is quiet, and the second build follows it.
-    herd.wait_until("the trial has run", || state_of(&herd, &trial) == "finished")
-        .await;
+    herd.wait_until("the trial has run", || {
+        state_of(&herd, &trial) == "finished"
+    })
+    .await;
     assert_eq!(herd.log(&trial), "trial");
     herd.wait_until("the second build has run", || {
         state_of(&herd, &second_build) == "finished"
@@ -952,7 +967,10 @@ async fn a_declared_requeue_code_is_bounded_and_spends_no_lost_runner_budget() {
         "a spent requeue budget is not a verdict of 75 (D76): {outcome}"
     );
     let reason = outcome["reason"].as_str().unwrap_or_default();
-    assert!(reason.contains("came back 75"), "it names the code: {reason}");
+    assert!(
+        reason.contains("came back 75"),
+        "it names the code: {reason}"
+    );
     assert!(
         reason.contains("3 of 3 goes spent"),
         "and the budget, with its figures: {reason}"
@@ -1090,8 +1108,10 @@ async fn a_switch_survives_a_kill_nine_on_the_runner() {
     until_nothing_is_claimed(&herd, began).await;
     runner.signal(rustix::process::Signal::KILL).await;
     let _again = herd.start_runner_with("wsl-pc", "again", "runner", &["--switch-poll", "100"]);
-    herd.wait_until("the runner is back", || herd.said("again").contains("joining"))
-        .await;
+    herd.wait_until("the runner is back", || {
+        herd.said("again").contains("joining")
+    })
+    .await;
     let refusal = herd.submit_with(&[], "printf nothing").await;
     assert!(
         !refusal.status.success(),

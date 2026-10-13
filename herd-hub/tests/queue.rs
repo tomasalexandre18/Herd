@@ -166,7 +166,7 @@ async fn a_priority_that_is_not_one_of_the_four_is_refused_by_name() {
     let mut socket = requester_socket(&harness.hub_url).await;
     socket
         .send(Message::text(
-            r#"{"type":"submit_job","command":["true"]}"#.to_owned(),
+            r#"{"type":"submit_job","asked":{"command":["true"]}}"#.to_owned(),
         ))
         .await
         .expect("the frame goes out");
@@ -399,7 +399,7 @@ async fn refusal_of_a_submission_with_priority(hub_url: &str, written: &str) -> 
     let mut socket = requester_socket(hub_url).await;
     socket
         .send(Message::text(format!(
-            r#"{{"type":"submit_job","command":["true"],"priority":{written}}}"#
+            r#"{{"type":"submit_job","asked":{{"command":["true"],"priority":{written}}}}}"#
         )))
         .await
         .expect("the frame goes out");

@@ -506,7 +506,10 @@ async fn the_lease_probe_is_read_on_exactly_its_two_declared_codes() {
     };
 
     // 0 — free: no lease, or an expired one.
-    assert_eq!(evaluate(&lease("exit 0"), timeout).await, Availability::Free);
+    assert_eq!(
+        evaluate(&lease("exit 0"), timeout).await,
+        Availability::Free
+    );
 
     // 10 — busy: somebody holds it. The job waits (D38), it is never failed,
     // and the sentence carries the code.
@@ -535,7 +538,8 @@ async fn the_lease_probe_is_read_on_exactly_its_two_declared_codes() {
         );
         assert!(read.suspends(), "{what}: {read:?}");
         assert_ne!(
-            read, Availability::Free,
+            read,
+            Availability::Free,
             "{what} must never be free: a lease nobody can read is not a lease nobody holds"
         );
         let reason = read.reason().expect("an unreadable probe says why");

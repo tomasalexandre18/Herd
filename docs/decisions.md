@@ -2221,3 +2221,241 @@ for the whole of its life, so the upgrade would be in the loop body and a
 failed upgrade would be a silent exit — the same leak, harder to see.
 
 ---
+## 2026-10-13 — D94 A deadline is absolute and bounds a wait, not a run
+
+**Context.** E-09 asks for "a deadline after which a job is cancelled if not
+started", and the consumer's case is their nightly: start by 05:00 or skip
+with the reason. Three things had to be fixed before a line of it could be
+written — what the moment is relative to, whose clock judges it, and what it
+does to a job that has already started.
+
+**Choice.**
+
+* **Absolute, not an offset.** The wire carries seconds since the Unix epoch
+  (`ToHub::Asked::deadline_unix_s`); `herdctl --deadline` accepts either an
+  RFC 3339 moment or a span from now (`+15m`) and resolves the span against
+  the requester's clock *before* sending. An offset from the submission would
+  have moved the consumer's 05:00 every time the submission itself was late,
+  which is the one case E-41 exists for.
+* **Judged on the hub's clock**, which is the only clock in Herd that decides
+  anything, and recorded on the record as it arrived (`JobRecord::deadline`).
+  A deadline read against a requester's clock would be a job cancelled
+  because a laptop's time zone was wrong.
+* **It bounds waiting and nothing else.** A job that has *started* is never
+  touched by its deadline: the only thing that ends a running job on a clock
+  is M4's time cap, exit 124. That falls out of where the judgement lives —
+  the claim step only ever sees queued jobs — and it is asserted directly,
+  with a job whose deadline passes while it runs and which finishes
+  normally.
+* **The end is `cancelled`, not `impossible`.** `Placement::Cancel` is a new
+  variant beside `Impossible` because the two are different facts: nobody
+  *could* ever run this against nobody *should* now. D40 gives both exit 125,
+  and the words are what tell them apart.
+* **Judged after the job's own contradictions, before anything about the
+  fleet.** A submission whose figures contradict each other says *that*, even
+  when its deadline has also passed — otherwise a malformed job would be
+  reported as a late one and the bug would never be found (M7's own defect, in
+  a new place). But the deadline is judged before an empty fleet and before
+  the parent, because it is **D88's only bound**: a job no connected runner
+  could ever fit waits deliberately and for ever, and a bound that fired only
+  when a machine happened to be connected would not be one.
+
+**What the operator reads.** `cancelled (deadline): it had not started by
+<moment>, which is 4m ago, … When the moment came it was: <the whole sentence
+the job was waiting on>`. The last clause is the one that matters and is
+tested on its own: a job cancelled by a deadline it only missed because the
+one machine of its labels was switched off is a correct cancellation and a
+baffling one, unless the reason says `she is gaming`.
+
+**Alternative rejected.** A relative deadline, "cancel if not started within
+N minutes of submission". Rejected on E-41: their nightly's bound is a time of
+day, and expressing it as an offset makes it drift by exactly the delay it is
+meant to catch.
+
+---
+## 2026-10-13 — D95 A parent's non-success cancels its child by name
+
+**Context.** E-10 is a `should` that E-12's pack flow needs: a test starts
+after the build that makes its pack. It is also the expectation most likely to
+grow into a workflow language, which invariant 1 refuses.
+
+**Choice.** One edge, no conditions, and **success is exit 0 and nothing
+else**. `Asked::after` carries at most one job id. A parent still going makes
+the child wait, with the parent named and its state in the sentence. A parent
+that ended any other way — a non-zero exit, a signal, `could_not_start`,
+`stopped_by_cap`, `cancelled`, `lost`, `impossible` — ends the child
+`cancelled (parent)`, naming the parent *and how it ended*, in the words the
+parent's own requester would have read. A parent this hub has no record of is
+`Gone` and is also a cancellation: a parent that cannot be read is never read
+as one that succeeded.
+
+**The cycle is unrepresentable, not merely refused.** A submission naming a
+parent that does not exist is refused at the submission, by name, with the
+reason spelled out. Because ids are minted by the hub in order, under one
+lock, a job can only ever name one *older than itself* — so a job cannot name
+itself (its id does not exist yet), and two jobs cannot name each other (the
+first would have to name an id not yet minted). There is no cycle check
+anywhere in Herd and none is needed, which is the point: the refusal of a
+missing parent is doing that work, and a test asserts it by guessing the next
+id and being refused.
+
+**Where it is decided.** `matcher::Parent::judge`, a pure function of the
+parent's standing, resolved outside the claim step by whoever has the store —
+because the claim step is a pure function of a record and a fleet, and a
+parent that had to be looked up inside it would make it a function of a disk.
+A finished parent is not in the queue at all, so the lookup is a read of the
+store; the *reading* of what an ending means is in one tested place.
+
+**Alternative rejected.** Letting a child whose parent failed run anyway, or
+waiting for ever. The first is a test run against a build that is not there;
+the second is a job nobody is told about. Cancellation with the parent named
+is the only ending an operator can act on.
+
+---
+## 2026-10-13 — D96 The requeue budget is three, counted apart from E-21's two
+
+**Context.** D76 settled that a command may declare one exit code meaning "the
+capability I was given went away under me" — 75 for the first consumer — and
+that such a code causes a **bounded** requeue with the capability re-probed,
+on a budget separate from E-21's two attempts. It left the size of the budget
+and the mechanism of the separation open.
+
+**Choice.** **Three**, as `--requeue-budget`, printed at startup. Three
+because the race this bounds is small and genuine — the lease was free when
+the probe was read and taken by the time the job started — so one retry is
+usually enough and a second machine is worth trying; and bounded because a
+lease somebody holds all afternoon would otherwise requeue a job for ever,
+which is a job nobody is told about.
+
+**How they are kept apart.** Not by two counters. An attempt carries
+`requeue_code: Option<i32>` — the declared code it ended *because of*, or
+nothing — and both budgets are read off the attempts every time they are
+asked: `JobRecord::requeues_spent` counts the attempts that carry one,
+`JobRecord::goes_a_runner_took` counts the ended attempts that do not. That
+follows D79 exactly: there is nothing to leak, nothing to rebuild after a
+restart, and no third place where the two could disagree.
+
+**The defect this closes before it was written.** E-21's budget was
+`if attempt < attempts_allowed` — the raw attempt *number*. A job answering 75
+twice would have reached attempt 3 and been declared `lost` on the next
+genuine loss, having spent on a leased machine the goes that exist for a
+machine that disappears. Both call sites now count from the record, and the
+unit test asserts the two counts move independently in both directions.
+
+**When the budget is spent** the job ends `Lost`, exit 125 (D40), with a
+reason naming the code, the figures (`3 of 3 goes spent`) and every machine
+that answered it. Not `Exited { code: 75 }`: a 75 reaching a requester as a
+verdict is the whole of what D76 exists to prevent.
+
+---
+## 2026-10-13 — D97 Three positions, a file, and what each one stops
+
+**Context.** E-33 is the owner's condition for lending her machine at all:
+`off <reason>`, `drain`, `on`, honoured in ten seconds, settable from her own
+machine and from an orchestrator, with the position and its reason visible.
+Invariant 3 says nothing on a runner's machine ever listens, so "settable from
+her machine" could not be a port.
+
+**Choice. It is a file**, `<data-root>/switch`, written by
+`herd-runner switch <position> --reason …` and read by the running runner every
+second (`--switch-poll`). Three things fall out of that and all three are
+wanted: it works with the hub down, which is when an owner most wants her
+machine back; it outlives the process, so a runner restarted on a machine its
+owner switched off does not give itself back; and a position set *through the
+hub* is written here too, so there is one state and not two. The position
+rides in the handshake and on every health report, required rather than
+defaulted (`PROTOCOL_VERSION` 5), because a hub that read a missing switch as
+`on` would claim on a withdrawn machine.
+
+**What each position stops.**
+
+| | claims | serves content (D11) | job in flight | the process |
+|---|---|---|---|---|
+| `on` | yes | yes | runs | runs |
+| `off <reason>` | **no** | **no** | **finishes** | stays connected |
+| `drain <reason>` | no | yes | **finishes** | leaves when empty |
+
+* **`off` stops serving content as well as claiming.** The owner is saying the
+  machine is hers again, and a runner that stopped taking jobs while still
+  pushing a 400 MiB pack up her link would have honoured half of E-33. There
+  is no fetch endpoint in Herd until M11, so what exists today is the gate —
+  `Switch::serves_content`, with `Session::serves_content` beside it — and the
+  rule that M11's endpoint is built behind it and nowhere else. The gate is
+  asserted; the endpoint cannot be, and this decision is where that is
+  written down.
+* **Neither position touches the job in flight.** That is the whole difference
+  between the owner's switch and a shutdown: a `SIGTERM` gives the machine
+  back inside five seconds and abandons what is running (invariant 2), while
+  `off` is the polite version and would lose her exactly the work she was
+  being polite about. A `drain` keeps serving content while it still holds a
+  job, because a peer halfway through fetching what that job produced is part
+  of finishing it.
+* **A job assigned in the instant the switch moves is handed back**, not run:
+  the check is in `take_job`, under the lock that takes the job in hand, and
+  the runner abandons the attempt naming the switch. The hub then places the
+  job elsewhere — nothing lost, machine given back.
+* **A withdrawn machine is not *available*** (D80, extended): a job does not
+  stick to it, everything queued for it is claimable elsewhere in the same
+  pass, and the sentence of a job with nowhere else to go carries the owner's
+  own words.
+
+**Where the ten seconds goes.** A second of polling at worst, a frame sent the
+moment the position moves rather than at the next report, and a dispatch pass
+the hub makes on receiving it. Measured with the real binaries from both
+sides, while a job was running; it is comfortably inside.
+
+**A switch file that will not read leaves the position where it is**, loudly.
+The dangerous reading is the other one: a mangled file read as `on` is a
+withdrawn machine quietly taking work again.
+
+---
+## 2026-10-13 — D98 Drain-first is declared, and it reserves the host
+
+**Context.** E-27 asks that a metal trial on the PC "drain the PC's build slot
+first (nothing new claimed, up to 15 min)". Two constraints shaped the answer.
+`herd-proto` says in so many words that nothing in Herd knows the `metal-`
+prefix means anything, and D86 says a probe is declared by the machine's
+operator in that runner's own capability file and never read out of a
+consumer's repository.
+
+**Choice.** A capability carries `drain_first: bool`, declared in the runner's
+own capability file beside its probe. It means two things, and the second is
+the one exclusivity does not give:
+
+* **a quiet host**: a job holding this capability starts only when no other
+  job of this runner's is running;
+* **a reservation**: from the moment such a job is queued and eligible here,
+  this machine claims nothing new.
+
+Without the reservation a trial waiting for a quiet host would starve for as
+long as builds kept arriving — which is exactly what E-27's own wording exists
+to answer, and what `exclusive` alone does not do. The reservations are
+computed from the queued records and the fleet **before a pass places
+anything** (`matcher::reservations`), because a reservation discovered while
+walking the queue in priority order would be found only after everything ahead
+of the trial had been claimed. Queue order still decides *which* job owns a
+contested host: the first one in it.
+
+**Bounded, and measured from the job's submission.** `--drain-first-limit`,
+fifteen minutes, the figure E-27 names. From submission because that is a
+field on the record, so the bound survives a restart and cannot leak — a hub
+that remembered when each drain began would have a third thing to rebuild, and
+the one it forgot would hold a machine empty for ever (D79). Past the limit the
+reservation is gone, the host takes other work again, and the job's sentence
+says **the drain did not win**, with what to do about it, rather than going on
+promising that it is about to.
+
+**What this costs, stated.** A drain-first job reserves its host from
+submission even when something *else* is also in its way — a lease held
+outside Herd, say. The bound is what makes that safe, and the sentence names
+the figures, but a machine can be held empty for up to fifteen minutes for a
+job that could not have started anyway. The alternative — reserving only when
+the quiet host is the single remaining obstacle — needs the pass to be
+simulated before it is run, and the complexity is not worth it at one
+declared capability on one machine.
+
+**Nothing reads the prefix**, and a test proves it: the same label
+`metal-pc`, declared without the flag, behaves as any counted capability does
+and the trial runs beside a build.
+
+---

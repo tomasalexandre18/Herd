@@ -370,8 +370,11 @@ async fn run(args: Args) -> Result<Done> {
             asking,
             command,
         } => {
-            let asked = declared(build_thread_mib, memory_mib, tmpfs_mib, asking)?
-                .asked(command, labels_of(labels)?, priority);
+            let asked = declared(build_thread_mib, memory_mib, tmpfs_mib, asking)?.asked(
+                command,
+                labels_of(labels)?,
+                priority,
+            );
             // On stdout, because this *is* the answer the caller asked for —
             // unlike `run`, where stdout belongs to the job.
             for line in herdctl::would_run(&config, asked).await? {

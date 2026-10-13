@@ -2,11 +2,10 @@
 //! the contract: a field that silently fails to round-trip is a lost field.
 
 use herd_proto::{
-    cap_exceeded_reason, cap_stop_reason, from_frame, to_frame, Availability, BusyProbe, Cap,
-    Capability, CapabilityOffer, CapabilityOrigins, CapabilityState, FromHub, HostSize, JobId,
-    Asked, JobMetrics, JobOutcome, LabelSet, LogStream, OfferedCapability, Priority, Role,
-    RunnerSwitch, RunningJob, Switch,
-    ToHub, PROTOCOL_VERSION,
+    cap_exceeded_reason, cap_stop_reason, from_frame, to_frame, Asked, Availability, BusyProbe,
+    Cap, Capability, CapabilityOffer, CapabilityOrigins, CapabilityState, FromHub, HostSize, JobId,
+    JobMetrics, JobOutcome, LabelSet, LogStream, OfferedCapability, Priority, Role, RunnerSwitch,
+    RunningJob, Switch, ToHub, PROTOCOL_VERSION,
 };
 
 /// An offer carrying one of each kind, each origin and each probe, so that
@@ -211,9 +210,13 @@ fn every_message_to_the_hub_round_trips() {
             requeue_exit_code: None,
         };
         // A dry run carries exactly what a submission carries (E-07).
-        round_trip_to_hub(ToHub::SubmitJob { asked: full.clone() });
+        round_trip_to_hub(ToHub::SubmitJob {
+            asked: full.clone(),
+        });
         round_trip_to_hub(ToHub::DryRun { asked: full });
-        round_trip_to_hub(ToHub::SubmitJob { asked: bare.clone() });
+        round_trip_to_hub(ToHub::SubmitJob {
+            asked: bare.clone(),
+        });
         round_trip_to_hub(ToHub::DryRun { asked: bare });
         round_trip_to_hub(ToHub::RaiseJob {
             job_id: JobId::new("j0000000007"),
@@ -624,8 +627,18 @@ fn every_link_frame_round_trips() {
         (true, Switch::On),
         // Every position, because a hub that read a missing or mangled switch
         // as `on` would claim on a withdrawn machine (E-33).
-        (false, Switch::Off { reason: "she is gaming".to_owned() }),
-        (false, Switch::Drain { reason: "a reboot is due".to_owned() }),
+        (
+            false,
+            Switch::Off {
+                reason: "she is gaming".to_owned(),
+            },
+        ),
+        (
+            false,
+            Switch::Drain {
+                reason: "a reboot is due".to_owned(),
+            },
+        ),
     ] {
         round_trip_to_hub(ToHub::Health {
             jobs: vec![

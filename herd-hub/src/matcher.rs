@@ -715,7 +715,12 @@ pub fn eligible(
 ) -> Vec<(String, String)> {
     seats
         .iter()
-        .filter(|seat| matches!(judge(record, seat, placing, now), Verdict::Now(_) | Verdict::Later(_)))
+        .filter(|seat| {
+            matches!(
+                judge(record, seat, placing, now),
+                Verdict::Now(_) | Verdict::Later(_)
+            )
+        })
         .map(|seat| {
             let answered: Vec<&str> = record
                 .labels
@@ -1755,17 +1760,35 @@ mod tests {
         let mut fleet = vec![her_pc()];
         let mut zero = a_build("j1", 0);
         zero.build_thread_mib = Some(0);
-        let why = impossible(place(&zero, &mut fleet, now(), Stickiness::default(), &Placing::default()));
+        let why = impossible(place(
+            &zero,
+            &mut fleet,
+            now(),
+            Stickiness::default(),
+            &Placing::default(),
+        ));
         assert!(why.contains("0 MiB"), "{why}");
 
         let mut no_token = a_build("j2", 1792);
         no_token.command = vec!["cargo".to_owned(), "xtask".to_owned(), "pack".to_owned()];
-        let why = impossible(place(&no_token, &mut fleet, now(), Stickiness::default(), &Placing::default()));
+        let why = impossible(place(
+            &no_token,
+            &mut fleet,
+            now(),
+            Stickiness::default(),
+            &Placing::default(),
+        ));
         assert!(why.contains("{j}") && why.contains("1792"), "{why}");
 
         let mut twice = a_build("j3", 1792);
         twice.command = vec!["make".to_owned(), "-j{j}".to_owned(), "J={j}".to_owned()];
-        let why = impossible(place(&twice, &mut fleet, now(), Stickiness::default(), &Placing::default()));
+        let why = impossible(place(
+            &twice,
+            &mut fleet,
+            now(),
+            Stickiness::default(),
+            &Placing::default(),
+        ));
         assert!(why.contains("2 times"), "{why}");
 
         // And a job that asks for nothing derived is untouched by all of it.
@@ -1878,10 +1901,22 @@ mod tests {
         let moment = second
             .submitted_at
             .after(Duration::from_secs(3 * 60 * 60 + 60));
-        let waiting = place(&second, &mut fleet, second.submitted_at, stickiness, &Placing::default());
+        let waiting = place(
+            &second,
+            &mut fleet,
+            second.submitted_at,
+            stickiness,
+            &Placing::default(),
+        );
         assert!(matches!(waiting, Placement::Wait { .. }), "{waiting:?}");
         second.waiting_for = None;
-        let (runner, why) = placed(place(&second, &mut fleet, moment, stickiness, &Placing::default()));
+        let (runner, why) = placed(place(
+            &second,
+            &mut fleet,
+            moment,
+            stickiness,
+            &Placing::default(),
+        ));
         assert_eq!(runner, "build-host");
         assert!(why.contains("past the 3h stickiness limit"), "{why}");
         assert!(why.contains("after waiting 3h01m for wsl-pc"), "{why}");
@@ -2169,13 +2204,25 @@ mod tests {
         let mut fleet = vec![their_server()];
         let first = a_test("j1", 14 * 1024, 0);
         let second = a_test("j2", 14 * 1024, 0);
-        let (runner, why) = placed(place(&first, &mut fleet, now(), Stickiness::default(), &Placing::default()));
+        let (runner, why) = placed(place(
+            &first,
+            &mut fleet,
+            now(),
+            Stickiness::default(),
+            &Placing::default(),
+        ));
         assert_eq!(runner, "build-host");
         assert!(
             why.contains("admitted 14 GiB of memory, 11 GiB free of 25 GiB after it"),
             "{why}"
         );
-        let why = waited(place(&second, &mut fleet, now(), Stickiness::default(), &Placing::default()));
+        let why = waited(place(
+            &second,
+            &mut fleet,
+            now(),
+            Stickiness::default(),
+            &Placing::default(),
+        ));
         assert!(
             why.contains("11 GiB free of its 25 GiB memory admission, 14 GiB needed"),
             "the second job of one pass must be weighed against the first: {why}"
@@ -2189,12 +2236,24 @@ mod tests {
         let mut fleet = vec![their_server()];
         let first = a_test("j1", 1024, 5 * 1024);
         let second = a_test("j2", 1024, 5 * 1024);
-        let (_, why) = placed(place(&first, &mut fleet, now(), Stickiness::default(), &Placing::default()));
+        let (_, why) = placed(place(
+            &first,
+            &mut fleet,
+            now(),
+            Stickiness::default(),
+            &Placing::default(),
+        ));
         assert!(
             why.contains("reserved 5 GiB in tmpfs, 3 GiB free of 8 GiB"),
             "{why}"
         );
-        let why = waited(place(&second, &mut fleet, now(), Stickiness::default(), &Placing::default()));
+        let why = waited(place(
+            &second,
+            &mut fleet,
+            now(),
+            Stickiness::default(),
+            &Placing::default(),
+        ));
         assert!(
             why.contains("3 GiB free in tmpfs, 5 GiB needed (8 GiB of tmpfs there in all)"),
             "{why}"
@@ -2399,7 +2458,13 @@ mod tests {
         let mut zero = queued("j1", &["build"]);
         zero.memory_mib = Some(0);
         let mut fleet = vec![their_server()];
-        let why = impossible(place(&zero, &mut fleet, now(), Stickiness::default(), &Placing::default()));
+        let why = impossible(place(
+            &zero,
+            &mut fleet,
+            now(),
+            Stickiness::default(),
+            &Placing::default(),
+        ));
         assert!(
             why.contains("0 MiB of memory, which is not a figure"),
             "{why}"
@@ -2407,7 +2472,13 @@ mod tests {
 
         let mut both = a_build("j2", 1792);
         both.memory_mib = Some(8192);
-        let why = impossible(place(&both, &mut fleet, now(), Stickiness::default(), &Placing::default()));
+        let why = impossible(place(
+            &both,
+            &mut fleet,
+            now(),
+            Stickiness::default(),
+            &Placing::default(),
+        ));
         assert!(why.contains("two answers to one question"), "{why}");
     }
 
@@ -2741,7 +2812,10 @@ mod tests {
             &Placing::default(),
         ));
         assert!(why.starts_with("cancelled (deadline)"), "{why}");
-        assert!(why.contains("4m ago"), "the sentence carries the figures: {why}");
+        assert!(
+            why.contains("4m ago"),
+            "the sentence carries the figures: {why}"
+        );
         assert!(
             why.contains("she is gaming"),
             "a job cancelled by a deadline it missed because its machine was off must say \
@@ -2776,7 +2850,13 @@ mod tests {
         let mut fleet = vec![their_server()];
         // On the dot: not past, so the job is placed.
         assert!(matches!(
-            place(&record, &mut fleet, moment, Stickiness::default(), &Placing::default()),
+            place(
+                &record,
+                &mut fleet,
+                moment,
+                Stickiness::default(),
+                &Placing::default()
+            ),
             Placement::Claim { .. }
         ));
         // A nanosecond later it is past, and the pass's single `now` is what
@@ -2881,7 +2961,10 @@ mod tests {
             ));
             assert!(why.starts_with("cancelled (parent)"), "{why}");
             assert!(why.contains("j1"), "{why}");
-            assert!(why.contains(how), "the child says how its parent went: {why}");
+            assert!(
+                why.contains(how),
+                "the child says how its parent went: {why}"
+            );
         }
         // And a parent nothing can be read about is never read as one that
         // succeeded.
@@ -2915,7 +2998,9 @@ mod tests {
         let seats = vec![pc];
         let reserved = reservations(&queue, &seats, now(), DRAIN_FIRST_LIMIT);
         assert_eq!(
-            reserved.get("wsl-pc").map(|(id, label)| (id.to_string(), label.clone())),
+            reserved
+                .get("wsl-pc")
+                .map(|(id, label)| (id.to_string(), label.clone())),
             Some(("j9".to_owned(), "metal-pc".to_owned())),
             "the host must be reserved for the trial even though a build is ahead of it in \
              the queue: a drain that lost to queue order would starve (E-27)"
@@ -2932,10 +3017,7 @@ mod tests {
             Stickiness::default(),
             &Placing::default(),
         ));
-        assert!(
-            why.contains("wsl-pc is being emptied for it"),
-            "{why}"
-        );
+        assert!(why.contains("wsl-pc is being emptied for it"), "{why}");
         assert!(why.contains("1 job(s) are still running there"), "{why}");
         assert!(why.contains("15m drain-first limit"), "{why}");
         // And the build behind it is **not** claimed there, which is the
@@ -2959,7 +3041,12 @@ mod tests {
     fn a_drain_first_job_starts_when_its_host_is_quiet() {
         let trial = queued("j9", &["metal-pc"]);
         let mut seats = vec![her_pc_with_a_metal_lease()];
-        let reserved = reservations(&[trial.clone()], &seats, now(), DRAIN_FIRST_LIMIT);
+        let reserved = reservations(
+            std::slice::from_ref(&trial),
+            &seats,
+            now(),
+            DRAIN_FIRST_LIMIT,
+        );
         for seat in seats.iter_mut() {
             seat.reserved_for = reserved.get(&seat.name).cloned();
         }
@@ -2988,7 +3075,9 @@ mod tests {
             .already_holding(&JobId::new("j0"), labels(&["build"]));
         pc.reserved.jobs = 1;
         let mut seats = vec![pc];
-        let too_late = trial.submitted_at.after(DRAIN_FIRST_LIMIT + Duration::from_secs(60));
+        let too_late = trial
+            .submitted_at
+            .after(DRAIN_FIRST_LIMIT + Duration::from_secs(60));
         let reserved = reservations(
             &[build.clone(), trial.clone()],
             &seats,
@@ -3036,7 +3125,12 @@ mod tests {
                 seat
             },
         ] {
-            let reserved = reservations(&[trial.clone()], &[seat], now(), DRAIN_FIRST_LIMIT);
+            let reserved = reservations(
+                std::slice::from_ref(&trial),
+                &[seat],
+                now(),
+                DRAIN_FIRST_LIMIT,
+            );
             assert!(reserved.is_empty(), "{reserved:?}");
         }
     }
@@ -3104,7 +3198,12 @@ mod tests {
             .already_holding(&JobId::new("j0"), labels(&["build"]));
         pc.reserved.jobs = 1;
         let mut seats = vec![pc];
-        let reserved = reservations(&[trial.clone()], &seats, now(), DRAIN_FIRST_LIMIT);
+        let reserved = reservations(
+            std::slice::from_ref(&trial),
+            &seats,
+            now(),
+            DRAIN_FIRST_LIMIT,
+        );
         assert!(
             reserved.is_empty(),
             "a label called metal-anything means nothing to Herd: {reserved:?}"
@@ -3166,5 +3265,4 @@ mod tests {
         assert_eq!(record.goes_a_runner_took(), 1);
         assert_eq!(record.requeues_spent(), 2);
     }
-
 }
