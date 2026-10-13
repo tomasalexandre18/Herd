@@ -818,6 +818,17 @@ pub enum Contention {
     ExclusiveNeedsIdle { label: String, running: usize },
     /// A host-wide capability is held here, so nothing else runs.
     HostIsExclusive { held: String, by: JobId },
+    /// This job is already holding something on this runner.
+    ///
+    /// The one variant here that is a caller's mistake rather than a state of
+    /// the world, and it is a mistake that must not be absorbed. Admitting a
+    /// job twice used to relabel it, silently: the second label set replaced
+    /// the first, so whatever the first one occupied was given back without
+    /// anything ending, and a counted capability would have been handed out
+    /// one slot too many. M7's claim step is built on this type, and there a
+    /// relabel would be an over-admission with nothing on any record to show
+    /// it. A job releases ([`Holdings::release`]) and is admitted again.
+    AlreadyHolding { job: JobId, held: LabelSet },
 }
 
 impl Contention {
@@ -846,6 +857,11 @@ impl Contention {
             Contention::HostIsExclusive { held, by } => format!(
                 "{by} holds {held}, which is host-wide, so nothing else runs \
                  here until it ends"
+            ),
+            Contention::AlreadyHolding { job, held } => format!(
+                "{job} already holds {held} on this runner, so it cannot be \
+                 admitted again; a job releases what it holds and is admitted \
+                 afresh"
             ),
         }
     }
@@ -1001,7 +1017,16 @@ impl Holdings {
     ///
     /// Checking and taking are one call on purpose: a caller that asked first
     /// and took afterwards would have a window in which the answer changed.
+    ///
+    /// A job that is already holding something here is an error, never a
+    /// relabel: see [`Contention::AlreadyHolding`].
     pub fn admit(&mut self, job: &JobId, labels: LabelSet) -> Result<(), Contention> {
+        if let Some(held) = self.held.get(job) {
+            return Err(Contention::AlreadyHolding {
+                job: job.clone(),
+                held: held.clone(),
+            });
+        }
         self.check(&labels)?;
         self.held.insert(job.clone(), labels);
         Ok(())
@@ -1122,6 +1147,47 @@ mod tests {
         held.release(&job(0));
         assert_eq!(held.running(), 0);
         admit(&mut held, 1, &["build"]);
+    }
+
+    /// Admitting a job that is already holding is an error, not a relabel.
+    ///
+    /// The relabel this forbids is silent and it loses count: the second
+    /// label set replaced the first, so the slot the first one took was given
+    /// back with nothing having ended. One more admission of `build` would
+    /// then have fitted in a capability with one slot. M7's claim step rests
+    /// on this type, and an over-admission there leaves no trace anywhere.
+    #[test]
+    fn admitting_a_job_that_already_holds_is_an_error() {
+        let mut held = holdings(vec![
+            Capability::counted("build", 1),
+            Capability::shared("reference"),
+        ]);
+        admit(&mut held, 0, &["build"]);
+        let why = held
+            .admit(&job(0), labels(&["reference"]))
+            .expect_err("a job that already holds cannot be admitted again");
+        assert_eq!(
+            why,
+            Contention::AlreadyHolding {
+                job: job(0),
+                held: labels(&["build"]),
+            }
+        );
+        assert!(why.reason().contains("j0"), "{}", why.reason());
+        assert!(why.reason().contains("build"), "{}", why.reason());
+        assert!(!why.is_impossible(), "a caller's mistake is not a verdict");
+        // Nothing moved: the first holding is untouched and the slot is still
+        // taken, which is the whole point.
+        assert_eq!(held.held_by(&job(0)), Some(&labels(&["build"])));
+        assert_eq!(held.holders_of("build"), 1);
+        assert_eq!(held.running(), 1);
+        assert!(matches!(
+            refuse(&held, &["build"]),
+            Contention::NoSlot { .. }
+        ));
+        // Released, the same job is admitted afresh.
+        held.release(&job(0));
+        admit(&mut held, 0, &["reference"]);
     }
 
     // ------------------------------------------- exclusive ----
