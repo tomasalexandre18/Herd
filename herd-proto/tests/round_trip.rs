@@ -608,10 +608,44 @@ fn a_silence_threshold_shorter_than_three_health_reports_is_refused_by_its_figur
         herd_proto::HEALTH_EVERY
     )
     .is_none());
+}
 
-    // And a cadence of nothing is not a cadence to judge anything against: it
-    // is refused where it is configured, not reinterpreted here.
+/// A health cadence of zero is not a cadence: nothing is ever reported at it,
+/// so no threshold can be judged against it. `--health-every 0` used to be
+/// read as "no cadence to judge" and let through — on the hub's own startup
+/// check, the runner's own startup check, and the hub's handshake check of a
+/// runner's announced cadence, because all three turn to this one function.
+/// A runner at `--health-every 0` paired with a hub at
+/// `--health-every 1 --lost-after 3` passed every one of them, then never
+/// reported, and a quiet job burnt both its attempts and ended `lost` —
+/// exactly what this function exists to refuse before a job is ever placed.
+#[test]
+fn a_health_cadence_of_zero_is_refused_naming_the_figure() {
+    use std::time::Duration;
+
+    let refusal = herd_proto::silence_threshold_refusal(
+        "the hub's silence threshold",
+        Duration::ZERO,
+        "its own health cadence",
+        Duration::ZERO,
+    )
+    .expect("a cadence of zero is not a cadence to judge anything against");
     assert!(
-        herd_proto::silence_threshold_refusal("t", Duration::ZERO, "i", Duration::ZERO).is_none()
+        refusal.contains("0s"),
+        "the refusal must name the figure: {refusal}"
     );
+    assert!(
+        refusal.contains("its own health cadence"),
+        "and which figure it is: {refusal}"
+    );
+
+    // Not exempted by a generous threshold either: zero stays zero no matter
+    // what it is being judged against.
+    assert!(herd_proto::silence_threshold_refusal(
+        "t",
+        Duration::from_secs(3600),
+        "i",
+        Duration::ZERO
+    )
+    .is_some());
 }
