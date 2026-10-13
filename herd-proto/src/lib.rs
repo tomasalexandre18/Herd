@@ -19,11 +19,15 @@ use std::time::Duration;
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 
 pub mod capability;
+pub mod placement;
 
 pub use capability::{
     check_label, metal_label, Availability, BusyProbe, Capability, CapabilityError, CapabilityKind,
     CapabilityOffer, CapabilityOrigins, CapabilityState, Contention, Holdings, LabelSet,
     OfferedCapability,
+};
+pub use placement::{
+    parallelism_tokens, with_parallelism, HostSize, Parallelism, PARALLELISM_TOKEN,
 };
 
 /// The version announced in [`ToHub::Hello`] and echoed in
@@ -34,8 +38,18 @@ pub use capability::{
 /// *required*, so that a submission can never acquire a level nobody chose
 /// (E-18). That is not an additive change — a version 1 submission has no
 /// priority field at all — so the number moves, which is exactly what the
-/// handshake's version is for. Nothing is deployed yet; it freezes at M16.
-pub const PROTOCOL_VERSION: u32 = 2;
+/// handshake's version is for.
+///
+/// 3 since M7: a runner announces how big its host is and how preferred it
+/// is ([`HostSize`], `preference`), and a submission may carry the memory one
+/// of its build threads needs, from which the hub derives the job's `-j`
+/// (E-22). Both are new fields on existing messages, so an older peer would
+/// be *served* rather than refused — and served wrongly: a version 2 runner
+/// announces no size, and a hub reading that as a machine of no size would
+/// derive nothing for it and place nothing on it. The number moves instead.
+/// Both numbers are free-running development counters until M16, where they
+/// are set back to 1 (D73).
+pub const PROTOCOL_VERSION: u32 = 3;
 
 /// How often a runner says it is alive and what it is doing (E-40).
 ///
@@ -345,6 +359,20 @@ pub enum JobOutcome {
     /// machine it was on stopped answering, which is neither an exit code,
     /// nor a signal, nor a failure to start.
     Lost { reason: String },
+    /// No machine could ever run this job, so the hub ended it instead of
+    /// queueing it for ever (E-36, M7).
+    ///
+    /// The one terminal answer the claim step gives, and it is deliberately
+    /// narrow: a label nobody offers *today* is a wait, because a machine
+    /// that offers it may dial in tomorrow. This is for what no fleet can
+    /// fix — a job asking for two labels that exclude each other, or asking
+    /// for a derived `-j` with no figure to derive it from. `reason` names
+    /// the labels or the figure, because the only thing to do about one of
+    /// these is change the submission.
+    ///
+    /// Distinct from [`JobOutcome::CouldNotStart`], which is a job Herd tried
+    /// to run: this one never reached a machine at all.
+    Impossible { reason: String },
 }
 
 /// Which cap a runner enforced against a job.
@@ -535,6 +563,32 @@ pub enum ToHub {
         /// that can run a job needing nothing.
         #[serde(default, skip_serializing_if = "CapabilityOffer::is_empty")]
         capabilities: CapabilityOffer,
+        /// How big this host is: the memory and the threads Herd's jobs may
+        /// use on it (E-22).
+        ///
+        /// In the handshake because it is the input to a derivation the hub
+        /// makes at claim time, and because it is a property of the machine
+        /// rather than of the moment — a figure that moved while a job ran
+        /// would change a `-j` already recorded for it. Either figure may be
+        /// absent, and an absent figure is absent: never zero.
+        #[serde(default, skip_serializing_if = "HostSize::is_silent")]
+        host: HostSize,
+        /// How preferred this runner is when more than one could run a job
+        /// (E-19).
+        ///
+        /// One integer, higher first, zero by default, declared by whoever
+        /// runs the machine. It is the whole of M7's placement preference,
+        /// and it is deliberately not a language (invariant 1): the first
+        /// consumer's case is one fact — their owner's PC builds 3.1x faster
+        /// than their loaded server, so a build belongs there and waits for
+        /// it rather than falling back to the server (E-19). A requester
+        /// still never names a machine (invariant 6); it is the machines that
+        /// say how they rank.
+        ///
+        /// M12 adds cache locality (E-23) as a further term on top of this,
+        /// not a second mechanism.
+        #[serde(default, skip_serializing_if = "is_no_preference")]
+        preference: i32,
     },
     /// Runner reports what its external busy probes say (E-26).
     ///
@@ -562,6 +616,19 @@ pub enum ToHub {
         /// what moved [`PROTOCOL_VERSION`] to 2, and it is the whole point —
         /// the one way this field could do harm is by being invisible.
         priority: Priority,
+        /// How much memory one of this job's build threads needs, in MiB.
+        ///
+        /// Present means "derive my `-j` from the machine you place me on"
+        /// (E-22): the hub divides the chosen runner's share of memory by
+        /// this figure, caps it by the host's threads, records the result and
+        /// puts it where the command's [`PARALLELISM_TOKEN`] is. Absent means
+        /// the job takes no `-j` and nothing is derived for it.
+        ///
+        /// A per-thread figure and a whole-job figure are different things,
+        /// and this is the per-thread one — 1 792 MiB for the first
+        /// consumer's builds. Whole-job memory admission is M8's (E-29).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        build_thread_mib: Option<u32>,
     },
     /// An operator raises one job above what its requester asked for (E-18).
     ///
@@ -947,6 +1014,11 @@ pub fn unreadable_handshake_reason(what_went_wrong: &str) -> String {
          and dialling again will not change it — the offer is in this peer's own \
          configuration. Correct it and start the peer again"
     )
+}
+
+/// Whether a runner declared no preference at all, which is the default.
+fn is_no_preference(value: &i32) -> bool {
+    *value == 0
 }
 
 /// Encode one message as the text of one WebSocket frame.

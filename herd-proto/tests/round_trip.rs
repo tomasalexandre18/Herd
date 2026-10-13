@@ -3,9 +3,9 @@
 
 use herd_proto::{
     cap_exceeded_reason, cap_stop_reason, from_frame, to_frame, Availability, BusyProbe, Cap,
-    Capability, CapabilityOffer, CapabilityOrigins, CapabilityState, FromHub, JobId, JobMetrics,
-    JobOutcome, LabelSet, LogStream, OfferedCapability, Priority, Role, RunningJob, ToHub,
-    PROTOCOL_VERSION,
+    Capability, CapabilityOffer, CapabilityOrigins, CapabilityState, FromHub, HostSize, JobId,
+    JobMetrics, JobOutcome, LabelSet, LogStream, OfferedCapability, Priority, Role, RunningJob,
+    ToHub, PROTOCOL_VERSION,
 };
 
 /// An offer carrying one of each kind, each origin and each probe, so that
@@ -81,6 +81,9 @@ fn every_outcome() -> Vec<JobOutcome> {
     outcomes.push(JobOutcome::Lost {
         reason: "runner wsl-pc stopped answering: nothing from it for 61s".to_owned(),
     });
+    outcomes.push(JobOutcome::Impossible {
+        reason: "gpu-venus and igpu-vfio cannot be held together".to_owned(),
+    });
     outcomes
 }
 
@@ -148,6 +151,8 @@ fn every_message_to_the_hub_round_trips() {
             state_root: Some("root-0123456789abcdef".to_owned()),
             health_every_ms: Some(15_000),
             capabilities: an_offer(),
+            host: HostSize::new(Some(17 * 1024), Some(20)),
+            preference: 10,
         });
         // The optional fields really are optional.
         round_trip_to_hub(ToHub::Hello {
@@ -159,6 +164,8 @@ fn every_message_to_the_hub_round_trips() {
             state_root: None,
             health_every_ms: None,
             capabilities: CapabilityOffer::empty(),
+            host: HostSize::default(),
+            preference: 0,
         });
     }
     round_trip_to_hub(ToHub::CapabilitiesChanged {
@@ -176,11 +183,13 @@ fn every_message_to_the_hub_round_trips() {
             command: vec!["sh".to_owned(), "-c".to_owned(), "echo hi".to_owned()],
             labels: LabelSet::new(["build", "reference"]).expect("valid labels"),
             priority,
+            build_thread_mib: Some(1792),
         });
         round_trip_to_hub(ToHub::SubmitJob {
             command: vec![],
             labels: LabelSet::default(),
             priority,
+            build_thread_mib: None,
         });
         round_trip_to_hub(ToHub::RaiseJob {
             job_id: JobId::new("j0000000007"),
@@ -342,6 +351,14 @@ fn each_outcome_is_a_tagged_object_inside_the_frame() {
         }),
         format!(
             r#"{{"type":"job_finished","job_id":"j1","attempt":1,"outcome":{{"type":"lost","reason":"runner wsl-pc stopped answering"}}{empty}"#
+        )
+    );
+    assert_eq!(
+        frame(JobOutcome::Impossible {
+            reason: "gpu-venus and igpu-vfio cannot be held together".to_owned()
+        }),
+        format!(
+            r#"{{"type":"job_finished","job_id":"j1","attempt":1,"outcome":{{"type":"impossible","reason":"gpu-venus and igpu-vfio cannot be held together"}}{empty}"#
         )
     );
     assert_eq!(
