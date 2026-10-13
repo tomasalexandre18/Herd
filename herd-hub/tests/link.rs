@@ -161,7 +161,7 @@ impl Puppet {
     /// one name is one process dialling again — a redial — and a twin is what
     /// [`Puppet::dial`] makes.
     async fn join(hub_url: &str, name: &str) -> Self {
-        Self::handshake(hub_url, name, &format!("run-{name}"), None).await
+        Self::handshake(hub_url, name, &format!("run-{name}"), None, None).await
     }
 
     /// Dial saying exactly which process this is and which hub state root it
@@ -178,7 +178,21 @@ impl Puppet {
         instance: &str,
         state_root: Option<&str>,
     ) -> Result<Self, Box<FromHub>> {
-        let mut puppet = Self::handshake(hub_url, name, instance, state_root).await;
+        Self::dial_saying(hub_url, name, instance, state_root, None).await
+    }
+
+    /// The same, announcing the cadence this runner really reports at — the
+    /// figure the hub judges its own silence threshold against, because two
+    /// configurations that each pass their own startup check can still be
+    /// fatal together.
+    async fn dial_saying(
+        hub_url: &str,
+        name: &str,
+        instance: &str,
+        state_root: Option<&str>,
+        health_every: Option<Duration>,
+    ) -> Result<Self, Box<FromHub>> {
+        let mut puppet = Self::handshake(hub_url, name, instance, state_root, health_every).await;
         match puppet.next_within(TURNED_AWAY_PATIENCE).await {
             Some(answer) => Err(Box::new(answer)),
             None => Ok(puppet),
@@ -190,6 +204,7 @@ impl Puppet {
         name: &str,
         instance: &str,
         state_root: Option<&str>,
+        health_every: Option<Duration>,
     ) -> Self {
         let (mut socket, _response) = tokio_tungstenite::connect_async(hub_url)
             .await
@@ -201,6 +216,7 @@ impl Puppet {
             name: Some(name.to_owned()),
             instance: Some(instance.to_owned()),
             state_root: state_root.map(str::to_owned),
+            health_every_ms: health_every.map(|every| every.as_millis() as u64),
         };
         socket
             .send(Message::text(to_frame(&hello).expect("encodes")))

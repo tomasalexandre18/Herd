@@ -763,6 +763,19 @@ enum Standing {
     AnotherRunner { holder: String },
 }
 
+/// What a peer really said, with a blank answer read as no answer.
+///
+/// `Some("")` is not an identity, and neither is `Some("   ")`. Both used to
+/// satisfy every "did it say?" test in this file by being `Some`, which let a
+/// peer announce itself as nobody and then match every other nobody's
+/// attempt. A name is also trimmed rather than taken as given, so that one
+/// runner spelled with a trailing space is not a second runner.
+fn said(value: Option<String>) -> Option<String> {
+    value
+        .map(|value| value.trim().to_owned())
+        .filter(|value| !value.is_empty())
+}
+
 async fn serve_peer(state: Arc<State>, stream: TcpStream) -> Result<()> {
     // Log chunks are small and must not wait for a full segment.
     let _ = stream.set_nodelay(true);
@@ -774,7 +787,7 @@ async fn serve_peer(state: Arc<State>, stream: TcpStream) -> Result<()> {
     let Some(hello) = next_message(&mut source).await? else {
         bail!("the peer closed before saying hello");
     };
-    let (role, peer_name, peer_instance, peer_state_root) = match hello {
+    let (role, peer_name, peer_instance, peer_state_root, peer_health_every) = match hello {
         ToHub::Hello {
             protocol_version,
             role,
@@ -782,13 +795,29 @@ async fn serve_peer(state: Arc<State>, stream: TcpStream) -> Result<()> {
             name,
             instance,
             state_root,
+            health_every_ms,
         } => {
             if protocol_version != PROTOCOL_VERSION {
                 return refuse(&mut sink, version_mismatch_reason(protocol_version)).await;
             }
             // The token is carried from M1 and validated from M15 (D6, Q8).
             let _ = token;
-            (role, name.unwrap_or_default(), instance, state_root)
+            (
+                role,
+                // A blank identity is no identity. `Some("")` — or a name of
+                // spaces — used to walk straight through the refusal below,
+                // because it *has* an instance and *has* a name as far as an
+                // `Option` is concerned, and the peer then wore a blank
+                // effective name: one that matches every other blank-named
+                // peer's attempt, which is the exact hole naming an attempt's
+                // runner was meant to close. So whitespace is stripped and
+                // what is left empty is absent, which is the case the hub
+                // already refuses.
+                said(name).unwrap_or_default(),
+                said(instance),
+                said(state_root),
+                health_every_ms.map(Duration::from_millis),
+            )
         }
         other => {
             let reason = format!(
@@ -838,6 +867,39 @@ async fn serve_peer(state: Arc<State>, stream: TcpStream) -> Result<()> {
     )
     .await?;
 
+    // Two configurations that are each legal on their own side and fatal
+    // together. The hub refuses, at startup, a silence threshold that does
+    // not outlast three of the reports it *expects*; the runner refuses one
+    // that does not outlast three of the reports it *sends*. Both checks pass
+    // for `herd-hub --health-every 1 --lost-after 3` against `herd-runner
+    // --health-every 10 --hub-silence-limit 30`, and that pair burnt both
+    // attempts of a quiet `sleep 30` in about six seconds and ended it
+    // `lost`: the hub was timing the gap between two reports the runner never
+    // promised. So the runner's real cadence crosses the handshake and the
+    // pairing is judged here, by its figures, before a job can be placed on
+    // it.
+    //
+    // `Refused` and not `StandBy`: a cadence is settled when the process
+    // starts and dialling again announces the same one, so a runner told to
+    // wait would wait for ever on a configuration only a human can change —
+    // exactly the terminal "no" D13 keeps this frame for, and the same answer
+    // a version mismatch gets. A refusal that names both figures is also what
+    // reaches the operator, where an endless stand-by is a quiet runner.
+    //
+    // A peer that announces no cadence is served as before: the hub refuses
+    // figures it has been given, never ones it has guessed.
+    if let (Role::Runner, Some(cadence)) = (role, peer_health_every) {
+        if let Some(reason) = herd_proto::silence_threshold_refusal(
+            "the hub's silence threshold (--lost-after)",
+            state.policy.lost_after,
+            "the cadence this runner really reports at (--health-every)",
+            cadence,
+        ) {
+            eprintln!("herd-hub: runner {peer_name} is refused: {reason}");
+            return refuse(&mut sink, reason).await;
+        }
+    }
+
     // A runner carrying another state root's state is not served on this
     // connection. Not because the machine is bad — it is fine, and it will be
     // welcome a second from now — but because everything it is holding is
@@ -848,6 +910,16 @@ async fn serve_peer(state: Arc<State>, stream: TcpStream) -> Result<()> {
     //
     // Only runners: a requester holds nothing between connections, so there
     // is nothing of a vanished state for it to carry.
+    //
+    // A runner that announces **no** root at all is admitted, and that is the
+    // behaviour and not an oversight — M3's note had it standing by until it
+    // could record one, which is not what happens and not what should. A
+    // runner whose data root cannot be written to is still a machine that can
+    // build: it says so loudly on its own stderr (`COULD NOT write down which
+    // hub state root this data root belongs to`), and because `None` never
+    // equals this hub's root, everything it is holding from a previous life
+    // is set aside rather than believed. Turning it away instead would cost a
+    // working runner and protect nothing.
     let foreign_root = match (role, &peer_state_root) {
         (Role::Runner, Some(theirs)) if theirs != &hub_state_root => {
             Some(foreign_state_root_reason(&hub_state_root, theirs))

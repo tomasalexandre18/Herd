@@ -106,6 +106,7 @@ fn every_message_to_the_hub_round_trips() {
             name: Some("wsl-pc".to_owned()),
             instance: Some("run-4242-17a3f9".to_owned()),
             state_root: Some("root-0123456789abcdef".to_owned()),
+            health_every_ms: Some(15_000),
         });
         // The optional fields really are optional.
         round_trip_to_hub(ToHub::Hello {
@@ -115,6 +116,7 @@ fn every_message_to_the_hub_round_trips() {
             name: None,
             instance: None,
             state_root: None,
+            health_every_ms: None,
         });
     }
     round_trip_to_hub(ToHub::SubmitJob {

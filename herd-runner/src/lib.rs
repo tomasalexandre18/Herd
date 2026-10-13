@@ -979,6 +979,15 @@ impl Session {
     ///   copied from somewhere — and the same rule applies, because
     ///   "unattributable" and "another hub's" are the same thing to a record.
     ///
+    /// And one case that is **not** a refusal to serve: the new root cannot be
+    /// written down at all — a read-only data root, a full disk. The runner
+    /// says so loudly and **carries on**: it is admitted, it runs jobs, and it
+    /// is useful. Nothing is risked by that, because a data root with no
+    /// recorded root announces `None` on its next dial, `None` never equals a
+    /// hub's root, and so whatever it is holding is set aside by the rule
+    /// above instead of being believed. What is lost is only the ability to
+    /// attribute a verdict spooled from here, which is why the line is loud.
+    ///
     /// What is held in *memory* goes the same way, and for the same reason: a
     /// verdict this runner produced for the hub that is gone names a job id
     /// the new hub hands out to other jobs. It is never offered, its bytes are
@@ -1056,7 +1065,9 @@ impl Session {
         if let Err(error) = root.remember_hub_state_root(hub_root) {
             said.push(format!(
                 "COULD NOT write down which hub state root this data root belongs to: \
-                 {error}. A verdict spooled here would not be attributable to {hub_root}"
+                 {error}. A verdict spooled here would not be attributable to {hub_root}, \
+                 so the next runner on this data root will set it aside instead of \
+                 delivering it. This runner goes on serving the hub: fix the data root"
             ));
         } else if recorded.is_some() {
             said.push(format!(
@@ -1395,6 +1406,13 @@ pub async fn serve_once(config: Config, session: Session, confined: Arc<Confined
         // to, so that nothing spooled for a hub that no longer exists is
         // believed by the hub that replaced it.
         state_root: confined.root().hub_state_root(),
+        // And how often this runner will really say it is alive. The hub's
+        // silence threshold is only meaningful as a multiple of *this*
+        // figure, and a hub cannot check a pairing it cannot see: a hub
+        // expecting a report every second and a runner sending one every ten
+        // are each self-consistent and together declare a healthy job lost
+        // (E-40, E-21).
+        health_every_ms: Some(config.health_every.as_millis() as u64),
     };
     sink.send(Message::text(to_frame(&hello).context("encoding hello")?))
         .await

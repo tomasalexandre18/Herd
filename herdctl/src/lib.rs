@@ -352,6 +352,9 @@ async fn join(config: &Config) -> Result<Socket> {
             // state root. A requester is one command's worth of conversation.
             instance: None,
             state_root: None,
+            // Nor a cadence: a requester reports nothing, so there is no
+            // silence of its own for a hub to time (E-40 is the runner's).
+            health_every_ms: None,
         },
     )
     .await

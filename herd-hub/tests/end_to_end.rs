@@ -311,6 +311,7 @@ async fn a_version_mismatch_is_refused_naming_both_versions() {
             name: Some("from-the-future".to_owned()),
             instance: Some("run-from-the-future".to_owned()),
             state_root: None,
+            health_every_ms: None,
         };
         socket
             .send(Message::text(to_frame(&hello).expect("hello encodes")))
