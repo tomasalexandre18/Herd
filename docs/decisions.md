@@ -1905,3 +1905,246 @@ five seconds outranks a reading, and that reading simply does not count.
 **Alternative rejected.** Reading the probe from the consumer's
 declaration. Rejected as above; it would need authentication and a trust
 model that does not exist before M15 (D57).
+## 2026-10-13 — D87 A running job holds what it declared, read off its record
+
+**Context.** E-29 weighs a job's need against "free memory minus a
+per-client floor minus what running jobs hold", and M8 had to decide what
+*hold* means. The tempting reading is the true one: what the job's processes
+are actually using, which the runner already measures (M4's `peak_memory`).
+It is also wrong in a way that cannot be seen until a host swaps. A job
+admitted a second ago has allocated **nothing** yet, so a hub costing real
+usage admits a second job beside it, and then both grow into their
+declarations at once.
+
+**Choice.** Admission counts the **declared** need of every job the records
+say has an open attempt on that runner, and never a measurement. Two figures
+live on the record for it — `memory_mib` and `tmpfs_mib` — and a build's
+whole-job need is its per-thread figure times the `-j` it was given, which
+is why D82's order (N first, requirements second) is load-bearing rather
+than tidy. The declaration is honest because M4's cap already stops a job
+that exceeds it: a job over its figure is killed, not tolerated, so the
+figure is a ceiling the kernel enforces and not a guess.
+
+The sums are derived **from the records at the start of every pass**, through
+the same filter the slot counts use (D79): one `out_there` iterator, two
+derivations. There is no reservation table, so none of the eight ways a job
+ends has a release path to forget, and a hub that restarts reads what the hub
+before it would have read — "rebuilt after a restart" is not a code path.
+The pass carries the figures forward as it goes, so two jobs offered in one
+pass are weighed against each other and not only against what was running
+when the pass began.
+
+**A holding that cannot be costed is named, never zero.** A build out on a
+runner with no `-j` on its record is a bug somewhere else; what it must not
+be is a machine that reads idle on top of a running build. Such a record
+stops that runner admitting anything more that costs memory, by name, with
+the job id in the sentence.
+
+**What "free" means here, and it is narrower than E-29's word.** Not what
+`free` prints: the memory the machine's owner **lends**, less the floor, less
+what is declared. A live figure would move under the hub between the
+judgement and the claim, and a reservation weighed against a moving figure is
+exactly the overcommit E-32 forbids. The live figures are still recorded —
+load on every placement line, peak memory on every record — they are simply
+not what admission is arithmetic over.
+
+**Alternative rejected.** Reading `MemAvailable` per pass and admitting
+against it. Rejected on the two-jobs-in-one-pass case above, and because it
+makes a placement unreproducible: the same fleet in the same state would
+make different choices, and E-36 asks for a decision an operator can
+explain.
+
+---
+
+## 2026-10-13 — D88 Short of room now waits; too big ever does not stick
+
+**Context.** E-31 says a job that cannot reserve its tmpfs **waits, not
+fails**. Read flatly, that makes every shortfall a wait — including a job
+asking for 8 GiB on a machine with 2 GiB, which would then be told, every
+minute, that it is "waiting for build-host" for something that can never
+happen. That is M7's own defect in a new place: it judged a suspended
+capability before a self-contradiction and left a job waiting for a lock
+that was irrelevant to why it could never run.
+
+**Choice.** Three answers, not two, and the difference is whether the job
+**sticks** to the machine (E-19).
+
+* **The room is there and something has it** → the job waits *for that
+  machine*, because a job ending there is what frees the room. The sentence
+  carries both figures: `1.2 GiB free in tmpfs, 2 GiB needed`.
+* **More than the machine has in all**, or a machine that does not say what
+  it has → *not here, whatever happens here*. The job does not stick to it,
+  the sentence says `has 4 GiB of tmpfs in all and this job needs 6 GiB … no
+  reservation there can ever cover it`, and the job is free to be placed on a
+  machine that could fit it.
+* **The job's own figures are not figures** → terminal (D84). A whole-job
+  memory of `0`, or a job declaring both a per-thread figure and a whole-job
+  figure, ends with the reason: a human has to fix it, and a job waiting for
+  that would wait for ever.
+
+**What we did not do, and the risk accepted.** A job that no *connected*
+runner could ever fit is **not** failed: it waits, and its sentence says
+"ever" rather than "not now". A fleet is not a closed world — the owner's PC
+is asleep at night and its 17 GiB come back in the morning — and a hub that
+killed the nightly because the big machine was briefly away would be worse
+than one that waited. The cost is real and is stated here: such a job can
+wait for ever, with a sentence an operator greps in one go, holding nothing
+else up (E-19's wait is non-blocking). The bound that ends it is **E-09's
+deadline, in M9**, which is where a bound on waiting belongs.
+
+**Alternative rejected.** Ending a job whose size no connected machine can
+take. Rejected on the asleep-PC case, and because E-31's own words are
+"wait, never fail".
+
+---
+
+## 2026-10-13 — D89 An override lends less of a machine, never more
+
+**Context.** M7 left a runner's announced memory as `MemTotal` unless its
+owner overrides it with `--host-memory`, which is right — `MemTotal` is the
+whole machine and an owner lends part of hers. M8 subtracts a floor from that
+figure so the host keeps room to live. The two together have a hole: an
+override **larger** than the real `MemTotal` makes the floor guard memory
+that does not exist. `--host-memory 64GiB --host-memory-floor 6GiB` on a
+17 GiB machine announces 58 GiB of admission, and the first job past the real
+total is the owner's PC swapping — the 2026-10-12 OOM E-30 exists to stop,
+arrived by a different road.
+
+**Choice.** The figure is **clamped to the machine, loudly**, where it is
+written: the runner prints both figures and the reason at startup, and
+announces the clamped one. Clamped rather than refused because the owner's
+intent is still readable and the clamp is still safe — she is lending her
+machine, and the clamp lends all of it — and because a runner that would not
+start takes a machine out of the fleet for a typo. When `MemTotal` cannot be
+read there is nothing to clamp against, so her figure stands and the line
+says it was not checked. The one option ruled out from the start was a silent
+accept. `--host-tmpfs` is clamped the same way against the mount it names.
+
+**The floor itself.** `--host-memory-floor`, announced by the machine like
+every other figure about it, because its owner is the authority on how much
+of it Herd may have. Absent, it is **a fifth of what is lent, between 1 GiB
+and 8 GiB** — a fraction chosen to reproduce the two figures E-29 names
+rather than invented: a fifth of their 31 GiB server is 6.2 GiB against the
+6 GiB they ask, and a fifth of the owner's 17 GiB PC is 3.4 GiB against her
+3. A floor at or past the memory lent is **refused at startup**: it is a
+machine that can admit nothing, and denying its capabilities is the honest
+way to say that. A floor a peer never announced at all is **unknown**, and
+nothing is admitted against an unknown — a hub reading it as zero would admit
+a job into exactly the memory the floor exists to keep.
+
+**This is not double-counting E-22's quarter.** D83 keeps a quarter of a
+host's memory back from *build threads*, per slot, to choose `-j`. The floor
+is subtracted from *whole-job admission*. They are two gates on two
+questions, and the first consumer's own fleet passes both: `-j 6` in each of
+two slots on the server is 2 × 10.5 GiB against 25 GiB admissible, and `-j 7`
+on the PC is 12.2 GiB against 14 — it fits, and barely, which is the figure
+E-22 and E-29 between them were always going to produce.
+
+**Alternative rejected.** Refusing the oversized override by name. Rejected
+because the clamp carries the same safety and keeps the machine in the fleet;
+both beat the silent accept, which is what mattered.
+
+---
+
+## 2026-10-13 — D90 A tmpfs figure is a capacity, and unknown is not zero
+
+**Context.** E-31 reserves room on "the client's tmpfs". The figure could be
+what is free this second, read per pass, or the mount's capacity with
+reservations subtracted.
+
+**Choice.** The runner announces the **capacity** — measured from
+`--host-tmpfs-path` (`/dev/shm` by default, checked to really be a tmpfs) or
+given by its owner — and what is *free* is that figure less what the records
+say is declared (D87). A figure that moves under the hub between the
+judgement and the claim cannot be weighed against. The consumer's tool
+lowering its own scenario count when its tmpfs is short is theirs to do and
+Herd never models it (D82): Herd admits against the `-j` it chose, and their
+ceiling promise makes that safe.
+
+**A figure that cannot be read is absent, and a job needing a reservation is
+refused on that machine by name.** Never `Some(0)`, which is a real and
+different statement — a machine that lends no tmpfs — and never an
+assumption that the room is there. This is M4's unmeasurable-disk-as-zero
+defect, forbidden in the one place M8 could have repeated it. A job
+reserving **nothing** is of course still placed on such a machine: `build`
+and `check` need no tmpfs, and `0` is how they say so.
+
+**Alternative rejected.** Reading free tmpfs per dispatch pass. Rejected on
+the moving-figure argument and on cost: it is a syscall per runner per pass
+for a number that is wrong by the time it is used.
+
+---
+
+## 2026-10-13 — D91 E-04's cadence is a figure, with a bound stated
+
+**Context.** E-04 wants a queued stream to report its position, what is
+ahead and why "at least every 60 s". That has two failure modes and M6 had
+already chosen one of them: `record_waiting` writes and tells only when the
+sentence is **news**, which is right for a record — history is not a
+countdown — and leaves a requester following a job stuck on one lock file in
+silence for an hour. The opposite is as bad: a line per dispatch pass, and a
+pass runs when a runner joins, when a probe changes its mind, when a job
+ends, when one is submitted, and once a minute besides. M7 added more.
+
+**Choice.** A clock of its own, `--wait-restatement`, 60 s by default,
+printed at startup, refused at zero. One task reads the sentence the
+dispatch pass already wrote on the record — it judges nothing itself — and
+tells each follower again no oftener and no rarer than the cadence. So the
+bound is arithmetic an operator can do: over a wait of `W` a follower gets at
+most `W / cadence + 1` lines, which is **eleven over ten minutes**, not
+three hundred. Writing to the record stays M6's news-only rule, and the
+sentence's own figures are rounded to the minute (`roughly`), so a
+ten-minute wait leaves about ten lines of history rather than one per pass.
+News resets the cadence, so a requester told the reason this second is not
+told it again a moment later because a clock came round.
+
+E-04's "what is ahead" is now in the sentence too: the jobs in front, by id
+and by level, three named and the rest counted — three because the string
+lands in `waiting_for` and a sentence naming a four-hundred-job queue would
+be a kilobyte of history per job per position.
+
+**Alternative rejected.** Restating inside the dispatch pass. Rejected
+because the pass's cadence is an event rate, not a clock, and because it
+would put a per-follower send inside the lock D92 measures.
+
+---
+
+## 2026-10-13 — D92 What the whole-pass lock costs, measured
+
+**Context.** The `dispatching` lock is held for one pass over the **whole**
+queue, including every claim's and every waiting line's fsyncs. M7 booked
+this as a known cost and did not measure it; M8 adds admission arithmetic
+and two more figures per claim inside the same lock, so it was measured.
+
+**The figures**, on the development server, debug build, 400 queued jobs and
+no runner connected — the shape an operator meets after a restart:
+
+* **3.31 s** for the pass that writes a waiting line on every record: 400
+  records, 400 fsynced `events.jsonl` lines, ~8 ms each. This is disk, not
+  arithmetic.
+* **46.8 ms** for the next pass, where no sentence is news and nothing is
+  written. That is what a steady-state pass costs, 400 jobs included.
+
+**Choice.** Recorded, not fixed. The cost is dominated by the fsyncs M2's
+durability asks for, and the admission arithmetic is not visible in it; the
+steady-state figure — a tenth of a millisecond per queued job — is far inside
+anything the first consumer's scale (tens of unfinished jobs) can notice. A
+test prints both figures on every run and fails if a pass over 400 jobs ever
+takes two minutes, which catches something going quadratic without pinning a
+figure a slow CI box cannot meet.
+
+**What is honestly bad about it, and left alone.** During that 3.31 s no
+runner's probe snapshot is applied and no submission is dispatched. At four
+hundred *queued* jobs after a restart that is a real three-second stall, and
+it grows linearly with the queue. Narrowing the lock is a redesign of the
+claim step's atomicity — the one thing that makes "two jobs offered in one
+pass contend" true — so it is not done here, under the rule that M8 widens
+into no redesign. It is written down so that the first person to see a
+ten-second pass knows the shape of it and does not have to measure it again.
+
+**Alternative rejected.** Taking the lock per job rather than per pass.
+Rejected for now because a pass would then see the fleet change underneath
+it, and the two-jobs-in-one-pass contention this milestone exists to get
+right would stop being expressible.
+
+---
