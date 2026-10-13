@@ -14,6 +14,7 @@
 //! inside the JSON frame by [`bytes_as_base64`].
 
 use std::fmt;
+use std::time::Duration;
 
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 
@@ -21,6 +22,63 @@ use serde::{de::DeserializeOwned, Deserialize, Serialize};
 /// [`FromHub::Welcome`]. It is bumped whenever a message shape changes in a
 /// way an older peer could not read.
 pub const PROTOCOL_VERSION: u32 = 1;
+
+/// How often a runner says it is alive and what it is doing (E-40).
+///
+/// Here rather than in the runner because both sides depend on the figure: a
+/// runner reports at this cadence, and the hub's silence threshold is only
+/// meaningful as a multiple of it ([`SILENCE_MARGIN`]). Two crates each
+/// holding their own 15 s would be two truths about one contract
+/// (invariant 4).
+pub const HEALTH_EVERY: Duration = Duration::from_secs(15);
+
+/// How many health reports a silence threshold must be able to miss before
+/// it fires.
+///
+/// Three. One missed report is a scheduler hiccup, a garbage collection, a
+/// socket buffer; two is a link having a bad minute. A threshold shorter than
+/// three reports does not detect a lost runner, it detects jitter — and what
+/// it does with that detection is burn an attempt of a job that is running
+/// perfectly well. The deployment's own figures are the shape of this: a
+/// report every 15 s, lost after 60 s, which is four.
+pub const SILENCE_MARGIN: u32 = 3;
+
+/// Whether a silence threshold is long enough to be about silence, and the
+/// sentence to refuse it with when it is not.
+///
+/// `--lost-after 8` against a 15 s health cadence burnt both attempts of a
+/// healthy job in nineteen seconds and ended it `lost`: the hub was not
+/// measuring a lost runner, it was measuring the gap between two reports it
+/// had asked for. A configuration that cannot work is refused at startup,
+/// naming both figures and the margin — never discovered from a job's record
+/// afterwards.
+///
+/// Both sides call this. The hub checks its `--lost-after` against the
+/// cadence it expects its runners to report at; a runner checks how long it
+/// believes a silent hub against its own `--health-every`, because the hub
+/// answers every report and the mistake is exactly as easy to make in that
+/// direction.
+pub fn silence_threshold_refusal(
+    threshold_name: &str,
+    threshold: Duration,
+    interval_name: &str,
+    interval: Duration,
+) -> Option<String> {
+    if interval.is_zero() {
+        return None;
+    }
+    let needed = interval.saturating_mul(SILENCE_MARGIN);
+    if threshold >= needed {
+        return None;
+    }
+    Some(format!(
+        "{threshold_name} is {:?} and {interval_name} is {:?}: a silence threshold has to \
+         outlast {SILENCE_MARGIN} health reports ({:?} here), or a runner reporting \
+         perfectly well is declared lost between two of its own reports and the job it is \
+         running loses an attempt it never spent",
+        threshold, interval, needed
+    ))
+}
 
 /// Which side of the conversation a connecting peer is.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -246,6 +304,41 @@ pub enum ToHub {
         /// Human-readable name of the peer, for logs and reports.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         name: Option<String>,
+        /// *This process*, as distinct from the name it answers to.
+        ///
+        /// A name says which machine and which role; it does not say which
+        /// run. Without something that does, the hub cannot tell a runner
+        /// **redialling** — the same process, whose previous connection the
+        /// hub has not noticed the end of — from a **twin**: a second process
+        /// configured with the same name. Both look identical in a name, and
+        /// the two cases need opposite answers: a redial supersedes the
+        /// connection it is replacing, while a twin must not be allowed to
+        /// kick a runner that is alive and running a job. Told apart by a
+        /// name alone, two live twins supersede each other for ever.
+        ///
+        /// Minted once per process, carried on every dial that process makes,
+        /// and never read for anything but this comparison: it is an
+        /// identity, not an address and not a credential (M15's token is the
+        /// credential).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        instance: Option<String>,
+        /// Which hub state root the durable things this peer is holding
+        /// belong to, when it is holding any.
+        ///
+        /// A runner's spool outlives the hub it was produced for (D34, D42),
+        /// and a hub's job ids restart at `j0000000001` on a state root that
+        /// was recreated. Those two facts meet in a verdict that is
+        /// *plausible and false*: the frame names a job id the new hub has
+        /// genuinely minted, for an attempt it has genuinely handed out, and
+        /// nothing in it says it was produced for a hub whose state no longer
+        /// exists. So the state root has an identity, it travels here, and a
+        /// peer carrying state from another one is told so by name rather
+        /// than believed.
+        ///
+        /// `None` from a peer holding nothing durable — every requester, and
+        /// a runner that has never met a hub.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        state_root: Option<String>,
     },
     /// Requester asks for work to be done.
     SubmitJob { command: Vec<String> },
@@ -342,6 +435,15 @@ pub enum FromHub {
     Welcome {
         protocol_version: u32,
         hub_version: String,
+        /// The identity of the state root this hub is serving from.
+        ///
+        /// The answer to [`ToHub::Hello`]'s `state_root`, and it has to be
+        /// here rather than only compared at the hub: a runner that announced
+        /// a state root this hub does not own learns *which* root it is
+        /// talking to now, and can deal with what it is holding — by name —
+        /// instead of offering a verdict for a vanished hub on every link it
+        /// ever makes.
+        state_root: String,
     },
     /// The hub declines to go on, and says why. Always the last frame.
     Refused { reason: String },
@@ -368,16 +470,25 @@ pub enum FromHub {
         attempt: u32,
         reason: String,
     },
-    /// The runner said something about an attempt that is over, and nothing of
-    /// it was recorded.
+    /// The runner said something about an attempt that is not its to speak
+    /// about, and nothing of it was recorded.
     ///
-    /// A runner that was gone long enough to be declared lost comes back still
-    /// holding the frames of its attempt — a result, output, the lot — and the
-    /// job it was running may already be on its second attempt. None of that
-    /// may touch the record (E-21), and the runner may not be left guessing
-    /// why nothing happens: it is told by name, and it ends whatever it is
-    /// still doing for that attempt. Not a refusal — `Refused` is terminal
-    /// (D13) and this connection goes on.
+    /// Two cases, one answer. The attempt is **over**: a runner that was gone
+    /// long enough to be declared lost comes back still holding the frames of
+    /// its attempt — a result, output, the lot — and the job it was running
+    /// may already be on its second attempt. Or the attempt was **never
+    /// handed to this runner**: an attempt belongs to the runner the hub gave
+    /// it to, and a frame about it from anyone else is a verdict, or a
+    /// paragraph of log, about work this peer did not do. A spool file from a
+    /// hub whose state root was recreated is exactly that, with no malice and
+    /// no hand-editing anywhere.
+    ///
+    /// Neither may touch the record (E-21), and the runner may not be left
+    /// guessing why nothing happens: it is told by name — the reason says
+    /// which runner holds the attempt — and it ends whatever it is still
+    /// doing for it, spool file included (D42). Not a refusal: `Refused` is
+    /// terminal (D13) and this connection goes on, because the runner itself
+    /// is fine and may be given work.
     StaleAttempt {
         job_id: JobId,
         attempt: u32,
@@ -512,6 +623,58 @@ pub fn version_mismatch_reason(announced: u32) -> String {
     format!(
         "protocol version mismatch: the hub speaks version {PROTOCOL_VERSION}, \
          the peer announced version {announced}"
+    )
+}
+
+/// Why a frame about an attempt was not acted on, when the attempt was handed
+/// to another runner.
+///
+/// One sentence, here, because three places need the same one: the hub says
+/// it on its own stderr, sends it in [`FromHub::StaleAttempt`], and a test
+/// asserts it. It names both runners on purpose — "refused" without "whose
+/// attempt this is" leaves an operator with nothing to go on.
+pub fn not_this_runner_s_attempt_reason(
+    job_id: &JobId,
+    attempt: u32,
+    holder: &str,
+    speaker: &str,
+) -> String {
+    format!(
+        "attempt {attempt} of {job_id} was handed to runner {holder}, and this frame came \
+         from runner {speaker}: an attempt belongs to the runner it was given to, so \
+         nothing of this is recorded"
+    )
+}
+
+/// Why a peer carrying another state root's state is not served, naming both
+/// roots.
+///
+/// Said to the peer and printed by the hub. The peer is not broken and the
+/// hub is not broken: one of them is holding state for a hub that no longer
+/// exists, and the only wrong answer is for either side to guess.
+pub fn foreign_state_root_reason(hub_root: &str, peer_root: &str) -> String {
+    format!(
+        "this hub serves the state root {hub_root}, and this peer announced {peer_root}: \
+         whatever it is holding — a spooled verdict, above all — belongs to another hub's \
+         state, where the same job ids mean different jobs. Nothing of it is believed here. \
+         Deal with it and dial again"
+    )
+}
+
+/// Why a second runner claiming a name already held by a live one is told to
+/// wait, naming the name and both instances.
+///
+/// A configuration mistake said plainly. Two runners on one host is a
+/// supported shape — with **two names**; one name claimed twice cannot be
+/// served, because every job, every attempt and every record entry would say
+/// which runner it was on and mean two machines.
+pub fn runner_twin_reason(name: &str, incumbent: &str, newcomer: &str, heard: Duration) -> String {
+    format!(
+        "runner {name} is already connected and alive — heard from {heard:?} ago — as \
+         instance {incumbent}, and this is instance {newcomer}. One name, two live \
+         processes: that is a configuration mistake, not a reconnection, and this hub will \
+         not take turns killing one of them. Two runners on one host is a supported shape \
+         with two names; give this one a name of its own"
     )
 }
 

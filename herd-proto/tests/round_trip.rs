@@ -104,6 +104,8 @@ fn every_message_to_the_hub_round_trips() {
             role,
             token: Some("a-token".to_owned()),
             name: Some("wsl-pc".to_owned()),
+            instance: Some("run-4242-17a3f9".to_owned()),
+            state_root: Some("root-0123456789abcdef".to_owned()),
         });
         // The optional fields really are optional.
         round_trip_to_hub(ToHub::Hello {
@@ -111,6 +113,8 @@ fn every_message_to_the_hub_round_trips() {
             role,
             token: None,
             name: None,
+            instance: None,
+            state_root: None,
         });
     }
     round_trip_to_hub(ToHub::SubmitJob {
@@ -160,6 +164,7 @@ fn every_message_from_the_hub_round_trips() {
     round_trip_from_hub(FromHub::Welcome {
         protocol_version: PROTOCOL_VERSION,
         hub_version: "0.1.0".to_owned(),
+        state_root: "root-0123456789abcdef0123456789abcdef".to_owned(),
     });
     round_trip_from_hub(FromHub::Refused {
         reason: herd_proto::version_mismatch_reason(PROTOCOL_VERSION + 1),

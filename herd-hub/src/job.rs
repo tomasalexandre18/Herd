@@ -338,6 +338,17 @@ pub enum LogWrite {
 /// hub's correctness depends on a transition being on the disk before the
 /// hub acts on it — an acknowledgement to a runner, above all.
 pub trait JobStore: Send + Sync + 'static {
+    /// Who the state this store keeps belongs to, as the handshake carries it
+    /// (see `JobDirStore::state_root_id`).
+    ///
+    /// On the trait because the hub puts it in `Welcome`, and because a job id
+    /// only means anything inside one state: `j0000000001` of a root that was
+    /// recreated is a different job with the same name. A store with no
+    /// durable identity of its own answers with something stable for its own
+    /// lifetime; what it must never do is answer with a string another store
+    /// could also answer with.
+    fn state_root_id(&self) -> &str;
+
     /// Mint a job, assign its id, and record it as [`JobState::Queued`].
     fn create_job(&self, command: Vec<String>) -> Result<JobRecord>;
 

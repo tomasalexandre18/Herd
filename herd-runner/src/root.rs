@@ -47,6 +47,20 @@ const LOCK: &str = ".herd-runner.lock";
 /// survive exactly the restart that reaper runs in.
 const HELD: &str = "held-results";
 
+/// Which hub state root everything in this data root belongs to.
+///
+/// One line of text: the identity the hub announced in its welcome, and
+/// nothing else. A file rather than a field in memory because the thing it
+/// answers questions about is on a disk: a verdict spooled under `HELD` is
+/// *for a particular hub's state*, and a job id only means something inside
+/// one. A hub whose state root is recreated mints `j0000000001` again, so a
+/// spooled verdict from the root that is gone is plausible and false — and
+/// this line is how the runner knows which it is holding.
+///
+/// Text and not JSON because it has one value and the runner carries no JSON
+/// writer of its own; a human reading the data root can `cat` it.
+const HUB_STATE_ROOT: &str = "hub-state-root";
+
 /// One validated data root. Holding this value is the proof that the
 /// directory exists, is a directory, is writable by this runner, and that no
 /// other runner owns it.
@@ -177,6 +191,38 @@ impl DataRoot {
     /// told to stop.
     pub fn held_results_dir(&self) -> PathBuf {
         self.path.join(HELD)
+    }
+
+    /// Which hub state root this data root's durable things belong to, if a
+    /// hub has ever said.
+    ///
+    /// `None` on a data root that has never been welcomed by a hub — a first
+    /// start — and that is a meaningful answer rather than a missing one: a
+    /// runner with no recorded state root is holding nothing it can attribute
+    /// to one, so anything it finds in `held-results/` came from somewhere it
+    /// cannot vouch for.
+    pub fn hub_state_root(&self) -> Option<String> {
+        let path = self.path.join(HUB_STATE_ROOT);
+        let text = fs::read_to_string(path).ok()?;
+        let id = text.trim().to_owned();
+        (!id.is_empty()).then_some(id)
+    }
+
+    /// Write down which hub state root this data root now belongs to.
+    ///
+    /// Fsynced, because the question it answers is asked after a crash: a
+    /// verdict in `held-results/` and a state root recorded only in a page
+    /// cache would be a verdict nobody can attribute.
+    pub fn remember_hub_state_root(&self, state_root: &str) -> Result<(), String> {
+        let path = self.path.join(HUB_STATE_ROOT);
+        fs::write(&path, format!("{state_root}\n"))
+            .and_then(|()| fs::File::open(&path).and_then(|file| file.sync_all()))
+            .map_err(|error| {
+                format!(
+                    "the hub's state root could not be written to {}: {error}",
+                    path.display()
+                )
+            })
     }
 
     /// The file one unacknowledged result is written to, named for its job.

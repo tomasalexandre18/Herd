@@ -506,12 +506,24 @@ impl Wreck {
     }
 }
 
-/// A result whose job the hub has no record of — the state root was replaced
-/// under it — is acknowledged and reported, not refused. Refusing it would
-/// wedge the runner: it would hold that result for ever and redeliver it on
-/// every connection it ever made.
+/// A result for a job of a state root that is gone is never offered to the
+/// hub that replaced it — and it does not wedge the runner either.
+///
+/// The hub's state root was replaced under this runner, so the verdict it is
+/// holding is about a job id that now means another job: the new hub mints
+/// `j0000000001` again. Offering it would have the exit code of one job land
+/// on another job's record, which is why the state root's identity travels in
+/// the handshake. The runner is told by name, deals with what it holds — the
+/// bytes kept, never destroyed (D19) — and the connection after that is an
+/// ordinary one.
+///
+/// Before the identity existed, this test asserted the opposite: the new hub
+/// *acknowledged* a verdict for a job it had never heard of. That was only
+/// safe because the test minted three jobs first so the ids could not
+/// collide. With a collision — a recreated volume, which is the real case —
+/// the same path wrote a fabricated verdict onto a live job.
 #[tokio::test]
-async fn a_result_for_a_job_the_hub_never_heard_of_does_not_wedge_the_runner() {
+async fn a_result_for_a_job_of_a_state_root_that_is_gone_is_never_offered() {
     let first_root = tempfile::tempdir().expect("a temporary state directory");
     let second_root = tempfile::tempdir().expect("another one");
 
@@ -528,15 +540,6 @@ async fn a_result_for_a_job_the_hub_never_heard_of_does_not_wedge_the_runner() {
     });
     first_hub.wait_for_runner().await;
 
-    // Three jobs first, so that the one that matters has an id a fresh state
-    // root has not minted — the ids of two different state roots are two
-    // different sequences, and this test is about an unknown id, not a
-    // collision.
-    for _ in 0..3 {
-        herdctl::run_job(&first_hub.requester(), shell("true"), |_, _| {})
-            .await
-            .expect("a trivial job runs");
-    }
     let lost = herdctl::submit_job(&first_hub.requester(), shell("sleep 0.3; exit 3"))
         .await
         .expect("the job is accepted");
@@ -550,8 +553,51 @@ async fn a_result_for_a_job_the_hub_never_heard_of_does_not_wedge_the_runner() {
     let _ = first_link.await.expect("the link to the dead hub ends");
     wait_until("the runner holds the result", || !session.holds_nothing()).await;
 
-    // A hub on a state root that knows nothing of that job at all.
+    // A hub on a state root that knows nothing of that job at all — and whose
+    // own ids start again at `j0000000001`, which is the id the runner is
+    // holding a verdict for.
+    assert_eq!(
+        lost.as_str(),
+        "j0000000001",
+        "the collision this test is about needs the first id of each root"
+    );
     let second_hub = HubProcess::start(second_root.path());
+    let turned_away = herd_runner::serve_once(
+        runner_config(&second_hub.hub_url, &data_root),
+        session.clone(),
+        Arc::clone(&confined),
+    )
+    .await
+    .expect_err("a runner holding another state root's verdict is told so by name");
+    let said = format!("{turned_away:#}");
+    assert!(
+        said.contains("state root") && said.contains("Deal with it and dial again"),
+        "the runner has to be told what is wrong, and that it may come back: {said}"
+    );
+
+    // What it was holding is settled on that same breath: never offered, and
+    // its bytes kept under the data root rather than destroyed.
+    assert!(
+        session.holds_nothing(),
+        "a verdict for a hub that is gone is dealt with, not held for ever"
+    );
+    let kept: Vec<String> = std::fs::read_dir(data_root.path().join("held-results"))
+        .expect("the data root has a held-results directory by now")
+        .flatten()
+        .map(|entry| entry.file_name().to_string_lossy().into_owned())
+        .collect();
+    assert!(
+        kept.iter()
+            .any(|name| name.ends_with(".foreign-state-root")),
+        "the bytes of a verdict nobody can record are kept, not dropped: {kept:?}"
+    );
+    assert!(
+        !job_dir(second_root.path(), &lost).exists(),
+        "a job the new hub never minted must not appear on its state root"
+    );
+
+    // And the next connection is an ordinary one: the runner agrees about the
+    // state root now, and runs jobs for it.
     let second_link = tokio::spawn({
         let (config, session) = (
             runner_config(&second_hub.hub_url, &data_root),
@@ -560,16 +606,7 @@ async fn a_result_for_a_job_the_hub_never_heard_of_does_not_wedge_the_runner() {
         let confined = Arc::clone(&confined);
         async move { herd_runner::serve_once(config, session, confined).await }
     });
-    wait_until("the stale result is acknowledged", || {
-        session.holds_nothing()
-    })
-    .await;
-    assert!(
-        !job_dir(second_root.path(), &lost).exists(),
-        "a job the new hub never minted must not appear on its state root"
-    );
-
-    // And the runner is still a working runner.
+    second_hub.wait_for_runner().await;
     let finished = herdctl::run_job(
         &second_hub.requester(),
         shell("printf 'still working\\n'"),
@@ -578,5 +615,19 @@ async fn a_result_for_a_job_the_hub_never_heard_of_does_not_wedge_the_runner() {
     .await
     .expect("the runner still runs jobs");
     assert_eq!(finished.outcome, JobOutcome::Exited { code: 0 });
+    // The sharp end of it: the new root's own `j0000000001` carries the
+    // verdict of the job this hub really ran, and not the exit 3 of a job it
+    // never heard of.
+    assert_eq!(
+        file_state_of(second_root.path(), &lost),
+        "finished",
+        "the new root's own first job is over"
+    );
+    assert_eq!(
+        record_of(second_root.path(), &lost)["state"]["outcome"]["code"],
+        serde_json::json!(0),
+        "another state root's verdict landed on this job: {}",
+        record_of(second_root.path(), &lost)
+    );
     second_link.abort();
 }

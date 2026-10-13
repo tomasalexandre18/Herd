@@ -2,7 +2,8 @@
 //!
 //! ```text
 //! <state root>/
-//!   store.json              the layout's version; rewritten at every start
+//!   store.json              the layout's version and this root's identity;
+//!                           rewritten at every start
 //!   hub.lock                held by the one hub using this root (D21)
 //!   jobs/
 //!     j0000000001/
@@ -87,6 +88,9 @@ const ID_DIGITS: usize = 10;
 #[derive(Debug)]
 pub struct JobDirStore {
     root: PathBuf,
+    /// Who this state root is: minted when the root is created, kept in
+    /// `store.json`, never changed afterwards.
+    state_root_id: String,
     /// The claim on the state root, held open for as long as the store is
     /// (D21). Never read: holding it *is* the point, and the kernel takes it
     /// back the moment this process ends, however it ends.
@@ -126,6 +130,11 @@ struct LogAt {
 #[derive(Debug, Serialize, Deserialize)]
 struct StoreFile {
     layout_version: u32,
+    /// This state root's own identity. `#[serde(default)]` so that a root
+    /// written before there was one reads as a root with no identity yet and
+    /// is given one, rather than failing to open.
+    #[serde(default)]
+    state_root_id: String,
 }
 
 /// `index/state.json`.
@@ -198,6 +207,15 @@ impl JobDirStore {
         }
 
         let store_file = root.join(STORE_FILE);
+        // The root's identity: whatever is already in there, or a new one.
+        //
+        // Minted once and kept for ever, because the whole of its job is to
+        // be *different* from the identity of the root that was here before.
+        // A hub whose volume is recreated hands out `j0000000001` again, and
+        // a runner may still be holding a verdict for the `j0000000001` of
+        // the root that is gone — plausible, false, and indistinguishable
+        // from the real thing without this (D42, and M2 flagged it).
+        let mut state_root_id = String::new();
         if let Some(text) = read_optional(&store_file)? {
             let found: StoreFile = serde_json::from_str(&text)
                 .map_err(|error| failed("reading", &store_file, &error))?;
@@ -209,6 +227,10 @@ impl JobDirStore {
                     found.layout_version
                 )));
             }
+            state_root_id = found.state_root_id;
+        }
+        if state_root_id.is_empty() {
+            state_root_id = mint_a_state_root_id();
         }
         // Rewriting it at every start is also the test that the root is
         // writable, and it is where a reader learns what the layout is.
@@ -216,11 +238,13 @@ impl JobDirStore {
             &store_file,
             &StoreFile {
                 layout_version: LAYOUT_VERSION,
+                state_root_id: state_root_id.clone(),
             },
         )?;
 
         let store = Self {
             root,
+            state_root_id,
             _lock: lock,
             live: Mutex::new(Live {
                 next_sequence: 1,
@@ -236,6 +260,17 @@ impl JobDirStore {
     /// The state root, for whoever has to say where the state is.
     pub fn root(&self) -> &Path {
         &self.root
+    }
+
+    /// Who this state root is, as the handshake carries it.
+    ///
+    /// Not the path: a path is reused on purpose — the deployment's volume is
+    /// always `/var/lib/herd` — and a path says nothing about whether the
+    /// state *inside* it is the state a peer remembers. The identity is minted
+    /// with the root and dies with it, which is exactly the lifetime a job id
+    /// has meaning over.
+    pub fn state_root_id(&self) -> &str {
+        &self.state_root_id
     }
 
     /// Where one job's files live. Stable for the life of the job: the first
@@ -612,6 +647,10 @@ impl JobDirStore {
 }
 
 impl JobStore for JobDirStore {
+    fn state_root_id(&self) -> &str {
+        JobDirStore::state_root_id(self)
+    }
+
     fn create_job(&self, command: Vec<String>) -> Result<JobRecord> {
         let mut live = self.lock()?;
         // `mkdir` is what claims an id: the directories, not the index, decide
@@ -1040,6 +1079,51 @@ fn sequence_of(name: &str) -> Option<u64> {
         return None;
     }
     digits.parse().ok()
+}
+
+/// A fresh identity for a state root: random, short, and printable.
+///
+/// Random because the one thing asked of it is that two state roots never
+/// share one — including a root created a second after the one it replaced, on
+/// the same path, by the same deployment. A counter or a timestamp would
+/// collide exactly there, which is the case this exists for. Sixteen bytes
+/// from the kernel, hex, with a prefix so that a reader of a log or a frame
+/// knows what kind of thing it is looking at.
+///
+/// Printable because it travels in a JSON frame and lands in an operator's
+/// terminal: the hub's refusal names both roots, and a reader who cannot read
+/// the names cannot act on the refusal.
+fn mint_a_state_root_id() -> String {
+    let mut bytes = [0u8; 16];
+    // A kernel that cannot give sixteen random bytes is not a kernel this hub
+    // can be sure of, so the fallback is loud rather than silent — and still
+    // an identity, because starting without one would make every spooled
+    // verdict believable again.
+    let filled =
+        match rustix::rand::getrandom(&mut bytes[..], rustix::rand::GetRandomFlags::empty()) {
+            Ok(filled) => filled,
+            Err(error) => {
+                eprintln!(
+                    "herd-hub: this host would not give random bytes for the state root's \
+                 identity ({error}); falling back to the clock and this process's id, \
+                 which is weaker"
+                );
+                0
+            }
+        };
+    if filled < bytes.len() {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |since| since.as_nanos() as u64);
+        bytes[0..8].copy_from_slice(&nanos.to_be_bytes());
+        bytes[8..12].copy_from_slice(&std::process::id().to_be_bytes());
+    }
+    let mut id = String::with_capacity(5 + bytes.len() * 2);
+    id.push_str("root-");
+    for byte in bytes {
+        id.push_str(&format!("{byte:02x}"));
+    }
+    id
 }
 
 /// Claim a state root for this hub, or refuse naming who holds it.
