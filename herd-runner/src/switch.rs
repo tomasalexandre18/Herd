@@ -86,6 +86,12 @@ pub fn read(path: &Path) -> Result<Option<Switch>, String> {
 }
 
 /// Write a position down, so that it outlives the process that applied it.
+///
+/// **Durably**, since D99: `herdctl switch` now reports success on the strength
+/// of this returning `Ok`, so `Ok` has to mean the bytes are on the disk and
+/// not in a page cache that a lost machine takes with it. Written beside,
+/// fsynced, renamed over, and the directory fsynced — the discipline
+/// `herd_hub::durable` uses for a job's record, for the same reason.
 pub fn write(path: &Path, switch: &Switch) -> Result<(), String> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)
@@ -105,13 +111,25 @@ pub fn write(path: &Path, switch: &Switch) -> Result<(), String> {
     let beside = path.with_extension("new");
     std::fs::write(&beside, text.as_bytes())
         .map_err(|error| format!("{} cannot be written: {error}", beside.display()))?;
+    std::fs::File::open(&beside)
+        .and_then(|file| file.sync_all())
+        .map_err(|error| format!("{} cannot be fsynced: {error}", beside.display()))?;
     std::fs::rename(&beside, path).map_err(|error| {
         format!(
             "{} cannot be renamed over {}: {error}",
             beside.display(),
             path.display()
         )
-    })
+    })?;
+    // The rename itself has to be on the disk too: without this the file is
+    // there for anything that reads it and gone after a power cut, and D99's
+    // promise is about a machine that comes back.
+    if let Some(parent) = path.parent() {
+        std::fs::File::open(parent)
+            .and_then(|directory| directory.sync_all())
+            .map_err(|error| format!("{} cannot be fsynced: {error}", parent.display()))?;
+    }
+    Ok(())
 }
 
 /// How long the runner waits between two readings of its switch file.
