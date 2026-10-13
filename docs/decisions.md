@@ -1144,3 +1144,74 @@ invariant 2.
 one, on a timeout and on a clean stop alike.
 
 **Alternative rejected.** Trusting a probe to clean up after itself.
+
+---
+
+## 2026-10-13 — D63 One terminal test, two doors over it
+
+**Context.** PR #11 made `JobDirStore::open_for_writing` the single
+write entry point, checking `is_terminal()` under the store mutex: a
+writer could not reach a record without passing the refusal, so the
+rule was unbypassable by construction. M5 split it because
+`record_waiting` must answer `false` rather than error on a job that
+ended mid-pass — an erroring dispatch pass propagates up and drops the
+runner's connection, a worse failure than a skipped waiting line.
+
+**Choice.** `open_unless_over` holds the one terminal test;
+`open_for_writing` wraps it and refuses by name. One terminal test, two
+doors over it: a writer that believes in what it writes is refused by
+name, a dispatch pass with nothing to write is simply told `false`.
+Recorded honestly: the rule still holds today — nothing writes through
+`open_unless_over` but `record_waiting`, and a test asserts the record
+it leaves untouched — but a future writer picking the wrong door is now
+stopped by review rather than by the compiler.
+
+**Alternative rejected.** Keep one door and let `record_waiting` error,
+rejected because it turns a harmless race into a dropped runner
+connection.
+
+---
+
+## 2026-10-13 — D64 A probe reading is swept out of /proc like a job
+
+**Context.** A capability probe is a command the owner wrote (D51) and
+it can call `setsid()`, leaving its own session and surviving the group
+kill (D62) — the same escape M4 found for job children.
+
+**Choice.** Reuse M4's mechanism rather than invent a second one: every
+reading carries a unique `HERD_JOB_MARKER` of shape
+`herd-probe-<runner pid>-<counter>`, and `ProbeGroup` sweeps `/proc` for
+it after the group kill, on the timeout path and the dropped-task path
+alike; the startup reaper reads probe tags beside a job's. The probe
+sweep's budget is four rounds (~100 ms) against a job's forty (~1 s),
+because a probe reading happens periodically where a job ends once, and
+invariant 2's five seconds has to hold across however many readings are
+in flight. A stray resisting `SIGKILL` longer than that is left to the
+next reading's sweep or the next runner's startup reaper.
+
+**Alternative rejected.** A second sweep mechanism built just for
+probes, rejected because M4 already solved the identical problem.
+
+**Booked weaknesses.** Two, neither closed by this PR: (a) the sweep's
+resistant case — a probe that outlives four rounds — was reasoned
+about above, not tested; (b) every probe reading now scans `/proc` and
+reads `environ` of every pid, estimated at a few milliseconds and not
+measured, so a host with thousands of processes and a short
+`--probe-interval` carries new periodic work nobody has benchmarked.
+
+---
+
+## 2026-10-13 — D65 A key written twice keeps its first value
+
+**Context.** The capability file is refused outright if any key is
+duplicated (D60), and the only thing that value is ever read for is
+naming the refusal to the operator.
+
+**Choice.** `WithEveryKey` keeps the first of two equal keys:
+`{"name":"build","name":"other"}` names `"build"`, the name the
+operator actually wrote first, and `"other"` appears nowhere in the
+message.
+
+**Alternative rejected.** Keep the last, which is what
+`serde_json::Map::insert` does by default and would quote back a name
+the operator may never have intended to write.
