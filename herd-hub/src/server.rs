@@ -54,9 +54,9 @@ use futures_util::stream::{SplitSink, SplitStream};
 use futures_util::{SinkExt, StreamExt};
 use herd_proto::{
     a_frame_about_a_job_that_is_over_reason, foreign_state_root_reason, from_frame,
-    not_this_runner_s_attempt_reason, runner_twin_reason, to_frame, version_mismatch_reason,
-    CapabilityState, FromHub, JobId, JobMetrics, JobOutcome, LabelSet, Role, RunningJob, ToHub,
-    HEALTH_EVERY, PROTOCOL_VERSION,
+    not_this_runner_s_attempt_reason, runner_twin_reason, to_frame, unreadable_handshake_reason,
+    version_mismatch_reason, CapabilityState, FromHub, JobId, JobMetrics, JobOutcome, LabelSet,
+    Role, RunningJob, ToHub, HEALTH_EVERY, PROTOCOL_VERSION,
 };
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::mpsc::{self, UnboundedReceiver, UnboundedSender};
@@ -918,8 +918,25 @@ async fn serve_peer(state: Arc<State>, stream: TcpStream) -> Result<()> {
         .context("websocket handshake")?;
     let (mut sink, mut source) = socket.split();
 
-    let Some(hello) = next_message(&mut source).await? else {
+    // The handshake is read as text first, because a handshake this hub
+    // cannot *decode* still deserves a sentence. A capability offer is
+    // validated as it decodes (E-24), so one mistake in a runner's
+    // configuration file — a name that is not a label, one capability
+    // offered twice — makes its whole `Hello` undecodable. Treated like any
+    // other unreadable frame that cost the connection its socket and put the
+    // reason on the hub's stdout, where the runner's owner never sees it.
+    // It is a terminal no of exactly D13's shape: the offer is on the
+    // runner's disk and dialling again will say the same thing.
+    let Some(text) = next_text(&mut source).await? else {
         bail!("the peer closed before saying hello");
+    };
+    let hello = match from_frame::<ToHub>(&text) {
+        Ok(hello) => hello,
+        Err(error) => {
+            let reason = unreadable_handshake_reason(&error.to_string());
+            eprintln!("herd-hub: {reason}");
+            return refuse(&mut sink, reason).await;
+        }
     };
     let (role, peer_name, peer_instance, peer_state_root, peer_health_every, capacity) = match hello
     {
@@ -2318,13 +2335,23 @@ async fn refuse(sink: &mut Sink, reason: String) -> Result<()> {
 
 /// The next protocol message, or `None` once the peer is done.
 async fn next_message(source: &mut Source) -> Result<Option<ToHub>> {
+    let Some(text) = next_text(source).await? else {
+        return Ok(None);
+    };
+    let message =
+        from_frame(&text).map_err(|error| anyhow!("undecodable frame {text}: {error}"))?;
+    Ok(Some(message))
+}
+
+/// The text of the next frame that carries any, undecoded.
+///
+/// Separate from [`next_message`] for one caller: the handshake, which has to
+/// be able to say *why* it could not be read rather than drop the connection
+/// (D13, and see [`unreadable_handshake_reason`]).
+async fn next_text(source: &mut Source) -> Result<Option<String>> {
     while let Some(frame) = source.next().await {
         match frame.context("reading a frame")? {
-            Message::Text(text) => {
-                let message = from_frame(text.as_str())
-                    .map_err(|error| anyhow!("undecodable frame {text}: {error}"))?;
-                return Ok(Some(message));
-            }
+            Message::Text(text) => return Ok(Some(text.to_string())),
             Message::Close(_) => return Ok(None),
             Message::Binary(_) => bail!("the protocol carries text frames only (D4)"),
             Message::Ping(_) | Message::Pong(_) | Message::Frame(_) => continue,

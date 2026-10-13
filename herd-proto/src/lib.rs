@@ -774,6 +774,28 @@ pub fn runner_twin_reason(name: &str, incumbent: &str, newcomer: &str, heard: Du
     )
 }
 
+/// Why a handshake this hub could not read is refused, carrying what was
+/// wrong with it.
+///
+/// The one terminal refusal that comes from a frame rather than from a
+/// judgement about peers, and it exists because the alternative was silence.
+/// A capability offer is validated when it is decoded — a name that is not a
+/// name, one capability offered twice, an exclusion of something that is not
+/// a label — so a mistake in a runner's configuration makes its whole `Hello`
+/// undecodable. The hub used to drop such a connection, which put the reason
+/// on the hub's stdout and gave the runner's owner a reset socket and nothing
+/// to read. Dialling again cannot help: the configuration is on the runner's
+/// disk and will say the same thing next time, which is exactly D13's shape
+/// of "no". So the reason travels, and it is the last frame on that
+/// connection.
+pub fn unreadable_handshake_reason(what_went_wrong: &str) -> String {
+    format!(
+        "this hub could not read the handshake: {what_went_wrong}. Nothing was dispatched \
+         and dialling again will not change it — the offer is in this peer's own \
+         configuration. Correct it and start the peer again"
+    )
+}
+
 /// Encode one message as the text of one WebSocket frame.
 pub fn to_frame<M: Serialize>(message: &M) -> Result<String, serde_json::Error> {
     serde_json::to_string(message)
