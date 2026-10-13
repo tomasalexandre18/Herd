@@ -139,6 +139,34 @@ struct Args {
     /// unreadable, which suspends its capability. In milliseconds.
     #[arg(long, env = "HERD_PROBE_TIMEOUT", value_name = "MS")]
     probe_timeout: Option<u64>,
+    /// How much memory Herd's jobs may use on this host: `17GiB`, `2048MiB`,
+    /// or plain bytes.
+    ///
+    /// The input to the `-j` a build gets here (E-22). Read from
+    /// `/proc/meminfo` when not given, which is the whole machine — so an
+    /// owner lending part of her PC says how much here. A quarter of
+    /// whatever it is is kept back from build threads in any case, because a
+    /// runner must never be the reason its host falls over (invariant 2).
+    #[arg(long, env = "HERD_HOST_MEMORY", value_name = "SIZE")]
+    host_memory: Option<String>,
+    /// How many hardware threads Herd's jobs may use on this host (E-22).
+    /// Read from the host when not given.
+    #[arg(long, env = "HERD_HOST_THREADS", value_name = "N")]
+    host_threads: Option<u32>,
+    /// How preferred this runner is when more than one could run a job
+    /// (E-19). Higher goes first; zero by default.
+    ///
+    /// A job waits for the most preferred machine that could run it rather
+    /// than falling back to a lesser one that is free — up to the hub's
+    /// `--stickiness-limit`. One integer, declared by whoever runs the
+    /// machine: a requester never names a machine (invariant 6).
+    #[arg(
+        long,
+        env = "HERD_PREFERENCE",
+        value_name = "N",
+        allow_negative_numbers = true
+    )]
+    preference: Option<i32>,
 }
 
 fn seconds(value: f64) -> Duration {
@@ -195,6 +223,40 @@ async fn main() -> Result<()> {
     .map_err(anyhow::Error::msg)
     .context("this runner's capabilities")?;
 
+    // How big this host is. Read from the host, then overridden by whatever
+    // its owner said — one figure at a time, so an owner who declares the
+    // memory she is lending keeps the thread count the host reports.
+    let mut host = herd_runner::metrics::host_size();
+    if let Some(size) = args.host_memory {
+        let bytes = parse_bytes(&size)
+            .map_err(anyhow::Error::msg)
+            .context("--host-memory")?;
+        let mib = bytes / (1 << 20);
+        // Zero is refused rather than announced. A figure of zero is not "no
+        // figure": it is a machine of no size, and a hub handed one would
+        // derive a `-j` from nothing (the `Some(0)` that caused a real defect
+        // in M4). An owner who wants this machine to take no build denies the
+        // capability — `--deny-capability build` — which is the honest way to
+        // say it and the one a reader can see.
+        if mib == 0 {
+            anyhow::bail!(
+                "--host-memory {size} is {bytes} bytes, which is under a MiB: a host of no \
+                 size is not a figure a -j can be derived from. Give the memory Herd's jobs \
+                 may use here, or deny the capabilities this machine should not take."
+            );
+        }
+        host.memory_mib = Some(mib);
+    }
+    if let Some(threads) = args.host_threads {
+        if threads == 0 {
+            anyhow::bail!(
+                "--host-threads 0 is a machine that can run nothing: deny the capabilities \
+                 this machine should not take instead."
+            );
+        }
+        host.threads = Some(threads);
+    }
+
     println!("herd-runner: joining {}", args.hub);
     herd_runner::run(Config {
         hub_url: args.hub,
@@ -211,6 +273,8 @@ async fn main() -> Result<()> {
         confinement,
         capabilities,
         probes,
+        host,
+        preference: args.preference.unwrap_or(0),
     })
     .await
 }

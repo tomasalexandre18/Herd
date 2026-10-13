@@ -94,6 +94,7 @@ pub fn exit_code_for(outcome: &JobOutcome) -> u8 {
         }
         JobOutcome::CouldNotStart { .. }
         | JobOutcome::Cancelled { .. }
+        | JobOutcome::Impossible { .. }
         | JobOutcome::Lost { .. } => NO_VERDICT_CODE,
         JobOutcome::StoppedByCap { .. } => STOPPED_BY_CAP_CODE,
     }
@@ -111,6 +112,12 @@ pub fn no_verdict_reason(outcome: &JobOutcome) -> Option<String> {
         JobOutcome::Lost { reason } => {
             Some(format!("the runner executing this job was lost: {reason}"))
         }
+        // Not "no machine is free": no machine could ever be. The sentence
+        // says which requirement made it so, because the only thing to do
+        // about one of these is change the submission (E-36).
+        JobOutcome::Impossible { reason } => Some(format!(
+            "no runner could ever run this job, so it was not queued for one: {reason}"
+        )),
         _ => None,
     }
 }
@@ -175,6 +182,7 @@ pub async fn run_job(
     command: Vec<String>,
     labels: LabelSet,
     priority: Priority,
+    build_thread_mib: Option<u32>,
     mut on_log: impl FnMut(LogStream, &[u8]),
     mut on_note: impl FnMut(&str),
 ) -> Result<Finished> {
@@ -188,6 +196,7 @@ pub async fn run_job(
             command,
             labels,
             priority,
+            build_thread_mib,
         },
     )
     .await
@@ -241,6 +250,7 @@ pub async fn submit_job(
     command: Vec<String>,
     labels: LabelSet,
     priority: Priority,
+    build_thread_mib: Option<u32>,
 ) -> Result<JobId> {
     if command.is_empty() {
         bail!("a job needs a command to run");
@@ -252,6 +262,7 @@ pub async fn submit_job(
             command,
             labels,
             priority,
+            build_thread_mib,
         },
     )
     .await
@@ -400,6 +411,11 @@ async fn join(config: &Config) -> Result<Socket> {
             role: Role::Requester,
             token: config.token.clone(),
             name: config.name.clone(),
+            // A requester offers no capacity and runs nothing, so it has no
+            // size and no preference: both are what the hub asks of a runner
+            // (E-22, E-19).
+            host: herd_proto::HostSize::default(),
+            preference: 0,
             // Neither belongs to a requester. It holds nothing between
             // connections — no attempt, no spooled verdict — so there is
             // nothing for the hub to tell apart and nothing to attribute to a

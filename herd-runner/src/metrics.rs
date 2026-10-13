@@ -33,6 +33,49 @@ pub fn host_load_milli() -> Option<u64> {
     Some(whole.saturating_mul(1000).saturating_add(milli))
 }
 
+/// How big this host is, as far as it can be read from the host itself
+/// (E-22).
+///
+/// `MemTotal` from `/proc/meminfo`, and the thread count the standard library
+/// reports. Both become the input to the hub's `-j` derivation, so **a figure
+/// that cannot be read is absent and never zero**: a host reporting 0 MiB
+/// would be a host no job fits on, and a hub that read it as a figure would
+/// derive from nothing.
+///
+/// `MemTotal` is the whole machine, which is not always what the owner is
+/// lending. That is why the runner's `--host-memory` exists and why the
+/// derivation keeps a quarter of whatever it is told in reserve: the owner of
+/// a machine is the authority on how much of it Herd may have, and the
+/// default must at least not be a figure larger than the machine.
+pub fn host_size() -> herd_proto::HostSize {
+    herd_proto::HostSize::new(
+        total_memory_mib(),
+        std::thread::available_parallelism()
+            .ok()
+            .and_then(|threads| u32::try_from(threads.get()).ok()),
+    )
+}
+
+/// `MemTotal` in MiB, or nothing when `/proc/meminfo` cannot be read or does
+/// not carry it.
+fn total_memory_mib() -> Option<u64> {
+    let text = fs::read_to_string("/proc/meminfo").ok()?;
+    for line in text.lines() {
+        let Some(rest) = line.strip_prefix("MemTotal:") else {
+            continue;
+        };
+        let mut words = rest.split_whitespace();
+        let figure: u64 = words.next()?.parse().ok()?;
+        // The kernel writes kB and has always written kB; a line in any other
+        // unit is one this cannot read, and an unreadable figure is absent.
+        return match words.next() {
+            Some("kB") => Some(figure / 1024),
+            _ => None,
+        };
+    }
+    None
+}
+
 /// The resident memory of one process, in bytes, read from `/proc`.
 ///
 /// Used only where there is no cgroup to ask: it is the job's own process and
@@ -75,6 +118,22 @@ mod tests {
                 load < 10_000_000,
                 "a load of {load} thousandths is not a load"
             );
+        }
+    }
+
+    /// E-22's input. On Linux both figures are there, and the memory is a
+    /// plausible size for a machine — above all it is not zero, because zero
+    /// is what a derivation must never be handed.
+    #[test]
+    fn this_host_says_how_big_it_is_and_never_says_zero() {
+        let size = host_size();
+        if cfg!(target_os = "linux") {
+            let memory = size.memory_mib.expect("/proc/meminfo carries MemTotal");
+            assert!(memory > 64, "{memory} MiB is not a machine");
+            assert!(memory < 64 * 1024 * 1024, "{memory} MiB is not a machine");
+            let threads = size.threads.expect("the thread count is readable");
+            assert!(threads >= 1, "a host with no thread cannot run this test");
+            assert!(size.what_is_missing().is_none());
         }
     }
 

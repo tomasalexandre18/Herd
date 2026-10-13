@@ -49,6 +49,14 @@ enum Action {
         /// merger, step, nightly or producer, highest first.
         #[arg(long, default_value = DEFAULT_PRIORITY, value_name = "LEVEL")]
         priority: Priority,
+        /// How much memory one build thread of this job needs, in MiB.
+        ///
+        /// Given, the hub derives this job's `-j` from the machine it places
+        /// it on and puts the figure where the command's `{j}` is (E-22).
+        /// The command must then carry exactly one `{j}`, or the job is
+        /// refused by name rather than run with a figure nothing was told.
+        #[arg(long, value_name = "MIB")]
+        build_thread_mib: Option<u32>,
         /// The command, after `--`.
         #[arg(trailing_var_arg = true, required = true, num_args = 1..)]
         command: Vec<String>,
@@ -66,6 +74,10 @@ enum Action {
         /// merger, step, nightly or producer, highest first.
         #[arg(long, default_value = DEFAULT_PRIORITY, value_name = "LEVEL")]
         priority: Priority,
+        /// How much memory one build thread of this job needs, in MiB (E-22).
+        /// See `herdctl run --help`.
+        #[arg(long, value_name = "MIB")]
+        build_thread_mib: Option<u32>,
         /// The command, after `--`.
         #[arg(trailing_var_arg = true, required = true, num_args = 1..)]
         command: Vec<String>,
@@ -132,6 +144,7 @@ async fn main() -> ExitCode {
                 // Said below, by no_verdict_reason, with the other ends that
                 // carry no verdict.
                 | JobOutcome::Cancelled { .. }
+                | JobOutcome::Impossible { .. }
                 | JobOutcome::Lost { .. } => {}
             }
             // An exit code outside 0..=255 is one no process can have worn,
@@ -169,6 +182,7 @@ async fn run(args: Args) -> Result<Done> {
         Action::Run {
             labels,
             priority,
+            build_thread_mib,
             command,
         } => {
             // Said out loud, on stderr, before anything runs: a level is
@@ -183,6 +197,7 @@ async fn run(args: Args) -> Result<Done> {
                 command,
                 labels_of(labels)?,
                 priority,
+                build_thread_mib,
                 |stream, data| match stream {
                     LogStream::Stdout => write_now(&mut std::io::stdout(), data),
                     LogStream::Stderr => write_now(&mut std::io::stderr(), data),
@@ -197,11 +212,18 @@ async fn run(args: Args) -> Result<Done> {
         Action::Submit {
             labels,
             priority,
+            build_thread_mib,
             command,
         } => {
             eprintln!("herdctl: {}", submitting_at(priority));
-            let job_id =
-                herdctl::submit_job(&config, command, labels_of(labels)?, priority).await?;
+            let job_id = herdctl::submit_job(
+                &config,
+                command,
+                labels_of(labels)?,
+                priority,
+                build_thread_mib,
+            )
+            .await?;
             // The id alone on stdout, so that `id=$(herdctl submit -- ...)`
             // is all a hook needs (E-42).
             println!("{job_id}");
