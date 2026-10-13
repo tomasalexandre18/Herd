@@ -18,6 +18,14 @@ use std::time::Duration;
 
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 
+pub mod capability;
+
+pub use capability::{
+    check_label, metal_label, Availability, BusyProbe, Capability, CapabilityError, CapabilityKind,
+    CapabilityOffer, CapabilityOrigins, CapabilityState, Contention, Holdings, LabelSet,
+    OfferedCapability,
+};
+
 /// The version announced in [`ToHub::Hello`] and echoed in
 /// [`FromHub::Welcome`]. It is bumped whenever a message shape changes in a
 /// way an older peer could not read.
@@ -378,9 +386,37 @@ pub enum ToHub {
         /// given, and it does not pretend to know one.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         health_every_ms: Option<u64>,
+        /// What this runner offers, with each capability's origin (E-24).
+        ///
+        /// It rides in the handshake because offering capacity is what
+        /// joining *is*: a hub that had a runner but not yet its offer would
+        /// have a window in which it could only guess, and guessing is how a
+        /// job lands on a machine that cannot run it. Empty from a requester,
+        /// and from a runner that offers nothing — which is still a runner
+        /// that can run a job needing nothing.
+        #[serde(default, skip_serializing_if = "CapabilityOffer::is_empty")]
+        capabilities: CapabilityOffer,
     },
+    /// Runner reports what its external busy probes say (E-26).
+    ///
+    /// The whole set every time, not a delta: a snapshot is idempotent, so a
+    /// frame nobody saw costs nothing, and a runner that has just redialled
+    /// tells the new hub everything by sending one. Sent once on every
+    /// connection, and again whenever any probe's verdict changes.
+    ///
+    /// A capability a probe says is busy is **suspended, not refused**: a job
+    /// that needs it waits, with the reason on its record, and runs when the
+    /// probe clears (D38, E-26). Nothing here ever fails a job.
+    CapabilitiesChanged { capabilities: Vec<CapabilityState> },
     /// Requester asks for work to be done.
-    SubmitJob { command: Vec<String> },
+    SubmitJob {
+        command: Vec<String>,
+        /// The capabilities this job needs, by name (E-25). Names only: a
+        /// requester says what it needs, never which machine has it
+        /// (invariant 6), and never how the capability is governed.
+        #[serde(default, skip_serializing_if = "LabelSet::is_empty")]
+        labels: LabelSet,
+    },
     /// Requester asks to be told how a job that already exists ends.
     ///
     /// This is what makes a submission detachable: `herdctl submit` leaves

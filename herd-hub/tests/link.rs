@@ -21,8 +21,8 @@ use std::time::{Duration, Instant};
 use futures_util::{SinkExt, StreamExt};
 use herd_hub::{Hub, HubHandle, JobDirStore, JobRecord, JobState, JobStore, Policy};
 use herd_proto::{
-    from_frame, to_frame, FromHub, JobId, JobMetrics, JobOutcome, LogStream, Role, RunningJob,
-    ToHub, PROTOCOL_VERSION,
+    from_frame, to_frame, FromHub, JobId, JobMetrics, JobOutcome, LabelSet, LogStream, Role,
+    RunningJob, ToHub, PROTOCOL_VERSION,
 };
 use herd_runner::testing::TempDir as DataRootDir;
 use tempfile::TempDir;
@@ -126,6 +126,7 @@ impl Quick {
         herdctl::submit_job(
             &self.requester(),
             vec!["/bin/sh".to_owned(), "-c".to_owned(), command.to_owned()],
+            LabelSet::default(),
         )
         .await
         .expect("the submission is accepted")
@@ -217,6 +218,7 @@ impl Puppet {
             instance: Some(instance.to_owned()),
             state_root: state_root.map(str::to_owned),
             health_every_ms: health_every.map(|every| every.as_millis() as u64),
+            capabilities: Default::default(),
         };
         socket
             .send(Message::text(to_frame(&hello).expect("encodes")))
@@ -378,9 +380,13 @@ async fn a_runner_s_health_report_and_its_age_are_in_the_hub_s_state() {
         hub.handle.runners().first().is_some_and(|r| r.draining)
     })
     .await;
-    let refused = herdctl::submit_job(&hub.requester(), vec!["true".to_owned()])
-        .await
-        .expect_err("a draining runner takes no new job");
+    let refused = herdctl::submit_job(
+        &hub.requester(),
+        vec!["true".to_owned()],
+        LabelSet::default(),
+    )
+    .await
+    .expect_err("a draining runner takes no new job");
     assert!(
         refused.to_string().contains("draining"),
         "the refusal must say why: {refused:#}"
@@ -909,9 +915,13 @@ async fn a_draining_runner_refuses_a_job_submitted_in_the_meantime() {
             || !hub.handle.runner_connected()
     })
     .await;
-    let refused = herdctl::submit_job(&hub.requester(), vec!["true".to_owned()])
-        .await
-        .expect_err("a draining runner takes no new job");
+    let refused = herdctl::submit_job(
+        &hub.requester(),
+        vec!["true".to_owned()],
+        LabelSet::default(),
+    )
+    .await
+    .expect_err("a draining runner takes no new job");
     let said = format!("{refused:#}");
     assert!(
         said.contains("draining") || said.contains("no runner is connected"),
@@ -1411,9 +1421,13 @@ async fn a_runner_announcing_another_state_root_is_turned_away_naming_both() {
     // submission in this window is refused by name rather than handed to a
     // runner the hub is not serving.
     assert!(!hub.handle.runner_connected());
-    let refused = herdctl::submit_job(&hub.requester(), vec!["true".to_owned()])
-        .await
-        .expect_err("there is no runner to place a job on");
+    let refused = herdctl::submit_job(
+        &hub.requester(),
+        vec!["true".to_owned()],
+        LabelSet::default(),
+    )
+    .await
+    .expect_err("there is no runner to place a job on");
     assert!(
         refused.to_string().contains("no runner is connected"),
         "the refusal must say why: {refused:#}"
@@ -1690,6 +1704,8 @@ async fn the_hub_s_first_answer(hub_url: &str, name: &str, instance: &str) -> Fr
         instance: Some(instance.to_owned()),
         state_root: None,
         health_every_ms: None,
+        // A peer whose identity the hub is about to refuse offers nothing.
+        capabilities: Default::default(),
     };
     socket
         .send(Message::text(to_frame(&hello).expect("encodes")))
@@ -1733,9 +1749,13 @@ async fn a_peer_whose_name_and_instance_are_blank_is_refused_like_a_nameless_one
     // There is therefore no blank-named runner for a second one to write onto:
     // a job submitted in this window is refused by name, not placed on a peer
     // the hub is not serving.
-    let refused = herdctl::submit_job(&hub.requester(), vec!["true".to_owned()])
-        .await
-        .expect_err("there is no runner to place a job on");
+    let refused = herdctl::submit_job(
+        &hub.requester(),
+        vec!["true".to_owned()],
+        LabelSet::default(),
+    )
+    .await
+    .expect_err("there is no runner to place a job on");
     assert!(
         refused.to_string().contains("no runner is connected"),
         "the refusal must say why: {refused:#}"

@@ -55,8 +55,8 @@ use futures_util::{SinkExt, StreamExt};
 use herd_proto::{
     a_frame_about_a_job_that_is_over_reason, foreign_state_root_reason, from_frame,
     not_this_runner_s_attempt_reason, runner_twin_reason, to_frame, version_mismatch_reason,
-    FromHub, JobId, JobMetrics, JobOutcome, Role, RunningJob, ToHub, HEALTH_EVERY,
-    PROTOCOL_VERSION,
+    CapabilityState, FromHub, JobId, JobMetrics, JobOutcome, LabelSet, Role, RunningJob, ToHub,
+    HEALTH_EVERY, PROTOCOL_VERSION,
 };
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::mpsc::{self, UnboundedReceiver, UnboundedSender};
@@ -64,7 +64,8 @@ use tokio::sync::watch;
 use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::WebSocketStream;
 
-use crate::job::{JobRecord, JobState, JobStore, LogWrite};
+use crate::capability::RunnerCapacity;
+use crate::job::{JobRecord, JobState, JobStore, LogWrite, NewJob};
 
 /// Loopback by default: the hub is reached through the reverse proxy, which
 /// terminates TLS; the hub itself only ever speaks plain `ws://` (D4).
@@ -214,6 +215,7 @@ impl Hub {
                 // has had no word of since it began.
                 started: Instant::now(),
                 peers: Mutex::new(Peers::default()),
+                dispatching: Mutex::new(()),
             }),
         })
     }
@@ -289,6 +291,16 @@ impl HubHandle {
                 .collect()
         })
     }
+
+    /// What the connected runner offers and what its probes say (M5, E-24).
+    ///
+    /// Read-only, and `None` when no runner is connected. M13 grows the
+    /// status document out of this; a test reads it to assert that the hub
+    /// recorded what it was offered rather than inferring it.
+    pub fn runner_capacity(&self) -> Option<RunnerCapacity> {
+        self.state
+            .with_peers(|peers| peers.runner.as_ref().map(|runner| runner.capacity.clone()))
+    }
 }
 
 /// What the hub can say about one connected runner right now.
@@ -321,6 +333,15 @@ struct State {
     /// it inherited and has heard nothing about.
     started: Instant,
     peers: Mutex<Peers>,
+    /// Held for the length of one dispatch pass.
+    ///
+    /// M5 gives the hub a second reason to look at the queue — a capability a
+    /// probe has just freed — so two passes can now want the same queued job
+    /// at the same time. The `queued -> assigned` transition would catch the
+    /// loser, as a refused transition, but by then it has already sent the
+    /// job to a runner. One pass at a time, and the question "may this job
+    /// start" is answered and acted on inside it.
+    dispatching: Mutex<()>,
 }
 
 /// What a requester gets when it attaches to a job by its id.
@@ -339,6 +360,14 @@ struct ConnectedRunner {
     /// redial from a twin, which a name cannot.
     instance: Option<String>,
     outbox: Outbox,
+    /// What this runner offers, and what its external probes say (M5).
+    ///
+    /// The runner is the authority: it announces its offer in the handshake
+    /// and a snapshot of its probes on every connection, so this is recorded
+    /// rather than computed. It lives on the connection because it belongs to
+    /// it — an offer from a machine that is no longer here is not an offer,
+    /// and a redial brings its own.
+    capacity: RunnerCapacity,
     /// How the hub ends this connection without waiting for the socket to
     /// notice. Used when a runner that is plainly alive dials in while this
     /// connection is still registered: the new one is the real one.
@@ -442,6 +471,7 @@ impl State {
         instance: Option<&str>,
         outbox: &Outbox,
         kick: watch::Sender<bool>,
+        capacity: RunnerCapacity,
     ) -> Admitted {
         self.with_peers(|peers| {
             if let Some(incumbent) = &peers.runner {
@@ -509,6 +539,7 @@ impl State {
                 name: name.to_owned(),
                 instance: instance.map(str::to_owned),
                 outbox: outbox.clone(),
+                capacity,
                 kick,
                 joined_at: now,
                 last_health: now,
@@ -549,6 +580,51 @@ impl State {
                 .as_ref()
                 .filter(|runner| !runner.draining)
                 .map(|runner| (runner.name.clone(), runner.outbox.clone()))
+        })
+    }
+
+    /// Take a runner's snapshot of what its probes say, if it is *the*
+    /// runner. A frame from a connection whose slot has already been taken
+    /// over changes nothing.
+    fn update_capabilities(&self, outbox: &Outbox, capabilities: Vec<CapabilityState>) -> bool {
+        self.with_peers(|peers| {
+            match peers
+                .runner
+                .as_mut()
+                .filter(|runner| runner.outbox.same_channel(outbox))
+            {
+                Some(runner) => {
+                    runner.capacity.update(capabilities);
+                    true
+                }
+                None => false,
+            }
+        })
+    }
+
+    /// Why the connected runner cannot be given a job needing `labels` right
+    /// now, or `None` when it can.
+    ///
+    /// The whole of M5's dispatch judgement, and deliberately the smallest
+    /// thing that makes E-26 true: the labels have to be offered here and
+    /// none of them suspended. Contention between jobs already running — the
+    /// counted slots, the host-wide capability, the exclusions — is
+    /// `herd_proto::Holdings`, and consulting it at claim time is M7's.
+    fn why_not_now(&self, labels: &LabelSet) -> Option<String> {
+        self.with_peers(|peers| match &peers.runner {
+            Some(runner) => runner.capacity.why_not_now(labels),
+            None => Some("no runner is connected".to_owned()),
+        })
+    }
+
+    /// Every capability a probe is currently suspending, for the hub's log.
+    fn suspended_capabilities(&self) -> Vec<(String, String)> {
+        self.with_peers(|peers| {
+            peers
+                .runner
+                .as_ref()
+                .map(|runner| runner.capacity.suspended())
+                .unwrap_or_default()
         })
     }
 
@@ -824,7 +900,8 @@ async fn serve_peer(state: Arc<State>, stream: TcpStream) -> Result<()> {
     let Some(hello) = next_message(&mut source).await? else {
         bail!("the peer closed before saying hello");
     };
-    let (role, peer_name, peer_instance, peer_state_root, peer_health_every) = match hello {
+    let (role, peer_name, peer_instance, peer_state_root, peer_health_every, capacity) = match hello
+    {
         ToHub::Hello {
             protocol_version,
             role,
@@ -833,12 +910,17 @@ async fn serve_peer(state: Arc<State>, stream: TcpStream) -> Result<()> {
             instance,
             state_root,
             health_every_ms,
+            capabilities,
         } => {
             if protocol_version != PROTOCOL_VERSION {
                 return refuse(&mut sink, version_mismatch_reason(protocol_version)).await;
             }
             // The token is carried from M1 and validated from M15 (D6, Q8).
             let _ = token;
+            // Trimmed once, here, so that every reader below — the ownership
+            // gate, the twin rule, the capability registry's sentences — is
+            // looking at the same name.
+            let name = said(name);
             (
                 role,
                 // A blank identity is no identity. `Some("")` — or a name of
@@ -850,10 +932,16 @@ async fn serve_peer(state: Arc<State>, stream: TcpStream) -> Result<()> {
                 // runner was meant to close. So whitespace is stripped and
                 // what is left empty is absent, which is the case the hub
                 // already refuses.
-                said(name).unwrap_or_default(),
+                //
+                // The offer carries the same trimmed name, not the one as
+                // given: the sentence a human reads about a capability names
+                // the runner, and " wsl-pc " is not a second machine there
+                // either.
+                name.clone().unwrap_or_default(),
                 said(instance),
                 said(state_root),
                 health_every_ms.map(Duration::from_millis),
+                RunnerCapacity::new(name, capabilities),
             )
         }
         other => {
@@ -982,6 +1070,7 @@ async fn serve_peer(state: Arc<State>, stream: TcpStream) -> Result<()> {
                 peer_instance.as_deref(),
                 &outbox,
                 &mut source,
+                capacity,
             )
             .await
         }
@@ -998,9 +1087,15 @@ async fn serve_runner(
     instance: Option<&str>,
     outbox: &Outbox,
     source: &mut Source,
+    capacity: RunnerCapacity,
 ) -> Result<()> {
+    // What it offers, said out loud with every capability's origin: a denial
+    // nobody can see is a denial nobody can trust (E-24).
+    for line in capacity.report() {
+        println!("herd-hub: {line}");
+    }
     let (kick, mut kicked) = watch::channel(false);
-    match state.register_runner(name, instance, outbox, kick) {
+    match state.register_runner(name, instance, outbox, kick, capacity) {
         Admitted::Yes => {}
         // Not a refusal: a runner told to wait comes back, and one that is
         // refused dies (D13). Telling a redialling runner "a runner is
@@ -1066,14 +1161,17 @@ fn attempts_in_the_air(state: &State) -> Vec<JobId> {
         .collect()
 }
 
-/// Hand whatever is queued to the runner that can take it.
+/// Hand the runner every queued job it can take, and leave the rest queued
+/// with the reason why.
 ///
-/// After a restart the queue is whatever the job directories say it is, and a
-/// job that was queued when the hub went down is simply a job waiting for a
-/// runner — as is a job that was requeued after a loss (E-21). Nobody need be
-/// following them: the requester that submitted them may be long gone, which
-/// is exactly the detached case (E-03), and the result is recorded whether
-/// anyone is listening or not.
+/// Called whenever the answer could have changed: a runner joins, a runner
+/// says a probe has changed its mind, a job is submitted. After a restart the
+/// queue is whatever the job directories say it is, and a job that was queued
+/// when the hub went down is simply a job waiting for a runner — as is a job
+/// that was requeued after a loss (E-21). Nobody need be following them: the
+/// requester that submitted them may be long gone, which is exactly the
+/// detached case (E-03), and the result is recorded whether anyone is
+/// listening or not.
 ///
 /// Only *queued* jobs are dispatched. A job that is assigned or running
 /// belongs to an attempt that is not over, and a job left `interrupted` by a
@@ -1081,6 +1179,10 @@ fn attempts_in_the_air(state: &State) -> Vec<JobId> {
 /// result — deciding that such an attempt is lost is the watchdog's, on the
 /// clock, never a guess made here.
 fn dispatch_queued_jobs(state: &State) -> Result<()> {
+    let _one_pass = state
+        .dispatching
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     let waiting = state
         .store
         .unfinished_jobs()
@@ -1089,9 +1191,55 @@ fn dispatch_queued_jobs(state: &State) -> Result<()> {
         if record.state != JobState::Queued {
             continue;
         }
-        if !dispatch(state, &record.id, record.command.clone())? {
+        if !offer_job(state, &record)? {
             return Ok(());
         }
+    }
+    Ok(())
+}
+
+/// Give one queued job to the runner, or leave it queued and say why.
+///
+/// `false` means there is no runner to hand it to and this pass is over; a job
+/// that waits is `true`, because nothing is wrong with it.
+///
+/// The two outcomes are the whole of E-26. A job whose capability something
+/// outside Herd is holding is **not** refused and **not** failed: it stays
+/// `queued`, the reason goes on its record, whoever is waiting for it is told,
+/// and the next pass — the one a freed probe triggers — starts it. `Refused`
+/// is terminal (D13) and was never available for this; `JobNote` and a
+/// `waiting` line on the record are (D38).
+fn offer_job(state: &State, record: &JobRecord) -> Result<bool> {
+    if let Some(reason) = state.why_not_now(&record.labels) {
+        say_it_waits(state, &record.id, &reason)?;
+        return Ok(true);
+    }
+    dispatch(state, &record.id, record.command.clone())
+}
+
+/// Record why a queued job is not starting, and tell whoever is waiting for
+/// it.
+///
+/// The record first and unconditionally, so that a job nobody is following
+/// still says on its disk why nothing is happening to it (E-53). The note goes
+/// out only when the reason is *news*, because a requester following a job
+/// that waits an hour on one lock file wants one sentence, not one per
+/// dispatch pass — M8 owns the periodic re-statement E-04 asks for.
+fn say_it_waits(state: &State, job_id: &JobId, reason: &str) -> Result<()> {
+    let news = state
+        .store
+        .record_waiting(job_id, reason)
+        .with_context(|| format!("recording why {job_id} is waiting"))?;
+    if !news {
+        return Ok(());
+    }
+    println!("herd-hub: {job_id} stays queued: {reason}");
+    let note = format!("this job is queued and has not started: {reason}");
+    for follower in state.followers_of(job_id) {
+        let _ = follower.send(FromHub::JobNote {
+            job_id: job_id.clone(),
+            note: note.clone(),
+        });
     }
     Ok(())
 }
@@ -1190,6 +1338,22 @@ async fn relay_from_runner(
                         }
                     }
                 }
+            }
+            // What the runner's external probes say (E-26). Recording it is
+            // half of it; the other half is that a probe which has just
+            // *freed* a capability is the one event that can make a queued
+            // job runnable with nothing else having happened, so the queue is
+            // walked again here. That is what turns "the job waits" into "the
+            // job runs when the lock is released" without anyone resubmitting
+            // it.
+            ToHub::CapabilitiesChanged { capabilities } => {
+                if !state.update_capabilities(outbox, capabilities) {
+                    continue;
+                }
+                for (name, reason) in state.suspended_capabilities() {
+                    println!("herd-hub: {name} is suspended on the runner: {reason}");
+                }
+                dispatch_queued_jobs(state)?;
             }
             ToHub::LogChunk {
                 job_id,
@@ -1879,7 +2043,7 @@ async fn serve_requester(state: &State, outbox: &Outbox, source: &mut Source) ->
 async fn accept_submissions(state: &State, outbox: &Outbox, source: &mut Source) -> Result<()> {
     while let Some(message) = next_message(source).await? {
         match message {
-            ToHub::SubmitJob { command } => {
+            ToHub::SubmitJob { command, labels } => {
                 if command.is_empty() {
                     let _ = outbox.send(FromHub::Refused {
                         reason: "a job needs a command to run".to_owned(),
@@ -1892,7 +2056,7 @@ async fn accept_submissions(state: &State, outbox: &Outbox, source: &mut Source)
                 }
                 let job = state
                     .store
-                    .create_job(command.clone())
+                    .create_job(NewJob::needing(command, labels))
                     .context("minting a job")?;
                 // JobAccepted first, so the requester has the id before any
                 // chunk of its log can reach it.
@@ -1900,7 +2064,19 @@ async fn accept_submissions(state: &State, outbox: &Outbox, source: &mut Source)
                     job_id: job.id.clone(),
                 });
                 state.follow(job.id.clone(), outbox);
-                if !dispatch(state, &job.id, command)? {
+                // And then the job goes through exactly the same gate every
+                // other queued job goes through: it starts, or it stays
+                // queued with its reason on its record and a note on this
+                // connection. A submission the runner cannot serve yet is not
+                // a submission that failed (D38).
+                let dispatched = {
+                    let _one_pass = state
+                        .dispatching
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner());
+                    offer_job(state, &job)?
+                };
+                if !dispatched {
                     state.stop_following(&job.id);
                     let _ = outbox.send(FromHub::Refused {
                         reason: "the runner disconnected before the job was assigned".to_owned(),
@@ -1938,6 +2114,7 @@ async fn accept_submissions(state: &State, outbox: &Outbox, source: &mut Source)
                     });
                 }
                 let metrics = record.metrics.clone();
+                let waiting_for = record.waiting_for.clone();
                 match record.state {
                     // Answered from the record, which is the point of writing
                     // one: a wait works an hour later, on another machine,
@@ -1975,8 +2152,22 @@ async fn accept_submissions(state: &State, outbox: &Outbox, source: &mut Source)
                     _ => {
                         if let Some(why) = stalled {
                             let _ = outbox.send(FromHub::JobNote {
-                                job_id,
+                                job_id: job_id.clone(),
                                 note: stalled_note(&why),
+                            });
+                        }
+                        // And a job that is queued because a capability it
+                        // needs is suspended says so to a wait that attaches
+                        // an hour later, from its record: `herdctl wait`
+                        // must not sit silent on a job nothing is happening
+                        // to (E-26, E-04).
+                        if let Some(waiting_for) = waiting_for {
+                            let _ = outbox.send(FromHub::JobNote {
+                                job_id,
+                                note: format!(
+                                    "this job is queued and has not started: \
+                                     {waiting_for}"
+                                ),
                             });
                         }
                     }
@@ -2125,6 +2316,7 @@ async fn next_message(source: &mut Source) -> Result<Option<ToHub>> {
 fn message_kind(message: &ToHub) -> &'static str {
     match message {
         ToHub::Hello { .. } => "hello",
+        ToHub::CapabilitiesChanged { .. } => "capabilities_changed",
         ToHub::SubmitJob { .. } => "submit_job",
         ToHub::CancelJob { .. } => "cancel_job",
         ToHub::WaitForJob { .. } => "wait_for_job",

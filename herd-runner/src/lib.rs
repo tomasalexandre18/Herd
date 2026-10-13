@@ -32,7 +32,14 @@
 //! for staying unprivileged (E-46), [`cgroup`] for the kernel memory ceiling
 //! (E-30), [`confine`] plus [`job`] for the caps a job runs under (E-34), and
 //! [`spool`] for a verdict that outlives the process holding it.
+//!
+//! What a runner *offers* is [`capability`]'s (M5): the capabilities it
+//! detected, those its owner declared, those its owner denied, and what their
+//! external probes say. Probes are read beside the redial loop rather than
+//! inside a connection, because a probe is a fact about the host and goes on
+//! being true while there is no hub to tell.
 
+pub mod capability;
 pub mod cgroup;
 pub mod confine;
 pub mod job;
@@ -249,6 +256,13 @@ pub struct Config {
     pub drain_grace: Duration,
     /// The one data root and every cap a job runs under (M4).
     pub confinement: Confinement,
+    /// What this runner offers, each capability with its origin (M5, E-24).
+    /// Resolved before the first dial, because it is what joining means.
+    pub capabilities: herd_proto::CapabilityOffer,
+    /// How often the external busy probes are read, and how long one may
+    /// take (E-26). Injectable because a test that really waited out the
+    /// default interval is a test CI drops.
+    pub probes: capability::ProbeSettings,
 }
 
 impl Default for Config {
@@ -264,6 +278,8 @@ impl Default for Config {
             confinement: Confinement::with_data_root(
                 root::DataRoot::default_path().unwrap_or_else(|_| "herd-data".into()),
             ),
+            capabilities: herd_proto::CapabilityOffer::empty(),
+            probes: capability::ProbeSettings::default(),
         }
     }
 }
@@ -462,6 +478,11 @@ fn finished_frame(job_id: &JobId, attempt: u32, chunks_sent: u64, end: &Ended) -
 #[derive(Debug, Clone, Default)]
 pub struct Session {
     inner: Arc<Mutex<Inner>>,
+    /// What this runner offers and what its probes say (M5). It belongs here
+    /// rather than to a connection for the same reason a held result does: it
+    /// is true of the host, and it has to be told again to whichever hub is
+    /// up next.
+    capacity: capability::Capacity,
 }
 
 #[derive(Debug)]
@@ -529,6 +550,36 @@ impl Session {
     /// Who this runner process is, as its handshake announces it.
     pub fn instance(&self) -> String {
         self.with(|inner| inner.instance.clone())
+    }
+
+    /// A session offering these capabilities, with these probe settings.
+    pub fn offering(
+        capabilities: herd_proto::CapabilityOffer,
+        probes: capability::ProbeSettings,
+    ) -> Self {
+        Self {
+            capacity: capability::Capacity::new(capabilities, probes),
+            ..Self::default()
+        }
+    }
+
+    /// What this runner offers and what its probes last said.
+    pub fn capacity(&self) -> &capability::Capacity {
+        &self.capacity
+    }
+
+    /// Tell the hub what every probe says, as one snapshot.
+    ///
+    /// Sent on every connection, before anything can be assigned on it: a hub
+    /// that had the offer but not the probes would believe a suspended
+    /// capability free for as long as it took the next change to happen,
+    /// which could be hours. Nothing to say when nothing is probed.
+    pub(crate) fn announce_capabilities(&self) {
+        let capabilities = self.capacity.snapshot();
+        if capabilities.is_empty() {
+            return;
+        }
+        self.send(ToHub::CapabilitiesChanged { capabilities });
     }
 
     /// How many results are waiting to be acknowledged.
@@ -1191,12 +1242,36 @@ pub async fn run_until(config: Config, stop: impl Future<Output = String>) -> Re
         eprintln!("herd-runner: {line}");
     }
 
-    let session = Session::new();
+    let session = Session::offering(config.capabilities.clone(), config.probes);
+    // What this runner offers, said once at startup, with each capability's
+    // origin (E-24) — the `kvm: present, denied` line above all, because a
+    // denial an operator cannot see is a denial they cannot trust.
+    for line in capability::report(session.capacity()) {
+        eprintln!("herd-runner: {line}");
+    }
     // Before the first dial: whatever a previous life of this runner wrote
     // down and nobody acknowledged. A verdict on a disk is only saved once it
     // reaches the hub, and no human belongs in that loop (D34).
     for line in session.pick_up(confined.root()) {
         eprintln!("herd-runner: {line}");
+    }
+    // Every probe read once *before* the first dial, so the offer the hub
+    // receives is already true. A capability whose probe has never been read
+    // is suspended, so skipping this would make a correctly configured runner
+    // look busy for one interval.
+    session.capacity().sweep().await;
+    {
+        // And read for ever afterwards, beside the redial loop rather than
+        // inside a connection: a lock file an operator removes while the hub
+        // is down must still free the capability, and the next connection
+        // announces it.
+        let watching = session.clone();
+        tokio::spawn(capability::watch(
+            session.capacity().clone(),
+            move |capabilities| {
+                watching.send(ToHub::CapabilitiesChanged { capabilities });
+            },
+        ));
     }
 
     let serving = serve_forever(config.clone(), session.clone(), Arc::clone(&confined));
@@ -1413,6 +1488,9 @@ pub async fn serve_once(config: Config, session: Session, confined: Arc<Confined
         // are each self-consistent and together declare a healthy job lost
         // (E-40, E-21).
         health_every_ms: Some(config.health_every.as_millis() as u64),
+        // The session's, not the config's: one runner has one offer, and the
+        // session is what survives a reconnect with it.
+        capabilities: session.capacity().offer().clone(),
     };
     sink.send(Message::text(to_frame(&hello).context("encoding hello")?))
         .await
@@ -1448,6 +1526,8 @@ pub async fn serve_once(config: Config, session: Session, confined: Arc<Confined
     // deliver. A job finished while the hub was away is still a job that ran,
     // and output the hub never wrote is still output the job produced.
     session.attach(outbox);
+    // And what every probe says, before this connection can be dispatched on.
+    session.announce_capabilities();
     let reporting = tokio::spawn(report_health(session.clone(), config.health_every));
     let outcome = serve_hub(&session, &mut source, confined, config.hub_silence_limit).await;
     reporting.abort();

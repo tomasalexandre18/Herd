@@ -1,9 +1,9 @@
 use std::io::Write;
 use std::process::ExitCode;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
-use herd_proto::{JobId, JobOutcome, LogStream};
+use herd_proto::{JobId, JobOutcome, LabelSet, LogStream};
 use herdctl::{
     could_not_start_message, exit_code_for, impossible_exit_code_reason, no_verdict_message,
     no_verdict_reason, stopped_by_cap_message, Config, DEFAULT_HUB_URL, NO_VERDICT_CODE,
@@ -29,6 +29,11 @@ enum Action {
     ///
     /// A requester never names a machine (invariant 6).
     Run {
+        /// A capability this job needs, by name (E-25). Repeat the option, or
+        /// separate names with `,`. Never a machine: the hub chooses
+        /// (invariant 6).
+        #[arg(long = "label", value_delimiter = ',', value_name = "NAME")]
+        labels: Vec<String>,
         /// The command, after `--`.
         #[arg(trailing_var_arg = true, required = true, num_args = 1..)]
         command: Vec<String>,
@@ -38,6 +43,10 @@ enum Action {
     /// The job runs and is recorded whether anyone is following it or not, so
     /// `herdctl wait <id>` works any time afterwards.
     Submit {
+        /// A capability this job needs, by name (E-25). Repeat the option, or
+        /// separate names with `,`.
+        #[arg(long = "label", value_delimiter = ',', value_name = "NAME")]
+        labels: Vec<String>,
         /// The command, after `--`.
         #[arg(trailing_var_arg = true, required = true, num_args = 1..)]
         command: Vec<String>,
@@ -123,18 +132,26 @@ async fn run(args: Args) -> Result<Done> {
         name: None,
     };
     match args.command {
-        Action::Run { command } => {
+        Action::Run { labels, command } => {
             // Each stream is written to its own, so a caller's pipes and
             // redirections behave as if the command had run here.
-            let finished = herdctl::run_job(&config, command, |stream, data| match stream {
-                LogStream::Stdout => write_now(&mut std::io::stdout(), data),
-                LogStream::Stderr => write_now(&mut std::io::stderr(), data),
-            })
+            let finished = herdctl::run_job(
+                &config,
+                command,
+                labels_of(labels)?,
+                |stream, data| match stream {
+                    LogStream::Stdout => write_now(&mut std::io::stdout(), data),
+                    LogStream::Stderr => write_now(&mut std::io::stderr(), data),
+                },
+                // Herd's own words, never the job's: stdout stays the job's
+                // alone. A queued job's reason arrives here (E-26).
+                |note| eprintln!("herdctl: {note}"),
+            )
             .await?;
             Ok(Done::Job(finished.outcome))
         }
-        Action::Submit { command } => {
-            let job_id = herdctl::submit_job(&config, command).await?;
+        Action::Submit { labels, command } => {
+            let job_id = herdctl::submit_job(&config, command, labels_of(labels)?).await?;
             // The id alone on stdout, so that `id=$(herdctl submit -- ...)`
             // is all a hook needs (E-42).
             println!("{job_id}");
@@ -164,6 +181,18 @@ async fn run(args: Args) -> Result<Done> {
             Ok(Done::Said)
         }
     }
+}
+
+/// Turn `--label` into a canonical label set, refusing a name that is not a
+/// label.
+///
+/// Refused here, before anything is submitted: a typo that reached the hub
+/// would become a job waiting for a capability no machine will ever offer,
+/// and the caller would read a wait where they should read a sentence.
+fn labels_of(labels: Vec<String>) -> Result<LabelSet> {
+    LabelSet::new(labels)
+        .map_err(anyhow::Error::msg)
+        .context("--label")
 }
 
 fn write_now(out: &mut impl Write, data: &[u8]) {

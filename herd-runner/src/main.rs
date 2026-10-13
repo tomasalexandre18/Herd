@@ -3,6 +3,9 @@ use std::time::Duration;
 
 use anyhow::{Context, Result};
 use clap::Parser;
+use herd_runner::capability::{
+    CapabilityConfig, ProbeSettings, DEFAULT_PROBE_INTERVAL_MS, DEFAULT_PROBE_TIMEOUT_MS,
+};
 use herd_runner::confine::{
     DEFAULT_DISK_BUDGET, DEFAULT_LOG_CAP, DEFAULT_MEMORY_MAX, DEFAULT_NICE, DEFAULT_TIMEOUT_SECONDS,
 };
@@ -89,6 +92,47 @@ struct Args {
         value_name = "PATH"
     )]
     privileged_helpers: Vec<String>,
+    /// A JSON file declaring what this runner offers: each capability's name,
+    /// kind (`exclusive`, `counted` with slots, or `shared`), what it cannot
+    /// be held alongside, and an optional external busy probe — a lock-file
+    /// path or a command whose exit code means busy (E-24, E-26).
+    ///
+    /// Data, not code: there is no plugin here and never will be (invariant
+    /// 1). Secrets stay out of the repo by this being a path given at
+    /// startup (invariant 7).
+    #[arg(long, env = "HERD_CAPABILITIES", value_name = "PATH")]
+    capabilities: Option<PathBuf>,
+    /// A capability this runner offers, by name, with no kind and no probe —
+    /// `shared`. Repeat the option, or separate names with `:` in the
+    /// environment variable. Anything that needs a kind goes in the file.
+    #[arg(
+        long = "declare-capability",
+        env = "HERD_DECLARE_CAPABILITIES",
+        value_delimiter = ':',
+        value_name = "NAME"
+    )]
+    declare_capability: Vec<String>,
+    /// A capability this runner refuses, whatever the host has (E-24).
+    /// Repeat the option, or separate names with `:` in the environment
+    /// variable. A denial wins over detection and over declaration both.
+    #[arg(
+        long = "deny-capability",
+        env = "HERD_DENY_CAPABILITIES",
+        value_delimiter = ':',
+        value_name = "NAME"
+    )]
+    deny_capability: Vec<String>,
+    /// Do not look at the host for capabilities at all; offer only what is
+    /// declared. For a test that must read the same on every machine.
+    #[arg(long, env = "HERD_NO_DETECT")]
+    no_detect: bool,
+    /// How often the external busy probes are read, in milliseconds.
+    #[arg(long, env = "HERD_PROBE_INTERVAL", value_name = "MS")]
+    probe_interval: Option<u64>,
+    /// How long one probe may take before it is killed and read as
+    /// unreadable, which suspends its capability. In milliseconds.
+    #[arg(long, env = "HERD_PROBE_TIMEOUT", value_name = "MS")]
+    probe_timeout: Option<u64>,
 }
 
 fn seconds(value: f64) -> Duration {
@@ -127,6 +171,24 @@ async fn main() -> Result<()> {
     confinement.cgroup_root = args.cgroup_root;
     confinement.privileged_helpers = args.privileged_helpers;
 
+    let probes = ProbeSettings {
+        interval: Duration::from_millis(args.probe_interval.unwrap_or(DEFAULT_PROBE_INTERVAL_MS)),
+        timeout: Duration::from_millis(args.probe_timeout.unwrap_or(DEFAULT_PROBE_TIMEOUT_MS)),
+    };
+    // Resolved here, before the dial: a capability file that does not read is
+    // a machine that would offer the wrong thing, so it is refused at startup
+    // naming the path, exactly as a bad data root is (E-45's rule).
+    let capabilities = CapabilityConfig {
+        file: args.capabilities,
+        declared: args.declare_capability,
+        denied: args.deny_capability,
+        detect: !args.no_detect,
+        probes,
+    }
+    .resolve()
+    .map_err(anyhow::Error::msg)
+    .context("this runner's capabilities")?;
+
     println!("herd-runner: joining {}", args.hub);
     herd_runner::run(Config {
         hub_url: args.hub,
@@ -141,6 +203,8 @@ async fn main() -> Result<()> {
         },
         drain_grace: seconds(args.drain_grace),
         confinement,
+        capabilities,
+        probes,
     })
     .await
 }

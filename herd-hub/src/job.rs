@@ -9,7 +9,7 @@
 use std::error::Error;
 use std::fmt;
 
-use herd_proto::{JobId, JobOutcome, LogStream};
+use herd_proto::{JobId, JobOutcome, LabelSet, LogStream};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 /// What a runner measured while a job ran.
@@ -147,12 +147,56 @@ pub struct Attempt {
     pub ended: Option<String>,
 }
 
+/// What a requester asked for, as the hub takes it in.
+///
+/// One struct rather than a growing argument list: M6 adds a priority and a
+/// deduplication key to a submission, and a store whose `create_job` took
+/// four positional arguments would be rewritten at each one.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct NewJob {
+    pub command: Vec<String>,
+    /// The capabilities the job needs, by name (E-25). Canonical, because
+    /// [`LabelSet`] sorts and deduplicates: M6's deduplication keys on them,
+    /// and two submissions that named the same two labels in a different
+    /// order are one submission.
+    pub labels: LabelSet,
+}
+
+impl NewJob {
+    /// A job that needs no capability in particular.
+    pub fn new(command: Vec<String>) -> Self {
+        Self {
+            command,
+            labels: LabelSet::default(),
+        }
+    }
+
+    /// A job that needs these capabilities.
+    pub fn needing(command: Vec<String>, labels: LabelSet) -> Self {
+        Self { command, labels }
+    }
+}
+
 /// What the hub knows about one job: the contents of its `job.json`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct JobRecord {
     pub id: JobId,
     pub command: Vec<String>,
+    /// The capabilities this job needs (E-25). Written at birth and never
+    /// changed: what a job asked for is part of what it was.
+    #[serde(default)]
+    pub labels: LabelSet,
     pub state: JobState,
+    /// Why the job has not started, while it has not.
+    ///
+    /// A waiting job is still `queued` — waiting is not being refused (D38),
+    /// and the state machine must not grow a variant for it or every later
+    /// milestone would have to handle "queued but differently". The reason
+    /// lives beside the state so that a reader of `job.json` alone sees why
+    /// nothing is happening (E-53), and it is cleared the moment the job
+    /// leaves the queue. `events.jsonl` keeps the history of these.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub waiting_for: Option<String>,
     /// When the hub minted the job.
     pub submitted_at: Timestamp,
     /// When its state last changed.
@@ -256,6 +300,14 @@ impl JobEvent {
         }
     }
 
+    /// Why a queued job is not starting, named on the record (E-26, E-04).
+    pub fn waiting(at: Timestamp, reason: String) -> Self {
+        Self {
+            at,
+            what: JobEventKind::Waiting { reason },
+        }
+    }
+
     /// The state the job moved to, when this line is a transition, and `None`
     /// when it records something else.
     pub fn state(&self) -> Option<&JobState> {
@@ -263,7 +315,8 @@ impl JobEvent {
             JobEventKind::Transition { state } => Some(state),
             JobEventKind::LogGap { .. }
             | JobEventKind::AttemptStarted { .. }
-            | JobEventKind::AttemptEnded { .. } => None,
+            | JobEventKind::AttemptEnded { .. }
+            | JobEventKind::Waiting { .. } => None,
         }
     }
 }
@@ -305,6 +358,16 @@ pub enum JobEventKind {
         /// The number of the last one, inclusive.
         last_missing: u64,
     },
+    /// The job is queued and the hub tried to start it and could not, and
+    /// this is the sentence why (E-26, E-04).
+    ///
+    /// Not a state and not a failure. A capability something outside Herd is
+    /// holding suspends it, and the job that needs it waits — with this line
+    /// on its record, so that "nothing is happening" is never silent and
+    /// never has to be said with `Refused`, which is terminal (D13, D38).
+    /// Written only when the reason *changes*, so a job that waits an hour
+    /// for one lock file leaves one line rather than a thousand.
+    Waiting { reason: String },
 }
 
 /// A job store failed, with the path or the id that failed in the message: the
@@ -372,7 +435,16 @@ pub trait JobStore: Send + Sync + 'static {
     fn state_root_id(&self) -> &str;
 
     /// Mint a job, assign its id, and record it as [`JobState::Queued`].
-    fn create_job(&self, command: Vec<String>) -> Result<JobRecord>;
+    fn create_job(&self, new: NewJob) -> Result<JobRecord>;
+
+    /// Record why a queued job is not starting, and say whether that was
+    /// news.
+    ///
+    /// `false` means the reason is already the one on the record, or the job
+    /// is not queued any more — nothing was written. The hub calls this on
+    /// every dispatch attempt, so writing unconditionally would turn a job
+    /// waiting on one lock file into an `events.jsonl` nobody can read.
+    fn record_waiting(&self, id: &JobId, reason: &str) -> Result<bool>;
 
     /// Record a transition, with the moment it happened. Unknown ids are an
     /// error, not a silent no-op, and so is a job that is already over — a
