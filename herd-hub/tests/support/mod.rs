@@ -84,6 +84,7 @@ pub async fn run_job(
         command,
         herd_proto::LabelSet::default(),
         herd_proto::Priority::Step,
+        None,
         on_log,
         |_| {},
     )
@@ -100,6 +101,7 @@ pub async fn submit_job(
         command,
         herd_proto::LabelSet::default(),
         herd_proto::Priority::Step,
+        None,
     )
     .await
 }
@@ -438,6 +440,7 @@ pub async fn run_job_at(
         command,
         herd_proto::LabelSet::default(),
         priority,
+        None,
         |_, _| {},
         |_| {},
     )

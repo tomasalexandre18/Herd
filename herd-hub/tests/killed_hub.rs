@@ -1131,18 +1131,13 @@ async fn a_verdict_planted_in_another_runner_s_spool_is_refused_by_name() {
     )
     .expect("the fixture writes the planted verdict");
 
-    // `runner-y` is started *before* the kill, so that it is dialling —
-    // standing by, this hub taking one runner until M5 — and is admitted the
-    // moment the slot frees. Starting it afterwards would race the attempt's
-    // own clock: a process start on a loaded machine against a three-second
-    // threshold, and the frame would arrive refused for the other reason.
+    // `runner-y` joins beside `runner-x` — since M7 this hub holds a fleet —
+    // and offers what it found in its spool at once, while the real attempt
+    // is still running on the machine it was handed to. That makes the lie
+    // sharper than it was: the frame arrives from a connected, healthy,
+    // welcome runner, about an attempt that is alive, and it is refused on
+    // the one ground that matters — it is not that runner's attempt.
     let mut y = herd.start_runner_called("runner-y", "runner-y");
-    herd.wait_until("runner-y is dialling and being asked to wait", || {
-        herd.said("runner-y").contains("stand by")
-    })
-    .await;
-    x.signal(rustix::process::Signal::KILL).await;
-
     herd.wait_until("the hub refuses the planted verdict by name", || {
         herd.said("first").contains(&format!(
             "attempt {attempt} of {job} was handed to runner runner-x"
@@ -1154,6 +1149,9 @@ async fn a_verdict_planted_in_another_runner_s_spool_is_refused_by_name() {
         "the refusal names who spoke, or an operator has nothing to go on: {}",
         herd.said("first")
     );
+    // Only now is the machine that really is running the job torn out, so
+    // that the rest of this test is about the job's own second go.
+    x.signal(rustix::process::Signal::KILL).await;
 
     // Nothing of it was recorded. The record still names attempt 1 on
     // runner-x, carries no verdict and no figures, and the log is the job's
