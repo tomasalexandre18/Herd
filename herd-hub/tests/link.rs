@@ -24,6 +24,7 @@ use herd_proto::{
     from_frame, to_frame, FromHub, JobId, JobMetrics, JobOutcome, LogStream, Role, RunningJob,
     ToHub, PROTOCOL_VERSION,
 };
+use herd_runner::testing::TempDir as DataRootDir;
 use tempfile::TempDir;
 use tokio::net::TcpStream;
 use tokio_tungstenite::tungstenite::Message;
@@ -617,10 +618,12 @@ async fn a_second_loss_ends_the_job_rather_than_starting_a_third_attempt() {
 #[tokio::test(flavor = "multi_thread")]
 async fn a_cancel_ends_one_job_within_ten_seconds_and_a_sibling_runs_on() {
     let hub = Quick::start(Duration::from_secs(60)).await;
+    let data_root = DataRootDir::new("cancel-sibling");
     let runner = tokio::spawn(herd_runner::run(herd_runner::Config {
         hub_url: hub.hub_url.clone(),
         name: Some("test-runner".to_owned()),
         token: None,
+        confinement: herd_runner::Confinement::with_data_root(data_root.path()),
         ..herd_runner::Config::default()
     }));
     hub.wait_until("the runner joins", || hub.handle.runner_connected())
@@ -698,12 +701,18 @@ async fn a_cancel_ends_one_job_within_ten_seconds_and_a_sibling_runs_on() {
 #[tokio::test(flavor = "multi_thread")]
 async fn a_busy_runner_asked_to_stop_drains_inside_five_seconds() {
     let hub = Quick::start(Duration::from_secs(60)).await;
+    let data_root = DataRootDir::new("drain-five-seconds");
     let (ask, asked) = tokio::sync::oneshot::channel::<String>();
     let runner = tokio::spawn(herd_runner::run_until(
         herd_runner::Config {
             hub_url: hub.hub_url.clone(),
             name: Some("test-runner".to_owned()),
             token: None,
+            // A data root of its own: a runner locks its root for the life of
+            // the process (D32), and `Config::default()` points at the real
+            // one under $XDG_STATE_HOME — which two tests would fight over
+            // and a test has no business touching at all.
+            confinement: herd_runner::Confinement::with_data_root(data_root.path()),
             ..herd_runner::Config::default()
         },
         async move {
@@ -761,12 +770,18 @@ async fn a_busy_runner_asked_to_stop_drains_inside_five_seconds() {
 #[tokio::test(flavor = "multi_thread")]
 async fn a_draining_runner_refuses_a_job_submitted_in_the_meantime() {
     let hub = Quick::start(Duration::from_secs(60)).await;
+    let data_root = DataRootDir::new("drain-refuses");
     let (ask, asked) = tokio::sync::oneshot::channel::<String>();
     let runner = tokio::spawn(herd_runner::run_until(
         herd_runner::Config {
             hub_url: hub.hub_url.clone(),
             name: Some("test-runner".to_owned()),
             token: None,
+            // A data root of its own: a runner locks its root for the life of
+            // the process (D32), and `Config::default()` points at the real
+            // one under $XDG_STATE_HOME — which two tests would fight over
+            // and a test has no business touching at all.
+            confinement: herd_runner::Confinement::with_data_root(data_root.path()),
             ..herd_runner::Config::default()
         },
         async move {
