@@ -1029,3 +1029,125 @@ async fn a_refused_runner_prints_the_reason_before_it_stops() {
     );
     hub.await.expect("the hand-written hub ends");
 }
+
+/// Invariant 2's other half, and the one that was broken: the probes a runner
+/// reads must not decide how long it takes to become a runner.
+///
+/// The figure that made this a defect was measured, not argued: ten probes
+/// that hang delayed the first dial by **20 057 ms** — a runner's whole
+/// startup spent being no use to anybody — because the first sweep was
+/// awaited in front of the join and read the probes one after another, at the
+/// `--probe-timeout` each. Both halves were wrong, and both are fixed: the
+/// sweep is one task beside the redial loop rather than a step before it, and
+/// a sweep reads every probe at once.
+///
+/// So ten hanging probes now cost **less than one timeout**, measured here
+/// against the real binaries, which is the only form of this claim worth
+/// making: not "faster", but "not on the join path at all". The timeout given
+/// is the real default of two seconds precisely so that the serial cost would
+/// be impossible to mistake for the concurrent one — twenty seconds against
+/// one bound — and the assertion is made on a number this test prints.
+///
+/// The readings still arrive, and the test waits for them: joining early is
+/// only safe because a probe with no reading suspends its capability at both
+/// ends (D49), so a job needing one waits rather than running on a machine an
+/// external holder is using.
+#[tokio::test]
+async fn ten_hanging_probes_do_not_delay_the_runner_joining() {
+    const PROBES: usize = 10;
+    /// The real default. A serial sweep would spend PROBES times this.
+    const PROBE_TIMEOUT_MS: u64 = 2_000;
+
+    let declared: Vec<String> = (0..PROBES)
+        .map(|n| {
+            format!(
+                r#"{{"name":"hangs-{n}","kind":{{"type":"shared"}},
+                     "busy_probe":{{"type":"command",
+                                    "command":["/bin/sh","-c","sleep 600"]}}}}"#
+            )
+        })
+        .collect();
+    let file = format!(r#"{{"capabilities":[{}]}}"#, declared.join(","));
+
+    let mut herd = Herd::new();
+    herd.start_hub().await;
+
+    // Measured from spawning the process to the hub saying it has joined:
+    // everything the runner does before it is a runner is inside this.
+    let dialled_at = Instant::now();
+    let path = herd.run.path().join("capabilities.json");
+    std::fs::write(&path, file.as_bytes()).expect("the capability file is written");
+    let child = Command::new(binary("herd-runner"))
+        .arg("--hub")
+        .arg(herd.url())
+        .arg("--name")
+        .arg("the-slow-probed-runner")
+        .arg("--data-root")
+        .arg(herd.data_root.path())
+        .arg("--capabilities")
+        .arg(&path)
+        .arg("--no-detect")
+        .arg("--probe-timeout")
+        .arg(PROBE_TIMEOUT_MS.to_string())
+        .arg("--probe-interval")
+        .arg("50")
+        .stdout(herd.output("runner", "out"))
+        .stderr(herd.output("runner", "err"))
+        .kill_on_drop(true)
+        .spawn()
+        .expect("herd-runner starts");
+    herd.runner = Some(Process { child });
+    herd.wait_until("the runner has joined", || {
+        herd.said("hub").contains("has joined")
+    })
+    .await;
+    let joined_in = dialled_at.elapsed();
+    println!(
+        "ten hanging probes at a {PROBE_TIMEOUT_MS} ms timeout: the runner \
+         joined in {} ms",
+        joined_in.as_millis()
+    );
+
+    let one_timeout = Duration::from_millis(PROBE_TIMEOUT_MS);
+    assert!(
+        joined_in < one_timeout,
+        "{PROBES} hanging probes held the join for {} ms, which is more than \
+         the one timeout a probe is allowed to cost: the sweep is back in \
+         front of the join, or back to being serial",
+        joined_in.as_millis()
+    );
+
+    // And the readings follow, rather than being skipped: every one of them
+    // is unknown, which suspends its capability, and a job that needs one
+    // waits with the reason on its record (D49, E-26).
+    let job = herd
+        .submit("hangs-7", "printf 'this should not have run\\n'")
+        .await;
+    herd.wait_until(&format!("{job} says why it is waiting"), || {
+        herd.waiting_for(&job).is_some()
+    })
+    .await;
+    assert_eq!(
+        herd.state_of(&job),
+        "queued",
+        "a capability whose probe has not answered must suspend it"
+    );
+    let why = herd.waiting_for(&job).expect("a reason");
+    assert!(
+        why.contains("hangs-7"),
+        "the reason must name the capability: {why}"
+    );
+
+    // A job needing nothing runs throughout, which is what "the runner is a
+    // runner" means while ten `sleep 600` are being started and killed every
+    // interval.
+    let ran = herd
+        .herdctl(&["run", "--", "/bin/sh", "-c", "printf 'serving\\n'"])
+        .await;
+    assert_eq!(
+        ran.status.code(),
+        Some(0),
+        "a job needing nothing must run while ten probes hang: {}",
+        String::from_utf8_lossy(&ran.stderr)
+    );
+}

@@ -569,25 +569,43 @@ impl Capacity {
 
     /// Read every probe once, and say whether anything changed.
     ///
-    /// Sequential on purpose: each probe is bounded by the timeout, so one
-    /// sweep is bounded too, and no two evaluations of the same probe can ever
-    /// overlap however slow the host is.
+    /// **All of them at once.** A sweep used to read them one after another,
+    /// which bounded it by the timeout *times the number of probes*: ten
+    /// probes that hang cost twenty seconds, and the runner spent all of it
+    /// not being a runner. Nothing ever needed them in order — each one
+    /// answers a question about a different thing — so one sweep now costs
+    /// one timeout however many probes there are.
+    ///
+    /// What is still true is that no two evaluations of the *same* probe
+    /// overlap: a sweep reads each probe once, and [`watch`] awaits the sweep
+    /// before starting the next, so a probe slower than the interval delays
+    /// its own next reading rather than running twice over.
     pub async fn sweep(&self) -> bool {
+        let readings = futures_util::future::join_all(
+            self.inner
+                .offer
+                .entries()
+                .iter()
+                .filter_map(|entry| {
+                    entry
+                        .capability
+                        .busy_probe
+                        .as_ref()
+                        .map(|probe| (entry.name(), probe))
+                })
+                .map(|(name, probe)| async move {
+                    (name, evaluate(probe, self.inner.settings.timeout).await)
+                }),
+        )
+        .await;
         let mut changed = false;
-        for entry in self.inner.offer.entries() {
-            let Some(probe) = &entry.capability.busy_probe else {
-                continue;
-            };
-            let read = evaluate(probe, self.inner.settings.timeout).await;
-            let was = self
-                .with(|availability| availability.insert(entry.name().to_owned(), read.clone()));
+        for (name, read) in readings {
+            let was = self.with(|availability| availability.insert(name.to_owned(), read.clone()));
             if was.as_ref() != Some(&read) {
                 changed = true;
                 match read.reason() {
-                    Some(reason) => {
-                        eprintln!("herd-runner: {} is suspended: {reason}", entry.name())
-                    }
-                    None => eprintln!("herd-runner: {} is free again", entry.name()),
+                    Some(reason) => eprintln!("herd-runner: {name} is suspended: {reason}"),
+                    None => eprintln!("herd-runner: {name} is free again"),
                 }
             }
         }
@@ -609,13 +627,22 @@ impl Capacity {
 /// Never ends. The caller spawns it beside the redial loop rather than inside
 /// one connection, because a probe is about the host and goes on being true
 /// while there is no hub to tell.
+///
+/// The **first** sweep is immediate rather than one interval in, and it is
+/// this task's rather than the runner's startup path: the runner joins and
+/// the readings follow it. That costs nothing, because a capability whose
+/// probe has not been read is suspended at both ends (D49) — the runner says
+/// so in its first snapshot, and a hub that has had the offer and no reading
+/// suspends it anyway. What it buys is a runner that is a runner while its
+/// probes are being read: ten probes that hang used to hold the first dial
+/// for as long as they hung.
 pub async fn watch(capacity: Capacity, mut on_change: impl FnMut(Vec<CapabilityState>)) {
     let interval = capacity.settings().interval;
     loop {
-        tokio::time::sleep(interval).await;
         if capacity.sweep().await {
             on_change(capacity.snapshot());
         }
+        tokio::time::sleep(interval).await;
     }
 }
 
