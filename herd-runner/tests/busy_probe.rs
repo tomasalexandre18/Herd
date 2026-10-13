@@ -23,6 +23,8 @@ use herd_runner::capability::evaluate;
 const HANGS_FOR: &str = "444442";
 const HANGS_AND_IS_SWEPT_FOR: &str = "444443";
 const HANGS_WHILE_THE_RUNNER_STOPS_FOR: &str = "444444";
+const LEAVES_ITS_SESSION_ON_A_TIMEOUT_FOR: &str = "444445";
+const LEAVES_ITS_SESSION_WHILE_THE_RUNNER_STOPS_FOR: &str = "444446";
 
 /// Two numbers, both configuration, and nothing else is read: not the
 /// probe's output, not its name, not what the capability means.
@@ -262,6 +264,187 @@ async fn a_runner_told_to_stop_takes_its_probes_children_with_it() {
             "{survivors:?} outlived the runner whose probe started them, \
              reparented to init; a clean stop may not strew a host with these"
         );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
+/// A probe's child that gave itself a new **session** dies with the reading
+/// too — on the timeout path.
+///
+/// The group kill is what D62 promised, and a new session is precisely what a
+/// process group kill cannot reach: `setsid` leaves the group by definition.
+/// `/bin/sh -c "setsid sleep N & wait"` survived every kill the probe path
+/// had, at ppid 1, which made D62's "killed as one" not quite true. It is
+/// M4's own case, and the fix is M4's own mechanism — a marker in the
+/// environment and a sweep of `/proc` — rather than a second one.
+#[tokio::test]
+async fn a_probe_child_that_left_the_group_dies_on_the_timeout_too() {
+    let Some(setsid) = setsid_on_this_host() else {
+        herd_runner::testing::skipped(
+            "a_probe_child_that_left_the_group_dies_on_the_timeout_too",
+            "setsid is not on this host, so a probe child cannot be put in a new session \
+             to be swept out of one",
+        );
+        return;
+    };
+    let hangs = BusyProbe::command([
+        "/bin/sh",
+        "-c",
+        &format!("{setsid} sleep {LEAVES_ITS_SESSION_ON_A_TIMEOUT_FOR} & wait"),
+    ]);
+    let read = evaluate(&hangs, Duration::from_millis(200)).await;
+    assert!(
+        matches!(read, Availability::Unknown { .. }),
+        "a hanging probe is unknown: {read:?}"
+    );
+    wait_until_gone(
+        LEAVES_ITS_SESSION_ON_A_TIMEOUT_FOR,
+        "outlived the probe that started them by leaving its process group; the group \
+         kill cannot reach a new session and the marker sweep is what must",
+    )
+    .await;
+}
+
+/// And on a clean stop, which is the case verification actually caught.
+///
+/// Observed before the fix: this exact probe, a real `SIGTERM` to the real
+/// runner binary, and `sleep` still running at ppid 1 afterwards. One
+/// survivor per stop rather than one per reading, so not a host hazard — but
+/// D62 says a probe is killed as one group "on a timeout and on a clean stop
+/// alike", and that has to be true.
+///
+/// The real binary and a real signal, like its sibling above it: the kill
+/// this is about happens between a task being dropped and a process exiting,
+/// which nothing short of the process can show.
+#[tokio::test]
+async fn a_probe_child_that_left_the_group_dies_when_the_runner_is_stopped() {
+    let Some(setsid) = setsid_on_this_host() else {
+        herd_runner::testing::skipped(
+            "a_probe_child_that_left_the_group_dies_when_the_runner_is_stopped",
+            "setsid is not on this host, so a probe child cannot be put in a new session \
+             to be swept out of one",
+        );
+        return;
+    };
+    let data_root = herd_runner::testing::TempDir::new("probe-setsid-stop");
+    let capabilities = data_root.path().join("capabilities.json");
+    // A minute of timeout, so the reading is still in flight when the signal
+    // arrives: what is under test is the stop, not the timeout.
+    std::fs::write(
+        &capabilities,
+        format!(
+            r#"{{"capabilities":[
+                {{"name":"metal-pc","kind":{{"type":"counted","slots":1}},
+                 "busy_probe":{{"type":"command",
+                   "command":["/bin/sh","-c",
+                     "{setsid} sleep {LEAVES_ITS_SESSION_WHILE_THE_RUNNER_STOPS_FOR} & wait"]}}}}
+            ]}}"#
+        ),
+    )
+    .expect("the capability file is written");
+    let mut runner = tokio::process::Command::new(env!("CARGO_BIN_EXE_herd-runner"))
+        .arg("--hub")
+        .arg("ws://127.0.0.1:1")
+        .arg("--data-root")
+        .arg(data_root.path())
+        .arg("--capabilities")
+        .arg(&capabilities)
+        .arg("--no-detect")
+        .arg("--probe-interval")
+        .arg("50")
+        .arg("--probe-timeout")
+        .arg("60000")
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .kill_on_drop(true)
+        .spawn()
+        .expect("the real runner binary runs");
+    let pid = runner.id().expect("a spawned process has a pid");
+
+    let deadline = Instant::now() + Duration::from_secs(20);
+    let escaped = loop {
+        if let Some(found) =
+            processes_with_argument(LEAVES_ITS_SESSION_WHILE_THE_RUNNER_STOPS_FOR).first()
+        {
+            break *found;
+        }
+        assert!(Instant::now() < deadline, "the probe never ran");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    };
+    // The whole premise, asserted rather than assumed: this process really is
+    // the leader of a session of its own, so no kill of the probe's process
+    // group can reach it and only the marker sweep can.
+    assert_eq!(
+        session_of(escaped),
+        Some(escaped),
+        "the fixture must really have left its group, or this test proves nothing"
+    );
+
+    // Safe: one signal, to one process this test spawned itself.
+    unsafe {
+        libc::kill(pid as libc::pid_t, libc::SIGTERM);
+    }
+    let asked = Instant::now();
+    let ended = tokio::time::timeout(Duration::from_secs(10), runner.wait())
+        .await
+        .expect("a runner asked to stop does not hang on sweeping for its probes")
+        .expect("the runner's own exit is readable");
+    assert!(ended.success(), "a runner told to stop left by {ended:?}");
+    // Invariant 2's five seconds, measured: the `/proc` sweep this fix adds
+    // is not allowed to be paid for with the owner's stop time.
+    assert!(
+        asked.elapsed() < Duration::from_secs(5),
+        "the stop took {:?}",
+        asked.elapsed()
+    );
+
+    wait_until_gone(
+        LEAVES_ITS_SESSION_WHILE_THE_RUNNER_STOPS_FOR,
+        "outlived the runner whose probe started them, in a session of their own at \
+         ppid 1; a clean stop may not leave one of these behind",
+    )
+    .await;
+}
+
+/// Where `setsid` is on this host, if it is anywhere.
+///
+/// Looked up rather than assumed: the fixture needs a real new session and
+/// there is no portable shell builtin that makes one. A host without it
+/// records a skip (D27) instead of a green run that checked nothing.
+fn setsid_on_this_host() -> Option<String> {
+    let path = std::env::var("PATH").ok()?;
+    std::env::split_paths(&path)
+        .map(|dir| dir.join("setsid"))
+        .find(|candidate| candidate.is_file())
+        .map(|candidate| candidate.display().to_string())
+}
+
+/// The session a process belongs to: field 6 of `/proc/<pid>/stat`, counting
+/// from 1. Equal to the pid itself exactly when the process leads its own.
+///
+/// `comm` is field 2 and may contain spaces and brackets, so the split starts
+/// after the last `)` rather than at the first space.
+fn session_of(pid: u32) -> Option<u32> {
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    let rest = &stat[stat.rfind(')')? + 1..];
+    // After `comm` the next field is `state`, so `session` is the fourth of
+    // what is left: state, ppid, pgrp, session.
+    rest.split_whitespace().nth(3)?.parse().ok()
+}
+
+/// Wait for every process carrying `needle` to be gone, and say what is left
+/// if any of them stays.
+///
+/// A kill is a signal, so the children go a moment after whatever was holding
+/// them: this waits for them rather than racing them.
+async fn wait_until_gone(needle: &str, complaint: &str) {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let survivors = processes_with_argument(needle);
+        if survivors.is_empty() {
+            return;
+        }
+        assert!(Instant::now() < deadline, "{survivors:?} {complaint}");
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
 }

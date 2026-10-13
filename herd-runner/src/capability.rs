@@ -34,6 +34,8 @@ use herd_proto::{
 };
 use serde::Deserialize;
 
+use crate::reclaim::ProbeTag;
+
 /// What a runner looks for on its own host, and where.
 ///
 /// Three devices, because those are the three the first consumer's machines
@@ -560,16 +562,24 @@ fn lock_file(path: &Path) -> Availability {
 /// than a protocol — and its stdin is closed so that a probe waiting for input
 /// hits the timeout instead of waiting for ever.
 ///
-/// The probe is its own **process group**, and that group dies with the
-/// reading, every time: when the probe answers, when it hangs past the
-/// timeout, and when the reading itself is dropped because the runner is
-/// stopping. A probe is a command an owner wrote (D51), and the ordinary shape
-/// of one is a shell line: killing only the shell leaves whatever it started
-/// running, so a probe read every two seconds would strew the host with
-/// orphans — a runner destabilising its host through its own configuration,
-/// which invariant 2 forbids. It is the same reasoning M4 applies to a job,
-/// through the same primitive ([`ProbeGroup`] is what makes it hold on the
-/// dropped path too).
+/// The probe is its own **process group** *and* carries its own marker, and
+/// both die with the reading, every time: when the probe answers, when it
+/// hangs past the timeout, and when the reading itself is dropped because the
+/// runner is stopping. A probe is a command an owner wrote (D51), and the
+/// ordinary shape of one is a shell line: killing only the shell leaves
+/// whatever it started running, so a probe read every two seconds would strew
+/// the host with orphans — a runner destabilising its host through its own
+/// configuration, which invariant 2 forbids.
+///
+/// The group alone was not enough, and this is the whole reason the marker is
+/// here. `killpg` reaches everything the probe started *in its group*, TERM
+/// -ignoring children included, and a new session is by definition not in it:
+/// `/bin/sh -c "setsid sleep 7779 & wait"` as a probe left `sleep 7779`
+/// running at ppid 1 after the runner was `SIGTERM`ed. So the reading is
+/// swept out of `/proc` by marker afterwards, which is exactly M4's mechanism
+/// for a job's processes, reused rather than reinvented
+/// ([`crate::reclaim::kill_probe_by_marker`]). [`ProbeGroup`] is what makes
+/// both hold on the dropped path too.
 async fn run_probe(
     command: &[String],
     busy_exit_code: i32,
@@ -581,12 +591,19 @@ async fn run_probe(
         Some(split) => split,
         None => return Availability::unknown("this probe has no command to run"),
     };
+    let tag = ProbeTag::mint();
     let mut probe = tokio::process::Command::new(program);
     probe
         .args(arguments)
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
+        // The marker the `/proc` sweep looks for. A probe inherits the
+        // runner's environment rather than being given a built one (it is the
+        // owner's own command, not a job — D51), so this is added to it
+        // rather than being the whole of it, and it is kept across every
+        // `fork`, `exec`, `nohup` and `setsid` the probe can do.
+        .env(crate::reclaim::MARKER_VARIABLE, tag.as_str())
         .kill_on_drop(true);
     // 0 means "a new group led by the child", so the child's own pid is the
     // group's, which is what makes the kill below reach everything it started.
@@ -605,7 +622,10 @@ async fn run_probe(
     // that is reading its probes, which drops this future mid-`wait`, and the
     // group has to die then too: `kill_on_drop` reaps the shell and nothing
     // the shell started.
-    let mut group = ProbeGroup(child.id());
+    let mut group = ProbeGroup {
+        pid: child.id(),
+        tag,
+    };
     let waited = match tokio::time::timeout(timeout, child.wait()).await {
         Ok(waited) => waited,
         Err(_) => {
@@ -646,7 +666,8 @@ async fn run_probe(
     }
 }
 
-/// A probe's process group, killed when the reading ends however it ends.
+/// A probe's process group **and** its marker, both killed when the reading
+/// ends however it ends.
 ///
 /// A guard rather than a line at each exit, because one of this future's exits
 /// is not written anywhere: the task that reads the probes is dropped when the
@@ -656,14 +677,30 @@ async fn run_probe(
 /// left that child running, reparented to init, for every stop. That is the
 /// orphan-strewing invariant 2 forbids, and it is this type's whole reason to
 /// exist: a `Drop` runs on the cancelled path, and an explicit kill cannot.
-struct ProbeGroup(Option<u32>);
+///
+/// Two handles and not one, because they catch different escapes. The group
+/// reaches everything the probe started that stayed in it — including a child
+/// that ignores `SIGTERM`, since the signal is `SIGKILL`. The marker reaches
+/// what left the group: `setsid` is not in the group by definition, and was
+/// the one survivor verification found of a probe that is otherwise killed as
+/// one (D62).
+struct ProbeGroup {
+    pid: Option<u32>,
+    tag: ProbeTag,
+}
 
 impl ProbeGroup {
     /// Kill the group now, and not twice: a pid that has been waited for may
     /// belong to something else by the time anyone asks again.
+    ///
+    /// The group first, then the sweep, in that order: `killpg` is one
+    /// syscall and takes the ordinary case, and the sweep then has only
+    /// whatever left the group to find — usually nothing, which is a single
+    /// pass over `/proc` and no sleeping at all.
     fn kill(&mut self) {
-        if let Some(pid) = self.0.take() {
+        if let Some(pid) = self.pid.take() {
             crate::confine::kill_process_group(pid);
+            crate::reclaim::kill_probe_by_marker(&self.tag);
         }
     }
 }

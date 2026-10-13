@@ -20,6 +20,22 @@
 //! its environment across `fork` and `exec`, so a double fork, a `nohup` and a
 //! `setsid` all stay findable. What stays beyond reach is a process that
 //! scrubs its own environment, and the fallback line says so.
+//!
+//! ## And a probe's, by the same mechanism
+//!
+//! A busy probe is a command the runner starts too (D51), and it has no
+//! cgroup at all — so `killpg` is the *only* handle M5 gave it, and `killpg`
+//! is exactly the handle a new session escapes. `/bin/sh -c "setsid sleep
+//! 7779 & wait"` as a probe, and a `SIGTERM` to the runner, left `sleep 7779`
+//! running at ppid 1: the group kill reached the shell and its ordinary
+//! children, and nothing reached the one that had left the group. D62 says a
+//! probe is killed as one group "on a timeout and on a clean stop alike", so
+//! a probe carries a marker of its own and is swept the same way, rather than
+//! a second mechanism being invented for it.
+//!
+//! One marker variable, one sweep, one startup reaper: a probe stray left by
+//! a runner that was `SIGKILL`ed is collected by [`reclaim_a_past_life`]
+//! beside a job's, because [`pid_in`] reads both shapes of tag.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -32,18 +48,38 @@ use crate::cgroup::Ceiling;
 use crate::confine::kill_process_group;
 use crate::root::{reclaim_directory, DataRoot, Workspace};
 
-/// The environment variable carrying a job's marker.
+/// The environment variable carrying the marker of a job — or of a probe
+/// reading, which is swept by the same code and collected by the same reaper.
 pub const MARKER_VARIABLE: &str = "HERD_JOB_MARKER";
 
 /// What every job's name starts with, in `/sys/fs/cgroup` and in the marker.
 const JOB_PREFIX: &str = "herd-job-";
 
+/// What every probe reading's marker starts with. A probe has no cgroup and
+/// no workspace, so this names nothing but the marker.
+const PROBE_PREFIX: &str = "herd-probe-";
+
 /// Counts jobs, so that no two tags minted by this process are equal.
 static JOBS: AtomicU64 = AtomicU64::new(0);
+
+/// The same, for probe readings. Its own counter, so that a probe tag can
+/// never collide with a job tag of the same runner even by accident.
+static PROBES: AtomicU64 = AtomicU64::new(0);
 
 /// How long to keep sweeping for a process that has been signalled.
 const SWEEP_TRIES: u32 = 40;
 const SWEEP_PAUSE: std::time::Duration = std::time::Duration::from_millis(25);
+
+/// The same sweep, on a much shorter budget, for a probe reading.
+///
+/// A job's sweep happens once, when that job ends, and a build's stray
+/// process is worth waiting a second for. A probe's happens on **every**
+/// reading, and once per probe on the stop path — where everything the runner
+/// has to do shares the owner's five seconds (invariant 2). Ten hanging
+/// probes on the job's budget would have put ten seconds of `/proc` sweeping
+/// inside those five. Two rounds are what the work needs — one to signal, one
+/// to see it gone — and the rest is margin for a slow host.
+const PROBE_SWEEP_TRIES: u32 = 4;
 
 /// One job's unique name: `herd-job-<runner pid>-<counter>-<job id>`.
 ///
@@ -80,14 +116,54 @@ impl JobTag {
     }
 }
 
+/// One probe reading's unique name: `herd-probe-<runner pid>-<counter>`.
+///
+/// Minted per *reading*, not per capability: two readings of the same probe
+/// never overlap (`Capacity::sweep` awaits each), but a tag that outlived one
+/// reading would make the next reading's sweep able to kill the previous
+/// one's leftovers and count them as its own. The runner's pid is in it for
+/// the same reason it is in a job tag — so [`reclaim_a_past_life`] can tell a
+/// stray whose runner is gone from one somebody is still watching.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProbeTag(String);
+
+impl ProbeTag {
+    pub fn mint() -> Self {
+        Self(format!(
+            "{PROBE_PREFIX}{}-{}",
+            std::process::id(),
+            PROBES.fetch_add(1, Ordering::SeqCst)
+        ))
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
 /// Kill everything still carrying this job's marker, and say how many.
 ///
 /// Called after `killpg` on the fallback path, where a process that gave
 /// itself a new session is otherwise out of reach.
 pub fn kill_by_marker(tag: &JobTag) -> usize {
+    sweep_for(tag.as_str(), SWEEP_TRIES)
+}
+
+/// The same, for one probe reading, on [`PROBE_SWEEP_TRIES`].
+///
+/// Called after `killpg` on the probe path, which has no cgroup to fall back
+/// on at all: a probe that gave itself a new session is reachable this way
+/// and no other (D62).
+pub fn kill_probe_by_marker(tag: &ProbeTag) -> usize {
+    sweep_for(tag.as_str(), PROBE_SWEEP_TRIES)
+}
+
+/// Signal everything carrying `marker` until nothing does, or the budget is
+/// out. One sweep, used by both callers above.
+fn sweep_for(marker: &str, tries: u32) -> usize {
     let mut killed = 0usize;
-    for _ in 0..SWEEP_TRIES {
-        let carriers = processes_carrying(tag);
+    for _ in 0..tries {
+        let carriers = processes_carrying(marker);
         if carriers.is_empty() {
             break;
         }
@@ -103,8 +179,8 @@ pub fn kill_by_marker(tag: &JobTag) -> usize {
 
 /// Every live process whose environment carries this marker, this runner's
 /// own processes excepted.
-fn processes_carrying(tag: &JobTag) -> Vec<u32> {
-    let needle = format!("{MARKER_VARIABLE}={}", tag.as_str());
+fn processes_carrying(marker: &str) -> Vec<u32> {
+    let needle = format!("{MARKER_VARIABLE}={marker}");
     let mut found = Vec::new();
     let me = std::process::id();
     for pid in live_pids() {
@@ -303,7 +379,7 @@ pub fn reclaim_a_past_life(root: &DataRoot, ceiling: &Ceiling) -> Vec<String> {
     for (pid, marker) in orphaned_job_processes() {
         if kill_pid(pid) {
             said.push(format!(
-                "killed the orphaned job process {pid} of {marker}, left by a runner \
+                "killed the orphaned process {pid} of {marker}, left by a runner \
                  that is gone"
             ));
         }
@@ -379,9 +455,15 @@ fn orphaned_job_processes() -> Vec<(u32, String)> {
     orphans
 }
 
-/// The runner pid inside a job tag, cgroup name or marker.
+/// The runner pid inside a job tag, a probe tag, a cgroup name or a marker.
+///
+/// A probe tag is read here as well as a job's, which is what makes the
+/// startup reaper collect a probe stray left by a runner that was
+/// `SIGKILL`ed: `orphaned_job_processes` finds the marker either way and
+/// needs only to know whose it was.
 fn pid_in(name: &str) -> Option<u32> {
     name.strip_prefix(JOB_PREFIX)
+        .or_else(|| name.strip_prefix(PROBE_PREFIX))
         .or_else(|| name.strip_prefix("herd-delegation-probe-"))?
         .split('-')
         .next()?
@@ -520,7 +602,7 @@ mod tests {
             .expect("the fixture starts");
         // Give the grandchild time to exist before sweeping for it.
         std::thread::sleep(std::time::Duration::from_millis(300));
-        let carriers = processes_carrying(&tag);
+        let carriers = processes_carrying(tag.as_str());
         assert!(
             carriers.len() >= 2,
             "the fixture should show the shell and its detached child: {carriers:?}"
@@ -529,9 +611,9 @@ mod tests {
         let killed = kill_by_marker(&tag);
         assert!(killed >= 2, "only {killed} process(es) were swept");
         assert!(
-            processes_carrying(&tag).is_empty(),
+            processes_carrying(tag.as_str()).is_empty(),
             "the sweep left something behind: {:?}",
-            processes_carrying(&tag)
+            processes_carrying(tag.as_str())
         );
         let _ = child.kill();
         let _ = child.wait();
