@@ -27,13 +27,13 @@ closes in M18.
 | E-16 | must | budgets, gc with pinning | M12 | planned | per runner, not central (D10); keepers pin |
 | E-17 | must | atomic publication everywhere | M11 | planned | a manifest registers only once every blob is held; job-record atomicity already in M2 (Q1) |
 | E-18 | must | four priorities with aging | M6 | in review (PR #15) | aging computed, not written (D67); default step 30 min, so the lowest level reaches the top in 90 min; the raise is upwards only (D72); the 90-min figure itself is a simulated-time and 6-second-real-clock assertion, not a measurement on a busy day |
-| E-19 | must | no fallback while available | M7 | planned | switch-off case retested with E-33 in M9 |
+| E-19 | must | no fallback while available | M7 | in review (PR #18) | preference is one declared integer per runner (D81); a draining runner does not count as available (D80); the limit is `--stickiness-limit`, 3 h, printed at startup and in every waiting sentence; verified against two real runners: the second build never moved while the PC was merely busy, and moved in well under 10 s when it died. Switch-off case retested with E-33 in M9 |
 | E-20 | must | one queue for everything | M6 | in review (PR #15) | the queue is the unfinished job directories; one dispatch pass, which a submission goes through like everything else; no lane for a merger. "Every QEMU on every client listed as a job" needs their executor and the status document (M13, gated M18) |
 | E-21 | must | lost runner, requeue once | M3 | merged | silence threshold is hub policy; a second loss ends the job `lost`; verified: two attempts, never a third, across six alternating runner lives |
-| E-22 | must | build slots, derived -j | M7 | planned |  |
+| E-22 | must | build slots, derived -j | M7 | in review (PR #18) | slots are read from the records every pass and counted nowhere, so none can leak and none is rebuilt after a restart (D79); `-j = min(threads, 3/4 of memory / 1792 MiB)` per slot, rounded down, never 0 (D83) — the owner's 17 GiB PC derives E-22's own `-j 7`; the figure is on the record before the job is handed over (D82) and reaches the process through one `{j}` token. Verified: a `kill -9` mid-job gives the slot back, a hub restart does not double-book it. **The memory figure is `MemTotal` unless the owner says otherwise** — whole-job memory admission is M8's (E-29) |
 | E-23 | should | placement prefers cache locality | M12 | planned | preference only; E-19 governs waiting |
 | E-24 | must | probed/declared/denied labels | M5 | merged | the offer and its origins; matching them at claim time is M7 |
-| E-25 | must | capability kinds and exclusion | M7 | planned | algebra and closure land in M5 (symmetric, not transitive); contention enforcement tested in M7 |
+| E-25 | must | capability kinds and exclusion | M7 | in review (PR #18) | algebra and closure landed in M5 (symmetric, not transitive); enforced at claim time in M7, with the seats carried through a pass so two jobs offered together contend. Verified against the real binaries: two counted jobs serialise on one slot and an exclusive one overlaps neither, including a job that holds no label at all. Note for the consumer: on their declaration `gpu-venus excludes igpu-vfio` is **inert**, because `igpu-vfio` is exclusive and host-wide already blocks everything — what keeps the two apart when something outside Herd holds the iGPU is the busy probe (E-26) |
 | E-26 | must | externally busy capability | M5 | merged | a probe nobody can read suspends too; an unknown *or duplicated* key in the capability file refuses the runner's startup; wait-reason wording polished by M8 |
 | E-27 | must | metal lease, drain first | M9 | planned | lease model lands in M5 as counted(1) plus a probe; drain-first in M9 |
 | E-28 | must | reference label carried | M5 | merged | a capability like any other; placement preferring it last is M12 |
@@ -44,7 +44,7 @@ closes in M18.
 | E-33 | must | owner switch in 10 s | M9 | planned | desktop shortcut on the real PC in M17 |
 | E-34 | must | niced, no inbound, disk budget | M4 | merged | D11: "no inbound" = no port on a router; a mesh-bound fetch endpoint is allowed. Windows logon task in M17 |
 | E-35 | must | machine-readable status | M13 | planned | format versioned per Q7 |
-| E-36 | must | every decision explained | M7 | planned | refusal figures completed in M8 |
+| E-36 | must | every decision explained | M7 | in review (PR #18) | one `claimed by …` line per placement, on the attempt, with the runner, the labels, the slot figures, any derived `-j` and the preference; verified by counting the lines against the attempts over a simulated busy day. "Nobody could ever run this" ends the job (`impossible`, exit 125 with the labels named); everything else waits, a label nothing offers included (D84). Refusal figures for memory and tmpfs completed in M8 |
 | E-37 | must | events routable to ntfy | M13 | planned |  |
 | E-38 | should | statistics over a period | — | planned | deferred past M18; raw data already written by M2/M4 records |
 | E-39 | should | results searchable | — | planned | deferred past M18; on-disk records are greppable meanwhile |
@@ -67,17 +67,18 @@ closes in M18.
 
 ## State of play (2026-10-13)
 
-Five milestones are merged to `main`: M1 (substrate, no must of its
-own), M2, M3, M4 and M5 (the capability model). **12 of 44 musts are
-merged and verified** against the real binaries by an independent
-adversarial pass (E-03, E-15, E-44 from M2; E-06, E-21 from M3; E-30,
-E-34, E-45, E-46 from M4; E-24, E-26, E-28 from M5). M2 and M3 also
-carry two `should` rows merged alongside them (E-53, E-40). Four more
-musts are written and in review, not merged: E-05, E-18, E-20, E-43
-(M6, the queue and its priorities). The remaining 28 musts are
-planned.
+Six milestones are merged to `main`: M1 (substrate, no must of its
+own), M2, M3, M4, M5 (the capability model) and M6 (the queue and its
+priorities). **12 of 44 musts are merged and verified** against the real
+binaries by an independent adversarial pass (E-03, E-15, E-44 from M2;
+E-06, E-21 from M3; E-30, E-34, E-45, E-46 from M4; E-24, E-26, E-28
+from M5); M6's four (E-05, E-18, E-20, E-43) are merged but have not had
+that pass. M2 and M3 also carry two `should` rows merged alongside them
+(E-53, E-40). Four more musts are written and in review, not merged:
+E-19, E-22, E-25, E-36 (M7, matching and slots). The remaining 24 musts
+are planned.
 
-Four things a reader must not mistake for done:
+Five things a reader must not mistake for done:
 
 1. **Authentication does not exist until M15.** A runner's name is
    self-asserted, so a hand-crafted peer reaching the hub's port can
@@ -97,12 +98,19 @@ Four things a reader must not mistake for done:
    weaker in three named ways (D23). The WSL replay on real hardware
    is still a manual M17 check.
 4. **Nothing is deployed, so every format is still free to change.**
-   M6 moved both: `PROTOCOL_VERSION` is 2 and `RECORD_VERSION` is 2,
-   because a submission and a record now carry a priority and carry it
-   required rather than defaulted (D71). A state root written before M6
-   is refused by name, with both figures, rather than read as if its
-   jobs had asked for the middle level; there is no migration and none
-   is owed, since nothing is deployed. They freeze at M16.
+   M7 moved both again: `PROTOCOL_VERSION` is **3** and
+   `RECORD_VERSION` is **3**. A runner now announces how big its host is
+   and how preferred it is, a submission may carry the memory one build
+   thread needs, an attempt carries the line explaining its placement
+   and a record carries the `-j` derived for it — all required rather
+   than defaulted, for the reason D71 gives. A state root written before
+   M7 is refused by name with both figures; there is no migration and
+   none is owed (D73). They freeze at M16.
+5. **A fleet, with no authentication.** The hub holds many runners from
+   M7, keyed on the name an attempt belongs to. That makes point 1 above
+   worse rather than better: a hand-crafted peer can now join *beside*
+   the real runners under any name it likes. Loopback only until M15
+   still holds.
 
 ## Musts per milestone
 
