@@ -2185,3 +2185,39 @@ it, and the two-jobs-in-one-pass contention this milestone exists to get
 right would stop being expressible.
 
 ---
+## 2026-10-13 — D93 A hub's housekeeping dies with its own future
+
+**Context.** `Hub::serve` spawns four background tasks — the lost-runner
+watchdog, the result-write retry, the queue's aging and M8's wait
+restatement — and each holds an `Arc<State>`, which holds the store, which
+holds the **`flock` on the state root**. The four `abort()` calls sat at the
+end of `serve`, after the accept loop. A dropped future never reaches its
+end, and dropping that future is exactly what every end-to-end harness in
+this workspace does: it runs `serve` in a task and aborts the task when the
+test is over. So a hub that was gone went on holding its state root against
+whatever came next, with nothing to say so.
+
+It had been latent since M1 with three tasks. M8's fourth made it bite at
+about **one run in six** of `herdctl/tests/exit_code.rs`, as
+`the state root … is already in use by herd-hub, process N` — naming a hub
+that nothing was running. Found by CI, reproduced locally, and bisected to
+the task by removing it.
+
+**Choice.** The handles live in a guard whose `Drop` aborts them, so the
+tasks end with the future that owns them however that future ends. A test
+asserts the property directly: bind a hub, spawn `serve`, abort the task,
+and the state root opens again. Under the old shape that test fails with the
+flake's own sentence.
+
+**Why it matters past the flake.** The deployment restarts the hub in docker
+compose (M16), and a hub whose previous process had not quite let go of the
+root would refuse to start with a message blaming a hub that does not exist.
+D21 made the lock name its holder precisely so an operator has something to
+act on; a holder that is a ghost is worse than no name at all.
+
+**Alternative rejected.** Dropping the `Arc<State>` from the tasks instead,
+by passing them a `Weak`. Rejected because every one of them needs the state
+for the whole of its life, so the upgrade would be in the loop body and a
+failed upgrade would be a silent exit — the same leak, harder to see.
+
+---
