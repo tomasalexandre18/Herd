@@ -936,3 +936,58 @@ external holder is already using — the exact harm E-26 exists to prevent.
 
 ---
 
+## 2026-10-13 — D49 A capability with a probe is suspended until read
+
+**Context.** Between a runner's handshake and its first availability snapshot
+the hub knows a probed capability exists but nothing about its state.
+
+**Choice.** The hub suspends it until a reading lands, closing the join race on
+both sides.
+
+**Alternative rejected.** Assuming free until told otherwise, which makes every
+reconnection a window.
+
+---
+
+## 2026-10-13 — D50 Waiting is a reason on the record, not a state
+
+**Context.** A queued job needs to say why it is waiting, and E-04 will later
+need figures in that sentence.
+
+**Choice.** `waiting_for` on `job.json` plus a `waiting` line in
+`events.jsonl`, written only when it changes; the job's state stays `queued`.
+
+**Alternative rejected.** A `JobState` variant for waiting, which would
+multiply states for every reason a job can wait and force a record migration
+each time a new reason appears.
+
+---
+
+## 2026-10-13 — D51 A busy probe is the owner's command, not Herd's
+
+**Context.** E-26's probe is by design "a command whose exit code means busy",
+so a probe can run a shell and do anything the runner's user can; "no shell" is
+a convention, not a guard.
+
+**Choice.** This is accepted and stated plainly — a probe is configuration the
+runner's owner writes, it runs with the runner's privileges, and Herd neither
+sandboxes nor interprets it. It stays strings and numbers, so it is not a
+plugin surface (invariant 1).
+
+**Alternative rejected.** Validating or restricting probe commands, which would
+grow into exactly the plugin API invariant 1 forbids.
+
+---
+
+## 2026-10-13 — D52 Durable labels are read permissively
+
+**Context.** A label set validates on deserialisation, so a single persisted
+job carrying a label today's rules reject would stop the hub from starting at
+all — one bad record bricking the service.
+
+**Choice.** Labels already on disk are read permissively and a job whose labels
+the current rules reject is quarantined by name, visible and skipped;
+validation stays strict at submission, where a requester can be told.
+
+**Alternative rejected.** Strict validation on the durable path, which makes a
+tightening of the rules a denial of service against ourselves.
