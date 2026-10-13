@@ -134,31 +134,57 @@ pub const WAIT_RESTATEMENT: Duration = Duration::from_secs(60);
 /// pulled out of its own: a test has to be able to drive ten minutes of
 /// waiting through **the hub's own decision**, counting the lines it would
 /// have produced, rather than through a copy of it or a ten-minute sleep.
+/// **The cadence is a deadline, not an interval**, and that distinction was
+/// found by measuring. A loop that wakes every `tick` and fires when a job
+/// was last told `cadence` ago produces gaps of up to `cadence + tick`: the
+/// first by-hand ten-minute wait measured gaps of 45 s, 60 s and **61 s**
+/// against a figure E-04 words as "at least every 60 s". One second over is
+/// still over. So the decision fires a tick *early* — the interval lands in
+/// `[cadence - tick, cadence]` and the worst gap is the cadence itself.
 #[derive(Debug, Clone, Copy)]
 pub struct Restating {
     pub cadence: Duration,
+    /// How often the loop that uses this wakes up. Kept here because the
+    /// decision has to know it: see the type's own documentation.
+    pub tick: Duration,
 }
 
 impl Restating {
+    /// The cadence an operator gave, with the tick that serves it.
+    ///
+    /// A quarter of the cadence, never under 50 ms: often enough that the
+    /// deadline is met with a quarter of it to spare, rarely enough that a
+    /// hub with nothing queued does not spin.
+    pub fn every(cadence: Duration) -> Self {
+        Self {
+            cadence,
+            tick: (cadence / 4).max(Duration::from_millis(50)),
+        }
+    }
+
     /// Whether a job last told `since` ago is due to be told again.
     ///
     /// `None` is a job nobody has been told about yet, which is always due:
     /// a requester that attaches to a job already waiting gets the reason at
     /// once rather than up to a cadence later.
     pub fn is_due(&self, since: Option<Duration>) -> bool {
-        since.is_none_or(|since| since >= self.cadence)
+        since.is_none_or(|since| since + self.tick >= self.cadence)
     }
 
-    /// The most lines a follower can get over a wait of `wait`.
+    /// The most lines a follower can get out of **this clock** over a wait of
+    /// `wait`.
     ///
     /// The bound E-04's flooding half needs stated rather than hoped for, and
-    /// the figure a test asserts against: one at the start, and one per whole
-    /// cadence after it.
+    /// the figure a test asserts against: one at the start, and one per
+    /// shortest interval the clock can produce after it. M6's news path adds
+    /// to this when the sentence genuinely changes, which the sentence's own
+    /// minute-rounded figures bound at about one a minute (D91).
     pub fn at_most_over(&self, wait: Duration) -> u32 {
-        if self.cadence.is_zero() {
+        let shortest = self.cadence.saturating_sub(self.tick);
+        if shortest.is_zero() {
             return u32::MAX;
         }
-        u32::try_from(wait.as_nanos() / self.cadence.as_nanos()).unwrap_or(u32::MAX - 1) + 1
+        u32::try_from(wait.as_nanos() / shortest.as_nanos()).unwrap_or(u32::MAX - 1) + 1
     }
 }
 
@@ -1730,9 +1756,9 @@ async fn say_again_why_jobs_wait(state: Arc<State>) {
     // Checked oftener than the cadence, so that "at least every 60 s" is met
     // rather than approached: a loop that woke exactly every 60 s would drift
     // past it by however long a pass of it takes.
-    let every = (state.policy.wait_restatement / 4).max(Duration::from_millis(50));
+    let restating = Restating::every(state.policy.wait_restatement);
     loop {
-        tokio::time::sleep(every).await;
+        tokio::time::sleep(restating.tick).await;
         let followed = state.with_peers(|peers| {
             // And the pruning, under the same lock: a job nobody follows any
             // more leaves nothing behind in this map.
@@ -1761,9 +1787,6 @@ async fn say_again_why_jobs_wait(state: Arc<State>) {
             }
             let Some(reason) = record.waiting_for else {
                 continue;
-            };
-            let restating = Restating {
-                cadence: state.policy.wait_restatement,
             };
             let due = state.with_peers(|peers| {
                 let due = restating.is_due(peers.wait_told.get(&job_id).map(|told| told.elapsed()));
@@ -3503,11 +3526,8 @@ mod tests {
     /// and the whole ten minutes produce no more lines than the bound.
     #[test]
     fn ten_simulated_minutes_of_waiting_leave_periodic_reasons_and_no_flood() {
-        let restating = Restating {
-            cadence: WAIT_RESTATEMENT,
-        };
+        let restating = Restating::every(WAIT_RESTATEMENT);
         let ten_minutes = Duration::from_secs(10 * 60);
-        let tick = Duration::from_secs(2);
 
         let mut said_at: Vec<Duration> = Vec::new();
         let mut last_told: Option<Duration> = None;
@@ -3517,35 +3537,39 @@ mod tests {
                 said_at.push(elapsed);
                 last_told = Some(Duration::ZERO);
             }
-            elapsed += tick;
-            last_told = last_told.map(|since| since + tick);
+            elapsed += restating.tick;
+            last_told = last_told.map(|since| since + restating.tick);
         }
 
-        // It does not stop: never a gap past the cadence, from the first
-        // moment to the last.
+        // It does not stop, and — this is the half measuring found — **no gap
+        // is longer than the cadence at all**, not "the cadence plus a tick".
+        // A loop firing when a job was last told `cadence` ago gives gaps of
+        // up to `cadence + tick`, and a by-hand ten-minute wait measured one
+        // of 61 s against a figure E-04 words as "at least every 60 s".
         assert_eq!(said_at.first(), Some(&Duration::ZERO), "{said_at:?}");
         for pair in said_at.windows(2) {
             let gap = pair[1] - pair[0];
             assert!(
-                gap <= restating.cadence + tick,
+                gap <= restating.cadence,
                 "a gap of {gap:?} is longer than E-04's 60 s: {said_at:?}"
             );
         }
         assert!(
-            ten_minutes - *said_at.last().expect("at least one") <= restating.cadence + tick,
+            ten_minutes - *said_at.last().expect("at least one") <= restating.cadence,
             "it stopped before the ten minutes were up: {said_at:?}"
         );
 
-        // And it does not flood: 300 passes over ten minutes, and eleven
-        // lines — not three hundred.
+        // And it does not flood. The clock's own bound over ten minutes is
+        // fourteen lines; a line per dispatch pass on a busy fleet would be
+        // hundreds.
         let bound = restating.at_most_over(ten_minutes);
-        assert_eq!(bound, 11);
+        assert_eq!(bound, 14);
         assert!(
             said_at.len() as u32 <= bound,
             "{} lines over ten minutes, bound {bound}: {said_at:?}",
             said_at.len()
         );
-        assert_eq!(said_at.len(), 11, "{said_at:?}");
+        assert_eq!(said_at.len(), 14, "{said_at:?}");
     }
 
     /// **Attack 11, measured.** The `dispatching` lock is held for a whole

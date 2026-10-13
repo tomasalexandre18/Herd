@@ -270,7 +270,11 @@ async fn a_waiting_job_says_why_again_on_a_clock_and_does_not_flood() {
     // And it does not flood. The bound is one line per cadence plus one, and
     // the dispatch pass ran far oftener than that — a line per pass would be
     // hundreds.
-    let bound = (watched.as_millis() / 200) as usize + 2;
+    // The clock's shortest interval is `cadence - tick`, three quarters of
+    // the cadence, because the cadence is a deadline rather than an interval
+    // (D91). Plus a couple for M6's news path, which adds a line whenever
+    // the sentence genuinely changes.
+    let bound = (watched.as_millis() / 150) as usize + 3;
     assert!(
         lines <= bound,
         "{lines} lines over {watched:?} is past the bound of {bound}: the reason is being \

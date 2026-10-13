@@ -2089,14 +2089,29 @@ ends, when one is submitted, and once a minute besides. M7 added more.
 **Choice.** A clock of its own, `--wait-restatement`, 60 s by default,
 printed at startup, refused at zero. One task reads the sentence the
 dispatch pass already wrote on the record — it judges nothing itself — and
-tells each follower again no oftener and no rarer than the cadence. So the
-bound is arithmetic an operator can do: over a wait of `W` a follower gets at
-most `W / cadence + 1` lines, which is **eleven over ten minutes**, not
-three hundred. Writing to the record stays M6's news-only rule, and the
-sentence's own figures are rounded to the minute (`roughly`), so a
-ten-minute wait leaves about ten lines of history rather than one per pass.
-News resets the cadence, so a requester told the reason this second is not
-told it again a moment later because a clock came round.
+tells each follower again no oftener and no rarer than the cadence. News
+resets the cadence, so a requester told the reason this second is not told it
+again a moment later because a clock came round.
+
+**The cadence is a deadline, not an interval, and measuring is what found
+that.** A loop that wakes every `tick` and fires when a job was last told
+`cadence` ago produces gaps of up to `cadence + tick`. The first by-hand
+ten-minute wait measured gaps of 45 s, 60 s and **61 s** against a figure
+E-04 words as *at least* every 60 s, and one second over is still over. So
+the decision fires a tick early: the interval lands in
+`[cadence − tick, cadence]`, the worst gap is the cadence itself, and the
+tick is a quarter of it.
+
+**The bound, stated exactly, because two paths add up.** The clock
+contributes at most `W / (cadence − tick) + 1` lines — **fourteen** over ten
+minutes at the default. M6's news path contributes on top of it whenever the
+sentence genuinely changes, and the sentence carries a countdown (`rising to
+merger in 28m`), so it changes about once a minute: `roughly` rounds to the
+minute precisely so that it is once a minute and not once a second. The
+figure measured by hand over a real ten-minute wait, before the deadline fix
+and so under the slightly rarer clock, was **11 lines** against the 300-odd
+a line per dispatch pass would have given. Writing to the *record* stays
+news-only, so the history is those ~11 lines and not every restatement.
 
 E-04's "what is ahead" is now in the sentence too: the jobs in front, by id
 and by level, three named and the rest counted — three because the string
