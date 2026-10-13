@@ -406,3 +406,43 @@ async fn herdctl_exits_124_for_every_cap_a_test_can_trip() {
     assert_eq!(status_code(&output), 124, "{}", stderr(&output));
     assert!(stderr(&output).contains("disk cap"), "{}", stderr(&output));
 }
+
+/// The strict half of D52: a label a requester *submits* is refused, by name,
+/// before anything is minted.
+///
+/// This is where strictness belongs and the only place it does any good: a
+/// requester is on the other end of the connection and can be told it made a
+/// typo. The permissive half — a label already on the disk, under rules that
+/// have since been tightened, quarantining its job instead of stopping the
+/// hub — is asserted in `herd-hub/tests/durability.rs`. Both halves are the
+/// one decision: tell whoever can act, and never take the service down for
+/// whoever cannot.
+#[tokio::test]
+async fn a_label_that_is_not_a_label_is_refused_at_submission_by_name() {
+    // No hub is needed and none is dialled: the refusal happens before the
+    // dial, which is itself the point — nothing was minted and nothing
+    // waits.
+    for action in ["run", "submit"] {
+        let output = Command::new(env!("CARGO_BIN_EXE_herdctl"))
+            .args([
+                "--hub",
+                "ws://127.0.0.1:1",
+                action,
+                "--label",
+                "BUILD",
+                "--",
+                "/bin/true",
+            ])
+            .output()
+            .await
+            .expect("herdctl runs");
+        assert_ne!(status_code(&output), 0, "{}", stderr(&output));
+        assert_eq!(stdout(&output), "", "nothing was submitted");
+        let said = stderr(&output);
+        assert!(
+            said.contains("BUILD"),
+            "the refusal must name the label: {said}"
+        );
+        assert!(said.contains("--label"), "and where it came from: {said}");
+    }
+}

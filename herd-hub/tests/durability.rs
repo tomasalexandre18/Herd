@@ -8,7 +8,7 @@
 
 use std::sync::Arc;
 
-use herd_hub::{JobState, JobStore};
+use herd_hub::{JobDirStore, JobState, JobStore};
 use herd_proto::{JobOutcome, LogStream};
 use herd_runner::Session;
 
@@ -630,4 +630,124 @@ async fn a_result_for_a_job_of_a_state_root_that_is_gone_is_never_offered() {
         record_of(second_root.path(), &lost)
     );
     second_link.abort();
+}
+
+/// D52: a job on the disk whose labels today's rules reject is quarantined by
+/// name, and the hub starts.
+///
+/// A label set validates when it is deserialised, which is exactly right at a
+/// submission — a requester is listening and can be told — and exactly wrong
+/// on the durable path, where nobody is. Read strictly, one record carrying a
+/// label the rules no longer accept made `JobDirStore::open` fail, which makes
+/// the hub refuse to start at all: a service down because of a single job it
+/// minted itself. It would also mean `check_label` could never be tightened
+/// again after anything was deployed, since every job already on the disk
+/// would have to pass the new rules.
+///
+/// So the labels are read permissively and the job is quarantined: named,
+/// visible, skipped, its record untouched. Everything else on that state root
+/// goes on working, which is the half this test spends most of its words on.
+#[tokio::test]
+async fn a_record_whose_labels_the_rules_reject_is_quarantined_not_fatal() {
+    let state = tempfile::tempdir().expect("a temporary state directory");
+    let (queued, rejected) = {
+        let store = JobDirStore::open(state.path()).expect("the state root opens");
+        let queued = store
+            .create_job(herd_hub::NewJob::new(shell("printf 'from the queue\\n'")))
+            .expect("minted")
+            .id;
+        let rejected = store
+            .create_job(herd_hub::NewJob::new(shell("printf 'never dispatched\\n'")))
+            .expect("minted")
+            .id;
+        (queued, rejected)
+    };
+
+    // The record a tightening of the rules would leave behind, planted by
+    // hand because that is the only way to make one today: `BUILD` is not a
+    // label, and `LabelSet` would refuse to build it.
+    let path = job_dir(state.path(), &rejected).join("job.json");
+    let mut record: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&path).expect("the record reads"))
+            .expect("the record is json");
+    record["labels"] = serde_json::json!(["BUILD"]);
+    std::fs::write(
+        &path,
+        serde_json::to_string(&record).expect("the record serializes"),
+    )
+    .expect("the record is planted");
+
+    // ---- The store opens. This is the whole point: one bad record is not a
+    // dead hub.
+    let store = JobDirStore::open(state.path())
+        .expect("a record whose labels the rules reject must not stop the hub");
+    let quarantined = store.quarantined().expect("the quarantine list reads");
+    assert_eq!(
+        quarantined.len(),
+        1,
+        "exactly the one job is quarantined: {quarantined:?}"
+    );
+    assert_eq!(quarantined[0].0, rejected, "and it is named");
+    assert!(
+        quarantined[0].1.contains("BUILD"),
+        "the reason must name what was rejected: {}",
+        quarantined[0].1
+    );
+
+    // Skipped: out of the queue, so nothing will ever dispatch it, while the
+    // job beside it is still there to be run.
+    let queue: Vec<String> = store
+        .unfinished_jobs()
+        .expect("the queue reads")
+        .into_iter()
+        .map(|record| record.id.to_string())
+        .collect();
+    assert_eq!(
+        queue,
+        vec![queued.to_string()],
+        "a quarantined job is not in the queue, and nothing else is missing \
+         from it"
+    );
+    // And asking for it answers with the quarantine rather than pretending it
+    // is not there.
+    let refused = store
+        .job(&rejected)
+        .expect_err("the hub will not act on a quarantined job");
+    let said = refused.to_string();
+    assert!(said.contains(rejected.as_str()), "{said}");
+    assert!(said.contains("quarantined"), "{said}");
+    assert!(said.contains("BUILD"), "{said}");
+    // Its record is left exactly as it was found: a job nobody can act on is
+    // not a job Herd may rewrite.
+    assert_eq!(
+        record_of(state.path(), &rejected)["labels"],
+        serde_json::json!(["BUILD"])
+    );
+    drop(store);
+
+    // ---- And the hub itself serves, on that same state root, with the
+    // quarantined job sitting in it.
+    let hub = HubProcess::start(state.path());
+    let (data_root, confined) = support::prepared_runner("quarantine-runner");
+    let link = tokio::spawn({
+        let config = runner_config(&hub.hub_url, &data_root);
+        let confined = Arc::clone(&confined);
+        async move { herd_runner::serve_once(config, Session::new(), confined).await }
+    });
+    hub.wait_for_runner().await;
+    let state_dir = state.path().to_path_buf();
+    wait_until("the inherited queue runs and ends", || {
+        file_state_of(&state_dir, &queued) == "finished"
+    })
+    .await;
+    assert_eq!(log_of(state.path(), &queued), "from the queue\n");
+    // A fresh submission is accepted and runs too.
+    let finished = support::run_job(&hub.requester(), shell("exit 5"), |_, _| {})
+        .await
+        .expect("the hub serves");
+    assert_eq!(finished.outcome, JobOutcome::Exited { code: 5 });
+    // The quarantined job never ran and never changed.
+    assert_eq!(file_state_of(&state_dir, &rejected), "queued");
+    assert_eq!(log_of(state.path(), &rejected), "");
+    link.abort();
 }
