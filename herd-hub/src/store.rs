@@ -2333,7 +2333,9 @@ mod tests {
             .job(&job.id)
             .expect_err("a newer version is not readable here");
         assert!(
-            error.to_string().contains(&format!("record version {newer}")),
+            error
+                .to_string()
+                .contains(&format!("record version {newer}")),
             "{error}"
         );
         assert!(

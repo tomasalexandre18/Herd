@@ -240,6 +240,76 @@ mod tests {
         }
     }
 
+    /// **Attack 5.** An override larger than the machine would make the
+    /// per-runner admission floor guard memory that does not exist. Clamped,
+    /// and the clamp is said out loud with both figures — a silent accept was
+    /// never on the table.
+    #[test]
+    fn an_override_larger_than_the_machine_is_clamped_and_said_out_loud() {
+        let (lent, said) = lendable_memory_mib(64 * 1024, Some(17 * 1024));
+        assert_eq!(lent, 17 * 1024, "a machine of 17 GiB cannot lend 64");
+        let said = said.expect("a clamp is never silent");
+        assert!(said.contains("asked for 65536 MiB"), "{said}");
+        assert!(said.contains("has 17408 MiB in all"), "{said}");
+        assert!(said.contains("17408 MiB is what is lent"), "{said}");
+        assert!(
+            said.contains(
+                "would make the per-runner admission floor guard memory that does \
+                           not exist"
+            ),
+            "the sentence has to say why, or the clamp reads as a bug: {said}"
+        );
+    }
+
+    /// Lending **less** than the machine has is the whole point of the
+    /// option, and it passes through untouched and unremarked.
+    #[test]
+    fn an_owner_may_lend_less_of_her_machine_than_it_has() {
+        let (lent, said) = lendable_memory_mib(17 * 1024, Some(24 * 1024));
+        assert_eq!(lent, 17 * 1024);
+        assert_eq!(said, None, "lending part of a machine is not news");
+        // Exactly the whole machine is not a lie either.
+        let (lent, said) = lendable_memory_mib(17 * 1024, Some(17 * 1024));
+        assert_eq!(lent, 17 * 1024);
+        assert_eq!(said, None);
+    }
+
+    /// And when `MemTotal` could not be read there is nothing to clamp
+    /// against. The owner's figure stands, and the sentence says it was not
+    /// checked — rather than the figure being silently read as zero, or the
+    /// runner refusing to start on a host whose `/proc` it cannot see.
+    #[test]
+    fn an_unreadable_memtotal_leaves_the_figure_alone_and_says_so() {
+        let (lent, said) = lendable_memory_mib(64 * 1024, None);
+        assert_eq!(lent, 64 * 1024);
+        let said = said.expect("an unchecked figure is said to be unchecked");
+        assert!(said.contains("MemTotal could not be read"), "{said}");
+        assert!(said.contains("was not checked"), "{said}");
+    }
+
+    /// E-31's input. On a Linux host `/dev/shm` is a tmpfs with room on it,
+    /// and a path that is not one is an **error** rather than a zero: a hub
+    /// handed `Some(0)` would read a machine that lends no tmpfs, which is a
+    /// different statement from a machine nobody could measure.
+    #[test]
+    fn the_tmpfs_room_is_measured_or_named_but_never_zero() {
+        if !cfg!(target_os = "linux") {
+            return;
+        }
+        match tmpfs_room_mib(DEFAULT_TMPFS_PATH) {
+            Ok(room) => assert!(room > 0, "{DEFAULT_TMPFS_PATH} has no room at all?"),
+            // A container without /dev/shm is a real host; what matters is
+            // that it says so rather than announcing a figure.
+            Err(why) => assert!(why.contains(DEFAULT_TMPFS_PATH), "{why}"),
+        }
+        // A path that exists and is not a tmpfs: named, with its type.
+        let why = tmpfs_room_mib("/proc").expect_err("/proc is not a tmpfs");
+        assert!(why.contains("is not a tmpfs"), "{why}");
+        // A path that does not exist at all: named, and not read as empty.
+        let why = tmpfs_room_mib("/herd-no-such-mount-point").expect_err("there is no such path");
+        assert!(why.contains("cannot be measured"), "{why}");
+    }
+
     /// E-22's input. On Linux both figures are there, and the memory is a
     /// plausible size for a machine — above all it is not zero, because zero
     /// is what a derivation must never be handed.

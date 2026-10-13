@@ -16,7 +16,7 @@ pub use job::{
 pub use matcher::{Placement, Seat, Stickiness, STICKINESS_LIMIT};
 pub use queue::{Standing, AGING_STEP};
 pub use server::{
-    hub_version, Hub, HubHandle, Policy, RunnerStatus, ATTEMPTS_ALLOWED, DEFAULT_LISTEN_ADDR,
-    FRAME_CEILING_BYTES, LOST_AFTER, MAX_FRAME_BYTES, Restating, WAIT_RESTATEMENT,
+    hub_version, Hub, HubHandle, Policy, Restating, RunnerStatus, ATTEMPTS_ALLOWED,
+    DEFAULT_LISTEN_ADDR, FRAME_CEILING_BYTES, LOST_AFTER, MAX_FRAME_BYTES, WAIT_RESTATEMENT,
 };
 pub use store::{JobDirStore, LAYOUT_VERSION};
