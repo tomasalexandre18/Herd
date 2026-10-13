@@ -92,7 +92,9 @@ Claiming matches labels against the algebra, enforcing kinds under contention
 threads, recorded (E-22). Stickiness: a job waits for an eligible runner while
 one is available (connected, switch on), moves only when none is, under a
 visible safety limit (E-19). One explanatory line per claim; impossible label
-sets fail fast (E-36).
+sets fail fast (E-36). Matching reads a job's requirements off its own
+record — stated at submission or produced by a `labels_from` reading
+(D74) — and never anywhere else.
 **Done when** two counted jobs serialize and an exclusive one never overlaps
 them; a modelled PC never runs two builds, its derived `-j` recorded; with the
 eligible runner busy the job stays queued, disconnected it moves within 10 s;
@@ -104,7 +106,8 @@ Memory admission: declared need vs free minus a per-runner floor minus what
 running jobs hold (E-29). tmpfs reservation before start, released at end;
 short → wait, never fail (E-31). Host-wide sums; load recorded, never a gate
 (E-32). A queued stream reports position, what is ahead and why, at least
-every 60 s; refusals carry figures (E-04).
+every 60 s; refusals carry figures (E-04). Admission reads the same
+requirements held on the record (D74), whoever put them there.
 **Done when** admission unit tests pass with figures in refusals (`1.2 GiB
 free in tmpfs, 2 GiB needed`); a reservation-starved job waits then starts
 when room frees; a 10-minute simulated wait leaves periodic reasons.
@@ -115,28 +118,52 @@ from the runner's host or via herdctl, state visible (E-33). Dry run (E-07).
 Deadline (E-09; needed by E-41). Dependency: at most one named parent, start
 after its success, else cancelled with the reason — one edge, no conditions
 (E-10; needed by E-12's flow). Metal drain-first: a `metal-<m>` job drains its
-host's build slot before starting, bounded 15 min (completes E-27).
+host's build slot before starting, bounded 15 min (completes E-27). A
+`metal-*` capability's lease file is read as a busy probe (D48, D51): a job
+whose machine is leased waits rather than runs and fails. A command may
+declare one requeue exit code (D76) — their 75 — for the race between that
+probe and the run; it causes a bounded requeue with the capability
+re-probed, separate from E-21's two attempts for a lost runner, and ends
+the job naming the code and the runners that answered it once the budget
+is spent.
 **Done when** `off` stops claims within 10 s and stops serving content too
 (D11), reason visible; dry run lists
 eligible runners and the queue ahead, runs nothing; a past-deadline job shows
 `cancelled (deadline)`; a dependent starts only after its parent; a simulated
-metal trial never overlaps a build on its host.
+metal trial never overlaps a build on its host; a leased `metal-*` job waits
+instead of failing, and a declared requeue code is retried within its
+budget then ends named.
 
 ### M10 — Command declaration contract (`m10-command-contract`)
-The consumer declares commands in one file in its own tree: name, command
-line, labels, resources, declared outputs, and a prepare step declaring the
-cache keys it needs and leaves (Q5). A
+The consumer declares commands in one file in its own tree (`commands.toml`),
+field set now named: `line`, `labels` and/or `labels_from`, `memory_mib`,
+`tmpfs_mib`, `timeout_s`, `priority`, `needs` (artefacts of an earlier job of
+the same commit), `leaves` (artefacts to keep, with a key), `coalesce`,
+`dedup_key`, `schedule`, plus the `[executor]` hooks (`up`, `fetch`, `run`,
+`down`) and the `{job} {commit} {args} {in} {out}` placeholders Herd must
+provide (`{in}` and `{out}` two directories under the runner's data root). A
 submission names a declared command and a commit of a configured bare
 repository — a branch resolves to a recorded hash, never a machine (E-01);
 dirty or unpushed trees refused naming the files (E-08). The runner
 materializes the commit, runs the command inside `nix develop` with the
-consumer's environment, confined per M4. Output framing: first line
+consumer's environment, confined per M4, through its four named executor
+steps in fixed order — the record gains one timestamped line per step: name,
+start, duration, exit code (D77). A command declaring `labels_from` in place
+of static labels is resolved by an ordinary job on a runner, confined and
+recorded like any other, against the command's declared baseline labels; its
+answer is read strictly, refuses the job by name on an unknown, missing or
+duplicated key, a non-numeric figure, a non-zero exit or a timeout, never
+recurses into a further `labels_from`, and is cached by (commit, command,
+args) in the job store (D74). Output framing: first line
 `ran on: <runner> (<why>)`, then the tool's verdict and exit code unchanged,
 0/1/75 passed through, format versioned (Q7) (E-02). Herd's code and docs name
 no consumer command (E-11).
 **Done when** a fixture consumer repo declares two commands and adding a third
 changes nothing on Herd's side; e2e asserts the `ran on:` line, the verbatim
-verdict, exit codes 0/1/75; a dirty submission is refused naming the files.
+verdict, exit codes 0/1/75; a dirty submission is refused naming the files;
+a `labels_from` reading lands as its own recorded job, caches by (commit,
+command, args), and a malformed answer refuses the real job by name; the
+record shows a timestamped line per executor step.
 The real chatOnS declaration closes in M18.
 
 ### M11 — Content registry, direct transfer (`m11-content-registry`)
@@ -153,7 +180,13 @@ only** (a runner with no mesh) — it pushes to and pulls from a keeper, never
 serves. A fetch endpoint binds to the one configured mesh interface and is
 refused at startup if it would bind a default or public one (D11). A pack is
 complete or absent: the manifest is registered only once every blob is held
-and fsynced (E-17, E-13, E-12).
+and fsynced (E-17, E-13, E-12). The real shape, now known: `<id>/manifest.tsv`,
+`<id>/pack.meta`, `<id>/objects/<sha256>`, `<id>` the sha256 of the manifest,
+complete-or-absent by write-then-rename. Herd keeps a build job's
+`{out}/packs/<id>` by (commit, id) and hands it to the same commit's
+test-pack jobs as `{in}/pack`; measured by them, ~400 MiB in ~560 files,
+verified in under 2 s. E-13's content-addressed storage is then simply
+storing objects by their sha256 name, which is what their pack already is.
 **Done when** a two-runner e2e produces a fixture pack on runner A and
 consumes it on runner B with the hub seeing no payload byte (asserted by
 counting bytes on the hub's sockets); a same-host fetch moves zero network
@@ -168,6 +201,19 @@ registry boundary — local CAS plus the same-host and keeper paths first,
 peer-to-peer fetch and capabilities second.
 
 ### M12 — Custody, budgets, GC, locality (`m12-custody-gc`)
+**This milestone shrinks.** The consumer's own words are "you move packs;
+our executor owns warm caches": their `up` step pulls its nearest cache
+itself and D77 already timestamps that step, so Herd need not carry a
+cache, know its contents, or collect it. Gone: the prepare step tied to
+cache keys, its duration bookkeeping, a runner's health report of cache
+keys held, and cache diffs registered specially as packs — all of it was
+the cache-engine apparatus D9 sketched, and it is replaced by nothing,
+because the generic mechanisms already cover the ground: `needs`/`leaves`
+(M10) for artefacts, D77's step timestamps for preparation time, M11's
+registry for which runner holds which blob. What stays: scheduling and
+running the consumer's `produce` command on a `build` runner, moving packs
+(M11), key-aware placement (E-23) off M11's own registry, and budgets and
+GC for what Herd itself holds.
 Custody (D10): a key family names one or more **keepers** — runners that pin
 what the retention policy keeps, so a pack outlives the machine that built it
 and survives its owner switching that machine off. The server's runner is the
@@ -176,22 +222,15 @@ a silent failure. Per-runner budgets shown as use against budget, gc on each
 runner never removing what a queued or running job references nor what its
 keeper role pins (N = 5 most recent per key family, configurable) (E-16).
 Result retention by priority class — 14/90 days, configurable (closes E-15).
-Warm caches per D9 — Herd carries no cache engine, it carries the consumer's:
-the prepare step runs before the job with its declared cache keys, its
-duration recorded against the job (E-14); a runner reports the keys it holds
-in its health report; and because content is addressed per file, the consumer
-may register cache diffs as ordinary packs, so a 57-700 MB diff between mains
-moves only the blobs the target lacks — directly, peer to peer.
-Placement preference among available eligible runners: keys already held /
-shortest prepare, then most free memory, reference last (E-23); E-19 still
-governs waiting.
+Placement preference among available eligible runners: keys already held,
+then most free memory, reference last (E-23); E-19 still governs waiting.
 **Done when** a pack whose only non-keeper holder goes offline is still
 fetchable from its keeper; a pack with no holder at all reports that state by
 name; gc on a runner with a budget 10 GiB below use comes in under it keeping
 every pinned and referenced item; a step result past retention is gone while a
-60-day merger result reads fine; prepare duration is recorded per job; a
-fixture cache diff registered as a pack moves only the missing blobs; and
-placement prefers the runner already holding the key, picking reference last.
+60-day merger result reads fine; a `produce` job is scheduled and run on a
+`build` runner and its pack moves like any other; and placement prefers the
+runner already holding the key, picking reference last.
 
 ### M13 — Status and events (`m13-status-events`)
 One status document, JSON with a format version (Q7), carrying the queue,
@@ -207,13 +246,21 @@ exactly the expected events and zero per-step ones.
 Hub-config schedule entries: at a local time, if a named ref of the bare
 repository moved since the last run, submit a declared command with labels,
 priority, deadline (E-41) — that one predicate, nothing richer (Q13, invariant
-1). Exclusivity from label kinds, deadline from M9. The push-hook path is a
-documented detached `herdctl` submission; the hook itself is the consumer's
-(E-42).
+1). Exclusivity from label kinds, deadline from M9. Their nightly is now
+concrete: 03:00 local, daily, only if main moved, main's tip read at start,
+5 h cap, `nightly` exclusive against everything on that runner, a 05:00
+start deadline past which it is skipped with the reason as an event. The
+push-hook path is a documented detached `herdctl` submission; the hook
+itself is the consumer's (E-42), submitting `produce` with a `dedup_key`
+of `produce:<commit>` and a `coalesce` key of `produce:main`: a queued
+`produce` of an older main is superseded, never a running one (D75).
 **Done when** a simulated clock fires at 03:00 only when the ref moved; the
 job carries its deadline and its exclusive label keeps everything else off
-that runner until it ends, a 03:30 job waiting or going elsewhere; a scripted
-bare-repo hook lands a lowest-priority job in e2e.
+that runner until it ends, a 03:30 job waiting or going elsewhere; a clock
+past 05:00 with no run yet skips it with the reason as an event; a scripted
+bare-repo hook lands a lowest-priority job in e2e; a second hook push before
+the first `produce` starts supersedes the queued one, exiting 125 and naming
+the superseding job, while a `produce` already running is never discarded.
 
 ### M15 — Auth and versions (`m15-auth-versions`)
 Per-runner token minted by one operator action (`herdctl runner approve`),
@@ -247,13 +294,22 @@ Flake builds the hub image; docker compose beside the consumer's dashboard;
 `wss://` through the existing reverse proxy; state and artefact volumes with
 their budgets (Q9). The server's runner runs natively, unprivileged, with
 `/dev/kvm`, `/dev/dri`, `/dev/vfio` and the consumer's namespaces reachable
-(E-47), restarting with the host (E-52, server side).
+(E-47), restarting with the host (E-52, server side). The runner's user is
+not in the `docker` group and never needs to be (D78): no crate in the
+workspace depends on a Docker client and `docker.sock` appears nowhere in
+it; a test asserts no open file descriptor of the runner resolves to the
+Docker socket while a job runs; and claim, execute, return the result and
+reconnect after a service restart are all exercised with that socket
+unreachable to the runner's user. The hub itself may still run in docker
+compose; that is the operator's deployment and needs nothing from the
+runner's user.
 **Done when** a fixture job submitted from a requester outside the compose
 network runs on the server's native runner over `wss://` and returns its log
 and exit code (automated against the deployed pair); a hub restart under
 docker compose re-asserts M2's no-loss test on the real volume; a reboot of
-the server brings the runner back with no hand. This milestone also sets
-`PROTOCOL_VERSION` and `RECORD_VERSION` back to 1 and freezes them: the
+the server brings the runner back with no hand; the no-Docker-socket test
+passes with the runner's user removed from `docker`. This milestone also
+sets `PROTOCOL_VERSION` and `RECORD_VERSION` back to 1 and freezes them: the
 first deployed protocol is version 1 (D73).
 
 ### M17 — The owner's PC joins (`m17-pc-runner`)

@@ -1421,3 +1421,172 @@ is why M6's bump is kept rather than reverted.
 deployment and reaching M16 at version nine or so. Rejected because a
 reader would then read eight compatibility eras that never existed,
 and the first version chatOnS pins at adoption should be 1.
+
+---
+
+## 2026-10-13 — D74 A job's requirements are read on a runner, never guessed
+
+**Context.** Until now Herd assumed a job's requirements were known at
+submission. Issue #16 breaks that: the labels a test needs, its memory
+and its tmpfs depend on the scenarios the test selects, and only the
+consumer's own tool knows them. Their declaration names a `labels_from`
+command — the same arguments plus `--labels`, which builds and boots
+nothing and prints `labels=…`, `tmpfs_mib=…`, `memory_mib=…`,
+`scenarios=…`. So the hub must learn a job's requirements before it can
+place it, and it cannot learn them by itself.
+
+**Choice.** The reading runs **on a runner**, not in the hub. It is an
+ordinary job: it goes through the one queue, is confined by M4's caps,
+and is recorded, so a refusal can quote it (E-36) and the reading itself
+is kept (E-15). The hub places it against the command's *declared*
+baseline labels — chatOnS's `--labels` needs the tree and nothing else,
+so `build` — then reads the answer, writes the requirements onto the
+record, and places the real job with M5's algebra and M8's admission.
+Then state these limits, each of which matters:
+
+- the answer is read **strictly**, like the capability file (D60): an
+  unknown key, a missing key, a duplicated key or a non-numeric figure
+  refuses the job **by name**;
+- a reading that exits non-zero, or that does not finish inside its
+  cap, **refuses the job by name** — a job is never placed on a guess;
+- **no recursion**: a command reached through `labels_from` never
+  itself resolves a `labels_from`;
+- the answer is **cached by (commit, command, args)**, in the job
+  store, because it is a property of those three alone — this is the
+  same key family as M6's dedup key, and without the cache every
+  submission pays a reading.
+
+**Consequence for the plan, and it costs nothing.** M7 and M8 are built
+against **the requirements held on the record**, and stay exactly where
+they are in the order. Where those requirements came from — a requester
+who stated them, or a reading that produced them — is the command
+contract's problem, so **the reading lands in M10** with the
+declaration file. M7's and M8's plan entries now say they consume the
+requirements on the record; M10's entry gains the reading, with its
+cache and its two refusals.
+
+**Alternative rejected.** The hub running the reading itself. Rejected
+because the hub would then execute the consumer's code, unconfined, on
+the machine that holds every job's record — and the runner already has
+M5's probe machinery for exactly this shape of work.
+
+---
+
+## 2026-10-13 — D75 Coalescing drops a queued job, never one in flight
+
+**Context.** M6 shipped deduplication (E-05): a second submission of
+work an open job is already doing **joins** it. Issue #16 asks for
+something different under E-42: a `coalesce` key, where "a queued
+produce of an older main is **dropped** when a newer one arrives".
+Dedup joins; coalescing discards. They are two behaviours, not one.
+
+**Choice.** A command may declare a `coalesce` key beside its
+`dedup_key`. At most one job with a given coalesce key sits in the
+queue: when a newer one arrives, the older one is **superseded** — a
+new outcome variant `superseded { by }` naming the job that replaced
+it, exiting **125** because Herd has no verdict of its own (consistent
+with D40, where `cancelled` and `lost` are outcomes and both exit 125).
+`herdctl wait` on a superseded job says which job superseded it.
+**Only a queued job is ever superseded** — work already running is
+never discarded, which is the consumer's own wording and also keeps
+invariant 2 honest about not throwing away a host's effort. A dedup
+join and a coalesce drop can both apply to the same submission; dedup
+is considered first.
+
+**Where.** M14, with E-42's push hook, which is the only thing that
+needs it. M14's plan entry gains the coalesce key and the supersede
+rule.
+
+**Alternative rejected.** Folding coalescing into M6's dedup as a flag.
+Rejected because the two answers are opposite — one caller gets the
+running job's result, the other gets told its job no longer exists —
+and a single switch over that would be read wrong by whoever touches
+it next.
+
+---
+
+## 2026-10-13 — D76 A lease is a busy probe; a requeue code is declared
+
+**Context.** The consumer's exit codes include **75**: "metal machine
+absent or leased to someone else: requeue, not a failure". Herd passes
+a job's own code through untouched today (D20), so 75 would reach the
+requester as a verdict. But their own label table already says
+`metal-<machine>` has capacity one and is **busy outside Herd while a
+lease file has not expired** — which is exactly M5's busy probe (D48,
+D51).
+
+**Choice.** Two halves, in this order. First, **the lease is a busy
+probe**: a `metal-*` capability reads the consumer's lease file, so a
+job whose machine is leased **waits** (`StandBy`, D38) instead of
+running and failing. Second, a command may declare **one** exit code
+meaning "the capability I was given went away under me" — 75 for them.
+That code is the race between the probe and the run, so it causes a
+**bounded requeue with the capability re-probed**, not a failure; when
+the budget is spent the job ends with an outcome naming the code and
+the runners that answered it, exiting 125. This requeue budget is
+**separate from E-21's two attempts for a lost runner** — conflating
+them would let a leased machine burn the budget that exists for a
+disappearing runner.
+
+**Where.** M9, with E-27's metal lease and drain-first. M9's plan
+entry gains the lease-as-probe and the declared requeue code.
+
+**Alternative rejected.** Hard-coding 75 in Herd. Rejected by
+invariant 1: 75 is the consumer's convention, and a project-agnostic
+service takes it as a declared field.
+
+---
+
+## 2026-10-13 — D77 The record timestamps the executor's steps
+
+**Context.** The consumer's declaration wraps every job in four of
+their own steps — `up` (a workspace over their nearest warm cache),
+`fetch`, `run`, `down` — and asks that the steps be timestamped so the
+preparation time is readable in the job's record. Their `up` may pull a
+whole cache the first time, which is minutes, and today that time
+would be invisible inside the job's wall time.
+
+**Choice.** The job record gains one line per step: its name, when it
+started, how long it took, and its exit code. Four **named** steps in a
+fixed order, with no conditions, no branching and no step a job can
+add — this is **not** a workflow language, and the boundary is
+invariant 1's: the day a step gains a condition, Herd has grown the
+thing it refuses to be. This is a record-format change, free before
+M16 and a migration after it (D73), so it lands with the declaration
+in **M10**. E-04's and E-36's explanations may then quote preparation
+time.
+
+**Alternative rejected.** Leaving the steps inside the job's wall
+time. Rejected because a thirty-minute cold cache pull would read as a
+slow test, and the consumer would be debugging the wrong thing.
+
+---
+
+## 2026-10-13 — D78 The runner never needs Docker, and proves it
+
+**Context.** We told the consumer that on the deployment host the
+runner's user is in the `docker` group, which is root-equivalent
+through the daemon's socket. Issue #16 calls that a blocker: their
+project never touches Docker, the host's Docker serves other
+workloads that are not theirs, and their jobs are agents' code run
+unattended. Their rules are one data root and root only through a
+short fixed helper list (E-45, E-46).
+
+**Choice.** Agreed without reservation, because the runner has never
+needed Docker for anything it does — the group membership is the
+host's current configuration, not a design requirement. Herd commits
+to three checkable things: no crate in the workspace depends on a
+Docker client and the string `docker.sock` appears nowhere in it; a
+test asserts that while a job runs, **no open file descriptor of the
+runner resolves to the Docker socket**; and the runner's whole run —
+claim, execute, return the result, reconnect after the service
+restarts — is exercised with that socket **unreachable to its user**.
+The hub may still run in docker compose: that is the operator's
+deployment and needs nothing from the runner's user. The acceptance
+belongs with the deployment, so this lands in **M16**, and removing the
+user from the group is a NixOS change that is Alexa's to make.
+
+**Alternative rejected.** Keeping the membership and arguing the
+runner does not use it. Rejected because the consumer's rule is about
+what is *reachable*, not about what is used, and a bug or a bad job is
+precisely the case the rule exists for.

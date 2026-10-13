@@ -10,7 +10,7 @@ closes in M18.
 | E | Prio | What | Milestone | State | Note |
 |---|---|---|---|---|---|
 | E-01 | must | submit by commit, never machine | M10 | planned |  |
-| E-02 | must | ran-on line, verdict unchanged | M10 | planned | format frozen per Q7; real verdict gated (M18) |
+| E-02 | must | ran-on line, verdict unchanged | M10 | planned | format frozen per Q7; results.json's real fields and a worked example are now known (issue #16); real verdict gated (M18) |
 | E-03 | must | stream, detached mode, wait | M2 | merged | foreground streaming itself lands in M1 |
 | E-04 | must | waits explained with figures | M8 | planned |  |
 | E-05 | must | identical submissions deduplicated | M6 | in review (PR #15) | keyed on the command and the labels, length-prefixed (D69); only an open job is joined — work that is over is rerun (D70); the higher level wins; verified: two waits, one execution, one log |
@@ -19,10 +19,10 @@ closes in M18.
 | E-08 | must | refuse dirty or unpushed | M10 | planned |  |
 | E-09 | should | deadline cancels unstarted job | M9 | planned | pulled forward: E-41 (must) needs it |
 | E-10 | should | depend on one other job | M9 | planned | capped: one parent, no conditions (invariant 1) |
-| E-11 | must | consumer-declared commands, nix develop | M10 | planned | gated: their real declaration file (M18) |
-| E-12 | must | packs by (commit, key), no shared build trees | M11 | planned | D10: hub registers, peers transfer; gated on their pack (M18) |
+| E-11 | must | consumer-declared commands, nix develop | M10 | planned | the field set, `[executor]` hooks and ten real commands are now known in full, including `labels_from` (D74) and the step timestamps (D77) (issue #16); gated: their real declaration file (M18) |
+| E-12 | must | packs by (commit, key), no shared build trees | M11 | planned | D10: hub registers, peers transfer; the real shape (`manifest.tsv`, `pack.meta`, `objects/<sha256>`, id = sha256 of the manifest) and measured figures (~400 MiB, ~560 files, verified under 2 s) are now known (issue #16); gated on their pack (M18) |
 | E-13 | should | content-addressed, complete or absent | M11 | planned | done with the store: retrofitting CAS would force a migration, and D10 needs it for free diffs |
-| E-14 | must | warm caches ready before job | M12 | planned | Q5/D9: no cache engine in Herd, but a declared prepare step, key-aware placement, and cache diffs publishable as packs; gated on their replication (M18) |
+| E-14 | must | warm caches ready before job | M12 | planned | Q5/D9: no cache engine in Herd; their own words, "you move packs; our executor owns warm caches" (issue #16), shrink M12 to moving packs, key-aware placement and GC/budgets — the cache-specific prepare step is dropped for the generic step timestamps (D77); gated on their replication (M18) |
 | E-15 | must | full job record on disk | M2 | merged | byte-faithful logs (D18); a lost log chunk leaves a named marker, and a lost tail is asked for (D36) |
 | E-16 | must | budgets, gc with pinning | M12 | planned | per runner, not central (D10); keepers pin |
 | E-17 | must | atomic publication everywhere | M11 | planned | a manifest registers only once every blob is held; job-record atomicity already in M2 (Q1) |
@@ -49,8 +49,8 @@ closes in M18.
 | E-38 | should | statistics over a period | — | planned | deferred past M18; raw data already written by M2/M4 records |
 | E-39 | should | results searchable | — | planned | deferred past M18; on-disk records are greppable meanwhile |
 | E-40 | should | health every 15 s | M3 | merged | the age is in the hub's state; surfaced in the status document in M13 |
-| E-41 | must | scheduled nightly, exclusive | M14 | planned | gated: their nightly command, live at M18 |
-| E-42 | must | push hook submits producer | M14 | planned | Herd side = scriptable detached submit; the hook is theirs |
+| E-41 | must | scheduled nightly, exclusive | M14 | planned | now concrete: 03:00 local, daily, only if main moved, 5 h cap, `nightly` exclusive, 05:00 start deadline else skipped with the reason as an event (issue #16); gated: their nightly command, live at M18 |
+| E-42 | must | push hook submits producer | M14 | planned | Herd side = scriptable detached submit; the hook is theirs; now concrete: `dedup_key` `produce:<commit>`, `coalesce` key `produce:main` superseding a queued older `produce`, never a running one (D75, issue #16) |
 | E-43 | must | merger jobs start first | M6 | in review (PR #15) | a priority, never a side door; verified against the real binaries: a merger submitted last takes the next free slot. Which jobs a merge submits is theirs (M18) |
 | E-44 | must | restart loses nothing | M2 | merged | verified: hub killed mid-job, result lands, record complete |
 | E-45 | must | one data root only | M4 | merged | cooperative confinement only — full containment needs a mount namespace E-46 forbids (D28) |
