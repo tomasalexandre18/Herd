@@ -2,38 +2,36 @@
 
 State of the project right now. Replaced every session, never appended to.
 
-## Where we are
-
-Seven milestones are merged to `main`: M1 (end-to-end substrate), M2
-(durable job store), M3 (link robustness), M4 (runner confinement), M5
-(the capability model), M6 (queue and priorities) and M7 (matching,
-slots, no fallback). Nothing else is written and waiting.
-
 ## What works
 
-Verified against the real binaries by an independent adversarial pass,
-not taken on report:
+Eight milestones are merged to `main`: M1 through M8 (substrate,
+durable store, link robustness, confinement, capability model, queue
+and priorities, matching and slots, admission). Nothing else is
+written and waiting. M1-M5 are additionally verified against the
+real binaries by a separate independent adversarial pass
+(`docs/coverage.md`); M6-M8 by their own milestone tests only.
 
-- **M1** — streamed output; exit codes reach `herdctl` unchanged; a
-  SIGTERM becomes 143.
-- **M2** — a hub killed mid-job loses no result; the record lands
-  complete once it comes back (E-44).
-- **M3** — a lost runner requeues a job exactly once, never a third
-  time (E-21); cancel kills the whole process tree (E-06).
-- **M4** — byte-faithful logs; every cap exits 124, named; descendants
-  die with the job; workspace always reclaimed (E-15, E-30, E-34,
-  E-45, E-46).
-- **M5** — one capability algebra; probed, declared or denied origins;
-  an externally busy capability suspends a claim rather than handing
-  it out (E-24, E-26, E-28).
-- **M6** — one queue for everything, four priorities with aging
-  computed from the record (D67); dedup joins, `coalesce` drops a
-  queued job (E-05, E-18, E-20, E-43).
-- **M7** — slots read from the record each pass, none leak (E-22);
-  `-j` derived from memory and threads, three quarters kept back,
-  rounded down, never zero (D83); a preferred runner is stuck to
-  while merely busy (E-19); exclusion enforced at claim time (E-25);
-  every placement, and every impossible ending, explained (E-36).
+- **M1-M5** — streamed output, exit codes unchanged, SIGTERM becomes
+  143; a hub killed mid-job loses no result (E-44); a lost runner
+  requeues once, cancel kills the whole tree (E-06, E-21);
+  byte-faithful logs, every cap exits 124 named, workspace always
+  reclaimed (E-15, E-30, E-34, E-45, E-46); one capability algebra,
+  a busy capability suspends a claim (E-24, E-26, E-28).
+- **M6-M7** — one queue, four priorities with aging from the record
+  (D67); dedup and `coalesce` (E-05, E-18, E-20, E-43); slots read
+  from the record each pass, none leak (E-22); `-j` derived, rounded
+  down, never zero (D83); stuck to a preferred runner while busy
+  (E-19); exclusion at claim time (E-25); every placement explained
+  (E-36).
+- **M8** — memory/tmpfs admission costed from the records, never
+  measured usage (D87); short of tmpfs waits for its machine, too
+  big for any connected runner waits "ever" rather than failing
+  (D88); refusals and waits carry their figures (E-04, E-29, E-31,
+  E-32). Fixed a leak predating M1: `Hub::serve`'s background tasks
+  held the store's `flock` after the hub was gone, a one-in-six
+  flake since M8's fourth task; a `Drop` guard now aborts them with
+  the owning future, proven by a regression test (D93); not proven:
+  how the leaked lock reached the particular root that complained.
 
 `cargo fmt`, `clippy -D warnings` and `cargo test --workspace` are
 green through `nix develop`. CI (`check` + `docs`) and the
@@ -41,50 +39,52 @@ pull-request flow are live on `main`.
 
 ## What is not done, and why
 
-24 of 44 musts are still planned, from M8 (admission and explained
-waits) onward. Caveats, detailed in `docs/coverage.md`:
+20 of 44 musts are still planned, from M9 (owner control) onward.
+Caveats, detailed in `docs/coverage.md`:
 
-1. No authentication before M15, and the hub now holds a **fleet**
-   (M7): a hand-crafted peer can join beside the real runners under
-   any name. Herd must stay on loopback.
-2. E-45's confinement is cooperative only (D28); the deployment host's
-   runner user is also in the `docker` group, root-equivalent through
-   the socket — removing it is Alexa's NixOS change, landing at M16.
-3. E-30's real kernel ceiling needs a delegated cgroup; the WSL replay
-   is a manual M17 check.
-4. Nothing is deployed, so both version numbers are free-running: M7
-   moved them to **3**; a pre-M7 root is refused with no migration,
-   frozen at M16 (D73).
-5. The `dispatching` lock is now held for a **whole pass** over the
-   whole queue, including every claim's disk writes; a pass's duration
-   against a large queue is unmeasured.
-6. A job queued for two mutually-exclusive labels is **ended** the
-   moment a runner joins declaring them so — a new way to die, albeit
-   a defensible one.
-7. M7's three-quarters reserve and slot divisor reproduce E-22's
-   worked figure exactly, but that is **judgement, not measurement**;
-   M8 is where they meet reality.
+1. No authentication before M15; the hub holds a **fleet** (M7), so
+   a hand-crafted peer can join beside real runners under any name.
+   Stay on loopback.
+2. E-45's confinement is cooperative only (D28); the runner user is
+   also in the `docker` group on the deployment host. Settled (D78):
+   the runner needs no Docker at all; three checks land in M16.
+3. E-30's real kernel ceiling needs a delegated cgroup; the WSL
+   replay is a manual M17 check.
+4. Both version numbers are free-running: M8 moved them to **4**; a
+   pre-M8 root is refused with no migration, frozen at M16 (D73).
+5. The whole-pass `dispatching` lock is measured, not fixed: 3.31 s
+   over 400 queued jobs writing a waiting line each, 46.8 ms steady
+   state; D92 names what is bad about it.
+6. A job queued for two mutually-exclusive labels is **ended** when
+   a runner joins declaring them so — defensible, but a new way to
+   die. Separately, a job no *connected* runner could ever fit
+   **waits, never ends** (D88): a fleet is not a closed world, and
+   E-31 says "wait, never fail". Such a job can wait for ever; the
+   bound is **E-09's deadline, in M9** — E-09 (a `should`) now
+   carries a second load-bearing role.
+7. Two smaller unsures from M8: the restatement figure is two lines
+   a minute, not twenty per ten minutes, because the 45 s clock and
+   M6's 60 s countdown interleave rather than coincide — recorded,
+   not tuned; and `--host-tmpfs-path`'s non-default-mount path was
+   never exercised against a real tmpfs.
 
 Booked, not yet fixed: a SIGKILLed runner leaves in-flight probes
-behind; a verdict the hub could not write, overtaken by its watchdog,
-logs "is over" for ever instead of erroring; D63's write-door rule
-holds by review, not the compiler; D64's probe sweep is untested and
-unmeasured at scale. **Q10, the licence** blocks nothing before M16.
+behind; a verdict the hub could not write logs "is over" for ever;
+D63's write-door rule holds by review, not the compiler; D64's
+probe sweep is untested at scale.
 
 ## Environment facts
 
 - Server: NixOS, kernel 6.18, i5-10600K, 12 threads, 31 GB RAM, no
   swap, `/dev/kvm`, Intel iGPU, nix with flakes, docker 29.7. Rust
-  1.98.1 comes from the flake (D12); nothing installed globally.
-- GitHub: `tomasalexandre18` via `gh`. `main` protected (pull request,
-  `check` + `docs` green, no force push, no deletion). Issue #1 holds
-  the consumer's expectations; issue #16 (six deliverables) is closed
-  through D74-D86, ending in their agreement on D51's probe rule.
-- This machine's SSH key is a deploy key for another repo; git uses
-  the HTTPS remote with the `gh` credential helper.
+  1.98.1 from the flake (D12); nothing installed globally.
+- GitHub: `tomasalexandre18` via `gh`; `main` protected (pull
+  request, checks green, no force push/deletion); issue #16 closed.
+- SSH key here is a deploy key for another repo; git uses the HTTPS
+  remote with the `gh` credential helper.
 
 ## Next action
 
-M8 (admission and explained waits) is next, built against the
-requirements, slots and preferences M7 already put on the record.
-Alexa's own action: take the runner's user out of the `docker` group (D78).
+M9 (owner control), in progress on `m9-owner-control`. Alexa's own,
+non-blocking: take the runner's user out of `docker` (D78), and
+settle **Q10, the licence** — blocks nothing before M16.
