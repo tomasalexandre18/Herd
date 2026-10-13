@@ -246,7 +246,29 @@ enum Done {
     Job(JobOutcome),
     /// The command did its own job; nothing ran.
     Said,
+    /// The command did **part** of what it says, and said which part on
+    /// stderr (D99).
+    ///
+    /// One case today: `herdctl switch <runner> <position>` where the runner
+    /// has not confirmed writing the position down. The position may be in
+    /// force and not durable, and an owner who read a zero exit code there
+    /// would believe her machine stays hers past a reboot.
+    ///
+    /// [`NOT_SETTLED_CODE`] rather than [`herdctl::NO_VERDICT_CODE`]: 125 says
+    /// "Herd has no verdict for this *job*", and this command runs no job. It
+    /// is a distinct code because a script that switches a fleet off before a
+    /// maintenance window has to be able to tell "the hub could not be
+    /// reached" from "the machine is off but may forget it".
+    SaidOnlyHalf,
 }
+
+/// `herdctl`'s exit code for a command that did part of what it says and
+/// named the rest on stderr (D99).
+///
+/// Not 1: 1 means "the job failed" (D20), and nothing here ran a job. Not 125:
+/// that is a job with no verdict. 2 is free, and the sentence on stderr is
+/// what a person reads either way.
+const NOT_SETTLED_CODE: u8 = 2;
 
 #[tokio::main]
 async fn main() -> ExitCode {
@@ -288,6 +310,9 @@ async fn main() -> ExitCode {
             ExitCode::from(exit_code_for(&outcome))
         }
         Ok(Done::Said) => ExitCode::SUCCESS,
+        // The sentence was printed where the command prints: what this arm
+        // decides is only that it is not success (D99).
+        Ok(Done::SaidOnlyHalf) => ExitCode::from(NOT_SETTLED_CODE),
         // Nothing ran, or nothing came back: Herd has no verdict to give, and
         // saying so with 1 would be indistinguishable from a job whose tests
         // failed (D20). One code, one meaning, and the reason on stderr.
@@ -407,7 +432,18 @@ async fn run(args: Args) -> Result<Done> {
                 (Some(runner), Some(position)) => {
                     let switch = herd_proto::Switch::parse(&position, reason.as_deref())
                         .map_err(anyhow::Error::msg)?;
-                    println!("{}", herdctl::set_switch(&config, runner, switch).await?);
+                    // This waits for the runner to have the position on its
+                    // own disk, bounded by E-33's ten seconds (D99). Anything
+                    // short of that is said on stderr and is not success: the
+                    // owner asked for a machine she can take back, and a
+                    // position that dies with the runner process is half of
+                    // that.
+                    let (said, confirmed) = herdctl::set_switch(&config, runner, switch).await?;
+                    if !confirmed {
+                        eprintln!("herdctl: {said}");
+                        return Ok(Done::SaidOnlyHalf);
+                    }
+                    println!("{said}");
                 }
             }
             Ok(Done::Said)

@@ -657,7 +657,29 @@ struct ConnectedRunner {
     /// view wrong for one health cadence and no longer, instead of leaving two
     /// sides each sure of a different position.
     switch: herd_proto::Switch,
+    /// What this runner last said it *did* with a position the hub asked it
+    /// for (E-33, D99).
+    ///
+    /// The channel `herdctl switch` waits on. It is separate from `switch`
+    /// above because the two answer different questions: `switch` is where the
+    /// position stands, and this is whether the runner has it on its own disk.
+    /// A health report proves the first and not the second — the runner applies
+    /// a position it could not write, and rightly — so a requester told
+    /// "success" on the strength of a health report was being told something
+    /// nobody had established.
+    ///
+    /// `None` is "nothing acknowledged since the last ask". Cleared by
+    /// [`set_a_switch`] before it asks, so that a stale acknowledgement of the
+    /// same position can never answer a new question.
+    applied: watch::Sender<Option<Acknowledged>>,
     jobs: Vec<RunningJob>,
+}
+
+/// What a runner said it did with a position the hub asked it for (E-33, D99).
+#[derive(Debug, Clone)]
+struct Acknowledged {
+    switch: herd_proto::Switch,
+    persistence: herd_proto::SwitchPersistence,
 }
 
 #[derive(Default)]
@@ -846,6 +868,11 @@ impl State {
                     reports_seen: 0,
                     draining: false,
                     switch: announced.switch.clone(),
+                    // Nothing has been asked of this connection yet, so
+                    // nothing has been acknowledged on it. A redial starts
+                    // empty on purpose: an acknowledgement is about one
+                    // process, and the process may be a different one.
+                    applied: watch::channel(None).0,
                     jobs: Vec::new(),
                 },
             );
@@ -1053,6 +1080,25 @@ impl State {
             );
             runner.switch = switch;
             Some(said)
+        })
+    }
+
+    /// Hand a runner's acknowledgement to whoever is waiting for it (D99).
+    ///
+    /// By the *connection*, like every other frame a runner sends: an
+    /// acknowledgement is about one process, and a redial under the same name
+    /// is a different one. Nobody waiting is the ordinary case — an owner who
+    /// set her own switch file asked nothing — and dropping it then costs
+    /// nothing, because the position itself travels on the health report.
+    fn record_switch_applied(&self, outbox: &Outbox, acknowledged: Acknowledged) {
+        self.with_peers(|peers| {
+            if let Some(runner) = peers
+                .runners
+                .values()
+                .find(|runner| runner.outbox.same_channel(outbox))
+            {
+                runner.applied.send_replace(Some(acknowledged));
+            }
         })
     }
 
@@ -2175,6 +2221,42 @@ async fn relay_from_runner(
                 // socket can stay open onto a hub that is gone.
                 let _ = outbox.send(FromHub::HealthRecorded {});
             }
+            // What the runner did with a position this hub asked it for, and
+            // the one thing `herdctl switch` may read as success (E-33, D99).
+            ToHub::SwitchApplied {
+                switch,
+                persistence,
+            } => {
+                // It is evidence about the position too, so the hub's own view
+                // moves on it rather than waiting for the health report that
+                // is on its way: the two carry the same position and the
+                // earlier one wins.
+                if let Some(said) = state.record_switch(outbox, switch.clone()) {
+                    println!("herd-hub: {said}");
+                    dispatch_queued_jobs(state)?;
+                }
+                match &persistence {
+                    herd_proto::SwitchPersistence::Written { path } => println!(
+                        "herd-hub: runner {name} has written its switch ({}) down in {path}",
+                        switch.sentence()
+                    ),
+                    // On stderr, because it is the half of E-33 that did not
+                    // happen: the machine is withdrawn and a restart of it
+                    // would come back claiming.
+                    herd_proto::SwitchPersistence::NotWritten { why } => eprintln!(
+                        "herd-hub: runner {name} holds its switch ({}) in memory only, so a \
+                         restart of it would forget the position: {why}",
+                        switch.sentence()
+                    ),
+                }
+                state.record_switch_applied(
+                    outbox,
+                    Acknowledged {
+                        switch,
+                        persistence,
+                    },
+                );
+            }
             ToHub::JobStarted { job_id, attempt } => {
                 if !is_current(state, name, outbox, &job_id, attempt) {
                     continue;
@@ -3232,34 +3314,141 @@ fn dry_run(state: &State, asked: herd_proto::Asked) -> Result<Vec<String>> {
     Ok(lines)
 }
 
-/// Move one runner's switch, and say what happened (E-33).
+/// Move one runner's switch, and say what happened (E-33, D99).
 ///
-/// The hub asks; the runner is the authority. It applies the position, writes
-/// it to its own file so a restart keeps it, and says so on its next report —
-/// which is what makes the two ways of setting a switch leave one state
-/// behind.
-fn set_a_switch(state: &State, runner: &str, switch: herd_proto::Switch) -> String {
+/// The hub asks; the runner is the authority. It writes the position to its own
+/// file so a restart keeps it, applies it, and acknowledges both — which is
+/// what makes the two ways of setting a switch leave one state behind.
+///
+/// **This waits for that acknowledgement, and that is D99.** Until D99 it
+/// returned the moment the ask had been *sent*, and `herdctl switch` printed
+/// success on the strength of it. There was then a window — measured at a
+/// second and a half on a two-core host — in which the owner had been told her
+/// machine was off, the hub honoured it, and the machine's own disk said
+/// nothing: a `kill -9` inside it brought the runner back on its previous
+/// position. For a command whose whole purpose is that an owner can take her
+/// machine back, that was the wrong answer.
+///
+/// The wait is bounded by [`herd_proto::SWITCH_HONOURED_WITHIN`], E-33's own
+/// ten seconds, and what comes back when it expires is **not** success: it is
+/// the position the hub holds, the fact that the runner has confirmed nothing,
+/// and the runner's name. Answers with the sentence and whether it is success.
+async fn set_a_switch(state: &State, runner: &str, switch: herd_proto::Switch) -> (String, bool) {
     let why = format!("set through this hub to {}", switch.sentence());
-    let found = state.with_peers(|peers| {
+    let asked = state.with_peers(|peers| {
         peers.runners.get(runner).map(|connected| {
+            // Cleared before the ask, so that an acknowledgement of this same
+            // position from an earlier `herdctl switch` cannot answer this one.
+            connected.applied.send_replace(None);
+            let acknowledgements = connected.applied.subscribe();
             let _ = connected.outbox.send(FromHub::SetSwitch {
                 switch: switch.clone(),
                 why: why.clone(),
             });
-            connected.switch.clone()
+            (connected.switch.clone(), acknowledgements)
         })
     });
-    match found {
-        Some(was) => format!(
-            "runner {runner} is asked to switch to {} (it was {was}); it honours this within \
-             ten seconds and its own report is what confirms it (E-33)",
-            switch.sentence()
+    let Some((was, mut acknowledgements)) = asked else {
+        return (
+            format!(
+                "no runner called {runner} is connected to this hub, so its switch cannot be \
+                 moved from here, and nothing about it has changed. An owner sets it on the \
+                 machine itself, with `herd-runner switch`, which works whether this hub is up \
+                 or not"
+            ),
+            false,
+        );
+    };
+    let heard = tokio::time::timeout(herd_proto::SWITCH_HONOURED_WITHIN, async {
+        loop {
+            let seen = acknowledgements.borrow_and_update().clone();
+            match seen {
+                // Only an acknowledgement of *this* position answers: a runner
+                // whose owner moved her own switch file in the same second
+                // acknowledges nothing, but its health report does carry a
+                // position, and that position is not an answer to this ask.
+                Some(ack) if ack.switch == switch => return Some(ack),
+                _ => {}
+            }
+            // The sender is dropped when the runner's connection is released,
+            // so a runner that went away ends this wait instead of spending
+            // ten seconds on a link that no longer exists.
+            if acknowledgements.changed().await.is_err() {
+                return None;
+            }
+        }
+    })
+    .await;
+    let position = switch.sentence();
+    match heard {
+        Ok(Some(Acknowledged {
+            persistence: herd_proto::SwitchPersistence::Written { path },
+            ..
+        })) => (
+            format!(
+                "runner {runner} is switched {position} (it was {was}) and has written the \
+                 position down in {path}, so {runner} comes back on it even if it is killed \
+                 now (E-33)"
+            ),
+            true,
         ),
-        None => format!(
-            "no runner called {runner} is connected to this hub, so its switch cannot be \
-             moved from here. An owner sets it on the machine itself, with \
-             `herd-runner switch`, which works whether this hub is up or not"
+        Ok(Some(Acknowledged {
+            persistence: herd_proto::SwitchPersistence::NotWritten { why },
+            ..
+        })) => (
+            format!(
+                "runner {runner} is switched {position} (it was {was}) and this hub honours \
+                 that now. What is NOT true: {runner} could not write the position down, so a \
+                 {runner} restarted would come back {}. Why it could not: {why}",
+                herd_proto::Switch::default().sentence()
+            ),
+            false,
         ),
+        // The link went while this was waiting. Said as what it is, because
+        // the position may well have been written before the runner went — and
+        // "may well have been" is not an answer anyone can act on.
+        Ok(None) => (
+            format!(
+                "runner {runner} was asked to switch to {position} (it was {was}) and its link \
+                 to this hub ended before it answered, so whether {runner} wrote the position \
+                 down is not known here. It is announced in the handshake, so `herdctl switch` \
+                 says where {runner} stands once it dials again"
+            ),
+            false,
+        ),
+        Err(_) => {
+            // Exactly what is and is not true, and the hub's half is read
+            // rather than assumed: the runner is the authority on the
+            // position (D98), so what this hub honours is what it has been
+            // told, and on this path it may have been told nothing at all.
+            let seen = state.with_peers(|peers| {
+                peers
+                    .runners
+                    .get(runner)
+                    .map(|connected| connected.switch.sentence())
+            });
+            let honouring = match seen.as_deref() {
+                Some(now) if now == position => format!(
+                    "this hub honours {position} on {runner} now — nothing new is claimed there"
+                ),
+                Some(now) => format!(
+                    "this hub still sees {runner} as {now}, so it has not been told the \
+                     position took effect either"
+                ),
+                None => format!("{runner} is no longer connected to this hub"),
+            };
+            (
+                format!(
+                    "runner {runner} was asked to switch to {position} (it was {was}) and \
+                     {honouring}. What is NOT true: {runner} has not confirmed writing the \
+                     position down, within the {:?} E-33 gives it. So if {runner} is killed \
+                     before it writes, it comes back {was}. Ask again, or set it on the \
+                     machine itself with `herd-runner switch`, which needs no hub",
+                    herd_proto::SWITCH_HONOURED_WITHIN
+                ),
+                false,
+            )
+        }
     }
 }
 
@@ -3401,9 +3590,9 @@ async fn accept_submissions(state: &State, outbox: &Outbox, source: &mut Source)
                 let _ = outbox.send(FromHub::WouldRun { lines });
             }
             ToHub::SetSwitch { runner, switch } => {
-                let said = set_a_switch(state, &runner, switch);
+                let (said, confirmed) = set_a_switch(state, &runner, switch).await;
                 println!("herd-hub: {said}");
-                let _ = outbox.send(FromHub::SwitchSet { said });
+                let _ = outbox.send(FromHub::SwitchSet { said, confirmed });
             }
             ToHub::AskFleetSwitches {} => {
                 let _ = outbox.send(FromHub::FleetSwitches {
@@ -3835,6 +4024,7 @@ fn message_kind(message: &ToHub) -> &'static str {
         ToHub::Health { .. } => "health",
         ToHub::AttemptAbandoned { .. } => "attempt_abandoned",
         ToHub::DryRun { .. } => "dry_run",
+        ToHub::SwitchApplied { .. } => "switch_applied",
         ToHub::SetSwitch { .. } => "set_switch",
         ToHub::AskFleetSwitches {} => "ask_fleet_switches",
     }

@@ -1679,27 +1679,62 @@ async fn serve_forever(config: Config, session: Session, confined: Arc<Confined>
     }
 }
 
-/// Apply a position and write it down, wherever it came from (E-33).
+/// Write a position down and apply it, wherever it came from (E-33).
 ///
 /// One function for both halves of E-33 — the file an owner writes and the
 /// frame an orchestrator sends — because the state they leave has to be one
 /// state. A file that cannot be written is said out loud and the position is
 /// still applied: the owner asked for her machine back, and a read-only data
 /// root is not a reason to go on claiming work. What is lost in that case is
-/// only that a restart would not remember, and the line says so.
-fn apply_a_switch(config: &Config, session: &Session, switch: herd_proto::Switch, why: &str) {
-    if let Some(said) = session.set_switch(switch.clone()) {
+/// only that a restart would not remember, and the line says so — and, since
+/// D99, the hub is told so rather than left to read a health report as proof
+/// of something it is not.
+///
+/// **The file goes first, and that order is the fix D99 records.** Applying a
+/// position tells the hub at once (`Session::set_switch` sends a health report
+/// in the same breath), and the hub stopping to claim is what `herdctl switch`
+/// used to take as its answer. Written afterwards, there was a window — a
+/// second and a half on a two-core host — in which the owner had been told
+/// success, the hub honoured the position, and a `kill -9` brought the machine
+/// back on its previous one. The owner's own path (`herd-runner switch`) was
+/// always this way round: the command writes the file and the running runner
+/// reads it. Now both are.
+///
+/// Returns what to tell the hub: in force and durable, or in force and not.
+fn apply_a_switch(
+    config: &Config,
+    session: &Session,
+    switch: herd_proto::Switch,
+    why: &str,
+) -> herd_proto::SwitchPersistence {
+    let persistence = match &config.switch_file {
+        Some(path) => match crate::switch::write(path, &switch) {
+            Ok(()) => herd_proto::SwitchPersistence::Written {
+                path: path.display().to_string(),
+            },
+            Err(error) => {
+                eprintln!(
+                    "herd-runner: this switch is in force now, but it could not be written \
+                     down, so a restart of this runner would come back {}: {error}",
+                    herd_proto::Switch::default().sentence()
+                );
+                herd_proto::SwitchPersistence::NotWritten { why: error }
+            }
+        },
+        // A runner started with no switch file keeps no position across a
+        // restart at all, and that is a configuration rather than a failure —
+        // but it is still not the durability an owner is promised, so it is not
+        // reported as one.
+        None => herd_proto::SwitchPersistence::NotWritten {
+            why: "this runner was started with no switch file, so no position it is given \
+                  outlives its process"
+                .to_owned(),
+        },
+    };
+    if let Some(said) = session.set_switch(switch) {
         eprintln!("herd-runner: {said} ({why})");
     }
-    if let Some(path) = &config.switch_file {
-        if let Err(error) = crate::switch::write(path, &switch) {
-            eprintln!(
-                "herd-runner: this switch is in force now, but it could not be written down, \
-                 so a restart of this runner would come back {}: {error}",
-                herd_proto::Switch::default().sentence()
-            );
-        }
-    }
+    persistence
 }
 
 /// Watch the switch file for ever, applying what it says (E-33).
@@ -1917,12 +1952,20 @@ async fn serve_hub(
             } => session.drop_stale(&job_id, attempt, &reason),
             FromHub::HealthRecorded {} => {}
             // The orchestrator's half of E-33, arriving through the hub. It is
-            // applied **and written down**, so that the two ways of setting a
-            // switch leave one state behind: an owner who later looks at her
-            // machine sees the position an agent set, and a runner restarted
-            // afterwards comes back on it.
+            // written down **and then** applied, so that the two ways of
+            // setting a switch leave one state behind: an owner who later looks
+            // at her machine sees the position an agent set, and a runner
+            // restarted afterwards comes back on it.
+            //
+            // And it is acknowledged, because whoever typed `herdctl switch` is
+            // waiting for exactly this and nothing else can stand in for it
+            // (D99).
             FromHub::SetSwitch { switch, why } => {
-                apply_a_switch(config, session, switch, &why);
+                let persistence = apply_a_switch(config, session, switch.clone(), &why);
+                session.send(ToHub::SwitchApplied {
+                    switch,
+                    persistence,
+                });
             }
             // A capability this runner handed out turned out to be taken
             // (D76). The reading that allowed it is known to be stale, so it

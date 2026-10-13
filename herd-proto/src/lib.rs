@@ -69,7 +69,19 @@ pub use placement::{
 /// each of those the absence of the field means something no value of it could
 /// mean. Both numbers are still free-running before M16 (D73): a version 4
 /// peer is refused by name, there is no migration and none is owed.
-pub const PROTOCOL_VERSION: u32 = 5;
+///
+/// **6 closes the window D99 found**: a runner says it has *written* the
+/// position down ([`ToHub::SwitchApplied`]) and the hub's answer to
+/// `herdctl switch` says whether it heard that ([`FromHub::SwitchSet`]'s
+/// `confirmed`). Both are additive in shape and neither may be read as absent.
+/// A version 5 runner would never acknowledge, so every `herdctl switch`
+/// against it would report a position nobody confirmed — a true sentence about
+/// a peer that is simply old, which reads to an owner as a fault on her
+/// machine. And `confirmed` missing would default to *something*, and either
+/// default is a lie in one direction. So the number moves, a version 5 peer is
+/// refused by name, and there is no migration — M16 sets both numbers back to
+/// 1 (D73).
+pub const PROTOCOL_VERSION: u32 = 6;
 
 /// How often a runner says it is alive and what it is doing (E-40).
 ///
@@ -287,6 +299,47 @@ impl Default for Switch {
 impl fmt::Display for Switch {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(&self.sentence())
+    }
+}
+
+/// How long E-33 gives a position to be honoured.
+///
+/// Ten seconds, and it lives here because both sides spend it: the runner
+/// reads its file on a short clock inside this budget, and the hub bounds the
+/// wait for [`ToHub::SwitchApplied`] by it before it answers `herdctl switch`
+/// with what it does and does not know (D99). Two crates each holding their
+/// own ten would be two truths about one promise (invariant 4).
+pub const SWITCH_HONOURED_WITHIN: Duration = Duration::from_secs(10);
+
+/// Whether a position a runner applied will outlive the runner (E-33, D99).
+///
+/// The difference this draws is the whole of D99. A position is *in force* the
+/// moment the runner applies it — it stops claiming, the hub is told, the queue
+/// is re-judged. A position is *durable* only once it is on the machine's own
+/// disk, and that is the half an owner is actually relying on: a runner killed
+/// before the file lands comes back in its previous position while she believes
+/// her machine is off.
+///
+/// So the two are reported apart, and the hub never calls the first one
+/// success.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "state", rename_all = "snake_case")]
+pub enum SwitchPersistence {
+    /// In force **and** on the runner's disk, fsynced: a machine killed now
+    /// comes back on this position, with the reason its owner gave.
+    Written { path: String },
+    /// In force on the running process and nowhere else, so a restart would
+    /// forget it. A read-only data root, a full disk, or a runner started with
+    /// no switch file at all. Never reported to an owner as plain success: what
+    /// she asked for is a machine she can take back, and a position that dies
+    /// with the process is only half of that.
+    NotWritten { why: String },
+}
+
+impl SwitchPersistence {
+    /// Whether the position will outlive the runner process.
+    pub fn is_durable(&self) -> bool {
+        matches!(self, SwitchPersistence::Written { .. })
     }
 }
 
@@ -802,6 +855,27 @@ pub enum ToHub {
     /// all: she writes the switch file on her machine, which is what keeps
     /// invariant 3 — nothing listens on a runner.
     SetSwitch { runner: String, switch: Switch },
+    /// Runner reports what it did with the position the hub asked it for
+    /// (E-33, D99).
+    ///
+    /// **The acknowledgement `herdctl switch` waits for.** Before D99 the only
+    /// thing that came back was the switch on the next health report, and a
+    /// health report says the position is *in force*, not that it is on the
+    /// machine's disk — the runner applies a position it could not write and
+    /// says so on stderr, which is the right thing to do and indistinguishable
+    /// from here. So the two are separated: this frame carries the position and
+    /// whether it is durable, and the hub answers the requester with what this
+    /// frame said or with the fact that it never arrived.
+    ///
+    /// It travels on the control connection the runner already holds, because
+    /// invariant 3 says nothing listens on a runner. Sent only for a position
+    /// the hub asked for: an owner setting her own switch file asked no one
+    /// anything, and the hub's view of her machine converges on the next health
+    /// report as it always did.
+    SwitchApplied {
+        switch: Switch,
+        persistence: SwitchPersistence,
+    },
     /// Requester asks where every runner's switch stands (E-33).
     AskFleetSwitches {},
     /// An operator raises one job above what its requester asked for (E-18).
@@ -1044,14 +1118,32 @@ pub enum FromHub {
     /// (E-35); this is the sentence a person reads before submitting.
     WouldRun { lines: Vec<String> },
     /// The hub has set a runner's switch, or says why it has not (E-33).
-    SwitchSet { said: String },
+    SwitchSet {
+        said: String,
+        /// Whether the runner **confirmed writing the position down**
+        /// ([`ToHub::SwitchApplied`], D99).
+        ///
+        /// `false` is never success. It covers three cases and `said` names
+        /// which: no runner of that name is connected; the runner answered
+        /// that it applied the position but could not write it; and the
+        /// acknowledgement did not arrive inside
+        /// [`SWITCH_HONOURED_WITHIN`] — in which case the hub *is* honouring
+        /// the position and the machine's own disk may or may not know it yet.
+        ///
+        /// Required, with no `serde(default)`: either default would be a lie
+        /// about a position an owner is relying on. That is what moved
+        /// [`PROTOCOL_VERSION`] to 6.
+        confirmed: bool,
+    },
     /// Where every runner's switch stands (E-33).
     FleetSwitches { runners: Vec<RunnerSwitch> },
     /// The owner, through the hub, moves this runner's switch (E-33).
     ///
-    /// A runner that receives it applies the position and writes it to its own
-    /// switch file, so that the two ways of setting it — her own machine and
-    /// an orchestrator — leave one state behind and a restart keeps it.
+    /// A runner that receives it **writes the position to its own switch file
+    /// first** and only then applies it, so that the two ways of setting it —
+    /// her own machine and an orchestrator — leave one state behind, in the
+    /// same order, and a restart keeps it. It then answers with
+    /// [`ToHub::SwitchApplied`] (D99).
     SetSwitch { switch: Switch, why: String },
     /// Read your probes again, now (D76).
     ///

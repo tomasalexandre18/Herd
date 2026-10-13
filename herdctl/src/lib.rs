@@ -410,15 +410,21 @@ pub async fn would_run(config: &Config, asked: Asked) -> Result<Vec<String>> {
 ///
 /// The orchestrator's half. The owner's half is `herd-runner switch` on the
 /// machine itself, which needs no hub at all.
-pub async fn set_switch(config: &Config, runner: String, switch: Switch) -> Result<String> {
+///
+/// Answers with the hub's sentence and **whether the runner confirmed writing
+/// the position down** (D99). The second half is not decoration: this call
+/// blocks until the runner has the position on its own disk, or until E-33's
+/// ten seconds are spent, and a caller that ignored the flag would report
+/// success for a position a `kill -9` could still undo.
+pub async fn set_switch(config: &Config, runner: String, switch: Switch) -> Result<(String, bool)> {
     let mut socket = join(config).await?;
     send(&mut socket, &ToHub::SetSwitch { runner, switch })
         .await
         .context("setting a switch")?;
     match next_message(&mut socket).await? {
-        Some(FromHub::SwitchSet { said }) => {
+        Some(FromHub::SwitchSet { said, confirmed }) => {
             let _ = socket.close(None).await;
-            Ok(said)
+            Ok((said, confirmed))
         }
         Some(FromHub::Refused { reason }) => bail!("the hub refused: {reason}"),
         Some(other) => bail!("the hub answered a switch with {}", message_kind(&other)),
