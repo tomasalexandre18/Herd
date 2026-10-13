@@ -1215,3 +1215,49 @@ message.
 **Alternative rejected.** Keep the last, which is what
 `serde_json::Map::insert` does by default and would quote back a name
 the operator may never have intended to write.
+
+---
+
+## 2026-10-13 — D66 A runner updates itself, and comes back alone
+
+**Context.** Alexa manages both this project and its first consumer,
+and will run the service on machines he does not want to touch again
+once they are joined. "I do not want to come back by hand on every
+runner to update it" is an operating requirement of the owner, not one
+of chatOnS's 55 expectations; it gets a milestone and this decision
+rather than an invented `E-56`, because that sheet belongs to the
+consumer. One consequence is immediate: a runner can only obey an
+instruction it already understands, so the update frames must be in
+the protocol **before the first deployment**. A fleet shipped without
+them is manual for ever.
+
+**Choice.** A new milestone **M15d**, between M15 and M16. The hub
+names a version and the artefact's digest; the runner fetches it
+outbound (invariant 3), verifies the digest, and swaps only while it
+holds no job, draining first (invariant 2). The host service keeps the
+previous binary, and the rollback is **local**: the new runner must
+complete a handshake and one health report inside a deadline, or the
+service restores the previous version and restarts it with no hub
+involved. The restored runner then reports what it refused and why, so
+a failed rollout is read from the hub and not from the machine. During
+a rollout the hub accepts the previous protocol version, and a runner
+too old to understand the instruction is **told to update rather than
+refused** — a refusal is a dead machine someone has to go and touch,
+which is the failure this milestone exists to remove.
+
+**Why it cannot land before M15.** Telling a host "fetch this and run
+it" is a remote code execution channel into every machine of the
+fleet. Runner names are self-asserted until M15 (D57), so before
+authentication exists anyone reaching the hub's port could own the
+whole fleet through this mechanism. M15 is a hard predecessor, and the
+digest check is not optional.
+
+**Alternative rejected.** Widening M15 itself to "auth, versions and
+self-update", which is the same handshake conversation. Rejected by
+Alexa in favour of a separate milestone: the periphery of M15 stays
+readable, and `M15d` inserts without renumbering M16, M17 and M18.
+
+**Not covered by this decision.** The hub updates with its deployment
+— it is one machine in docker compose on the NixOS server. The
+server's own runner runs natively and is updated by Nix (E-47), so
+M15d serves the non-Nix hosts: the WSL PC and whatever joins later.

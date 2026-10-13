@@ -221,6 +221,25 @@ refuse on major, naming both (E-51).
 **Done when** e2e shows an unapproved runner getting no job and one approval
 command fixing it; mismatch tests assert both versions in warning and refusal.
 
+### M15d — Self-update and rollback (`m15d-self-update`)
+A runner updates itself on the hub's word and never needs a hand on its
+host (D66, the owner's operating requirement, not a chatOnS expectation).
+The hub names a version and the artefact's digest; the runner fetches it
+outbound, verifies the digest, and swaps only while it holds no job,
+draining first. The host service keeps the previous binary: the new one must
+complete a handshake and one health report inside a deadline or the service
+restores the previous version and restarts it, locally, with no hub
+involved. The restored runner reports what it refused and why, so a failed
+rollout is read from the hub instead of from the machine. During a rollout
+the hub accepts the previous protocol version, and a runner too old to
+understand the instruction is told to update rather than refused.
+**Done when** a real runner moves from version A to B on the hub's word with
+no shell opened on its host; a B that exits on start, a B that never
+handshakes and a B whose digest does not match each come back as A with the
+reason readable on the hub; and no swap ever interrupts a running job.
+The server's native runner is updated by Nix (E-47), so this milestone
+serves the non-Nix hosts.
+
 ### M16 — The hub deployed, the server's runner native (`m16-deploy-hub`)
 Flake builds the hub image; docker compose beside the consumer's dashboard;
 `wss://` through the existing reverse proxy; state and artefact volumes with
@@ -267,8 +286,9 @@ Off the spine but **not optional** — each carries musts and each must land
 before M16, because the first consumer cannot submit a single real job
 without them: M3 (the link), M4 (confinement), M10 (the command contract),
 M11 and M12 (artefacts), M13 (status and events), M14 (the scheduled job),
-M15 (auth). They are parallelisable, not deferrable. The only genuinely
-deferrable items are E-38, E-39 and E-55 (see `docs/coverage.md`).
+M15 (auth), M15d (self-update). They are parallelisable, not
+deferrable. The only genuinely deferrable items are E-38, E-39 and E-55
+(see `docs/coverage.md`).
 
 - M1 → M2: the store persists the lifecycle M1 creates; anything built before
   it would be rewritten onto it — the walk-back E-44 exists to forbid.
@@ -282,6 +302,12 @@ deferrable items are E-38, E-39 and E-55 (see `docs/coverage.md`).
   explanations annotate its refusals.
 - M8 → M9: switch, drain and dry run manipulate claim and admission state that
   must exist first.
+- M15 → M15d: the update instruction is an authenticated instruction.
+  Without auth it is a remote code execution channel into every machine of
+  the fleet (D66), because runner names are self-asserted until M15 (D57).
+- M15d → M16: a runner can only obey an instruction it already understands,
+  so the update frames must exist before the first deployment. A fleet
+  shipped without them stays manual for ever.
 - M9, M10, M11, M12, M13, M14, M15 → M16: nothing is exposed over `wss://`
   until a job can be declared, confined, placed, stored, observed and
   authenticated. Deploying earlier would freeze the public formats (Q7) on a
