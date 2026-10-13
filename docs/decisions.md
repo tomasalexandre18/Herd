@@ -991,3 +991,156 @@ validation stays strict at submission, where a requester can be told.
 
 **Alternative rejected.** Strict validation on the durable path, which makes a
 tightening of the rules a denial of service against ourselves.
+
+---
+
+## 2026-10-13 — D53 A silence threshold is judged against the real cadence
+
+**Context.** A hub at `--health-every 1 --lost-after 3` and a runner at
+`--health-every 10` each passed their own startup check and then destroyed
+a healthy job, burning both its attempts in six seconds, because the
+runner's cadence never crossed the handshake.
+
+**Choice.** The runner announces its real cadence in `Hello` and the hub
+refuses a pairing that cannot satisfy its silence threshold with the
+three-report margin, naming all the figures. This is judged once,
+terminally, at the handshake — a cadence is settled when the process
+starts, so standing by would wait for ever on something only a person can
+change.
+
+**Alternative rejected.** Checking each side alone, which is how two
+legal configurations killed a healthy job.
+
+---
+
+## 2026-10-13 — D54 A terminal record is immutable at one write point
+
+**Context.** A late frame bearing the correct runner name for a finished
+job appended to its closed log with a false "chunks never reached this
+log" marker and let a metrics write replace real figures with forged
+ones, because the guard existed on one writer and not another.
+
+**Choice.** The rule sits at the store's single write entry point so it
+covers every writer, and a terminal transition stamps the attempt's end.
+
+**Alternative rejected.** A guard per function, which is exactly how this
+one was missed.
+
+---
+
+## 2026-10-13 — D55 A blank identity is no identity
+
+**Context.** An empty instance string matched the "has an instance" arm,
+so a peer ended up with a blank effective name, and a blank name matches
+every other blank-named peer's attempt.
+
+**Choice.** A blank or whitespace-only name, instance or state root is
+read as absent and refused like a nameless peer; identities are trimmed.
+
+**Alternative rejected.** Treating the empty string as a value, which
+made one attempt writable by any blank peer.
+
+---
+
+## 2026-10-13 — D56 A runner that can't record a hub's identity still works
+
+**Context.** A runner whose data root cannot be written cannot remember
+which state root it spoke to.
+
+**Choice.** It announces no state root, is admitted, and says so in one
+loud line — safe because "no root" never equals a hub's root, so a stale
+verdict is set aside rather than believed.
+
+**Alternative rejected.** Making it stand by, which would idle a useful
+runner over a detail that costs nothing.
+
+---
+
+## 2026-10-13 — D57 The ownership gate is not a credential
+
+**Context.** An attempt belongs to the runner it was handed to, but a
+runner's name is **self-asserted** until M15 mints per-runner tokens
+(E-48), so a hand-crafted peer reaching the hub's port can announce any
+name and, while the legitimate runner is down, write a false verdict,
+fabricated metrics and forged log lines onto its job.
+
+**Choice.** State this plainly in the code at the gate and in the docs,
+keep the hub on loopback by default (D14), and do not expose Herd beyond
+loopback before M15. The twin rule blocks the impersonation only while
+the real runner is alive.
+
+**Alternative rejected.** Building authentication here, which is M15's
+work and would have been done twice.
+
+---
+
+## 2026-10-13 — D58 An unreadable handshake is refused with the reason
+
+**Context.** An undecodable or invalid first frame got a TCP reset, so
+the reason reached only the hub's own output and the runner's owner
+never saw it.
+
+**Choice.** `Refused { reason }` as the last frame before the close,
+extending D13 from judgements about a peer to a frame the hub cannot
+read at all.
+
+**Alternative rejected.** A silent reset, which makes a configuration
+mistake look like a network fault.
+
+---
+
+## 2026-10-13 — D59 One lock orders a claim against a probe's reading
+
+**Context.** A capability snapshot going busy between the moment a claim
+was judged and the moment it was recorded handed a job to a runner an
+external holder had just taken.
+
+**Choice.** The claim lock is taken before capability state is touched,
+in one documented order and never the other way, so a claim and the
+availability it was judged against cannot disagree.
+
+**Alternative rejected.** Judging availability outside the claim, which
+made the window inevitable.
+
+---
+
+## 2026-10-13 — D60 The capability file is read strictly, through its shape
+
+**Context.** An unknown key — `probe` where `busy_probe` was meant —
+offered a capability unprobed, and a job ran while an external holder
+held the lock; a duplicated key did the same by silently taking the last
+value.
+
+**Choice.** The file deserialises through private types that refuse
+unknown and duplicated keys at every level, naming the key and the
+capability, while the protocol's own types keep whatever compatibility
+stance they have. The file is an operator-facing surface and deserves
+the strict reading.
+
+**Alternative rejected.** Tolerating unknown keys for forward
+compatibility, which turns one character into E-26's exact harm.
+
+---
+
+## 2026-10-13 — D61 One runner declares a capability name once
+
+**Context.** A name declared twice silently kept the last declaration and
+dropped the first one's exclusion list.
+
+**Choice.** A duplicate name refuses the runner's startup, naming it.
+
+**Alternative rejected.** Last-wins, which loses an exclusion without a
+word.
+
+---
+
+## 2026-10-13 — D62 A probe is killed as a process group
+
+**Context.** A busy probe is a command the owner writes (D51) and may
+spawn children; reaping only the leader left them on the host, against
+invariant 2.
+
+**Choice.** Each probe runs in its own process group and is killed as
+one, on a timeout and on a clean stop alike.
+
+**Alternative rejected.** Trusting a probe to clean up after itself.
