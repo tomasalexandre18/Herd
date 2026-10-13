@@ -394,10 +394,20 @@ impl Hub {
     /// Serve until the listener fails. Dropping the returned future releases
     /// the port and ends the hub's own four housekeeping tasks.
     pub async fn serve(self) -> Result<()> {
-        let watching = tokio::spawn(watch_for_a_lost_runner(Arc::clone(&self.state)));
-        let writing = tokio::spawn(keep_trying_to_write_results(Arc::clone(&self.state)));
-        let aging = tokio::spawn(let_the_queue_age(Arc::clone(&self.state)));
-        let restating = tokio::spawn(say_again_why_jobs_wait(Arc::clone(&self.state)));
+        // Held in a guard rather than aborted at the end, **because the end
+        // is not always reached**: a caller that drops this future — every
+        // end-to-end test does, by aborting the task it runs in — would
+        // otherwise leave four tasks alive, each holding an `Arc<State>` and
+        // through it the store's `flock` on the state root. A hub that is
+        // gone would go on holding its state root against the next one, which
+        // M8 turned from a theoretical leak into a real test flake: a state
+        // root reported "already in use" by a hub nothing was running.
+        let _housekeeping = Housekeeping(vec![
+            tokio::spawn(watch_for_a_lost_runner(Arc::clone(&self.state))),
+            tokio::spawn(keep_trying_to_write_results(Arc::clone(&self.state))),
+            tokio::spawn(let_the_queue_age(Arc::clone(&self.state))),
+            tokio::spawn(say_again_why_jobs_wait(Arc::clone(&self.state))),
+        ]);
         let serving = async {
             loop {
                 let (stream, peer) = self.listener.accept().await.context("accepting")?;
@@ -409,12 +419,23 @@ impl Hub {
                 });
             }
         };
-        let outcome = serving.await;
-        watching.abort();
-        writing.abort();
-        aging.abort();
-        restating.abort();
-        outcome
+        serving.await
+    }
+}
+
+/// The hub's own background tasks, ended when this goes.
+///
+/// One line of `Drop` instead of four `abort()` calls at the end of
+/// [`Hub::serve`], and the difference is not tidiness: the four calls only
+/// ran when `serve` *returned*, and a dropped future never returns. See the
+/// comment at the top of `serve`.
+struct Housekeeping(Vec<tokio::task::JoinHandle<()>>);
+
+impl Drop for Housekeeping {
+    fn drop(&mut self) {
+        for task in &self.0 {
+            task.abort();
+        }
     }
 }
 
@@ -3570,6 +3591,50 @@ mod tests {
             said_at.len()
         );
         assert_eq!(said_at.len(), 14, "{said_at:?}");
+    }
+
+    /// A hub whose `serve` future is **dropped** lets its state root go.
+    ///
+    /// Found as a flake rather than by reasoning, and worth a test of its own
+    /// because of how it reads when it happens: `the state root … is already
+    /// in use by herd-hub, process N`, naming a hub that nothing is running.
+    /// `serve` spawns housekeeping tasks that each hold an `Arc<State>`, and
+    /// through it the store's `flock`; the aborts used to live at the end of
+    /// `serve`, which a dropped future never reaches. M8's fourth task made
+    /// it bite often enough to catch — at about one run in six — and the
+    /// aborts now live in a `Drop`.
+    #[tokio::test]
+    async fn a_dropped_serve_gives_the_state_root_back() {
+        let dir = tempfile::tempdir().expect("a temporary state directory");
+        let hub = Hub::bind(
+            "127.0.0.1:0".parse().expect("a literal loopback address"),
+            Arc::new(JobDirStore::open(dir.path()).expect("the state root opens"))
+                as Arc<dyn JobStore>,
+        )
+        .await
+        .expect("the hub binds a free port");
+        let serving = tokio::spawn(async move {
+            let _ = hub.serve().await;
+        });
+        // Let the housekeeping tasks start, then take the future away, as
+        // every end-to-end harness in this workspace does.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        serving.abort();
+
+        // The root is free again. Polled rather than asserted at once:
+        // aborting a task is a request, and the `Arc` it holds goes when the
+        // runtime reaps it.
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            match JobDirStore::open(dir.path()) {
+                Ok(_) => break,
+                Err(why) => assert!(
+                    Instant::now() < deadline,
+                    "the hub is gone and its state root is still locked: {why}"
+                ),
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
     }
 
     /// **Attack 11, measured.** The `dispatching` lock is held for a whole
