@@ -725,3 +725,80 @@ async fn a_capability_file_that_does_not_read_stops_the_runner_naming_it() {
         );
     }
 }
+
+/// A requester that *follows* its job hears why it is waiting on the open
+/// connection, and then gets the job's own verdict when the probe clears.
+///
+/// This is D38 from the caller's side: `herdctl run` neither exits with a
+/// refusal nor sits silent. `Refused` is terminal and would have ended the
+/// connection; a note does not.
+#[tokio::test]
+async fn a_following_requester_is_told_why_its_job_waits_and_then_gets_it() {
+    let mut herd = Herd::new();
+    let lock = herd.hold("qemu.lock");
+    let file = one_probed_capability(
+        "qemu",
+        &format!(
+            r#"{{"type":"lock_file","path":"{}"}}"#,
+            lock.to_string_lossy()
+        ),
+    );
+    herd.start_hub().await;
+    herd.start_runner(Some(&file), &["--no-detect"]).await;
+    herd.wait_until("the runner has read the held lock file", || {
+        herd.said("runner").contains("qemu is suspended")
+    })
+    .await;
+
+    // `herdctl run` is meant *not* to come back while the lock is held, so it
+    // is started and watched rather than run to completion.
+    let mut following = Command::new(binary("herdctl"))
+        .arg("--hub")
+        .arg(herd.url())
+        .args([
+            "run",
+            "--label",
+            "qemu",
+            "--",
+            "/bin/sh",
+            "-c",
+            "printf 'at last\\n'; exit 3",
+        ])
+        .stdout(herd.output("run", "out"))
+        .stderr(herd.output("run", "err"))
+        .kill_on_drop(true)
+        .spawn()
+        .expect("herdctl starts");
+
+    herd.wait_until("the follower is told why its job waits", || {
+        herd.said("run").contains("queued and has not started")
+    })
+    .await;
+    assert!(
+        herd.said("run").contains("qemu is suspended"),
+        "the note must carry the reason: {}",
+        herd.said("run")
+    );
+    assert!(
+        matches!(following.try_wait(), Ok(None)),
+        "a waiting job must not end the connection: {}",
+        herd.said("run")
+    );
+
+    std::fs::remove_file(&lock).expect("the lock file is removed");
+    let ended = tokio::time::timeout(PATIENCE, following.wait())
+        .await
+        .expect("herdctl comes back once the probe clears")
+        .expect("herdctl runs");
+    assert_eq!(
+        ended.code(),
+        Some(3),
+        "the follower must get the job's own verdict: {}",
+        herd.said("run")
+    );
+    assert!(
+        herd.said("run").contains("at last"),
+        "and its output: {}",
+        herd.said("run")
+    );
+}

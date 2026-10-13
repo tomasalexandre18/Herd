@@ -175,6 +175,39 @@ impl Harness {
         self.handle.runner_connected()
     }
 
+    /// A hub with one runner joined, offering what `capabilities` says and
+    /// reading its probes on the interval `probes` gives (M5).
+    pub async fn with_hub_and_runner_offering(
+        capabilities: herd_proto::CapabilityOffer,
+        probes: herd_runner::capability::ProbeSettings,
+    ) -> Self {
+        let mut harness = Self::start().await;
+        let data_root = DataRootDir::new("hub-capabilities");
+        let config = herd_runner::Config {
+            hub_url: harness.hub_url.clone(),
+            name: Some("test-runner".to_owned()),
+            confinement: confinement(&data_root),
+            capabilities,
+            probes,
+            ..herd_runner::Config::default()
+        };
+        harness.tasks.push(tokio::spawn(async move {
+            let _ = herd_runner::run(config).await;
+        }));
+        harness._data_root = Some(data_root);
+        let deadline = Instant::now() + PATIENCE;
+        while !harness.runner_joined() {
+            assert!(Instant::now() < deadline, "the runner never joined the hub");
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        harness
+    }
+
+    /// What the hub recorded about the runner's capabilities (M5, E-24).
+    pub fn runner_capacity(&self) -> Option<herd_hub::RunnerCapacity> {
+        self.handle.runner_capacity()
+    }
+
     /// What the hub itself believes became of a job.
     pub fn state_of(&self, job_id: &JobId) -> herd_hub::JobState {
         self.store
