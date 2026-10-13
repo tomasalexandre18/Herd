@@ -5,7 +5,7 @@ use herd_proto::{
     cap_exceeded_reason, cap_stop_reason, from_frame, to_frame, Asked, Availability, BusyProbe,
     Cap, Capability, CapabilityOffer, CapabilityOrigins, CapabilityState, FromHub, HostSize, JobId,
     JobMetrics, JobOutcome, LabelSet, LogStream, OfferedCapability, Priority, Role, RunnerSwitch,
-    RunningJob, Switch, ToHub, PROTOCOL_VERSION,
+    RunningJob, Switch, SwitchPersistence, ToHub, PROTOCOL_VERSION,
 };
 
 /// An offer carrying one of each kind, each origin and each probe, so that
@@ -678,9 +678,28 @@ fn every_link_frame_round_trips() {
         },
     });
     round_trip_to_hub(ToHub::AskFleetSwitches {});
-    round_trip_from_hub(FromHub::SwitchSet {
-        said: "runner wsl-pc is asked to switch to off (she is gaming)".to_owned(),
-    });
+    for confirmed in [true, false] {
+        round_trip_from_hub(FromHub::SwitchSet {
+            said: "runner wsl-pc is switched off (she is gaming)".to_owned(),
+            confirmed,
+        });
+    }
+    // The acknowledgement D99 added, both answers it carries.
+    for persistence in [
+        SwitchPersistence::Written {
+            path: "/var/lib/herd/switch".to_owned(),
+        },
+        SwitchPersistence::NotWritten {
+            why: "/var/lib/herd/switch.new cannot be written: Read-only file system".to_owned(),
+        },
+    ] {
+        round_trip_to_hub(ToHub::SwitchApplied {
+            switch: Switch::Off {
+                reason: "she is gaming".to_owned(),
+            },
+            persistence,
+        });
+    }
     round_trip_from_hub(FromHub::SetSwitch {
         switch: Switch::On,
         why: "set through this hub to on".to_owned(),
