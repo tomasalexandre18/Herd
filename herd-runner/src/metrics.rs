@@ -89,6 +89,16 @@ pub fn tmpfs_room_mib(path: &str) -> std::result::Result<u64, String> {
             measured.kind
         ));
     }
+    // A block size or a block count of zero is a mount this cannot measure,
+    // not a mount with no room: `Ok(0)` would be announced as a host that
+    // lends no tmpfs, which is a statement, and the whole rule here is that an
+    // unmeasurable figure is absent rather than said.
+    if measured.block_size == 0 || measured.blocks == 0 {
+        return Err(format!(
+            "{path} measures as {} blocks of {} bytes, which is not a size this can read",
+            measured.blocks, measured.block_size
+        ));
+    }
     Ok(measured.blocks.saturating_mul(measured.block_size) / (1 << 20))
 }
 
