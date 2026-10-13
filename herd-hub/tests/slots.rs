@@ -457,7 +457,7 @@ async fn an_impossible_label_set_fails_while_a_held_one_waits() {
             "printf 'this must never run\\n'",
         ])
         .await;
-    let said = String::from_utf8_lossy(&impossible.stderr).to_owned();
+    let said = String::from_utf8_lossy(&impossible.stderr).into_owned();
     assert!(
         said.contains("no runner could ever run this job"),
         "an unsatisfiable job must end, with the reason: {said}"
