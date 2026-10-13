@@ -63,6 +63,21 @@ impl Process {
         let _ = self.child.wait().await;
     }
 
+    /// Signal it and come straight back, without reaping it.
+    ///
+    /// For `SIGSTOP` and `SIGCONT`, which a process does not exit on: a paused
+    /// process is how a test makes a peer that is plainly there and answers
+    /// nothing, which is the only honest way to let an acknowledgement time out
+    /// (D99). Waiting for it, as [`Process::signal`] does, would never return.
+    pub fn signal_without_waiting(&mut self, signal: rustix::process::Signal) {
+        let pid = self.child.id().expect("a running process has a pid");
+        rustix::process::kill_process(
+            rustix::process::Pid::from_raw(pid as i32).expect("a pid is not zero"),
+            signal,
+        )
+        .unwrap_or_else(|e| panic!("signalling the {}: {e}", self.what));
+    }
+
     /// Signal it and come straight back, so the caller can time how long it
     /// takes to go. Invariant 2 is a promise about exactly that duration.
     pub fn ask_it_to_stop(&mut self) {

@@ -107,6 +107,14 @@ async fn a_switch_off_on_the_machine_stops_claims_in_ten_seconds_and_spares_the_
     let began = Instant::now();
     herd.switch_on_the_machine("runner", &["off", "--reason", "she is gaming"])
         .await;
+    // **The owner's own path is written first**, and this is where that order
+    // is pinned: `herd-runner switch` is the write, and the running runner
+    // reads it afterwards. The order through the hub is now the same (D99), and
+    // a change that inverted either one would break here rather than on a
+    // slower host three pull requests later.
+    let on_her_disk = std::fs::read_to_string(herd.switch_file("runner"))
+        .expect("`herd-runner switch` writes the file before anything else happens");
+    assert!(on_her_disk.contains("she is gaming"), "{on_her_disk}");
     let (took, refusal) = until_nothing_is_claimed(&herd, began).await;
     assert!(
         took < TEN_SECONDS,
@@ -165,11 +173,21 @@ async fn a_switch_off_on_the_machine_stops_claims_in_ten_seconds_and_spares_the_
     }
 }
 
-/// The same switch, moved by an orchestrator through `herdctl` (E-33).
+/// The same switch, moved by an orchestrator through `herdctl` (E-33, D99).
 ///
 /// Both halves of E-33 — her machine and the server — and they leave **one**
 /// state: the position a `herdctl` set is written to the runner's own switch
 /// file, so a restart keeps it and the owner sees what an agent did.
+///
+/// **The file is read in the instant `herdctl switch` returns, with no wait of
+/// any kind**, because that is the guarantee D99 added: a success from
+/// `herdctl switch` means the position is already on the machine's disk. This
+/// test used to read the file after waiting for the hub to stop claiming, which
+/// passed on a twelve-thread host and failed on a two-core one — and what it
+/// was failing on was not the test but the product, which had told its owner
+/// success a second and a half before her machine knew anything about it.
+/// Polling until the file appears would make this green again and hide exactly
+/// that, so nothing here polls.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_switch_off_through_herdctl_stops_claims_in_ten_seconds_and_is_written_down() {
     let herd = Herd::new();
@@ -183,27 +201,48 @@ async fn a_switch_off_through_herdctl_stops_claims_in_ten_seconds_and_is_written
         .await;
     assert!(
         said.status.success(),
-        "herdctl switch failed: {}",
+        "herdctl switch failed: {} {}",
+        String::from_utf8_lossy(&said.stdout),
         String::from_utf8_lossy(&said.stderr)
     );
+    // Not a poll, not a sleep: the next statement after the command returned.
+    let written = std::fs::read_to_string(herd.switch_file("runner")).expect(
+        "D99: a successful `herdctl switch` means the runner has already written the position \
+         down, so this read cannot be allowed to wait for it",
+    );
+    assert!(written.contains("\"off\""), "{written}");
+    assert!(written.contains("a reboot is due"), "{written}");
+    // And the command says so, naming where: an owner reading success has to
+    // be able to tell which half of E-33 she was promised.
+    let answer = String::from_utf8_lossy(&said.stdout);
+    assert!(
+        answer.contains("written the position down"),
+        "the success has to say the position is durable (D99): {answer}"
+    );
+    assert!(
+        answer.contains(&herd.switch_file("runner").display().to_string()),
+        "and where it is: {answer}"
+    );
+    // E-33's ten seconds is still a promise about the hub, and it is still
+    // kept — now from a command that no longer returns before the runner has
+    // acted.
     let (took, refusal) = until_nothing_is_claimed(&herd, began).await;
     assert!(took < TEN_SECONDS, "it took {took:?}");
     assert!(refusal.contains("a reboot is due"), "{refusal}");
 
-    // One state, not two: it is on the machine's own disk.
-    let written = std::fs::read_to_string(herd.switch_file("runner"))
-        .expect("the runner wrote its switch down");
-    assert!(written.contains("\"off\""), "{written}");
-    assert!(written.contains("a reboot is due"), "{written}");
-
-    // A runner nobody is connected as is named rather than silently ignored.
+    // A runner nobody is connected as is named rather than silently ignored —
+    // and is not success either, because nothing was switched (D99).
     let missing = herd
         .herdctl(&["switch", "nowhere", "off", "--reason", "x"])
         .await;
     assert!(
-        String::from_utf8_lossy(&missing.stdout).contains("no runner called nowhere"),
+        !missing.status.success(),
+        "a switch nothing applied must not report success"
+    );
+    assert!(
+        String::from_utf8_lossy(&missing.stderr).contains("no runner called nowhere"),
         "{}",
-        String::from_utf8_lossy(&missing.stdout)
+        String::from_utf8_lossy(&missing.stderr)
     );
     // And `off` with no reason is refused before it reaches anything: a
     // machine withdrawn for no stated reason is one nobody can switch back.
@@ -214,6 +253,123 @@ async fn a_switch_off_through_herdctl_stops_claims_in_ten_seconds_and_is_written
         "{}",
         String::from_utf8_lossy(&unreasoned.stderr)
     );
+}
+
+/// An acknowledgement that does not arrive is a **partial result naming the
+/// runner**, never success (E-33, D99).
+///
+/// The companion to the test above: `herdctl switch` now reports success only
+/// when the runner has the position on its disk, so there has to be an honest
+/// answer for the case where the runner says nothing. The runner here is paused
+/// with `SIGSTOP` — plainly there, answering nothing, which is what a wedged
+/// machine or a hung write looks like from the hub — and the ten seconds E-33
+/// gives are allowed to run out.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_acknowledgement_that_times_out_is_a_partial_result_naming_the_runner() {
+    let herd = Herd::new();
+    // Comfortably longer than the ten seconds this test spends paused, so that
+    // what is measured is the acknowledgement and not a lost runner.
+    let _hub = herd.start_hub_losing_runners_after("hub", 60.0).await;
+    let mut runner =
+        herd.start_runner_with("wsl-pc", "runner", "runner", &["--switch-poll", "100"]);
+    herd.wait_for_runner().await;
+
+    runner.signal_without_waiting(rustix::process::Signal::STOP);
+    let began = Instant::now();
+    let said = herd
+        .herdctl(&["switch", "wsl-pc", "off", "--reason", "a reboot is due"])
+        .await;
+    let took = began.elapsed();
+    runner.signal_without_waiting(rustix::process::Signal::CONT);
+
+    assert!(
+        !said.status.success(),
+        "a position nobody confirmed must never be reported as success (D99): {}",
+        String::from_utf8_lossy(&said.stdout)
+    );
+    // Bounded by E-33's own figure: it waits, and it stops waiting.
+    assert!(
+        took >= TEN_SECONDS && took < TEN_SECONDS * 3,
+        "the wait is E-33's ten seconds, and it took {took:?}"
+    );
+    let partial = String::from_utf8_lossy(&said.stderr);
+    assert!(
+        partial.contains("wsl-pc"),
+        "the partial result has to name the runner (D99): {partial}"
+    );
+    assert!(
+        partial.contains("has not confirmed writing the position down"),
+        "and say exactly what is not true: {partial}"
+    );
+    assert!(
+        partial.contains("off (a reboot is due)"),
+        "and which position was asked for, with her reason: {partial}"
+    );
+    // Nothing was printed on stdout, which is where this command's answers go:
+    // a caller that reads stdout must not find half a success there.
+    assert!(
+        String::from_utf8_lossy(&said.stdout).trim().is_empty(),
+        "{}",
+        String::from_utf8_lossy(&said.stdout)
+    );
+}
+
+/// A position a runner cannot write down is reported as in force and **not
+/// durable**, naming the runner (E-33, D99).
+///
+/// The other half of the same honesty. A runner that cannot write its switch
+/// file still applies the position — the owner asked for her machine back, and
+/// a read-only data root is not a reason to go on claiming work — so the hub
+/// honours it, nothing new is claimed, and a restart of that runner would
+/// nonetheless forget it. That is two true sentences and one of them is bad
+/// news, so neither is reported as plain success.
+///
+/// The switch file here is given a path whose parent is a regular file, which
+/// no `mkdir` can make: a deterministic unwritable switch with no permissions
+/// games and no root.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_position_the_runner_cannot_write_is_reported_as_not_durable() {
+    let herd = Herd::new();
+    let _hub = herd.start_hub("hub").await;
+    let blocked = herd.logs.path().join("not-a-directory");
+    std::fs::write(&blocked, b"a file where a directory would have to be")
+        .expect("the fixture writes the obstacle");
+    let unwritable = blocked.join("switch");
+    let _runner = herd.start_runner_with(
+        "wsl-pc",
+        "runner",
+        "runner",
+        &[
+            "--switch-poll",
+            "100",
+            "--switch-file",
+            &unwritable.display().to_string(),
+        ],
+    );
+    herd.wait_for_runner().await;
+
+    let began = Instant::now();
+    let said = herd
+        .herdctl(&["switch", "wsl-pc", "off", "--reason", "a reboot is due"])
+        .await;
+    assert!(
+        !said.status.success(),
+        "a position that would not survive a restart is not success (D99): {}",
+        String::from_utf8_lossy(&said.stdout)
+    );
+    let partial = String::from_utf8_lossy(&said.stderr);
+    assert!(
+        partial.contains("wsl-pc") && partial.contains("could not write the position down"),
+        "the partial result names the runner and what failed (D99): {partial}"
+    );
+    assert!(
+        partial.contains(&blocked.display().to_string()),
+        "and the path it could not write: {partial}"
+    );
+    // And it is not a refusal to obey: the machine really is withdrawn.
+    let (took, refusal) = until_nothing_is_claimed(&herd, began).await;
+    assert!(took < TEN_SECONDS, "it took {took:?}");
+    assert!(refusal.contains("a reboot is due"), "{refusal}");
 }
 
 /// A switch set off outlives the runner process (E-33).
@@ -1091,10 +1247,21 @@ async fn a_drain_first_reservation_survives_a_kill_nine_on_either_side() {
     let _ = &held_off;
 }
 
-/// A switch survives a `kill -9` on the runner (E-33, attack 12).
+/// A switch survives a `kill -9` **in the instant `herdctl switch` returned**
+/// (E-33, attack 12, D99).
 ///
-/// It is a file, written before it is applied, so a machine its owner
-/// withdrew does not come back claiming because the process died badly.
+/// The failure this defect would have caused in the field, and the one that
+/// matters. Before D99 there was a window — about a second and a half on a
+/// two-core host — between `herdctl switch off` reporting success and the
+/// position reaching the machine's disk. A runner killed inside it came back in
+/// its **previous** position while its owner believed her machine was off: she
+/// had been told success, the hub honoured it, and a reboot gave the machine
+/// away again.
+///
+/// So nothing is waited for here. The kill is the statement after the one that
+/// read success, which is the strongest form of this test there is: the earlier
+/// version of it waited for the hub to stop claiming first, which stepped
+/// straight over the window.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_switch_survives_a_kill_nine_on_the_runner() {
     let herd = Herd::new();
@@ -1102,10 +1269,16 @@ async fn a_switch_survives_a_kill_nine_on_the_runner() {
     let mut runner =
         herd.start_runner_with("wsl-pc", "runner", "runner", &["--switch-poll", "100"]);
     herd.wait_for_runner().await;
-    herd.herdctl(&["switch", "wsl-pc", "off", "--reason", "she is gaming"])
+    let said = herd
+        .herdctl(&["switch", "wsl-pc", "off", "--reason", "she is gaming"])
         .await;
-    let began = Instant::now();
-    until_nothing_is_claimed(&herd, began).await;
+    assert!(
+        said.status.success(),
+        "herdctl switch failed: {} {}",
+        String::from_utf8_lossy(&said.stdout),
+        String::from_utf8_lossy(&said.stderr)
+    );
+    // No wait of any kind between the success and the kill.
     runner.signal(rustix::process::Signal::KILL).await;
     let _again = herd.start_runner_with("wsl-pc", "again", "runner", &["--switch-poll", "100"]);
     herd.wait_until("the runner is back", || {
@@ -1115,11 +1288,18 @@ async fn a_switch_survives_a_kill_nine_on_the_runner() {
     let refusal = herd.submit_with(&[], "printf nothing").await;
     assert!(
         !refusal.status.success(),
-        "a runner killed while switched off must come back switched off (E-33)"
+        "a runner killed in the instant `herdctl switch` returned must come back switched \
+         off (E-33, D99); it said: {}",
+        herd.switches().await
     );
     assert!(
         String::from_utf8_lossy(&refusal.stderr).contains("she is gaming"),
-        "{}",
+        "and with the owner's own reason: {}",
         String::from_utf8_lossy(&refusal.stderr)
     );
+    // The reason is also where it has to be for the next life of this runner:
+    // on the disk, not only in the hub's memory.
+    let written = std::fs::read_to_string(herd.switch_file("runner"))
+        .expect("the position the owner was promised is on the machine");
+    assert!(written.contains("she is gaming"), "{written}");
 }
