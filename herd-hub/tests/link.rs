@@ -21,8 +21,8 @@ use std::time::{Duration, Instant};
 use futures_util::{SinkExt, StreamExt};
 use herd_hub::{Hub, HubHandle, JobDirStore, JobRecord, JobState, JobStore, Policy};
 use herd_proto::{
-    from_frame, to_frame, FromHub, JobId, JobMetrics, JobOutcome, LabelSet, LogStream, Role,
-    RunningJob, ToHub, PROTOCOL_VERSION,
+    from_frame, to_frame, FromHub, JobId, JobMetrics, JobOutcome, LabelSet, LogStream, Priority,
+    Role, RunningJob, ToHub, PROTOCOL_VERSION,
 };
 use herd_runner::testing::TempDir as DataRootDir;
 use tempfile::TempDir;
@@ -127,6 +127,7 @@ impl Quick {
             &self.requester(),
             vec!["/bin/sh".to_owned(), "-c".to_owned(), command.to_owned()],
             LabelSet::default(),
+            Priority::Step,
         )
         .await
         .expect("the submission is accepted")
@@ -384,6 +385,7 @@ async fn a_runner_s_health_report_and_its_age_are_in_the_hub_s_state() {
         &hub.requester(),
         vec!["true".to_owned()],
         LabelSet::default(),
+        Priority::Step,
     )
     .await
     .expect_err("a draining runner takes no new job");
@@ -919,6 +921,7 @@ async fn a_draining_runner_refuses_a_job_submitted_in_the_meantime() {
         &hub.requester(),
         vec!["true".to_owned()],
         LabelSet::default(),
+        Priority::Step,
     )
     .await
     .expect_err("a draining runner takes no new job");
@@ -1425,6 +1428,7 @@ async fn a_runner_announcing_another_state_root_is_turned_away_naming_both() {
         &hub.requester(),
         vec!["true".to_owned()],
         LabelSet::default(),
+        Priority::Step,
     )
     .await
     .expect_err("there is no runner to place a job on");
@@ -1753,6 +1757,7 @@ async fn a_peer_whose_name_and_instance_are_blank_is_refused_like_a_nameless_one
         &hub.requester(),
         vec!["true".to_owned()],
         LabelSet::default(),
+        Priority::Step,
     )
     .await
     .expect_err("there is no runner to place a job on");

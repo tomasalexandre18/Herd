@@ -4,7 +4,7 @@ use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use clap::Parser;
-use herd_hub::{Hub, JobDirStore, JobStore, Policy, DEFAULT_LISTEN_ADDR, LOST_AFTER};
+use herd_hub::{Hub, JobDirStore, JobStore, Policy, AGING_STEP, DEFAULT_LISTEN_ADDR, LOST_AFTER};
 use herd_proto::HEALTH_EVERY;
 
 /// Where the hub keeps its state unless told otherwise. Relative on purpose:
@@ -38,6 +38,13 @@ struct Args {
     /// the expectation, never the whole of the check.
     #[arg(long, env = "HERD_HEALTH_EVERY", default_value_t = HEALTH_EVERY.as_secs_f64())]
     health_every: f64,
+    /// Seconds a queued job waits before its priority counts as one level
+    /// higher, so that the lowest level never starves (E-18). The bound it
+    /// gives is this figure times the number of levels above the job: at the
+    /// default, ninety minutes for the lowest of the four. Zero turns aging
+    /// off, which is said in the sentence every waiting job carries.
+    #[arg(long, env = "HERD_AGING_STEP", default_value_t = AGING_STEP.as_secs_f64())]
+    aging_step: f64,
 }
 
 /// Seconds as a duration, with a negative figure read as zero rather than
@@ -66,6 +73,7 @@ async fn main() -> Result<()> {
     let policy = Policy {
         lost_after: seconds(args.lost_after),
         health_every: seconds(args.health_every),
+        aging_step: seconds(args.aging_step),
         ..Policy::default()
     };
     let state_root_id = store.state_root_id().to_owned();
@@ -75,13 +83,14 @@ async fn main() -> Result<()> {
     println!(
         "herd-hub {} listening on ws://{}, state in {} ({state_root_id}), \
          {unfinished} job(s) not over, {} quarantined, a runner reporting every {:?} is \
-         lost after {:?}",
+         lost after {:?}, a queued job rising one priority level every {:?}",
         herd_hub::hub_version(),
         hub.local_addr(),
         args.state_dir.display(),
         quarantined.len(),
         policy.health_every,
         policy.lost_after,
+        policy.aging_step,
     );
     hub.serve().await
 }

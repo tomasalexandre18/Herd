@@ -13,7 +13,7 @@ closes in M18.
 | E-02 | must | ran-on line, verdict unchanged | M10 | planned | format frozen per Q7; real verdict gated (M18) |
 | E-03 | must | stream, detached mode, wait | M2 | merged | foreground streaming itself lands in M1 |
 | E-04 | must | waits explained with figures | M8 | planned |  |
-| E-05 | must | identical submissions deduplicated | M6 | planned |  |
+| E-05 | must | identical submissions deduplicated | M6 | in review (PR #M6) | keyed on the command and the labels, length-prefixed (D69); only an open job is joined — work that is over is rerun (D70); the higher level wins; verified: two waits, one execution, one log |
 | E-06 | must | cancel kills process tree | M3 | merged | propagation and the sibling-untouched case asserted in M3; the kill becomes a process-tree kill in M4 |
 | E-07 | must | dry run shows placement | M9 | planned |  |
 | E-08 | must | refuse dirty or unpushed | M10 | planned |  |
@@ -26,9 +26,9 @@ closes in M18.
 | E-15 | must | full job record on disk | M2 | merged | byte-faithful logs (D18); a lost log chunk leaves a named marker, and a lost tail is asked for (D36) |
 | E-16 | must | budgets, gc with pinning | M12 | planned | per runner, not central (D10); keepers pin |
 | E-17 | must | atomic publication everywhere | M11 | planned | a manifest registers only once every blob is held; job-record atomicity already in M2 (Q1) |
-| E-18 | must | four priorities with aging | M6 | planned |  |
+| E-18 | must | four priorities with aging | M6 | in review (PR #M6) | aging computed, not written (D67); default step 30 min, so the lowest level reaches the top in 90 min; the raise is upwards only (D72); the 90-min figure itself is a simulated-time and 6-second-real-clock assertion, not a measurement on a busy day |
 | E-19 | must | no fallback while available | M7 | planned | switch-off case retested with E-33 in M9 |
-| E-20 | must | one queue for everything | M6 | planned |  |
+| E-20 | must | one queue for everything | M6 | in review (PR #M6) | the queue is the unfinished job directories; one dispatch pass, which a submission goes through like everything else; no lane for a merger. "Every QEMU on every client listed as a job" needs their executor and the status document (M13, gated M18) |
 | E-21 | must | lost runner, requeue once | M3 | merged | silence threshold is hub policy; a second loss ends the job `lost`; verified: two attempts, never a third, across six alternating runner lives |
 | E-22 | must | build slots, derived -j | M7 | planned |  |
 | E-23 | should | placement prefers cache locality | M12 | planned | preference only; E-19 governs waiting |
@@ -51,7 +51,7 @@ closes in M18.
 | E-40 | should | health every 15 s | M3 | merged | the age is in the hub's state; surfaced in the status document in M13 |
 | E-41 | must | scheduled nightly, exclusive | M14 | planned | gated: their nightly command, live at M18 |
 | E-42 | must | push hook submits producer | M14 | planned | Herd side = scriptable detached submit; the hook is theirs |
-| E-43 | must | merger jobs start first | M6 | planned |  |
+| E-43 | must | merger jobs start first | M6 | in review (PR #M6) | a priority, never a side door; verified against the real binaries: a merger submitted last takes the next free slot. Which jobs a merge submits is theirs (M18) |
 | E-44 | must | restart loses nothing | M2 | merged | verified: hub killed mid-job, result lands, record complete |
 | E-45 | must | one data root only | M4 | merged | cooperative confinement only — full containment needs a mount namespace E-46 forbids (D28) |
 | E-46 | must | unprivileged, root via helper | M4 | merged |  |
@@ -72,8 +72,10 @@ own), M2, M3, M4 and M5 (the capability model). **12 of 44 musts are
 merged and verified** against the real binaries by an independent
 adversarial pass (E-03, E-15, E-44 from M2; E-06, E-21 from M3; E-30,
 E-34, E-45, E-46 from M4; E-24, E-26, E-28 from M5). M2 and M3 also
-carry two `should` rows merged alongside them (E-53, E-40). The
-remaining 32 musts are planned.
+carry two `should` rows merged alongside them (E-53, E-40). Four more
+musts are written and in review, not merged: E-05, E-18, E-20, E-43
+(M6, the queue and its priorities). The remaining 28 musts are
+planned.
 
 Four things a reader must not mistake for done:
 
@@ -95,8 +97,12 @@ Four things a reader must not mistake for done:
    weaker in three named ways (D23). The WSL replay on real hardware
    is still a manual M17 check.
 4. **Nothing is deployed, so every format is still free to change.**
-   `PROTOCOL_VERSION` and `RECORD_VERSION` are both still 1 by
-   deliberate choice, and they freeze at M16.
+   M6 moved both: `PROTOCOL_VERSION` is 2 and `RECORD_VERSION` is 2,
+   because a submission and a record now carry a priority and carry it
+   required rather than defaulted (D71). A state root written before M6
+   is refused by name, with both figures, rather than read as if its
+   jobs had asked for the middle level; there is no migration and none
+   is owed, since nothing is deployed. They freeze at M16.
 
 ## Musts per milestone
 

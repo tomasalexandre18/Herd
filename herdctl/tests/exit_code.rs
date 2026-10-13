@@ -11,7 +11,7 @@ use std::process::Output;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use herd_hub::{Hub, JobDirStore, JobStore};
+use herd_hub::{Hub, JobDirStore, JobStore, Mint};
 // Two throwaway directories with the same name: the hub's state root and the
 // runner's data root are different things and a test must not share them.
 use herd_runner::testing::TempDir as DataRootDir;

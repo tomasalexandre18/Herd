@@ -194,6 +194,7 @@ async fn a_probe_the_runner_cannot_read_keeps_a_job_queued_on_the_hub() {
         &harness.requester(),
         support::shell("printf 'this should not have run\\n'"),
         labels(&["metal-pc"]),
+        herd_proto::Priority::Step,
     )
     .await
     .expect("a job needing a suspended capability is accepted, never refused");

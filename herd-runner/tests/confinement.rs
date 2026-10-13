@@ -99,6 +99,7 @@ impl Harness {
             // No capability in particular: M4's caps are numbers a runner
             // enforces, never labels (M5 keeps them apart).
             herd_proto::LabelSet::default(),
+            herd_proto::Priority::Step,
             |stream, data| match stream {
                 LogStream::Stdout => out.push_str(&String::from_utf8_lossy(data)),
                 LogStream::Stderr => err.push_str(&String::from_utf8_lossy(data)),
@@ -1000,6 +1001,7 @@ async fn the_runner_binds_no_listening_socket() {
             &requester,
             shell("sleep 1.5"),
             herd_proto::LabelSet::default(),
+            herd_proto::Priority::Step,
             |_, _| {},
             |_| {},
         )
@@ -1114,6 +1116,7 @@ impl RealRunner {
                 &requester,
                 command,
                 herd_proto::LabelSet::default(),
+                herd_proto::Priority::Step,
                 |_, _| {},
                 |_| {},
             )

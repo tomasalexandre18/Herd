@@ -77,8 +77,10 @@ with the reason recorded, releasing it afterwards.
 ### M6 — Queue and priorities (`m6-queue-priorities`)
 One durable queue for every job (E-20). Four levels set at submission, FIFO
 within, aging so the lowest never starves, operator raise (E-18; merger-first
-is E-43). Dedup on (commit, command, args, labels): the second submission
-joins the first, both callers one result id, higher priority wins (E-05).
+is E-43). Dedup on the command and the labels — the commit joins the key when a
+submission names one, in M10 (E-01): the second submission joins the first
+while that job is open, both callers one result id, higher priority wins;
+work that is over is rerun (E-05, D70).
 **Done when** simulated-time tests show a lowest-priority job behind a steady
 higher stream running within the aging bound, a merger submitted last claiming
 the next free slot, and two identical submissions producing one execution with

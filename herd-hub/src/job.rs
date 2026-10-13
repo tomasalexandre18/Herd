@@ -9,7 +9,7 @@
 use std::error::Error;
 use std::fmt;
 
-use herd_proto::{JobId, JobOutcome, LabelSet, LogStream};
+use herd_proto::{JobId, JobOutcome, LabelSet, LogStream, Priority};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 /// What a runner measured while a job ran.
@@ -24,7 +24,14 @@ pub use herd_proto::JobMetrics;
 /// The version of the shape of a job's recorded data: `job.json` and every
 /// line of `events.jsonl`. Bumped whenever an older reader could not read
 /// what a newer Herd writes.
-pub const RECORD_VERSION: u32 = 1;
+///
+/// 2 since M6: a record carries the [`Priority`] its requester named (E-18).
+/// It is a *required* field, not a defaulted one, so a record written before
+/// M6 is refused by name — with its path and both version numbers — rather
+/// than read as if its requester had asked for the middle level. A guessed
+/// priority on a durable record is a lie a reader cannot see, and the version
+/// probe in front of every record file exists for exactly this.
+pub const RECORD_VERSION: u32 = 2;
 
 /// A moment, as the record files carry it: RFC 3339 in UTC, to the
 /// nanosecond. A string a human and the consumer can both read, so that a
@@ -38,6 +45,25 @@ pub struct Timestamp(time::OffsetDateTime);
 impl Timestamp {
     pub fn now() -> Self {
         Self(time::OffsetDateTime::now_utc())
+    }
+
+    /// How much time there is between `earlier` and this moment, and zero
+    /// when there is none.
+    ///
+    /// Saturating, because this is wall-clock time: a host whose clock steps
+    /// backwards would otherwise give a job a *negative* age, and aging
+    /// computed from a negative age is aging that fires at once. A job can
+    /// read as younger than it is for as long as the step lasts; it can
+    /// never read as older than it is (E-18).
+    pub fn since(self, earlier: Self) -> std::time::Duration {
+        (self.0 - earlier.0).try_into().unwrap_or_default()
+    }
+
+    /// This moment, `how_long` later. For a caller that needs a moment it
+    /// chooses rather than the one the clock has — a test of aging, above
+    /// all, which must be able to make an hour pass without waiting one.
+    pub fn after(self, how_long: std::time::Duration) -> Self {
+        Self(self.0 + how_long)
     }
 }
 
@@ -152,7 +178,7 @@ pub struct Attempt {
 /// One struct rather than a growing argument list: M6 adds a priority and a
 /// deduplication key to a submission, and a store whose `create_job` took
 /// four positional arguments would be rewritten at each one.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NewJob {
     pub command: Vec<String>,
     /// The capabilities the job needs, by name (E-25). Canonical, because
@@ -160,21 +186,82 @@ pub struct NewJob {
     /// and two submissions that named the same two labels in a different
     /// order are one submission.
     pub labels: LabelSet,
+    /// Which of the four levels the requester asked for (E-18). No
+    /// `Default`: see [`Priority`].
+    pub priority: Priority,
 }
 
 impl NewJob {
-    /// A job that needs no capability in particular.
+    /// A job that needs no capability in particular, at the ordinary level.
+    ///
+    /// `new` and `needing` are for the callers that are not a requester —
+    /// the store's and the hub's own tests, which are about something other
+    /// than the level. Every path a real submission takes carries the level
+    /// the requester named: the wire field is required, and
+    /// [`NewJob::at`] is what the hub calls.
     pub fn new(command: Vec<String>) -> Self {
+        Self::at(command, LabelSet::default(), Priority::Step)
+    }
+
+    /// A job that needs these capabilities, at the ordinary level.
+    pub fn needing(command: Vec<String>, labels: LabelSet) -> Self {
+        Self::at(command, labels, Priority::Step)
+    }
+
+    /// A job as a requester asked for it: its command, its capabilities and
+    /// its level.
+    pub fn at(command: Vec<String>, labels: LabelSet, priority: Priority) -> Self {
         Self {
             command,
-            labels: LabelSet::default(),
+            labels,
+            priority,
         }
     }
 
-    /// A job that needs these capabilities.
-    pub fn needing(command: Vec<String>, labels: LabelSet) -> Self {
-        Self { command, labels }
+    /// The key E-05 deduplicates on: what makes two submissions *the same
+    /// work*.
+    ///
+    /// The command and the labels, and nothing else. Not the priority — two
+    /// agents asking for one build at two levels are still asking for one
+    /// build, and the higher level wins (E-05). Not the time, not the
+    /// requester. The commit will join it when a submission names one
+    /// (E-01, M10): it is part of the command's meaning, and today the
+    /// command is where it is.
+    ///
+    /// **Length-prefixed, never concatenated.** `["a b", "c"]` and
+    /// `["a", "b c"]` are different work, and any key built by joining
+    /// strings with a separator makes them equal — whatever separator is
+    /// chosen, since a command may contain it. Each piece is written as its
+    /// length in bytes, a colon, then the bytes, so the encoding can be
+    /// parsed back and two different lists can never produce one key. The
+    /// labels go through the same encoding and are already sorted and
+    /// deduplicated by [`LabelSet`], so naming two labels in the other order
+    /// is the same work.
+    pub fn dedup_key(&self) -> String {
+        dedup_key(&self.command, &self.labels)
     }
+}
+
+/// The key E-05 deduplicates on, for a command and a label set that are
+/// already somewhere — on a record, say. See [`NewJob::dedup_key`].
+pub fn dedup_key(command: &[String], labels: &LabelSet) -> String {
+    let mut key = String::new();
+    key.push_str("command ");
+    for piece in command {
+        push_counted(&mut key, piece);
+    }
+    key.push_str(" labels ");
+    for label in labels.iter() {
+        push_counted(&mut key, label);
+    }
+    key
+}
+
+/// One piece of a key, as its byte length and its bytes.
+fn push_counted(key: &mut String, piece: &str) {
+    key.push_str(&piece.len().to_string());
+    key.push(':');
+    key.push_str(piece);
 }
 
 /// What the hub knows about one job: the contents of its `job.json`.
@@ -186,6 +273,27 @@ pub struct JobRecord {
     /// changed: what a job asked for is part of what it was.
     #[serde(default)]
     pub labels: LabelSet,
+    /// The level this job is weighed at (E-18).
+    ///
+    /// What the requester asked for, raised since by an operator (E-18's
+    /// raise) and by nothing else. **Aging is not written here**: a job's
+    /// effective level is computed from this one and the job's age every time
+    /// the queue is ordered, so there is no periodic write, nothing to lose
+    /// in a crash, and no record claiming a level a requester never asked
+    /// for. See `crate::queue`.
+    ///
+    /// Required, not `#[serde(default)]`: a record with no priority is a
+    /// record from before M6 and is refused by its version, never read as if
+    /// its requester had asked for the middle level.
+    pub priority: Priority,
+    /// How many submissions this one execution answers (E-05).
+    ///
+    /// 1 for an ordinary job; 2 after a second identical submission joined
+    /// it; 3 after a third. It is the operator-visible proof that two
+    /// requesters got one result id out of one run, and `events.jsonl` keeps
+    /// the moment each of them joined.
+    #[serde(default = "one")]
+    pub submissions: u32,
     pub state: JobState,
     /// Why the job has not started, while it has not.
     ///
@@ -218,7 +326,25 @@ pub struct JobRecord {
     pub metrics: JobMetrics,
 }
 
+/// What `submissions` is on a record that predates the field. One, because
+/// one submission is what every record ever written meant.
+fn one() -> u32 {
+    1
+}
+
 impl JobRecord {
+    /// The key this job would be joined on (E-05), derived from its own
+    /// fields.
+    ///
+    /// Derived rather than stored, on purpose: a key kept beside the fields
+    /// it is made of is a second copy that can disagree with them, and the
+    /// disagreement would silently join two submissions that are not the
+    /// same work. The hub's index of open keys is rebuilt from the records at
+    /// every start, through this.
+    pub fn dedup_key(&self) -> String {
+        dedup_key(&self.command, &self.labels)
+    }
+
     /// The attempt that is current, if one is.
     pub fn attempt(&self) -> Option<&Attempt> {
         self.attempts.last()
@@ -308,6 +434,26 @@ impl JobEvent {
         }
     }
 
+    /// A second identical submission joined this job rather than minting a
+    /// new one (E-05).
+    pub fn joined(at: Timestamp, submissions: u32, asked_for: Priority) -> Self {
+        Self {
+            at,
+            what: JobEventKind::Joined {
+                submissions,
+                asked_for,
+            },
+        }
+    }
+
+    /// The job's level moved up, and why.
+    pub fn priority_raised(at: Timestamp, from: Priority, to: Priority, why: String) -> Self {
+        Self {
+            at,
+            what: JobEventKind::PriorityRaised { from, to, why },
+        }
+    }
+
     /// The state the job moved to, when this line is a transition, and `None`
     /// when it records something else.
     pub fn state(&self) -> Option<&JobState> {
@@ -316,6 +462,8 @@ impl JobEvent {
             JobEventKind::LogGap { .. }
             | JobEventKind::AttemptStarted { .. }
             | JobEventKind::AttemptEnded { .. }
+            | JobEventKind::Joined { .. }
+            | JobEventKind::PriorityRaised { .. }
             | JobEventKind::Waiting { .. } => None,
         }
     }
@@ -357,6 +505,27 @@ pub enum JobEventKind {
         first_missing: u64,
         /// The number of the last one, inclusive.
         last_missing: u64,
+    },
+    /// A second submission asked for work this job is already doing, and
+    /// joined it instead of minting a job of its own (E-05).
+    ///
+    /// On the record because one execution answering two requesters is the
+    /// single most surprising thing about a job id a caller did not expect
+    /// to be given: the line says when it happened, how many submissions the
+    /// job now answers, and which level the joiner asked for — which is what
+    /// explains the `priority_raised` line that may follow it.
+    Joined {
+        submissions: u32,
+        asked_for: Priority,
+    },
+    /// The job's level moved up, and why: an operator raised it (E-18), or a
+    /// submission that joined it asked for more than it had (E-05).
+    ///
+    /// Only ever upwards, and only ever written here — aging is not a write.
+    PriorityRaised {
+        from: Priority,
+        to: Priority,
+        why: String,
     },
     /// The job is queued and the hub tried to start it and could not, and
     /// this is the sentence why (E-26, E-04).
@@ -409,6 +578,78 @@ pub enum LogWrite {
     AlreadyRecorded,
 }
 
+/// Minting one job, for a caller that is not a requester.
+///
+/// The hub's own path is [`JobStore::submit`], which may join (E-05), and
+/// everything a requester sends goes through it. A test that is about
+/// something else — a transition, a log, a restart — wants one job per call
+/// and would be quietly testing a *join* if two of its jobs happened to
+/// carry the same command and labels. So this says so: it goes through the
+/// one door, and a submission that joined is an error naming the job it
+/// joined, never a record handed back as if it were new.
+pub trait Mint {
+    fn create_job(&self, new: NewJob) -> Result<JobRecord>;
+}
+
+impl<S: JobStore + ?Sized> Mint for S {
+    fn create_job(&self, new: NewJob) -> Result<JobRecord> {
+        match self.submit(new)? {
+            Submission::Minted(record) => Ok(record),
+            Submission::Joined { record, .. } => Err(StoreError::new(format!(
+                "this submission joined {}, which is already doing that work, so no \
+                 job was minted; a caller that needs two jobs has to ask for two \
+                 different pieces of work",
+                record.id
+            ))),
+        }
+    }
+}
+
+/// What became of a submission (E-05).
+#[derive(Debug, Clone, PartialEq)]
+pub enum Submission {
+    /// A job of its own, minted now.
+    Minted(JobRecord),
+    /// It joined a job that is already doing this work, and the record is
+    /// that job's. Both callers hold one id and will be given one result.
+    ///
+    /// **Only an open job is ever joined.** A submission whose work was done
+    /// an hour ago mints a new job and runs again: see D70 — handing back a
+    /// finished verdict would make a rerun impossible to ask for, and would
+    /// make a second caller wear a `cancelled` or `lost` 125 for a job it
+    /// never submitted (D40).
+    Joined {
+        record: JobRecord,
+        /// The level the joined job was raised to by this submission, when
+        /// the joiner asked for more than the job had (E-05: the higher
+        /// priority wins).
+        raised: Option<Priority>,
+    },
+}
+
+impl Submission {
+    /// The record either way: the job this submission is now about.
+    pub fn record(&self) -> &JobRecord {
+        match self {
+            Submission::Minted(record) | Submission::Joined { record, .. } => record,
+        }
+    }
+}
+
+/// What became of a request to raise a job's level (E-18).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Raise {
+    /// It moved, and these are the two levels.
+    Raised { from: Priority, to: Priority },
+    /// The job is already at this level or above it. Nothing was written,
+    /// and nothing is wrong.
+    AlreadyThere(Priority),
+    /// The level asked for is *below* the one the job has. Refused rather
+    /// than done: lowering a job by hand is how something gets starved on
+    /// purpose, and E-18 offers a raise and nothing else.
+    NotARaise { from: Priority, asked: Priority },
+}
+
 /// Everything the hub does to a job's state.
 ///
 /// Deliberately boring and synchronous: the writes are small files, and the
@@ -434,8 +675,26 @@ pub trait JobStore: Send + Sync + 'static {
     /// could also answer with.
     fn state_root_id(&self) -> &str;
 
-    /// Mint a job, assign its id, and record it as [`JobState::Queued`].
-    fn create_job(&self, new: NewJob) -> Result<JobRecord>;
+    /// Take a submission in: mint a job for it, or join it to the one
+    /// already doing that work (E-05).
+    ///
+    /// One method, because the decision and the mint have to be one step. A
+    /// store that answered "is there an open job with this key?" and then
+    /// minted would let two submissions arriving together both mint, which
+    /// is the defect deduplication exists to prevent — and the two
+    /// submissions that race are exactly the two agents building one commit
+    /// that E-05 is about.
+    ///
+    /// Only an **open** job is joined: see [`Submission`].
+    fn submit(&self, new: NewJob) -> Result<Submission>;
+
+    /// Raise one job's level, as an operator may (E-18).
+    ///
+    /// Upwards only, and never on a job that is over: both are answered by
+    /// name — the first here, the second by the store's one write door,
+    /// which refuses every write to a terminal record (D54). A level that is
+    /// already at least the one asked for is not an error and not a write.
+    fn raise_priority(&self, id: &JobId, to: Priority) -> Result<Raise>;
 
     /// Record why a queued job is not starting, and say whether that was
     /// news.

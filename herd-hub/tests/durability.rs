@@ -8,7 +8,7 @@
 
 use std::sync::Arc;
 
-use herd_hub::{JobDirStore, JobState, JobStore};
+use herd_hub::{JobDirStore, JobState, JobStore, Mint};
 use herd_proto::{JobOutcome, LogStream};
 use herd_runner::Session;
 

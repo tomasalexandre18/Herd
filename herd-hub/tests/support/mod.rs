@@ -83,6 +83,7 @@ pub async fn run_job(
         config,
         command,
         herd_proto::LabelSet::default(),
+        herd_proto::Priority::Step,
         on_log,
         |_| {},
     )
@@ -94,7 +95,13 @@ pub async fn submit_job(
     config: &herdctl::Config,
     command: Vec<String>,
 ) -> anyhow::Result<herd_proto::JobId> {
-    herdctl::submit_job(config, command, herd_proto::LabelSet::default()).await
+    herdctl::submit_job(
+        config,
+        command,
+        herd_proto::LabelSet::default(),
+        herd_proto::Priority::Step,
+    )
+    .await
 }
 
 /// A hub, optionally a runner, and the means to reach them.
@@ -415,4 +422,24 @@ pub fn events_of(state_dir: &Path, job_id: &JobId) -> Vec<serde_json::Value> {
     text.lines()
         .map(|line| serde_json::from_str(line).unwrap_or_else(|e| panic!("{line} is json: {e}")))
         .collect()
+}
+
+/// Submit a job at a level of the caller's choosing, and follow it (E-18).
+///
+/// The sibling of [`run_job`] for the tests that are about the level rather
+/// than about the job: same empty label set, same silence about notes.
+pub async fn run_job_at(
+    config: &herdctl::Config,
+    command: Vec<String>,
+    priority: herd_proto::Priority,
+) -> anyhow::Result<herdctl::Finished> {
+    herdctl::run_job(
+        config,
+        command,
+        herd_proto::LabelSet::default(),
+        priority,
+        |_, _| {},
+        |_| {},
+    )
+    .await
 }

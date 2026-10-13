@@ -1,0 +1,496 @@
+//! Driving the real binaries: a hub, its runners and `herdctl`, as processes.
+//!
+//! `cargo test --workspace` does **not** build a workspace binary unless a
+//! test target needs it as a library, and a test that runs `herd-runner` as a
+//! *program* has no such need that cargo can see. A stale binary from an
+//! earlier build would then be the one under test, which is worse than no
+//! test at all — it reads green while proving nothing about the code in front
+//! of you. So [`binaries`] asks for the build itself, once per test process,
+//! and failing to build fails the test.
+//!
+//! Shared by the test files that need a real kill, a real restart or a real
+//! exit code: `killed_hub.rs` (E-44, D17) and `priorities.rs` (E-18, E-05).
+//! Not every file uses every helper here, hence the allowance below: a
+//! helper that only one of them needs is still worth having in one place.
+#![allow(dead_code)]
+
+use std::fs::File;
+use std::net::{SocketAddr, TcpListener, TcpStream};
+use std::path::{Path, PathBuf};
+use std::process::Stdio;
+use std::time::{Duration, Instant};
+
+use tempfile::TempDir;
+use tokio::process::{Child, Command};
+
+/// How long any wait here may take before it is a failure. Generous because
+/// CI is slow, and never a substitute for waiting on a real condition.
+pub const PATIENCE: Duration = Duration::from_secs(30);
+
+/// How often the runners here report they are alive, in seconds.
+///
+/// Often enough that a test does not spend a minute proving the hub noticed.
+/// The 15 s of E-40 is the default; this is the same mechanism on a shorter
+/// clock. One figure, given to both sides, because the hub refuses a silence
+/// threshold that is not comfortably longer than the cadence it expects — and
+/// a test that handed the two sides different figures would be testing a
+/// configuration nobody can run.
+pub const HEALTH_EVERY_IN_THESE_TESTS: &str = "0.2";
+
+/// A process the test started, killed when the test ends however it ends —
+/// so a failure never leaves a hub or a runner behind.
+pub struct Process {
+    pub what: &'static str,
+    pub child: Child,
+}
+
+impl Process {
+    /// Whether it is still running. The whole point of D17: a runner whose hub
+    /// was killed must answer `true` here.
+    pub fn alive(&mut self) -> bool {
+        matches!(self.child.try_wait(), Ok(None))
+    }
+
+    pub async fn signal(&mut self, signal: rustix::process::Signal) {
+        let pid = self.child.id().expect("a running process has a pid");
+        rustix::process::kill_process(
+            rustix::process::Pid::from_raw(pid as i32).expect("a pid is not zero"),
+            signal,
+        )
+        .unwrap_or_else(|e| panic!("signalling the {}: {e}", self.what));
+        // Reaped here, so that the port and the state root's lock are free
+        // before anything tries to take them again.
+        let _ = self.child.wait().await;
+    }
+
+    /// Signal it and come straight back, so the caller can time how long it
+    /// takes to go. Invariant 2 is a promise about exactly that duration.
+    pub fn ask_it_to_stop(&mut self) {
+        let pid = self.child.id().expect("a running process has a pid");
+        rustix::process::kill_process(
+            rustix::process::Pid::from_raw(pid as i32).expect("a pid is not zero"),
+            rustix::process::Signal::TERM,
+        )
+        .unwrap_or_else(|e| panic!("signalling the {}: {e}", self.what));
+    }
+
+    /// How long it took to be gone, and how it went.
+    pub async fn gone(&mut self) -> std::process::ExitStatus {
+        self.child
+            .wait()
+            .await
+            .unwrap_or_else(|e| panic!("waiting for the {}: {e}", self.what))
+    }
+}
+
+impl Drop for Process {
+    fn drop(&mut self) {
+        let _ = self.child.start_kill();
+    }
+}
+
+/// Where the workspace's binaries are, once they are known to be the ones the
+/// sources say they should be.
+///
+/// `cargo test` does not build a workspace *binary* unless some test target
+/// needs it, and this test's needs are invisible to it: it runs `herd-runner`
+/// and `herdctl` as programs, not as libraries. A stale `herd-runner` from an
+/// earlier build would then be the one this test drives — and a test of the
+/// real binaries that silently drives yesterday's binary is worse than no
+/// test at all. So the build is asked for here, once per test process, and
+/// failing to build is failing the test.
+pub fn binaries() -> &'static Path {
+    static BINARIES: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+    BINARIES.get_or_init(|| {
+        let directory = Path::new(env!("CARGO_BIN_EXE_herd-hub"))
+            .parent()
+            .expect("a binary lives in a directory")
+            .to_path_buf();
+        let mut cargo = std::process::Command::new(env!("CARGO"));
+        cargo.args([
+            "build",
+            "--offline",
+            "-p",
+            "herd-hub",
+            "-p",
+            "herd-runner",
+            "-p",
+            "herdctl",
+        ]);
+        // The same profile as the test itself, whichever it is.
+        if directory.file_name().is_some_and(|name| name == "release") {
+            cargo.arg("--release");
+        }
+        let built = cargo.status().expect("cargo runs");
+        assert!(
+            built.success(),
+            "the binaries this test drives could not be built"
+        );
+        directory
+    })
+}
+
+pub fn binary(name: &str) -> PathBuf {
+    let path = binaries().join(name);
+    assert!(
+        path.is_file(),
+        "{} is not built; this test runs the real binaries",
+        path.display()
+    );
+    path
+}
+
+/// The health cadence these tests run both sides at, unless the test under
+/// way is about the cadence itself — in which case it gives its own, and this
+/// adds nothing: the binaries refuse the same option twice, and rightly.
+pub fn cadence_unless_given(options: &[&str]) -> Vec<String> {
+    if options.contains(&"--health-every") {
+        return Vec::new();
+    }
+    vec![
+        "--health-every".to_owned(),
+        HEALTH_EVERY_IN_THESE_TESTS.to_owned(),
+    ]
+}
+
+/// A port nothing is listening on, kept for the hub that is restarted: a
+/// runner dials one URL, so the hub that comes back has to take the same one.
+pub fn free_port() -> u16 {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("a free loopback port");
+    listener
+        .local_addr()
+        .expect("a bound listener has an address")
+        .port()
+}
+
+pub struct Herd {
+    pub state: TempDir,
+    pub logs: TempDir,
+    /// The data root the runner of this herd is given (E-45). One per herd,
+    /// because a runner locks its root for the life of the process: two of
+    /// these tests running at once would otherwise be two runners fighting
+    /// over one directory, and the second would refuse to start.
+    pub data_root: TempDir,
+    pub port: u16,
+}
+
+impl Herd {
+    pub fn new() -> Self {
+        Self {
+            state: tempfile::tempdir().expect("a temporary state directory"),
+            logs: tempfile::tempdir().expect("a temporary directory for the logs"),
+            data_root: tempfile::tempdir().expect("a temporary data root"),
+            port: free_port(),
+        }
+    }
+
+    pub fn url(&self) -> String {
+        format!("ws://127.0.0.1:{}", self.port)
+    }
+
+    pub fn addr(&self) -> SocketAddr {
+        format!("127.0.0.1:{}", self.port)
+            .parse()
+            .expect("a literal loopback address")
+    }
+
+    /// Start a hub, with its output kept in a file the test can read.
+    pub async fn start_hub(&self, which: &str) -> Process {
+        // A minute, as the deployment has it: these tests are about a hub and
+        // a runner dying, not about the threshold.
+        self.start_hub_losing_runners_after(which, 60.0).await
+    }
+
+    /// The same, with the hub told how long a runner may be unheard from.
+    ///
+    /// The threshold is the hub's policy rather than a constant for exactly
+    /// this reason: a test of what happens 60 s after a runner dies would take
+    /// a minute and be the first thing deleted, while the behaviour it proves
+    /// is the behaviour whatever the number is.
+    pub async fn start_hub_losing_runners_after(&self, which: &str, seconds: f64) -> Process {
+        self.start_hub_with(which, &["--lost-after", &seconds.to_string()])
+            .await
+    }
+
+    /// A hub with whatever options the test wants, and its output in files.
+    ///
+    /// The health cadence goes with the threshold, because the hub refuses a
+    /// threshold that is not comfortably longer than the cadence it expects
+    /// its runners to report at: a three-second silence means nothing against
+    /// reports fifteen seconds apart. The runners these tests start report
+    /// every 0.2 s, so the hub is told the same, and the deployment's shape —
+    /// a threshold many reports long — is kept.
+    pub async fn start_hub_with(&self, which: &str, options: &[&str]) -> Process {
+        let output = |stream: &str| {
+            Stdio::from(
+                File::create(self.logs.path().join(format!("{which}-{stream}")))
+                    .expect("a file for the hub's output"),
+            )
+        };
+        let child = Command::new(binary("herd-hub"))
+            .arg("--listen")
+            .arg(self.addr().to_string())
+            .arg("--state-dir")
+            .arg(self.state.path())
+            // Unless the test is itself about the cadence: the binary
+            // refuses the same option twice, and rightly.
+            .args(cadence_unless_given(options))
+            .args(options)
+            .stdout(output("out"))
+            .stderr(output("err"))
+            .kill_on_drop(true)
+            .spawn()
+            .expect("herd-hub starts");
+        let hub = Process { what: "hub", child };
+        // Waiting on the port, not on a sleep: the hub is up when it accepts.
+        let deadline = Instant::now() + PATIENCE;
+        while TcpStream::connect(self.addr()).is_err() {
+            assert!(
+                Instant::now() < deadline,
+                "the hub never listened on {}: {}",
+                self.addr(),
+                self.said(which)
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        hub
+    }
+
+    pub fn start_runner(&self) -> Process {
+        self.start_runner_called("the-real-runner", "runner")
+    }
+
+    /// The data root of one named runner of this herd, and where its spooled
+    /// verdicts land (D34).
+    pub fn runner_root(&self, which: &str) -> PathBuf {
+        self.data_root.path().join(which)
+    }
+
+    /// A runner under a name of its own, with its output in files of its own —
+    /// so that a test can have two of them, and read what each said.
+    pub fn start_runner_called(&self, name: &str, which: &str) -> Process {
+        self.start_runner_rooted(name, which, which)
+    }
+
+    /// The same, with the data root named separately from the output files, so
+    /// that a runner can be started again on the root a previous one left —
+    /// which is how a spooled verdict gets delivered (D34).
+    pub fn start_runner_rooted(&self, name: &str, which: &str, root: &str) -> Process {
+        self.start_runner_with(name, which, root, &[])
+    }
+
+    /// The same, with whatever options the test wants — its own cadence above
+    /// all, because the pairing of the two sides' timings is itself something
+    /// the hub judges.
+    pub fn start_runner_with(
+        &self,
+        name: &str,
+        which: &str,
+        root: &str,
+        options: &[&str],
+    ) -> Process {
+        let child = Command::new(binary("herd-runner"))
+            .arg("--hub")
+            .arg(self.url())
+            .arg("--name")
+            .arg(name)
+            // A data root of its own, and the real one: this is the binary
+            // the server runs, confinement included (M4). One per runner,
+            // because a runner locks its root for the life of the process
+            // (D32), and these tests run two at a time.
+            .arg("--data-root")
+            .arg(self.runner_root(root))
+            // The same cadence the hub is told to expect, unless the test is
+            // itself about the cadence.
+            .args(cadence_unless_given(options))
+            .args(options)
+            .stdout(Stdio::from(
+                File::create(self.logs.path().join(format!("{which}-out"))).expect("a file"),
+            ))
+            .stderr(Stdio::from(
+                File::create(self.logs.path().join(format!("{which}-err"))).expect("a file"),
+            ))
+            .kill_on_drop(true)
+            .spawn()
+            .expect("herd-runner starts");
+        Process {
+            what: "runner",
+            child,
+        }
+    }
+
+    /// Everything one of the processes has printed so far.
+    pub fn said(&self, which: &str) -> String {
+        let mut text = String::new();
+        for stream in ["out", "err"] {
+            text.push_str(
+                &std::fs::read_to_string(self.logs.path().join(format!("{which}-{stream}")))
+                    .unwrap_or_default(),
+            );
+        }
+        text
+    }
+
+    pub async fn herdctl(&self, arguments: &[&str]) -> std::process::Output {
+        tokio::time::timeout(
+            PATIENCE,
+            Command::new(binary("herdctl"))
+                .arg("--hub")
+                .arg(self.url())
+                .args(arguments)
+                .output(),
+        )
+        .await
+        .unwrap_or_else(|_| panic!("herdctl {arguments:?} never came back"))
+        .expect("herdctl runs")
+    }
+
+    /// Submit a job and leave with its id, as a push hook would (E-03).
+    pub async fn submit(&self, script: &str) -> String {
+        let output = self
+            .herdctl(&["submit", "--", "/bin/sh", "-c", script])
+            .await;
+        assert!(
+            output.status.success(),
+            "the submission failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8_lossy(&output.stdout).trim().to_owned()
+    }
+
+    /// Wait until the runner has joined, by giving it something to run.
+    pub async fn wait_for_runner(&self) {
+        let deadline = Instant::now() + PATIENCE;
+        loop {
+            let output = self
+                .herdctl(&["run", "--", "/bin/sh", "-c", "printf ready"])
+                .await;
+            if output.status.success() {
+                return;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "the runner never joined: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    }
+
+    /// Start a `herdctl wait` and leave it running, with what it says kept in
+    /// a file: a wait that is *meant* not to end cannot be run to completion.
+    pub fn start_wait(&self, job_id: &str) -> Process {
+        let child = Command::new(binary("herdctl"))
+            .arg("--hub")
+            .arg(self.url())
+            .args(["wait", job_id])
+            .stdout(Stdio::from(
+                File::create(self.logs.path().join("wait-out")).expect("a file"),
+            ))
+            .stderr(Stdio::from(
+                File::create(self.logs.path().join("wait-err")).expect("a file"),
+            ))
+            .kill_on_drop(true)
+            .spawn()
+            .expect("herdctl starts");
+        Process {
+            what: "wait",
+            child,
+        }
+    }
+
+    pub fn job_dir(&self, job_id: &str) -> PathBuf {
+        self.state.path().join("jobs").join(job_id)
+    }
+
+    /// The identity of the hub's state root, read from its own file as a
+    /// runner learns it from the handshake.
+    pub fn state_root_id(&self) -> String {
+        let path = self.state.path().join("store.json");
+        let text = std::fs::read_to_string(&path)
+            .unwrap_or_else(|e| panic!("{} reads: {e}", path.display()));
+        let store: serde_json::Value = serde_json::from_str(&text).expect("store.json is json");
+        store["state_root_id"]
+            .as_str()
+            .expect("a state root has an identity")
+            .to_owned()
+    }
+
+    /// Make a runner's data root believe it belongs to this hub's state root,
+    /// as it would after one welcome.
+    pub fn pretend_the_root_was_welcomed(&self, which: &str) {
+        let root = self.runner_root(which);
+        std::fs::create_dir_all(&root).expect("the fixture makes the data root");
+        std::fs::write(root.join("hub-state-root"), self.state_root_id())
+            .expect("the fixture writes which hub state root it belongs to");
+    }
+
+    pub fn record(&self, job_id: &str) -> serde_json::Value {
+        let path = self.job_dir(job_id).join("job.json");
+        let text = std::fs::read_to_string(&path)
+            .unwrap_or_else(|e| panic!("{} reads: {e}", path.display()));
+        serde_json::from_str(&text).unwrap_or_else(|e| panic!("{} is json: {e}", path.display()))
+    }
+
+    /// The transitions on a job's record, in order. A line of `events.jsonl`
+    /// that records something else — output that never arrived — is not one.
+    pub fn states_of(&self, job_id: &str) -> Vec<String> {
+        let path = self.job_dir(job_id).join("events.jsonl");
+        std::fs::read_to_string(&path)
+            .unwrap_or_default()
+            .lines()
+            .filter_map(|line| {
+                let event: serde_json::Value =
+                    serde_json::from_str(line).unwrap_or_else(|e| panic!("{line} is json: {e}"));
+                event["state"]["type"].as_str().map(str::to_owned)
+            })
+            .collect()
+    }
+
+    pub fn log(&self, job_id: &str) -> String {
+        std::fs::read_to_string(self.job_dir(job_id).join("log")).unwrap_or_default()
+    }
+
+    pub async fn wait_until(&self, what: &str, mut condition: impl FnMut() -> bool) {
+        let deadline = Instant::now() + PATIENCE;
+        while !condition() {
+            assert!(
+                Instant::now() < deadline,
+                "timed out waiting until {what}; the hub said: {}",
+                self.said("first")
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }
+}
+
+impl Herd {
+    /// Submit a job that needs one capability, at one of the four levels,
+    /// and leave with its id (E-18, E-25).
+    ///
+    /// The capability is what makes the job *wait*: a runner whose probe says
+    /// the capability is held takes no job needing it, which is the only
+    /// honest way to make a queue of real jobs stand still until a test says
+    /// otherwise (E-26, D38).
+    pub async fn submit_needing(&self, label: &str, priority: &str, script: &str) -> String {
+        let output = self
+            .herdctl(&[
+                "submit",
+                "--label",
+                label,
+                "--priority",
+                priority,
+                "--",
+                "/bin/sh",
+                "-c",
+                script,
+            ])
+            .await;
+        assert!(
+            output.status.success(),
+            "the submission failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8_lossy(&output.stdout).trim().to_owned()
+    }
+}

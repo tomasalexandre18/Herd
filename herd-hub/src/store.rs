@@ -42,13 +42,13 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
-use herd_proto::{JobId, LabelSet, LogStream};
+use herd_proto::{JobId, LabelSet, LogStream, Priority};
 use serde::{Deserialize, Serialize};
 
 use crate::durable;
 use crate::job::{
-    Attempt, JobEvent, JobMetrics, JobRecord, JobState, JobStore, LogWrite, NewJob, Result,
-    StoreError, Timestamp, RECORD_VERSION,
+    Attempt, JobEvent, JobMetrics, JobRecord, JobState, JobStore, LogWrite, NewJob, Raise, Result,
+    StoreError, Submission, Timestamp, RECORD_VERSION,
 };
 
 /// The version of the directory layout above. A state root written by a newer
@@ -111,6 +111,17 @@ struct Live {
     jobs_accounted: u64,
     /// The jobs that have not reached a terminal state: the queue.
     pending: BTreeSet<u64>,
+    /// Which open job is doing which piece of work (E-05): the deduplication
+    /// key of every job that is not over, and the job doing it.
+    ///
+    /// **Derived from the records, never persisted on its own.** Each key is
+    /// computed from the record's own command and labels
+    /// ([`JobRecord::dedup_key`]), so there is no second copy to disagree
+    /// with them, and it is rebuilt from the pending records at every start —
+    /// which is what makes a join survive a restart (D69). A map that lived
+    /// only in this process would lose the link when the hub went down, and
+    /// the next identical submission would run the same build a second time.
+    open_work: HashMap<String, u64>,
     /// Per job that is still producing output, how far its log has got: how
     /// many chunks the hub has written — the number the next chunk should
     /// carry — and how many bytes those chunks are. Read from `log.seq` the
@@ -299,6 +310,7 @@ impl JobDirStore {
                 next_sequence: 1,
                 jobs_accounted: 0,
                 pending: BTreeSet::new(),
+                open_work: HashMap::new(),
                 log_chunks: HashMap::new(),
                 quarantined: BTreeMap::new(),
             }),
@@ -389,6 +401,7 @@ impl JobDirStore {
         };
 
         let mut pending = BTreeSet::new();
+        let mut open_work: HashMap<String, u64> = HashMap::new();
         let mut interrupted = Vec::new();
         let mut quarantined = BTreeMap::new();
         for sequence in to_read {
@@ -397,6 +410,17 @@ impl JobDirStore {
                 Stored::Read(record) => {
                     if !record.state.is_terminal() {
                         pending.insert(sequence);
+                        // The deduplication link, rebuilt from the record
+                        // itself (E-05, D69). Two open jobs cannot share a
+                        // key — `submit` is the only minting path and it
+                        // joins instead — but a hand-edited state root
+                        // could, and then the *older* job is the one a
+                        // submission joins, because that is the one the
+                        // first submission was told about.
+                        open_work
+                            .entry(record.dedup_key())
+                            .and_modify(|first| *first = (*first).min(sequence))
+                            .or_insert(sequence);
                     }
                     // An attempt was under way when the hub that ran before
                     // this one stopped. It is named on the record below, never
@@ -432,6 +456,7 @@ impl JobDirStore {
             live.next_sequence = next_sequence;
             live.jobs_accounted = jobs_accounted;
             live.pending = pending;
+            live.open_work = open_work;
             live.quarantined = quarantined;
             self.write_index(&live)?;
         }
@@ -839,6 +864,15 @@ impl JobDirStore {
             }
             if let Some(sequence) = sequence_of(id.as_str()) {
                 live.pending.remove(&sequence);
+                // The job is over, so it is no longer the job a second
+                // identical submission joins: the next one mints and runs
+                // again (E-05, D70). Removed only if the key still points at
+                // *this* job, so that nothing here can unlink a different
+                // job's work.
+                let key = record.dedup_key();
+                if live.open_work.get(&key) == Some(&sequence) {
+                    live.open_work.remove(&key);
+                }
             }
             // Nothing more will be appended to this log, so the hub stops
             // carrying its chunk count. `log.seq` keeps it on the disk.
@@ -847,15 +881,18 @@ impl JobDirStore {
         }
         Ok(())
     }
-}
-
-impl JobStore for JobDirStore {
-    fn state_root_id(&self) -> &str {
-        JobDirStore::state_root_id(self)
-    }
-
-    fn create_job(&self, new: NewJob) -> Result<JobRecord> {
-        let NewJob { command, labels } = new;
+    /// Mint a job for a submission nothing else is already doing.
+    ///
+    /// `key` is the submission's deduplication key, computed by the caller
+    /// before the lock was taken: it is recorded in `open_work` under the
+    /// same lock that claims the id, so there is no moment at which a job
+    /// exists and is not joinable.
+    fn mint(&self, new: NewJob, key: String) -> Result<JobRecord> {
+        let NewJob {
+            command,
+            labels,
+            priority,
+        } = new;
         let mut live = self.lock()?;
         // `mkdir` is what claims an id: the directories, not the index, decide
         // which ids are taken, so a wrong hint costs one extra attempt.
@@ -896,6 +933,8 @@ impl JobStore for JobDirStore {
             id: id.clone(),
             command,
             labels,
+            priority,
+            submissions: 1,
             state: JobState::Queued,
             waiting_for: None,
             submitted_at: at,
@@ -910,9 +949,112 @@ impl JobStore for JobDirStore {
         // ran ahead would claim a job that is not there.
         let sequence = sequence_of(id.as_str()).expect("an id this store minted");
         live.pending.insert(sequence);
+        // And this job is now the one an identical submission joins, under
+        // the same lock that claimed its id (E-05).
+        live.open_work.insert(key, sequence);
         live.jobs_accounted += 1;
         self.write_index(&live)?;
         Ok(record)
+    }
+
+    /// A second submission of work an open job is already doing joins it
+    /// (E-05).
+    ///
+    /// The joiner gets no job of its own: it gets *this* job's id, so both
+    /// callers hold one id and will be given one result out of one
+    /// execution. What it may change is the level — "the merged job takes the
+    /// higher priority" — and that is a raise like any other, through the one
+    /// write door, recorded with its reason.
+    fn join(&self, id: &JobId, asked_for: Priority) -> Result<Submission> {
+        // The raise first, so that the record the caller is handed already
+        // carries the level this submission bought it.
+        let raised = match self.raise_priority_because(
+            id,
+            asked_for,
+            "a second identical submission asked for this level",
+        )? {
+            Raise::Raised { to, .. } => Some(to),
+            Raise::AlreadyThere(_) | Raise::NotARaise { .. } => None,
+        };
+        let (_live, mut record) = self.open_for_writing(id)?;
+        let at = Timestamp::now();
+        record.submissions += 1;
+        record.updated_at = at;
+        self.write_record(&record)?;
+        self.append_event(id, &JobEvent::joined(at, record.submissions, asked_for))?;
+        Ok(Submission::Joined { record, raised })
+    }
+
+    /// One job's level raised, with the sentence that says who raised it.
+    ///
+    /// Both callers of a raise come through here — the operator's
+    /// [`JobStore::raise_priority`] and the join above — so that there is one
+    /// place where a level moves, and it is behind the write door that
+    /// refuses a job that is over (D54).
+    fn raise_priority_because(&self, id: &JobId, to: Priority, why: &str) -> Result<Raise> {
+        let (_live, mut record) = self.open_for_writing(id)?;
+        let from = record.priority;
+        if from == to {
+            return Ok(Raise::AlreadyThere(from));
+        }
+        if from.outranks(to) {
+            return Ok(Raise::NotARaise { from, asked: to });
+        }
+        let at = Timestamp::now();
+        record.priority = to;
+        record.updated_at = at;
+        // A level that changed changes why the job is waiting, and the
+        // sentence on the record names the old level. Cleared rather than
+        // rewritten here: the next dispatch pass writes the true one, and
+        // `events.jsonl` keeps the one that was.
+        record.waiting_for = None;
+        self.write_record(&record)?;
+        self.append_event(id, &JobEvent::priority_raised(at, from, to, why.to_owned()))?;
+        Ok(Raise::Raised { from, to })
+    }
+}
+
+impl JobStore for JobDirStore {
+    fn state_root_id(&self) -> &str {
+        JobDirStore::state_root_id(self)
+    }
+
+    /// Mint a job, or join the open one already doing this work (E-05).
+    ///
+    /// The whole of it is under the store's one lock, from looking the key up
+    /// to writing the index: two agents submitting one build at the same
+    /// moment are the case this exists for, and a check followed by a mint
+    /// would let both of them through.
+    ///
+    /// Only a job that is **not over** is joined. There is no window where a
+    /// job that has just finished is still joinable: `move_to` takes the key
+    /// out under this same lock at the moment the job reaches its end.
+    fn submit(&self, new: NewJob) -> Result<Submission> {
+        let key = new.dedup_key();
+        {
+            let live = self.lock()?;
+            if let Some(sequence) = live.open_work.get(&key).copied() {
+                let id = id_of(sequence);
+                // Read, rather than believed: the map is derived, and a
+                // record that has somehow gone terminal or unreadable under
+                // it must not be joined. `None` or a job that is over means
+                // the map is stale, and the submission mints below.
+                if let Ok(Some(record)) = self.read_record(&id) {
+                    if !record.state.is_terminal() {
+                        drop(live);
+                        return self.join(&id, new.priority);
+                    }
+                }
+            }
+        }
+        self.mint(new, key).map(Submission::Minted)
+    }
+
+    fn raise_priority(&self, id: &JobId, to: Priority) -> Result<Raise> {
+        // Through the one write door, so a job that is over is refused by
+        // name before anything is read off it (D54). An operator raising a
+        // job that ended a second ago is told so, and nothing is written.
+        self.raise_priority_because(id, to, "an operator raised it")
     }
 
     /// Write what the runner measured, and nothing else about the job.
@@ -1431,6 +1573,8 @@ fn failed_line(what: &str, path: &Path, line: usize, error: &dyn std::fmt::Displ
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::job::JobEventKind;
+    use crate::job::Mint;
     use herd_proto::JobOutcome;
     use tempfile::TempDir;
 
@@ -2115,11 +2259,11 @@ mod tests {
             .join(JOBS_DIR)
             .join(job.id.as_str())
             .join(RECORD_FILE);
-        durable::write_file(&path, br#"{"record_version":2,"id":"j0000000001"}"#).expect("written");
+        durable::write_file(&path, br#"{"record_version":3,"id":"j0000000001"}"#).expect("written");
         let error = store
             .job(&job.id)
-            .expect_err("version 2 is not readable here");
-        assert!(error.to_string().contains("record version 2"), "{error}");
+            .expect_err("version 3 is not readable here");
+        assert!(error.to_string().contains("record version 3"), "{error}");
     }
 
     /// D21: two hubs on one state root would mint ids from the same
@@ -2188,11 +2332,367 @@ mod tests {
         };
         fs::remove_dir_all(dir.path().join(INDEX_DIR)).expect("the index is gone");
         let store = JobDirStore::open(dir.path()).expect("opens without an index");
+        // A different command, because the first job is still open and an
+        // identical submission would join it rather than mint (E-05).
         let second = store
-            .create_job(NewJob::new(vec!["true".to_owned()]))
+            .create_job(NewJob::new(vec!["false".to_owned()]))
             .expect("minted")
             .id;
         assert_ne!(first, second);
         assert!(second.as_str() > first.as_str(), "{first} then {second}");
+    }
+
+    // --- M6: the one queue, its priorities and its deduplication ---
+
+    /// A job carries the level its requester asked for, and the record says
+    /// so in a word a person can read.
+    #[test]
+    fn a_record_carries_the_priority_its_requester_asked_for() {
+        let (dir, store) = store();
+        for priority in Priority::ALL {
+            let job = store
+                .create_job(NewJob::at(
+                    vec![priority.name().to_owned()],
+                    LabelSet::default(),
+                    priority,
+                ))
+                .expect("minted");
+            assert_eq!(job.priority, priority);
+            assert_eq!(job.submissions, 1);
+            let path = dir
+                .path()
+                .join(JOBS_DIR)
+                .join(job.id.as_str())
+                .join(RECORD_FILE);
+            let written: serde_json::Value =
+                serde_json::from_str(&read(&path)).expect("the record is json");
+            assert_eq!(written["priority"], priority.name());
+            assert_eq!(written["record_version"], RECORD_VERSION);
+        }
+    }
+
+    /// E-05: the second submission of work that is already under way joins
+    /// it. One execution, one id, and the record says it answers two.
+    #[test]
+    fn a_second_identical_submission_joins_the_open_job() {
+        let (_dir, store) = store();
+        let work = || {
+            NewJob::at(
+                vec!["cargo".to_owned(), "build".to_owned()],
+                LabelSet::new(["build"]).expect("a label"),
+                Priority::Step,
+            )
+        };
+        let first = match store.submit(work()).expect("the first submission") {
+            Submission::Minted(record) => record,
+            other => panic!("the first submission should mint: {other:?}"),
+        };
+        let second = store.submit(work()).expect("the second submission");
+        match &second {
+            Submission::Joined { record, raised } => {
+                assert_eq!(record.id, first.id, "both callers hold one id");
+                assert_eq!(record.submissions, 2);
+                assert_eq!(*raised, None, "the same level is no raise");
+            }
+            other => panic!("the second submission should join: {other:?}"),
+        }
+        // A third one too, and the count keeps up.
+        let third = store.submit(work()).expect("the third submission");
+        assert_eq!(third.record().submissions, 3);
+        // One job on the disk, not three.
+        assert_eq!(
+            store.unfinished_jobs().expect("the queue reads").len(),
+            1,
+            "three submissions of one piece of work are one job"
+        );
+        // And the join is on the record's history, with the level the joiner
+        // asked for.
+        let events = store
+            .job_events(&first.id)
+            .expect("the events read")
+            .expect("a job this store minted has events");
+        let joins: Vec<_> = events
+            .iter()
+            .filter(|event| matches!(event.what, JobEventKind::Joined { .. }))
+            .collect();
+        assert_eq!(joins.len(), 2, "two joins, one line each: {events:?}");
+    }
+
+    /// E-05: "the merged job takes the higher priority" — and only ever the
+    /// higher one.
+    #[test]
+    fn a_joining_submission_raises_the_job_but_never_lowers_it() {
+        let (_dir, store) = store();
+        let work = |priority| {
+            NewJob::at(
+                vec!["cargo".to_owned(), "build".to_owned()],
+                LabelSet::default(),
+                priority,
+            )
+        };
+        let first = store
+            .create_job(work(Priority::Producer))
+            .expect("the first submission mints");
+        match store.submit(work(Priority::Merger)).expect("joins") {
+            Submission::Joined { record, raised } => {
+                assert_eq!(raised, Some(Priority::Merger));
+                assert_eq!(record.priority, Priority::Merger);
+            }
+            other => panic!("expected a join: {other:?}"),
+        }
+        // And a later joiner asking for less leaves it where it is.
+        match store.submit(work(Priority::Nightly)).expect("joins") {
+            Submission::Joined { record, raised } => {
+                assert_eq!(raised, None);
+                assert_eq!(record.priority, Priority::Merger);
+            }
+            other => panic!("expected a join: {other:?}"),
+        }
+        assert_eq!(
+            store
+                .job(&first.id)
+                .expect("the record reads")
+                .expect("it is there")
+                .priority,
+            Priority::Merger
+        );
+    }
+
+    /// The attack: a submission must never join work that is *over*, however
+    /// that work ended. A stale verdict handed to a caller that never
+    /// submitted the first job is a verdict about a different request — and
+    /// for `cancelled` and `lost` it is a 125 worn for somebody else's
+    /// cancellation (D40, D70).
+    #[test]
+    fn a_submission_never_joins_a_job_that_is_over() {
+        for ending in [
+            JobOutcome::Exited { code: 0 },
+            JobOutcome::Exited { code: 1 },
+            JobOutcome::Cancelled {
+                reason: "a requester asked for it".to_owned(),
+            },
+            JobOutcome::Lost {
+                reason: "its runner went silent".to_owned(),
+            },
+        ] {
+            let (_dir, store) = store();
+            let work = || {
+                NewJob::at(
+                    vec!["cargo".to_owned(), "build".to_owned()],
+                    LabelSet::default(),
+                    Priority::Step,
+                )
+            };
+            let first = store.create_job(work()).expect("minted");
+            store
+                .record_state(
+                    &first.id,
+                    JobState::Finished {
+                        outcome: ending.clone(),
+                    },
+                )
+                .expect("the job ends");
+            let again = store.submit(work()).expect("the second submission");
+            match &again {
+                Submission::Minted(record) => assert_ne!(
+                    record.id, first.id,
+                    "a submission after {ending:?} must be its own job"
+                ),
+                Submission::Joined { record, .. } => panic!(
+                    "a submission joined {} which had ended {ending:?}",
+                    record.id
+                ),
+            }
+            // The new job is queued and waiting for a runner, not carrying
+            // the old job's end.
+            assert_eq!(again.record().state, JobState::Queued);
+            assert_eq!(again.record().submissions, 1);
+        }
+    }
+
+    /// The deduplication link is derived from the records, so a hub that
+    /// comes back finds it again (D69). Without this the restart would run
+    /// one piece of work twice.
+    #[test]
+    fn a_join_survives_a_restart_of_the_hub() {
+        let dir = tempfile::tempdir().expect("a temporary directory");
+        let work = || {
+            NewJob::at(
+                vec!["cargo".to_owned(), "build".to_owned()],
+                LabelSet::new(["build", "kvm"]).expect("labels"),
+                Priority::Nightly,
+            )
+        };
+        let first = {
+            let store = JobDirStore::open(dir.path()).expect("opens");
+            store.create_job(work()).expect("minted").id
+        };
+        // Including the case where the index has to be rebuilt from the
+        // directories: the link is read off the records either way.
+        for attempt in 0..2 {
+            if attempt == 1 {
+                fs::remove_dir_all(dir.path().join(INDEX_DIR)).expect("the index is gone");
+            }
+            let store = JobDirStore::open(dir.path()).expect("reopens");
+            match store.submit(work()).expect("the submission") {
+                Submission::Joined { record, .. } => assert_eq!(record.id, first),
+                Submission::Minted(record) => panic!(
+                    "a hub that came back minted {} for work {first} is already doing",
+                    record.id
+                ),
+            }
+        }
+    }
+
+    /// The attack: raising a job that is over must be refused by name at the
+    /// store's one write door, never written (D54).
+    #[test]
+    fn the_priority_of_a_job_that_is_over_cannot_be_raised() {
+        let (_dir, store) = store();
+        let job = store
+            .create_job(NewJob::at(
+                vec!["true".to_owned()],
+                LabelSet::default(),
+                Priority::Producer,
+            ))
+            .expect("minted");
+        store
+            .record_state(
+                &job.id,
+                JobState::Finished {
+                    outcome: JobOutcome::Exited { code: 0 },
+                },
+            )
+            .expect("the job ends");
+        let error = store
+            .raise_priority(&job.id, Priority::Merger)
+            .expect_err("a record that has reached its end is never written to again");
+        let said = error.to_string();
+        assert!(said.contains(job.id.as_str()), "{said}");
+        assert!(said.contains("is over"), "{said}");
+        // And nothing was written: the level is the one the requester asked
+        // for, and the history has no raise on it.
+        let record = store
+            .job(&job.id)
+            .expect("the record reads")
+            .expect("it is there");
+        assert_eq!(record.priority, Priority::Producer);
+        let events = store
+            .job_events(&job.id)
+            .expect("the events read")
+            .expect("there are events");
+        assert!(
+            !events
+                .iter()
+                .any(|event| matches!(event.what, JobEventKind::PriorityRaised { .. })),
+            "{events:?}"
+        );
+    }
+
+    /// A raise only raises, and says so (E-18).
+    #[test]
+    fn a_raise_only_ever_raises() {
+        let (_dir, store) = store();
+        let job = store
+            .create_job(NewJob::at(
+                vec!["true".to_owned()],
+                LabelSet::default(),
+                Priority::Nightly,
+            ))
+            .expect("minted");
+        assert_eq!(
+            store
+                .raise_priority(&job.id, Priority::Nightly)
+                .expect("ok"),
+            Raise::AlreadyThere(Priority::Nightly)
+        );
+        assert_eq!(
+            store
+                .raise_priority(&job.id, Priority::Producer)
+                .expect("ok"),
+            Raise::NotARaise {
+                from: Priority::Nightly,
+                asked: Priority::Producer
+            }
+        );
+        assert_eq!(
+            store.raise_priority(&job.id, Priority::Merger).expect("ok"),
+            Raise::Raised {
+                from: Priority::Nightly,
+                to: Priority::Merger
+            }
+        );
+        let record = store.job(&job.id).expect("reads").expect("it is there");
+        assert_eq!(record.priority, Priority::Merger);
+        // One raise on the history, not three.
+        let raises = store
+            .job_events(&job.id)
+            .expect("reads")
+            .expect("events")
+            .into_iter()
+            .filter(|event| matches!(event.what, JobEventKind::PriorityRaised { .. }))
+            .count();
+        assert_eq!(raises, 1);
+    }
+
+    /// Raising a job nobody minted is refused by name, not silently created.
+    #[test]
+    fn raising_a_job_that_does_not_exist_is_refused_by_name() {
+        let (_dir, store) = store();
+        let error = store
+            .raise_priority(&JobId::new("j0000009999"), Priority::Merger)
+            .expect_err("there is no such job");
+        assert!(error.to_string().contains("j0000009999"), "{error}");
+    }
+
+    /// Everything that is not over is in the one queue (E-20), whatever its
+    /// level, and the store hands it over oldest first — the order
+    /// `crate::queue` then sorts.
+    #[test]
+    fn every_job_that_is_not_over_is_in_the_one_queue() {
+        let (_dir, store) = store();
+        let mut minted = Vec::new();
+        for priority in Priority::ALL {
+            minted.push(
+                store
+                    .create_job(NewJob::at(
+                        vec![format!("job-at-{}", priority.name())],
+                        LabelSet::default(),
+                        priority,
+                    ))
+                    .expect("minted"),
+            );
+        }
+        let queue = store.unfinished_jobs().expect("the queue reads");
+        assert_eq!(queue.len(), 4);
+        assert_eq!(
+            queue
+                .iter()
+                .map(|record| record.priority)
+                .collect::<Vec<_>>(),
+            Priority::ALL.to_vec(),
+            "the store's order is the order they were minted in"
+        );
+        // One of them ends, and it leaves the queue — nothing else moves.
+        store
+            .record_state(
+                &minted[1].id,
+                JobState::Finished {
+                    outcome: JobOutcome::Exited { code: 0 },
+                },
+            )
+            .expect("it ends");
+        let queue = store.unfinished_jobs().expect("the queue reads");
+        assert_eq!(
+            queue
+                .iter()
+                .map(|record| record.id.clone())
+                .collect::<Vec<_>>(),
+            vec![
+                minted[0].id.clone(),
+                minted[2].id.clone(),
+                minted[3].id.clone()
+            ]
+        );
     }
 }

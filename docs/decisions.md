@@ -1261,3 +1261,129 @@ readable, and `M15d` inserts without renumbering M16, M17 and M18.
 — it is one machine in docker compose on the NixOS server. The
 server's own runner runs natively and is updated by Nix (E-47), so
 M15d serves the non-Nix hosts: the WSL PC and whatever joins later.
+
+---
+
+## 2026-10-13 — D67 Aging is computed from the record, never written
+
+**Context.** E-18 needs the lowest level never to starve. The obvious
+shape — a counter per queued job, ticked up and written down — costs a
+write per job per tick and loses whatever the tick had not yet written
+when the hub dies.
+
+**Choice.** A job's effective level is a pure function of its record and
+the current moment: its declared level raised one step per whole aging
+step it has spent queued, capped at the top. The moment is an argument,
+so the simulated-time tests drive the same function the hub calls with
+`Timestamp::now()` — there is no second implementation. The default step
+is 30 min, which puts the lowest level at the top 90 min after
+submission, the figure E-18's own criterion names; `--aging-step` tunes
+it. The queue is re-judged on every event that could change it and, so
+that a waiting job's figures are never stale, on a timer at a quarter of
+the step.
+
+**Alternative rejected.** A persisted aging counter, which has to be
+written to be believed and starves a job for every tick it loses.
+
+---
+
+## 2026-10-13 — D68 A restart keeps a job's accumulated wait, downtime included
+
+**Context.** A hub killed mid-queue must not reset what a job has
+waited — that starves it afresh at every restart — and must not hand it
+back maximally aged either.
+
+**Choice.** A job's age is wall-clock time since the `submitted_at` on
+its own record, which was fsynced when the job was minted. A restart
+therefore changes nothing: the age is what it is, and the time the hub
+was down counts as waiting, because the requester was waiting. Relative
+order among jobs queued before the crash is untouched by downtime, since
+all of them gain the same. A clock that steps backwards saturates at
+zero, so a job can read younger than it is but never older.
+
+**Alternative rejected.** Accumulating queued time in the record and
+pausing it while the hub is down: it needs a periodic write, and a hub
+that restarts often would keep losing the unwritten part — starvation
+through bookkeeping.
+
+---
+
+## 2026-10-13 — D69 The dedup key is the command and the labels, counted
+
+**Context.** E-05 joins a second submission of the same work. A key made
+by joining the pieces with a separator makes `["a b","c"]` and
+`["a","b c"]` the same work, whatever separator is chosen, because a
+command may contain it.
+
+**Choice.** The key is each piece of the command and each label written
+as its byte length, a colon and its bytes — parseable back, so two
+different lists can never produce one key. Labels come canonical from
+`LabelSet`, so naming two in the other order is the same work; the
+priority is *not* in the key, since two agents asking for one build at
+two levels are asking for one build. The key is derived from the record's
+own fields and never stored beside them, and the index of open keys is
+rebuilt from the records at every start — so a join survives a restart
+instead of running the work twice.
+
+**Alternative rejected.** A separate durable index of keys, which is a
+second copy that can disagree with the records it describes.
+
+---
+
+## 2026-10-13 — D70 A submission joins only a job that is not over
+
+**Context.** A second identical submission arriving after the first
+ended could be handed the first's verdict. For a job that ended
+`cancelled` or `lost` that verdict is 125 (D40) — a second caller wearing
+"no verdict" for a cancellation it never asked for — and for any ending
+it makes a rerun impossible to ask for.
+
+**Choice.** Only an open job is joined; work that is over is minted and
+run again, as its own job with its own verdict. The store takes the key
+out of the open-work index at the moment the job reaches its end, under
+the same lock, so there is no window in which a finished job is still
+joinable.
+
+**Alternative rejected.** Returning the existing result, which inherits
+a stale or 125 verdict and leaves no way to ask for the work again.
+
+---
+
+## 2026-10-13 — D71 A submission must name its priority
+
+**Context.** A level nobody chose is invisible on the wire, invisible in
+the record, and wrong exactly when it matters — the job goes before or
+after somebody else's work on the strength of it.
+
+**Choice.** `SubmitJob` carries a required `Priority`, `Priority` has no
+`Default`, and `job.json` carries the level as a required field. A frame
+without one is refused by name, as is a name that is not one of the four
+— never clamped to the nearest. `herdctl` has a visible default (`step`,
+shown in `--help` and echoed on stderr at every submission), because an
+agent submitting its branch is submitting a step; what it must not have
+is an *invisible* one. Both versions moved for this: `PROTOCOL_VERSION`
+to 2 and `RECORD_VERSION` to 2, so a pre-M6 record is refused with both
+figures rather than read as if its requester had asked for the middle
+level. Nothing is deployed; they freeze at M16.
+
+**Alternative rejected.** A defaulted field, which keeps both version
+numbers and buys that with a level a reader cannot tell from a chosen
+one.
+
+---
+
+## 2026-10-13 — D72 A priority is only ever raised
+
+**Context.** E-18 lets the consumer's orchestrator raise one job.
+Offering the other direction offers a way to starve something by hand,
+and the queue's own aging is what moves a level down.
+
+**Choice.** `RaiseJob` raises and nothing else: a request to lower is
+answered with a sentence naming both levels and writes nothing, a job
+already at or above the level asked for is a no-op, and a job that is
+over is refused by name through the store's one write door (D54) — which
+is also what makes a joining submission's raise safe, since it goes
+through the same door.
+
+**Alternative rejected.** A `set_priority` that takes any level, whose
+first use would be the one it should not have.
