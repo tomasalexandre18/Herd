@@ -1102,6 +1102,14 @@ impl JobStore for JobDirStore {
         Ok(LogWrite::Recorded)
     }
 
+    fn quarantine_reason(&self, id: &JobId) -> Result<Option<String>> {
+        let _live = self.lock()?;
+        match self.read_stored(id)? {
+            Stored::Quarantined(why) => Ok(Some(why)),
+            Stored::Read(_) | Stored::Missing => Ok(None),
+        }
+    }
+
     fn job(&self, id: &JobId) -> Result<Option<JobRecord>> {
         let _live = self.lock()?;
         self.read_record(id)
