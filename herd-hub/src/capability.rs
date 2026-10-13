@@ -22,6 +22,12 @@ use std::collections::BTreeMap;
 
 use herd_proto::{Availability, CapabilityOffer, CapabilityState, LabelSet};
 
+/// What a suspension reads as when the reading that suspended it carried no
+/// reason. Every [`Availability`] that suspends has one today; this is here so
+/// that the hub never has to invent one, and never has to treat "no reason" as
+/// "not suspended".
+const UNSAID: &str = "its probe did not say why";
+
 /// One connected runner's offer, and what its probes last said.
 #[derive(Debug, Clone, Default)]
 pub struct RunnerCapacity {
@@ -100,6 +106,10 @@ impl RunnerCapacity {
     /// Every capability currently suspended, with its reason: one a probe
     /// says is busy, one whose probe could not be read, and one whose reading
     /// has not arrived yet.
+    ///
+    /// Whether a reading suspends is [`Availability::suspends`]'s judgement
+    /// and nothing else's, here as in [`Self::why_not_now`]: the hub asks the
+    /// question, it does not answer it.
     pub fn suspended(&self) -> Vec<(String, String)> {
         self.offer
             .entries()
@@ -107,9 +117,13 @@ impl RunnerCapacity {
             .filter(|entry| entry.capability.busy_probe.is_some())
             .filter_map(|entry| {
                 let state = self.availability_of(entry.name());
-                state
-                    .reason()
-                    .map(|reason| (entry.name().to_owned(), reason.to_owned()))
+                if !state.suspends() {
+                    return None;
+                }
+                Some((
+                    entry.name().to_owned(),
+                    state.reason().unwrap_or(UNSAID).to_owned(),
+                ))
             })
             .collect()
     }
@@ -146,7 +160,16 @@ impl RunnerCapacity {
                     )
                 });
             }
-            if let Some(reason) = self.availability_of(label).reason() {
+            // Whether a reading suspends is `Availability::suspends`'s to
+            // say — one judgement, made in `herd-proto`, for the runner that
+            // reads a probe and the hub that acts on it alike (D48). The hub
+            // reads the *reason* here, never decides from it: a reason is a
+            // sentence for a human, and a hub that treated "has a reason" as
+            // the test would be making the judgement a second time, in a
+            // second place, where it could drift.
+            let availability = self.availability_of(label);
+            if availability.suspends() {
+                let reason = availability.reason().unwrap_or(UNSAID);
                 return Some(format!(
                     "{label} is suspended on {}: {reason}. This job waits and \
                      runs when the probe clears; it is not refused",
