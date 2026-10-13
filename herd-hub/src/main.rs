@@ -56,6 +56,13 @@ async fn main() -> Result<()> {
         )
     })?;
     let unfinished = store.unfinished_jobs()?.len();
+    // A job the hub read and will not act on is named here as well as on the
+    // store's own log, because the count below would otherwise be the only
+    // number anyone reads and it does not include them (D52).
+    let quarantined = store.quarantined()?;
+    for (id, why) in &quarantined {
+        println!("herd-hub: {id} is quarantined and will not be dispatched: {why}");
+    }
     let policy = Policy {
         lost_after: seconds(args.lost_after),
         health_every: seconds(args.health_every),
@@ -67,10 +74,12 @@ async fn main() -> Result<()> {
     let hub = Hub::bind_with_policy(args.listen, Arc::new(store), policy).await?;
     println!(
         "herd-hub {} listening on ws://{}, state in {} ({state_root_id}), \
-         {unfinished} job(s) not over, a runner reporting every {:?} is lost after {:?}",
+         {unfinished} job(s) not over, {} quarantined, a runner reporting every {:?} is \
+         lost after {:?}",
         herd_hub::hub_version(),
         hub.local_addr(),
         args.state_dir.display(),
+        quarantined.len(),
         policy.health_every,
         policy.lost_after,
     );

@@ -36,13 +36,13 @@
 //! gap detection — `log.seq` and the marker in [`log_gap_marker`] — and
 //! nothing anywhere reorders by them.
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
-use herd_proto::{JobId, LogStream};
+use herd_proto::{JobId, LabelSet, LogStream};
 use serde::{Deserialize, Serialize};
 
 use crate::durable;
@@ -117,6 +117,10 @@ struct Live {
     /// first time this hub sees a chunk of a job, written through to it
     /// afterwards, and forgotten when the job is over.
     log_chunks: HashMap<JobId, LogAt>,
+    /// The jobs this hub has read and will not act on, with why (D52). Filled
+    /// at recovery and never added to afterwards: what quarantines a record is
+    /// a judgement about rules that do not change while the hub runs.
+    quarantined: BTreeMap<JobId, String>,
 }
 
 /// How far a job has got in its log, as the hub counts it.
@@ -168,6 +172,37 @@ struct EventLine {
 struct VersionProbe {
     #[serde(default)]
     record_version: u32,
+}
+
+/// A record's labels as the disk carries them, before today's rules judge
+/// them (D52).
+///
+/// Plain strings, read permissively on purpose. [`LabelSet`] validates on
+/// deserialisation, which is right at a submission and wrong here: a single
+/// job persisted under rules that have since been tightened would otherwise
+/// make the whole state root unreadable, and the hub would refuse to start at
+/// all. One bad record must not take the service down, and a rule nobody can
+/// ever tighten again is not a rule.
+#[derive(Debug, Deserialize)]
+struct DurableLabels {
+    #[serde(default)]
+    labels: Vec<String>,
+}
+
+/// What `job.json` turned out to be.
+///
+/// Three outcomes rather than two, because "readable, and not something this
+/// hub may act on" is its own answer (D52): it is neither a missing record nor
+/// a reason to fail.
+enum Stored {
+    /// No `job.json` in the directory at all.
+    Missing,
+    /// A record this hub reads and acts on.
+    Read(JobRecord),
+    /// A record this hub reads and refuses to act on, with why. Named,
+    /// visible, skipped — never dispatched, never failed, never silently
+    /// repaired.
+    Quarantined(String),
 }
 
 impl JobDirStore {
@@ -251,6 +286,7 @@ impl JobDirStore {
                 jobs_accounted: 0,
                 pending: BTreeSet::new(),
                 log_chunks: HashMap::new(),
+                quarantined: BTreeMap::new(),
             }),
         };
         store.recover()?;
@@ -271,6 +307,23 @@ impl JobDirStore {
     /// has meaning over.
     pub fn state_root_id(&self) -> &str {
         &self.state_root_id
+    }
+
+    /// The jobs this hub read and will not act on, with why, oldest first
+    /// (D52).
+    ///
+    /// Empty on every ordinary state root. A job is here when its record is
+    /// readable and what it asked for is something today's rules reject — a
+    /// job minted before the rules were tightened. It is skipped, not failed
+    /// and not repaired, and this is how it stays visible: the hub names each
+    /// one as it starts, and whoever asks the store gets the same list.
+    pub fn quarantined(&self) -> Result<Vec<(JobId, String)>> {
+        Ok(self
+            .lock()?
+            .quarantined
+            .iter()
+            .map(|(id, why)| (id.clone(), why.clone()))
+            .collect())
     }
 
     /// Where one job's files live. Stable for the life of the job: the first
@@ -323,9 +376,11 @@ impl JobDirStore {
 
         let mut pending = BTreeSet::new();
         let mut interrupted = Vec::new();
+        let mut quarantined = BTreeMap::new();
         for sequence in to_read {
-            match self.read_record(&id_of(sequence))? {
-                Some(record) => {
+            let id = id_of(sequence);
+            match self.read_stored(&id)? {
+                Stored::Read(record) => {
                     if !record.state.is_terminal() {
                         pending.insert(sequence);
                     }
@@ -339,10 +394,22 @@ impl JobDirStore {
                 // A directory with no record is a mint that was interrupted
                 // between claiming the id and writing the record: there is no
                 // job to recover, and the id stays spent.
-                None => eprintln!(
+                Stored::Missing => eprintln!(
                     "herd-hub: {} holds no {RECORD_FILE}, so no job was ever recorded there",
-                    self.job_dir(&id_of(sequence)).display()
+                    self.job_dir(&id).display()
                 ),
+                // Readable and not actionable (D52). Out of the queue, so
+                // nothing dispatches it; on this list and on the hub's log, so
+                // nobody has to wonder where it went. The record is left
+                // exactly as it is: it is not Herd's to rewrite.
+                Stored::Quarantined(why) => {
+                    eprintln!(
+                        "herd-hub: {id} is QUARANTINED and will not be \
+                         dispatched: {why}. Its record is untouched; the hub \
+                         is running"
+                    );
+                    quarantined.insert(id, why);
+                }
             }
         }
 
@@ -351,6 +418,7 @@ impl JobDirStore {
             live.next_sequence = next_sequence;
             live.jobs_accounted = jobs_accounted;
             live.pending = pending;
+            live.quarantined = quarantined;
             self.write_index(&live)?;
         }
         // After the index, and with the lock given back: naming an
@@ -433,12 +501,21 @@ impl JobDirStore {
         // here today, which is exactly the case the rule exists for.
         for sequence in sequences.iter().copied().filter(|s| !listed.contains(s)) {
             let id = id_of(sequence);
-            match self.read_record(&id) {
-                Ok(Some(record)) if !record.state.is_terminal() => {
+            match self.read_stored(&id) {
+                Ok(Stored::Read(record)) if !record.state.is_terminal() => {
                     return rebuild(format!(
                         "it leaves out {id}, whose record is {} and so not over",
                         describe(&record.state)
                     ))
+                }
+                // A quarantined record hides no job — nothing will dispatch
+                // it — but it has to be *named*, at every start, and only the
+                // full read names it (D52). So the index is set aside for it:
+                // the cost is reading every record on a state root that holds
+                // one, which is the price of a job nobody can act on never
+                // going quiet.
+                Ok(Stored::Quarantined(why)) => {
+                    return rebuild(format!("{id} is quarantined: {why}"))
                 }
                 // No record at all is a mint that never finished, which the
                 // full read reports on its own.
@@ -501,10 +578,19 @@ impl JobDirStore {
         Ok((live, record))
     }
 
-    fn read_record(&self, id: &JobId) -> Result<Option<JobRecord>> {
+    /// Read a record, or say what else it was.
+    ///
+    /// The labels are read permissively first and judged by today's rules
+    /// second (D52). A set the rules reject quarantines the job rather than
+    /// failing the read: the alternative is a hub that will not start because
+    /// of one record it minted itself under rules that have since changed.
+    /// Validation stays strict where a requester is listening — at
+    /// submission, through [`LabelSet`] — and that is the only place it can
+    /// do any good.
+    fn read_stored(&self, id: &JobId) -> Result<Stored> {
         let path = self.job_dir(id).join(RECORD_FILE);
         let Some(text) = read_optional(&path)? else {
-            return Ok(None);
+            return Ok(Stored::Missing);
         };
         let probe: VersionProbe =
             serde_json::from_str(&text).map_err(|error| failed("reading", &path, &error))?;
@@ -515,9 +601,36 @@ impl JobDirStore {
                 probe.record_version
             )));
         }
+        let durable: DurableLabels =
+            serde_json::from_str(&text).map_err(|error| failed("reading", &path, &error))?;
+        if let Err(why) = LabelSet::new(durable.labels.clone()) {
+            return Ok(Stored::Quarantined(format!(
+                "its labels {:?} are not labels this hub accepts: {why}",
+                durable.labels
+            )));
+        }
+        // The labels just passed the very check `LabelSet` makes when it
+        // deserialises, so reading the whole record cannot fail on them.
         let file: RecordFile =
             serde_json::from_str(&text).map_err(|error| failed("reading", &path, &error))?;
-        Ok(Some(file.record))
+        Ok(Stored::Read(file.record))
+    }
+
+    /// The record, for a caller that is about to act on it.
+    ///
+    /// A quarantined job is an error here, naming it and why: everything that
+    /// reads a record through this is about to write one, and a hub that
+    /// quietly reported "no such job" would make a job that is plainly on the
+    /// disk invisible. Recovery, which must *skip* such a job rather than
+    /// fail, reads [`Self::read_stored`] instead.
+    fn read_record(&self, id: &JobId) -> Result<Option<JobRecord>> {
+        match self.read_stored(id)? {
+            Stored::Missing => Ok(None),
+            Stored::Read(record) => Ok(Some(record)),
+            Stored::Quarantined(why) => Err(StoreError::new(format!(
+                "{id} is quarantined and this hub will not act on it: {why}"
+            ))),
+        }
     }
 
     fn write_record(&self, record: &JobRecord) -> Result<()> {
@@ -1050,7 +1163,11 @@ impl JobStore for JobDirStore {
         let live = self.lock()?;
         let mut records = Vec::with_capacity(live.pending.len());
         for sequence in live.pending.iter().copied() {
-            if let Some(record) = self.read_record(&id_of(sequence))? {
+            // `read_stored`, because the queue is what the hub acts on and a
+            // quarantined job is not in it: recovery keeps it out of
+            // `pending`, and reading one here would be a hub that cannot even
+            // list its queue (D52).
+            if let Stored::Read(record) = self.read_stored(&id_of(sequence))? {
                 records.push(record);
             }
         }
