@@ -508,6 +508,21 @@ pub trait JobStore: Send + Sync + 'static {
     /// The job's record, if the store has one.
     fn job(&self, id: &JobId) -> Result<Option<JobRecord>>;
 
+    /// Why this store will not act on this job, if it will not (D52).
+    ///
+    /// `None` for every ordinary job, including one that does not exist.
+    /// `Some(why)` for a quarantined record: the job is on the disk, it is
+    /// readable, and what it asked for is something today's rules reject.
+    ///
+    /// Asked *before* acting rather than discovered while acting. Every other
+    /// method here answers a quarantined id with an error, which is right —
+    /// they are all about to write something — but an error is not an answer
+    /// a requester can be given: the hub that treated it as one dropped the
+    /// connection without a frame, and `herdctl` told the caller its job was
+    /// still running. This is how the hub says "no, and here is why" instead
+    /// (D13).
+    fn quarantine_reason(&self, id: &JobId) -> Result<Option<String>>;
+
     /// The job's output so far, both streams interleaved as they arrived, and
     /// byte for byte what the process wrote.
     fn job_log(&self, id: &JobId) -> Result<Option<Vec<u8>>>;

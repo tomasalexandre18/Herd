@@ -2072,6 +2072,37 @@ fn stalled_note(why: &str) -> String {
     )
 }
 
+/// What a requester asking about a quarantined job is told, if it is one.
+///
+/// D52 quarantines a record whose labels today's rules reject: the job is on
+/// the disk, named at every start, skipped, and never acted on. Every store
+/// method that would act on it errors — and an error here used to travel up
+/// out of the connection, so the requester got **no frame at all**: the hub
+/// put the reason on its own stderr, the socket went away, and `herdctl` said
+/// "the hub closed the connection while j… was still running", which is false
+/// twice over. The job is not running and the connection did not just happen
+/// to close.
+///
+/// So it is a refusal, of exactly D13's shape — terminal, last, carrying the
+/// sentence a human reads — which is what `herdctl` turns into 125 with the
+/// reason on stderr (D20). A quarantine is terminal by construction: waiting
+/// longer will not lift it, and only a change to the rules or to the record
+/// can.
+fn quarantine_refusal(state: &State, job_id: &JobId) -> Result<Option<String>> {
+    let quarantined = state
+        .store
+        .quarantine_reason(job_id)
+        .with_context(|| format!("reading the record of {job_id}"))?;
+    Ok(quarantined.map(|why| {
+        format!(
+            "{job_id} is quarantined and this hub will not act on it: {why}. \
+             It is skipped rather than failed or repaired: its record is left \
+             exactly as it is, and nothing will dispatch it, cancel it or \
+             report an end for it on this state root."
+        )
+    }))
+}
+
 async fn serve_requester(state: &State, outbox: &Outbox, source: &mut Source) -> Result<()> {
     let outcome = accept_submissions(state, outbox, source).await;
     state.forget_follower(outbox);
@@ -2123,9 +2154,17 @@ async fn accept_submissions(state: &State, outbox: &Outbox, source: &mut Source)
                 }
             }
             ToHub::CancelJob { job_id } => {
+                if let Some(reason) = quarantine_refusal(state, &job_id)? {
+                    let _ = outbox.send(FromHub::Refused { reason });
+                    return Ok(());
+                }
                 cancel_job(state, outbox, &job_id)?;
             }
             ToHub::WaitForJob { job_id } => {
+                if let Some(reason) = quarantine_refusal(state, &job_id)? {
+                    let _ = outbox.send(FromHub::Refused { reason });
+                    return Ok(());
+                }
                 let attached = state
                     .attach(&job_id, outbox)
                     .with_context(|| format!("reading the record of {job_id}"))?;
@@ -2461,6 +2500,9 @@ mod tests {
         }
         fn job(&self, id: &JobId) -> StoreResult<Option<JobRecord>> {
             self.inner.job(id)
+        }
+        fn quarantine_reason(&self, id: &JobId) -> StoreResult<Option<String>> {
+            self.inner.quarantine_reason(id)
         }
         fn job_log(&self, id: &JobId) -> StoreResult<Option<Vec<u8>>> {
             self.inner.job_log(id)

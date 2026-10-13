@@ -46,8 +46,55 @@ impl Harness {
         Self::start(None::<fn(&mut herd_runner::Confinement)>).await
     }
 
+    /// A hub whose state root already holds a job today's rules reject (D52),
+    /// with that job's id: what a requester asking about a quarantined job
+    /// gets is a refusal, and this is the only way to make one.
+    async fn with_a_quarantined_job() -> (Self, String) {
+        let state = tempfile::tempdir().expect("a temporary state directory");
+        let quarantined = {
+            let store = JobDirStore::open(state.path()).expect("the state root opens");
+            let id = store
+                .create_job(herd_hub::NewJob::new(vec![
+                    "/bin/sh".to_owned(),
+                    "-c".to_owned(),
+                    "exit 0".to_owned(),
+                ]))
+                .expect("minted")
+                .id;
+            // Planted by hand because that is the only way to make such a
+            // record today: `BUILD` is not a label, and `LabelSet` would
+            // refuse to build one. It stands for a job minted before the
+            // rules were tightened.
+            let path = state.path().join("jobs").join(id.as_str()).join("job.json");
+            let mut record: serde_json::Value =
+                serde_json::from_str(&std::fs::read_to_string(&path).expect("the record reads"))
+                    .expect("the record is json");
+            record["labels"] = serde_json::json!(["BUILD"]);
+            std::fs::write(
+                &path,
+                serde_json::to_string(&record).expect("the record serializes"),
+            )
+            .expect("the record is planted");
+            id.to_string()
+        };
+        // No runner: nothing is going to run, and a quarantined job is
+        // answered from its record.
+        (
+            Self::start_on(state, None::<fn(&mut herd_runner::Confinement)>).await,
+            quarantined,
+        )
+    }
+
     async fn start(shape: Option<impl FnOnce(&mut herd_runner::Confinement)>) -> Self {
         let state = tempfile::tempdir().expect("a temporary state directory");
+        Self::start_on(state, shape).await
+    }
+
+    /// The same, on a state root the caller has already prepared.
+    async fn start_on(
+        state: TempDir,
+        shape: Option<impl FnOnce(&mut herd_runner::Confinement)>,
+    ) -> Self {
         let store = JobDirStore::open(state.path()).expect("the state root opens");
         let hub = Hub::bind(
             "127.0.0.1:0".parse().expect("a literal loopback address"),
@@ -307,6 +354,45 @@ async fn waiting_for_a_job_that_does_not_exist_says_so() {
         "the refusal must name the id: {}",
         stderr(&output)
     );
+}
+
+/// Asking about a quarantined job gets a sentence, not a dropped socket.
+///
+/// D52 keeps a record the rules reject visible and skipped, and every path
+/// that would act on it refuses. That refusal reached the hub's own stderr and
+/// stopped there: the connection was dropped with no frame at all, and
+/// `herdctl` fell through to "the hub closed the connection while j… was
+/// still running" — a sentence that is false twice over and tells the one
+/// person who could fix it nothing. D13 says the hub's "no" is one
+/// `Refused { reason }` and that it is the last frame; this is that, and the
+/// reason names the quarantine.
+#[tokio::test]
+async fn asking_about_a_quarantined_job_is_refused_with_the_reason() {
+    let (harness, quarantined) = Harness::with_a_quarantined_job().await;
+    for asked in ["wait", "cancel"] {
+        let output = harness.herdctl_args(&[asked, &quarantined]).await;
+        let said = stderr(&output);
+        assert_eq!(
+            status_code(&output),
+            125,
+            "`herdctl {asked}` on a quarantined job is Herd failing to give a \
+             verdict, not a job that failed (D20): {said}"
+        );
+        assert_eq!(stdout(&output), "", "stdout belongs to the job");
+        assert!(
+            said.contains(&quarantined) && said.contains("quarantined"),
+            "the reason must name the job and the quarantine: {said}"
+        );
+        assert!(
+            said.contains("BUILD"),
+            "and what it is quarantined over: {said}"
+        );
+        assert!(
+            !said.contains("closed the connection"),
+            "the hub refused in a frame, so `herdctl` must not be guessing \
+             from a dropped socket: {said}"
+        );
+    }
 }
 
 /// D20: every way Herd itself can fail to produce a verdict exits 125, with
