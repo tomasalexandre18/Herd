@@ -529,10 +529,21 @@ async fn stop(
     // from, and a stop that stopped reading could never see one, which would
     // make every stop write a file for a result the hub in fact had. Bounded
     // and short, because invariant 2 is about leaving quickly.
+    // Quiet twice over, a poll apart. A job reports its end and only then
+    // leaves the live list, so one observation of "nothing live, nothing
+    // held" is already honest — but a job that never started holds its result
+    // without ever joining that list, and asking twice costs one poll and
+    // closes that instant too.
     let settled = async {
+        let mut quiet = 0u8;
         loop {
             if confined.live().count() == 0 && session.holds_nothing() {
-                return;
+                quiet += 1;
+                if quiet >= 2 {
+                    return;
+                }
+            } else {
+                quiet = 0;
             }
             tokio::time::sleep(STOP_POLL).await;
         }
