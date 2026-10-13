@@ -1036,9 +1036,7 @@ mod tests {
         CapabilityOffer::new(
             capabilities
                 .into_iter()
-                .map(|capability| {
-                    OfferedCapability::new(capability, CapabilityOrigins::declared())
-                })
+                .map(|capability| OfferedCapability::new(capability, CapabilityOrigins::declared()))
                 .collect(),
         )
         .expect("a valid offer")
@@ -1164,7 +1162,11 @@ mod tests {
                 },
                 "{asked:?} started while a host-wide capability was held"
             );
-            assert!(why.reason().contains("nothing else runs"), "{}", why.reason());
+            assert!(
+                why.reason().contains("nothing else runs"),
+                "{}",
+                why.reason()
+            );
         }
         // A second holder of the exclusive capability is the same answer.
         assert!(matches!(
@@ -1222,7 +1224,12 @@ mod tests {
             Capability::shared("b"),
         ]);
         // The closure put it in the offer itself.
-        assert!(offer.get("b").expect("offered").capability.excludes.contains("a"));
+        assert!(offer
+            .get("b")
+            .expect("offered")
+            .capability
+            .excludes
+            .contains("a"));
 
         // And it is enforced in both orders of arrival.
         let mut first = Holdings::new(offer.clone());
@@ -1272,10 +1279,7 @@ mod tests {
         admit(&mut held, 0, &["a"]);
         admit(&mut held, 1, &["c"]);
         // The middle overlaps neither.
-        assert!(matches!(
-            refuse(&held, &["b"]),
-            Contention::Excluded { .. }
-        ));
+        assert!(matches!(refuse(&held, &["b"]), Contention::Excluded { .. }));
 
         // And one job may hold both ends at once, for the same reason.
         let mut together = Holdings::new(offer);
@@ -1449,12 +1453,9 @@ mod tests {
         assert_eq!(set.to_string(), "build, reference");
         assert_eq!(LabelSet::default().to_string(), "none");
         for bad in ["", "Build", "a b", "a,b", "a:b", &"x".repeat(65)] {
-            assert!(
-                LabelSet::of(bad).is_err(),
-                "{bad:?} must not be a label"
-            );
+            assert!(LabelSet::of(bad).is_err(), "{bad:?} must not be a label");
         }
-        assert!(LabelSet::of(&"x".repeat(64)).is_ok());
+        assert!(LabelSet::of("x".repeat(64)).is_ok());
     }
 
     /// E-28 again, from the algebra's side: nothing here knows the name
