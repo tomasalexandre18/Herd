@@ -2710,15 +2710,6 @@ shapes instead, and all three are the same error wearing different clothes:
   `a_cancel_ends_one_job_within_ten_seconds_and_a_sibling_runs_on` waited
   for the job to be `Running` and cancelled it, then asserted that what the
   job had printed was still in its log. `Running` is the runner reporting a
-  shell it has *spawned*; the shell has still to reach its first `printf`.
-  Pinned to two cores under five spinners the kill won that race in **one
-  run of six**, and the test failed saying output had been lost when the
-  job had never produced any — a true sentence about a false premise. It
-  waits for the line now, and passed eight of eight afterwards.
-* **A cancel that lands before the thing it is about.** `link.rs`'s
-  `a_cancel_ends_one_job_within_ten_seconds_and_a_sibling_runs_on` waited
-  for the job to be `Running` and cancelled it, then asserted that what the
-  job had printed was still in its log. `Running` is the runner reporting a
   shell it has *spawned*, and the shell has still to reach its first
   `printf`. Pinned to two cores under five spinners the kill won that race
   in **one run of six** — and in the first full pinned run of the suite —
@@ -2872,17 +2863,43 @@ that passed took 148 to 179 s — nearly all of it spent asleep. That test now
 runs its runner with `--redial-cap 1`, because it is a test of a log
 surviving kills and not of the redial policy, and it takes **9.9 s**.
 
-**Decision: report it, do not change it.** What counts as a consecutive
-failure is the redial policy, and the policy is Alexa's to set — a runner
-that redialled every 500 ms against a hub crash-looping would be a different
-trade, not obviously a better one, and the give-up bound is reasoned about in
-terms of consecutive failures too. The fix, if it is wanted, is small: count
-consecutive *dial* failures rather than consecutive link endings, by resetting
-the count whenever the attempt got as far as being welcomed.
+**Worse than the backoff, and measured after the sweep reported it: the
+runner *exits*.** `failing_since`, the instant the give-up bound is measured
+from, is reset in that same one place — so the bound is not a span of
+unreachability at all. It is the time since the runner's **first ever** failed
+ending, whatever happened in between. Proved against the real binaries with
+`--give-up-after 3 --redial-first 0.05`: the runner failed to dial a hub that
+was not up yet, the hub started, the runner joined and served for **five
+seconds**, and the first `kill -9` of that hub ended the process for good.
 
-**What it costs until then.** Every hub restart after the first few leaves
-every runner idle for up to 30 s. Nothing is lost — a runner holds its jobs
-and its unacknowledged output across the gap (D36, D17) — but a deployment
-that restarts the hub twice in a minute has a herd that looks dead for half a
-minute afterwards, with only `dialling … again in 30s` on the runners' stdout
-to say why.
+```
+Error: giving up on ws://127.0.0.1:18791: 27 attempt(s) over 3s failed,
+which is longer than a runner waits for a hub to come back
+```
+
+Every part of that sentence that matters is false: the hub had come back, and
+the runner had been serving on it. At the default bound it reads: a runner
+that misses one dial, then runs healthily for a day, is killed for good by the
+next hub restart. That is the one failure an unattended fleet cannot have, and
+the one Alexa named when he asked for M15d — nobody going back to every
+machine by hand.
+
+**And the clean close is not the common case; it is no case at all.** The
+`Ok(())` arm that does the resetting wants the hub to close the WebSocket with
+a handshake. Measured: a hub stopped with **SIGTERM** — the polite stop, what
+a deployment does — ends the link as `Connection reset without closing
+handshake`, and the runner's very next line is `dialling … again (attempt 2)`.
+The reset path therefore never runs in practice, and both counters are
+monotonic for the life of the process.
+
+**Decision: report it, do not change it here.** A sweep of the tests is not
+where the redial policy is rewritten, and the fix has a real trade to settle:
+resetting on any welcomed connection turns a hub that accepts and dies in a
+loop into a 2 Hz dial loop, so the reset wants a floor — a connection that
+lasted at least the cap, say. Both counters are in scope, the failure count
+*and* `failing_since`.
+
+**What it costs until then.** Nothing today: the hub here is only ever stopped
+by hand, nothing is deployed, and a runner holds its jobs and its
+unacknowledged output across the gap (D36, D17). But it cannot ship to a real
+fleet, so it is fixed before M16 puts a runner on the server for good.
