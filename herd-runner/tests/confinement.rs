@@ -60,6 +60,7 @@ impl Harness {
                 name: Some(format!("m4-{label}")),
                 token: None,
                 confinement,
+                ..herd_runner::Config::default()
             };
             async move {
                 if let Err(error) = herd_runner::run(config).await {
@@ -254,6 +255,7 @@ async fn a_runner_with_a_bad_data_root_refuses_to_start_naming_it() {
         name: None,
         token: None,
         confinement: Confinement::with_data_root(&file),
+        ..herd_runner::Config::default()
     })
     .await
     .expect_err("a file is not a data root");
@@ -382,7 +384,8 @@ async fn a_job_past_its_time_cap_is_stopped_by_name() {
         ran.outcome,
         JobOutcome::StoppedByCap {
             cap: Cap::Time,
-            limit: 1
+            limit: 1,
+            detail: None
         },
         "a job past its time cap must name the cap: {:?}",
         ran.outcome
@@ -411,7 +414,8 @@ async fn a_job_flooding_its_log_is_stopped_at_the_log_cap() {
         ran.outcome,
         JobOutcome::StoppedByCap {
             cap: Cap::Log,
-            limit: cap
+            limit: cap,
+            detail: None
         },
         "a flooding job must name the log cap: {:?}",
         ran.outcome
@@ -443,7 +447,8 @@ async fn a_job_filling_its_workspace_is_stopped_at_its_disk_budget() {
         ran.outcome,
         JobOutcome::StoppedByCap {
             cap: Cap::Disk,
-            limit: budget
+            limit: budget,
+            detail: None
         },
         "a job filling its workspace must name the disk budget: {:?}",
         ran.outcome
@@ -479,7 +484,8 @@ async fn a_job_cannot_hide_what_it_wrote_from_its_disk_budget() {
         ran.outcome,
         JobOutcome::StoppedByCap {
             cap: Cap::Disk,
-            limit: budget
+            limit: budget,
+            detail: None
         },
         "a job that blinds the runner must still be held to its budget: {:?} / {}",
         ran.outcome,
@@ -513,7 +519,8 @@ async fn a_job_that_fills_its_workspace_and_exits_at_once_is_still_stopped() {
         ran.outcome,
         JobOutcome::StoppedByCap {
             cap: Cap::Disk,
-            limit: budget
+            limit: budget,
+            detail: None
         },
         "exiting first does not buy a job its budget back: {:?}",
         ran.outcome
@@ -589,7 +596,8 @@ async fn a_job_that_breaches_the_log_cap_and_exits_at_once_names_the_cap() {
         ran.outcome,
         JobOutcome::StoppedByCap {
             cap: Cap::Log,
-            limit: cap
+            limit: cap,
+            detail: None
         },
         "a cut log is never a pass, whatever the process exited with: {:?}",
         ran.outcome
@@ -616,7 +624,8 @@ async fn a_job_killed_by_the_pipe_the_log_cap_closed_still_names_the_cap() {
         ran.outcome,
         JobOutcome::StoppedByCap {
             cap: Cap::Log,
-            limit: cap
+            limit: cap,
+            detail: None
         },
         "SIGPIPE from the cap's own doing must not leak out as the job's \
          verdict: {:?}",
@@ -655,6 +664,75 @@ async fn a_job_s_child_in_its_own_session_does_not_outlive_the_job() {
         );
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
+}
+
+/// Finding 2 of M4's verification, end to end: a job whose workspace cannot
+/// be measured at all is stopped by the disk cap (D30) — and the record says
+/// **why**, rather than naming a figure the job never came near.
+///
+/// The reproduction is the one `root.rs` uses for an unmeasurable tree: the
+/// job replaces its own workspace directory with a *file*. `read_dir` then
+/// fails with `ENOTDIR`, which no mode can fix, so the runner genuinely
+/// cannot take the figure. Before this, the requester was told "the runner
+/// stopped this job at its disk cap of 21474836480 bytes" for a job that had
+/// written a few bytes, and the true reason went to the runner's stderr where
+/// no requester can read it.
+#[tokio::test]
+async fn an_unmeasurable_workspace_says_why_in_the_job_s_own_record() {
+    let budget = 64 << 20;
+    let harness = Harness::new("unmeasurable-workspace", |confinement| {
+        confinement.disk_budget = budget;
+    })
+    .await;
+    let ran = harness
+        .run(
+            "base=$(dirname \"$PWD\"); printf 'wrecking it\\n'; cd /; rm -rf \"$base\"; \
+             : > \"$base\"; exit 0",
+        )
+        .await;
+    let JobOutcome::StoppedByCap { cap, limit, detail } = &ran.outcome else {
+        panic!(
+            "a workspace the runner cannot measure is a budget it cannot enforce, and \
+             that is never a job that passed: {:?} / {}",
+            ran.outcome, ran.err
+        )
+    };
+    assert_eq!(*cap, Cap::Disk, "{:?}", ran.outcome);
+    assert_eq!(*limit, budget, "the cap's own figure is still the cap's");
+    let detail = detail
+        .as_ref()
+        .expect("the record must carry the true reason, not only the cap's figure");
+    assert!(
+        detail.contains("could not measure") && detail.contains("workspace"),
+        "the reason must say the workspace could not be measured: {detail}"
+    );
+    // D30's other half: the figure is absent, never a zero.
+    assert!(
+        ran.metrics.bytes_written.is_none(),
+        "a figure that could not be taken must be absent: {:?}",
+        ran.metrics
+    );
+    // And the requester is told the same thing in words, not only in a field.
+    let said = herdctl::stopped_by_cap_message(*cap, *limit, detail.as_str().into());
+    assert!(said.contains("could not measure"), "{said}");
+}
+
+/// Finding 6 of M4's verification, from the other end: a workspace the runner
+/// cannot reclaim is in the job's **record**, not only on the runner's
+/// stderr. Same reproduction, and the job's log is part of its record.
+#[tokio::test]
+async fn a_workspace_that_cannot_be_reclaimed_is_in_the_job_s_log() {
+    let harness = Harness::new("unreclaimable-workspace", |_| {}).await;
+    let ran = harness
+        .run("base=$(dirname \"$PWD\"); cd /; rm -rf \"$base\"; : > \"$base\"; exit 0")
+        .await;
+    assert!(
+        ran.err.contains("could not be reclaimed") && ran.err.contains("left on this host"),
+        "bytes left on a host nobody will collect must reach the requester, not \
+         only the runner's stderr: {:?} / {}",
+        ran.outcome,
+        ran.err
+    );
 }
 
 /// Defect 9: the whole metric path, so that a measured zero and a figure
@@ -804,7 +882,8 @@ async fn an_allocation_past_the_ceiling_kills_the_job_and_only_the_job() {
             hog.outcome,
             JobOutcome::StoppedByCap {
                 cap: Cap::Memory,
-                limit: 64 << 20
+                limit: 64 << 20,
+                detail: None
             },
             "the kernel killed the job's cgroup, so the outcome must name the \
              memory ceiling rather than a bare signal: {:?}",
@@ -1075,9 +1154,19 @@ async fn a_runner_told_to_stop_ends_its_jobs_rather_than_orphaning_them() {
     let left = nothing_left_in(data_root.path());
     assert!(left.is_empty(), "the stopped runner left {left:?} on disk");
     let said = runner.stderr.await.unwrap_or_default();
+    // What it says is M3's drain, which is where M4's stop now lives: the
+    // signal that asked, how many jobs it had to end, and that it is over.
+    // The job itself is ended by its own task — that is what produces an
+    // honest `attempt_abandoned` rather than a verdict nobody earned — and
+    // the backstop in `LiveJobs::end_all` only speaks when a task did not
+    // get there.
     assert!(
-        said.contains("SIGTERM received") && said.contains("ended job"),
-        "a runner must say what it ended on its way out: {said}"
+        said.contains("SIGTERM") && said.contains("draining"),
+        "a runner must say that it is stopping and what asked it to: {said}"
+    );
+    assert!(
+        said.contains("job(s) to end") && said.contains("herd-runner: stopped"),
+        "and that it ended what it was running, and is gone: {said}"
     );
     job.abort();
     serving.abort();

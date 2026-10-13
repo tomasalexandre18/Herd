@@ -96,6 +96,7 @@ impl Harness {
             // Carried, not checked: M15 gives tokens meaning.
             token: Some("not-validated-yet".to_owned()),
             confinement: confinement(&data_root),
+            ..herd_runner::Config::default()
         };
         harness.tasks.push(tokio::spawn(async move {
             let _ = herd_runner::run(config).await;
@@ -273,14 +274,20 @@ impl Drop for HubProcess {
     }
 }
 
-/// Open a state root, waiting for the hub that held it to let go.
+/// Open a state root, waiting for whoever held it to let go.
 ///
 /// One hub owns a state root at a time (D21). A real restart is a new process
 /// and the kernel has already dropped the dead one's lock; two hubs on one
 /// runtime in one test process are not that, and the lock is given back only
 /// once the tasks of the hub that was killed have finished being dropped. So
 /// this waits for it, rather than racing it.
-fn open_when_free(state_dir: &Path) -> JobDirStore {
+///
+/// **Every** `JobDirStore::open` in the suite goes through here, not only the
+/// restarts. One test opened a root directly and failed once in CI with "the
+/// state root is already in use by herd-hub, process <itself>" — its own
+/// lock, not yet handed back. A flaky suite erodes invariant 5 faster than a
+/// missing test does, so the fix is the wait, never a rerun.
+pub fn open_when_free(state_dir: &Path) -> JobDirStore {
     let deadline = Instant::now() + PATIENCE;
     loop {
         match JobDirStore::open(state_dir) {

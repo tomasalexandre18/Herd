@@ -95,7 +95,31 @@ pub enum JobOutcome {
     /// This is neither the job failing nor Herd failing: the job asked for
     /// more than the machine was willing to give it. A runner must say this
     /// rather than let a job hang or grow without end (invariant 2).
-    StoppedByCap { cap: Cap, limit: u64 },
+    ///
+    /// `detail` is for the case where the cap's figure alone would be a true
+    /// number inside a false sentence. A job whose workspace could not be
+    /// measured is stopped by the disk cap (D30) and may have written four
+    /// kilobytes: "stopped at its disk cap of 21474836480 bytes" is then a
+    /// lie, and the real reason belongs in the record rather than only on the
+    /// runner's stderr. Absent whenever the cap's own figure says it all.
+    StoppedByCap {
+        cap: Cap,
+        limit: u64,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        detail: Option<String>,
+    },
+    /// A requester asked for this job to be cancelled and the runner ended it
+    /// (E-06). The process was most likely killed by a signal, and reporting
+    /// `signalled` would be true and useless: what a reader needs to know is
+    /// that somebody asked for this, so there is no verdict to read and
+    /// nothing failed.
+    Cancelled { reason: String },
+    /// The runner executing this job went silent and the job will not be
+    /// attempted again (E-21). D15 named this variant in advance as the one
+    /// M3 would have to add, and this is it: a job can end because the
+    /// machine it was on stopped answering, which is neither an exit code,
+    /// nor a signal, nor a failure to start.
+    Lost { reason: String },
 }
 
 /// Which cap a runner enforced against a job.
@@ -190,6 +214,24 @@ impl fmt::Display for JobId {
     }
 }
 
+/// One job a runner is executing, as its health report names it.
+///
+/// `chunks_sent` is how many chunks of that job's output the runner has handed
+/// to its link since the attempt began — and therefore the number the hub's
+/// own count has to agree with. The hub writes the chunks it receives and
+/// counts them; when the runner says it has sent more than the hub has
+/// written, output is missing, and the hub can ask for it back instead of
+/// learning of the loss only when a later chunk arrives with a number that
+/// does not follow. That late discovery is the one case M2 could not close:
+/// chunks lost with nothing after them look exactly like a job gone quiet.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RunningJob {
+    pub job_id: JobId,
+    /// Which attempt of that job this runner is executing.
+    pub attempt: u32,
+    pub chunks_sent: u64,
+}
+
 /// Sent to the hub by a runner or a requester.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
@@ -217,7 +259,7 @@ pub enum ToHub {
     /// for this message to mean anything.
     WaitForJob { job_id: JobId },
     /// Runner reports that it has spawned the job's process.
-    JobStarted { job_id: JobId },
+    JobStarted { job_id: JobId, attempt: u32 },
     /// Runner reports output. `seq` counts chunks per job, across both
     /// streams, from 0, and the runner numbers a chunk as it enqueues it, so
     /// the numbers arrive in the order they were given out.
@@ -233,20 +275,63 @@ pub enum ToHub {
     /// `data` is the bytes the process wrote, unaltered (D18).
     LogChunk {
         job_id: JobId,
+        /// Which attempt produced it. A job can be attempted twice (E-21) and
+        /// the second attempt's output is not the first's, so a chunk whose
+        /// attempt is over is refused by name rather than written into the
+        /// record of the attempt that is current.
+        attempt: u32,
         stream: LogStream,
         seq: u64,
         #[serde(with = "bytes_as_base64")]
         data: Vec<u8>,
     },
-    /// Runner reports how the job ended, and what it measured while it ran.
+    /// Runner reports how the job ended, how much output that attempt
+    /// produced in all, and what it measured while it ran.
+    ///
+    /// `chunks_sent` is what closes the lost-tail case: when the job ends the
+    /// hub learns the exact number of chunks the attempt wrote, so a log that
+    /// is short says so at once instead of waiting for a chunk that is never
+    /// coming. The hub asks for the missing ones back before it records the
+    /// end, and names them in the log only once they are truly gone.
     JobFinished {
         job_id: JobId,
+        attempt: u32,
         outcome: JobOutcome,
+        chunks_sent: u64,
         /// Default for a peer that measured nothing; never silently zero for
         /// a figure that was simply not readable (see [`JobMetrics`]).
         #[serde(default)]
         metrics: JobMetrics,
     },
+    /// Runner reports that it is alive and what it is doing (E-40).
+    ///
+    /// Sent about every 15 s, and the mechanism everything about a lost runner
+    /// rests on: the hub keeps the age of the last report, a runner silent for
+    /// about 60 s is lost and its running jobs are requeued once (E-21), and
+    /// the age is what M13 surfaces. `draining` says the runner is stopping
+    /// and takes no new job (invariant 2), so the hub stops handing work to a
+    /// runner on its way out the moment it says so.
+    Health {
+        jobs: Vec<RunningJob>,
+        draining: bool,
+    },
+    /// Runner gives an attempt back without a verdict, and says why.
+    ///
+    /// Not an outcome: the job did not end, this *attempt* did. A runner asked
+    /// to stop while a job is running abandons it rather than inventing a
+    /// verdict for it (invariant 2), and a runner handed a job while it is
+    /// draining abandons it before it starts. What becomes of the job — one
+    /// more attempt, or an end — is the hub's policy and never the runner's.
+    AttemptAbandoned {
+        job_id: JobId,
+        attempt: u32,
+        reason: String,
+    },
+    /// Requester asks for a job to be cancelled (E-06).
+    ///
+    /// The hub propagates it to whichever runner holds the attempt; a
+    /// requester never names a machine (invariant 6).
+    CancelJob { job_id: JobId },
 }
 
 /// Sent by the hub to a runner or a requester.
@@ -262,8 +347,82 @@ pub enum FromHub {
     Refused { reason: String },
     /// The submitted job exists and will be followed on this connection.
     JobAccepted { job_id: JobId },
-    /// The runner is asked to execute this job.
-    AssignJob { job_id: JobId, command: Vec<String> },
+    /// The runner is asked to execute this job, as attempt `attempt` of it.
+    ///
+    /// The number is the hub's, minted when the attempt is recorded, and the
+    /// runner carries it on everything it says about that job afterwards. It
+    /// is what lets the hub tell a frame of the attempt it is waiting for from
+    /// a frame of an attempt it has already given up on (E-21).
+    AssignJob {
+        job_id: JobId,
+        attempt: u32,
+        command: Vec<String>,
+    },
+    /// The runner is asked to end a job it is executing, and told why.
+    ///
+    /// A requester asked for it (E-06), or the hub has decided this attempt is
+    /// over. Scoped to one attempt of one job: a sibling job on the same
+    /// runner is not touched by it.
+    CancelJob {
+        job_id: JobId,
+        attempt: u32,
+        reason: String,
+    },
+    /// The runner said something about an attempt that is over, and nothing of
+    /// it was recorded.
+    ///
+    /// A runner that was gone long enough to be declared lost comes back still
+    /// holding the frames of its attempt — a result, output, the lot — and the
+    /// job it was running may already be on its second attempt. None of that
+    /// may touch the record (E-21), and the runner may not be left guessing
+    /// why nothing happens: it is told by name, and it ends whatever it is
+    /// still doing for that attempt. Not a refusal — `Refused` is terminal
+    /// (D13) and this connection goes on.
+    StaleAttempt {
+        job_id: JobId,
+        attempt: u32,
+        reason: String,
+    },
+    /// Every chunk of this job's output numbered below `through_seq` is on the
+    /// hub's disk, and the runner may forget it.
+    ///
+    /// The same promise as [`FromHub::JobResultAck`], for output: a runner
+    /// holds the chunks it has sent until they are recorded, so a link that
+    /// dies under a running job costs the log nothing. Sent after the chunk is
+    /// appended, never before.
+    LogAck {
+        job_id: JobId,
+        attempt: u32,
+        through_seq: u64,
+    },
+    /// The hub is missing this job's output from `from_seq` onwards, and asks
+    /// the runner to send it again.
+    ///
+    /// What the runner still holds it resends under the numbers it first gave
+    /// them; what it no longer holds is genuinely gone, and the hub then names
+    /// it in the log rather than leaving the log quietly short (D29).
+    ResendLog {
+        job_id: JobId,
+        attempt: u32,
+        from_seq: u64,
+    },
+    /// Not now, and not never: dial again in `retry_in_ms`.
+    ///
+    /// A runner redialling into a hub that has not yet noticed its previous
+    /// connection is gone used to be told "a runner is already connected" and,
+    /// `Refused` being terminal (D13), died of it. So that case is not a
+    /// refusal at all: the hub says stand by, names what it is waiting for,
+    /// and the runner comes back. D13's own warning, honoured — a peer that
+    /// waits is not a peer that was refused.
+    StandBy { reason: String, retry_in_ms: u64 },
+    /// The hub has the runner's health report, and is itself still there.
+    ///
+    /// The answer matters as much as the report: a TCP connection can stay
+    /// open to a hub that is gone, and a runner that only ever writes would
+    /// never find out. Hearing nothing at all from the hub for as long as the
+    /// hub would take to call the *runner* lost is a dead link, and the runner
+    /// redials.
+    HealthRecorded {},
     /// Output relayed to the requester that submitted the job, as bytes
     /// (D18). `seq` is the runner's own numbering, carried through for the
     /// same reason as in [`ToHub::LogChunk`]: telling a gap from a reordering.
@@ -327,6 +486,24 @@ pub fn cap_exceeded_reason(cap: Cap, limit: u64) -> String {
         cap.name(),
         cap.unit()
     )
+}
+
+/// The same sentence, with the reason a cap carries when its figure alone
+/// would mislead ([`JobOutcome::StoppedByCap`]'s `detail`).
+///
+/// Without a detail this is exactly [`cap_exceeded_reason`]. With one it says
+/// the cap could not be *held to* rather than that the job reached it, so
+/// nobody reads a job that wrote four kilobytes as a job that filled a disk.
+pub fn cap_stop_reason(cap: Cap, limit: u64, detail: Option<&str>) -> String {
+    match detail {
+        None => cap_exceeded_reason(cap, limit),
+        Some(detail) => format!(
+            "the runner stopped this job because it could not hold it to its {} cap of \
+             {limit} {}: {detail}",
+            cap.name(),
+            cap.unit()
+        ),
+    }
 }
 
 /// The wording of a version refusal, so that every peer reads one sentence and

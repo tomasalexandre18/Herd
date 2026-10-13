@@ -52,6 +52,25 @@ impl Process {
         // before anything tries to take them again.
         let _ = self.child.wait().await;
     }
+
+    /// Signal it and come straight back, so the caller can time how long it
+    /// takes to go. Invariant 2 is a promise about exactly that duration.
+    fn ask_it_to_stop(&mut self) {
+        let pid = self.child.id().expect("a running process has a pid");
+        rustix::process::kill_process(
+            rustix::process::Pid::from_raw(pid as i32).expect("a pid is not zero"),
+            rustix::process::Signal::TERM,
+        )
+        .unwrap_or_else(|e| panic!("signalling the {}: {e}", self.what));
+    }
+
+    /// How long it took to be gone, and how it went.
+    async fn gone(&mut self) -> std::process::ExitStatus {
+        self.child
+            .wait()
+            .await
+            .unwrap_or_else(|e| panic!("waiting for the {}: {e}", self.what))
+    }
 }
 
 impl Drop for Process {
@@ -154,6 +173,18 @@ impl Herd {
 
     /// Start a hub, with its output kept in a file the test can read.
     async fn start_hub(&self, which: &str) -> Process {
+        // A minute, as the deployment has it: these tests are about a hub and
+        // a runner dying, not about the threshold.
+        self.start_hub_losing_runners_after(which, 60.0).await
+    }
+
+    /// The same, with the hub told how long a runner may be unheard from.
+    ///
+    /// The threshold is the hub's policy rather than a constant for exactly
+    /// this reason: a test of what happens 60 s after a runner dies would take
+    /// a minute and be the first thing deleted, while the behaviour it proves
+    /// is the behaviour whatever the number is.
+    async fn start_hub_losing_runners_after(&self, which: &str, seconds: f64) -> Process {
         let output = |stream: &str| {
             Stdio::from(
                 File::create(self.logs.path().join(format!("{which}-{stream}")))
@@ -165,6 +196,8 @@ impl Herd {
             .arg(self.addr().to_string())
             .arg("--state-dir")
             .arg(self.state.path())
+            .arg("--lost-after")
+            .arg(seconds.to_string())
             .stdout(output("out"))
             .stderr(output("err"))
             .kill_on_drop(true)
@@ -186,20 +219,46 @@ impl Herd {
     }
 
     fn start_runner(&self) -> Process {
+        self.start_runner_called("the-real-runner", "runner")
+    }
+
+    /// The data root of one named runner of this herd, and where its spooled
+    /// verdicts land (D34).
+    fn runner_root(&self, which: &str) -> PathBuf {
+        self.data_root.path().join(which)
+    }
+
+    /// A runner under a name of its own, with its output in files of its own —
+    /// so that a test can have two of them, and read what each said.
+    fn start_runner_called(&self, name: &str, which: &str) -> Process {
+        self.start_runner_rooted(name, which, which)
+    }
+
+    /// The same, with the data root named separately from the output files, so
+    /// that a runner can be started again on the root a previous one left —
+    /// which is how a spooled verdict gets delivered (D34).
+    fn start_runner_rooted(&self, name: &str, which: &str, root: &str) -> Process {
         let child = Command::new(binary("herd-runner"))
             .arg("--hub")
             .arg(self.url())
             .arg("--name")
-            .arg("the-real-runner")
-            // Its own data root, and the real one: this is the binary the
-            // server runs, confinement included (M4).
+            .arg(name)
+            // A data root of its own, and the real one: this is the binary
+            // the server runs, confinement included (M4). One per runner,
+            // because a runner locks its root for the life of the process
+            // (D32), and these tests run two at a time.
             .arg("--data-root")
-            .arg(self.data_root.path())
+            .arg(self.runner_root(root))
+            // Often enough that a test does not spend a minute proving the
+            // hub noticed. The 15 s of E-40 is the default; this is the same
+            // mechanism on a shorter clock.
+            .arg("--health-every")
+            .arg("0.2")
             .stdout(Stdio::from(
-                File::create(self.logs.path().join("runner-out")).expect("a file"),
+                File::create(self.logs.path().join(format!("{which}-out"))).expect("a file"),
             ))
             .stderr(Stdio::from(
-                File::create(self.logs.path().join("runner-err")).expect("a file"),
+                File::create(self.logs.path().join(format!("{which}-err"))).expect("a file"),
             ))
             .kill_on_drop(true)
             .spawn()
@@ -513,17 +572,22 @@ async fn a_result_the_hub_cannot_write_is_kept_until_it_can() {
 }
 
 /// D29, and the one thing a record may never do: a log that is short of
-/// output says so, at the place where the output is missing.
+/// output says so, at the place where the output is missing — and M3's, which
+/// is that there is nothing to say, because the output comes back.
 ///
 /// Twelve `kill -9`s of the hub during one job is how the defect was found.
 /// The hub came back each time, the runner redialled and went on streaming,
 /// and everything the job had printed while there was no hub was simply gone —
 /// a quarter of the lines, with the record reading `finished{exited 5}` and
-/// nothing anywhere saying a byte was missing. Getting those chunks back is
-/// M3's work; saying they are not there is M2's, and that is what the chunk
-/// numbers have been carried for since D4.
+/// nothing anywhere saying a byte was missing. M2 made the loss visible; M3
+/// makes it not happen: the runner holds every chunk until the hub says it has
+/// it, and sends again what was never acknowledged (D36). So the promise this
+/// test now holds the code to is the strong one — **not one line of the job's
+/// output is missing after twelve killed hubs** — with the marker kept as the
+/// fallback for output that really is gone, asserted where it can be
+/// provoked (`link.rs`).
 #[tokio::test(flavor = "multi_thread")]
-async fn a_log_that_lost_chunks_to_twelve_killed_hubs_says_where() {
+async fn a_log_survives_twelve_killed_hubs_whole() {
     const KILLS: u32 = 12;
 
     let herd = Herd::new();
@@ -582,9 +646,12 @@ async fn a_log_that_lost_chunks_to_twelve_killed_hubs_says_where() {
     );
     assert_eq!(herd.record(&job)["state"]["type"], "finished");
 
-    // ---- What the log says about itself. Every jump in the job's own line
-    // numbers must have a marker between the two lines that name the jump:
-    // that is the whole of it, a log that is short is a log that says so.
+    // ---- What the log says about itself. The job numbered its own lines, so
+    // the log is checkable against the job's intent rather than against the
+    // hub's bookkeeping: the numbers must run 1, 2, 3, … with nothing missing,
+    // nothing repeated, and nothing out of order. A gap is allowed only if the
+    // hub named it where it happened (D29) — and after M3 there should be
+    // none, because the runner held the chunks and sent them again (D36).
     let log = herd.log(&job);
     let mut last: Option<u64> = None;
     let mut announced = false;
@@ -600,13 +667,18 @@ async fn a_log_that_lost_chunks_to_twelve_killed_hubs_says_where() {
             .and_then(|rest| rest.strip_suffix(" END"))
             .and_then(|digits| digits.parse::<u64>().ok())
         else {
-            // A line a lost chunk cut in half, or the blank line the marker
+            // A line a lost chunk cut in half, or the blank line a marker
             // stands on. Neither is one of the job's lines.
             continue;
         };
         lines += 1;
         if let Some(last) = last {
-            assert!(number > last, "the log went backwards at {number}: {log}");
+            assert!(
+                number > last,
+                "line {number} is in the log twice, or out of order, after \
+                 line {last}: a log with a line written twice is as false as \
+                 one with a line missing. {log}"
+            );
             if number != last + 1 {
                 assert!(
                     announced,
@@ -622,21 +694,27 @@ async fn a_log_that_lost_chunks_to_twelve_killed_hubs_says_where() {
         announced = false;
         last = Some(number);
     }
-    assert!(lines > 0, "the log holds none of the job's lines: {log}");
     assert!(
-        gaps > 0,
-        "twelve killed hubs cost this job no output at all, so nothing was \
-         proved; {lines} lines, log: {log}"
+        lines > 100,
+        "the log holds too few of the job's lines: {log}"
     );
-
-    // And the record carries the gaps too, as events of their own kind: a
-    // reader of the record alone must not have to parse the log to learn that
-    // it is incomplete.
+    assert_eq!(
+        last,
+        Some(lines as u64),
+        "the job printed {lines} lines numbered 1 upwards and the log must \
+         hold every one of them: twelve killed hubs may cost a job nothing \
+         (D36)"
+    );
+    assert_eq!(
+        gaps, 0,
+        "twelve killed hubs cost this job {gaps} stretch(es) of output; the \
+         runner holds what it sends until the hub acknowledges it, so none \
+         should be missing. {log}"
+    );
+    // The record agrees with the log about that: no gap in one, no gap event
+    // in the other. A reader of the record alone must not have to parse the
+    // log to learn whether it is complete.
     let markers = log.matches("never reached this log").count();
-    assert!(
-        markers >= gaps as usize,
-        "{gaps} gap(s) in the job's lines and only {markers} marker(s)"
-    );
     let path = herd.job_dir(&job).join("events.jsonl");
     let events = std::fs::read_to_string(&path).expect("the events read");
     let recorded = events
@@ -647,6 +725,14 @@ async fn a_log_that_lost_chunks_to_twelve_killed_hubs_says_where() {
     assert_eq!(
         recorded, markers,
         "every marker in the log is an event on the record: {events}"
+    );
+    assert_eq!(markers, 0, "nothing was lost, so nothing is named as lost");
+    // One attempt, throughout. Twelve hubs died; the job was never run twice.
+    let record = herd.record(&job);
+    assert_eq!(
+        record["attempts"].as_array().expect("attempts").len(),
+        1,
+        "a hub dying is not a runner being lost: {record}"
     );
     assert_eq!(
         herd.states_of(&job).first().map(String::as_str),
@@ -821,28 +907,268 @@ async fn a_wait_on_an_interrupted_job_says_so_rather_than_hanging_mutely() {
     second.signal(rustix::process::Signal::TERM).await;
 }
 
-/// Where M4's stop meets M2's held result, with both real binaries: a runner
-/// told to stop while it is holding a verdict no hub has acknowledged does
-/// **not** take that verdict with it.
+/// E-21 against the real binaries: `kill -9` the runner mid-job, and the job
+/// is attempted again on the runner that takes its place, with the record
+/// naming both goes.
 ///
-/// The two promises pull against each other. M4 says a runner asked to stop
-/// ends its running jobs — not doing so is how a `sleep` outlives its runner,
-/// reparented to init, with its cgroup and its workspace left for nobody. M2
-/// says a finished job's outcome is held until the hub acknowledges it,
-/// because a destroyed verdict is the one thing Herd never does (D19, E-44) —
-/// and the job this stop ends produces exactly such an outcome, with no hub
-/// left to take it.
+/// The in-process version of this (`link.rs`) drives a hand-written runner
+/// that goes quiet. This one kills a process: the socket really closes, the
+/// job's child really dies with it, the result it was holding really is gone,
+/// and the hub has to decide on a clock that the attempt is not coming back.
+/// That is the failure mode that got through M2's first pass, so it is the one
+/// a real-binary test has to cover.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_killed_runner_s_job_is_attempted_again_on_another_runner() {
+    let herd = Herd::new();
+    // Three seconds instead of sixty: the threshold is the hub's policy, and
+    // what is being proved is what happens when it passes.
+    let mut hub = herd.start_hub_losing_runners_after("first", 3.0).await;
+    let mut doomed = herd.start_runner_called("the-doomed-runner", "runner");
+    herd.wait_for_runner().await;
+
+    // A command that behaves differently the second time it is run, so that
+    // the first attempt is still going when its runner is killed and the
+    // second one can finish. It is also the shape of the thing being tested:
+    // the job really is run twice, on two machines, and the record has to say
+    // so.
+    let marker = herd.logs.path().join("ran-once");
+    let job = herd
+        .submit(&format!(
+            "if [ -f '{0}' ]; then printf 'the second attempt\\n'; exit 0; fi; \
+             : > '{0}'; printf 'the first attempt\\n'; sleep 120; printf 'never\\n'",
+            marker.display()
+        ))
+        .await;
+    herd.wait_until("the job is running and has printed something", || {
+        herd.record(&job)["state"]["type"] == "running"
+            && herd.log(&job).contains("the first attempt")
+    })
+    .await;
+
+    // ---- The kill. Nothing of this attempt survives on the runner's side:
+    // the process is gone and so is the result it would have reported.
+    let killed_at = Instant::now();
+    doomed.signal(rustix::process::Signal::KILL).await;
+    assert!(!doomed.alive(), "the runner is gone");
+
+    // A runner takes its place, and the hub hands it the job again.
+    let mut replacement = herd.start_runner_called("the-replacement-runner", "second-runner");
+    // Waiting on the *transitions*, not only on the record: the hub writes
+    // `job.json` and then appends to `events.jsonl`, in that order and on
+    // purpose (a transition is readable in the journal only once the record
+    // agrees with it), so a test that reads the record and then the journal
+    // in one breath can see a finished job with its last line not yet
+    // there. That is the race, not a missing transition.
+    herd.wait_until(
+        "the job ends on the runner that replaced the dead one",
+        || {
+            herd.record(&job)["state"]["type"] == "finished"
+                && herd
+                    .states_of(&job)
+                    .last()
+                    .is_some_and(|last| last == "finished")
+        },
+    )
+    .await;
+    let took = killed_at.elapsed();
+    assert!(
+        took < Duration::from_secs(90),
+        "a killed runner's job must be attempted again within 90 s; this took {took:?}"
+    );
+
+    // ---- The record. Two attempts, each naming its runner, the first one
+    // saying why it ended, and the second one's verdict kept.
+    let record = herd.record(&job);
+    let attempts = record["attempts"].as_array().expect("attempts").clone();
+    assert_eq!(
+        attempts.len(),
+        2,
+        "a reader must see that this job ran twice and why: {record}"
+    );
+    assert_eq!(attempts[0]["number"], 1);
+    assert_eq!(attempts[0]["runner"], "the-doomed-runner");
+    let why = attempts[0]["ended"]
+        .as_str()
+        .expect("the attempt that was lost says why it ended");
+    assert!(
+        why.contains("runner")
+            && (why.contains("not coming back") || why.contains("stopped answering")),
+        "the reason must name the lost runner: {why}"
+    );
+    assert_eq!(attempts[1]["number"], 2);
+    assert_eq!(attempts[1]["runner"], "the-replacement-runner");
+    assert!(
+        attempts[1]["ended"].is_null(),
+        "the attempt that produced the verdict needs no excuse: {record}"
+    );
+    assert_eq!(
+        record["state"]["outcome"],
+        serde_json::json!({"type": "exited", "code": 0}),
+        "the second attempt's own verdict, not an invented one: {record}"
+    );
+
+    // The transitions say the same thing in order, and the log says where the
+    // second attempt begins so that nobody reads the first one's output as
+    // part of it.
+    assert_eq!(
+        herd.states_of(&job),
+        ["queued", "assigned", "running", "queued", "assigned", "running", "finished"],
+        "the job went round exactly once"
+    );
+    let log = herd.log(&job);
+    assert!(log.contains("the first attempt"), "{log}");
+    assert!(log.contains("the second attempt"), "{log}");
+    assert!(
+        log.contains("attempt 2 of this job starts here"),
+        "the log must say where the second attempt begins: {log}"
+    );
+    assert!(
+        log.find("the first attempt") < log.find("the second attempt"),
+        "in the order they happened: {log}"
+    );
+    assert!(
+        !log.contains("never\n"),
+        "the first attempt never got there: {log}"
+    );
+
+    // And a requester that comes back by id gets the second attempt's code.
+    let waited = herd.herdctl(&["wait", &job]).await;
+    assert_eq!(
+        waited.status.code(),
+        Some(0),
+        "{}",
+        herd.said("second-runner")
+    );
+
+    replacement.signal(rustix::process::Signal::TERM).await;
+    hub.signal(rustix::process::Signal::TERM).await;
+}
+
+/// Invariant 2 against the real binary: a busy runner asked to stop is gone
+/// inside five seconds, has refused a job submitted in the meantime, and the
+/// job it was running is named on the record rather than silently lost.
 ///
-/// So the runner writes what it still holds into its data root, one file per
-/// job, and names each path on its way out. The file is the `job_finished`
-/// frame itself, so nothing has to be reinterpreted to replay it (invariant
-/// 4). A verdict on a disk is recoverable; a verdict in the memory of a
-/// process that has exited is not.
+/// `SIGTERM` is how an owner asks today — `systemctl stop`, a Ctrl-C, a
+/// container told to go. The switch she flips from her desktop is E-33 and
+/// M9's; this is the stop path it pulls.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_busy_runner_asked_to_stop_is_gone_in_five_seconds() {
+    let herd = Herd::new();
+    let mut hub = herd.start_hub("first").await;
+    let mut runner = herd.start_runner();
+    herd.wait_for_runner().await;
+
+    let job = herd
+        .submit("printf 'working\\n'; sleep 600; printf 'never\\n'")
+        .await;
+    herd.wait_until("the job is running", || {
+        herd.record(&job)["state"]["type"] == "running" && herd.log(&job).contains("working")
+    })
+    .await;
+
+    // ---- The owner asks. Nothing is waited for before the clock starts.
+    let asked_at = Instant::now();
+    runner.ask_it_to_stop();
+
+    // A job submitted while it is draining is refused by name, rather than
+    // handed to a runner that is leaving. Polled, because the refusal becomes
+    // true the moment the hub hears the runner is draining — which is the
+    // first thing a draining runner says.
+    let mut refusal = String::new();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while Instant::now() < deadline {
+        let attempt = herd.herdctl(&["run", "--", "/bin/sh", "-c", "true"]).await;
+        if !attempt.status.success() {
+            refusal = String::from_utf8_lossy(&attempt.stderr).into_owned();
+            assert_eq!(
+                attempt.status.code(),
+                Some(125),
+                "a refused submission has no verdict to report (D20): {refusal}"
+            );
+            break;
+        }
+    }
+    assert!(
+        refusal.contains("draining") || refusal.contains("no runner is connected"),
+        "a job submitted while the runner is stopping must be refused by name: {refusal:?}"
+    );
+
+    // ---- And it is gone, inside the five seconds invariant 2 promises.
+    let status = tokio::time::timeout(Duration::from_secs(5), runner.gone())
+        .await
+        .unwrap_or_else(|_| {
+            panic!(
+                "invariant 2: a runner asked to stop is gone in five seconds. \
+                 It said: {}",
+                herd.said("runner")
+            )
+        });
+    let took = asked_at.elapsed();
+    assert!(
+        took <= Duration::from_secs(5),
+        "invariant 2 promises five seconds; this took {took:?}"
+    );
+    assert_eq!(
+        status.code(),
+        Some(0),
+        "a runner asked to stop stops cleanly: {}",
+        herd.said("runner")
+    );
+    assert!(
+        herd.said("runner").contains("draining"),
+        "and says what it is doing: {}",
+        herd.said("runner")
+    );
+
+    // ---- What became of the job it was running. Named, with the reason, and
+    // waiting for a runner that can take it — never silently lost.
+    herd.wait_until("the drained job's attempt is ended by name", || {
+        herd.record(&job)["attempts"][0]["ended"].is_string()
+    })
+    .await;
+    let record = herd.record(&job);
+    let why = record["attempts"][0]["ended"]
+        .as_str()
+        .expect("the attempt says why it ended");
+    assert!(
+        why.contains("asked it to stop"),
+        "the record must say the owner asked: {why}"
+    );
+    assert_eq!(
+        record["state"]["type"], "queued",
+        "the job waits for a runner rather than being failed: {record}"
+    );
+    assert!(
+        herd.log(&job).contains("working"),
+        "what it printed before the drain is still its log: {}",
+        herd.log(&job)
+    );
+    assert!(
+        !herd.log(&job).contains("never"),
+        "and it did not go on running: {}",
+        herd.log(&job)
+    );
+
+    hub.signal(rustix::process::Signal::TERM).await;
+}
+
+/// Where M4's stop meets M3's drain and M2's held result, with the real
+/// binaries: a runner told to stop while it is holding a verdict no hub has
+/// acknowledged does **not** take that verdict with it (D34).
 ///
-/// **What this leaves to M3**: reading these files back on the next start, so
-/// that the hub learns of them with no human in the loop, and the ≤ 5 s stop
-/// of invariant 2 with its full drain. This is the minimum honest thing — the
-/// verdict survives, and the runner says where it is.
+/// The job here has already *finished* when the stop arrives. That is the
+/// case the spool exists for, and the reconciliation of the two milestones:
+/// a job still **running** when the owner asks is abandoned by name, because
+/// inventing "killed by signal 9" for work nobody finished would be a false
+/// verdict and the hub would have no reason to attempt the job again
+/// (invariant 2, D39 — that is
+/// `a_busy_runner_asked_to_stop_is_gone_in_five_seconds`). A job that *ran to
+/// its end* produced a real verdict, the hub never took it, and nothing is
+/// allowed to destroy it (D19, E-44).
+///
+/// What is written is the `job_finished` frame itself, so nothing has to be
+/// reinterpreted to replay it (invariant 4). A verdict on a disk is
+/// recoverable; a verdict in the memory of a process that has exited is not.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_runner_stopped_while_holding_a_result_leaves_it_on_disk() {
     let herd = Herd::new();
@@ -850,29 +1176,45 @@ async fn a_runner_stopped_while_holding_a_result_leaves_it_on_disk() {
     let mut runner = herd.start_runner();
     herd.wait_for_runner().await;
 
-    let job = herd.submit("printf 'working\\n'; sleep 120").await;
-    herd.wait_until("the job is running", || {
-        herd.record(&job)["state"]["type"] == "running"
+    let job = herd
+        .submit("printf 'working\\n'; sleep 1; printf 'done\\n'; exit 7")
+        .await;
+    herd.wait_until("the job is running and has printed something", || {
+        herd.record(&job)["state"]["type"] == "running" && herd.log(&job).contains("working")
     })
     .await;
 
     // The hub goes first, so there is nothing left to acknowledge anything.
+    // The job keeps running under the runner, which is D17's whole point.
     hub.signal(rustix::process::Signal::KILL).await;
     assert!(!hub.alive(), "the hub is gone");
     herd.wait_until("the runner has noticed the hub is gone", || {
         herd.said("runner").contains("the link to the hub ended")
     })
     .await;
+    // And now it finishes, with nobody to tell. The result exists in exactly
+    // one place: the memory of this runner.
+    herd.wait_until("the job ended with no hub to tell", || {
+        herd.said("runner")
+            .contains("ended while there was no hub to tell")
+    })
+    .await;
+    assert!(runner.alive(), "D17: a runner outlives its hub");
 
-    // And now the runner is told to stop, with a job still running under it.
-    runner.signal(rustix::process::Signal::TERM).await;
+    // ---- The owner asks it to stop, and it must not leave with the verdict.
+    runner.ask_it_to_stop();
+    let status = tokio::time::timeout(Duration::from_secs(5), runner.gone())
+        .await
+        .unwrap_or_else(|_| {
+            panic!(
+                "invariant 2: a runner asked to stop is gone in five seconds. It said: {}",
+                herd.said("runner")
+            )
+        });
+    assert_eq!(status.code(), Some(0), "{}", herd.said("runner"));
 
     let said = herd.said("runner");
-    assert!(
-        said.contains("SIGTERM received"),
-        "a runner must say it is stopping: {said}"
-    );
-    let held = herd.data_root.path().join("held-results");
+    let held = herd.runner_root("runner").join("held-results");
     let spooled: Vec<PathBuf> = std::fs::read_dir(&held)
         .unwrap_or_else(|error| {
             panic!(
@@ -898,13 +1240,10 @@ async fn a_runner_stopped_while_holding_a_result_leaves_it_on_disk() {
             job_id, outcome, ..
         } => {
             assert_eq!(job_id.as_str(), job, "the frame names the job it is about");
-            assert!(
-                matches!(
-                    outcome,
-                    JobOutcome::Signalled { .. } | JobOutcome::StoppedByCap { .. }
-                ),
-                "the job was ended by the stop, so that is what the verdict says: \
-                 {outcome:?}"
+            assert_eq!(
+                outcome,
+                JobOutcome::Exited { code: 7 },
+                "the job ran to its end, so the real verdict is what is kept"
             );
         }
         other => panic!("a held result is a job_finished frame, not {other:?}"),
@@ -917,11 +1256,169 @@ async fn a_runner_stopped_while_holding_a_result_leaves_it_on_disk() {
     );
     // And nothing invented a verdict the hub was never told: the record is
     // not finished. It reads `running` because this hub was killed outright
-    // and never got to name the interruption; the next hub on this state root
-    // does that, and M3 is what will hand it the file above (D17).
+    // and never got to name the interruption.
     assert_ne!(
         herd.record(&job)["state"]["type"],
         "finished",
         "nothing may claim a verdict the hub was never told"
     );
+}
+
+/// The obligation M4 left open, closed: a spooled verdict reaches the hub by
+/// itself, with no human in the loop (D34).
+///
+/// The runner of the test above wrote a verdict to its data root and exited.
+/// Here a hub comes back on the same state root and a runner comes back on
+/// the same data root — which is a restart, nothing more — and the job's
+/// record ends up carrying the exit code that job really had. Then the file
+/// is gone, because the hub acknowledged it, and only because of that.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_spooled_verdict_reaches_the_hub_when_the_runner_comes_back() {
+    let herd = Herd::new();
+    let mut hub = herd.start_hub("first").await;
+    let mut runner = herd.start_runner();
+    herd.wait_for_runner().await;
+
+    let job = herd
+        .submit("printf 'working\\n'; sleep 1; printf 'done\\n'; exit 7")
+        .await;
+    herd.wait_until("the job is running", || {
+        herd.record(&job)["state"]["type"] == "running" && herd.log(&job).contains("working")
+    })
+    .await;
+    hub.signal(rustix::process::Signal::KILL).await;
+    herd.wait_until("the job ended with no hub to tell", || {
+        herd.said("runner")
+            .contains("ended while there was no hub to tell")
+    })
+    .await;
+    runner.ask_it_to_stop();
+    let _ = tokio::time::timeout(Duration::from_secs(5), runner.gone()).await;
+    let held = herd.runner_root("runner").join("held-results");
+    assert_eq!(
+        std::fs::read_dir(&held).into_iter().flatten().count(),
+        1,
+        "the verdict is on the disk before anything is restarted"
+    );
+
+    // ---- The restart. Nobody tells either process anything about the file.
+    let mut hub = herd.start_hub("second").await;
+    let mut second = herd.start_runner_rooted("the-real-runner", "second-runner", "runner");
+    herd.wait_until("the spooled verdict is picked up", || {
+        herd.said("second-runner").contains("picked up the verdict")
+    })
+    .await;
+    herd.wait_until("the job's record carries the verdict it really had", || {
+        herd.record(&job)["state"]["type"] == "finished"
+    })
+    .await;
+    let record = herd.record(&job);
+    assert_eq!(
+        record["state"]["outcome"],
+        serde_json::json!({"type": "exited", "code": 7}),
+        "the verdict that reached the hub a restart late is the job's own: {record}"
+    );
+
+    // Acknowledged, and only then removed: the file is the one copy until the
+    // hub has it on a disk (D19).
+    herd.wait_until("the spool file is gone once the hub has it", || {
+        std::fs::read_dir(&held).into_iter().flatten().count() == 0
+    })
+    .await;
+    assert!(
+        herd.said("second-runner").contains("been acknowledged"),
+        "delivering a verdict a restart late is said out loud: {}",
+        herd.said("second-runner")
+    );
+
+    // And a requester coming back by id is given that code, not Herd's own.
+    let waited = herd.herdctl(&["wait", &job]).await;
+    assert_eq!(
+        waited.status.code(),
+        Some(7),
+        "{}",
+        String::from_utf8_lossy(&waited.stderr)
+    );
+
+    second.signal(rustix::process::Signal::TERM).await;
+    hub.signal(rustix::process::Signal::TERM).await;
+}
+
+/// The tail gap, with the exact reproduction M4's verification used: `kill -9`
+/// the hub while a job is running, let the job's last line be the one that is
+/// lost, start the hub again, and ask the requester what it got.
+///
+/// Before D36 this was a silently short log reported as a success: the earlier
+/// output, exit 42, and no sign anywhere that a line was missing. A gap is
+/// only detectable when the chunk *after* it arrives, so chunks lost with
+/// nothing following them left the record short and said nothing — the defect
+/// class this project keeps refusing.
+///
+/// What closes it is the chunk count on `job_finished`: the hub learns how
+/// many chunks the attempt wrote, asks for what it is missing, and names the
+/// shortfall in the log if it never comes. So the requester ends with either
+/// the missing line or a marker that says it is gone. Never silence.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_log_that_loses_its_tail_says_so_rather_than_reading_short() {
+    let herd = Herd::new();
+    let mut hub = herd.start_hub("first").await;
+    let mut runner = herd.start_runner();
+    herd.wait_for_runner().await;
+
+    // `before` lands while the hub is up; `after` is written in the instant
+    // the hub does not exist, so it is the tail — and the end follows it with
+    // nothing in between to give the loss away.
+    let job = herd
+        .submit("printf 'before\\n'; sleep 2; printf 'after\\n'; exit 42")
+        .await;
+    herd.wait_until("the first line is recorded", || {
+        herd.log(&job).contains("before")
+    })
+    .await;
+
+    hub.signal(rustix::process::Signal::KILL).await;
+    assert!(!hub.alive(), "the hub is gone");
+    // The job goes on and writes its tail into a link that is not there.
+    herd.wait_until("the runner has noticed the hub is gone", || {
+        herd.said("runner").contains("the link to the hub ended")
+    })
+    .await;
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    assert!(runner.alive(), "D17: a runner outlives its hub");
+
+    let mut hub = herd.start_hub("second").await;
+    herd.wait_until("the job ends on the hub that came back", || {
+        herd.record(&job)["state"]["type"] == "finished"
+    })
+    .await;
+
+    // The verdict is the job's own, and the log is not allowed to be quietly
+    // short: either the line is there, or something names it as lost.
+    let record = herd.record(&job);
+    assert_eq!(
+        record["state"]["outcome"],
+        serde_json::json!({"type": "exited", "code": 42}),
+        "{record}"
+    );
+    let log = herd.log(&job);
+    let names_the_gap = log.contains("missing") || log.contains("output") && log.contains("lost");
+    assert!(
+        log.contains("after") || names_the_gap,
+        "a log that lost its tail must either get it back or say it is gone, \
+         never read short in silence: {log:?}"
+    );
+
+    // And the requester reading it by id sees exactly the same thing: the
+    // exit code the job really had, over a log that is honest about itself.
+    let waited = herd.herdctl(&["wait", &job]).await;
+    assert_eq!(waited.status.code(), Some(42), "{log:?}");
+    let seen = String::from_utf8_lossy(&waited.stdout).into_owned();
+    assert!(seen.contains("before"), "{seen:?}");
+    assert!(
+        seen.contains("after") || seen.contains("missing") || seen.contains("lost"),
+        "the requester must not be handed a short log with nothing said: {seen:?}"
+    );
+
+    runner.signal(rustix::process::Signal::TERM).await;
+    hub.signal(rustix::process::Signal::TERM).await;
 }

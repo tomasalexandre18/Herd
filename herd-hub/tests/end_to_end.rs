@@ -17,7 +17,7 @@ use tokio_tungstenite::tungstenite::Message;
 
 mod support;
 
-use support::{confinement, shell, DataRootDir, Harness};
+use support::{confinement, shell, Harness};
 
 /// What a requester saw, in arrival order.
 #[derive(Default)]
@@ -348,20 +348,77 @@ async fn a_submission_with_no_runner_is_refused_by_name() {
     );
 }
 
+/// D13, and the defect it warned about: a runner the hub has no room for is
+/// told to **stand by**, not refused.
+///
+/// M2 answered a second runner with `Refused`, which is terminal, and a
+/// runner that is refused exits. The commonest way to hit that was not a
+/// second machine at all — it was one runner redialling faster than the hub
+/// noticed its previous connection had gone, so the runner died of its own
+/// reconnection. A peer that waits is not a peer that was refused.
 #[tokio::test]
-async fn a_second_runner_is_refused_in_m1() {
+async fn a_second_runner_is_told_to_stand_by_rather_than_refused() {
     let harness = Harness::with_hub_and_runner().await;
-    let data_root = DataRootDir::new("second-runner");
-    let error = herd_runner::run(herd_runner::Config {
+    let (data_root, confined) = support::prepared_runner("second-runner");
+    let error = herd_runner::serve_once(
+        herd_runner::Config {
+            hub_url: harness.hub_url.clone(),
+            name: Some("the-second-runner".to_owned()),
+            token: None,
+            confinement: confinement(&data_root),
+            ..herd_runner::Config::default()
+        },
+        herd_runner::Session::new(),
+        confined,
+    )
+    .await
+    .expect_err("this hub accepts one runner until M5");
+    let stand_by = error
+        .downcast_ref::<herd_runner::StandBy>()
+        .expect("a runner with no room is asked to wait, never refused (D13)");
+    assert!(
+        stand_by.reason.contains("test-runner"),
+        "the answer must name what the hub is waiting for: {stand_by}"
+    );
+    assert!(
+        error.downcast_ref::<herd_runner::Refusal>().is_none(),
+        "a stand-by must not be a refusal: a refused runner exits"
+    );
+    assert!(
+        stand_by.retry_in > std::time::Duration::ZERO,
+        "and it must say when to come back: {stand_by}"
+    );
+}
+
+/// The same hub, the same runner name, a new connection: the hub drops the
+/// connection it was holding and takes the new one.
+///
+/// This is the case that killed runners in M2. A runner whose link dropped
+/// without the hub noticing — a kill, a NAT timeout — redials within
+/// milliseconds, and the hub still has the old connection registered. Told
+/// "a runner is already connected" with a terminal frame, the runner exited
+/// and its host stopped being part of the herd until someone noticed.
+#[tokio::test]
+async fn the_same_runner_dialling_again_replaces_its_own_dead_connection() {
+    let harness = Harness::with_hub_and_runner().await;
+    // The runner in the harness is called `test-runner`, and this is that
+    // runner coming back: the hub must take it, not turn it away.
+    let session = herd_runner::Session::new();
+    let (data_root, confined) = support::prepared_runner("same-runner-again");
+    let config = herd_runner::Config {
         hub_url: harness.hub_url.clone(),
-        name: Some("the-second-runner".to_owned()),
+        name: Some("test-runner".to_owned()),
         token: None,
         confinement: confinement(&data_root),
-    })
-    .await
-    .expect_err("M1 accepts one runner");
-    assert!(
-        error.to_string().contains("already connected"),
-        "the refusal must say why: {error:#}"
-    );
+        ..herd_runner::Config::default()
+    };
+    let joined =
+        tokio::spawn(async move { herd_runner::serve_once(config, session, confined).await });
+    // It is in, and a job submitted now runs on it: the hub has one runner,
+    // and it is the one that just dialled.
+    let finished = herdctl::run_job(&harness.requester(), shell("printf 'back\\n'"), |_, _| {})
+        .await
+        .expect("the runner that dialled again is the hub's runner now");
+    assert_eq!(finished.outcome, JobOutcome::Exited { code: 0 });
+    joined.abort();
 }

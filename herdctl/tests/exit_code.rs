@@ -75,6 +75,7 @@ impl Harness {
                     name: Some("exit-code-runner".to_owned()),
                     token: None,
                     confinement,
+                    ..herd_runner::Config::default()
                 };
                 async move {
                     let _ = herd_runner::run(config).await;

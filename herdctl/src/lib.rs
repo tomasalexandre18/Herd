@@ -2,14 +2,14 @@
 //!
 //! A requester never names a machine (invariant 6): it says what to run and
 //! the hub decides where. The surface is `run` to submit and follow, `submit`
-//! to fire and leave with the id, and `wait` to come back to an id later;
-//! `cancel` arrives with M3.
+//! to fire and leave with the id, `wait` to come back to an id later, and
+//! `cancel` to ask for a job to be ended wherever it is running (E-06).
 
 use anyhow::{anyhow, bail, Context, Result};
 use futures_util::{SinkExt, StreamExt};
 use herd_proto::{
-    cap_exceeded_reason, from_frame, to_frame, Cap, FromHub, JobId, JobMetrics, JobOutcome,
-    LogStream, Role, ToHub, PROTOCOL_VERSION,
+    cap_stop_reason, from_frame, to_frame, Cap, FromHub, JobId, JobMetrics, JobOutcome, LogStream,
+    Role, ToHub, PROTOCOL_VERSION,
 };
 use tokio::net::TcpStream;
 use tokio_tungstenite::tungstenite::Message;
@@ -76,6 +76,11 @@ pub const STOPPED_BY_CAP_CODE: u8 = 124;
 /// An exit code is worn untouched — 0, 1 and 75 included, as E-02 needs. A
 /// signal becomes `128 + signal`, exactly as a shell reports one, so no
 /// sentinel value is spent on it.
+///
+/// A job that was cancelled, and one whose runner was lost, are both "Herd
+/// cannot give you a verdict" and so both 125 (D20): nobody ran the tests to
+/// the end, and the one mistake a caller must not be able to make is reading
+/// either of those as a failing build.
 pub fn exit_code_for(outcome: &JobOutcome) -> u8 {
     match outcome {
         // A real process code is 0..=255. Anything else came from a peer
@@ -87,17 +92,39 @@ pub fn exit_code_for(outcome: &JobOutcome) -> u8 {
         JobOutcome::Signalled { signal } => {
             128u8.saturating_add(u8::try_from(*signal).unwrap_or(127))
         }
-        JobOutcome::CouldNotStart { .. } => NO_VERDICT_CODE,
+        JobOutcome::CouldNotStart { .. }
+        | JobOutcome::Cancelled { .. }
+        | JobOutcome::Lost { .. } => NO_VERDICT_CODE,
         JobOutcome::StoppedByCap { .. } => STOPPED_BY_CAP_CODE,
+    }
+}
+
+/// Why there is no verdict, when the job's end is one of the ends that is not
+/// a verdict. `None` for an end that is one.
+///
+/// The sentence goes on stderr beside the 125, so that a caller reading a
+/// terminal can tell a cancelled job from a lost one from a build that never
+/// started — the exit code cannot, and is not asked to.
+pub fn no_verdict_reason(outcome: &JobOutcome) -> Option<String> {
+    match outcome {
+        JobOutcome::Cancelled { reason } => Some(format!("this job was cancelled: {reason}")),
+        JobOutcome::Lost { reason } => {
+            Some(format!("the runner executing this job was lost: {reason}"))
+        }
+        _ => None,
     }
 }
 
 /// The one sentence `herdctl` prints on stderr for a job a runner stopped at
 /// a cap. The runner is the subject: the job did not fail, it was stopped.
-pub fn stopped_by_cap_message(cap: Cap, limit: u64) -> String {
+///
+/// `detail` is the cap's own reason when its figure alone would mislead — a
+/// job of four kilobytes "stopped at its disk cap of 21474836480 bytes" being
+/// the case that made the field exist (D30).
+pub fn stopped_by_cap_message(cap: Cap, limit: u64, detail: Option<&str>) -> String {
     format!(
         "this job has no verdict of its own: {}",
-        cap_exceeded_reason(cap, limit)
+        cap_stop_reason(cap, limit, detail)
     )
 }
 
@@ -278,6 +305,35 @@ pub async fn wait_for_job(
     bail!("the hub closed the connection while {job_id} was still running")
 }
 
+/// Ask for a job to be cancelled, and come back with what the hub says
+/// happened (E-06).
+///
+/// A requester never names a machine (invariant 6), here as anywhere: it names
+/// the job, and the hub reaches whichever runner is executing it. The answer is
+/// one sentence, because there are three true answers — it was queued and is
+/// over, it is being ended on its runner, it was already finished — and a
+/// caller that cannot tell them apart would have to guess.
+pub async fn cancel_job(config: &Config, job_id: JobId) -> Result<String> {
+    let mut socket = join(config).await?;
+    send(
+        &mut socket,
+        &ToHub::CancelJob {
+            job_id: job_id.clone(),
+        },
+    )
+    .await
+    .context("asking for the job to be cancelled")?;
+    match next_message(&mut socket).await? {
+        Some(FromHub::JobNote { note, .. }) => {
+            let _ = socket.close(None).await;
+            Ok(note)
+        }
+        Some(FromHub::Refused { reason }) => bail!("the hub refused the cancel: {reason}"),
+        Some(other) => bail!("the hub answered a cancel with {}", message_kind(&other)),
+        None => bail!("the hub closed the connection without answering the cancel"),
+    }
+}
+
 /// Dial the hub and get through the handshake.
 async fn join(config: &Config) -> Result<Socket> {
     let (mut socket, _response) = tokio_tungstenite::connect_async(&config.hub_url)
@@ -327,9 +383,15 @@ fn message_kind(message: &FromHub) -> &'static str {
     match message {
         FromHub::Welcome { .. } => "welcome",
         FromHub::Refused { .. } => "refused",
+        FromHub::StandBy { .. } => "stand_by",
+        FromHub::HealthRecorded {} => "health_recorded",
         FromHub::JobAccepted { .. } => "job_accepted",
         FromHub::AssignJob { .. } => "assign_job",
+        FromHub::CancelJob { .. } => "cancel_job",
+        FromHub::StaleAttempt { .. } => "stale_attempt",
         FromHub::LogChunk { .. } => "log_chunk",
+        FromHub::LogAck { .. } => "log_ack",
+        FromHub::ResendLog { .. } => "resend_log",
         FromHub::JobLog { .. } => "job_log",
         FromHub::JobNote { .. } => "job_note",
         FromHub::JobFinished { .. } => "job_finished",
@@ -404,7 +466,11 @@ mod tests {
     fn a_job_stopped_at_a_cap_is_the_wrapper_s_cap_code() {
         for cap in [Cap::Time, Cap::Memory, Cap::Log, Cap::Disk] {
             assert_eq!(
-                exit_code_for(&JobOutcome::StoppedByCap { cap, limit: 600 }),
+                exit_code_for(&JobOutcome::StoppedByCap {
+                    cap,
+                    limit: 600,
+                    detail: None
+                }),
                 124,
                 "cap {} did not get the cap code",
                 cap.name()
@@ -414,12 +480,39 @@ mod tests {
 
     #[test]
     fn the_cap_sentence_names_the_cap_and_its_figure() {
-        let message = stopped_by_cap_message(Cap::Memory, 2_147_483_648);
+        let message = stopped_by_cap_message(Cap::Memory, 2_147_483_648, None);
         assert!(message.contains("memory"), "{message}");
         assert!(message.contains("2147483648"), "{message}");
         assert!(
             message.contains("no verdict of its own"),
             "a stopped job must not read as a failing one: {message}"
+        );
+    }
+
+    /// Finding 2 of M4's verification: a job that wrote four kilobytes and
+    /// whose workspace could not be measured was told "the runner stopped
+    /// this job at its disk cap of 21474836480 bytes". The figure was true
+    /// and the sentence was a lie, and the real reason was only ever on the
+    /// runner's stderr. The cap now carries it (D30).
+    #[test]
+    fn a_cap_whose_figure_would_mislead_says_what_really_happened() {
+        let message = stopped_by_cap_message(
+            Cap::Disk,
+            21_474_836_480,
+            Some("this runner could not measure the job's workspace"),
+        );
+        assert!(
+            message.contains("could not measure"),
+            "the requester must be told the real reason: {message}"
+        );
+        assert!(
+            message.contains("could not hold it"),
+            "and that the cap is what could not be enforced, not what was \
+             reached: {message}"
+        );
+        assert!(
+            !message.contains("stopped this job at its disk cap"),
+            "the misleading sentence must not be the one printed: {message}"
         );
     }
 

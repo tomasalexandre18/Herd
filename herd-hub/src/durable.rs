@@ -240,6 +240,19 @@ fn temporary_beside(path: &Path) -> PathBuf {
     let unique = TEMPORARIES.fetch_add(1, Ordering::Relaxed);
     path.with_file_name(format!(".{name}.tmp-{}-{unique}", process::id()))
 }
+/// Cut a file back to a length, without waiting for the disk.
+///
+/// One caller, and one reason: a job's log holding the bytes of a chunk the
+/// hub appended and never counted, which the runner is about to send again
+/// (see `JobDirStore::log_at`). Appending it twice would put a paragraph of
+/// the job's output in the log twice, so the uncounted bytes come off first.
+pub fn truncate(path: &Path, length: u64) -> io::Result<()> {
+    OpenOptions::new()
+        .write(true)
+        .truncate(false)
+        .open(path)?
+        .set_len(length)
+}
 
 #[cfg(test)]
 mod tests {

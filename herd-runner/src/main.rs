@@ -8,12 +8,19 @@ use herd_runner::confine::{
 };
 use herd_runner::root::DataRoot;
 use herd_runner::size::parse_bytes;
-use herd_runner::{Config, Confinement, DEFAULT_HUB_URL};
+use herd_runner::{
+    Backoff, Config, Confinement, DEFAULT_HUB_URL, DRAIN_GRACE, HEALTH_EVERY, HUB_SILENCE_LIMIT,
+};
 
 /// A Herd runner: dials the hub, executes jobs under caps, streams their logs.
 ///
 /// Every cap is a number, and every path is a path: there is no policy
 /// language and no plugin here, by design (invariant 1).
+///
+/// Asked to stop — `SIGTERM`, or a Ctrl-C — it drains: it takes no new job,
+/// ends what it is running, says so to the hub, and exits inside five seconds
+/// (invariant 2). A verdict the hub has not acknowledged by then is written
+/// under the data root and delivered on the next start (D34).
 #[derive(Debug, Parser)]
 #[command(name = "herd-runner", version, about)]
 struct Args {
@@ -27,6 +34,26 @@ struct Args {
     /// (invariant 7), so this comes from the environment or the command line.
     #[arg(long, env = "HERD_TOKEN", hide_env_values = true)]
     token: Option<String>,
+    /// Seconds between health reports (E-40).
+    #[arg(long, env = "HERD_HEALTH_EVERY", default_value_t = HEALTH_EVERY.as_secs_f64())]
+    health_every: f64,
+    /// Seconds of silence from the hub after which this link is dead.
+    #[arg(long, env = "HERD_HUB_SILENCE_LIMIT", default_value_t = HUB_SILENCE_LIMIT.as_secs_f64())]
+    hub_silence_limit: f64,
+    /// Seconds before the first redial; it doubles from there.
+    #[arg(long, env = "HERD_REDIAL_FIRST", default_value_t = Backoff::default().first.as_secs_f64())]
+    redial_first: f64,
+    /// The longest a redial delay ever gets, in seconds.
+    #[arg(long, env = "HERD_REDIAL_CAP", default_value_t = Backoff::default().cap.as_secs_f64())]
+    redial_cap: f64,
+    /// Seconds of an unreachable hub after which this runner gives up and
+    /// says so. Long enough to outlast a maintenance window on purpose.
+    #[arg(long, env = "HERD_GIVE_UP_AFTER", default_value_t = Backoff::default().give_up_after.as_secs_f64())]
+    give_up_after: f64,
+    /// Seconds a drain may take before the process exits regardless. Must
+    /// stay under the five seconds invariant 2 promises the owner.
+    #[arg(long, env = "HERD_DRAIN_GRACE", default_value_t = DRAIN_GRACE.as_secs_f64())]
+    drain_grace: f64,
     /// The one directory this runner may write in (E-45). Defaults to
     /// `$XDG_STATE_HOME/herd-runner`, or `~/.local/state/herd-runner`.
     /// A root this runner cannot use is refused at startup, naming it.
@@ -62,6 +89,10 @@ struct Args {
         value_name = "PATH"
     )]
     privileged_helpers: Vec<String>,
+}
+
+fn seconds(value: f64) -> Duration {
+    Duration::try_from_secs_f64(value.max(0.0)).unwrap_or(Duration::ZERO)
 }
 
 #[tokio::main]
@@ -101,6 +132,14 @@ async fn main() -> Result<()> {
         hub_url: args.hub,
         name: args.name,
         token: args.token,
+        health_every: seconds(args.health_every),
+        hub_silence_limit: seconds(args.hub_silence_limit),
+        redial: Backoff {
+            first: seconds(args.redial_first),
+            cap: seconds(args.redial_cap),
+            give_up_after: seconds(args.give_up_after),
+        },
+        drain_grace: seconds(args.drain_grace),
         confinement,
     })
     .await

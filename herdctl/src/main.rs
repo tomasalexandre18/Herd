@@ -6,7 +6,7 @@ use clap::{Parser, Subcommand};
 use herd_proto::{JobId, JobOutcome, LogStream};
 use herdctl::{
     could_not_start_message, exit_code_for, impossible_exit_code_reason, no_verdict_message,
-    stopped_by_cap_message, Config, DEFAULT_HUB_URL, NO_VERDICT_CODE,
+    no_verdict_reason, stopped_by_cap_message, Config, DEFAULT_HUB_URL, NO_VERDICT_CODE,
 };
 
 /// The requester CLI: submit a job, follow its log, exit with its code.
@@ -47,6 +47,16 @@ enum Action {
         /// The id a submission printed.
         job_id: String,
     },
+    /// Ask for a job to be cancelled, wherever it is running (E-06).
+    ///
+    /// The hub reaches the runner executing it; a requester never names a
+    /// machine (invariant 6). Prints what became of the job and exits 0 — the
+    /// job's own exit code belongs to a job that ran to its end, and a
+    /// cancelled one has none.
+    Cancel {
+        /// The id a submission printed.
+        job_id: String,
+    },
 }
 
 /// What a subcommand leaves the process to exit with.
@@ -68,15 +78,29 @@ async fn main() -> ExitCode {
                 JobOutcome::CouldNotStart { reason } => {
                     eprintln!("herdctl: {}", could_not_start_message(reason));
                 }
-                JobOutcome::StoppedByCap { cap, limit } => {
-                    eprintln!("herdctl: {}", stopped_by_cap_message(*cap, *limit));
+                JobOutcome::StoppedByCap { cap, limit, detail } => {
+                    eprintln!(
+                        "herdctl: {}",
+                        stopped_by_cap_message(*cap, *limit, detail.as_deref())
+                    );
                 }
-                JobOutcome::Exited { .. } | JobOutcome::Signalled { .. } => {}
+                JobOutcome::Exited { .. }
+                | JobOutcome::Signalled { .. }
+                // Said below, by no_verdict_reason, with the other ends that
+                // carry no verdict.
+                | JobOutcome::Cancelled { .. }
+                | JobOutcome::Lost { .. } => {}
             }
             // An exit code outside 0..=255 is one no process can have worn,
             // so there is no verdict to report and the reason is said as
             // Herd's own failure, never as the job's (D20).
             if let Some(reason) = impossible_exit_code_reason(&outcome) {
+                eprintln!("herdctl: {}", no_verdict_message(&reason));
+            }
+            // Cancelled, or lost with its runner: a real end, and not one that
+            // carries a verdict. Said in words, because 125 cannot say which
+            // of them it was (D20).
+            if let Some(reason) = no_verdict_reason(&outcome) {
                 eprintln!("herdctl: {}", no_verdict_message(&reason));
             }
             ExitCode::from(exit_code_for(&outcome))
@@ -133,6 +157,11 @@ async fn run(args: Args) -> Result<Done> {
             )
             .await?;
             Ok(Done::Job(finished.outcome))
+        }
+        Action::Cancel { job_id } => {
+            let note = herdctl::cancel_job(&config, JobId::new(job_id)).await?;
+            println!("{note}");
+            Ok(Done::Said)
         }
     }
 }
