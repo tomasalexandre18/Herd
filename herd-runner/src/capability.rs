@@ -288,9 +288,10 @@ impl<'de> serde::de::Visitor<'de> for EveryKey {
         let mut repeated: Option<String> = None;
         while let Some(key) = access.next_key::<String>()? {
             let element = access.next_value::<WithEveryKey>()?;
+            let written_twice = object.contains_key(&key);
             // The key itself, written twice at this level: the case that
             // silently dropped a probe, a kind or an exclusion list.
-            if object.contains_key(&key) && repeated.is_none() {
+            if written_twice && repeated.is_none() {
                 repeated = Some(key.clone());
             }
             // Or a key written twice somewhere under this one.
@@ -299,7 +300,18 @@ impl<'de> serde::de::Visitor<'de> for EveryKey {
                     repeated = Some(format!("{key}.{inner}"));
                 }
             }
-            object.insert(key, element.value);
+            // **The first value is the one kept**, which is the opposite of
+            // what a map does. Nothing is ever *acted* on here — a file with
+            // a duplicate anywhere in it is refused — so the only thing this
+            // value is read for is to say which capability is being refused.
+            // Last-wins made that sentence name a capability the operator had
+            // not written: `{"name":"build","name":"other"}` was refused
+            // naming `"other"`, the value the swallowing map happened to
+            // keep, and an operator looking for `"other"` in a file that says
+            // `build` has been sent to the wrong line.
+            if !written_twice {
+                object.insert(key, element.value);
+            }
         }
         Ok(WithEveryKey {
             value: serde_json::Value::Object(object),
@@ -1336,6 +1348,26 @@ mod tests {
                 "{what} must say what is wrong: {why}"
             );
         }
+
+        // And when `name` itself is the key written twice, the capability
+        // named is the **first** value — the one the operator wrote and
+        // meant. Naming the last sent the operator looking for a capability
+        // that is not in the file: the second value is only there because a
+        // map keeps it, and `{"name":"build","name":"other"}` was refused
+        // naming `"other"`.
+        let why = CapabilityFile::parse(
+            r#"{"capabilities":[
+                {"name":"build","name":"other","kind":{"type":"shared"}}]}"#,
+        )
+        .expect_err("a name written twice is refused");
+        assert!(
+            why.contains("\"build\""),
+            "the refusal names the capability the operator wrote: {why}"
+        );
+        assert!(
+            !why.contains("other"),
+            "and not the one only a swallowing map kept: {why}"
+        );
 
         // And the file's own top-level keys, which serde's own derive
         // refuses — asserted here so that a change of reading cannot drop it
