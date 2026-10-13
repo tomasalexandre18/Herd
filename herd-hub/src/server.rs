@@ -341,6 +341,11 @@ struct State {
     /// loser, as a refused transition, but by then it has already sent the
     /// job to a runner. One pass at a time, and the question "may this job
     /// start" is answered and acted on inside it.
+    ///
+    /// It also keeps a runner's probe snapshot out of the middle of a claim
+    /// ([`State::update_capabilities`]). **Lock order: this before
+    /// [`State::peers`], never the other way**, which is what makes holding
+    /// both safe; nothing taken inside `with_peers` reaches back for this.
     dispatching: Mutex<()>,
 }
 
@@ -586,7 +591,23 @@ impl State {
     /// Take a runner's snapshot of what its probes say, if it is *the*
     /// runner. A frame from a connection whose slot has already been taken
     /// over changes nothing.
+    ///
+    /// Taken under [`State::dispatching`], and that is the whole of it. A
+    /// dispatch pass holds that lock from the moment it asks
+    /// [`State::why_not_now`] to the moment the job is claimed, and the claim
+    /// is not instant: numbering an attempt writes the record, the log's
+    /// counter and a line of `events.jsonl`, and fsyncs each one. A snapshot
+    /// landing inside that window used to be applied at once, so the hub
+    /// *knew* a capability was busy and handed out a job judged free on the
+    /// reading before it — a job starting on a runner an external holder is
+    /// using, which is the one thing E-26 exists to prevent. Serialised, the
+    /// snapshot either precedes the pass, and the job waits, or follows it,
+    /// and the next pass is judged on it. There is no third order.
     fn update_capabilities(&self, outbox: &Outbox, capabilities: Vec<CapabilityState>) -> bool {
+        let _not_inside_a_claim = self
+            .dispatching
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         self.with_peers(|peers| {
             match peers
                 .runner
@@ -2325,5 +2346,240 @@ fn message_kind(message: &ToHub) -> &'static str {
         ToHub::JobFinished { .. } => "job_finished",
         ToHub::Health { .. } => "health",
         ToHub::AttemptAbandoned { .. } => "attempt_abandoned",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::mpsc as std_mpsc;
+
+    use herd_proto::{
+        Availability, BusyProbe, Capability, CapabilityOffer, CapabilityOrigins, LabelSet,
+        OfferedCapability,
+    };
+
+    use super::*;
+    use crate::job::{JobEvent, LogWrite, NewJob, Result as StoreResult};
+    use crate::store::JobDirStore;
+    use herd_proto::LogStream;
+
+    /// A real store with one method held open on command.
+    ///
+    /// Everything is the real [`JobDirStore`] — the records, the fsyncs, the
+    /// transitions — except that `begin_attempt` can be made to sit inside the
+    /// claim before it writes anything. That is how the window this test is
+    /// about is forced open: in production it is as long as three fsyncs, and
+    /// a test that hoped to hit three fsyncs would be a test that passes by
+    /// luck.
+    struct StoreThatHoldsTheClaimOpen {
+        inner: JobDirStore,
+        /// Raised by the dispatch pass when it is inside the window.
+        in_the_window: Arc<AtomicBool>,
+        /// What the pass waits for before it finishes claiming.
+        go_on: Mutex<Option<std_mpsc::Receiver<()>>>,
+    }
+
+    impl JobStore for StoreThatHoldsTheClaimOpen {
+        fn begin_attempt(&self, id: &JobId, runner: &str) -> StoreResult<u32> {
+            self.in_the_window.store(true, Ordering::SeqCst);
+            if let Some(go_on) = self
+                .go_on
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .take()
+            {
+                let _ = go_on.recv();
+            }
+            self.inner.begin_attempt(id, runner)
+        }
+
+        fn state_root_id(&self) -> &str {
+            self.inner.state_root_id()
+        }
+        fn create_job(&self, new: NewJob) -> StoreResult<JobRecord> {
+            self.inner.create_job(new)
+        }
+        fn record_waiting(&self, id: &JobId, reason: &str) -> StoreResult<bool> {
+            self.inner.record_waiting(id, reason)
+        }
+        fn record_state(&self, id: &JobId, state: JobState) -> StoreResult<()> {
+            self.inner.record_state(id, state)
+        }
+        fn record_metrics(&self, id: &JobId, metrics: JobMetrics) -> StoreResult<()> {
+            self.inner.record_metrics(id, metrics)
+        }
+        fn end_attempt(&self, id: &JobId, attempt: u32, reason: &str) -> StoreResult<()> {
+            self.inner.end_attempt(id, attempt, reason)
+        }
+        fn append_log(
+            &self,
+            id: &JobId,
+            stream: LogStream,
+            seq: u64,
+            data: &[u8],
+        ) -> StoreResult<LogWrite> {
+            self.inner.append_log(id, stream, seq, data)
+        }
+        fn chunks_recorded(&self, id: &JobId) -> StoreResult<u64> {
+            self.inner.chunks_recorded(id)
+        }
+        fn name_missing_log(
+            &self,
+            id: &JobId,
+            first_missing: u64,
+            last_missing: u64,
+        ) -> StoreResult<()> {
+            self.inner.name_missing_log(id, first_missing, last_missing)
+        }
+        fn job(&self, id: &JobId) -> StoreResult<Option<JobRecord>> {
+            self.inner.job(id)
+        }
+        fn job_log(&self, id: &JobId) -> StoreResult<Option<Vec<u8>>> {
+            self.inner.job_log(id)
+        }
+        fn job_events(&self, id: &JobId) -> StoreResult<Option<Vec<JobEvent>>> {
+            self.inner.job_events(id)
+        }
+        fn unfinished_jobs(&self) -> StoreResult<Vec<JobRecord>> {
+            self.inner.unfinished_jobs()
+        }
+    }
+
+    /// A runner offering `kvm` behind a lock-file probe, read free.
+    fn offering_kvm_free() -> RunnerCapacity {
+        let offer = CapabilityOffer::new(vec![OfferedCapability::new(
+            Capability::shared("kvm").probed_by(BusyProbe::lock_file("/run/herd/kvm")),
+            CapabilityOrigins::probed(),
+        )])
+        .expect("a valid offer");
+        let mut capacity = RunnerCapacity::new(Some("the-runner".to_owned()), offer);
+        capacity.update(vec![herd_proto::CapabilityState::new(
+            "kvm",
+            Availability::Free,
+        )]);
+        capacity
+    }
+
+    /// E-26, in the one place it is hardest to see: a probe's snapshot and a
+    /// claim judged against the reading before it must not overlap.
+    ///
+    /// The harm is specific. `offer_job` asks `why_not_now`, is told the
+    /// capability is free, and only then claims the job — and claiming it
+    /// writes the record, the log counter and a line of `events.jsonl`, each
+    /// fsynced. A `capabilities_changed` saying `kvm` is busy used to be
+    /// applied the instant it arrived, so for the length of those writes the
+    /// hub held two incompatible facts at once and acted on the stale one: a
+    /// job dispatched onto a capability the hub already knew an external
+    /// holder had taken.
+    ///
+    /// **How the window is forced open.** Not by timing: the store's
+    /// `begin_attempt` is wrapped so that it raises a flag the moment the
+    /// pass is inside the claim and then blocks until this test says go on.
+    /// Everything else is the real store. The snapshot is delivered from a
+    /// second thread *while the pass is in there*, which is the race, and the
+    /// thread records — the instant its own call returns — whether the claim
+    /// had finished. Under the defect that answer is "no": the snapshot was
+    /// applied mid-claim. There is nothing to wait out and nothing to sleep
+    /// for.
+    #[test]
+    fn a_probe_s_snapshot_cannot_land_in_the_middle_of_a_claim() {
+        let dir = tempfile::tempdir().expect("a temporary state directory");
+        let in_the_window = Arc::new(AtomicBool::new(false));
+        let (go_on, wait_for_go_on) = std_mpsc::channel();
+        let store = Arc::new(StoreThatHoldsTheClaimOpen {
+            inner: JobDirStore::open(dir.path()).expect("the state root opens"),
+            in_the_window: Arc::clone(&in_the_window),
+            go_on: Mutex::new(Some(wait_for_go_on)),
+        });
+        let labels = LabelSet::new(["kvm"]).expect("valid labels");
+        store
+            .create_job(NewJob::needing(vec!["true".to_owned()], labels.clone()))
+            .expect("minted");
+
+        let state = Arc::new(State {
+            store: Arc::clone(&store) as Arc<dyn JobStore>,
+            policy: Policy::default(),
+            started: Instant::now(),
+            peers: Mutex::new(Peers::default()),
+            dispatching: Mutex::new(()),
+        });
+        let (outbox, _inbox) = mpsc::unbounded_channel();
+        let (kick, _kicked) = watch::channel(false);
+        assert!(matches!(
+            state.register_runner(
+                "the-runner",
+                Some("run-1"),
+                &outbox,
+                kick,
+                offering_kvm_free()
+            ),
+            Admitted::Yes
+        ));
+        assert_eq!(
+            state.why_not_now(&labels),
+            None,
+            "the reading this claim is about to be judged on is free"
+        );
+
+        // The pass. It stops inside the claim and waits to be let go.
+        let claim_is_over = Arc::new(AtomicBool::new(false));
+        let pass = std::thread::spawn({
+            let (state, claim_is_over) = (Arc::clone(&state), Arc::clone(&claim_is_over));
+            move || {
+                dispatch_queued_jobs(&state).expect("the pass runs");
+                claim_is_over.store(true, Ordering::SeqCst);
+            }
+        });
+        while !in_the_window.load(Ordering::SeqCst) {
+            std::thread::yield_now();
+        }
+
+        // The snapshot, delivered from outside while the claim is open.
+        let snapshot = std::thread::spawn({
+            let (state, claim_is_over) = (Arc::clone(&state), Arc::clone(&claim_is_over));
+            let outbox = outbox.clone();
+            move || {
+                state.update_capabilities(
+                    &outbox,
+                    vec![herd_proto::CapabilityState::new(
+                        "kvm",
+                        Availability::busy("the lock file /run/herd/kvm is there"),
+                    )],
+                );
+                // Read *after* the snapshot was applied, which is the whole
+                // assertion: nothing may have been applied while a claim was
+                // still open.
+                claim_is_over.load(Ordering::SeqCst)
+            }
+        });
+
+        // Let the claim finish. Both orders of this and the line above are
+        // fine: the snapshot thread is either already blocked on the lock or
+        // about to be, and neither can be applied before the pass is done.
+        go_on.send(()).expect("the pass is still there");
+        pass.join().expect("the pass ends");
+        let claim_was_over = snapshot.join().expect("the snapshot lands");
+
+        assert!(
+            claim_was_over,
+            "a probe's snapshot was applied while a claim judged on the \
+             reading before it was still open: the hub knew the capability \
+             was busy and dispatched anyway (E-26)"
+        );
+        // And the claim itself stands, judged on the reading that held when
+        // it was made. The snapshot governs the next pass, not this one.
+        let record = store
+            .unfinished_jobs()
+            .expect("the queue reads")
+            .into_iter()
+            .next()
+            .expect("the job is still there");
+        assert_eq!(record.state, JobState::Assigned);
+        assert_eq!(
+            state.why_not_now(&labels).as_deref().map(|_| "suspended"),
+            Some("suspended"),
+            "and the snapshot is in force for whatever comes next"
+        );
     }
 }
