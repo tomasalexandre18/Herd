@@ -22,14 +22,14 @@
 //! each one into an [`Availability`]. A capability a probe says is busy is
 //! suspended; a job needing it waits and is never failed (D38).
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use herd_proto::{
-    Availability, BusyProbe, Capability, CapabilityError, CapabilityOffer, CapabilityOrigins,
-    CapabilityState, OfferedCapability,
+    Availability, BusyProbe, Capability, CapabilityError, CapabilityKind, CapabilityOffer,
+    CapabilityOrigins, CapabilityState, LabelSet, OfferedCapability,
 };
 use serde::Deserialize;
 
@@ -78,20 +78,27 @@ impl Default for ProbeSettings {
 
 /// A runner's capability configuration, as a file holds it.
 ///
-/// The file is a path given at startup (invariant 7) and its unit is
+/// The file is a path given at startup (invariant 7) and what it declares is
 /// [`herd_proto`]'s own [`Capability`]: the protocol is the contract
-/// (invariant 4), so there is no second shape to keep in step. What the file
-/// does *not* carry is origins — reading it is what makes a capability
+/// (invariant 4), so this carries no shape of its own past the door. What the
+/// file does *not* carry is origins — reading it is what makes a capability
 /// `declared`, and a file that could claim `probed` could claim a device the
 /// host has not got.
-#[derive(Debug, Clone, Default, Deserialize)]
-#[serde(deny_unknown_fields)]
+///
+/// **The reading is strict.** It goes through the private types below, which
+/// refuse an unknown key at every level and name both the key and the
+/// capability that carried it. The protocol's types are not made strict to
+/// achieve that, and must not be: they are a wire contract whose compatibility
+/// stance is its own. A file is the other thing entirely — an operator wrote
+/// it by hand, once, and will not see it again — and `probe` where
+/// `busy_probe` was meant would otherwise offer the capability **unprobed**,
+/// handing out a resource something outside Herd is holding because of one
+/// missing word (E-26).
+#[derive(Debug, Clone, Default)]
 pub struct CapabilityFile {
     /// Capabilities this runner offers because its owner says so.
-    #[serde(default)]
     pub capabilities: Vec<Capability>,
     /// Capabilities this runner refuses, whatever the host has.
-    #[serde(default)]
     pub deny: Vec<String>,
 }
 
@@ -100,8 +107,141 @@ impl CapabilityFile {
     pub fn read(path: &Path) -> Result<Self, String> {
         let text = std::fs::read_to_string(path)
             .map_err(|error| format!("{} cannot be read: {error}", path.display()))?;
-        serde_json::from_str(&text)
-            .map_err(|error| format!("{} is not a capability file: {error}", path.display()))
+        Self::parse(&text)
+            .map_err(|why| format!("{} is not a capability file: {why}", path.display()))
+    }
+
+    /// The same reading, over the text itself, so that what a key refuses can
+    /// be asserted without a file on a disk.
+    ///
+    /// Each capability is taken as JSON first and read strictly second, for
+    /// one reason: serde's own refusal names the key it did not know and
+    /// nothing else, and "unknown field `probe`" in a file of nine
+    /// capabilities is not an answer. The name is lifted out of the raw value
+    /// — which is still there however badly the rest of the entry is spelled —
+    /// so the refusal names the capability too.
+    fn parse(text: &str) -> Result<Self, String> {
+        let shape: FileShape = serde_json::from_str(text).map_err(|error| error.to_string())?;
+        let mut capabilities = Vec::with_capacity(shape.capabilities.len());
+        for raw in shape.capabilities {
+            let named = match raw.get("name").and_then(serde_json::Value::as_str) {
+                Some(name) => format!("the capability {name:?}"),
+                None => "a capability with no name".to_owned(),
+            };
+            let read: FileCapability =
+                serde_json::from_value(raw).map_err(|error| format!("{named}: {error}"))?;
+            capabilities.push(
+                read.into_capability()
+                    .map_err(|error| format!("{named}: {error}"))?,
+            );
+        }
+        Ok(Self {
+            capabilities,
+            deny: shape.deny,
+        })
+    }
+}
+
+/// The file's top level, strictly.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct FileShape {
+    #[serde(default)]
+    capabilities: Vec<serde_json::Value>,
+    #[serde(default)]
+    deny: Vec<String>,
+}
+
+/// One capability as a file spells it: every key known, nothing ignored.
+///
+/// A mirror of [`Capability`], and the test
+/// `the_file_reads_every_shape_the_protocol_can_write` is what keeps it one:
+/// it writes each shape with the protocol's own serialiser and reads it back
+/// through here, so a field added to `Capability` without a field added here
+/// turns red rather than becoming a key this file quietly refuses.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct FileCapability {
+    name: String,
+    kind: FileKind,
+    #[serde(default)]
+    excludes: Vec<String>,
+    #[serde(default)]
+    busy_probe: Option<FileProbe>,
+}
+
+impl FileCapability {
+    fn into_capability(self) -> Result<Capability, CapabilityError> {
+        let capability = Capability {
+            name: self.name,
+            kind: self.kind.into(),
+            excludes: LabelSet::new(self.excludes)?,
+            busy_probe: self.busy_probe.map(BusyProbe::from),
+        };
+        // Refused here as well as in `offer`, so that a bad capability in a
+        // file is a bad capability whoever reads it.
+        capability.check()?;
+        Ok(capability)
+    }
+}
+
+/// [`CapabilityKind`] as a file spells it.
+#[derive(Debug, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
+enum FileKind {
+    Exclusive,
+    Counted { slots: u32 },
+    Shared,
+}
+
+impl From<FileKind> for CapabilityKind {
+    fn from(kind: FileKind) -> Self {
+        match kind {
+            FileKind::Exclusive => CapabilityKind::Exclusive,
+            FileKind::Counted { slots } => CapabilityKind::Counted { slots },
+            FileKind::Shared => CapabilityKind::Shared,
+        }
+    }
+}
+
+/// [`BusyProbe`] as a file spells it, exit-code defaults included.
+#[derive(Debug, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
+enum FileProbe {
+    LockFile {
+        path: String,
+    },
+    Command {
+        command: Vec<String>,
+        #[serde(default = "busy_exit_code")]
+        busy_exit_code: i32,
+        #[serde(default = "free_exit_code")]
+        free_exit_code: i32,
+    },
+}
+
+fn busy_exit_code() -> i32 {
+    herd_proto::capability::DEFAULT_BUSY_EXIT_CODE
+}
+
+fn free_exit_code() -> i32 {
+    herd_proto::capability::DEFAULT_FREE_EXIT_CODE
+}
+
+impl From<FileProbe> for BusyProbe {
+    fn from(probe: FileProbe) -> Self {
+        match probe {
+            FileProbe::LockFile { path } => BusyProbe::LockFile { path },
+            FileProbe::Command {
+                command,
+                busy_exit_code,
+                free_exit_code,
+            } => BusyProbe::Command {
+                command,
+                busy_exit_code,
+                free_exit_code,
+            },
+        }
     }
 }
 
@@ -151,6 +291,13 @@ pub fn detect_among(table: &[(&str, &str)]) -> Vec<String> {
 /// all of them; a declaration's kind, exclusions and probe win over the plain
 /// `shared` a detection implies, because the owner wrote them down; and
 /// denial makes the entry unofferable without making it invisible.
+///
+/// **One name is declared once.** Two declarations of `build` are two
+/// different capabilities claiming one name — a kind, an exclusion list and a
+/// probe each — and nothing can choose between them: taking the last would
+/// silently drop the exclusion the first declared, which is a guard an
+/// operator wrote down and believes is in force. So it is refused here,
+/// naming the name, before the runner dials.
 pub fn offer(
     detected: &[String],
     declared: Vec<Capability>,
@@ -167,9 +314,19 @@ pub fn offer(
             ),
         );
     }
+    // Declaring a name the host also has is not a duplicate: that is the
+    // merge this function exists for. Declaring it twice is.
+    let mut names_declared: BTreeSet<String> = BTreeSet::new();
     for capability in declared {
         capability.check()?;
         let name = capability.name.clone();
+        if !names_declared.insert(name.clone()) {
+            return Err(CapabilityError::new(format!(
+                "{name} is declared twice; one runner offers a capability \
+                 under one name, with one kind, one exclusion list and one \
+                 probe"
+            )));
+        }
         let probed = entries.get(&name).is_some_and(|found| found.origins.probed);
         entries.insert(
             name,
@@ -742,6 +899,152 @@ mod tests {
             .excludes
             .contains("build"));
         assert!(offer.inert_exclusions().is_empty());
+    }
+
+    /// A key this file does not know refuses the runner's startup, naming the
+    /// key and the capability that carried it.
+    ///
+    /// This is the defect that made the strict reading necessary, verbatim:
+    /// `probe` where `busy_probe` was meant. Read permissively, it offers
+    /// `metal-pc` **unprobed** — the external holder is never asked about, a
+    /// job lands on a machine someone is using bare, and the whole of E-26 is
+    /// defeated by one missing word in a file nobody looks at twice.
+    #[test]
+    fn an_unknown_key_refuses_the_file_naming_the_key_and_the_capability() {
+        let typo = r#"{"capabilities":[
+            {"name":"metal-pc","kind":{"type":"counted","slots":1},
+             "probe":{"type":"lock_file","path":"/run/metal-pc"}}
+        ]}"#;
+        let why = CapabilityFile::parse(typo).expect_err("`probe` is not `busy_probe`");
+        assert!(why.contains("probe"), "the key must be named: {why}");
+        assert!(
+            why.contains("metal-pc"),
+            "the capability must be named: {why}"
+        );
+
+        // And at every level: inside the kind, inside the probe, and in an
+        // entry with no name at all.
+        for (what, text, expected) in [
+            (
+                "a key inside a kind",
+                r#"{"capabilities":[{"name":"build","kind":{"type":"counted","slots":1,"slot":2}}]}"#,
+                "build",
+            ),
+            (
+                "a key inside a probe",
+                r#"{"capabilities":[{"name":"metal-pc","kind":{"type":"shared"},
+                   "busy_probe":{"type":"lock_file","path":"/run/l","paths":[]}}]}"#,
+                "metal-pc",
+            ),
+            (
+                "an entry with no name",
+                r#"{"capabilities":[{"kind":{"type":"shared"}}]}"#,
+                "a capability with no name",
+            ),
+            (
+                "a key at the top level",
+                r#"{"capabilities":[],"capabilites":[]}"#,
+                "capabilites",
+            ),
+        ] {
+            let why = CapabilityFile::parse(text)
+                .err()
+                .unwrap_or_else(|| panic!("{what} must be refused, not ignored"));
+            assert!(why.contains(expected), "{what} must name {expected}: {why}");
+        }
+    }
+
+    /// The file's shape is the protocol's shape, and this is what keeps it so.
+    ///
+    /// Every capability the protocol can write is written with the protocol's
+    /// own serialiser and read back through the file's strict types. A field
+    /// added to [`Capability`] and not to [`FileCapability`] fails here —
+    /// loudly, once — instead of becoming a declaration this file silently
+    /// refuses.
+    #[test]
+    fn the_file_reads_every_shape_the_protocol_can_write() {
+        let shapes = vec![
+            Capability::shared("plain"),
+            Capability::exclusive("nightly"),
+            Capability::counted("build", 4),
+            Capability::lease("metal-pc", BusyProbe::lock_file("/run/metal-pc.lease")),
+            Capability::shared("probed").probed_by(BusyProbe::Command {
+                command: vec!["/bin/true".to_owned(), "--check".to_owned()],
+                busy_exit_code: 3,
+                free_exit_code: 9,
+            }),
+            Capability::counted("excluding", 2)
+                .excluding(["nightly", "build"])
+                .expect("a valid exclusion"),
+        ];
+        for capability in shapes {
+            let text = serde_json::to_string(&serde_json::json!({
+                "capabilities": [capability.clone()],
+            }))
+            .expect("the protocol's own type serializes");
+            let read = CapabilityFile::parse(&text)
+                .unwrap_or_else(|why| panic!("the file must read what the protocol writes: {why}"));
+            assert_eq!(read.capabilities, vec![capability]);
+        }
+    }
+
+    /// Two declarations of one name are two capabilities claiming it, and
+    /// nothing can choose between them.
+    ///
+    /// Read as "the last one wins", `build` declared `exclusive` excluding
+    /// `kvm` and then `counted(9)` starts a runner whose exclusion is gone —
+    /// a guard its owner wrote down and believes is in force. Refused by
+    /// name, at startup.
+    #[test]
+    fn a_capability_declared_twice_is_refused_by_name() {
+        let error = offer(
+            &[],
+            vec![
+                Capability::exclusive("build")
+                    .excluding(["kvm"])
+                    .expect("a valid exclusion"),
+                Capability::shared("kvm"),
+                Capability::counted("build", 9),
+            ],
+            &[],
+        )
+        .expect_err("build is declared twice");
+        assert!(error.to_string().contains("build"), "{error}");
+        assert!(error.to_string().contains("twice"), "{error}");
+
+        // The same name detected *and* declared is not a duplicate: that is
+        // the merge of origins E-24 asks for.
+        let offer = offer(
+            &["kvm".to_owned()],
+            vec![Capability::counted("kvm", 2)],
+            &[],
+        )
+        .expect("a detection and a declaration of one name are one entry");
+        assert_eq!(offer.report(), vec!["kvm: present, declared".to_owned()]);
+    }
+
+    /// And the same through the file, which is where it will be written.
+    #[test]
+    fn a_file_declaring_one_name_twice_stops_the_runner() {
+        let dir = crate::testing::TempDir::new("declared-twice");
+        let path = dir.path().join("capabilities.json");
+        std::fs::write(
+            &path,
+            br#"{"capabilities":[
+                {"name":"build","kind":{"type":"exclusive"},"excludes":["kvm"]},
+                {"name":"kvm","kind":{"type":"shared"}},
+                {"name":"build","kind":{"type":"counted","slots":9}}
+            ]}"#,
+        )
+        .expect("written");
+        let config = CapabilityConfig {
+            file: Some(path),
+            detect: false,
+            ..CapabilityConfig::default()
+        };
+        let error = config.resolve().expect_err("build is declared twice");
+        assert!(error.contains("build"), "{error}");
+        assert!(error.contains("twice"), "{error}");
     }
 
     #[test]

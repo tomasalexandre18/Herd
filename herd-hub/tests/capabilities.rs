@@ -698,6 +698,40 @@ async fn a_capability_file_that_does_not_read_stops_the_runner_naming_it() {
             Some(r#"{"capabilities":[],"capabilites":[]}"#),
             "is not a capability file",
         ),
+        // The one that matters most: `probe` where `busy_probe` was meant.
+        // Read permissively, this runner would offer `metal-pc` unprobed and
+        // hand it to a job while something outside Herd held it (E-26). The
+        // refusal names the key and the capability.
+        (
+            "misspelled-probe.json",
+            Some(
+                r#"{"capabilities":[{"name":"metal-pc",
+                   "kind":{"type":"counted","slots":1},
+                   "probe":{"type":"lock_file","path":"/run/metal-pc"}}]}"#,
+            ),
+            "probe",
+        ),
+        (
+            "misspelled-probe-names-it.json",
+            Some(
+                r#"{"capabilities":[{"name":"metal-pc",
+                   "kind":{"type":"counted","slots":1},
+                   "probe":{"type":"lock_file","path":"/run/metal-pc"}}]}"#,
+            ),
+            "metal-pc",
+        ),
+        // And a name declared twice, whose second declaration would otherwise
+        // drop the exclusion the first one wrote down.
+        (
+            "declared-twice.json",
+            Some(
+                r#"{"capabilities":[
+                   {"name":"build","kind":{"type":"exclusive"},"excludes":["kvm"]},
+                   {"name":"kvm","kind":{"type":"shared"}},
+                   {"name":"build","kind":{"type":"counted","slots":9}}]}"#,
+            ),
+            "build is declared twice",
+        ),
     ] {
         let path = herd.run.path().join(name);
         if let Some(contents) = contents {
