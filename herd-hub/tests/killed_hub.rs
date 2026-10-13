@@ -1529,8 +1529,17 @@ async fn a_verdict_planted_in_another_runner_s_spool_is_refused_by_name() {
     )
     .expect("the fixture writes the planted verdict");
 
-    x.signal(rustix::process::Signal::KILL).await;
+    // `runner-y` is started *before* the kill, so that it is dialling —
+    // standing by, this hub taking one runner until M5 — and is admitted the
+    // moment the slot frees. Starting it afterwards would race the attempt's
+    // own clock: a process start on a loaded machine against a three-second
+    // threshold, and the frame would arrive refused for the other reason.
     let mut y = herd.start_runner_called("runner-y", "runner-y");
+    herd.wait_until("runner-y is dialling and being asked to wait", || {
+        herd.said("runner-y").contains("stand by")
+    })
+    .await;
+    x.signal(rustix::process::Signal::KILL).await;
 
     herd.wait_until("the hub refuses the planted verdict by name", || {
         herd.said("first").contains(&format!(
