@@ -315,6 +315,7 @@ async fn a_version_mismatch_is_refused_naming_both_versions() {
             capabilities: Default::default(),
             host: herd_proto::HostSize::default(),
             preference: 0,
+            load_milli: None,
         };
         socket
             .send(Message::text(to_frame(&hello).expect("hello encodes")))

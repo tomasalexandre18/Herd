@@ -177,12 +177,27 @@ pub fn impossible_exit_code_reason(outcome: &JobOutcome) -> Option<String> {
 /// something outside Herd is holding stays queued and says so through
 /// `on_note`; it is never refused for it (E-26, D38), so a caller that ignores
 /// notes simply waits.
+/// What a requester declares about one job's resources (E-22, E-29, E-31).
+///
+/// One struct rather than three arguments carried side by side: they are
+/// three answers to one question — how much of a machine this job needs — and
+/// the hub refuses two of them given together.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct Declared {
+    /// How much memory one build thread needs, in MiB (E-22).
+    pub build_thread_mib: Option<u32>,
+    /// How much memory the whole job needs, in MiB (E-29).
+    pub memory_mib: Option<u64>,
+    /// How much tmpfs it reserves while it runs, in MiB (E-31).
+    pub tmpfs_mib: Option<u64>,
+}
+
 pub async fn run_job(
     config: &Config,
     command: Vec<String>,
     labels: LabelSet,
     priority: Priority,
-    build_thread_mib: Option<u32>,
+    declared: Declared,
     mut on_log: impl FnMut(LogStream, &[u8]),
     mut on_note: impl FnMut(&str),
 ) -> Result<Finished> {
@@ -196,7 +211,9 @@ pub async fn run_job(
             command,
             labels,
             priority,
-            build_thread_mib,
+            build_thread_mib: declared.build_thread_mib,
+            memory_mib: declared.memory_mib,
+            tmpfs_mib: declared.tmpfs_mib,
         },
     )
     .await
@@ -250,7 +267,7 @@ pub async fn submit_job(
     command: Vec<String>,
     labels: LabelSet,
     priority: Priority,
-    build_thread_mib: Option<u32>,
+    declared: Declared,
 ) -> Result<JobId> {
     if command.is_empty() {
         bail!("a job needs a command to run");
@@ -262,7 +279,9 @@ pub async fn submit_job(
             command,
             labels,
             priority,
-            build_thread_mib,
+            build_thread_mib: declared.build_thread_mib,
+            memory_mib: declared.memory_mib,
+            tmpfs_mib: declared.tmpfs_mib,
         },
     )
     .await
@@ -416,6 +435,8 @@ async fn join(config: &Config) -> Result<Socket> {
             // (E-22, E-19).
             host: herd_proto::HostSize::default(),
             preference: 0,
+            // Nor does a requester measure anything about a host (E-32).
+            load_milli: None,
             // Neither belongs to a requester. It holds nothing between
             // connections — no attempt, no spooled verdict — so there is
             // nothing for the hub to tell apart and nothing to attribute to a

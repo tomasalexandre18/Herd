@@ -40,7 +40,16 @@ pub use herd_proto::JobMetrics;
 /// asked for no derived `-j`" from "this record predates the question". A
 /// pre-M7 state root is refused by name, with both figures, and no migration
 /// is written for it (D73).
-pub const RECORD_VERSION: u32 = 3;
+///
+/// 4 since M8: a record carries the whole-job memory and the tmpfs its
+/// requester declared (E-29, E-31). Required fields, and this time the reason
+/// is load-bearing twice over: a running job's **declared** need is what
+/// admission subtracts from the next job's room, read back off the record at
+/// the start of every pass (D79), and a record that defaulted its two figures
+/// to zero would read as a job holding nothing while it held gibibytes. A
+/// pre-M8 state root is refused by name and no migration is written for it
+/// (D73).
+pub const RECORD_VERSION: u32 = 4;
 
 /// A moment, as the record files carry it: RFC 3339 in UTC, to the
 /// nanosecond. A string a human and the consumer can both read, so that a
@@ -215,6 +224,10 @@ pub struct NewJob {
     /// requester asked for a derived `-j` (E-22). See
     /// [`herd_proto::ToHub::SubmitJob`].
     pub build_thread_mib: Option<u32>,
+    /// How much memory the whole job needs, in MiB (E-29).
+    pub memory_mib: Option<u64>,
+    /// How much tmpfs it reserves while it runs, in MiB (E-31).
+    pub tmpfs_mib: Option<u64>,
 }
 
 impl NewJob {
@@ -242,6 +255,8 @@ impl NewJob {
             labels,
             priority,
             build_thread_mib: None,
+            memory_mib: None,
+            tmpfs_mib: None,
         }
     }
 
@@ -249,6 +264,14 @@ impl NewJob {
     /// derives this job's `-j` from whatever machine it lands on (E-22).
     pub fn with_build_thread_mib(mut self, mib: Option<u32>) -> Self {
         self.build_thread_mib = mib;
+        self
+    }
+
+    /// The whole-job memory and the tmpfs the requester declared (E-29,
+    /// E-31). Both optional and neither read as zero when absent.
+    pub fn with_admission(mut self, memory_mib: Option<u64>, tmpfs_mib: Option<u64>) -> Self {
+        self.memory_mib = memory_mib;
+        self.tmpfs_mib = tmpfs_mib;
         self
     }
 
@@ -329,6 +352,29 @@ pub struct JobRecord {
     /// record written before the question existed. The figure is the
     /// requester's; the `-j` derived from it is the field below.
     pub build_thread_mib: Option<u32>,
+    /// How much memory this whole job declares it needs, in MiB (E-29).
+    ///
+    /// The figure admission weighs, and — once the job is out on a runner —
+    /// the figure the **next** job's admission subtracts, read back off this
+    /// record at the start of every pass (D79). It is the *declaration* and
+    /// never a measurement: a job admitted a second ago has allocated nothing
+    /// yet, so costing what a job uses would let a second job in beside it
+    /// and let both then grow. A job that exceeds its declaration is stopped
+    /// by M4's cap, which is what makes the declaration the honest unit.
+    ///
+    /// Mutually exclusive with [`JobRecord::build_thread_mib`], which is the
+    /// per-thread figure a build declares: the whole-job need of such a job is
+    /// that figure times the `-j` it was given.
+    pub memory_mib: Option<u64>,
+    /// How much room on its runner's tmpfs this job reserves while it runs,
+    /// in MiB (E-31).
+    ///
+    /// Reserved before the job starts and released by the write that ends the
+    /// job, because the reservation *is* this field on a record whose attempt
+    /// is open — there is no counter to decrement and so none to leak (D79).
+    /// `Some(0)` is a real declaration and so is absence: the first
+    /// consumer's `build` and `check` need no tmpfs at all.
+    pub tmpfs_mib: Option<u64>,
     /// The `-j` this job was actually given, derived from the machine the hub
     /// placed it on (E-22). `None` until it is placed, and `None` for ever on
     /// a job that asked for no derivation.
@@ -402,6 +448,48 @@ impl JobRecord {
     /// every start, through this.
     pub fn dedup_key(&self) -> String {
         dedup_key(&self.command, &self.labels)
+    }
+
+    /// How much memory this job declares it needs, in MiB, given the `-j` it
+    /// has been or would be given (E-29).
+    ///
+    /// Three answers, and the third is the one that matters. `Ok(Some(mib))`
+    /// is a declared figure. `Ok(None)` is a job that declares no memory need
+    /// at all, which is a real state — `herdctl submit -- true` — and is
+    /// admitted on its capabilities alone. `Err` is a need that **cannot be
+    /// costed**: a job declaring what one build thread needs, with no `-j` to
+    /// multiply it by. That is never read as zero, here or anywhere: a job out
+    /// on a runner whose holding cannot be costed stops the hub admitting
+    /// anything more there, by name, rather than reading as a machine holding
+    /// nothing.
+    pub fn memory_need_mib(
+        &self,
+        threads: Option<u32>,
+    ) -> std::result::Result<Option<u64>, String> {
+        if let Some(mib) = self.memory_mib {
+            return Ok(Some(mib));
+        }
+        let Some(per_thread) = self.build_thread_mib else {
+            return Ok(None);
+        };
+        match threads {
+            Some(threads) => Ok(Some(u64::from(per_thread) * u64::from(threads))),
+            None => Err(format!(
+                "it needs {per_thread} MiB per build thread and no -j is known for it, so what \
+                 it holds cannot be costed"
+            )),
+        }
+    }
+
+    /// The same, for a job that is already out on a runner: the `-j` on its
+    /// own record is the figure it was given (D82).
+    pub fn memory_held_mib(&self) -> std::result::Result<Option<u64>, String> {
+        self.memory_need_mib(self.parallelism)
+    }
+
+    /// The tmpfs this job reserves, in MiB (E-31). Absent is no reservation.
+    pub fn tmpfs_need_mib(&self) -> u64 {
+        self.tmpfs_mib.unwrap_or(0)
     }
 
     /// The attempt that is current, if one is.

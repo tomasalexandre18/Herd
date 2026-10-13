@@ -100,7 +100,7 @@ impl Harness {
             // enforces, never labels (M5 keeps them apart).
             herd_proto::LabelSet::default(),
             herd_proto::Priority::Step,
-            None,
+            herdctl::Declared::default(),
             |stream, data| match stream {
                 LogStream::Stdout => out.push_str(&String::from_utf8_lossy(data)),
                 LogStream::Stderr => err.push_str(&String::from_utf8_lossy(data)),
@@ -1003,7 +1003,7 @@ async fn the_runner_binds_no_listening_socket() {
             shell("sleep 1.5"),
             herd_proto::LabelSet::default(),
             herd_proto::Priority::Step,
-            None,
+            herdctl::Declared::default(),
             |_, _| {},
             |_| {},
         )
@@ -1119,7 +1119,7 @@ impl RealRunner {
                 command,
                 herd_proto::LabelSet::default(),
                 herd_proto::Priority::Step,
-                None,
+                herdctl::Declared::default(),
                 |_, _| {},
                 |_| {},
             )

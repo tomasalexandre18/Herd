@@ -6,7 +6,7 @@ use anyhow::{Context, Result};
 use clap::Parser;
 use herd_hub::{
     Hub, JobDirStore, JobStore, Policy, Stickiness, AGING_STEP, DEFAULT_LISTEN_ADDR, LOST_AFTER,
-    STICKINESS_LIMIT,
+    STICKINESS_LIMIT, WAIT_RESTATEMENT,
 };
 use herd_proto::HEALTH_EVERY;
 
@@ -60,6 +60,16 @@ struct Args {
     /// stickiness off.
     #[arg(long, env = "HERD_STICKINESS_LIMIT", default_value_t = STICKINESS_LIMIT.as_secs_f64())]
     stickiness_limit: f64,
+    /// Seconds between two tellings of why a queued job is still waiting,
+    /// to whoever is following it (E-04).
+    ///
+    /// E-04 asks for "at least every 60 s", which is the default. It is a
+    /// setting because both ways of failing it are real: a rarer cadence
+    /// leaves a ten-minute wait in silence, and a line per dispatch pass
+    /// fills a transcript with hundreds of identical sentences. Over a wait
+    /// of W a follower gets at most W / this + 1 lines. Zero is refused.
+    #[arg(long, env = "HERD_WAIT_RESTATEMENT", default_value_t = WAIT_RESTATEMENT.as_secs_f64())]
+    wait_restatement: f64,
 }
 
 /// Seconds as a duration, with a negative figure read as zero rather than
@@ -92,6 +102,7 @@ async fn main() -> Result<()> {
         stickiness: Stickiness {
             limit: seconds(args.stickiness_limit),
         },
+        wait_restatement: seconds(args.wait_restatement),
         ..Policy::default()
     };
     let state_root_id = store.state_root_id().to_owned();
@@ -102,7 +113,8 @@ async fn main() -> Result<()> {
         "herd-hub {} listening on ws://{}, state in {} ({state_root_id}), \
          {unfinished} job(s) not over, {} quarantined, a runner reporting every {:?} is \
          lost after {:?}, a queued job rising one priority level every {:?}, and waiting \
-         up to {:?} for the runner it is sticking to before it is placed elsewhere",
+         up to {:?} for the runner it is sticking to before it is placed elsewhere, and \
+         saying again every {:?} why a job it is following is still queued",
         herd_hub::hub_version(),
         hub.local_addr(),
         args.state_dir.display(),
@@ -111,6 +123,7 @@ async fn main() -> Result<()> {
         policy.lost_after,
         policy.aging_step,
         policy.stickiness.limit,
+        policy.wait_restatement,
     );
     hub.serve().await
 }

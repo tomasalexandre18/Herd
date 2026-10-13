@@ -57,6 +57,23 @@ enum Action {
         /// refused by name rather than run with a figure nothing was told.
         #[arg(long, value_name = "MIB")]
         build_thread_mib: Option<u32>,
+        /// How much memory this whole job needs, in MiB (E-29).
+        ///
+        /// What admission weighs it at on whatever machine it goes to: a
+        /// runner takes it only if its memory, less the floor it keeps for
+        /// itself, less what the jobs already out there declared, covers
+        /// this. Not given together with `--build-thread-mib`, which is the
+        /// per-thread figure a build declares instead.
+        #[arg(long, value_name = "MIB")]
+        memory_mib: Option<u64>,
+        /// How much room on the runner's tmpfs this job reserves while it
+        /// runs, in MiB (E-31).
+        ///
+        /// Reserved before it starts and released when it ends, however it
+        /// ends. A job that cannot be given the room **waits**; one asking
+        /// for more than a machine has in all is never sent there.
+        #[arg(long, value_name = "MIB")]
+        tmpfs_mib: Option<u64>,
         /// The command, after `--`.
         #[arg(trailing_var_arg = true, required = true, num_args = 1..)]
         command: Vec<String>,
@@ -78,6 +95,23 @@ enum Action {
         /// See `herdctl run --help`.
         #[arg(long, value_name = "MIB")]
         build_thread_mib: Option<u32>,
+        /// How much memory this whole job needs, in MiB (E-29).
+        ///
+        /// What admission weighs it at on whatever machine it goes to: a
+        /// runner takes it only if its memory, less the floor it keeps for
+        /// itself, less what the jobs already out there declared, covers
+        /// this. Not given together with `--build-thread-mib`, which is the
+        /// per-thread figure a build declares instead.
+        #[arg(long, value_name = "MIB")]
+        memory_mib: Option<u64>,
+        /// How much room on the runner's tmpfs this job reserves while it
+        /// runs, in MiB (E-31).
+        ///
+        /// Reserved before it starts and released when it ends, however it
+        /// ends. A job that cannot be given the room **waits**; one asking
+        /// for more than a machine has in all is never sent there.
+        #[arg(long, value_name = "MIB")]
+        tmpfs_mib: Option<u64>,
         /// The command, after `--`.
         #[arg(trailing_var_arg = true, required = true, num_args = 1..)]
         command: Vec<String>,
@@ -183,6 +217,8 @@ async fn run(args: Args) -> Result<Done> {
             labels,
             priority,
             build_thread_mib,
+            memory_mib,
+            tmpfs_mib,
             command,
         } => {
             // Said out loud, on stderr, before anything runs: a level is
@@ -197,7 +233,11 @@ async fn run(args: Args) -> Result<Done> {
                 command,
                 labels_of(labels)?,
                 priority,
-                build_thread_mib,
+                herdctl::Declared {
+                    build_thread_mib,
+                    memory_mib,
+                    tmpfs_mib,
+                },
                 |stream, data| match stream {
                     LogStream::Stdout => write_now(&mut std::io::stdout(), data),
                     LogStream::Stderr => write_now(&mut std::io::stderr(), data),
@@ -213,6 +253,8 @@ async fn run(args: Args) -> Result<Done> {
             labels,
             priority,
             build_thread_mib,
+            memory_mib,
+            tmpfs_mib,
             command,
         } => {
             eprintln!("herdctl: {}", submitting_at(priority));
@@ -221,7 +263,11 @@ async fn run(args: Args) -> Result<Done> {
                 command,
                 labels_of(labels)?,
                 priority,
-                build_thread_mib,
+                herdctl::Declared {
+                    build_thread_mib,
+                    memory_mib,
+                    tmpfs_mib,
+                },
             )
             .await?;
             // The id alone on stdout, so that `id=$(herdctl submit -- ...)`
