@@ -2555,3 +2555,97 @@ is one command's own connection and nothing else waits on it, but it has not
 been measured under a fleet being switched off at once.
 
 ---
+
+## 2026-10-13 — D100 A test asserts only what it established
+
+**Context.** Two of M9's tests have now gone red on the two-core CI host and
+green on this twelve-thread one, and neither failure was caused by the change
+under test — the second one failed on a pull request containing nothing but
+documentation. D99 was the first and it was a real product defect. The second
+was not: `herdctl switch` said `wsl-pc: off (she is gaming), 2 jobs running
+there finish`, which is true, correct and correctly pluralised, and the test
+demanded the literal `1 job running there finishes`. The test had created one
+job; the other was its own: the loop that establishes "the hub has stopped
+claiming" submits a job every 50 ms, and on a slow host one of those was
+claimed before the switch moved.
+
+That is one instance of one mistake, and the file was full of it. Sweeping it
+under `taskset -c 0,1` with five spinning processes on the same two cores
+turned up **six** failures across seven tests in `owner_control.rs`, plus one
+in `herd-hub`'s own unit tests, every one of them a test asserting something
+it had not established.
+
+**Choice.** A test may assert a figure, a sentence or an ordering only when it
+put that state there itself. Four rules, and the fixtures to keep them.
+
+* **Hold work with a file, never a `sleep`.**
+  `a_job_held_until_the_test_says_so` returns a script that waits for a
+  path the test creates. Six jobs that were `sleep 2` or `sleep 3` are now
+  held until the assertions about them are done. A `sleep` is a guess about
+  how long an assertion takes, and the guess is wrong on a loaded host in the
+  one direction that matters: the job ends first, and what is then asserted
+  is a machine with nothing on it.
+* **Make the count a fact of the fixture.** The machine in the switch test
+  has one build slot and nothing detected, the job in flight is a build, and
+  so are the probes — so every probe the hub accepts queues instead of being
+  claimed, and the only thing ever running there is the job the test started.
+  The assertion is now the **whole line**, `wsl-pc: off (she is gaming), 1 job
+  running there finishes`: the machine, her own words, the figure, and
+  *finishes* rather than dying, which is the whole difference between her
+  switch and a shutdown. A regex that passed on any number would have made
+  CI green and the test worthless.
+* **Wait on the hub's view, not on what a runner printed.** `joining` and
+  `switch says off` are a runner's own news, printed before the hub has the
+  connection. Three tests read them as permission to submit; one of them then
+  read "no runner is connected" as the refusal it was looking for, and another
+  read a job id that had never been minted. `until_the_fleet_says` waits for
+  `herdctl switch` to say exactly one line, and
+  `until_a_submission_is_refused_saying` waits for the refusal itself —
+  treating a submission the hub *accepts* as the defect it would be, and
+  failing at once rather than retrying.
+* **Raise a flag inside the lock it is about.** `herd-hub`'s
+  `a_probe_s_snapshot_cannot_land_in_the_middle_of_a_claim` asks whether a
+  probe's snapshot was applied while a claim was open. It read a flag the pass
+  thread set *after* `dispatch_queued_jobs` returned — after the `dispatching`
+  lock was released — so a snapshot let into that gap read it as `false`. The
+  instrumented store now raises it while the pass still holds the lock, which
+  a snapshot must take. The product was never wrong here; the test said it
+  was, on two cores, in seven of nine `cargo test --workspace` runs — and in
+  none of five runs of that target on its own, so it needs the contention to
+  show at all.
+
+**Two figures widened, and said out loud.** E-09's two tests set a deadline
+`+1s` and needed the hub to judge the job before it fell. A dispatch pass is
+not synchronous with the answer a submission gets, and on two loaded cores it
+ran more than a second late: one test had its *running* job cancelled before
+it started and then waited thirty seconds for a slot nobody would take, and
+the other was cancelled with the hub's other true sentence — "nothing had been
+recorded about why it was waiting" — instead of the one it asserted. Both are
+now `+5s`, with the precondition waited for explicitly, and the hub in the
+first is given `--aging-step 4` so that the deadline fires on its own clock
+rather than as a side effect of another job ending. Five seconds is a measured
+margin and not a proof: it is a figure, it is in the test next to why, and a
+host five times slower again would need another.
+
+**What is proved, and how.** Every fix was made to fail first. The hard-coded
+count was reproduced with the CI host's exact panic — `2 jobs running there
+finish` — in two of four runs with five spinning processes pinned to cores 0
+and 1; the kill-nine switch test in two of three, the dry run's
+byte-for-byte comparison in two of three, and the four found later once the
+first two were fixed and stopped masking them. With the fixes, twenty tests
+pass ten times out of ten under that same load, and the suite is green
+unpinned. The unit test above failed in six of six `./scripts/test.sh` runs
+pinned to two cores on unmodified `main` — and in none of five runs of its
+own target alone, which is why nobody had seen it — and passes there now.
+
+**What is not proved.** `until_the_state_root_is_quiet` — for the dry run that
+has no single file to watch — is two identical readings 200 ms apart, which is
+a heuristic and is written down as one. The `events.jsonl` line of a
+transition lands *after* the `job.json` that announces it, so a reader of a
+record can see a state whose transition is not yet recorded; the tests here
+now wait for both files, and whether the product should write them the other
+way round is not this change's question. And the load these figures were
+measured under is one machine's: five spinners on two cores is a shape of
+contention, not the CI host.
+
+---
