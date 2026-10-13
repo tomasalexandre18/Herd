@@ -6,9 +6,8 @@ State of the project right now. Replaced every session, never appended to.
 
 Five milestones are merged to `main`: M1 (end-to-end substrate), M2
 (durable job store), M3 (link robustness), M4 (runner confinement)
-and M5 (the capability model). PR #11 (an M3 follow-up: a terminal
-record is immutable, plus three refusals that name their figures) is
-open, not merged.
+and M5 (the capability model). Nothing else is written and waiting:
+every expectation below is either merged or not yet started.
 
 ## What works
 
@@ -39,14 +38,10 @@ not taken on report:
 green through `nix develop`. CI (`check` + `docs`) and the
 pull-request flow are live on `main`.
 
-## In review, not merged
-
-- **PR #11 — M3 follow-up.** A terminal record is immutable (D54),
-  plus three refusals that name their figures. Written, not merged.
-
 ## What is not done, and why
 
-32 of 44 musts are still planned; M6 through M18 have not started.
+32 of 44 musts are still planned. M6 (queue and priorities) is in
+progress on `m6-queue-priorities`; M7 through M18 have not started.
 Four caveats, detailed in `docs/coverage.md`:
 
 1. No authentication before M15 — a runner's name is self-asserted,
