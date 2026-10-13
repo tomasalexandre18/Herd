@@ -12,10 +12,16 @@
 //!
 //! The lock-file probe, which forks nothing, is unit-tested in the module.
 
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use herd_proto::{Availability, BusyProbe};
 use herd_runner::capability::evaluate;
+
+/// How long a hanging probe of these tests sleeps for. Numbers nobody else on
+/// this host would be sleeping, so that finding one is finding ours — and one
+/// each, because these tests run in one binary at the same time.
+const HANGS_FOR: &str = "444442";
+const HANGS_AND_IS_SWEPT_FOR: &str = "444443";
 
 /// Two numbers, both configuration, and nothing else is read: not the
 /// probe's output, not its name, not what the capability means.
@@ -88,8 +94,10 @@ async fn a_broken_probe_is_unknown_and_never_free() {
 
     // Hanging: bounded by the timeout, killed, and said as such. What this
     // forbids is a probe holding a runner — and through it a hub — for ever.
+    // It sleeps for a number nobody else would, because the assertion that it
+    // left nothing behind is made below.
     let started = std::time::Instant::now();
-    let hangs = BusyProbe::command(["/bin/sh", "-c", "sleep 30"]);
+    let hangs = BusyProbe::command(["/bin/sh", "-c", &format!("sleep {HANGS_FOR}")]);
     let read = evaluate(&hangs, timeout).await;
     assert!(
         started.elapsed() < Duration::from_secs(5),
@@ -118,4 +126,73 @@ async fn a_broken_probe_is_unknown_and_never_free() {
         matches!(read, Availability::Unknown { .. }),
         "exit 9 means neither busy nor free here: {read:?}"
     );
+}
+
+/// A probe that is killed leaves nothing of itself running.
+///
+/// The shape this is about is the ordinary one: a probe is a command an
+/// owner wrote (D51), and an owner writes a shell line. A kill that reached
+/// only the shell would leave whatever it started behind — and a probe is
+/// re-read every interval, so one hanging shell line means an orphan every
+/// two seconds for as long as the runner is up. That is a runner
+/// destabilising its host through its own configuration, which invariant 2
+/// forbids, and it is what made a test suite leave thirty-two `sleep`s on
+/// this machine. The probe is its own process group and is killed as one.
+#[tokio::test]
+async fn a_killed_probe_leaves_nothing_of_itself_behind() {
+    // `sleep & wait` rather than a bare `sleep`, which a shell execs into
+    // itself: what is asserted here is a probe with a *child*, which is the
+    // shape that leaked. The hanging probe asserted above is the execed one.
+    let hangs = BusyProbe::command([
+        "/bin/sh",
+        "-c",
+        &format!("sleep {HANGS_AND_IS_SWEPT_FOR} & wait"),
+    ]);
+    let read = evaluate(&hangs, Duration::from_millis(200)).await;
+    assert!(
+        matches!(read, Availability::Unknown { .. }),
+        "a hanging probe is unknown: {read:?}"
+    );
+    // The kill is a signal, so the children go away a moment after the probe
+    // has been read: this waits for them rather than racing them.
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let survivors = processes_with_argument(HANGS_AND_IS_SWEPT_FOR);
+        if survivors.is_empty() {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "{survivors:?} outlived the probe that started them; a probe read \
+             every interval would strew the host with these"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
+/// Every live process whose command line carries this argument.
+///
+/// The same sweep `confinement.rs` uses to find a job's detached children,
+/// kept here rather than shared: a test binary that reaches into another
+/// test binary for a helper is a worse dependency than ten lines of `/proc`.
+fn processes_with_argument(needle: &str) -> Vec<u32> {
+    let Ok(entries) = std::fs::read_dir("/proc") else {
+        return Vec::new();
+    };
+    let mut found = Vec::new();
+    for entry in entries.flatten() {
+        let Ok(pid) = entry.file_name().to_string_lossy().parse::<u32>() else {
+            continue;
+        };
+        let Ok(cmdline) = std::fs::read(format!("/proc/{pid}/cmdline")) else {
+            continue;
+        };
+        if cmdline
+            .split(|byte| *byte == 0)
+            .any(|argument| argument == needle.as_bytes())
+        {
+            found.push(pid);
+        }
+    }
+    found
 }

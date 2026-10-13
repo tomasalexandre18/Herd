@@ -395,6 +395,14 @@ fn lock_file(path: &Path) -> Availability {
 /// Its output is not read at all — that is what keeps a probe a probe rather
 /// than a protocol — and its stdin is closed so that a probe waiting for input
 /// hits the timeout instead of waiting for ever.
+///
+/// The probe is its own **process group**, and a probe that has to be killed
+/// is killed as a group. A probe is a command an owner wrote (D51), and the
+/// ordinary shape of one is a shell line: killing only the shell leaves
+/// whatever it started running, so a probe read every two seconds would strew
+/// the host with orphans — a runner destabilising its host through its
+/// configuration, which invariant 2 forbids. It is the same reasoning M4
+/// applies to a job, through the same primitive.
 async fn run_probe(
     command: &[String],
     busy_exit_code: i32,
@@ -406,14 +414,18 @@ async fn run_probe(
         Some(split) => split,
         None => return Availability::unknown("this probe has no command to run"),
     };
-    let mut child = match tokio::process::Command::new(program)
+    let mut probe = tokio::process::Command::new(program);
+    probe
         .args(arguments)
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
-        .kill_on_drop(true)
-        .spawn()
-    {
+        .kill_on_drop(true);
+    // 0 means "a new group led by the child", so the child's own pid is the
+    // group's, which is what makes the kill below reach everything it started.
+    #[cfg(unix)]
+    probe.process_group(0);
+    let mut child = match probe.spawn() {
         Ok(child) => child,
         // A command that is not there, or is not executable. The commonest
         // broken probe there is, and the one that must never read as free.
@@ -424,9 +436,12 @@ async fn run_probe(
     let waited = match tokio::time::timeout(timeout, child.wait()).await {
         Ok(waited) => waited,
         Err(_) => {
-            // A probe that hangs is killed here. It cannot hold the runner up
-            // past this timeout, and it never reaches the hub at all: the hub
-            // learns a verdict, never a probe.
+            // A probe that hangs is killed here, with everything it started.
+            // It cannot hold the runner up past this timeout, and it never
+            // reaches the hub at all: the hub learns a verdict, never a probe.
+            if let Some(pid) = child.id() {
+                crate::confine::kill_process_group(pid);
+            }
             let _ = child.kill().await;
             return Availability::unknown(format!(
                 "the probe {shown} did not answer within {} ms and was killed",
