@@ -4058,6 +4058,10 @@ mod tests {
         inner: JobDirStore,
         /// Raised by the dispatch pass when it is inside the window.
         in_the_window: Arc<AtomicBool>,
+        /// Raised when the claim has written everything it writes — **inside
+        /// the `dispatching` lock**, which is what makes this test's answer a
+        /// fact rather than a race (D100).
+        claim_is_over: Arc<AtomicBool>,
         /// What the pass waits for before it finishes claiming.
         go_on: Mutex<Option<std_mpsc::Receiver<()>>>,
     }
@@ -4079,7 +4083,20 @@ mod tests {
             {
                 let _ = go_on.recv();
             }
-            self.inner.begin_attempt(id, runner, why, parallelism)
+            let attempt = self.inner.begin_attempt(id, runner, why, parallelism);
+            // Here, and not when the pass thread comes back. The pass still
+            // holds `dispatching` at this point, so a snapshot — which takes
+            // that lock — cannot be applied before this is raised. Raised by
+            // the pass thread *after* `dispatch_queued_jobs` returned, it was
+            // raised after the lock had already been released, and on a
+            // two-core host the snapshot thread routinely got in between: the
+            // test then reported the product dispatching onto a busy
+            // capability when the product had done nothing of the kind. It
+            // failed in seven of nine workspace suite runs on `taskset -c 0,1`
+            // against unmodified `main`, and in none of five runs of this
+            // target on its own — it needs the contention to show (D100).
+            self.claim_is_over.store(true, Ordering::SeqCst);
+            attempt
         }
 
         fn state_root_id(&self) -> &str {
@@ -4183,14 +4200,23 @@ mod tests {
     /// had finished. Under the defect that answer is "no": the snapshot was
     /// applied mid-claim. There is nothing to wait out and nothing to sleep
     /// for.
+    ///
+    /// "The claim had finished" is raised by the instrumented store **inside**
+    /// the lock the pass holds, and that detail is the test (D100). Raised by
+    /// the pass thread once `dispatch_queued_jobs` had returned, it was raised
+    /// after the lock was released, and a snapshot let in during that gap read
+    /// it as `false` — a green product reported red in seven of nine workspace
+    /// suite runs on two pinned cores.
     #[test]
     fn a_probe_s_snapshot_cannot_land_in_the_middle_of_a_claim() {
         let dir = tempfile::tempdir().expect("a temporary state directory");
         let in_the_window = Arc::new(AtomicBool::new(false));
+        let claim_is_over = Arc::new(AtomicBool::new(false));
         let (go_on, wait_for_go_on) = std_mpsc::channel();
         let store = Arc::new(StoreThatHoldsTheClaimOpen {
             inner: JobDirStore::open(dir.path()).expect("the state root opens"),
             in_the_window: Arc::clone(&in_the_window),
+            claim_is_over: Arc::clone(&claim_is_over),
             go_on: Mutex::new(Some(wait_for_go_on)),
         });
         let labels = LabelSet::new(["kvm"]).expect("valid labels");
@@ -4231,14 +4257,12 @@ mod tests {
             "the reading this claim is about to be judged on is free"
         );
 
-        // The pass. It stops inside the claim and waits to be let go.
-        let claim_is_over = Arc::new(AtomicBool::new(false));
+        // The pass. It stops inside the claim and waits to be let go. The
+        // store raises `claim_is_over` itself, under the lock, rather than
+        // this thread raising it on the way out.
         let pass = std::thread::spawn({
-            let (state, claim_is_over) = (Arc::clone(&state), Arc::clone(&claim_is_over));
-            move || {
-                dispatch_queued_jobs(&state).expect("the pass runs");
-                claim_is_over.store(true, Ordering::SeqCst);
-            }
+            let state = Arc::clone(&state);
+            move || dispatch_queued_jobs(&state).expect("the pass runs")
         });
         while !in_the_window.load(Ordering::SeqCst) {
             std::thread::yield_now();
