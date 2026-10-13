@@ -44,7 +44,7 @@
 //!   is retried for as long as it takes and never dropped (D19); output the
 //!   hub is missing is asked for again before the log is declared short (D29).
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -55,8 +55,8 @@ use futures_util::{SinkExt, StreamExt};
 use herd_proto::{
     a_frame_about_a_job_that_is_over_reason, foreign_state_root_reason, from_frame,
     not_this_runner_s_attempt_reason, runner_twin_reason, to_frame, unreadable_handshake_reason,
-    version_mismatch_reason, CapabilityState, FromHub, JobId, JobMetrics, JobOutcome, LabelSet,
-    Priority, Role, RunningJob, ToHub, HEALTH_EVERY, PROTOCOL_VERSION,
+    version_mismatch_reason, CapabilityState, FromHub, Holdings, HostSize, JobId, JobMetrics,
+    JobOutcome, LabelSet, Priority, Role, RunningJob, ToHub, HEALTH_EVERY, PROTOCOL_VERSION,
 };
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::mpsc::{self, UnboundedReceiver, UnboundedSender};
@@ -66,6 +66,7 @@ use tokio_tungstenite::WebSocketStream;
 
 use crate::capability::RunnerCapacity;
 use crate::job::{JobRecord, JobState, JobStore, LogWrite, NewJob, Raise, Submission, Timestamp};
+use crate::matcher::{self, Placement, Seat, Stickiness};
 use crate::queue;
 
 /// Loopback by default: the hub is reached through the reverse proxy, which
@@ -164,6 +165,13 @@ pub struct Policy {
     /// second *through the code the hub runs*, and an operator can tune one
     /// number.
     pub aging_step: Duration,
+    /// How long a job waits for the runner it is sticking to before the hub
+    /// places it on a less preferred one (E-19).
+    ///
+    /// E-19 asks for this limit to be a **visible setting**, so it is one:
+    /// `--stickiness-limit`, three hours by default, printed when the hub
+    /// starts, named in the sentence of every job waiting on it.
+    pub stickiness: Stickiness,
 }
 
 impl Default for Policy {
@@ -175,6 +183,7 @@ impl Default for Policy {
             write_retry_first: Duration::from_millis(250),
             write_retry_cap: Duration::from_secs(5 * 60),
             aging_step: crate::queue::AGING_STEP,
+            stickiness: Stickiness::default(),
         }
     }
 }
@@ -315,18 +324,19 @@ pub struct HubHandle {
 }
 
 impl HubHandle {
-    /// Whether a runner has finished its handshake and can be dispatched to.
+    /// Whether any runner has finished its handshake and can be dispatched
+    /// to.
     pub fn runner_connected(&self) -> bool {
-        self.state.with_peers(|peers| peers.runner.is_some())
+        self.state.with_peers(|peers| !peers.runners.is_empty())
     }
 
     /// What the hub knows about the runners connected to it, health ages
-    /// included (E-40). One entry at most until M5, which holds a set.
+    /// included (E-40). A set since M7, in the order their names sort.
     pub fn runners(&self) -> Vec<RunnerStatus> {
         self.state.with_peers(|peers| {
             peers
-                .runner
-                .iter()
+                .runners
+                .values()
                 .map(|runner| RunnerStatus {
                     name: runner.name.clone(),
                     instance: runner.instance.clone(),
@@ -340,14 +350,31 @@ impl HubHandle {
         })
     }
 
-    /// What the connected runner offers and what its probes say (M5, E-24).
+    /// What one connected runner offers and what its probes say (M5, E-24).
     ///
     /// Read-only, and `None` when no runner is connected. M13 grows the
     /// status document out of this; a test reads it to assert that the hub
-    /// recorded what it was offered rather than inferring it.
+    /// recorded what it was offered rather than inferring it. With a fleet,
+    /// this is the first runner by name; [`HubHandle::capacity_of`] asks
+    /// about one in particular.
     pub fn runner_capacity(&self) -> Option<RunnerCapacity> {
-        self.state
-            .with_peers(|peers| peers.runner.as_ref().map(|runner| runner.capacity.clone()))
+        self.state.with_peers(|peers| {
+            peers
+                .runners
+                .values()
+                .next()
+                .map(|runner| runner.capacity.clone())
+        })
+    }
+
+    /// What one named runner offers and what its probes say.
+    pub fn capacity_of(&self, name: &str) -> Option<RunnerCapacity> {
+        self.state.with_peers(|peers| {
+            peers
+                .runners
+                .get(name)
+                .map(|runner| runner.capacity.clone())
+        })
     }
 }
 
@@ -421,6 +448,13 @@ struct ConnectedRunner {
     /// it — an offer from a machine that is no longer here is not an offer,
     /// and a redial brings its own.
     capacity: RunnerCapacity,
+    /// How big this machine says it is: the input to E-22's derivation, and
+    /// the one thing a job's `-j` is computed from. Announced in the
+    /// handshake, because it belongs to the machine and not to the moment.
+    host: HostSize,
+    /// How preferred this machine is when more than one could run a job
+    /// (E-19). Declared by whoever runs it; zero when it says nothing.
+    preference: i32,
     /// How the hub ends this connection without waiting for the socket to
     /// notice. Used when a runner that is plainly alive dials in while this
     /// connection is still registered: the new one is the real one.
@@ -434,8 +468,22 @@ struct ConnectedRunner {
 
 #[derive(Default)]
 struct Peers {
-    /// M1 accepts exactly one runner. M5 onwards holds a set.
-    runner: Option<ConnectedRunner>,
+    /// Every runner that has finished its handshake, by the name it
+    /// announced.
+    ///
+    /// **By name, because a name is what an attempt belongs to.** The record
+    /// of every attempt carries the runner's name and nothing else, so a
+    /// frame about an attempt is judged by looking the name up here; a map
+    /// keyed on anything else would need a second lookup that could disagree.
+    /// It is also what makes two live processes under one name a
+    /// configuration mistake rather than a silent pair (the twin rule in
+    /// [`State::register_runner`]) — the hub has exactly one place to put
+    /// each name.
+    ///
+    /// Sorted, so that a fleet in the same state makes the same choice twice:
+    /// the claim step breaks a tie between equally preferred runners by name
+    /// (E-36 — a placement nobody can predict is one nobody can explain).
+    runners: BTreeMap<String, ConnectedRunner>,
     /// When this hub last had evidence that an attempt was alive.
     ///
     /// *Per attempt*, and that is the whole of the design. "Is the runner
@@ -516,8 +564,12 @@ impl State {
     /// configured twice really did — forty-three dropped connections in eight
     /// seconds, with jobs dispatched onto links about to be cut. **A runner
     /// whose link has gone quiet** is reaped either way, because a link
-    /// nothing comes back on is not a link and holding it would keep the slot
+    /// nothing comes back on is not a link and holding it would keep the name
     /// against a runner that is plainly alive.
+    ///
+    /// Since M7 the hub holds a **fleet**: a second machine under a second
+    /// name joins beside the first, and the three cases above are all judged
+    /// per name.
     fn register_runner(
         &self,
         name: &str,
@@ -525,10 +577,15 @@ impl State {
         outbox: &Outbox,
         kick: watch::Sender<bool>,
         capacity: RunnerCapacity,
+        host: HostSize,
+        preference: i32,
     ) -> Admitted {
         self.with_peers(|peers| {
-            if let Some(incumbent) = &peers.runner {
-                let same_name = !name.is_empty() && incumbent.name == name;
+            // Only the runner wearing this *name* is in the way. A second
+            // machine under a second name is a fleet, which is what M7 is
+            // for; a second process under one name is the twin the rule
+            // below refuses, because an attempt belongs to a name.
+            if let Some(incumbent) = peers.runners.get(name) {
                 // An instance nobody announced is not an instance that
                 // matches: the safe reading of "I cannot tell whether this is
                 // the same process" is that it is not, because the harm is
@@ -538,102 +595,124 @@ impl State {
                 let quiet_for = incumbent.last_health.elapsed();
                 let gone_quiet =
                     incumbent.reports_seen > 0 && quiet_for > self.policy.health_is_stale_after();
-                if !(same_name && same_instance) && !gone_quiet {
-                    // How soon it is worth coming back differs by case. A
-                    // runner waiting for a slot may have it in a moment; a
-                    // twin is waiting for a configuration to change, or for
-                    // the runner holding the name to go quiet, and asking
+                if !same_instance && !gone_quiet {
+                    // A twin is waiting for a configuration to change, or
+                    // for the runner holding the name to go quiet, and asking
                     // every few seconds for that would be the flap again in
                     // a quieter costume — one line of log per second instead
                     // of one dropped job.
-                    let retry_in = if same_name {
-                        self.policy.health_is_stale_after()
-                    } else {
-                        self.policy.stand_by_retry()
+                    let twin = runner_twin_reason(
+                        name,
+                        incumbent.instance.as_deref().unwrap_or("unnamed"),
+                        instance.unwrap_or("unnamed"),
+                        quiet_for,
+                    );
+                    // On stderr, and in these words, because this is not
+                    // the hub being busy: it is a configuration that
+                    // cannot be served, and the owner reads it here or
+                    // reads nothing.
+                    eprintln!("herd-hub: {twin}");
+                    return Admitted::StandBy {
+                        reason: twin,
+                        retry_in: self.policy.health_is_stale_after(),
                     };
-                    let reason = if same_name {
-                        let twin = runner_twin_reason(
-                            name,
-                            incumbent.instance.as_deref().unwrap_or("unnamed"),
-                            instance.unwrap_or("unnamed"),
-                            quiet_for,
-                        );
-                        // On stderr, and in these words, because this is not
-                        // the hub being busy: it is a configuration that
-                        // cannot be served, and the owner reads it here or
-                        // reads nothing.
-                        eprintln!("herd-hub: {twin}");
-                        twin
-                    } else {
-                        format!(
-                            "runner {} is connected and was heard from {:?} ago; this hub \
-                             accepts one runner until M5",
-                            incumbent.name, quiet_for
-                        )
-                    };
-                    return Admitted::StandBy { reason, retry_in };
                 }
-                let why = if same_name && same_instance {
+                let why = if same_instance {
                     format!(
                         "runner {name} (instance {}) has dialled again",
                         instance.unwrap_or("unnamed")
                     )
                 } else {
-                    format!(
-                        "runner {} has said nothing for {:?}",
-                        incumbent.name, quiet_for
-                    )
+                    format!("runner {name} has said nothing for {quiet_for:?}")
                 };
                 println!("herd-hub: dropping the connection this hub was holding, because {why}");
                 let _ = incumbent.kick.send(true);
             }
             let now = Instant::now();
-            peers.runner = Some(ConnectedRunner {
-                name: name.to_owned(),
-                instance: instance.map(str::to_owned),
-                outbox: outbox.clone(),
-                capacity,
-                kick,
-                joined_at: now,
-                last_health: now,
-                reports_seen: 0,
-                draining: false,
-                jobs: Vec::new(),
-            });
+            peers.runners.insert(
+                name.to_owned(),
+                ConnectedRunner {
+                    name: name.to_owned(),
+                    instance: instance.map(str::to_owned),
+                    outbox: outbox.clone(),
+                    capacity,
+                    host,
+                    preference,
+                    kick,
+                    joined_at: now,
+                    last_health: now,
+                    reports_seen: 0,
+                    draining: false,
+                    jobs: Vec::new(),
+                },
+            );
             Admitted::Yes
         })
     }
 
-    /// Give up the runner slot, if this connection is the one holding it.
+    /// Give up a runner's place, if this connection is the one holding it.
+    ///
+    /// By the *connection* and not by the name: a redial has already taken
+    /// the name over by the time the old connection notices it is finished,
+    /// and a release by name would then throw out the live runner. Answers
+    /// with the name released, so the caller can say whose link went.
     ///
     /// The clock on the attempts it was running is not touched here: a socket
     /// closing is not evidence about a job, and a runner that redials in a
     /// second finishes what it was doing. What times an attempt out is the
     /// absence of anything said about it ([`Peers::attempt_seen`]).
-    fn release_runner(&self, outbox: &Outbox) -> bool {
+    fn release_runner(&self, outbox: &Outbox) -> Option<String> {
         self.with_peers(|peers| {
-            if !peers
-                .runner
-                .as_ref()
-                .is_some_and(|runner| runner.outbox.same_channel(outbox))
-            {
-                return false;
-            }
-            peers.runner = None;
-            true
+            let name = peers
+                .runners
+                .values()
+                .find(|runner| runner.outbox.same_channel(outbox))
+                .map(|runner| runner.name.clone())?;
+            peers.runners.remove(&name);
+            Some(name)
         })
     }
 
-    /// The runner a job may be handed to: connected, and not on its way out
-    /// (invariant 2).
-    fn runner_for_dispatch(&self) -> Option<(String, Outbox)> {
+    /// Every runner a job may be handed to, as the claim step sees them:
+    /// connected, with what it offers, what its probes say, how big it is and
+    /// how preferred it is (E-19, E-22, E-25).
+    ///
+    /// `held` is what the records say is already running, per runner — the
+    /// only source of a slot count there is (see `crate::matcher`). A runner
+    /// that is draining is in here and marked, not left out: the sentence a
+    /// waiting job gets has to be able to say that the machine it would have
+    /// gone to is leaving.
+    fn seats(&self, held: &BTreeMap<String, Vec<(JobId, LabelSet)>>) -> Vec<Seat> {
         self.with_peers(|peers| {
             peers
-                .runner
-                .as_ref()
-                .filter(|runner| !runner.draining)
-                .map(|runner| (runner.name.clone(), runner.outbox.clone()))
+                .runners
+                .values()
+                .map(|runner| {
+                    let mut holdings = Holdings::new(runner.capacity.offer().clone());
+                    for (job, labels) in held.get(&runner.name).into_iter().flatten() {
+                        // Written down, never checked: a job the records say
+                        // is out there is out there, whatever the offer says
+                        // about its labels now. Checking would quietly leave
+                        // such a job out of the holdings and read the host as
+                        // idle on top of work that is running.
+                        holdings.already_holding(job, labels.clone());
+                    }
+                    Seat {
+                        name: runner.name.clone(),
+                        preference: runner.preference,
+                        host: runner.host,
+                        draining: runner.draining,
+                        capacity: runner.capacity.clone(),
+                        holdings,
+                    }
+                })
+                .collect()
         })
+    }
+
+    /// Where a job that has been claimed is sent.
+    fn outbox_of(&self, name: &str) -> Option<Outbox> {
+        self.with_peers(|peers| peers.runners.get(name).map(|runner| runner.outbox.clone()))
     }
 
     /// Take a runner's snapshot of what its probes say, if it is *the*
@@ -658,9 +737,9 @@ impl State {
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         self.with_peers(|peers| {
             match peers
-                .runner
-                .as_mut()
-                .filter(|runner| runner.outbox.same_channel(outbox))
+                .runners
+                .values_mut()
+                .find(|runner| runner.outbox.same_channel(outbox))
             {
                 Some(runner) => {
                     runner.capacity.update(capabilities);
@@ -671,56 +750,72 @@ impl State {
         })
     }
 
-    /// Why the connected runner cannot be given a job needing `labels` right
-    /// now, or `None` when it can.
-    ///
-    /// The whole of M5's dispatch judgement, and deliberately the smallest
-    /// thing that makes E-26 true: the labels have to be offered here and
-    /// none of them suspended. Contention between jobs already running — the
-    /// counted slots, the host-wide capability, the exclusions — is
-    /// `herd_proto::Holdings`, and consulting it at claim time is M7's.
-    fn why_not_now(&self, labels: &LabelSet) -> Option<String> {
-        self.with_peers(|peers| match &peers.runner {
-            Some(runner) => runner.capacity.why_not_now(labels),
-            None => Some("no runner is connected".to_owned()),
-        })
-    }
-
-    /// Every capability a probe is currently suspending, for the hub's log.
+    /// Every capability a probe is currently suspending, for the hub's log,
+    /// with the runner each one is on.
     fn suspended_capabilities(&self) -> Vec<(String, String)> {
         self.with_peers(|peers| {
             peers
-                .runner
-                .as_ref()
-                .map(|runner| runner.capacity.suspended())
-                .unwrap_or_default()
+                .runners
+                .values()
+                .flat_map(|runner| runner.capacity.suspended())
+                .collect()
         })
     }
 
-    /// Whichever runner is connected, draining or not: where an
-    /// acknowledgement or a cancel goes.
-    fn runner(&self) -> Option<Outbox> {
-        self.with_peers(|peers| peers.runner.as_ref().map(|runner| runner.outbox.clone()))
+    /// Where a message about an attempt goes: the runner the attempt was
+    /// handed to, draining or not.
+    ///
+    /// By name, because that is what an attempt belongs to. An
+    /// acknowledgement or a cancel sent to "whichever runner is connected"
+    /// was a frame about one machine's work delivered to another, which is
+    /// the defect naming the holder exists to prevent.
+    fn runner_holding(&self, job_id: &JobId) -> Option<Outbox> {
+        let holder = self.with_peers(|peers| {
+            peers
+                .live_attempts
+                .get(job_id)
+                .map(|(_, holder)| holder.clone())
+        });
+        let holder = match holder {
+            Some(holder) => holder,
+            // Nothing cached: after a restart the record is the authority.
+            None => self
+                .store
+                .job(job_id)
+                .ok()
+                .flatten()
+                .and_then(|record| record.attempt().map(|attempt| attempt.runner.clone()))?,
+        };
+        self.outbox_of(&holder)
     }
 
-    /// Why a submission cannot be placed, if it cannot.
+    /// Why a submission cannot be placed anywhere at all, if it cannot.
+    ///
+    /// About the *fleet*, not about one job: a job that no connected runner
+    /// can take is queued with its own sentence and is not refused (D38).
+    /// This is the one case a submission is answered with a refusal — there
+    /// is no machine here to run anything.
     fn why_no_runner(&self) -> Option<String> {
-        self.with_peers(|peers| match &peers.runner {
-            None => Some("no runner is connected".to_owned()),
-            Some(runner) if runner.draining => Some(format!(
-                "runner {} is draining and takes no new job",
-                runner.name
-            )),
-            Some(_) => None,
+        self.with_peers(|peers| {
+            if peers.runners.is_empty() {
+                return Some("no runner is connected".to_owned());
+            }
+            if peers.runners.values().all(|runner| runner.draining) {
+                return Some(format!(
+                    "every runner connected to this hub is draining and takes no new job: {}",
+                    peers.runners.keys().cloned().collect::<Vec<_>>().join(", ")
+                ));
+            }
+            None
         })
     }
 
     fn record_health(&self, outbox: &Outbox, jobs: Vec<RunningJob>, draining: bool) {
         self.with_peers(|peers| {
             if let Some(runner) = peers
-                .runner
-                .as_mut()
-                .filter(|runner| runner.outbox.same_channel(outbox))
+                .runners
+                .values_mut()
+                .find(|runner| runner.outbox.same_channel(outbox))
             {
                 runner.last_health = Instant::now();
                 runner.reports_seen += 1;
@@ -998,8 +1093,16 @@ async fn serve_peer(state: Arc<State>, stream: TcpStream) -> Result<()> {
             return refuse(&mut sink, reason).await;
         }
     };
-    let (role, peer_name, peer_instance, peer_state_root, peer_health_every, capacity) = match hello
-    {
+    let (
+        role,
+        peer_name,
+        peer_instance,
+        peer_state_root,
+        peer_health_every,
+        capacity,
+        host,
+        preference,
+    ) = match hello {
         ToHub::Hello {
             protocol_version,
             role,
@@ -1009,6 +1112,8 @@ async fn serve_peer(state: Arc<State>, stream: TcpStream) -> Result<()> {
             state_root,
             health_every_ms,
             capabilities,
+            host,
+            preference,
         } => {
             if protocol_version != PROTOCOL_VERSION {
                 return refuse(&mut sink, version_mismatch_reason(protocol_version)).await;
@@ -1040,6 +1145,8 @@ async fn serve_peer(state: Arc<State>, stream: TcpStream) -> Result<()> {
                 said(state_root),
                 health_every_ms.map(Duration::from_millis),
                 RunnerCapacity::new(name, capabilities),
+                host,
+                preference,
             )
         }
         other => {
@@ -1169,6 +1276,8 @@ async fn serve_peer(state: Arc<State>, stream: TcpStream) -> Result<()> {
                 &outbox,
                 &mut source,
                 capacity,
+                host,
+                preference,
             )
             .await
         }
@@ -1186,14 +1295,30 @@ async fn serve_runner(
     outbox: &Outbox,
     source: &mut Source,
     capacity: RunnerCapacity,
+    host: HostSize,
+    preference: i32,
 ) -> Result<()> {
     // What it offers, said out loud with every capability's origin: a denial
     // nobody can see is a denial nobody can trust (E-24).
     for line in capacity.report() {
         println!("herd-hub: {line}");
     }
+    // And how big it says it is, because that is what every `-j` on this
+    // machine is derived from (E-22) — and a machine that says nothing is a
+    // machine no derived job can be placed on, which an operator should read
+    // here rather than infer from a queue that will not move.
+    match (host.memory_mib, host.threads) {
+        (Some(memory), Some(threads)) => println!(
+            "herd-hub: {name} offers {memory} MiB and {threads} threads, preference {preference}"
+        ),
+        _ => println!(
+            "herd-hub: {name} does not say {}, so no job whose -j has to be derived can be \
+             placed on it (preference {preference})",
+            host.what_is_missing().unwrap_or("how big it is")
+        ),
+    }
     let (kick, mut kicked) = watch::channel(false);
-    match state.register_runner(name, instance, outbox, kick, capacity) {
+    match state.register_runner(name, instance, outbox, kick, capacity, host, preference) {
         Admitted::Yes => {}
         // Not a refusal: a runner told to wait comes back, and one that is
         // refused dies (D13). Telling a redialling runner "a runner is
@@ -1215,12 +1340,20 @@ async fn serve_runner(
         Ok(()) => relay_from_runner(state, name, outbox, source, &mut kicked).await,
         Err(error) => Err(error),
     };
-    if state.release_runner(outbox) {
+    if let Some(gone) = state.release_runner(outbox) {
         println!(
-            "herd-hub: runner {name} is gone; an attempt it was running is lost if it is \
+            "herd-hub: runner {gone} is gone; an attempt it was running is lost if it is \
              not back within {:?} (E-21)",
             state.policy.lost_after
         );
+        // A job that was sticking to this runner is no longer sticking to it:
+        // it was waiting for a machine that is now not *available*, which is
+        // exactly when E-19 lets it move. One pass, now, so that the job
+        // moves within seconds of the link going rather than at the next
+        // thing that happens to wake the queue.
+        if let Err(error) = dispatch_queued_jobs(state) {
+            eprintln!("herd-hub: judging the queue after {gone} left failed: {error:#}");
+        }
         // Whoever is waiting hears that the link went, and that the job has
         // not been given up on. Not a refusal, and the followers keep their
         // place: the runner may redeliver the result it is holding, and if it
@@ -1298,6 +1431,11 @@ fn dispatch_a_pass(state: &State) -> Result<()> {
         .store
         .unfinished_jobs()
         .context("reading the queue the hub recovered")?;
+    // What every runner is already holding, read from those same records and
+    // from nothing else: there is no counter of busy slots in this hub, so
+    // there is none to leak and none to rebuild after a restart (D81).
+    let held = matcher::holdings(&unfinished);
+    let mut seats = state.seats(&held);
     // One moment for the whole pass, so that the order cannot change halfway
     // through it, and the moment the figures in the sentences are computed
     // from is the moment the order was.
@@ -1305,14 +1443,43 @@ fn dispatch_a_pass(state: &State) -> Result<()> {
     let queue = queue::order(unfinished, now, state.policy.aging_step);
     let total = queue.len();
     for (place, record) in queue.iter().enumerate() {
-        match offer_job(state, record)? {
-            Offered::Dispatched => {}
-            // This job cannot start for a reason of its own — a capability
-            // it needs is not offered, or something outside Herd is holding
-            // it (E-26). The jobs behind it are not affected: it waits with
-            // its reason on its record, and the pass goes on. Head-of-line
-            // blocking on a label is M7's question (E-19), not this one.
-            Offered::NotForThisJob(why) => {
+        // The whole claim decision, for this job, against the fleet as this
+        // pass found it — and `seats` is carried *through* the loop, so a job
+        // this pass has just placed is contending with the next one (E-25).
+        match matcher::place(record, &mut seats, now, state.policy.stickiness) {
+            Placement::Claim {
+                runner,
+                why,
+                command,
+                parallelism,
+            } => {
+                if !dispatch(state, record, &runner, &why, command, parallelism)? {
+                    // The link went between the judgement and the frame. The
+                    // job is still queued, its labels are still taken on a
+                    // seat that is gone, and the next pass — which a
+                    // released runner triggers — judges it afresh.
+                    let standing = queue::standing(record, now, state.policy.aging_step);
+                    let sentence = queue::waiting_sentence(
+                        place + 1,
+                        total,
+                        &standing,
+                        &format!(
+                            "it is waiting because runner {runner}'s connection ended while \
+                             this pass was placing it there"
+                        ),
+                    );
+                    say_it_waits(state, &record.id, &sentence)?;
+                }
+            }
+            // This job waits, and the queue behind it does not. **That is
+            // E-19's answer** to the head-of-line question M6 left open: a
+            // job sticking to a busy runner it prefers holds nothing else up,
+            // because the machine it is waiting for is not the machine the
+            // job behind it would go to. The cost is that a lower-priority
+            // job can take a free lesser runner while a higher-priority one
+            // waits for its preferred machine — which is what E-19 asks for,
+            // bounded by the stickiness limit it asks to be visible.
+            Placement::Wait { why } => {
                 let standing = queue::standing(record, now, state.policy.aging_step);
                 let sentence = queue::waiting_sentence(
                     place + 1,
@@ -1322,20 +1489,40 @@ fn dispatch_a_pass(state: &State) -> Result<()> {
                 );
                 say_it_waits(state, &record.id, &sentence)?;
             }
-            // There is nowhere to put *any* job, so this pass is over — and
-            // everything still in the queue, this job included, is told
-            // where it stands, what it is weighed at and when that changes
-            // (E-04, E-18).
-            Offered::NoRunner(why) => {
-                let because = format!("the job at the front of the queue is waiting because {why}");
-                for (behind, waiting) in queue.iter().enumerate().skip(place) {
-                    let standing = queue::standing(waiting, now, state.policy.aging_step);
-                    let sentence = queue::waiting_sentence(behind + 1, total, &standing, &because);
-                    say_it_waits(state, &waiting.id, &sentence)?;
-                }
-                return Ok(());
+            // Nothing anywhere can ever run it, so it ends here rather than
+            // waiting for a machine that cannot exist (E-36). Terminal, and
+            // the one place in the claim step that is: everything else about
+            // a job that cannot start now is a wait (D38).
+            Placement::Impossible { why } => {
+                refuse_the_job(state, record, &why)?;
             }
         }
+    }
+    Ok(())
+}
+
+/// End a job no machine could ever run, with the reason on its record and in
+/// the stream of whoever is waiting for it (E-36).
+fn refuse_the_job(state: &State, record: &JobRecord, why: &str) -> Result<()> {
+    let outcome = JobOutcome::Impossible {
+        reason: why.to_owned(),
+    };
+    state
+        .store
+        .record_state(
+            &record.id,
+            JobState::Finished {
+                outcome: outcome.clone(),
+            },
+        )
+        .with_context(|| format!("ending {} as impossible", record.id))?;
+    eprintln!("herd-hub: {} can never run: {why}", record.id);
+    for follower in state.stop_following(&record.id) {
+        let _ = follower.send(FromHub::JobFinished {
+            job_id: record.id.clone(),
+            outcome: outcome.clone(),
+            metrics: JobMetrics::default(),
+        });
     }
     Ok(())
 }
@@ -1378,40 +1565,6 @@ async fn let_the_queue_age(state: Arc<State>) {
     }
 }
 
-/// What one offer of one job came to.
-enum Offered {
-    /// It is on its way to a runner.
-    Dispatched,
-    /// This job waits, and the queue behind it does not: the reason is about
-    /// this job's own capabilities (E-26).
-    NotForThisJob(String),
-    /// There is no runner to hand anything to, and this is why.
-    NoRunner(String),
-}
-
-/// Give one queued job to the runner, or leave it queued and say why.
-///
-/// Three answers, because the caller has to tell "this job waits" from
-/// "nothing can start": see [`Offered`].
-///
-/// The two waiting outcomes are the whole of E-26. A job whose capability something
-/// outside Herd is holding is **not** refused and **not** failed: it stays
-/// `queued`, the reason goes on its record, whoever is waiting for it is told,
-/// and the next pass — the one a freed probe triggers — starts it. `Refused`
-/// is terminal (D13) and was never available for this; `JobNote` and a
-/// `waiting` line on the record are (D38).
-fn offer_job(state: &State, record: &JobRecord) -> Result<Offered> {
-    if let Some(reason) = state.why_not_now(&record.labels) {
-        return Ok(Offered::NotForThisJob(reason));
-    }
-    if dispatch(state, &record.id, record.command.clone())? {
-        return Ok(Offered::Dispatched);
-    }
-    Ok(Offered::NoRunner(state.why_no_runner().unwrap_or_else(
-        || "the runner's connection ended while this pass was running".to_owned(),
-    )))
-}
-
 /// Record why a queued job is not starting, and tell whoever is waiting for
 /// it.
 ///
@@ -1441,18 +1594,37 @@ fn say_it_waits(state: &State, job_id: &JobId, reason: &str) -> Result<()> {
 
 /// Hand one job to the runner, recording the attempt before the frame goes
 /// out. False when there is no runner to hand it to.
-fn dispatch(state: &State, job_id: &JobId, command: Vec<String>) -> Result<bool> {
-    let Some((runner_name, runner)) = state.runner_for_dispatch() else {
+fn dispatch(
+    state: &State,
+    record: &JobRecord,
+    runner_name: &str,
+    why: &str,
+    command: Vec<String>,
+    parallelism: Option<herd_proto::Parallelism>,
+) -> Result<bool> {
+    let job_id = &record.id;
+    let Some(runner) = state.outbox_of(runner_name) else {
         return Ok(false);
     };
+    // The explanation and the derived figure go on the record **before** the
+    // frame goes out, in the one write the attempt is numbered by. A hub that
+    // sent the job first and explained afterwards would have a window in
+    // which a job was running with no line saying why it was there (E-36) —
+    // and, worse for M10, a `-j` that reached the machine before it reached
+    // the record.
     let attempt = state
         .store
-        .begin_attempt(job_id, &runner_name)
+        .begin_attempt(
+            job_id,
+            runner_name,
+            why,
+            parallelism.map(|derived| derived.threads),
+        )
         .with_context(|| format!("recording an attempt on {job_id}"))?;
     state.with_peers(|peers| {
         peers
             .live_attempts
-            .insert(job_id.clone(), (attempt, runner_name.clone()))
+            .insert(job_id.clone(), (attempt, runner_name.to_owned()))
     });
     // Handing it out is the first word about it: the clock on this attempt
     // starts here, not at whatever the hub last heard about the job before.
@@ -1467,7 +1639,7 @@ fn dispatch(state: &State, job_id: &JobId, command: Vec<String>) -> Result<bool>
     {
         return Ok(false);
     }
-    println!("herd-hub: {job_id} is attempt {attempt} on runner {runner_name}");
+    println!("herd-hub: {job_id} is attempt {attempt} on runner {runner_name}: {why}");
     Ok(true)
 }
 
@@ -1669,6 +1841,14 @@ async fn relay_from_runner(
                         metrics: metrics.clone(),
                     });
                 }
+                // A job that ends gives back whatever it was holding, and
+                // something queued may have been waiting for exactly that
+                // (E-22, E-25). Before M7 this trigger was not needed —
+                // nothing was counted, so a queued job was never waiting for
+                // a slot — and without it a one-slot machine would run one
+                // job and then stand still until the next thing happened to
+                // wake the queue.
+                dispatch_queued_jobs(state)?;
             }
             ToHub::AttemptAbandoned {
                 job_id,
@@ -1976,7 +2156,7 @@ async fn keep_trying_to_write_results(state: Arc<State>) {
                         "herd-hub: {job_id} is written at last: {outcome:?}. The runner is \
                          told it may forget it."
                     );
-                    if let Some(runner) = state.runner() {
+                    if let Some(runner) = state.runner_holding(&job_id) {
                         let _ = runner.send(FromHub::JobResultAck {
                             job_id: job_id.clone(),
                         });
@@ -1987,6 +2167,14 @@ async fn keep_trying_to_write_results(state: Arc<State>) {
                             outcome: outcome.clone(),
                             metrics: metrics.clone(),
                         });
+                    }
+                    // Written at last, so what it was holding is given back
+                    // at last: whatever was waiting for that slot can go.
+                    if let Err(error) = dispatch_queued_jobs(&state) {
+                        eprintln!(
+                            "herd-hub: judging the queue after {job_id} was written failed: \
+                             {error:#}"
+                        );
                     }
                 }
                 Err(error) => {
@@ -2025,23 +2213,23 @@ async fn watch_for_a_lost_runner(state: Arc<State>) {
     loop {
         ticker.tick().await;
 
-        // A connection nothing has come back on for the threshold: dropped,
-        // so that the slot is free for the runner that is dialling.
-        let silent_link = state.with_peers(|peers| {
-            let silent = peers
-                .runner
-                .as_ref()
+        // Every connection nothing has come back on for the threshold:
+        // dropped, so that the name is free for the runner that is dialling.
+        let silent_links = state.with_peers(|peers| {
+            let silent: Vec<(String, Duration)> = peers
+                .runners
+                .values()
                 .filter(|runner| runner.last_health.elapsed() > state.policy.lost_after)
-                .map(|runner| (runner.name.clone(), runner.last_health.elapsed()));
-            if silent.is_some() {
-                if let Some(runner) = &peers.runner {
+                .map(|runner| (runner.name.clone(), runner.last_health.elapsed()))
+                .collect();
+            for (name, _) in &silent {
+                if let Some(runner) = peers.runners.remove(name) {
                     let _ = runner.kick.send(true);
                 }
-                peers.runner = None;
             }
             silent
         });
-        if let Some((name, quiet_for)) = silent_link {
+        for (name, quiet_for) in silent_links {
             eprintln!(
                 "herd-hub: dropping the connection to runner {name}: nothing has come back \
                  on it for {quiet_for:?}"
@@ -2146,8 +2334,12 @@ fn give_the_job_another_go(
             });
         }
         // There may be a runner here already — the one that replaced the one
-        // that went — in which case the second attempt starts at once.
-        dispatch(state, job_id, record.command.clone())?;
+        // that went, or another machine of the fleet entirely — in which case
+        // the second attempt starts at once. It goes through the one dispatch
+        // pass like everything else (E-20): a requeued job is placed by the
+        // claim step, with its own explanation, not handed back to the
+        // machine it was on.
+        dispatch_queued_jobs(state)?;
         return Ok(());
     }
 
@@ -2195,9 +2387,8 @@ fn give_the_job_another_go(
 fn name_what_that_attempt_lost(state: &State, job_id: &JobId, holder: &str) {
     let sent = state.with_peers(|peers| {
         peers
-            .runner
-            .as_ref()
-            .filter(|runner| runner.name == holder)
+            .runners
+            .get(holder)
             .into_iter()
             .flat_map(|runner| runner.jobs.iter())
             .find(|job| &job.job_id == job_id)
@@ -2292,6 +2483,7 @@ async fn accept_submissions(state: &State, outbox: &Outbox, source: &mut Source)
                 command,
                 labels,
                 priority,
+                build_thread_mib,
             } => {
                 if command.is_empty() {
                     let _ = outbox.send(FromHub::Refused {
@@ -2305,7 +2497,10 @@ async fn accept_submissions(state: &State, outbox: &Outbox, source: &mut Source)
                 }
                 let submission = state
                     .store
-                    .submit(NewJob::at(command, labels, priority))
+                    .submit(
+                        NewJob::at(command, labels, priority)
+                            .with_build_thread_mib(build_thread_mib),
+                    )
                     .context("taking a submission in")?;
                 let job_id = submission.record().id.clone();
                 // JobAccepted first, so the requester has the id before any
@@ -2613,7 +2808,7 @@ fn cancel_job(state: &State, outbox: &Outbox, job_id: &JobId) -> Result<()> {
         _ => {
             let attempt = record.attempt_number();
             let reason = "a requester cancelled this job".to_owned();
-            match state.runner() {
+            match state.runner_holding(job_id) {
                 Some(runner) => {
                     let _ = runner.send(FromHub::CancelJob {
                         job_id: job_id.clone(),
@@ -2840,7 +3035,13 @@ mod tests {
     }
 
     impl JobStore for StoreThatHoldsTheClaimOpen {
-        fn begin_attempt(&self, id: &JobId, runner: &str) -> StoreResult<u32> {
+        fn begin_attempt(
+            &self,
+            id: &JobId,
+            runner: &str,
+            why: &str,
+            parallelism: Option<u32>,
+        ) -> StoreResult<u32> {
             self.in_the_window.store(true, Ordering::SeqCst);
             if let Some(go_on) = self
                 .go_on
@@ -2850,7 +3051,7 @@ mod tests {
             {
                 let _ = go_on.recv();
             }
-            self.inner.begin_attempt(id, runner)
+            self.inner.begin_attempt(id, runner, why, parallelism)
         }
 
         fn state_root_id(&self) -> &str {
@@ -2978,12 +3179,16 @@ mod tests {
                 Some("run-1"),
                 &outbox,
                 kick,
-                offering_kvm_free()
+                offering_kvm_free(),
+                HostSize::default(),
+                0,
             ),
             Admitted::Yes
         ));
         assert_eq!(
-            state.why_not_now(&labels),
+            state.seats(&BTreeMap::new())[0]
+                .capacity
+                .why_not_now(&labels),
             None,
             "the reading this claim is about to be judged on is free"
         );
@@ -3043,7 +3248,11 @@ mod tests {
             .expect("the job is still there");
         assert_eq!(record.state, JobState::Assigned);
         assert_eq!(
-            state.why_not_now(&labels).as_deref().map(|_| "suspended"),
+            state.seats(&BTreeMap::new())[0]
+                .capacity
+                .why_not_now(&labels)
+                .as_deref()
+                .map(|_| "suspended"),
             Some("suspended"),
             "and the snapshot is in force for whatever comes next"
         );
