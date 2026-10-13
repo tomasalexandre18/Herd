@@ -27,7 +27,8 @@ pub use capability::{
     OfferedCapability,
 };
 pub use placement::{
-    parallelism_tokens, with_parallelism, HostSize, Parallelism, PARALLELISM_TOKEN,
+    default_memory_floor_mib, parallelism_tokens, size_mib, with_parallelism, HostSize,
+    Parallelism, PARALLELISM_TOKEN,
 };
 
 /// The version announced in [`ToHub::Hello`] and echoed in
@@ -49,7 +50,16 @@ pub use placement::{
 /// derive nothing for it and place nothing on it. The number moves instead.
 /// Both numbers are free-running development counters until M16, where they
 /// are set back to 1 (D73).
-pub const PROTOCOL_VERSION: u32 = 3;
+///
+/// 4 since M8: a runner announces the memory it keeps for itself and the
+/// tmpfs room jobs may reserve on it ([`HostSize::memory_floor_mib`],
+/// [`HostSize::tmpfs_mib`]) and the load it last measured; a submission may
+/// carry the whole-job memory and the tmpfs its requester declares. The
+/// reason the number moves is the same as M7's, and sharper: a version 3
+/// runner announces no floor and no tmpfs, and a hub that read either as zero
+/// would admit a job into the memory its host needs to stay alive
+/// (invariant 2) or take a reservation on room nobody said was there.
+pub const PROTOCOL_VERSION: u32 = 4;
 
 /// How often a runner says it is alive and what it is doing (E-40).
 ///
@@ -589,6 +599,11 @@ pub enum ToHub {
         /// not a second mechanism.
         #[serde(default, skip_serializing_if = "is_no_preference")]
         preference: i32,
+        /// The host's one-minute load average as this runner dialled, times
+        /// 1000 (E-32). Recorded, never a gate; see
+        /// [`ToHub::Health::load_milli`], which is where it is refreshed.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        load_milli: Option<u64>,
     },
     /// Runner reports what its external busy probes say (E-26).
     ///
@@ -629,6 +644,31 @@ pub enum ToHub {
         /// consumer's builds. Whole-job memory admission is M8's (E-29).
         #[serde(default, skip_serializing_if = "Option::is_none")]
         build_thread_mib: Option<u32>,
+        /// How much memory this whole job needs, in MiB (E-29).
+        ///
+        /// What admission costs the job at: a runner takes it only if its
+        /// memory, less the floor it keeps for itself, less what the jobs
+        /// already out there declared, covers this figure. Absent means the
+        /// job declares no whole-job memory need — which is not zero: it is a
+        /// job admission has no figure to weigh, and it is admitted on
+        /// capabilities alone.
+        ///
+        /// Mutually exclusive with `build_thread_mib`: a build declares what
+        /// one of its threads needs and the hub multiplies by the `-j` it
+        /// derived, a test declares what the whole job needs. A submission
+        /// carrying both says two things about one question and is refused by
+        /// name.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        memory_mib: Option<u64>,
+        /// How much room on the runner's tmpfs this job reserves while it
+        /// runs, in MiB (E-31).
+        ///
+        /// Reserved before the job starts and released by the record ending,
+        /// so there is nothing to leak (D79). `Some(0)` is a real declaration
+        /// — the first consumer's `build` and `check` need no tmpfs at all —
+        /// and absent means the same thing said by not saying it.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        tmpfs_mib: Option<u64>,
     },
     /// An operator raises one job above what its requester asked for (E-18).
     ///
@@ -702,6 +742,21 @@ pub enum ToHub {
     Health {
         jobs: Vec<RunningJob>,
         draining: bool,
+        /// The host's one-minute load average when this report was made,
+        /// times 1000 (E-32).
+        ///
+        /// **Recorded, never a gate.** E-32 is explicit that a busy host is a
+        /// fact to report and not a reason to refuse a job, so this figure
+        /// reaches the hub, lands on the line explaining every placement, and
+        /// is compared against nothing anywhere. It rides on the health report
+        /// rather than the handshake because it is a fact about the moment;
+        /// the handshake carries the one the runner measured as it dialled, so
+        /// that a job placed before the first report still has a figure.
+        ///
+        /// Absent when `/proc/loadavg` cannot be read — never zero, because
+        /// zero is a measurement.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        load_milli: Option<u64>,
     },
     /// Runner gives an attempt back without a verdict, and says why.
     ///

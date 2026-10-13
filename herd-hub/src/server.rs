@@ -118,6 +118,50 @@ pub const FRAME_CEILING_BYTES: usize = 64 << 20;
 /// attempt would be a different promise and nobody has asked for one.
 pub const ATTEMPTS_ALLOWED: u32 = 2;
 
+/// How often a job that is still waiting says so again (E-04).
+///
+/// Sixty seconds, because that is the figure E-04 names: "at least every
+/// 60 s". A setting rather than a constant — `--wait-restatement`, printed at
+/// startup — for the reason the stickiness limit is one: a test has to be
+/// able to make ten minutes of waiting pass without waiting ten minutes, and
+/// through the hub's own code rather than a copy of it.
+pub const WAIT_RESTATEMENT: Duration = Duration::from_secs(60);
+
+/// E-04's cadence, as a decision rather than a sleep.
+///
+/// The arithmetic of "at least every 60 s" is one comparison, and it is
+/// pulled out of the loop that uses it for the reason the queue's aging is
+/// pulled out of its own: a test has to be able to drive ten minutes of
+/// waiting through **the hub's own decision**, counting the lines it would
+/// have produced, rather than through a copy of it or a ten-minute sleep.
+#[derive(Debug, Clone, Copy)]
+pub struct Restating {
+    pub cadence: Duration,
+}
+
+impl Restating {
+    /// Whether a job last told `since` ago is due to be told again.
+    ///
+    /// `None` is a job nobody has been told about yet, which is always due:
+    /// a requester that attaches to a job already waiting gets the reason at
+    /// once rather than up to a cadence later.
+    pub fn is_due(&self, since: Option<Duration>) -> bool {
+        since.is_none_or(|since| since >= self.cadence)
+    }
+
+    /// The most lines a follower can get over a wait of `wait`.
+    ///
+    /// The bound E-04's flooding half needs stated rather than hoped for, and
+    /// the figure a test asserts against: one at the start, and one per whole
+    /// cadence after it.
+    pub fn at_most_over(&self, wait: Duration) -> u32 {
+        if self.cadence.is_zero() {
+            return u32::MAX;
+        }
+        u32::try_from(wait.as_nanos() / self.cadence.as_nanos()).unwrap_or(u32::MAX - 1) + 1
+    }
+}
+
 /// The hub's own version, reported in `Welcome`.
 pub fn hub_version() -> &'static str {
     env!("CARGO_PKG_VERSION")
@@ -172,6 +216,22 @@ pub struct Policy {
     /// `--stickiness-limit`, three hours by default, printed when the hub
     /// starts, named in the sentence of every job waiting on it.
     pub stickiness: Stickiness,
+    /// How often a job that is still waiting says so again, to whoever is
+    /// following it (E-04).
+    ///
+    /// E-04 asks for "at least every 60 s", which has two failure modes and
+    /// this figure bounds both. Too rare and a ten-minute wait is silence; a
+    /// line per dispatch pass and a job waiting on one lock file fills a
+    /// transcript with hundreds of identical sentences — M7 alone added
+    /// several passes per second to a busy fleet. So the cadence is a figure
+    /// rather than an event: a following requester is told again no oftener
+    /// than this and no rarer, whatever the fleet is doing in between, and
+    /// the arithmetic of the bound is `wait / restatement + 1`.
+    ///
+    /// It is deliberately *not* the dispatch pass's cadence. The pass is
+    /// where the reason is **computed**, and it may run twenty times a minute
+    /// or once an hour; this is where it is **said**.
+    pub wait_restatement: Duration,
 }
 
 impl Default for Policy {
@@ -184,6 +244,7 @@ impl Default for Policy {
             write_retry_cap: Duration::from_secs(5 * 60),
             aging_step: crate::queue::AGING_STEP,
             stickiness: Stickiness::default(),
+            wait_restatement: WAIT_RESTATEMENT,
         }
     }
 }
@@ -200,6 +261,18 @@ impl Policy {
     /// finish. Refused here, at startup, naming both figures and the margin,
     /// because the alternative is finding it in a job's record.
     pub fn refusal(&self) -> Option<String> {
+        // A restatement cadence of zero is the flooding half of E-04: every
+        // turn of the loop would be due, so a requester following one job
+        // waiting on one lock file would be written to as fast as the hub can
+        // run. Refused at startup rather than found in a transcript.
+        if self.wait_restatement.is_zero() {
+            return Some(
+                "--wait-restatement 0 would say why a job is waiting as fast as this hub can \
+                 loop, which is not a cadence. E-04 asks for at least every 60 s; give that, \
+                 or a shorter figure a test can make ten minutes pass under."
+                    .to_owned(),
+            );
+        }
         herd_proto::silence_threshold_refusal(
             "the hub's silence threshold (--lost-after)",
             self.lost_after,
@@ -293,11 +366,12 @@ impl Hub {
     }
 
     /// Serve until the listener fails. Dropping the returned future releases
-    /// the port and ends the hub's own three housekeeping tasks.
+    /// the port and ends the hub's own four housekeeping tasks.
     pub async fn serve(self) -> Result<()> {
         let watching = tokio::spawn(watch_for_a_lost_runner(Arc::clone(&self.state)));
         let writing = tokio::spawn(keep_trying_to_write_results(Arc::clone(&self.state)));
         let aging = tokio::spawn(let_the_queue_age(Arc::clone(&self.state)));
+        let restating = tokio::spawn(say_again_why_jobs_wait(Arc::clone(&self.state)));
         let serving = async {
             loop {
                 let (stream, peer) = self.listener.accept().await.context("accepting")?;
@@ -313,6 +387,7 @@ impl Hub {
         watching.abort();
         writing.abort();
         aging.abort();
+        restating.abort();
         outcome
     }
 }
@@ -438,6 +513,9 @@ struct Announced {
     host: HostSize,
     /// How preferred it is when more than one machine could run a job (E-19).
     preference: i32,
+    /// The load it measured as it dialled, times 1000 (E-32). Recorded,
+    /// never a gate; refreshed by every health report.
+    load_milli: Option<u64>,
 }
 
 /// What a requester gets when it attaches to a job by its id.
@@ -471,6 +549,15 @@ struct ConnectedRunner {
     /// How preferred this machine is when more than one could run a job
     /// (E-19). Declared by whoever runs it; zero when it says nothing.
     preference: i32,
+    /// The one-minute load average this machine last reported, times 1000
+    /// (E-32).
+    ///
+    /// Kept because E-32 asks for the figure to be **recorded**, and refreshed
+    /// on every health report because it is a fact about the moment. It is
+    /// quoted on the line explaining a placement and compared against nothing:
+    /// a busy host is a fact to report, never a reason to refuse a job.
+    /// `None` until the first report, and for a machine that cannot read it.
+    load_milli: Option<u64>,
     /// How the hub ends this connection without waiting for the socket to
     /// notice. Used when a runner that is plainly alive dials in while this
     /// connection is still registered: the new one is the real one.
@@ -556,6 +643,15 @@ struct Peers {
     /// noticed. A shortfall that is still there at the next report, with
     /// nothing written in between, is a loss rather than a chunk in flight.
     short_log: HashMap<JobId, u64>,
+    /// When whoever is following each queued job was last told why it is
+    /// waiting (E-04).
+    ///
+    /// The cadence lives here rather than on the record because it is about a
+    /// *stream*: the record already carries the reason, written only when it
+    /// is news (M6), and E-04 asks for something else — that a requester
+    /// watching a ten-minute wait is not left in silence. One instant per
+    /// job, pruned when nobody is following it any more.
+    wait_told: HashMap<JobId, Instant>,
 }
 
 impl State {
@@ -652,6 +748,7 @@ impl State {
                     capacity: announced.capacity,
                     host: announced.host,
                     preference: announced.preference,
+                    load_milli: announced.load_milli,
                     kick,
                     joined_at: now,
                     last_health: now,
@@ -691,12 +788,17 @@ impl State {
     /// connected, with what it offers, what its probes say, how big it is and
     /// how preferred it is (E-19, E-22, E-25).
     ///
-    /// `held` is what the records say is already running, per runner — the
-    /// only source of a slot count there is (see `crate::matcher`). A runner
-    /// that is draining is in here and marked, not left out: the sentence a
-    /// waiting job gets has to be able to say that the machine it would have
-    /// gone to is leaving.
-    fn seats(&self, held: &BTreeMap<String, Vec<(JobId, LabelSet)>>) -> Vec<Seat> {
+    /// `held` and `reserved` are what the records say is already running, per
+    /// runner — the only source of a slot count, a memory holding or a tmpfs
+    /// reservation there is (see `crate::matcher`, D79). A runner that is
+    /// draining is in here and marked, not left out: the sentence a waiting
+    /// job gets has to be able to say that the machine it would have gone to
+    /// is leaving.
+    fn seats(
+        &self,
+        held: &BTreeMap<String, Vec<(JobId, LabelSet)>>,
+        reserved: &BTreeMap<String, matcher::Reserved>,
+    ) -> Vec<Seat> {
         self.with_peers(|peers| {
             peers
                 .runners
@@ -718,6 +820,8 @@ impl State {
                         draining: runner.draining,
                         capacity: runner.capacity.clone(),
                         holdings,
+                        reserved: reserved.get(&runner.name).cloned().unwrap_or_default(),
+                        load_milli: runner.load_milli,
                     }
                 })
                 .collect()
@@ -835,7 +939,13 @@ impl State {
         })
     }
 
-    fn record_health(&self, outbox: &Outbox, jobs: Vec<RunningJob>, draining: bool) {
+    fn record_health(
+        &self,
+        outbox: &Outbox,
+        jobs: Vec<RunningJob>,
+        draining: bool,
+        load_milli: Option<u64>,
+    ) {
         self.with_peers(|peers| {
             if let Some(runner) = peers
                 .runners
@@ -846,6 +956,13 @@ impl State {
                 runner.reports_seen += 1;
                 runner.draining = draining;
                 runner.jobs = jobs;
+                // A figure that could not be read this time does not erase
+                // the last one that could: an absent load is unknown, and the
+                // most recent figure the machine managed to give is still the
+                // most recent figure there is (E-32).
+                if load_milli.is_some() {
+                    runner.load_milli = load_milli;
+                }
             }
         });
     }
@@ -1131,6 +1248,7 @@ async fn serve_peer(state: Arc<State>, stream: TcpStream) -> Result<()> {
                 capabilities,
                 host,
                 preference,
+                load_milli,
             } => {
                 if protocol_version != PROTOCOL_VERSION {
                     return refuse(&mut sink, version_mismatch_reason(protocol_version)).await;
@@ -1165,6 +1283,7 @@ async fn serve_peer(state: Arc<State>, stream: TcpStream) -> Result<()> {
                         capacity: RunnerCapacity::new(name, capabilities),
                         host,
                         preference,
+                        load_milli,
                     },
                 )
             }
@@ -1451,7 +1570,13 @@ fn dispatch_a_pass(state: &State) -> Result<()> {
     // from nothing else: there is no counter of busy slots in this hub, so
     // there is none to leak and none to rebuild after a restart (D79).
     let held = matcher::holdings(&unfinished);
-    let mut seats = state.seats(&held);
+    // And what every runner has reserved, from the same records and the same
+    // filter: the memory a running job *declared* it needs and the tmpfs it
+    // *declared* it would take (E-29, E-31). There is no reservation table in
+    // this hub, so there is none to release on any of the eight ways a job
+    // ends and none to rebuild after a restart (D79).
+    let reserved = matcher::reserved(&unfinished);
+    let mut seats = state.seats(&held, &reserved);
     // One moment for the whole pass, so that the order cannot change halfway
     // through it, and the moment the figures in the sentences are computed
     // from is the moment the order was.
@@ -1475,10 +1600,11 @@ fn dispatch_a_pass(state: &State) -> Result<()> {
                     // seat that is gone, and the next pass — which a
                     // released runner triggers — judges it afresh.
                     let standing = queue::standing(record, now, state.policy.aging_step);
-                    let sentence = queue::waiting_sentence(
+                    let sentence = queue::waiting_sentence_behind(
                         place + 1,
                         total,
                         &standing,
+                        &queue::what_is_ahead(&queue, place, now, state.policy.aging_step),
                         &format!(
                             "it is waiting because runner {runner}'s connection ended while \
                              this pass was placing it there"
@@ -1497,10 +1623,11 @@ fn dispatch_a_pass(state: &State) -> Result<()> {
             // bounded by the stickiness limit it asks to be visible.
             Placement::Wait { why } => {
                 let standing = queue::standing(record, now, state.policy.aging_step);
-                let sentence = queue::waiting_sentence(
+                let sentence = queue::waiting_sentence_behind(
                     place + 1,
                     total,
                     &standing,
+                    &queue::what_is_ahead(&queue, place, now, state.policy.aging_step),
                     &format!("it is waiting because {why}"),
                 );
                 say_it_waits(state, &record.id, &sentence)?;
@@ -1581,6 +1708,89 @@ async fn let_the_queue_age(state: Arc<State>) {
     }
 }
 
+/// Say again, on a clock, why every followed job is still waiting (E-04).
+///
+/// E-04 asks for a queued stream to report "at least every 60 s", and the two
+/// ways to fail that are opposite. Saying it only when the sentence *changes*
+/// — which is what the record does, and rightly, because a record is history —
+/// leaves a requester watching a job stuck on one lock file in silence for an
+/// hour. Saying it on every dispatch pass floods: a pass runs when a runner
+/// joins, when a probe changes its mind, when a job ends, when one is
+/// submitted, and once a minute besides, so a busy fleet would write a
+/// requester hundreds of identical lines.
+///
+/// So this is a clock of its own, and it reads the sentence the dispatch pass
+/// already wrote on the record rather than judging anything itself: one task,
+/// one figure (`--wait-restatement`), and a bound an operator can compute —
+/// over a wait of `W` a follower gets at most `W / restatement + 1` lines.
+///
+/// It reads only the records of jobs somebody is following, so a hub nobody is
+/// watching does no work here at all.
+async fn say_again_why_jobs_wait(state: Arc<State>) {
+    // Checked oftener than the cadence, so that "at least every 60 s" is met
+    // rather than approached: a loop that woke exactly every 60 s would drift
+    // past it by however long a pass of it takes.
+    let every = (state.policy.wait_restatement / 4).max(Duration::from_millis(50));
+    loop {
+        tokio::time::sleep(every).await;
+        let followed = state.with_peers(|peers| {
+            // And the pruning, under the same lock: a job nobody follows any
+            // more leaves nothing behind in this map.
+            peers.wait_told.retain(|job, _| {
+                peers
+                    .followers
+                    .get(job)
+                    .is_some_and(|followers| !followers.is_empty())
+            });
+            peers
+                .followers
+                .iter()
+                .filter(|(_, followers)| !followers.is_empty())
+                .map(|(job, _)| job.clone())
+                .collect::<Vec<_>>()
+        });
+        for job_id in followed {
+            // Only a job that is *queued* and has a reason on it. A running
+            // job is not waiting, and a queued job the hub has not yet had a
+            // reason for says nothing rather than saying nothing useful.
+            let Ok(Some(record)) = state.store.job(&job_id) else {
+                continue;
+            };
+            if record.state != JobState::Queued {
+                continue;
+            }
+            let Some(reason) = record.waiting_for else {
+                continue;
+            };
+            let restating = Restating {
+                cadence: state.policy.wait_restatement,
+            };
+            let due = state.with_peers(|peers| {
+                let due = restating.is_due(
+                    peers
+                        .wait_told
+                        .get(&job_id)
+                        .map(|told| told.elapsed()),
+                );
+                if due {
+                    peers.wait_told.insert(job_id.clone(), Instant::now());
+                }
+                due
+            });
+            if !due {
+                continue;
+            }
+            let note = format!("this job is queued and has not started: {reason}");
+            for follower in state.followers_of(&job_id) {
+                let _ = follower.send(FromHub::JobNote {
+                    job_id: job_id.clone(),
+                    note: note.clone(),
+                });
+            }
+        }
+    }
+}
+
 /// Record why a queued job is not starting, and tell whoever is waiting for
 /// it.
 ///
@@ -1598,6 +1808,10 @@ fn say_it_waits(state: &State, job_id: &JobId, reason: &str) -> Result<()> {
         return Ok(());
     }
     println!("herd-hub: {job_id} stays queued: {reason}");
+    // News resets the cadence: a requester told the reason this second does
+    // not want the same sentence again a second later because a clock
+    // happened to come round (E-04's flooding half).
+    state.with_peers(|peers| peers.wait_told.insert(job_id.clone(), Instant::now()));
     let note = format!("this job is queued and has not started: {reason}");
     for follower in state.followers_of(job_id) {
         let _ = follower.send(FromHub::JobNote {
@@ -1681,7 +1895,11 @@ async fn relay_from_runner(
             },
         };
         match message {
-            ToHub::Health { jobs, draining } => {
+            ToHub::Health {
+                jobs,
+                draining,
+                load_milli,
+            } => {
                 // A report is two different claims. "I am alive" is this
                 // runner's to make, and it is recorded whatever else the
                 // report says. "I am running these jobs" is a claim about
@@ -1695,7 +1913,7 @@ async fn relay_from_runner(
                         its_own.push(job);
                     }
                 }
-                state.record_health(outbox, its_own, draining);
+                state.record_health(outbox, its_own, draining, load_milli);
                 // The answer is what tells the runner this link is alive: a
                 // socket can stay open onto a hub that is gone.
                 let _ = outbox.send(FromHub::HealthRecorded {});
@@ -2500,6 +2718,8 @@ async fn accept_submissions(state: &State, outbox: &Outbox, source: &mut Source)
                 labels,
                 priority,
                 build_thread_mib,
+                memory_mib,
+                tmpfs_mib,
             } => {
                 if command.is_empty() {
                     let _ = outbox.send(FromHub::Refused {
@@ -2515,7 +2735,8 @@ async fn accept_submissions(state: &State, outbox: &Outbox, source: &mut Source)
                     .store
                     .submit(
                         NewJob::at(command, labels, priority)
-                            .with_build_thread_mib(build_thread_mib),
+                            .with_build_thread_mib(build_thread_mib)
+                            .with_admission(memory_mib, tmpfs_mib),
                     )
                     .context("taking a submission in")?;
                 let job_id = submission.record().id.clone();
@@ -3199,12 +3420,13 @@ mod tests {
                     capacity: offering_kvm_free(),
                     host: HostSize::default(),
                     preference: 0,
+                    load_milli: None,
                 },
             ),
             Admitted::Yes
         ));
         assert_eq!(
-            state.seats(&BTreeMap::new())[0]
+            state.seats(&BTreeMap::new(), &BTreeMap::new())[0]
                 .capacity
                 .why_not_now(&labels),
             None,
@@ -3266,7 +3488,7 @@ mod tests {
             .expect("the job is still there");
         assert_eq!(record.state, JobState::Assigned);
         assert_eq!(
-            state.seats(&BTreeMap::new())[0]
+            state.seats(&BTreeMap::new(), &BTreeMap::new())[0]
                 .capacity
                 .why_not_now(&labels)
                 .as_deref()

@@ -151,8 +151,11 @@ fn every_message_to_the_hub_round_trips() {
             state_root: Some("root-0123456789abcdef".to_owned()),
             health_every_ms: Some(15_000),
             capabilities: an_offer(),
-            host: HostSize::new(Some(17 * 1024), Some(20)),
+            host: HostSize::new(Some(17 * 1024), Some(20))
+                .with_floor(Some(3481))
+                .with_tmpfs(Some(8192)),
             preference: 10,
+            load_milli: Some(1420),
         });
         // The optional fields really are optional.
         round_trip_to_hub(ToHub::Hello {
@@ -166,6 +169,7 @@ fn every_message_to_the_hub_round_trips() {
             capabilities: CapabilityOffer::empty(),
             host: HostSize::default(),
             preference: 0,
+            load_milli: None,
         });
     }
     round_trip_to_hub(ToHub::CapabilitiesChanged {
@@ -184,12 +188,16 @@ fn every_message_to_the_hub_round_trips() {
             labels: LabelSet::new(["build", "reference"]).expect("valid labels"),
             priority,
             build_thread_mib: Some(1792),
+            memory_mib: None,
+            tmpfs_mib: Some(0),
         });
         round_trip_to_hub(ToHub::SubmitJob {
             command: vec![],
             labels: LabelSet::default(),
             priority,
             build_thread_mib: None,
+            memory_mib: Some(3584),
+            tmpfs_mib: Some(4096),
         });
         round_trip_to_hub(ToHub::RaiseJob {
             job_id: JobId::new("j0000000007"),
@@ -527,14 +535,16 @@ fn the_link_frames_are_tagged_json_objects() {
                 chunks_sent: 412,
             }],
             draining: false,
+            load_milli: Some(1420),
         })
         .expect("encodes"),
-        r#"{"type":"health","jobs":[{"job_id":"j0000000007","attempt":2,"chunks_sent":412}],"draining":false}"#
+        r#"{"type":"health","jobs":[{"job_id":"j0000000007","attempt":2,"chunks_sent":412}],"draining":false,"load_milli":1420}"#
     );
     assert_eq!(
         to_frame(&ToHub::Health {
             jobs: vec![],
             draining: true,
+            load_milli: None,
         })
         .expect("encodes"),
         r#"{"type":"health","jobs":[],"draining":true}"#
@@ -604,6 +614,7 @@ fn every_link_frame_round_trips() {
                 },
             ],
             draining,
+            load_milli: Some(u64::MAX),
         });
     }
     round_trip_to_hub(ToHub::CancelJob {

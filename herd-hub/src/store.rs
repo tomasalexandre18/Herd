@@ -893,6 +893,8 @@ impl JobDirStore {
             labels,
             priority,
             build_thread_mib,
+            memory_mib,
+            tmpfs_mib,
         } = new;
         let mut live = self.lock()?;
         // `mkdir` is what claims an id: the directories, not the index, decide
@@ -936,6 +938,8 @@ impl JobDirStore {
             labels,
             priority,
             build_thread_mib,
+            memory_mib,
+            tmpfs_mib,
             parallelism: None,
             submissions: 1,
             state: JobState::Queued,
@@ -2316,11 +2320,22 @@ mod tests {
             .join(JOBS_DIR)
             .join(job.id.as_str())
             .join(RECORD_FILE);
-        durable::write_file(&path, br#"{"record_version":4,"id":"j0000000001"}"#).expect("written");
+        // One past whatever this Herd reads, computed rather than written
+        // down, so the test does not have to be edited every time the number
+        // moves (it has moved three times: M6, M7, M8).
+        let newer = RECORD_VERSION + 1;
+        durable::write_file(
+            &path,
+            format!(r#"{{"record_version":{newer},"id":"j0000000001"}}"#).as_bytes(),
+        )
+        .expect("written");
         let error = store
             .job(&job.id)
-            .expect_err("version 4 is not readable here");
-        assert!(error.to_string().contains("record version 4"), "{error}");
+            .expect_err("a newer version is not readable here");
+        assert!(
+            error.to_string().contains(&format!("record version {newer}")),
+            "{error}"
+        );
         assert!(
             error
                 .to_string()

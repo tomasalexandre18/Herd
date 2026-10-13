@@ -54,6 +54,39 @@ pub struct HostSize {
     /// How many hardware threads this host has for Herd's jobs.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub threads: Option<u32>,
+    /// How much of [`HostSize::memory_mib`] this host keeps for itself, in
+    /// MiB: the per-runner floor admission subtracts before it admits
+    /// anything (E-29).
+    ///
+    /// The first consumer names 6 GiB on their 31 GiB server and 3 GiB on the
+    /// owner's 17 GiB PC. It is announced by the machine rather than chosen by
+    /// the hub, for the reason the memory figure is: the owner of a machine is
+    /// the authority on how much of it Herd may have.
+    ///
+    /// Absent is **unknown**, not zero: a hub reading an absent floor as zero
+    /// would admit a job into the memory the host needs to stay alive
+    /// (invariant 2), which is the whole of what the floor exists for. A
+    /// runner of this version always announces one
+    /// ([`default_memory_floor_mib`]), so absent means a peer older than the
+    /// figure.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub memory_floor_mib: Option<u64>,
+    /// How much room on this host's tmpfs Herd's jobs may reserve, in MiB
+    /// (E-31).
+    ///
+    /// The **capacity**, not what is free this second: what is free is this
+    /// figure less what the jobs the records say are running here declared
+    /// they would take, which is the only arithmetic that cannot leak a
+    /// reservation (D79). Read from the host's tmpfs, or given at startup by
+    /// its owner.
+    ///
+    /// Absent is **unknown**: a job that needs a reservation is refused on
+    /// this machine *by name* rather than admitted on the assumption that the
+    /// room is there. `Some(0)` is a different statement — a host that lends
+    /// no tmpfs at all — and it is never written for a figure that could not
+    /// be read.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tmpfs_mib: Option<u64>,
 }
 
 impl HostSize {
@@ -61,11 +94,41 @@ impl HostSize {
         Self {
             memory_mib,
             threads,
+            memory_floor_mib: None,
+            tmpfs_mib: None,
         }
     }
 
+    /// The same, with the memory this host keeps for itself (E-29).
+    pub fn with_floor(mut self, memory_floor_mib: Option<u64>) -> Self {
+        self.memory_floor_mib = memory_floor_mib;
+        self
+    }
+
+    /// The same, with the tmpfs room a job may reserve here (E-31).
+    pub fn with_tmpfs(mut self, tmpfs_mib: Option<u64>) -> Self {
+        self.tmpfs_mib = tmpfs_mib;
+        self
+    }
+
     pub fn is_silent(&self) -> bool {
-        self.memory_mib.is_none() && self.threads.is_none()
+        self.memory_mib.is_none()
+            && self.threads.is_none()
+            && self.memory_floor_mib.is_none()
+            && self.tmpfs_mib.is_none()
+    }
+
+    /// How much memory a job may be admitted into here: what is lent, less
+    /// the floor the host keeps (E-29).
+    ///
+    /// `None` when either figure is absent, because an absent figure is not
+    /// zero. Saturating, so a floor larger than the memory it is subtracted
+    /// from admits nothing rather than wrapping round to a machine of
+    /// eighteen exabytes. A runner refuses that pairing where it is written,
+    /// which is the honest place for it; this is what a hub does with one if
+    /// it ever arrives anyway.
+    pub fn admissible_memory_mib(&self) -> Option<u64> {
+        Some(self.memory_mib?.saturating_sub(self.memory_floor_mib?))
     }
 
     /// Which figure is missing, as a sentence, or `None` when both are there.
@@ -176,6 +239,40 @@ impl Parallelism {
             ));
         }
         said
+    }
+}
+
+/// How much of a host's memory its own floor is, when nobody says (E-29).
+///
+/// A fifth, between 1 GiB and 8 GiB. The fraction reproduces the two figures
+/// the first consumer names for themselves rather than inventing one: a fifth
+/// of their 31 GiB server is 6.2 GiB against the 6 GiB they ask for, and a
+/// fifth of the owner's 17 GiB PC is 3.4 GiB against her 3 GiB. The bounds
+/// are there because a floor is the room a host needs to stay alive, and no
+/// host needs less than a gibibyte of that or more than eight.
+///
+/// Here rather than in the runner because the hub's sentences quote the
+/// figure, and a reader of one has to be able to find where it came from.
+pub fn default_memory_floor_mib(memory_mib: u64) -> u64 {
+    (memory_mib / 5).clamp(1024, 8 * 1024)
+}
+
+/// A figure in MiB, as the sentence an operator reads carries it (E-04).
+///
+/// E-04's own example is `1.2 GiB free in tmpfs, 2 GiB needed`, so: MiB below
+/// a gibibyte, whole gibibytes with no decimal point, and one decimal
+/// otherwise. Truncated rather than rounded, always: a sentence that turned
+/// 1 331 MiB into `1.3 GiB` would be quoting an operator a figure larger than
+/// the room that is actually there, and the job that then did not fit would
+/// look like a bug in the arithmetic rather than in the rounding.
+pub fn size_mib(figure: u64) -> String {
+    if figure < 1024 {
+        return format!("{figure} MiB");
+    }
+    let whole = figure / 1024;
+    match (figure % 1024) * 10 / 1024 {
+        0 => format!("{whole} GiB"),
+        tenths => format!("{whole}.{tenths} GiB"),
     }
 }
 
@@ -293,6 +390,61 @@ mod tests {
             .parallelism(0, 1)
             .expect_err("zero is not a figure");
         assert!(why.contains("0 MiB is not a figure"), "{why}");
+    }
+
+    /// E-04's own example sentence has to come out of the formatter that
+    /// writes it: `1.2 GiB free in tmpfs, 2 GiB needed`.
+    #[test]
+    fn a_figure_reads_the_way_e04_s_example_writes_it() {
+        assert_eq!(size_mib(2048), "2 GiB");
+        // 1 229 MiB is E-04's own `1.2 GiB free in tmpfs`.
+        assert_eq!(size_mib(1229), "1.2 GiB");
+        assert_eq!(size_mib(1152), "1.1 GiB");
+        assert_eq!(size_mib(8192), "8 GiB");
+        assert_eq!(size_mib(3584), "3.5 GiB");
+        assert_eq!(size_mib(512), "512 MiB");
+        assert_eq!(size_mib(0), "0 MiB");
+        // Truncated, never rounded up: 1 331 MiB is 1.29 GiB and must never
+        // be quoted as more room than it is.
+        assert_eq!(size_mib(1331), "1.2 GiB");
+    }
+
+    /// The default floor reproduces the two figures the first consumer names
+    /// for their own two machines (E-29).
+    #[test]
+    fn the_default_floor_is_about_what_the_consumer_asks_for() {
+        assert_eq!(default_memory_floor_mib(31 * 1024), 6348);
+        assert_eq!(default_memory_floor_mib(17 * 1024), 3481);
+        // And it is bounded both ways: a tiny machine still keeps a gibibyte,
+        // and a huge one does not keep fifty.
+        assert_eq!(default_memory_floor_mib(2048), 1024);
+        assert_eq!(default_memory_floor_mib(256 * 1024), 8192);
+    }
+
+    /// A floor is subtracted, and an absent figure makes the whole admission
+    /// unknown rather than generous.
+    #[test]
+    fn an_absent_memory_or_floor_is_an_unknown_admission_and_never_a_zero() {
+        let server = HostSize::new(Some(31 * 1024), Some(12)).with_floor(Some(6 * 1024));
+        assert_eq!(server.admissible_memory_mib(), Some(25 * 1024));
+        assert_eq!(
+            HostSize::new(Some(31 * 1024), Some(12)).admissible_memory_mib(),
+            None,
+            "a runner that does not say what it keeps back admits nothing by assumption"
+        );
+        assert_eq!(
+            HostSize::new(None, Some(12))
+                .with_floor(Some(1024))
+                .admissible_memory_mib(),
+            None
+        );
+        // A floor past the memory admits nothing, and does not wrap round.
+        assert_eq!(
+            HostSize::new(Some(2048), Some(4))
+                .with_floor(Some(8192))
+                .admissible_memory_mib(),
+            Some(0)
+        );
     }
 
     #[test]

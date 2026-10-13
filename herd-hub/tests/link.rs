@@ -128,7 +128,7 @@ impl Quick {
             vec!["/bin/sh".to_owned(), "-c".to_owned(), command.to_owned()],
             LabelSet::default(),
             Priority::Step,
-            None,
+            herdctl::Declared::default(),
         )
         .await
         .expect("the submission is accepted")
@@ -223,6 +223,7 @@ impl Puppet {
             capabilities: Default::default(),
             host: herd_proto::HostSize::default(),
             preference: 0,
+            load_milli: None,
         };
         socket
             .send(Message::text(to_frame(&hello).expect("encodes")))
@@ -313,7 +314,12 @@ impl Puppet {
     }
 
     async fn report_health(&mut self, jobs: Vec<RunningJob>, draining: bool) {
-        self.say(ToHub::Health { jobs, draining }).await;
+        self.say(ToHub::Health {
+            jobs,
+            draining,
+            load_milli: None,
+        })
+        .await;
     }
 }
 
@@ -389,7 +395,7 @@ async fn a_runner_s_health_report_and_its_age_are_in_the_hub_s_state() {
         vec!["true".to_owned()],
         LabelSet::default(),
         Priority::Step,
-        None,
+        herdctl::Declared::default(),
     )
     .await
     .expect_err("a draining runner takes no new job");
@@ -926,7 +932,7 @@ async fn a_draining_runner_refuses_a_job_submitted_in_the_meantime() {
         vec!["true".to_owned()],
         LabelSet::default(),
         Priority::Step,
-        None,
+        herdctl::Declared::default(),
     )
     .await
     .expect_err("a draining runner takes no new job");
@@ -1434,7 +1440,7 @@ async fn a_runner_announcing_another_state_root_is_turned_away_naming_both() {
         vec!["true".to_owned()],
         LabelSet::default(),
         Priority::Step,
-        None,
+        herdctl::Declared::default(),
     )
     .await
     .expect_err("there is no runner to place a job on");
@@ -1718,6 +1724,7 @@ async fn the_hub_s_first_answer(hub_url: &str, name: &str, instance: &str) -> Fr
         capabilities: Default::default(),
         host: herd_proto::HostSize::default(),
         preference: 0,
+        load_milli: None,
     };
     socket
         .send(Message::text(to_frame(&hello).expect("encodes")))
@@ -1766,7 +1773,7 @@ async fn a_peer_whose_name_and_instance_are_blank_is_refused_like_a_nameless_one
         vec!["true".to_owned()],
         LabelSet::default(),
         Priority::Step,
-        None,
+        herdctl::Declared::default(),
     )
     .await
     .expect_err("there is no runner to place a job on");

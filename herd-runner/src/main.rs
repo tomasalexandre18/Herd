@@ -153,6 +153,32 @@ struct Args {
     /// Read from the host when not given.
     #[arg(long, env = "HERD_HOST_THREADS", value_name = "N")]
     host_threads: Option<u32>,
+    /// How much of this host's memory stays this host's, whatever is queued:
+    /// `6GiB`, `3072MiB`, or plain bytes (E-29).
+    ///
+    /// The per-runner floor admission subtracts before it admits anything, so
+    /// that a machine keeps room to live (invariant 2). A fifth of the
+    /// memory, between 1 GiB and 8 GiB, when not given — which is about the
+    /// 6 GiB the first consumer asks of their server and the 3 GiB they ask of
+    /// the owner's PC. A floor at or past the memory lent is refused at
+    /// startup: it is a machine that can admit nothing, and denying its
+    /// capabilities is the honest way to say that.
+    #[arg(long, env = "HERD_HOST_MEMORY_FLOOR", value_name = "SIZE")]
+    host_memory_floor: Option<String>,
+    /// How much room on this host's tmpfs a job may reserve: `8GiB`,
+    /// `2048MiB`, or plain bytes (E-31).
+    ///
+    /// Measured from `--host-tmpfs-path` when not given, and clamped to what
+    /// is really there when it is: a figure larger than the mount is a
+    /// reservation nothing backs. A figure that can be neither given nor
+    /// measured stays **absent** — never zero — and a job that needs a
+    /// reservation is then refused on this machine by name rather than
+    /// admitted on an assumption.
+    #[arg(long, env = "HERD_HOST_TMPFS", value_name = "SIZE")]
+    host_tmpfs: Option<String>,
+    /// Which tmpfs `--host-tmpfs` is measured from. `/dev/shm` by default.
+    #[arg(long, env = "HERD_HOST_TMPFS_PATH", value_name = "PATH")]
+    host_tmpfs_path: Option<String>,
     /// How preferred this runner is when more than one could run a job
     /// (E-19). Higher goes first; zero by default.
     ///
@@ -245,7 +271,18 @@ async fn main() -> Result<()> {
                  may use here, or deny the capabilities this machine should not take."
             );
         }
-        host.memory_mib = Some(mib);
+        // An owner may lend less of her machine than it has. She may not lend
+        // more: the floor E-29 subtracts would then guard memory that does
+        // not exist, and the first job past the real total is the host
+        // swapping. Clamped, and the clamp is printed with both figures.
+        let (lendable, said) = herd_runner::metrics::lendable_memory_mib(
+            mib,
+            herd_runner::metrics::total_memory_mib(),
+        );
+        if let Some(said) = said {
+            println!("{said}");
+        }
+        host.memory_mib = Some(lendable);
     }
     if let Some(threads) = args.host_threads {
         if threads == 0 {
@@ -256,7 +293,92 @@ async fn main() -> Result<()> {
         }
         host.threads = Some(threads);
     }
+    // What this host keeps for itself, whatever is queued (E-29). Derived
+    // from what is lent when nobody says, so a runner of this version always
+    // announces a floor — an absent floor is read by the hub as a figure it
+    // was never given, and nothing is admitted against one.
+    host.memory_floor_mib = match args.host_memory_floor {
+        Some(size) => {
+            let bytes = parse_bytes(&size)
+                .map_err(anyhow::Error::msg)
+                .context("--host-memory-floor")?;
+            Some(bytes / (1 << 20))
+        }
+        None => host.memory_mib.map(herd_proto::default_memory_floor_mib),
+    };
+    // A floor that leaves nothing is refused where it is written, rather than
+    // discovered in the sentence of every job this machine turns away.
+    if let (Some(memory), Some(floor)) = (host.memory_mib, host.memory_floor_mib) {
+        if floor >= memory {
+            anyhow::bail!(
+                "--host-memory-floor is {floor} MiB and this host lends {memory} MiB, so \
+                 nothing could ever be admitted here. A floor is the room the host keeps to \
+                 stay alive, not the whole machine: lower it, or deny the capabilities this \
+                 machine should not take."
+            );
+        }
+    }
+    // And how much tmpfs a job may reserve here (E-31). Given, measured, or
+    // absent — and absent is unknown, never zero.
+    let tmpfs_path = args
+        .host_tmpfs_path
+        .unwrap_or_else(|| herd_runner::metrics::DEFAULT_TMPFS_PATH.to_owned());
+    let measured = herd_runner::metrics::tmpfs_room_mib(&tmpfs_path);
+    host.tmpfs_mib = match args.host_tmpfs {
+        Some(size) => {
+            let bytes = parse_bytes(&size)
+                .map_err(anyhow::Error::msg)
+                .context("--host-tmpfs")?;
+            let asked = bytes / (1 << 20);
+            match &measured {
+                // The same rule as the memory: lend less than the mount has,
+                // never more. A reservation nothing backs is a reservation.
+                Ok(room) if asked > *room => {
+                    println!(
+                        "herd-runner: --host-tmpfs asked for {asked} MiB and {tmpfs_path} holds \
+                         {room} MiB in all, so {room} MiB is what jobs may reserve here"
+                    );
+                    Some(*room)
+                }
+                Ok(_) => Some(asked),
+                Err(why) => {
+                    println!(
+                        "herd-runner: lending {asked} MiB of tmpfs as asked; it was not checked \
+                         against the mount, because {why}"
+                    );
+                    Some(asked)
+                }
+            }
+        }
+        None => match &measured {
+            Ok(room) => Some(*room),
+            Err(why) => {
+                // Said out loud, because the consequence is visible in the
+                // fleet: this machine takes no job that needs a reservation,
+                // and the hub's refusal will name it.
+                println!(
+                    "herd-runner: this host announces no tmpfs room, so it takes no job that \
+                     reserves any: {why}"
+                );
+                None
+            }
+        },
+    };
 
+    // Printed, because these three figures decide what this machine will and
+    // will not take and an operator reading a refusal has to be able to find
+    // where they came from (E-04, E-29, E-31).
+    println!(
+        "herd-runner: admission here is {} of memory less a {} floor, and {} of tmpfs",
+        host.memory_mib
+            .map_or("an unannounced amount".to_owned(), herd_proto::size_mib),
+        host.memory_floor_mib
+            .map_or("unannounced".to_owned(), herd_proto::size_mib),
+        host.tmpfs_mib.map_or(
+            "no announced amount, so no job that reserves any".to_owned(),
+            herd_proto::size_mib
+        )
+    );
     println!("herd-runner: joining {}", args.hub);
     herd_runner::run(Config {
         hub_url: args.hub,

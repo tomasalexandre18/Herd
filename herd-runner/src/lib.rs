@@ -981,6 +981,9 @@ impl Session {
         self.with(|inner| ToHub::Health {
             jobs: running_jobs(inner),
             draining: inner.draining,
+            // Measured now, on every report, because it is a fact about the
+            // moment (E-32). The hub records it and gates nothing on it.
+            load_milli: crate::metrics::host_load_milli(),
         })
     }
 
@@ -1004,6 +1007,7 @@ impl Session {
             let health = ToHub::Health {
                 jobs: running_jobs(inner),
                 draining: true,
+                load_milli: crate::metrics::host_load_milli(),
             };
             send_on(&inner.link, health);
             ending
@@ -1536,6 +1540,9 @@ pub async fn serve_once(config: Config, session: Session, confined: Arc<Confined
         // The session's, not the config's: one runner has one offer, and the
         // session is what survives a reconnect with it.
         capabilities: session.capacity().offer().clone(),
+        // The load as this runner dials, so that a job placed before the
+        // first health report still has a figure on its line (E-32).
+        load_milli: crate::metrics::host_load_milli(),
     };
     sink.send(Message::text(to_frame(&hello).context("encoding hello")?))
         .await

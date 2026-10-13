@@ -167,6 +167,73 @@ pub fn waiting_sentence(place: usize, total: usize, standing: &Standing, why: &s
     sentence
 }
 
+/// What is in front of this job in the queue, by name and level (E-04).
+///
+/// E-04 asks a queued stream for three things: the position, **what is
+/// ahead**, and why. The position alone answers none of the questions an
+/// operator actually has — a job that is third of forty behind two nightly
+/// passes is in a different situation from one that is third behind two
+/// mergers, and the figure is the same. So the jobs ahead are named, with the
+/// level each is weighed at, and an aged one says both its levels for the
+/// reason [`waiting_sentence`] does.
+///
+/// `place` is this job's index in `queue`, zero-based.
+pub fn what_is_ahead(
+    queue: &[JobRecord],
+    place: usize,
+    now: Timestamp,
+    aging_step: Duration,
+) -> String {
+    let ahead = &queue[..place.min(queue.len())];
+    if ahead.is_empty() {
+        return "nothing is ahead of it".to_owned();
+    }
+    let named: Vec<String> = ahead
+        .iter()
+        .take(AHEAD_NAMED)
+        .map(|record| {
+            let standing = standing(record, now, aging_step);
+            if standing.aged() {
+                format!(
+                    "{} ({} weighed as {})",
+                    record.id, standing.declared, standing.effective
+                )
+            } else {
+                format!("{} ({})", record.id, standing.declared)
+            }
+        })
+        .collect();
+    let mut said = format!("{} ahead of it: {}", ahead.len(), named.join(", "));
+    if ahead.len() > AHEAD_NAMED {
+        said.push_str(&format!(" and {} more", ahead.len() - AHEAD_NAMED));
+    }
+    said
+}
+
+/// How many of the jobs ahead are named one by one before the rest are
+/// counted.
+///
+/// Three, because this string lands in `waiting_for` — a field the store
+/// writes a line of `events.jsonl` for whenever it changes — and a sentence
+/// naming all of a four-hundred-job queue would be a kilobyte of history per
+/// job per position. Three is enough to see *what kind* of work is in front,
+/// which is the question E-04's "what is ahead" is asked for.
+const AHEAD_NAMED: usize = 3;
+
+/// The same sentence, with what is ahead of the job in it (E-04).
+pub fn waiting_sentence_behind(
+    place: usize,
+    total: usize,
+    standing: &Standing,
+    ahead: &str,
+    why: &str,
+) -> String {
+    let mut sentence = waiting_sentence(place, total, standing, why);
+    sentence.push_str("; ");
+    sentence.push_str(ahead);
+    sentence
+}
+
 /// A place in the queue, as a person says it.
 fn ordinal(place: usize) -> String {
     let suffix = match (place % 10, place % 100) {
@@ -219,6 +286,8 @@ mod tests {
             labels: LabelSet::default(),
             priority,
             build_thread_mib: None,
+            memory_mib: None,
+            tmpfs_mib: None,
             parallelism: None,
             submissions: 1,
             state: JobState::Queued,

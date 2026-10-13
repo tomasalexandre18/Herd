@@ -40,7 +40,7 @@ async fn two_identical_submissions_are_one_execution_with_one_log_for_both() {
             first_command,
             LabelSet::default(),
             Priority::Step,
-            None,
+            herdctl::Declared::default(),
             |_, data| log.extend_from_slice(data),
             |_| {},
         )
@@ -69,7 +69,7 @@ async fn two_identical_submissions_are_one_execution_with_one_log_for_both() {
         command,
         LabelSet::default(),
         Priority::Step,
-        None,
+        herdctl::Declared::default(),
         |_, data| joined_log.extend_from_slice(data),
         |note| joined_notes.push(note.to_owned()),
     )
@@ -200,7 +200,7 @@ async fn an_operator_raises_a_queued_job_and_can_never_lower_one() {
         shell("printf 'should not run yet\\n'"),
         labels(&["kvm"]),
         Priority::Producer,
-        None,
+        herdctl::Declared::default(),
     )
     .await
     .expect("a job needing a capability nobody offers is accepted, never refused");
@@ -346,7 +346,7 @@ async fn a_waiting_job_says_where_it_stands_with_its_figures() {
                 shell(&format!("printf '{} waits\\n'", priority.name())),
                 labels(&["kvm"]),
                 priority,
-                None,
+                herdctl::Declared::default(),
             )
             .await
             .expect("accepted, never refused"),
@@ -433,6 +433,7 @@ async fn requester_socket(
         capabilities: Default::default(),
         host: herd_proto::HostSize::default(),
         preference: 0,
+        load_milli: None,
     };
     socket
         .send(Message::text(to_frame(&hello).expect("encodes")))

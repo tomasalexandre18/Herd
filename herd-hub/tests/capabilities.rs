@@ -1029,6 +1029,7 @@ async fn an_unreadable_first_frame_is_refused_whatever_is_wrong_with_it() {
                 herd_proto::to_frame(&herd_proto::ToHub::Health {
                     jobs: Vec::new(),
                     draining: false,
+                    load_milli: None,
                 })
                 .expect("a health report encodes"),
             ),
