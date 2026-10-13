@@ -187,7 +187,7 @@ fn ordinal(place: usize) -> String {
 /// would make every dispatch pass a write and a job that waits an hour an
 /// unreadable history — the very thing `record_waiting`'s "only when it is
 /// news" rule exists to prevent.
-fn roughly(how_long: Duration) -> String {
+pub(crate) fn roughly(how_long: Duration) -> String {
     let seconds = how_long.as_secs();
     if seconds < 60 {
         return "under a minute".to_owned();
@@ -218,6 +218,8 @@ mod tests {
             command: vec!["true".to_owned()],
             labels: LabelSet::default(),
             priority,
+            build_thread_mib: None,
+            parallelism: None,
             submissions: 1,
             state: JobState::Queued,
             waiting_for: None,

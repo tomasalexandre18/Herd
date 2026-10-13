@@ -892,6 +892,7 @@ impl JobDirStore {
             command,
             labels,
             priority,
+            build_thread_mib,
         } = new;
         let mut live = self.lock()?;
         // `mkdir` is what claims an id: the directories, not the index, decide
@@ -934,6 +935,8 @@ impl JobDirStore {
             command,
             labels,
             priority,
+            build_thread_mib,
+            parallelism: None,
             submissions: 1,
             state: JobState::Queued,
             waiting_for: None,
@@ -1133,7 +1136,13 @@ impl JobStore for JobDirStore {
     /// its first chunk as a gap, and with the reset alone it would overwrite
     /// nothing: the log keeps everything, and a line says where the second
     /// attempt begins.
-    fn begin_attempt(&self, id: &JobId, runner: &str) -> Result<u32> {
+    fn begin_attempt(
+        &self,
+        id: &JobId,
+        runner: &str,
+        why: &str,
+        parallelism: Option<u32>,
+    ) -> Result<u32> {
         let (mut live, record) = self.open_for_writing(id)?;
         let number = record.attempt_number() + 1;
         let at = Timestamp::now();
@@ -1167,10 +1176,15 @@ impl JobStore for JobDirStore {
             started_at: at,
             ended_at: None,
             ended: None,
+            why: why.to_owned(),
         });
+        // The figure travels with the job, not only inside the attempt's
+        // sentence: whatever reads this job's requirements reads the N it was
+        // given (D82).
+        record.parallelism = parallelism;
         record.updated_at = at;
         self.write_record(&record)?;
-        self.append_event(id, &JobEvent::attempt_started(at, number, runner))?;
+        self.append_event(id, &JobEvent::attempt_started(at, number, runner, why))?;
         Ok(number)
     }
 
@@ -2085,7 +2099,9 @@ mod tests {
             .create_job(NewJob::new(vec!["true".to_owned()]))
             .expect("minted");
         let runner = "wsl-pc";
-        let attempt = store.begin_attempt(&job.id, runner).expect("attempt 1");
+        let attempt = store
+            .begin_attempt(&job.id, runner, "claimed by wsl-pc: labels none", None)
+            .expect("attempt 1");
         store
             .append_log(&job.id, LogStream::Stdout, 0, b"the real output\n")
             .expect("the attempt's own output");
@@ -2128,7 +2144,7 @@ mod tests {
             (
                 "an attempt",
                 store
-                    .begin_attempt(&job.id, "somebody-else")
+                    .begin_attempt(&job.id, "somebody-else", "claimed by somebody-else", None)
                     .expect_err("begin"),
             ),
             (
@@ -2300,11 +2316,17 @@ mod tests {
             .join(JOBS_DIR)
             .join(job.id.as_str())
             .join(RECORD_FILE);
-        durable::write_file(&path, br#"{"record_version":3,"id":"j0000000001"}"#).expect("written");
+        durable::write_file(&path, br#"{"record_version":4,"id":"j0000000001"}"#).expect("written");
         let error = store
             .job(&job.id)
-            .expect_err("version 3 is not readable here");
-        assert!(error.to_string().contains("record version 3"), "{error}");
+            .expect_err("version 4 is not readable here");
+        assert!(error.to_string().contains("record version 4"), "{error}");
+        assert!(
+            error
+                .to_string()
+                .contains(&format!("reads version {RECORD_VERSION}")),
+            "both figures, so a reader knows which way round it is: {error}"
+        );
     }
 
     /// D21: two hubs on one state root would mint ids from the same
