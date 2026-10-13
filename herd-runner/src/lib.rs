@@ -1255,6 +1255,7 @@ pub async fn run_until(config: Config, stop: impl Future<Output = String>) -> Re
     for line in session.pick_up(confined.root()) {
         eprintln!("herd-runner: {line}");
     }
+    let probing: tokio::task::JoinHandle<()>;
     {
         // The probes are read beside the redial loop rather than inside a
         // connection: a lock file an operator removes while the hub is down
@@ -1270,7 +1271,7 @@ pub async fn run_until(config: Config, stop: impl Future<Output = String>) -> Re
         // case is a job that waits the moment it would have waited anyway,
         // and the readings arrive on this same connection as a snapshot.
         let watching = session.clone();
-        tokio::spawn(capability::watch(
+        probing = tokio::spawn(capability::watch(
             session.capacity().clone(),
             move |capabilities| {
                 watching.send(ToHub::CapabilitiesChanged { capabilities });
@@ -1278,9 +1279,21 @@ pub async fn run_until(config: Config, stop: impl Future<Output = String>) -> Re
         ));
     }
 
+    // Stopping the probes is part of stopping the runner, not an afterthought
+    // of process exit. A probe in flight is a process group of this runner's
+    // making, and dropping the task that is reading it is what kills that
+    // group (`ProbeGroup`): a stop that left the task alone exited in a
+    // fifth of a second and left the probe's children running, reparented to
+    // init — the orphan-strewing invariant 2 forbids, and the one case the
+    // timeout path did not cover.
+    let stop_probing = probing.abort_handle();
     let serving = serve_forever(config.clone(), session.clone(), Arc::clone(&confined));
     let stopping = async {
         let reason = stop.await;
+        // Before the drain rather than after it: a draining runner offers
+        // nothing, so a probe it is still reading is work nobody wants, and
+        // the kill belongs at the start of the owner's five seconds.
+        stop_probing.abort();
         drain(&config, &session, &confined, &reason).await;
     };
     // Both are polled until one of them finishes, which is what lets the
@@ -1292,6 +1305,13 @@ pub async fn run_until(config: Config, stop: impl Future<Output = String>) -> Re
         outcome = serving => outcome,
         () = stopping => Ok(()),
     };
+    // Whichever way this runner is leaving — a signal, a refusal, a run out of
+    // redials — no probe of its own outlives it. Aborted *and awaited*:
+    // aborting only asks for the task to be dropped, and it is the drop that
+    // kills the probe's process group, so a stop that did not wait here would
+    // race its own promise.
+    probing.abort();
+    let _ = probing.await;
     // Whichever way the runner is leaving, nothing it holds goes with it. A
     // refusal and a run out of redials end the process just as a signal does,
     // and a result that exists nowhere else is not allowed to end with it.

@@ -22,6 +22,7 @@ use herd_runner::capability::evaluate;
 /// each, because these tests run in one binary at the same time.
 const HANGS_FOR: &str = "444442";
 const HANGS_AND_IS_SWEPT_FOR: &str = "444443";
+const HANGS_WHILE_THE_RUNNER_STOPS_FOR: &str = "444444";
 
 /// Two numbers, both configuration, and nothing else is read: not the
 /// probe's output, not its name, not what the capability means.
@@ -165,6 +166,101 @@ async fn a_killed_probe_leaves_nothing_of_itself_behind() {
             Instant::now() < deadline,
             "{survivors:?} outlived the probe that started them; a probe read \
              every interval would strew the host with these"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
+/// A runner asked to stop takes its probes' children with it.
+///
+/// The distinct case, and the one the timeout path did not cover: the probe is
+/// not hanging past anything — its timeout is a minute away — it is simply
+/// *in flight* when the owner asks the runner to stop. `kill_on_drop` reaps
+/// the probe's own process and nothing it started, so the runner exited in a
+/// fifth of a second and left `sleep` running, reparented to init. Invariant 2
+/// says a runner never destabilises its host; a probe is read every two
+/// seconds, so one stop at the wrong moment is one orphan, and a machine
+/// restarted all day is a machine filling up with them.
+///
+/// The real binary, a real `SIGTERM` and a real sweep of `/proc`: the
+/// cancellation this is about happens between a task being dropped and a
+/// process exiting, which nothing short of the process can show.
+#[tokio::test]
+async fn a_runner_told_to_stop_takes_its_probes_children_with_it() {
+    let data_root = herd_runner::testing::TempDir::new("probe-stop");
+    let capabilities = data_root.path().join("capabilities.json");
+    // A probe of the ordinary shape (D51): a shell line with a child. The
+    // timeout is a minute, so this reading is still in flight when the signal
+    // arrives — what is under test is the stop, not the timeout.
+    std::fs::write(
+        &capabilities,
+        format!(
+            r#"{{"capabilities":[
+                {{"name":"metal-pc","kind":{{"type":"counted","slots":1}},
+                 "busy_probe":{{"type":"command",
+                   "command":["/bin/sh","-c","sleep {HANGS_WHILE_THE_RUNNER_STOPS_FOR} & wait"]}}}}
+            ]}}"#
+        ),
+    )
+    .expect("the capability file is written");
+    // No hub: the probes are read beside the redial loop, so a runner with
+    // nothing to dial still reads them — and this test is about the runner's
+    // own host, not about a link.
+    let mut runner = tokio::process::Command::new(env!("CARGO_BIN_EXE_herd-runner"))
+        .arg("--hub")
+        .arg("ws://127.0.0.1:1")
+        .arg("--data-root")
+        .arg(data_root.path())
+        .arg("--capabilities")
+        .arg(&capabilities)
+        .arg("--no-detect")
+        .arg("--probe-interval")
+        .arg("50")
+        .arg("--probe-timeout")
+        .arg("60000")
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .kill_on_drop(true)
+        .spawn()
+        .expect("the real runner binary runs");
+    let pid = runner.id().expect("a spawned process has a pid");
+
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while processes_with_argument(HANGS_WHILE_THE_RUNNER_STOPS_FOR).is_empty() {
+        assert!(Instant::now() < deadline, "the probe never ran");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+
+    // Safe: one signal, to one process this test spawned itself.
+    unsafe {
+        libc::kill(pid as libc::pid_t, libc::SIGTERM);
+    }
+    let asked = Instant::now();
+    let ended = tokio::time::timeout(Duration::from_secs(10), runner.wait())
+        .await
+        .expect("a runner asked to stop does not hang on its probes")
+        .expect("the runner's own exit is readable");
+    assert!(ended.success(), "a runner told to stop left by {ended:?}");
+    // Invariant 2's five seconds, measured: killing a probe's group is not
+    // allowed to be paid for with the owner's stop time.
+    assert!(
+        asked.elapsed() < Duration::from_secs(5),
+        "the stop took {:?}",
+        asked.elapsed()
+    );
+
+    // The kill is a signal, so the children go a moment after the runner has:
+    // this waits for them rather than racing them.
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let survivors = processes_with_argument(HANGS_WHILE_THE_RUNNER_STOPS_FOR);
+        if survivors.is_empty() {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "{survivors:?} outlived the runner whose probe started them, \
+             reparented to init; a clean stop may not strew a host with these"
         );
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
