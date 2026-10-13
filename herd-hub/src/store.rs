@@ -466,6 +466,41 @@ impl JobDirStore {
             .map_err(|_| StoreError::new("the job store lock is poisoned"))
     }
 
+    /// Take the store's lock and the job's record together, refusing every
+    /// write to a job that is already over.
+    ///
+    /// **The one gate every writer in this store goes through**, and the
+    /// reason it is one gate: `record_state` had a terminal guard of its own
+    /// and `record_metrics` did not, so a late frame replaced a finished
+    /// job's measurements with figures nobody measured while its outcome
+    /// stood, and `append_log` put a paragraph and a bogus gap marker into a
+    /// log that was closed and fsynced. A rule enforced once per function is
+    /// a rule that is missed by the next function; enforced here, a writer
+    /// cannot even read the record it needs without passing it.
+    ///
+    /// What is terminal is **the job**, never an attempt. A first attempt
+    /// ending is how a requeue begins (E-21, D39), and the record it ends on
+    /// is `queued` a moment later — so the thing tested is `state`, which is
+    /// the only thing that is final.
+    ///
+    /// The refusal is an error and not a silent no-op on purpose: the caller
+    /// is writing something it believes in, and it has to learn that the
+    /// record would not take it.
+    fn open_for_writing(&self, id: &JobId) -> Result<(std::sync::MutexGuard<'_, Live>, JobRecord)> {
+        let live = self.lock()?;
+        let Some(record) = self.read_record(id)? else {
+            return Err(StoreError::new(format!("no such job: {id}")));
+        };
+        if record.state.is_terminal() {
+            return Err(StoreError::new(format!(
+                "{id} is over ({}) and a record that has reached its end is never written \
+                 to again",
+                describe(&record.state)
+            )));
+        }
+        Ok((live, record))
+    }
+
     fn read_record(&self, id: &JobId) -> Result<Option<JobRecord>> {
         let path = self.job_dir(id).join(RECORD_FILE);
         let Some(text) = read_optional(&path)? else {
@@ -624,6 +659,21 @@ impl JobDirStore {
         let at = Timestamp::now();
         record.state = state.clone();
         record.updated_at = at;
+        // An attempt is over the moment its job is. This was the missing
+        // half: the happy path never stamped `ended_at`, so the attempt that
+        // produced a verdict stayed "current" for ever on a record that was
+        // closed — and a frame naming that attempt and the right runner
+        // passed the hub's ownership gate long after the job was done. There
+        // is no *reason* to write: `ended` answers "why did this attempt end
+        // without a verdict", and this attempt produced one. The moment is
+        // the fact, and the transition beside it is the explanation.
+        if record.state.is_terminal() {
+            if let Some(attempt) = record.attempts.last_mut() {
+                if attempt.ended_at.is_none() {
+                    attempt.ended_at = Some(at);
+                }
+            }
+        }
         // The record first, so that the moment a transition is readable in
         // `events.jsonl` the record agrees with it.
         self.write_record(&record)?;
@@ -717,16 +767,13 @@ impl JobStore for JobDirStore {
     /// find the measurements beside it (E-15). Fsynced like every other write
     /// here, so an acknowledgement that follows it is not a lie (D19).
     fn record_metrics(&self, id: &JobId, metrics: JobMetrics) -> Result<()> {
-        let _live = self.lock()?;
-        let Some(mut record) = self.read_record(id)? else {
-            return Err(StoreError::new(format!("no such job: {id}")));
-        };
+        let (_live, mut record) = self.open_for_writing(id)?;
         record.metrics = metrics;
         self.write_record(&record)
     }
 
     fn record_state(&self, id: &JobId, state: JobState) -> Result<()> {
-        let mut live = self.lock()?;
+        let (mut live, _record) = self.open_for_writing(id)?;
         self.move_to(&mut live, id, state)
     }
 
@@ -741,10 +788,7 @@ impl JobStore for JobDirStore {
     /// nothing: the log keeps everything, and a line says where the second
     /// attempt begins.
     fn begin_attempt(&self, id: &JobId, runner: &str) -> Result<u32> {
-        let mut live = self.lock()?;
-        let Some(record) = self.read_record(id)? else {
-            return Err(StoreError::new(format!("no such job: {id}")));
-        };
+        let (mut live, record) = self.open_for_writing(id)?;
         let number = record.attempt_number() + 1;
         let at = Timestamp::now();
         if number > 1 {
@@ -785,10 +829,7 @@ impl JobStore for JobDirStore {
     }
 
     fn end_attempt(&self, id: &JobId, attempt: u32, reason: &str) -> Result<()> {
-        let _live = self.lock()?;
-        let Some(mut record) = self.read_record(id)? else {
-            return Err(StoreError::new(format!("no such job: {id}")));
-        };
+        let (_live, mut record) = self.open_for_writing(id)?;
         let Some(entry) = record
             .attempts
             .iter_mut()
@@ -819,11 +860,8 @@ impl JobStore for JobDirStore {
         if last_missing < first_missing {
             return Ok(());
         }
-        let mut live = self.lock()?;
+        let (mut live, _record) = self.open_for_writing(id)?;
         let path = self.job_dir(id).join(LOG_FILE);
-        if !self.job_dir(id).is_dir() {
-            return Err(StoreError::new(format!("no such job: {id}")));
-        }
         durable::append_bytes(
             &path,
             log_gap_marker(first_missing, last_missing).as_bytes(),
@@ -874,12 +912,8 @@ impl JobStore for JobDirStore {
         seq: u64,
         data: &[u8],
     ) -> Result<LogWrite> {
-        let mut live = self.lock()?;
-        let dir = self.job_dir(id);
-        if !dir.is_dir() {
-            return Err(StoreError::new(format!("no such job: {id}")));
-        }
-        let path = dir.join(LOG_FILE);
+        let (mut live, _record) = self.open_for_writing(id)?;
+        let path = self.job_dir(id).join(LOG_FILE);
         let so_far = self.log_at(&mut live, id)?;
         let expected = so_far.map(|at| at.chunks);
         if expected.is_some_and(|expected| seq < expected) {
@@ -1597,29 +1631,144 @@ mod tests {
         assert_eq!(store.job_events(&ghost).expect("readable"), None);
     }
 
-    /// The same end, twice, is a runner redelivering a result it was never
-    /// acknowledged for. A *different* end is a bug, and says so.
+    /// A record that has reached its end is never written to again, by
+    /// anyone, with anything — the same end included.
+    ///
+    /// The redelivery handshake E-44 rests on is settled a level up now: the
+    /// hub refuses a frame about a job that is over *by name*, and the runner
+    /// drops what it was holding (D42). The store used to accept the identical
+    /// end as a no-op, and that acceptance was the thin end of the wedge the
+    /// verification drove in — a late frame that gets as far as a writer is a
+    /// late frame that writes.
     #[test]
-    fn the_same_end_twice_is_accepted_and_a_different_one_is_not() {
+    fn a_record_that_is_over_refuses_every_end_including_its_own() {
         let (_dir, store) = store();
         let job = store.create_job(vec!["true".to_owned()]).expect("minted");
         let end = JobState::Finished {
             outcome: JobOutcome::Exited { code: 7 },
         };
         store.record_state(&job.id, end.clone()).expect("the end");
+        for again in [
+            end,
+            JobState::Finished {
+                outcome: JobOutcome::Exited { code: 0 },
+            },
+        ] {
+            let error = store
+                .record_state(&job.id, again)
+                .expect_err("a job that is over does not end a second time");
+            // Naming what the record holds, not merely refusing: an operator
+            // reading this has to see which verdict stood.
+            assert!(error.to_string().contains("is over"), "{error}");
+            assert!(error.to_string().contains("code\":7"), "{error}");
+        }
+    }
+
+    /// Nothing at all is written to a job that is over: not its state, not
+    /// its measurements, not an attempt, not a byte of its log, not a gap
+    /// marker on that log.
+    ///
+    /// Every writer of [`JobStore`] is here on purpose. The defect this
+    /// forbids was found because `record_state` had a guard of its own and
+    /// `record_metrics` did not — so a forged frame replaced a finished job's
+    /// real figures with 999s and a forged chunk went into a closed log with
+    /// a gap marker claiming four chunks had been lost. A new writer belongs
+    /// in this list the day it is added.
+    #[test]
+    fn a_record_that_is_over_refuses_every_writer() {
+        let (_dir, store) = store();
+        let job = store.create_job(vec!["true".to_owned()]).expect("minted");
+        let runner = "wsl-pc";
+        let attempt = store.begin_attempt(&job.id, runner).expect("attempt 1");
         store
-            .record_state(&job.id, end)
-            .expect("the same end again is the redelivery handshake");
-        let error = store
+            .append_log(&job.id, LogStream::Stdout, 0, b"the real output\n")
+            .expect("the attempt's own output");
+        let measured = JobMetrics {
+            log_bytes: 16,
+            ..JobMetrics::default()
+        };
+        store
+            .record_metrics(&job.id, measured.clone())
+            .expect("what the runner measured");
+        store
             .record_state(
                 &job.id,
                 JobState::Finished {
                     outcome: JobOutcome::Exited { code: 0 },
                 },
             )
-            .expect_err("a job does not end twice, differently");
-        assert!(error.to_string().contains("cannot go from"), "{error}");
-        assert!(error.to_string().contains("code\":7"), "{error}");
+            .expect("the end");
+
+        let refusals: Vec<(&str, StoreError)> = vec![
+            (
+                "a state",
+                store
+                    .record_state(&job.id, JobState::Running)
+                    .expect_err("state"),
+            ),
+            (
+                "measurements",
+                store
+                    .record_metrics(
+                        &job.id,
+                        JobMetrics {
+                            log_bytes: 999,
+                            wall_time_ms: 999,
+                            ..JobMetrics::default()
+                        },
+                    )
+                    .expect_err("metrics"),
+            ),
+            (
+                "an attempt",
+                store
+                    .begin_attempt(&job.id, "somebody-else")
+                    .expect_err("begin"),
+            ),
+            (
+                "the end of an attempt",
+                store
+                    .end_attempt(&job.id, attempt, "a late sentence")
+                    .expect_err("end attempt"),
+            ),
+            (
+                "output",
+                store
+                    .append_log(&job.id, LogStream::Stdout, 1, b"forged\n")
+                    .expect_err("append"),
+            ),
+            (
+                "a gap marker",
+                store.name_missing_log(&job.id, 1, 4).expect_err("gap"),
+            ),
+        ];
+        for (what, error) in refusals {
+            assert!(
+                error.to_string().contains("is over")
+                    && error.to_string().contains(job.id.as_str()),
+                "writing {what} to a job that is over must be refused by name: {error}"
+            );
+        }
+
+        // And the record is exactly what the job's own attempt left.
+        let record = store.job(&job.id).expect("readable").expect("there");
+        assert_eq!(record.metrics, measured, "{record:?}");
+        assert_eq!(
+            record.state,
+            JobState::Finished {
+                outcome: JobOutcome::Exited { code: 0 }
+            }
+        );
+        assert_eq!(record.attempts.len(), 1, "{record:?}");
+        assert!(
+            record.attempts[0].ended_at.is_some() && record.attempts[0].ended.is_none(),
+            "the attempt that produced the verdict is over, with nothing to excuse: {record:?}"
+        );
+        assert_eq!(
+            store.job_log(&job.id).expect("readable").expect("there"),
+            b"the real output\n",
+            "the log of a job that is over is byte for byte what the job wrote"
+        );
     }
 
     /// A job goes forward, with exactly one way back: the requeue M3 adds for
@@ -1652,8 +1801,8 @@ mod tests {
             .record_state(&job.id, JobState::Queued)
             .expect_err("a finished job is never queued again");
         assert!(
-            error.to_string().contains("to queued"),
-            "a refused transition names both states: {error}"
+            error.to_string().contains("is over") && error.to_string().contains("code\":0"),
+            "the refusal names the job and the end it reached: {error}"
         );
     }
 

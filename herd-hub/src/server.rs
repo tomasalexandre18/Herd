@@ -46,9 +46,10 @@ use anyhow::{anyhow, bail, Context, Result};
 use futures_util::stream::{SplitSink, SplitStream};
 use futures_util::{SinkExt, StreamExt};
 use herd_proto::{
-    foreign_state_root_reason, from_frame, not_this_runner_s_attempt_reason, runner_twin_reason,
-    to_frame, version_mismatch_reason, FromHub, JobId, JobMetrics, JobOutcome, Role, RunningJob,
-    ToHub, HEALTH_EVERY, PROTOCOL_VERSION,
+    a_frame_about_a_job_that_is_over_reason, foreign_state_root_reason, from_frame,
+    not_this_runner_s_attempt_reason, runner_twin_reason, to_frame, version_mismatch_reason,
+    FromHub, JobId, JobMetrics, JobOutcome, Role, RunningJob, ToHub, HEALTH_EVERY,
+    PROTOCOL_VERSION,
 };
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::mpsc::{self, UnboundedReceiver, UnboundedSender};
@@ -690,6 +691,20 @@ impl State {
     /// recreated, which happens to carry the same number for the same id. The
     /// number alone cannot tell them apart. The runner the attempt was handed
     /// to can.
+    ///
+    /// # This gate is not authentication, and must not be read as one
+    ///
+    /// A runner's name is **self-asserted**. Until M15 there is no token to
+    /// check (E-48), so any peer that can reach the hub's port can announce
+    /// any name — and while the legitimate runner is *down*, a hand-crafted
+    /// peer wearing its name is, to this gate, that runner: it can write a
+    /// false verdict, fabricated metrics and forged log lines onto the job
+    /// that runner was given. What this gate does stop is a *second* peer
+    /// talking about an attempt while the real holder is alive, which is
+    /// M3's twin rule, and what D14 does is keep the port on loopback by
+    /// default. Neither is a credential. The gate is exactly as strong as
+    /// M15's token, which does not exist yet; nothing here should be taken
+    /// for proof of who is speaking.
     fn standing_of(&self, id: &JobId, attempt: u32, speaker: &str) -> crate::job::Result<Standing> {
         if let Some((number, holder)) =
             self.with_peers(|peers| peers.live_attempts.get(id).cloned())
@@ -705,6 +720,17 @@ impl State {
         let Some(record) = self.store.job(id)? else {
             return Ok(Standing::Superseded);
         };
+        // A job that is over is over for everyone, including the runner it
+        // was really running on. Its outcome, its measurements and its log
+        // were closed together, and a frame that arrives afterwards is
+        // refused by name — said first and separately from "that attempt is
+        // not the current one", because it is a different thing to be told:
+        // the record is final, not merely moved on.
+        if record.state.is_terminal() {
+            return Ok(Standing::JobIsOver {
+                state: record.state.name().to_owned(),
+            });
+        }
         if !record.attempt_is_current(attempt) {
             return Ok(Standing::Superseded);
         }
@@ -761,6 +787,10 @@ enum Standing {
     Superseded,
     /// A live attempt, but somebody else's: `holder` has it.
     AnotherRunner { holder: String },
+    /// The job itself has reached its end, so there is no attempt of it to be
+    /// current. Nothing is written to a record that is over — not its
+    /// outcome, not its metrics, not its log.
+    JobIsOver { state: String },
 }
 
 /// What a peer really said, with a blank answer read as no answer.
@@ -1023,7 +1053,7 @@ fn attempts_in_the_air(state: &State) -> Vec<JobId> {
             matches!(
                 record.state,
                 JobState::Assigned | JobState::Running | JobState::Interrupted { .. }
-            ) && record.attempt().is_some_and(|a| a.ended.is_none())
+            ) && record.attempt().is_some_and(|a| a.ended_at.is_none())
         })
         .map(|record| record.id)
         .collect()
@@ -1321,6 +1351,20 @@ fn is_current(state: &State, from: &str, outbox: &Outbox, job_id: &JobId, attemp
                 "attempt {attempt} of {job_id} is not the attempt this hub is waiting for; \
                  nothing of it is recorded"
             );
+            eprintln!("herd-hub: {reason}");
+            let _ = outbox.send(FromHub::StaleAttempt {
+                job_id: job_id.clone(),
+                attempt,
+                reason,
+            });
+            false
+        }
+        // A record that is over. Refused by name, with the state it reached:
+        // whoever sent this is holding something about a job whose story is
+        // told, and the one thing that must not happen is for it to be
+        // appended to a log a reader has already been given as complete.
+        Ok(Standing::JobIsOver { state }) => {
+            let reason = a_frame_about_a_job_that_is_over_reason(job_id, &state, attempt);
             eprintln!("herd-hub: {reason}");
             let _ = outbox.send(FromHub::StaleAttempt {
                 job_id: job_id.clone(),
