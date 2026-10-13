@@ -255,15 +255,20 @@ impl PrivilegedHelpers {
     /// Build the list, refusing anything that is not one named, ordinary,
     /// unprivileged file that the machine's owner wrote down.
     ///
-    /// Four refusals, each about a different way a "fixed list" stops being
+    /// Five refusals, each about a different way a "fixed list" stops being
     /// one:
     ///
     /// 1. a relative path, which `PATH` would resolve — so the list would not
     ///    decide what runs;
-    /// 2. a general-purpose escalation tool, which turns one entry into
-    ///    permission to run anything;
-    /// 3. a file that does not exist, because then nothing about it can be
-    ///    checked and the entry is a promise rather than a path;
+    /// 2. a general-purpose escalation tool, judged on the **resolved**
+    ///    file's name as well as the given one: `ln -s /usr/bin/unshare
+    ///    harmless` was accepted while the setuid check that follows was not
+    ///    fooled, so the name check now looks at the same file the kernel
+    ///    would run;
+    /// 3. anything that is not an existing *file* — a path that is not there
+    ///    is a promise rather than a path, and a **directory** is not a
+    ///    command at all, though it used to be printed as a configured
+    ///    helper;
     /// 4. a **setuid or setgid** file, checked on the file itself and not on
     ///    its name: that is what an escalation tool actually is, and it
     ///    catches the ones this list has never heard of.
@@ -281,16 +286,47 @@ impl PrivilegedHelpers {
                 ));
             }
             let path = std::path::Path::new(&trimmed);
-            let name = path
-                .file_name()
-                .map(|name| name.to_string_lossy().into_owned())
-                .unwrap_or_default();
-            if ESCALATION_TOOLS.contains(&name.as_str()) {
-                return Err(format!(
-                    "the privileged helper {trimmed:?} is {name}, a general-purpose \
-                     escalation tool: a list containing one allows everything, and a \
-                     runner escalates through the fixed list itself (E-46)"
-                ));
+            // Both names: the one written down, and the one the kernel would
+            // actually execute. A symlink called `harmless` pointing at
+            // `unshare` is `unshare`.
+            let resolved = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+            for judged in [path, resolved.as_path()] {
+                let name = judged
+                    .file_name()
+                    .map(|name| name.to_string_lossy().into_owned())
+                    .unwrap_or_default();
+                if ESCALATION_TOOLS.contains(&name.as_str()) {
+                    return Err(format!(
+                        "the privileged helper {trimmed:?} is {name} ({}), a \
+                         general-purpose escalation tool: a list containing one allows \
+                         everything, and a runner escalates through the fixed list \
+                         itself (E-46)",
+                        resolved.display()
+                    ));
+                }
+            }
+            // An existing *file*. A directory passed every check here and was
+            // then printed at startup as a configured helper, which is a
+            // fixed list with an entry that cannot be run.
+            match std::fs::metadata(path) {
+                Ok(metadata) if metadata.is_file() => {}
+                Ok(metadata) => {
+                    return Err(format!(
+                        "the privileged helper {trimmed:?} is {}, not a file: a helper is \
+                         one command this runner may call, and nothing else can be one",
+                        if metadata.is_dir() {
+                            "a directory"
+                        } else {
+                            "not a regular file"
+                        }
+                    ))
+                }
+                Err(error) => {
+                    return Err(format!(
+                        "the privileged helper {trimmed:?} cannot be checked: {error}. A \
+                         helper this runner cannot look at is not a helper it may call."
+                    ))
+                }
             }
             match set_user_or_group_id(path) {
                 Ok(false) => {}
@@ -395,6 +431,67 @@ mod tests {
         std::fs::write(&innocent, b"#!/bin/sh\n").expect("the fixture writes");
         PrivilegedHelpers::new(vec![innocent.display().to_string()])
             .expect("a tool whose name merely contains those letters is allowed");
+    }
+
+    /// Finding 1 of M4's verification: `--privileged-helper /tmp` was
+    /// accepted and then printed at startup as a configured helper.
+    ///
+    /// A helper is one command. A directory is not one, and a fixed list
+    /// whose entries cannot be run is not a list of anything.
+    #[test]
+    fn a_directory_is_not_a_helper_and_is_refused_naming_it() {
+        let temp = crate::testing::TempDir::new("helper-directory");
+        let error = PrivilegedHelpers::new(vec![temp.path().display().to_string()])
+            .expect_err("a directory is not a command");
+        assert!(
+            error.contains(&temp.path().display().to_string()),
+            "the refusal must name the path: {error}"
+        );
+        assert!(error.contains("a directory"), "{error}");
+        // And `/tmp` itself, which is the reproduction as it was found.
+        let error = PrivilegedHelpers::new(vec!["/tmp".to_owned()])
+            .expect_err("/tmp is not a command either");
+        assert!(error.contains("not a file"), "{error}");
+        // A path that is simply not there is still refused, as before.
+        let error = PrivilegedHelpers::new(vec!["/herd-no-such-helper-anywhere".to_owned()])
+            .expect_err("a path that is not there is a promise, not a helper");
+        assert!(error.contains("cannot be checked"), "{error}");
+    }
+
+    /// Finding 4: the name check looked at the last component of the path it
+    /// was handed, so `ln -s /usr/bin/unshare harmless` walked straight past
+    /// it. The setuid check below already survived that — a symlink is
+    /// resolved by `fs::metadata` — and the name check now does too.
+    #[test]
+    #[cfg(unix)]
+    fn a_symlink_to_an_escalation_tool_is_refused_by_what_it_points_at() {
+        let temp = crate::testing::TempDir::new("helper-symlink");
+        // A stand-in for the real tool, so the test does not depend on this
+        // host having `unshare` or on where it keeps it. What is being tested
+        // is that the *resolved* name is the one judged.
+        let real = temp.path().join("unshare");
+        std::fs::write(&real, b"#!/bin/sh\n").expect("the fixture writes");
+        let link = temp.path().join("harmless");
+        std::os::unix::fs::symlink(&real, &link).expect("the fixture links");
+
+        let error = PrivilegedHelpers::new(vec![link.display().to_string()])
+            .expect_err("a link to an escalation tool is an escalation tool");
+        assert!(
+            error.contains("unshare") && error.contains("escalation tool"),
+            "the refusal must name what the link points at: {error}"
+        );
+        assert!(
+            error.contains(&real.display().to_string()),
+            "and where it points: {error}"
+        );
+        // A link to something innocent is still allowed: what is refused is
+        // the target, not the fact of being a link.
+        let innocent = temp.path().join("my-own-helper");
+        std::fs::write(&innocent, b"#!/bin/sh\n").expect("the fixture writes");
+        let to_innocent = temp.path().join("also-harmless");
+        std::os::unix::fs::symlink(&innocent, &to_innocent).expect("the fixture links");
+        PrivilegedHelpers::new(vec![to_innocent.display().to_string()])
+            .expect("a link to an ordinary file is an ordinary helper");
     }
 
     /// A file that is setuid or setgid *is* an escalation tool, whatever it is
