@@ -3,7 +3,6 @@ use std::time::Duration;
 
 use anyhow::{Context, Result};
 use clap::Parser;
-use herd_runner::switch::DEFAULT_POLL_MS;
 use herd_runner::capability::{
     CapabilityConfig, ProbeSettings, DEFAULT_PROBE_INTERVAL_MS, DEFAULT_PROBE_TIMEOUT_MS,
 };
@@ -12,6 +11,7 @@ use herd_runner::confine::{
 };
 use herd_runner::root::DataRoot;
 use herd_runner::size::parse_bytes;
+use herd_runner::switch::DEFAULT_POLL_MS;
 use herd_runner::{
     Backoff, Config, Confinement, DEFAULT_HUB_URL, DRAIN_GRACE, HEALTH_EVERY, HUB_SILENCE_LIMIT,
 };

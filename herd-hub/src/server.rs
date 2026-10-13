@@ -1748,12 +1748,7 @@ fn dispatch_a_pass(state: &State) -> Result<()> {
     // then starve a metal trial for ever, which is the attack E-27's
     // "drains the build slot first" exists to answer. Derived from these same
     // records, so there is nothing to leak and nothing to rebuild (D79).
-    let held_empty = matcher::reservations(
-        &queue,
-        &seats,
-        now,
-        state.policy.drain_first_limit,
-    );
+    let held_empty = matcher::reservations(&queue, &seats, now, state.policy.drain_first_limit);
     for seat in seats.iter_mut() {
         seat.reserved_for = held_empty.get(&seat.name).cloned();
     }
@@ -1908,12 +1903,7 @@ fn how_it_ended(outcome: &JobOutcome) -> String {
 /// (`cancelled`, E-09) and the one job it named did not succeed (`cancelled`,
 /// E-10). The outcome is the caller's because the three are not the same end,
 /// and a reader of a record must be able to tell them apart (D15).
-fn end_the_job(
-    state: &State,
-    record: &JobRecord,
-    outcome: JobOutcome,
-    said: &str,
-) -> Result<()> {
+fn end_the_job(state: &State, record: &JobRecord, outcome: JobOutcome, said: &str) -> Result<()> {
     state
         .store
         .record_state(
@@ -2950,8 +2940,10 @@ async fn requeue_for_a_lost_capability(
     // the job ran. Asked for again before the next pass, so the budget is not
     // spent three times against one stale answer.
     let _ = outbox.send(FromHub::ReadProbesAgain {
-        why: format!("{job_id} exited {code} on {runner}, so what it was given is held by \
-                      something outside Herd after all"),
+        why: format!(
+            "{job_id} exited {code} on {runner}, so what it was given is held by \
+                      something outside Herd after all"
+        ),
     });
     if spent + 1 < state.policy.requeue_budget {
         state

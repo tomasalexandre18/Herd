@@ -53,9 +53,9 @@ pub mod switch;
 #[doc(hidden)]
 pub mod testing;
 
-use std::path::PathBuf;
 use std::collections::{HashMap, VecDeque};
 use std::future::Future;
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -697,7 +697,10 @@ impl Session {
                 "the owner's switch is now {} (it was {}); {}",
                 switch.sentence(),
                 inner.switch.sentence(),
-                what_that_position_does(&switch, inner.jobs.values().filter(|job| job.end.is_none()).count())
+                what_that_position_does(
+                    &switch,
+                    inner.jobs.values().filter(|job| job.end.is_none()).count()
+                )
             );
             inner.switch = switch;
             // Said to the hub **at once**, not at the next health report:
@@ -1824,7 +1827,14 @@ pub async fn serve_once(config: Config, session: Session, confined: Arc<Confined
     // And what every probe says, before this connection can be dispatched on.
     session.announce_capabilities();
     let reporting = tokio::spawn(report_health(session.clone(), config.health_every));
-    let outcome = serve_hub(&config, &session, &mut source, confined, config.hub_silence_limit).await;
+    let outcome = serve_hub(
+        &config,
+        &session,
+        &mut source,
+        confined,
+        config.hub_silence_limit,
+    )
+    .await;
     reporting.abort();
     session.detach();
     // The writer is holding a queue for a hub that may be gone, and the jobs
@@ -1912,7 +1922,7 @@ async fn serve_hub(
             // machine sees the position an agent set, and a runner restarted
             // afterwards comes back on it.
             FromHub::SetSwitch { switch, why } => {
-                apply_a_switch(&config, &session, switch, &why);
+                apply_a_switch(config, session, switch, &why);
             }
             // A capability this runner handed out turned out to be taken
             // (D76). The reading that allowed it is known to be stale, so it

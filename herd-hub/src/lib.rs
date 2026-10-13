@@ -13,7 +13,9 @@ pub use job::{
     Attempt, JobEvent, JobMetrics, JobRecord, JobState, JobStore, LogWrite, Mint, NewJob, Raise,
     StoreError, Submission, Timestamp, RECORD_VERSION,
 };
-pub use matcher::{Parent, Placement, Placing, Seat, Stickiness, DRAIN_FIRST_LIMIT, STICKINESS_LIMIT};
+pub use matcher::{
+    Parent, Placement, Placing, Seat, Stickiness, DRAIN_FIRST_LIMIT, STICKINESS_LIMIT,
+};
 pub use queue::{Standing, AGING_STEP};
 pub use server::{
     hub_version, Hub, HubHandle, Policy, Restating, RunnerStatus, ATTEMPTS_ALLOWED,
