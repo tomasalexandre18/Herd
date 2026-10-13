@@ -1188,9 +1188,20 @@ async fn a_busy_runner_asked_to_stop_is_gone_in_five_seconds() {
 
     // ---- What became of the job it was running. Named, with the reason, and
     // waiting for a runner that can take it — never silently lost.
-    herd.wait_until("the drained job's attempt is ended by name", || {
-        herd.record(&job)["attempts"][0]["ended"].is_string()
-    })
+    // Both facts, because they are two writes. The hub ends the attempt on
+    // the record, says in the log what that attempt's output lost, and only
+    // then requeues the job — so there is a moment in which the attempt reads
+    // `ended` while the state still reads `running`, and a wait on the first
+    // of them alone caught it about once in three runs. Waiting on the pair
+    // asserts no less: a hub that left the job `running` for good still times
+    // out here, with the record in the message.
+    herd.wait_until(
+        "the drained job's attempt is ended by name and the job is no longer running",
+        || {
+            let record = herd.record(&job);
+            record["attempts"][0]["ended"].is_string() && record["state"]["type"] != "running"
+        },
+    )
     .await;
     let record = herd.record(&job);
     let why = record["attempts"][0]["ended"]
