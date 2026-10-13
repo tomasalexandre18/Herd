@@ -17,7 +17,7 @@ variable, in the style of `--hub` / `HERD_HUB_URL`.
 | Flag | Environment | Default | What |
 |---|---|---|---|
 | `--data-root` | `HERD_DATA_ROOT` | `$XDG_STATE_HOME/herd-runner`, else `~/.local/state/herd-runner` | The one directory this runner may write in |
-| `--job-memory-max` | `HERD_JOB_MEMORY_MAX` | `2GiB` | Kernel memory ceiling per job |
+| `--job-memory-max` | `HERD_JOB_MEMORY_MAX` | `2GiB` | Kernel memory ceiling per job. Refused below `16MiB` |
 | `--job-timeout` | `HERD_JOB_TIMEOUT` | `3600` | Time cap per job, in seconds |
 | `--job-log-cap` | `HERD_JOB_LOG_CAP` | `64MiB` | Log one job may produce |
 | `--job-disk-budget` | `HERD_JOB_DISK_BUDGET` | `20GiB` | Workspace one job may hold |
@@ -29,6 +29,12 @@ Sizes accept a plain number of bytes or a suffix: `B`, `KiB`, `MiB`, `GiB`,
 `TiB`, and the decimal `kB`, `MB`, `GB`, `TB`. A value that does not parse is
 refused at startup naming itself.
 
+A cap of `0` is refused, and so is a cap too small to be a cap at all: a
+memory ceiling under **16 MiB** refuses every job exactly as `0` does, since
+`/bin/sh` alone needs that much address space under the `RLIMIT_AS` fallback.
+`--job-memory-max 1kB` used to be accepted. Invariant 2 asks for a cap, not
+for a wall, and the refusal names the floor.
+
 A runner prints what it will enforce on its own stderr before it dials the
 hub, so that the answer to "what is this machine doing to my job" never has
 to be inferred from a job that behaved oddly. That report also carries, in
@@ -37,10 +43,19 @@ less confined than the expectations ask.
 
 ## The data root (E-45)
 
-One directory, validated at startup: created if absent, refused if it is a
-file, not writable, or the filesystem root — every refusal naming the path.
+One directory, validated at startup: created if absent, and refused — every
+refusal naming the path — if the path exists and is not a directory, if it is
+a symlink to something that is not a directory, if it is not writable, or if
+it is the filesystem root. The "not a directory" case is asked *before* the
+directory is created: `create_dir_all` answered a regular file with "cannot
+be created: File exists", which named neither the problem nor the fix and
+left the `is_dir` refusal unreachable for the commonest way of getting this
+wrong.
+
 Inside it, `jobs/<job>/` holds `work` (the job's working directory), `home`
-(its `HOME`) and `tmp` (its `TMPDIR`).
+(its `HOME`) and `tmp` (its `TMPDIR`), and `held-results/` holds a verdict
+the hub never acknowledged — deliberately outside `jobs/`, so the startup
+reaper cannot clear it (D34, and "A runner's own death" below).
 
 **One runner per data root.** A runner takes an exclusive lock on
 `<root>/.herd-runner.lock` and refuses to start if another runner holds it,
@@ -58,12 +73,20 @@ those directories are its own — so:
   runner see;
 - a figure that still cannot be taken is **absent**, and the job ends at its
   disk cap: a budget that cannot be measured cannot be enforced, and an
-  unenforced cap must never read as a job that passed;
-- the workspace is reclaimed when the job ends whatever its modes are. If a
-  reclaim still fails, that is said in the **job's own record** — a line on
-  the job's stderr the requester reads — and not only in the runner's log,
+  unenforced cap must never read as a job that passed. The outcome then
+  carries **why** as well as the cap's figure, because the figure alone lies:
+  a job that wrote four kilobytes was being told "the runner stopped this job
+  at its disk cap of 21474836480 bytes", with the real reason only on the
+  runner's stderr. `stopped_by_cap` has a `detail` field for exactly this,
+  absent whenever the cap's own figure says it all;
+- the workspace is reclaimed when the job ends, whatever its modes are, and
+  if a reclaim still fails that is said in the **job's own record** — a line
+  on the job's stderr the requester reads — and not only in the runner's log,
   because bytes left on a host nobody collects are exactly what invariant 2
-  forbids.
+  forbids. **This holds on both paths**: the job's own end, and the drain's
+  backstop when a runner is stopped before a job's task got that far. The
+  backstop used to say `ITS WORKSPACE LEFT BEHIND` on the runner's stderr and
+  nowhere a requester could read.
 
 The job's environment is built from scratch rather than inherited: `HOME`,
 `TMPDIR`, `TMP`, `TEMP` and the `XDG_*` directories all point inside the
@@ -87,14 +110,20 @@ if any module but `privilege.rs` so much as names one.
 
 Anything that ever needs privilege must go through the configured fixed list
 of absolute helper paths. An entry is refused unless it is **an absolute
-path**, **an existing file**, **not setuid and not setgid** — checked on the
-file's mode, not on its name — and **not one of the known escalation tools**,
-matched on the file's own name: `sudo`, `doas`, `pkexec`, `run0`, `su`,
-`runuser`, `setpriv`, `machinectl`, `systemd-run`, `nsenter`, `unshare`,
-`chroot`, `capsh` and `sudoedit`. So a list containing an escalation tool is
-itself refused, and so is a tool nobody listed that happens to be
-setuid-root. A command not on the list is refused by name. Nothing in M4
-needs a helper, so no helper is invoked.
+path**, an existing **regular file** — a directory passed every check and was
+then printed at startup as a configured helper, which is a list with an entry
+nobody can run — **not setuid and not setgid**, checked on the file's mode
+rather than on its name, and **not one of the known escalation tools**:
+`sudo`, `doas`, `pkexec`, `run0`, `su`, `runuser`, `setpriv`, `machinectl`,
+`systemd-run`, `nsenter`, `unshare`, `chroot`, `capsh` and `sudoedit`.
+
+That last check is made on the **resolved** path as well as the one written
+down: `ln -s /usr/bin/unshare harmless` walked straight past a check that
+looked only at the last component it was handed. A symlink to an escalation
+tool is an escalation tool, and the refusal names what the link points at.
+So a list containing an escalation tool is itself refused, and so is a tool
+nobody listed that happens to be setuid-root. A command not on the list is
+refused by name. Nothing in M4 needs a helper, so no helper is invoked.
 
 ### Honest limits of "unprivileged"
 
@@ -158,11 +187,27 @@ endpoint of D10 and D11 arrives in M11.
 A job must not outlive the runner that was watching it, in any of the three
 ways a runner can go:
 
-- **asked to stop** (`SIGTERM`, `SIGINT`): the runner ends every running job
-  — cgroup kill, process-group kill, marker sweep — reclaims each workspace,
-  names what it ended on its stderr, and leaves. M3 owns the orderly drain
-  that invariant 2's ≤ 5 s is about; this is the part that must never be
-  missing, which is that nothing survives.
+- **asked to stop** (`SIGTERM`, `SIGINT`): the runner **drains**. It refuses
+  new work from that instant and says so to the hub at once rather than at
+  the next report; it tells every running job it is over, which makes each
+  job's own task kill its process tree — cgroup kill, process-group kill,
+  marker sweep — reclaim its workspace, and hand the *attempt* back to the
+  hub without a verdict; it waits briefly for those to land and to be
+  acknowledged; and then, as a backstop, it ends whatever did not get that
+  far itself. It is gone inside invariant 2's five seconds whatever happened,
+  and a job still running when the owner asked is named on the record as an
+  abandoned attempt and attempted again — never reported as "killed by signal
+  9", which would be a verdict nobody earned.
+- **asked to stop while holding a verdict**: a job that *ran to its end* with
+  no hub to tell produced a real outcome, and that outcome exists nowhere but
+  this process's memory. On its way out the runner writes the `job_finished`
+  frame verbatim and fsynced to `<root>/held-results/<job>.json`, naming each
+  path on stderr — and **the next runner on that data root picks it up,
+  offers it on every link it makes, and removes the file only once the hub
+  has acknowledged it** (D34). A verdict the hub will never record — an
+  unknown job, a job already finished, an attempt superseded by a requeue —
+  is dropped by name rather than offered for ever, and a file that cannot be
+  decoded at all is kept under a `.unreadable` name rather than deleted.
 - **killed** (`SIGKILL`): nothing can be handled, so the cleanup happens in
   the next life. At startup, before it dials the hub, a runner **reaps what a
   previous life left**: every process carrying a job marker whose runner is

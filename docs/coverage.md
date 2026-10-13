@@ -14,7 +14,7 @@ closes in M18.
 | E-03 | must | stream, detached mode, wait | M2 | in review (PR #4) | foreground streaming itself lands in M1 |
 | E-04 | must | waits explained with figures | M8 | planned |  |
 | E-05 | must | identical submissions deduplicated | M6 | planned |  |
-| E-06 | must | cancel kills process tree | M3 | planned | kill mechanics hardened in M4 |
+| E-06 | must | cancel kills process tree | M3 | in review (M3) | propagation and the sibling-untouched case asserted in M3; the kill becomes a process-tree kill in M4 |
 | E-07 | must | dry run shows placement | M9 | planned |  |
 | E-08 | must | refuse dirty or unpushed | M10 | planned |  |
 | E-09 | should | deadline cancels unstarted job | M9 | planned | pulled forward: E-41 (must) needs it |
@@ -29,7 +29,7 @@ closes in M18.
 | E-18 | must | four priorities with aging | M6 | planned |  |
 | E-19 | must | no fallback while available | M7 | planned | switch-off case retested with E-33 in M9 |
 | E-20 | must | one queue for everything | M6 | planned |  |
-| E-21 | must | lost runner, requeue once | M3 | planned |  |
+| E-21 | must | lost runner, requeue once | M3 | in review (M3) | silence threshold is hub policy; a second loss ends the job `lost` |
 | E-22 | must | build slots, derived -j | M7 | planned |  |
 | E-23 | should | placement prefers cache locality | M12 | planned | preference only; E-19 governs waiting |
 | E-24 | must | probed/declared/denied labels | M5 | planned |  |
@@ -48,11 +48,11 @@ closes in M18.
 | E-37 | must | events routable to ntfy | M13 | planned |  |
 | E-38 | should | statistics over a period | — | planned | deferred past M18; raw data already written by M2/M4 records |
 | E-39 | should | results searchable | — | planned | deferred past M18; on-disk records are greppable meanwhile |
-| E-40 | should | health every 15 s | M3 | planned | ages surfaced in status in M13 |
+| E-40 | should | health every 15 s | M3 | in review (M3) | the age is in the hub's state; surfaced in the status document in M13 |
 | E-41 | must | scheduled nightly, exclusive | M14 | planned | gated: their nightly command, live at M18 |
 | E-42 | must | push hook submits producer | M14 | planned | Herd side = scriptable detached submit; the hook is theirs |
 | E-43 | must | merger jobs start first | M6 | planned |  |
-| E-44 | must | restart loses nothing | M2 | in review (PR #4) | re-asserted across reconnects in M3; failed real-binary verification 2026-10-12; fix in flight (D17) |
+| E-44 | must | restart loses nothing | M2 | merged | re-asserted across reconnects in M3, which also recovers the log the gap used to leave (D36) |
 | E-45 | must | one data root only | M4 | in review (PR #5) | cooperative confinement only — full containment needs a mount namespace E-46 forbids (D28) |
 | E-46 | must | unprivileged, root via helper | M4 | in review (PR #5) |  |
 | E-47 | must | server runner runs natively | M16 | planned |  |
