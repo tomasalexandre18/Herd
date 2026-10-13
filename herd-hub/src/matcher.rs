@@ -1791,7 +1791,10 @@ mod tests {
         let first = a_test("j1", 1024, 5 * 1024);
         let second = a_test("j2", 1024, 5 * 1024);
         let (_, why) = placed(place(&first, &mut fleet, now(), Stickiness::default()));
-        assert!(why.contains("reserved 5 GiB in tmpfs, 3 GiB free of 8 GiB"), "{why}");
+        assert!(
+            why.contains("reserved 5 GiB in tmpfs, 3 GiB free of 8 GiB"),
+            "{why}"
+        );
         let why = waited(place(&second, &mut fleet, now(), Stickiness::default()));
         assert!(
             why.contains("3 GiB free in tmpfs, 5 GiB needed (8 GiB of tmpfs there in all)"),
@@ -1989,7 +1992,10 @@ mod tests {
         zero.memory_mib = Some(0);
         let mut fleet = vec![their_server()];
         let why = impossible(place(&zero, &mut fleet, now(), Stickiness::default()));
-        assert!(why.contains("0 MiB of memory, which is not a figure"), "{why}");
+        assert!(
+            why.contains("0 MiB of memory, which is not a figure"),
+            "{why}"
+        );
 
         let mut both = a_build("j2", 1792);
         both.memory_mib = Some(8192);
@@ -2044,7 +2050,10 @@ mod tests {
     #[test]
     fn a_reservation_is_released_by_every_way_a_job_ends() {
         let running = out_on(a_test("j1", 8192, 4096), "build-host");
-        assert_eq!(reserved(std::slice::from_ref(&running))["build-host"].tmpfs_mib, 4096);
+        assert_eq!(
+            reserved(std::slice::from_ref(&running))["build-host"].tmpfs_mib,
+            4096
+        );
 
         for state in [
             JobState::Finished {
@@ -2189,8 +2198,14 @@ mod tests {
             calm_runner, busy_runner,
             "a busy host is a fact to report, never a reason to refuse (E-32)"
         );
-        assert!(calm_why.contains("load 0.10 there, recorded and not a gate"), "{calm_why}");
-        assert!(busy_why.contains("load 50.00 there, recorded and not a gate"), "{busy_why}");
+        assert!(
+            calm_why.contains("load 0.10 there, recorded and not a gate"),
+            "{calm_why}"
+        );
+        assert!(
+            busy_why.contains("load 50.00 there, recorded and not a gate"),
+            "{busy_why}"
+        );
         // And the two lines differ in nothing but that figure.
         assert_eq!(
             calm_why.replace("load 0.10", "load X"),
@@ -2235,5 +2250,4 @@ mod tests {
             }
         }
     }
-
 }

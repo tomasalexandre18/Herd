@@ -494,3 +494,47 @@ impl Herd {
         String::from_utf8_lossy(&output.stdout).trim().to_owned()
     }
 }
+
+impl Herd {
+    /// Submit a job that declares what it needs of a machine (E-29, E-31),
+    /// and leave with its id.
+    ///
+    /// The two figures are what admission weighs: a whole-job memory need and
+    /// a tmpfs reservation. Either may be left out, which is a job that
+    /// declares nothing of the kind rather than a job that needs zero.
+    pub async fn submit_reserving(
+        &self,
+        memory_mib: Option<u64>,
+        tmpfs_mib: Option<u64>,
+        script: &str,
+    ) -> String {
+        let mut arguments: Vec<String> = vec!["submit".to_owned()];
+        if let Some(memory_mib) = memory_mib {
+            arguments.push("--memory-mib".to_owned());
+            arguments.push(memory_mib.to_string());
+        }
+        if let Some(tmpfs_mib) = tmpfs_mib {
+            arguments.push("--tmpfs-mib".to_owned());
+            arguments.push(tmpfs_mib.to_string());
+        }
+        for word in ["--", "/bin/sh", "-c", script] {
+            arguments.push(word.to_owned());
+        }
+        let borrowed: Vec<&str> = arguments.iter().map(String::as_str).collect();
+        let output = self.herdctl(&borrowed).await;
+        assert!(
+            output.status.success(),
+            "the submission failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8_lossy(&output.stdout).trim().to_owned()
+    }
+
+    /// Why a job is not starting, as its own record says it (E-04, E-53).
+    pub fn waiting_for(&self, job_id: &str) -> String {
+        self.record(job_id)["waiting_for"]
+            .as_str()
+            .unwrap_or_default()
+            .to_owned()
+    }
+}

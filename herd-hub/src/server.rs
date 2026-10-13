@@ -1766,12 +1766,7 @@ async fn say_again_why_jobs_wait(state: Arc<State>) {
                 cadence: state.policy.wait_restatement,
             };
             let due = state.with_peers(|peers| {
-                let due = restating.is_due(
-                    peers
-                        .wait_told
-                        .get(&job_id)
-                        .map(|told| told.elapsed()),
-                );
+                let due = restating.is_due(peers.wait_told.get(&job_id).map(|told| told.elapsed()));
                 if due {
                     peers.wait_told.insert(job_id.clone(), Instant::now());
                 }
@@ -3496,5 +3491,115 @@ mod tests {
             Some("suspended"),
             "and the snapshot is in force for whatever comes next"
         );
+    }
+
+    /// **Attack 8.** E-04 asks for "at least every 60 s", and that has two
+    /// failure modes: a reason that stops, and a reason that floods.
+    ///
+    /// Ten simulated minutes are driven through the hub's own decision — the
+    /// one [`say_again_why_jobs_wait`] calls — at the cadence of a busy
+    /// fleet's dispatch passes, two seconds apart. The two assertions are
+    /// the two failure modes: there is never a gap longer than the cadence,
+    /// and the whole ten minutes produce no more lines than the bound.
+    #[test]
+    fn ten_simulated_minutes_of_waiting_leave_periodic_reasons_and_no_flood() {
+        let restating = Restating {
+            cadence: WAIT_RESTATEMENT,
+        };
+        let ten_minutes = Duration::from_secs(10 * 60);
+        let tick = Duration::from_secs(2);
+
+        let mut said_at: Vec<Duration> = Vec::new();
+        let mut last_told: Option<Duration> = None;
+        let mut elapsed = Duration::ZERO;
+        while elapsed <= ten_minutes {
+            if restating.is_due(last_told) {
+                said_at.push(elapsed);
+                last_told = Some(Duration::ZERO);
+            }
+            elapsed += tick;
+            last_told = last_told.map(|since| since + tick);
+        }
+
+        // It does not stop: never a gap past the cadence, from the first
+        // moment to the last.
+        assert_eq!(said_at.first(), Some(&Duration::ZERO), "{said_at:?}");
+        for pair in said_at.windows(2) {
+            let gap = pair[1] - pair[0];
+            assert!(
+                gap <= restating.cadence + tick,
+                "a gap of {gap:?} is longer than E-04's 60 s: {said_at:?}"
+            );
+        }
+        assert!(
+            ten_minutes - *said_at.last().expect("at least one") <= restating.cadence + tick,
+            "it stopped before the ten minutes were up: {said_at:?}"
+        );
+
+        // And it does not flood: 300 passes over ten minutes, and eleven
+        // lines — not three hundred.
+        let bound = restating.at_most_over(ten_minutes);
+        assert_eq!(bound, 11);
+        assert!(
+            said_at.len() as u32 <= bound,
+            "{} lines over ten minutes, bound {bound}: {said_at:?}",
+            said_at.len()
+        );
+        assert_eq!(said_at.len(), 11, "{said_at:?}");
+    }
+
+    /// **Attack 11, measured.** The `dispatching` lock is held for a whole
+    /// pass over the whole queue, including every claim's and every waiting
+    /// line's fsyncs — and M8 adds admission arithmetic inside the same pass.
+    ///
+    /// This is a measurement rather than a bound: it prints the wall-clock
+    /// figure for a pass over a large queue, so that the cost is a number in
+    /// the record instead of a worry. The assertion is deliberately loose —
+    /// it is there to catch something going quadratic, not to pin a figure a
+    /// slow CI box cannot meet.
+    #[test]
+    fn one_pass_over_a_large_queue_is_measured_and_the_figure_is_printed() {
+        const QUEUED: usize = 400;
+        let dir = tempfile::tempdir().expect("a temporary state directory");
+        let store = Arc::new(JobDirStore::open(dir.path()).expect("the state root opens"));
+        for which in 0..QUEUED {
+            store
+                .create_job(
+                    NewJob::new(vec!["true".to_owned(), format!("{which}")])
+                        .with_admission(Some(2048), Some(1024)),
+                )
+                .expect("minted");
+        }
+        let state = Arc::new(State {
+            store: Arc::clone(&store) as Arc<dyn JobStore>,
+            policy: Policy::default(),
+            started: Instant::now(),
+            peers: Mutex::new(Peers::default()),
+            dispatching: Mutex::new(()),
+        });
+
+        // The first pass writes a waiting line on every record: 400 records,
+        // 400 `events.jsonl` lines, every one fsynced. That is the expensive
+        // pass, and the one an operator would meet after a restart.
+        let began = Instant::now();
+        dispatch_queued_jobs(&state).expect("the pass runs");
+        let writing = began.elapsed();
+        // The second writes nothing, because no sentence is news. That is
+        // what a steady-state pass costs.
+        let began = Instant::now();
+        dispatch_queued_jobs(&state).expect("the pass runs again");
+        let steady = began.elapsed();
+
+        println!(
+            "herd-hub: one dispatch pass over {QUEUED} queued jobs took {writing:?} writing a \
+             waiting line for each, and {steady:?} when none of them was news. The \
+             `dispatching` lock is held for all of it."
+        );
+        assert!(
+            writing < Duration::from_secs(120),
+            "a pass over {QUEUED} jobs took {writing:?}, which is not a cost this design can \
+             carry: something is quadratic"
+        );
+        assert!(steady < writing, "{steady:?} against {writing:?}");
     }
 }
