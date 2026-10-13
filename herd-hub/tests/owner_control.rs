@@ -9,9 +9,10 @@
 
 mod real_herd;
 
+use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
-use real_herd::Herd;
+use real_herd::{Herd, PATIENCE};
 
 /// E-33's figure, as this test holds it to.
 const TEN_SECONDS: Duration = Duration::from_secs(10);
@@ -67,8 +68,25 @@ fn outcome_of(herd: &Herd, job: &str) -> serde_json::Value {
 /// How long until a submission is refused because no machine will take it —
 /// which is what "the hub stopped claiming" means from the outside (E-33).
 async fn until_nothing_is_claimed(herd: &Herd, began: Instant) -> (Duration, String) {
+    until_nothing_of_this_kind_is_claimed(herd, began, &[]).await
+}
+
+/// The same, for a probe that declares a label.
+///
+/// Every probe the hub *accepts* becomes a job, and a job the machine under
+/// test claims is counted on the line `herdctl switch` prints. A test that
+/// then asserts a figure has to be able to say which jobs it put there — so it
+/// probes with a label the machine has one slot of, already held by the job
+/// the test started. Each accepted probe then queues instead of running, and
+/// the only thing ever claimed on that machine is the job the test created
+/// (D100).
+async fn until_nothing_of_this_kind_is_claimed(
+    herd: &Herd,
+    began: Instant,
+    options: &[&str],
+) -> (Duration, String) {
     loop {
-        let output = herd.submit_with(&[], "printf nothing").await;
+        let output = herd.submit_with(options, "printf nothing").await;
         if !output.status.success() {
             return (
                 began.elapsed(),
@@ -85,24 +103,171 @@ async fn until_nothing_is_claimed(herd: &Herd, began: Instant) -> (Duration, Str
     }
 }
 
+/// A job that runs until this test lets it finish, and then prints `says`.
+///
+/// Returned with the file that releases it. Everything here that needs work
+/// *in flight* while something else is asserted used to hold it there with
+/// `sleep 2` or `sleep 3`, which is a guess about how long the assertions
+/// take. On a loaded two-core host they take longer, the job ends early, and
+/// what is then asserted is a machine with nothing on it: either a figure
+/// that is wrong, or a proof that passes while proving nothing (D100). A job
+/// held on a file the test creates ends when the test says so and not before,
+/// and writes nothing at all until then.
+fn a_job_held_until_the_test_says_so(herd: &Herd, which: &str, says: &str) -> (PathBuf, String) {
+    let release = herd.logs.path().join(format!("release-{which}"));
+    let script = format!(
+        "until [ -e {} ]; do sleep 0.05; done; printf {says}",
+        release.display()
+    );
+    (release, script)
+}
+
+/// Let one of those jobs finish.
+fn let_it_finish(release: &Path) {
+    std::fs::write(release, b"go").expect("the test releases the job it was holding");
+}
+
+/// The line `herdctl switch` prints about one machine, if it prints one.
+fn line_about(said: &str, runner: &str) -> Option<String> {
+    said.lines()
+        .find(|line| line.starts_with(&format!("{runner}:")))
+        .map(str::to_owned)
+}
+
+/// The same, insisting there is one.
+fn the_line_about(said: &str, runner: &str) -> String {
+    line_about(said, runner)
+        .unwrap_or_else(|| panic!("`herdctl switch` says nothing about {runner}: {said}"))
+}
+
+/// Wait until `herdctl switch` says exactly this about one machine.
+///
+/// The figures on that line are the runner's own, carried on its health
+/// report, so they lag what they describe by up to one cadence. A test that
+/// read them without waiting would be asserting a state it had not
+/// established (D100).
+async fn until_the_fleet_says(herd: &Herd, runner: &str, line: &str) {
+    let deadline = Instant::now() + PATIENCE;
+    loop {
+        let said = herd.switches().await;
+        if line_about(&said, runner).as_deref() == Some(line) {
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "`herdctl switch` never said {line:?}; it says: {said}"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
+/// Wait until nothing is being written in the hub's state root, and come back
+/// with every byte of it.
+///
+/// For the tests that compare the whole state root before and after a dry run
+/// (E-07) and have no single file to watch. A record is more than one file —
+/// `job.json` lands before the matching line of `events.jsonl` — so "the job
+/// I was waiting for has finished" is not the same as "nothing is in flight",
+/// and a `before` taken between the two measures the hub finishing a job
+/// rather than the dry run. Two identical readings a cadence apart is a
+/// heuristic and is admitted as one; where a test knows what it is waiting
+/// for, it waits for that instead (D100).
+async fn until_the_state_root_is_quiet(herd: &Herd) -> Vec<(String, Vec<u8>)> {
+    let deadline = Instant::now() + PATIENCE;
+    let mut last = herd.state_bytes();
+    loop {
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        let now = herd.state_bytes();
+        if now == last {
+            return now;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the hub never stopped writing in its state root"
+        );
+        last = now;
+    }
+}
+
+/// Submit until the hub refuses **for this reason**, and come back with what
+/// it said.
+///
+/// What a runner prints as it dials is the runner's own news; a submission
+/// means something only once the *hub* has that runner, and nothing in the
+/// runner's log says when that is. So the condition waited on here is the
+/// refusal itself: refused for her reason is the answer, refused because
+/// nothing is connected yet is a wait, and a submission the hub **accepts**
+/// fails at once rather than being retried — a machine that claims work after
+/// its owner switched it off is exactly the defect these tests watch for
+/// (D100).
+async fn until_a_submission_is_refused_saying(herd: &Herd, reason: &str) -> String {
+    let deadline = Instant::now() + PATIENCE;
+    loop {
+        let output = herd.submit_with(&[], "printf nothing").await;
+        assert!(
+            !output.status.success(),
+            "the machine claimed work it had to refuse; it says: {}",
+            herd.switches().await
+        );
+        let refusal = String::from_utf8_lossy(&output.stderr).into_owned();
+        if refusal.contains(reason) {
+            return refusal;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "no refusal ever carried {reason:?}; the last one said: {refusal}"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
 // ------------------------------------------------------------------ E-33
 
 /// `off`, set on the machine itself, stops the hub claiming inside ten
 /// seconds — **while a job is running** — and does not touch that job
 /// (E-33, attack 1).
+///
+/// The count on the line this asserts is a figure the test creates, and it is
+/// made so by the fixture rather than by a looser assertion (D100). The
+/// machine has **one** build slot and nothing detected; the job in flight is
+/// a build, so it holds that slot; and the probes that establish the hub has
+/// stopped claiming are builds too, so every one the hub accepts queues
+/// instead of being claimed. Before this, the probes were unlabelled, a
+/// second one was claimed on a slow host while the switch was still moving,
+/// and the hub rightly said `2 jobs running there finish` — a correct
+/// sentence that a literal `1 job` could not survive.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_switch_off_on_the_machine_stops_claims_in_ten_seconds_and_spares_the_job() {
     let herd = Herd::new();
     let _hub = herd.start_hub("hub").await;
-    let _runner = herd.start_runner_with("wsl-pc", "runner", "runner", &["--switch-poll", "100"]);
+    let file = capability_file(&herd, "pc", ONE_BUILD_SLOT);
+    let _runner = herd.start_runner_with(
+        "wsl-pc",
+        "runner",
+        "runner",
+        &[
+            "--capabilities",
+            &file,
+            "--no-detect",
+            "--switch-poll",
+            "100",
+        ],
+    );
     herd.wait_for_runner().await;
 
-    // Something real is running on the machine when its owner wants it back.
-    let running = herd.submit_ok(&[], "sleep 3; printf done").await;
+    // Something real is running on the machine when its owner wants it back,
+    // and it runs until this test says otherwise rather than for a guessed
+    // number of seconds.
+    let (release, script) = a_job_held_until_the_test_says_so(&herd, "spared", "done");
+    let running = herd.submit_ok(&["--label", "build"], &script).await;
     herd.wait_until("the job has started", || {
         matches!(state_of(&herd, &running).as_str(), "assigned" | "running")
     })
     .await;
+    // And the hub has caught up with that before anything is switched: the
+    // count it prints is the runner's own figure, carried on a health report,
+    // so it is waited for rather than assumed.
+    until_the_fleet_says(&herd, "wsl-pc", "wsl-pc: on, 1 job running there finishes").await;
 
     let began = Instant::now();
     herd.switch_on_the_machine("runner", &["off", "--reason", "she is gaming"])
@@ -115,7 +280,8 @@ async fn a_switch_off_on_the_machine_stops_claims_in_ten_seconds_and_spares_the_
     let on_her_disk = std::fs::read_to_string(herd.switch_file("runner"))
         .expect("`herd-runner switch` writes the file before anything else happens");
     assert!(on_her_disk.contains("she is gaming"), "{on_her_disk}");
-    let (took, refusal) = until_nothing_is_claimed(&herd, began).await;
+    let (took, refusal) =
+        until_nothing_of_this_kind_is_claimed(&herd, began, &["--label", "build"]).await;
     assert!(
         took < TEN_SECONDS,
         "E-33 asks for ten seconds; it took {took:?}"
@@ -124,20 +290,27 @@ async fn a_switch_off_on_the_machine_stops_claims_in_ten_seconds_and_spares_the_
         refusal.contains("wsl-pc is switched off (she is gaming)"),
         "the refusal must carry her own reason (E-33): {refusal}"
     );
-    // And the state is visible, with the reason, through herdctl.
+    // And the state is visible, with the reason, through herdctl — the whole
+    // line and not a fragment of it: the machine's name, the owner's own
+    // words, and the **one** job this test put there, which *finishes*. That
+    // last word is the whole difference between her switch and a shutdown.
     let said = herd.switches().await;
-    assert!(
-        said.contains("wsl-pc: off (she is gaming)"),
-        "E-33 asks for the state and its reason to be visible: {said}"
-    );
-    assert!(
-        said.contains("1 job running there finishes"),
-        "a machine switched off with work on it is the ordinary case and the line has to say \
-         so: {said}"
+    assert_eq!(
+        the_line_about(&said, "wsl-pc"),
+        "wsl-pc: off (she is gaming), 1 job running there finishes",
+        "E-33 asks for the position, its reason and what becomes of the work in flight: {said}"
     );
 
     // The job that was running is **not** killed. That is the whole
-    // difference between the owner's switch and a shutdown.
+    // difference between the owner's switch and a shutdown — and it is still
+    // running now, after the hub has stopped claiming, because this test is
+    // the only thing that can end it.
+    assert!(
+        matches!(state_of(&herd, &running).as_str(), "assigned" | "running"),
+        "a switch off must leave the job in flight alone (E-33); it is {}",
+        state_of(&herd, &running)
+    );
+    let_it_finish(&release);
     let waited = herd.herdctl(&["wait", &running]).await;
     assert!(
         waited.status.success(),
@@ -393,15 +566,13 @@ async fn a_runner_restarted_while_switched_off_comes_back_switched_off() {
         herd.said("second").contains("switch says off")
     })
     .await;
-    let refusal = herd.submit_with(&[], "printf nothing").await;
+    // That line is the runner's own: it says the machine read its file, not
+    // that the hub has the connection yet. So the refusal is what is waited
+    // on, and a submission the hub accepts fails at once (D100).
+    let refusal = until_a_submission_is_refused_saying(&herd, "she is gaming").await;
     assert!(
-        !refusal.status.success(),
-        "a runner restarted while switched off must not claim"
-    );
-    assert!(
-        String::from_utf8_lossy(&refusal.stderr).contains("she is gaming"),
-        "{}",
-        String::from_utf8_lossy(&refusal.stderr)
+        refusal.contains("wsl-pc"),
+        "and the refusal names the machine: {refusal}"
     );
 }
 
@@ -418,7 +589,8 @@ async fn a_drain_finishes_its_job_and_then_the_runner_leaves() {
         herd.start_runner_with("wsl-pc", "runner", "runner", &["--switch-poll", "100"]);
     herd.wait_for_runner().await;
 
-    let running = herd.submit_ok(&[], "sleep 2; printf finished").await;
+    let (release, script) = a_job_held_until_the_test_says_so(&herd, "drained", "finished");
+    let running = herd.submit_ok(&[], &script).await;
     herd.wait_until("the job has started", || {
         matches!(state_of(&herd, &running).as_str(), "assigned" | "running")
     })
@@ -432,7 +604,24 @@ async fn a_drain_finishes_its_job_and_then_the_runner_leaves() {
     assert!(took < TEN_SECONDS, "{took:?}");
     assert!(refusal.contains("a reboot is due"), "{refusal}");
 
+    // The runner is **still here**, because it still holds the job — and the
+    // job is still running, because nothing but this test can end it. Held
+    // there by a `sleep 2`, both of those were a guess: a job that had quietly
+    // ended while the assertions above ran would leave this test asserting a
+    // drain with nothing to drain (D100).
+    assert!(
+        runner.alive(),
+        "a drain waits for the job it holds (invariant 2): {}",
+        herd.said("runner")
+    );
+    assert!(
+        matches!(state_of(&herd, &running).as_str(), "assigned" | "running"),
+        "a drain must not kill the job it holds; it is {}",
+        state_of(&herd, &running)
+    );
+
     // What it held ran to its end, and only then did the runner go.
+    let_it_finish(&release);
     let waited = herd.herdctl(&["wait", &running]).await;
     assert!(
         waited.status.success(),
@@ -484,20 +673,32 @@ async fn a_job_assigned_as_the_switch_moves_is_handed_back_naming_the_switch() {
         "server",
         &["--capabilities", &server_file, "--no-detect"],
     );
-    herd.wait_until("both runners have joined", || {
-        herd.said("pc").contains("joining") && herd.said("server").contains("joining")
-    })
-    .await;
+    // Both of them as the **hub** has them, not as their own logs say they are
+    // dialling: a build submitted while the server was still joining was
+    // refused, and this test then read a job id that had never been minted
+    // (D100).
+    until_the_fleet_says(&herd, "wsl-pc", "wsl-pc: on, nothing running").await;
+    until_the_fleet_says(&herd, "build-host", "build-host: on, nothing running").await;
     // The PC is preferred, so a build belongs there (E-19). Switched off, the
     // same build goes to the server instead — at once, because a withdrawn
     // machine is not available and nothing waits for it (D80).
     herd.switch_on_the_machine("pc", &["off", "--reason", "she is gaming"])
         .await;
-    tokio::time::sleep(Duration::from_millis(400)).await;
-    let build = herd
-        .submit_with(&["--label", "build"], "printf built")
-        .await;
-    let build = String::from_utf8_lossy(&build.stdout).trim().to_owned();
+    // Waited for on the hub's own view rather than slept off. The 400 ms that
+    // stood here was a guess about how long a loaded host takes to carry the
+    // position from her disk to the hub, and a build submitted a moment too
+    // early would be placed on the machine she had just withdrawn — which
+    // this test would then report as the product placing it wrongly (D100).
+    until_the_fleet_says(
+        &herd,
+        "wsl-pc",
+        "wsl-pc: off (she is gaming), nothing running",
+    )
+    .await;
+    // `submit_ok`, so a refusal is a failure here and says so: read through
+    // `submit_with`, a refused submission gave an empty id and the next line
+    // panicked trying to read the record of a job that was never minted.
+    let build = herd.submit_ok(&["--label", "build"], "printf built").await;
     herd.wait_until("the build is over", || {
         state_of(&herd, &build) == "finished"
     })
@@ -534,18 +735,31 @@ async fn a_dry_run_changes_nothing_and_says_what_the_real_pass_would_say() {
     herd.wait_for_runner().await;
     // One build is already running, so the slot is taken and the dry run has
     // something real to be right about.
-    let holding = herd
-        .submit_ok(&["--label", "build"], "sleep 3; printf held")
-        .await;
+    let (release, script) = a_job_held_until_the_test_says_so(&herd, "holding", "held");
+    let holding = herd.submit_ok(&["--label", "build"], &script).await;
     // Waited all the way to `running`, and the job writes nothing until it
     // ends: the comparison below has to be against a state root that is
     // quiescent, or it would be measuring the job rather than the dry run.
-    herd.wait_until("the first build is running", || {
-        state_of(&herd, &holding) == "running"
-    })
+    // **Which is why it ends when this test says so.** Held there by a
+    // `sleep 3`, the job finished mid-comparison on a loaded two-core host and
+    // the bytes it wrote were read as a dry run writing to the state root —
+    // reproduced, and the reason this is a file and not a duration (D100).
+    //
+    // And waited for in **both** files of the record, not only in `job.json`:
+    // the `running` line of `events.jsonl` lands after the record says
+    // `running`, and `state_bytes` reads both. That window is what actually
+    // reddened CI here, and it is microseconds wide on an idle host and wide
+    // enough to step in on a loaded two-core one.
+    herd.wait_until(
+        "the first build is running, in its record and in its events",
+        || {
+            state_of(&herd, &holding) == "running"
+                && herd.states_of(&holding).last().map(String::as_str) == Some("running")
+        },
+    )
     .await;
 
-    let before = herd.state_bytes();
+    let before = until_the_state_root_is_quiet(&herd).await;
     let said = herd
         .herdctl(&[
             "would-run",
@@ -611,6 +825,7 @@ async fn a_dry_run_changes_nothing_and_says_what_the_real_pass_would_say() {
         waiting.contains("build slot") || waiting.contains("waiting for wsl-pc"),
         "the real pass waits for the same reason the dry run gave: {waiting} against {lines}"
     );
+    let_it_finish(&release);
 }
 
 /// A dry run of a job nothing could take says so, and still changes nothing
@@ -627,7 +842,11 @@ async fn a_dry_run_of_an_unplaceable_job_says_so_and_still_writes_nothing() {
         &["--capabilities", &file, "--no-detect"],
     );
     herd.wait_for_runner().await;
-    let before = herd.state_bytes();
+    // The job `wait_for_runner` ran is over, which is not the same as its
+    // record being finished being written: the same two-file window as above,
+    // and here there is no id to watch, so the root is waited on until it
+    // stops changing (D100).
+    let before = until_the_state_root_is_quiet(&herd).await;
     let said = herd
         .herdctl(&[
             "would-run",
@@ -666,7 +885,17 @@ async fn a_dry_run_of_an_unplaceable_job_says_so_and_still_writes_nothing() {
 #[tokio::test(flavor = "multi_thread")]
 async fn a_deadline_cancels_a_queued_job_and_never_a_running_one() {
     let herd = Herd::new();
-    let _hub = herd.start_hub("hub").await;
+    // An aging step of four seconds, which is a re-judging pass a second: a
+    // deadline is judged on a dispatch pass, and the passes that are not on a
+    // clock are provoked by something happening. The job holding the slot here
+    // is held until this test releases it, so nothing happens — and read
+    // against the default step, a quarter of which is clamped to a minute,
+    // the deadline fired long after the thirty seconds a test waits. Before,
+    // the pass came from the `sleep 3` job ending, which made the cancellation
+    // a side effect of a duration nobody chose (D100).
+    let _hub = herd
+        .start_hub_with("hub", &["--lost-after", "60", "--aging-step", "4"])
+        .await;
     let file = capability_file(&herd, "pc", ONE_BUILD_SLOT);
     let _runner = herd.start_runner_with(
         "wsl-pc",
@@ -679,21 +908,36 @@ async fn a_deadline_cancels_a_queued_job_and_never_a_running_one() {
     // A job that starts at once, with a deadline that passes **while it
     // runs**. Its deadline must do nothing to it: a running job is the time
     // cap's business (M4, exit 124), never E-09's.
+    //
+    // Five seconds rather than one, and held on a file rather than a `sleep`.
+    // A deadline that has to pass *after* the job started gives the hub until
+    // then to start it, and on a loaded two-core host a dispatch pass can be
+    // more than a second behind the submission: this job was then cancelled
+    // before it ever ran, and the test sat waiting thirty seconds for a slot
+    // nothing would ever take (D100).
+    let (release, script) = a_job_held_until_the_test_says_so(&herd, "survives", "survived");
     let running = herd
-        .submit_ok(
-            &["--label", "build", "--deadline", "+1s"],
-            "sleep 3; printf survived",
-        )
+        .submit_ok(&["--label", "build", "--deadline", "+5s"], &script)
         .await;
     herd.wait_until("the long job holds the slot", || {
         matches!(state_of(&herd, &running).as_str(), "assigned" | "running")
     })
     .await;
     // And a second job of the same label, which therefore waits — and whose
-    // deadline passes while it waits.
+    // deadline passes while it waits. It is **judged** first: the sentence
+    // asserted below is the one a job waiting for a named thing is cancelled
+    // with, and a deadline that fires on the very first pass to touch a job
+    // says instead, just as truly, that nothing had been recorded about why it
+    // was waiting. Asserting one of those while racing the other is how this
+    // reddened CI (D100).
     let queued = herd
-        .submit_ok(&["--label", "build", "--deadline", "+1s"], "printf never")
+        .submit_ok(&["--label", "build", "--deadline", "+5s"], "printf never")
         .await;
+    herd.wait_until(
+        "the queued job has been judged, before its deadline",
+        || !herd.waiting_for(&queued).is_empty(),
+    )
+    .await;
     herd.wait_until("the queued job is cancelled by its deadline", || {
         state_of(&herd, &queued) == "finished"
     })
@@ -719,7 +963,16 @@ async fn a_deadline_cancels_a_queued_job_and_never_a_running_one() {
         String::from_utf8_lossy(&waited.stderr)
     );
 
-    // The one that had started ran to its end, untouched.
+    // The one that had started is **still running**, and its own deadline has
+    // certainly passed: the queued job was given the same span a moment later,
+    // so a moment later is when its deadline fell, and it has already fired.
+    assert!(
+        matches!(state_of(&herd, &running).as_str(), "assigned" | "running"),
+        "a deadline must never touch a job that has started (E-09); it is {}",
+        state_of(&herd, &running)
+    );
+    // And it then ran to its end, untouched.
+    let_it_finish(&release);
     let waited = herd.herdctl(&["wait", &running]).await;
     assert!(
         waited.status.success(),
@@ -763,6 +1016,7 @@ async fn a_deadline_already_past_at_submission_fires_at_once() {
 async fn a_hub_restarted_after_a_deadline_passed_cancels_the_job() {
     let herd = Herd::new();
     let job;
+    let submitted;
     {
         let _hub = herd.start_hub("first").await;
         let file = capability_file(&herd, "pc", ONE_BUILD_SLOT);
@@ -775,9 +1029,19 @@ async fn a_hub_restarted_after_a_deadline_passed_cancels_the_job() {
         herd.wait_for_runner().await;
         // Nothing offers `metal-dell`, so this waits — and its deadline
         // passes while the hub is down.
+        //
+        // Five seconds rather than one. The deadline must not fall before the
+        // first hub has judged the job, and the pass that judges a submission
+        // is not synchronous with the answer: on a loaded two-core host it ran
+        // more than a second late, the hub about to be killed cancelled the
+        // job itself, and this test then waited thirty seconds for a reason
+        // that would never be written — while what it is here to prove, that
+        // the *restarted* hub fires the deadline, had not been tried at all
+        // (D100).
+        submitted = Instant::now();
         job = herd
             .submit_ok(
-                &["--label", "metal-dell", "--deadline", "+1s"],
+                &["--label", "metal-dell", "--deadline", "+5s"],
                 "printf never",
             )
             .await;
@@ -786,7 +1050,11 @@ async fn a_hub_restarted_after_a_deadline_passed_cancels_the_job() {
         })
         .await;
     }
-    tokio::time::sleep(Duration::from_millis(1_200)).await;
+    // Down until the deadline has certainly gone by, counted from the
+    // submission the deadline was measured against rather than guessed at.
+    while submitted.elapsed() < Duration::from_secs(6) {
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
     let _hub = herd.start_hub("second").await;
     let _runner = herd.start_runner_called("wsl-pc", "again");
     // Waited for, so that the pass the restarted hub makes when a runner joins
@@ -812,7 +1080,12 @@ async fn a_dependent_waits_for_its_parent_and_is_cancelled_when_it_fails() {
     herd.wait_for_runner().await;
 
     // A parent that takes its time, and a child that must not start first.
-    let parent = herd.submit_ok(&[], "sleep 2; printf parent").await;
+    // The parent is held on a file rather than a `sleep 2`: a parent that had
+    // ended before the child was judged would leave the wait below looking for
+    // a reason the hub had no cause to record, and thirty seconds later the
+    // test would fail having proved nothing about E-10 (D100).
+    let (release, script) = a_job_held_until_the_test_says_so(&herd, "parent", "parent");
+    let parent = herd.submit_ok(&[], &script).await;
     let child = herd.submit_ok(&["--after", &parent], "printf child").await;
     herd.wait_until("the child has been judged", || {
         herd.waiting_for(&child).contains(&parent)
@@ -828,6 +1101,14 @@ async fn a_dependent_waits_for_its_parent_and_is_cancelled_when_it_fails() {
         "",
         "a child must not run before its parent (E-10)"
     );
+    // The parent is still in flight as that is read, because nothing but this
+    // test can end it.
+    assert!(
+        matches!(state_of(&herd, &parent).as_str(), "assigned" | "running"),
+        "the parent has to still be in flight for the line above to prove anything; it is {}",
+        state_of(&herd, &parent)
+    );
+    let_it_finish(&release);
     herd.wait_until("the child has run", || {
         state_of(&herd, &child) == "finished"
     })
@@ -1025,9 +1306,12 @@ async fn a_metal_job_drains_the_build_slot_first_and_no_build_overlaps_it() {
     herd.wait_for_runner().await;
 
     // A build is running on the machine, and the trial arrives behind it.
-    let build = herd
-        .submit_ok(&["--label", "build"], "sleep 2; printf first-build")
-        .await;
+    // Held on a file rather than a `sleep 2`: the drain-first reason this
+    // asserts only exists while the build is still there, and a build that had
+    // ended first would leave both waits below hunting a sentence the hub had
+    // no cause to write (D100).
+    let (release, script) = a_job_held_until_the_test_says_so(&herd, "first-build", "first-build");
+    let build = herd.submit_ok(&["--label", "build"], &script).await;
     herd.wait_until("the build holds the slot", || {
         matches!(state_of(&herd, &build).as_str(), "assigned" | "running")
     })
@@ -1062,7 +1346,10 @@ async fn a_metal_job_drains_the_build_slot_first_and_no_build_overlaps_it() {
         "a host being emptied for a metal job must claim nothing new (E-27): {held_off}"
     );
 
-    // The trial runs once the host is quiet, and the second build follows it.
+    // The trial runs once the host is quiet — which is now, because this test
+    // lets the build it was emptying for finish — and the second build follows
+    // it.
+    let_it_finish(&release);
     herd.wait_until("the trial has run", || {
         state_of(&herd, &trial) == "finished"
     })
@@ -1285,17 +1572,18 @@ async fn a_switch_survives_a_kill_nine_on_the_runner() {
         herd.said("again").contains("joining")
     })
     .await;
-    let refusal = herd.submit_with(&[], "printf nothing").await;
+    // `joining` is the replacement runner's own news, and it is printed before
+    // the hub has the connection: a submission made on the strength of it was
+    // refused because *nothing was connected yet*, and the test then read that
+    // refusal for her reason and failed. Reproduced on two pinned cores, twice
+    // in three runs. So the refusal is the condition — and a submission the
+    // hub **accepts** is the defect this test exists for and fails at once
+    // (D100).
+    let refusal = until_a_submission_is_refused_saying(&herd, "she is gaming").await;
     assert!(
-        !refusal.status.success(),
-        "a runner killed in the instant `herdctl switch` returned must come back switched \
-         off (E-33, D99); it said: {}",
-        herd.switches().await
-    );
-    assert!(
-        String::from_utf8_lossy(&refusal.stderr).contains("she is gaming"),
-        "and with the owner's own reason: {}",
-        String::from_utf8_lossy(&refusal.stderr)
+        refusal.contains("wsl-pc"),
+        "a runner killed in the instant `herdctl switch` returned comes back switched off, \
+         and the refusal names it (E-33, D99): {refusal}"
     );
     // The reason is also where it has to be for the next life of this runner:
     // on the disk, not only in the hub's memory.
