@@ -234,7 +234,22 @@ async fn a_log_survives_twelve_killed_hubs_whole() {
 
     let herd = Herd::new();
     let mut hub = herd.start_hub("hub-0").await;
-    let mut runner = herd.start_runner();
+    // **The redial delay is capped at a second here, and that matters.** A
+    // hub killed with `SIGKILL` ends the connection as a failure, and the
+    // runner's failure count is reset only by a hub that closes *cleanly*
+    // (`serve_forever`): twelve kills in a row therefore walk the default
+    // backoff up 0.5, 1, 2, 4, 8, 16 and then 30 s a round. This test's own
+    // patience is 30 s, so from the seventh kill on the two figures are
+    // equal and the test fails whenever a jittered delay lands near the cap
+    // — which it did, unpinned, in one run of four. It is not a test of the
+    // redial policy, so it does not wait one out; the policy itself is a
+    // product question, written down in D101 rather than changed here.
+    let mut runner = herd.start_runner_with(
+        "the-real-runner",
+        "runner",
+        "runner",
+        &["--redial-cap", "1"],
+    );
     herd.wait_for_runner().await;
 
     // A line every 50 ms until the test says stop, so output is always being

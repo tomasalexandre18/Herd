@@ -2749,6 +2749,19 @@ replaced. The first is 800 ms against a 100 ms interval that is itself wall
 clock, so the arithmetic is sound and the assertion is a negative one that
 can only under-prove; it is named here rather than quietly fixed.
 
+**A diagnostic that said nothing.** `real_herd`'s `wait_until` printed
+`self.said("first")` on a timeout — the hub of the tests that call their
+first hub `first`, and the empty string for every other test in the file.
+The twelve-kills failure below printed its sentence and then nothing at
+all, which costs a rerun to learn what the suite already knew. It names
+every process of the herd now.
+
+**A product defect, reported and not fixed: see D104.** The runner's redial
+backoff never resets on a connection that *served*, only on one the hub
+closed cleanly, so twelve killed hubs walk it to its 30 s cap — against a
+test patience of 30 s. That test now caps its runner's redial at a second;
+the policy is Alexa's to set.
+
 **A hazard found and closed.** `busy_probe.rs` and `confinement.rs` both
 sweep `/proc` for a process carrying a known `sleep` duration, and both
 declared those durations as constants — two of which **collide between the
@@ -2832,3 +2845,44 @@ not a contradiction.
 **Cost of the decision as taken.** A reader polling `job.json` alone can act
 on a state a moment before its line is readable. That is the cost, it is
 bounded by one append, and E-53's row in `docs/coverage.md` now says so.
+
+## 2026-10-13 — D104 A served connection still counts as a redial failure
+
+**A product defect, found by this sweep and deliberately not fixed here.**
+
+`herd-runner`'s `serve_forever` resets its consecutive-failure count in one
+place only: when `serve_once` returns `Ok(())`, which is the hub closing the
+connection **cleanly**. Every other ending — a hub killed, a reset link, a
+NAT timeout — increments it. The count is never reset by a connection that
+*worked*: a runner that joined, served for an hour and then lost the link is
+treated as the next consecutive failure of the previous one.
+
+So the delays walk up and stay up: 0.5 s, 1 s, 2 s, 4 s, 8 s, 16 s, then the
+30 s cap, for ever, however long each connection lasted in between. The
+backoff's own documented intent is the opposite — *"500 ms is for the common
+case, a hub restarted by its deployment: the runner is back before anybody
+notices"* — and that is true of the first restart only. By the seventh, a
+hub that is **up** is left waiting half a minute for its runners.
+
+**How it surfaced.** `killed_hub.rs`'s `a_log_survives_twelve_killed_hubs_
+whole` kills the hub twelve times in one job. Its per-round patience is 30 s
+and the backoff cap is 30 s: equal figures, the same trap D102 closes in
+`capabilities.rs`. It failed, unpinned, in one run of four, and the runs
+that passed took 148 to 179 s — nearly all of it spent asleep. That test now
+runs its runner with `--redial-cap 1`, because it is a test of a log
+surviving kills and not of the redial policy, and it takes **9.9 s**.
+
+**Decision: report it, do not change it.** What counts as a consecutive
+failure is the redial policy, and the policy is Alexa's to set — a runner
+that redialled every 500 ms against a hub crash-looping would be a different
+trade, not obviously a better one, and the give-up bound is reasoned about in
+terms of consecutive failures too. The fix, if it is wanted, is small: count
+consecutive *dial* failures rather than consecutive link endings, by resetting
+the count whenever the attempt got as far as being welcomed.
+
+**What it costs until then.** Every hub restart after the first few leaves
+every runner idle for up to 30 s. Nothing is lost — a runner holds its jobs
+and its unacknowledged output across the gap (D36, D17) — but a deployment
+that restarts the hub twice in a minute has a herd that looks dead for half a
+minute afterwards, with only `dialling … again in 30s` on the runners' stdout
+to say why.

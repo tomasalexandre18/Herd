@@ -471,11 +471,36 @@ impl Herd {
         while !condition() {
             assert!(
                 Instant::now() < deadline,
-                "timed out waiting until {what}; the hub said: {}",
-                self.said("first")
+                "timed out waiting until {what}.\n{}",
+                self.everything_said()
             );
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
+    }
+
+    /// Everything every process of this herd has printed, named.
+    ///
+    /// The diagnostic above used to read `self.said("first")`, which is the
+    /// hub of the tests that call their first hub `first` and **empty** for
+    /// every other test in the file. A timeout in one of those printed its
+    /// sentence and then nothing at all, which is the worst a failure can
+    /// do: it costs a rerun to learn what the suite already knew (D101).
+    pub fn everything_said(&self) -> String {
+        let mut whos: Vec<String> = std::fs::read_dir(self.logs.path())
+            .into_iter()
+            .flatten()
+            .filter_map(Result::ok)
+            .filter_map(|entry| {
+                let name = entry.file_name().to_string_lossy().into_owned();
+                name.strip_suffix("-out").map(str::to_owned)
+            })
+            .collect();
+        whos.sort();
+        let mut text = String::new();
+        for who in whos {
+            text.push_str(&format!("--- {who} said:\n{}", self.said(&who)));
+        }
+        text
     }
 }
 
