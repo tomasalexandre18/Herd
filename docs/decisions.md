@@ -1470,6 +1470,18 @@ because the hub would then execute the consumer's code, unconfined, on
 the machine that holds every job's record — and the runner already has
 M5's probe machinery for exactly this shape of work.
 
+**Confirmed by the consumer: the cache key is correct.** `labels_from`'s
+answer depends only on (commit, command, args): `--labels` reads only the
+arguments and the scenario table compiled into that commit, and nothing on
+the machine — no load, no free memory, no free tmpfs. They committed to
+opening an issue before ever changing that. Their figures are computed for
+the `-j N` they were given, though, so N is part of `args` and the cache
+key is only correct if N is chosen first — which is what D82 settles.
+
+**Confirmed by the consumer: one parent is enough.** Their only `needs`
+is test-pack → the build that made the pack of the same commit; they do
+not foresee two parents and asked to keep the cap E-10 states (invariant 1).
+
 ---
 
 ## 2026-10-13 — D75 Coalescing drops a queued job, never one in flight
@@ -1818,3 +1830,78 @@ lock, for ever, for work that could never have run.
 ever been offered and failing anything outside it. Rejected because the
 roster would have to be durable to survive a restart, and an empty
 roster on a fresh hub would fail every job in the queue by name.
+
+---
+
+## 2026-10-13 — D85 Herd keeps a job's files under `{out}`, names what it drops
+
+**Context.** The consumer's `results.json` lists, per scenario, the files a
+test left — serial logs, screendumps, recordings — and asks that Herd
+keep them with the result (E-15). We asked whether those paths are always
+under `{out}`, the directory Herd gives the job under the runner's data
+root. Their first answer was **no, not today**: the files were written in
+their workspace's scratch area, inside the data root but outside `{out}`. They
+then changed it the same day and reported it tested: when `CHATONS_RESULTS`
+is set, every kept file is placed at `{out}/files/<scenario>/<name>` before
+`results.json` is written — hard-linked, or copied across filesystems,
+a name collision becoming `<n>-<name>`, and a file that can be neither
+linked nor copied dropped from the list **and reported in their log**.
+
+**Choice.** Herd keeps what a job left **under `{out}`** and nothing else. A
+path in a result that points outside `{out}` is **not kept**, and Herd says
+so by name in the job's record rather than dropping it in silence — the
+same rule as everywhere else here: a figure or a file that is missing says
+it is missing (contrast M4's `Some(0)` defect, and D27's rule that a skip
+is never read as a pass). This is why `{out}` exists as a named directory
+rather than Herd scanning the data root: the data root also holds the
+runner's own state, other jobs' directories, and the consumer's workspace,
+and a job's result must not be able to name any of them.
+
+**Alternative rejected.** Keeping any path a result names, as long as it
+falls inside the runner's data root. Rejected because a result would then
+be able to attach another job's files, or the runner's own state, to itself
+— and because E-45's confinement is cooperative (D28), so a job's claim
+about where its files are is not evidence.
+
+---
+
+## 2026-10-13 — D86 A busy probe is declared by its machine's owner, not a repo
+
+**Context.** The consumer proposed declaring their metal-lease probe in
+their own `tools/herd/commands.toml`, as a `busy_probe` field beside each
+`metal-<machine>` label: `cargo xtask metal <machine> --lease-status`,
+exit **0** free, **10** busy, **1** cannot tell, **64** unknown machine,
+with everything other than 0 and 10 to be treated as busy. The probe itself
+is exactly the shape D48 requires — two known codes, so a missing command
+exiting 127 can never read as free — and they asked for the stricter
+reading themselves.
+
+**Choice.** The probe's **contract** is taken as offered; the **declaration**
+is not. D51 already says a busy probe is the machine owner's command: it
+runs with the runner's privileges, outside any job, without the caps and
+the confinement a job's command line runs under (M4). Reading it out of
+a repository would let anyone who can push to that repository choose what
+executes on every metal runner, unconfined and with no job attached — a
+different trust story from "a consumer declares what its jobs need", and the
+one Herd refuses. So the consumer's `busy_probe` block stays in their file
+as **the text an operator copies** into that runner's capability file, which
+is where Herd reads it from, and a `metal-<machine>` capability therefore
+exists only on a machine whose owner put it there deliberately. The consumer
+agreed without reservation, noting it is the same rule they apply to root
+("root only through a short fixed helper list").
+
+**What the consumer will observe, and it differs slightly from what they
+asked.** They asked that any code other than 0 and 10 be read as busy. Herd
+reads it as **unreadable**, which under D48 **suspends** the capability:
+the job waits exactly as it would for a real lease, and the reason names the
+probe and its exit code. The outcome is the same — the job waits — but a
+permanently broken probe surfaces as a capability nobody can offer rather than
+a machine that is mysteriously always busy. Their 64, an unknown machine,
+is therefore loud the day a label and a machine name drift apart. Also
+record: a probe still waiting on their lock when the owner asks the runner
+to stop is **killed** by the probe group, not waited for — invariant 2's
+five seconds outranks a reading, and that reading simply does not count.
+
+**Alternative rejected.** Reading the probe from the consumer's
+declaration. Rejected as above; it would need authentication and a trust
+model that does not exist before M15 (D57).
