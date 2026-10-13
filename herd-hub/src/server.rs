@@ -764,14 +764,25 @@ impl State {
         })
     }
 
-    /// Every capability a probe is currently suspending, for the hub's log,
-    /// with the runner each one is on.
-    fn suspended_capabilities(&self) -> Vec<(String, String)> {
+    /// Every capability a probe is currently suspending, for the hub's log:
+    /// the runner it is on, the capability, and what said so.
+    ///
+    /// The runner's name is in here because with a fleet it has to be. The
+    /// line used to read "kvm is suspended on the runner", which was true of
+    /// a hub that held one and is a lie about a hub that holds several.
+    fn suspended_capabilities(&self) -> Vec<(String, String, String)> {
         self.with_peers(|peers| {
             peers
                 .runners
                 .values()
-                .flat_map(|runner| runner.capacity.suspended())
+                .flat_map(|runner| {
+                    runner
+                        .capacity
+                        .suspended()
+                        .into_iter()
+                        .map(|(label, why)| (runner.name.clone(), label, why))
+                        .collect::<Vec<_>>()
+                })
                 .collect()
         })
     }
@@ -1722,8 +1733,8 @@ async fn relay_from_runner(
                 if !state.update_capabilities(outbox, capabilities) {
                     continue;
                 }
-                for (name, reason) in state.suspended_capabilities() {
-                    println!("herd-hub: {name} is suspended on the runner: {reason}");
+                for (runner, label, reason) in state.suspended_capabilities() {
+                    println!("herd-hub: {label} is suspended on {runner}: {reason}");
                 }
                 dispatch_queued_jobs(state)?;
             }
