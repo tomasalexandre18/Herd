@@ -29,7 +29,13 @@ pub use capability::{
 /// The version announced in [`ToHub::Hello`] and echoed in
 /// [`FromHub::Welcome`]. It is bumped whenever a message shape changes in a
 /// way an older peer could not read.
-pub const PROTOCOL_VERSION: u32 = 1;
+///
+/// 2 since M6: [`ToHub::SubmitJob`] carries a [`Priority`], and carries it
+/// *required*, so that a submission can never acquire a level nobody chose
+/// (E-18). That is not an additive change — a version 1 submission has no
+/// priority field at all — so the number moves, which is exactly what the
+/// handshake's version is for. Nothing is deployed yet; it freezes at M16.
+pub const PROTOCOL_VERSION: u32 = 2;
 
 /// How often a runner says it is alive and what it is doing (E-40).
 ///
@@ -146,6 +152,139 @@ pub mod bytes_as_base64 {
 pub enum LogStream {
     Stdout,
     Stderr,
+}
+
+/// What a requester asks for its job to be weighed at (E-18).
+///
+/// Four levels, in the first consumer's own words and ordered
+/// `merger > step > nightly > producer`: a merger's verification of what is
+/// about to land on `main` beats a branch step, which beats the nightly,
+/// which beats the cache producer. Four and no more — a number, or a level an
+/// operator could invent, is the beginning of a scheduling language, and
+/// invariant 1 says no.
+///
+/// There is deliberately **no `Default`**. A level nobody chose is the defect
+/// this type exists to make impossible: it would be invisible on the wire,
+/// invisible in the record, and wrong exactly when it mattered. The CLI shows
+/// the level it sends, the frame carries it, and the record keeps it.
+///
+/// The order is spelled out in [`Priority::rank`] rather than derived. A
+/// derived `Ord` over this declaration order would make `Merger` the
+/// *smallest* value, and "the greater priority wins" would then quietly mean
+/// the opposite of what it says.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Priority {
+    /// A merger's jobs: the check, and the scenarios a merge overlaps (E-43).
+    Merger,
+    /// The ordinary branch step an agent submits.
+    Step,
+    /// The scheduled nightly run (E-41).
+    Nightly,
+    /// The cache producer, which may always give way.
+    Producer,
+}
+
+impl Priority {
+    /// Every level, highest first: the order aging climbs and a help text
+    /// lists.
+    pub const ALL: [Priority; 4] = [
+        Priority::Merger,
+        Priority::Step,
+        Priority::Nightly,
+        Priority::Producer,
+    ];
+
+    /// The level's name, as the wire, the record and the CLI all spell it.
+    pub fn name(self) -> &'static str {
+        match self {
+            Priority::Merger => "merger",
+            Priority::Step => "step",
+            Priority::Nightly => "nightly",
+            Priority::Producer => "producer",
+        }
+    }
+
+    /// How high the level is, 0 being the highest. Small on purpose: the
+    /// queue is sorted on this number, and "0 comes first" is the order a
+    /// sort already has.
+    pub fn rank(self) -> u8 {
+        match self {
+            Priority::Merger => 0,
+            Priority::Step => 1,
+            Priority::Nightly => 2,
+            Priority::Producer => 3,
+        }
+    }
+
+    /// Whether this level is served before `other`.
+    pub fn outranks(self, other: Priority) -> bool {
+        self.rank() < other.rank()
+    }
+
+    /// The level one step up, or `None` at the top. What aging climbs.
+    pub fn higher(self) -> Option<Priority> {
+        match self {
+            Priority::Merger => None,
+            Priority::Step => Some(Priority::Merger),
+            Priority::Nightly => Some(Priority::Step),
+            Priority::Producer => Some(Priority::Nightly),
+        }
+    }
+
+    /// This level raised by `levels` steps, stopping at the top.
+    pub fn raised_by(self, levels: u32) -> Priority {
+        let mut level = self;
+        for _ in 0..levels {
+            match level.higher() {
+                Some(higher) => level = higher,
+                None => break,
+            }
+        }
+        level
+    }
+
+    /// How many steps there are between this level and the top: how far
+    /// aging has to climb before this job waits behind nothing.
+    pub fn steps_to_the_top(self) -> u32 {
+        u32::from(self.rank())
+    }
+
+    /// Every level's name, for a refusal or a help text.
+    pub fn names() -> String {
+        Priority::ALL
+            .iter()
+            .map(|level| level.name())
+            .collect::<Vec<_>>()
+            .join(", ")
+    }
+}
+
+impl fmt::Display for Priority {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.name())
+    }
+}
+
+impl std::str::FromStr for Priority {
+    type Err = String;
+
+    /// Exactly one of the four, refused by name otherwise.
+    ///
+    /// Never clamped and never guessed: a typo must not become a level. The
+    /// four names are in the refusal, so the caller does not have to go
+    /// looking for them (E-18, invariant 1).
+    fn from_str(text: &str) -> std::result::Result<Self, Self::Err> {
+        Priority::ALL
+            .into_iter()
+            .find(|level| level.name() == text)
+            .ok_or_else(|| {
+                format!(
+                    "{text:?} is not a priority; it is one of {}",
+                    Priority::names()
+                )
+            })
+    }
 }
 
 /// How a job ended.
@@ -416,7 +555,21 @@ pub enum ToHub {
         /// (invariant 6), and never how the capability is governed.
         #[serde(default, skip_serializing_if = "LabelSet::is_empty")]
         labels: LabelSet,
+        /// Which of the four levels this job is weighed at (E-18).
+        ///
+        /// Required, with no `serde(default)`: a submission that does not say
+        /// is refused by name rather than given a level nobody chose. That is
+        /// what moved [`PROTOCOL_VERSION`] to 2, and it is the whole point —
+        /// the one way this field could do harm is by being invisible.
+        priority: Priority,
     },
+    /// An operator raises one job above what its requester asked for (E-18).
+    ///
+    /// Only ever upwards. Lowering a job is not offered: it is the way to
+    /// starve something by hand, and the queue's own aging is what moves a
+    /// level in the other direction. The hub answers in one sentence, whether
+    /// it raised the job, found it there already, or refused.
+    RaiseJob { job_id: JobId, priority: Priority },
     /// Requester asks to be told how a job that already exists ends.
     ///
     /// This is what makes a submission detachable: `herdctl submit` leaves

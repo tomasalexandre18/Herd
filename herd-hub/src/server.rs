@@ -56,7 +56,7 @@ use herd_proto::{
     a_frame_about_a_job_that_is_over_reason, foreign_state_root_reason, from_frame,
     not_this_runner_s_attempt_reason, runner_twin_reason, to_frame, unreadable_handshake_reason,
     version_mismatch_reason, CapabilityState, FromHub, JobId, JobMetrics, JobOutcome, LabelSet,
-    Role, RunningJob, ToHub, HEALTH_EVERY, PROTOCOL_VERSION,
+    Priority, Role, RunningJob, ToHub, HEALTH_EVERY, PROTOCOL_VERSION,
 };
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::mpsc::{self, UnboundedReceiver, UnboundedSender};
@@ -65,7 +65,8 @@ use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::WebSocketStream;
 
 use crate::capability::RunnerCapacity;
-use crate::job::{JobRecord, JobState, JobStore, LogWrite, NewJob};
+use crate::job::{JobRecord, JobState, JobStore, LogWrite, NewJob, Raise, Submission, Timestamp};
+use crate::queue;
 
 /// Loopback by default: the hub is reached through the reverse proxy, which
 /// terminates TLS; the hub itself only ever speaks plain `ws://` (D4).
@@ -153,6 +154,16 @@ pub struct Policy {
     /// The longest that delay ever gets. There is no give-up: a result is
     /// never destroyed, so the hub goes on trying.
     pub write_retry_cap: Duration,
+    /// How long a queued job waits before its effective level rises one step
+    /// (E-18). See [`crate::queue::AGING_STEP`].
+    ///
+    /// The bound it gives is `aging_step` times the number of levels between
+    /// a job and the top: at the default, ninety minutes for the lowest. It
+    /// is here, in the hub's one timing struct, for exactly the reason the
+    /// struct exists — so that a test can make ninety minutes pass in a
+    /// second *through the code the hub runs*, and an operator can tune one
+    /// number.
+    pub aging_step: Duration,
 }
 
 impl Default for Policy {
@@ -163,6 +174,7 @@ impl Default for Policy {
             attempts_allowed: ATTEMPTS_ALLOWED,
             write_retry_first: Duration::from_millis(250),
             write_retry_cap: Duration::from_secs(5 * 60),
+            aging_step: crate::queue::AGING_STEP,
         }
     }
 }
@@ -272,10 +284,11 @@ impl Hub {
     }
 
     /// Serve until the listener fails. Dropping the returned future releases
-    /// the port and ends the hub's own two housekeeping tasks.
+    /// the port and ends the hub's own three housekeeping tasks.
     pub async fn serve(self) -> Result<()> {
         let watching = tokio::spawn(watch_for_a_lost_runner(Arc::clone(&self.state)));
         let writing = tokio::spawn(keep_trying_to_write_results(Arc::clone(&self.state)));
+        let aging = tokio::spawn(let_the_queue_age(Arc::clone(&self.state)));
         let serving = async {
             loop {
                 let (stream, peer) = self.listener.accept().await.context("accepting")?;
@@ -290,6 +303,7 @@ impl Hub {
         let outcome = serving.await;
         watching.abort();
         writing.abort();
+        aging.abort();
         outcome
     }
 }
@@ -1267,38 +1281,134 @@ fn dispatch_queued_jobs(state: &State) -> Result<()> {
         .dispatching
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
-    let waiting = state
+    dispatch_a_pass(state)
+}
+
+/// One pass over the queue, in order, with the claim lock already held.
+///
+/// Separate from [`dispatch_queued_jobs`] only so that the submission path —
+/// which has to take the same lock around a little more than this — cannot
+/// take it twice and deadlock. **Every** dispatch in this hub goes through
+/// here: there is one queue and one way out of it (E-20). A submission does
+/// not hand its own job to a runner on the side, and a merger's job is not
+/// pushed ahead through a lane of its own — it is simply first in this order
+/// (E-43).
+fn dispatch_a_pass(state: &State) -> Result<()> {
+    let unfinished = state
         .store
         .unfinished_jobs()
         .context("reading the queue the hub recovered")?;
-    for record in waiting {
-        if record.state != JobState::Queued {
-            continue;
-        }
-        if !offer_job(state, &record)? {
-            return Ok(());
+    // One moment for the whole pass, so that the order cannot change halfway
+    // through it, and the moment the figures in the sentences are computed
+    // from is the moment the order was.
+    let now = Timestamp::now();
+    let queue = queue::order(unfinished, now, state.policy.aging_step);
+    let total = queue.len();
+    for (place, record) in queue.iter().enumerate() {
+        match offer_job(state, record)? {
+            Offered::Dispatched => {}
+            // This job cannot start for a reason of its own — a capability
+            // it needs is not offered, or something outside Herd is holding
+            // it (E-26). The jobs behind it are not affected: it waits with
+            // its reason on its record, and the pass goes on. Head-of-line
+            // blocking on a label is M7's question (E-19), not this one.
+            Offered::NotForThisJob(why) => {
+                let standing = queue::standing(record, now, state.policy.aging_step);
+                let sentence = queue::waiting_sentence(
+                    place + 1,
+                    total,
+                    &standing,
+                    &format!("it is waiting because {why}"),
+                );
+                say_it_waits(state, &record.id, &sentence)?;
+            }
+            // There is nowhere to put *any* job, so this pass is over — and
+            // everything still in the queue, this job included, is told
+            // where it stands, what it is weighed at and when that changes
+            // (E-04, E-18).
+            Offered::NoRunner(why) => {
+                let because = format!("the job at the front of the queue is waiting because {why}");
+                for (behind, waiting) in queue.iter().enumerate().skip(place) {
+                    let standing = queue::standing(waiting, now, state.policy.aging_step);
+                    let sentence = queue::waiting_sentence(behind + 1, total, &standing, &because);
+                    say_it_waits(state, &waiting.id, &sentence)?;
+                }
+                return Ok(());
+            }
         }
     }
     Ok(())
 }
 
+/// Re-judge the queue on a clock, so that aging happens even when nothing
+/// else does (E-18).
+///
+/// Every other dispatch pass is triggered by something: a runner joins, a
+/// probe changes its mind, a job ends, a job is submitted. That is enough for
+/// the *order* to be right — the order only matters at the moment a job can
+/// start, and every one of those moments is one of those events. It is not
+/// enough for the **sentence** on a waiting job's record, which carries
+/// figures: a job queued on a hub where nothing happens for an hour would
+/// still be saying it rises to the next level in two minutes, and a figure
+/// that is an hour stale is worse than no figure at all.
+///
+/// So the queue is also re-judged on a clock. A quarter of the aging step,
+/// never oftener than once a second and never rarer than once a minute: at
+/// the default that is a pass every seven and a half minutes, which costs
+/// one read of the queue, and the pass writes nothing unless a sentence has
+/// actually changed (`record_waiting` writes only what is news). A hub with
+/// nothing queued does not even read: there is nothing to age.
+async fn let_the_queue_age(state: Arc<State>) {
+    let every =
+        (state.policy.aging_step / 4).clamp(Duration::from_secs(1), Duration::from_secs(60));
+    loop {
+        tokio::time::sleep(every).await;
+        let anything_queued = state
+            .store
+            .unfinished_jobs()
+            .map(|queue| queue.iter().any(|record| record.state == JobState::Queued))
+            .unwrap_or(false);
+        if !anything_queued {
+            continue;
+        }
+        if let Err(error) = dispatch_queued_jobs(&state) {
+            eprintln!("herd-hub: re-judging the queue failed: {error:#}");
+        }
+    }
+}
+
+/// What one offer of one job came to.
+enum Offered {
+    /// It is on its way to a runner.
+    Dispatched,
+    /// This job waits, and the queue behind it does not: the reason is about
+    /// this job's own capabilities (E-26).
+    NotForThisJob(String),
+    /// There is no runner to hand anything to, and this is why.
+    NoRunner(String),
+}
+
 /// Give one queued job to the runner, or leave it queued and say why.
 ///
-/// `false` means there is no runner to hand it to and this pass is over; a job
-/// that waits is `true`, because nothing is wrong with it.
+/// Three answers, because the caller has to tell "this job waits" from
+/// "nothing can start": see [`Offered`].
 ///
-/// The two outcomes are the whole of E-26. A job whose capability something
+/// The two waiting outcomes are the whole of E-26. A job whose capability something
 /// outside Herd is holding is **not** refused and **not** failed: it stays
 /// `queued`, the reason goes on its record, whoever is waiting for it is told,
 /// and the next pass — the one a freed probe triggers — starts it. `Refused`
 /// is terminal (D13) and was never available for this; `JobNote` and a
 /// `waiting` line on the record are (D38).
-fn offer_job(state: &State, record: &JobRecord) -> Result<bool> {
+fn offer_job(state: &State, record: &JobRecord) -> Result<Offered> {
     if let Some(reason) = state.why_not_now(&record.labels) {
-        say_it_waits(state, &record.id, &reason)?;
-        return Ok(true);
+        return Ok(Offered::NotForThisJob(reason));
     }
-    dispatch(state, &record.id, record.command.clone())
+    if dispatch(state, &record.id, record.command.clone())? {
+        return Ok(Offered::Dispatched);
+    }
+    Ok(Offered::NoRunner(state.why_no_runner().unwrap_or_else(
+        || "the runner's connection ended while this pass was running".to_owned(),
+    )))
 }
 
 /// Record why a queued job is not starting, and tell whoever is waiting for
@@ -2156,9 +2266,32 @@ async fn serve_requester(state: &State, outbox: &Outbox, source: &mut Source) ->
 }
 
 async fn accept_submissions(state: &State, outbox: &Outbox, source: &mut Source) -> Result<()> {
-    while let Some(message) = next_message(source).await? {
+    loop {
+        // A frame this hub cannot *decode* gets a sentence, not a dropped
+        // socket (D13, extended past the handshake by D58). The mistake this
+        // closes is a requester naming a priority that is not one of the
+        // four: `--priority urgnet` reached here as a frame with an unknown
+        // variant in it, and the connection used to die with the reason on
+        // the hub's own stdout, where the person who typed it never looks.
+        let text = match next_text(source).await? {
+            Some(text) => text,
+            None => break,
+        };
+        let message = match from_frame::<ToHub>(&text) {
+            Ok(message) => message,
+            Err(error) => {
+                let reason = format!("this hub could not read what you sent: {error}");
+                eprintln!("herd-hub: a requester sent a frame that would not read: {error}");
+                let _ = outbox.send(FromHub::Refused { reason });
+                return Ok(());
+            }
+        };
         match message {
-            ToHub::SubmitJob { command, labels } => {
+            ToHub::SubmitJob {
+                command,
+                labels,
+                priority,
+            } => {
                 if command.is_empty() {
                     let _ = outbox.send(FromHub::Refused {
                         reason: "a job needs a command to run".to_owned(),
@@ -2169,35 +2302,89 @@ async fn accept_submissions(state: &State, outbox: &Outbox, source: &mut Source)
                     let _ = outbox.send(FromHub::Refused { reason });
                     return Ok(());
                 }
-                let job = state
+                let submission = state
                     .store
-                    .create_job(NewJob::needing(command, labels))
-                    .context("minting a job")?;
+                    .submit(NewJob::at(command, labels, priority))
+                    .context("taking a submission in")?;
+                let job_id = submission.record().id.clone();
                 // JobAccepted first, so the requester has the id before any
-                // chunk of its log can reach it.
+                // chunk of its log can reach it — and for a submission that
+                // joined, before the sentence explaining the id it was given.
                 let _ = outbox.send(FromHub::JobAccepted {
-                    job_id: job.id.clone(),
+                    job_id: job_id.clone(),
                 });
-                state.follow(job.id.clone(), outbox);
+                match &submission {
+                    Submission::Minted(_) => state.follow(job_id.clone(), outbox),
+                    Submission::Joined { record, raised } => {
+                        println!(
+                            "herd-hub: a submission joined {job_id}, which is {} and \
+                             answers {} submission(s) now",
+                            record.state.name(),
+                            record.submissions
+                        );
+                        let mut note = format!(
+                            "this submission asked for work {job_id} is already doing, \
+                             so it joined that job rather than running it twice: same \
+                             command, same labels. One execution, one result, for both \
+                             callers"
+                        );
+                        if let Some(to) = raised {
+                            note.push_str(&format!(
+                                ". It was the higher priority, so {job_id} is now at \
+                                 priority {to}"
+                            ));
+                        }
+                        let _ = outbox.send(FromHub::JobNote {
+                            job_id: job_id.clone(),
+                            note,
+                        });
+                        // And then exactly what a `wait` on that id would
+                        // do: the output it has already produced, a place
+                        // in the followers under the same lock, and — if it
+                        // ended in the moment since the join — its end. A
+                        // joiner that was told nothing until the next chunk
+                        // arrived would be a joiner whose log is short of
+                        // everything that happened before it joined.
+                        answer_a_wait(state, outbox, job_id.clone())?;
+                    }
+                }
                 // And then the job goes through exactly the same gate every
-                // other queued job goes through: it starts, or it stays
-                // queued with its reason on its record and a note on this
-                // connection. A submission the runner cannot serve yet is not
-                // a submission that failed (D38).
-                let dispatched = {
+                // other queued job goes through — the one queue, in its own
+                // order (E-20). It starts, or it stays queued with its
+                // reason on its record and a note on this connection: a
+                // submission the runner cannot serve yet is not a submission
+                // that failed (D38).
+                {
                     let _one_pass = state
                         .dispatching
                         .lock()
                         .unwrap_or_else(|poisoned| poisoned.into_inner());
-                    offer_job(state, &job)?
-                };
-                if !dispatched {
-                    state.stop_following(&job.id);
-                    let _ = outbox.send(FromHub::Refused {
-                        reason: "the runner disconnected before the job was assigned".to_owned(),
-                    });
+                    dispatch_a_pass(state)?;
+                }
+                // A runner that went away between the check above and the
+                // pass leaves the job queued with nowhere to go, and the
+                // requester is told rather than left watching a job nothing
+                // will pick up. Read from the record, because the pass may
+                // well have started it.
+                let still_queued = state
+                    .store
+                    .job(&job_id)
+                    .with_context(|| format!("reading the record of {job_id}"))?
+                    .is_some_and(|record| record.state == JobState::Queued);
+                if still_queued {
+                    if let Some(reason) = state.why_no_runner() {
+                        state.stop_following(&job_id);
+                        let _ = outbox.send(FromHub::Refused { reason });
+                        return Ok(());
+                    }
+                }
+            }
+            ToHub::RaiseJob { job_id, priority } => {
+                if let Some(reason) = quarantine_refusal(state, &job_id)? {
+                    let _ = outbox.send(FromHub::Refused { reason });
                     return Ok(());
                 }
+                raise_job(state, outbox, &job_id, priority)?;
             }
             ToHub::CancelJob { job_id } => {
                 if let Some(reason) = quarantine_refusal(state, &job_id)? {
@@ -2211,89 +2398,8 @@ async fn accept_submissions(state: &State, outbox: &Outbox, source: &mut Source)
                     let _ = outbox.send(FromHub::Refused { reason });
                     return Ok(());
                 }
-                let attached = state
-                    .attach(&job_id, outbox)
-                    .with_context(|| format!("reading the record of {job_id}"))?;
-                let Some(Attached {
-                    record,
-                    log,
-                    stalled,
-                }) = attached
-                else {
-                    // A terminal no, as D13 means it: this id will not come
-                    // into being by waiting for it.
-                    let _ = outbox.send(FromHub::Refused {
-                        reason: format!("no such job: {job_id}"),
-                    });
+                if !answer_a_wait(state, outbox, job_id)? {
                     return Ok(());
-                };
-                // The output the job has already produced, before anything
-                // else about it. A detached requester has no other way to get
-                // a job's log through the CLI (D22).
-                if !log.is_empty() {
-                    let _ = outbox.send(FromHub::JobLog {
-                        job_id: job_id.clone(),
-                        data: log,
-                    });
-                }
-                let metrics = record.metrics.clone();
-                let waiting_for = record.waiting_for.clone();
-                match record.state {
-                    // Answered from the record, which is the point of writing
-                    // one: a wait works an hour later, on another machine,
-                    // across a restart of the hub. The measurements come from
-                    // the record too, so a wait an hour later reads the same
-                    // figures the requester that followed the job read (E-15).
-                    JobState::Finished { outcome } => {
-                        let _ = outbox.send(FromHub::JobFinished {
-                            job_id,
-                            outcome,
-                            metrics,
-                        });
-                    }
-                    // Waiting for a job whose attempt was interrupted is
-                    // waiting for a runner that may never come back, so the
-                    // wait says so rather than being silent (D17). It is not a
-                    // refusal: the runner may still redeliver, and if it does
-                    // not the job is attempted again — either way this same
-                    // connection carries the answer.
-                    JobState::Interrupted { reason } => {
-                        let _ = outbox.send(FromHub::JobNote {
-                            job_id,
-                            note: format!(
-                                "this job is not over and its last attempt was \
-                                 interrupted: {reason}. If the runner comes back, \
-                                 its result arrives here; if it does not, the job is \
-                                 attempted again."
-                            ),
-                        });
-                    }
-                    // Queued, assigned or running — and if this hub knows that
-                    // the attempt is not progressing because it cannot write
-                    // the job down, the wait is told so rather than left
-                    // watching a record that says `running` and never moves.
-                    _ => {
-                        if let Some(why) = stalled {
-                            let _ = outbox.send(FromHub::JobNote {
-                                job_id: job_id.clone(),
-                                note: stalled_note(&why),
-                            });
-                        }
-                        // And a job that is queued because a capability it
-                        // needs is suspended says so to a wait that attaches
-                        // an hour later, from its record: `herdctl wait`
-                        // must not sit silent on a job nothing is happening
-                        // to (E-26, E-04).
-                        if let Some(waiting_for) = waiting_for {
-                            let _ = outbox.send(FromHub::JobNote {
-                                job_id,
-                                note: format!(
-                                    "this job is queued and has not started: \
-                                     {waiting_for}"
-                                ),
-                            });
-                        }
-                    }
                 }
             }
             other => {
@@ -2303,6 +2409,152 @@ async fn accept_submissions(state: &State, outbox: &Outbox, source: &mut Source)
                 return Ok(());
             }
         }
+    }
+    Ok(())
+}
+
+/// Tell this connection where a job stands, and keep it following until the
+/// job ends.
+///
+/// What `WaitForJob` does — and what a submission that *joined* an open job
+/// does too (E-05), because the two are the same question: "I hold this id,
+/// tell me everything about it from here on". Writing it once is what
+/// guarantees a joiner is given the log the job produced before it joined,
+/// and is answered at once if the job ended in the meantime.
+///
+/// `false` means the job does not exist and the connection has been refused.
+fn answer_a_wait(state: &State, outbox: &Outbox, job_id: JobId) -> Result<bool> {
+    let attached = state
+        .attach(&job_id, outbox)
+        .with_context(|| format!("reading the record of {job_id}"))?;
+    let Some(Attached {
+        record,
+        log,
+        stalled,
+    }) = attached
+    else {
+        // A terminal no, as D13 means it: this id will not come
+        // into being by waiting for it.
+        let _ = outbox.send(FromHub::Refused {
+            reason: format!("no such job: {job_id}"),
+        });
+        return Ok(false);
+    };
+    // The output the job has already produced, before anything
+    // else about it. A detached requester has no other way to get
+    // a job's log through the CLI (D22).
+    if !log.is_empty() {
+        let _ = outbox.send(FromHub::JobLog {
+            job_id: job_id.clone(),
+            data: log,
+        });
+    }
+    let metrics = record.metrics.clone();
+    let waiting_for = record.waiting_for.clone();
+    match record.state {
+        // Answered from the record, which is the point of writing
+        // one: a wait works an hour later, on another machine,
+        // across a restart of the hub. The measurements come from
+        // the record too, so a wait an hour later reads the same
+        // figures the requester that followed the job read (E-15).
+        JobState::Finished { outcome } => {
+            let _ = outbox.send(FromHub::JobFinished {
+                job_id,
+                outcome,
+                metrics,
+            });
+        }
+        // Waiting for a job whose attempt was interrupted is
+        // waiting for a runner that may never come back, so the
+        // wait says so rather than being silent (D17). It is not a
+        // refusal: the runner may still redeliver, and if it does
+        // not the job is attempted again — either way this same
+        // connection carries the answer.
+        JobState::Interrupted { reason } => {
+            let _ = outbox.send(FromHub::JobNote {
+                job_id,
+                note: format!(
+                    "this job is not over and its last attempt was \
+                     interrupted: {reason}. If the runner comes back, \
+                     its result arrives here; if it does not, the job is \
+                     attempted again."
+                ),
+            });
+        }
+        // Queued, assigned or running — and if this hub knows that
+        // the attempt is not progressing because it cannot write
+        // the job down, the wait is told so rather than left
+        // watching a record that says `running` and never moves.
+        _ => {
+            if let Some(why) = stalled {
+                let _ = outbox.send(FromHub::JobNote {
+                    job_id: job_id.clone(),
+                    note: stalled_note(&why),
+                });
+            }
+            // And a job that is queued because a capability it
+            // needs is suspended says so to a wait that attaches
+            // an hour later, from its record: `herdctl wait`
+            // must not sit silent on a job nothing is happening
+            // to (E-26, E-04).
+            if let Some(waiting_for) = waiting_for {
+                let _ = outbox.send(FromHub::JobNote {
+                    job_id,
+                    note: format!(
+                        "this job is queued and has not started: \
+                         {waiting_for}"
+                    ),
+                });
+            }
+        }
+    }
+    Ok(true)
+}
+
+/// Raise one job's level, as an operator may (E-18).
+///
+/// Four answers and each is said in words, because an operator who asked for
+/// a job to go first has to know which of them happened: it moved, it was
+/// there already, the level asked for is *below* the one it has, or the job
+/// is over and a record that has reached its end is never written to again
+/// (D54). Only the last is a refusal; the rest are notes about a job that is
+/// in exactly the state the operator can now see.
+///
+/// A raise that moved the job runs a dispatch pass, because the order of the
+/// queue has just changed and the raise would otherwise take effect only at
+/// the next thing that happened to the hub.
+fn raise_job(state: &State, outbox: &Outbox, job_id: &JobId, to: Priority) -> Result<()> {
+    let raised = match state.store.raise_priority(job_id, to) {
+        Ok(raised) => raised,
+        // The store refuses a job that is over, and one that does not exist,
+        // by name. Both are terminal answers to this request (D13): asking
+        // again will say the same thing.
+        Err(error) => {
+            let _ = outbox.send(FromHub::Refused {
+                reason: format!("{job_id} cannot be raised to {to}: {error}"),
+            });
+            return Ok(());
+        }
+    };
+    let note = match raised {
+        Raise::Raised { from, to } => {
+            println!("herd-hub: {job_id} was raised from {from} to {to} by an operator");
+            format!("this job was at priority {from} and is now at {to}")
+        }
+        Raise::AlreadyThere(at) => {
+            format!("this job is already at priority {at}; nothing was changed")
+        }
+        Raise::NotARaise { from, asked } => format!(
+            "this job is at priority {from}, which is above {asked}: a job's priority \
+             is only ever raised, never lowered, so nothing was changed"
+        ),
+    };
+    let _ = outbox.send(FromHub::JobNote {
+        job_id: job_id.clone(),
+        note,
+    });
+    if matches!(raised, Raise::Raised { .. }) {
+        dispatch_queued_jobs(state)?;
     }
     Ok(())
 }
@@ -2543,6 +2795,7 @@ fn message_kind(message: &ToHub) -> &'static str {
         ToHub::Hello { .. } => "hello",
         ToHub::CapabilitiesChanged { .. } => "capabilities_changed",
         ToHub::SubmitJob { .. } => "submit_job",
+        ToHub::RaiseJob { .. } => "raise_job",
         ToHub::CancelJob { .. } => "cancel_job",
         ToHub::WaitForJob { .. } => "wait_for_job",
         ToHub::JobStarted { .. } => "job_started",
@@ -2564,6 +2817,7 @@ mod tests {
     };
 
     use super::*;
+    use crate::job::Mint;
     use crate::job::{JobEvent, LogWrite, NewJob, Result as StoreResult};
     use crate::store::JobDirStore;
     use herd_proto::LogStream;
@@ -2601,8 +2855,12 @@ mod tests {
         fn state_root_id(&self) -> &str {
             self.inner.state_root_id()
         }
-        fn create_job(&self, new: NewJob) -> StoreResult<JobRecord> {
-            self.inner.create_job(new)
+        fn submit(&self, new: NewJob) -> StoreResult<crate::job::Submission> {
+            self.inner.submit(new)
+        }
+
+        fn raise_priority(&self, id: &JobId, to: Priority) -> StoreResult<crate::job::Raise> {
+            self.inner.raise_priority(id, to)
         }
         fn record_waiting(&self, id: &JobId, reason: &str) -> StoreResult<bool> {
             self.inner.record_waiting(id, reason)

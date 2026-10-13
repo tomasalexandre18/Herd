@@ -3,11 +3,22 @@ use std::process::ExitCode;
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
-use herd_proto::{JobId, JobOutcome, LabelSet, LogStream};
+use herd_proto::{JobId, JobOutcome, LabelSet, LogStream, Priority};
 use herdctl::{
     could_not_start_message, exit_code_for, impossible_exit_code_reason, no_verdict_message,
     no_verdict_reason, stopped_by_cap_message, Config, DEFAULT_HUB_URL, NO_VERDICT_CODE,
 };
+
+/// The level a submission that does not name one is weighed at: the ordinary
+/// branch step (E-18).
+///
+/// There is a default because an agent submitting a build of its branch is
+/// submitting a step, and making every caller type it would make the option
+/// noise rather than a decision. What there must not be is an *invisible*
+/// one, so this one is shown three times over: in `--help` as the default, on
+/// stderr at every submission ([`submitting_at`]), and on the job's own
+/// record, which carries the level whatever its origin.
+const DEFAULT_PRIORITY: &str = "step";
 
 /// The requester CLI: submit a job, follow its log, exit with its code.
 #[derive(Debug, Parser)]
@@ -34,6 +45,10 @@ enum Action {
         /// (invariant 6).
         #[arg(long = "label", value_delimiter = ',', value_name = "NAME")]
         labels: Vec<String>,
+        /// Which of the four levels this job is weighed at (E-18):
+        /// merger, step, nightly or producer, highest first.
+        #[arg(long, default_value = DEFAULT_PRIORITY, value_name = "LEVEL")]
+        priority: Priority,
         /// The command, after `--`.
         #[arg(trailing_var_arg = true, required = true, num_args = 1..)]
         command: Vec<String>,
@@ -47,6 +62,10 @@ enum Action {
         /// separate names with `,`.
         #[arg(long = "label", value_delimiter = ',', value_name = "NAME")]
         labels: Vec<String>,
+        /// Which of the four levels this job is weighed at (E-18):
+        /// merger, step, nightly or producer, highest first.
+        #[arg(long, default_value = DEFAULT_PRIORITY, value_name = "LEVEL")]
+        priority: Priority,
         /// The command, after `--`.
         #[arg(trailing_var_arg = true, required = true, num_args = 1..)]
         command: Vec<String>,
@@ -65,6 +84,21 @@ enum Action {
     Cancel {
         /// The id a submission printed.
         job_id: String,
+    },
+    /// Raise a queued job's priority above what its requester asked for
+    /// (E-18).
+    ///
+    /// For an orchestrator, not for the requester that submitted the job.
+    /// Upwards only: lowering a job is how something gets starved on purpose,
+    /// and the queue's own aging is what moves a level the other way. Prints
+    /// what the hub did and exits 0.
+    Raise {
+        /// The id a submission printed.
+        job_id: String,
+        /// The level to raise it to: merger, step, nightly or producer,
+        /// highest first.
+        #[arg(long, value_name = "LEVEL")]
+        priority: Priority,
     },
 }
 
@@ -132,13 +166,23 @@ async fn run(args: Args) -> Result<Done> {
         name: None,
     };
     match args.command {
-        Action::Run { labels, command } => {
+        Action::Run {
+            labels,
+            priority,
+            command,
+        } => {
+            // Said out loud, on stderr, before anything runs: a level is
+            // what decides whether this job goes before or after somebody
+            // else's, and a default nobody can see is the defect E-18 is
+            // most easily broken by. stdout stays the job's own.
+            eprintln!("herdctl: {}", submitting_at(priority));
             // Each stream is written to its own, so a caller's pipes and
             // redirections behave as if the command had run here.
             let finished = herdctl::run_job(
                 &config,
                 command,
                 labels_of(labels)?,
+                priority,
                 |stream, data| match stream {
                     LogStream::Stdout => write_now(&mut std::io::stdout(), data),
                     LogStream::Stderr => write_now(&mut std::io::stderr(), data),
@@ -150,8 +194,14 @@ async fn run(args: Args) -> Result<Done> {
             .await?;
             Ok(Done::Job(finished.outcome))
         }
-        Action::Submit { labels, command } => {
-            let job_id = herdctl::submit_job(&config, command, labels_of(labels)?).await?;
+        Action::Submit {
+            labels,
+            priority,
+            command,
+        } => {
+            eprintln!("herdctl: {}", submitting_at(priority));
+            let job_id =
+                herdctl::submit_job(&config, command, labels_of(labels)?, priority).await?;
             // The id alone on stdout, so that `id=$(herdctl submit -- ...)`
             // is all a hook needs (E-42).
             println!("{job_id}");
@@ -180,6 +230,11 @@ async fn run(args: Args) -> Result<Done> {
             println!("{note}");
             Ok(Done::Said)
         }
+        Action::Raise { job_id, priority } => {
+            let note = herdctl::raise_job(&config, JobId::new(job_id), priority).await?;
+            println!("{note}");
+            Ok(Done::Said)
+        }
     }
 }
 
@@ -189,6 +244,22 @@ async fn run(args: Args) -> Result<Done> {
 /// Refused here, before anything is submitted: a typo that reached the hub
 /// would become a job waiting for a capability no machine will ever offer,
 /// and the caller would read a wait where they should read a sentence.
+/// What every submission says about its own level, on stderr.
+///
+/// One sentence, with the word `default` in it when the level was not asked
+/// for, because "this job is a step" and "nobody said, so it is a step" are
+/// different facts and only the second one is worth looking at twice.
+fn submitting_at(priority: Priority) -> String {
+    if priority.name() == DEFAULT_PRIORITY {
+        format!(
+            "submitting at priority {priority} (the default; --priority takes one of {})",
+            Priority::names()
+        )
+    } else {
+        format!("submitting at priority {priority}")
+    }
+}
+
 fn labels_of(labels: Vec<String>) -> Result<LabelSet> {
     LabelSet::new(labels)
         .map_err(anyhow::Error::msg)

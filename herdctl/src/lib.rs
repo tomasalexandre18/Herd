@@ -9,7 +9,7 @@ use anyhow::{anyhow, bail, Context, Result};
 use futures_util::{SinkExt, StreamExt};
 use herd_proto::{
     cap_stop_reason, from_frame, to_frame, Cap, CapabilityOffer, FromHub, JobId, JobMetrics,
-    JobOutcome, LabelSet, LogStream, Role, ToHub, PROTOCOL_VERSION,
+    JobOutcome, LabelSet, LogStream, Priority, Role, ToHub, PROTOCOL_VERSION,
 };
 use tokio::net::TcpStream;
 use tokio_tungstenite::tungstenite::Message;
@@ -174,6 +174,7 @@ pub async fn run_job(
     config: &Config,
     command: Vec<String>,
     labels: LabelSet,
+    priority: Priority,
     mut on_log: impl FnMut(LogStream, &[u8]),
     mut on_note: impl FnMut(&str),
 ) -> Result<Finished> {
@@ -181,9 +182,16 @@ pub async fn run_job(
         bail!("a job needs a command to run");
     }
     let mut socket = join(config).await?;
-    send(&mut socket, &ToHub::SubmitJob { command, labels })
-        .await
-        .context("submitting the job")?;
+    send(
+        &mut socket,
+        &ToHub::SubmitJob {
+            command,
+            labels,
+            priority,
+        },
+    )
+    .await
+    .context("submitting the job")?;
 
     let mut job_id: Option<JobId> = None;
     while let Some(message) = next_message(&mut socket).await? {
@@ -228,14 +236,26 @@ pub async fn run_job(
 /// (E-03, E-42). The id is the only handle needed afterwards:
 /// [`wait_for_job`] takes it, and so does the job's directory on the hub's
 /// disk.
-pub async fn submit_job(config: &Config, command: Vec<String>, labels: LabelSet) -> Result<JobId> {
+pub async fn submit_job(
+    config: &Config,
+    command: Vec<String>,
+    labels: LabelSet,
+    priority: Priority,
+) -> Result<JobId> {
     if command.is_empty() {
         bail!("a job needs a command to run");
     }
     let mut socket = join(config).await?;
-    send(&mut socket, &ToHub::SubmitJob { command, labels })
-        .await
-        .context("submitting the job")?;
+    send(
+        &mut socket,
+        &ToHub::SubmitJob {
+            command,
+            labels,
+            priority,
+        },
+    )
+    .await
+    .context("submitting the job")?;
     match next_message(&mut socket).await? {
         Some(FromHub::JobAccepted { job_id }) => {
             let _ = socket.close(None).await;
@@ -336,6 +356,35 @@ pub async fn cancel_job(config: &Config, job_id: JobId) -> Result<String> {
         Some(FromHub::Refused { reason }) => bail!("the hub refused the cancel: {reason}"),
         Some(other) => bail!("the hub answered a cancel with {}", message_kind(&other)),
         None => bail!("the hub closed the connection without answering the cancel"),
+    }
+}
+
+/// Ask for a job's priority to be raised, and come back with what the hub
+/// says happened (E-18).
+///
+/// For the consumer's orchestrator, which is the only thing that raises a
+/// job: an agent says what its job is worth at submission and does not come
+/// back to argue. Upwards only — the hub refuses a request to lower one —
+/// and never on a job that is over.
+pub async fn raise_job(config: &Config, job_id: JobId, priority: Priority) -> Result<String> {
+    let mut socket = join(config).await?;
+    send(
+        &mut socket,
+        &ToHub::RaiseJob {
+            job_id: job_id.clone(),
+            priority,
+        },
+    )
+    .await
+    .context("asking for the job's priority to be raised")?;
+    match next_message(&mut socket).await? {
+        Some(FromHub::JobNote { note, .. }) => {
+            let _ = socket.close(None).await;
+            Ok(note)
+        }
+        Some(FromHub::Refused { reason }) => bail!("the hub refused the raise: {reason}"),
+        Some(other) => bail!("the hub answered a raise with {}", message_kind(&other)),
+        None => bail!("the hub closed the connection without answering the raise"),
     }
 }
 
