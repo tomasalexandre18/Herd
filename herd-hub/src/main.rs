@@ -4,7 +4,10 @@ use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use clap::Parser;
-use herd_hub::{Hub, JobDirStore, JobStore, Policy, AGING_STEP, DEFAULT_LISTEN_ADDR, LOST_AFTER};
+use herd_hub::{
+    Hub, JobDirStore, JobStore, Policy, Stickiness, AGING_STEP, DEFAULT_LISTEN_ADDR, LOST_AFTER,
+    STICKINESS_LIMIT,
+};
 use herd_proto::HEALTH_EVERY;
 
 /// Where the hub keeps its state unless told otherwise. Relative on purpose:
@@ -45,6 +48,18 @@ struct Args {
     /// off, which is said in the sentence every waiting job carries.
     #[arg(long, env = "HERD_AGING_STEP", default_value_t = AGING_STEP.as_secs_f64())]
     aging_step: f64,
+    /// Seconds a job waits for the runner it is sticking to before this hub
+    /// places it on a less preferred one (E-19).
+    ///
+    /// A job goes to the most preferred machine that can run it, and waits
+    /// for that machine while it is connected rather than falling back to a
+    /// lesser one that is free. This is the safety limit on that wait, and
+    /// E-19 asks for it to be visible: it is printed at startup and named in
+    /// the sentence of every job waiting on it. Zero makes a job move the
+    /// moment anything else can take it, which is to say it turns the
+    /// stickiness off.
+    #[arg(long, env = "HERD_STICKINESS_LIMIT", default_value_t = STICKINESS_LIMIT.as_secs_f64())]
+    stickiness_limit: f64,
 }
 
 /// Seconds as a duration, with a negative figure read as zero rather than
@@ -74,6 +89,9 @@ async fn main() -> Result<()> {
         lost_after: seconds(args.lost_after),
         health_every: seconds(args.health_every),
         aging_step: seconds(args.aging_step),
+        stickiness: Stickiness {
+            limit: seconds(args.stickiness_limit),
+        },
         ..Policy::default()
     };
     let state_root_id = store.state_root_id().to_owned();
@@ -83,7 +101,8 @@ async fn main() -> Result<()> {
     println!(
         "herd-hub {} listening on ws://{}, state in {} ({state_root_id}), \
          {unfinished} job(s) not over, {} quarantined, a runner reporting every {:?} is \
-         lost after {:?}, a queued job rising one priority level every {:?}",
+         lost after {:?}, a queued job rising one priority level every {:?}, and waiting \
+         up to {:?} for the runner it is sticking to before it is placed elsewhere",
         herd_hub::hub_version(),
         hub.local_addr(),
         args.state_dir.display(),
@@ -91,6 +110,7 @@ async fn main() -> Result<()> {
         policy.health_every,
         policy.lost_after,
         policy.aging_step,
+        policy.stickiness.limit,
     );
     hub.serve().await
 }
