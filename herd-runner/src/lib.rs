@@ -1849,4 +1849,40 @@ mod tests {
         assert!(said.contains("ws://127.0.0.1:1"), "{said}");
         assert!(said.contains("giving up"), "{said}");
     }
+
+    /// M3 noted that a runner whose data root cannot record which hub state
+    /// root it belongs to stands by until it can. It does not — it says so
+    /// loudly and goes on serving — and that is the better behaviour, so the
+    /// note was wrong and not the code. A runner with an unwritable data
+    /// root is still a machine that can build; what it loses is only the
+    /// ability to attribute a verdict it spools, and because the identity it
+    /// then announces is `None`, which is never a hub's root, everything it
+    /// holds is set aside rather than believed.
+    #[test]
+    fn a_data_root_that_cannot_record_the_hub_s_state_root_says_so_and_carries_on() {
+        let temp = crate::testing::TempDir::new("state-root-unwritable");
+        let root = root::DataRoot::open(temp.path()).expect("a throwaway root");
+        // The one way this fails on a root the runner would not have refused
+        // outright: the file's own name is taken by something that is not a
+        // file (a read-only root is refused at startup, naming it).
+        std::fs::create_dir(temp.path().join("hub-state-root"))
+            .expect("the fixture takes the name");
+
+        let said = Session::new()
+            .settle_against_state_root(&root, "root-0123456789abcdef")
+            .join("\n");
+        assert!(
+            said.contains("COULD NOT write down which hub state root"),
+            "the failure is loud, and that is the whole of the mitigation: {said}"
+        );
+        assert!(
+            said.contains("goes on serving"),
+            "and it says what it is doing about it: {said}"
+        );
+        assert_eq!(
+            root.hub_state_root(),
+            None,
+            "so the next dial announces no root at all, and is admitted"
+        );
+    }
 }
