@@ -47,8 +47,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::durable;
 use crate::job::{
-    Attempt, JobEvent, JobMetrics, JobRecord, JobState, JobStore, LogWrite, Result, StoreError,
-    Timestamp, RECORD_VERSION,
+    Attempt, JobEvent, JobMetrics, JobRecord, JobState, JobStore, LogWrite, NewJob, Result,
+    StoreError, Timestamp, RECORD_VERSION,
 };
 
 /// The version of the directory layout above. A state root written by a newer
@@ -660,6 +660,12 @@ impl JobDirStore {
             }
         }
         let at = Timestamp::now();
+        // A job that is no longer queued is no longer waiting for anything:
+        // the reason goes, while the `waiting` lines of `events.jsonl` keep
+        // the history of why it waited.
+        if !matches!(state, JobState::Queued) {
+            record.waiting_for = None;
+        }
         record.state = state.clone();
         record.updated_at = at;
         // An attempt is over the moment its job is. This was the missing
@@ -704,7 +710,8 @@ impl JobStore for JobDirStore {
         JobDirStore::state_root_id(self)
     }
 
-    fn create_job(&self, command: Vec<String>) -> Result<JobRecord> {
+    fn create_job(&self, new: NewJob) -> Result<JobRecord> {
+        let NewJob { command, labels } = new;
         let mut live = self.lock()?;
         // `mkdir` is what claims an id: the directories, not the index, decide
         // which ids are taken, so a wrong hint costs one extra attempt.
@@ -744,7 +751,9 @@ impl JobStore for JobDirStore {
         let record = JobRecord {
             id: id.clone(),
             command,
+            labels,
             state: JobState::Queued,
+            waiting_for: None,
             submitted_at: at,
             updated_at: at,
             attempts: Vec::new(),
@@ -773,6 +782,36 @@ impl JobStore for JobDirStore {
         let (_live, mut record) = self.open_for_writing(id)?;
         record.metrics = metrics;
         self.write_record(&record)
+    }
+
+    /// Why a queued job is not starting, on its record and in its history.
+    ///
+    /// Written only when it is news, for two reasons. The hub tries to
+    /// dispatch a queued job on every event that could have changed the
+    /// answer, so an unconditional write would make `events.jsonl` unreadable
+    /// and spin the disk of a hub with nothing to do. And a reason that has
+    /// not changed is not something that happened.
+    ///
+    /// A job that is no longer queued is not waiting for anything, so this is
+    /// a no-op on it: that closes the race where a dispatch pass decides a job
+    /// must wait a moment after another pass has started it.
+    fn record_waiting(&self, id: &JobId, reason: &str) -> Result<bool> {
+        let _live = self.lock()?;
+        let Some(mut record) = self.read_record(id)? else {
+            return Err(StoreError::new(format!("no such job: {id}")));
+        };
+        if record.state != JobState::Queued || record.waiting_for.as_deref() == Some(reason) {
+            return Ok(false);
+        }
+        let at = Timestamp::now();
+        record.waiting_for = Some(reason.to_owned());
+        record.updated_at = at;
+        // The record first, so that the moment the line is readable in
+        // `events.jsonl` the record agrees with it — the same order every
+        // other write here uses.
+        self.write_record(&record)?;
+        self.append_event(id, &JobEvent::waiting(at, reason.to_owned()))?;
+        Ok(true)
     }
 
     fn record_state(&self, id: &JobId, state: JobState) -> Result<()> {
@@ -1292,8 +1331,12 @@ mod tests {
     #[test]
     fn a_minted_job_is_queued_and_has_a_fresh_id() {
         let (_dir, store) = store();
-        let first = store.create_job(vec!["true".to_owned()]).expect("minted");
-        let second = store.create_job(vec!["false".to_owned()]).expect("minted");
+        let first = store
+            .create_job(NewJob::new(vec!["true".to_owned()]))
+            .expect("minted");
+        let second = store
+            .create_job(NewJob::new(vec!["false".to_owned()]))
+            .expect("minted");
         assert_ne!(first.id, second.id);
         assert_eq!(first.state, JobState::Queued);
         assert_eq!(
@@ -1308,11 +1351,11 @@ mod tests {
     fn a_job_is_a_directory_of_plain_files_carrying_their_version() {
         let (dir, store) = store();
         let job = store
-            .create_job(vec![
+            .create_job(NewJob::new(vec![
                 "/bin/sh".to_owned(),
                 "-c".to_owned(),
                 "true".to_owned(),
-            ])
+            ]))
             .expect("minted");
         store
             .append_log(&job.id, LogStream::Stdout, 0, b"half a line")
@@ -1363,7 +1406,9 @@ mod tests {
     #[test]
     fn transitions_and_log_chunks_land_on_the_record() {
         let (_dir, store) = store();
-        let job = store.create_job(vec!["true".to_owned()]).expect("minted");
+        let job = store
+            .create_job(NewJob::new(vec!["true".to_owned()]))
+            .expect("minted");
         store
             .record_state(&job.id, JobState::Running)
             .expect("transition");
@@ -1410,7 +1455,9 @@ mod tests {
         use crate::job::JobEventKind;
 
         let (dir, store) = store();
-        let job = store.create_job(vec!["true".to_owned()]).expect("minted");
+        let job = store
+            .create_job(NewJob::new(vec!["true".to_owned()]))
+            .expect("minted");
         store
             .append_log(&job.id, LogStream::Stdout, 0, b"first\n")
             .expect("appended");
@@ -1486,7 +1533,9 @@ mod tests {
     #[test]
     fn every_transition_is_recorded_in_order_with_its_moment() {
         let (dir, store) = store();
-        let job = store.create_job(vec!["true".to_owned()]).expect("minted");
+        let job = store
+            .create_job(NewJob::new(vec!["true".to_owned()]))
+            .expect("minted");
         for state in [
             JobState::Assigned,
             JobState::Running,
@@ -1535,7 +1584,9 @@ mod tests {
     #[test]
     fn an_unfinished_line_is_not_read_as_a_transition() {
         let (dir, store) = store();
-        let job = store.create_job(vec!["true".to_owned()]).expect("minted");
+        let job = store
+            .create_job(NewJob::new(vec!["true".to_owned()]))
+            .expect("minted");
         let path = dir
             .path()
             .join(JOBS_DIR)
@@ -1562,7 +1613,9 @@ mod tests {
                 reason: "no-such-tool: not found".to_owned(),
             },
         ] {
-            let job = store.create_job(vec!["true".to_owned()]).expect("minted");
+            let job = store
+                .create_job(NewJob::new(vec!["true".to_owned()]))
+                .expect("minted");
             store
                 .record_state(
                     &job.id,
@@ -1588,7 +1641,9 @@ mod tests {
     #[test]
     fn a_runner_s_measurements_land_on_the_record() {
         let (_dir, store) = store();
-        let job = store.create_job(vec!["true".to_owned()]).expect("minted");
+        let job = store
+            .create_job(NewJob::new(vec!["true".to_owned()]))
+            .expect("minted");
         assert_eq!(
             job.metrics,
             JobMetrics::default(),
@@ -1646,7 +1701,9 @@ mod tests {
     #[test]
     fn a_record_that_is_over_refuses_every_end_including_its_own() {
         let (_dir, store) = store();
-        let job = store.create_job(vec!["true".to_owned()]).expect("minted");
+        let job = store
+            .create_job(NewJob::new(vec!["true".to_owned()]))
+            .expect("minted");
         let end = JobState::Finished {
             outcome: JobOutcome::Exited { code: 7 },
         };
@@ -1680,7 +1737,9 @@ mod tests {
     #[test]
     fn a_record_that_is_over_refuses_every_writer() {
         let (_dir, store) = store();
-        let job = store.create_job(vec!["true".to_owned()]).expect("minted");
+        let job = store
+            .create_job(NewJob::new(vec!["true".to_owned()]))
+            .expect("minted");
         let runner = "wsl-pc";
         let attempt = store.begin_attempt(&job.id, runner).expect("attempt 1");
         store
@@ -1779,7 +1838,9 @@ mod tests {
     #[test]
     fn a_job_goes_backwards_only_to_be_attempted_again() {
         let (_dir, store) = store();
-        let job = store.create_job(vec!["true".to_owned()]).expect("minted");
+        let job = store
+            .create_job(NewJob::new(vec!["true".to_owned()]))
+            .expect("minted");
         store
             .record_state(&job.id, JobState::Running)
             .expect("transition");
@@ -1812,9 +1873,15 @@ mod tests {
     #[test]
     fn the_queue_is_every_job_that_is_not_over_oldest_first() {
         let (_dir, store) = store();
-        let first = store.create_job(vec!["first".to_owned()]).expect("minted");
-        let second = store.create_job(vec!["second".to_owned()]).expect("minted");
-        let third = store.create_job(vec!["third".to_owned()]).expect("minted");
+        let first = store
+            .create_job(NewJob::new(vec!["first".to_owned()]))
+            .expect("minted");
+        let second = store
+            .create_job(NewJob::new(vec!["second".to_owned()]))
+            .expect("minted");
+        let third = store
+            .create_job(NewJob::new(vec!["third".to_owned()]))
+            .expect("minted");
         store
             .record_state(
                 &second.id,
@@ -1864,7 +1931,9 @@ mod tests {
     #[test]
     fn a_record_from_a_newer_herd_is_refused_rather_than_misread() {
         let (dir, store) = store();
-        let job = store.create_job(vec!["true".to_owned()]).expect("minted");
+        let job = store
+            .create_job(NewJob::new(vec!["true".to_owned()]))
+            .expect("minted");
         let path = dir
             .path()
             .join(JOBS_DIR)
@@ -1937,14 +2006,14 @@ mod tests {
         let first = {
             let store = JobDirStore::open(dir.path()).expect("opens");
             store
-                .create_job(vec!["true".to_owned()])
+                .create_job(NewJob::new(vec!["true".to_owned()]))
                 .expect("minted")
                 .id
         };
         fs::remove_dir_all(dir.path().join(INDEX_DIR)).expect("the index is gone");
         let store = JobDirStore::open(dir.path()).expect("opens without an index");
         let second = store
-            .create_job(vec!["true".to_owned()])
+            .create_job(NewJob::new(vec!["true".to_owned()]))
             .expect("minted")
             .id;
         assert_ne!(first, second);

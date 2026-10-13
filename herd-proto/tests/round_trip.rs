@@ -2,9 +2,48 @@
 //! the contract: a field that silently fails to round-trip is a lost field.
 
 use herd_proto::{
-    cap_exceeded_reason, cap_stop_reason, from_frame, to_frame, Cap, FromHub, JobId, JobMetrics,
-    JobOutcome, LogStream, Role, RunningJob, ToHub, PROTOCOL_VERSION,
+    cap_exceeded_reason, cap_stop_reason, from_frame, to_frame, Availability, BusyProbe, Cap,
+    Capability, CapabilityOffer, CapabilityOrigins, CapabilityState, FromHub, JobId, JobMetrics,
+    JobOutcome, LabelSet, LogStream, OfferedCapability, Role, RunningJob, ToHub, PROTOCOL_VERSION,
 };
+
+/// An offer carrying one of each kind, each origin and each probe, so that
+/// nothing in the algebra crosses the wire untested.
+fn an_offer() -> CapabilityOffer {
+    CapabilityOffer::new(vec![
+        OfferedCapability::new(
+            Capability::counted("build", 2)
+                .excluding(["metal-pc"])
+                .expect("a valid exclusion"),
+            CapabilityOrigins::declared(),
+        ),
+        OfferedCapability::new(
+            Capability::lease("metal-pc", BusyProbe::lock_file("/run/herd/metal-pc")),
+            CapabilityOrigins::declared(),
+        ),
+        OfferedCapability::new(
+            Capability::exclusive("nightly").probed_by(BusyProbe::Command {
+                command: vec!["/usr/bin/leased".to_owned(), "--check".to_owned()],
+                busy_exit_code: 3,
+                free_exit_code: 4,
+            }),
+            CapabilityOrigins::declared(),
+        ),
+        OfferedCapability::new(
+            Capability::shared("reference"),
+            CapabilityOrigins::declared(),
+        ),
+        OfferedCapability::new(
+            Capability::shared("kvm"),
+            CapabilityOrigins {
+                probed: true,
+                declared: false,
+                denied: true,
+            },
+        ),
+    ])
+    .expect("a valid offer")
+}
 
 /// Every cap a runner can stop a job at (M4).
 pub const EVERY_CAP: [Cap; 4] = [Cap::Time, Cap::Memory, Cap::Log, Cap::Disk];
@@ -107,6 +146,7 @@ fn every_message_to_the_hub_round_trips() {
             instance: Some("run-4242-17a3f9".to_owned()),
             state_root: Some("root-0123456789abcdef".to_owned()),
             health_every_ms: Some(15_000),
+            capabilities: an_offer(),
         });
         // The optional fields really are optional.
         round_trip_to_hub(ToHub::Hello {
@@ -117,12 +157,27 @@ fn every_message_to_the_hub_round_trips() {
             instance: None,
             state_root: None,
             health_every_ms: None,
+            capabilities: CapabilityOffer::empty(),
         });
     }
+    round_trip_to_hub(ToHub::CapabilitiesChanged {
+        capabilities: vec![
+            CapabilityState::new("metal-pc", Availability::Free),
+            CapabilityState::new("kvm", Availability::busy("the lock file /run/k is there")),
+            CapabilityState::new("vfio", Availability::unknown("the probe /bin/p exited 7")),
+        ],
+    });
+    round_trip_to_hub(ToHub::CapabilitiesChanged {
+        capabilities: Vec::new(),
+    });
     round_trip_to_hub(ToHub::SubmitJob {
         command: vec!["sh".to_owned(), "-c".to_owned(), "echo hi".to_owned()],
+        labels: LabelSet::new(["build", "reference"]).expect("valid labels"),
     });
-    round_trip_to_hub(ToHub::SubmitJob { command: vec![] });
+    round_trip_to_hub(ToHub::SubmitJob {
+        command: vec![],
+        labels: LabelSet::default(),
+    });
     round_trip_to_hub(ToHub::WaitForJob {
         job_id: JobId::new("j0000000001"),
     });
@@ -648,4 +703,114 @@ fn a_health_cadence_of_zero_is_refused_naming_the_figure() {
         Duration::ZERO
     )
     .is_some());
+}
+
+/// The capability algebra on the wire (M5). These shapes land in durable
+/// queue entries from M6 onwards, so they are pinned here rather than left to
+/// be discovered by a migration.
+#[test]
+fn the_capability_algebra_is_tagged_json_objects() {
+    assert_eq!(
+        to_frame(&Capability::shared("reference")).expect("encodes"),
+        r#"{"name":"reference","kind":{"type":"shared"}}"#
+    );
+    assert_eq!(
+        to_frame(&Capability::counted("build", 2)).expect("encodes"),
+        r#"{"name":"build","kind":{"type":"counted","slots":2}}"#
+    );
+    assert_eq!(
+        to_frame(&Capability::exclusive("nightly")).expect("encodes"),
+        r#"{"name":"nightly","kind":{"type":"exclusive"}}"#
+    );
+    // A lease is counted(1) and a probe, with no kind of its own (E-27).
+    assert_eq!(
+        to_frame(&Capability::lease(
+            "metal-pc",
+            BusyProbe::lock_file("/run/herd/metal-pc")
+        ))
+        .expect("encodes"),
+        r#"{"name":"metal-pc","kind":{"type":"counted","slots":1},"#.to_owned()
+            + r#""busy_probe":{"type":"lock_file","path":"/run/herd/metal-pc"}}"#
+    );
+    // Each origin is its own flag, so all three can be true at once (E-24).
+    assert_eq!(
+        to_frame(&CapabilityOrigins {
+            probed: true,
+            declared: false,
+            denied: true,
+        })
+        .expect("encodes"),
+        r#"{"probed":true,"declared":false,"denied":true}"#
+    );
+    assert_eq!(
+        to_frame(&Availability::busy("the lock file /run/x is there")).expect("encodes"),
+        r#"{"type":"busy","reason":"the lock file /run/x is there"}"#
+    );
+    assert_eq!(
+        to_frame(&Availability::Free).expect("encodes"),
+        r#"{"type":"free"}"#
+    );
+}
+
+/// A command probe's two exit codes default, so a configuration that gives
+/// neither means "0 is busy, 1 is free".
+#[test]
+fn a_command_probe_s_exit_codes_default() {
+    let probe: BusyProbe =
+        from_frame(r#"{"type":"command","command":["/bin/test","-e","/run/x"]}"#).expect("decodes");
+    assert_eq!(
+        probe,
+        BusyProbe::Command {
+            command: vec!["/bin/test".to_owned(), "-e".to_owned(), "/run/x".to_owned()],
+            busy_exit_code: 0,
+            free_exit_code: 1,
+        }
+    );
+}
+
+/// A label set is canonical whichever way it arrives: a peer that sends the
+/// same two labels in another order, or twice, sends the same set. M6's
+/// deduplication keys on this (E-05).
+#[test]
+fn a_label_set_arrives_canonical() {
+    let one: LabelSet = from_frame(r#"["reference","build","build"]"#).expect("decodes");
+    let other: LabelSet = from_frame(r#"["build","reference"]"#).expect("decodes");
+    assert_eq!(one, other);
+    assert_eq!(to_frame(&one).expect("encodes"), r#"["build","reference"]"#);
+}
+
+/// A label a peer sent that is not a label is a decode error naming it, never
+/// a label that silently matches nothing (the rule D15 set for outcomes).
+#[test]
+fn a_label_that_is_not_a_label_is_refused_by_name() {
+    for bad in [r#"["Build"]"#, r#"["with space"]"#, r#"[""]"#, r#"["a,b"]"#] {
+        let error = from_frame::<LabelSet>(bad).expect_err("{bad} must be refused");
+        assert!(!error.to_string().is_empty(), "{bad}: {error}");
+    }
+    // And an offer with two entries under one name is refused too: one runner
+    // offers a capability once, with one kind.
+    let error = from_frame::<CapabilityOffer>(
+        r#"[{"name":"build","kind":{"type":"shared"},"origins":{"declared":true}},
+            {"name":"build","kind":{"type":"exclusive"},"origins":{"declared":true}}]"#,
+    )
+    .expect_err("a duplicate name must be refused");
+    assert!(error.to_string().contains("build"), "{error}");
+}
+
+/// The symmetric closure is part of what crosses the wire: an offer decoded
+/// from a configuration that named one direction carries both.
+#[test]
+fn the_exclusion_closure_survives_the_wire() {
+    let offer: CapabilityOffer = from_frame(
+        r#"[{"name":"build","kind":{"type":"shared"},"excludes":["nightly"],
+             "origins":{"declared":true}},
+            {"name":"nightly","kind":{"type":"exclusive"},"origins":{"declared":true}}]"#,
+    )
+    .expect("decodes");
+    assert!(offer
+        .get("nightly")
+        .expect("offered")
+        .capability
+        .excludes
+        .contains("build"));
 }

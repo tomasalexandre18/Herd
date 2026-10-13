@@ -308,6 +308,8 @@ dependencies = [
  "herd-proto",
  "herdctl",
  "libc",
+ "serde",
+ "serde_json",
  "tokio",
  "tokio-tungstenite",
 ]

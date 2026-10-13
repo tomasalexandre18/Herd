@@ -8,8 +8,8 @@
 use anyhow::{anyhow, bail, Context, Result};
 use futures_util::{SinkExt, StreamExt};
 use herd_proto::{
-    cap_stop_reason, from_frame, to_frame, Cap, FromHub, JobId, JobMetrics, JobOutcome, LogStream,
-    Role, ToHub, PROTOCOL_VERSION,
+    cap_stop_reason, from_frame, to_frame, Cap, CapabilityOffer, FromHub, JobId, JobMetrics,
+    JobOutcome, LabelSet, LogStream, Role, ToHub, PROTOCOL_VERSION,
 };
 use tokio::net::TcpStream;
 use tokio_tungstenite::tungstenite::Message;
@@ -165,16 +165,23 @@ pub fn impossible_exit_code_reason(outcome: &JobOutcome) -> Option<String> {
 /// `on_log` is called with each chunk as it arrives, in the order the runner
 /// produced it, carrying the bytes the process wrote (D18); the binary prints
 /// them, a test times them.
+/// `labels` names the capabilities the job needs (E-25) — names only, because
+/// a requester never names a machine (invariant 6). A job needing a capability
+/// something outside Herd is holding stays queued and says so through
+/// `on_note`; it is never refused for it (E-26, D38), so a caller that ignores
+/// notes simply waits.
 pub async fn run_job(
     config: &Config,
     command: Vec<String>,
+    labels: LabelSet,
     mut on_log: impl FnMut(LogStream, &[u8]),
+    mut on_note: impl FnMut(&str),
 ) -> Result<Finished> {
     if command.is_empty() {
         bail!("a job needs a command to run");
     }
     let mut socket = join(config).await?;
-    send(&mut socket, &ToHub::SubmitJob { command })
+    send(&mut socket, &ToHub::SubmitJob { command, labels })
         .await
         .context("submitting the job")?;
 
@@ -188,9 +195,7 @@ pub async fn run_job(
             // are still shown rather than swallowed, the recorded log as the
             // job's own output and a note as Herd's own words (stderr).
             FromHub::JobLog { data, .. } => on_log(LogStream::Stdout, &data),
-            FromHub::JobNote { note, .. } => {
-                on_log(LogStream::Stderr, format!("herdctl: {note}\n").as_bytes())
-            }
+            FromHub::JobNote { note, .. } => on_note(&note),
             FromHub::JobFinished {
                 job_id,
                 outcome,
@@ -223,12 +228,12 @@ pub async fn run_job(
 /// (E-03, E-42). The id is the only handle needed afterwards:
 /// [`wait_for_job`] takes it, and so does the job's directory on the hub's
 /// disk.
-pub async fn submit_job(config: &Config, command: Vec<String>) -> Result<JobId> {
+pub async fn submit_job(config: &Config, command: Vec<String>, labels: LabelSet) -> Result<JobId> {
     if command.is_empty() {
         bail!("a job needs a command to run");
     }
     let mut socket = join(config).await?;
-    send(&mut socket, &ToHub::SubmitJob { command })
+    send(&mut socket, &ToHub::SubmitJob { command, labels })
         .await
         .context("submitting the job")?;
     match next_message(&mut socket).await? {
@@ -355,6 +360,8 @@ async fn join(config: &Config) -> Result<Socket> {
             // Nor a cadence: a requester reports nothing, so there is no
             // silence of its own for a hub to time (E-40 is the runner's).
             health_every_ms: None,
+            // A requester offers nothing: capacity is a runner's word.
+            capabilities: CapabilityOffer::empty(),
         },
     )
     .await

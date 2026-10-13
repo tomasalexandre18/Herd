@@ -93,17 +93,20 @@ impl Harness {
     async fn run(&self, script: &str) -> Ran {
         let mut out = String::new();
         let mut err = String::new();
-        let finished =
-            herdctl::run_job(
-                &self.requester(),
-                shell(script),
-                |stream, data| match stream {
-                    LogStream::Stdout => out.push_str(&String::from_utf8_lossy(data)),
-                    LogStream::Stderr => err.push_str(&String::from_utf8_lossy(data)),
-                },
-            )
-            .await
-            .expect("the hub answers with an outcome");
+        let finished = herdctl::run_job(
+            &self.requester(),
+            shell(script),
+            // No capability in particular: M4's caps are numbers a runner
+            // enforces, never labels (M5 keeps them apart).
+            herd_proto::LabelSet::default(),
+            |stream, data| match stream {
+                LogStream::Stdout => out.push_str(&String::from_utf8_lossy(data)),
+                LogStream::Stderr => err.push_str(&String::from_utf8_lossy(data)),
+            },
+            |_note| {},
+        )
+        .await
+        .expect("the hub answers with an outcome");
         Ran {
             outcome: finished.outcome,
             metrics: finished.metrics,
@@ -993,7 +996,14 @@ async fn the_runner_binds_no_listening_socket() {
         name: Some("no-listener-requester".to_owned()),
     };
     let job = tokio::spawn(async move {
-        let _ = herdctl::run_job(&requester, shell("sleep 1.5"), |_, _| {}).await;
+        let _ = herdctl::run_job(
+            &requester,
+            shell("sleep 1.5"),
+            herd_proto::LabelSet::default(),
+            |_, _| {},
+            |_| {},
+        )
+        .await;
     });
     tokio::time::sleep(Duration::from_millis(400)).await;
 
@@ -1100,7 +1110,14 @@ impl RealRunner {
         };
         let command = shell(script);
         tokio::spawn(async move {
-            let _ = herdctl::run_job(&requester, command, |_, _| {}).await;
+            let _ = herdctl::run_job(
+                &requester,
+                command,
+                herd_proto::LabelSet::default(),
+                |_, _| {},
+                |_| {},
+            )
+            .await;
         })
     }
 }

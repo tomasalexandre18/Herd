@@ -55,7 +55,7 @@ async fn a_hub_that_restarts_loses_no_result_and_no_queued_job() {
 
     // A detached submission: the requester leaves with the id, and the job
     // outlives both it and the hub.
-    let running = herdctl::submit_job(
+    let running = support::submit_job(
         &first_hub.requester(),
         shell("printf 'before the restart\\n'; sleep 1; printf 'after it\\n'; exit 7"),
     )
@@ -97,7 +97,7 @@ async fn a_hub_that_restarts_loses_no_result_and_no_queued_job() {
     let (queued, recovered) = {
         let store = support::open_when_free(state.path());
         let queued = store
-            .create_job(shell("printf 'from the queue\\n'"))
+            .create_job(herd_hub::NewJob::new(shell("printf 'from the queue\\n'")))
             .expect("minted")
             .id;
         let recovered: Vec<(String, String)> = store
@@ -193,7 +193,7 @@ async fn a_hub_that_restarts_loses_no_result_and_no_queued_job() {
 #[tokio::test]
 async fn a_detached_submission_can_be_waited_for_and_its_log_read_as_a_file() {
     let harness = Harness::with_hub_and_runner().await;
-    let job_id = herdctl::submit_job(
+    let job_id = support::submit_job(
         &harness.requester(),
         shell("printf 'one\\n'; printf 'two\\n' >&2; exit 75"),
     )
@@ -228,7 +228,7 @@ async fn a_detached_submission_can_be_waited_for_and_its_log_read_as_a_file() {
 async fn the_log_file_equals_what_the_stream_delivered() {
     let harness = Harness::with_hub_and_runner().await;
     let mut streamed: Vec<u8> = Vec::new();
-    let finished = herdctl::run_job(
+    let finished = support::run_job(
         &harness.requester(),
         // Enough output, in enough chunks, that a difference would show.
         shell("for i in $(seq 1 200); do printf 'line %s\\n' \"$i\"; printf 'err %s\\n' \"$i\" >&2; done"),
@@ -255,7 +255,7 @@ async fn a_job_s_output_reaches_the_record_byte_for_byte() {
     let harness = Harness::with_hub_and_runner().await;
     let mut streamed: Vec<u8> = Vec::new();
     // Three bytes no JSON string could have carried: a NUL, 0xff, 0xfe.
-    let finished = herdctl::run_job(
+    let finished = support::run_job(
         &harness.requester(),
         shell(r"printf 'a\000b\377\376c\n'"),
         |_stream, data| streamed.extend_from_slice(data),
@@ -287,7 +287,7 @@ async fn a_job_s_output_reaches_the_record_byte_for_byte() {
 #[tokio::test]
 async fn a_job_that_prints_nothing_still_has_a_log_file() {
     let harness = Harness::with_hub_and_runner().await;
-    let job_id = herdctl::submit_job(&harness.requester(), shell("exit 0"))
+    let job_id = support::submit_job(&harness.requester(), shell("exit 0"))
         .await
         .expect("the job is accepted");
     let log = job_dir(harness.state_dir(), &job_id).join("log");
@@ -312,7 +312,7 @@ async fn a_job_that_prints_nothing_still_has_a_log_file() {
 #[tokio::test]
 async fn a_job_s_record_is_readable_while_it_is_still_running() {
     let harness = Harness::with_hub_and_runner().await;
-    let job_id = herdctl::submit_job(
+    let job_id = support::submit_job(
         &harness.requester(),
         shell("printf 'working\\n'; sleep 2; printf 'done\\n'"),
     )
@@ -402,11 +402,11 @@ async fn deleting_the_derived_index_loses_nothing() {
     let (finished, queued) = {
         let store = support::open_when_free(state.path());
         let finished = store
-            .create_job(vec!["true".to_owned()])
+            .create_job(herd_hub::NewJob::new(vec!["true".to_owned()]))
             .expect("minted")
             .id;
         let queued = store
-            .create_job(vec!["false".to_owned()])
+            .create_job(herd_hub::NewJob::new(vec!["false".to_owned()]))
             .expect("minted")
             .id;
         store
@@ -540,7 +540,7 @@ async fn a_result_for_a_job_of_a_state_root_that_is_gone_is_never_offered() {
     });
     first_hub.wait_for_runner().await;
 
-    let lost = herdctl::submit_job(&first_hub.requester(), shell("sleep 0.3; exit 3"))
+    let lost = support::submit_job(&first_hub.requester(), shell("sleep 0.3; exit 3"))
         .await
         .expect("the job is accepted");
     let first_dir = first_root.path().to_path_buf();
@@ -607,7 +607,7 @@ async fn a_result_for_a_job_of_a_state_root_that_is_gone_is_never_offered() {
         async move { herd_runner::serve_once(config, session, confined).await }
     });
     second_hub.wait_for_runner().await;
-    let finished = herdctl::run_job(
+    let finished = support::run_job(
         &second_hub.requester(),
         shell("printf 'still working\\n'"),
         |_, _| {},

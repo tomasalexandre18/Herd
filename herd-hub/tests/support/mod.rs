@@ -63,6 +63,40 @@ pub fn shell(script: &str) -> Vec<String> {
     vec!["/bin/sh".to_owned(), "-c".to_owned(), script.to_owned()]
 }
 
+/// The capabilities a job needs, as a canonical set.
+pub fn labels(names: &[&str]) -> herd_proto::LabelSet {
+    herd_proto::LabelSet::new(names.iter().map(|n| (*n).to_owned())).expect("valid labels")
+}
+
+/// Submit a job that needs no capability in particular, and follow it.
+///
+/// Most of this suite is about things other than labels, so it goes through
+/// the same `run_job` a caller uses with an empty label set and nothing
+/// listening for notes. The tests that *are* about labels call `run_job`
+/// themselves.
+pub async fn run_job(
+    config: &herdctl::Config,
+    command: Vec<String>,
+    on_log: impl FnMut(herd_proto::LogStream, &[u8]),
+) -> anyhow::Result<herdctl::Finished> {
+    herdctl::run_job(
+        config,
+        command,
+        herd_proto::LabelSet::default(),
+        on_log,
+        |_| {},
+    )
+    .await
+}
+
+/// Submit a job that needs no capability in particular, and leave with its id.
+pub async fn submit_job(
+    config: &herdctl::Config,
+    command: Vec<String>,
+) -> anyhow::Result<herd_proto::JobId> {
+    herdctl::submit_job(config, command, herd_proto::LabelSet::default()).await
+}
+
 /// A hub, optionally a runner, and the means to reach them.
 pub struct Harness {
     pub hub_url: String,

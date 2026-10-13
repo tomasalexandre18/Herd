@@ -42,7 +42,7 @@ impl Seen {
 async fn a_job_streams_its_output_and_succeeds() {
     let harness = Harness::with_hub_and_runner().await;
     let mut seen = Seen::default();
-    let finished = herdctl::run_job(
+    let finished = support::run_job(
         &harness.requester(),
         shell("printf 'out of the runner\\n'; printf 'and its stderr\\n' >&2"),
         |stream, data| seen.chunks.push((stream, data.to_vec())),
@@ -90,7 +90,7 @@ async fn a_job_streams_its_output_and_succeeds() {
 async fn a_job_s_record_carries_what_the_runner_measured() {
     let harness = Harness::with_hub_and_runner().await;
     let written = 256 * 1024;
-    let finished = herdctl::run_job(
+    let finished = support::run_job(
         &harness.requester(),
         shell(&format!(
             "dd if=/dev/zero of=./payload bs=1024 count={} 2>/dev/null; printf 'wrote it\\n'; \
@@ -148,7 +148,7 @@ async fn a_job_s_record_carries_what_the_runner_measured() {
 async fn a_failing_job_reports_its_own_exit_code() {
     let harness = Harness::with_hub_and_runner().await;
     let mut seen = Seen::default();
-    let finished = herdctl::run_job(
+    let finished = support::run_job(
         &harness.requester(),
         shell("printf 'it went wrong\\n' >&2; exit 42"),
         |stream, data| seen.chunks.push((stream, data.to_vec())),
@@ -181,7 +181,7 @@ async fn a_job_killed_by_a_signal_is_reported_as_signalled() {
     let mut seen = Seen::default();
     // The shell kills itself, so the runner's own child dies by the signal
     // rather than reporting a shell's 128 + 15. SIGTERM is 15 everywhere.
-    let finished = herdctl::run_job(
+    let finished = support::run_job(
         &harness.requester(),
         shell("printf 'about to die\\n'; kill -TERM $$"),
         |stream, data| seen.chunks.push((stream, data.to_vec())),
@@ -211,7 +211,7 @@ async fn a_job_killed_by_a_signal_is_reported_as_signalled() {
 async fn a_command_that_does_not_exist_is_reported_as_could_not_start() {
     let harness = Harness::with_hub_and_runner().await;
     let mut seen = Seen::default();
-    let finished = herdctl::run_job(
+    let finished = support::run_job(
         &harness.requester(),
         vec![NO_SUCH_COMMAND.to_owned(), "--whatever".to_owned()],
         |stream, data| seen.chunks.push((stream, data.to_vec())),
@@ -258,7 +258,7 @@ async fn output_arrives_while_the_job_is_still_running() {
     let harness = Harness::with_hub_and_runner().await;
     let mut seen = Seen::default();
     let submitted_at = Instant::now();
-    let finished = herdctl::run_job(
+    let finished = support::run_job(
         &harness.requester(),
         // Writes, waits, writes: if the log were delivered at exit, the first
         // chunk and the outcome would arrive together.
@@ -312,6 +312,7 @@ async fn a_version_mismatch_is_refused_naming_both_versions() {
             instance: Some("run-from-the-future".to_owned()),
             state_root: None,
             health_every_ms: None,
+            capabilities: Default::default(),
         };
         socket
             .send(Message::text(to_frame(&hello).expect("hello encodes")))
@@ -342,7 +343,7 @@ async fn a_version_mismatch_is_refused_naming_both_versions() {
 #[tokio::test]
 async fn a_submission_with_no_runner_is_refused_by_name() {
     let harness = Harness::with_hub().await;
-    let error = herdctl::run_job(&harness.requester(), shell("true"), |_, _| {})
+    let error = support::run_job(&harness.requester(), shell("true"), |_, _| {})
         .await
         .expect_err("there is nothing to run the job on");
     assert!(
@@ -419,7 +420,7 @@ async fn the_same_runner_dialling_again_replaces_its_own_dead_connection() {
         tokio::spawn(async move { herd_runner::serve_once(config, session, confined).await });
     // It is in, and a job submitted now runs on it: the hub has one runner,
     // and it is the one that just dialled.
-    let finished = herdctl::run_job(&harness.requester(), shell("printf 'back\\n'"), |_, _| {})
+    let finished = support::run_job(&harness.requester(), shell("printf 'back\\n'"), |_, _| {})
         .await
         .expect("the runner that dialled again is the hub's runner now");
     assert_eq!(finished.outcome, JobOutcome::Exited { code: 0 });
