@@ -205,6 +205,20 @@ enum Stored {
     Quarantined(String),
 }
 
+/// What a writer found when it opened a job: a record it may write to, or one
+/// that is over.
+///
+/// Carries the store's lock, so a writer cannot hold the record without
+/// holding the mutex it was read under, and cannot have reached the record at
+/// all without the terminal test in
+/// [`JobDirStore::open_unless_over`] having been made.
+enum Writable<'a> {
+    /// The lock, and the record as it stands. Write through this.
+    Live(std::sync::MutexGuard<'a, Live>, Box<JobRecord>),
+    /// The job is over, named by the state it reached. Nothing is written.
+    Over(String),
+}
+
 impl JobDirStore {
     /// Open, or create, a state root, and recover what is in it.
     ///
@@ -564,18 +578,35 @@ impl JobDirStore {
     /// is writing something it believes in, and it has to learn that the
     /// record would not take it.
     fn open_for_writing(&self, id: &JobId) -> Result<(std::sync::MutexGuard<'_, Live>, JobRecord)> {
+        match self.open_unless_over(id)? {
+            Writable::Live(live, record) => Ok((live, *record)),
+            Writable::Over(state) => Err(StoreError::new(format!(
+                "{id} is over ({state}) and a record that has reached its end is never \
+                 written to again"
+            ))),
+        }
+    }
+
+    /// The gate itself: the lock and the record, or word that the job is over.
+    ///
+    /// The terminal test lives here and nowhere else, which is the whole
+    /// point of [`Self::open_for_writing`]. It is separate from it only
+    /// because the two writers that pass through want different things said
+    /// about the same fact. A frame about a job that is over is a *mistake*,
+    /// and is refused by name. A dispatch pass that decides a job must wait,
+    /// a moment after that job ended, has nothing to write and nothing to
+    /// complain about — and that no-op is what closes the race
+    /// [`JobStore::record_waiting`] exists to close. Neither of them writes to
+    /// a record that is over, which is the rule.
+    fn open_unless_over(&self, id: &JobId) -> Result<Writable<'_>> {
         let live = self.lock()?;
         let Some(record) = self.read_record(id)? else {
             return Err(StoreError::new(format!("no such job: {id}")));
         };
         if record.state.is_terminal() {
-            return Err(StoreError::new(format!(
-                "{id} is over ({}) and a record that has reached its end is never written \
-                 to again",
-                describe(&record.state)
-            )));
+            return Ok(Writable::Over(describe(&record.state)));
         }
-        Ok((live, record))
+        Ok(Writable::Live(live, Box::new(record)))
     }
 
     /// Read a record, or say what else it was.
@@ -907,11 +938,14 @@ impl JobStore for JobDirStore {
     ///
     /// A job that is no longer queued is not waiting for anything, so this is
     /// a no-op on it: that closes the race where a dispatch pass decides a job
-    /// must wait a moment after another pass has started it.
+    /// must wait a moment after another pass has started it. A job that has
+    /// *ended* in that same window is the same no-op and not an error, which
+    /// is why this writer takes [`JobDirStore::open_unless_over`] rather than
+    /// the refusing door above it — it still passes the one terminal test,
+    /// and it still writes nothing to a record that is over.
     fn record_waiting(&self, id: &JobId, reason: &str) -> Result<bool> {
-        let _live = self.lock()?;
-        let Some(mut record) = self.read_record(id)? else {
-            return Err(StoreError::new(format!("no such job: {id}")));
+        let Writable::Live(_live, mut record) = self.open_unless_over(id)? else {
+            return Ok(false);
         };
         if record.state != JobState::Queued || record.waiting_for.as_deref() == Some(reason) {
             return Ok(false);
@@ -1937,9 +1971,26 @@ mod tests {
             );
         }
 
+        // M5's writer is on this list too, and it is the one that says `false`
+        // instead of erroring: a dispatch pass that decides a job must wait, a
+        // moment after that job ended, has nothing to write and nothing to
+        // complain about — the no-op is what closes that race (D50). It
+        // passes the same terminal test as everybody else, and the proof that
+        // it wrote nothing is the untouched record just below.
+        assert!(
+            !store
+                .record_waiting(&job.id, "a lock file nobody holds any more")
+                .expect("a job that is over is simply not waiting for anything"),
+            "it is news to nobody"
+        );
+
         // And the record is exactly what the job's own attempt left.
         let record = store.job(&job.id).expect("readable").expect("there");
         assert_eq!(record.metrics, measured, "{record:?}");
+        assert_eq!(
+            record.waiting_for, None,
+            "and nothing put a waiting reason on a record that is over: {record:?}"
+        );
         assert_eq!(
             record.state,
             JobState::Finished {
