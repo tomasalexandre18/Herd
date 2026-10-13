@@ -140,6 +140,19 @@ fn binary(name: &str) -> PathBuf {
     path
 }
 
+/// The health cadence these tests run both sides at, unless the test under
+/// way is about the cadence itself — in which case it gives its own, and this
+/// adds nothing: the binaries refuse the same option twice, and rightly.
+fn cadence_unless_given(options: &[&str]) -> Vec<String> {
+    if options.contains(&"--health-every") {
+        return Vec::new();
+    }
+    vec![
+        "--health-every".to_owned(),
+        HEALTH_EVERY_IN_THESE_TESTS.to_owned(),
+    ]
+}
+
 /// A port nothing is listening on, kept for the hub that is restarted: a
 /// runner dials one URL, so the hub that comes back has to take the same one.
 fn free_port() -> u16 {
@@ -219,8 +232,9 @@ impl Herd {
             .arg(self.addr().to_string())
             .arg("--state-dir")
             .arg(self.state.path())
-            .arg("--health-every")
-            .arg(HEALTH_EVERY_IN_THESE_TESTS)
+            // Unless the test is itself about the cadence: the binary
+            // refuses the same option twice, and rightly.
+            .args(cadence_unless_given(options))
             .args(options)
             .stdout(output("out"))
             .stderr(output("err"))
@@ -262,6 +276,13 @@ impl Herd {
     /// that a runner can be started again on the root a previous one left —
     /// which is how a spooled verdict gets delivered (D34).
     fn start_runner_rooted(&self, name: &str, which: &str, root: &str) -> Process {
+        self.start_runner_with(name, which, root, &[])
+    }
+
+    /// The same, with whatever options the test wants — its own cadence above
+    /// all, because the pairing of the two sides' timings is itself something
+    /// the hub judges.
+    fn start_runner_with(&self, name: &str, which: &str, root: &str, options: &[&str]) -> Process {
         let child = Command::new(binary("herd-runner"))
             .arg("--hub")
             .arg(self.url())
@@ -273,9 +294,10 @@ impl Herd {
             // (D32), and these tests run two at a time.
             .arg("--data-root")
             .arg(self.runner_root(root))
-            // The same cadence the hub is told to expect.
-            .arg("--health-every")
-            .arg(HEALTH_EVERY_IN_THESE_TESTS)
+            // The same cadence the hub is told to expect, unless the test is
+            // itself about the cadence.
+            .args(cadence_unless_given(options))
+            .args(options)
             .stdout(Stdio::from(
                 File::create(self.logs.path().join(format!("{which}-out"))).expect("a file"),
             ))
@@ -1775,4 +1797,96 @@ async fn a_lost_after_shorter_than_the_health_cadence_is_refused_at_startup() {
             "the runner's refusal must name {figure} too: {said}"
         );
     }
+}
+
+/// **Two timings that are each legal and together kill a healthy job**, with
+/// the real binaries and the figures that did it.
+///
+/// `herd-hub --health-every 1 --lost-after 3` passes the hub's own startup
+/// check: three seconds outlasts three of the reports it expects. `herd-runner
+/// --health-every 10 --hub-silence-limit 30` passes the runner's: thirty
+/// seconds outlasts three of the reports it sends. Both started, and a quiet
+/// `sleep 30` burnt **both** of its attempts and ended `lost` in about six
+/// seconds — the hub was timing a silence the runner had never promised to
+/// break. Neither configuration is wrong alone, so neither check could see
+/// it; the runner's real cadence now crosses the handshake and the hub judges
+/// the pairing by its figures.
+///
+/// The defaults (15 and 60 on both sides) are safe, which is exactly why this
+/// would be met by the first person to tune one side.
+#[tokio::test]
+async fn a_runner_reporting_too_rarely_for_the_hub_s_threshold_is_refused_by_figures() {
+    let herd = Herd::new();
+    // A hub that is entirely self-consistent: it loses a runner after three
+    // seconds and expects a report every second.
+    let mut hub = herd
+        .start_hub_with("first", &["--health-every", "1", "--lost-after", "3"])
+        .await;
+
+    // And a runner that is entirely self-consistent too, reporting every ten
+    // seconds and giving a silent hub thirty.
+    let mut quiet = herd.start_runner_with(
+        "the-real-runner",
+        "runner",
+        "runner",
+        &["--health-every", "10", "--hub-silence-limit", "30"],
+    );
+    let left = tokio::time::timeout(PATIENCE, quiet.gone())
+        .await
+        .unwrap_or_else(|_| {
+            panic!(
+                "a runner the hub cannot keep its promises about must be turned away, not \
+                 served: {}",
+                herd.said("runner")
+            )
+        });
+    assert!(
+        !left.success(),
+        "and a refusal is terminal (D13): the process ends rather than dialling again"
+    );
+
+    // The refusal names the figures on both sides and the margin they need:
+    // this is what an operator has to act on.
+    let said = herd.said("runner");
+    for figure in ["3s", "10s", "3 health reports", "30s"] {
+        assert!(
+            said.contains(figure),
+            "the runner must be told {figure}: {said}"
+        );
+    }
+    assert!(
+        herd.said("first").contains("is refused"),
+        "and the hub says on its own stderr which runner it turned away: {}",
+        herd.said("first")
+    );
+
+    // Nothing was placed on it, so no job was ever put at risk: the
+    // submission is refused by name instead of being handed to a runner whose
+    // job the hub would declare lost between two of its own reports.
+    let output = herd
+        .herdctl(&["run", "--", "/bin/sh", "-c", "sleep 30"])
+        .await;
+    assert_eq!(
+        output.status.code(),
+        Some(125),
+        "Herd's own failure to place a job is 125: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("no runner is connected"),
+        "and it says why: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    // The same machine, reporting often enough, is welcome: what was refused
+    // is a pairing of figures, never a runner.
+    let mut often = herd.start_runner_with(
+        "the-real-runner",
+        "second-runner",
+        "runner",
+        &["--health-every", "0.5"],
+    );
+    herd.wait_for_runner().await;
+    often.signal(rustix::process::Signal::TERM).await;
+    hub.signal(rustix::process::Signal::TERM).await;
 }
