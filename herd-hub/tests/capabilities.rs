@@ -89,6 +89,13 @@ fn binary(name: &str) -> PathBuf {
     path
 }
 
+/// A port that was free a moment ago.
+///
+/// It cannot be more than that: the hub under test is a *process*, which binds
+/// the port itself, so the listener has to be let go before it starts and
+/// anything else in the suite may take it in between. [`Herd::start_hub`]
+/// therefore retries on another port rather than failing a test about
+/// capabilities for a reason that has nothing to do with them.
 fn free_port() -> u16 {
     TcpListener::bind("127.0.0.1:0")
         .expect("a free loopback port")
@@ -163,26 +170,63 @@ impl Herd {
     }
 
     async fn start_hub(&mut self) {
-        let child = Command::new(binary("herd-hub"))
-            .arg("--listen")
-            .arg(self.addr().to_string())
-            .arg("--state-dir")
-            .arg(self.state.path())
-            .stdout(self.output("hub", "out"))
-            .stderr(self.output("hub", "err"))
-            .kill_on_drop(true)
-            .spawn()
-            .expect("herd-hub starts");
-        self.hub = Some(Process { child });
-        // Waiting on the port, not on a sleep: the hub is up when it accepts.
-        let deadline = Instant::now() + PATIENCE;
-        while TcpStream::connect(self.addr()).is_err() {
+        // A few attempts, because the port was only free a moment ago: if
+        // something else in the suite took it in between, the hub exits
+        // saying so and this picks another one. Nothing else is retried —
+        // every other way the hub can fail to come up is a failure.
+        for attempt in 1..=5 {
+            let child = Command::new(binary("herd-hub"))
+                .arg("--listen")
+                .arg(self.addr().to_string())
+                .arg("--state-dir")
+                .arg(self.state.path())
+                .stdout(self.output("hub", "out"))
+                .stderr(self.output("hub", "err"))
+                .kill_on_drop(true)
+                .spawn()
+                .expect("herd-hub starts");
+            self.hub = Some(Process { child });
+            if self.hub_accepts().await {
+                return;
+            }
+            let said = self.said("hub");
             assert!(
-                Instant::now() < deadline,
-                "the hub never listened on {}: {}",
-                self.addr(),
-                self.said("hub")
+                said.contains("Address already in use"),
+                "the hub never listened on {}: {said}",
+                self.addr()
             );
+            eprintln!(
+                "this test's hub found {} taken on attempt {attempt}; trying \
+                 another port",
+                self.addr()
+            );
+            self.hub = None;
+            self.port = free_port();
+        }
+        panic!(
+            "no free port was still free by the time the hub bound it: {}",
+            self.said("hub")
+        );
+    }
+
+    /// Whether the hub came up, waiting on the port rather than on a sleep.
+    ///
+    /// `false` means the process ended instead — which is what a port taken
+    /// in the meantime looks like from here.
+    async fn hub_accepts(&mut self) -> bool {
+        let deadline = Instant::now() + PATIENCE;
+        loop {
+            if TcpStream::connect(self.addr()).is_ok() {
+                return true;
+            }
+            if let Some(process) = &mut self.hub {
+                if matches!(process.child.try_wait(), Ok(Some(_))) {
+                    return false;
+                }
+            }
+            if Instant::now() >= deadline {
+                return false;
+            }
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
     }
