@@ -2040,6 +2040,22 @@ two slots on the server is 2 × 10.5 GiB against 25 GiB admissible, and `-j 7`
 on the PC is 12.2 GiB against 14 — it fits, and barely, which is the figure
 E-22 and E-29 between them were always going to produce.
 
+**What the clamp cost, found by CI and not by reasoning.** M7's real-binary
+test of E-22 starts a runner with `--host-memory 17GiB` and asserts the
+process was given `-j 7`. That passed on the development server and went red
+on GitHub Actions the moment the clamp landed, because that box has 16 GiB:
+the lending figure was clamped and the derivation gave 6. The clamp is right
+and the test's assumption was wrong — it was simulating a machine larger than
+the one it ran on, and nothing had been making that visible. So the exact
+`-j 7` is now asserted **only on a host that really has 17 GiB**, and skipped
+with its reason elsewhere (D27); the derivation itself is asserted with no
+host at all in `herd_proto::placement`, and what that test now asserts on
+*every* host is the thing only the real binaries can show — that the figure
+on the record, the figure in the explanatory line and the figure the process
+was given are one value. The net effect is one host-dependent assertion that
+is now loud about being host-dependent, which is the trade D27 exists to
+make.
+
 **Alternative rejected.** Refusing the oversized override by name. Rejected
 because the clamp carries the same safety and keeps the machine in the fleet;
 both beat the silent accept, which is what mattered.
@@ -2108,10 +2124,16 @@ minutes at the default. M6's news path contributes on top of it whenever the
 sentence genuinely changes, and the sentence carries a countdown (`rising to
 merger in 28m`), so it changes about once a minute: `roughly` rounds to the
 minute precisely so that it is once a minute and not once a second. The
-figure measured by hand over a real ten-minute wait, before the deadline fix
-and so under the slightly rarer clock, was **11 lines** against the 300-odd
-a line per dispatch pass would have given. Writing to the *record* stays
-news-only, so the history is those ~11 lines and not every restatement.
+figures measured by hand over two real ten-minute waits are **11 lines**
+before the deadline fix and **20 after it** — the two paths interleave rather
+than coincide, the clock firing at 45 s and the countdown changing at 60 s —
+against the 300-odd a line per dispatch pass would have given. Twenty lines
+over ten minutes is two a minute for one followed job, which is a transcript
+a person reads; it is recorded here rather than tuned away, because the
+alternative is suppressing a restatement when the sentence is *about* to
+change, and that is cleverness nobody could debug. Writing to the *record*
+stays news-only, so the history was 11 lines in both runs and not every
+restatement.
 
 E-04's "what is ahead" is now in the sentence too: the jobs in front, by id
 and by level, three named and the rest counted — three because the string

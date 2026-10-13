@@ -12,6 +12,7 @@ mod real_herd;
 
 use std::time::{Duration, Instant};
 
+use herd_runner::testing::skipped;
 use real_herd::Herd;
 
 /// A runner that has one build slot and an iGPU nobody may share: the owner's
@@ -640,11 +641,35 @@ async fn the_derived_j_is_recorded_and_is_what_the_job_is_given() {
         "the build failed: {}",
         String::from_utf8_lossy(&ran.stderr)
     );
-    assert_eq!(
-        String::from_utf8_lossy(&ran.stdout).trim(),
-        "built with -j7",
-        "the figure E-22 asks for, in the process's own words"
-    );
+    // **Host-dependent, and skipped rather than fudged where it cannot be
+    // made** (D27). M8 made the runner clamp `--host-memory` to the machine's
+    // real `MemTotal`, because a figure larger than the machine makes E-29's
+    // admission floor guard memory that does not exist (D89). So the exact
+    // figure E-22 names — `-j 7` from 17 GiB — can only be asserted on a host
+    // that really has 17 GiB. The arithmetic itself is asserted without a host
+    // at all in `herd_proto::placement`; what is asserted here on *every*
+    // host is the thing only the real binaries can show: that the figure on
+    // the record is the figure the process was given.
+    let said = String::from_utf8_lossy(&ran.stdout).trim().to_owned();
+    let lends_seventeen_gibibytes =
+        herd_runner::metrics::total_memory_mib().is_some_and(|total| total >= 17 * 1024);
+    if lends_seventeen_gibibytes {
+        assert_eq!(
+            said, "built with -j7",
+            "the figure E-22 asks for, in the process's own words"
+        );
+    } else {
+        skipped(
+            "the_derived_j_is_recorded_and_is_what_the_job_is_given (E-22's own -j 7)",
+            &format!(
+                "this host has {:?} MiB of MemTotal, under the 17 GiB the figure is derived \
+                 from, and a lending figure larger than the machine is clamped (D89). The \
+                 process said {said:?} instead; the derivation itself is asserted without a \
+                 host in herd_proto::placement",
+                herd_runner::metrics::total_memory_mib()
+            ),
+        );
+    }
 
     // And the same figure on the record, where M10's requirements reading
     // will have to find it (D82).
@@ -662,15 +687,27 @@ async fn the_derived_j_is_recorded_and_is_what_the_job_is_given() {
         .max()
         .expect("the build is the newest job");
     let record = herd.record(&job);
-    assert_eq!(record["parallelism"], 7, "{record}");
     assert_eq!(record["build_thread_mib"], 1792, "{record}");
     let why = record["attempts"][0]["why"]
         .as_str()
         .expect("every attempt carries its explanation")
         .to_owned();
-    assert!(why.contains("-j 7"), "{why}");
-    assert!(why.contains("17408 MiB and 20 threads"), "{why}");
     assert!(why.contains("1792 MiB per build thread"), "{why}");
+    // **The assertion that holds on every host**, and the one only the real
+    // binaries can make: the figure written on the record, the figure in the
+    // line explaining the placement, and the figure the process was actually
+    // given are one value. Under M7's own defect — a `-j` derived at the
+    // moment of handing over, with the record told afterwards — these three
+    // could differ, and that is what this is here to catch.
+    let derived = record["parallelism"]
+        .as_u64()
+        .unwrap_or_else(|| panic!("a derived -j is on the record: {record}"));
+    assert_eq!(said, format!("built with -j{derived}"), "{record}");
+    assert!(why.contains(&format!("-j {derived}")), "{why}");
+    if lends_seventeen_gibibytes {
+        assert_eq!(derived, 7, "{record}");
+        assert!(why.contains("17408 MiB and 20 threads"), "{why}");
+    }
 }
 
 /// A figure of zero is refused where it is written, not announced as a size
