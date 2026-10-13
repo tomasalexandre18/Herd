@@ -2459,3 +2459,99 @@ declared capability on one machine.
 and the trial runs beside a build.
 
 ---
+## 2026-10-13 — D99 `herdctl switch` succeeds only once it is written down
+
+**Context.** M9 shipped E-33's switch and its own tests passed. The defect was
+found by a **docs-only pull request's CI run**: the same test,
+`a_switch_off_through_herdctl_stops_claims_in_ten_seconds_and_is_written_down`,
+failed on the two-core CI host with `the runner wrote its switch down: Os {
+code: 2, kind: NotFound }`. Nothing in that pull request touched any code. The
+twelve-thread development machine simply never lost the race, and a two-core
+box tests an ordering that a fast one cannot: every assertion about *which of
+two things happened first* is, on a wide host, an assertion about nothing.
+
+The race was real and it was not only in the test. `herdctl switch <runner>
+<position>` returned the moment the hub had **sent** the ask; the hub stopped
+claiming when the runner's health report arrived, and the runner's own switch
+file — the file that makes the position outlive a reboot (E-33) — was written
+afterwards, because `apply_a_switch` applied the position first and wrote it
+second. So there was a window, measured at about 1.5 s on two cores, in which
+the product lied to its owner: she had been told success, the hub honoured the
+position, and a runner killed inside that window came back in its **previous**
+position. For a command whose whole purpose is that an owner can take her
+machine back, that is the wrong answer.
+
+**Choice.** Two changes, and the second is the one that closes the window.
+
+* **The runner writes the file before it applies the position.** The owner's
+  own path was always this way round — `herd-runner switch` *is* the write, and
+  the running runner reads it afterwards — so now both paths leave the same
+  state in the same order. A write that fails still applies the position: she
+  asked for her machine back, and a read-only data root is not a reason to go
+  on claiming work. `switch::write` also fsyncs the temporary and the
+  directory, because `Ok` now means "durable" to a caller that reports success
+  on the strength of it.
+* **The acknowledgement travels back and `herdctl switch` waits for it.** New
+  frame `ToHub::SwitchApplied { switch, persistence }`, where `persistence` is
+  `Written { path }` or `NotWritten { why }`. It rides the control connection
+  the runner already holds (invariant 3 — nothing listens on a runner). The hub
+  bounds the wait by `SWITCH_HONOURED_WITHIN`, E-33's own ten seconds, now a
+  constant in `herd-proto` because both sides spend it.
+
+**`herd-proto` gained a frame and `PROTOCOL_VERSION` moved 5 → 6.** Also
+`FromHub::SwitchSet` gained a required `confirmed: bool`. Both numbers are
+free-running before M16 (D73), so this is cheap, but it is not free and it is
+said out loud: a version 5 peer is refused by name. The reason to move rather
+than default: a version 5 runner never acknowledges, so every `herdctl switch`
+against it would report a position nobody confirmed — a true sentence about a
+peer that is merely old, which an owner reads as a fault on her machine. And
+`confirmed` missing would default to something, and either default is a lie in
+one direction.
+
+**An unconfirmed switch is never plain success.** `herdctl switch <runner>
+<position>` exits **2** (`NOT_SETTLED_CODE`) with the sentence on stderr in
+three cases: no runner of that name is connected, the runner applied the
+position but could not write it, and no acknowledgement arrived in ten seconds.
+Not 1, which means "the job failed" (D20), and not 125, which means a job with
+no verdict — this command runs no job, and a script switching a fleet off
+before a maintenance window has to be able to tell "the hub was unreachable"
+from "the machine is off but may forget it". The timeout sentence names the
+runner, the position asked for, **what the hub actually sees** — read, not
+assumed, because the runner is the authority on the position (D98) — and what
+is not true: that the runner confirmed writing it down.
+
+**Alternative rejected: read the health report as the acknowledgement.** The
+runner already sends its switch on every report and sends one the instant the
+position moves, so no new frame would have been needed. But a health report
+says the position is *in force*, not that it is on the machine's disk — the
+runner applies a position it could not write, and rightly — and the two are
+indistinguishable from the hub. A `herdctl switch` that reported success on a
+health report would have been reporting something nobody had established, which
+is the defect again with a smaller window.
+
+**Alternative rejected: poll for the file in the test.** It would have made CI
+green in one line and hidden the product defect for good. A test that waits for
+a file to appear is a test that has agreed the product may take its time; what
+E-33 is worth depends on it not taking any. The test now reads the file in the
+statement after the one that read success, and the `kill -9` test kills the
+runner in the statement after that — no wait of any kind in either.
+
+**What is proved, and how.** The race was reproduced before it was fixed, by
+putting a 1.5 s sleep between applying and writing: the original test failed
+with the CI host's exact panic. With the fix, the same 1.5 s sleep moved to
+*before* the write — the slow half, now on the honest side of the order —
+leaves all twenty tests green, including pinned to two cores with `taskset`.
+Pushed past the budget (a 12 s write) the command reports the partial result
+instead of a false success, which is the bound working. Three tests carry it:
+the file read with no wait after success, the acknowledgement timing out
+(runner paused with `SIGSTOP`) reported as a partial result naming the runner,
+and the position that cannot be written reported as in force and not durable.
+
+**What is not proved.** The fsync is a code path, not a measurement: nothing
+here pulls power from a machine to show that the position survived. And the
+ten-second bound is spent by the *requester's* connection, so a `herdctl
+switch` against a wedged runner holds one hub connection for ten seconds; that
+is one command's own connection and nothing else waits on it, but it has not
+been measured under a fleet being switched off at once.
+
+---
