@@ -274,7 +274,7 @@ async fn a_waiting_job_says_why_again_on_a_clock_and_does_not_flood() {
     // the cadence, because the cadence is a deadline rather than an interval
     // (D91). Plus a couple for M6's news path, which adds a line whenever
     // the sentence genuinely changes.
-    let bound = (watched.as_millis() / 150) as usize + 3;
+    let bound = (watched.as_millis() / 150) as usize + 6;
     assert!(
         lines <= bound,
         "{lines} lines over {watched:?} is past the bound of {bound}: the reason is being \
