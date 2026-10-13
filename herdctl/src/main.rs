@@ -20,6 +20,46 @@ use herdctl::{
 /// record, which carries the level whatever its origin.
 const DEFAULT_PRIORITY: &str = "step";
 
+/// The three M9 options every job-making subcommand shares (E-07, E-09,
+/// E-10, D76).
+///
+/// A flattened group rather than three options written out four times: `run`,
+/// `submit` and `would-run` have to take exactly the same set, or the dry run
+/// would be answering about a job nobody can submit.
+#[derive(Debug, Clone, clap::Args)]
+struct Asking {
+    /// When this job stops being worth starting (E-09).
+    ///
+    /// An absolute moment in RFC 3339 — `2026-10-14T05:00:00+02:00` — or a
+    /// span from now: `+15m`, `+2h`, `+90s`. A job that has not **started**
+    /// by then ends `cancelled (deadline)`, with the reason naming what it
+    /// was waiting for when the moment came. A job that has started is never
+    /// touched by it; the time cap is what bounds a running job.
+    ///
+    /// It is also the only bound on a job no connected machine could ever fit
+    /// (D88), which waits rather than failing, deliberately and possibly for
+    /// ever.
+    #[arg(long, value_name = "WHEN")]
+    deadline: Option<String>,
+    /// The one job this one starts after (E-10).
+    ///
+    /// It starts after that job **succeeds** — exit 0 — and ends `cancelled`
+    /// naming the parent if it ends any other way. At most one, with no
+    /// conditions: a second edge would be a workflow language and Herd
+    /// refuses to be one. The parent must already exist.
+    #[arg(long, value_name = "JOB_ID")]
+    after: Option<String>,
+    /// The exit code this job's command means "the capability I was given
+    /// went away under me" by (D76).
+    ///
+    /// Not a verdict: such a code requeues the job with the capability read
+    /// again, a bounded number of times, and then ends it naming the code and
+    /// the machines that answered it. Separate from the two goes a job gets
+    /// at a runner that disappears.
+    #[arg(long, value_name = "CODE")]
+    requeue_exit_code: Option<i32>,
+}
+
 /// The requester CLI: submit a job, follow its log, exit with its code.
 #[derive(Debug, Parser)]
 #[command(name = "herdctl", version, about)]
@@ -74,6 +114,8 @@ enum Action {
         /// for more than a machine has in all is never sent there.
         #[arg(long, value_name = "MIB")]
         tmpfs_mib: Option<u64>,
+        #[command(flatten)]
+        asking: Asking,
         /// The command, after `--`.
         #[arg(trailing_var_arg = true, required = true, num_args = 1..)]
         command: Vec<String>,
@@ -112,9 +154,59 @@ enum Action {
         /// for more than a machine has in all is never sent there.
         #[arg(long, value_name = "MIB")]
         tmpfs_mib: Option<u64>,
+        #[command(flatten)]
+        asking: Asking,
         /// The command, after `--`.
         #[arg(trailing_var_arg = true, required = true, num_args = 1..)]
         command: Vec<String>,
+    },
+    /// Say where a job **would** run, and run nothing (E-07).
+    ///
+    /// The eligible runners with the labels each of them answers for, what is
+    /// queued ahead of it, and the verdict the claim step would give — judged
+    /// through exactly the same code a submission goes through, against the
+    /// fleet and the queue as they are this second. Nothing is minted, nothing
+    /// is written, no slot and no reservation is taken.
+    #[command(name = "would-run", alias = "dry-run")]
+    WouldRun {
+        /// A capability this job would need, by name (E-25).
+        #[arg(long = "label", value_delimiter = ',', value_name = "NAME")]
+        labels: Vec<String>,
+        /// Which of the four levels it would be weighed at (E-18).
+        #[arg(long, default_value = DEFAULT_PRIORITY, value_name = "LEVEL")]
+        priority: Priority,
+        /// How much memory one build thread would need, in MiB (E-22).
+        #[arg(long, value_name = "MIB")]
+        build_thread_mib: Option<u32>,
+        /// How much memory the whole job would need, in MiB (E-29).
+        #[arg(long, value_name = "MIB")]
+        memory_mib: Option<u64>,
+        /// How much tmpfs it would reserve, in MiB (E-31).
+        #[arg(long, value_name = "MIB")]
+        tmpfs_mib: Option<u64>,
+        #[command(flatten)]
+        asking: Asking,
+        /// The command, after `--`.
+        #[arg(trailing_var_arg = true, required = true, num_args = 1..)]
+        command: Vec<String>,
+    },
+    /// Read or move a runner's owner switch (E-33).
+    ///
+    /// With no arguments: where every runner's switch stands, with the reason
+    /// its owner gave. With a runner and a position: move it, honoured within
+    /// ten seconds.
+    ///
+    /// This is the orchestrator's half of E-33. The owner's own half is
+    /// `herd-runner switch <position> --reason ...` on the machine itself,
+    /// which needs no hub and works when the hub is down.
+    Switch {
+        /// The runner to move. Left out, every runner's switch is printed.
+        runner: Option<String>,
+        /// One of `on`, `off`, `drain`.
+        position: Option<String>,
+        /// Why. Required for `off` and `drain`, refused for `on`.
+        #[arg(long)]
+        reason: Option<String>,
     },
     /// Wait for a job that already exists, and exit with its code.
     Wait {
@@ -219,6 +311,7 @@ async fn run(args: Args) -> Result<Done> {
             build_thread_mib,
             memory_mib,
             tmpfs_mib,
+            asking,
             command,
         } => {
             // Said out loud, on stderr, before anything runs: a level is
@@ -233,11 +326,7 @@ async fn run(args: Args) -> Result<Done> {
                 command,
                 labels_of(labels)?,
                 priority,
-                herdctl::Declared {
-                    build_thread_mib,
-                    memory_mib,
-                    tmpfs_mib,
-                },
+                declared(build_thread_mib, memory_mib, tmpfs_mib, asking)?,
                 |stream, data| match stream {
                     LogStream::Stdout => write_now(&mut std::io::stdout(), data),
                     LogStream::Stderr => write_now(&mut std::io::stderr(), data),
@@ -255,6 +344,7 @@ async fn run(args: Args) -> Result<Done> {
             build_thread_mib,
             memory_mib,
             tmpfs_mib,
+            asking,
             command,
         } => {
             eprintln!("herdctl: {}", submitting_at(priority));
@@ -263,16 +353,60 @@ async fn run(args: Args) -> Result<Done> {
                 command,
                 labels_of(labels)?,
                 priority,
-                herdctl::Declared {
-                    build_thread_mib,
-                    memory_mib,
-                    tmpfs_mib,
-                },
+                declared(build_thread_mib, memory_mib, tmpfs_mib, asking)?,
             )
             .await?;
             // The id alone on stdout, so that `id=$(herdctl submit -- ...)`
             // is all a hook needs (E-42).
             println!("{job_id}");
+            Ok(Done::Said)
+        }
+        Action::WouldRun {
+            labels,
+            priority,
+            build_thread_mib,
+            memory_mib,
+            tmpfs_mib,
+            asking,
+            command,
+        } => {
+            let asked = declared(build_thread_mib, memory_mib, tmpfs_mib, asking)?
+                .asked(command, labels_of(labels)?, priority);
+            // On stdout, because this *is* the answer the caller asked for —
+            // unlike `run`, where stdout belongs to the job.
+            for line in herdctl::would_run(&config, asked).await? {
+                println!("{line}");
+            }
+            Ok(Done::Said)
+        }
+        Action::Switch {
+            runner,
+            position,
+            reason,
+        } => {
+            match (runner, position) {
+                (None, _) => {
+                    let runners = herdctl::fleet_switches(&config).await?;
+                    if runners.is_empty() {
+                        println!("no runner is connected to this hub");
+                    }
+                    for runner in &runners {
+                        println!("{}", herdctl::switch_line(runner));
+                    }
+                }
+                (Some(runner), None) => {
+                    anyhow::bail!(
+                        "`herdctl switch {runner}` does not say what to set it to: give a \
+                         position (on, off, drain), or leave the runner out to read every \
+                         switch"
+                    );
+                }
+                (Some(runner), Some(position)) => {
+                    let switch = herd_proto::Switch::parse(&position, reason.as_deref())
+                        .map_err(anyhow::Error::msg)?;
+                    println!("{}", herdctl::set_switch(&config, runner, switch).await?);
+                }
+            }
             Ok(Done::Said)
         }
         Action::Wait { job_id } => {
@@ -326,6 +460,32 @@ fn submitting_at(priority: Priority) -> String {
     } else {
         format!("submitting at priority {priority}")
     }
+}
+
+/// Everything a requester declares about a job, from the options it typed.
+///
+/// One function, for `run`, `submit` **and** `would-run`, which is what makes
+/// a dry run answer about the job a submission would make (E-07). A deadline
+/// is resolved here, against this machine's clock, so what travels is an
+/// instant (E-09).
+fn declared(
+    build_thread_mib: Option<u32>,
+    memory_mib: Option<u64>,
+    tmpfs_mib: Option<u64>,
+    asking: Asking,
+) -> Result<herdctl::Declared> {
+    let deadline_unix_s = match &asking.deadline {
+        Some(said) => Some(herdctl::deadline_at(said).context("--deadline")?),
+        None => None,
+    };
+    Ok(herdctl::Declared {
+        build_thread_mib,
+        memory_mib,
+        tmpfs_mib,
+        deadline_unix_s,
+        after: asking.after,
+        requeue_exit_code: asking.requeue_exit_code,
+    })
 }
 
 fn labels_of(labels: Vec<String>) -> Result<LabelSet> {

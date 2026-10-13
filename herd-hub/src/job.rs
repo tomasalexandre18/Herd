@@ -49,7 +49,17 @@ pub use herd_proto::JobMetrics;
 /// to zero would read as a job holding nothing while it held gibibytes. A
 /// pre-M8 state root is refused by name and no migration is written for it
 /// (D73).
-pub const RECORD_VERSION: u32 = 4;
+/// 5 since M9: a record carries its deadline, the one job it starts after and
+/// the exit code its command means "requeue me" by (E-09, E-10, D76), and an
+/// attempt says whether it ended *because of* that code. Required fields,
+/// again, and the requeue code is the one that makes it load-bearing: the
+/// budget for such a requeue is counted by reading the attempts off the record
+/// every time, separately from E-21's two goes at a lost runner (D79), so a
+/// record whose attempts could not say which kind of ending each one was would
+/// let a leased machine spend the budget that exists for a runner that
+/// disappears. A pre-M9 state root is refused by name and no migration is
+/// written for it (D73).
+pub const RECORD_VERSION: u32 = 5;
 
 /// A moment, as the record files carry it: RFC 3339 in UTC, to the
 /// nanosecond. A string a human and the consumer can both read, so that a
@@ -75,6 +85,25 @@ impl Timestamp {
     /// never read as older than it is (E-18).
     pub fn since(self, earlier: Self) -> std::time::Duration {
         (self.0 - earlier.0).try_into().unwrap_or_default()
+    }
+
+    /// A moment given as seconds since the Unix epoch, as a deadline arrives
+    /// on the wire (E-09).
+    ///
+    /// Saturating at the representable ends rather than refusing: a requester
+    /// that asked for a deadline in the year 300 000 asked for "never", and a
+    /// deadline so far in the past that it does not fit asked for "now". Both
+    /// are answers; neither is a reason to drop a submission.
+    pub fn at_unix_seconds(seconds: i64) -> Self {
+        Self(
+            time::OffsetDateTime::from_unix_timestamp(seconds)
+                .unwrap_or(time::OffsetDateTime::UNIX_EPOCH),
+        )
+    }
+
+    /// The same moment as seconds since the Unix epoch.
+    pub fn unix_seconds(self) -> i64 {
+        self.0.unix_timestamp()
     }
 
     /// This moment, `how_long` later. For a caller that needs a moment it
@@ -184,6 +213,20 @@ pub struct Attempt {
     /// which is the ordinary way and was the one that used to be left unset.
     /// `None` means the attempt is under way, and nothing else does.
     pub ended_at: Option<Timestamp>,
+    /// The declared requeue code this attempt ended **because of**, when that
+    /// is why it ended (D76).
+    ///
+    /// The field that keeps two budgets apart. A job gets two goes at a runner
+    /// that disappears (E-21, D39) and its own, separate budget of goes at a
+    /// capability that turned out to be taken — and both are counted by
+    /// reading these attempts back off the record every time, because a hub
+    /// that kept counters would have two to leak instead of none (D79).
+    /// Without something on the attempt saying which kind of ending it was,
+    /// one leased machine answering 75 three times would leave a job with no
+    /// attempts left for the case E-21 exists for.
+    ///
+    /// `None` on every other ending: a verdict, a loss, an abandonment.
+    pub requeue_code: Option<i32>,
     /// Why this attempt ended without a verdict, when that is what happened.
     /// `None` on the attempt that produced one: the job's outcome is the
     /// answer, so there is nothing to excuse (see [`Attempt::ended_at`] for
@@ -228,6 +271,13 @@ pub struct NewJob {
     pub memory_mib: Option<u64>,
     /// How much tmpfs it reserves while it runs, in MiB (E-31).
     pub tmpfs_mib: Option<u64>,
+    /// When this job stops being worth starting (E-09). Absolute, on the
+    /// hub's clock; see [`JobRecord::deadline`].
+    pub deadline: Option<Timestamp>,
+    /// The one job this one starts after (E-10).
+    pub after: Option<JobId>,
+    /// The exit code this job's command means "requeue me" by (D76).
+    pub requeue_exit_code: Option<i32>,
 }
 
 impl NewJob {
@@ -257,7 +307,25 @@ impl NewJob {
             build_thread_mib: None,
             memory_mib: None,
             tmpfs_mib: None,
+            deadline: None,
+            after: None,
+            requeue_exit_code: None,
         }
+    }
+
+    /// The same, with M9's three: when it stops being worth starting, the one
+    /// job it starts after, and the code its command means "requeue me" by
+    /// (E-09, E-10, D76).
+    pub fn with_m9(
+        mut self,
+        deadline: Option<Timestamp>,
+        after: Option<JobId>,
+        requeue_exit_code: Option<i32>,
+    ) -> Self {
+        self.deadline = deadline;
+        self.after = after;
+        self.requeue_exit_code = requeue_exit_code;
+        self
     }
 
     /// The same, with the memory one build thread needs, so that the hub
@@ -391,6 +459,47 @@ pub struct JobRecord {
     /// figure and rewrites this one; the line on each attempt keeps the
     /// arithmetic of that attempt.
     pub parallelism: Option<u32>,
+    /// When this job stops being worth starting (E-09).
+    ///
+    /// **Absolute, and on the hub's clock.** The requester's CLI turns a
+    /// human's `05:00` or `+15m` into an instant and sends the instant; the
+    /// hub records it as it received it and judges it against its own clock,
+    /// which is the only clock in Herd that decides anything. An offset from
+    /// the submission would have moved the consumer's 05:00 every time the
+    /// submission itself was late, and a deadline read against the
+    /// requester's clock would be a job cancelled because a laptop's time
+    /// zone was wrong.
+    ///
+    /// It bounds **waiting** and nothing else. A queued job past it ends
+    /// `cancelled`, with the reason naming the figures *and what it was
+    /// waiting for when the moment came*; a job that has started is never
+    /// touched by it (M4's time cap is what bounds a running job, exit 124).
+    /// It is also the only bound D88 leaves on a job no connected runner could
+    /// ever fit.
+    ///
+    /// Required, not `#[serde(default)]`, for the reason the priority is: a
+    /// reader must be able to tell a job whose requester asked for no deadline
+    /// from a record written before deadlines existed.
+    pub deadline: Option<Timestamp>,
+    /// The one job this one starts after (E-10).
+    ///
+    /// At most one, and the edge is "after it **succeeds**": a parent that
+    /// ends any other way ends this job `cancelled`, naming the parent and how
+    /// it ended. One edge and no conditions, because two would be a graph and
+    /// a graph with conditions on it is a workflow language (invariant 1).
+    ///
+    /// The parent has to exist **already** when this job is submitted, which
+    /// is what makes a cycle unrepresentable rather than merely refused: ids
+    /// are minted by the hub in order, so a job can only ever name one that is
+    /// older than itself.
+    pub after: Option<JobId>,
+    /// The exit code this job's command means "the capability I was given went
+    /// away under me" by (D76). 75 for the first consumer.
+    ///
+    /// Not a verdict: such a code causes a bounded requeue with the capability
+    /// re-probed. Absent means every code the command exits with is its own
+    /// verdict, passed through untouched (D20).
+    pub requeue_exit_code: Option<i32>,
     /// How many submissions this one execution answers (E-05).
     ///
     /// 1 for an ordinary job; 2 after a second identical submission joined
@@ -490,6 +599,86 @@ impl JobRecord {
     /// The tmpfs this job reserves, in MiB (E-31). Absent is no reservation.
     pub fn tmpfs_need_mib(&self) -> u64 {
         self.tmpfs_mib.unwrap_or(0)
+    }
+
+    /// The record a job **would** have, for a dry run to be judged on (E-07).
+    ///
+    /// Not minted and never written. Its id is
+    /// [`JobRecord::DRY_RUN_ID`], which is not a shape this hub's counter can
+    /// produce, so a record carrying it cannot be mistaken for one of this
+    /// hub's jobs by anything that reads a state root — and an id that *could*
+    /// collide would be the one way a dry run could touch a real job.
+    ///
+    /// Everything else is what the store would have written: the same
+    /// [`NewJob`], queued, submitted now, no attempt, no `-j`.
+    pub fn hypothetical(new: NewJob, now: Timestamp) -> Self {
+        Self {
+            id: JobId::new(Self::DRY_RUN_ID),
+            command: new.command,
+            labels: new.labels,
+            priority: new.priority,
+            build_thread_mib: new.build_thread_mib,
+            memory_mib: new.memory_mib,
+            tmpfs_mib: new.tmpfs_mib,
+            deadline: new.deadline,
+            after: new.after,
+            requeue_exit_code: new.requeue_exit_code,
+            parallelism: None,
+            submissions: 1,
+            state: JobState::Queued,
+            waiting_for: None,
+            submitted_at: now,
+            updated_at: now,
+            attempts: Vec::new(),
+            metrics: JobMetrics::default(),
+        }
+    }
+
+    /// The id a job that is only being asked about carries (E-07).
+    ///
+    /// Deliberately not of the form this hub mints (`j` and ten digits), so
+    /// that it can never name a real job: the one way a dry run could change
+    /// anything is by being mistaken for one.
+    pub const DRY_RUN_ID: &'static str = "(a dry run, never minted)";
+
+    /// How many goes at this job a runner has taken away with it (E-21, D39).
+    ///
+    /// Read off the attempts every time it is asked, never counted (D79), and
+    /// it counts only the attempts that ended with no verdict for a reason
+    /// that is *about the runner*: lost, abandoned, superseded. An attempt
+    /// that ended because the job answered its declared requeue code is not
+    /// one of these, which is the whole of D76's "separate budget" — a leased
+    /// machine answering 75 must not spend the goes that exist for a machine
+    /// that disappears.
+    pub fn goes_a_runner_took(&self) -> u32 {
+        self.attempts
+            .iter()
+            .filter(|attempt| attempt.ended_at.is_some() && attempt.requeue_code.is_none())
+            .count() as u32
+    }
+
+    /// How much of the requeue budget this job has spent (D76).
+    ///
+    /// Derived from the attempts, like everything else a pass needs: there is
+    /// no counter, so a hub restart rebuilds nothing and a crash mid-requeue
+    /// cannot leave a budget that has quietly grown back.
+    pub fn requeues_spent(&self) -> u32 {
+        self.attempts
+            .iter()
+            .filter(|attempt| attempt.requeue_code.is_some())
+            .count() as u32
+    }
+
+    /// The runners that answered this job's declared requeue code, in order,
+    /// each named once (D76).
+    pub fn runners_that_requeued_it(&self) -> Vec<String> {
+        let mut named: Vec<String> = Vec::new();
+        for attempt in &self.attempts {
+            if attempt.requeue_code.is_some() && !named.contains(&attempt.runner) {
+                named.push(attempt.runner.clone());
+            }
+        }
+        named
     }
 
     /// The attempt that is current, if one is.
@@ -908,7 +1097,13 @@ pub trait JobStore: Send + Sync + 'static {
     /// Idempotent: ending an attempt that is already ended keeps the first
     /// reason, because the first reason is the true one and a record is not a
     /// journal of the hub's second thoughts.
-    fn end_attempt(&self, id: &JobId, attempt: u32, reason: &str) -> Result<()>;
+    fn end_attempt(
+        &self,
+        id: &JobId,
+        attempt: u32,
+        reason: &str,
+        requeue_code: Option<i32>,
+    ) -> Result<()>;
 
     /// Append one chunk of a job's output in the order the runner produced it,
     /// as the bytes the process wrote (D18): a job's output is not text.

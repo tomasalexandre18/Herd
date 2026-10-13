@@ -346,6 +346,15 @@ struct FileCapability {
     excludes: Vec<String>,
     #[serde(default)]
     busy_probe: Option<FileProbe>,
+    /// E-27's drain-first, declared **here and only here** (D86).
+    ///
+    /// A job holding this capability starts only on a quiet host, and the host
+    /// claims nothing new while one is waiting. It is the machine operator's
+    /// own statement about her own machine, in her own file, exactly as a
+    /// probe is: nothing about a label's spelling makes Herd behave this way,
+    /// and no declaration living in a *repository* can ever turn into it.
+    #[serde(default)]
+    drain_first: bool,
 }
 
 impl FileCapability {
@@ -355,6 +364,7 @@ impl FileCapability {
             kind: self.kind.into(),
             excludes: LabelSet::new(self.excludes)?,
             busy_probe: self.busy_probe.map(BusyProbe::from),
+            drain_first: self.drain_first,
         };
         // Refused here as well as in `offer`, so that a bad capability in a
         // file is a bad capability whoever reads it.

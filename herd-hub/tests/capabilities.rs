@@ -1030,6 +1030,7 @@ async fn an_unreadable_first_frame_is_refused_whatever_is_wrong_with_it() {
                     jobs: Vec::new(),
                     draining: false,
                     load_milli: None,
+                    switch: herd_proto::Switch::On,
                 })
                 .expect("a health report encodes"),
             ),

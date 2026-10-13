@@ -8,8 +8,8 @@
 use anyhow::{anyhow, bail, Context, Result};
 use futures_util::{SinkExt, StreamExt};
 use herd_proto::{
-    cap_stop_reason, from_frame, to_frame, Cap, CapabilityOffer, FromHub, JobId, JobMetrics,
-    JobOutcome, LabelSet, LogStream, Priority, Role, ToHub, PROTOCOL_VERSION,
+    cap_stop_reason, from_frame, to_frame, Asked, Cap, CapabilityOffer, FromHub, JobId, JobMetrics,
+    JobOutcome, LabelSet, LogStream, Priority, Role, RunnerSwitch, Switch, ToHub, PROTOCOL_VERSION,
 };
 use tokio::net::TcpStream;
 use tokio_tungstenite::tungstenite::Message;
@@ -182,7 +182,7 @@ pub fn impossible_exit_code_reason(outcome: &JobOutcome) -> Option<String> {
 /// One struct rather than three arguments carried side by side: they are
 /// three answers to one question — how much of a machine this job needs — and
 /// the hub refuses two of them given together.
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Default)]
 pub struct Declared {
     /// How much memory one build thread needs, in MiB (E-22).
     pub build_thread_mib: Option<u32>,
@@ -190,6 +190,34 @@ pub struct Declared {
     pub memory_mib: Option<u64>,
     /// How much tmpfs it reserves while it runs, in MiB (E-31).
     pub tmpfs_mib: Option<u64>,
+    /// When this job stops being worth starting, in seconds since the Unix
+    /// epoch (E-09). Absolute, and judged on the hub's clock.
+    pub deadline_unix_s: Option<i64>,
+    /// The one job this one starts after (E-10). At most one, no conditions.
+    pub after: Option<String>,
+    /// The exit code this job's command means "what you gave me has gone" by
+    /// (D76). 75 for the first consumer.
+    pub requeue_exit_code: Option<i32>,
+}
+
+impl Declared {
+    /// What a requester asks for, as one [`herd_proto::Asked`] (E-07).
+    ///
+    /// One conversion, used by `run`, `submit` **and** the dry run, so that
+    /// the job E-07 judges and the job a submission makes are one job.
+    pub fn asked(self, command: Vec<String>, labels: LabelSet, priority: Priority) -> Asked {
+        Asked {
+            command,
+            labels,
+            priority,
+            build_thread_mib: self.build_thread_mib,
+            memory_mib: self.memory_mib,
+            tmpfs_mib: self.tmpfs_mib,
+            deadline_unix_s: self.deadline_unix_s,
+            after: self.after.map(JobId::new),
+            requeue_exit_code: self.requeue_exit_code,
+        }
+    }
 }
 
 pub async fn run_job(
@@ -208,12 +236,7 @@ pub async fn run_job(
     send(
         &mut socket,
         &ToHub::SubmitJob {
-            command,
-            labels,
-            priority,
-            build_thread_mib: declared.build_thread_mib,
-            memory_mib: declared.memory_mib,
-            tmpfs_mib: declared.tmpfs_mib,
+            asked: declared.asked(command, labels, priority),
         },
     )
     .await
@@ -276,12 +299,7 @@ pub async fn submit_job(
     send(
         &mut socket,
         &ToHub::SubmitJob {
-            command,
-            labels,
-            priority,
-            build_thread_mib: declared.build_thread_mib,
-            memory_mib: declared.memory_mib,
-            tmpfs_mib: declared.tmpfs_mib,
+            asked: declared.asked(command, labels, priority),
         },
     )
     .await
@@ -368,6 +386,126 @@ pub async fn wait_for_job(
 /// one sentence, because there are three true answers — it was queued and is
 /// over, it is being ended on its runner, it was already finished — and a
 /// caller that cannot tell them apart would have to guess.
+/// Ask where a job would run, and for nothing to happen (E-07).
+///
+/// The same [`Asked`] a submission carries, so the answer is about the job a
+/// submission would make. Returns the hub's lines, in order.
+pub async fn would_run(config: &Config, asked: Asked) -> Result<Vec<String>> {
+    let mut socket = join(config).await?;
+    send(&mut socket, &ToHub::DryRun { asked })
+        .await
+        .context("asking where a job would run")?;
+    match next_message(&mut socket).await? {
+        Some(FromHub::WouldRun { lines }) => {
+            let _ = socket.close(None).await;
+            Ok(lines)
+        }
+        Some(FromHub::Refused { reason }) => bail!("the hub refused the question: {reason}"),
+        Some(other) => bail!("the hub answered a dry run with {}", message_kind(&other)),
+        None => bail!("the hub closed the connection without answering"),
+    }
+}
+
+/// Move one runner's switch through the hub (E-33).
+///
+/// The orchestrator's half. The owner's half is `herd-runner switch` on the
+/// machine itself, which needs no hub at all.
+pub async fn set_switch(config: &Config, runner: String, switch: Switch) -> Result<String> {
+    let mut socket = join(config).await?;
+    send(&mut socket, &ToHub::SetSwitch { runner, switch })
+        .await
+        .context("setting a switch")?;
+    match next_message(&mut socket).await? {
+        Some(FromHub::SwitchSet { said }) => {
+            let _ = socket.close(None).await;
+            Ok(said)
+        }
+        Some(FromHub::Refused { reason }) => bail!("the hub refused: {reason}"),
+        Some(other) => bail!("the hub answered a switch with {}", message_kind(&other)),
+        None => bail!("the hub closed the connection without answering"),
+    }
+}
+
+/// Where every runner's switch stands (E-33).
+pub async fn fleet_switches(config: &Config) -> Result<Vec<RunnerSwitch>> {
+    let mut socket = join(config).await?;
+    send(&mut socket, &ToHub::AskFleetSwitches {})
+        .await
+        .context("asking where the fleet's switches stand")?;
+    match next_message(&mut socket).await? {
+        Some(FromHub::FleetSwitches { runners }) => {
+            let _ = socket.close(None).await;
+            Ok(runners)
+        }
+        Some(FromHub::Refused { reason }) => bail!("the hub refused: {reason}"),
+        Some(other) => bail!("the hub answered with {}", message_kind(&other)),
+        None => bail!("the hub closed the connection without answering"),
+    }
+}
+
+/// One runner's switch, as `herdctl switch` prints it (E-33).
+///
+/// The position, the owner's reason, and whether work is still running there —
+/// because "off with a job on it" is the ordinary case and a line that did not
+/// say so would read like a contradiction.
+pub fn switch_line(runner: &RunnerSwitch) -> String {
+    let mut line = format!("{}: {}", runner.name, runner.switch.sentence());
+    line.push_str(&match runner.jobs {
+        0 => ", nothing running".to_owned(),
+        1 => ", 1 job running there finishes".to_owned(),
+        many => format!(", {many} jobs running there finish"),
+    });
+    if runner.stopping {
+        line.push_str("; it is also stopping (SIGTERM)");
+    }
+    line
+}
+
+/// A deadline as a requester types it, in seconds since the Unix epoch
+/// (E-09).
+///
+/// Two spellings, and the relative one is resolved **here**, against this
+/// machine's clock, so that what goes on the wire is an instant: `+15m` means
+/// a quarter of an hour from now whatever the hub is doing, and `05:00
+/// tomorrow` means that moment. The hub then judges the instant against its
+/// own clock, which is the only clock in Herd that decides anything.
+///
+/// A deadline already in the past is **not** refused. "Start this only if you
+/// can start it at once" is a real thing to ask for, E-41's nightly is
+/// exactly that shape, and the job ends `cancelled (deadline)` on the first
+/// pass with the reason naming both moments.
+pub fn deadline_at(said: &str) -> Result<i64> {
+    let said = said.trim();
+    let now = time::OffsetDateTime::now_utc();
+    if let Some(offset) = said.strip_prefix('+') {
+        let seconds = parse_offset_seconds(offset)
+            .ok_or_else(|| anyhow::anyhow!("{said:?} is not a span: try +15m, +2h or +90s"))?;
+        return Ok(now.unix_timestamp() + seconds);
+    }
+    let parsed = time::OffsetDateTime::parse(said, &time::format_description::well_known::Rfc3339)
+        .with_context(|| {
+            format!(
+                "{said:?} is not a moment: give it as RFC 3339 \
+                 (2026-10-14T05:00:00+02:00) or as a span from now (+15m)"
+            )
+        })?;
+    Ok(parsed.unix_timestamp())
+}
+
+/// `90s`, `15m`, `2h`, `1d` as seconds.
+fn parse_offset_seconds(said: &str) -> Option<i64> {
+    let (figure, unit) = said.split_at(said.len().checked_sub(1)?);
+    let figure: i64 = figure.parse().ok()?;
+    let scale = match unit {
+        "s" => 1,
+        "m" => 60,
+        "h" => 60 * 60,
+        "d" => 24 * 60 * 60,
+        _ => return None,
+    };
+    figure.checked_mul(scale)
+}
+
 pub async fn cancel_job(config: &Config, job_id: JobId) -> Result<String> {
     let mut socket = join(config).await?;
     send(
@@ -437,6 +575,9 @@ async fn join(config: &Config) -> Result<Socket> {
             preference: 0,
             // Nor does a requester measure anything about a host (E-32).
             load_milli: None,
+            // And a requester has no owner's switch: nothing is ever claimed
+            // on it (E-33). `on` is what "nobody has withdrawn this" means.
+            switch: Switch::On,
             // Neither belongs to a requester. It holds nothing between
             // connections — no attempt, no spooled verdict — so there is
             // nothing for the hub to tell apart and nothing to attribute to a
@@ -498,6 +639,11 @@ fn message_kind(message: &FromHub) -> &'static str {
         FromHub::JobNote { .. } => "job_note",
         FromHub::JobFinished { .. } => "job_finished",
         FromHub::JobResultAck { .. } => "job_result_ack",
+        FromHub::WouldRun { .. } => "would_run",
+        FromHub::SwitchSet { .. } => "switch_set",
+        FromHub::FleetSwitches { .. } => "fleet_switches",
+        FromHub::SetSwitch { .. } => "set_switch",
+        FromHub::ReadProbesAgain { .. } => "read_probes_again",
     }
 }
 

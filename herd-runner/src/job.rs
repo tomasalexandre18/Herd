@@ -84,13 +84,23 @@ pub async fn execute(
     // numbers this job's output, holds its result against an acknowledgement,
     // and gives back the token every way of ending it goes through.
     let Some(cancel) = session.take_job(&job_id, attempt) else {
-        // Assigned while draining: the hub sent this before it heard that
-        // this runner is stopping. Handed straight back, so the job waits for
-        // a runner that will actually run it rather than failing (invariant 2).
+        // Assigned while this runner takes no job: the hub sent it before it
+        // heard that this runner is stopping (invariant 2) or that its owner
+        // has withdrawn the machine (E-33). Handed straight back, so the job
+        // waits for a runner that will actually run it rather than failing —
+        // and the reason names which of the two it was, because "the PC said
+        // no" and "she is gaming on the PC" are different facts.
         session.abandon(
             &job_id,
             attempt,
-            "the runner is draining and never started this job",
+            &format!(
+                "{} and never started this job",
+                if session.draining() {
+                    "the runner is draining".to_owned()
+                } else {
+                    format!("the runner is switched {}", session.switch().sentence())
+                }
+            ),
         );
         return;
     };

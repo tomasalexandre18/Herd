@@ -59,7 +59,17 @@ pub use placement::{
 /// runner announces no floor and no tmpfs, and a hub that read either as zero
 /// would admit a job into the memory its host needs to stay alive
 /// (invariant 2) or take a reservation on room nobody said was there.
-pub const PROTOCOL_VERSION: u32 = 4;
+///
+/// **5 is M9's**, and it moves for four reasons at once, every one of them a
+/// field that must never be read as absent. A runner announces its owner's
+/// [`Switch`] in the handshake and on every health report, and a hub that read
+/// a missing switch as `on` would hand work to a machine its owner has
+/// withdrawn (E-33). A submission may carry a deadline, one named parent and
+/// the exit code its command means "requeue me" by (E-09, E-10, D76), and for
+/// each of those the absence of the field means something no value of it could
+/// mean. Both numbers are still free-running before M16 (D73): a version 4
+/// peer is refused by name, there is no migration and none is owed.
+pub const PROTOCOL_VERSION: u32 = 5;
 
 /// How often a runner says it is alive and what it is doing (E-40).
 ///
@@ -146,6 +156,150 @@ pub enum Role {
     Runner,
     /// Submits jobs and follows them.
     Requester,
+}
+
+/// The owner's switch on one runner (E-33).
+///
+/// The one thing in Herd that belongs to the person whose machine it is, and
+/// the condition on which she lends it at all: three positions, honoured in
+/// **ten seconds**, settable from her own machine and from an orchestrator,
+/// with the reason she gave visible wherever the position is.
+///
+/// It is **not** the shutdown drain. A runner asked to stop by `SIGTERM` gives
+/// the machine back inside five seconds and abandons what it is running
+/// (invariant 2); this says something slower and more useful — *stop taking
+/// work* — and leaves the job in flight alone.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "position", rename_all = "snake_case")]
+pub enum Switch {
+    /// The ordinary position: this runner claims work.
+    On,
+    /// Withdrawn by its owner. Nothing new is claimed, **nothing is served to
+    /// a peer** (D11), the jobs it already holds run to their end, and
+    /// everything queued for it is claimable elsewhere at once (D80). The
+    /// runner stays connected, so the reason stays visible and `on` can be set
+    /// from anywhere.
+    Off { reason: String },
+    /// Finish and leave. Nothing new is claimed, what is held runs to its end,
+    /// and the runner disconnects once it holds nothing — the owner's way of
+    /// saying "I want this process gone, but not at the cost of the build it
+    /// is running".
+    Drain { reason: String },
+}
+
+impl Switch {
+    /// Whether this runner may be given new work.
+    pub fn claims(&self) -> bool {
+        matches!(self, Switch::On)
+    }
+
+    /// Whether this runner may serve content to a peer (D10, D11).
+    ///
+    /// **The one gate**, and it is a method on the protocol's own type rather
+    /// than a line inside the registry M11 brings, because `off` is the owner
+    /// saying "this machine is mine again": a runner that stopped claiming
+    /// jobs while still pushing a 400 MiB pack up her link would have
+    /// honoured half of E-33. A drain is the other way round — it is
+    /// finishing work it already holds, and a peer halfway through fetching
+    /// what that work produced is part of finishing it.
+    pub fn serves_content(&self) -> bool {
+        !matches!(self, Switch::Off { .. })
+    }
+
+    /// Whether the runner leaves once it holds nothing.
+    pub fn leaves_when_empty(&self) -> bool {
+        matches!(self, Switch::Drain { .. })
+    }
+
+    /// The position's own word: `on`, `off`, `drain`.
+    pub fn name(&self) -> &'static str {
+        match self {
+            Switch::On => "on",
+            Switch::Off { .. } => "off",
+            Switch::Drain { .. } => "drain",
+        }
+    }
+
+    /// The reason its owner gave, when the position carries one.
+    pub fn reason(&self) -> Option<&str> {
+        match self {
+            Switch::On => None,
+            Switch::Off { reason } | Switch::Drain { reason } => Some(reason),
+        }
+    }
+
+    /// The position and its reason, as every line that mentions it says them.
+    ///
+    /// One formatter, because this clause lands in four places — the runner's
+    /// own stderr, the hub's log, the sentence explaining why a job is not
+    /// going to that machine, and `herdctl switch` — and an operator grepping
+    /// for the reason she typed has to find it spelled one way.
+    pub fn sentence(&self) -> String {
+        match self {
+            Switch::On => "on".to_owned(),
+            Switch::Off { reason } => format!("off ({reason})"),
+            Switch::Drain { reason } => format!("draining ({reason})"),
+        }
+    }
+
+    /// Read a position from the word an owner typed, with the reason she gave.
+    ///
+    /// A reason is **required** for `off` and for `drain`, and refused for
+    /// `on`: E-33 asks for `off <reason>` in so many words, and a machine
+    /// withdrawn for no stated reason is a machine nobody can decide to switch
+    /// back on.
+    pub fn parse(position: &str, reason: Option<&str>) -> Result<Self, String> {
+        let said = reason.map(str::trim).filter(|reason| !reason.is_empty());
+        match (position, said) {
+            ("on", None) => Ok(Switch::On),
+            ("on", Some(_)) => Err(
+                "switching a runner on takes no reason: a reason is what explains a machine \
+                 being withdrawn"
+                    .to_owned(),
+            ),
+            ("off", Some(reason)) => Ok(Switch::Off {
+                reason: reason.to_owned(),
+            }),
+            ("drain", Some(reason)) => Ok(Switch::Drain {
+                reason: reason.to_owned(),
+            }),
+            ("off" | "drain", None) => Err(format!(
+                "switching a runner {position} needs a reason (--reason): the position is \
+                 visible to everyone whose job is not running, and a withdrawal nobody can \
+                 explain is one nobody can undo"
+            )),
+            (other, _) => Err(format!(
+                "{other:?} is not a switch position; it is one of on, off, drain"
+            )),
+        }
+    }
+}
+
+impl Default for Switch {
+    /// `on`, because a runner nobody has withdrawn is a runner that claims.
+    /// Used for what an absent switch file means, and nowhere on the wire:
+    /// the field is required there.
+    fn default() -> Self {
+        Switch::On
+    }
+}
+
+impl fmt::Display for Switch {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.sentence())
+    }
+}
+
+/// What one runner's switch is, as the hub reports the fleet's (E-33).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RunnerSwitch {
+    pub name: String,
+    pub switch: Switch,
+    /// How many jobs it is running. A machine switched off with a job still on
+    /// it is the ordinary case and not a contradiction: its work finishes.
+    pub jobs: u32,
+    /// Whether it is also stopping for good (`SIGTERM`, invariant 2).
+    pub stopping: bool,
 }
 
 /// How a log payload travels inside the JSON frame: standard base64, padded.
@@ -604,6 +758,16 @@ pub enum ToHub {
         /// [`ToHub::Health::load_milli`], which is where it is refreshed.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         load_milli: Option<u64>,
+        /// Where its owner's switch stands (E-33).
+        ///
+        /// In the handshake because a switch outlives the runner process: an
+        /// owner who switches her PC off and reboots it has not changed her
+        /// mind, and a runner that rejoined `on` would be a machine that gave
+        /// itself back. **Required, with no `serde(default)`**, for the reason
+        /// the priority is: a hub that read a missing switch as `on` would
+        /// hand work to a withdrawn machine, which is the one thing E-33
+        /// exists to prevent. That is what moved [`PROTOCOL_VERSION`] to 5.
+        switch: Switch,
     },
     /// Runner reports what its external busy probes say (E-26).
     ///
@@ -617,59 +781,29 @@ pub enum ToHub {
     /// probe clears (D38, E-26). Nothing here ever fails a job.
     CapabilitiesChanged { capabilities: Vec<CapabilityState> },
     /// Requester asks for work to be done.
-    SubmitJob {
-        command: Vec<String>,
-        /// The capabilities this job needs, by name (E-25). Names only: a
-        /// requester says what it needs, never which machine has it
-        /// (invariant 6), and never how the capability is governed.
-        #[serde(default, skip_serializing_if = "LabelSet::is_empty")]
-        labels: LabelSet,
-        /// Which of the four levels this job is weighed at (E-18).
-        ///
-        /// Required, with no `serde(default)`: a submission that does not say
-        /// is refused by name rather than given a level nobody chose. That is
-        /// what moved [`PROTOCOL_VERSION`] to 2, and it is the whole point —
-        /// the one way this field could do harm is by being invisible.
-        priority: Priority,
-        /// How much memory one of this job's build threads needs, in MiB.
-        ///
-        /// Present means "derive my `-j` from the machine you place me on"
-        /// (E-22): the hub divides the chosen runner's share of memory by
-        /// this figure, caps it by the host's threads, records the result and
-        /// puts it where the command's [`PARALLELISM_TOKEN`] is. Absent means
-        /// the job takes no `-j` and nothing is derived for it.
-        ///
-        /// A per-thread figure and a whole-job figure are different things,
-        /// and this is the per-thread one — 1 792 MiB for the first
-        /// consumer's builds. Whole-job memory admission is M8's (E-29).
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        build_thread_mib: Option<u32>,
-        /// How much memory this whole job needs, in MiB (E-29).
-        ///
-        /// What admission costs the job at: a runner takes it only if its
-        /// memory, less the floor it keeps for itself, less what the jobs
-        /// already out there declared, covers this figure. Absent means the
-        /// job declares no whole-job memory need — which is not zero: it is a
-        /// job admission has no figure to weigh, and it is admitted on
-        /// capabilities alone.
-        ///
-        /// Mutually exclusive with `build_thread_mib`: a build declares what
-        /// one of its threads needs and the hub multiplies by the `-j` it
-        /// derived, a test declares what the whole job needs. A submission
-        /// carrying both says two things about one question and is refused by
-        /// name.
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        memory_mib: Option<u64>,
-        /// How much room on the runner's tmpfs this job reserves while it
-        /// runs, in MiB (E-31).
-        ///
-        /// Reserved before the job starts and released by the record ending,
-        /// so there is nothing to leak (D79). `Some(0)` is a real declaration
-        /// — the first consumer's `build` and `check` need no tmpfs at all —
-        /// and absent means the same thing said by not saying it.
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        tmpfs_mib: Option<u64>,
-    },
+    ///
+    /// Everything it asks for is one [`Asked`], shared with [`ToHub::DryRun`]
+    /// — which is E-07's whole safety property. A dry run that described its
+    /// job in a second shape would be a dry run whose answer is about a
+    /// slightly different job than the one a submission makes, and that is
+    /// exactly the lie E-07 must not tell.
+    SubmitJob { asked: Asked },
+    /// Requester asks where a job **would** run, and for nothing to happen
+    /// (E-07).
+    ///
+    /// Answered with [`FromHub::WouldRun`]. Nothing is minted, nothing is
+    /// written, no slot and no reservation is taken: the hub judges the
+    /// hypothetical job through the same claim step a submission goes
+    /// through, over a copy of the fleet it throws away.
+    DryRun { asked: Asked },
+    /// Requester or owner sets one runner's switch (E-33).
+    ///
+    /// The orchestrator's half of E-33. The owner's own half needs no frame at
+    /// all: she writes the switch file on her machine, which is what keeps
+    /// invariant 3 — nothing listens on a runner.
+    SetSwitch { runner: String, switch: Switch },
+    /// Requester asks where every runner's switch stands (E-33).
+    AskFleetSwitches {},
     /// An operator raises one job above what its requester asked for (E-18).
     ///
     /// Only ever upwards. Lowering a job is not offered: it is the way to
@@ -757,6 +891,15 @@ pub enum ToHub {
         /// zero is a measurement.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         load_milli: Option<u64>,
+        /// Where its owner's switch stands (E-33).
+        ///
+        /// Repeated on every report, and sent **at once** when it moves rather
+        /// than waiting for the next one: E-33's ten seconds is a promise
+        /// about the hub stopping, not about the runner noticing. The report
+        /// is what makes the position converge anyway — a `set_switch` frame
+        /// the runner never received leaves the hub's view wrong for one
+        /// cadence and no longer.
+        switch: Switch,
     },
     /// Runner gives an attempt back without a verdict, and says why.
     ///
@@ -775,6 +918,100 @@ pub enum ToHub {
     /// The hub propagates it to whichever runner holds the attempt; a
     /// requester never names a machine (invariant 6).
     CancelJob { job_id: JobId },
+}
+
+/// Everything a requester asks for about one job (E-07).
+///
+/// One type, carried by [`ToHub::SubmitJob`] and by [`ToHub::DryRun`] alike,
+/// because E-07 asks where a job *would* go and the only useful answer is the
+/// one the real claim would give. Two shapes would be two jobs, and the dry
+/// run would be answering about the second one.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Asked {
+    pub command: Vec<String>,
+    /// The capabilities this job needs, by name (E-25). Names only: a
+    /// requester says what it needs, never which machine has it (invariant 6),
+    /// and never how the capability is governed.
+    #[serde(default, skip_serializing_if = "LabelSet::is_empty")]
+    pub labels: LabelSet,
+    /// Which of the four levels this job is weighed at (E-18).
+    ///
+    /// Required, with no `serde(default)`: a submission that does not say is
+    /// refused by name rather than given a level nobody chose. That is what
+    /// moved [`PROTOCOL_VERSION`] to 2, and it is the whole point — the one
+    /// way this field could do harm is by being invisible.
+    pub priority: Priority,
+    /// How much memory one of this job's build threads needs, in MiB.
+    ///
+    /// Present means "derive my `-j` from the machine you place me on" (E-22):
+    /// the hub divides the chosen runner's share of memory by this figure,
+    /// caps it by the host's threads, records the result and puts it where the
+    /// command's [`PARALLELISM_TOKEN`] is. Absent means the job takes no `-j`
+    /// and nothing is derived for it.
+    ///
+    /// A per-thread figure and a whole-job figure are different things, and
+    /// this is the per-thread one — 1 792 MiB for the first consumer's builds.
+    /// Whole-job memory admission is M8's (E-29).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub build_thread_mib: Option<u32>,
+    /// How much memory this whole job needs, in MiB (E-29).
+    ///
+    /// What admission costs the job at: a runner takes it only if its memory,
+    /// less the floor it keeps for itself, less what the jobs already out
+    /// there declared, covers this figure. Absent means the job declares no
+    /// whole-job memory need — which is not zero: it is a job admission has no
+    /// figure to weigh, and it is admitted on capabilities alone.
+    ///
+    /// Mutually exclusive with `build_thread_mib`: a build declares what one
+    /// of its threads needs and the hub multiplies by the `-j` it derived, a
+    /// test declares what the whole job needs. A submission carrying both says
+    /// two things about one question and is refused by name.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub memory_mib: Option<u64>,
+    /// How much room on the runner's tmpfs this job reserves while it runs, in
+    /// MiB (E-31).
+    ///
+    /// Reserved before the job starts and released by the record ending, so
+    /// there is nothing to leak (D79). `Some(0)` is a real declaration — the
+    /// first consumer's `build` and `check` need no tmpfs at all — and absent
+    /// means the same thing said by not saying it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tmpfs_mib: Option<u64>,
+    /// When this job stops being worth starting, in **seconds since the Unix
+    /// epoch** (E-09).
+    ///
+    /// An absolute instant, not an offset, and judged on the **hub's** clock:
+    /// the consumer's nightly is "skipped if it has not started by 05:00", and
+    /// an offset from a submission that was itself delayed would move the
+    /// 05:00. Unix seconds rather than a formatted time because a number has
+    /// no time zone to be wrong about — the requester's CLI is where a human's
+    /// `05:00` or `+15m` is turned into one.
+    ///
+    /// It bounds **waiting** and nothing else: a job that has not started by
+    /// then ends `cancelled`, and a job that *has* started is never touched by
+    /// it (that is M4's time cap, exit 124).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub deadline_unix_s: Option<i64>,
+    /// The one job this one starts after, if it names one (E-10).
+    ///
+    /// **One parent, no conditions**: it starts after that job *succeeds*, and
+    /// if the parent ends any other way this job ends `cancelled` naming it. A
+    /// list, a condition or a second edge would be a workflow language, which
+    /// invariant 1 refuses — anything more than this is refused by name rather
+    /// than grown into a graph.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub after: Option<JobId>,
+    /// The one exit code this job's command means "the capability I was given
+    /// went away under me" by (D76).
+    ///
+    /// 75 for the first consumer, whose `metal` commands exit it when the
+    /// machine's lease turns out to be held after all. Such a code is **not a
+    /// verdict**: it causes a bounded requeue with the capability re-probed,
+    /// on a budget of its own, separate from E-21's two attempts for a runner
+    /// that disappears. Absent means every code this job exits with is its own
+    /// verdict, reported verbatim (D20).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub requeue_exit_code: Option<i32>,
 }
 
 /// Sent by the hub to a runner or a requester.
@@ -797,6 +1034,33 @@ pub enum FromHub {
     },
     /// The hub declines to go on, and says why. Always the last frame.
     Refused { reason: String },
+    /// Where a hypothetical job would run, and nothing else (E-07).
+    ///
+    /// Lines rather than a structure, and said in the hub's own words: the
+    /// eligible runners with the labels each of them answers for, what is
+    /// queued ahead, and the verdict the claim step gave — built by the same
+    /// function that builds the line on a real placement (E-36), so the two
+    /// cannot drift. M13's machine-readable status is the structured view
+    /// (E-35); this is the sentence a person reads before submitting.
+    WouldRun { lines: Vec<String> },
+    /// The hub has set a runner's switch, or says why it has not (E-33).
+    SwitchSet { said: String },
+    /// Where every runner's switch stands (E-33).
+    FleetSwitches { runners: Vec<RunnerSwitch> },
+    /// The owner, through the hub, moves this runner's switch (E-33).
+    ///
+    /// A runner that receives it applies the position and writes it to its own
+    /// switch file, so that the two ways of setting it — her own machine and
+    /// an orchestrator — leave one state behind and a restart keeps it.
+    SetSwitch { switch: Switch, why: String },
+    /// Read your probes again, now (D76).
+    ///
+    /// Sent to the runner a job has just answered its declared requeue code
+    /// on: the capability it held turned out to be taken, so whatever the
+    /// probe last said about it is known to be stale. Without this the requeue
+    /// would be judged on the reading that caused it, and the budget would be
+    /// spent against one stale answer.
+    ReadProbesAgain { why: String },
     /// The submitted job exists and will be followed on this connection.
     JobAccepted { job_id: JobId },
     /// The runner is asked to execute this job, as attempt `attempt` of it.

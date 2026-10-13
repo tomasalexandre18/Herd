@@ -3,6 +3,7 @@ use std::time::Duration;
 
 use anyhow::{Context, Result};
 use clap::Parser;
+use herd_runner::switch::DEFAULT_POLL_MS;
 use herd_runner::capability::{
     CapabilityConfig, ProbeSettings, DEFAULT_PROBE_INTERVAL_MS, DEFAULT_PROBE_TIMEOUT_MS,
 };
@@ -193,6 +194,47 @@ struct Args {
         allow_negative_numbers = true
     )]
     preference: Option<i32>,
+    /// Where the owner's switch is kept (E-33). Under the data root by
+    /// default, as `switch`.
+    ///
+    /// A file rather than a socket, because nothing on a runner's machine ever
+    /// listens (invariant 3): `herd-runner switch off --reason ...` writes it
+    /// and a running runner reads it on a short clock. That it is a file is
+    /// also what makes it work with the hub down — which is when an owner is
+    /// most likely to want her machine back — and what makes a position
+    /// outlive a reboot.
+    #[arg(long, env = "HERD_SWITCH_FILE", value_name = "PATH")]
+    switch_file: Option<PathBuf>,
+    /// How often the switch file is read, in milliseconds. A second by
+    /// default, against E-33's ten seconds.
+    #[arg(long, env = "HERD_SWITCH_POLL", value_name = "MS")]
+    switch_poll: Option<u64>,
+    #[command(subcommand)]
+    command: Option<Command>,
+}
+
+/// What this binary does instead of being a runner (E-33).
+///
+/// One subcommand, and it is the owner's: everything else about a runner is
+/// an option on the runner itself.
+#[derive(Debug, clap::Subcommand)]
+enum Command {
+    /// Set this machine's switch and leave (E-33).
+    ///
+    /// `herd-runner switch off --reason "I am gaming"` withdraws the machine:
+    /// nothing new is claimed, nothing is served to a peer, and the jobs it
+    /// already holds finish. `drain` is the same and then leaves once it
+    /// holds nothing. `on` puts it back. Honoured within ten seconds, and it
+    /// outlives both this command and the runner process.
+    Switch {
+        /// One of `on`, `off`, `drain`.
+        position: String,
+        /// Why. Required for `off` and `drain`, refused for `on`: a machine
+        /// withdrawn for no stated reason is one nobody can decide to switch
+        /// back on.
+        #[arg(long)]
+        reason: Option<String>,
+    },
 }
 
 fn seconds(value: f64) -> Duration {
@@ -206,6 +248,31 @@ async fn main() -> Result<()> {
         Some(path) => path,
         None => DataRoot::default_path().map_err(anyhow::Error::msg)?,
     };
+    // Where the owner's switch lives: under the data root, which is the one
+    // directory this runner may write in (E-45), unless she says otherwise.
+    let switch_file = args
+        .switch_file
+        .clone()
+        .unwrap_or_else(|| herd_runner::switch::default_path(&data_root));
+    // `herd-runner switch off --reason ...`: writes the file and leaves. This
+    // is E-33's "settable by the owner from her machine" — one command, which
+    // is what a desktop shortcut can be (M17), and nothing listens on this
+    // machine for it to talk to (invariant 3).
+    if let Some(Command::Switch { position, reason }) = &args.command {
+        let switch = herd_proto::Switch::parse(position, reason.as_deref())
+            .map_err(anyhow::Error::msg)
+            .context("herd-runner switch")?;
+        herd_runner::switch::write(&switch_file, &switch)
+            .map_err(anyhow::Error::msg)
+            .context("writing the switch")?;
+        println!(
+            "herd-runner: the switch in {} is now {}. A runner of this data root honours it \
+             within ten seconds, whether or not a hub is up (E-33)",
+            switch_file.display(),
+            switch.sentence()
+        );
+        return Ok(());
+    }
     let mut confinement = Confinement::with_data_root(data_root);
     if let Some(size) = args.job_memory_max {
         confinement.memory_max = parse_bytes(&size)
@@ -397,6 +464,8 @@ async fn main() -> Result<()> {
         probes,
         host,
         preference: args.preference.unwrap_or(0),
+        switch_file: Some(switch_file),
+        switch_poll: Duration::from_millis(args.switch_poll.unwrap_or(DEFAULT_POLL_MS)),
     })
     .await
 }

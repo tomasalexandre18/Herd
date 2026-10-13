@@ -90,6 +90,25 @@ pub struct Seat {
     /// D80 records — it does not count as *available* either, so a job does
     /// not stick to a machine that is leaving.
     pub draining: bool,
+    /// Where its owner's switch stands (E-33).
+    ///
+    /// Treated exactly as a drain is, and for D80's reason: a machine its
+    /// owner has withdrawn is not *available*, so nothing waits for it and
+    /// everything queued for it is claimable elsewhere in the same pass. The
+    /// seat is still here rather than left out of the fleet, because a job
+    /// that has nowhere to go has to be able to say that the machine it would
+    /// have gone to is switched off, and why.
+    pub switch: herd_proto::Switch,
+    /// The job this host is being held empty for, with the capability that
+    /// asked for it (E-27).
+    ///
+    /// Set by [`reservations`] before a pass places anything, from the records
+    /// alone — never accumulated, never released (D79). While it is set, this
+    /// machine claims nothing else, whatever the queue's order says: a drain
+    /// that only won when the metal job happened to be at the front of the
+    /// queue would lose to every build submitted behind it, which is the
+    /// starvation E-27's "drains the build slot first" exists to answer.
+    pub reserved_for: Option<(JobId, String)>,
     pub capacity: RunnerCapacity,
     pub holdings: Holdings,
     /// What the jobs already out here declared they would take (E-29, E-31).
@@ -126,6 +145,108 @@ pub enum Placement {
     /// Nothing anywhere can ever run it, so it ends here (E-36). `why` names
     /// the labels or the figure that made it impossible.
     Impossible { why: String },
+    /// It is over before it began, and **cancelled** is what that is (E-09,
+    /// E-10, D40).
+    ///
+    /// Two causes, and neither is a fact about any machine: the job's deadline
+    /// has passed while it was still queued, or the one job it named as its
+    /// parent did not succeed. A separate variant from [`Placement::Impossible`]
+    /// because the outcomes differ and must: `impossible` says nobody could
+    /// ever run this, `cancelled` says nobody should now — and `herdctl` says
+    /// them in different words even though D40 gives both exit 125.
+    Cancel { why: String },
+}
+
+/// Where the one job this job named as its parent stands (E-10).
+///
+/// Resolved outside the claim step, by whoever has the store, and handed in:
+/// the claim step is a pure function of a record and a fleet, and a parent
+/// that had to be looked up inside it would make it a function of a disk.
+/// What the *reading* of a parent's end means is [`Parent::judge`], which is
+/// pure and is the one place that decides what "success" is.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub enum Parent {
+    /// This job named none.
+    #[default]
+    None,
+    /// It named one, and that job is still going: queued, assigned, running,
+    /// or interrupted by a hub that died.
+    NotYet { id: JobId, state: String },
+    /// It named one, and that job exited 0.
+    Succeeded { id: JobId },
+    /// It named one, and that job ended some other way. `how` is the parent's
+    /// own ending, in the words its own requester would read.
+    DidNot { id: JobId, how: String },
+    /// It named one this hub has no record of.
+    ///
+    /// Unreachable through a submission, which is refused when the parent does
+    /// not exist — but a state root can lose a directory, and the one thing
+    /// this must not do is read as a parent that succeeded.
+    Gone { id: JobId },
+}
+
+impl Parent {
+    /// What this parent says about its child: nothing, wait, or end.
+    ///
+    /// The whole of E-10's edge, in one function and in one place. **Success
+    /// is exit 0 and nothing else.** A parent that failed, was signalled,
+    /// could not start, was stopped by a cap, was cancelled, was lost or was
+    /// judged impossible did not produce what its child was waiting for, and a
+    /// child that ran anyway would be a test run against a build that is not
+    /// there (E-12's flow).
+    fn judge(&self) -> Option<Placement> {
+        match self {
+            Parent::None | Parent::Succeeded { .. } => None,
+            Parent::NotYet { id, state } => Some(Placement::Wait {
+                why: format!(
+                    "it starts after {id}, which is {state}; it waits for that job to succeed \
+                     and is cancelled if it does not (E-10)"
+                ),
+            }),
+            Parent::DidNot { id, how } => Some(Placement::Cancel {
+                why: format!(
+                    "cancelled (parent): it starts only after {id} succeeds, and {id} {how}. \
+                     One job depends on one other job's success, with no conditions and no \
+                     alternative branch (E-10)"
+                ),
+            }),
+            Parent::Gone { id } => Some(Placement::Cancel {
+                why: format!(
+                    "cancelled (parent): it starts only after {id} succeeds, and this hub has \
+                     no record of {id} at all, so whether it succeeded cannot be known. A \
+                     parent that cannot be read is never read as one that succeeded"
+                ),
+            }),
+        }
+    }
+}
+
+/// How long a job may hold a host empty waiting for it to go quiet (E-27).
+///
+/// Fifteen minutes, which is the figure E-27 names. Measured from the job's
+/// **submission**, because that is a figure on the record and therefore
+/// survives a restart and cannot leak (D79): a hub that remembered when each
+/// drain began would have one more thing to rebuild, and the one it forgot
+/// would hold a machine empty for ever.
+pub const DRAIN_FIRST_LIMIT: Duration = Duration::from_secs(15 * 60);
+
+/// What the claim step needs beyond the record and the fleet.
+///
+/// A struct rather than three more arguments, and with a [`Default`], so that
+/// the hundred-odd unit tests of the arithmetic say what they are about and
+/// nothing else. Every field here is a fact somebody else looked up.
+#[derive(Debug, Clone, Default)]
+pub struct Placing {
+    /// Where the one job this job named stands (E-10).
+    pub parent: Parent,
+    /// How long a drain-first job may hold a host empty (E-27).
+    pub drain_first_limit: Option<Duration>,
+}
+
+impl Placing {
+    fn drain_first_limit(&self) -> Duration {
+        self.drain_first_limit.unwrap_or(DRAIN_FIRST_LIMIT)
+    }
 }
 
 /// A job that fits a machine now: what was derived for it, and what it takes
@@ -458,12 +579,37 @@ fn admission(record: &JobRecord, seat: &Seat, threads: Option<u32>) -> Admission
 }
 
 /// What this runner can do with this job right now.
-fn judge(record: &JobRecord, seat: &Seat) -> Verdict {
+fn judge(record: &JobRecord, seat: &Seat, placing: &Placing, now: Timestamp) -> Verdict {
     if seat.draining {
         return Verdict::NotHere(format!(
             "{} is draining and takes no new job, so nothing waits for it",
             seat.name
         ));
+    }
+    // The owner's switch, judged exactly as the drain is and for D80's reason:
+    // a machine its owner has withdrawn is not available, so this job does not
+    // stick to it and is free to go elsewhere in this same pass (E-33).
+    if !seat.switch.claims() {
+        return Verdict::NotHere(format!(
+            "{} is switched {} by its owner and claims nothing, so nothing waits for it \
+             (E-33)",
+            seat.name,
+            seat.switch.sentence()
+        ));
+    }
+    // A host being held empty for another job takes nothing, whatever its
+    // slots say (E-27). Judged here, before the capability algebra, because
+    // the reservation is about the *host* and not about any one capability —
+    // and a job told "the build slot is free" on a machine that is being
+    // emptied would be a job claimed into the middle of a drain.
+    if let Some((held_for, label)) = &seat.reserved_for {
+        if held_for != &record.id {
+            return Verdict::NotHere(format!(
+                "{} is being emptied for {held_for}, which needs {label} and starts only on a \
+                 quiet host, so nothing new is claimed there (E-27)",
+                seat.name
+            ));
+        }
     }
     // What M5's algebra decides: the kinds, under contention with what is
     // already running here (E-25).
@@ -519,11 +665,30 @@ fn judge(record: &JobRecord, seat: &Seat) -> Verdict {
         Admission::Fits {
             memory_mib,
             tmpfs_mib,
-        } => Verdict::Now(Fitted {
-            derived,
-            memory_mib,
-            tmpfs_mib,
-        }),
+        } => {
+            // And last, E-27's drain-first: a job whose capability its
+            // machine's operator declared `drain_first` starts only when
+            // nothing else of this runner's is running. Last on purpose — a
+            // job whose lease is held, or which does not fit, has a better
+            // reason to be waiting than an empty host it could not use
+            // anyway, and the sentence an operator reads should be that one.
+            if let Some(label) = needs_a_quiet_host(record, seat) {
+                if seat.holdings.running() > 0 {
+                    return Verdict::Later(quiet_host_sentence(
+                        record,
+                        seat,
+                        &label,
+                        placing.drain_first_limit(),
+                        now,
+                    ));
+                }
+            }
+            Verdict::Now(Fitted {
+                derived,
+                memory_mib,
+                tmpfs_mib,
+            })
+        }
         // Short now is a wait, never a failure (E-31), and the job sticks to
         // this machine because a job ending here is what frees the room.
         Admission::ShortNow(why) => Verdict::Later(why),
@@ -533,6 +698,139 @@ fn judge(record: &JobRecord, seat: &Seat) -> Verdict {
         // not about a machine that can never have it.
         Admission::NotHere(why) => Verdict::NotHere(why),
     }
+}
+
+/// Which runners could run this job, now or later, and which of its labels
+/// each of them answers for (E-07).
+///
+/// The *eligible* set, in E-19's sense: available machines of this job's
+/// labels, whether or not one is free this second. Built from the same
+/// [`judge`] the claim uses, so a dry run cannot name a machine the real pass
+/// would refuse — the reverse of the defect E-07 is most easily broken by.
+pub fn eligible(
+    record: &JobRecord,
+    seats: &[Seat],
+    now: Timestamp,
+    placing: &Placing,
+) -> Vec<(String, String)> {
+    seats
+        .iter()
+        .filter(|seat| matches!(judge(record, seat, placing, now), Verdict::Now(_) | Verdict::Later(_)))
+        .map(|seat| {
+            let answered: Vec<&str> = record
+                .labels
+                .iter()
+                .filter(|label| seat.capacity.offer().available(label).is_some())
+                .collect();
+            let said = if answered.is_empty() {
+                "no capability needed".to_owned()
+            } else {
+                answered.join(", ")
+            };
+            (seat.name.clone(), said)
+        })
+        .collect()
+}
+
+/// Which capability of this job's, on this runner, asks for a quiet host
+/// (E-27).
+///
+/// `None` for every ordinary job, which is the point: nothing in Herd reads a
+/// label's spelling, and `metal-pc` only behaves differently from `build`
+/// because the PC's own capability file says `"drain_first": true` about it
+/// (D86). A label the runner does not offer cannot ask for anything.
+fn needs_a_quiet_host(record: &JobRecord, seat: &Seat) -> Option<String> {
+    record.labels.iter().find_map(|label| {
+        seat.capacity
+            .offer()
+            .available(label)
+            .filter(|capability| capability.drain_first)
+            .map(|_| label.to_owned())
+    })
+}
+
+/// Whether a drain-first job may still hold a host empty, and for how much
+/// longer (E-27).
+///
+/// Measured from the job's submission, because that is the one moment about
+/// this job that is written down (D79).
+fn may_still_hold_a_host(record: &JobRecord, limit: Duration, now: Timestamp) -> bool {
+    now.since(record.submitted_at) < limit
+}
+
+/// What a job waiting for a quiet host says, with its figures (E-04, E-27).
+fn quiet_host_sentence(
+    record: &JobRecord,
+    seat: &Seat,
+    label: &str,
+    limit: Duration,
+    now: Timestamp,
+) -> String {
+    let waited = now.since(record.submitted_at);
+    let running = seat.holdings.running();
+    if may_still_hold_a_host(record, limit, now) {
+        format!(
+            "{} is being emptied for it: {label} starts only on a quiet host and {running} \
+             job(s) are still running there, so {} claims nothing new until they end or until \
+             the {} drain-first limit is reached (--drain-first-limit); it has waited {}",
+            seat.name,
+            seat.name,
+            roughly(limit),
+            roughly(waited)
+        )
+    } else {
+        format!(
+            "{label} starts only on a quiet host and {running} job(s) are still running on \
+             {}; the {} this job may hold a machine empty for is spent after {}, so {} claims \
+             other work again and this job now waits for its host to go quiet on its own. \
+             The drain did not win: raise this job's priority, or stop submitting work to {} \
+             (--drain-first-limit)",
+            seat.name,
+            roughly(limit),
+            roughly(waited),
+            seat.name,
+            seat.name
+        )
+    }
+}
+
+/// Which hosts are being held empty for which job (E-27).
+///
+/// Read from the queued records and the fleet, at the start of every pass, and
+/// from nothing else — the same rule as the slots and the reservations (D79).
+/// A hub that remembered its drains would have a third thing to rebuild after
+/// a restart, and the one it forgot would be a machine held empty for a job
+/// that ended an hour ago.
+///
+/// Computed **before** the pass places anything, which is what makes the drain
+/// win: a reservation discovered while walking the queue in priority order
+/// would be found only after everything ahead of the metal job had already
+/// been claimed, and a stream of builds would then starve it for ever. The
+/// queue order still decides *which* job owns a contested host — the first one
+/// in it.
+pub fn reservations(
+    queued: &[JobRecord],
+    seats: &[Seat],
+    now: Timestamp,
+    limit: Duration,
+) -> BTreeMap<String, (JobId, String)> {
+    let mut held: BTreeMap<String, (JobId, String)> = BTreeMap::new();
+    for record in queued {
+        if !may_still_hold_a_host(record, limit, now) {
+            continue;
+        }
+        for seat in seats {
+            if seat.draining || !seat.switch.claims() {
+                continue;
+            }
+            let Some(label) = needs_a_quiet_host(record, seat) else {
+                continue;
+            };
+            held.entry(seat.name.clone())
+                .or_insert_with(|| (record.id.clone(), label));
+        }
+    }
+    held
 }
 
 /// Where this job goes now, among these runners.
@@ -545,20 +843,44 @@ pub fn place(
     seats: &mut [Seat],
     now: Timestamp,
     stickiness: Stickiness,
+    placing: &Placing,
 ) -> Placement {
     // A requirement the record does not carry is refused by name, never read
     // as zero and placed anywhere (D74's rule, and the defect behind it): a
     // job asking for a derived `-j` with nowhere to put it would be recorded
     // as `-j 7` and run with its tool's own default.
+    //
+    // **First, before the clock and before the parent.** A job whose own
+    // figures contradict each other is a bug a human has to fix, and a job
+    // cancelled by its deadline would have hidden it — the operator would
+    // read "cancelled (deadline)" and never learn that the submission was
+    // malformed. This is M7's own lesson in a new place: judge the fact about
+    // the submission before the fact about the moment.
     if let Some(why) = nothing_can_ever_run_this(record) {
         return Placement::Impossible { why };
+    }
+    // Then the clock (E-09). **Before anything about the fleet**, including
+    // an empty fleet: a deadline is the bound D88 leaves on a job no connected
+    // runner could ever fit, and a bound that only fired when a machine
+    // happened to be connected would not be one. Judged against the pass's
+    // single `now`, so a job is either claimed in this pass or expired in it,
+    // never both.
+    if let Some(why) = past_its_deadline(record, now) {
+        return Placement::Cancel { why };
+    }
+    // And then the one parent, if it named one (E-10).
+    if let Some(placement) = placing.parent.judge() {
+        return placement;
     }
     if seats.is_empty() {
         return Placement::Wait {
             why: "no runner is connected to this hub".to_owned(),
         };
     }
-    let verdicts: Vec<Verdict> = seats.iter().map(|seat| judge(record, seat)).collect();
+    let verdicts: Vec<Verdict> = seats
+        .iter()
+        .map(|seat| judge(record, seat, placing, now))
+        .collect();
     let is_eligible = |at: usize| matches!(verdicts[at], Verdict::Now(_) | Verdict::Later(_));
 
     // The runners this job is entitled to wait for: the ones that are
@@ -664,6 +986,41 @@ pub fn place(
         roughly(waited)
     ));
     Placement::Wait { why }
+}
+
+/// Why this job is over before it started, if its deadline has passed (E-09).
+///
+/// Only ever asked of a job the pass found **queued**: the queue is queued
+/// jobs and nothing else (`queue::order`), so a job that has started cannot
+/// reach here at all. That is the design rather than a happy accident — E-09
+/// cancels an *unstarted* job, and a running job past its deadline is M4's
+/// time cap's business and nobody else's (exit 124).
+///
+/// The sentence carries three things, and the third is the one an operator
+/// needs most: the moment that passed, how long ago, and **what the job was
+/// waiting for when it passed**. A job cancelled by a deadline it only missed
+/// because the one machine of its labels was switched off is a correct
+/// cancellation and a baffling one, unless the reason says so.
+fn past_its_deadline(record: &JobRecord, now: Timestamp) -> Option<String> {
+    let deadline = record.deadline?;
+    if now <= deadline {
+        return None;
+    }
+    let mut why = format!(
+        "cancelled (deadline): it had not started by {deadline}, which is {} ago, and a \
+         deadline cancels a job that has not started (E-09). It was submitted {} before that \
+         moment",
+        roughly(now.since(deadline)),
+        roughly(deadline.since(record.submitted_at))
+    );
+    match &record.waiting_for {
+        Some(waiting) => why.push_str(&format!(". When the moment came it was: {waiting}")),
+        None => why.push_str(
+            ". Nothing had been recorded about why it was waiting, which means no dispatch \
+             pass had judged it yet",
+        ),
+    }
+    Some(why)
 }
 
 /// Every reason of one kind, in one clause.
@@ -909,6 +1266,9 @@ mod tests {
             build_thread_mib: None,
             memory_mib: None,
             tmpfs_mib: None,
+            deadline: None,
+            after: None,
+            requeue_exit_code: None,
             parallelism: None,
             submissions: 1,
             state: JobState::Queued,
@@ -992,6 +1352,8 @@ mod tests {
             preference,
             host,
             draining: false,
+            switch: herd_proto::Switch::On,
+            reserved_for: None,
             capacity: RunnerCapacity::new(Some(name.to_owned()), offer.clone()),
             holdings: Holdings::new(offer),
             reserved: Reserved::default(),
@@ -1041,6 +1403,7 @@ mod tests {
             &mut fleet,
             now(),
             Stickiness::default(),
+            &Placing::default(),
         ));
         assert_eq!(first.0, "build-host");
         assert!(first.1.contains("build slot 1 of 2"), "{}", first.1);
@@ -1049,6 +1412,7 @@ mod tests {
             &mut fleet,
             now(),
             Stickiness::default(),
+            &Placing::default(),
         ));
         assert!(second.1.contains("build slot 2 of 2"), "{}", second.1);
         let third = waited(place(
@@ -1056,6 +1420,7 @@ mod tests {
             &mut fleet,
             now(),
             Stickiness::default(),
+            &Placing::default(),
         ));
         assert!(
             third.contains("build has 2 slot(s) and 2 are taken"),
@@ -1076,6 +1441,7 @@ mod tests {
             &mut fleet,
             now(),
             Stickiness::default(),
+            &Placing::default(),
         );
         assert!(matches!(counted, Placement::Claim { .. }));
         let exclusive = waited(place(
@@ -1083,6 +1449,7 @@ mod tests {
             &mut fleet,
             now(),
             Stickiness::default(),
+            &Placing::default(),
         ));
         assert!(
             exclusive.contains("host-wide") && exclusive.contains("running 1 other job"),
@@ -1097,6 +1464,7 @@ mod tests {
             &mut fleet,
             now(),
             Stickiness::default(),
+            &Placing::default(),
         );
         assert!(matches!(exclusive, Placement::Claim { .. }));
         let counted = waited(place(
@@ -1104,6 +1472,7 @@ mod tests {
             &mut fleet,
             now(),
             Stickiness::default(),
+            &Placing::default(),
         ));
         assert!(counted.contains("holds igpu-vfio"), "{counted}");
         let needs_nothing = waited(place(
@@ -1111,6 +1480,7 @@ mod tests {
             &mut fleet,
             now(),
             Stickiness::default(),
+            &Placing::default(),
         ));
         assert!(
             needs_nothing.contains("holds igpu-vfio"),
@@ -1132,6 +1502,7 @@ mod tests {
             &mut fleet,
             now(),
             Stickiness::default(),
+            &Placing::default(),
         ));
         assert!(why.contains("has not reported a reading"), "{why}");
         // The reading arrives and says free: it runs.
@@ -1143,7 +1514,8 @@ mod tests {
                 &queued("j1", &["igpu-vfio"]),
                 &mut fleet,
                 now(),
-                Stickiness::default()
+                Stickiness::default(),
+                &Placing::default(),
             ),
             Placement::Claim { .. }
         ));
@@ -1169,7 +1541,8 @@ mod tests {
                 &queued("j1", &["gpu-venus"]),
                 &mut fleet,
                 now(),
-                Stickiness::default()
+                Stickiness::default(),
+                &Placing::default(),
             ),
             Placement::Claim { .. }
         ));
@@ -1178,6 +1551,7 @@ mod tests {
             &mut fleet,
             now(),
             Stickiness::default(),
+            &Placing::default(),
         ));
         assert!(
             other_way.contains("igpu-vfio is host-wide")
@@ -1190,7 +1564,8 @@ mod tests {
                 &queued("j1", &["igpu-vfio"]),
                 &mut fleet,
                 now(),
-                Stickiness::default()
+                Stickiness::default(),
+                &Placing::default(),
             ),
             Placement::Claim { .. }
         ));
@@ -1199,6 +1574,7 @@ mod tests {
             &mut fleet,
             now(),
             Stickiness::default(),
+            &Placing::default(),
         ));
         assert!(back.contains("holds igpu-vfio"), "{back}");
 
@@ -1221,7 +1597,8 @@ mod tests {
                     &queued("j1", &[first]),
                     &mut fleet,
                     now(),
-                    Stickiness::default()
+                    Stickiness::default(),
+                    &Placing::default(),
                 ),
                 Placement::Claim { .. }
             ));
@@ -1230,6 +1607,7 @@ mod tests {
                 &mut fleet,
                 now(),
                 Stickiness::default(),
+                &Placing::default(),
             ));
             assert!(
                 blocked.contains(second) && blocked.contains(first),
@@ -1258,7 +1636,8 @@ mod tests {
                 &queued("j1", &["a"]),
                 &mut fleet,
                 now(),
-                Stickiness::default()
+                Stickiness::default(),
+                &Placing::default(),
             ),
             Placement::Claim { .. }
         ));
@@ -1268,7 +1647,8 @@ mod tests {
                     &queued("j2", &["c"]),
                     &mut fleet,
                     now(),
-                    Stickiness::default()
+                    Stickiness::default(),
+                    &Placing::default(),
                 ),
                 Placement::Claim { .. }
             ),
@@ -1288,6 +1668,7 @@ mod tests {
             &mut fleet,
             now(),
             Stickiness::default(),
+            &Placing::default(),
         );
         let (runner, why) = placed(placement.clone());
         assert_eq!(runner, "wsl-pc");
@@ -1317,6 +1698,7 @@ mod tests {
             &mut fleet,
             now(),
             Stickiness::default(),
+            &Placing::default(),
         ));
         assert!(why.contains("-j 6"), "two slots halve the share: {why}");
         assert!(why.contains("shared between 2 slots"), "{why}");
@@ -1340,6 +1722,7 @@ mod tests {
             &mut fleet,
             now(),
             Stickiness::default(),
+            &Placing::default(),
         ));
         assert!(
             why.contains("how much memory or how many threads"),
@@ -1358,6 +1741,7 @@ mod tests {
             &mut fleet,
             now(),
             Stickiness::default(),
+            &Placing::default(),
         ));
         assert!(why.contains("how many threads"), "{why}");
     }
@@ -1371,17 +1755,17 @@ mod tests {
         let mut fleet = vec![her_pc()];
         let mut zero = a_build("j1", 0);
         zero.build_thread_mib = Some(0);
-        let why = impossible(place(&zero, &mut fleet, now(), Stickiness::default()));
+        let why = impossible(place(&zero, &mut fleet, now(), Stickiness::default(), &Placing::default()));
         assert!(why.contains("0 MiB"), "{why}");
 
         let mut no_token = a_build("j2", 1792);
         no_token.command = vec!["cargo".to_owned(), "xtask".to_owned(), "pack".to_owned()];
-        let why = impossible(place(&no_token, &mut fleet, now(), Stickiness::default()));
+        let why = impossible(place(&no_token, &mut fleet, now(), Stickiness::default(), &Placing::default()));
         assert!(why.contains("{j}") && why.contains("1792"), "{why}");
 
         let mut twice = a_build("j3", 1792);
         twice.command = vec!["make".to_owned(), "-j{j}".to_owned(), "J={j}".to_owned()];
-        let why = impossible(place(&twice, &mut fleet, now(), Stickiness::default()));
+        let why = impossible(place(&twice, &mut fleet, now(), Stickiness::default(), &Placing::default()));
         assert!(why.contains("2 times"), "{why}");
 
         // And a job that asks for nothing derived is untouched by all of it.
@@ -1390,7 +1774,8 @@ mod tests {
                 &queued("j4", &["build"]),
                 &mut fleet,
                 now(),
-                Stickiness::default()
+                Stickiness::default(),
+                &Placing::default(),
             ),
             Placement::Claim { .. }
         ));
@@ -1410,6 +1795,7 @@ mod tests {
             &mut fleet,
             now(),
             Stickiness::default(),
+            &Placing::default(),
         ));
         assert_eq!(runner, "wsl-pc");
         assert!(why.contains("preference 10"), "{why}");
@@ -1421,6 +1807,7 @@ mod tests {
             &mut fleet,
             now(),
             Stickiness::default(),
+            &Placing::default(),
         ));
         assert!(why.contains("waiting for wsl-pc"), "{why}");
         assert!(
@@ -1445,6 +1832,7 @@ mod tests {
             &mut fleet,
             now(),
             Stickiness::default(),
+            &Placing::default(),
         ));
         assert_eq!(runner, "build-host");
         assert!(why.contains("the only eligible runner"), "{why}");
@@ -1459,6 +1847,7 @@ mod tests {
             &mut fleet,
             now(),
             Stickiness::default(),
+            &Placing::default(),
         ));
         assert_eq!(
             runner, "build-host",
@@ -1476,6 +1865,7 @@ mod tests {
             &mut fleet,
             now(),
             Stickiness::default(),
+            &Placing::default(),
         );
         assert!(matches!(busy, Placement::Claim { .. }));
 
@@ -1488,10 +1878,10 @@ mod tests {
         let moment = second
             .submitted_at
             .after(Duration::from_secs(3 * 60 * 60 + 60));
-        let waiting = place(&second, &mut fleet, second.submitted_at, stickiness);
+        let waiting = place(&second, &mut fleet, second.submitted_at, stickiness, &Placing::default());
         assert!(matches!(waiting, Placement::Wait { .. }), "{waiting:?}");
         second.waiting_for = None;
-        let (runner, why) = placed(place(&second, &mut fleet, moment, stickiness));
+        let (runner, why) = placed(place(&second, &mut fleet, moment, stickiness, &Placing::default()));
         assert_eq!(runner, "build-host");
         assert!(why.contains("past the 3h stickiness limit"), "{why}");
         assert!(why.contains("after waiting 3h01m for wsl-pc"), "{why}");
@@ -1514,6 +1904,7 @@ mod tests {
             &mut fleet,
             now(),
             Stickiness::default(),
+            &Placing::default(),
         ));
         assert!(
             why.contains("gpu-venus") && why.contains("igpu-vfio"),
@@ -1529,6 +1920,7 @@ mod tests {
             &mut fleet,
             now(),
             Stickiness::default(),
+            &Placing::default(),
         ));
         assert!(why.contains("does not offer metal-dell"), "{why}");
 
@@ -1541,6 +1933,7 @@ mod tests {
             &mut with_pc,
             now(),
             Stickiness::default(),
+            &Placing::default(),
         ));
         assert!(why.contains("does not offer metal-dell"), "{why}");
 
@@ -1565,6 +1958,7 @@ mod tests {
             &mut fleet,
             now(),
             Stickiness::default(),
+            &Placing::default(),
         ));
         assert!(why.contains("denied"), "{why}");
 
@@ -1574,6 +1968,7 @@ mod tests {
             &mut [],
             now(),
             Stickiness::default(),
+            &Placing::default(),
         ));
         assert!(why.contains("no runner is connected"), "{why}");
     }
@@ -1589,6 +1984,7 @@ mod tests {
             &mut fleet,
             now(),
             Stickiness::default(),
+            &Placing::default(),
         ));
         assert!(!why.contains('\n'), "one line: {why}");
         assert_eq!(why.matches("claimed by").count(), 1, "{why}");
@@ -1641,6 +2037,7 @@ mod tests {
             started_at: Timestamp::now(),
             ended_at: None,
             ended: None,
+            requeue_code: None,
             why: "claimed by wsl-pc: labels build".to_owned(),
         }];
         let held = holdings(std::slice::from_ref(&running));
@@ -1718,6 +2115,7 @@ mod tests {
             &mut fleet,
             now(),
             Stickiness::default(),
+            &Placing::default(),
         ));
         assert!(why.contains("running 1 other job"), "{why}");
     }
@@ -1743,6 +2141,7 @@ mod tests {
             started_at: Timestamp::now(),
             ended_at: None,
             ended: None,
+            requeue_code: None,
             why: format!("claimed by {runner}"),
         }];
         record
@@ -1770,13 +2169,13 @@ mod tests {
         let mut fleet = vec![their_server()];
         let first = a_test("j1", 14 * 1024, 0);
         let second = a_test("j2", 14 * 1024, 0);
-        let (runner, why) = placed(place(&first, &mut fleet, now(), Stickiness::default()));
+        let (runner, why) = placed(place(&first, &mut fleet, now(), Stickiness::default(), &Placing::default()));
         assert_eq!(runner, "build-host");
         assert!(
             why.contains("admitted 14 GiB of memory, 11 GiB free of 25 GiB after it"),
             "{why}"
         );
-        let why = waited(place(&second, &mut fleet, now(), Stickiness::default()));
+        let why = waited(place(&second, &mut fleet, now(), Stickiness::default(), &Placing::default()));
         assert!(
             why.contains("11 GiB free of its 25 GiB memory admission, 14 GiB needed"),
             "the second job of one pass must be weighed against the first: {why}"
@@ -1790,12 +2189,12 @@ mod tests {
         let mut fleet = vec![their_server()];
         let first = a_test("j1", 1024, 5 * 1024);
         let second = a_test("j2", 1024, 5 * 1024);
-        let (_, why) = placed(place(&first, &mut fleet, now(), Stickiness::default()));
+        let (_, why) = placed(place(&first, &mut fleet, now(), Stickiness::default(), &Placing::default()));
         assert!(
             why.contains("reserved 5 GiB in tmpfs, 3 GiB free of 8 GiB"),
             "{why}"
         );
-        let why = waited(place(&second, &mut fleet, now(), Stickiness::default()));
+        let why = waited(place(&second, &mut fleet, now(), Stickiness::default(), &Placing::default()));
         assert!(
             why.contains("3 GiB free in tmpfs, 5 GiB needed (8 GiB of tmpfs there in all)"),
             "{why}"
@@ -1822,6 +2221,7 @@ mod tests {
             &mut fleet,
             now(),
             Stickiness::default(),
+            &Placing::default(),
         ));
         assert!(
             why.contains("5 GiB free of its 25 GiB memory admission, 6 GiB needed"),
@@ -1842,6 +2242,7 @@ mod tests {
             &mut fleet,
             now(),
             Stickiness::default(),
+            &Placing::default(),
         ));
         assert!(
             why.contains("1.2 GiB free in tmpfs, 2 GiB needed"),
@@ -1865,6 +2266,7 @@ mod tests {
             &mut fleet,
             now(),
             Stickiness::default(),
+            &Placing::default(),
         ));
         assert!(why.contains("it is waiting for build-host"), "{why}");
         assert!(why.contains("2 GiB free in tmpfs, 4 GiB needed"), "{why}");
@@ -1877,6 +2279,7 @@ mod tests {
             &mut fleet,
             now(),
             Stickiness::default(),
+            &Placing::default(),
         ));
         assert!(
             why.contains("build-host has 8 GiB of tmpfs in all and this job needs 16 GiB"),
@@ -1905,6 +2308,7 @@ mod tests {
             &mut whole_fleet,
             now(),
             Stickiness::default(),
+            &Placing::default(),
         ));
         assert_eq!(runner, "big-host");
         // With that machine gone, the job waits rather than ending.
@@ -1914,6 +2318,7 @@ mod tests {
             &mut fleet,
             now(),
             Stickiness::default(),
+            &Placing::default(),
         );
         assert!(
             matches!(placement, Placement::Wait { .. }),
@@ -1940,6 +2345,7 @@ mod tests {
             &mut fleet,
             now(),
             Stickiness::default(),
+            &Placing::default(),
         ));
         assert!(
             why.contains("silent-floor does not say how much memory it keeps back"),
@@ -1959,6 +2365,7 @@ mod tests {
             &mut fleet,
             now(),
             Stickiness::default(),
+            &Placing::default(),
         ));
         assert!(
             why.contains("silent-tmpfs does not say how much tmpfs it has"),
@@ -1978,6 +2385,7 @@ mod tests {
             &mut fleet,
             now(),
             Stickiness::default(),
+            &Placing::default(),
         ));
         assert_eq!(runner, "silent-tmpfs");
         assert!(why.contains("it reserves no tmpfs"), "{why}");
@@ -1991,7 +2399,7 @@ mod tests {
         let mut zero = queued("j1", &["build"]);
         zero.memory_mib = Some(0);
         let mut fleet = vec![their_server()];
-        let why = impossible(place(&zero, &mut fleet, now(), Stickiness::default()));
+        let why = impossible(place(&zero, &mut fleet, now(), Stickiness::default(), &Placing::default()));
         assert!(
             why.contains("0 MiB of memory, which is not a figure"),
             "{why}"
@@ -1999,7 +2407,7 @@ mod tests {
 
         let mut both = a_build("j2", 1792);
         both.memory_mib = Some(8192);
-        let why = impossible(place(&both, &mut fleet, now(), Stickiness::default()));
+        let why = impossible(place(&both, &mut fleet, now(), Stickiness::default(), &Placing::default()));
         assert!(why.contains("two answers to one question"), "{why}");
     }
 
@@ -2016,6 +2424,7 @@ mod tests {
             &mut fleet,
             now(),
             Stickiness::default(),
+            &Placing::default(),
         ));
         assert!(why.contains("-j 6"), "{why}");
         assert!(why.contains("admitted 10.5 GiB of memory"), "{why}");
@@ -2026,6 +2435,7 @@ mod tests {
             &mut fleet,
             now(),
             Stickiness::default(),
+            &Placing::default(),
         ));
         assert!(why.contains("admitted 10.5 GiB of memory"), "{why}");
         assert!(why.contains("build slot 2 of 2"), "{why}");
@@ -2038,6 +2448,7 @@ mod tests {
             &mut fleet,
             now(),
             Stickiness::default(),
+            &Placing::default(),
         ));
         assert!(why.contains("-j 7"), "{why}");
         assert!(why.contains("admitted 12.2 GiB of memory"), "{why}");
@@ -2141,6 +2552,7 @@ mod tests {
             &mut fleet,
             now(),
             Stickiness::default(),
+            &Placing::default(),
         ));
         assert!(why.contains("build-host is holding j1"), "{why}");
         assert!(why.contains("cannot be costed"), "{why}");
@@ -2166,6 +2578,7 @@ mod tests {
             &mut fleet,
             now(),
             Stickiness::default(),
+            &Placing::default(),
         ));
         assert!(
             why.contains("all-floor admits at most 0 MiB of memory (4 GiB lent, 8 GiB kept"),
@@ -2185,6 +2598,7 @@ mod tests {
             &mut quiet,
             now(),
             Stickiness::default(),
+            &Placing::default(),
         ));
         let mut hammered = vec![their_server()];
         hammered[0].load_milli = Some(50_000);
@@ -2193,6 +2607,7 @@ mod tests {
             &mut hammered,
             now(),
             Stickiness::default(),
+            &Placing::default(),
         ));
         assert_eq!(
             calm_runner, busy_runner,
@@ -2221,6 +2636,7 @@ mod tests {
             &mut silent,
             now(),
             Stickiness::default(),
+            &Placing::default(),
         ));
         assert_eq!(runner, "build-host");
         assert!(why.contains("does not say what its load is"), "{why}");
@@ -2250,4 +2666,505 @@ mod tests {
             }
         }
     }
+    // ---------------------------------------------------------------- M9
+
+    fn cancelled(placement: Placement) -> String {
+        match placement {
+            Placement::Cancel { why } => why,
+            other => panic!("expected a cancellation, got {other:?}"),
+        }
+    }
+
+    /// A runner whose owner has switched it off is not available (E-33, D80).
+    ///
+    /// Not here, rather than later: the job must not stick to a machine that
+    /// has been withdrawn, and the sentence has to carry her reason, because
+    /// "the PC is busy" and "she is gaming" are different facts.
+    #[test]
+    fn a_switched_off_runner_takes_nothing_and_nothing_waits_for_it() {
+        let mut off = her_pc();
+        off.switch = herd_proto::Switch::Off {
+            reason: "she is gaming".to_owned(),
+        };
+        let mut fleet = vec![their_server(), off];
+        // The PC is preferred (10 against 0) and would normally take a build
+        // under E-19. Switched off, the build goes to the server at once.
+        let (runner, _) = placed(place(
+            &queued("j1", &["build"]),
+            &mut fleet,
+            now(),
+            Stickiness::default(),
+            &Placing::default(),
+        ));
+        assert_eq!(
+            runner, "build-host",
+            "a job must not stick to a machine its owner has withdrawn (D80)"
+        );
+        // And with nothing else to take it, the wait names the position and
+        // the reason she typed.
+        let mut only_the_pc = vec![fleet.pop().expect("the pc is last")];
+        let why = waited(place(
+            &queued("j2", &["build"]),
+            &mut only_the_pc,
+            now(),
+            Stickiness::default(),
+            &Placing::default(),
+        ));
+        assert!(
+            why.contains("wsl-pc is switched off (she is gaming)"),
+            "the sentence must carry the owner's own words: {why}"
+        );
+        assert!(why.contains("E-33"), "{why}");
+    }
+
+    /// A queued job past its deadline is cancelled, and the sentence says
+    /// what it was waiting for when the moment came (E-09, attack 11).
+    #[test]
+    fn a_queued_job_past_its_deadline_is_cancelled_and_says_what_it_waited_for() {
+        let mut off = her_pc();
+        off.switch = herd_proto::Switch::Off {
+            reason: "she is gaming".to_owned(),
+        };
+        let mut fleet = vec![off];
+        let mut record = queued("j1", &["build"]);
+        // What the previous pass wrote on it: the machine of its labels was
+        // switched off.
+        record.waiting_for =
+            Some("queued 1st of 1 … wsl-pc is switched off (she is gaming)".to_owned());
+        record.deadline = Some(record.submitted_at.after(Duration::from_secs(60)));
+        let moment = record.submitted_at.after(Duration::from_secs(5 * 60));
+        let why = cancelled(place(
+            &record,
+            &mut fleet,
+            moment,
+            Stickiness::default(),
+            &Placing::default(),
+        ));
+        assert!(why.starts_with("cancelled (deadline)"), "{why}");
+        assert!(why.contains("4m ago"), "the sentence carries the figures: {why}");
+        assert!(
+            why.contains("she is gaming"),
+            "a job cancelled by a deadline it missed because its machine was off must say \
+             so, not merely say 'deadline': {why}"
+        );
+    }
+
+    /// The deadline fires with no fleet at all, which is the bound D88 leaves
+    /// on a job no connected runner could ever fit (E-09).
+    #[test]
+    fn a_deadline_fires_on_an_empty_fleet_which_is_d88_s_only_bound() {
+        let mut record = queued("j1", &["build"]);
+        record.deadline = Some(record.submitted_at);
+        let why = cancelled(place(
+            &record,
+            &mut [],
+            record.submitted_at.after(Duration::from_secs(1)),
+            Stickiness::default(),
+            &Placing::default(),
+        ));
+        assert!(why.starts_with("cancelled (deadline)"), "{why}");
+    }
+
+    /// A deadline already past at submission fires on the first pass, and one
+    /// exactly at the moment of the pass does not: the comparison is strict,
+    /// so a job and its deadline arriving together is a job that may start.
+    #[test]
+    fn a_deadline_in_the_past_fires_at_once_and_one_on_the_dot_does_not() {
+        let mut record = queued("j1", &["build"]);
+        let moment = record.submitted_at;
+        record.deadline = Some(moment.after(Duration::from_secs(0)));
+        let mut fleet = vec![their_server()];
+        // On the dot: not past, so the job is placed.
+        assert!(matches!(
+            place(&record, &mut fleet, moment, Stickiness::default(), &Placing::default()),
+            Placement::Claim { .. }
+        ));
+        // A nanosecond later it is past, and the pass's single `now` is what
+        // decides — so a job is either claimed in a pass or expired in it,
+        // never both.
+        let mut fleet = vec![their_server()];
+        let why = cancelled(place(
+            &record,
+            &mut fleet,
+            moment.after(Duration::from_nanos(1)),
+            Stickiness::default(),
+            &Placing::default(),
+        ));
+        assert!(why.starts_with("cancelled (deadline)"), "{why}");
+    }
+
+    /// A job whose own figures contradict each other says *that*, even when
+    /// its deadline has also passed — M7's lesson, in a new place: the fact
+    /// about the submission is judged before the fact about the moment, or a
+    /// malformed job would be reported as a late one and the bug would never
+    /// be found.
+    #[test]
+    fn a_contradictory_submission_outranks_its_own_deadline() {
+        let mut record = a_build("j1", 1792);
+        record.memory_mib = Some(4096);
+        record.deadline = Some(record.submitted_at);
+        let mut fleet = vec![their_server()];
+        let why = impossible(place(
+            &record,
+            &mut fleet,
+            record.submitted_at.after(Duration::from_secs(60)),
+            Stickiness::default(),
+            &Placing::default(),
+        ));
+        assert!(why.contains("two answers to one question"), "{why}");
+    }
+
+    /// E-10's one edge, every way a parent can end.
+    ///
+    /// Success is exit 0 and nothing else. Every other ending cancels the
+    /// child **by name**, so that an operator reading the child's record
+    /// learns which job let it down and how.
+    #[test]
+    fn a_parent_that_did_not_succeed_cancels_its_child_by_name() {
+        let mut fleet = vec![their_server()];
+        let child = queued("j2", &["build"]);
+        // Succeeded: the child is placed like anything else.
+        assert!(matches!(
+            place(
+                &child,
+                &mut fleet,
+                now(),
+                Stickiness::default(),
+                &Placing {
+                    parent: Parent::Succeeded {
+                        id: JobId::new("j1")
+                    },
+                    ..Placing::default()
+                }
+            ),
+            Placement::Claim { .. }
+        ));
+        // Still going: it waits, naming the parent and where it is.
+        let why = waited(place(
+            &child,
+            &mut fleet,
+            now(),
+            Stickiness::default(),
+            &Placing {
+                parent: Parent::NotYet {
+                    id: JobId::new("j1"),
+                    state: "running".to_owned(),
+                },
+                ..Placing::default()
+            },
+        ));
+        assert!(
+            why.contains("it starts after j1, which is running"),
+            "{why}"
+        );
+        // Every other ending: cancelled, naming the parent and how it went.
+        for how in [
+            "exited 1 rather than 0",
+            "was killed by signal 9",
+            "was cancelled: its requester asked",
+            "was lost: runner wsl-pc stopped answering",
+            "was stopped by its Time cap of 7200",
+            "could never have run: nothing offers metal-dell",
+        ] {
+            let why = cancelled(place(
+                &child,
+                &mut fleet,
+                now(),
+                Stickiness::default(),
+                &Placing {
+                    parent: Parent::DidNot {
+                        id: JobId::new("j1"),
+                        how: how.to_owned(),
+                    },
+                    ..Placing::default()
+                },
+            ));
+            assert!(why.starts_with("cancelled (parent)"), "{why}");
+            assert!(why.contains("j1"), "{why}");
+            assert!(why.contains(how), "the child says how its parent went: {why}");
+        }
+        // And a parent nothing can be read about is never read as one that
+        // succeeded.
+        let why = cancelled(place(
+            &child,
+            &mut fleet,
+            now(),
+            Stickiness::default(),
+            &Placing {
+                parent: Parent::Gone {
+                    id: JobId::new("j1"),
+                },
+                ..Placing::default()
+            },
+        ));
+        assert!(why.contains("no record of j1 at all"), "{why}");
+    }
+
+    /// A drain-first capability empties its host before the job starts, and
+    /// the host claims nothing new while it waits (E-27).
+    #[test]
+    fn a_drain_first_job_waits_for_a_quiet_host_and_reserves_it() {
+        let trial = queued("j9", &["metal-pc"]);
+        let build = queued("j1", &["build"]);
+        let mut pc = her_pc_with_a_metal_lease();
+        // A build is already running there.
+        pc.holdings
+            .already_holding(&JobId::new("j0"), labels(&["build"]));
+        pc.reserved.jobs = 1;
+        let queue = vec![build.clone(), trial.clone()];
+        let seats = vec![pc];
+        let reserved = reservations(&queue, &seats, now(), DRAIN_FIRST_LIMIT);
+        assert_eq!(
+            reserved.get("wsl-pc").map(|(id, label)| (id.to_string(), label.clone())),
+            Some(("j9".to_owned(), "metal-pc".to_owned())),
+            "the host must be reserved for the trial even though a build is ahead of it in \
+             the queue: a drain that lost to queue order would starve (E-27)"
+        );
+        let mut seats = seats;
+        for seat in seats.iter_mut() {
+            seat.reserved_for = reserved.get(&seat.name).cloned();
+        }
+        // The trial waits for the host to go quiet, with the figures.
+        let why = waited(place(
+            &trial,
+            &mut seats,
+            now(),
+            Stickiness::default(),
+            &Placing::default(),
+        ));
+        assert!(
+            why.contains("wsl-pc is being emptied for it"),
+            "{why}"
+        );
+        assert!(why.contains("1 job(s) are still running there"), "{why}");
+        assert!(why.contains("15m drain-first limit"), "{why}");
+        // And the build behind it is **not** claimed there, which is the
+        // whole of the drain: builds that kept arriving would otherwise keep
+        // the host busy for ever.
+        let why = waited(place(
+            &build,
+            &mut seats,
+            now(),
+            Stickiness::default(),
+            &Placing::default(),
+        ));
+        assert!(
+            why.contains("wsl-pc is being emptied for j9"),
+            "a host being emptied must claim nothing new (E-27): {why}"
+        );
+    }
+
+    /// A quiet host runs the trial at once.
+    #[test]
+    fn a_drain_first_job_starts_when_its_host_is_quiet() {
+        let trial = queued("j9", &["metal-pc"]);
+        let mut seats = vec![her_pc_with_a_metal_lease()];
+        let reserved = reservations(&[trial.clone()], &seats, now(), DRAIN_FIRST_LIMIT);
+        for seat in seats.iter_mut() {
+            seat.reserved_for = reserved.get(&seat.name).cloned();
+        }
+        let (runner, _) = placed(place(
+            &trial,
+            &mut seats,
+            now(),
+            Stickiness::default(),
+            &Placing::default(),
+        ));
+        assert_eq!(runner, "wsl-pc");
+    }
+
+    /// A drain that did not win says so, and gives the machine back (E-27).
+    ///
+    /// Bounded, because a host held empty for a job that never comes is a
+    /// machine lent for nothing. Past the limit the reservation is gone, the
+    /// host takes other work again, and the trial's sentence says the drain
+    /// did not win rather than going on claiming it is about to.
+    #[test]
+    fn a_drain_that_times_out_gives_the_machine_back_and_says_so() {
+        let trial = queued("j9", &["metal-pc"]);
+        let build = queued("j1", &["build"]);
+        let mut pc = her_pc_with_a_metal_lease();
+        pc.holdings
+            .already_holding(&JobId::new("j0"), labels(&["build"]));
+        pc.reserved.jobs = 1;
+        let mut seats = vec![pc];
+        let too_late = trial.submitted_at.after(DRAIN_FIRST_LIMIT + Duration::from_secs(60));
+        let reserved = reservations(
+            &[build.clone(), trial.clone()],
+            &seats,
+            too_late,
+            DRAIN_FIRST_LIMIT,
+        );
+        assert!(
+            reserved.is_empty(),
+            "past its limit a drain-first job holds no host empty: {reserved:?}"
+        );
+        for seat in seats.iter_mut() {
+            seat.reserved_for = reserved.get(&seat.name).cloned();
+        }
+        let why = waited(place(
+            &trial,
+            &mut seats,
+            too_late,
+            Stickiness::default(),
+            &Placing::default(),
+        ));
+        assert!(
+            why.contains("The drain did not win"),
+            "a drain that lost must say so rather than promising: {why}"
+        );
+        assert!(why.contains("--drain-first-limit"), "{why}");
+    }
+
+    /// A withdrawn or draining machine is never held empty for anything: a
+    /// reservation on a machine that claims nothing is a machine lent twice
+    /// over for nothing.
+    #[test]
+    fn nothing_holds_a_withdrawn_machine_empty() {
+        let trial = queued("j9", &["metal-pc"]);
+        for seat in [
+            {
+                let mut seat = her_pc_with_a_metal_lease();
+                seat.switch = herd_proto::Switch::Off {
+                    reason: "she is gaming".to_owned(),
+                };
+                seat
+            },
+            {
+                let mut seat = her_pc_with_a_metal_lease();
+                seat.draining = true;
+                seat
+            },
+        ] {
+            let reserved = reservations(&[trial.clone()], &[seat], now(), DRAIN_FIRST_LIMIT);
+            assert!(reserved.is_empty(), "{reserved:?}");
+        }
+    }
+
+    /// Her PC, with the metal lease of E-27 declared on it: counted(1) with a
+    /// probe (D76), and **drain-first declared in her own file** (D86) —
+    /// nothing about the spelling `metal-pc` does anything here.
+    fn her_pc_with_a_metal_lease() -> Seat {
+        let mut seat = seat(
+            "wsl-pc",
+            10,
+            HostSize::new(Some(17 * 1024), Some(20))
+                .with_floor(Some(3 * 1024))
+                .with_tmpfs(Some(2 * 1024)),
+            offering(vec![
+                declared(Capability::counted("build", 1)),
+                declared(
+                    Capability::lease(
+                        "metal-pc",
+                        BusyProbe::Command {
+                            command: vec![
+                                "cargo".to_owned(),
+                                "xtask".to_owned(),
+                                "metal".to_owned(),
+                                "pc".to_owned(),
+                                "--lease-status".to_owned(),
+                            ],
+                            busy_exit_code: 10,
+                            free_exit_code: 0,
+                        },
+                    )
+                    .draining_first(),
+                ),
+            ]),
+        );
+        // The lease read free, which is what a probe says when nobody outside
+        // Herd holds the machine (D49: an unread probe suspends, so a test of
+        // the drain has to say the lease was read).
+        seat.capacity
+            .update(vec![CapabilityState::new("metal-pc", Availability::Free)]);
+        seat
+    }
+
+    /// Nothing in Herd reads the `metal-` prefix (E-27, invariant 1).
+    ///
+    /// The same label, declared without `drain_first`, behaves as any counted
+    /// capability does: the trial runs beside a build. What makes a metal
+    /// trial empty the PC is the flag in the PC's own file, and this test is
+    /// what keeps that true.
+    #[test]
+    fn the_metal_prefix_means_nothing_without_the_declared_flag() {
+        let trial = queued("j9", &["metal-pc"]);
+        let mut pc = seat(
+            "wsl-pc",
+            10,
+            HostSize::new(Some(17 * 1024), Some(20))
+                .with_floor(Some(3 * 1024))
+                .with_tmpfs(Some(2 * 1024)),
+            offering(vec![
+                declared(Capability::counted("build", 1)),
+                declared(Capability::counted("metal-pc", 1)),
+            ]),
+        );
+        pc.holdings
+            .already_holding(&JobId::new("j0"), labels(&["build"]));
+        pc.reserved.jobs = 1;
+        let mut seats = vec![pc];
+        let reserved = reservations(&[trial.clone()], &seats, now(), DRAIN_FIRST_LIMIT);
+        assert!(
+            reserved.is_empty(),
+            "a label called metal-anything means nothing to Herd: {reserved:?}"
+        );
+        for seat in seats.iter_mut() {
+            seat.reserved_for = reserved.get(&seat.name).cloned();
+        }
+        assert!(matches!(
+            place(
+                &trial,
+                &mut seats,
+                now(),
+                Stickiness::default(),
+                &Placing::default()
+            ),
+            Placement::Claim { .. }
+        ));
+    }
+
+    /// The two budgets are counted from different attempts of one record
+    /// (D76, D79) — a leased machine must not spend the goes that exist for a
+    /// machine that disappears.
+    #[test]
+    fn the_requeue_budget_and_the_lost_runner_budget_are_counted_apart() {
+        let mut record = queued("j1", &["metal-pc"]);
+        record.requeue_exit_code = Some(75);
+        let attempt = |number: u32, runner: &str, requeue_code: Option<i32>| Attempt {
+            number,
+            runner: runner.to_owned(),
+            started_at: record.submitted_at,
+            ended_at: Some(record.submitted_at),
+            requeue_code,
+            ended: Some("ended".to_owned()),
+            why: "claimed by somebody".to_owned(),
+        };
+        record.attempts = vec![
+            attempt(1, "wsl-pc", Some(75)),
+            attempt(2, "build-host", Some(75)),
+        ];
+        assert_eq!(record.requeues_spent(), 2);
+        assert_eq!(
+            record.goes_a_runner_took(),
+            0,
+            "two machines answering 75 must leave both of E-21's goes unspent"
+        );
+        assert_eq!(
+            record.runners_that_requeued_it(),
+            vec!["wsl-pc".to_owned(), "build-host".to_owned()]
+        );
+        // And the other way round: a lost runner spends no requeue budget.
+        record.attempts.push(attempt(3, "wsl-pc", None));
+        assert_eq!(record.goes_a_runner_took(), 1);
+        assert_eq!(record.requeues_spent(), 2);
+        // An attempt still under way counts for neither.
+        let mut running = attempt(4, "build-host", None);
+        running.ended_at = None;
+        running.ended = None;
+        record.attempts.push(running);
+        assert_eq!(record.goes_a_runner_took(), 1);
+        assert_eq!(record.requeues_spent(), 2);
+    }
+
 }
