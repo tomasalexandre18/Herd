@@ -280,6 +280,29 @@ impl Herd {
         }
     }
 
+    /// Ask the runner to stop, and wait for it to be gone.
+    ///
+    /// `SIGTERM` rather than the `kill_on_drop` every other test here relies
+    /// on: a drain lets the runner take its own probe processes with it
+    /// (invariant 2), while a hard kill leaves whatever it had in flight
+    /// running on the host.
+    async fn stop_runner(&mut self) {
+        let Some(process) = &mut self.runner else {
+            return;
+        };
+        let pid = process.child.id().expect("a running runner has a pid");
+        rustix::process::kill_process(
+            rustix::process::Pid::from_raw(pid as i32).expect("a pid is not zero"),
+            rustix::process::Signal::TERM,
+        )
+        .expect("the runner takes a signal");
+        tokio::time::timeout(PATIENCE, process.child.wait())
+            .await
+            .expect("a runner asked to stop is gone inside five seconds (invariant 2)")
+            .expect("the runner's exit status reads");
+        self.runner = None;
+    }
+
     async fn herdctl(&self, arguments: &[&str]) -> std::process::Output {
         tokio::time::timeout(
             PATIENCE,
@@ -1057,13 +1080,17 @@ async fn ten_hanging_probes_do_not_delay_the_runner_joining() {
     const PROBES: usize = 10;
     /// The real default. A serial sweep would spend PROBES times this.
     const PROBE_TIMEOUT_MS: u64 = 2_000;
+    /// Longer than the timeout, so the probe hangs as far as the runner is
+    /// concerned, and short enough that one left behind by a hard kill of
+    /// this test's own processes reaps itself rather than outliving the suite.
+    const HANGS_FOR_SECONDS: u64 = 8;
 
     let declared: Vec<String> = (0..PROBES)
         .map(|n| {
             format!(
                 r#"{{"name":"hangs-{n}","kind":{{"type":"shared"}},
                      "busy_probe":{{"type":"command",
-                                    "command":["/bin/sh","-c","sleep 600"]}}}}"#
+                                    "command":["/bin/sleep","{HANGS_FOR_SECONDS}"]}}}}"#
             )
         })
         .collect();
@@ -1150,4 +1177,11 @@ async fn ten_hanging_probes_do_not_delay_the_runner_joining() {
         "a job needing nothing must run while ten probes hang: {}",
         String::from_utf8_lossy(&ran.stderr)
     );
+
+    // Asked to stop, not killed. This test is the one place in the suite
+    // where ten probe processes are in flight at once, and a `SIGKILL` would
+    // leave every one of them running — not the runner's fault, but this
+    // test's leavings all the same, and invariant 2 is about a runner that
+    // does not litter the host it runs on.
+    herd.stop_runner().await;
 }
