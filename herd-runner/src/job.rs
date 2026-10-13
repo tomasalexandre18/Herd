@@ -324,12 +324,19 @@ pub async fn execute(
     // job's own record and not only in the runner's log.
     drop(cgroup);
     reclaim_or_say(&workspace, &job_id, &session, &seq);
-    confined.live().remove(token);
 
     // Held until the hub acknowledges it, and redelivered on every
     // connection until it does: a result is the one thing a runner cannot
     // reproduce (E-44, D17, D19).
+    //
+    // Before the job leaves the live list, on purpose. A runner that is
+    // stopping waits for that list to empty and for nothing to be held
+    // ([`crate::run`]'s stop), so leaving the list first would open an
+    // instant in which the job is neither running nor held — and a stop that
+    // looked in that instant would find nothing to write down and take the
+    // verdict with it. CI found exactly that instant.
     session.report(&job_id, outcome, metrics);
+    confined.live().remove(token);
 }
 
 /// Reclaim a job's workspace, saying so in the job's record if it will not go.
