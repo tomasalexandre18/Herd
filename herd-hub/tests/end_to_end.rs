@@ -313,6 +313,8 @@ async fn a_version_mismatch_is_refused_naming_both_versions() {
             state_root: None,
             health_every_ms: None,
             capabilities: Default::default(),
+            host: herd_proto::HostSize::default(),
+            preference: 0,
         };
         socket
             .send(Message::text(to_frame(&hello).expect("hello encodes")))
@@ -360,14 +362,23 @@ async fn a_submission_with_no_runner_is_refused_by_name() {
 /// second machine at all — it was one runner redialling faster than the hub
 /// noticed its previous connection had gone, so the runner died of its own
 /// reconnection. A peer that waits is not a peer that was refused.
+///
+/// Since M7 the hub holds a **fleet**, so "no room" is no longer about a
+/// second machine: a second name joins beside the first. What is still
+/// refused room is a **twin** — a second process wearing a name another live
+/// process is answering to — because an attempt belongs to a name and two
+/// live twins would take turns kicking each other off it. That is the case
+/// this test drives, and the answer it must get is still a stand-by.
 #[tokio::test]
-async fn a_second_runner_is_told_to_stand_by_rather_than_refused() {
+async fn a_twin_of_a_live_runner_is_told_to_stand_by_rather_than_refused() {
     let harness = Harness::with_hub_and_runner().await;
     let (data_root, confined) = support::prepared_runner("second-runner");
     let error = herd_runner::serve_once(
         herd_runner::Config {
             hub_url: harness.hub_url.clone(),
-            name: Some("the-second-runner".to_owned()),
+            // The name the harness's own runner is answering to, from a
+            // different process: a twin.
+            name: Some("test-runner".to_owned()),
             token: None,
             confinement: confinement(&data_root),
             ..herd_runner::Config::default()
@@ -376,7 +387,7 @@ async fn a_second_runner_is_told_to_stand_by_rather_than_refused() {
         confined,
     )
     .await
-    .expect_err("this hub accepts one runner until M5");
+    .expect_err("a live runner's name is not free");
     let stand_by = error
         .downcast_ref::<herd_runner::StandBy>()
         .expect("a runner with no room is asked to wait, never refused (D13)");
