@@ -23,6 +23,7 @@
 //! suspended; a job needing it waits and is never failed (D38).
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::fmt;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -94,6 +95,13 @@ impl Default for ProbeSettings {
 /// `busy_probe` was meant would otherwise offer the capability **unprobed**,
 /// handing out a resource something outside Herd is holding because of one
 /// missing word (E-26).
+///
+/// **And nothing is written twice.** A key repeated anywhere in the file
+/// refuses the runner's startup, naming the key and the capability. The same
+/// harm arrives that way — `busy_probe` written twice offered a leased machine
+/// as free while its lock was held — and the reading that stops it is
+/// [`WithEveryKey`], because a duplicate is gone before any strict type can
+/// see it.
 #[derive(Debug, Clone, Default)]
 pub struct CapabilityFile {
     /// Capabilities this runner offers because its owner says so.
@@ -120,16 +128,28 @@ impl CapabilityFile {
     /// capabilities is not an answer. The name is lifted out of the raw value
     /// — which is still there however badly the rest of the entry is spelled —
     /// so the refusal names the capability too.
+    ///
+    /// A key written **twice** is caught here rather than by the strict types
+    /// below, and that is not a preference: a JSON object is a map, and the
+    /// map a [`serde_json::Value`] is read into keeps the last of two equal
+    /// keys and drops the first without a word. The strict types never see
+    /// the duplicate at all — by the time one is handed a value, the file has
+    /// already become "whatever the last line said", and no
+    /// `deny_unknown_fields` can recover what is gone. So the duplicate is
+    /// noticed while the text goes by, by [`WithEveryKey`].
     fn parse(text: &str) -> Result<Self, String> {
         let shape: FileShape = serde_json::from_str(text).map_err(|error| error.to_string())?;
         let mut capabilities = Vec::with_capacity(shape.capabilities.len());
         for raw in shape.capabilities {
-            let named = match raw.get("name").and_then(serde_json::Value::as_str) {
+            let named = match raw.value.get("name").and_then(serde_json::Value::as_str) {
                 Some(name) => format!("the capability {name:?}"),
                 None => "a capability with no name".to_owned(),
             };
+            if let Some(key) = &raw.repeated {
+                return Err(format!("{named}: {}", repeated_key_refusal(key)));
+            }
             let read: FileCapability =
-                serde_json::from_value(raw).map_err(|error| format!("{named}: {error}"))?;
+                serde_json::from_value(raw.value).map_err(|error| format!("{named}: {error}"))?;
             capabilities.push(
                 read.into_capability()
                     .map_err(|error| format!("{named}: {error}"))?,
@@ -142,12 +162,156 @@ impl CapabilityFile {
     }
 }
 
+/// What a key written twice is refused with: one sentence in one place, so
+/// every level of the file refuses it the same way.
+fn repeated_key_refusal(key: &str) -> String {
+    format!(
+        "the key {key:?} is written more than once, and this file is read \
+         exactly as it is written: taking the last value would silently drop \
+         what the first one said — a probe, an exclusion or a kind its owner \
+         wrote down and believes is in force"
+    )
+}
+
+/// One JSON value, read with every key it was written with.
+///
+/// This type exists because [`serde_json::Value`] cannot carry the mistake
+/// that has to be reported. An object is a map: reading `{"busy_probe": A,
+/// "busy_probe": B}` into one inserts both and keeps `B`, and nothing
+/// downstream can tell that apart from a file that only ever said `B`. The
+/// detection has to happen where the keys go past, which is the visitor that
+/// builds the map.
+///
+/// The duplicate is **remembered rather than raised**. Raising it where it is
+/// seen would refuse the file naming the key and nothing else, because `name`
+/// may well be written after the duplicate; keeping it lets
+/// [`CapabilityFile::parse`] name the capability too, which is the whole
+/// reason this file is read in two passes.
+#[derive(Debug)]
+struct WithEveryKey {
+    value: serde_json::Value,
+    /// The first key written twice at or under this value, as a path: `kind`
+    /// for a repeated kind, `busy_probe.path` for one inside a probe.
+    repeated: Option<String>,
+}
+
+impl WithEveryKey {
+    fn of(value: serde_json::Value) -> Self {
+        Self {
+            value,
+            repeated: None,
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for WithEveryKey {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        deserializer.deserialize_any(EveryKey)
+    }
+}
+
+/// The visitor behind [`WithEveryKey`]: a value is built exactly as
+/// `serde_json` builds one, except that a map notices a key it already holds.
+struct EveryKey;
+
+impl<'de> serde::de::Visitor<'de> for EveryKey {
+    type Value = WithEveryKey;
+
+    fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("any JSON value")
+    }
+
+    fn visit_unit<E>(self) -> Result<WithEveryKey, E> {
+        Ok(WithEveryKey::of(serde_json::Value::Null))
+    }
+
+    fn visit_none<E>(self) -> Result<WithEveryKey, E> {
+        Ok(WithEveryKey::of(serde_json::Value::Null))
+    }
+
+    fn visit_some<D: serde::Deserializer<'de>>(
+        self,
+        deserializer: D,
+    ) -> Result<WithEveryKey, D::Error> {
+        deserializer.deserialize_any(EveryKey)
+    }
+
+    fn visit_bool<E>(self, value: bool) -> Result<WithEveryKey, E> {
+        Ok(WithEveryKey::of(serde_json::Value::Bool(value)))
+    }
+
+    fn visit_i64<E>(self, value: i64) -> Result<WithEveryKey, E> {
+        Ok(WithEveryKey::of(serde_json::Value::from(value)))
+    }
+
+    fn visit_u64<E>(self, value: u64) -> Result<WithEveryKey, E> {
+        Ok(WithEveryKey::of(serde_json::Value::from(value)))
+    }
+
+    fn visit_f64<E>(self, value: f64) -> Result<WithEveryKey, E> {
+        Ok(WithEveryKey::of(serde_json::Value::from(value)))
+    }
+
+    fn visit_str<E>(self, value: &str) -> Result<WithEveryKey, E> {
+        Ok(WithEveryKey::of(serde_json::Value::from(value)))
+    }
+
+    fn visit_seq<A: serde::de::SeqAccess<'de>>(
+        self,
+        mut access: A,
+    ) -> Result<WithEveryKey, A::Error> {
+        let mut values = Vec::new();
+        let mut repeated: Option<String> = None;
+        while let Some(element) = access.next_element::<WithEveryKey>()? {
+            // A duplicate inside the third element of a list reads as
+            // `[2].key`, so the path still leads to it.
+            if repeated.is_none() {
+                if let Some(inner) = element.repeated {
+                    repeated = Some(format!("[{}].{inner}", values.len()));
+                }
+            }
+            values.push(element.value);
+        }
+        Ok(WithEveryKey {
+            value: serde_json::Value::Array(values),
+            repeated,
+        })
+    }
+
+    fn visit_map<A: serde::de::MapAccess<'de>>(
+        self,
+        mut access: A,
+    ) -> Result<WithEveryKey, A::Error> {
+        let mut object = serde_json::Map::new();
+        let mut repeated: Option<String> = None;
+        while let Some(key) = access.next_key::<String>()? {
+            let element = access.next_value::<WithEveryKey>()?;
+            // The key itself, written twice at this level: the case that
+            // silently dropped a probe, a kind or an exclusion list.
+            if object.contains_key(&key) && repeated.is_none() {
+                repeated = Some(key.clone());
+            }
+            // Or a key written twice somewhere under this one.
+            if repeated.is_none() {
+                if let Some(inner) = element.repeated {
+                    repeated = Some(format!("{key}.{inner}"));
+                }
+            }
+            object.insert(key, element.value);
+        }
+        Ok(WithEveryKey {
+            value: serde_json::Value::Object(object),
+            repeated,
+        })
+    }
+}
+
 /// The file's top level, strictly.
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct FileShape {
     #[serde(default)]
-    capabilities: Vec<serde_json::Value>,
+    capabilities: Vec<WithEveryKey>,
     #[serde(default)]
     deny: Vec<String>,
 }
@@ -994,6 +1158,155 @@ mod tests {
                 .unwrap_or_else(|| panic!("{what} must be refused, not ignored"));
             assert!(why.contains(expected), "{what} must name {expected}: {why}");
         }
+    }
+
+    /// A key written twice refuses the file, naming the key and the
+    /// capability — at every level, and whatever the second value is.
+    ///
+    /// This is the same harm as the unknown key above, by the other route,
+    /// and it was live: `busy_probe` written twice, the second one pointing
+    /// at a path that is not there, offered `metal-pc` **free while the lock
+    /// was held** — the runner said "metal-pc is free again" and a job ran on
+    /// a machine an external holder had. The whole of E-26 lost to a
+    /// copy-and-paste nobody could see, because a map keeps the last of two
+    /// equal keys.
+    ///
+    /// It is not only the probe. A second `kind` turns an `exclusive`
+    /// capability into a shared one, a second `excludes` drops an exclusion
+    /// its owner wrote down, and a second `name` is two capabilities in one
+    /// entry — the very duplicate-name defect
+    /// `a_capability_declared_twice_is_refused_by_name` refuses, slipping
+    /// through underneath it.
+    #[test]
+    fn a_key_written_twice_refuses_the_file_naming_the_key_and_the_capability() {
+        // First, the mechanism, stated rather than assumed: plain JSON really
+        // does drop the first of two equal keys. That is what this guard is
+        // for, and a reader of this test should not have to take it on trust.
+        let swallowed: serde_json::Value = serde_json::from_str(
+            r#"{"busy_probe":{"type":"lock_file","path":"HELD"},
+                "busy_probe":{"type":"lock_file","path":"FREE"}}"#,
+        )
+        .expect("duplicate keys are legal JSON");
+        assert_eq!(
+            swallowed["busy_probe"]["path"], "FREE",
+            "a map keeps the last of two equal keys, which is the defect"
+        );
+
+        for (what, text, keys) in [
+            (
+                "a probe written twice",
+                r#"{"capabilities":[
+                    {"name":"metal-pc","kind":{"type":"counted","slots":1},
+                     "busy_probe":{"type":"lock_file","path":"HELD"},
+                     "busy_probe":{"type":"lock_file","path":"FREE"}}]}"#,
+                vec!["busy_probe", "metal-pc"],
+            ),
+            (
+                "a probe written twice, the second one null",
+                r#"{"capabilities":[
+                    {"name":"metal-pc","kind":{"type":"counted","slots":1},
+                     "busy_probe":{"type":"lock_file","path":"HELD"},
+                     "busy_probe":null}]}"#,
+                vec!["busy_probe", "metal-pc"],
+            ),
+            (
+                "a kind written twice",
+                r#"{"capabilities":[
+                    {"name":"nightly","kind":{"type":"exclusive"},
+                     "kind":{"type":"shared"}}]}"#,
+                vec!["kind", "nightly"],
+            ),
+            (
+                "an exclusion list written twice",
+                r#"{"capabilities":[
+                    {"name":"build","kind":{"type":"shared"},
+                     "excludes":["nightly"],"excludes":[]}]}"#,
+                vec!["excludes", "build"],
+            ),
+            (
+                "a name written twice",
+                r#"{"capabilities":[
+                    {"name":"build","name":"metal-pc","kind":{"type":"shared"}}]}"#,
+                vec!["name"],
+            ),
+            (
+                "a key written twice inside a kind",
+                r#"{"capabilities":[
+                    {"name":"build","kind":{"type":"counted","slots":1,"slots":9}}]}"#,
+                vec!["kind.slots", "build"],
+            ),
+            (
+                "a key written twice inside a probe",
+                r#"{"capabilities":[
+                    {"name":"metal-pc","kind":{"type":"shared"},
+                     "busy_probe":{"type":"lock_file","path":"HELD","path":"FREE"}}]}"#,
+                vec!["busy_probe.path", "metal-pc"],
+            ),
+            (
+                "a key written twice in an entry with no name",
+                r#"{"capabilities":[
+                    {"kind":{"type":"shared"},"excludes":[],"excludes":[]}]}"#,
+                vec!["excludes", "a capability with no name"],
+            ),
+        ] {
+            let why = CapabilityFile::parse(text)
+                .err()
+                .unwrap_or_else(|| panic!("{what} must be refused, not taken last-wins"));
+            for key in keys {
+                assert!(why.contains(key), "{what} must name {key}: {why}");
+            }
+            assert!(
+                why.contains("more than once"),
+                "{what} must say what is wrong: {why}"
+            );
+        }
+
+        // And the file's own top-level keys, which serde's own derive
+        // refuses — asserted here so that a change of reading cannot drop it
+        // silently.
+        for (what, text, key) in [
+            (
+                "the capability list written twice",
+                r#"{"capabilities":[{"name":"build","kind":{"type":"shared"}}],
+                    "capabilities":[]}"#,
+                "capabilities",
+            ),
+            (
+                "the denial list written twice",
+                r#"{"capabilities":[],"deny":["kvm"],"deny":[]}"#,
+                "deny",
+            ),
+        ] {
+            let why = CapabilityFile::parse(text)
+                .err()
+                .unwrap_or_else(|| panic!("{what} must be refused"));
+            assert!(why.contains(key), "{what} must name {key}: {why}");
+        }
+
+        // A runner reads this through `resolve`, and that is where the
+        // refusal has to land: the process does not start, so there is no
+        // runner to announce anything free.
+        let dir = crate::testing::TempDir::new("written-twice");
+        let path = dir.path().join("capabilities.json");
+        std::fs::write(
+            &path,
+            br#"{"capabilities":[
+                {"name":"metal-pc","kind":{"type":"counted","slots":1},
+                 "busy_probe":{"type":"lock_file","path":"HELD"},
+                 "busy_probe":{"type":"lock_file","path":"FREE"}}
+            ]}"#,
+        )
+        .expect("written");
+        let error = CapabilityConfig {
+            file: Some(path.clone()),
+            detect: false,
+            ..CapabilityConfig::default()
+        }
+        .resolve()
+        .expect_err("a runner does not start on a file that says a probe twice");
+        assert!(error.contains(&path.display().to_string()), "{error}");
+        assert!(error.contains("busy_probe"), "{error}");
+        assert!(error.contains("metal-pc"), "{error}");
     }
 
     /// The file's shape is the protocol's shape, and this is what keeps it so.
