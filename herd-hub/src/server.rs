@@ -13,27 +13,58 @@
 //! is holding it until then (E-44). And a job that is still queued when a
 //! runner joins is handed to it, whether that job was submitted a second ago
 //! or inherited from the hub that ran before this one.
+//!
+//! **M3 adds the part that deals with a runner which is not there.** A runner
+//! says it is alive about every 15 s (E-40) and the hub keeps the age of that
+//! report; a runner nothing has been heard from for about 60 s is lost, and
+//! the jobs it was running are attempted once more (E-21). Three rules make
+//! that safe rather than merely automatic:
+//!
+//! - **An attempt is named and numbered.** Every job frame carries the attempt
+//!   it is about, so a runner that comes back from the dead cannot finish a job
+//!   the hub has already written off, and cannot write into the record of the
+//!   attempt that replaced it. It is told so by name.
+//! - **Once more means once.** A job is requeued one time. A second loss is an
+//!   end — `lost` — not a third attempt, because a job that kills runners
+//!   would otherwise go round for ever.
+//! - **Nothing is destroyed to make this tidy.** A result the hub cannot write
+//!   is retried for as long as it takes and never dropped (D19); output the
+//!   hub is missing is asked for again before the log is declared short (D29).
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, bail, Context, Result};
 use futures_util::stream::{SplitSink, SplitStream};
 use futures_util::{SinkExt, StreamExt};
 use herd_proto::{
-    from_frame, to_frame, version_mismatch_reason, FromHub, JobId, Role, ToHub, PROTOCOL_VERSION,
+    from_frame, to_frame, version_mismatch_reason, FromHub, JobId, JobMetrics, JobOutcome, Role,
+    RunningJob, ToHub, PROTOCOL_VERSION,
 };
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::mpsc::{self, UnboundedReceiver, UnboundedSender};
+use tokio::sync::watch;
 use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::WebSocketStream;
 
-use crate::job::{JobState, JobStore};
+use crate::job::{JobRecord, JobState, JobStore, LogWrite};
 
 /// Loopback by default: the hub is reached through the reverse proxy, which
 /// terminates TLS; the hub itself only ever speaks plain `ws://` (D4).
 pub const DEFAULT_LISTEN_ADDR: &str = "127.0.0.1:8787";
+
+/// How long a runner may be unheard from before it is lost (E-21).
+pub const LOST_AFTER: Duration = Duration::from_secs(60);
+
+/// How many goes at running one job the hub allows (E-21).
+///
+/// Two: the attempt, and one more after a loss. The second loss is an end,
+/// because the alternative is a job that destroys every runner it touches
+/// going round the herd for ever. M6's priorities do not change this; a third
+/// attempt would be a different promise and nobody has asked for one.
+pub const ATTEMPTS_ALLOWED: u32 = 2;
 
 /// The hub's own version, reported in `Welcome`.
 pub fn hub_version() -> &'static str {
@@ -45,9 +76,57 @@ type Sink = SplitSink<Socket, Message>;
 type Source = SplitStream<Socket>;
 
 /// Queue of frames waiting to go out on one connection. Unbounded so that a
-/// relay never blocks the task that reads from the runner; M3 revisits this
-/// when it adds backpressure and heartbeats.
+/// relay never blocks the task that reads from the runner.
 type Outbox = UnboundedSender<FromHub>;
+
+/// The hub's timing, in one place, so a test can make an hour pass in a
+/// second and an operator can tune one number.
+#[derive(Debug, Clone, Copy)]
+pub struct Policy {
+    /// A runner unheard from for this long is lost, and the jobs it was
+    /// running are attempted once more (E-21).
+    pub lost_after: Duration,
+    /// How many goes one job gets.
+    pub attempts_allowed: u32,
+    /// The first delay between two tries at writing a result the hub could
+    /// not write, before the growth starts (D19).
+    pub write_retry_first: Duration,
+    /// The longest that delay ever gets. There is no give-up: a result is
+    /// never destroyed, so the hub goes on trying.
+    pub write_retry_cap: Duration,
+}
+
+impl Default for Policy {
+    fn default() -> Self {
+        Self {
+            lost_after: LOST_AFTER,
+            attempts_allowed: ATTEMPTS_ALLOWED,
+            write_retry_first: Duration::from_millis(250),
+            write_retry_cap: Duration::from_secs(5 * 60),
+        }
+    }
+}
+
+impl Policy {
+    /// How often the hub looks for a runner that has gone quiet. Often enough
+    /// that the loss is noticed near the threshold rather than a threshold
+    /// later, and never so often that a hub with nothing to do spins.
+    fn watchdog_every(&self) -> Duration {
+        (self.lost_after / 20).clamp(Duration::from_millis(50), Duration::from_secs(1))
+    }
+
+    /// How long a runner told to stand by waits before dialling again.
+    fn stand_by_retry(&self) -> Duration {
+        (self.lost_after / 20).clamp(Duration::from_millis(200), Duration::from_secs(5))
+    }
+
+    /// How long a connected runner's last health report may be before the
+    /// hub treats the connection as one it may replace with a new one from a
+    /// runner that is plainly alive.
+    fn health_is_stale_after(&self) -> Duration {
+        self.lost_after / 2
+    }
+}
 
 /// A bound hub, not yet serving.
 pub struct Hub {
@@ -59,6 +138,16 @@ impl Hub {
     /// Bind the listener. Port 0 binds a free port; ask [`Hub::local_addr`]
     /// which one it got.
     pub async fn bind(addr: SocketAddr, store: Arc<dyn JobStore>) -> Result<Self> {
+        Self::bind_with_policy(addr, store, Policy::default()).await
+    }
+
+    /// The same, with the timing given: what a test and the binary's options
+    /// both go through.
+    pub async fn bind_with_policy(
+        addr: SocketAddr,
+        store: Arc<dyn JobStore>,
+        policy: Policy,
+    ) -> Result<Self> {
         let listener = TcpListener::bind(addr)
             .await
             .with_context(|| format!("binding {addr}"))?;
@@ -66,6 +155,11 @@ impl Hub {
             listener,
             state: Arc::new(State {
                 store,
+                policy,
+                // The clock on every attempt this hub inherited starts here: a
+                // job left `running` by the hub that died is a job this hub
+                // has had no word of since it began.
+                started: Instant::now(),
                 peers: Mutex::new(Peers::default()),
             }),
         })
@@ -80,7 +174,8 @@ impl Hub {
 
     /// A read-only handle on the hub's live peers, kept by the caller after
     /// [`Hub::serve`] has taken the hub. M13 grows this into the status
-    /// surface; M1 needs only "is the runner here yet".
+    /// surface; what is here is "is the runner there, and how long since it
+    /// last said so" (E-40).
     pub fn handle(&self) -> HubHandle {
         HubHandle {
             state: Arc::clone(&self.state),
@@ -88,17 +183,25 @@ impl Hub {
     }
 
     /// Serve until the listener fails. Dropping the returned future releases
-    /// the port.
+    /// the port and ends the hub's own two housekeeping tasks.
     pub async fn serve(self) -> Result<()> {
-        loop {
-            let (stream, peer) = self.listener.accept().await.context("accepting")?;
-            let state = Arc::clone(&self.state);
-            tokio::spawn(async move {
-                if let Err(error) = serve_peer(state, stream).await {
-                    eprintln!("herd-hub: connection from {peer} ended: {error:#}");
-                }
-            });
-        }
+        let watching = tokio::spawn(watch_for_a_lost_runner(Arc::clone(&self.state)));
+        let writing = tokio::spawn(keep_trying_to_write_results(Arc::clone(&self.state)));
+        let serving = async {
+            loop {
+                let (stream, peer) = self.listener.accept().await.context("accepting")?;
+                let state = Arc::clone(&self.state);
+                tokio::spawn(async move {
+                    if let Err(error) = serve_peer(state, stream).await {
+                        eprintln!("herd-hub: connection from {peer} ended: {error:#}");
+                    }
+                });
+            }
+        };
+        let outcome = serving.await;
+        watching.abort();
+        writing.abort();
+        outcome
     }
 }
 
@@ -113,26 +216,99 @@ impl HubHandle {
     pub fn runner_connected(&self) -> bool {
         self.state.with_peers(|peers| peers.runner.is_some())
     }
+
+    /// What the hub knows about the runners connected to it, health ages
+    /// included (E-40). One entry at most until M5, which holds a set.
+    pub fn runners(&self) -> Vec<RunnerStatus> {
+        self.state.with_peers(|peers| {
+            peers
+                .runner
+                .iter()
+                .map(|runner| RunnerStatus {
+                    name: runner.name.clone(),
+                    joined_for: runner.joined_at.elapsed(),
+                    last_health_age: runner.last_health.elapsed(),
+                    reports_seen: runner.reports_seen,
+                    draining: runner.draining,
+                    jobs: runner.jobs.iter().map(|job| job.job_id.clone()).collect(),
+                })
+                .collect()
+        })
+    }
+}
+
+/// What the hub can say about one connected runner right now.
+///
+/// `last_health_age` is the field everything about a lost runner rests on, and
+/// the one M13 puts on the status document (E-40): a number that grows is a
+/// runner that has stopped talking, and there is no other way to tell that
+/// from a runner with nothing to do.
+#[derive(Debug, Clone)]
+pub struct RunnerStatus {
+    pub name: String,
+    pub joined_for: Duration,
+    pub last_health_age: Duration,
+    /// How many health reports this connection has carried. Zero is a runner
+    /// that has only just joined, which is not the same as one that has gone
+    /// quiet.
+    pub reports_seen: u64,
+    pub draining: bool,
+    pub jobs: Vec<JobId>,
 }
 
 struct State {
     store: Arc<dyn JobStore>,
+    policy: Policy,
+    /// When this hub started serving: where the clock begins for an attempt
+    /// it inherited and has heard nothing about.
+    started: Instant,
     peers: Mutex<Peers>,
 }
 
 /// What a requester gets when it attaches to a job by its id.
 struct Attached {
-    record: crate::job::JobRecord,
+    record: JobRecord,
     /// The output the job had already produced.
     log: Vec<u8>,
     /// Why the job is not moving, if this hub knows that it is not (D19).
     stalled: Option<String>,
 }
 
+/// One runner's connection, and what the hub knows about it.
+struct ConnectedRunner {
+    name: String,
+    outbox: Outbox,
+    /// How the hub ends this connection without waiting for the socket to
+    /// notice. Used when a runner that is plainly alive dials in while this
+    /// connection is still registered: the new one is the real one.
+    kick: watch::Sender<bool>,
+    joined_at: Instant,
+    last_health: Instant,
+    reports_seen: u64,
+    draining: bool,
+    jobs: Vec<RunningJob>,
+}
+
 #[derive(Default)]
 struct Peers {
     /// M1 accepts exactly one runner. M5 onwards holds a set.
-    runner: Option<Outbox>,
+    runner: Option<ConnectedRunner>,
+    /// When this hub last had evidence that an attempt was alive.
+    ///
+    /// *Per attempt*, and that is the whole of the design. "Is the runner
+    /// connected" is the wrong question twice over: a different runner
+    /// connecting says nothing about the attempt the dead one was running,
+    /// and a runner that was killed and came back fresh is connected and
+    /// healthy while the job it was running exists nowhere. So what is timed
+    /// is the attempt: anything the runner says about it is evidence — a
+    /// frame, or a health report naming it, which is why that report carries
+    /// the jobs — and an attempt nothing has been heard about for the
+    /// threshold is lost (E-21), whoever is connected.
+    ///
+    /// An attempt this hub inherited has no entry, and falls back to the
+    /// moment the hub started: it has had no evidence at all, and the clock
+    /// cannot begin before it could have been watching.
+    attempt_seen: HashMap<JobId, Instant>,
     /// Who to relay a job's logs and outcome to. More than one is possible
     /// from M2: a `herdctl run` follows the job it submitted, and a
     /// `herdctl wait` on the same id attaches beside it rather than taking
@@ -142,11 +318,31 @@ struct Peers {
     ///
     /// A job whose end the hub cannot store keeps a record that reads
     /// `running` while nothing at all is happening to it (D19): the runner is
-    /// holding the result, and this hub has stopped trying. Nothing about that
-    /// is visible from the outside, which is why the reason is kept here —
-    /// what a wait on such a job may not do is say nothing. Cleared the moment
-    /// the hub does write the job down.
+    /// holding the result, and this hub is still trying. Nothing about that is
+    /// visible from the outside, which is why the reason is kept here — what a
+    /// wait on such a job may not do is say nothing. Cleared the moment the
+    /// hub does write the job down.
     stalled: HashMap<JobId, String>,
+    /// Ends the hub was told about and could not write, with the connection
+    /// that was holding each one. Retried for as long as it takes and never
+    /// dropped: a stalled job is recoverable, a destroyed verdict is not
+    /// (D19).
+    unwritten: HashMap<JobId, (JobOutcome, JobMetrics)>,
+    /// Which attempt of each unfinished job this hub is waiting for.
+    ///
+    /// A cache of the record, so that checking "is this frame about the
+    /// attempt I am waiting for" does not read a file for every 8 KiB of a
+    /// build log. Absent means "ask the record", which is what happens once
+    /// per job after a restart.
+    live_attempts: HashMap<JobId, u32>,
+    /// Jobs whose end arrived with a log the hub knows to be short, and for
+    /// which the missing output has been asked for once. A second short end
+    /// is one the hub records, naming what is gone (D29).
+    tail_asked: HashSet<JobId>,
+    /// Per job reported short of output, how much the hub had written when it
+    /// noticed. A shortfall that is still there at the next report, with
+    /// nothing written in between, is a loss rather than a chunk in flight.
+    short_log: HashMap<JobId, u64>,
 }
 
 impl State {
@@ -158,39 +354,126 @@ impl State {
         f(&mut peers)
     }
 
-    /// Returns the reason to refuse, if the single runner slot is taken.
-    fn register_runner(&self, outbox: &Outbox) -> std::result::Result<(), String> {
-        self.with_peers(|peers| match &peers.runner {
-            Some(_) => Err("a runner is already connected; M1 accepts one".to_owned()),
-            None => {
-                peers.runner = Some(outbox.clone());
-                Ok(())
+    /// Register a runner, or say what to tell it instead.
+    fn register_runner(&self, name: &str, outbox: &Outbox, kick: watch::Sender<bool>) -> Admitted {
+        self.with_peers(|peers| {
+            if let Some(incumbent) = &peers.runner {
+                // The same runner dialling again. Its previous connection is
+                // one this hub has not noticed the end of yet — exactly the
+                // case that used to kill a redialling runner with a terminal
+                // `Refused` (D13) — so the new connection wins and the old one
+                // is dropped.
+                let same_runner = !name.is_empty() && incumbent.name == name;
+                let quiet_for = incumbent.last_health.elapsed();
+                let gone_quiet =
+                    incumbent.reports_seen > 0 && quiet_for > self.policy.health_is_stale_after();
+                if !same_runner && !gone_quiet {
+                    return Admitted::StandBy {
+                        reason: format!(
+                            "runner {} is connected and was heard from {:?} ago; this hub \
+                             accepts one runner until M5",
+                            incumbent.name, quiet_for
+                        ),
+                        retry_in: self.policy.stand_by_retry(),
+                    };
+                }
+                let why = if same_runner {
+                    format!("runner {name} has dialled again")
+                } else {
+                    format!(
+                        "runner {} has said nothing for {:?}",
+                        incumbent.name, quiet_for
+                    )
+                };
+                println!("herd-hub: dropping the connection this hub was holding, because {why}");
+                let _ = incumbent.kick.send(true);
             }
+            let now = Instant::now();
+            peers.runner = Some(ConnectedRunner {
+                name: name.to_owned(),
+                outbox: outbox.clone(),
+                kick,
+                joined_at: now,
+                last_health: now,
+                reports_seen: 0,
+                draining: false,
+                jobs: Vec::new(),
+            });
+            Admitted::Yes
         })
     }
 
-    /// Give up the runner slot, and tell whoever was following a job of this
-    /// runner that it is not coming back. M3 requeues instead of refusing.
-    fn release_runner(&self, outbox: &Outbox) -> Vec<Outbox> {
+    /// Give up the runner slot, if this connection is the one holding it.
+    ///
+    /// The clock on the attempts it was running is not touched here: a socket
+    /// closing is not evidence about a job, and a runner that redials in a
+    /// second finishes what it was doing. What times an attempt out is the
+    /// absence of anything said about it ([`Peers::attempt_seen`]).
+    fn release_runner(&self, outbox: &Outbox) -> bool {
         self.with_peers(|peers| {
             if !peers
                 .runner
                 .as_ref()
-                .is_some_and(|r| r.same_channel(outbox))
+                .is_some_and(|runner| runner.outbox.same_channel(outbox))
             {
-                return Vec::new();
+                return false;
             }
             peers.runner = None;
-            peers.followers.drain().flat_map(|(_, f)| f).collect()
+            true
         })
     }
 
+    /// The runner a job may be handed to: connected, and not on its way out
+    /// (invariant 2).
+    fn runner_for_dispatch(&self) -> Option<(String, Outbox)> {
+        self.with_peers(|peers| {
+            peers
+                .runner
+                .as_ref()
+                .filter(|runner| !runner.draining)
+                .map(|runner| (runner.name.clone(), runner.outbox.clone()))
+        })
+    }
+
+    /// Whichever runner is connected, draining or not: where an
+    /// acknowledgement or a cancel goes.
     fn runner(&self) -> Option<Outbox> {
-        self.with_peers(|peers| peers.runner.clone())
+        self.with_peers(|peers| peers.runner.as_ref().map(|runner| runner.outbox.clone()))
+    }
+
+    /// Why a submission cannot be placed, if it cannot.
+    fn why_no_runner(&self) -> Option<String> {
+        self.with_peers(|peers| match &peers.runner {
+            None => Some("no runner is connected".to_owned()),
+            Some(runner) if runner.draining => Some(format!(
+                "runner {} is draining and takes no new job",
+                runner.name
+            )),
+            Some(_) => None,
+        })
+    }
+
+    fn record_health(&self, outbox: &Outbox, jobs: Vec<RunningJob>, draining: bool) {
+        self.with_peers(|peers| {
+            if let Some(runner) = peers
+                .runner
+                .as_mut()
+                .filter(|runner| runner.outbox.same_channel(outbox))
+            {
+                runner.last_health = Instant::now();
+                runner.reports_seen += 1;
+                runner.draining = draining;
+                runner.jobs = jobs;
+            }
+        });
     }
 
     fn follow(&self, id: JobId, outbox: &Outbox) {
         self.with_peers(|peers| peers.followers.entry(id).or_default().push(outbox.clone()));
+    }
+
+    fn followers_of(&self, id: &JobId) -> Vec<Outbox> {
+        self.with_peers(|peers| peers.followers.get(id).cloned().unwrap_or_default())
     }
 
     /// Record one chunk of a job's output and take the list of who is
@@ -207,7 +490,7 @@ impl State {
         stream: herd_proto::LogStream,
         seq: u64,
         data: &[u8],
-    ) -> (crate::job::Result<()>, Vec<Outbox>) {
+    ) -> (crate::job::Result<LogWrite>, Vec<Outbox>) {
         self.with_peers(|peers| {
             let written = self.store.append_log(id, stream, seq, data);
             let followers = peers.followers.get(id).cloned().unwrap_or_default();
@@ -217,16 +500,28 @@ impl State {
 
     /// Remember that the hub cannot write a job down, and take the list of who
     /// is waiting for it.
-    fn note_a_stall(&self, id: &JobId, reason: String) -> Vec<Outbox> {
+    fn note_a_stall(
+        &self,
+        id: &JobId,
+        reason: String,
+        outcome: &JobOutcome,
+        metrics: &JobMetrics,
+    ) -> Vec<Outbox> {
         self.with_peers(|peers| {
             peers.stalled.insert(id.clone(), reason);
+            peers
+                .unwritten
+                .insert(id.clone(), (outcome.clone(), metrics.clone()));
             peers.followers.get(id).cloned().unwrap_or_default()
         })
     }
 
     /// The hub wrote the job down after all: it is moving again.
     fn stall_is_over(&self, id: &JobId) {
-        self.with_peers(|peers| peers.stalled.remove(id));
+        self.with_peers(|peers| {
+            peers.stalled.remove(id);
+            peers.unwritten.remove(id);
+        });
     }
 
     /// Attach a requester to a job by its id: its record, the output recorded
@@ -271,6 +566,58 @@ impl State {
             peers.followers.retain(|_, following| !following.is_empty());
         });
     }
+
+    /// Whether a frame a runner sent about `attempt` of `id` is about the
+    /// attempt this hub is waiting for (E-21).
+    ///
+    /// The record is the authority; the cache is only there so that a build
+    /// log does not cost one file read per chunk.
+    fn attempt_is_current(&self, id: &JobId, attempt: u32) -> crate::job::Result<bool> {
+        if let Some(known) = self.with_peers(|peers| peers.live_attempts.get(id).copied()) {
+            return Ok(known == attempt);
+        }
+        let Some(record) = self.store.job(id)? else {
+            return Ok(false);
+        };
+        if record.attempt_is_current(attempt) {
+            self.with_peers(|peers| peers.live_attempts.insert(id.clone(), attempt));
+            return Ok(true);
+        }
+        Ok(false)
+    }
+
+    fn attempt_is_over(&self, id: &JobId) {
+        self.with_peers(|peers| {
+            peers.live_attempts.remove(id);
+            peers.tail_asked.remove(id);
+            peers.attempt_seen.remove(id);
+            peers.short_log.remove(id);
+        });
+    }
+
+    /// Word of an attempt: it is alive, whatever else is happening.
+    fn attempt_was_heard_of(&self, id: &JobId) {
+        self.with_peers(|peers| peers.attempt_seen.insert(id.clone(), Instant::now()));
+    }
+
+    /// How long since anything was heard about each attempt that is under
+    /// way, for the jobs named.
+    fn unheard_of_for(&self, jobs: &[JobId]) -> Vec<(JobId, Duration)> {
+        self.with_peers(|peers| {
+            jobs.iter()
+                .map(|id| {
+                    let seen = peers.attempt_seen.get(id).copied().unwrap_or(self.started);
+                    (id.clone(), seen.elapsed())
+                })
+                .collect()
+        })
+    }
+}
+
+/// What the hub does with a runner that has just said hello.
+enum Admitted {
+    Yes,
+    StandBy { reason: String, retry_in: Duration },
 }
 
 async fn serve_peer(state: Arc<State>, stream: TcpStream) -> Result<()> {
@@ -284,7 +631,7 @@ async fn serve_peer(state: Arc<State>, stream: TcpStream) -> Result<()> {
     let Some(hello) = next_message(&mut source).await? else {
         bail!("the peer closed before saying hello");
     };
-    let role = match hello {
+    let (role, peer_name) = match hello {
         ToHub::Hello {
             protocol_version,
             role,
@@ -296,8 +643,7 @@ async fn serve_peer(state: Arc<State>, stream: TcpStream) -> Result<()> {
             }
             // The token is carried from M1 and validated from M15 (D6, Q8).
             let _ = token;
-            let _ = name;
-            role
+            (role, name.unwrap_or_default())
         }
         other => {
             let reason = format!(
@@ -320,7 +666,7 @@ async fn serve_peer(state: Arc<State>, stream: TcpStream) -> Result<()> {
     let (outbox, inbox) = mpsc::unbounded_channel();
     let writer = tokio::spawn(write_frames(sink, inbox));
     let outcome = match role {
-        Role::Runner => serve_runner(&state, &outbox, &mut source).await,
+        Role::Runner => serve_runner(&state, &peer_name, &outbox, &mut source).await,
         Role::Requester => serve_requester(&state, &outbox, &mut source).await,
     };
     drop(outbox); // ends the writer, which then closes the socket
@@ -328,39 +674,94 @@ async fn serve_peer(state: Arc<State>, stream: TcpStream) -> Result<()> {
     outcome
 }
 
-async fn serve_runner(state: &State, outbox: &Outbox, source: &mut Source) -> Result<()> {
-    if let Err(reason) = state.register_runner(outbox) {
-        let _ = outbox.send(FromHub::Refused { reason });
-        return Ok(());
+async fn serve_runner(
+    state: &State,
+    name: &str,
+    outbox: &Outbox,
+    source: &mut Source,
+) -> Result<()> {
+    let (kick, mut kicked) = watch::channel(false);
+    match state.register_runner(name, outbox, kick) {
+        Admitted::Yes => {}
+        // Not a refusal: a runner told to wait comes back, and one that is
+        // refused dies (D13). Telling a redialling runner "a runner is
+        // already connected" with a terminal frame is how M2 killed runners.
+        Admitted::StandBy { reason, retry_in } => {
+            println!("herd-hub: a runner is asked to stand by: {reason}");
+            let _ = outbox.send(FromHub::StandBy {
+                reason,
+                retry_in_ms: retry_in.as_millis() as u64,
+            });
+            return Ok(());
+        }
     }
+    println!("herd-hub: runner {name} has joined");
     // Whatever happens from here, the runner slot is given back before this
     // returns: a failure that kept the slot would mean no runner could ever
     // join this hub again.
-    let outcome = match dispatch_recovered_jobs(state, outbox) {
-        Ok(()) => relay_from_runner(state, outbox, source).await,
+    let outcome = match dispatch_queued_jobs(state) {
+        Ok(()) => relay_from_runner(state, outbox, source, &mut kicked).await,
         Err(error) => Err(error),
     };
-    for follower in state.release_runner(outbox) {
-        let _ = follower.send(FromHub::Refused {
-            reason: "the runner was lost while the job was running".to_owned(),
-        });
+    if state.release_runner(outbox) {
+        println!(
+            "herd-hub: runner {name} is gone; an attempt it was running is lost if it is \
+             not back within {:?} (E-21)",
+            state.policy.lost_after
+        );
+        // Whoever is waiting hears that the link went, and that the job has
+        // not been given up on. Not a refusal, and the followers keep their
+        // place: the runner may redeliver the result it is holding, and if it
+        // does not the job is attempted again on this same connection's watch.
+        for job in attempts_in_the_air(state) {
+            for follower in state.followers_of(&job) {
+                let _ = follower.send(FromHub::JobNote {
+                    job_id: job.clone(),
+                    note: format!(
+                        "the runner executing this job lost its link to the hub. If it does \
+                         not come back within {:?} the job is attempted again, and this wait \
+                         carries on either way.",
+                        state.policy.lost_after
+                    ),
+                });
+            }
+        }
     }
     outcome
 }
 
-/// Hand a newly joined runner the jobs that are still queued.
+/// The jobs whose attempt is under way and whose runner is not here.
+fn attempts_in_the_air(state: &State) -> Vec<JobId> {
+    state
+        .store
+        .unfinished_jobs()
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|record| {
+            matches!(
+                record.state,
+                JobState::Assigned | JobState::Running | JobState::Interrupted { .. }
+            ) && record.attempt().is_some_and(|a| a.ended.is_none())
+        })
+        .map(|record| record.id)
+        .collect()
+}
+
+/// Hand whatever is queued to the runner that can take it.
 ///
 /// After a restart the queue is whatever the job directories say it is, and a
 /// job that was queued when the hub went down is simply a job waiting for a
-/// runner. Nobody follows these: the requester that submitted them is long
-/// gone, which is exactly the detached case (E-03), and the result is recorded
-/// whether anyone is listening or not.
+/// runner — as is a job that was requeued after a loss (E-21). Nobody need be
+/// following them: the requester that submitted them may be long gone, which
+/// is exactly the detached case (E-03), and the result is recorded whether
+/// anyone is listening or not.
 ///
-/// Only *queued* jobs are dispatched. A job that was already assigned or
-/// running belongs to an attempt this hub did not see end; deciding that such
-/// an attempt is lost, and requeueing it once, is M3's — doing it here would
-/// risk running a job twice.
-fn dispatch_recovered_jobs(state: &State, runner: &Outbox) -> Result<()> {
+/// Only *queued* jobs are dispatched. A job that is assigned or running
+/// belongs to an attempt that is not over, and a job left `interrupted` by a
+/// hub that died belongs to an attempt whose runner may still redeliver its
+/// result — deciding that such an attempt is lost is the watchdog's, on the
+/// clock, never a guess made here.
+fn dispatch_queued_jobs(state: &State) -> Result<()> {
     let waiting = state
         .store
         .unfinished_jobs()
@@ -369,31 +770,72 @@ fn dispatch_recovered_jobs(state: &State, runner: &Outbox) -> Result<()> {
         if record.state != JobState::Queued {
             continue;
         }
-        state
-            .store
-            .record_state(&record.id, JobState::Assigned)
-            .with_context(|| format!("recording {} as assigned", record.id))?;
-        if runner
-            .send(FromHub::AssignJob {
-                job_id: record.id.clone(),
-                command: record.command,
-            })
-            .is_err()
-        {
+        if !dispatch(state, &record.id, record.command.clone())? {
             return Ok(());
         }
-        println!(
-            "herd-hub: {} was still queued and has been handed to the runner",
-            record.id
-        );
     }
     Ok(())
 }
 
-async fn relay_from_runner(state: &State, outbox: &Outbox, source: &mut Source) -> Result<()> {
-    while let Some(message) = next_message(source).await? {
+/// Hand one job to the runner, recording the attempt before the frame goes
+/// out. False when there is no runner to hand it to.
+fn dispatch(state: &State, job_id: &JobId, command: Vec<String>) -> Result<bool> {
+    let Some((runner_name, runner)) = state.runner_for_dispatch() else {
+        return Ok(false);
+    };
+    let attempt = state
+        .store
+        .begin_attempt(job_id, &runner_name)
+        .with_context(|| format!("recording an attempt on {job_id}"))?;
+    state.with_peers(|peers| peers.live_attempts.insert(job_id.clone(), attempt));
+    // Handing it out is the first word about it: the clock on this attempt
+    // starts here, not at whatever the hub last heard about the job before.
+    state.attempt_was_heard_of(job_id);
+    if runner
+        .send(FromHub::AssignJob {
+            job_id: job_id.clone(),
+            attempt,
+            command,
+        })
+        .is_err()
+    {
+        return Ok(false);
+    }
+    println!("herd-hub: {job_id} is attempt {attempt} on runner {runner_name}");
+    Ok(true)
+}
+
+async fn relay_from_runner(
+    state: &State,
+    outbox: &Outbox,
+    source: &mut Source,
+    kicked: &mut watch::Receiver<bool>,
+) -> Result<()> {
+    loop {
+        let message = tokio::select! {
+            // The hub has accepted a newer connection from this runner; this
+            // one is a socket onto a process that is gone, or onto a link
+            // nothing comes back on.
+            _ = kicked.changed() => return Ok(()),
+            message = next_message(source) => match message? {
+                Some(message) => message,
+                None => return Ok(()),
+            },
+        };
         match message {
-            ToHub::JobStarted { job_id } => {
+            ToHub::Health { jobs, draining } => {
+                state.record_health(outbox, jobs.clone(), draining);
+                // The answer is what tells the runner this link is alive: a
+                // socket can stay open onto a hub that is gone.
+                let _ = outbox.send(FromHub::HealthRecorded {});
+                for job in jobs {
+                    mind_a_reported_job(state, outbox, &job);
+                }
+            }
+            ToHub::JobStarted { job_id, attempt } => {
+                if !is_current(state, outbox, &job_id, attempt) {
+                    continue;
+                }
                 // A failure here is the hub's disk, not the runner's doing, so
                 // it is said out loud and the connection goes on (D19) — and
                 // whoever is waiting for the job is told, because a record
@@ -402,37 +844,83 @@ async fn relay_from_runner(state: &State, outbox: &Outbox, source: &mut Source) 
                     Ok(()) => state.stall_is_over(&job_id),
                     Err(error) => {
                         eprintln!("herd-hub: recording {job_id} as running failed: {error}");
-                        say_it_is_stalled(state, &job_id, error.to_string());
+                        let note = stalled_note(&error.to_string());
+                        for follower in state.followers_of(&job_id) {
+                            let _ = follower.send(FromHub::JobNote {
+                                job_id: job_id.clone(),
+                                note: note.clone(),
+                            });
+                        }
                     }
                 }
             }
             ToHub::LogChunk {
                 job_id,
+                attempt,
                 stream,
                 seq,
                 data,
             } => {
-                let (written, followers) = state.record_chunk(&job_id, stream, seq, &data);
-                if let Err(error) = written {
-                    eprintln!("herd-hub: recording a log chunk of {job_id} failed: {error}");
+                if !is_current(state, outbox, &job_id, attempt) {
+                    continue;
                 }
-                // Relayed whether or not it could be recorded: a requester
-                // watching the job must not go blind because the hub's disk
-                // did.
-                for follower in followers {
-                    let _ = follower.send(FromHub::LogChunk {
-                        job_id: job_id.clone(),
-                        stream,
-                        seq,
-                        data: data.clone(),
-                    });
+                let (written, followers) = state.record_chunk(&job_id, stream, seq, &data);
+                match written {
+                    // Acknowledged only once it is on the disk, so that a
+                    // chunk the runner still holds is a chunk the hub does not
+                    // have (D36) — the same rule as a result, for the same
+                    // reason.
+                    Ok(LogWrite::Recorded) => {
+                        let _ = outbox.send(FromHub::LogAck {
+                            job_id: job_id.clone(),
+                            attempt,
+                            through_seq: seq + 1,
+                        });
+                        // Relayed whether or not anyone is listening: a
+                        // requester watching the job must not go blind
+                        // because the hub's disk did.
+                        for follower in followers {
+                            let _ = follower.send(FromHub::LogChunk {
+                                job_id: job_id.clone(),
+                                stream,
+                                seq,
+                                data: data.clone(),
+                            });
+                        }
+                    }
+                    // Already written: this is the runner sending again what
+                    // it was never acknowledged for. Acknowledged, not
+                    // relayed — whoever is following has seen it once.
+                    Ok(LogWrite::AlreadyRecorded) => {
+                        let _ = outbox.send(FromHub::LogAck {
+                            job_id: job_id.clone(),
+                            attempt,
+                            through_seq: seq + 1,
+                        });
+                    }
+                    Err(error) => {
+                        eprintln!("herd-hub: recording a log chunk of {job_id} failed: {error}");
+                        for follower in followers {
+                            let _ = follower.send(FromHub::LogChunk {
+                                job_id: job_id.clone(),
+                                stream,
+                                seq,
+                                data: data.clone(),
+                            });
+                        }
+                    }
                 }
             }
             ToHub::JobFinished {
                 job_id,
+                attempt,
                 outcome,
+                chunks_sent,
                 metrics,
             } => {
+                if !is_current(state, outbox, &job_id, attempt) {
+                    continue;
+                }
                 // A result for a job this hub has no record of — a state root
                 // that was replaced under it, say. There is nothing to write
                 // it to, and refusing it would wedge the runner, which would
@@ -455,6 +943,14 @@ async fn relay_from_runner(state: &State, outbox: &Outbox, source: &mut Source) 
                     }
                     Ok(Some(_)) => {}
                 }
+                // The log before the end. A job that ended having written more
+                // chunks than this hub holds is the lost-tail case, and the
+                // end is not recorded on a log known to be short: the missing
+                // output is asked for first, once. Asked twice it is gone, and
+                // then it is named (D29) rather than waited for for ever.
+                if !the_log_is_whole(state, outbox, &job_id, attempt, chunks_sent) {
+                    continue;
+                }
                 // Recorded first, acknowledged second. The runner is holding
                 // this result until the acknowledgement arrives, so the order
                 // of these two steps is the whole of E-44's promise: nothing
@@ -462,11 +958,11 @@ async fn relay_from_runner(state: &State, outbox: &Outbox, source: &mut Source) 
                 // disk.
                 if !record_the_end(state, &job_id, &outcome, &metrics).await {
                     // The hub could not write it. Nothing is acknowledged, so
-                    // the runner keeps holding it and redelivers it on its
-                    // next connection; the job stalls, and a stalled job is
-                    // recoverable where a destroyed outcome is not (D19).
+                    // the runner keeps holding it; the hub goes on trying in
+                    // the background and never destroys it (D19).
                     continue;
                 }
+                state.attempt_is_over(&job_id);
                 let _ = outbox.send(FromHub::JobResultAck {
                     job_id: job_id.clone(),
                 });
@@ -478,6 +974,19 @@ async fn relay_from_runner(state: &State, outbox: &Outbox, source: &mut Source) 
                     });
                 }
             }
+            ToHub::AttemptAbandoned {
+                job_id,
+                attempt,
+                reason,
+            } => {
+                if !is_current(state, outbox, &job_id, attempt) {
+                    continue;
+                }
+                println!("herd-hub: attempt {attempt} of {job_id} was abandoned: {reason}");
+                if let Err(error) = give_the_job_another_go(state, &job_id, attempt, &reason) {
+                    eprintln!("herd-hub: {job_id} could not be requeued: {error:#}");
+                }
+            }
             other => {
                 let _ = outbox.send(FromHub::Refused {
                     reason: format!("a runner may not send {}", message_kind(&other)),
@@ -486,39 +995,168 @@ async fn relay_from_runner(state: &State, outbox: &Outbox, source: &mut Source) 
             }
         }
     }
-    Ok(())
 }
 
-/// How many times the hub tries to write a result before leaving it with the
-/// runner, and how long it waits between tries.
-///
-/// Deliberately short and dumb: the point is to ride out the kind of failure
-/// that passes — a directory being replaced, a brief ENOSPC — and then to stop
-/// and say so, rather than to turn one unwritable result into a connection
-/// that stalls for ever. Nothing here decides a job is lost; that is M3's.
-const RECORDING_ATTEMPTS: u32 = 4;
-const BETWEEN_ATTEMPTS: std::time::Duration = std::time::Duration::from_millis(250);
+/// Whether a frame about an attempt is one the hub will act on, telling the
+/// runner by name when it is not (E-21).
+fn is_current(state: &State, outbox: &Outbox, job_id: &JobId, attempt: u32) -> bool {
+    match state.attempt_is_current(job_id, attempt) {
+        // Every frame about the attempt that is current — a start, a chunk, an
+        // end, a health report naming it — is word that the attempt is alive,
+        // and that is what the watchdog times (E-21).
+        Ok(true) => {
+            state.attempt_was_heard_of(job_id);
+            true
+        }
+        Ok(false) => {
+            let reason = format!(
+                "attempt {attempt} of {job_id} is not the attempt this hub is waiting for; \
+                 nothing of it is recorded"
+            );
+            eprintln!("herd-hub: {reason}");
+            let _ = outbox.send(FromHub::StaleAttempt {
+                job_id: job_id.clone(),
+                attempt,
+                reason,
+            });
+            false
+        }
+        // Not knowing is not a licence to write: the frame is left alone and
+        // the runner keeps holding whatever it was about.
+        Err(error) => {
+            eprintln!("herd-hub: reading which attempt {job_id} is on failed: {error}");
+            false
+        }
+    }
+}
 
-/// Write a job's end to the disk, retrying, and say whether it is written.
+/// What the hub does about one job a health report mentions: tell the runner
+/// if the attempt is over, and ask for output the hub is short of (E-40).
+///
+/// A shortfall at the instant of a report is the ordinary case, not a loss: a
+/// chunk is in flight, or is being written, every time a busy job is reported
+/// on. So the hub asks only for a shortfall that has *survived* a report —
+/// nothing written between two of them, with the runner saying both times
+/// that it has sent more. Asking on sight would have the hub ask for output
+/// it is in the middle of recording, every fifteen seconds, for every running
+/// job.
+fn mind_a_reported_job(state: &State, outbox: &Outbox, job: &RunningJob) {
+    if !is_current(state, outbox, &job.job_id, job.attempt) {
+        return;
+    }
+    let recorded = match state.store.chunks_recorded(&job.job_id) {
+        Ok(recorded) => recorded,
+        Err(error) => {
+            eprintln!(
+                "herd-hub: cannot tell how much of {}'s log is written: {error}",
+                job.job_id
+            );
+            return;
+        }
+    };
+    if recorded >= job.chunks_sent {
+        state.with_peers(|peers| peers.short_log.remove(&job.job_id));
+        return;
+    }
+    let stuck = state.with_peers(|peers| {
+        peers
+            .short_log
+            .insert(job.job_id.clone(), recorded)
+            .is_some_and(|before| before == recorded)
+    });
+    if !stuck {
+        return;
+    }
+    println!(
+        "herd-hub: runner has sent {} chunk(s) of {} and this hub still has {}; asking \
+         for the rest",
+        job.chunks_sent, job.job_id, recorded
+    );
+    let _ = outbox.send(FromHub::ResendLog {
+        job_id: job.job_id.clone(),
+        attempt: job.attempt,
+        from_seq: recorded,
+    });
+}
+
+/// Whether the job's log holds everything the attempt says it wrote.
+///
+/// This is the case M2 could not close. Chunks lost with nothing after them
+/// leave the log short with nothing to notice it by — the next chunk is what
+/// reveals a gap, and there is no next chunk. The end of the job carries the
+/// attempt's total, so the hub can see the shortfall at the one moment it
+/// still can: it asks for the output back before recording an end, and only
+/// if it is asked for in vain does the log say it is short.
+fn the_log_is_whole(
+    state: &State,
+    outbox: &Outbox,
+    job_id: &JobId,
+    attempt: u32,
+    chunks_sent: u64,
+) -> bool {
+    let recorded = match state.store.chunks_recorded(job_id) {
+        Ok(recorded) => recorded,
+        Err(error) => {
+            eprintln!("herd-hub: cannot tell how much of {job_id}'s log is written: {error}");
+            return true;
+        }
+    };
+    if recorded >= chunks_sent {
+        return true;
+    }
+    let asked_before = state.with_peers(|peers| !peers.tail_asked.insert(job_id.clone()));
+    if !asked_before {
+        println!(
+            "herd-hub: {job_id} ended having written {chunks_sent} chunk(s) and this hub \
+             holds {recorded}; asking the runner for the tail before recording the end"
+        );
+        let _ = outbox.send(FromHub::ResendLog {
+            job_id: job_id.clone(),
+            attempt,
+            from_seq: recorded,
+        });
+        return false;
+    }
+    // Asked, and the runner does not have it. The log is short, and says so.
+    if let Err(error) = state
+        .store
+        .name_missing_log(job_id, recorded, chunks_sent - 1)
+    {
+        eprintln!("herd-hub: naming the missing tail of {job_id} failed: {error}");
+    }
+    true
+}
+
+/// Write a job's end to the disk, retrying briefly, and say whether it is
+/// written.
 ///
 /// A result is the one thing a runner cannot reproduce, and the hub failing to
 /// store it is the hub's problem, never the runner's: it is never acknowledged
 /// unless it is written, the runner is never dropped for it, and the reason is
 /// said in full so that an operator can act on it (D19).
+///
+/// The tries here are the fast path — three of them, inside a second — for the
+/// failure that passes while the frame is in hand. What M2 did next was give
+/// up and leave the resolution to a link bouncing, which is not a policy; what
+/// happens now is that the end is handed to
+/// [`keep_trying_to_write_results`], which goes on trying on a growing delay
+/// and never stops. There is no give-up, because the only alternative to
+/// writing a result eventually is losing it.
 async fn record_the_end(
     state: &State,
     job_id: &JobId,
-    outcome: &herd_proto::JobOutcome,
-    metrics: &herd_proto::JobMetrics,
+    outcome: &JobOutcome,
+    metrics: &JobMetrics,
 ) -> bool {
+    const FAST_TRIES: u32 = 3;
     let end = JobState::Finished {
         outcome: outcome.clone(),
     };
     let mut why = String::new();
-    for attempt in 1..=RECORDING_ATTEMPTS {
+    for attempt in 1..=FAST_TRIES {
         // The measurements go down before the transition, so that a reader
         // who sees `finished` is entitled to find the figures beside it
-        // (E-15) — and inside the same retry, because a hub that could not
+        // (E-15) — and inside the same try, because a hub that could not
         // write what a runner measured must not acknowledge the result
         // either. Failing to store either half is the hub's problem, never
         // the runner's, and never a reason to drop it (D19).
@@ -535,44 +1173,307 @@ async fn record_the_end(
                 why = error.to_string();
                 eprintln!(
                     "herd-hub: recording the outcome of {job_id} failed \
-                     (attempt {attempt} of {RECORDING_ATTEMPTS}): {error}"
+                     (try {attempt} of {FAST_TRIES}): {error}"
                 );
-                if attempt < RECORDING_ATTEMPTS {
-                    tokio::time::sleep(BETWEEN_ATTEMPTS).await;
+                if attempt < FAST_TRIES {
+                    tokio::time::sleep(state.policy.write_retry_first).await;
                 }
             }
         }
     }
     eprintln!(
         "herd-hub: {job_id} ended with {outcome:?} and this hub cannot write it. \
-         The result is NOT acknowledged: the runner still holds it and will \
-         redeliver it. Make the state root writable."
+         The result is NOT acknowledged: the runner still holds it, and this hub \
+         goes on trying to write it for as long as it takes. Make the state root \
+         writable."
     );
     // The record will go on reading `running`, or `assigned`, with nothing
     // happening to it at all. Whoever is waiting for this job hears why, and
     // so does whoever waits for it later: being mute about a job that is
     // going nowhere is not a policy (D19).
-    say_it_is_stalled(state, job_id, why);
-    false
-}
-
-/// Keep the reason a job cannot be written down, and tell whoever is waiting.
-fn say_it_is_stalled(state: &State, job_id: &JobId, why: String) {
     let note = stalled_note(&why);
-    for follower in state.note_a_stall(job_id, why) {
+    for follower in state.note_a_stall(job_id, why, outcome, metrics) {
         let _ = follower.send(FromHub::JobNote {
             job_id: job_id.clone(),
             note: note.clone(),
         });
+    }
+    false
+}
+
+/// Go on trying to write the ends this hub could not write, for as long as it
+/// takes (D19).
+///
+/// The delay grows to a cap and stays there; there is no attempt count and no
+/// give-up. A full disk is fixed in minutes or in days, and either way the
+/// outcome in memory here is the only copy besides the one the runner is
+/// holding — so the one thing this task may never do is stop.
+async fn keep_trying_to_write_results(state: Arc<State>) {
+    let mut delay = state.policy.write_retry_first;
+    loop {
+        tokio::time::sleep(delay).await;
+        let pending: Vec<(JobId, JobOutcome, JobMetrics)> = state.with_peers(|peers| {
+            peers
+                .unwritten
+                .iter()
+                .map(|(id, (outcome, metrics))| (id.clone(), outcome.clone(), metrics.clone()))
+                .collect()
+        });
+        if pending.is_empty() {
+            delay = state.policy.write_retry_first;
+            continue;
+        }
+        let mut wrote_something = false;
+        for (job_id, outcome, metrics) in pending {
+            let end = JobState::Finished {
+                outcome: outcome.clone(),
+            };
+            match state
+                .store
+                .record_metrics(&job_id, metrics.clone())
+                .and_then(|()| state.store.record_state(&job_id, end))
+            {
+                Ok(()) => {
+                    wrote_something = true;
+                    state.stall_is_over(&job_id);
+                    state.attempt_is_over(&job_id);
+                    println!(
+                        "herd-hub: {job_id} is written at last: {outcome:?}. The runner is \
+                         told it may forget it."
+                    );
+                    if let Some(runner) = state.runner() {
+                        let _ = runner.send(FromHub::JobResultAck {
+                            job_id: job_id.clone(),
+                        });
+                    }
+                    for follower in state.stop_following(&job_id) {
+                        let _ = follower.send(FromHub::JobFinished {
+                            job_id: job_id.clone(),
+                            outcome: outcome.clone(),
+                            metrics: metrics.clone(),
+                        });
+                    }
+                }
+                Err(error) => {
+                    eprintln!("herd-hub: {job_id} still cannot be written: {error}");
+                }
+            }
+        }
+        delay = if wrote_something {
+            state.policy.write_retry_first
+        } else {
+            (delay * 2).min(state.policy.write_retry_cap)
+        };
+    }
+}
+
+/// Watch for attempts nothing is being heard about, and give their jobs one
+/// more go (E-21).
+///
+/// What is timed is **an attempt**, never "is a runner connected". Three cases
+/// made that the only model that works. A runner killed and replaced by
+/// another leaves its attempt dead while the hub has a connected, healthy
+/// runner. A runner killed and restarted comes back itself, healthy, with no
+/// memory of the job it was running — and it is the *job* that is gone, not
+/// the machine. And a hub that restarts inherits attempts it has never heard
+/// a word about. So the clock is per attempt, anything the runner says about
+/// it is evidence, and a health report naming it is evidence too, which is
+/// what that list in the report is for.
+///
+/// A connected runner that has stopped reporting is also dropped here, which
+/// is a separate thing: a link nothing comes back on is not a link, and
+/// holding it would keep the slot and refuse the runner that is trying to
+/// take its place.
+async fn watch_for_a_lost_runner(state: Arc<State>) {
+    let mut ticker = tokio::time::interval(state.policy.watchdog_every());
+    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    loop {
+        ticker.tick().await;
+
+        // A connection nothing has come back on for the threshold: dropped,
+        // so that the slot is free for the runner that is dialling.
+        let silent_link = state.with_peers(|peers| {
+            let silent = peers
+                .runner
+                .as_ref()
+                .filter(|runner| runner.last_health.elapsed() > state.policy.lost_after)
+                .map(|runner| (runner.name.clone(), runner.last_health.elapsed()));
+            if silent.is_some() {
+                if let Some(runner) = &peers.runner {
+                    let _ = runner.kick.send(true);
+                }
+                peers.runner = None;
+            }
+            silent
+        });
+        if let Some((name, quiet_for)) = silent_link {
+            eprintln!(
+                "herd-hub: dropping the connection to runner {name}: nothing has come back \
+                 on it for {quiet_for:?}"
+            );
+        }
+
+        let in_the_air = attempts_in_the_air(&state);
+        if in_the_air.is_empty() {
+            continue;
+        }
+        for (job_id, unheard_for) in state.unheard_of_for(&in_the_air) {
+            if unheard_for <= state.policy.lost_after {
+                continue;
+            }
+            let Ok(Some(record)) = state.store.job(&job_id) else {
+                continue;
+            };
+            let attempt = record.attempt_number();
+            if attempt == 0 {
+                continue;
+            }
+            let runner = record
+                .attempt()
+                .map(|attempt| attempt.runner.clone())
+                .unwrap_or_default();
+            let reason = format!(
+                "runner {runner} stopped answering: nothing about attempt {attempt} of this \
+                 job for {unheard_for:?}, so it is not coming back"
+            );
+            if let Err(error) = give_the_job_another_go(&state, &job_id, attempt, &reason) {
+                eprintln!("herd-hub: {job_id} could not be requeued: {error:#}");
+            }
+        }
+    }
+}
+
+/// End an attempt that produced no verdict, and give the job one more go —
+/// or, if it has had its goes, end it by name (E-21).
+///
+/// The job goes back to where it was in the queue: priority levels and aging
+/// arrive in M6, and until then "its existing place" is what the durable queue
+/// already gives, oldest first.
+fn give_the_job_another_go(
+    state: &State,
+    job_id: &JobId,
+    attempt: u32,
+    reason: &str,
+) -> Result<()> {
+    let Some(record) = state
+        .store
+        .job(job_id)
+        .with_context(|| format!("reading the record of {job_id}"))?
+    else {
+        return Ok(());
+    };
+    if record.state.is_terminal() {
+        return Ok(());
+    }
+    // Only the attempt that is current can be given up on, and only once. Two
+    // callers reach here — the runner abandoning an attempt and the watchdog
+    // declaring it lost — and they can arrive about the same attempt at the
+    // same moment. Without this, the second one would requeue the job *again*,
+    // off the back of an attempt that has already been replaced, and a job
+    // allowed two goes would get three.
+    if !record.attempt_is_current(attempt) {
+        return Ok(());
+    }
+    state
+        .store
+        .end_attempt(job_id, attempt, reason)
+        .with_context(|| format!("ending attempt {attempt} of {job_id}"))?;
+    state.attempt_is_over(job_id);
+    // Whatever that attempt wrote and the hub never received is gone with it:
+    // the runner held it in memory. Said in the log, at the place where it is
+    // missing, rather than left to be noticed by its absence (D29).
+    name_what_that_attempt_lost(state, job_id);
+
+    if attempt < state.policy.attempts_allowed {
+        state
+            .store
+            .record_state(job_id, JobState::Queued)
+            .with_context(|| format!("requeueing {job_id}"))?;
+        println!(
+            "herd-hub: {job_id} is queued again for attempt {} of {}: {reason}",
+            attempt + 1,
+            state.policy.attempts_allowed
+        );
+        for follower in state.followers_of(job_id) {
+            let _ = follower.send(FromHub::JobNote {
+                job_id: job_id.clone(),
+                note: format!(
+                    "attempt {attempt} of this job ended without a verdict ({reason}); it is \
+                     queued again as attempt {}. This wait carries on.",
+                    attempt + 1
+                ),
+            });
+        }
+        // There may be a runner here already — the one that replaced the one
+        // that went — in which case the second attempt starts at once.
+        dispatch(state, job_id, record.command.clone())?;
+        return Ok(());
+    }
+
+    // Out of goes. An end, and a named one: not an exit code, because no
+    // process gave one (D15).
+    let outcome = JobOutcome::Lost {
+        reason: format!(
+            "{reason}; this was attempt {attempt} of {}, so the job is not attempted again",
+            state.policy.attempts_allowed
+        ),
+    };
+    state
+        .store
+        .record_state(
+            job_id,
+            JobState::Finished {
+                outcome: outcome.clone(),
+            },
+        )
+        .with_context(|| format!("recording {job_id} as lost"))?;
+    eprintln!("herd-hub: {job_id} is lost: {reason}");
+    for follower in state.stop_following(job_id) {
+        let _ = follower.send(FromHub::JobFinished {
+            job_id: job_id.clone(),
+            outcome: outcome.clone(),
+            // Whatever the record holds, which for a job no runner ever
+            // reported on is nothing at all — and nothing is what is sent,
+            // never a zero (D23).
+            metrics: record.metrics.clone(),
+        });
+    }
+    Ok(())
+}
+
+/// Name the output an attempt took with it, if the hub knows there was any.
+///
+/// The last health report said how many chunks the runner had sent; what the
+/// hub has written is what it has. The difference went with the runner, and a
+/// log short of it says so (D29).
+fn name_what_that_attempt_lost(state: &State, job_id: &JobId) {
+    let sent = state.with_peers(|peers| {
+        peers
+            .runner
+            .as_ref()
+            .into_iter()
+            .flat_map(|runner| runner.jobs.iter())
+            .find(|job| &job.job_id == job_id)
+            .map(|job| job.chunks_sent)
+    });
+    let Some(sent) = sent else {
+        return;
+    };
+    let Ok(recorded) = state.store.chunks_recorded(job_id) else {
+        return;
+    };
+    if recorded < sent {
+        if let Err(error) = state.store.name_missing_log(job_id, recorded, sent - 1) {
+            eprintln!("herd-hub: naming what {job_id} lost failed: {error}");
+        }
     }
 }
 
 /// What a wait is told about a job the hub cannot write down.
 ///
 /// Neither a refusal nor a verdict: the result exists, the runner is holding
-/// it, and this hub cannot put it on its disk (D19). How long a hub tries
-/// before leaving it there is M3's policy; saying nothing at all never was
-/// one. One sentence in one place, so a test can rely on it.
+/// it, and this hub cannot put it on its disk (D19). One sentence in one
+/// place, so a test can rely on it.
 fn stalled_note(why: &str) -> String {
     format!(
         "this job is not over and the hub cannot write it down: {why}. \
@@ -597,12 +1498,10 @@ async fn accept_submissions(state: &State, outbox: &Outbox, source: &mut Source)
                     });
                     return Ok(());
                 }
-                let Some(runner) = state.runner() else {
-                    let _ = outbox.send(FromHub::Refused {
-                        reason: "no runner is connected".to_owned(),
-                    });
+                if let Some(reason) = state.why_no_runner() {
+                    let _ = outbox.send(FromHub::Refused { reason });
                     return Ok(());
-                };
+                }
                 let job = state
                     .store
                     .create_job(command.clone())
@@ -613,23 +1512,16 @@ async fn accept_submissions(state: &State, outbox: &Outbox, source: &mut Source)
                     job_id: job.id.clone(),
                 });
                 state.follow(job.id.clone(), outbox);
-                state
-                    .store
-                    .record_state(&job.id, JobState::Assigned)
-                    .with_context(|| format!("recording {} as assigned", job.id))?;
-                if runner
-                    .send(FromHub::AssignJob {
-                        job_id: job.id.clone(),
-                        command,
-                    })
-                    .is_err()
-                {
+                if !dispatch(state, &job.id, command)? {
                     state.stop_following(&job.id);
                     let _ = outbox.send(FromHub::Refused {
                         reason: "the runner disconnected before the job was assigned".to_owned(),
                     });
                     return Ok(());
                 }
+            }
+            ToHub::CancelJob { job_id } => {
+                cancel_job(state, outbox, &job_id)?;
             }
             ToHub::WaitForJob { job_id } => {
                 let attached = state
@@ -674,15 +1566,17 @@ async fn accept_submissions(state: &State, outbox: &Outbox, source: &mut Source)
                     // Waiting for a job whose attempt was interrupted is
                     // waiting for a runner that may never come back, so the
                     // wait says so rather than being silent (D17). It is not a
-                    // refusal: the runner may still redeliver, and then this
-                    // same connection carries the result.
+                    // refusal: the runner may still redeliver, and if it does
+                    // not the job is attempted again — either way this same
+                    // connection carries the answer.
                     JobState::Interrupted { reason } => {
                         let _ = outbox.send(FromHub::JobNote {
                             job_id,
                             note: format!(
                                 "this job is not over and its last attempt was \
                                  interrupted: {reason}. If the runner comes back, \
-                                 its result arrives here."
+                                 its result arrives here; if it does not, the job is \
+                                 attempted again."
                             ),
                         });
                     }
@@ -708,6 +1602,90 @@ async fn accept_submissions(state: &State, outbox: &Outbox, source: &mut Source)
             }
         }
     }
+    Ok(())
+}
+
+/// Cancel one job, wherever it is (E-06).
+///
+/// Three cases, and each is answered rather than assumed. A job nobody has
+/// started is ended here and now, because there is no runner to ask. A job
+/// being executed is cancelled on its runner, scoped to that one attempt, so
+/// a sibling job on the same machine is untouched; the runner reports the end
+/// and the record gets it the ordinary way. A job that is already over is not
+/// a failure to report — it is simply too late, said in one sentence.
+fn cancel_job(state: &State, outbox: &Outbox, job_id: &JobId) -> Result<()> {
+    let Some(record) = state
+        .store
+        .job(job_id)
+        .with_context(|| format!("reading the record of {job_id}"))?
+    else {
+        let _ = outbox.send(FromHub::Refused {
+            reason: format!("no such job: {job_id}"),
+        });
+        return Ok(());
+    };
+    let note = match record.state {
+        JobState::Finished { .. } => {
+            format!("{job_id} is already over, so there was nothing to cancel")
+        }
+        JobState::Queued => {
+            let reason = "a requester cancelled this job before it started".to_owned();
+            state
+                .store
+                .record_state(
+                    job_id,
+                    JobState::Finished {
+                        outcome: JobOutcome::Cancelled {
+                            reason: reason.clone(),
+                        },
+                    },
+                )
+                .with_context(|| format!("recording {job_id} as cancelled"))?;
+            state.attempt_is_over(job_id);
+            for follower in state.stop_following(job_id) {
+                let _ = follower.send(FromHub::JobFinished {
+                    job_id: job_id.clone(),
+                    outcome: JobOutcome::Cancelled {
+                        reason: reason.clone(),
+                    },
+                    // A job cancelled before it started cost no machine
+                    // anything, so there is nothing measured to send.
+                    metrics: JobMetrics::default(),
+                });
+            }
+            format!("{job_id} was queued and is cancelled")
+        }
+        _ => {
+            let attempt = record.attempt_number();
+            let reason = "a requester cancelled this job".to_owned();
+            match state.runner() {
+                Some(runner) => {
+                    let _ = runner.send(FromHub::CancelJob {
+                        job_id: job_id.clone(),
+                        attempt,
+                        reason: reason.clone(),
+                    });
+                    format!(
+                        "attempt {attempt} of {job_id} is being ended on the runner \
+                         executing it"
+                    )
+                }
+                // Nothing to propagate to. The attempt is already in the air,
+                // and the watchdog is what resolves it; inventing an end here
+                // would claim a job was cancelled that is still running
+                // somewhere.
+                None => format!(
+                    "{job_id} is on a runner that is not connected; it is cancelled as soon \
+                     as the runner is back, and lost if it never is"
+                ),
+            }
+        }
+    };
+    println!("herd-hub: {note}");
+    let _ = outbox.send(FromHub::JobNote {
+        job_id: job_id.clone(),
+        note,
+    });
     Ok(())
 }
 
@@ -760,9 +1738,12 @@ fn message_kind(message: &ToHub) -> &'static str {
     match message {
         ToHub::Hello { .. } => "hello",
         ToHub::SubmitJob { .. } => "submit_job",
+        ToHub::CancelJob { .. } => "cancel_job",
         ToHub::WaitForJob { .. } => "wait_for_job",
         ToHub::JobStarted { .. } => "job_started",
         ToHub::LogChunk { .. } => "log_chunk",
         ToHub::JobFinished { .. } => "job_finished",
+        ToHub::Health { .. } => "health",
+        ToHub::AttemptAbandoned { .. } => "attempt_abandoned",
     }
 }

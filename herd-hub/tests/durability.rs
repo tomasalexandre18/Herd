@@ -8,7 +8,7 @@
 
 use std::sync::Arc;
 
-use herd_hub::{JobDirStore, JobState, JobStore};
+use herd_hub::{JobState, JobStore};
 use herd_proto::{JobOutcome, LogStream};
 use herd_runner::Session;
 
@@ -24,6 +24,7 @@ fn runner_config(hub_url: &str, data_root: &support::DataRootDir) -> herd_runner
         name: Some("durable-runner".to_owned()),
         token: None,
         confinement: support::confinement(data_root),
+        ..herd_runner::Config::default()
     }
 }
 
@@ -94,7 +95,7 @@ async fn a_hub_that_restarts_loses_no_result_and_no_queued_job() {
     // there while no runner is free; until then it is minted the way the hub
     // itself mints one.
     let (queued, recovered) = {
-        let store = JobDirStore::open(state.path()).expect("the state root opens");
+        let store = support::open_when_free(state.path());
         let queued = store
             .create_job(shell("printf 'from the queue\\n'"))
             .expect("minted")
@@ -148,16 +149,23 @@ async fn a_hub_that_restarts_loses_no_result_and_no_queued_job() {
         serde_json::json!({"type": "exited", "code": 7}),
         "the outcome is recorded as the runner reported it"
     );
-    // What the hub had written stayed written. What the job printed while no
-    // hub existed did not arrive: a runner holds its *results* until they are
-    // acknowledged, not its output. That is M2's line, drawn on purpose — a
-    // result is work that would otherwise be redone, while a log chunk is a
-    // stream whose continuity across a dead link is M3's problem, together
-    // with the reconnection that makes it possible at all.
+    // And the log is whole, tail included. The job printed its last line while
+    // there was no hub at all: those chunks were held by the runner, sent again
+    // on the connection that came after, and written in the order they were
+    // produced. This is the promise M2 could not make — it recorded the loss
+    // honestly and left the recovery to M3 (D36) — and the one that matters,
+    // because a build log missing its last line is a build log missing the
+    // error.
     assert_eq!(
         log_of(state.path(), &running),
-        "before the restart\n",
-        "the log the hub had recorded before it died must not have changed"
+        "before the restart\nafter it\n",
+        "the log must hold everything the job printed, including what it \
+         printed while no hub existed"
+    );
+    assert!(
+        !log_of(state.path(), &running).contains("never reached this log"),
+        "nothing was lost, so nothing may be named as lost: {}",
+        log_of(state.path(), &running)
     );
     // And the runner is told it may forget it.
     wait_until("the hub acknowledges the result", || {
@@ -335,13 +343,22 @@ async fn a_job_s_record_is_readable_while_it_is_still_running() {
         "the log is what the job has written so far, not what it will write"
     );
 
-    // The transitions so far, in order, each with a moment.
+    // The transitions so far, in order, each with a moment. A line recording
+    // something else — the attempt being handed to a runner, output that
+    // never arrived — is not a transition, and is read as what it is.
     let events = events_of(&state_dir, &job_id);
     let states: Vec<&str> = events
         .iter()
-        .map(|event| event["state"]["type"].as_str().expect("a state"))
+        .filter_map(|event| event["state"]["type"].as_str())
         .collect();
     assert_eq!(states, ["queued", "assigned", "running"]);
+    let attempts: Vec<&serde_json::Value> = events
+        .iter()
+        .filter(|event| event["event"] == "attempt_started")
+        .collect();
+    assert_eq!(attempts.len(), 1, "one go at the job so far: {events:?}");
+    assert_eq!(attempts[0]["attempt"], 1);
+    assert_eq!(attempts[0]["runner"], "test-runner");
     for event in &events {
         assert_eq!(event["record_version"], herd_hub::RECORD_VERSION);
         assert!(
@@ -357,8 +374,23 @@ async fn a_job_s_record_is_readable_while_it_is_still_running() {
         .expect("the job ends");
     assert_eq!(finished.outcome, JobOutcome::Exited { code: 0 });
     let events = events_of(&state_dir, &job_id);
-    assert_eq!(events.len(), 4, "the end is a transition too: {events:?}");
-    assert_eq!(events[3]["state"]["type"], "finished");
+    let states: Vec<&str> = events
+        .iter()
+        .filter_map(|event| event["state"]["type"].as_str())
+        .collect();
+    assert_eq!(
+        states,
+        ["queued", "assigned", "running", "finished"],
+        "the end is a transition too: {events:?}"
+    );
+    // And the record carries the attempt whole: which runner it was on, when
+    // it began, and no reason for its ending — because it ended by producing
+    // the verdict, which is the answer to why.
+    let record = record_of(&state_dir, &job_id);
+    assert_eq!(record["attempts"].as_array().expect("attempts").len(), 1);
+    assert_eq!(record["attempts"][0]["number"], 1);
+    assert_eq!(record["attempts"][0]["runner"], "test-runner");
+    assert!(record["attempts"][0]["ended"].is_null(), "{record}");
 }
 
 /// The index is derived, and only derived: delete it, start again, and every
@@ -368,7 +400,7 @@ async fn a_job_s_record_is_readable_while_it_is_still_running() {
 async fn deleting_the_derived_index_loses_nothing() {
     let state = tempfile::tempdir().expect("a temporary state directory");
     let (finished, queued) = {
-        let store = JobDirStore::open(state.path()).expect("the state root opens");
+        let store = support::open_when_free(state.path());
         let finished = store
             .create_job(vec!["true".to_owned()])
             .expect("minted")
@@ -400,7 +432,7 @@ async fn deleting_the_derived_index_loses_nothing() {
         Wreck::Short,
     ] {
         wreck.apply(state.path());
-        let store = JobDirStore::open(state.path()).expect("a useless index is not a dead hub");
+        let store = support::open_when_free(state.path());
         let queue: Vec<String> = store
             .unfinished_jobs()
             .expect("the queue reads")

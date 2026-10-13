@@ -4,7 +4,7 @@ use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use clap::Parser;
-use herd_hub::{Hub, JobDirStore, JobStore, DEFAULT_LISTEN_ADDR};
+use herd_hub::{Hub, JobDirStore, JobStore, Policy, DEFAULT_LISTEN_ADDR, LOST_AFTER};
 
 /// Where the hub keeps its state unless told otherwise. Relative on purpose:
 /// a development hub writes beside the repository, and the deployment names
@@ -23,6 +23,10 @@ struct Args {
     /// written.
     #[arg(long, env = "HERD_STATE_DIR", default_value = DEFAULT_STATE_DIR)]
     state_dir: PathBuf,
+    /// Seconds without a health report after which a runner is lost and the
+    /// jobs it was running are attempted once more (E-21).
+    #[arg(long, env = "HERD_LOST_AFTER", default_value_t = LOST_AFTER.as_secs_f64())]
+    lost_after: f64,
 }
 
 #[tokio::main]
@@ -35,12 +39,19 @@ async fn main() -> Result<()> {
         )
     })?;
     let unfinished = store.unfinished_jobs()?.len();
-    let hub = Hub::bind(args.listen, Arc::new(store)).await?;
+    let policy = Policy {
+        lost_after: std::time::Duration::try_from_secs_f64(args.lost_after.max(0.0))
+            .unwrap_or(LOST_AFTER),
+        ..Policy::default()
+    };
+    let hub = Hub::bind_with_policy(args.listen, Arc::new(store), policy).await?;
     println!(
-        "herd-hub {} listening on ws://{}, state in {}, {unfinished} job(s) not over",
+        "herd-hub {} listening on ws://{}, state in {}, {unfinished} job(s) not over, \
+         a runner is lost after {:?}",
         herd_hub::hub_version(),
         hub.local_addr(),
         args.state_dir.display(),
+        policy.lost_after,
     );
     hub.serve().await
 }

@@ -39,6 +39,25 @@ pub fn skipped(test: &str, why: &str) {
     }
 }
 
+/// Serialises the tests that plant, sweep for, or reap Herd job markers.
+///
+/// The startup reaper walks `/proc` and kills every process carrying a marker
+/// whose runner is gone ([`crate::reclaim`]) — and it runs inside
+/// `Confined::prepare`, which several tests call. So a test that deliberately
+/// plants an orphan to prove the reaper finds it was racing every other test
+/// that prepared a confinement: the other reaper killed the orphan first, and
+/// the planted process was a zombie with an empty `environ` by the time the
+/// assertion looked. That is a flake, and a flake erodes invariant 5, so it
+/// is held still rather than retried.
+///
+/// Every test in this crate that prepares a confinement or sweeps `/proc`
+/// takes this first. Poisoning is ignored: one failing test must not turn
+/// every other one into a second failure with a different reason.
+pub fn one_reaper_at_a_time() -> std::sync::MutexGuard<'static, ()> {
+    static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
 /// A directory under the system temporary directory, removed on drop.
 #[derive(Debug)]
 pub struct TempDir {

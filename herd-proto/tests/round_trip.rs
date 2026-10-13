@@ -2,8 +2,8 @@
 //! the contract: a field that silently fails to round-trip is a lost field.
 
 use herd_proto::{
-    cap_exceeded_reason, from_frame, to_frame, Cap, FromHub, JobId, JobMetrics, JobOutcome,
-    LogStream, Role, ToHub, PROTOCOL_VERSION,
+    cap_exceeded_reason, cap_stop_reason, from_frame, to_frame, Cap, FromHub, JobId, JobMetrics,
+    JobOutcome, LogStream, Role, RunningJob, ToHub, PROTOCOL_VERSION,
 };
 
 /// Every cap a runner can stop a job at (M4).
@@ -23,15 +23,24 @@ fn every_outcome() -> Vec<JobOutcome> {
     outcomes.push(JobOutcome::CouldNotStart {
         reason: String::new(),
     });
-    outcomes.extend(
-        EVERY_CAP
-            .into_iter()
-            .map(|cap| JobOutcome::StoppedByCap { cap, limit: 0 }),
-    );
+    outcomes.extend(EVERY_CAP.into_iter().map(|cap| JobOutcome::StoppedByCap {
+        cap,
+        limit: 0,
+        detail: None,
+    }));
     outcomes.extend(EVERY_CAP.into_iter().map(|cap| JobOutcome::StoppedByCap {
         cap,
         limit: u64::MAX,
+        detail: Some("the workspace could not be measured".to_owned()),
     }));
+    // M3: a job can also end because somebody asked for it to, or because the
+    // machine it was on stopped answering (E-06, E-21).
+    outcomes.push(JobOutcome::Cancelled {
+        reason: "a requester cancelled this job".to_owned(),
+    });
+    outcomes.push(JobOutcome::Lost {
+        reason: "runner wsl-pc stopped answering: nothing from it for 61s".to_owned(),
+    });
     outcomes
 }
 
@@ -113,11 +122,13 @@ fn every_message_to_the_hub_round_trips() {
     });
     round_trip_to_hub(ToHub::JobStarted {
         job_id: JobId::new("j1"),
+        attempt: 1,
     });
     for stream in [LogStream::Stdout, LogStream::Stderr] {
         for data in every_payload() {
             round_trip_to_hub(ToHub::LogChunk {
                 job_id: JobId::new("j1"),
+                attempt: 1,
                 stream,
                 seq: 0,
                 data,
@@ -126,6 +137,7 @@ fn every_message_to_the_hub_round_trips() {
     }
     round_trip_to_hub(ToHub::LogChunk {
         job_id: JobId::new("j1"),
+        attempt: u32::MAX,
         stream: LogStream::Stdout,
         seq: u64::MAX,
         data: b"quotes \" braces {} newline \n tab \t".to_vec(),
@@ -134,7 +146,9 @@ fn every_message_to_the_hub_round_trips() {
         for metrics in every_metrics() {
             round_trip_to_hub(ToHub::JobFinished {
                 job_id: JobId::new("j1"),
+                attempt: 2,
                 outcome: outcome.clone(),
+                chunks_sent: 97,
                 metrics,
             });
         }
@@ -158,6 +172,7 @@ fn every_message_from_the_hub_round_trips() {
     });
     round_trip_from_hub(FromHub::AssignJob {
         job_id: JobId::new("j1"),
+        attempt: 1,
         command: vec!["true".to_owned()],
     });
     for stream in [LogStream::Stdout, LogStream::Stderr] {
@@ -195,9 +210,13 @@ fn every_message_from_the_hub_round_trips() {
 fn frames_are_tagged_json_objects() {
     let frame = to_frame(&ToHub::JobStarted {
         job_id: JobId::new("j42"),
+        attempt: 1,
     })
     .expect("encodes");
-    assert_eq!(frame, r#"{"type":"job_started","job_id":"j42"}"#);
+    assert_eq!(
+        frame,
+        r#"{"type":"job_started","job_id":"j42","attempt":1}"#
+    );
 }
 
 /// The outcome's wire shape, pinned variant by variant. A job's end is a
@@ -208,24 +227,26 @@ fn each_outcome_is_a_tagged_object_inside_the_frame() {
     let frame = |outcome| {
         to_frame(&ToHub::JobFinished {
             job_id: JobId::new("j1"),
+            attempt: 1,
             outcome,
+            chunks_sent: 0,
             metrics: JobMetrics::default(),
         })
         .expect("encodes")
     };
     // No measurement was taken, so every optional figure is absent from the
     // frame rather than present as a zero.
-    let empty = r#","metrics":{"log_bytes":0,"wall_time_ms":0}}"#;
+    let empty = r#","chunks_sent":0,"metrics":{"log_bytes":0,"wall_time_ms":0}}"#;
     assert_eq!(
         frame(JobOutcome::Exited { code: 42 }),
         format!(
-            r#"{{"type":"job_finished","job_id":"j1","outcome":{{"type":"exited","code":42}}{empty}"#
+            r#"{{"type":"job_finished","job_id":"j1","attempt":1,"outcome":{{"type":"exited","code":42}}{empty}"#
         )
     );
     assert_eq!(
         frame(JobOutcome::Signalled { signal: 15 }),
         format!(
-            r#"{{"type":"job_finished","job_id":"j1","outcome":{{"type":"signalled","signal":15}}{empty}"#
+            r#"{{"type":"job_finished","job_id":"j1","attempt":1,"outcome":{{"type":"signalled","signal":15}}{empty}"#
         )
     );
     assert_eq!(
@@ -233,16 +254,45 @@ fn each_outcome_is_a_tagged_object_inside_the_frame() {
             reason: "no-such-tool: not found".to_owned()
         }),
         format!(
-            r#"{{"type":"job_finished","job_id":"j1","outcome":{{"type":"could_not_start","reason":"no-such-tool: not found"}}{empty}"#
+            r#"{{"type":"job_finished","job_id":"j1","attempt":1,"outcome":{{"type":"could_not_start","reason":"no-such-tool: not found"}}{empty}"#
+        )
+    );
+    assert_eq!(
+        frame(JobOutcome::Cancelled {
+            reason: "a requester cancelled this job".to_owned()
+        }),
+        format!(
+            r#"{{"type":"job_finished","job_id":"j1","attempt":1,"outcome":{{"type":"cancelled","reason":"a requester cancelled this job"}}{empty}"#
+        )
+    );
+    assert_eq!(
+        frame(JobOutcome::Lost {
+            reason: "runner wsl-pc stopped answering".to_owned()
+        }),
+        format!(
+            r#"{{"type":"job_finished","job_id":"j1","attempt":1,"outcome":{{"type":"lost","reason":"runner wsl-pc stopped answering"}}{empty}"#
         )
     );
     assert_eq!(
         frame(JobOutcome::StoppedByCap {
             cap: Cap::Memory,
-            limit: 2_147_483_648
+            limit: 2_147_483_648,
+            detail: None
         }),
         format!(
-            r#"{{"type":"job_finished","job_id":"j1","outcome":{{"type":"stopped_by_cap","cap":"memory","limit":2147483648}}{empty}"#
+            r#"{{"type":"job_finished","job_id":"j1","attempt":1,"outcome":{{"type":"stopped_by_cap","cap":"memory","limit":2147483648}}{empty}"#
+        )
+    );
+    // A cap whose figure alone would mislead carries its reason, and a cap
+    // whose figure says it all does not carry an empty field (D30).
+    assert_eq!(
+        frame(JobOutcome::StoppedByCap {
+            cap: Cap::Disk,
+            limit: 21_474_836_480,
+            detail: Some("the workspace could not be measured".to_owned())
+        }),
+        format!(
+            r#"{{"type":"job_finished","job_id":"j1","attempt":1,"outcome":{{"type":"stopped_by_cap","cap":"disk","limit":21474836480,"detail":"the workspace could not be measured"}}{empty}"#
         )
     );
 }
@@ -254,7 +304,9 @@ fn each_outcome_is_a_tagged_object_inside_the_frame() {
 fn a_figure_that_was_not_measured_is_absent_rather_than_zero() {
     let frame = to_frame(&ToHub::JobFinished {
         job_id: JobId::new("j1"),
+        attempt: 1,
         outcome: JobOutcome::Exited { code: 0 },
+        chunks_sent: 2,
         metrics: JobMetrics {
             host_load_milli: None,
             peak_memory_bytes: Some(0),
@@ -284,18 +336,30 @@ fn every_cap_s_sentence_names_the_cap_and_its_figure() {
         assert!(reason.contains(cap.name()), "{reason}");
         assert!(reason.contains("600"), "{reason}");
         assert!(reason.contains(cap.unit()), "{reason}");
+        // With no detail it is that same sentence, so there is one wording
+        // for one event (D24) however the caller asks for it.
+        assert_eq!(cap_stop_reason(cap, 600, None), reason);
+        // With one, the cap is what the runner could not hold the job *to*,
+        // and the reason is in the sentence: "stopped at its disk cap of
+        // 21474836480 bytes" for a job of four kilobytes was a true number
+        // in a false sentence (D30).
+        let said = cap_stop_reason(cap, 600, Some("the workspace could not be measured"));
+        assert!(said.contains(cap.name()), "{said}");
+        assert!(said.contains("could not hold it"), "{said}");
+        assert!(said.contains("could not be measured"), "{said}");
     }
 }
 
 /// A peer from a later milestone reporting an end this one does not know is a
-/// decode error naming it, never a job silently read as having exited.
+/// decode error naming it, never a job silently read as having exited. The
+/// end used here is M9's deadline, because M3's own 'lost' is a variant now.
 #[test]
 fn an_unknown_outcome_is_a_decode_error_not_a_panic() {
     let err = from_frame::<ToHub>(
-        r#"{"type":"job_finished","job_id":"j1","outcome":{"type":"lost","since":"m3"}}"#,
+        r#"{"type":"job_finished","job_id":"j1","attempt":1,"chunks_sent":0,"outcome":{"type":"deadline_passed","by":"m9"}}"#,
     )
     .expect_err("an unknown way to end must be rejected");
-    assert!(err.to_string().contains("lost"), "{err}");
+    assert!(err.to_string().contains("deadline_passed"), "{err}");
 }
 
 #[test]
@@ -313,6 +377,7 @@ fn a_log_payload_is_base64_in_the_frame_and_comes_back_byte_for_byte() {
     let written = b"a\0b\xffc\n".to_vec();
     let frame = to_frame(&ToHub::LogChunk {
         job_id: JobId::new("j1"),
+        attempt: 1,
         stream: LogStream::Stdout,
         seq: 3,
         data: written.clone(),
@@ -320,7 +385,7 @@ fn a_log_payload_is_base64_in_the_frame_and_comes_back_byte_for_byte() {
     .expect("encodes");
     assert_eq!(
         frame,
-        r#"{"type":"log_chunk","job_id":"j1","stream":"stdout","seq":3,"data":"YQBi/2MK"}"#
+        r#"{"type":"log_chunk","job_id":"j1","attempt":1,"stream":"stdout","seq":3,"data":"YQBi/2MK"}"#
     );
     let ToHub::LogChunk { data, .. } = from_frame(&frame).expect("decodes") else {
         panic!("a log chunk decodes as a log chunk");
@@ -330,7 +395,7 @@ fn a_log_payload_is_base64_in_the_frame_and_comes_back_byte_for_byte() {
     // And a payload that is not base64 at all is a decode error, not an empty
     // log: a chunk Herd cannot read is never read as nothing.
     let error = from_frame::<ToHub>(
-        r#"{"type":"log_chunk","job_id":"j1","stream":"stdout","seq":0,"data":"not base64!"}"#,
+        r#"{"type":"log_chunk","job_id":"j1","attempt":1,"stream":"stdout","seq":0,"data":"not base64!"}"#,
     )
     .expect_err("a payload that is no base64 must be refused");
     assert!(!error.to_string().is_empty(), "{error}");
@@ -356,4 +421,134 @@ fn the_durability_frames_are_tagged_json_objects() {
         .expect("encodes"),
         r#"{"type":"job_result_ack","job_id":"j0000000042"}"#
     );
+}
+
+/// The frames M3 added, pinned on the wire.
+///
+/// Four of them carry an attempt number, and that is the point: a runner that
+/// comes back after being declared lost says things about an attempt the hub
+/// has written off, and the number is the only way to tell that from a frame
+/// about the attempt running now (E-21).
+#[test]
+fn the_link_frames_are_tagged_json_objects() {
+    assert_eq!(
+        to_frame(&ToHub::Health {
+            jobs: vec![RunningJob {
+                job_id: JobId::new("j0000000007"),
+                attempt: 2,
+                chunks_sent: 412,
+            }],
+            draining: false,
+        })
+        .expect("encodes"),
+        r#"{"type":"health","jobs":[{"job_id":"j0000000007","attempt":2,"chunks_sent":412}],"draining":false}"#
+    );
+    assert_eq!(
+        to_frame(&ToHub::Health {
+            jobs: vec![],
+            draining: true,
+        })
+        .expect("encodes"),
+        r#"{"type":"health","jobs":[],"draining":true}"#
+    );
+    assert_eq!(
+        to_frame(&ToHub::CancelJob {
+            job_id: JobId::new("j1")
+        })
+        .expect("encodes"),
+        r#"{"type":"cancel_job","job_id":"j1"}"#
+    );
+    assert_eq!(
+        to_frame(&ToHub::AttemptAbandoned {
+            job_id: JobId::new("j1"),
+            attempt: 1,
+            reason: "the runner was asked to stop".to_owned(),
+        })
+        .expect("encodes"),
+        r#"{"type":"attempt_abandoned","job_id":"j1","attempt":1,"reason":"the runner was asked to stop"}"#
+    );
+    assert_eq!(
+        to_frame(&FromHub::StandBy {
+            reason: "runner wsl-pc is connected".to_owned(),
+            retry_in_ms: 2000,
+        })
+        .expect("encodes"),
+        r#"{"type":"stand_by","reason":"runner wsl-pc is connected","retry_in_ms":2000}"#
+    );
+    assert_eq!(
+        to_frame(&FromHub::HealthRecorded {}).expect("encodes"),
+        r#"{"type":"health_recorded"}"#
+    );
+    assert_eq!(
+        to_frame(&FromHub::LogAck {
+            job_id: JobId::new("j1"),
+            attempt: 1,
+            through_seq: 9,
+        })
+        .expect("encodes"),
+        r#"{"type":"log_ack","job_id":"j1","attempt":1,"through_seq":9}"#
+    );
+    assert_eq!(
+        to_frame(&FromHub::ResendLog {
+            job_id: JobId::new("j1"),
+            attempt: 1,
+            from_seq: 4,
+        })
+        .expect("encodes"),
+        r#"{"type":"resend_log","job_id":"j1","attempt":1,"from_seq":4}"#
+    );
+}
+
+#[test]
+fn every_link_frame_round_trips() {
+    for draining in [false, true] {
+        round_trip_to_hub(ToHub::Health {
+            jobs: vec![
+                RunningJob {
+                    job_id: JobId::new("j1"),
+                    attempt: 1,
+                    chunks_sent: 0,
+                },
+                RunningJob {
+                    job_id: JobId::new("j2"),
+                    attempt: u32::MAX,
+                    chunks_sent: u64::MAX,
+                },
+            ],
+            draining,
+        });
+    }
+    round_trip_to_hub(ToHub::CancelJob {
+        job_id: JobId::new("j1"),
+    });
+    round_trip_to_hub(ToHub::AttemptAbandoned {
+        job_id: JobId::new("j1"),
+        attempt: 1,
+        reason: String::new(),
+    });
+    round_trip_from_hub(FromHub::HealthRecorded {});
+    round_trip_from_hub(FromHub::StandBy {
+        reason: "a runner is already connected".to_owned(),
+        retry_in_ms: u64::MAX,
+    });
+    round_trip_from_hub(FromHub::CancelJob {
+        job_id: JobId::new("j1"),
+        attempt: 3,
+        reason: "a requester cancelled this job".to_owned(),
+    });
+    round_trip_from_hub(FromHub::StaleAttempt {
+        job_id: JobId::new("j1"),
+        attempt: 1,
+        reason: "attempt 1 is not the attempt this hub is waiting for".to_owned(),
+    });
+    round_trip_from_hub(FromHub::LogAck {
+        job_id: JobId::new("j1"),
+        attempt: 1,
+        through_seq: u64::MAX,
+    });
+    round_trip_from_hub(FromHub::ResendLog {
+        job_id: JobId::new("j1"),
+        attempt: 1,
+        from_seq: 0,
+    });
 }

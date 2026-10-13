@@ -9,7 +9,8 @@
 //!       job.json            the record: fields, current state, timestamps
 //!       events.jsonl         one line per thing that happened, in order
 //!       log                 the job's output, both streams in arrival order
-//!       log.seq             how many chunks of that log the hub has written
+//!       log.seq             how many chunks of that log the hub has written,
+//!                           and how many bytes they are
 //!       files/              room for what a job keeps (M11's artefacts)
 //!   index/
 //!     state.json            derived: which jobs are not over yet
@@ -45,8 +46,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::durable;
 use crate::job::{
-    JobEvent, JobMetrics, JobRecord, JobState, JobStore, Result, StoreError, Timestamp,
-    RECORD_VERSION,
+    Attempt, JobEvent, JobMetrics, JobRecord, JobState, JobStore, LogWrite, Result, StoreError,
+    Timestamp, RECORD_VERSION,
 };
 
 /// The version of the directory layout above. A state root written by a newer
@@ -65,10 +66,12 @@ const RECORD_FILE: &str = "job.json";
 const EVENTS_FILE: &str = "events.jsonl";
 const LOG_FILE: &str = "log";
 /// How many chunks of a job's `log` the hub has written — which is also the
-/// number it expects the next chunk to carry. The hub's own bookkeeping, not
-/// part of the record: one fixed-width decimal, rewritten in place beside the
-/// log it counts, so that a hub starting on this state root can still tell
-/// whether the chunks that follow are the ones that follow.
+/// number it expects the next chunk to carry — and how many bytes those
+/// chunks are. The hub's own bookkeeping, not part of the record: two
+/// fixed-width decimals, rewritten in place beside the log they count, so
+/// that a hub starting on this state root can still tell whether the chunks
+/// that follow are the ones that follow, and can tell a log holding bytes it
+/// never counted from one that does not.
 const LOG_SEQ_FILE: &str = "log.seq";
 /// The width of that number, in digits: a `u64` never needs more, and a fixed
 /// width is what lets the file be written in place with nothing to truncate.
@@ -104,11 +107,19 @@ struct Live {
     jobs_accounted: u64,
     /// The jobs that have not reached a terminal state: the queue.
     pending: BTreeSet<u64>,
-    /// Per job that is still producing output, how many chunks of its log the
-    /// hub has written — the number the next chunk should carry. Read from
-    /// `log.seq` the first time this hub sees a chunk of a job, written
-    /// through to it afterwards, and forgotten when the job is over.
-    log_chunks: HashMap<JobId, u64>,
+    /// Per job that is still producing output, how far its log has got: how
+    /// many chunks the hub has written — the number the next chunk should
+    /// carry — and how many bytes those chunks are. Read from `log.seq` the
+    /// first time this hub sees a chunk of a job, written through to it
+    /// afterwards, and forgotten when the job is over.
+    log_chunks: HashMap<JobId, LogAt>,
+}
+
+/// How far a job has got in its log, as the hub counts it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct LogAt {
+    chunks: u64,
+    bytes: u64,
 }
 
 /// `store.json`.
@@ -459,13 +470,24 @@ impl JobDirStore {
     /// is read from the disk once per job per hub, so that a hub which has
     /// just started on a state root still knows where the log it inherited got
     /// to, and is carried in memory from then on.
-    fn log_chunks_written(
+    /// It also carries how many *bytes* of the log those chunks are, and that
+    /// second number exists for one failure: the hub appends a chunk's bytes
+    /// and then counts it, so a hub that stops between the two leaves a log
+    /// holding a chunk it never counted. The runner is holding that chunk
+    /// against an acknowledgement it never got (D36) and sends it again, and
+    /// without the byte count the hub would append it twice — a log with a
+    /// paragraph written twice, which is as false as one with a paragraph
+    /// missing. So the first time a hub looks at a job's log it compares the
+    /// file's length with the length it counted, and gives back the bytes it
+    /// never counted. They are not lost: they are the chunk that is about to
+    /// arrive again, and if it never does, what is missing is named (D29).
+    fn log_at(
         &self,
         live: &mut std::sync::MutexGuard<'_, Live>,
         id: &JobId,
-    ) -> Result<Option<u64>> {
-        if let Some(written) = live.log_chunks.get(id) {
-            return Ok(Some(*written));
+    ) -> Result<Option<LogAt>> {
+        if let Some(at) = live.log_chunks.get(id) {
+            return Ok(Some(*at));
         }
         let path = self.job_dir(id).join(LOG_SEQ_FILE);
         let Some(text) = read_optional(&path)? else {
@@ -476,26 +498,56 @@ impl JobDirStore {
             );
             return Ok(None);
         };
-        match text.trim().parse::<u64>() {
-            Ok(written) => {
-                live.log_chunks.insert(id.clone(), written);
-                Ok(Some(written))
-            }
-            Err(error) => {
+        let mut numbers = text.split_whitespace();
+        let chunks = match numbers.next().map(str::parse::<u64>) {
+            Some(Ok(chunks)) => chunks,
+            other => {
                 eprintln!(
-                    "herd-hub: {} does not hold a number ({error}), so this hub cannot tell \
+                    "herd-hub: {} does not hold a number ({other:?}), so this hub cannot tell \
                      whether chunks of {id}'s log are missing",
                     path.display()
                 );
-                Ok(None)
+                return Ok(None);
             }
-        }
+        };
+        let log = self.job_dir(id).join(LOG_FILE);
+        let length = fs::metadata(&log).map(|at| at.len()).unwrap_or(0);
+        let counted = numbers.next().and_then(|bytes| bytes.parse::<u64>().ok());
+        let bytes = match counted {
+            Some(counted) if length > counted => {
+                eprintln!(
+                    "herd-hub: {} holds {length} bytes and this hub counted {counted}; the \
+                     {} uncounted byte(s) belong to a chunk the hub never acknowledged and \
+                     are dropped, so that the runner sending it again does not write it \
+                     twice",
+                    log.display(),
+                    length - counted
+                );
+                durable::truncate(&log, counted)
+                    .map_err(|error| failed("truncating", &log, &error))?;
+                counted
+            }
+            // Either the count agrees with the file, or there is no count to
+            // compare with. A file *shorter* than the count is a log that was
+            // replaced under the hub, and nothing good comes of guessing: the
+            // file is what it is, and the chunk count stands.
+            Some(counted) => counted.min(length),
+            None => length,
+        };
+        let at = LogAt { chunks, bytes };
+        live.log_chunks.insert(id.clone(), at);
+        Ok(Some(at))
     }
 
-    /// Write that count down, in place and in a fixed width.
-    fn write_log_chunks(&self, id: &JobId, written: u64) -> Result<()> {
+    /// Write those two numbers down, in place and in a fixed width.
+    fn write_log_at(&self, id: &JobId, at: LogAt) -> Result<()> {
         let path = self.job_dir(id).join(LOG_SEQ_FILE);
-        let line = format!("{written:0>width$}\n", width = LOG_SEQ_DIGITS);
+        let line = format!(
+            "{:0>width$} {:0>width$}\n",
+            at.chunks,
+            at.bytes,
+            width = LOG_SEQ_DIGITS
+        );
         durable::write_fixed_in_place(&path, line.as_bytes())
             .map_err(|error| failed("writing", &path, &error))
     }
@@ -509,78 +561,14 @@ impl JobDirStore {
         .map_err(|error| failed("writing", &path, &error))?;
         durable::append_line(&path, &line).map_err(|error| failed("appending to", &path, &error))
     }
-}
 
-impl JobStore for JobDirStore {
-    fn create_job(&self, command: Vec<String>) -> Result<JobRecord> {
-        let mut live = self.lock()?;
-        // `mkdir` is what claims an id: the directories, not the index, decide
-        // which ids are taken, so a wrong hint costs one extra attempt.
-        let id = loop {
-            let sequence = live.next_sequence;
-            live.next_sequence += 1;
-            let id = id_of(sequence);
-            let dir = self.job_dir(&id);
-            match durable::create_dir_exclusive(&dir) {
-                Ok(()) => break id,
-                Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
-                    eprintln!("herd-hub: {} is already taken", dir.display());
-                }
-                Err(error) => return Err(failed("creating", &dir, &error)),
-            }
-        };
-        let kept = self.job_dir(&id).join(KEPT_FILES_DIR);
-        durable::create_dir(&kept).map_err(|error| failed("creating", &kept, &error))?;
-        // The log exists from the job's first moment, even if the job never
-        // writes a byte: a consumer reading the record of a silent job must
-        // find an empty file, not ENOENT (D22).
-        let log = self.job_dir(&id).join(LOG_FILE);
-        durable::touch(&log).map_err(|error| failed("creating", &log, &error))?;
-        // And it is counted from its first moment too: "no chunk written yet"
-        // has to be a number the hub can compare against, so that a first
-        // chunk numbered 3 is seen for what it is — chunks 0 to 2 gone — and
-        // not mistaken for a hub that has nothing to compare with.
-        self.write_log_chunks(&id, 0)?;
-
-        let at = Timestamp::now();
-        let record = JobRecord {
-            id: id.clone(),
-            command,
-            state: JobState::Queued,
-            submitted_at: at,
-            updated_at: at,
-            metrics: JobMetrics::default(),
-        };
-        self.write_record(&record)?;
-        self.append_event(&id, &JobEvent::transition(at, JobState::Queued))?;
-        // The index is written after the record it describes, always: an index
-        // that has fallen behind is detected and rebuilt, while an index that
-        // ran ahead would claim a job that is not there.
-        let sequence = sequence_of(id.as_str()).expect("an id this store minted");
-        live.pending.insert(sequence);
-        live.jobs_accounted += 1;
-        self.write_index(&live)?;
-        Ok(record)
-    }
-
-    /// Write what the runner measured, and nothing else about the job.
-    ///
-    /// Separate from the transition because the figures are the runner's and
-    /// the state is the hub's, and because the hub writes these *before* it
-    /// writes `finished`: a reader that sees the terminal state is entitled to
-    /// find the measurements beside it (E-15). Fsynced like every other write
-    /// here, so an acknowledgement that follows it is not a lie (D19).
-    fn record_metrics(&self, id: &JobId, metrics: JobMetrics) -> Result<()> {
-        let _live = self.lock()?;
-        let Some(mut record) = self.read_record(id)? else {
-            return Err(StoreError::new(format!("no such job: {id}")));
-        };
-        record.metrics = metrics;
-        self.write_record(&record)
-    }
-
-    fn record_state(&self, id: &JobId, state: JobState) -> Result<()> {
-        let mut live = self.lock()?;
+    /// One transition, with the lock already held.
+    fn move_to(
+        &self,
+        live: &mut std::sync::MutexGuard<'_, Live>,
+        id: &JobId,
+        state: JobState,
+    ) -> Result<()> {
         let Some(mut record) = self.read_record(id)? else {
             return Err(StoreError::new(format!("no such job: {id}")));
         };
@@ -617,9 +605,209 @@ impl JobStore for JobDirStore {
             // Nothing more will be appended to this log, so the hub stops
             // carrying its chunk count. `log.seq` keeps it on the disk.
             live.log_chunks.remove(id);
-            self.write_index(&live)?;
+            self.write_index(live)?;
         }
         Ok(())
+    }
+}
+
+impl JobStore for JobDirStore {
+    fn create_job(&self, command: Vec<String>) -> Result<JobRecord> {
+        let mut live = self.lock()?;
+        // `mkdir` is what claims an id: the directories, not the index, decide
+        // which ids are taken, so a wrong hint costs one extra attempt.
+        let id = loop {
+            let sequence = live.next_sequence;
+            live.next_sequence += 1;
+            let id = id_of(sequence);
+            let dir = self.job_dir(&id);
+            match durable::create_dir_exclusive(&dir) {
+                Ok(()) => break id,
+                Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
+                    eprintln!("herd-hub: {} is already taken", dir.display());
+                }
+                Err(error) => return Err(failed("creating", &dir, &error)),
+            }
+        };
+        let kept = self.job_dir(&id).join(KEPT_FILES_DIR);
+        durable::create_dir(&kept).map_err(|error| failed("creating", &kept, &error))?;
+        // The log exists from the job's first moment, even if the job never
+        // writes a byte: a consumer reading the record of a silent job must
+        // find an empty file, not ENOENT (D22).
+        let log = self.job_dir(&id).join(LOG_FILE);
+        durable::touch(&log).map_err(|error| failed("creating", &log, &error))?;
+        // And it is counted from its first moment too: "no chunk written yet"
+        // has to be a number the hub can compare against, so that a first
+        // chunk numbered 3 is seen for what it is — chunks 0 to 2 gone — and
+        // not mistaken for a hub that has nothing to compare with.
+        self.write_log_at(
+            &id,
+            LogAt {
+                chunks: 0,
+                bytes: 0,
+            },
+        )?;
+
+        let at = Timestamp::now();
+        let record = JobRecord {
+            id: id.clone(),
+            command,
+            state: JobState::Queued,
+            submitted_at: at,
+            updated_at: at,
+            attempts: Vec::new(),
+            metrics: JobMetrics::default(),
+        };
+        self.write_record(&record)?;
+        self.append_event(&id, &JobEvent::transition(at, JobState::Queued))?;
+        // The index is written after the record it describes, always: an index
+        // that has fallen behind is detected and rebuilt, while an index that
+        // ran ahead would claim a job that is not there.
+        let sequence = sequence_of(id.as_str()).expect("an id this store minted");
+        live.pending.insert(sequence);
+        live.jobs_accounted += 1;
+        self.write_index(&live)?;
+        Ok(record)
+    }
+
+    /// Write what the runner measured, and nothing else about the job.
+    ///
+    /// Separate from the transition because the figures are the runner's and
+    /// the state is the hub's, and because the hub writes these *before* it
+    /// writes `finished`: a reader that sees the terminal state is entitled to
+    /// find the measurements beside it (E-15). Fsynced like every other write
+    /// here, so an acknowledgement that follows it is not a lie (D19).
+    fn record_metrics(&self, id: &JobId, metrics: JobMetrics) -> Result<()> {
+        let _live = self.lock()?;
+        let Some(mut record) = self.read_record(id)? else {
+            return Err(StoreError::new(format!("no such job: {id}")));
+        };
+        record.metrics = metrics;
+        self.write_record(&record)
+    }
+
+    fn record_state(&self, id: &JobId, state: JobState) -> Result<()> {
+        let mut live = self.lock()?;
+        self.move_to(&mut live, id, state)
+    }
+
+    /// Record an attempt, number it, and start its output from zero.
+    ///
+    /// Everything under one lock, because these three facts have to agree: the
+    /// record says which attempt is current, the transition says the job is
+    /// assigned, and the chunk count says this attempt has produced nothing
+    /// yet. A second attempt numbers its chunks from 0 again — it is a new
+    /// process with a new counter — so without the reset the hub would read
+    /// its first chunk as a gap, and with the reset alone it would overwrite
+    /// nothing: the log keeps everything, and a line says where the second
+    /// attempt begins.
+    fn begin_attempt(&self, id: &JobId, runner: &str) -> Result<u32> {
+        let mut live = self.lock()?;
+        let Some(record) = self.read_record(id)? else {
+            return Err(StoreError::new(format!("no such job: {id}")));
+        };
+        let number = record.attempt_number() + 1;
+        let at = Timestamp::now();
+        if number > 1 {
+            // The log is one file for the whole job, and a reader has to be
+            // able to tell the attempt that was lost from the one that ran.
+            let path = self.job_dir(id).join(LOG_FILE);
+            durable::append_bytes(&path, new_attempt_marker(number).as_bytes())
+                .map_err(|error| failed("appending to", &path, &error))?;
+        }
+        // A second attempt numbers its chunks from zero again, and its output
+        // goes on the end of the log the first attempt left.
+        let length = fs::metadata(self.job_dir(id).join(LOG_FILE))
+            .map(|at| at.len())
+            .unwrap_or(0);
+        let at_log = LogAt {
+            chunks: 0,
+            bytes: length,
+        };
+        live.log_chunks.insert(id.clone(), at_log);
+        self.write_log_at(id, at_log)?;
+        self.move_to(&mut live, id, JobState::Assigned)?;
+        // Read again: `move_to` wrote the record, and this adds to what it
+        // wrote rather than to the copy read before it.
+        let Some(mut record) = self.read_record(id)? else {
+            return Err(StoreError::new(format!("no such job: {id}")));
+        };
+        record.attempts.push(Attempt {
+            number,
+            runner: runner.to_owned(),
+            started_at: at,
+            ended_at: None,
+            ended: None,
+        });
+        record.updated_at = at;
+        self.write_record(&record)?;
+        self.append_event(id, &JobEvent::attempt_started(at, number, runner))?;
+        Ok(number)
+    }
+
+    fn end_attempt(&self, id: &JobId, attempt: u32, reason: &str) -> Result<()> {
+        let _live = self.lock()?;
+        let Some(mut record) = self.read_record(id)? else {
+            return Err(StoreError::new(format!("no such job: {id}")));
+        };
+        let Some(entry) = record
+            .attempts
+            .iter_mut()
+            .find(|entry| entry.number == attempt)
+        else {
+            return Err(StoreError::new(format!(
+                "{id} has no attempt {attempt} to end"
+            )));
+        };
+        // The first reason is the true one: the attempt ended once.
+        if entry.ended.is_some() {
+            return Ok(());
+        }
+        let at = Timestamp::now();
+        entry.ended_at = Some(at);
+        entry.ended = Some(reason.to_owned());
+        record.updated_at = at;
+        self.write_record(&record)?;
+        self.append_event(id, &JobEvent::attempt_ended(at, attempt, reason))
+    }
+
+    fn chunks_recorded(&self, id: &JobId) -> Result<u64> {
+        let mut live = self.lock()?;
+        Ok(self.log_at(&mut live, id)?.map_or(0, |at| at.chunks))
+    }
+
+    fn name_missing_log(&self, id: &JobId, first_missing: u64, last_missing: u64) -> Result<()> {
+        if last_missing < first_missing {
+            return Ok(());
+        }
+        let mut live = self.lock()?;
+        let path = self.job_dir(id).join(LOG_FILE);
+        if !self.job_dir(id).is_dir() {
+            return Err(StoreError::new(format!("no such job: {id}")));
+        }
+        durable::append_bytes(
+            &path,
+            log_gap_marker(first_missing, last_missing).as_bytes(),
+        )
+        .map_err(|error| failed("appending to", &path, &error))?;
+        self.append_event(
+            id,
+            &JobEvent::log_gap(Timestamp::now(), first_missing, last_missing),
+        )?;
+        eprintln!(
+            "herd-hub: {} log chunk(s) of {id} are gone for good (chunks {first_missing} to \
+             {last_missing}); the gap is named in the log and on the record",
+            last_missing - first_missing + 1
+        );
+        // Counted as if they had been written, so that whatever comes next
+        // follows the marker instead of being read as a second gap.
+        let length = fs::metadata(&path).map(|at| at.len()).unwrap_or(0);
+        let at_log = LogAt {
+            chunks: last_missing.saturating_add(1),
+            bytes: length,
+        };
+        live.log_chunks.insert(id.clone(), at_log);
+        self.write_log_at(id, at_log)
     }
 
     /// Append one chunk, and name whatever is missing before it.
@@ -633,19 +821,38 @@ impl JobStore for JobDirStore {
     /// is named in the log at the place where the bytes are missing, and on
     /// the record. Either side of the marker the log stays byte for byte what
     /// the job wrote.
-    fn append_log(&self, id: &JobId, _stream: LogStream, seq: u64, data: &[u8]) -> Result<()> {
+    ///
+    /// A number *below* the one expected is the other half of the same
+    /// bookkeeping: the runner holds every chunk until the hub acknowledges
+    /// it, so a chunk already written arrives again whenever the link died
+    /// between the write and the acknowledgement. Writing it twice would put a
+    /// paragraph of the job's output in the log twice, which is as false as
+    /// losing it, so it is dropped and said to be dropped.
+    fn append_log(
+        &self,
+        id: &JobId,
+        _stream: LogStream,
+        seq: u64,
+        data: &[u8],
+    ) -> Result<LogWrite> {
         let mut live = self.lock()?;
         let dir = self.job_dir(id);
         if !dir.is_dir() {
             return Err(StoreError::new(format!("no such job: {id}")));
         }
         let path = dir.join(LOG_FILE);
-        let expected = self.log_chunks_written(&mut live, id)?;
+        let so_far = self.log_at(&mut live, id)?;
+        let expected = so_far.map(|at| at.chunks);
+        if expected.is_some_and(|expected| seq < expected) {
+            return Ok(LogWrite::AlreadyRecorded);
+        }
+        let mut bytes = so_far.map_or(0, |at| at.bytes);
         if let Some(expected) = expected.filter(|expected| seq > *expected) {
             let (first, last) = (expected, seq - 1);
             let marker = log_gap_marker(first, last);
             durable::append_bytes(&path, marker.as_bytes())
                 .map_err(|error| failed("appending to", &path, &error))?;
+            bytes += marker.len() as u64;
             self.append_event(id, &JobEvent::log_gap(Timestamp::now(), first, last))?;
             eprintln!(
                 "herd-hub: {} log chunk(s) of {id} never reached its log (chunks {first} to \
@@ -658,9 +865,13 @@ impl JobStore for JobDirStore {
         // Counted only now, and only if the bytes went in. A chunk the hub
         // could not write is a chunk that is missing, and the next one must
         // show it missing rather than paper over it.
-        let written = expected.unwrap_or(0).max(seq.saturating_add(1));
-        live.log_chunks.insert(id.clone(), written);
-        self.write_log_chunks(id, written)
+        let at_log = LogAt {
+            chunks: expected.unwrap_or(0).max(seq.saturating_add(1)),
+            bytes: bytes + data.len() as u64,
+        };
+        live.log_chunks.insert(id.clone(), at_log);
+        self.write_log_at(id, at_log)?;
+        Ok(LogWrite::Recorded)
     }
 
     fn job(&self, id: &JobId) -> Result<Option<JobRecord>> {
@@ -749,6 +960,19 @@ pub fn log_gap_marker(first_missing: u64, last_missing: u64) -> String {
     )
 }
 
+/// What the log says where a second attempt's output begins.
+///
+/// A requeued job's log is one file holding two runs of the same command
+/// (E-21), and a reader who cannot see the seam would read the first
+/// attempt's half-finished output as part of the second's. One line, the hub
+/// speaking, in the same voice as [`log_gap_marker`].
+pub fn new_attempt_marker(attempt: u32) -> String {
+    format!(
+        "\n[herd-hub] attempt {attempt} of this job starts here. Everything above is an \
+         earlier attempt, which ended without a verdict; the record names why.\n"
+    )
+}
+
 /// What a transition from one state to another is.
 enum Transition {
     Allowed,
@@ -759,15 +983,21 @@ enum Transition {
 
 /// The job state machine, in one place.
 ///
-/// A job goes forward only: minted queued, handed to a runner, running, over.
-/// M3 adds a second attempt after a lost runner, which is a new edge recorded
-/// here rather than a record quietly overwritten.
+/// A job goes forward only — minted queued, handed to a runner, running, over
+/// — with one exception, and it is deliberate: a job whose runner was lost
+/// goes back to `queued` for its second and last attempt (E-21). That edge is
+/// recorded like any other, so the record shows the job going round once
+/// rather than quietly starting again.
 fn transition(from: &JobState, to: &JobState) -> Transition {
     use JobState::{Assigned, Finished, Interrupted, Queued, Running};
     match (from, to) {
         (Queued, Assigned | Running | Finished { .. })
         | (Assigned, Running | Finished { .. })
         | (Running, Finished { .. })
+        // Requeued for one more attempt. Whether the job is allowed a second
+        // attempt is the hub's policy, not the store's; what the store
+        // enforces is that the move is written down.
+        | (Assigned | Running | Interrupted { .. }, Queued)
         // An attempt the hub stopped seeing (D17). A queued job is not in it:
         // nothing was under way, so nothing was interrupted.
         | (Assigned | Running, Interrupted { .. })
@@ -779,7 +1009,7 @@ fn transition(from: &JobState, to: &JobState) -> Transition {
         }
         // A second restart with the same attempt still missing says nothing
         // new, and a record is not a journal of the hub's own restarts.
-        (Interrupted { .. }, Interrupted { .. }) => Transition::AlreadyThere,
+        (Interrupted { .. }, Interrupted { .. }) | (Queued, Queued) => Transition::AlreadyThere,
         _ => Transition::Refused,
     }
 }
@@ -1055,7 +1285,7 @@ mod tests {
             .iter()
             .find_map(|event| match &event.what {
                 JobEventKind::LogGap { .. } => Some(&event.what),
-                JobEventKind::Transition { .. } => None,
+                _ => None,
             })
             .expect("the gap is on the record, not only in the log");
         assert_eq!(
@@ -1266,18 +1496,37 @@ mod tests {
         assert!(error.to_string().contains("code\":7"), "{error}");
     }
 
+    /// A job goes forward, with exactly one way back: the requeue M3 adds for
+    /// a job whose runner was lost (E-21). A job that is over is over.
     #[test]
-    fn a_job_never_goes_backwards() {
+    fn a_job_goes_backwards_only_to_be_attempted_again() {
         let (_dir, store) = store();
         let job = store.create_job(vec!["true".to_owned()]).expect("minted");
         store
             .record_state(&job.id, JobState::Running)
             .expect("transition");
+        // The one edge backwards, and it is recorded like any other.
+        store
+            .record_state(&job.id, JobState::Queued)
+            .expect("a lost attempt is requeued once (E-21)");
+        assert_eq!(
+            store.job(&job.id).expect("readable").expect("there").state,
+            JobState::Queued
+        );
+        // And not from an end. A verdict is not undone by requeueing.
+        store
+            .record_state(
+                &job.id,
+                JobState::Finished {
+                    outcome: JobOutcome::Exited { code: 0 },
+                },
+            )
+            .expect("the second attempt ends");
         let error = store
             .record_state(&job.id, JobState::Queued)
-            .expect_err("M2 has no requeue; M3 adds one as its own transition");
+            .expect_err("a finished job is never queued again");
         assert!(
-            error.to_string().contains("from running to queued"),
+            error.to_string().contains("to queued"),
             "a refused transition names both states: {error}"
         );
     }

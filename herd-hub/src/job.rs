@@ -114,6 +114,32 @@ impl JobState {
     }
 }
 
+/// One go at running a job on one runner.
+///
+/// A job is attempted once, and — when the runner it was on is lost — once
+/// more (E-21). Both attempts stay on the record: a reader has to be able to
+/// see that there was a first one, which runner it was on, and why it ended,
+/// because "this job ran twice and the first machine died" is the single most
+/// useful thing to know about a job that took twice as long as it should.
+///
+/// `ended` is the sentence that answers *why*, and it is set only when the
+/// attempt ended without producing the job's verdict — lost, abandoned,
+/// superseded. An attempt that produced the verdict needs no sentence: the
+/// job's outcome is the answer.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Attempt {
+    /// 1 for the first, 2 for the one after a loss. Also what the runner
+    /// carries on every frame about the job, so a late frame of attempt 1 is
+    /// recognisable as late.
+    pub number: u32,
+    /// The runner the attempt was handed to, by the name it announced.
+    pub runner: String,
+    pub started_at: Timestamp,
+    pub ended_at: Option<Timestamp>,
+    /// Why this attempt ended without a verdict, when that is what happened.
+    pub ended: Option<String>,
+}
+
 /// What the hub knows about one job: the contents of its `job.json`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct JobRecord {
@@ -124,10 +150,46 @@ pub struct JobRecord {
     pub submitted_at: Timestamp,
     /// When its state last changed.
     pub updated_at: Timestamp,
+    /// Every go at running this job, in order (E-21). Empty while the job is
+    /// only queued, one entry in the ordinary case, two when the first
+    /// runner was lost.
+    ///
+    /// `#[serde(default)]`, so a record written before M3 reads as a job with
+    /// no attempt recorded rather than as a read error. [`RECORD_VERSION`]
+    /// stays 1 for the same reason D15 and D18 kept `PROTOCOL_VERSION` at 1:
+    /// the field is purely additive, an older reader ignores it, and nothing
+    /// is deployed to read it wrongly.
+    #[serde(default)]
+    pub attempts: Vec<Attempt>,
     /// What the runner measured while the job ran (E-15). Reserved in the
     /// record's shape by M2 and filled by M4: every figure is unset until the
     /// runner reports it, which it does once, with the outcome.
     pub metrics: JobMetrics,
+}
+
+impl JobRecord {
+    /// The attempt that is current, if one is.
+    pub fn attempt(&self) -> Option<&Attempt> {
+        self.attempts.last()
+    }
+
+    /// The number of the attempt that is current: 0 before the first one, so
+    /// that "which attempt is this frame about" always has an answer.
+    pub fn attempt_number(&self) -> u32 {
+        self.attempts.last().map_or(0, |attempt| attempt.number)
+    }
+
+    /// Whether a frame a runner sent about `attempt` concerns the attempt the
+    /// hub is waiting for.
+    ///
+    /// False for an attempt that has been superseded by a later one, and false
+    /// for one that has been ended by name — a runner declared lost and come
+    /// back may not finish what the hub has already written off (E-21).
+    pub fn attempt_is_current(&self, attempt: u32) -> bool {
+        self.attempts
+            .last()
+            .is_some_and(|current| current.number == attempt && current.ended.is_none())
+    }
 }
 
 /// One line of `events.jsonl`: a moment, and what happened at it.
@@ -158,12 +220,36 @@ impl JobEvent {
         }
     }
 
+    /// An attempt handed to a runner.
+    pub fn attempt_started(at: Timestamp, attempt: u32, runner: &str) -> Self {
+        Self {
+            at,
+            what: JobEventKind::AttemptStarted {
+                attempt,
+                runner: runner.to_owned(),
+            },
+        }
+    }
+
+    /// An attempt that ended without producing the job's verdict, and why.
+    pub fn attempt_ended(at: Timestamp, attempt: u32, reason: &str) -> Self {
+        Self {
+            at,
+            what: JobEventKind::AttemptEnded {
+                attempt,
+                reason: reason.to_owned(),
+            },
+        }
+    }
+
     /// The state the job moved to, when this line is a transition, and `None`
     /// when it records something else.
     pub fn state(&self) -> Option<&JobState> {
         match &self.what {
             JobEventKind::Transition { state } => Some(state),
-            JobEventKind::LogGap { .. } => None,
+            JobEventKind::LogGap { .. }
+            | JobEventKind::AttemptStarted { .. }
+            | JobEventKind::AttemptEnded { .. } => None,
         }
     }
 }
@@ -180,6 +266,13 @@ impl JobEvent {
 pub enum JobEventKind {
     /// The job moved to a new state.
     Transition { state: JobState },
+    /// The job was handed to a runner, as this attempt of it (E-21).
+    AttemptStarted { attempt: u32, runner: String },
+    /// That attempt ended without the job's verdict, and this is why: the
+    /// runner went silent, it was asked to stop, the hub gave the attempt up.
+    /// The job itself may go on — requeued once — or end here; the transition
+    /// line that follows says which.
+    AttemptEnded { attempt: u32, reason: String },
     /// Chunks of the job's output never made it into the log, and the log
     /// names the gap at the point where they are missing.
     ///
@@ -187,9 +280,11 @@ pub enum JobEventKind {
     /// exactly this: a number that is not the successor of the last one the
     /// hub wrote means the chunks in between are gone — the control
     /// connection dropped under a running job, or the hub could not write
-    /// one. Getting them back is M3's (the runner would have to hold its
-    /// output as it holds a result); saying they are missing is M2's, because
-    /// a silently short log is worse than a short log that says so.
+    /// one. M3 holds the chunks on the runner until the hub acknowledges
+    /// them and asks for them again, so a link that drops costs the log
+    /// nothing; this line is for what is missing even so — chunks the runner
+    /// no longer holds, or a runner that never came back. A silently short
+    /// log is worse than a short log that says so.
     LogGap {
         /// The number of the first chunk that is missing.
         first_missing: u64,
@@ -220,6 +315,23 @@ impl Error for StoreError {}
 
 pub type Result<T> = std::result::Result<T, StoreError>;
 
+/// What became of a log chunk the store was handed.
+///
+/// A runner holds the chunks it has sent until the hub acknowledges them, so
+/// the hub does receive the same chunk twice: once on the link that died
+/// before the acknowledgement got out, once on the link that came after. The
+/// second one must not be appended — a log with a paragraph written twice is
+/// as wrong as a log with a paragraph missing — and the hub must not relay it
+/// to a requester that already saw it either, which is why the answer comes
+/// back rather than being swallowed here.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LogWrite {
+    /// New output, now in the log.
+    Recorded,
+    /// The store already had this chunk, and nothing was written.
+    AlreadyRecorded,
+}
+
 /// Everything the hub does to a job's state.
 ///
 /// Deliberately boring and synchronous: the writes are small files, and the
@@ -240,15 +352,52 @@ pub trait JobStore: Send + Sync + 'static {
     /// store that keeps no measurements is still a correct store.
     fn record_metrics(&self, id: &JobId, metrics: JobMetrics) -> Result<()>;
 
+    /// Record the start of an attempt on a job, and give it its number.
+    ///
+    /// One call so that the attempt, the transition to
+    /// [`JobState::Assigned`] and the reset of the job's chunk count are one
+    /// step: a second attempt numbers its output from zero again, and a hub
+    /// that had recorded the attempt without resetting the count would read
+    /// the new attempt's first chunk as a gap.
+    fn begin_attempt(&self, id: &JobId, runner: &str) -> Result<u32>;
+
+    /// Record that an attempt ended without the job's verdict, and why.
+    ///
+    /// Idempotent: ending an attempt that is already ended keeps the first
+    /// reason, because the first reason is the true one and a record is not a
+    /// journal of the hub's second thoughts.
+    fn end_attempt(&self, id: &JobId, attempt: u32, reason: &str) -> Result<()>;
+
     /// Append one chunk of a job's output in the order the runner produced it,
     /// as the bytes the process wrote (D18): a job's output is not text.
     ///
-    /// `seq` is the runner's per-job chunk number, and the store uses it to
-    /// notice that chunks are missing: a number that is not the successor of
-    /// the last one written leaves a named gap in the log and a
-    /// [`JobEventKind::LogGap`] on the record. A store that threw `seq` away
-    /// would make a quarter of a log disappear in silence.
-    fn append_log(&self, id: &JobId, stream: LogStream, seq: u64, data: &[u8]) -> Result<()>;
+    /// `seq` is the runner's per-attempt chunk number, and the store uses it
+    /// for two things. A number *above* the one expected means the chunks in
+    /// between are missing, so the log gets a named gap and the record a
+    /// [`JobEventKind::LogGap`]. A number *below* it is a chunk the store has
+    /// already written — a runner resending what it was never acknowledged
+    /// for — and writing it twice would corrupt the log with duplicated
+    /// output, so it is reported as [`LogWrite::AlreadyRecorded`] and
+    /// dropped.
+    fn append_log(&self, id: &JobId, stream: LogStream, seq: u64, data: &[u8]) -> Result<LogWrite>;
+
+    /// How many chunks of this job's output the store has written for the
+    /// attempt under way: the number the next chunk should carry.
+    ///
+    /// What the hub compares against the runner's own count, so that output
+    /// lost with nothing behind it is still noticed (E-40's health report
+    /// carries the runner's number).
+    fn chunks_recorded(&self, id: &JobId) -> Result<u64>;
+
+    /// Name output that is missing and is not coming back, at the point in
+    /// the log where it should have been.
+    ///
+    /// The hub calls this once it knows the chunks are gone for good: the
+    /// runner was asked for them and does not have them, or it is never
+    /// coming back. Up to that point a short log is a log waiting for a
+    /// resend, not a log with a hole in it, and claiming a gap that then
+    /// fills in would be its own kind of lie.
+    fn name_missing_log(&self, id: &JobId, first_missing: u64, last_missing: u64) -> Result<()>;
 
     /// The job's record, if the store has one.
     fn job(&self, id: &JobId) -> Result<Option<JobRecord>>;

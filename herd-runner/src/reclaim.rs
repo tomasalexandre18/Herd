@@ -175,10 +175,26 @@ fn minter_is_gone(pid: u32) -> bool {
 /// stopped can end its jobs instead of orphaning them.
 #[derive(Debug)]
 struct Live {
+    job_id: JobId,
     tag: JobTag,
     pid: u32,
     cgroup: Option<PathBuf>,
     workspace: Workspace,
+}
+
+/// What became of one job the stop path had to end itself.
+///
+/// `said` is the line for the runner's stderr. `workspace_left` is the one
+/// thing that must not stop there: bytes left on a host nobody will collect
+/// are what invariant 2 forbids above all, so the caller — which has the
+/// session, and therefore the job's log — puts it in the job's own record,
+/// exactly as the job-end path does.
+#[derive(Debug, Clone)]
+pub struct EndedJob {
+    pub job_id: JobId,
+    pub said: String,
+    pub workspace: PathBuf,
+    pub workspace_left: Option<String>,
 }
 
 /// The jobs this runner is running right now.
@@ -191,12 +207,20 @@ pub struct LiveJobs {
 impl LiveJobs {
     /// Record a job that has just been spawned. The token returned is what
     /// takes it off the list again.
-    pub fn add(&self, tag: JobTag, pid: u32, cgroup: Option<PathBuf>, workspace: Workspace) -> u64 {
+    pub fn add(
+        &self,
+        job_id: JobId,
+        tag: JobTag,
+        pid: u32,
+        cgroup: Option<PathBuf>,
+        workspace: Workspace,
+    ) -> u64 {
         let token = self.next.fetch_add(1, Ordering::SeqCst);
         if let Ok(mut jobs) = self.jobs.lock() {
             jobs.push((
                 token,
                 Live {
+                    job_id,
                     tag,
                     pid,
                     cgroup,
@@ -220,36 +244,47 @@ impl LiveJobs {
 
     /// End every running job and reclaim what it held, naming each one.
     ///
-    /// This is what a runner does when its owner asks it to stop: a job dies
-    /// with the runner that was watching it rather than becoming a process
-    /// nobody owns. M3 owns the orderly drain (invariant 2's ≤ 5 s); this is
-    /// the part that must never be missing, which is that nothing survives.
-    pub fn end_all(&self) -> Vec<String> {
+    /// This is the backstop of a runner being stopped: the orderly drain asks
+    /// every job's own task to end its process tree and report, and this ends
+    /// whatever did not manage that inside the owner's five seconds
+    /// (invariant 2). A job dies with the runner that was watching it rather
+    /// than becoming a process nobody owns.
+    ///
+    /// What it returns is per job, not one blob of text, because one of those
+    /// lines has to reach somewhere a requester can read: a workspace left
+    /// behind goes into the job's own record, not only onto stderr.
+    pub fn end_all(&self) -> Vec<EndedJob> {
         let taken: Vec<(u64, Live)> = match self.jobs.lock() {
             Ok(mut jobs) => std::mem::take(&mut *jobs),
             Err(_) => Vec::new(),
         };
-        let mut said = Vec::new();
+        let mut ended = Vec::new();
         for (_, job) in taken {
             if let Some(dir) = &job.cgroup {
                 let _ = fs::write(dir.join("cgroup.kill"), "1");
             }
             kill_process_group(job.pid);
             let swept = kill_by_marker(&job.tag);
-            let workspace = match job.workspace.reclaim() {
-                Ok(()) => "its workspace reclaimed".to_owned(),
-                Err(error) => format!("ITS WORKSPACE LEFT BEHIND: {error}"),
+            let workspace_left = job.workspace.reclaim().err();
+            let workspace = match &workspace_left {
+                None => "its workspace reclaimed".to_owned(),
+                Some(error) => format!("ITS WORKSPACE LEFT BEHIND: {error}"),
             };
             if let Some(dir) = &job.cgroup {
                 remove_cgroup(dir);
             }
-            said.push(format!(
-                "ended job {} (pid {}, {swept} stray process(es) swept), {workspace}",
-                job.tag.as_str(),
-                job.pid
-            ));
+            ended.push(EndedJob {
+                said: format!(
+                    "ended job {} (pid {}, {swept} stray process(es) swept), {workspace}",
+                    job.tag.as_str(),
+                    job.pid
+                ),
+                job_id: job.job_id,
+                workspace: job.workspace.base_dir().to_path_buf(),
+                workspace_left,
+            });
         }
-        said
+        ended
     }
 }
 
@@ -398,6 +433,10 @@ mod tests {
     #[test]
     #[cfg(unix)]
     fn the_reaper_kills_a_job_whose_runner_is_gone_and_spares_one_whose_runner_is_not() {
+        // Nothing else in this binary may reap while this test has an orphan
+        // planted: another reaper killing it first is the one flake this
+        // assertion ever had.
+        let _reaping = crate::testing::one_reaper_at_a_time();
         let gone = std::process::Command::new("/bin/sh")
             .arg("-c")
             .arg("exit 0")
@@ -466,6 +505,7 @@ mod tests {
     #[test]
     #[cfg(unix)]
     fn the_sweep_kills_a_process_that_left_its_process_group() {
+        let _reaping = crate::testing::one_reaper_at_a_time();
         let tag = JobTag::mint(&JobId::new("sweep"));
         let mut child = std::process::Command::new("/bin/sh")
             .arg("-c")
