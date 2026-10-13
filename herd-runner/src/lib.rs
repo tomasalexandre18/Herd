@@ -374,7 +374,10 @@ pub async fn run(config: Config) -> Result<()> {
     // The stop is watched around the whole redial loop, not inside one
     // connection: a runner asked to stop while there is no hub at all still
     // has jobs to end and, possibly, a verdict nobody has taken yet.
-    let serving = async {
+    // Pinned, because the stop goes on polling it: the acknowledgement of a
+    // result the stop has just produced arrives on that same connection, and
+    // a stop that dropped the reader could never see it.
+    let mut serving = std::pin::pin!(async {
         let mut failures = 0u32;
         loop {
             match serve_once(config.clone(), session.clone(), Arc::clone(&confined)).await {
@@ -395,11 +398,11 @@ pub async fn run(config: Config) -> Result<()> {
             }
             tokio::time::sleep(REDIAL_DELAY).await;
         }
-    };
+    });
     let ended = tokio::select! {
-        ended = serving => ended,
+        ended = &mut serving => ended,
         signal = stop_requested() => {
-            stop(signal?, &session, &confined).await;
+            stop(signal?, &session, &confined, serving).await;
             Ok(())
         }
     };
@@ -507,7 +510,12 @@ async fn stop_requested() -> Result<&'static str> {
 /// draining, and *reading these files back* on the next start so the hub is
 /// told without a human in the loop. This is the minimum honest thing: the
 /// verdict survives and says where it is.
-async fn stop(signal: &'static str, session: &Session, confined: &Arc<Confined>) {
+async fn stop(
+    signal: &'static str,
+    session: &Session,
+    confined: &Arc<Confined>,
+    serving: std::pin::Pin<&mut impl std::future::Future<Output = Result<()>>>,
+) {
     eprintln!(
         "herd-runner: {signal} received, ending {} running job(s) before leaving",
         confined.live().count()
@@ -516,14 +524,31 @@ async fn stop(signal: &'static str, session: &Session, confined: &Arc<Confined>)
         eprintln!("herd-runner: {line}");
     }
     // The ended jobs are still reporting: each one's task has to notice its
-    // process is gone, measure, and hold its outcome. Bounded, and short,
-    // because invariant 2 is about leaving quickly.
-    let deadline = tokio::time::Instant::now() + STOP_GRACE;
-    while tokio::time::Instant::now() < deadline {
-        if confined.live().count() == 0 && session.holds_nothing() {
-            return;
+    // process is gone, measure, hold its outcome and send it. So the hub goes
+    // on being served for a moment — that is where the acknowledgement comes
+    // from, and a stop that stopped reading could never see one, which would
+    // make every stop write a file for a result the hub in fact had. Bounded
+    // and short, because invariant 2 is about leaving quickly.
+    let settled = async {
+        loop {
+            if confined.live().count() == 0 && session.holds_nothing() {
+                return;
+            }
+            tokio::time::sleep(STOP_POLL).await;
         }
-        tokio::time::sleep(STOP_POLL).await;
+    };
+    let _ = tokio::time::timeout(STOP_GRACE, async move {
+        tokio::select! {
+            _ = serving => {}
+            () = settled => {}
+        }
+    })
+    .await;
+    // Anything the hub managed to assign inside that moment is ended too.
+    // Refusing a job while draining is M3's (invariant 2); what must not
+    // happen meanwhile is a job started here and left behind.
+    for line in confined.live().end_all() {
+        eprintln!("herd-runner: {line}");
     }
     // Whatever is still held is written by [`run`], on the way out: one place
     // for it, so that a refusal and a stop lose a verdict in exactly the same
