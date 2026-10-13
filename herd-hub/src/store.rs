@@ -198,7 +198,7 @@ enum Stored {
     /// No `job.json` in the directory at all.
     Missing,
     /// A record this hub reads and acts on.
-    Read(JobRecord),
+    Read(Box<JobRecord>),
     /// A record this hub reads and refuses to act on, with why. Named,
     /// visible, skipped — never dispatched, never failed, never silently
     /// repaired.
@@ -613,7 +613,7 @@ impl JobDirStore {
         // deserialises, so reading the whole record cannot fail on them.
         let file: RecordFile =
             serde_json::from_str(&text).map_err(|error| failed("reading", &path, &error))?;
-        Ok(Stored::Read(file.record))
+        Ok(Stored::Read(Box::new(file.record)))
     }
 
     /// The record, for a caller that is about to act on it.
@@ -626,7 +626,7 @@ impl JobDirStore {
     fn read_record(&self, id: &JobId) -> Result<Option<JobRecord>> {
         match self.read_stored(id)? {
             Stored::Missing => Ok(None),
-            Stored::Read(record) => Ok(Some(record)),
+            Stored::Read(record) => Ok(Some(*record)),
             Stored::Quarantined(why) => Err(StoreError::new(format!(
                 "{id} is quarantined and this hub will not act on it: {why}"
             ))),
@@ -1168,7 +1168,7 @@ impl JobStore for JobDirStore {
             // `pending`, and reading one here would be a hub that cannot even
             // list its queue (D52).
             if let Stored::Read(record) = self.read_stored(&id_of(sequence))? {
-                records.push(record);
+                records.push(*record);
             }
         }
         Ok(records)
