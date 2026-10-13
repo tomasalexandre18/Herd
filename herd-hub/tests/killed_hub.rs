@@ -19,6 +19,7 @@ use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::time::{Duration, Instant};
 
+use herd_proto::JobOutcome;
 use tempfile::TempDir;
 use tokio::process::{Child, Command};
 
@@ -818,4 +819,109 @@ async fn a_wait_on_an_interrupted_job_says_so_rather_than_hanging_mutely() {
 
     waiting.signal(rustix::process::Signal::TERM).await;
     second.signal(rustix::process::Signal::TERM).await;
+}
+
+/// Where M4's stop meets M2's held result, with both real binaries: a runner
+/// told to stop while it is holding a verdict no hub has acknowledged does
+/// **not** take that verdict with it.
+///
+/// The two promises pull against each other. M4 says a runner asked to stop
+/// ends its running jobs — not doing so is how a `sleep` outlives its runner,
+/// reparented to init, with its cgroup and its workspace left for nobody. M2
+/// says a finished job's outcome is held until the hub acknowledges it,
+/// because a destroyed verdict is the one thing Herd never does (D19, E-44) —
+/// and the job this stop ends produces exactly such an outcome, with no hub
+/// left to take it.
+///
+/// So the runner writes what it still holds into its data root, one file per
+/// job, and names each path on its way out. The file is the `job_finished`
+/// frame itself, so nothing has to be reinterpreted to replay it (invariant
+/// 4). A verdict on a disk is recoverable; a verdict in the memory of a
+/// process that has exited is not.
+///
+/// **What this leaves to M3**: reading these files back on the next start, so
+/// that the hub learns of them with no human in the loop, and the ≤ 5 s stop
+/// of invariant 2 with its full drain. This is the minimum honest thing — the
+/// verdict survives, and the runner says where it is.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_runner_stopped_while_holding_a_result_leaves_it_on_disk() {
+    let herd = Herd::new();
+    let mut hub = herd.start_hub("first").await;
+    let mut runner = herd.start_runner();
+    herd.wait_for_runner().await;
+
+    let job = herd.submit("printf 'working\\n'; sleep 120").await;
+    herd.wait_until("the job is running", || {
+        herd.record(&job)["state"]["type"] == "running"
+    })
+    .await;
+
+    // The hub goes first, so there is nothing left to acknowledge anything.
+    hub.signal(rustix::process::Signal::KILL).await;
+    assert!(!hub.alive(), "the hub is gone");
+    herd.wait_until("the runner has noticed the hub is gone", || {
+        herd.said("runner").contains("the link to the hub ended")
+    })
+    .await;
+
+    // And now the runner is told to stop, with a job still running under it.
+    runner.signal(rustix::process::Signal::TERM).await;
+
+    let said = herd.said("runner");
+    assert!(
+        said.contains("SIGTERM received"),
+        "a runner must say it is stopping: {said}"
+    );
+    let held = herd.data_root.path().join("held-results");
+    let spooled: Vec<PathBuf> = std::fs::read_dir(&held)
+        .unwrap_or_else(|error| {
+            panic!(
+                "a runner that stopped holding a result must leave it in {}: \
+                 {error}. It said: {said}",
+                held.display()
+            )
+        })
+        .flatten()
+        .map(|entry| entry.path())
+        .collect();
+    assert_eq!(
+        spooled.len(),
+        1,
+        "exactly the one unacknowledged result belongs there: {spooled:?}"
+    );
+    let frame = std::fs::read_to_string(&spooled[0]).expect("the held result reads");
+    let message: herd_proto::ToHub = herd_proto::from_frame(&frame).unwrap_or_else(|error| {
+        panic!("a held result is a frame; {frame} did not decode: {error}")
+    });
+    match message {
+        herd_proto::ToHub::JobFinished {
+            job_id, outcome, ..
+        } => {
+            assert_eq!(job_id.as_str(), job, "the frame names the job it is about");
+            assert!(
+                matches!(
+                    outcome,
+                    JobOutcome::Signalled { .. } | JobOutcome::StoppedByCap { .. }
+                ),
+                "the job was ended by the stop, so that is what the verdict says: \
+                 {outcome:?}"
+            );
+        }
+        other => panic!("a held result is a job_finished frame, not {other:?}"),
+    }
+    // Impossible to miss: a verdict that reached no hub is said out loud, with
+    // the path, never left for someone to discover.
+    assert!(
+        said.contains("never acknowledged") && said.contains(&held.display().to_string()),
+        "the runner must say where the verdict went: {said}"
+    );
+    // And nothing invented a verdict the hub was never told: the record is
+    // not finished. It reads `running` because this hub was killed outright
+    // and never got to name the interruption; the next hub on this state root
+    // does that, and M3 is what will hand it the file above (D17).
+    assert_ne!(
+        herd.record(&job)["state"]["type"],
+        "finished",
+        "nothing may claim a verdict the hub was never told"
+    );
 }
