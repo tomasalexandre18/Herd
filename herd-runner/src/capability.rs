@@ -560,13 +560,16 @@ fn lock_file(path: &Path) -> Availability {
 /// than a protocol — and its stdin is closed so that a probe waiting for input
 /// hits the timeout instead of waiting for ever.
 ///
-/// The probe is its own **process group**, and a probe that has to be killed
-/// is killed as a group. A probe is a command an owner wrote (D51), and the
-/// ordinary shape of one is a shell line: killing only the shell leaves
-/// whatever it started running, so a probe read every two seconds would strew
-/// the host with orphans — a runner destabilising its host through its
-/// configuration, which invariant 2 forbids. It is the same reasoning M4
-/// applies to a job, through the same primitive.
+/// The probe is its own **process group**, and that group dies with the
+/// reading, every time: when the probe answers, when it hangs past the
+/// timeout, and when the reading itself is dropped because the runner is
+/// stopping. A probe is a command an owner wrote (D51), and the ordinary shape
+/// of one is a shell line: killing only the shell leaves whatever it started
+/// running, so a probe read every two seconds would strew the host with
+/// orphans — a runner destabilising its host through its own configuration,
+/// which invariant 2 forbids. It is the same reasoning M4 applies to a job,
+/// through the same primitive ([`ProbeGroup`] is what makes it hold on the
+/// dropped path too).
 async fn run_probe(
     command: &[String],
     busy_exit_code: i32,
@@ -597,15 +600,19 @@ async fn run_probe(
             return Availability::unknown(format!("the probe {shown} cannot be started: {error}"))
         }
     };
+    // Armed from here to the end of this reading, whichever way it ends — and
+    // that includes not ending at all. A runner asked to stop drops the task
+    // that is reading its probes, which drops this future mid-`wait`, and the
+    // group has to die then too: `kill_on_drop` reaps the shell and nothing
+    // the shell started.
+    let mut group = ProbeGroup(child.id());
     let waited = match tokio::time::timeout(timeout, child.wait()).await {
         Ok(waited) => waited,
         Err(_) => {
             // A probe that hangs is killed here, with everything it started.
             // It cannot hold the runner up past this timeout, and it never
             // reaches the hub at all: the hub learns a verdict, never a probe.
-            if let Some(pid) = child.id() {
-                crate::confine::kill_process_group(pid);
-            }
+            group.kill();
             let _ = child.kill().await;
             return Availability::unknown(format!(
                 "the probe {shown} did not answer within {} ms and was killed",
@@ -613,6 +620,10 @@ async fn run_probe(
             ));
         }
     };
+    // The probe itself is over; whatever it left running is not. Killed every
+    // time, as M4 kills what a job leaves behind: a probe that backgrounds
+    // something and exits free would otherwise leak one process per interval.
+    group.kill();
     let status = match waited {
         Ok(status) => status,
         Err(error) => {
@@ -632,6 +643,34 @@ async fn run_probe(
              {busy_exit_code} and free with {free_exit_code}"
         )),
         None => Availability::unknown(format!("the probe {shown} was killed by a signal")),
+    }
+}
+
+/// A probe's process group, killed when the reading ends however it ends.
+///
+/// A guard rather than a line at each exit, because one of this future's exits
+/// is not written anywhere: the task that reads the probes is dropped when the
+/// runner is asked to stop, and the reading in flight is then cancelled at its
+/// `await`. `kill_on_drop` reaps the probe's own process and nothing else, so a
+/// probe of the ordinary shape — `sleep 7777 & wait`, a shell with a child —
+/// left that child running, reparented to init, for every stop. That is the
+/// orphan-strewing invariant 2 forbids, and it is this type's whole reason to
+/// exist: a `Drop` runs on the cancelled path, and an explicit kill cannot.
+struct ProbeGroup(Option<u32>);
+
+impl ProbeGroup {
+    /// Kill the group now, and not twice: a pid that has been waited for may
+    /// belong to something else by the time anyone asks again.
+    fn kill(&mut self) {
+        if let Some(pid) = self.0.take() {
+            crate::confine::kill_process_group(pid);
+        }
+    }
+}
+
+impl Drop for ProbeGroup {
+    fn drop(&mut self) {
+        self.kill();
     }
 }
 
