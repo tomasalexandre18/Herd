@@ -28,6 +28,18 @@ use herd_proto::{Availability, CapabilityOffer, CapabilityState, LabelSet};
 /// "not suspended".
 const UNSAID: &str = "its probe did not say why";
 
+/// Why a runner cannot be given a job right now, and whether waiting here
+/// would help (E-19, E-36).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HeldUp {
+    /// True when the obstacle is the moment — a probe outside Herd holding a
+    /// capability — and false when it is the machine: a label it does not
+    /// offer, or one its owner denied.
+    pub clears_with_time: bool,
+    /// The one sentence, with the probe's own words in it.
+    pub reason: String,
+}
+
 /// One connected runner's offer, and what its probes last said.
 #[derive(Debug, Clone, Default)]
 pub struct RunnerCapacity {
@@ -140,24 +152,44 @@ impl RunnerCapacity {
     /// here: the label is not offered at all, or the label is offered and
     /// suspended. Neither is a refusal.
     pub fn why_not_now(&self, labels: &LabelSet) -> Option<String> {
+        self.held_up_by(labels).map(|held_up| held_up.reason)
+    }
+
+    /// The same judgement, with M7's question answered too: does waiting
+    /// *here* clear it?
+    ///
+    /// The two reasons M5 found are the two sides of E-36, and telling them
+    /// apart is what M7's claim step is built on. A label this runner does
+    /// not offer — or whose owner denied it — is not about the moment at all:
+    /// no job ending here will make this machine offer it, so a job must not
+    /// stick to this runner for it (E-19). A label something outside Herd is
+    /// holding is exactly about the moment: the lock file goes, the probe
+    /// clears, the job runs (D48).
+    ///
+    /// Neither is a refusal, here or in the hub (D38). What differs is only
+    /// which machine the job waits *for*.
+    pub fn held_up_by(&self, labels: &LabelSet) -> Option<HeldUp> {
         for label in labels.iter() {
             if self.offer.available(label).is_none() {
                 let denied = self
                     .offer
                     .get(label)
                     .is_some_and(|entry| entry.origins.denied);
-                return Some(if denied {
-                    format!(
-                        "{} has {label} and its owner has denied it, so this job \
-                         waits for a runner that offers it",
-                        self.named()
-                    )
-                } else {
-                    format!(
-                        "{} does not offer {label}, so this job waits for a \
-                         runner that does",
-                        self.named()
-                    )
+                return Some(HeldUp {
+                    clears_with_time: false,
+                    reason: if denied {
+                        format!(
+                            "{} has {label} and its owner has denied it, so this job \
+                             waits for a runner that offers it",
+                            self.named()
+                        )
+                    } else {
+                        format!(
+                            "{} does not offer {label}, so this job waits for a \
+                             runner that does",
+                            self.named()
+                        )
+                    },
                 });
             }
             // Whether a reading suspends is `Availability::suspends`'s to
@@ -170,11 +202,14 @@ impl RunnerCapacity {
             let availability = self.availability_of(label);
             if availability.suspends() {
                 let reason = availability.reason().unwrap_or(UNSAID);
-                return Some(format!(
-                    "{label} is suspended on {}: {reason}. This job waits and \
-                     runs when the probe clears; it is not refused",
-                    self.named(),
-                ));
+                return Some(HeldUp {
+                    clears_with_time: true,
+                    reason: format!(
+                        "{label} is suspended on {}: {reason}. This job waits and \
+                         runs when the probe clears; it is not refused",
+                        self.named(),
+                    ),
+                });
             }
         }
         None
