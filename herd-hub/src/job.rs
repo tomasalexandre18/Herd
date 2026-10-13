@@ -31,7 +31,16 @@ pub use herd_proto::JobMetrics;
 /// than read as if its requester had asked for the middle level. A guessed
 /// priority on a durable record is a lie a reader cannot see, and the version
 /// probe in front of every record file exists for exactly this.
-pub const RECORD_VERSION: u32 = 2;
+///
+/// 3 since M7: an attempt carries the one line explaining why it was placed
+/// where it was (E-36), and a record carries the per-build-thread memory its
+/// requester declared, if it declared one (E-22). Both are required fields,
+/// for the same reason the priority is: an attempt with no explanation is
+/// precisely what E-36 forbids, and a reader must be able to tell "this job
+/// asked for no derived `-j`" from "this record predates the question". A
+/// pre-M7 state root is refused by name, with both figures, and no migration
+/// is written for it (D73).
+pub const RECORD_VERSION: u32 = 3;
 
 /// A moment, as the record files carry it: RFC 3339 in UTC, to the
 /// nanosecond. A string a human and the consumer can both read, so that a
@@ -171,6 +180,19 @@ pub struct Attempt {
     /// answer, so there is nothing to excuse (see [`Attempt::ended_at`] for
     /// the moment, which is set either way).
     pub ended: Option<String>,
+    /// The one line that explains this placement (E-36).
+    ///
+    /// Written once, when the attempt is numbered, and never rewritten: it is
+    /// the decision as it was made, with the figures it was made from. "Every
+    /// scheduling decision is explained in one line in the job's record" is
+    /// E-36's whole text, and this is that line — on the attempt rather than
+    /// on the job, because a job attempted twice was placed twice, and two
+    /// placements have two explanations.
+    ///
+    /// A queued job's `waiting_for` is the other half and is not this: that
+    /// one is rewritten whenever the job's place changes (M6), which is why a
+    /// placement must not be recorded there.
+    pub why: String,
 }
 
 /// What a requester asked for, as the hub takes it in.
@@ -189,6 +211,10 @@ pub struct NewJob {
     /// Which of the four levels the requester asked for (E-18). No
     /// `Default`: see [`Priority`].
     pub priority: Priority,
+    /// How much memory one build thread of this job needs, in MiB, when the
+    /// requester asked for a derived `-j` (E-22). See
+    /// [`herd_proto::ToHub::SubmitJob`].
+    pub build_thread_mib: Option<u32>,
 }
 
 impl NewJob {
@@ -215,7 +241,15 @@ impl NewJob {
             command,
             labels,
             priority,
+            build_thread_mib: None,
         }
+    }
+
+    /// The same, with the memory one build thread needs, so that the hub
+    /// derives this job's `-j` from whatever machine it lands on (E-22).
+    pub fn with_build_thread_mib(mut self, mib: Option<u32>) -> Self {
+        self.build_thread_mib = mib;
+        self
     }
 
     /// The key E-05 deduplicates on: what makes two submissions *the same
@@ -286,6 +320,31 @@ pub struct JobRecord {
     /// record from before M6 and is refused by its version, never read as if
     /// its requester had asked for the middle level.
     pub priority: Priority,
+    /// How much memory one build thread of this job needs, in MiB, when its
+    /// requester asked for its `-j` to be derived (E-22). `None` when it
+    /// asked for nothing of the kind.
+    ///
+    /// Required, not `#[serde(default)]`, for the reason the priority is: a
+    /// reader has to be able to tell a job that wanted no derivation from a
+    /// record written before the question existed. The figure is the
+    /// requester's; the `-j` derived from it is the field below.
+    pub build_thread_mib: Option<u32>,
+    /// The `-j` this job was actually given, derived from the machine the hub
+    /// placed it on (E-22). `None` until it is placed, and `None` for ever on
+    /// a job that asked for no derivation.
+    ///
+    /// **Written at the claim, before the job is handed over**, and therefore
+    /// before anything can read what the job needs. That ordering is
+    /// load-bearing rather than cosmetic: the first consumer's `--labels`
+    /// reading computes its memory and tmpfs figures *for the N it was given*
+    /// (M10, D82), so a design that chose N after reading the requirements
+    /// would be circular — N from memory, memory from a reading that needs N.
+    /// N first, requirements second, placement third.
+    ///
+    /// A requeue onto a differently sized machine (E-21) derives its own
+    /// figure and rewrites this one; the line on each attempt keeps the
+    /// arithmetic of that attempt.
+    pub parallelism: Option<u32>,
     /// How many submissions this one execution answers (E-05).
     ///
     /// 1 for an ordinary job; 2 after a second identical submission joined
@@ -404,13 +463,15 @@ impl JobEvent {
         }
     }
 
-    /// An attempt handed to a runner.
-    pub fn attempt_started(at: Timestamp, attempt: u32, runner: &str) -> Self {
+    /// An attempt handed to a runner, and the one line explaining why that
+    /// runner (E-36).
+    pub fn attempt_started(at: Timestamp, attempt: u32, runner: &str, why: &str) -> Self {
         Self {
             at,
             what: JobEventKind::AttemptStarted {
                 attempt,
                 runner: runner.to_owned(),
+                why: why.to_owned(),
             },
         }
     }
@@ -481,8 +542,19 @@ impl JobEvent {
 pub enum JobEventKind {
     /// The job moved to a new state.
     Transition { state: JobState },
-    /// The job was handed to a runner, as this attempt of it (E-21).
-    AttemptStarted { attempt: u32, runner: String },
+    /// The job was handed to a runner, as this attempt of it (E-21), with the
+    /// one line that explains the placement (E-36).
+    ///
+    /// **One of these per placement, and exactly one.** It is what "a day's
+    /// decisions are greppable" means: `grep claimed` over the state root
+    /// gives one line per job that ran, with the runner, the labels, the
+    /// slots and any derived `-j` in it. Nothing else in the record writes
+    /// that word.
+    AttemptStarted {
+        attempt: u32,
+        runner: String,
+        why: String,
+    },
     /// That attempt ended without the job's verdict, and this is why: the
     /// runner went silent, it was asked to stop, the hub gave the attempt up.
     /// The job itself may go on — requeued once — or end here; the transition
@@ -724,7 +796,24 @@ pub trait JobStore: Send + Sync + 'static {
     /// step: a second attempt numbers its output from zero again, and a hub
     /// that had recorded the attempt without resetting the count would read
     /// the new attempt's first chunk as a gap.
-    fn begin_attempt(&self, id: &JobId, runner: &str) -> Result<u32>;
+    /// `why` is the one line explaining the placement, which goes on the
+    /// attempt and into `events.jsonl` with it (E-36). It is taken here
+    /// rather than written afterwards because an attempt whose explanation
+    /// could be written separately is an attempt that can exist without one.
+    /// `parallelism` is the `-j` derived for the machine this attempt is
+    /// going to, or `None` when the job asked for no derivation. It is
+    /// written onto the **record** rather than only into `why`, because it
+    /// has to travel with the job: the first consumer's requirements reading
+    /// (M10) is a function of the arguments it is given, `-j N` among them,
+    /// so N has to exist and be written down before anything reads what the
+    /// job needs (D82).
+    fn begin_attempt(
+        &self,
+        id: &JobId,
+        runner: &str,
+        why: &str,
+        parallelism: Option<u32>,
+    ) -> Result<u32>;
 
     /// Record that an attempt ended without the job's verdict, and why.
     ///
