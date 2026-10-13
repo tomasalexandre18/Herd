@@ -10,9 +10,10 @@ herd-proto.workspace = true
 anyhow.workspace = true
 clap.workspace = true
 futures-util.workspace = true
-# A runner's capability declarations come from a JSON file whose unit is
-# herd-proto's own `Capability` (M5): the protocol is the contract
-# (invariant 4), so the file needs no shape of its own.
+# A runner's capability declarations come from a JSON file, read strictly so
+# that an unknown key is refused rather than ignored (M5). What it declares is
+# herd-proto's own `Capability`, because the protocol is the contract
+# (invariant 4).
 serde.workspace = true
 serde_json.workspace = true
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "net", "process", "signal", "sync", "time", "io-util"] }
