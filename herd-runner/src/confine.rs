@@ -21,6 +21,22 @@ use crate::size::show_bytes;
 /// admission rather than by taking the host down.
 pub const DEFAULT_MEMORY_MAX: u64 = 2 << 30;
 
+/// The smallest memory ceiling that is a cap rather than a wall.
+///
+/// `--job-memory-max 0` was refused and `--job-memory-max 1kB` was accepted,
+/// and the two do the same thing: refuse every job. Under the fallback
+/// (`RLIMIT_AS`, D23) the figure bounds the address space of each process, and
+/// on this host `/bin/sh -c 'echo ok'` needs 16 MiB of it: 8 MiB fails in the
+/// dynamic loader, 4 MiB fails to allocate at all, 1 MiB segfaults. So 16 MiB
+/// is where a ceiling stops being a cap on a job and becomes a guarantee that
+/// nothing runs — and a runner that cannot run `/bin/sh` is not a runner.
+///
+/// Measured rather than guessed, and deliberately generous in the refusal's
+/// direction: refusing a ceiling that would work is a startup an operator can
+/// argue with, while accepting one that cannot is a runner whose every job
+/// fails for a reason nobody looks for.
+pub const MINIMUM_MEMORY_MAX: u64 = 16 << 20;
+
 /// An hour. Long enough for a cold build of the first consumer (over thirty
 /// minutes), short enough that a wedged job is noticed the same morning.
 pub const DEFAULT_TIMEOUT_SECONDS: u64 = 3600;
@@ -107,6 +123,18 @@ impl Confined {
                         asks for a cap, not for a wall"
                     .to_owned(),
             );
+        }
+        // And neither is a ceiling no process could live under. `0` was
+        // refused while `1kB` was accepted, and both refuse every job.
+        if confinement.memory_max < MINIMUM_MEMORY_MAX {
+            return Err(format!(
+                "a memory ceiling of {} would refuse every job, exactly as 0 does: \
+                 a shell alone needs {} of address space. The floor is {}; invariant 2 \
+                 asks for a cap, not for a wall.",
+                show_bytes(confinement.memory_max),
+                show_bytes(MINIMUM_MEMORY_MAX),
+                show_bytes(MINIMUM_MEMORY_MAX)
+            ));
         }
         if confinement.timeout.is_zero() {
             return Err("a time cap of 0 s would stop every job before it ran".to_owned());
@@ -416,6 +444,7 @@ mod tests {
 
     #[test]
     fn a_prepared_confinement_reports_its_caps_and_its_root() {
+        let _reaping = crate::testing::one_reaper_at_a_time();
         let temp = TempDir::new("confine-report");
         let confined = Confined::prepare(Confinement::with_data_root(temp.path()))
             .expect("an unprivileged process with a writable root can confine");
@@ -444,6 +473,7 @@ mod tests {
     /// assertion in `the_runner_says_which_memory_ceiling_it_enforces`.
     #[test]
     fn a_fallback_is_shouted_not_mentioned() {
+        let _reaping = crate::testing::one_reaper_at_a_time();
         let temp = TempDir::new("confine-fallback");
         let confined = Confined::prepare(Confinement::with_data_root(temp.path()))
             .expect("an unprivileged process with a writable root can confine");
@@ -510,6 +540,32 @@ mod tests {
         confinement.timeout = Duration::ZERO;
         let error = Confined::prepare(confinement).expect_err("0 s is not a cap");
         assert!(error.contains("time cap of 0"), "{error}");
+    }
+
+    /// Finding 5 of M4's verification: `--job-memory-max 1kB` was accepted,
+    /// and it refuses every job exactly as `0` does — only `0` was refused.
+    /// A ceiling too small to run anything is a wall, and the refusal has to
+    /// name the floor so the operator knows what to write instead.
+    #[test]
+    fn a_memory_ceiling_too_small_to_run_anything_is_refused_naming_the_floor() {
+        let _reaping = crate::testing::one_reaper_at_a_time();
+        let temp = TempDir::new("confine-tiny");
+        for tiny in [1, 1_000, 1 << 20, MINIMUM_MEMORY_MAX - 1] {
+            let mut confinement = Confinement::with_data_root(temp.path());
+            confinement.memory_max = tiny;
+            let error = Confined::prepare(confinement)
+                .err()
+                .unwrap_or_else(|| panic!("a ceiling of {tiny} bytes was accepted"));
+            assert!(
+                error.contains("refuse every job") && error.contains("16 MiB"),
+                "the refusal must name the floor: {error}"
+            );
+        }
+        // And the floor itself is accepted: the refusal is a floor, not a
+        // second default.
+        let mut confinement = Confinement::with_data_root(temp.path());
+        confinement.memory_max = MINIMUM_MEMORY_MAX;
+        Confined::prepare(confinement).expect("the floor is a usable ceiling");
     }
 
     #[test]

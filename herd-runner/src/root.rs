@@ -94,6 +94,26 @@ impl DataRoot {
         if given.as_os_str().is_empty() {
             return Err("the data root is an empty path".to_owned());
         }
+        // Asked before the directory is created, because `create_dir_all` on
+        // a path that exists and is not a directory fails with "File
+        // exists" — which names neither the problem nor the fix, and left
+        // the `is_dir()` refusal below unreachable for the commonest way of
+        // getting this wrong.
+        if let Ok(metadata) = fs::symlink_metadata(given) {
+            if !metadata.is_dir() && !resolves_to_a_directory(given) {
+                return Err(format!(
+                    "the data root {} is not a directory: it is {}",
+                    given.display(),
+                    if metadata.is_file() {
+                        "a file"
+                    } else if metadata.is_symlink() {
+                        "a symlink to something that is not a directory"
+                    } else {
+                        "not a regular file either"
+                    }
+                ));
+            }
+        }
         fs::create_dir_all(given).map_err(|error| {
             format!(
                 "the data root {} cannot be created: {error}",
@@ -541,6 +561,14 @@ fn directory_name(job_id: &JobId) -> Result<String, String> {
     Ok(name)
 }
 
+/// Whether a path leads to a directory once links are followed. A symlink to
+/// a directory is a perfectly good data root; a symlink to a file is not.
+fn resolves_to_a_directory(path: &Path) -> bool {
+    fs::metadata(path)
+        .map(|data| data.is_dir())
+        .unwrap_or(false)
+}
+
 fn non_empty_var(name: &str) -> Option<String> {
     std::env::var(name).ok().filter(|value| !value.is_empty())
 }
@@ -573,6 +601,39 @@ mod tests {
         assert!(
             error.contains(&file.display().to_string()),
             "the refusal must name the path: {error}"
+        );
+        // And it names what is wrong. `create_dir_all` answered this with
+        // "cannot be created: File exists", which says neither the problem
+        // nor the fix — and docs/runner-confinement.md claimed the `is_dir`
+        // refusal below, which was unreachable for the commonest mistake.
+        assert!(
+            error.contains("is not a directory") && error.contains("a file"),
+            "the refusal must say it is a file, not that something exists: {error}"
+        );
+    }
+
+    /// A symlink is judged by what it points at: to a directory it is a
+    /// usable root, to a file it is refused like the file it is.
+    #[test]
+    #[cfg(unix)]
+    fn a_root_reached_through_a_symlink_is_judged_by_its_target() {
+        let temp = TempDir::new("root-symlink");
+        let file = temp.path().join("a-file");
+        fs::write(&file, b"i am a file").expect("the fixture writes");
+        let to_file = temp.path().join("link-to-file");
+        std::os::unix::fs::symlink(&file, &to_file).expect("the fixture links");
+        let error = DataRoot::open(&to_file).expect_err("a link to a file is not a root");
+        assert!(error.contains("not a directory"), "{error}");
+
+        let directory = temp.path().join("a-directory");
+        fs::create_dir(&directory).expect("the fixture makes it");
+        let to_directory = temp.path().join("link-to-directory");
+        std::os::unix::fs::symlink(&directory, &to_directory).expect("the fixture links");
+        let root = DataRoot::open(&to_directory).expect("a link to a directory is a root");
+        assert_eq!(
+            root.path(),
+            fs::canonicalize(&directory).expect("canonical").as_path(),
+            "a root is canonical, so being reached through a link changes nothing after"
         );
     }
 
