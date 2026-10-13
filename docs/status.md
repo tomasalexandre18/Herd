@@ -53,8 +53,9 @@ Four caveats, detailed in `docs/coverage.md`:
    NixOS change, Alexa's to make, landing with M16.
 3. E-30's real kernel ceiling needs a delegated cgroup; the WSL replay
    on real hardware is a manual M17 check.
-4. Nothing is deployed, so `PROTOCOL_VERSION` and `RECORD_VERSION`
-   stay at 1 by choice, freezing only at M16.
+4. Nothing is deployed, so both version numbers are free-running: M6
+   moved them to 2, a pre-M6 state root is refused with no migration,
+   and they are set back to 1 and frozen at M16 (D73).
 
 Booked, not yet fixed: a SIGKILLed runner leaves its in-flight probes
 behind; a verdict the hub could not write, later overtaken by its own
@@ -62,11 +63,10 @@ watchdog, logs "is over" for ever instead of erroring — loud, never a
 false write, but a stall worth a later look; D63's single write-door
 rule is now enforced by review, not the compiler — a future caller of
 `open_unless_over` can skip the wrapper that refuses; D64's probe
-sweep is reasoned about, not tested, for a probe that outlives four
-rounds; D64's `/proc` scan and per-pid `environ` read on every probe
-reading is a few milliseconds by estimate, not measured — a host with
-thousands of processes and a short `--probe-interval` carries new
-periodic work nobody has benchmarked. **Q10, the licence**, is the
+sweep is untested for a probe outliving four rounds, and its `/proc`
+scan with a per-pid `environ` read on every reading is a few
+milliseconds by estimate, not measured — a host with thousands of
+processes and a short `--probe-interval` carries unbenchmarked work. **Q10, the licence**, is the
 owner's only outstanding decision; it blocks nothing before M16.
 
 ## Environment facts
@@ -77,14 +77,14 @@ owner's only outstanding decision; it blocks nothing before M16.
   is installed globally.
 - GitHub: `tomasalexandre18` via `gh`. `main` protected (a pull
   request, `check` + `docs` green, no force push, no deletion). Issue
-  #1 open, unanswered — replying is outward-facing, waits for Alexa.
-  Issue #16 (chatOnS's six deliverables, plus the `docker`-group
-  requirement) is triaged into D74-D78 and the matching plan edits;
-  replying is outward-facing, waits for Alexa too.
+  #1 holds the consumer's expectations and our first status reply.
+  Issue #16 holds their six deliverables, triaged into D74-D78, and
+  our answer with five open questions back to them.
 - This machine's SSH key is a deploy key for another repo; git uses
   the HTTPS remote with the `gh` credential helper.
 
 ## Next action
 
-Land `m6-queue-priorities` (PR #15), then start M7, which now places
-against the requirements already on the job's record (D74).
+M7 (matching, slots, no fallback) is in progress on `m7-matching-slots`,
+placing against the requirements already on the record (D74). Alexa's
+own action: take the runner's user out of the `docker` group (D78).
