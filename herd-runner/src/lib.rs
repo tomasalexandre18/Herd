@@ -96,6 +96,13 @@ pub const DRAIN_GRACE: Duration = Duration::from_secs(3);
 /// How often the drain looks at whether it is done.
 const DRAIN_POLL: Duration = Duration::from_millis(20);
 
+/// How long the last frames a drain produces are given to leave.
+///
+/// Carved out of [`Config::drain_grace`], never added to it: the five seconds
+/// invariant 2 promises the owner is the whole of the stop, and a flush that
+/// the waiting had already spent would never happen at all.
+const FINAL_FLUSH: Duration = Duration::from_millis(200);
+
 /// How much of a job's output a runner holds against an acknowledgement.
 ///
 /// The hold is what makes a lost link cost the log nothing (D36): the chunks
@@ -1048,7 +1055,12 @@ pub async fn run_until(config: Config, stop: impl Future<Output = String>) -> Re
 /// whatever did not manage that, and let [`run_until`] write down whatever
 /// the hub still has not acknowledged.
 async fn drain(config: &Config, session: &Session, confined: &Arc<Confined>, reason: &str) {
-    let deadline = Instant::now() + config.drain_grace;
+    // The flush is carved out of the grace rather than added to it. A drain
+    // that spent its whole budget waiting for a job would otherwise reach the
+    // flush with nothing left, and the last frames it produced — the
+    // workspace a stop left behind, above all — would never leave the
+    // process. The owner's five seconds is the whole of it, flush included.
+    let deadline = Instant::now() + config.drain_grace.saturating_sub(FINAL_FLUSH);
     let ending = session.start_draining(reason);
     // On stderr, like everything else the stop path says: these lines are
     // what an owner reads to see that the runner went quietly, and they have
@@ -1099,9 +1111,12 @@ async fn drain(config: &Config, session: &Session, confined: &Arc<Confined>, rea
             );
         }
     }
-    // A moment for the frames just produced to leave, still inside the grace.
-    let flush = deadline.saturating_duration_since(Instant::now());
-    tokio::time::sleep(flush.min(Duration::from_millis(200))).await;
+    // The moment the frames just produced need to leave, which the deadline
+    // above kept out of the waiting. Only skipped where there is nothing to
+    // flush to, so a runner with no hub at all does not sit here.
+    if session.linked() {
+        tokio::time::sleep(FINAL_FLUSH).await;
+    }
     eprintln!("herd-runner: stopped");
 }
 
