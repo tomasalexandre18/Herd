@@ -277,6 +277,35 @@ impl Puppet {
         }
     }
 
+    /// Wait for the hub to acknowledge a result, which is the moment it is on
+    /// the hub's disk and the runner may forget it (E-44).
+    async fn wait_for_the_result_ack(&mut self, job_id: &JobId) {
+        loop {
+            match self.next().await {
+                Some(FromHub::JobResultAck { job_id: acked }) if &acked == job_id => return,
+                Some(_) => continue,
+                None => panic!("the hub never acknowledged the result of {job_id}"),
+            }
+        }
+    }
+
+    /// The reason the hub refused the next frame about an attempt, skipping
+    /// the acknowledgements of whatever came before it — and never skipping
+    /// an acknowledgement of a *result*, because a result the hub says it has
+    /// is a result it has written (D19).
+    async fn next_refusal(&mut self) -> Option<String> {
+        loop {
+            match self.next().await {
+                Some(FromHub::StaleAttempt { reason, .. }) => return Some(reason),
+                Some(FromHub::JobResultAck { job_id }) => {
+                    panic!("the hub acknowledged a verdict for {job_id} it must not have taken")
+                }
+                Some(_) => continue,
+                None => return None,
+            }
+        }
+    }
+
     async fn report_health(&mut self, jobs: Vec<RunningJob>, draining: bool) {
         self.say(ToHub::Health { jobs, draining }).await;
     }
@@ -1493,4 +1522,288 @@ async fn one_name_claimed_by_two_live_runners_is_said_plainly_and_nobody_is_kick
         "nothing in this was a lost attempt: {:?}",
         hub.record(&job_id).attempts
     );
+}
+
+/// **A terminal record is immutable, and that is the whole of this test.**
+///
+/// The job ran, the runner reported how it ended, the hub wrote it down and
+/// answered. Then the very same runner — right name, right attempt number,
+/// nothing forged about its identity at all — sends a log chunk and a second
+/// verdict about that job. Before this, both got through: the chunk landed in
+/// a log that had been closed and fsynced, carrying a gap marker that claimed
+/// four chunks of the job's output had been lost, and the metrics were
+/// replaced by figures nobody measured, with two of the real ones dropped.
+/// The outcome itself held, which is exactly what made it easy to miss.
+///
+/// Nothing is written to a job that is over. The attempt that produced the
+/// verdict is over with it — that is the stamp the happy path never made —
+/// and the frame is refused by name.
+#[tokio::test]
+async fn nothing_is_written_to_a_job_that_is_over_not_even_by_its_own_runner() {
+    let hub = Quick::start(Duration::from_secs(60)).await;
+    let mut runner = Puppet::join(&hub.hub_url, "runner-x").await;
+    let job_id = hub.submit("true").await;
+    let (_, attempt, _) = runner.take_a_job().await;
+    runner
+        .say(ToHub::JobStarted {
+            job_id: job_id.clone(),
+            attempt,
+        })
+        .await;
+    runner
+        .say(ToHub::LogChunk {
+            job_id: job_id.clone(),
+            attempt,
+            stream: LogStream::Stdout,
+            seq: 0,
+            data: b"the output this job really produced\n".to_vec(),
+        })
+        .await;
+    let measured = JobMetrics {
+        log_bytes: 35,
+        wall_time_ms: 12,
+        host_load_milli: Some(700),
+        bytes_written: Some(4096),
+        ..JobMetrics::default()
+    };
+    runner
+        .say(ToHub::JobFinished {
+            job_id: job_id.clone(),
+            attempt,
+            outcome: JobOutcome::Exited { code: 0 },
+            chunks_sent: 1,
+            metrics: measured.clone(),
+        })
+        .await;
+    // Waited on the acknowledgement, not on a poll: when it arrives the end
+    // is on the hub's disk and this connection has nothing left pending.
+    runner.wait_for_the_result_ack(&job_id).await;
+    assert!(matches!(
+        hub.record(&job_id).state,
+        JobState::Finished { .. }
+    ));
+
+    // The record as a reader has now been given it: this is what may never
+    // change again.
+    let closed = hub.record(&job_id);
+    let log_when_closed = hub.log(&job_id);
+    let events_when_closed = hub.events(&job_id).len();
+    assert!(
+        closed.attempts[0].ended_at.is_some(),
+        "the attempt that produced the verdict is over too: {closed:?}"
+    );
+    assert!(
+        closed.attempts[0].ended.is_none(),
+        "and it has nothing to excuse: {closed:?}"
+    );
+    assert!(
+        !closed.attempt_is_current(attempt),
+        "so no frame about it is the one the hub is waiting for: {closed:?}"
+    );
+
+    // And now the late frames, from the runner the attempt really was handed
+    // to. The chunk number is deliberately 5 — four ahead of what the log
+    // holds — because what used to happen was worse than the chunk itself:
+    // the hub wrote a gap marker saying four chunks of this job's output had
+    // been lost, onto a log that was complete.
+    runner
+        .say(ToHub::LogChunk {
+            job_id: job_id.clone(),
+            attempt,
+            stream: LogStream::Stdout,
+            seq: 5,
+            data: b"a paragraph this job never wrote\n".to_vec(),
+        })
+        .await;
+    let refused = runner.next_refusal().await;
+    let Some(reason) = &refused else {
+        panic!("a frame about a job that is over is refused by name: {refused:?}");
+    };
+    assert!(
+        reason.contains(job_id.as_str()) && reason.contains("is over"),
+        "the refusal names the job and that its record is final: {reason}"
+    );
+
+    runner
+        .say(ToHub::JobFinished {
+            job_id: job_id.clone(),
+            attempt,
+            outcome: JobOutcome::Exited { code: 77 },
+            chunks_sent: 6,
+            metrics: JobMetrics {
+                log_bytes: 999,
+                wall_time_ms: 999,
+                ..JobMetrics::default()
+            },
+        })
+        .await;
+    let refused = runner.next_refusal().await;
+    assert!(
+        refused
+            .as_deref()
+            .is_some_and(|reason| reason.contains("is over")),
+        "and so is a second verdict: {refused:?}"
+    );
+
+    let after = hub.record(&job_id);
+    assert_eq!(
+        after, closed,
+        "the record of a job that is over never moves"
+    );
+    assert_eq!(
+        after.metrics, measured,
+        "the measurements are the ones the job's own attempt reported"
+    );
+    assert_eq!(
+        hub.log(&job_id),
+        log_when_closed,
+        "and its log is byte for byte what the job wrote"
+    );
+    assert!(
+        !hub.log(&job_id).contains("never reached this log"),
+        "a complete log must never be given a gap marker: {}",
+        hub.log(&job_id)
+    );
+    assert_eq!(
+        hub.events(&job_id).len(),
+        events_when_closed,
+        "nothing was appended to its history either: {:?}",
+        hub.events(&job_id)
+    );
+}
+
+/// Dial and take the hub's first answer, whatever it is.
+///
+/// [`Puppet::dial`] insists on the welcome, because a peer that has said who
+/// it is gets one even when the hub is about to turn it away. A peer that has
+/// *not* is refused before the welcome, so this is the only way to read that
+/// refusal.
+async fn the_hub_s_first_answer(hub_url: &str, name: &str, instance: &str) -> FromHub {
+    let (mut socket, _response) = tokio_tungstenite::connect_async(hub_url)
+        .await
+        .expect("the hub accepts a connection");
+    let hello = ToHub::Hello {
+        protocol_version: PROTOCOL_VERSION,
+        role: Role::Runner,
+        token: None,
+        name: Some(name.to_owned()),
+        instance: Some(instance.to_owned()),
+        state_root: None,
+        health_every_ms: None,
+    };
+    socket
+        .send(Message::text(to_frame(&hello).expect("encodes")))
+        .await
+        .expect("hello goes out");
+    match tokio::time::timeout(PATIENCE, socket.next()).await {
+        Ok(Some(Ok(Message::Text(text)))) => {
+            from_frame(text.as_str()).expect("the hub speaks the protocol")
+        }
+        other => panic!("the hub said nothing a peer can read: {other:?}"),
+    }
+}
+/// A blank identity is no identity (and `Some("")` is blank).
+///
+/// M3 refuses a runner that announces neither a name nor an instance, because
+/// an attempt belongs to the runner it was handed to and a nameless peer
+/// cannot be told from any other. `instance: ""` walked straight through that
+/// refusal — it *has* an instance as far as an `Option` is concerned — and the
+/// peer ended up wearing a blank effective name, which matches every other
+/// blank-named peer's attempt. Two such peers were enough: the first took a
+/// dispatch, the second wrote `exited 77` and a forged line onto it.
+#[tokio::test]
+async fn a_peer_whose_name_and_instance_are_blank_is_refused_like_a_nameless_one() {
+    let hub = Quick::start(Duration::from_secs(60)).await;
+
+    for (name, instance) in [("", ""), ("   ", "\t"), ("", " ")] {
+        let turned_away = the_hub_s_first_answer(&hub.hub_url, name, instance).await;
+        let FromHub::Refused { reason } = turned_away else {
+            panic!("a blank identity will not change by dialling again (D13): {turned_away:?}");
+        };
+        assert!(
+            reason.contains("no name") && reason.contains("no instance"),
+            "the refusal says what is missing: {reason}"
+        );
+        assert!(
+            !hub.handle.runner_connected(),
+            "and such a peer is never admitted, so nothing is ever dispatched to it"
+        );
+    }
+
+    // There is therefore no blank-named runner for a second one to write onto:
+    // a job submitted in this window is refused by name, not placed on a peer
+    // the hub is not serving.
+    let refused = herdctl::submit_job(&hub.requester(), vec!["true".to_owned()])
+        .await
+        .expect_err("there is no runner to place a job on");
+    assert!(
+        refused.to_string().contains("no runner is connected"),
+        "the refusal must say why: {refused:#}"
+    );
+
+    // A runner with no name but a real instance still wears it: that is the
+    // case M3 kept, and it is not this one.
+    let nameless = Puppet::dial(&hub.hub_url, "", "run-3fa91c", None)
+        .await
+        .expect("a runner that says which process it is has an identity");
+    drop(nameless);
+    hub.wait_until("the hub has that runner", || {
+        hub.handle
+            .runners()
+            .first()
+            .is_some_and(|runner| runner.name == "run-3fa91c")
+    })
+    .await;
+}
+
+/// Two timings, each legal on its own side, that together kill a healthy job.
+///
+/// The hub refuses at startup a silence threshold that does not outlast three
+/// of the reports it *expects*; the runner refuses one that does not outlast
+/// three of the reports it *sends*. Both pass for a hub losing a runner after
+/// 3 s while expecting a report every second, against a runner that really
+/// reports every ten — and that pair spent both attempts of a quiet job in
+/// about six seconds and ended it `lost`. Only the pairing is wrong, so the
+/// runner's real cadence crosses the handshake and the pairing is refused by
+/// its figures.
+#[tokio::test]
+async fn a_runner_whose_real_cadence_cannot_satisfy_the_hub_is_refused_by_figures() {
+    let hub = Quick::start(Duration::from_secs(3)).await;
+
+    let turned_away = *Puppet::dial_saying(
+        &hub.hub_url,
+        "wsl-pc",
+        "run-one",
+        None,
+        Some(Duration::from_secs(10)),
+    )
+    .await
+    .expect_err("a cadence that cannot satisfy this hub's threshold is not served");
+    let FromHub::Refused { reason } = turned_away else {
+        panic!("a cadence does not change by dialling again, so this is terminal: {turned_away:?}");
+    };
+    assert!(
+        reason.contains("3s") && reason.contains("10s") && reason.contains("30s"),
+        "both figures and the margin they need are named: {reason}"
+    );
+    assert!(
+        !hub.handle.runner_connected(),
+        "and no job is ever placed on a runner the hub cannot keep its promises about"
+    );
+
+    // The same runner, reporting often enough, is welcome and is dispatched
+    // to: what was refused is a pairing, not a machine.
+    let mut fast = Puppet::dial_saying(
+        &hub.hub_url,
+        "wsl-pc",
+        "run-two",
+        None,
+        Some(Duration::from_millis(300)),
+    )
+    .await
+    .expect("a runner whose cadence the threshold outlasts three times over");
+    let job_id = hub.submit("true").await;
+    let (assigned, attempt, _) = fast.take_a_job().await;
+    assert_eq!(assigned, job_id);
+    assert_eq!(attempt, 1);
 }

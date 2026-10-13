@@ -32,7 +32,10 @@ struct Args {
     lost_after: f64,
     /// Seconds between the health reports this hub expects of its runners
     /// (E-40). It sends none itself: this is what `--lost-after` is judged
-    /// against, and it has to match what the runners are configured with.
+    /// against at startup. A runner that announces a cadence of its own is
+    /// judged against *that* when it dials, and refused by name if
+    /// `--lost-after` cannot outlast three of its reports — so this figure is
+    /// the expectation, never the whole of the check.
     #[arg(long, env = "HERD_HEALTH_EVERY", default_value_t = HEALTH_EVERY.as_secs_f64())]
     health_every: f64,
 }
