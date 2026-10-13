@@ -263,6 +263,20 @@ pub struct Config {
     /// take (E-26). Injectable because a test that really waited out the
     /// default interval is a test CI drops.
     pub probes: capability::ProbeSettings,
+    /// How big this host says it is: the memory and the threads Herd's jobs
+    /// may use here (E-22).
+    ///
+    /// Read from the host by default ([`metrics::host_size`]) and overridable
+    /// at startup, because `MemTotal` is the whole machine and the owner of a
+    /// machine is the authority on how much of it she is lending. A figure
+    /// that cannot be read stays absent, and a runner that announces no size
+    /// is one no derived-`-j` job is placed on — said out loud by the hub
+    /// when it joins, rather than left to be guessed from a queue that will
+    /// not move.
+    pub host: herd_proto::HostSize,
+    /// How preferred this runner is when more than one could run a job
+    /// (E-19). Higher first; zero unless its owner says otherwise.
+    pub preference: i32,
 }
 
 impl Default for Config {
@@ -279,6 +293,8 @@ impl Default for Config {
                 root::DataRoot::default_path().unwrap_or_else(|_| "herd-data".into()),
             ),
             capabilities: herd_proto::CapabilityOffer::empty(),
+            host: metrics::host_size(),
+            preference: 0,
             probes: capability::ProbeSettings::default(),
         }
     }
@@ -1501,6 +1517,11 @@ pub async fn serve_once(config: Config, session: Session, confined: Arc<Confined
         // Which process this is, so the hub can tell this runner dialling
         // again from a second runner wearing its name.
         instance: Some(session.instance()),
+        // How big this machine is and how preferred it is: the two things
+        // the hub's claim step needs about a machine that it cannot work out
+        // for itself (E-22, E-19).
+        host: config.host,
+        preference: config.preference,
         // And which hub state the durable things under this data root belong
         // to, so that nothing spooled for a hub that no longer exists is
         // believed by the hub that replaced it.
