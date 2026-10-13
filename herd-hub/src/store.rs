@@ -644,9 +644,12 @@ impl JobDirStore {
         };
         match transition(&record.state, &state) {
             Transition::Allowed => {}
-            // A runner redelivering a result it was never acknowledged for
-            // reports the same end again. That is the durability handshake
-            // working, not a second ending.
+            // Nothing new said: a second restart that still cannot see an
+            // attempt, a job queued again where it already was. Not an
+            // ending reported twice — a record that is over refuses every
+            // writer before this is reached, and the runner redelivering a
+            // verdict whose acknowledgement it never saw is told so by name
+            // and drops it (D42).
             Transition::AlreadyThere => return Ok(()),
             Transition::Refused => {
                 return Err(StoreError::new(format!(

@@ -33,6 +33,13 @@
 //! - **Once more means once.** A job is requeued one time. A second loss is an
 //!   end — `lost` — not a third attempt, because a job that kills runners
 //!   would otherwise go round for ever.
+//! - **A record that is over is never written to again.** Its outcome, its
+//!   measurements and its log are closed together, and the attempt that
+//!   produced the verdict is ended with the job — so a frame that arrives
+//!   afterwards, *even from the runner the attempt was handed to*, is refused
+//!   by name and reaches no writer. The rule is the store's single write
+//!   entry point rather than a guard per function, because a rule enforced
+//!   once per function is a rule the next function is missing.
 //! - **Nothing is destroyed to make this tidy.** A result the hub cannot write
 //!   is retried for as long as it takes and never dropped (D19); output the
 //!   hub is missing is asked for again before the log is declared short (D29).
