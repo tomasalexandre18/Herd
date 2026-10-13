@@ -877,3 +877,62 @@ which looks like a Herd fault rather than a configuration one.
 
 ---
 
+## 2026-10-13 — D45 A privileged helper is judged on the file the kernel runs
+
+**Context.** The escalation denylist matched the last component of the path it
+was handed, so a symlink named `harmless` pointing at `unshare` was accepted.
+
+**Choice.** The path is resolved and the target judged, it must be a regular
+file, and the setuid/setgid check applies to it. A directory is refused by
+name.
+
+**Alternative rejected.** Trusting the name given, which makes the allowlist a
+formality.
+
+---
+
+## 2026-10-13 — D46 `exclusive` is host-wide; `counted(1)` is not
+
+**Context.** Read narrowly, "nothing else may hold it or what it excludes"
+makes `exclusive` a synonym for `counted(1)`, and then M14's nightly
+exclusivity has nothing to rest on.
+
+**Choice.** While an exclusive capability is held, nothing else runs on that
+runner at all, and taking it requires an idle runner; `counted(1)` merely
+limits one capability to a single holder.
+
+**Alternative rejected.** Collapsing the two kinds, which would have forced a
+second exclusivity mechanism later.
+
+---
+
+## 2026-10-13 — D47 Exclusion closes symmetrically, never transitively
+
+**Context.** Exclusion is declared on one side of a pair, and a closure rule
+has to be fixed before queue entries embed label sets.
+
+**Choice.** Symmetric, because exclusion is a property of the pair — otherwise
+whether two capabilities overlap would depend on which job started first; never
+transitive, because `a–b` and `b–c` say nothing about `a–c` and closing
+transitively would silently forbid pairs nobody declared. A whole mutually
+exclusive group is spelled as one `exclusive` capability or declared in full.
+
+**Alternative rejected.** Transitive closure, which turns a typo into a policy.
+
+---
+
+## 2026-10-13 — D48 A probe nobody can read suspends its capability
+
+**Context.** An external busy probe can fail in ways that mean nothing about
+whether the resource is busy — a missing command, a signal, a timeout, an exit
+code nobody declared.
+
+**Choice.** Those all read as `unknown`, which suspends the capability, and a
+command probe declares both a busy and a free exit code so that `127` cannot be
+mistaken for "free"; a hanging probe is killed at `--probe-timeout`.
+
+**Alternative rejected.** Defaulting to free, which hands a job to a runner an
+external holder is already using — the exact harm E-26 exists to prevent.
+
+---
+
