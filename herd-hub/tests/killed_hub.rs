@@ -49,9 +49,16 @@ async fn a_killed_hub_loses_nothing(signal: rustix::process::Signal) {
     // ---- The kill.
     hub.signal(signal).await;
     assert!(!hub.alive(), "the hub is gone");
-    // The runner's control connection has just been reset under it. Half a
-    // second is far longer than it takes a process to die of that.
-    tokio::time::sleep(Duration::from_millis(500)).await;
+    // The runner's control connection has just been reset under it. Waited
+    // for by name rather than slept over: half a second is a guess about how
+    // long a process takes to die of a reset link, and what is wanted is the
+    // moment the runner has *seen* the reset — which is the instant D17 is
+    // about. A sleep that ended before the runner noticed would assert that
+    // it is alive before anything had happened to it (D101).
+    herd.wait_until("the runner has noticed the hub is gone", || {
+        herd.said("runner").contains("the link to the hub ended")
+    })
+    .await;
     assert!(
         runner.alive(),
         "the runner died with the hub ({signal:?}), so its job died too: {}",
@@ -1014,8 +1021,22 @@ async fn a_log_that_loses_its_tail_says_so_rather_than_reading_short() {
     // `before` lands while the hub is up; `after` is written in the instant
     // the hub does not exist, so it is the tail — and the end follows it with
     // nothing in between to give the loss away.
+    //
+    // Both halves are held by files this test creates rather than by sleeps.
+    // "The hub is down when the tail is written" was two figures — the job's
+    // own `sleep 2` and a `sleep 3` here — and neither was a condition: a
+    // host slow enough to spend two seconds between the kill and the runner
+    // noticing would have the tail written while the hub was still up, and
+    // the test would pass having proved nothing (D101).
+    let gate = herd.logs.path().join("write-the-tail-now");
+    let ended = herd.logs.path().join("the-job-is-over");
     let job = herd
-        .submit("printf 'before\\n'; sleep 2; printf 'after\\n'; exit 42")
+        .submit(&format!(
+            "printf 'before\\n'; while [ ! -e {} ]; do sleep 0.05; done; \
+             printf 'after\\n'; : > {}; exit 42",
+            gate.display(),
+            ended.display()
+        ))
         .await;
     herd.wait_until("the first line is recorded", || {
         herd.log(&job).contains("before")
@@ -1029,7 +1050,9 @@ async fn a_log_that_loses_its_tail_says_so_rather_than_reading_short() {
         herd.said("runner").contains("the link to the hub ended")
     })
     .await;
-    tokio::time::sleep(Duration::from_secs(3)).await;
+    std::fs::write(&gate, b"the hub is down; write the tail").expect("the gate is opened");
+    herd.wait_until("the job has ended with no hub to tell", || ended.exists())
+        .await;
     assert!(runner.alive(), "D17: a runner outlives its hub");
 
     let mut hub = herd.start_hub("second").await;

@@ -51,6 +51,22 @@ fn marks_its_interval(which: &str, seconds: &str) -> String {
     format!("printf '{which}\\n' >/dev/null; date +%s.%N; sleep {seconds}; date +%s.%N")
 }
 
+/// The same, held open until the test creates `gate` instead of for a number
+/// of seconds.
+///
+/// For a test whose point is that something is true *while this job holds its
+/// slot*: a job that sleeps for a fixed time is a race between the test and
+/// the clock, and the test losing it does not fail — it passes, having
+/// proved nothing, because the slot it meant to find occupied was free
+/// (D101).
+fn marks_its_interval_until(which: &str, gate: &std::path::Path) -> String {
+    format!(
+        "printf '{which}\\n' >/dev/null; date +%s.%N; \
+         while [ ! -e {} ]; do sleep 0.05; done; date +%s.%N",
+        gate.display()
+    )
+}
+
 /// The two moments one of those jobs printed.
 fn interval(herd: &Herd, job: &str) -> (f64, f64) {
     let log = herd.log(job);
@@ -283,8 +299,16 @@ async fn the_slots_are_rebuilt_from_the_records_after_a_hub_restart() {
     );
     herd.wait_for_runner().await;
 
+    // Held open by a file rather than by a count of seconds: what this test
+    // is about is only true while the inherited job still holds the one
+    // slot, and a job that ends on a clock takes that with it.
+    let gate = herd.logs.path().join("release-the-inherited-build");
     let holding = herd
-        .submit_needing("build", "step", &marks_its_interval("inherited", "4"))
+        .submit_needing(
+            "build",
+            "step",
+            &marks_its_interval_until("inherited", &gate),
+        )
         .await;
     herd.wait_until("the build is running", || {
         state_of(&herd, &holding) == "running"
@@ -309,6 +333,27 @@ async fn the_slots_are_rebuilt_from_the_records_after_a_hub_restart() {
             &marks_its_interval("after the restart", "0.3"),
         )
         .await;
+    // The positive half, and the one the interval comparison below cannot
+    // make on its own: the hub that came back **says** the one slot is taken,
+    // by a job it only knows from a record. Without this the comparison is
+    // satisfied by a second build that ran after the first had ended for
+    // reasons of its own, which proves nothing about counting.
+    herd.wait_until("the second build has said why it waits", || {
+        herd.record(&second)["waiting_for"].is_string()
+    })
+    .await;
+    let why = herd.record(&second)["waiting_for"]
+        .as_str()
+        .expect("a sentence")
+        .to_owned();
+    assert!(
+        why.contains("build has 1 slot(s) and 1 are taken"),
+        "the hub that came back must count the inherited job's slot: {why}"
+    );
+    assert_eq!(state_of(&herd, &second), "queued", "{why}");
+
+    // Only now may the inherited job end.
+    std::fs::write(&gate, b"the test has seen the slot held").expect("the gate is opened");
     for job in [&holding, &second] {
         let job = job.clone();
         herd.wait_until(&format!("{job} is over"), || {
@@ -333,7 +378,12 @@ async fn the_slots_are_rebuilt_from_the_records_after_a_hub_restart() {
 #[tokio::test(flavor = "multi_thread")]
 async fn a_job_waits_for_the_busy_runner_it_prefers_and_moves_when_it_goes() {
     let herd = Herd::new();
-    let _hub = herd.start_hub_losing_runners_after("hub", 2.0).await;
+    // Two seconds of silence is lost, and a waiting job is told why again
+    // every 200 ms: the second is how this test watches the hub judge the
+    // same job several times over without a sleep standing in for it.
+    let _hub = herd
+        .start_hub_with("hub", &["--lost-after", "2", "--wait-restatement", "0.2"])
+        .await;
     let pc_file = capability_file(&herd, "pc", ONE_SLOT_AND_AN_IGPU);
     let server_file = capability_file(&herd, "server", TWO_BUILD_SLOTS);
     // The PC is the preferred machine for a build: 3.1x the loaded server,
@@ -393,7 +443,25 @@ async fn a_job_waits_for_the_busy_runner_it_prefers_and_moves_when_it_goes() {
         waiting.contains("--stickiness-limit"),
         "and the limit on the wait has to be visible (E-19): {waiting}"
     );
-    tokio::time::sleep(Duration::from_millis(600)).await;
+    // Not a sleep: a sleep that ends early proves nothing happened, and a
+    // sleep that ends late is a figure nobody can defend. A follower hears
+    // the reason restated on the hub's own clock, so three of them is three
+    // separate judgements of this job — each one an opportunity to move it
+    // to the machine with two free slots, and each one declined (D101).
+    let mut following = herd.start_wait(&second);
+    let restatements = || {
+        std::fs::read_to_string(herd.logs.path().join("wait-err"))
+            .unwrap_or_default()
+            .lines()
+            .filter(|line| line.contains("is queued and has not started"))
+            .count()
+    };
+    herd.wait_until(
+        "the hub has judged the second build three times over",
+        || restatements() >= 3,
+    )
+    .await;
+    following.ask_it_to_stop();
     assert_eq!(
         state_of(&herd, &second),
         "queued",

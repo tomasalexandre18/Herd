@@ -2668,3 +2668,167 @@ measured under is one machine's: five spinners on two cores is a shape of
 contention, not the CI host.
 
 ---
+
+## 2026-10-13 — D101 The sweep's rule: wait for the hub, hold with a file
+
+**Context.** D100 swept one file, `owner_control.rs`, and found eight tests
+asserting what they had never established. This is the same sweep over the
+other ten test files, their shared harnesses and the unit tests that touch
+timing, locks or ordering. The method was D100's: `taskset -c 0,1` with
+thirteen spinning processes on the same two cores, and a figure measured
+before it is argued about.
+
+**What it found, as a class.** Not one new instance of D100's first
+mistake — an assertion about a count the test did not create. Three other
+shapes instead, and all three are the same error wearing different clothes:
+**a test that does not establish the state it then asserts against.**
+
+* **A fixture that ends on a clock.** `slots.rs`'s restart test held its one
+  build slot with `sleep 4` and then asserted that a second build did not
+  overlap it. A host slow enough to spend four seconds on the restart gets
+  that for nothing, from a slot that was free — the test passes having
+  proved the opposite of its name. The slot is now held by a file the test
+  removes, and the hub that came back must **say** the slot is taken, with
+  its figures, before anything is released. `killed_hub.rs`'s tail-loss test
+  had the same shape twice over, a `sleep 2` in the job and a `sleep 3` in
+  the test, and is now two files: one that lets the tail be written and one
+  the job writes when it is over. `confinement.rs`'s invariant-3 test slept
+  400 ms and then checked the runner "while a job is running"; the job now
+  says when it has started and waits to be let go.
+* **A fixture that never happens at all.** `end_to_end.rs`'s
+  `the_same_runner_dialling_again_replaces_its_own_dead_connection` dialled
+  a second `herd_runner::Session` beside the harness's own runner. A
+  `Session` mints the instance id, so a new one is a **twin** — which the
+  test directly above it proves is told to stand by. The case under test
+  therefore never occurred, and the assertion that followed, that a job ran,
+  was answered by the harness's runner, which nothing had replaced. It now
+  dials one `Session` twice with no other runner in the herd, so the job
+  runs on the connection that dialled again or on nothing. The hub
+  superseding a connection it is *still holding* stays where it is pinned
+  deterministically, in `link.rs`.
+* **A cancel that lands before the thing it is about.** `link.rs`'s
+  `a_cancel_ends_one_job_within_ten_seconds_and_a_sibling_runs_on` waited
+  for the job to be `Running` and cancelled it, then asserted that what the
+  job had printed was still in its log. `Running` is the runner reporting a
+  shell it has *spawned*; the shell has still to reach its first `printf`.
+  Pinned to two cores under five spinners the kill won that race in **one
+  run of six**, and the test failed saying output had been lost when the
+  job had never produced any — a true sentence about a false premise. It
+  waits for the line now, and passed eight of eight afterwards.
+* **A cancel that lands before the thing it is about.** `link.rs`'s
+  `a_cancel_ends_one_job_within_ten_seconds_and_a_sibling_runs_on` waited
+  for the job to be `Running` and cancelled it, then asserted that what the
+  job had printed was still in its log. `Running` is the runner reporting a
+  shell it has *spawned*, and the shell has still to reach its first
+  `printf`. Pinned to two cores under five spinners the kill won that race
+  in **one run of six** — and in the first full pinned run of the suite —
+  and the test failed saying output had been lost when the job had never
+  produced any: a true sentence about a false premise. It waits for the
+  line now, and passed eight of eight under the same load afterwards.
+* **A runner's own log read as the hub's view.** `capabilities.rs` waited
+  for the runner to print `qemu is suspended` and then asserted, on sight,
+  that the hub had been told. It is waited for now.
+
+**And the rule it leaves behind, which is one sentence.** *Hold a fixture
+open with a file the test removes, never with a number of seconds; and wait
+for the hub's own view, never for a runner's news about it.*
+
+**Figures, because the ones that were argued about turned out to be fine.**
+The margins this sweep suspected were measured rather than rewritten, under
+thirteen spinners on two pinned cores: the killed-hub admission test used
+0.47–0.59 s of its 4 s hold, the starved reservation 0.04–0.23 s of 1.5 s,
+the slots restart 0.42–0.57 s of 4 s, the two-submissions dedup 0.09–0.12 s
+of 0.6 s, and the aging restart 2.95 s of its 6 s — of which 2 s is the wait
+it is *meant* to take. `ten_hanging_probes_do_not_delay_the_runner_joining`
+joined in 70–182 ms against its 2 000 ms bound. None of them was touched. A
+measurement that says "leave it alone" is worth as much as one that does not.
+
+**What is still a sleep, and why it was left.** Two windows remain —
+`capabilities.rs`'s eight probe intervals and `recorded_offer.rs`'s, now
+replaced. The first is 800 ms against a 100 ms interval that is itself wall
+clock, so the arithmetic is sound and the assertion is a negative one that
+can only under-prove; it is named here rather than quietly fixed.
+
+**A hazard found and closed.** `busy_probe.rs` and `confinement.rs` both
+sweep `/proc` for a process carrying a known `sleep` duration, and both
+declared those durations as constants — two of which **collide between the
+two files**, and all of which collide with a second checkout of this
+repository running its own suite. The duration is now
+`1_000_000 + pid * 10 + n`, so the sweep can only ever find this test
+process's own leavings.
+
+## 2026-10-13 — D102 A twin's thirty seconds, and the wait that is not one
+
+**Context.** D100 named this and deliberately left it: `capabilities.rs`'s
+`a_label_no_runner_offers_leaves_the_job_queued` kills its runner and starts
+a replacement under the **same name**. While the hub still holds the dead
+connection the replacement is a twin, and a twin is told to stand by for
+`lost_after / 2` — 30 s at this hub's default. That file's own `PATIENCE` is
+also 30 s. Two equal figures, so the test fails the instant the race is lost.
+
+**Measured, not argued.** Instrumented to record whether the hub had already
+let go at the moment the replacement was started, and how long it took to
+let go: under thirteen spinners on two pinned cores, the hub had **not** let
+go in **eight runs of eight**, and took **220 to 640 ms** to notice the
+close. The test won every one of those races only because spawning a process
+and completing a handshake took longer still. It is a coin weighted in the
+test's favour on this host and nothing more; a host where the hub's reactor
+is starved and process spawn is cheap turns it over.
+
+**Decision.** Not a bigger patience, and not a short `--lost-after` either:
+the test waits for **the hub's own view of the loss**. A new harness method
+kills the runner, reaps it, and then waits until the hub has printed
+`runner … is gone` before anything dials under that name again. The
+replacement is then not a twin, by construction rather than by luck.
+
+A bigger patience was rejected because it makes the test slower in exactly
+the case it is wrong about, and says nothing about why. A short
+`--lost-after` was rejected because it is a second figure to keep paired
+with a health cadence — the hub refuses a threshold that is not comfortably
+longer than the cadence it expects — and because it changes what every other
+test in that file is running against, to fix one of them.
+
+**And it is now asserted, not merely avoided.** The test asserts that the
+hub never said `asked to stand by`. Under the old shape that assertion would
+have failed on exactly the runs the race was lost, instead of the test
+hanging for thirty seconds and then failing for want of a runner — which is
+the difference between a failure that names its cause and one that does not.
+
+## 2026-10-13 — D103 `job.json` is never behind `events.jsonl`
+
+**Context.** D100 left this open as a product question. A reader of a job's
+directory can see `job.json` saying `running` with nothing in
+`events.jsonl` yet: the record is written first and the transition line
+appended after it, so for the width of one file append the summary is ahead
+of the history. E-53 promises the records are readable during a run, so what
+a reader may see in that window is a promise and not an accident.
+
+**Decision. The order stays as it is, and it is the rule rather than the
+window that is written down:**
+
+> `job.json` is the authority on where a job stands **now**.
+> `events.jsonl` is its history, and may be one transition behind the
+> record. It is **never ahead of it**: a line in `events.jsonl` means the
+> record already agrees with that line, or has moved past it.
+
+So a reader who wants both — a state and the transition that produced it —
+waits on `events.jsonl`, which is the later of the two writers. A test that
+reads `job.json` as proof that the matching line has landed is reading the
+wrong side of the window; none in this suite currently does, and the ones
+that read both wait on the log or on a state written after the one they are
+about.
+
+**Why not the other order.** Writing `events.jsonl` first would make the
+window point the other way: a reader could see `finished` in the history
+while the record still said `running`, which is the authoritative file being
+stale about the one thing it exists to answer. Worse, a hub killed inside
+that window would leave a history claiming a transition the record never
+took — and recovery reads `job.json`, so the hub that came back would
+disagree with its own history for ever, with nothing to reconcile it from.
+The present order fails the other way: a crash in the window leaves a
+correct record and a history one line short, which is a loss of detail and
+not a contradiction.
+
+**Cost of the decision as taken.** A reader polling `job.json` alone can act
+on a state a moment before its line is readable. That is the cost, it is
+bounded by one append, and E-53's row in `docs/coverage.md` now says so.

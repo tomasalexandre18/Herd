@@ -354,6 +354,25 @@ async fn a_waiting_job_says_where_it_stands_with_its_figures() {
     }
     // Every one of them is in the one queue the hub recovers, none of them
     // has started, and each says why in a sentence with its figures.
+    //
+    // Waited for: a submission is answered before the dispatch pass that
+    // judges it has run, so the reason is written a moment *after* the id
+    // comes back. Read on sight, this panicked with "{job_id} is queued and
+    // says nothing about why" — the hub's other true sentence — on a host
+    // slow enough to put the pass behind the answer (D101).
+    let queued_now = queued.clone();
+    let store = std::sync::Arc::clone(&harness.store);
+    support::wait_until("every queued job says why it waits", move || {
+        queued_now.iter().all(|job_id| {
+            store
+                .job(job_id)
+                .expect("the record reads")
+                .expect("it is there")
+                .waiting_for
+                .is_some()
+        })
+    })
+    .await;
     let waiting = harness.store.unfinished_jobs().expect("the queue reads");
     assert_eq!(waiting.len(), 3);
     for (job_id, priority) in

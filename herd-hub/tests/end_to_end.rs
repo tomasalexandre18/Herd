@@ -417,11 +417,20 @@ async fn a_twin_of_a_live_runner_is_told_to_stand_by_rather_than_refused() {
 /// and its host stopped being part of the herd until someone noticed.
 #[tokio::test]
 async fn the_same_runner_dialling_again_replaces_its_own_dead_connection() {
-    let harness = Harness::with_hub_and_runner().await;
-    // The runner in the harness is called `test-runner`, and this is that
-    // runner coming back: the hub must take it, not turn it away.
-    let session = herd_runner::Session::new();
+    // **One `Session`, dialling twice.** The redial the hub must take is the
+    // *same process* coming back, which it tells apart from a twin by the
+    // instance id — and that id belongs to the `Session`, minted once and
+    // shared by every connection that session makes.
+    //
+    // This test used to start from [`Harness::with_hub_and_runner`] and dial
+    // a fresh `Session::new()` beside it, which mints a *different* instance:
+    // a twin, which the test just above proves is told to stand by. The
+    // assertion that followed — that a job ran — was then satisfied by the
+    // harness's own runner, which had never been replaced by anything. It
+    // passed without the case under test ever happening (D101).
+    let harness = Harness::with_hub().await;
     let (data_root, confined) = support::prepared_runner("same-runner-again");
+    let session = herd_runner::Session::new();
     let config = herd_runner::Config {
         hub_url: harness.hub_url.clone(),
         name: Some("test-runner".to_owned()),
@@ -429,13 +438,49 @@ async fn the_same_runner_dialling_again_replaces_its_own_dead_connection() {
         confinement: confinement(&data_root),
         ..herd_runner::Config::default()
     };
-    let joined =
-        tokio::spawn(async move { herd_runner::serve_once(config, session, confined).await });
-    // It is in, and a job submitted now runs on it: the hub has one runner,
-    // and it is the one that just dialled.
+    let first = tokio::spawn({
+        let (config, session, confined) = (
+            config.clone(),
+            session.clone(),
+            std::sync::Arc::clone(&confined),
+        );
+        async move { herd_runner::serve_once(config, session, confined).await }
+    });
+    support::wait_until("the first connection has joined", || {
+        harness.runner_joined()
+    })
+    .await;
+
+    // The link goes from under it, and the same process dials again at once
+    // — the same name and, because the `Session` is the same, the same
+    // instance. That is the redial; a fresh `Session` here would mint a new
+    // instance and be the *twin* of the test above, which the hub rightly
+    // tells to stand by.
+    first.abort();
+    let again = tokio::spawn({
+        let (config, session, confined) = (config, session, confined);
+        async move { herd_runner::serve_once(config, session, confined).await }
+    });
+
+    // There is no other runner left to answer for it: this hub's own runner
+    // is the connection that just dialled, and a job runs on it or on
+    // nothing. That is what the old shape of this test could not say — it
+    // dialled beside a harness runner that stayed connected throughout, so
+    // the job it submitted was answered by the machine that had never been
+    // replaced (D101).
+    //
+    // The hub superseding a connection it is *still holding* is pinned
+    // deterministically in `link.rs`, with a hand-written peer that does not
+    // close: here the close is real, so whether the hub has already noticed
+    // it by the time the redial lands is a race either way, and both of its
+    // outcomes are this assertion.
     let finished = support::run_job(&harness.requester(), shell("printf 'back\\n'"), |_, _| {})
         .await
         .expect("the runner that dialled again is the hub's runner now");
     assert_eq!(finished.outcome, JobOutcome::Exited { code: 0 });
-    joined.abort();
+    assert!(
+        !again.is_finished(),
+        "the redial was turned away rather than taken"
+    );
+    again.abort();
 }
