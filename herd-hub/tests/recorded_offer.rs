@@ -8,6 +8,7 @@
 
 use std::time::Duration;
 
+use herd_hub::JobStore;
 use herd_proto::{
     BusyProbe, Capability, CapabilityOffer, CapabilityOrigins, LabelSet, OfferedCapability,
 };
@@ -146,4 +147,118 @@ async fn a_runner_that_offers_nothing_still_runs_a_job_that_needs_nothing() {
         .await
         .expect("the job runs");
     assert_eq!(finished.outcome, herd_proto::JobOutcome::Exited { code: 0 });
+}
+
+/// D48 where the harm would actually land: a probe nobody can read keeps a
+/// job **queued**, with the reason on its record.
+///
+/// The fail-safe is one judgement — `Availability::suspends` in `herd-proto`,
+/// which reads `unknown` as suspended — and it was pinned by a single
+/// assertion in `herd-runner`'s unit tests. That is the wrong layer: the harm
+/// of reading an unreadable probe as "free" is not a wrong value in a runner,
+/// it is a job dispatched onto a machine something outside Herd is using
+/// (E-26, invariant 2). So it is pinned here, against the hub: the probe
+/// cannot be started at all, and the job waits with a sentence naming it and
+/// is never refused and never failed (D38).
+///
+/// Make `suspends` read `unknown` as free and this test fails.
+#[tokio::test]
+async fn a_probe_the_runner_cannot_read_keeps_a_job_queued_on_the_hub() {
+    let offer = CapabilityOffer::new(vec![OfferedCapability::new(
+        Capability::lease("metal-pc", BusyProbe::command(["/nonexistent/herd-probe"])),
+        CapabilityOrigins::declared(),
+    )])
+    .expect("a valid offer");
+    let harness = Harness::with_hub_and_runner_offering(
+        offer,
+        ProbeSettings {
+            interval: Duration::from_millis(50),
+            timeout: Duration::from_secs(1),
+        },
+    )
+    .await;
+
+    // The probe has been read — and could not be. Not "no reading yet": the
+    // runner has tried and told the hub why it failed.
+    wait_until("the hub has been told the probe cannot be read", || {
+        harness
+            .runner_capacity()
+            .expect("still joined")
+            .suspended()
+            .iter()
+            .any(|(name, why)| name == "metal-pc" && why.contains("cannot be started"))
+    })
+    .await;
+
+    let job = herdctl::submit_job(
+        &harness.requester(),
+        support::shell("printf 'this should not have run\\n'"),
+        labels(&["metal-pc"]),
+    )
+    .await
+    .expect("a job needing a suspended capability is accepted, never refused");
+
+    wait_until("the job's record says why it is waiting", || {
+        harness
+            .store
+            .job(&job)
+            .expect("the store reads")
+            .expect("the hub knows this job")
+            .waiting_for
+            .is_some()
+    })
+    .await;
+    let record = harness
+        .store
+        .job(&job)
+        .expect("the store reads")
+        .expect("the hub knows this job");
+    assert_eq!(
+        record.state,
+        herd_hub::JobState::Queued,
+        "a job needing a capability whose probe cannot be read waits: it is \
+         not dispatched, not failed and not refused"
+    );
+    let why = record.waiting_for.expect("a reason");
+    assert!(why.contains("metal-pc"), "{why}");
+    assert!(
+        why.contains("/nonexistent/herd-probe"),
+        "the reason must name the probe nobody could read: {why}"
+    );
+    assert!(why.contains("not refused"), "{why}");
+    // And on the history, as D50 asks, exactly once.
+    let waits: Vec<String> = harness
+        .store
+        .job_events(&job)
+        .expect("the events read")
+        .expect("this job has a history")
+        .into_iter()
+        .filter_map(|event| match event.what {
+            herd_hub::job::JobEventKind::Waiting { reason } => Some(reason),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(waits.len(), 1, "{waits:?}");
+
+    // It stays queued across many probe sweeps: every one of them reads the
+    // same unreadable probe, and not one of them hands the job out.
+    tokio::time::sleep(Duration::from_millis(400)).await;
+    assert_eq!(
+        harness
+            .store
+            .job(&job)
+            .expect("the store reads")
+            .expect("still there")
+            .state,
+        herd_hub::JobState::Queued
+    );
+    assert_eq!(
+        harness
+            .store
+            .job_log(&job)
+            .expect("the log reads")
+            .unwrap_or_default(),
+        Vec::<u8>::new(),
+        "the job must not have run"
+    );
 }
