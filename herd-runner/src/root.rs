@@ -529,6 +529,12 @@ fn restore_access(directory: &Path) {
 #[cfg(not(unix))]
 fn restore_access(_directory: &Path) {}
 
+/// How long the data root's lock is retried before a refusal is believed, and
+/// how often. Long enough to outlast a `fork` reaching its `exec` by orders of
+/// magnitude; short enough that a genuinely occupied root is reported at once.
+const LOCK_PATIENCE: std::time::Duration = std::time::Duration::from_millis(500);
+const LOCK_RETRY_EVERY: std::time::Duration = std::time::Duration::from_millis(10);
+
 /// Take the root's lock, or refuse naming the runner that holds it.
 ///
 /// One runner per data root, for the same reason as one hub per state root
@@ -536,6 +542,21 @@ fn restore_access(_directory: &Path) {}
 /// "left" can only mean "left by a runner that is gone" if no second runner
 /// is using the same directory. The lock dies with the process, so a runner
 /// that was killed leaves the root free.
+///
+/// # Why this is not one try
+///
+/// `flock` belongs to an *open file description*, and `fork` duplicates every
+/// one of those. So between a `fork` and its `exec` — every job this runner
+/// spawns, and every external busy probe it reads (M5) — a child briefly
+/// holds this lock too, even though the descriptor is close-on-exec and goes
+/// the instant the child execs. A runner starting in that window would be
+/// told the root belongs to a process that has already let go.
+///
+/// Microseconds, and not worth a design: the lock is retried for
+/// [`LOCK_PATIENCE`] before the refusal is believed. A root a live runner
+/// really holds stays held for the whole window, so the refusal that matters
+/// still happens — later by a fraction of a second, on a path that ends the
+/// process anyway.
 #[cfg(unix)]
 fn lock_exclusively(path: &Path) -> Result<fs::File, String> {
     use std::io::Write;
@@ -548,8 +569,17 @@ fn lock_exclusively(path: &Path) -> Result<fs::File, String> {
         .write(true)
         .open(path)
         .map_err(|error| format!("the lock file {} cannot be opened: {error}", path.display()))?;
-    // Safe: flock on an open descriptor, with no allocation involved.
-    let locked = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0;
+    let give_up_at = std::time::Instant::now() + LOCK_PATIENCE;
+    let locked = loop {
+        // Safe: flock on an open descriptor, with no allocation involved.
+        if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0 {
+            break true;
+        }
+        if std::time::Instant::now() >= give_up_at {
+            break false;
+        }
+        std::thread::sleep(LOCK_RETRY_EVERY);
+    };
     if !locked {
         let holder = fs::read_to_string(path).unwrap_or_default();
         let holder = holder.trim();
@@ -858,12 +888,22 @@ mod tests {
     fn a_second_runner_is_refused_the_same_data_root_naming_the_holder() {
         let temp = TempDir::new("one-owner");
         let first = DataRoot::open(temp.path()).expect("the first runner owns it");
+        let started = std::time::Instant::now();
         let error = DataRoot::open(temp.path()).expect_err("the second is refused");
         assert!(
             error.contains(&std::process::id().to_string()),
             "the refusal must name the holder: {error}"
         );
         assert!(error.contains("--data-root"), "{error}");
+        // The lock is retried before the refusal is believed, because a
+        // `fork` holds it until its `exec` (see `lock_exclusively`). What that
+        // must not become is a wait: an occupied root is reported while
+        // somebody is still watching the terminal.
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(2),
+            "an occupied root took {:?} to be reported",
+            started.elapsed()
+        );
         drop(first);
         // The lock dies with its holder, so the root is free again.
         DataRoot::open(temp.path()).expect("a released root is usable again");
