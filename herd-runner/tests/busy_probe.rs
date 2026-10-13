@@ -475,3 +475,93 @@ fn processes_with_argument(needle: &str) -> Vec<u32> {
     }
     found
 }
+
+/// The lease probe of E-27, against **the consumer's own four exit codes**
+/// (issue #16, D76, attack 8).
+///
+/// `cargo xtask metal <machine> --lease-status` exits 0 free, 10 busy with
+/// `holder=` and `expires=` on stdout, 1 when it cannot tell, and 64 for an
+/// unknown machine or bad usage. Herd is configured with two of those — busy
+/// 10, free 0 — and the whole of this test is that the other two, and
+/// everything like them, **suspend the capability naming the code** (D48)
+/// rather than reading as free.
+///
+/// The consumer asked for "treat as busy"; this is the stricter reading they
+/// agreed to, and the reason is in the two sentences it produces: a
+/// permanently broken probe surfaces as a capability nobody can offer, with
+/// its exit code in the sentence, instead of a machine that is mysteriously
+/// always busy.
+#[tokio::test]
+async fn the_lease_probe_is_read_on_exactly_its_two_declared_codes() {
+    let timeout = Duration::from_secs(5);
+    // As a machine's operator declares it in her own capability file (D86).
+    let lease = |exit: &str| BusyProbe::Command {
+        command: vec![
+            "/bin/sh".to_owned(),
+            "-c".to_owned(),
+            format!("echo holder=alexa expires=1792000000; {exit}"),
+        ],
+        busy_exit_code: 10,
+        free_exit_code: 0,
+    };
+
+    // 0 — free: no lease, or an expired one.
+    assert_eq!(evaluate(&lease("exit 0"), timeout).await, Availability::Free);
+
+    // 10 — busy: somebody holds it. The job waits (D38), it is never failed,
+    // and the sentence carries the code.
+    let read = evaluate(&lease("exit 10"), timeout).await;
+    assert!(
+        matches!(read, Availability::Busy { .. }),
+        "10 is busy: {read:?}"
+    );
+    let reason = read.reason().expect("a busy probe says why");
+    assert!(reason.contains("exited 10"), "{reason}");
+    assert!(reason.contains("which means busy"), "{reason}");
+
+    // 1 — cannot tell: an unreadable or unparsable lease, or its lock held
+    // past five seconds. **Suspended, naming the code**, not busy and never
+    // free.
+    for (code, what) in [
+        ("exit 1", "a lease it cannot read"),
+        ("exit 64", "an unknown machine or bad usage"),
+        ("exec no-such-xtask", "no such command at all (127)"),
+        ("kill -TERM $$", "killed by a signal"),
+    ] {
+        let read = evaluate(&lease(code), timeout).await;
+        assert!(
+            matches!(read, Availability::Unknown { .. }),
+            "{what} must suspend the capability, never read as free: {read:?}"
+        );
+        assert!(read.suspends(), "{what}: {read:?}");
+        assert_ne!(
+            read, Availability::Free,
+            "{what} must never be free: a lease nobody can read is not a lease nobody holds"
+        );
+        let reason = read.reason().expect("an unreadable probe says why");
+        // Either the code it gave, or the fact that it gave none.
+        assert!(
+            reason.contains("exited") || reason.contains("signal"),
+            "{what}: the sentence has to name what happened: {reason}"
+        );
+        assert!(
+            reason.contains("metal") || reason.contains("xtask") || reason.contains("holder"),
+            "and which probe it was: {reason}"
+        );
+    }
+
+    // And the output is never read, whatever it says: `holder=alexa` on
+    // stdout beside an exit of 0 is **free**, because the exit code is the
+    // whole of the contract (D51 — a probe is a command and two numbers, not
+    // a protocol).
+    let lying = BusyProbe::Command {
+        command: vec![
+            "/bin/sh".to_owned(),
+            "-c".to_owned(),
+            "echo holder=somebody expires=99999999999; exit 0".to_owned(),
+        ],
+        busy_exit_code: 10,
+        free_exit_code: 0,
+    };
+    assert_eq!(evaluate(&lying, timeout).await, Availability::Free);
+}

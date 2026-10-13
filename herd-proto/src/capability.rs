@@ -351,6 +351,30 @@ pub struct Capability {
     pub excludes: LabelSet,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub busy_probe: Option<BusyProbe>,
+    /// A job holding this capability starts only on a **quiet host**, and
+    /// while one is waiting for that, this machine claims nothing new (E-27).
+    ///
+    /// E-27's drain-first, as a fact the machine's operator declares about one
+    /// of her capabilities — never as a meaning Herd reads out of a label's
+    /// spelling. `metal-<machine>` is still a string nothing in Herd
+    /// understands: the prefix means something to the consumer's tool and to
+    /// nobody here, and what makes a metal trial empty the PC first is this
+    /// flag in the PC's own capability file.
+    ///
+    /// Two halves, and the second is the one exclusivity does not give.
+    /// *Quiet host*: no other job of this runner's may be running when it
+    /// starts. *Reserved*: from the moment such a job is queued and eligible
+    /// here, this machine takes no new work — bounded, because a host held
+    /// empty for a job that never comes is a machine lent for nothing. Without
+    /// the reservation a trial waiting for a quiet host would starve for as
+    /// long as builds kept arriving, which is the attack E-27's own wording
+    /// ("drains the PC's build slot first, up to 15 min") exists to answer.
+    #[serde(default, skip_serializing_if = "is_not_drain_first")]
+    pub drain_first: bool,
+}
+
+fn is_not_drain_first(drain_first: &bool) -> bool {
+    !*drain_first
 }
 
 impl Capability {
@@ -390,7 +414,15 @@ impl Capability {
             kind,
             excludes: LabelSet::default(),
             busy_probe: None,
+            drain_first: false,
         }
+    }
+
+    /// Declare that a job holding this capability starts only on a quiet host,
+    /// and that this machine claims nothing new while one is waiting (E-27).
+    pub fn draining_first(mut self) -> Self {
+        self.drain_first = true;
+        self
     }
 
     /// Declare that this capability cannot be held alongside `labels`.

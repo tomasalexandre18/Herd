@@ -224,6 +224,7 @@ impl Puppet {
             host: herd_proto::HostSize::default(),
             preference: 0,
             load_milli: None,
+            switch: herd_proto::Switch::On,
         };
         socket
             .send(Message::text(to_frame(&hello).expect("encodes")))
@@ -318,6 +319,7 @@ impl Puppet {
             jobs,
             draining,
             load_milli: None,
+            switch: herd_proto::Switch::On,
         })
         .await;
     }
@@ -1725,6 +1727,7 @@ async fn the_hub_s_first_answer(hub_url: &str, name: &str, instance: &str) -> Fr
         host: herd_proto::HostSize::default(),
         preference: 0,
         load_milli: None,
+        switch: herd_proto::Switch::On,
     };
     socket
         .send(Message::text(to_frame(&hello).expect("encodes")))

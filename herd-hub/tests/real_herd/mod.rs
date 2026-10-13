@@ -538,3 +538,97 @@ impl Herd {
             .to_owned()
     }
 }
+
+impl Herd {
+    /// Submit a job with whatever options the test wants, and leave with its
+    /// id. The M9 options — a deadline, a parent, a requeue code — go through
+    /// here.
+    pub async fn submit_with(&self, options: &[&str], script: &str) -> std::process::Output {
+        let mut arguments: Vec<&str> = vec!["submit"];
+        arguments.extend_from_slice(options);
+        arguments.extend_from_slice(&["--", "/bin/sh", "-c", script]);
+        self.herdctl(&arguments).await
+    }
+
+    /// The same, asserting it was accepted.
+    pub async fn submit_ok(&self, options: &[&str], script: &str) -> String {
+        let output = self.submit_with(options, script).await;
+        assert!(
+            output.status.success(),
+            "the submission failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8_lossy(&output.stdout).trim().to_owned()
+    }
+
+    /// Where the owner's switch file of one named runner is (E-33).
+    pub fn switch_file(&self, root: &str) -> PathBuf {
+        self.runner_root(root).join("switch")
+    }
+
+    /// Set a switch on the machine itself, as an owner does (E-33). Returns
+    /// how long the command took, which is the owner's half of the ten
+    /// seconds.
+    pub async fn switch_on_the_machine(&self, root: &str, arguments: &[&str]) -> Duration {
+        let began = Instant::now();
+        let output = Command::new(binary("herd-runner"))
+            .arg("--data-root")
+            .arg(self.runner_root(root))
+            .arg("switch")
+            .args(arguments)
+            .output()
+            .await
+            .expect("herd-runner switch runs");
+        let took = began.elapsed();
+        assert!(
+            output.status.success(),
+            "herd-runner switch {arguments:?} failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        took
+    }
+
+    /// What `herdctl switch` says about the fleet (E-33).
+    pub async fn switches(&self) -> String {
+        let output = self.herdctl(&["switch"]).await;
+        assert!(
+            output.status.success(),
+            "herdctl switch failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8_lossy(&output.stdout).into_owned()
+    }
+
+    /// Every byte of this hub's state root, as a sorted list of paths and
+    /// contents (E-07).
+    ///
+    /// What a dry run must not change. Paths **and** bytes, because "nothing
+    /// was written" has two halves: no file appeared and no file moved.
+    pub fn state_bytes(&self) -> Vec<(String, Vec<u8>)> {
+        fn walk(at: &Path, under: &Path, into: &mut Vec<(String, Vec<u8>)>) {
+            let mut entries: Vec<PathBuf> = std::fs::read_dir(at)
+                .into_iter()
+                .flatten()
+                .filter_map(Result::ok)
+                .map(|entry| entry.path())
+                .collect();
+            entries.sort();
+            for entry in entries {
+                let shown = entry
+                    .strip_prefix(under)
+                    .unwrap_or(&entry)
+                    .display()
+                    .to_string();
+                if entry.is_dir() {
+                    into.push((format!("{shown}/"), Vec::new()));
+                    walk(&entry, under, into);
+                } else {
+                    into.push((shown, std::fs::read(&entry).unwrap_or_default()));
+                }
+            }
+        }
+        let mut bytes = Vec::new();
+        walk(self.state.path(), self.state.path(), &mut bytes);
+        bytes
+    }
+}

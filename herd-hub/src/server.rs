@@ -189,6 +189,10 @@ impl Restating {
 }
 
 /// The hub's own version, reported in `Welcome`.
+/// How many goes a job gets at a capability that turned out to be taken
+/// (D76). See [`Policy::requeue_budget`].
+pub const REQUEUE_BUDGET: u32 = 3;
+
 pub fn hub_version() -> &'static str {
     env!("CARGO_PKG_VERSION")
 }
@@ -258,6 +262,25 @@ pub struct Policy {
     /// where the reason is **computed**, and it may run twenty times a minute
     /// or once an hour; this is where it is **said**.
     pub wait_restatement: Duration,
+    /// How long a job may hold a host empty waiting for it to go quiet
+    /// (E-27).
+    ///
+    /// Fifteen minutes, the figure E-27 names, and a setting for the reason
+    /// the stickiness limit is one: an operator has to be able to see it, and
+    /// a test has to be able to make it pass without waiting a quarter of an
+    /// hour. Named in the sentence of every job that is waiting on it.
+    pub drain_first_limit: Duration,
+    /// How many goes a job gets at a capability that turned out to be taken
+    /// (D76).
+    ///
+    /// Three, and **separate from [`Policy::attempts_allowed`]**, which is
+    /// E-21's budget for a runner that disappears. Three because the race
+    /// this bounds is small and genuine — the lease was free when the probe
+    /// was read and taken by the time the job started — so one retry is
+    /// usually enough and a second machine is worth trying; and bounded
+    /// because a lease somebody else holds all afternoon would otherwise
+    /// requeue a job for ever, which is a job nobody is told about.
+    pub requeue_budget: u32,
 }
 
 impl Default for Policy {
@@ -271,6 +294,8 @@ impl Default for Policy {
             aging_step: crate::queue::AGING_STEP,
             stickiness: Stickiness::default(),
             wait_restatement: WAIT_RESTATEMENT,
+            drain_first_limit: crate::matcher::DRAIN_FIRST_LIMIT,
+            requeue_budget: REQUEUE_BUDGET,
         }
     }
 }
@@ -466,6 +491,7 @@ impl HubHandle {
                     last_health_age: runner.last_health.elapsed(),
                     reports_seen: runner.reports_seen,
                     draining: runner.draining,
+                    switch: runner.switch.clone(),
                     jobs: runner.jobs.iter().map(|job| job.job_id.clone()).collect(),
                 })
                 .collect()
@@ -520,6 +546,8 @@ pub struct RunnerStatus {
     /// quiet.
     pub reports_seen: u64,
     pub draining: bool,
+    /// Where its owner's switch stands (E-33), with her reason.
+    pub switch: herd_proto::Switch,
     pub jobs: Vec<JobId>,
 }
 
@@ -563,6 +591,13 @@ struct Announced {
     /// The load it measured as it dialled, times 1000 (E-32). Recorded,
     /// never a gate; refreshed by every health report.
     load_milli: Option<u64>,
+    /// Where its owner's switch stood as it dialled (E-33).
+    ///
+    /// In the handshake because the switch outlives the process: an owner who
+    /// switched her PC off before rebooting it has not changed her mind, and a
+    /// runner the hub believed `on` until its first health report would be a
+    /// machine that could be claimed on in that window.
+    switch: herd_proto::Switch,
 }
 
 /// What a requester gets when it attaches to a job by its id.
@@ -613,6 +648,15 @@ struct ConnectedRunner {
     last_health: Instant,
     reports_seen: u64,
     draining: bool,
+    /// Where its owner's switch stands (E-33), as this runner last said.
+    ///
+    /// **The runner is the authority**, not the hub. `herdctl switch` asks the
+    /// hub to ask the runner; the runner applies the position, writes it to
+    /// its own file and says so here. One state, in the place that owns the
+    /// machine — so a `set_switch` frame that never arrived leaves the hub's
+    /// view wrong for one health cadence and no longer, instead of leaving two
+    /// sides each sure of a different position.
+    switch: herd_proto::Switch,
     jobs: Vec<RunningJob>,
 }
 
@@ -801,6 +845,7 @@ impl State {
                     last_health: now,
                     reports_seen: 0,
                     draining: false,
+                    switch: announced.switch.clone(),
                     jobs: Vec::new(),
                 },
             );
@@ -869,6 +914,10 @@ impl State {
                         holdings,
                         reserved: reserved.get(&runner.name).cloned().unwrap_or_default(),
                         load_milli: runner.load_milli,
+                        switch: runner.switch.clone(),
+                        // Filled by `reservations` before the pass places
+                        // anything, from the records alone (D79).
+                        reserved_for: None,
                     }
                 })
                 .collect()
@@ -965,6 +1014,48 @@ impl State {
         self.outbox_of(&holder)
     }
 
+    /// Where every connected runner's switch stands (E-33).
+    ///
+    /// E-33 asks for the position and its reason to be **visible**. The status
+    /// document is M13's; this is the answer `herdctl switch` prints, and it is
+    /// read straight off the fleet so there is nothing for it to disagree with.
+    fn fleet_switches(&self) -> Vec<herd_proto::RunnerSwitch> {
+        self.with_peers(|peers| {
+            peers
+                .runners
+                .values()
+                .map(|runner| herd_proto::RunnerSwitch {
+                    name: runner.name.clone(),
+                    switch: runner.switch.clone(),
+                    jobs: runner.jobs.len() as u32,
+                    stopping: runner.draining,
+                })
+                .collect()
+        })
+    }
+
+    /// Take a runner's switch, if it is *the* runner on this connection
+    /// (E-33).
+    fn record_switch(&self, outbox: &Outbox, switch: herd_proto::Switch) -> Option<String> {
+        self.with_peers(|peers| {
+            let runner = peers
+                .runners
+                .values_mut()
+                .find(|runner| runner.outbox.same_channel(outbox))?;
+            if runner.switch == switch {
+                return None;
+            }
+            let said = format!(
+                "runner {} is now switched {} (it was {})",
+                runner.name,
+                switch.sentence(),
+                runner.switch.sentence()
+            );
+            runner.switch = switch;
+            Some(said)
+        })
+    }
+
     /// Why a submission cannot be placed anywhere at all, if it cannot.
     ///
     /// About the *fleet*, not about one job: a job that no connected runner
@@ -976,10 +1067,29 @@ impl State {
             if peers.runners.is_empty() {
                 return Some("no runner is connected".to_owned());
             }
-            if peers.runners.values().all(|runner| runner.draining) {
+            if peers
+                .runners
+                .values()
+                .all(|runner| runner.draining || !runner.switch.claims())
+            {
                 return Some(format!(
-                    "every runner connected to this hub is draining and takes no new job: {}",
-                    peers.runners.keys().cloned().collect::<Vec<_>>().join(", ")
+                    "every runner connected to this hub takes no new job: {}",
+                    peers
+                        .runners
+                        .values()
+                        .map(|runner| {
+                            if runner.draining {
+                                format!("{} is draining", runner.name)
+                            } else {
+                                // The owner's own words, which is the whole
+                                // point of E-33's reason: a submission refused
+                                // because somebody is gaming on the PC should
+                                // say so.
+                                format!("{} is switched {}", runner.name, runner.switch.sentence())
+                            }
+                        })
+                        .collect::<Vec<_>>()
+                        .join(", ")
                 ));
             }
             None
@@ -1296,6 +1406,7 @@ async fn serve_peer(state: Arc<State>, stream: TcpStream) -> Result<()> {
                 host,
                 preference,
                 load_milli,
+                switch,
             } => {
                 if protocol_version != PROTOCOL_VERSION {
                     return refuse(&mut sink, version_mismatch_reason(protocol_version)).await;
@@ -1331,6 +1442,7 @@ async fn serve_peer(state: Arc<State>, stream: TcpStream) -> Result<()> {
                         host,
                         preference,
                         load_milli,
+                        switch,
                     },
                 )
             }
@@ -1628,13 +1740,38 @@ fn dispatch_a_pass(state: &State) -> Result<()> {
     // through it, and the moment the figures in the sentences are computed
     // from is the moment the order was.
     let now = Timestamp::now();
-    let queue = queue::order(unfinished, now, state.policy.aging_step);
+    let queue = queue::order(unfinished.clone(), now, state.policy.aging_step);
+    // Which hosts are being held empty for which job (E-27), decided before a
+    // single job is placed. Before, because a reservation found while walking
+    // the queue in priority order would be found only after everything ahead
+    // of the drain-first job had been claimed — and a stream of builds would
+    // then starve a metal trial for ever, which is the attack E-27's
+    // "drains the build slot first" exists to answer. Derived from these same
+    // records, so there is nothing to leak and nothing to rebuild (D79).
+    let held_empty = matcher::reservations(
+        &queue,
+        &seats,
+        now,
+        state.policy.drain_first_limit,
+    );
+    for seat in seats.iter_mut() {
+        seat.reserved_for = held_empty.get(&seat.name).cloned();
+    }
     let total = queue.len();
     for (place, record) in queue.iter().enumerate() {
+        // The one job this one named, if it named one (E-10). Looked up here
+        // rather than inside the claim step, which is a pure function of a
+        // record and a fleet: a parent that is finished is not in the queue at
+        // all, so finding it is a read of the store and the claim step does no
+        // I/O. `unfinished` first, because that is already in hand.
+        let placing = matcher::Placing {
+            parent: parent_of(state, record, &unfinished),
+            drain_first_limit: Some(state.policy.drain_first_limit),
+        };
         // The whole claim decision, for this job, against the fleet as this
         // pass found it — and `seats` is carried *through* the loop, so a job
         // this pass has just placed is contending with the next one (E-25).
-        match matcher::place(record, &mut seats, now, state.policy.stickiness) {
+        match matcher::place(record, &mut seats, now, state.policy.stickiness, &placing) {
             Placement::Claim {
                 runner,
                 why,
@@ -1684,19 +1821,99 @@ fn dispatch_a_pass(state: &State) -> Result<()> {
             // the one place in the claim step that is: everything else about
             // a job that cannot start now is a wait (D38).
             Placement::Impossible { why } => {
-                refuse_the_job(state, record, &why)?;
+                end_the_job(
+                    state,
+                    record,
+                    JobOutcome::Impossible {
+                        reason: why.clone(),
+                    },
+                    &format!("can never run: {why}"),
+                )?;
+            }
+            // Over before it began: its deadline passed while it was queued,
+            // or the one job it named did not succeed (E-09, E-10). Terminal
+            // like `Impossible`, and a **different outcome** on purpose:
+            // `cancelled` is what D40 calls an end nobody chose to run, and
+            // `herdctl` says it in different words.
+            Placement::Cancel { why } => {
+                end_the_job(
+                    state,
+                    record,
+                    JobOutcome::Cancelled {
+                        reason: why.clone(),
+                    },
+                    &why,
+                )?;
             }
         }
     }
     Ok(())
 }
 
-/// End a job no machine could ever run, with the reason on its record and in
-/// the stream of whoever is waiting for it (E-36).
-fn refuse_the_job(state: &State, record: &JobRecord, why: &str) -> Result<()> {
-    let outcome = JobOutcome::Impossible {
-        reason: why.to_owned(),
+/// Where the one job this job named as its parent stands (E-10).
+///
+/// Read from the records: the queue this pass already holds first, then the
+/// store for a parent that is over. A parent this hub has no record of is
+/// [`matcher::Parent::Gone`] and is never read as one that succeeded.
+fn parent_of(state: &State, record: &JobRecord, unfinished: &[JobRecord]) -> matcher::Parent {
+    let Some(parent_id) = record.after.clone() else {
+        return matcher::Parent::None;
     };
+    let parent = unfinished
+        .iter()
+        .find(|other| other.id == parent_id)
+        .cloned()
+        .or_else(|| state.store.job(&parent_id).ok().flatten());
+    let Some(parent) = parent else {
+        return matcher::Parent::Gone { id: parent_id };
+    };
+    match &parent.state {
+        JobState::Finished { outcome } => match outcome {
+            JobOutcome::Exited { code: 0 } => matcher::Parent::Succeeded { id: parent_id },
+            other => matcher::Parent::DidNot {
+                id: parent_id,
+                how: how_it_ended(other),
+            },
+        },
+        state => matcher::Parent::NotYet {
+            id: parent_id,
+            state: state.name().to_owned(),
+        },
+    }
+}
+
+/// A parent's ending, in the words its own requester would have read.
+///
+/// Said here rather than borrowed from `herdctl`, because the hub writes it
+/// onto a *child's* record and a record is read with no tool but `cat`.
+fn how_it_ended(outcome: &JobOutcome) -> String {
+    match outcome {
+        JobOutcome::Exited { code } => format!("exited {code} rather than 0"),
+        JobOutcome::Signalled { signal } => format!("was killed by signal {signal}"),
+        JobOutcome::CouldNotStart { reason } => format!("could not be started: {reason}"),
+        JobOutcome::StoppedByCap { cap, limit, .. } => {
+            format!("was stopped by its {cap:?} cap of {limit}")
+        }
+        JobOutcome::Cancelled { reason } => format!("was cancelled: {reason}"),
+        JobOutcome::Lost { reason } => format!("was lost: {reason}"),
+        JobOutcome::Impossible { reason } => format!("could never have run: {reason}"),
+    }
+}
+
+/// End a job the claim step ended, with the reason on its record and in the
+/// stream of whoever is waiting for it (E-36, E-09, E-10).
+///
+/// One door for the three ends the claim step can decide: no machine could
+/// ever run it (`impossible`, E-36), its deadline passed while it waited
+/// (`cancelled`, E-09) and the one job it named did not succeed (`cancelled`,
+/// E-10). The outcome is the caller's because the three are not the same end,
+/// and a reader of a record must be able to tell them apart (D15).
+fn end_the_job(
+    state: &State,
+    record: &JobRecord,
+    outcome: JobOutcome,
+    said: &str,
+) -> Result<()> {
     state
         .store
         .record_state(
@@ -1705,8 +1922,8 @@ fn refuse_the_job(state: &State, record: &JobRecord, why: &str) -> Result<()> {
                 outcome: outcome.clone(),
             },
         )
-        .with_context(|| format!("ending {} as impossible", record.id))?;
-    eprintln!("herd-hub: {} can never run: {why}", record.id);
+        .with_context(|| format!("ending {}", record.id))?;
+    eprintln!("herd-hub: {} {said}", record.id);
     for follower in state.stop_following(&record.id) {
         let _ = follower.send(FromHub::JobFinished {
             job_id: record.id.clone(),
@@ -1938,6 +2155,7 @@ async fn relay_from_runner(
                 jobs,
                 draining,
                 load_milli,
+                switch,
             } => {
                 // A report is two different claims. "I am alive" is this
                 // runner's to make, and it is recorded whatever else the
@@ -1953,6 +2171,16 @@ async fn relay_from_runner(
                     }
                 }
                 state.record_health(outbox, its_own, draining, load_milli);
+                // And the owner's switch, which rides on every report (E-33).
+                // A position that moved is said out loud **and** re-judges the
+                // queue at once: `off` means the jobs waiting for this machine
+                // are claimable elsewhere now, not at the next thing that
+                // happens to wake the hub (D80). That is where E-33's ten
+                // seconds is actually spent.
+                if let Some(said) = state.record_switch(outbox, switch) {
+                    println!("herd-hub: {said}");
+                    dispatch_queued_jobs(state)?;
+                }
                 // The answer is what tells the runner this link is alive: a
                 // socket can stay open onto a hub that is gone.
                 let _ = outbox.send(FromHub::HealthRecorded {});
@@ -2067,7 +2295,7 @@ async fn relay_from_runner(
                 // it to, and refusing it would wedge the runner, which would
                 // redeliver it on every connection for ever. So it is
                 // acknowledged and said out loud.
-                match state.store.job(&job_id) {
+                let known = match state.store.job(&job_id) {
                     Ok(None) => {
                         eprintln!(
                             "herd-hub: a runner reported how {job_id} ended, and this hub \
@@ -2082,7 +2310,17 @@ async fn relay_from_runner(
                         eprintln!("herd-hub: reading the record of {job_id} failed: {error}");
                         continue;
                     }
-                    Ok(Some(_)) => {}
+                    Ok(Some(record)) => record,
+                };
+                // The declared requeue code, before anything is recorded as a
+                // verdict (D76). This is **not** how the job ended: the
+                // capability it was given had gone, which is a race between a
+                // probe and a run, and the answer is a bounded requeue with
+                // the capability re-probed — never a 75 handed to the
+                // requester as a result.
+                if is_the_requeue_code(&known, &outcome) {
+                    requeue_for_a_lost_capability(state, outbox, &known, attempt).await?;
+                    continue;
                 }
                 // The log before the end. A job that ended having written more
                 // chunks than this hub holds is the lost-tail case, and the
@@ -2570,9 +2808,16 @@ fn give_the_job_another_go(
     if !record.attempt_is_current(attempt) {
         return Ok(());
     }
+    // How many goes a *runner* has taken away from this job already — read off
+    // the record, not off the attempt number (D79, D76). An attempt that ended
+    // because the job answered its declared requeue code is not one of these:
+    // a leased machine must not spend the goes that exist for a machine that
+    // disappears, and before this was counted separately three 75s left a job
+    // with nothing left for the case E-21 is about.
+    let goes_taken = record.goes_a_runner_took();
     state
         .store
-        .end_attempt(job_id, attempt, reason)
+        .end_attempt(job_id, attempt, reason, None)
         .with_context(|| format!("ending attempt {attempt} of {job_id}"))?;
     state.attempt_is_over(job_id);
     // Whatever that attempt wrote and the hub never received is gone with it:
@@ -2586,14 +2831,15 @@ fn give_the_job_another_go(
             .map_or("", |attempt| attempt.runner.as_str()),
     );
 
-    if attempt < state.policy.attempts_allowed {
+    if goes_taken + 1 < state.policy.attempts_allowed {
         state
             .store
             .record_state(job_id, JobState::Queued)
             .with_context(|| format!("requeueing {job_id}"))?;
         println!(
-            "herd-hub: {job_id} is queued again for attempt {} of {}: {reason}",
-            attempt + 1,
+            "herd-hub: {job_id} is queued again for attempt {} of {} at a runner that went \
+             away: {reason}",
+            goes_taken + 1,
             state.policy.attempts_allowed
         );
         for follower in state.followers_of(job_id) {
@@ -2620,7 +2866,10 @@ fn give_the_job_another_go(
     // process gave one (D15).
     let outcome = JobOutcome::Lost {
         reason: format!(
-            "{reason}; this was attempt {attempt} of {}, so the job is not attempted again",
+            "{reason}; this was attempt {} of {} at a runner that went away, so the job is not \
+             attempted again (E-21). A go spent on a capability that had gone under it would \
+             not have counted towards these (D76)",
+            goes_taken + 1,
             state.policy.attempts_allowed
         ),
     };
@@ -2641,6 +2890,127 @@ fn give_the_job_another_go(
             // Whatever the record holds, which for a job no runner ever
             // reported on is nothing at all — and nothing is what is sent,
             // never a zero (D23).
+            metrics: record.metrics.clone(),
+        });
+    }
+    Ok(())
+}
+
+/// Whether this is the job's own declared "the capability I was given went
+/// away" code, rather than a verdict (D76).
+///
+/// Only an [`JobOutcome::Exited`] can be: a signal, a cap breach and a
+/// failure to start are not exit codes, and a job whose requester declared no
+/// such code has every code of its own passed through untouched (D20).
+fn is_the_requeue_code(record: &JobRecord, outcome: &JobOutcome) -> bool {
+    match (record.requeue_exit_code, outcome) {
+        (Some(declared), JobOutcome::Exited { code }) => *code == declared,
+        _ => false,
+    }
+}
+
+/// Give a job another go at a capability that turned out to be taken, or end
+/// it naming the code and the machines that answered it (D76).
+///
+/// On its **own** budget. E-21's two goes exist for a runner that disappears,
+/// and a leased machine answering 75 three times must not spend them — so the
+/// two are counted from different attempts of the same record
+/// ([`JobRecord::requeues_spent`], [`JobRecord::goes_a_runner_took`]) and
+/// neither can reach the other's.
+///
+/// The result is acknowledged, because the runner is holding it and it is not
+/// a verdict anybody wants: the attempt is over, not the job.
+async fn requeue_for_a_lost_capability(
+    state: &State,
+    outbox: &Outbox,
+    record: &JobRecord,
+    attempt: u32,
+) -> Result<()> {
+    let job_id = &record.id;
+    let code = record.requeue_exit_code.unwrap_or_default();
+    let runner = record
+        .attempt()
+        .map(|attempt| attempt.runner.clone())
+        .unwrap_or_default();
+    let spent = record.requeues_spent();
+    let reason = format!(
+        "it exited {code} on {runner}, the code this job declares for a capability that has \
+         gone (--requeue-exit-code); that is not a verdict, so the attempt ends here"
+    );
+    state
+        .store
+        .end_attempt(job_id, attempt, &reason, Some(code))
+        .with_context(|| format!("ending attempt {attempt} of {job_id}"))?;
+    state.attempt_is_over(job_id);
+    let _ = outbox.send(FromHub::JobResultAck {
+        job_id: job_id.clone(),
+    });
+    // The reading that let this job through is known to be stale: the
+    // capability was free when the probe last said so and taken by the time
+    // the job ran. Asked for again before the next pass, so the budget is not
+    // spent three times against one stale answer.
+    let _ = outbox.send(FromHub::ReadProbesAgain {
+        why: format!("{job_id} exited {code} on {runner}, so what it was given is held by \
+                      something outside Herd after all"),
+    });
+    if spent + 1 < state.policy.requeue_budget {
+        state
+            .store
+            .record_state(job_id, JobState::Queued)
+            .with_context(|| format!("requeueing {job_id}"))?;
+        println!(
+            "herd-hub: {job_id} is queued again, having spent {} of its {} goes at a \
+             capability that went away: {reason}",
+            spent + 1,
+            state.policy.requeue_budget
+        );
+        for follower in state.followers_of(job_id) {
+            let _ = follower.send(FromHub::JobNote {
+                job_id: job_id.clone(),
+                note: format!(
+                    "{reason}. It is queued again, having spent {} of its {} goes at a \
+                     capability that went away, and the capability is being read again. This \
+                     wait carries on.",
+                    spent + 1,
+                    state.policy.requeue_budget
+                ),
+            });
+        }
+        dispatch_queued_jobs(state)?;
+        return Ok(());
+    }
+    // The budget is spent. An end, naming the code and every machine that
+    // answered it — which is the sentence an operator acts on: it says the
+    // lease is held, and by how many machines it has been tried.
+    let answered = record.runners_that_requeued_it();
+    let outcome = JobOutcome::Lost {
+        reason: format!(
+            "every go at a capability this job needs came back {code}, the code it declares \
+             for a capability that has gone: {} of {} goes spent, on {}. Something outside \
+             Herd is holding what it needs, and Herd has no verdict for it",
+            spent + 1,
+            state.policy.requeue_budget,
+            if answered.is_empty() {
+                runner.clone()
+            } else {
+                answered.join(", ")
+            }
+        ),
+    };
+    state
+        .store
+        .record_state(
+            job_id,
+            JobState::Finished {
+                outcome: outcome.clone(),
+            },
+        )
+        .with_context(|| format!("recording {job_id} as out of requeues"))?;
+    eprintln!("herd-hub: {job_id} has spent its requeue budget: {reason}");
+    for follower in state.stop_following(job_id) {
+        let _ = follower.send(FromHub::JobFinished {
+            job_id: job_id.clone(),
+            outcome: outcome.clone(),
             metrics: record.metrics.clone(),
         });
     }
@@ -2730,6 +3100,177 @@ async fn serve_requester(state: &State, outbox: &Outbox, source: &mut Source) ->
     outcome
 }
 
+/// What a requester asked for, as the store takes it in.
+///
+/// One function, used by the submission **and** by the dry run, so that the
+/// job E-07 judges and the job a submission makes are the same job down to the
+/// last field. Two conversions would be the lie E-07 must not tell.
+fn new_job(asked: herd_proto::Asked) -> NewJob {
+    NewJob::at(asked.command, asked.labels, asked.priority)
+        .with_build_thread_mib(asked.build_thread_mib)
+        .with_admission(asked.memory_mib, asked.tmpfs_mib)
+        .with_m9(
+            asked.deadline_unix_s.map(Timestamp::at_unix_seconds),
+            asked.after,
+            asked.requeue_exit_code,
+        )
+}
+
+/// Why the job a submission named as its parent will not do, if it will not
+/// (E-10).
+///
+/// One rule: it has to exist. Everything else about a parent — whether it
+/// succeeded, whether it is still going — is judged every pass by the claim
+/// step, because it is a fact that changes.
+fn why_that_parent_will_not_do(state: &State, after: Option<&JobId>) -> Result<Option<String>> {
+    let Some(parent) = after else {
+        return Ok(None);
+    };
+    let known = state
+        .store
+        .job(parent)
+        .with_context(|| format!("reading the record of {parent}"))?;
+    if known.is_some() {
+        return Ok(None);
+    }
+    Ok(Some(format!(
+        "this job starts after {parent}, and this hub has no record of {parent}. A parent has \
+         to exist before the job that depends on it is submitted: ids are minted here, in \
+         order, so a job can only ever depend on one older than itself — which is also why no \
+         job can name itself and no two jobs can name each other (E-10)"
+    )))
+}
+
+/// Where a job **would** run, said in lines, with nothing happening (E-07).
+///
+/// The whole answer comes out of one dispatch pass that is thrown away. The
+/// fleet is built exactly as [`dispatch_a_pass`] builds it, the queue is
+/// ordered by exactly the same function, every job ahead of the hypothetical
+/// one is placed against the same seats so that the slots and the room it
+/// would really find are the slots and the room it finds here — and then the
+/// seats, which are values, go out of scope.
+///
+/// **Nothing is written.** No id is minted (the record carries one that cannot
+/// be minted), no state is recorded, no reservation is taken anywhere but in
+/// these local seats, and no event is appended. The claim lock is held for the
+/// same reason a real pass holds it: a probe snapshot landing halfway through
+/// would make the answer describe two different fleets.
+fn dry_run(state: &State, asked: herd_proto::Asked) -> Result<Vec<String>> {
+    let _one_pass = state
+        .dispatching
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let unfinished = state
+        .store
+        .unfinished_jobs()
+        .context("reading the queue a dry run is judged against")?;
+    let held = matcher::holdings(&unfinished);
+    let reserved = matcher::reserved(&unfinished);
+    let mut seats = state.seats(&held, &reserved);
+    let now = Timestamp::now();
+    let hypothetical = JobRecord::hypothetical(new_job(asked), now);
+    let mut queue = queue::order(unfinished.clone(), now, state.policy.aging_step);
+    // Inserted where the queue's own ordering function puts it, so "what is
+    // queued ahead" is what would really be ahead of it (E-07 asks for that
+    // in so many words).
+    queue.push(hypothetical.clone());
+    let queue = queue::order(queue, now, state.policy.aging_step);
+    let held_empty = matcher::reservations(&queue, &seats, now, state.policy.drain_first_limit);
+    for seat in seats.iter_mut() {
+        seat.reserved_for = held_empty.get(&seat.name).cloned();
+    }
+    let mut lines = Vec::new();
+    let mut verdict = None;
+    for (place, record) in queue.iter().enumerate() {
+        let placing = matcher::Placing {
+            parent: parent_of(state, record, &unfinished),
+            drain_first_limit: Some(state.policy.drain_first_limit),
+        };
+        if record.id == hypothetical.id {
+            let eligible = matcher::eligible(record, &seats, now, &placing);
+            lines.push(if eligible.is_empty() {
+                "would run on: nothing connected to this hub could run it".to_owned()
+            } else {
+                format!(
+                    "would run on: {}",
+                    eligible
+                        .iter()
+                        .map(|(runner, labels)| format!("{runner} ({labels})"))
+                        .collect::<Vec<_>>()
+                        .join("; ")
+                )
+            });
+            lines.push(format!(
+                "queued {} of {}; {}",
+                place + 1,
+                queue.len(),
+                queue::what_is_ahead(&queue, place, now, state.policy.aging_step)
+            ));
+            verdict = Some(matcher::place(
+                record,
+                &mut seats,
+                now,
+                state.policy.stickiness,
+                &placing,
+            ));
+            break;
+        }
+        // Everything ahead of it, placed against these same seats and
+        // discarded: a dry run that judged an empty fleet would promise a
+        // slot the jobs in front of it are about to take.
+        let _ = matcher::place(record, &mut seats, now, state.policy.stickiness, &placing);
+    }
+    lines.push(match verdict {
+        Some(Placement::Claim { why, .. }) => {
+            format!("it would start now, {why}")
+        }
+        Some(Placement::Wait { why }) => format!("it would wait: {why}"),
+        Some(Placement::Impossible { why }) => {
+            format!("it would be refused and never run: {why}")
+        }
+        Some(Placement::Cancel { why }) => format!("it would end at once: {why}"),
+        // Unreachable: the hypothetical job is in the queue this loop walks.
+        None => "this hub could not judge it".to_owned(),
+    });
+    lines.push(
+        "nothing ran: no job id was minted, nothing was written to this hub's state, no slot \
+         and no reservation was taken (E-07)"
+            .to_owned(),
+    );
+    Ok(lines)
+}
+
+/// Move one runner's switch, and say what happened (E-33).
+///
+/// The hub asks; the runner is the authority. It applies the position, writes
+/// it to its own file so a restart keeps it, and says so on its next report —
+/// which is what makes the two ways of setting a switch leave one state
+/// behind.
+fn set_a_switch(state: &State, runner: &str, switch: herd_proto::Switch) -> String {
+    let why = format!("set through this hub to {}", switch.sentence());
+    let found = state.with_peers(|peers| {
+        peers.runners.get(runner).map(|connected| {
+            let _ = connected.outbox.send(FromHub::SetSwitch {
+                switch: switch.clone(),
+                why: why.clone(),
+            });
+            connected.switch.clone()
+        })
+    });
+    match found {
+        Some(was) => format!(
+            "runner {runner} is asked to switch to {} (it was {was}); it honours this within \
+             ten seconds and its own report is what confirms it (E-33)",
+            switch.sentence()
+        ),
+        None => format!(
+            "no runner called {runner} is connected to this hub, so its switch cannot be \
+             moved from here. An owner sets it on the machine itself, with \
+             `herd-runner switch`, which works whether this hub is up or not"
+        ),
+    }
+}
+
 async fn accept_submissions(state: &State, outbox: &Outbox, source: &mut Source) -> Result<()> {
     loop {
         // A frame this hub cannot *decode* gets a sentence, not a dropped
@@ -2752,15 +3293,8 @@ async fn accept_submissions(state: &State, outbox: &Outbox, source: &mut Source)
             }
         };
         match message {
-            ToHub::SubmitJob {
-                command,
-                labels,
-                priority,
-                build_thread_mib,
-                memory_mib,
-                tmpfs_mib,
-            } => {
-                if command.is_empty() {
+            ToHub::SubmitJob { asked } => {
+                if asked.command.is_empty() {
                     let _ = outbox.send(FromHub::Refused {
                         reason: "a job needs a command to run".to_owned(),
                     });
@@ -2770,13 +3304,21 @@ async fn accept_submissions(state: &State, outbox: &Outbox, source: &mut Source)
                     let _ = outbox.send(FromHub::Refused { reason });
                     return Ok(());
                 }
+                // The one job it named has to exist **already** (E-10).
+                // Refused here, at the submission, rather than left to be
+                // cancelled later, because a requester naming a job that is
+                // not there has made a mistake and is standing right here to
+                // be told — and because this is what makes a cycle
+                // unrepresentable: ids are minted in order by this hub, so a
+                // job can only ever name one older than itself, and a job
+                // cannot name itself at all.
+                if let Some(reason) = why_that_parent_will_not_do(state, asked.after.as_ref())? {
+                    let _ = outbox.send(FromHub::Refused { reason });
+                    return Ok(());
+                }
                 let submission = state
                     .store
-                    .submit(
-                        NewJob::at(command, labels, priority)
-                            .with_build_thread_mib(build_thread_mib)
-                            .with_admission(memory_mib, tmpfs_mib),
-                    )
+                    .submit(new_job(asked))
                     .context("taking a submission in")?;
                 let job_id = submission.record().id.clone();
                 // JobAccepted first, so the requester has the id before any
@@ -2850,6 +3392,31 @@ async fn accept_submissions(state: &State, outbox: &Outbox, source: &mut Source)
                         return Ok(());
                     }
                 }
+            }
+            // E-07, and the whole of what it must not do: judge, say, and
+            // change nothing.
+            ToHub::DryRun { asked } => {
+                if asked.command.is_empty() {
+                    let _ = outbox.send(FromHub::Refused {
+                        reason: "a dry run needs a command to judge".to_owned(),
+                    });
+                    return Ok(());
+                }
+                let lines = match why_that_parent_will_not_do(state, asked.after.as_ref())? {
+                    Some(reason) => vec![format!("it would be refused at submission: {reason}")],
+                    None => dry_run(state, asked)?,
+                };
+                let _ = outbox.send(FromHub::WouldRun { lines });
+            }
+            ToHub::SetSwitch { runner, switch } => {
+                let said = set_a_switch(state, &runner, switch);
+                println!("herd-hub: {said}");
+                let _ = outbox.send(FromHub::SwitchSet { said });
+            }
+            ToHub::AskFleetSwitches {} => {
+                let _ = outbox.send(FromHub::FleetSwitches {
+                    runners: state.fleet_switches(),
+                });
             }
             ToHub::RaiseJob { job_id, priority } => {
                 if let Some(reason) = quarantine_refusal(state, &job_id)? {
@@ -3275,6 +3842,9 @@ fn message_kind(message: &ToHub) -> &'static str {
         ToHub::JobFinished { .. } => "job_finished",
         ToHub::Health { .. } => "health",
         ToHub::AttemptAbandoned { .. } => "attempt_abandoned",
+        ToHub::DryRun { .. } => "dry_run",
+        ToHub::SetSwitch { .. } => "set_switch",
+        ToHub::AskFleetSwitches {} => "ask_fleet_switches",
     }
 }
 
@@ -3349,8 +3919,14 @@ mod tests {
         fn record_metrics(&self, id: &JobId, metrics: JobMetrics) -> StoreResult<()> {
             self.inner.record_metrics(id, metrics)
         }
-        fn end_attempt(&self, id: &JobId, attempt: u32, reason: &str) -> StoreResult<()> {
-            self.inner.end_attempt(id, attempt, reason)
+        fn end_attempt(
+            &self,
+            id: &JobId,
+            attempt: u32,
+            reason: &str,
+            requeue_code: Option<i32>,
+        ) -> StoreResult<()> {
+            self.inner.end_attempt(id, attempt, reason, requeue_code)
         }
         fn append_log(
             &self,
@@ -3460,6 +4036,7 @@ mod tests {
                     host: HostSize::default(),
                     preference: 0,
                     load_milli: None,
+                    switch: herd_proto::Switch::On,
                 },
             ),
             Admitted::Yes

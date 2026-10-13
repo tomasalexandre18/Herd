@@ -5,7 +5,7 @@ use std::sync::Arc;
 use anyhow::{Context, Result};
 use clap::Parser;
 use herd_hub::{
-    Hub, JobDirStore, JobStore, Policy, Stickiness, AGING_STEP, DEFAULT_LISTEN_ADDR, LOST_AFTER,
+    Hub, JobDirStore, JobStore, Policy, Stickiness, AGING_STEP, DEFAULT_LISTEN_ADDR, DRAIN_FIRST_LIMIT, LOST_AFTER, REQUEUE_BUDGET,
     STICKINESS_LIMIT, WAIT_RESTATEMENT,
 };
 use herd_proto::HEALTH_EVERY;
@@ -70,6 +70,27 @@ struct Args {
     /// of W a follower gets at most W / this + 1 lines. Zero is refused.
     #[arg(long, env = "HERD_WAIT_RESTATEMENT", default_value_t = WAIT_RESTATEMENT.as_secs_f64())]
     wait_restatement: f64,
+    /// Seconds a job may hold a runner empty while it waits for that host to
+    /// go quiet (E-27).
+    ///
+    /// A capability its machine's operator declared `drain_first` starts only
+    /// on a quiet host, and while such a job is waiting the host claims
+    /// nothing new. This bounds that: past it the host takes other work
+    /// again and the job says, in the sentence on its record, that the drain
+    /// did not win. Fifteen minutes, the figure E-27 names.
+    #[arg(long, env = "HERD_DRAIN_FIRST_LIMIT", default_value_t = DRAIN_FIRST_LIMIT.as_secs_f64())]
+    drain_first_limit: f64,
+    /// How many goes a job gets at a capability that turned out to be taken
+    /// (D76).
+    ///
+    /// A job may declare one exit code meaning "what you gave me has gone"
+    /// (`herdctl --requeue-exit-code`, 75 for the first consumer). Such a
+    /// code is not a verdict: it requeues the job with the capability read
+    /// again, this many times, and then ends it naming the code and the
+    /// machines that answered it. **Separate from `--attempts`**, which is
+    /// E-21's budget for a runner that disappears.
+    #[arg(long, env = "HERD_REQUEUE_BUDGET", default_value_t = REQUEUE_BUDGET)]
+    requeue_budget: u32,
 }
 
 /// Seconds as a duration, with a negative figure read as zero rather than
@@ -103,6 +124,8 @@ async fn main() -> Result<()> {
             limit: seconds(args.stickiness_limit),
         },
         wait_restatement: seconds(args.wait_restatement),
+        drain_first_limit: seconds(args.drain_first_limit),
+        requeue_budget: args.requeue_budget,
         ..Policy::default()
     };
     let state_root_id = store.state_root_id().to_owned();
@@ -114,7 +137,10 @@ async fn main() -> Result<()> {
          {unfinished} job(s) not over, {} quarantined, a runner reporting every {:?} is \
          lost after {:?}, a queued job rising one priority level every {:?}, and waiting \
          up to {:?} for the runner it is sticking to before it is placed elsewhere, and \
-         saying again every {:?} why a job it is following is still queued",
+         saying again every {:?} why a job it is following is still queued; a job that \
+         needs a quiet host holds one empty for at most {:?}, and a job whose declared \
+         requeue code comes back gets {} goes at it, separately from the {} goes it gets \
+         at a runner that goes away",
         herd_hub::hub_version(),
         hub.local_addr(),
         args.state_dir.display(),
@@ -124,6 +150,9 @@ async fn main() -> Result<()> {
         policy.aging_step,
         policy.stickiness.limit,
         policy.wait_restatement,
+        policy.drain_first_limit,
+        policy.requeue_budget,
+        policy.attempts_allowed,
     );
     hub.serve().await
 }

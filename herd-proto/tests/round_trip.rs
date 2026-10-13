@@ -4,7 +4,8 @@
 use herd_proto::{
     cap_exceeded_reason, cap_stop_reason, from_frame, to_frame, Availability, BusyProbe, Cap,
     Capability, CapabilityOffer, CapabilityOrigins, CapabilityState, FromHub, HostSize, JobId,
-    JobMetrics, JobOutcome, LabelSet, LogStream, OfferedCapability, Priority, Role, RunningJob,
+    Asked, JobMetrics, JobOutcome, LabelSet, LogStream, OfferedCapability, Priority, Role,
+    RunnerSwitch, RunningJob, Switch,
     ToHub, PROTOCOL_VERSION,
 };
 
@@ -156,6 +157,9 @@ fn every_message_to_the_hub_round_trips() {
                 .with_tmpfs(Some(8192)),
             preference: 10,
             load_milli: Some(1420),
+            switch: Switch::Off {
+                reason: "she is gaming".to_owned(),
+            },
         });
         // The optional fields really are optional.
         round_trip_to_hub(ToHub::Hello {
@@ -170,6 +174,7 @@ fn every_message_to_the_hub_round_trips() {
             host: HostSize::default(),
             preference: 0,
             load_milli: None,
+            switch: Switch::On,
         });
     }
     round_trip_to_hub(ToHub::CapabilitiesChanged {
@@ -183,22 +188,33 @@ fn every_message_to_the_hub_round_trips() {
         capabilities: Vec::new(),
     });
     for priority in Priority::ALL {
-        round_trip_to_hub(ToHub::SubmitJob {
+        let full = Asked {
             command: vec!["sh".to_owned(), "-c".to_owned(), "echo hi".to_owned()],
             labels: LabelSet::new(["build", "reference"]).expect("valid labels"),
             priority,
             build_thread_mib: Some(1792),
             memory_mib: None,
             tmpfs_mib: Some(0),
-        });
-        round_trip_to_hub(ToHub::SubmitJob {
+            deadline_unix_s: Some(1_792_000_000),
+            after: Some(JobId::new("j0000000003")),
+            requeue_exit_code: Some(75),
+        };
+        let bare = Asked {
             command: vec![],
             labels: LabelSet::default(),
             priority,
             build_thread_mib: None,
             memory_mib: Some(3584),
             tmpfs_mib: Some(4096),
-        });
+            deadline_unix_s: None,
+            after: None,
+            requeue_exit_code: None,
+        };
+        // A dry run carries exactly what a submission carries (E-07).
+        round_trip_to_hub(ToHub::SubmitJob { asked: full.clone() });
+        round_trip_to_hub(ToHub::DryRun { asked: full });
+        round_trip_to_hub(ToHub::SubmitJob { asked: bare.clone() });
+        round_trip_to_hub(ToHub::DryRun { asked: bare });
         round_trip_to_hub(ToHub::RaiseJob {
             job_id: JobId::new("j0000000007"),
             priority,
@@ -536,18 +552,22 @@ fn the_link_frames_are_tagged_json_objects() {
             }],
             draining: false,
             load_milli: Some(1420),
+            switch: Switch::On,
         })
         .expect("encodes"),
-        r#"{"type":"health","jobs":[{"job_id":"j0000000007","attempt":2,"chunks_sent":412}],"draining":false,"load_milli":1420}"#
+        r#"{"type":"health","jobs":[{"job_id":"j0000000007","attempt":2,"chunks_sent":412}],"draining":false,"load_milli":1420,"switch":{"position":"on"}}"#
     );
     assert_eq!(
         to_frame(&ToHub::Health {
             jobs: vec![],
             draining: true,
             load_milli: None,
+            switch: Switch::Off {
+                reason: "she is gaming".to_owned(),
+            },
         })
         .expect("encodes"),
-        r#"{"type":"health","jobs":[],"draining":true}"#
+        r#"{"type":"health","jobs":[],"draining":true,"switch":{"position":"off","reason":"she is gaming"}}"#
     );
     assert_eq!(
         to_frame(&ToHub::CancelJob {
@@ -599,7 +619,14 @@ fn the_link_frames_are_tagged_json_objects() {
 
 #[test]
 fn every_link_frame_round_trips() {
-    for draining in [false, true] {
+    for (draining, switch) in [
+        (false, Switch::On),
+        (true, Switch::On),
+        // Every position, because a hub that read a missing or mangled switch
+        // as `on` would claim on a withdrawn machine (E-33).
+        (false, Switch::Off { reason: "she is gaming".to_owned() }),
+        (false, Switch::Drain { reason: "a reboot is due".to_owned() }),
+    ] {
         round_trip_to_hub(ToHub::Health {
             jobs: vec![
                 RunningJob {
@@ -615,8 +642,43 @@ fn every_link_frame_round_trips() {
             ],
             draining,
             load_milli: Some(u64::MAX),
+            switch,
         });
     }
+    for runners in [
+        Vec::new(),
+        vec![RunnerSwitch {
+            name: "wsl-pc".to_owned(),
+            switch: Switch::Off {
+                reason: "she is gaming".to_owned(),
+            },
+            jobs: 1,
+            stopping: false,
+        }],
+    ] {
+        round_trip_from_hub(FromHub::FleetSwitches { runners });
+    }
+    round_trip_to_hub(ToHub::SetSwitch {
+        runner: "wsl-pc".to_owned(),
+        switch: Switch::Drain {
+            reason: "a reboot is due".to_owned(),
+        },
+    });
+    round_trip_to_hub(ToHub::AskFleetSwitches {});
+    round_trip_from_hub(FromHub::SwitchSet {
+        said: "runner wsl-pc is asked to switch to off (she is gaming)".to_owned(),
+    });
+    round_trip_from_hub(FromHub::SetSwitch {
+        switch: Switch::On,
+        why: "set through this hub to on".to_owned(),
+    });
+    round_trip_from_hub(FromHub::ReadProbesAgain {
+        why: "j1 exited 75 on wsl-pc".to_owned(),
+    });
+    round_trip_from_hub(FromHub::WouldRun {
+        lines: vec!["would run on: wsl-pc (build)".to_owned()],
+    });
+    round_trip_from_hub(FromHub::WouldRun { lines: Vec::new() });
     round_trip_to_hub(ToHub::CancelJob {
         job_id: JobId::new("j1"),
     });

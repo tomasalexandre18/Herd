@@ -28,3 +28,4 @@ libc.workspace = true
 [dev-dependencies]
 herd-hub.workspace = true
 herdctl.workspace = true
+tempfile.workspace = true

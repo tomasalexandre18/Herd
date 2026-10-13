@@ -1,0 +1,1105 @@
+//! M9 against the real binaries: the owner's switch, a dry run, a deadline, a
+//! parent, and the metal lease (E-33, E-07, E-09, E-10, E-27).
+//!
+//! All five are about what happens *between* processes, so all five are driven
+//! as processes: a `herd-hub`, one or two `herd-runner`s and `herdctl`. The
+//! arithmetic each of them rests on is a unit test of `herd_hub::matcher`;
+//! only this proves the arithmetic is wired to anything — and E-33's ten
+//! seconds is a figure that can only be *measured* here.
+
+mod real_herd;
+
+use std::time::{Duration, Instant};
+
+use real_herd::Herd;
+
+/// E-33's figure, as this test holds it to.
+const TEN_SECONDS: Duration = Duration::from_secs(10);
+
+/// A runner with one build slot, as the owner's PC has (issue #16).
+const ONE_BUILD_SLOT: &str = r#"{"capabilities":[
+    {"name":"build","kind":{"type":"counted","slots":1}}
+]}"#;
+
+/// The owner's PC as E-27 describes it: one build slot, and a `metal-pc`
+/// lease that is **declared drain-first in her own file** (D86) and read
+/// through a command probe with the consumer's own exit codes — 0 free, 10
+/// busy, anything else unreadable (issue #16).
+const A_METAL_LEASE_THAT_DRAINS_FIRST: &str = r#"{"capabilities":[
+    {"name":"build","kind":{"type":"counted","slots":1}},
+    {"name":"metal-pc","kind":{"type":"counted","slots":1},"drain_first":true,
+     "busy_probe":{"type":"command","command":["/bin/sh","-c","PROBE"],
+                   "busy_exit_code":10,"free_exit_code":0}}
+]}"#;
+
+fn capability_file(herd: &Herd, which: &str, contents: &str) -> String {
+    let path = herd.logs.path().join(format!("{which}-capabilities.json"));
+    std::fs::write(&path, contents).expect("the capability file is written");
+    path.display().to_string()
+}
+
+/// A lease probe of the shape issue #16 pins: exit 10 with `holder=` and
+/// `expires=` on stdout while the lease file is there, exit 0 when it is not.
+fn a_lease_probe(herd: &Herd, lease: &std::path::Path) -> String {
+    let script = format!(
+        "if [ -e {lease} ]; then echo holder=alexa expires=1792000000; exit 10; \
+         else exit 0; fi",
+        lease = lease.display()
+    );
+    capability_file(
+        herd,
+        "pc",
+        &A_METAL_LEASE_THAT_DRAINS_FIRST.replace("PROBE", &script),
+    )
+}
+
+fn state_of(herd: &Herd, job: &str) -> String {
+    herd.record(job)["state"]["type"]
+        .as_str()
+        .unwrap_or("unreadable")
+        .to_owned()
+}
+
+fn outcome_of(herd: &Herd, job: &str) -> serde_json::Value {
+    herd.record(job)["state"]["outcome"].clone()
+}
+
+/// How long until a submission is refused because no machine will take it —
+/// which is what "the hub stopped claiming" means from the outside (E-33).
+async fn until_nothing_is_claimed(herd: &Herd, began: Instant) -> (Duration, String) {
+    loop {
+        let output = herd.submit_with(&[], "printf nothing").await;
+        if !output.status.success() {
+            return (
+                began.elapsed(),
+                String::from_utf8_lossy(&output.stderr).into_owned(),
+            );
+        }
+        assert!(
+            began.elapsed() < TEN_SECONDS,
+            "E-33 gives ten seconds and the hub was still claiming after {:?}; it says: {}",
+            began.elapsed(),
+            herd.switches().await
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
+// ------------------------------------------------------------------ E-33
+
+/// `off`, set on the machine itself, stops the hub claiming inside ten
+/// seconds — **while a job is running** — and does not touch that job
+/// (E-33, attack 1).
+#[tokio::test(flavor = "multi_thread")]
+async fn a_switch_off_on_the_machine_stops_claims_in_ten_seconds_and_spares_the_job() {
+    let herd = Herd::new();
+    let _hub = herd.start_hub("hub").await;
+    let _runner = herd.start_runner_with(
+        "wsl-pc",
+        "runner",
+        "runner",
+        &["--switch-poll", "100"],
+    );
+    herd.wait_for_runner().await;
+
+    // Something real is running on the machine when its owner wants it back.
+    let running = herd.submit_ok(&[], "sleep 3; printf done").await;
+    herd.wait_until("the job has started", || {
+        matches!(state_of(&herd, &running).as_str(), "assigned" | "running")
+    })
+    .await;
+
+    let began = Instant::now();
+    herd.switch_on_the_machine("runner", &["off", "--reason", "she is gaming"])
+        .await;
+    let (took, refusal) = until_nothing_is_claimed(&herd, began).await;
+    assert!(
+        took < TEN_SECONDS,
+        "E-33 asks for ten seconds; it took {took:?}"
+    );
+    assert!(
+        refusal.contains("wsl-pc is switched off (she is gaming)"),
+        "the refusal must carry her own reason (E-33): {refusal}"
+    );
+    // And the state is visible, with the reason, through herdctl.
+    let said = herd.switches().await;
+    assert!(
+        said.contains("wsl-pc: off (she is gaming)"),
+        "E-33 asks for the state and its reason to be visible: {said}"
+    );
+    assert!(
+        said.contains("1 job running there finishes"),
+        "a machine switched off with work on it is the ordinary case and the line has to say \
+         so: {said}"
+    );
+
+    // The job that was running is **not** killed. That is the whole
+    // difference between the owner's switch and a shutdown.
+    let waited = herd.herdctl(&["wait", &running]).await;
+    assert!(
+        waited.status.success(),
+        "a switch off must not touch the job in flight (E-33): {}",
+        String::from_utf8_lossy(&waited.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&waited.stdout).trim(),
+        "done",
+        "the job ran to its end"
+    );
+    assert_eq!(state_of(&herd, &running), "finished");
+    assert_eq!(outcome_of(&herd, &running)["code"], 0);
+
+    // Switched back on, the machine claims again.
+    herd.switch_on_the_machine("runner", &["on"]).await;
+    let back = Instant::now();
+    loop {
+        if herd
+            .submit_with(&[], "printf claimed again")
+            .await
+            .status
+            .success()
+        {
+            break;
+        }
+        assert!(
+            back.elapsed() < TEN_SECONDS,
+            "`on` is honoured in ten seconds too; {:?} passed",
+            back.elapsed()
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
+/// The same switch, moved by an orchestrator through `herdctl` (E-33).
+///
+/// Both halves of E-33 — her machine and the server — and they leave **one**
+/// state: the position a `herdctl` set is written to the runner's own switch
+/// file, so a restart keeps it and the owner sees what an agent did.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_switch_off_through_herdctl_stops_claims_in_ten_seconds_and_is_written_down() {
+    let herd = Herd::new();
+    let _hub = herd.start_hub("hub").await;
+    let _runner = herd.start_runner_with("wsl-pc", "runner", "runner", &["--switch-poll", "100"]);
+    herd.wait_for_runner().await;
+
+    let began = Instant::now();
+    let said = herd
+        .herdctl(&["switch", "wsl-pc", "off", "--reason", "a reboot is due"])
+        .await;
+    assert!(
+        said.status.success(),
+        "herdctl switch failed: {}",
+        String::from_utf8_lossy(&said.stderr)
+    );
+    let (took, refusal) = until_nothing_is_claimed(&herd, began).await;
+    assert!(took < TEN_SECONDS, "it took {took:?}");
+    assert!(refusal.contains("a reboot is due"), "{refusal}");
+
+    // One state, not two: it is on the machine's own disk.
+    let written = std::fs::read_to_string(herd.switch_file("runner"))
+        .expect("the runner wrote its switch down");
+    assert!(written.contains("\"off\""), "{written}");
+    assert!(written.contains("a reboot is due"), "{written}");
+
+    // A runner nobody is connected as is named rather than silently ignored.
+    let missing = herd.herdctl(&["switch", "nowhere", "off", "--reason", "x"]).await;
+    assert!(
+        String::from_utf8_lossy(&missing.stdout).contains("no runner called nowhere"),
+        "{}",
+        String::from_utf8_lossy(&missing.stdout)
+    );
+    // And `off` with no reason is refused before it reaches anything: a
+    // machine withdrawn for no stated reason is one nobody can switch back.
+    let unreasoned = herd.herdctl(&["switch", "wsl-pc", "off"]).await;
+    assert!(!unreasoned.status.success());
+    assert!(
+        String::from_utf8_lossy(&unreasoned.stderr).contains("needs a reason"),
+        "{}",
+        String::from_utf8_lossy(&unreasoned.stderr)
+    );
+}
+
+/// A switch set off outlives the runner process (E-33).
+///
+/// An owner who switched her PC off before rebooting it has not changed her
+/// mind. The position is announced in the handshake, so there is no window in
+/// which the hub believes a withdrawn machine is `on`.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_runner_restarted_while_switched_off_comes_back_switched_off() {
+    let herd = Herd::new();
+    let _hub = herd.start_hub("hub").await;
+    {
+        let _runner = herd.start_runner_with("wsl-pc", "first", "runner", &["--switch-poll", "100"]);
+        herd.wait_for_runner().await;
+    }
+    herd.switch_on_the_machine("runner", &["off", "--reason", "she is gaming"])
+        .await;
+    let _again = herd.start_runner_with("wsl-pc", "second", "runner", &["--switch-poll", "100"]);
+    herd.wait_until("the runner has rejoined switched off", || {
+        herd.said("second").contains("switch says off")
+    })
+    .await;
+    let refusal = herd.submit_with(&[], "printf nothing").await;
+    assert!(
+        !refusal.status.success(),
+        "a runner restarted while switched off must not claim"
+    );
+    assert!(
+        String::from_utf8_lossy(&refusal.stderr).contains("she is gaming"),
+        "{}",
+        String::from_utf8_lossy(&refusal.stderr)
+    );
+}
+
+/// A drain is a drain: nothing new, what is held finishes, then it leaves
+/// (E-33, invariant 2, attack 2).
+///
+/// The job in flight is **waited for**, not killed — which is what makes this
+/// different from the shutdown drain a `SIGTERM` starts.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_drain_finishes_its_job_and_then_the_runner_leaves() {
+    let herd = Herd::new();
+    let _hub = herd.start_hub("hub").await;
+    let mut runner = herd.start_runner_with("wsl-pc", "runner", "runner", &["--switch-poll", "100"]);
+    herd.wait_for_runner().await;
+
+    let running = herd.submit_ok(&[], "sleep 2; printf finished").await;
+    herd.wait_until("the job has started", || {
+        matches!(state_of(&herd, &running).as_str(), "assigned" | "running")
+    })
+    .await;
+    herd.switch_on_the_machine("runner", &["drain", "--reason", "a reboot is due"])
+        .await;
+
+    // Nothing new, at once.
+    let began = Instant::now();
+    let (took, refusal) = until_nothing_is_claimed(&herd, began).await;
+    assert!(took < TEN_SECONDS, "{took:?}");
+    assert!(refusal.contains("a reboot is due"), "{refusal}");
+
+    // What it held ran to its end, and only then did the runner go.
+    let waited = herd.herdctl(&["wait", &running]).await;
+    assert!(
+        waited.status.success(),
+        "a drain must finish what it holds, never kill it: {}",
+        String::from_utf8_lossy(&waited.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&waited.stdout).trim(), "finished");
+    let gone = tokio::time::timeout(Duration::from_secs(20), runner.gone())
+        .await
+        .expect("a draining runner leaves once it holds nothing");
+    assert!(gone.success(), "it leaves quietly: {gone:?}");
+    assert!(
+        herd.said("runner").contains("holds nothing, so it leaves"),
+        "the runner says why it left: {}",
+        herd.said("runner")
+    );
+}
+
+/// A job assigned in the instant the switch moves is handed back, not run
+/// (E-33, attack 2).
+///
+/// The hub sends an assignment; the switch moves before the runner takes the
+/// job in hand. The runner abandons the attempt, naming the switch, and the
+/// hub places the job on the other machine — nothing is lost and the machine
+/// is given back.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_job_assigned_as_the_switch_moves_is_handed_back_naming_the_switch() {
+    let herd = Herd::new();
+    let _hub = herd.start_hub("hub").await;
+    let file = capability_file(&herd, "pc", ONE_BUILD_SLOT);
+    let _pc = herd.start_runner_with(
+        "wsl-pc",
+        "pc",
+        "pc",
+        &[
+            "--capabilities",
+            &file,
+            "--no-detect",
+            "--preference",
+            "10",
+            "--switch-poll",
+            "100",
+        ],
+    );
+    let server_file = capability_file(&herd, "server", ONE_BUILD_SLOT);
+    let _server = herd.start_runner_with(
+        "build-host",
+        "server",
+        "server",
+        &["--capabilities", &server_file, "--no-detect"],
+    );
+    herd.wait_until("both runners have joined", || {
+        herd.said("pc").contains("joining") && herd.said("server").contains("joining")
+    })
+    .await;
+    // The PC is preferred, so a build belongs there (E-19). Switched off, the
+    // same build goes to the server instead — at once, because a withdrawn
+    // machine is not available and nothing waits for it (D80).
+    herd.switch_on_the_machine("pc", &["off", "--reason", "she is gaming"])
+        .await;
+    tokio::time::sleep(Duration::from_millis(400)).await;
+    let build = herd
+        .submit_with(&["--label", "build"], "printf built")
+        .await;
+    let build = String::from_utf8_lossy(&build.stdout).trim().to_owned();
+    herd.wait_until("the build is over", || state_of(&herd, &build) == "finished")
+        .await;
+    let ran_on = herd.record(&build)["attempts"][0]["runner"]
+        .as_str()
+        .unwrap_or_default()
+        .to_owned();
+    assert_eq!(
+        ran_on, "build-host",
+        "a job must not wait for a machine its owner has withdrawn (D80, E-33)"
+    );
+}
+
+// ------------------------------------------------------------------ E-07
+
+/// A dry run says where a job would run and changes **nothing** (E-07,
+/// attack 3).
+///
+/// Proved by taking every byte of the state root before and after: no record,
+/// no event, no id, no reservation. And then proved not to be lying, by
+/// submitting the same job for real and comparing the two answers (attack 4).
+#[tokio::test(flavor = "multi_thread")]
+async fn a_dry_run_changes_nothing_and_says_what_the_real_pass_would_say() {
+    let herd = Herd::new();
+    let _hub = herd.start_hub("hub").await;
+    let file = capability_file(&herd, "pc", ONE_BUILD_SLOT);
+    let _runner = herd.start_runner_with(
+        "wsl-pc",
+        "runner",
+        "runner",
+        &["--capabilities", &file, "--no-detect"],
+    );
+    herd.wait_for_runner().await;
+    // One build is already running, so the slot is taken and the dry run has
+    // something real to be right about.
+    let holding = herd
+        .submit_ok(&["--label", "build"], "sleep 3; printf held")
+        .await;
+    // Waited all the way to `running`, and the job writes nothing until it
+    // ends: the comparison below has to be against a state root that is
+    // quiescent, or it would be measuring the job rather than the dry run.
+    herd.wait_until("the first build is running", || {
+        state_of(&herd, &holding) == "running"
+    })
+    .await;
+
+    let before = herd.state_bytes();
+    let said = herd
+        .herdctl(&["would-run", "--label", "build", "--", "/bin/sh", "-c", "printf hi"])
+        .await;
+    assert!(
+        said.status.success(),
+        "the dry run failed: {}",
+        String::from_utf8_lossy(&said.stderr)
+    );
+    let after = herd.state_bytes();
+    assert_eq!(
+        before.len(),
+        after.len(),
+        "a dry run must write nothing: {} paths before, {} after",
+        before.len(),
+        after.len()
+    );
+    if before != after {
+        for ((path, was), (also, now)) in before.iter().zip(after.iter()) {
+            assert_eq!(path, also, "a dry run must not move a file (E-07)");
+            assert_eq!(
+                String::from_utf8_lossy(was),
+                String::from_utf8_lossy(now),
+                "a dry run must not write to {path} (E-07)"
+            );
+        }
+        panic!("a dry run must leave the state root byte for byte as it found it (E-07)");
+    }
+
+    let lines = String::from_utf8_lossy(&said.stdout).into_owned();
+    assert!(
+        lines.contains("would run on: wsl-pc (build)"),
+        "E-07 asks for the eligible runners and their labels: {lines}"
+    );
+    assert!(
+        lines.contains("queued 1 of 1"),
+        "E-07 asks for what is queued ahead: {lines}"
+    );
+    assert!(
+        lines.contains("it would wait: "),
+        "the slot is taken, so it would wait: {lines}"
+    );
+    assert!(
+        lines.contains("no job id was minted"),
+        "the answer says so in so many words: {lines}"
+    );
+    // **Not lying.** The real submission gets the same verdict, in the same
+    // words, out of the same function: it waits, for the same reason.
+    let real = herd
+        .submit_ok(&["--label", "build"], "printf hi")
+        .await;
+    herd.wait_until("the real job has been judged", || {
+        !herd.waiting_for(&real).is_empty()
+    })
+    .await;
+    let waiting = herd.waiting_for(&real);
+    assert!(
+        waiting.contains("build slot") || waiting.contains("waiting for wsl-pc"),
+        "the real pass waits for the same reason the dry run gave: {waiting} against {lines}"
+    );
+}
+
+/// A dry run of a job nothing could take says so, and still changes nothing
+/// (E-07).
+#[tokio::test(flavor = "multi_thread")]
+async fn a_dry_run_of_an_unplaceable_job_says_so_and_still_writes_nothing() {
+    let herd = Herd::new();
+    let _hub = herd.start_hub("hub").await;
+    let file = capability_file(&herd, "pc", ONE_BUILD_SLOT);
+    let _runner = herd.start_runner_with(
+        "wsl-pc",
+        "runner",
+        "runner",
+        &["--capabilities", &file, "--no-detect"],
+    );
+    herd.wait_for_runner().await;
+    let before = herd.state_bytes();
+    let said = herd
+        .herdctl(&[
+            "would-run",
+            "--label",
+            "metal-dell",
+            "--",
+            "/bin/sh",
+            "-c",
+            "printf hi",
+        ])
+        .await;
+    let lines = String::from_utf8_lossy(&said.stdout).into_owned();
+    assert!(
+        lines.contains("would run on: nothing connected to this hub could run it"),
+        "{lines}"
+    );
+    assert_eq!(before, herd.state_bytes(), "still nothing written (E-07)");
+
+    // And a dry run naming a parent that does not exist is answered rather
+    // than refused silently: the same rule a submission is held to.
+    let said = herd
+        .herdctl(&["would-run", "--after", "j0000000099", "--", "/bin/true"])
+        .await;
+    let lines = String::from_utf8_lossy(&said.stdout).into_owned();
+    assert!(
+        lines.contains("it would be refused at submission"),
+        "{lines}"
+    );
+    assert_eq!(before, herd.state_bytes());
+}
+
+// ------------------------------------------------------------------ E-09
+
+/// A queued job past its deadline ends `cancelled (deadline)`; a job that has
+/// **started** is never touched by one (E-09, attack 5).
+#[tokio::test(flavor = "multi_thread")]
+async fn a_deadline_cancels_a_queued_job_and_never_a_running_one() {
+    let herd = Herd::new();
+    let _hub = herd.start_hub("hub").await;
+    let file = capability_file(&herd, "pc", ONE_BUILD_SLOT);
+    let _runner = herd.start_runner_with(
+        "wsl-pc",
+        "runner",
+        "runner",
+        &["--capabilities", &file, "--no-detect"],
+    );
+    herd.wait_for_runner().await;
+
+    // A job that starts at once, with a deadline that passes **while it
+    // runs**. Its deadline must do nothing to it: a running job is the time
+    // cap's business (M4, exit 124), never E-09's.
+    let running = herd
+        .submit_ok(
+            &["--label", "build", "--deadline", "+1s"],
+            "sleep 3; printf survived",
+        )
+        .await;
+    herd.wait_until("the long job holds the slot", || {
+        matches!(state_of(&herd, &running).as_str(), "assigned" | "running")
+    })
+    .await;
+    // And a second job of the same label, which therefore waits — and whose
+    // deadline passes while it waits.
+    let queued = herd
+        .submit_ok(&["--label", "build", "--deadline", "+1s"], "printf never")
+        .await;
+    herd.wait_until("the queued job is cancelled by its deadline", || {
+        state_of(&herd, &queued) == "finished"
+    })
+    .await;
+    let outcome = outcome_of(&herd, &queued);
+    assert_eq!(outcome["type"], "cancelled", "{outcome}");
+    let reason = outcome["reason"].as_str().unwrap_or_default();
+    assert!(
+        reason.starts_with("cancelled (deadline)"),
+        "E-09's own words: {reason}"
+    );
+    assert!(
+        reason.contains("When the moment came it was"),
+        "a job cancelled by a deadline must say what it was waiting for (attack 11): {reason}"
+    );
+    // D40: cancelled is an outcome and exits 125, in words rather than a code
+    // nobody can read.
+    let waited = herd.herdctl(&["wait", &queued]).await;
+    assert_eq!(waited.status.code(), Some(125));
+    assert!(
+        String::from_utf8_lossy(&waited.stderr).contains("cancelled (deadline)"),
+        "{}",
+        String::from_utf8_lossy(&waited.stderr)
+    );
+
+    // The one that had started ran to its end, untouched.
+    let waited = herd.herdctl(&["wait", &running]).await;
+    assert!(
+        waited.status.success(),
+        "a deadline must never kill a job that has started (E-09): {}",
+        String::from_utf8_lossy(&waited.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&waited.stdout).trim(), "survived");
+}
+
+/// A deadline already past when the job is submitted fires on the first
+/// pass (E-09, attack 6).
+#[tokio::test(flavor = "multi_thread")]
+async fn a_deadline_already_past_at_submission_fires_at_once() {
+    let herd = Herd::new();
+    let _hub = herd.start_hub("hub").await;
+    let _runner = herd.start_runner();
+    herd.wait_for_runner().await;
+    let job = herd
+        .submit_ok(&["--deadline", "1970-01-01T00:00:00Z"], "printf never")
+        .await;
+    herd.wait_until("it is cancelled", || state_of(&herd, &job) == "finished")
+        .await;
+    let outcome = outcome_of(&herd, &job);
+    assert_eq!(outcome["type"], "cancelled", "{outcome}");
+    assert!(
+        outcome["reason"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("cancelled (deadline)"),
+        "{outcome}"
+    );
+    assert_eq!(herd.log(&job), "", "it never ran");
+}
+
+/// A hub restarted after a deadline passed fires it on its first pass
+/// (E-09, attack 6, attack 12).
+///
+/// The deadline is a field on the record, judged against the clock, so there
+/// is nothing for a restart to rebuild and nothing for it to forget.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_hub_restarted_after_a_deadline_passed_cancels_the_job() {
+    let herd = Herd::new();
+    let job;
+    {
+        let _hub = herd.start_hub("first").await;
+        let file = capability_file(&herd, "pc", ONE_BUILD_SLOT);
+        let _runner = herd.start_runner_with(
+            "wsl-pc",
+            "runner",
+            "runner",
+            &["--capabilities", &file, "--no-detect"],
+        );
+        herd.wait_for_runner().await;
+        // Nothing offers `metal-dell`, so this waits — and its deadline
+        // passes while the hub is down.
+        job = herd
+            .submit_ok(
+                &["--label", "metal-dell", "--deadline", "+1s"],
+                "printf never",
+            )
+            .await;
+        herd.wait_until("the job is queued and waiting", || {
+            !herd.waiting_for(&job).is_empty()
+        })
+        .await;
+    }
+    tokio::time::sleep(Duration::from_millis(1_200)).await;
+    let _hub = herd.start_hub("second").await;
+    let _runner = herd.start_runner_called("wsl-pc", "again");
+    // Waited for, so that the pass the restarted hub makes when a runner joins
+    // has certainly happened: the point of this test is the deadline, not how
+    // quickly a runner dials.
+    herd.wait_for_runner().await;
+    herd.wait_until("the restarted hub cancels it", || {
+        state_of(&herd, &job) == "finished"
+    })
+    .await;
+    assert_eq!(outcome_of(&herd, &job)["type"], "cancelled");
+}
+
+// ------------------------------------------------------------------ E-10
+
+/// A dependent starts after its parent succeeds, and is cancelled by name
+/// when its parent does not (E-10, attack 7).
+#[tokio::test(flavor = "multi_thread")]
+async fn a_dependent_waits_for_its_parent_and_is_cancelled_when_it_fails() {
+    let herd = Herd::new();
+    let _hub = herd.start_hub("hub").await;
+    let _runner = herd.start_runner();
+    herd.wait_for_runner().await;
+
+    // A parent that takes its time, and a child that must not start first.
+    let parent = herd.submit_ok(&[], "sleep 2; printf parent").await;
+    let child = herd
+        .submit_ok(&["--after", &parent], "printf child")
+        .await;
+    herd.wait_until("the child has been judged", || {
+        herd.waiting_for(&child).contains(&parent)
+    })
+    .await;
+    let waiting = herd.waiting_for(&child);
+    assert!(
+        waiting.contains(&format!("it starts after {parent}")),
+        "{waiting}"
+    );
+    assert_eq!(
+        herd.log(&child),
+        "",
+        "a child must not run before its parent (E-10)"
+    );
+    herd.wait_until("the child has run", || state_of(&herd, &child) == "finished")
+        .await;
+    assert_eq!(outcome_of(&herd, &child)["code"], 0);
+    // The parent really did finish first, which is the only thing E-10 asks.
+    assert_eq!(state_of(&herd, &parent), "finished");
+
+    // A parent that fails cancels its child **by name**, saying how.
+    let failing = herd.submit_ok(&[], "exit 3").await;
+    herd.wait_until("the parent failed", || {
+        state_of(&herd, &failing) == "finished"
+    })
+    .await;
+    let orphan = herd.submit_ok(&["--after", &failing], "printf never").await;
+    herd.wait_until("the child is cancelled", || {
+        state_of(&herd, &orphan) == "finished"
+    })
+    .await;
+    let outcome = outcome_of(&herd, &orphan);
+    assert_eq!(outcome["type"], "cancelled", "{outcome}");
+    let reason = outcome["reason"].as_str().unwrap_or_default();
+    assert!(reason.starts_with("cancelled (parent)"), "{reason}");
+    assert!(reason.contains(&failing), "it names the parent: {reason}");
+    assert!(
+        reason.contains("exited 3 rather than 0"),
+        "and says how the parent went: {reason}"
+    );
+    assert_eq!(herd.log(&orphan), "", "it never ran");
+}
+
+/// A parent that is cancelled, or lost, is not a parent that succeeded
+/// (E-10, attack 7).
+#[tokio::test(flavor = "multi_thread")]
+async fn only_a_parent_that_exited_zero_counts_as_success() {
+    let herd = Herd::new();
+    let _hub = herd.start_hub("hub").await;
+    let _runner = herd.start_runner();
+    herd.wait_for_runner().await;
+
+    // Cancelled by its requester.
+    let parent = herd.submit_ok(&[], "sleep 30").await;
+    herd.wait_until("it is running", || {
+        matches!(state_of(&herd, &parent).as_str(), "assigned" | "running")
+    })
+    .await;
+    let child = herd.submit_ok(&["--after", &parent], "printf never").await;
+    herd.herdctl(&["cancel", &parent]).await;
+    herd.wait_until("the child is cancelled with it", || {
+        state_of(&herd, &child) == "finished"
+    })
+    .await;
+    let reason = outcome_of(&herd, &child)["reason"]
+        .as_str()
+        .unwrap_or_default()
+        .to_owned();
+    assert!(reason.contains("was cancelled"), "{reason}");
+
+    // And a parent that could never run.
+    let impossible = herd
+        .submit_ok(&["--build-thread-mib", "1792"], "cargo xtask pack")
+        .await;
+    herd.wait_until("the parent is refused", || {
+        state_of(&herd, &impossible) == "finished"
+    })
+    .await;
+    let child = herd
+        .submit_ok(&["--after", &impossible], "printf never")
+        .await;
+    herd.wait_until("its child is cancelled", || {
+        state_of(&herd, &child) == "finished"
+    })
+    .await;
+    let reason = outcome_of(&herd, &child)["reason"]
+        .as_str()
+        .unwrap_or_default()
+        .to_owned();
+    assert!(reason.contains("could never have run"), "{reason}");
+}
+
+/// A job cannot name a parent that does not exist — which is also why no job
+/// can name **itself** and no two jobs can name each other (E-10, attack 7).
+#[tokio::test(flavor = "multi_thread")]
+async fn a_parent_must_already_exist_so_no_cycle_can_be_written() {
+    let herd = Herd::new();
+    let _hub = herd.start_hub("hub").await;
+    let _runner = herd.start_runner();
+    herd.wait_for_runner().await;
+
+    // A parent that is not there.
+    let refused = herd.submit_with(&["--after", "j0000000099"], "printf never").await;
+    assert!(!refused.status.success());
+    let said = String::from_utf8_lossy(&refused.stderr).into_owned();
+    assert!(said.contains("j0000000099"), "{said}");
+    assert!(
+        said.contains("only ever depend on one older than itself"),
+        "the refusal says why a cycle cannot be written: {said}"
+    );
+
+    // A job naming the id it is about to be given: the same refusal, which is
+    // what makes self-reference unrepresentable rather than merely checked.
+    let next = herd.submit_ok(&[], "printf first").await;
+    let guessed = format!(
+        "j{:010}",
+        next.trim_start_matches('j').parse::<u64>().unwrap_or(0) + 1
+    );
+    let refused = herd.submit_with(&["--after", &guessed], "printf itself").await;
+    assert!(
+        !refused.status.success(),
+        "a job must not be able to name the id it is about to be given"
+    );
+    assert!(
+        String::from_utf8_lossy(&refused.stderr).contains(&guessed),
+        "{}",
+        String::from_utf8_lossy(&refused.stderr)
+    );
+}
+
+// ------------------------------------------------------------------ E-27
+
+/// A `metal-*` job whose lease is held **waits** and names the holder; it
+/// runs when the lease clears (E-27, D76, attack 8).
+#[tokio::test(flavor = "multi_thread")]
+async fn a_leased_metal_job_waits_and_runs_when_the_lease_clears() {
+    let herd = Herd::new();
+    let _hub = herd.start_hub("hub").await;
+    let lease = herd.logs.path().join("metal-pc.lease");
+    std::fs::write(&lease, b"holder=alexa\n").expect("the lease is held");
+    let file = a_lease_probe(&herd, &lease);
+    let _runner = herd.start_runner_with(
+        "wsl-pc",
+        "runner",
+        "runner",
+        &[
+            "--capabilities",
+            &file,
+            "--no-detect",
+            "--probe-interval",
+            "150",
+        ],
+    );
+    herd.wait_until("the runner has read its lease", || {
+        herd.said("runner").contains("metal-pc is suspended")
+    })
+    .await;
+
+    let trial = herd
+        .submit_ok(&["--label", "metal-pc"], "printf trial")
+        .await;
+    herd.wait_until("the trial is waiting on the lease the probe read", || {
+        herd.waiting_for(&trial).contains("exited 10")
+    })
+    .await;
+    let waiting = herd.waiting_for(&trial);
+    assert!(
+        waiting.contains("exited 10, which means busy"),
+        "a job whose machine is leased waits rather than failing (E-27, D76): {waiting}"
+    );
+    assert_eq!(herd.log(&trial), "", "it has not run");
+
+    // The lease clears, and the job runs — with nothing having failed.
+    std::fs::remove_file(&lease).expect("the lease is released");
+    herd.wait_until("the trial has run", || state_of(&herd, &trial) == "finished")
+        .await;
+    assert_eq!(outcome_of(&herd, &trial)["code"], 0);
+    assert_eq!(herd.log(&trial), "trial");
+}
+
+/// A `metal-*` job empties its host's build slot before it starts, and the
+/// host claims nothing new while it waits (E-27, attack 10).
+#[tokio::test(flavor = "multi_thread")]
+async fn a_metal_job_drains_the_build_slot_first_and_no_build_overlaps_it() {
+    let herd = Herd::new();
+    let _hub = herd.start_hub("hub").await;
+    let lease = herd.logs.path().join("metal-pc.lease");
+    let file = a_lease_probe(&herd, &lease);
+    let _runner = herd.start_runner_with(
+        "wsl-pc",
+        "runner",
+        "runner",
+        &[
+            "--capabilities",
+            &file,
+            "--no-detect",
+            "--probe-interval",
+            "150",
+        ],
+    );
+    herd.wait_for_runner().await;
+
+    // A build is running on the machine, and the trial arrives behind it.
+    let build = herd
+        .submit_ok(&["--label", "build"], "sleep 2; printf first-build")
+        .await;
+    herd.wait_until("the build holds the slot", || {
+        matches!(state_of(&herd, &build).as_str(), "assigned" | "running")
+    })
+    .await;
+    let trial = herd
+        .submit_ok(&["--label", "metal-pc"], "printf trial")
+        .await;
+    herd.wait_until("the trial is draining the host", || {
+        herd.waiting_for(&trial).contains("being emptied")
+    })
+    .await;
+    let waiting = herd.waiting_for(&trial);
+    assert!(
+        waiting.contains("starts only on a quiet host"),
+        "E-27's drain-first, with its figures: {waiting}"
+    );
+    assert!(waiting.contains("15m drain-first limit"), "{waiting}");
+
+    // **A build submitted during the drain is not claimed.** This is the
+    // whole of the drain: without it, builds that kept arriving would starve
+    // the trial for ever.
+    let second_build = herd
+        .submit_ok(&["--label", "build"], "printf second-build")
+        .await;
+    herd.wait_until("the second build has been judged", || {
+        !herd.waiting_for(&second_build).is_empty()
+    })
+    .await;
+    let held_off = herd.waiting_for(&second_build);
+    assert!(
+        held_off.contains(&format!("being emptied for {trial}")),
+        "a host being emptied for a metal job must claim nothing new (E-27): {held_off}"
+    );
+
+    // The trial runs once the host is quiet, and the second build follows it.
+    herd.wait_until("the trial has run", || state_of(&herd, &trial) == "finished")
+        .await;
+    assert_eq!(herd.log(&trial), "trial");
+    herd.wait_until("the second build has run", || {
+        state_of(&herd, &second_build) == "finished"
+    })
+    .await;
+    // Neither build overlapped the trial: the first ended before the trial's
+    // attempt began, and the second began after it ended.
+    assert_eq!(state_of(&herd, &build), "finished");
+    assert_eq!(herd.log(&build), "first-build");
+    assert_eq!(herd.log(&second_build), "second-build");
+}
+
+/// A declared requeue code is retried on its own budget, and then ends naming
+/// the code and the machines that answered it (D76, attack 9).
+///
+/// Three goes, which is **more than E-21's two**: the proof that a leased
+/// machine does not spend the budget that exists for a runner that
+/// disappears.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_declared_requeue_code_is_bounded_and_spends_no_lost_runner_budget() {
+    let herd = Herd::new();
+    let _hub = herd.start_hub("hub").await;
+    let lease = herd.logs.path().join("metal-pc.lease");
+    let file = a_lease_probe(&herd, &lease);
+    let _runner = herd.start_runner_with(
+        "wsl-pc",
+        "runner",
+        "runner",
+        &[
+            "--capabilities",
+            &file,
+            "--no-detect",
+            "--probe-interval",
+            "150",
+        ],
+    );
+    herd.wait_for_runner().await;
+
+    // The probe says the lease is free; the command finds it taken and exits
+    // the code it declares for exactly that. This is D76's race.
+    let trial = herd
+        .submit_ok(
+            &["--label", "metal-pc", "--requeue-exit-code", "75"],
+            "printf 'lease gone\\n'; exit 75",
+        )
+        .await;
+    herd.wait_until("it has spent its budget", || {
+        state_of(&herd, &trial) == "finished"
+    })
+    .await;
+    let outcome = outcome_of(&herd, &trial);
+    assert_eq!(
+        outcome["type"], "lost",
+        "a spent requeue budget is not a verdict of 75 (D76): {outcome}"
+    );
+    let reason = outcome["reason"].as_str().unwrap_or_default();
+    assert!(reason.contains("came back 75"), "it names the code: {reason}");
+    assert!(
+        reason.contains("3 of 3 goes spent"),
+        "and the budget, with its figures: {reason}"
+    );
+    assert!(
+        reason.contains("wsl-pc"),
+        "and the machines that answered it: {reason}"
+    );
+
+    let record = herd.record(&trial);
+    let attempts = record["attempts"].as_array().expect("attempts").clone();
+    assert_eq!(
+        attempts.len(),
+        3,
+        "three goes at the capability, which is more than E-21's two attempts — the proof \
+         that the two budgets are separate (D76): {attempts:#?}"
+    );
+    for attempt in &attempts {
+        assert_eq!(
+            attempt["requeue_code"], 75,
+            "every one of these ended on the declared code, and the record says so, which is \
+             what keeps the budgets apart: {attempt}"
+        );
+    }
+    // The capability was read again each time, rather than the budget being
+    // spent against one stale reading.
+    let said = herd.said("runner");
+    assert!(
+        said.contains("reading every probe again now"),
+        "D76 asks for the capability to be re-probed: {said}"
+    );
+    // And the requester is told in words, with 125 rather than 75: a 75 that
+    // reached a requester as a verdict is the defect D76 exists to prevent.
+    let waited = herd.herdctl(&["wait", &trial]).await;
+    assert_eq!(waited.status.code(), Some(125));
+}
+
+/// Nothing M9 adds can leak, because nothing M9 adds is counted (D79,
+/// attack 12).
+///
+/// A host held empty for a metal trial, and then a `kill -9` on each side in
+/// turn. The reservation is **derived from the records every pass**, so there
+/// is nothing for a restart to rebuild and nothing for a crash to leave
+/// behind: after the hub is killed and comes back the host is still being
+/// emptied for the same job, and after the runner is killed the slot the dead
+/// build held is gone and the trial runs.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_drain_first_reservation_survives_a_kill_nine_on_either_side() {
+    let herd = Herd::new();
+    let lease = herd.logs.path().join("metal-pc.lease");
+    let file = a_lease_probe(&herd, &lease);
+    let options = [
+        "--capabilities",
+        file.as_str(),
+        "--no-detect",
+        "--probe-interval",
+        "150",
+    ];
+    let trial;
+    let held_off;
+    let mut runner;
+    {
+        let _hub = herd.start_hub_losing_runners_after("first", 2.0).await;
+        runner = herd.start_runner_with("wsl-pc", "runner", "runner", &options);
+        herd.wait_for_runner().await;
+        let build = herd
+            .submit_ok(&["--label", "build"], "sleep 60; printf never")
+            .await;
+        herd.wait_until("the build holds the slot", || {
+            matches!(state_of(&herd, &build).as_str(), "assigned" | "running")
+        })
+        .await;
+        trial = herd
+            .submit_ok(&["--label", "metal-pc"], "printf trial")
+            .await;
+        herd.wait_until("the host is being emptied", || {
+            herd.waiting_for(&trial).contains("being emptied")
+        })
+        .await;
+        held_off = herd
+            .submit_ok(&["--label", "build"], "printf second-build")
+            .await;
+        herd.wait_until("the second build is held off", || {
+            herd.waiting_for(&held_off).contains("being emptied")
+        })
+        .await;
+        // The hub, with `kill -9`: no drain, no chance to write anything
+        // down.
+        let mut hub = _hub;
+        hub.signal(rustix::process::Signal::KILL).await;
+    }
+    // A hub that rebuilt a reservation from a counter would have none here.
+    let _hub = herd.start_hub_losing_runners_after("second", 2.0).await;
+    herd.wait_until("the restarted hub is still emptying the host", || {
+        herd.waiting_for(&held_off).contains("being emptied")
+            || herd.waiting_for(&trial).contains("being emptied")
+    })
+    .await;
+
+    // And now the runner, with `kill -9`, taking the build with it. The slot
+    // that build held is gone the moment its record says the attempt is over,
+    // so the host is quiet and the trial runs on the runner that replaces it.
+    runner.signal(rustix::process::Signal::KILL).await;
+    let _again = herd.start_runner_with("wsl-pc", "again", "runner", &options);
+    herd.wait_until("the trial runs on a quiet host", || {
+        state_of(&herd, &trial) == "finished"
+    })
+    .await;
+    assert_eq!(herd.log(&trial), "trial");
+    // What becomes of the build that was held off is deliberately **not**
+    // asserted: the build the killed runner was running gets its second go
+    // (E-21) and holds the one slot again for the whole of its sleep, so the
+    // second build waits behind it for a minute. That is E-21 working rather
+    // than a leak, and the leak this test is about is the reservation — which
+    // is proved by the trial having run at all: a reservation that had leaked
+    // would have held the host empty against the trial itself, and one that
+    // had been lost in the restart would have let a build in first.
+    let _ = &held_off;
+}
+
+/// A switch survives a `kill -9` on the runner (E-33, attack 12).
+///
+/// It is a file, written before it is applied, so a machine its owner
+/// withdrew does not come back claiming because the process died badly.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_switch_survives_a_kill_nine_on_the_runner() {
+    let herd = Herd::new();
+    let _hub = herd.start_hub_losing_runners_after("hub", 2.0).await;
+    let mut runner =
+        herd.start_runner_with("wsl-pc", "runner", "runner", &["--switch-poll", "100"]);
+    herd.wait_for_runner().await;
+    herd.herdctl(&["switch", "wsl-pc", "off", "--reason", "she is gaming"])
+        .await;
+    let began = Instant::now();
+    until_nothing_is_claimed(&herd, began).await;
+    runner.signal(rustix::process::Signal::KILL).await;
+    let _again = herd.start_runner_with("wsl-pc", "again", "runner", &["--switch-poll", "100"]);
+    herd.wait_until("the runner is back", || herd.said("again").contains("joining"))
+        .await;
+    let refusal = herd.submit_with(&[], "printf nothing").await;
+    assert!(
+        !refusal.status.success(),
+        "a runner killed while switched off must come back switched off (E-33)"
+    );
+    assert!(
+        String::from_utf8_lossy(&refusal.stderr).contains("she is gaming"),
+        "{}",
+        String::from_utf8_lossy(&refusal.stderr)
+    );
+}

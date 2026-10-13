@@ -434,6 +434,7 @@ async fn requester_socket(
         host: herd_proto::HostSize::default(),
         preference: 0,
         load_milli: None,
+        switch: herd_proto::Switch::On,
     };
     socket
         .send(Message::text(to_frame(&hello).expect("encodes")))

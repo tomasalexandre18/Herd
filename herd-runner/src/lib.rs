@@ -49,9 +49,11 @@ pub mod reclaim;
 pub mod root;
 pub mod size;
 pub mod spool;
+pub mod switch;
 #[doc(hidden)]
 pub mod testing;
 
+use std::path::PathBuf;
 use std::collections::{HashMap, VecDeque};
 use std::future::Future;
 use std::sync::{Arc, Mutex};
@@ -277,6 +279,19 @@ pub struct Config {
     /// How preferred this runner is when more than one could run a job
     /// (E-19). Higher first; zero unless its owner says otherwise.
     pub preference: i32,
+    /// Where the owner's switch is kept (E-33).
+    ///
+    /// A path, because invariant 3 forbids anything on this machine to listen:
+    /// `herd-runner switch off --reason ...` writes this file and the running
+    /// runner reads it. `None` turns the whole mechanism off, which is for a
+    /// test that is about something else — a runner with no switch file claims
+    /// as it always did.
+    pub switch_file: Option<PathBuf>,
+    /// How often the switch file is read (E-33).
+    ///
+    /// A second by default. Injectable because a test that is about the ten
+    /// seconds must be able to measure them without them being mostly this.
+    pub switch_poll: Duration,
 }
 
 impl Default for Config {
@@ -296,6 +311,11 @@ impl Default for Config {
             host: metrics::host_size(),
             preference: 0,
             probes: capability::ProbeSettings::default(),
+            // Under the data root, which is the one directory this runner may
+            // write in (E-45). Resolved by the binary, because only it knows
+            // where the root really ended up.
+            switch_file: None,
+            switch_poll: crate::switch::Poll::default().0,
         }
     }
 }
@@ -528,6 +548,14 @@ struct Inner {
     spooled: Vec<Spooled>,
     /// The runner is stopping: it takes no new job (invariant 2).
     draining: bool,
+    /// Where its owner's switch stands (E-33).
+    ///
+    /// Separate from `draining` above, which is the process stopping. This is
+    /// slower and does less: `off` takes no new job and serves no content
+    /// while **leaving the job in flight alone**, and a runner that killed
+    /// its build because its owner wanted the machine back in ten seconds
+    /// would have lost her exactly the work she was being polite about.
+    switch: herd_proto::Switch,
 }
 
 impl Default for Inner {
@@ -538,7 +566,31 @@ impl Default for Inner {
             jobs: HashMap::new(),
             spooled: Vec::new(),
             draining: false,
+            switch: herd_proto::Switch::On,
         }
+    }
+}
+
+/// What a position means for the machine it was just set on (E-33).
+///
+/// Said on the runner's own stderr, where its owner is looking, and it names
+/// the job in flight because that is the thing she is most likely to be
+/// worried about: `off` does not touch it.
+fn what_that_position_does(switch: &herd_proto::Switch, running: usize) -> String {
+    let in_flight = match running {
+        0 => "nothing is running here".to_owned(),
+        1 => "the 1 job running here finishes".to_owned(),
+        many => format!("the {many} jobs running here finish"),
+    };
+    match switch {
+        herd_proto::Switch::On => format!("this machine claims work again, and {in_flight}"),
+        herd_proto::Switch::Off { .. } => format!(
+            "nothing new is claimed and nothing is served to a peer (D11); {in_flight}, and \
+             everything queued for this machine is claimable elsewhere at once"
+        ),
+        herd_proto::Switch::Drain { .. } => format!(
+            "nothing new is claimed; {in_flight}, and this runner leaves once it holds nothing"
+        ),
     }
 }
 
@@ -613,6 +665,56 @@ impl Session {
         self.with(|inner| inner.draining)
     }
 
+    /// Where its owner's switch stands (E-33).
+    pub fn switch(&self) -> herd_proto::Switch {
+        self.with(|inner| inner.switch.clone())
+    }
+
+    /// Whether this runner may serve content to a peer right now (D11).
+    ///
+    /// **The one gate the registry M11 brings must consult**, and the reason
+    /// this method exists before there is anything to serve: `off` is the
+    /// owner saying the machine is hers again, and an `off` that stopped
+    /// claiming jobs while still pushing packs up her link would have
+    /// honoured half of E-33. There is no fetch endpoint in Herd yet (M11),
+    /// so what is asserted today is the gate and the line the runner prints;
+    /// the endpoint is built behind this and nowhere else.
+    pub fn serves_content(&self) -> bool {
+        self.with(|inner| !inner.draining && inner.switch.serves_content())
+    }
+
+    /// Move the switch, and say so if it moved.
+    ///
+    /// Returns the sentence an owner reads, or `None` when the position was
+    /// already this one — which is what keeps a file polled once a second from
+    /// printing a line a second.
+    pub fn set_switch(&self, switch: herd_proto::Switch) -> Option<String> {
+        self.with(|inner| {
+            if inner.switch == switch {
+                return None;
+            }
+            let said = format!(
+                "the owner's switch is now {} (it was {}); {}",
+                switch.sentence(),
+                inner.switch.sentence(),
+                what_that_position_does(&switch, inner.jobs.values().filter(|job| job.end.is_none()).count())
+            );
+            inner.switch = switch;
+            // Said to the hub **at once**, not at the next health report:
+            // E-33's ten seconds is a promise about the hub stopping to hand
+            // work to this machine, and a report fifteen seconds away would
+            // spend all of it.
+            let health = ToHub::Health {
+                jobs: running_jobs(inner),
+                draining: inner.draining,
+                load_milli: crate::metrics::host_load_milli(),
+                switch: inner.switch.clone(),
+            };
+            send_on(&inner.link, health);
+            Some(said)
+        })
+    }
+
     /// Whether there is a hub to say anything to right now.
     ///
     /// The drain waits for what it holds to be acknowledged — but only while
@@ -671,6 +773,16 @@ impl Session {
     pub(crate) fn take_job(&self, job_id: &JobId, attempt: u32) -> Option<CancelToken> {
         self.with(|inner| {
             if inner.draining {
+                return None;
+            }
+            // And the owner's switch, in the same place and under the same
+            // lock — which is the whole of the race E-33 can lose: a job the
+            // hub sent in the instant before the switch moved arrives after
+            // it, and a runner that checked only `draining` would start it.
+            // The hub then gives the job another go somewhere else (E-21's
+            // path, an abandoned attempt), which is exactly right: nothing is
+            // lost and the machine is given back.
+            if !inner.switch.claims() {
                 return None;
             }
             let cancel = CancelToken::new();
@@ -981,6 +1093,7 @@ impl Session {
         self.with(|inner| ToHub::Health {
             jobs: running_jobs(inner),
             draining: inner.draining,
+            switch: inner.switch.clone(),
             // Measured now, on every report, because it is a fact about the
             // moment (E-32). The hub records it and gates nothing on it.
             load_milli: crate::metrics::host_load_milli(),
@@ -1008,6 +1121,7 @@ impl Session {
                 jobs: running_jobs(inner),
                 draining: true,
                 load_milli: crate::metrics::host_load_milli(),
+                switch: inner.switch.clone(),
             };
             send_on(&inner.link, health);
             ending
@@ -1306,10 +1420,67 @@ pub async fn run_until(config: Config, stop: impl Future<Output = String>) -> Re
     // fifth of a second and left the probe's children running, reparented to
     // init — the orphan-strewing invariant 2 forbids, and the one case the
     // timeout path did not cover.
+    // The owner's switch, read beside the redial loop for the probes' reason:
+    // a machine withdrawn while the hub is down is still withdrawn, and the
+    // next connection announces the position in its handshake (E-33).
+    //
+    // Read **once, here, before the first dial**, so that a runner restarted
+    // on a machine its owner switched off never claims anything at all. The
+    // watcher then takes over.
+    if let Some(path) = &config.switch_file {
+        match crate::switch::read(path) {
+            Ok(Some(switch)) => {
+                eprintln!(
+                    "herd-runner: the owner's switch says {} ({}); {}",
+                    switch.sentence(),
+                    path.display(),
+                    what_that_position_does(&switch, 0)
+                );
+                session.set_switch(switch);
+            }
+            Ok(None) => {}
+            Err(why) => eprintln!(
+                "herd-runner: this runner starts switched {} because its switch file will not \
+                 read, and an unreadable switch is never read as on: {why}",
+                session.switch().sentence()
+            ),
+        }
+    }
+    let watching_the_switch = tokio::spawn(watch_the_switch(config.clone(), session.clone()));
+    let stop_watching_the_switch = watching_the_switch.abort_handle();
     let stop_probing = probing.abort_handle();
     let serving = serve_forever(config.clone(), session.clone(), Arc::clone(&confined));
+    // A `drain` position is "finish and leave" (E-33), and this is the leaving
+    // half: it waits for what the runner holds to be over, and then stops the
+    // process through exactly the path a `SIGTERM` stops it through. There is
+    // nothing to kill by then — which is the difference between this and the
+    // shutdown drain, and the whole of attack 2: a drain that killed the job
+    // it was waiting for would have finished nothing.
+    let left_when_empty = {
+        let session = session.clone();
+        let poll = config.switch_poll;
+        async move {
+            loop {
+                let switch = session.switch();
+                if switch.leaves_when_empty() && session.jobs_running() == 0 {
+                    return format!(
+                        "the owner's switch is {} and this runner holds nothing, so it leaves",
+                        switch.sentence()
+                    );
+                }
+                tokio::time::sleep(poll).await;
+            }
+        }
+    };
+    let stop = async move {
+        tokio::select! {
+            reason = stop => reason,
+            reason = left_when_empty => reason,
+        }
+    };
     let stopping = async {
         let reason = stop.await;
+        stop_watching_the_switch.abort();
         // Before the drain rather than after it: a draining runner offers
         // nothing, so a probe it is still reading is work nobody wants, and
         // the kill belongs at the start of the owner's five seconds.
@@ -1332,6 +1503,10 @@ pub async fn run_until(config: Config, stop: impl Future<Output = String>) -> Re
     // race its own promise.
     probing.abort();
     let _ = probing.await;
+    // And no switch watcher either: a task reading a file every second for a
+    // runner that has left is the leak M8 found in this same shape (D93).
+    watching_the_switch.abort();
+    let _ = watching_the_switch.await;
     // Whichever way the runner is leaving, nothing it holds goes with it. A
     // refusal and a run out of redials end the process just as a signal does,
     // and a result that exists nowhere else is not allowed to end with it.
@@ -1501,6 +1676,69 @@ async fn serve_forever(config: Config, session: Session, confined: Arc<Confined>
     }
 }
 
+/// Apply a position and write it down, wherever it came from (E-33).
+///
+/// One function for both halves of E-33 — the file an owner writes and the
+/// frame an orchestrator sends — because the state they leave has to be one
+/// state. A file that cannot be written is said out loud and the position is
+/// still applied: the owner asked for her machine back, and a read-only data
+/// root is not a reason to go on claiming work. What is lost in that case is
+/// only that a restart would not remember, and the line says so.
+fn apply_a_switch(config: &Config, session: &Session, switch: herd_proto::Switch, why: &str) {
+    if let Some(said) = session.set_switch(switch.clone()) {
+        eprintln!("herd-runner: {said} ({why})");
+    }
+    if let Some(path) = &config.switch_file {
+        if let Err(error) = crate::switch::write(path, &switch) {
+            eprintln!(
+                "herd-runner: this switch is in force now, but it could not be written down, \
+                 so a restart of this runner would come back {}: {error}",
+                herd_proto::Switch::default().sentence()
+            );
+        }
+    }
+}
+
+/// Watch the switch file for ever, applying what it says (E-33).
+///
+/// Beside the redial loop, like the probes, and for the same reason: an owner
+/// switching her machine off while the hub is down must still be obeyed, and
+/// the next connection announces the position in its handshake.
+async fn watch_the_switch(config: Config, session: Session) {
+    let Some(path) = config.switch_file.clone() else {
+        return;
+    };
+    let mut said_it_will_not_read: Option<String> = None;
+    loop {
+        match crate::switch::read(&path) {
+            Ok(read) => {
+                said_it_will_not_read = None;
+                // An absent file is a machine nobody has withdrawn, and that
+                // is how a switch is turned back on with `rm`.
+                let switch = read.unwrap_or_default();
+                if let Some(said) = session.set_switch(switch) {
+                    eprintln!("herd-runner: {said} (from {})", path.display());
+                }
+            }
+            // **The position is left where it is.** A file that will not read
+            // is not a runner that claims: the one reading that could do harm
+            // is treating a mangled switch file as `on`, which would be a
+            // withdrawn machine quietly taking work again.
+            Err(why) => {
+                if said_it_will_not_read.as_deref() != Some(why.as_str()) {
+                    eprintln!(
+                        "herd-runner: the switch stays {} because its file will not read, and \
+                         an unreadable switch is never read as on: {why}",
+                        session.switch().sentence()
+                    );
+                    said_it_will_not_read = Some(why);
+                }
+            }
+        }
+        tokio::time::sleep(config.switch_poll).await;
+    }
+}
+
 /// Join the hub and serve it until this one connection ends.
 ///
 /// Public because a test needs one connection it can watch, and because
@@ -1526,6 +1764,11 @@ pub async fn serve_once(config: Config, session: Session, confined: Arc<Confined
         // for itself (E-22, E-19).
         host: config.host,
         preference: config.preference,
+        // And where its owner's switch stands, which is announced rather than
+        // assumed: a runner restarted while switched off has not changed its
+        // owner's mind, and a hub that believed it `on` until the first health
+        // report could claim on it inside that window (E-33).
+        switch: session.switch(),
         // And which hub state the durable things under this data root belong
         // to, so that nothing spooled for a hub that no longer exists is
         // believed by the hub that replaced it.
@@ -1581,7 +1824,7 @@ pub async fn serve_once(config: Config, session: Session, confined: Arc<Confined
     // And what every probe says, before this connection can be dispatched on.
     session.announce_capabilities();
     let reporting = tokio::spawn(report_health(session.clone(), config.health_every));
-    let outcome = serve_hub(&session, &mut source, confined, config.hub_silence_limit).await;
+    let outcome = serve_hub(&config, &session, &mut source, confined, config.hub_silence_limit).await;
     reporting.abort();
     session.detach();
     // The writer is holding a queue for a hub that may be gone, and the jobs
@@ -1609,6 +1852,7 @@ async fn report_health(session: Session, every: Duration) {
 }
 
 async fn serve_hub(
+    config: &Config,
     session: &Session,
     source: &mut Source,
     confined: Arc<Confined>,
@@ -1662,6 +1906,23 @@ async fn serve_hub(
                 reason,
             } => session.drop_stale(&job_id, attempt, &reason),
             FromHub::HealthRecorded {} => {}
+            // The orchestrator's half of E-33, arriving through the hub. It is
+            // applied **and written down**, so that the two ways of setting a
+            // switch leave one state behind: an owner who later looks at her
+            // machine sees the position an agent set, and a runner restarted
+            // afterwards comes back on it.
+            FromHub::SetSwitch { switch, why } => {
+                apply_a_switch(&config, &session, switch, &why);
+            }
+            // A capability this runner handed out turned out to be taken
+            // (D76). The reading that allowed it is known to be stale, so it
+            // is taken again now rather than at the next interval.
+            FromHub::ReadProbesAgain { why } => {
+                eprintln!("herd-runner: reading every probe again now: {why}");
+                if session.capacity().sweep().await {
+                    session.announce_capabilities();
+                }
+            }
             FromHub::Refused { reason } => return Err(Refusal(reason).into()),
             FromHub::StandBy {
                 reason,
@@ -1745,6 +2006,11 @@ fn message_kind(message: &FromHub) -> &'static str {
         FromHub::JobNote { .. } => "job_note",
         FromHub::JobFinished { .. } => "job_finished",
         FromHub::JobResultAck { .. } => "job_result_ack",
+        FromHub::WouldRun { .. } => "would_run",
+        FromHub::SwitchSet { .. } => "switch_set",
+        FromHub::FleetSwitches { .. } => "fleet_switches",
+        FromHub::SetSwitch { .. } => "set_switch",
+        FromHub::ReadProbesAgain { .. } => "read_probes_again",
     }
 }
 
