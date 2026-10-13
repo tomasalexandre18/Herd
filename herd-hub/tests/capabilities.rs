@@ -422,8 +422,11 @@ async fn a_held_lock_file_keeps_a_job_queued_until_it_is_released() {
     })
     .await;
     assert!(
-        herd.said("hub").contains("qemu is suspended on the runner"),
-        "the hub must record what it was told: {}",
+        // Named, since M7: this hub holds a fleet, and "the runner" is a lie
+        // about which machine is holding the lock file.
+        herd.said("hub")
+            .contains("qemu is suspended on the-real-runner"),
+        "the hub must record what it was told, and on which machine: {}",
         herd.said("hub")
     );
 
