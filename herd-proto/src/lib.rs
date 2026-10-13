@@ -53,11 +53,18 @@ pub const SILENCE_MARGIN: u32 = 3;
 /// naming both figures and the margin — never discovered from a job's record
 /// afterwards.
 ///
-/// Both sides call this. The hub checks its `--lost-after` against the
-/// cadence it expects its runners to report at; a runner checks how long it
-/// believes a silent hub against its own `--health-every`, because the hub
-/// answers every report and the mistake is exactly as easy to make in that
-/// direction.
+/// Both sides call this, in three places. The hub checks its `--lost-after`
+/// against the cadence it expects its runners to report at; a runner checks
+/// how long it believes a silent hub against its own `--health-every`,
+/// because the hub answers every report and the mistake is exactly as easy to
+/// make in that direction. And the hub checks its threshold against the
+/// cadence a runner **really** reports at, announced in
+/// [`ToHub::Hello::health_every_ms`] — because two configurations that each
+/// pass their own check can still be fatal together: `--lost-after 3` with
+/// `--health-every 1` on the hub and `--health-every 10` on the runner spent
+/// both attempts of a quiet `sleep 30` in about six seconds and ended it
+/// `lost`. Neither side is wrong on its own; only the pair is, and only the
+/// handshake can see the pair.
 pub fn silence_threshold_refusal(
     threshold_name: &str,
     threshold: Duration,
@@ -339,6 +346,25 @@ pub enum ToHub {
         /// a runner that has never met a hub.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         state_root: Option<String>,
+        /// How often this runner will report that it is alive, in
+        /// milliseconds — its real cadence, not a figure anyone expects of
+        /// it (E-40).
+        ///
+        /// It travels because the mistake it prevents needs **both** sides at
+        /// once. Each side alone refuses a silence threshold shorter than
+        /// [`SILENCE_MARGIN`] of its own reports, and two individually legal
+        /// configurations still destroy a healthy job: a hub losing a runner
+        /// after 3 s while expecting a report every 1 s, and a runner really
+        /// reporting every 10 s, are each self-consistent, and together they
+        /// burn both of a quiet job's attempts in six seconds. Only the
+        /// pairing is wrong, so the pairing is what the handshake has to be
+        /// able to see.
+        ///
+        /// `None` from a requester, which reports nothing, and from any peer
+        /// that does not say: a hub cannot refuse a figure it was never
+        /// given, and it does not pretend to know one.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        health_every_ms: Option<u64>,
     },
     /// Requester asks for work to be done.
     SubmitJob { command: Vec<String> },
@@ -643,6 +669,27 @@ pub fn not_this_runner_s_attempt_reason(
         "attempt {attempt} of {job_id} was handed to runner {holder}, and this frame came \
          from runner {speaker}: an attempt belongs to the runner it was given to, so \
          nothing of this is recorded"
+    )
+}
+
+/// Why nothing of a frame about a job that is over was recorded, naming the
+/// job, its state and the attempt the frame claimed.
+///
+/// A terminal record is the last thing a job ever has: its outcome, its
+/// metrics and its log are closed together, and a frame that arrives
+/// afterwards is refused *by name* rather than written into a record a reader
+/// has already been given. The sentence is here because the hub says it on
+/// its own stderr, sends it in [`FromHub::StaleAttempt`], and a test asserts
+/// it — one sentence, three readers (invariant 4).
+pub fn a_frame_about_a_job_that_is_over_reason(
+    job_id: &JobId,
+    state: &str,
+    attempt: u32,
+) -> String {
+    format!(
+        "{job_id} is over ({state}), and this frame is about attempt {attempt} of it: a \
+         record that has reached its end is never written to again — not its outcome, not \
+         its metrics, not its log — so nothing of this is recorded"
     )
 }
 
