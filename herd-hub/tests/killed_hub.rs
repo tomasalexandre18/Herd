@@ -1466,3 +1466,304 @@ async fn a_log_that_loses_its_tail_says_so_rather_than_reading_short() {
     runner.signal(rustix::process::Signal::TERM).await;
     hub.signal(rustix::process::Signal::TERM).await;
 }
+
+/// **Fix 1 against the real binaries: whose verdict is it?**
+///
+/// A job runs as attempt 1 on `runner-x`. A `job_finished` frame for that
+/// exact attempt is planted in `runner-y`'s spool — the one place a verdict
+/// legitimately waits — `runner-x` is killed outright, and `runner-y` starts
+/// and offers what it found. Nothing about the frame is malformed: it names a
+/// job the hub really has, an attempt the hub really is waiting for, and a
+/// state root `runner-y` really does belong to. It is a lie only in its
+/// author.
+///
+/// The hub used to believe it: exit 99 and metrics nobody measured, on a
+/// record still naming attempt 1 on `runner-x`, with the real job's output in
+/// the log underneath. Now it is refused by name, the planted file is dropped
+/// by name on the runner's side (D42), and the job goes on to be attempted
+/// again and to end with its own verdict.
+#[tokio::test]
+async fn a_verdict_planted_in_another_runner_s_spool_is_refused_by_name() {
+    let herd = Herd::new();
+    let mut hub = herd.start_hub_losing_runners_after("first", 3.0).await;
+    let mut x = herd.start_runner_called("runner-x", "runner-x");
+    herd.wait_for_runner().await;
+
+    let job = herd
+        .submit("printf 'the job that really ran\\n'; sleep 2; exit 5")
+        .await;
+    herd.wait_until("the job is running on runner-x", || {
+        herd.record(&job)["state"]["type"] == "running"
+            && herd.log(&job).contains("the job that really ran")
+    })
+    .await;
+    let record = herd.record(&job);
+    assert_eq!(
+        record["attempts"][0]["runner"],
+        serde_json::json!("runner-x")
+    );
+    let attempt = record["attempts"][0]["number"]
+        .as_u64()
+        .expect("an attempt is numbered") as u32;
+
+    // The fixture: a verdict for that attempt, in the spool of a runner that
+    // never ran it and that genuinely serves this hub's state root.
+    herd.pretend_the_root_was_welcomed("runner-y");
+    let planted = herd.runner_root("runner-y").join("held-results");
+    std::fs::create_dir_all(&planted).expect("the fixture makes the spool directory");
+    let planted = planted.join(format!("{job}.json"));
+    std::fs::write(
+        &planted,
+        herd_proto::to_frame(&herd_proto::ToHub::JobFinished {
+            job_id: herd_proto::JobId::new(&job),
+            attempt,
+            outcome: JobOutcome::Exited { code: 99 },
+            chunks_sent: 0,
+            metrics: herd_proto::JobMetrics {
+                log_bytes: 4096,
+                wall_time_ms: 77,
+                ..herd_proto::JobMetrics::default()
+            },
+        })
+        .expect("the fixture frame encodes"),
+    )
+    .expect("the fixture writes the planted verdict");
+
+    x.signal(rustix::process::Signal::KILL).await;
+    let mut y = herd.start_runner_called("runner-y", "runner-y");
+
+    herd.wait_until("the hub refuses the planted verdict by name", || {
+        herd.said("first").contains(&format!(
+            "attempt {attempt} of {job} was handed to runner runner-x"
+        ))
+    })
+    .await;
+    assert!(
+        herd.said("first").contains("came from runner runner-y"),
+        "the refusal names who spoke, or an operator has nothing to go on: {}",
+        herd.said("first")
+    );
+
+    // Nothing of it was recorded. The record still names attempt 1 on
+    // runner-x, carries no verdict and no figures, and the log is the job's
+    // own.
+    let record = herd.record(&job);
+    assert_ne!(
+        record["state"]["type"], "finished",
+        "a foreign verdict ended the job: {record}"
+    );
+    assert_eq!(
+        record["metrics"],
+        serde_json::json!({"log_bytes": 0, "wall_time_ms": 0})
+    );
+    assert_eq!(
+        record["attempts"][0]["runner"],
+        serde_json::json!("runner-x")
+    );
+
+    // And runner-y drops the file by name rather than offering it for ever.
+    herd.wait_until("the planted file is dropped by name", || {
+        herd.said("runner-y")
+            .contains("the hub will not record the spooled verdict")
+            && !planted.exists()
+    })
+    .await;
+
+    // The job itself is not a casualty of any of this: its attempt was lost
+    // with runner-x, so it is attempted again — on runner-y, which is a
+    // perfectly good runner — and it ends with its own exit code.
+    herd.wait_until("the job ends with its own verdict", || {
+        herd.record(&job)["state"]["type"] == "finished"
+    })
+    .await;
+    let record = herd.record(&job);
+    assert_eq!(
+        record["state"]["outcome"],
+        serde_json::json!({"type": "exited", "code": 5}),
+        "the job's verdict is its own, and 99 was never it: {record}"
+    );
+    assert_eq!(
+        record["attempts"].as_array().map(Vec::len),
+        Some(2),
+        "two attempts, the first named as lost: {record}"
+    );
+
+    y.signal(rustix::process::Signal::TERM).await;
+    hub.signal(rustix::process::Signal::TERM).await;
+}
+
+/// **Fix 2 against the real binaries: the state root that was recreated.**
+///
+/// No hand-edited file anywhere. A hub's state root is wiped — a new volume,
+/// a restored backup, `rm -rf` on a directory — so its job ids start again at
+/// `j0000000001`, while the runner's spool from the previous root is still on
+/// its disk naming exactly that id. The two together make a verdict that is
+/// plausible and false, and that is what M2's author deferred to M3 as "the
+/// store's identity in `Welcome`".
+#[tokio::test]
+async fn a_verdict_spooled_for_a_state_root_that_was_recreated_is_never_believed() {
+    let herd = Herd::new();
+    let mut hub = herd.start_hub_losing_runners_after("first", 3.0).await;
+    let mut runner = herd.start_runner();
+    herd.wait_for_runner().await;
+
+    let job = herd
+        .submit("printf 'the first life\\n'; sleep 1; exit 3")
+        .await;
+    herd.wait_until("the job is running", || {
+        herd.record(&job)["state"]["type"] == "running"
+    })
+    .await;
+    let first_root_id = herd.state_root_id();
+
+    // The hub dies, the job ends with nobody to tell, and the runner is
+    // stopped: the verdict goes to its spool (D34).
+    hub.signal(rustix::process::Signal::KILL).await;
+    herd.wait_until("the job ended with no hub to tell", || {
+        herd.said("runner")
+            .contains("ended while there was no hub to tell")
+    })
+    .await;
+    runner.ask_it_to_stop();
+    let _ = tokio::time::timeout(Duration::from_secs(5), runner.gone()).await;
+    let spool = herd.runner_root("runner").join("held-results");
+    assert_eq!(
+        std::fs::read_dir(&spool).into_iter().flatten().count(),
+        1,
+        "the verdict of the first life is on the disk"
+    );
+
+    // The state root is recreated. Nobody touches the runner's disk.
+    std::fs::remove_dir_all(herd.state.path()).expect("the fixture wipes the state root");
+    std::fs::create_dir_all(herd.state.path()).expect("and leaves an empty one");
+    let mut hub = herd.start_hub_losing_runners_after("second", 3.0).await;
+    let second_root_id = herd.state_root_id();
+    assert_ne!(
+        first_root_id, second_root_id,
+        "a recreated state root is a different state root, or none of this can be told apart"
+    );
+
+    let mut again = herd.start_runner_rooted("the-real-runner", "second-runner", "runner");
+    herd.wait_until("the runner is told which state root it is holding", || {
+        let said = herd.said("second-runner");
+        said.contains(&first_root_id) && said.contains(&second_root_id)
+    })
+    .await;
+    assert!(
+        herd.said("second-runner").contains("NOT offered"),
+        "a verdict for a vanished hub is never offered, and that is said: {}",
+        herd.said("second-runner")
+    );
+    assert!(
+        std::fs::read_dir(&spool)
+            .into_iter()
+            .flatten()
+            .flatten()
+            .any(|entry| entry
+                .file_name()
+                .to_string_lossy()
+                .ends_with(".foreign-state-root")),
+        "its bytes are kept under a name that says why, never destroyed (D19)"
+    );
+
+    // And now the collision itself. A fresh state root hands out ids from
+    // one, so it is walked to the very id the spooled verdict names — which
+    // is the whole hazard: the same string, two different jobs, two different
+    // hubs' worth of state.
+    herd.wait_until("the runner is serving the new state root", || {
+        herd.said("second").contains("has joined")
+    })
+    .await;
+    let number: u64 = job
+        .trim_start_matches('j')
+        .trim_start_matches('0')
+        .parse()
+        .expect("a job id is a number behind its padding");
+    for _ in 1..number {
+        herd.submit("true").await;
+    }
+    let second = herd.submit("printf 'the second life\\n'; exit 0").await;
+    assert_eq!(
+        second, job,
+        "the fresh root hands out the id the spooled verdict names"
+    );
+    herd.wait_until("the new root's first job is over", || {
+        herd.record(&second)["state"]["type"] == "finished"
+    })
+    .await;
+    let record = herd.record(&second);
+    assert_eq!(
+        record["state"]["outcome"],
+        serde_json::json!({"type": "exited", "code": 0}),
+        "a verdict from a state root that is gone landed on a live job: {record}"
+    );
+    assert!(
+        herd.log(&second).contains("the second life")
+            && !herd.log(&second).contains("the first life"),
+        "and the log is this job's own: {}",
+        herd.log(&second)
+    );
+
+    again.signal(rustix::process::Signal::TERM).await;
+    hub.signal(rustix::process::Signal::TERM).await;
+}
+
+/// **Fix 4: a silence threshold that cannot mean what it says.**
+///
+/// `--lost-after 8` with the 15 s health cadence E-40 asks for burnt *both*
+/// attempts of a live, perfectly healthy job in nineteen seconds and ended it
+/// `lost`: the hub was timing the gap between two reports it had itself asked
+/// for. It is refused at startup, naming both figures and the margin, by the
+/// real binary — because that is where an operator makes this mistake.
+///
+/// The same mistake is possible on the runner's side, in the one direction it
+/// can be made there, and it is refused the same way.
+#[tokio::test]
+async fn a_lost_after_shorter_than_the_health_cadence_is_refused_at_startup() {
+    let herd = Herd::new();
+    let hub = std::process::Command::new(binary("herd-hub"))
+        .arg("--listen")
+        .arg(herd.addr().to_string())
+        .arg("--state-dir")
+        .arg(herd.state.path())
+        .arg("--lost-after")
+        .arg("8")
+        .output()
+        .expect("herd-hub runs");
+    assert!(
+        !hub.status.success(),
+        "a hub that cannot keep its promise about a live runner must not start"
+    );
+    let said = String::from_utf8_lossy(&hub.stderr);
+    for figure in ["8s", "15s", "3 health reports", "45s"] {
+        assert!(
+            said.contains(figure),
+            "the refusal must name {figure}: {said}"
+        );
+    }
+    assert!(
+        TcpStream::connect(herd.addr()).is_err(),
+        "a refused hub must not be listening"
+    );
+
+    let runner = std::process::Command::new(binary("herd-runner"))
+        .arg("--hub")
+        .arg(herd.url())
+        .arg("--data-root")
+        .arg(herd.runner_root("refused"))
+        .arg("--hub-silence-limit")
+        .arg("8")
+        .output()
+        .expect("herd-runner runs");
+    assert!(
+        !runner.status.success(),
+        "a runner that would redial a live link for ever must not start"
+    );
+    let said = String::from_utf8_lossy(&runner.stderr);
+    for figure in ["8s", "15s", "3 health reports", "45s"] {
+        assert!(
+            said.contains(figure),
+            "the runner's refusal must name {figure} too: {said}"
+        );
+    }
+}

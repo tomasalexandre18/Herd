@@ -20,10 +20,16 @@
 //! the jobs it was running are attempted once more (E-21). Three rules make
 //! that safe rather than merely automatic:
 //!
-//! - **An attempt is named and numbered.** Every job frame carries the attempt
-//!   it is about, so a runner that comes back from the dead cannot finish a job
-//!   the hub has already written off, and cannot write into the record of the
-//!   attempt that replaced it. It is told so by name.
+//! - **An attempt is named, numbered, and somebody's.** Every job frame
+//!   carries the attempt it is about, so a runner that comes back from the
+//!   dead cannot finish a job the hub has already written off, and cannot
+//!   write into the record of the attempt that replaced it. And an attempt
+//!   belongs to the runner it was handed to: a frame about it from any other
+//!   runner is refused by name, because a number alone cannot tell a verdict
+//!   from a verdict about another machine's work. The handshake carries the
+//!   state root's identity for the same reason one step up — a job id means
+//!   something only inside one hub's state — and a runner instance identity,
+//!   so a redial can be told from a second runner wearing the same name.
 //! - **Once more means once.** A job is requeued one time. A second loss is an
 //!   end — `lost` — not a third attempt, because a job that kills runners
 //!   would otherwise go round for ever.
@@ -442,6 +448,18 @@ impl State {
                 let gone_quiet =
                     incumbent.reports_seen > 0 && quiet_for > self.policy.health_is_stale_after();
                 if !(same_name && same_instance) && !gone_quiet {
+                    // How soon it is worth coming back differs by case. A
+                    // runner waiting for a slot may have it in a moment; a
+                    // twin is waiting for a configuration to change, or for
+                    // the runner holding the name to go quiet, and asking
+                    // every few seconds for that would be the flap again in
+                    // a quieter costume — one line of log per second instead
+                    // of one dropped job.
+                    let retry_in = if same_name {
+                        self.policy.health_is_stale_after()
+                    } else {
+                        self.policy.stand_by_retry()
+                    };
                     let reason = if same_name {
                         let twin = runner_twin_reason(
                             name,
@@ -462,10 +480,7 @@ impl State {
                             incumbent.name, quiet_for
                         )
                     };
-                    return Admitted::StandBy {
-                        reason,
-                        retry_in: self.policy.stand_by_retry(),
-                    };
+                    return Admitted::StandBy { reason, retry_in };
                 }
                 let why = if same_name && same_instance {
                     format!(
@@ -784,6 +799,29 @@ async fn serve_peer(state: Arc<State>, stream: TcpStream) -> Result<()> {
         }
     };
 
+    // A runner has to be a *particular* runner, because that is what an
+    // attempt belongs to. With an empty name, the record's `runner` field says
+    // nothing and two different machines both match it — so a runner that
+    // gave no name wears its instance identity, which is the next best thing
+    // it has, and one that gave neither is refused by name. The refusal is
+    // terminal (D13) on purpose: dialling again with the same silence changes
+    // nothing. Our own runner always announces an instance, so this reaches
+    // only a peer that identifies itself not at all.
+    let peer_name = match (role, peer_name.is_empty(), &peer_instance) {
+        (Role::Runner, true, Some(instance)) => instance.clone(),
+        (Role::Runner, true, None) => {
+            return refuse(
+                &mut sink,
+                "a runner must say what it is called, or at least which process it is: an \
+                 attempt belongs to the runner it was handed to, and a runner with no name \
+                 and no instance cannot be told from any other"
+                    .to_owned(),
+            )
+            .await
+        }
+        _ => peer_name,
+    };
+
     // The hub's own state root goes out with the welcome whatever happens
     // next, including to a peer this hub is about to turn away: that string is
     // how a runner holding a verdict for a hub whose state is gone finds out,
@@ -1004,13 +1042,23 @@ async fn relay_from_runner(
         };
         match message {
             ToHub::Health { jobs, draining } => {
-                state.record_health(outbox, jobs.clone(), draining);
+                // A report is two different claims. "I am alive" is this
+                // runner's to make, and it is recorded whatever else the
+                // report says. "I am running these jobs" is a claim about
+                // *attempts*, and an attempt belongs to the runner it was
+                // handed to — so each entry is judged before it is kept, and
+                // an entry about somebody else's attempt is refused by name
+                // rather than landing in the hub's picture of this runner.
+                let mut its_own = Vec::new();
+                for job in jobs {
+                    if mind_a_reported_job(state, name, outbox, &job) {
+                        its_own.push(job);
+                    }
+                }
+                state.record_health(outbox, its_own, draining);
                 // The answer is what tells the runner this link is alive: a
                 // socket can stay open onto a hub that is gone.
                 let _ = outbox.send(FromHub::HealthRecorded {});
-                for job in jobs {
-                    mind_a_reported_job(state, name, outbox, &job);
-                }
             }
             ToHub::JobStarted { job_id, attempt } => {
                 if !is_current(state, name, outbox, &job_id, attempt) {
@@ -1233,7 +1281,9 @@ fn is_current(state: &State, from: &str, outbox: &Outbox, job_id: &JobId, attemp
 }
 
 /// What the hub does about one job a health report mentions: tell the runner
-/// if the attempt is over, and ask for output the hub is short of (E-40).
+/// if the attempt is not its to report on, and ask for output the hub is
+/// short of (E-40). False when the entry is refused, so that the hub's
+/// picture of this runner holds only the attempts it was really given.
 ///
 /// A shortfall at the instant of a report is the ordinary case, not a loss: a
 /// chunk is in flight, or is being written, every time a busy job is reported
@@ -1242,9 +1292,9 @@ fn is_current(state: &State, from: &str, outbox: &Outbox, job_id: &JobId, attemp
 /// that it has sent more. Asking on sight would have the hub ask for output
 /// it is in the middle of recording, every fifteen seconds, for every running
 /// job.
-fn mind_a_reported_job(state: &State, from: &str, outbox: &Outbox, job: &RunningJob) {
+fn mind_a_reported_job(state: &State, from: &str, outbox: &Outbox, job: &RunningJob) -> bool {
     if !is_current(state, from, outbox, &job.job_id, job.attempt) {
-        return;
+        return false;
     }
     let recorded = match state.store.chunks_recorded(&job.job_id) {
         Ok(recorded) => recorded,
@@ -1253,12 +1303,12 @@ fn mind_a_reported_job(state: &State, from: &str, outbox: &Outbox, job: &Running
                 "herd-hub: cannot tell how much of {}'s log is written: {error}",
                 job.job_id
             );
-            return;
+            return true;
         }
     };
     if recorded >= job.chunks_sent {
         state.with_peers(|peers| peers.short_log.remove(&job.job_id));
-        return;
+        return true;
     }
     let stuck = state.with_peers(|peers| {
         peers
@@ -1267,7 +1317,7 @@ fn mind_a_reported_job(state: &State, from: &str, outbox: &Outbox, job: &Running
             .is_some_and(|before| before == recorded)
     });
     if !stuck {
-        return;
+        return true;
     }
     println!(
         "herd-hub: runner has sent {} chunk(s) of {} and this hub still has {}; asking \
@@ -1279,6 +1329,7 @@ fn mind_a_reported_job(state: &State, from: &str, outbox: &Outbox, job: &Running
         attempt: job.attempt,
         from_seq: recorded,
     });
+    true
 }
 
 /// Whether the job's log holds everything the attempt says it wrote.

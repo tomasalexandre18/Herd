@@ -1210,6 +1210,48 @@ mod tests {
         fs::read_to_string(path).unwrap_or_else(|e| panic!("{} reads: {e}", path.display()))
     }
 
+    /// The identity a job id only means anything inside.
+    ///
+    /// Minted with the root, kept in `store.json`, unchanged by a restart —
+    /// and *different* for a root created where one was deleted, which is the
+    /// case it exists for: both roots hand out `j0000000001`, and a runner
+    /// holding a verdict for one of them must not have it recorded on the
+    /// other.
+    #[test]
+    fn a_state_root_s_identity_is_minted_once_and_dies_with_the_root() {
+        let dir = tempfile::tempdir().expect("a temporary directory");
+        let first = JobDirStore::open(dir.path()).expect("the state root opens");
+        let id = first.state_root_id().to_owned();
+        assert!(
+            !id.is_empty(),
+            "a state root has an identity from the start"
+        );
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&read(&dir.path().join(STORE_FILE)))
+                .expect("store.json is json")["state_root_id"]
+                .as_str(),
+            Some(id.as_str()),
+            "and it is on the disk, not only in memory"
+        );
+        drop(first);
+
+        let again = JobDirStore::open(dir.path()).expect("the same root opens again");
+        assert_eq!(
+            again.state_root_id(),
+            id,
+            "a restart is the same state, so it is the same identity"
+        );
+        drop(again);
+
+        fs::remove_dir_all(dir.path()).expect("the root is deleted");
+        let recreated = JobDirStore::open(dir.path()).expect("a root is created in its place");
+        assert_ne!(
+            recreated.state_root_id(),
+            id,
+            "a recreated root is another state, and its ids mean other jobs"
+        );
+    }
+
     #[test]
     fn a_minted_job_is_queued_and_has_a_fresh_id() {
         let (_dir, store) = store();
