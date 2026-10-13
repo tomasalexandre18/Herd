@@ -1018,3 +1018,481 @@ impl Holdings {
         self.held.get(job)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn job(n: u32) -> JobId {
+        JobId::new(format!("j{n:010}"))
+    }
+
+    fn labels(names: &[&str]) -> LabelSet {
+        LabelSet::new(names.iter().map(|n| (*n).to_owned())).expect("valid labels")
+    }
+
+    /// An offer of these capabilities, all declared, all offerable.
+    fn offering(capabilities: Vec<Capability>) -> CapabilityOffer {
+        CapabilityOffer::new(
+            capabilities
+                .into_iter()
+                .map(|capability| {
+                    OfferedCapability::new(capability, CapabilityOrigins::declared())
+                })
+                .collect(),
+        )
+        .expect("a valid offer")
+    }
+
+    fn holdings(capabilities: Vec<Capability>) -> Holdings {
+        Holdings::new(offering(capabilities))
+    }
+
+    /// Take a label set for a job and insist it works.
+    fn admit(held: &mut Holdings, n: u32, names: &[&str]) {
+        held.admit(&job(n), labels(names))
+            .unwrap_or_else(|why| panic!("j{n} should have been admitted: {why}"));
+    }
+
+    /// Try to take a label set and insist it does not work, returning why.
+    fn refuse(held: &Holdings, names: &[&str]) -> Contention {
+        held.check(&labels(names))
+            .expect_err("this should have been held up")
+    }
+
+    // ---------------------------------------------- shared ----
+
+    /// `shared` is a fact about the machine, so there is no number of holders
+    /// that is too many.
+    #[test]
+    fn a_shared_capability_has_no_limit() {
+        let mut held = holdings(vec![Capability::shared("reference")]);
+        for n in 0..50 {
+            admit(&mut held, n, &["reference"]);
+        }
+        assert_eq!(held.running(), 50);
+        assert_eq!(held.holders_of("reference"), 50);
+    }
+
+    // --------------------------------------------- counted ----
+
+    /// The boundary that matters: `n` holders fit, the `n + 1`th does not, and
+    /// the reason carries both figures.
+    #[test]
+    fn counted_fits_exactly_n_holders_and_not_one_more() {
+        for n in 1..=4u32 {
+            let mut held = holdings(vec![Capability::counted("build", n)]);
+            for which in 0..n {
+                admit(&mut held, which, &["build"]);
+            }
+            assert_eq!(held.holders_of("build"), n);
+            let why = refuse(&held, &["build"]);
+            assert_eq!(
+                why,
+                Contention::NoSlot {
+                    label: "build".to_owned(),
+                    slots: n,
+                    holders: n,
+                },
+                "counted({n}) let an {}th holder in",
+                n + 1
+            );
+            let said = why.reason();
+            assert!(said.contains(&n.to_string()), "{said}");
+            assert!(!why.is_impossible(), "a full slot passes: {said}");
+            // And a slot given back is a slot available again.
+            held.release(&job(0));
+            admit(&mut held, 100, &["build"]);
+        }
+    }
+
+    /// A job that holds nothing at all is not counted against anything.
+    #[test]
+    fn a_job_holding_no_label_takes_no_slot() {
+        let mut held = holdings(vec![Capability::counted("build", 1)]);
+        admit(&mut held, 0, &[]);
+        admit(&mut held, 1, &["build"]);
+        assert_eq!(held.running(), 2);
+    }
+
+    /// A job's release is a job's, whatever it was holding, and twice is once.
+    #[test]
+    fn releasing_is_idempotent() {
+        let mut held = holdings(vec![Capability::counted("build", 1)]);
+        admit(&mut held, 0, &["build"]);
+        held.release(&job(0));
+        held.release(&job(0));
+        assert_eq!(held.running(), 0);
+        admit(&mut held, 1, &["build"]);
+    }
+
+    // ------------------------------------------- exclusive ----
+
+    /// `exclusive` is host-wide: it needs an idle runner, and while it is held
+    /// nothing else runs at all — not another capability, not a job needing
+    /// none. This is what makes it a different kind from `counted(1)`.
+    #[test]
+    fn exclusive_empties_the_runner_and_needs_it_empty() {
+        let mut held = holdings(vec![
+            Capability::exclusive("nightly"),
+            Capability::counted("build", 4),
+            Capability::shared("reference"),
+        ]);
+        // It needs the machine idle.
+        admit(&mut held, 0, &["build"]);
+        let why = refuse(&held, &["nightly"]);
+        assert_eq!(
+            why,
+            Contention::ExclusiveNeedsIdle {
+                label: "nightly".to_owned(),
+                running: 1,
+            }
+        );
+        held.release(&job(0));
+        admit(&mut held, 1, &["nightly"]);
+
+        // And while it is held, nothing else may start: not the counted
+        // capability with three free slots, not the shared one, not a job
+        // that asks for nothing.
+        for asked in [vec!["build"], vec!["reference"], vec![]] {
+            let why = refuse(&held, &asked);
+            assert_eq!(
+                why,
+                Contention::HostIsExclusive {
+                    held: "nightly".to_owned(),
+                    by: job(1),
+                },
+                "{asked:?} started while a host-wide capability was held"
+            );
+            assert!(why.reason().contains("nothing else runs"), "{}", why.reason());
+        }
+        // A second holder of the exclusive capability is the same answer.
+        assert!(matches!(
+            refuse(&held, &["nightly"]),
+            Contention::HostIsExclusive { .. }
+        ));
+        held.release(&job(1));
+        admit(&mut held, 2, &["build"]);
+    }
+
+    /// `counted(1)` is *not* `exclusive`: it serialises its own holders and
+    /// leaves the rest of the machine alone. A lease is one of these (E-27).
+    #[test]
+    fn counted_one_is_not_exclusive() {
+        let mut held = holdings(vec![
+            Capability::lease("metal-pc", BusyProbe::lock_file("/run/metal-pc")),
+            Capability::counted("build", 2),
+        ]);
+        admit(&mut held, 0, &["metal-pc"]);
+        // Another job runs alongside it, which `exclusive` would have stopped.
+        admit(&mut held, 1, &["build"]);
+        // But a second holder of the lease itself does not.
+        assert!(matches!(
+            refuse(&held, &["metal-pc"]),
+            Contention::NoSlot { slots: 1, .. }
+        ));
+    }
+
+    /// An exclusive capability can never overlap anything it excludes,
+    /// because it can never overlap anything at all. Asserted from both ends:
+    /// it cannot start while the excluded thing runs, and the excluded thing
+    /// cannot start while it runs.
+    #[test]
+    fn exclusive_never_overlaps_what_it_excludes() {
+        let nightly = Capability::exclusive("nightly")
+            .excluding(["build"])
+            .expect("a valid exclusion");
+        let mut held = holdings(vec![nightly, Capability::counted("build", 4)]);
+        admit(&mut held, 0, &["build"]);
+        assert!(held.check(&labels(&["nightly"])).is_err());
+        held.release(&job(0));
+        admit(&mut held, 1, &["nightly"]);
+        assert!(held.check(&labels(&["build"])).is_err());
+    }
+
+    // -------------------------------------------- exclusion ----
+
+    /// The closure rule, half one: **symmetric**. A configuration that names
+    /// one direction gets the other, so whether two things may overlap never
+    /// depends on which started first.
+    #[test]
+    fn exclusion_is_symmetric_whichever_direction_was_declared() {
+        let offer = offering(vec![
+            Capability::shared("a").excluding(["b"]).expect("valid"),
+            Capability::shared("b"),
+        ]);
+        // The closure put it in the offer itself.
+        assert!(offer.get("b").expect("offered").capability.excludes.contains("a"));
+
+        // And it is enforced in both orders of arrival.
+        let mut first = Holdings::new(offer.clone());
+        admit(&mut first, 0, &["a"]);
+        assert_eq!(
+            refuse(&first, &["b"]),
+            Contention::Excluded {
+                label: "b".to_owned(),
+                held: "a".to_owned(),
+                by: job(0),
+            }
+        );
+        let mut other = Holdings::new(offer);
+        admit(&mut other, 0, &["b"]);
+        assert!(matches!(
+            refuse(&other, &["a"]),
+            Contention::Excluded { .. }
+        ));
+    }
+
+    /// The closure rule, half two: **not transitive**. `a` excludes `b` and
+    /// `b` excludes `c` says nothing about `a` and `c`, which therefore
+    /// overlap. Pinned here so the rule cannot quietly change.
+    #[test]
+    fn exclusion_is_not_transitive_along_a_chain() {
+        let offer = offering(vec![
+            Capability::shared("a").excluding(["b"]).expect("valid"),
+            Capability::shared("b").excluding(["c"]).expect("valid"),
+            Capability::shared("c"),
+        ]);
+        // The closure added the two reverse directions and nothing else.
+        assert_eq!(
+            offer.get("b").expect("offered").capability.excludes,
+            labels(&["a", "c"])
+        );
+        assert_eq!(
+            offer.get("a").expect("offered").capability.excludes,
+            labels(&["b"])
+        );
+        assert_eq!(
+            offer.get("c").expect("offered").capability.excludes,
+            labels(&["b"])
+        );
+
+        // The ends of the chain overlap: nobody said they could not.
+        let mut held = Holdings::new(offer.clone());
+        admit(&mut held, 0, &["a"]);
+        admit(&mut held, 1, &["c"]);
+        // The middle overlaps neither.
+        assert!(matches!(
+            refuse(&held, &["b"]),
+            Contention::Excluded { .. }
+        ));
+
+        // And one job may hold both ends at once, for the same reason.
+        let mut together = Holdings::new(offer);
+        admit(&mut together, 0, &["a", "c"]);
+    }
+
+    /// A cycle is not a special case: the symmetric closure of `a excludes b,
+    /// b excludes a` is itself, so the computation adds the one missing
+    /// direction, finds nothing more, and terminates.
+    #[test]
+    fn a_cycle_of_exclusions_closes_to_itself() {
+        let both = offering(vec![
+            Capability::shared("a").excluding(["b"]).expect("valid"),
+            Capability::shared("b").excluding(["a"]).expect("valid"),
+        ]);
+        let one_way = offering(vec![
+            Capability::shared("a").excluding(["b"]).expect("valid"),
+            Capability::shared("b"),
+        ]);
+        assert_eq!(
+            both, one_way,
+            "declaring a cycle must mean exactly what declaring one half means"
+        );
+        assert_eq!(
+            both.get("a").expect("offered").capability.excludes,
+            labels(&["b"])
+        );
+        let mut held = Holdings::new(both);
+        admit(&mut held, 0, &["a"]);
+        assert!(matches!(refuse(&held, &["b"]), Contention::Excluded { .. }));
+    }
+
+    /// A longer cycle, so that the closure is not merely "the two-element
+    /// case works": a ring of four, where each is excluded by its two
+    /// neighbours and overlaps the one opposite it.
+    #[test]
+    fn a_ring_of_exclusions_stays_pairwise() {
+        let ring = ["a", "b", "c", "d"];
+        let offer = offering(
+            ring.iter()
+                .enumerate()
+                .map(|(at, name)| {
+                    Capability::shared(*name)
+                        .excluding([ring[(at + 1) % ring.len()]])
+                        .expect("valid")
+                })
+                .collect(),
+        );
+        // Each name excludes exactly its two neighbours, never the opposite.
+        assert_eq!(
+            offer.get("a").expect("offered").capability.excludes,
+            labels(&["b", "d"])
+        );
+        let mut held = Holdings::new(offer);
+        admit(&mut held, 0, &["a"]);
+        admit(&mut held, 1, &["c"]);
+        assert!(matches!(refuse(&held, &["b"]), Contention::Excluded { .. }));
+        assert!(matches!(refuse(&held, &["d"]), Contention::Excluded { .. }));
+    }
+
+    /// A job asking for two labels that exclude each other asks for something
+    /// no machine can ever give it, and the algebra says so by name. What to
+    /// do about it — failing it fast rather than queueing it for ever — is
+    /// M7's (E-36).
+    #[test]
+    fn a_job_asking_for_two_mutually_exclusive_labels_is_impossible() {
+        let held = holdings(vec![
+            Capability::shared("a").excluding(["b"]).expect("valid"),
+            Capability::shared("b"),
+        ]);
+        let why = refuse(&held, &["a", "b"]);
+        assert!(
+            why.is_impossible(),
+            "this can never become possible by waiting: {why}"
+        );
+        assert!(why.reason().contains("no runner can give it"), "{why}");
+        // On an idle runner, too: it is a property of the request.
+        assert_eq!(held.running(), 0);
+    }
+
+    // ------------------------------------------- the offer ----
+
+    #[test]
+    fn a_label_this_runner_does_not_offer_is_never_held() {
+        let held = holdings(vec![Capability::shared("build")]);
+        assert_eq!(
+            refuse(&held, &["kvm"]),
+            Contention::NotOffered {
+                label: "kvm".to_owned()
+            }
+        );
+    }
+
+    /// Denial wins over detection: a denied capability is reported and never
+    /// held (E-24).
+    #[test]
+    fn a_denied_capability_is_offered_to_nobody() {
+        let offer = CapabilityOffer::new(vec![OfferedCapability::new(
+            Capability::shared("kvm"),
+            CapabilityOrigins {
+                probed: true,
+                declared: false,
+                denied: true,
+            },
+        )])
+        .expect("a valid offer");
+        assert_eq!(offer.report(), vec!["kvm: present, denied".to_owned()]);
+        assert!(offer.get("kvm").is_some(), "it is still reported");
+        assert!(offer.available("kvm").is_none(), "but never offered");
+        let held = Holdings::new(offer);
+        assert_eq!(
+            held.check(&labels(&["kvm"])),
+            Err(Contention::NotOffered {
+                label: "kvm".to_owned()
+            })
+        );
+    }
+
+    #[test]
+    fn a_job_needing_nothing_runs_on_an_offer_of_nothing() {
+        let mut held = Holdings::new(CapabilityOffer::empty());
+        admit(&mut held, 0, &[]);
+    }
+
+    // -------------------------------------------- validation ----
+
+    #[test]
+    fn a_capability_nothing_can_hold_is_refused() {
+        let error = Capability::counted("build", 0)
+            .check()
+            .expect_err("counted(0) is not a capability");
+        assert!(error.to_string().contains("counted(0)"), "{error}");
+    }
+
+    #[test]
+    fn a_capability_that_excludes_itself_is_refused() {
+        let error = Capability::shared("build")
+            .excluding(["build"])
+            .expect("the list itself is valid")
+            .check()
+            .expect_err("a capability cannot exclude itself");
+        assert!(error.to_string().contains("build"), "{error}");
+    }
+
+    #[test]
+    fn a_probe_that_means_both_things_with_one_code_is_refused() {
+        let error = Capability::shared("metal-pc")
+            .probed_by(BusyProbe::Command {
+                command: vec!["/bin/true".to_owned()],
+                busy_exit_code: 0,
+                free_exit_code: 0,
+            })
+            .check()
+            .expect_err("one code cannot mean both");
+        assert!(error.to_string().contains('0'), "{error}");
+    }
+
+    #[test]
+    fn an_empty_probe_is_refused() {
+        assert!(BusyProbe::lock_file("").check().is_err());
+        assert!(BusyProbe::command(Vec::<String>::new()).check().is_err());
+    }
+
+    #[test]
+    fn a_label_set_is_sorted_deduplicated_and_checked() {
+        let set = LabelSet::new(["reference", "build", "build"]).expect("valid");
+        assert_eq!(set.as_slice(), ["build", "reference"]);
+        assert_eq!(set.len(), 2);
+        assert!(set.contains("build"));
+        assert!(!set.contains("kvm"));
+        assert_eq!(set.to_string(), "build, reference");
+        assert_eq!(LabelSet::default().to_string(), "none");
+        for bad in ["", "Build", "a b", "a,b", "a:b", &"x".repeat(65)] {
+            assert!(
+                LabelSet::of(bad).is_err(),
+                "{bad:?} must not be a label"
+            );
+        }
+        assert!(LabelSet::of(&"x".repeat(64)).is_ok());
+    }
+
+    /// E-28 again, from the algebra's side: nothing here knows the name
+    /// `reference`, so it has to behave exactly as another shared capability
+    /// does — including under every rule above.
+    #[test]
+    fn the_reference_label_is_governed_by_its_kind_and_nothing_else() {
+        let mut named = holdings(vec![Capability::shared("reference")]);
+        let mut other = holdings(vec![Capability::shared("something-else")]);
+        for n in 0..3 {
+            admit(&mut named, n, &["reference"]);
+            admit(&mut other, n, &["something-else"]);
+        }
+        assert_eq!(named.running(), other.running());
+        // And declared `counted(1)` instead, it is governed as that, with no
+        // special case for the name.
+        let mut counted = holdings(vec![Capability::counted("reference", 1)]);
+        admit(&mut counted, 0, &["reference"]);
+        assert!(matches!(
+            refuse(&counted, &["reference"]),
+            Contention::NoSlot { slots: 1, .. }
+        ));
+    }
+
+    /// E-27: the lease model, with nothing in the algebra reading the prefix.
+    #[test]
+    fn a_metal_lease_is_the_lease_model_and_not_a_kind() {
+        let lease = Capability::lease(
+            metal_label("pc"),
+            BusyProbe::lock_file("/run/herd/metal-pc.lease"),
+        );
+        assert_eq!(lease.name, "metal-pc");
+        assert_eq!(lease.kind, CapabilityKind::Counted { slots: 1 });
+        assert!(lease.busy_probe.is_some());
+        // The same thing written out by hand is the same capability: there is
+        // no lease type and no metal rule.
+        let by_hand = Capability::counted("metal-pc", 1)
+            .probed_by(BusyProbe::lock_file("/run/herd/metal-pc.lease"));
+        assert_eq!(lease, by_hand);
+    }
+}
