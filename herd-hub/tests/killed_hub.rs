@@ -1890,3 +1890,101 @@ async fn a_runner_reporting_too_rarely_for_the_hub_s_threshold_is_refused_by_fig
     often.signal(rustix::process::Signal::TERM).await;
     hub.signal(rustix::process::Signal::TERM).await;
 }
+
+/// The exact reproduction that found this hole: `--health-every 0` used to be
+/// read as "no cadence to judge" and let through every one of the three
+/// places that call [`herd_proto::silence_threshold_refusal`].
+///
+/// `herd-hub --health-every 1 --lost-after 3` is a legitimate pairing on its
+/// own (three seconds outlasts three one-second reports) and still starts.
+/// `herd-runner --health-every 0 --hub-silence-limit 30` is not: a runner
+/// that never reports is not one thirty seconds of silence can be judged
+/// against. It used to start anyway, dial this very hub, cross its
+/// handshake, and then simply never report — a quiet `sleep 30` burnt both
+/// its attempts and ended `lost` in about seven seconds, the identical
+/// symptom D53's refusal exists to close. Now it refuses before it ever
+/// dials, naming the figure.
+///
+/// The other half of D44's precedent — a figure is refused by name, not
+/// reinterpreted — is that a hub asked to *declare* a cadence of zero for
+/// itself is refused exactly the same way a runner *reporting* zero is.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_health_cadence_of_zero_is_refused_on_both_sides() {
+    let herd = Herd::new();
+
+    // Timed and `kill_on_drop`, not a bare blocking `.output()`: the defect
+    // this guards is a runner that joins and sits connected rather than
+    // refusing, and a test that cannot tell that apart from "still starting"
+    // would hang on the very regression it exists to catch, instead of
+    // failing it.
+    let runner_output = Command::new(binary("herd-runner"))
+        .arg("--hub")
+        .arg(herd.url())
+        .arg("--data-root")
+        .arg(herd.runner_root("zero"))
+        .arg("--health-every")
+        .arg("0")
+        .arg("--hub-silence-limit")
+        .arg("30")
+        .kill_on_drop(true)
+        .output();
+    let runner = tokio::time::timeout(PATIENCE, runner_output)
+        .await
+        .unwrap_or_else(|_| {
+            panic!(
+                "a runner reporting at a cadence of zero must refuse at startup, not join \
+                 the hub and sit connected"
+            )
+        })
+        .expect("herd-runner runs");
+    assert!(
+        !runner.status.success(),
+        "a runner that never reports must not start, let alone dial a hub"
+    );
+    let said = String::from_utf8_lossy(&runner.stderr);
+    assert!(
+        said.contains("0s"),
+        "the refusal must name the figure that is wrong: {said}"
+    );
+
+    // The reproduction's own hub: a legitimate pairing on its own terms, so
+    // it starts exactly as it did before this fix — the defect was never on
+    // this side of this particular pairing, only the runner's.
+    let mut hub = herd
+        .start_hub_with("first", &["--health-every", "1", "--lost-after", "3"])
+        .await;
+
+    // A hub declaring a cadence of zero for itself, on a fresh port since the
+    // one above is already bound.
+    let declares_zero = Herd::new();
+    let bad_hub_output = Command::new(binary("herd-hub"))
+        .arg("--listen")
+        .arg(declares_zero.addr().to_string())
+        .arg("--state-dir")
+        .arg(declares_zero.state.path())
+        .arg("--health-every")
+        .arg("0")
+        .kill_on_drop(true)
+        .output();
+    let bad_hub = tokio::time::timeout(PATIENCE, bad_hub_output)
+        .await
+        .unwrap_or_else(|_| {
+            panic!("a hub declaring a cadence of zero must refuse at startup, not bind its port")
+        })
+        .expect("herd-hub runs");
+    assert!(
+        !bad_hub.status.success(),
+        "a hub that declares a cadence of zero must not start either"
+    );
+    let said = String::from_utf8_lossy(&bad_hub.stderr);
+    assert!(
+        said.contains("0s"),
+        "the hub's own refusal must name the figure too: {said}"
+    );
+    assert!(
+        TcpStream::connect(declares_zero.addr()).is_err(),
+        "a refused hub must not be listening"
+    );
+
+    hub.signal(rustix::process::Signal::TERM).await;
+}

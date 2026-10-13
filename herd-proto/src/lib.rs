@@ -65,6 +65,15 @@ pub const SILENCE_MARGIN: u32 = 3;
 /// both attempts of a quiet `sleep 30` in about six seconds and ended it
 /// `lost`. Neither side is wrong on its own; only the pair is, and only the
 /// handshake can see the pair.
+///
+/// A cadence of zero used to be read as "no cadence to judge", and let the
+/// check through: `--health-every 0` paired with `--health-every 1
+/// --lost-after 3` passed every one of these three call sites, the runner
+/// never reported, and the same `lost` a mismeasured pair produces followed.
+/// Zero is not an unset cadence, it is a runner that never reports at
+/// all — so it is refused here, naming the figure, exactly where the three
+/// call sites already turn to this function (D44's precedent: a ceiling of
+/// zero is refused by name rather than let through as "nothing to measure").
 pub fn silence_threshold_refusal(
     threshold_name: &str,
     threshold: Duration,
@@ -72,7 +81,11 @@ pub fn silence_threshold_refusal(
     interval: Duration,
 ) -> Option<String> {
     if interval.is_zero() {
-        return None;
+        return Some(format!(
+            "{interval_name} is 0s: a health cadence of zero is not a cadence, there is \
+             nothing for {threshold_name} to outlast and nothing a runner ever really reports \
+             at"
+        ));
     }
     let needed = interval.saturating_mul(SILENCE_MARGIN);
     if threshold >= needed {
