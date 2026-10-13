@@ -618,3 +618,199 @@ not an oversight, and it is the first thing to raise with the first consumer.
 
 **Alternative rejected.** Holding privilege to build a namespace, which
 breaks E-46 and invariant 2's spirit.
+
+---
+
+## 2026-10-13 — D29 The log file is arrival-ordered
+
+**Context.** The single `log` file interleaves stdout and stderr by
+arrival, so `echo OUT1; echo ERR1 >&2; echo OUT2` may legitimately
+record `OUT1 OUT2 ERR1`, and the store was discarding the per-job
+sequence numbers that decision D4 introduced on day one.
+
+**Choice.** The log is the job's output as a terminal would have shown
+it, and promises no per-stream exactness; the sequence numbers serve
+**gap detection**, not reordering.
+
+**Alternative rejected.** Reconstructing true interleaving, which would
+cost a second index on every chunk of a three-million-line job for a
+transcript nobody reads that way.
+
+---
+
+## 2026-10-13 — D30 An unmeasurable workspace is a cap failure, never a success
+
+**Context.** A job could blind the runner's disk accounting with
+`chmod 300` on a subdirectory, be reported `Exited{0}`, and leave
+100 MB on the host permanently — invariant 2.
+
+**Choice.** The runner restores the access it owns in order to
+measure, and if a figure cannot be measured the job ends as
+`stopped_by_cap{disk}` with the figure **absent**; a measured zero and
+an unmeasured figure are different values and must never be confused.
+
+**Alternative rejected.** Treating an unreadable directory as zero
+bytes, which is how the bypass worked.
+
+---
+
+## 2026-10-13 — D31 A breached cap outranks the child's exit status
+
+**Context.** A job that breached its log cap and then exited promptly
+was reported `Exited{0}` with the log silently truncated, and one
+that kept writing surfaced the cap's own `SIGPIPE` as the job's
+verdict. A build service that reports a truncated build as green has
+no worse failure mode.
+
+**Choice.** The cap is re-read after the child is gone and always
+wins, ending the job as `stopped_by_cap` and exiting 124.
+
+**Alternative rejected.** Reporting whichever came first, which makes
+the verdict a race.
+
+---
+
+## 2026-10-13 — D32 One runner per data root
+
+**Context.** Two runners sharing a data root made workspaces, cgroup
+names and the reaper ambiguous, and "left behind by a dead runner"
+meaningless.
+
+**Choice.** The runner locks its data root at startup and refuses a
+second one by naming the holder — the same choice D21 made for the
+hub's state root.
+
+**Alternative rejected.** Namespacing per runner inside one root,
+which keeps the ambiguity and buys nothing.
+
+---
+
+## 2026-10-13 — D33 An explicit cgroup root that cannot be used refuses
+
+**Context.** D23's `RLIMIT_AS` fallback exists for a *host* that
+cannot delegate a cgroup; an operator who names a specific subtree is
+making a precise request.
+
+**Choice.** An unusable explicit `--cgroup-root` refuses the startup,
+naming what the operator must grant — cgroup v2 needs write access on
+the **common ancestor's** `cgroup.procs` — while an absent one still
+falls back loudly.
+
+**Alternative rejected.** Falling back silently from an explicit
+request, which would hand someone a weaker ceiling than they asked
+for without telling them.
+
+---
+
+## 2026-10-13 — D34 An unacknowledged verdict is spooled on the way out
+
+**Context.** D17 has a runner hold a finished result until the hub
+acknowledges it, and D19 forbids ever destroying an outcome, but a
+runner told to stop while the hub is unreachable had nowhere to put
+one.
+
+**Choice.** On its way out the runner writes the `job_finished` frame
+verbatim and fsynced to `<data root>/held-results/<job>.json`,
+outside `jobs/` so the startup reaper cannot clear it, naming each
+path on stderr; it first ends its jobs, then keeps serving a live hub
+briefly so an acknowledgement still lands rather than spooling a
+verdict the hub already has.
+
+**Alternative rejected.** Dropping the verdict on stop, which is the
+one thing Herd never does.
+
+---
+
+## 2026-10-13 — D35 The job record's metric field names follow the protocol
+
+**Context.** M2 reserved placeholder metric fields in the hub's
+`job.json` and M4 filled them from `herd-proto`'s own type; two names
+for one thing would be two truths, against invariant 4.
+
+**Choice.** The record carries the protocol's names —
+`host_load_milli`, `peak_memory_bytes`, `bytes_written`, `log_bytes`,
+`wall_time_ms` — and `RECORD_VERSION` stays 1 because nothing is
+deployed.
+
+**Alternative rejected.** Keeping both sets behind a translation
+layer.
+
+---
+
+## 2026-10-13 — D36 A runner holds its output until it is acknowledged
+
+**Context.** A log could lose its tail invisibly, because a gap is
+only detectable when the chunk after it arrives, so chunks lost with
+nothing following left the record silently short.
+
+**Choice.** The runner holds log chunks until the hub acknowledges
+them, replays them on attach, and `job_finished` carries the
+attempt's chunk count so a missing tail is asked for once and named
+only if it never comes; the holding is bounded at 4 MiB per job, and
+`log.seq` counts **bytes**, because a chunk appended but never
+counted was being written twice after a `kill -9`.
+
+**Alternative rejected.** Unbounded holding, which turns a long
+outage into a runner that eats its own host.
+
+---
+
+## 2026-10-13 — D37 What is timed for loss is an attempt, not a connection
+
+**Context.** "Sixty seconds of silence means lost" does not say
+whose silence, and timing the connection is wrong twice over — a
+replacement runner masks the loss of the old one's job, and a runner
+killed and restarted is connected and perfectly healthy while its
+job exists nowhere.
+
+**Choice.** The hub times the **attempt**.
+
+**Alternative rejected.** Timing the connection, which both of this
+milestone's real-binary failures came from.
+
+---
+
+## 2026-10-13 — D38 Waiting is not being refused
+
+**Context.** D13 makes `Refused` the hub's single terminal "no" and
+always the last frame, so a runner redialing into a hub that had not
+yet noticed its previous connection was told "a runner is already
+connected" and died of its own reconnection.
+
+**Choice.** A new `StandBy { reason, retry_in_ms }` frame says
+"wait", with a same-name supersede rule, leaving `Refused` terminal
+exactly as D13 intended.
+
+**Alternative rejected.** Reusing `Refused` for a transient state,
+which D13 explicitly forbids and M8's explained waits would have
+broken next.
+
+---
+
+## 2026-10-13 — D39 Two attempts, counted by the record
+
+**Context.** E-21 requeues a lost job **once**, and the count has to
+live somewhere that survives a hub restart.
+
+**Choice.** The attempts are the entries on the job's own record, so
+the limit is read from durable state rather than held in memory; a
+second loss is a terminal outcome, not a third attempt. A drain race
+can spend the second attempt before anything ran — chosen
+deliberately, not an oversight.
+
+**Alternative rejected.** A counter in the queue entry, which a
+restart would have to reconstruct anyway.
+
+---
+
+## 2026-10-13 — D40 `cancelled` and `lost` are outcome variants
+
+**Context.** D15 made a job's end a tagged outcome so that a new way
+to end is a new variant and never a magic number.
+
+**Choice.** A cancelled job and a job whose runner was lost twice
+both end as named `JobOutcome` variants, and both exit **125**
+because Herd has no verdict to give — consistent with D20.
+
+**Alternative rejected.** Inventing a distinct exit code for each,
+which multiplies sentinels colliding with real exit codes.
