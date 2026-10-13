@@ -32,11 +32,11 @@ closes in M18.
 | E-21 | must | lost runner, requeue once | M3 | merged | silence threshold is hub policy; a second loss ends the job `lost`; verified: two attempts, never a third, across six alternating runner lives |
 | E-22 | must | build slots, derived -j | M7 | planned |  |
 | E-23 | should | placement prefers cache locality | M12 | planned | preference only; E-19 governs waiting |
-| E-24 | must | probed/declared/denied labels | M5 | in review (PR #9) |  |
-| E-25 | must | capability kinds and exclusion | M7 | planned | model in M5; contention enforcement tested in M7 |
-| E-26 | must | externally busy capability | M5 | in review (PR #9) | wait-reason wording polished by M8; in review: a duplicated key in the capability file can still offer a capability unprobed (fix in flight) |
-| E-27 | must | metal lease, drain first | M9 | planned | lease model in M5; drain-first in M9 |
-| E-28 | must | reference label carried | M5 | in review (PR #9) |  |
+| E-24 | must | probed/declared/denied labels | M5 | in review (PR #9) | the offer and its origins; matching them at claim time is M7 |
+| E-25 | must | capability kinds and exclusion | M7 | planned | algebra and closure land in M5 (symmetric, not transitive); contention enforcement tested in M7 |
+| E-26 | must | externally busy capability | M5 | in review (PR #9) | a probe nobody can read suspends too; an unknown *or duplicated* key in the capability file refuses the runner's startup; wait-reason wording polished by M8 |
+| E-27 | must | metal lease, drain first | M9 | planned | lease model lands in M5 as counted(1) plus a probe; drain-first in M9 |
+| E-28 | must | reference label carried | M5 | in review (PR #9) | a capability like any other; placement preferring it last is M12 |
 | E-29 | must | memory admission with floor | M8 | planned |  |
 | E-30 | must | kernel memory ceiling | M4 | merged | WSL OOM replay is a manual M17 check; real ceiling asserted only under a delegated cgroup; RLIMIT_AS fallback per D23 |
 | E-31 | must | tmpfs reservation, wait | M8 | planned |  |
