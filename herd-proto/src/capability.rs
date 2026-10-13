@@ -874,6 +874,32 @@ impl Contention {
     pub fn is_impossible(&self) -> bool {
         matches!(self, Contention::ExcludedWithin { .. })
     }
+
+    /// Whether waiting on *this* runner can clear it.
+    ///
+    /// The distinction M7 is built on (E-36). A slot that is taken, an
+    /// exclusion held by a job that is running, a host emptied for something
+    /// host-wide: every one of those ends when that work ends, so the job
+    /// waits here. A label this runner does not offer, and a label set that
+    /// contradicts itself, are not about the moment at all — no amount of
+    /// waiting *here* changes them, and a hub that treated them as "busy"
+    /// would hold a job against a machine that will never run it.
+    ///
+    /// What to do with a `false` is still the hub's: a label nobody offers
+    /// may be offered by a runner that has not joined yet, so the job waits
+    /// for the *fleet* even while it stops waiting for this runner. Only
+    /// [`Self::is_impossible`] ends a job (E-36).
+    pub fn clears_with_time(&self) -> bool {
+        match self {
+            Contention::NoSlot { .. }
+            | Contention::Excluded { .. }
+            | Contention::ExclusiveNeedsIdle { .. }
+            | Contention::HostIsExclusive { .. } => true,
+            Contention::NotOffered { .. }
+            | Contention::ExcludedWithin { .. }
+            | Contention::AlreadyHolding { .. } => false,
+        }
+    }
 }
 
 impl fmt::Display for Contention {
@@ -1030,6 +1056,28 @@ impl Holdings {
         self.check(&labels)?;
         self.held.insert(job.clone(), labels);
         Ok(())
+    }
+
+    /// Write down something that is **already** running, without checking it.
+    ///
+    /// For rebuilding the holdings of a runner from the durable records of
+    /// the jobs out on it, which is how the hub knows what a machine is
+    /// holding at all (no counter: see `herd_hub::matcher`). It takes no
+    /// answer because there is no question — the job *is* running there, and
+    /// the only thing a check could do is refuse to write down a fact.
+    ///
+    /// That refusal is exactly the bug it exists to prevent. A job holding a
+    /// label its runner has since stopped offering fails [`Self::check`], so
+    /// `admit` would leave it out of the holdings; the host would then read
+    /// as idle, and a host-wide capability would be handed out on top of work
+    /// that is still running (D46). What is out there is out there, whatever
+    /// the offer says now.
+    ///
+    /// A job already in the holdings keeps the labels it was first written
+    /// with: a relabel is what [`Contention::AlreadyHolding`] exists to
+    /// refuse, and a rebuild must not be the one path that does it.
+    pub fn already_holding(&mut self, job: &JobId, labels: LabelSet) {
+        self.held.entry(job.clone()).or_insert(labels);
     }
 
     /// Give back whatever a job was holding. Idempotent: a job that ended
