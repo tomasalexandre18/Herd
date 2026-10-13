@@ -135,8 +135,15 @@ pub struct Attempt {
     /// The runner the attempt was handed to, by the name it announced.
     pub runner: String,
     pub started_at: Timestamp,
+    /// When this attempt stopped being the one the hub is waiting for,
+    /// whichever way it ended: lost, abandoned, superseded — or finished,
+    /// which is the ordinary way and was the one that used to be left unset.
+    /// `None` means the attempt is under way, and nothing else does.
     pub ended_at: Option<Timestamp>,
     /// Why this attempt ended without a verdict, when that is what happened.
+    /// `None` on the attempt that produced one: the job's outcome is the
+    /// answer, so there is nothing to excuse (see [`Attempt::ended_at`] for
+    /// the moment, which is set either way).
     pub ended: Option<String>,
 }
 
@@ -183,12 +190,19 @@ impl JobRecord {
     /// hub is waiting for.
     ///
     /// False for an attempt that has been superseded by a later one, and false
-    /// for one that has been ended by name — a runner declared lost and come
-    /// back may not finish what the hub has already written off (E-21).
+    /// for one that has ended — a runner declared lost and come back may not
+    /// finish what the hub has already written off (E-21), and neither may
+    /// anybody go on talking about an attempt that produced its job's verdict.
+    ///
+    /// What is tested is [`Attempt::ended_at`] and not [`Attempt::ended`].
+    /// `ended` is a sentence, and the attempt that produces a verdict has
+    /// nothing to excuse — so testing it made every normally-finished job's
+    /// attempt read as current for ever, which is how a late frame bearing
+    /// the *correct* runner name got through the ownership gate.
     pub fn attempt_is_current(&self, attempt: u32) -> bool {
         self.attempts
             .last()
-            .is_some_and(|current| current.number == attempt && current.ended.is_none())
+            .is_some_and(|current| current.number == attempt && current.ended_at.is_none())
     }
 }
 
@@ -337,6 +351,14 @@ pub enum LogWrite {
 /// Deliberately boring and synchronous: the writes are small files, and the
 /// hub's correctness depends on a transition being on the disk before the
 /// hub acts on it — an acknowledgement to a runner, above all.
+/// **Every writer here refuses a job that is over.** A terminal record is the
+/// last thing a job ever has — its outcome, its measurements and its log are
+/// closed together — so `record_state`, `record_metrics`, `begin_attempt`,
+/// `end_attempt`, `append_log` and `name_missing_log` all answer a finished
+/// job with an error naming it, and the hub refuses such a frame by name
+/// before it ever gets here. What is terminal is the *job*: a first attempt
+/// ending is how a requeue begins (E-21), and that record is `queued` a
+/// moment later.
 pub trait JobStore: Send + Sync + 'static {
     /// Who the state this store keeps belongs to, as the handshake carries it
     /// (see `JobDirStore::state_root_id`).
@@ -353,9 +375,10 @@ pub trait JobStore: Send + Sync + 'static {
     fn create_job(&self, command: Vec<String>) -> Result<JobRecord>;
 
     /// Record a transition, with the moment it happened. Unknown ids are an
-    /// error, not a silent no-op. Reporting the same end twice is accepted:
-    /// that is a runner redelivering a result whose acknowledgement it never
-    /// saw, not a second ending.
+    /// error, not a silent no-op, and so is a job that is already over — a
+    /// runner redelivering a result whose acknowledgement it never saw is
+    /// told by name that the record holds its end already, and drops it
+    /// (D42), rather than writing the same ending twice.
     fn record_state(&self, id: &JobId, state: JobState) -> Result<()>;
 
     /// Record what the runner measured (E-15). Separate from the transition
