@@ -48,7 +48,9 @@ Four caveats, detailed in `docs/coverage.md`:
    so Herd must not be exposed beyond loopback.
 2. E-45's confinement is cooperative only (D28); the deployment host's
    runner user is additionally in the `docker` group, root-equivalent
-   through the container socket.
+   through the container socket. chatOnS named this a blocker (issue
+   #16); D78 agrees without reservation — removing the group is a
+   NixOS change, Alexa's to make, landing with M16.
 3. E-30's real kernel ceiling needs a delegated cgroup; the WSL replay
    on real hardware is a manual M17 check.
 4. Nothing is deployed, so `PROTOCOL_VERSION` and `RECORD_VERSION`
@@ -76,9 +78,13 @@ owner's only outstanding decision; it blocks nothing before M16.
 - GitHub: `tomasalexandre18` via `gh`. `main` protected (a pull
   request, `check` + `docs` green, no force push, no deletion). Issue
   #1 open, unanswered — replying is outward-facing, waits for Alexa.
+  Issue #16 (chatOnS's six deliverables, plus the `docker`-group
+  requirement) is triaged into D74-D78 and the matching plan edits;
+  replying is outward-facing, waits for Alexa too.
 - This machine's SSH key is a deploy key for another repo; git uses
   the HTTPS remote with the `gh` credential helper.
 
 ## Next action
 
-Start milestone M6 (queue and priorities).
+Land `m6-queue-priorities` (PR #15), then start M7, which now places
+against the requirements already on the job's record (D74).
