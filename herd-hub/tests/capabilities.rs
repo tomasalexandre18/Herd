@@ -880,3 +880,152 @@ async fn a_following_requester_is_told_why_its_job_waits_and_then_gets_it() {
         herd.said("run")
     );
 }
+
+/// D13, against the real hub: an offer the hub cannot read is refused with a
+/// sentence, and that sentence is the last frame.
+///
+/// A capability offer is validated as it is decoded (E-24), so one mistake in
+/// a peer's configuration — here, `build` offered twice — makes its whole
+/// `Hello` undecodable. The hub used to drop the connection: the reason went
+/// to the hub's stdout, on a machine the runner's owner does not read, and
+/// the owner got a reset socket. That is the same shape of mistake M3 already
+/// refuses by name for a runner announcing neither name nor instance — it
+/// will say the same thing on the next dial — so it gets the same answer:
+/// `Refused { reason }`, carrying what was wrong, and nothing after it.
+///
+/// A hand-written peer, because a correctly built `herd-runner` cannot send
+/// this: it validates the same offer at startup and refuses to start. What is
+/// being pinned is the hub's answer to a peer that is wrong, whoever wrote it.
+#[tokio::test]
+async fn an_offer_the_hub_cannot_read_is_refused_with_the_reason_as_the_last_frame() {
+    use futures_util::{SinkExt, StreamExt};
+    use tokio_tungstenite::tungstenite::Message;
+
+    let mut herd = Herd::new();
+    herd.start_hub().await;
+
+    let (mut socket, _response) = tokio_tungstenite::connect_async(herd.url())
+        .await
+        .expect("the hub accepts the connection");
+    // One name, two entries, each with a kind of its own: a runner offers a
+    // capability once, and the algebra says so where it is decoded.
+    let hello = format!(
+        r#"{{"type":"hello","protocol_version":{},"role":"runner",
+            "name":"the-wrong-runner","instance":"run-1",
+            "capabilities":[
+              {{"name":"build","kind":{{"type":"shared"}},"origins":{{"declared":true}}}},
+              {{"name":"build","kind":{{"type":"exclusive"}},"origins":{{"declared":true}}}}]}}"#,
+        herd_proto::PROTOCOL_VERSION
+    );
+    socket
+        .send(Message::text(hello))
+        .await
+        .expect("the hello is sent");
+
+    let answer = tokio::time::timeout(PATIENCE, socket.next())
+        .await
+        .expect("the hub answers rather than going quiet")
+        .expect("there is a frame")
+        .expect("the frame reads");
+    let text = answer.to_text().expect("the protocol carries text (D4)");
+    let refusal: herd_proto::FromHub =
+        herd_proto::from_frame(text).unwrap_or_else(|e| panic!("{text} decodes: {e}"));
+    let herd_proto::FromHub::Refused { reason } = refusal else {
+        panic!("an offer that cannot be read is a terminal no (D13), not {text}");
+    };
+    assert!(
+        reason.contains("build"),
+        "the refusal must name what was wrong with the offer: {reason}"
+    );
+    assert!(
+        reason.contains("dialling again will not change it"),
+        "and say that coming back will not help, which is what makes it \
+         terminal rather than a stand-by: {reason}"
+    );
+
+    // Last frame: nothing else comes, and the hub closes.
+    let after = tokio::time::timeout(PATIENCE, socket.next())
+        .await
+        .expect("the hub closes rather than holding the connection open");
+    match after {
+        None | Some(Ok(Message::Close(_))) => {}
+        other => panic!("the refusal must be the last frame, not followed by {other:?}"),
+    }
+
+    // And the hub is still a hub: the refusal cost it nothing.
+    herd.start_runner(None, &[]).await;
+}
+
+/// The other half of D13, from the runner's side: a refused runner says why
+/// before it stops.
+///
+/// A reason the hub takes the trouble to send is worth nothing if the runner
+/// swallows it. The hub here is hand-written, because the point is what the
+/// **real `herd-runner` binary** does with a `Refused` frame — and a hub that
+/// refuses a correctly built runner is not something this suite can arrange,
+/// which is exactly why the frame has to be tested from this end too.
+#[tokio::test]
+async fn a_refused_runner_prints_the_reason_before_it_stops() {
+    use futures_util::{SinkExt, StreamExt};
+    use tokio_tungstenite::tungstenite::Message;
+
+    const REASON: &str = "this hub could not read the handshake: build is offered twice";
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("a free loopback port");
+    let addr = listener
+        .local_addr()
+        .expect("a bound listener has an address");
+    let hub = tokio::spawn(async move {
+        let (stream, _from) = listener.accept().await.expect("the runner dials in");
+        let mut socket = tokio_tungstenite::accept_async(stream)
+            .await
+            .expect("the websocket handshake");
+        let _hello = socket.next().await.expect("the runner says hello");
+        socket
+            .send(Message::text(
+                herd_proto::to_frame(&herd_proto::FromHub::Refused {
+                    reason: REASON.to_owned(),
+                })
+                .expect("the refusal encodes"),
+            ))
+            .await
+            .expect("the refusal is sent");
+        let _ = socket.close(None).await;
+    });
+
+    let logs = tempfile::tempdir().expect("a temporary directory for the logs");
+    let data_root = tempfile::tempdir().expect("a temporary data root");
+    let stderr = logs.path().join("runner-err");
+    let mut child = Command::new(binary("herd-runner"))
+        .arg("--hub")
+        .arg(format!("ws://{addr}"))
+        .arg("--name")
+        .arg("the-refused-runner")
+        .arg("--data-root")
+        .arg(data_root.path())
+        .arg("--no-detect")
+        .stdout(Stdio::null())
+        .stderr(Stdio::from(
+            File::create(&stderr).expect("a file for the runner's stderr"),
+        ))
+        .kill_on_drop(true)
+        .spawn()
+        .expect("herd-runner starts");
+
+    let ended = tokio::time::timeout(PATIENCE, child.wait())
+        .await
+        .expect("a refused runner stops rather than redialling for ever")
+        .expect("the runner's exit status reads");
+    let said = std::fs::read_to_string(&stderr).unwrap_or_default();
+    assert!(
+        said.contains(REASON),
+        "a refused runner must print the hub's reason, not die mute: {said:?}"
+    );
+    assert!(
+        !ended.success(),
+        "and it must leave a failing status behind: {ended:?}"
+    );
+    hub.await.expect("the hand-written hub ends");
+}
