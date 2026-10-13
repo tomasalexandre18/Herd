@@ -1590,3 +1590,231 @@ user from the group is a NixOS change that is Alexa's to make.
 runner does not use it. Rejected because the consumer's rule is about
 what is *reachable*, not about what is used, and a bug or a bad job is
 precisely the case the rule exists for.
+
+## 2026-10-13 — D79 Holdings are read from the records, never counted
+
+**Context.** M7 has to know how many slots of a counted capability are
+taken on each runner (E-22, E-25). The obvious shape is a counter per
+runner, incremented at the claim and decremented when the job ends. That
+counter has one job — never, ever to leak — and seven ways to fail it: a
+job exits, is signalled, is stopped by a cap, is cancelled queued, is
+cancelled running, is lost, is superseded by a requeue, or its runner's
+link drops mid-job. A hub restart has to rebuild it. One forgotten path
+halves a machine for the rest of the hub's life, silently.
+
+**Choice.** There is no counter. A runner's holdings are rebuilt at the
+start of **every dispatch pass** from the job records: a job holds its
+labels on the runner of its open attempt exactly while its record is
+`assigned`, `running` or `interrupted` with an attempt that has no
+`ended_at`. That is the same fact the watchdog, the requeue and the
+restart already work from, so the release *is* the write that ends the
+job and there is no second path to forget. A hub that restarts reads the
+same thing the hub before it would have read, so "rebuilt after a
+restart" is not a code path either — there is nothing to rebuild.
+
+The pass carries its holdings forward as it goes: a job placed on the
+first job of a pass contends with the second one in the same pass, which
+is what stops an exclusive claim and a counted claim being admitted
+together. Taking the labels is [`Holdings::admit`], which checks again
+under the claim lock before it writes, so a judgement that has gone
+stale places nothing.
+
+A job the records say is out there is written into the holdings
+**unchecked** (`Holdings::already_holding`). Checking would refuse to
+write down a job whose label its runner has since stopped offering, the
+host would read as idle, and something host-wide would be handed out on
+top of work that is still running.
+
+**Cost.** One read of the unfinished job directories per pass, which
+every pass already did for the queue's order (E-20), plus a few
+hundred bytes of holdings per pass. At the first consumer's scale — tens
+of unfinished jobs, two runners — that is nothing, and it buys a class
+of defect that cannot be represented.
+
+**Alternative rejected.** A counter with a careful release on every
+path. Rejected on the arithmetic above: eight release paths and a
+restart, against a derived value that cannot drift from the record it is
+derived from.
+
+---
+
+## 2026-10-13 — D80 A draining runner is not available, so nothing waits for it
+
+**Context.** E-19 says a job waits for a runner of its labels "as long as
+such a runner is available (connected, switch on)". A runner that is
+**draining** — asked to stop, finishing what it has, taking nothing new,
+gone inside five seconds (invariant 2) — is connected. So the question
+had to be answered either way, and tested either way.
+
+**Choice.** Draining is **not available**. A job does not stick to a
+machine that is leaving; it is placed on the next eligible runner at
+once, and the sentence of a job that has nowhere else to go names the
+drain. The claim step still *sees* a draining runner and still says so,
+rather than leaving it out of the fleet: a job that cannot run has to be
+able to say that the machine it would have gone to is on its way out.
+
+**Why this way round.** The harm is one-sided. Waiting for a draining
+runner costs the whole drain and then a re-judgement anyway, on a
+machine that by then offers nothing — up to the stickiness limit of
+three hours if the drain is a shutdown. Not waiting costs a job that
+runs on a less preferred machine, which is slower and correct. E-19's
+own words are "connected, switch on", and a draining runner has in
+effect already answered that switch.
+
+**Alternative rejected.** Reading "connected" literally, so a drain
+holds its queue for three hours. Rejected because an owner shutting her
+PC down is the case E-19 exists to serve, not the case it exists to
+fight.
+
+---
+
+## 2026-10-13 — D81 Preference is one integer, declared by the machine
+
+**Context.** E-19 asks for a job to wait for the runner of its labels
+rather than fall back to another eligible one, and its acceptance
+criterion is "with the PC on and busy, a second build shows `queued 2nd
+on pc` and never moves to the server". That only means something if the
+hub knows the PC is the *right* machine for a build — the consumer
+measures it at 3.1x their loaded server — and a requester may never name
+a machine (invariant 6).
+
+**Choice.** A runner declares one integer in its handshake:
+`--preference N`, higher first, zero by default. The claim step places a
+job on the most preferred runner that can take it now; when the most
+preferred *available* runner cannot take it now, the job waits for that
+one. The figure is in the line explaining every placement and in the
+sentence of every job waiting on it.
+
+One integer, per machine, and nothing more: not per capability, not per
+job, not an expression. M12 adds cache locality (E-23) as a further term
+on top of it rather than a second mechanism, and the moment this wants
+to be anything a person would call a rule, invariant 1 says no.
+
+**What it costs, said plainly.** E-19 is a deliberate loss of
+throughput: three builds submitted at once on this fleet queue behind
+the one slot of the preferred machine while a two-slot machine sits
+idle, until the stickiness limit lets them move. That is what the first
+consumer asked for and what their acceptance criterion asserts. The
+limit is what keeps it from being starvation, and it is why E-19 asks
+for the limit to be visible.
+
+**A consequence worth knowing.** A job waiting for its preferred runner
+does **not** hold the queue behind it: the next job is offered to the
+fleet as usual. So a lower-priority job can take a free lesser machine
+while a higher-priority one waits for the machine it prefers. E-19 over
+E-18, bounded by the limit, and said out loud here because it is
+surprising.
+
+**Alternative rejected.** Per-capability preference, which the first
+consumer's fleet does not need — the only label two of their machines
+both offer is `build` — and which would have been the first line of a
+policy language.
+
+---
+
+## 2026-10-13 — D82 The `-j` is chosen before the requirements are read
+
+**Context.** E-22 derives a build's `-j` from the machine it lands on.
+Issue #16's answers add two facts: their tool treats the figure as a
+**ceiling** — it may run fewer scenarios at once, never more, and lowers
+the count itself when its tmpfs is short — and their `--labels` reading
+computes its memory and tmpfs figures **for the `-j` it was given**. The
+second one is a trap: N comes from the machine's memory, and the job's
+memory requirement comes from a reading that needs N.
+
+**Choice.** **N first, requirements second, placement third.** The
+derived figure is written onto the **job record** (`parallelism`) by the
+same write that numbers the attempt, before the job is handed to
+anything, so that whatever later reads the job's requirements reads the
+N the job was given. No interface in Herd may ask for a job's
+requirements and then choose N, and none may choose N from a reading's
+output.
+
+Because the figure is a property of the machine, a requeue onto a
+differently sized machine derives its own and rewrites the record's
+field; M10's reading must therefore be re-read, or its cache keyed, on
+the figure. The arithmetic of each attempt stays on that attempt's
+explanatory line.
+
+**What it means for admission (M8).** Their ceiling promise is what
+makes this sound: a figure obtained for a given N stays valid on any
+machine, so admitting against N is always safe and Herd never has to
+model their lowering.
+
+**Alternative rejected.** Deriving N at the moment the job is handed
+over, with the record told afterwards. Rejected because it reads
+identically today and is circular the moment M10 lands.
+
+---
+
+## 2026-10-13 — D83 A derived `-j` rounds down and keeps a quarter back
+
+**Context.** E-22 wants `-j` derived from a runner's memory and threads
+at the consumer's measured 1 792 MiB per build thread, and names the
+answer it expects: about `-j 7` on the owner's 17 GiB PC. Three quarters
+of 17 GiB is 13 056 MiB, which is 7 threads of 1 792. All of 17 GiB
+would be 9, two more than they found fits.
+
+**Choice.** `-j = min(threads / slots, (memory × 3 / 4 / slots) /
+1 792)`, rounded **down**, never below 1, with every figure in the line
+that explains the placement.
+
+* **Three quarters.** The last quarter is the host's: the page cache the
+  build reads through, the linker's peak over the mean the per-thread
+  figure is, and the desktop session of whoever owns the machine
+  (invariant 2). It also reproduces their measured figure exactly.
+* **Divided by the slots.** A host must survive **every** slot being
+  full, not the first job to arrive. Two build slots on their 31 GiB
+  server are `-j 6` each, not `-j 12` each.
+* **Rounded down.** A thread the memory does not cover is a host that
+  swaps. Rounding up is the direction that breaks invariant 2.
+* **Never zero.** `-j 0` is "no limit" to `make` and an error to cargo;
+  a slot whose share does not cover one thread gets one thread, and the
+  line says the share does not cover it.
+* **A figure that is missing is missing.** A runner that does not say
+  how much memory or how many threads it has takes no job whose `-j` has
+  to be derived, and the sentence names which figure is absent. `0` is
+  refused where it is written — at the runner's startup — rather than
+  announced as a size: an owner who wants a machine to take no build
+  denies the capability.
+
+**Alternative rejected.** Handing out the whole of the memory and
+letting M8's admission catch the overcommit. Rejected because it would
+contradict the one figure E-22's acceptance criterion names, and because
+the host that swaps is the owner's own PC.
+
+---
+
+## 2026-10-13 — D84 "Nobody ever" ends a job; "nobody now" queues it
+
+**Context.** E-36 asks for impossible label sets to fail fast, and D38
+says waiting is never a refusal. The two meet on one question: a job
+whose labels no connected runner offers — is that an end or a wait?
+
+**Choice.** A job is ended (`JobOutcome::Impossible`, terminal) only
+when nothing about the fleet could ever fix it:
+
+* two of its labels exclude each other on a runner that offers both, so
+  no machine could hold them together;
+* it asks for a derived `-j` and carries no figure to derive it from, or
+  carries a figure of zero, or has nowhere in its command for the figure
+  to go.
+
+Everything else is a **wait**, with its reason on the record: a label
+nothing here offers, a label its owner denied, a label a probe outside
+Herd is holding, a slot that is taken, a host emptied for something
+host-wide, a machine that has not said how big it is. A runner that
+offers the label may dial in a minute from now, and the hub cannot tell
+"nobody has it" from "the machine that has it is switched off" — so it
+must never read the second as the first.
+
+**The order the claim step asks these questions in is load-bearing.**
+Self-contradiction is judged **before** anything about the moment: a job
+asking for two labels that exclude each other, one of which a lock file
+happens to be holding, would otherwise be told it is waiting for that
+lock, for ever, for work that could never have run.
+
+**Alternative rejected.** Keeping a roster of every label the hub has
+ever been offered and failing anything outside it. Rejected because the
+roster would have to be durable to survive a restart, and an empty
+roster on a fresh hub would fail every job in the queue by name.
