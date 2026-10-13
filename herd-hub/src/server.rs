@@ -1353,11 +1353,12 @@ fn dispatch_a_pass(state: &State) -> Result<()> {
 /// that is an hour stale is worse than no figure at all.
 ///
 /// So the queue is also re-judged on a clock. A quarter of the aging step,
-/// never oftener than once a second and never rarer than once a minute: at
-/// the default that is a pass every seven and a half minutes, which costs
-/// one read of the queue, and the pass writes nothing unless a sentence has
-/// actually changed (`record_waiting` writes only what is news). A hub with
-/// nothing queued does not even read: there is nothing to age.
+/// never oftener than once a second and never rarer than once a minute — so
+/// at the default step it is a pass a minute, and a figure in a sentence is
+/// never more than a minute stale. A pass costs one read of the queue, and
+/// writes nothing unless a sentence has actually changed (`record_waiting`
+/// writes only what is news). A hub with nothing queued does not even read:
+/// there is nothing to age.
 async fn let_the_queue_age(state: Arc<State>) {
     let every =
         (state.policy.aging_step / 4).clamp(Duration::from_secs(1), Duration::from_secs(60));

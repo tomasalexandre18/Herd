@@ -965,24 +965,43 @@ impl JobDirStore {
     /// execution. What it may change is the level — "the merged job takes the
     /// higher priority" — and that is a raise like any other, through the one
     /// write door, recorded with its reason.
-    fn join(&self, id: &JobId, asked_for: Priority) -> Result<Submission> {
-        // The raise first, so that the record the caller is handed already
-        // carries the level this submission bought it.
-        let raised = match self.raise_priority_because(
-            id,
-            asked_for,
-            "a second identical submission asked for this level",
-        )? {
-            Raise::Raised { to, .. } => Some(to),
-            Raise::AlreadyThere(_) | Raise::NotARaise { .. } => None,
+    fn join(&self, id: &JobId, asked_for: Priority) -> Result<Option<Submission>> {
+        // One lock for the whole join, held across both writes. The *test*
+        // that the job is still open and the writes that join it have to be
+        // one step: a job that ended in between would otherwise answer this
+        // submission with an error — "that record is over" — where the right
+        // answer is a job of its own (D70). `None` is that answer, and
+        // `submit` mints.
+        let Writable::Live(_live, record) = self.open_unless_over(id)? else {
+            return Ok(None);
         };
-        let (_live, mut record) = self.open_for_writing(id)?;
+        let mut record = *record;
         let at = Timestamp::now();
+        // The raise first, so that the record the caller is handed already
+        // carries the level this submission bought it (E-05).
+        let raise = raise_in_place(&mut record, asked_for, at);
         record.submissions += 1;
         record.updated_at = at;
         self.write_record(&record)?;
+        if let Raise::Raised { from, to } = raise {
+            self.append_event(
+                id,
+                &JobEvent::priority_raised(
+                    at,
+                    from,
+                    to,
+                    "a second identical submission asked for this level".to_owned(),
+                ),
+            )?;
+        }
         self.append_event(id, &JobEvent::joined(at, record.submissions, asked_for))?;
-        Ok(Submission::Joined { record, raised })
+        Ok(Some(Submission::Joined {
+            record,
+            raised: match raise {
+                Raise::Raised { to, .. } => Some(to),
+                Raise::AlreadyThere(_) | Raise::NotARaise { .. } => None,
+            },
+        }))
     }
 
     /// One job's level raised, with the sentence that says who raised it.
@@ -993,24 +1012,14 @@ impl JobDirStore {
     /// refuses a job that is over (D54).
     fn raise_priority_because(&self, id: &JobId, to: Priority, why: &str) -> Result<Raise> {
         let (_live, mut record) = self.open_for_writing(id)?;
-        let from = record.priority;
-        if from == to {
-            return Ok(Raise::AlreadyThere(from));
-        }
-        if from.outranks(to) {
-            return Ok(Raise::NotARaise { from, asked: to });
-        }
         let at = Timestamp::now();
-        record.priority = to;
-        record.updated_at = at;
-        // A level that changed changes why the job is waiting, and the
-        // sentence on the record names the old level. Cleared rather than
-        // rewritten here: the next dispatch pass writes the true one, and
-        // `events.jsonl` keeps the one that was.
-        record.waiting_for = None;
+        let raise = raise_in_place(&mut record, to, at);
+        let Raise::Raised { from, to } = raise else {
+            return Ok(raise);
+        };
         self.write_record(&record)?;
         self.append_event(id, &JobEvent::priority_raised(at, from, to, why.to_owned()))?;
-        Ok(Raise::Raised { from, to })
+        Ok(raise)
     }
 }
 
@@ -1042,7 +1051,13 @@ impl JobStore for JobDirStore {
                 if let Ok(Some(record)) = self.read_record(&id) {
                     if !record.state.is_terminal() {
                         drop(live);
-                        return self.join(&id, new.priority);
+                        // `None` means the job reached its end between that
+                        // reading and the join's own, which takes the lock
+                        // again: the submission is its own job then, so it
+                        // falls through to the mint below (D70).
+                        if let Some(joined) = self.join(&id, new.priority)? {
+                            return Ok(joined);
+                        }
                     }
                 }
             }
@@ -1568,6 +1583,32 @@ fn failed(what: &str, path: &Path, error: &dyn std::fmt::Display) -> StoreError 
 
 fn failed_line(what: &str, path: &Path, line: usize, error: &dyn std::fmt::Display) -> StoreError {
     StoreError::new(format!("{what} {}:{line} failed: {error}", path.display()))
+}
+
+/// Move one record's level up, in memory, and say what that came to.
+///
+/// **The one place a level changes.** Both callers go through it — the
+/// operator's raise and the raise a joining submission buys (E-05, E-18) —
+/// so that "only ever upwards" is one rule in one function rather than two
+/// copies that can drift. It writes nothing: the caller holds the store's
+/// lock and the write door's verdict, and persists the record and the line
+/// that explains it.
+fn raise_in_place(record: &mut JobRecord, to: Priority, at: Timestamp) -> Raise {
+    let from = record.priority;
+    if from == to {
+        return Raise::AlreadyThere(from);
+    }
+    if from.outranks(to) {
+        return Raise::NotARaise { from, asked: to };
+    }
+    record.priority = to;
+    record.updated_at = at;
+    // A level that changed changes why the job is waiting, and the sentence
+    // on the record names the old level. Cleared rather than rewritten here:
+    // the next dispatch pass writes the true one, and `events.jsonl` keeps
+    // the one that was.
+    record.waiting_for = None;
+    Raise::Raised { from, to }
 }
 
 #[cfg(test)]
@@ -2507,6 +2548,47 @@ mod tests {
             // the old job's end.
             assert_eq!(again.record().state, JobState::Queued);
             assert_eq!(again.record().submissions, 1);
+        }
+    }
+
+    /// The narrow race under D70: the open-work index says a job is doing
+    /// this work, and the job reaches its end between that reading and the
+    /// join. The submission must become a job of its own — never an error
+    /// saying "that record is over", which is a submission lost to a
+    /// coincidence of timing.
+    #[test]
+    fn a_stale_open_work_link_mints_rather_than_failing() {
+        let (_dir, store) = store();
+        let work = || {
+            NewJob::at(
+                vec!["cargo".to_owned(), "build".to_owned()],
+                LabelSet::default(),
+                Priority::Step,
+            )
+        };
+        let first = store.create_job(work()).expect("minted");
+        // The job ends, and the index is left pointing at it by hand: this
+        // is the state the race leaves for the few microseconds it lasts.
+        store
+            .record_state(
+                &first.id,
+                JobState::Finished {
+                    outcome: JobOutcome::Exited { code: 0 },
+                },
+            )
+            .expect("the job ends");
+        {
+            let mut live = store.lock().expect("the lock");
+            live.open_work.insert(
+                first.dedup_key(),
+                sequence_of(first.id.as_str()).expect("an id this store minted"),
+            );
+        }
+        match store.submit(work()).expect("the submission is answered") {
+            Submission::Minted(record) => assert_ne!(record.id, first.id),
+            Submission::Joined { record, .. } => {
+                panic!("a submission joined {}, which is over", record.id)
+            }
         }
     }
 
