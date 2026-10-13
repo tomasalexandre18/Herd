@@ -1387,3 +1387,37 @@ through the same door.
 
 **Alternative rejected.** A `set_priority` that takes any level, whose
 first use would be the one it should not have.
+
+---
+
+## 2026-10-13 — D73 Before M16 the version numbers are free-running
+
+**Context.** M6 made the priority a required field in `SubmitJob` and in
+`job.json`, so it moved `PROTOCOL_VERSION` and `RECORD_VERSION` from 1
+to 2, and a pre-M6 state root is now refused by name with no migration.
+Alexa was asked, because a protocol break is his to approve: his answer
+was that before M16 nothing uses either number, so bumping is harmless
+and staying at 1 would have been fine too. Between here and M15 the
+formats will break several more times, so the question worth settling
+is not this bump but what the numbers mean while nothing is deployed.
+
+**Choice.** Before M16 both numbers are free-running development
+counters. Every format break advances the one it touches, neither
+promises compatibility with anything, and **no migration is ever
+written for a pre-M16 state root** — it is refused by name and the
+operator deletes it. At M16, the deployment milestone, both are set
+back to **1**: the first deployed protocol is version 1 and the freeze
+begins there. After that a bump is a compatibility statement and
+carries whatever migration it needs.
+
+**Why not simply leave them at 1 until M16.** A required field absent
+from an old record is a deserialisation failure, not a refusal: the
+reader gets a parse error naming a missing field instead of a sentence
+saying the root predates a format change. Advancing the number is what
+turns that into the refusal the store already knows how to make, which
+is why M6's bump is kept rather than reverted.
+
+**Alternative rejected.** Carrying the development counters into the
+deployment and reaching M16 at version nine or so. Rejected because a
+reader would then read eight compatibility eras that never existed,
+and the first version chatOnS pins at adoption should be 1.

@@ -252,7 +252,9 @@ their budgets (Q9). The server's runner runs natively, unprivileged, with
 network runs on the server's native runner over `wss://` and returns its log
 and exit code (automated against the deployed pair); a hub restart under
 docker compose re-asserts M2's no-loss test on the real volume; a reboot of
-the server brings the runner back with no hand.
+the server brings the runner back with no hand. This milestone also sets
+`PROTOCOL_VERSION` and `RECORD_VERSION` back to 1 and freezes them: the
+first deployed protocol is version 1 (D73).
 
 ### M17 — The owner's PC joins (`m17-pc-runner`)
 The second machine, and the one with the hard conditions. Runner on WSL2: a
