@@ -5,6 +5,7 @@ use std::sync::Arc;
 use anyhow::{Context, Result};
 use clap::Parser;
 use herd_hub::{Hub, JobDirStore, JobStore, Policy, DEFAULT_LISTEN_ADDR, LOST_AFTER};
+use herd_proto::HEALTH_EVERY;
 
 /// Where the hub keeps its state unless told otherwise. Relative on purpose:
 /// a development hub writes beside the repository, and the deployment names
@@ -24,9 +25,22 @@ struct Args {
     #[arg(long, env = "HERD_STATE_DIR", default_value = DEFAULT_STATE_DIR)]
     state_dir: PathBuf,
     /// Seconds without a health report after which a runner is lost and the
-    /// jobs it was running are attempted once more (E-21).
+    /// jobs it was running are attempted once more (E-21). It must outlast
+    /// three health reports, or a healthy runner is declared lost between two
+    /// of its own: the hub refuses to start otherwise, naming both figures.
     #[arg(long, env = "HERD_LOST_AFTER", default_value_t = LOST_AFTER.as_secs_f64())]
     lost_after: f64,
+    /// Seconds between the health reports this hub expects of its runners
+    /// (E-40). It sends none itself: this is what `--lost-after` is judged
+    /// against, and it has to match what the runners are configured with.
+    #[arg(long, env = "HERD_HEALTH_EVERY", default_value_t = HEALTH_EVERY.as_secs_f64())]
+    health_every: f64,
+}
+
+/// Seconds as a duration, with a negative figure read as zero rather than
+/// silently becoming a very long wait.
+fn seconds(value: f64) -> std::time::Duration {
+    std::time::Duration::try_from_secs_f64(value.max(0.0)).unwrap_or(std::time::Duration::ZERO)
 }
 
 #[tokio::main]
@@ -40,17 +54,21 @@ async fn main() -> Result<()> {
     })?;
     let unfinished = store.unfinished_jobs()?.len();
     let policy = Policy {
-        lost_after: std::time::Duration::try_from_secs_f64(args.lost_after.max(0.0))
-            .unwrap_or(LOST_AFTER),
+        lost_after: seconds(args.lost_after),
+        health_every: seconds(args.health_every),
         ..Policy::default()
     };
+    let state_root_id = store.state_root_id().to_owned();
+    // A timing that cannot mean what it says is refused here, before the port
+    // is bound and before any runner can join (E-21, E-40).
     let hub = Hub::bind_with_policy(args.listen, Arc::new(store), policy).await?;
     println!(
-        "herd-hub {} listening on ws://{}, state in {}, {unfinished} job(s) not over, \
-         a runner is lost after {:?}",
+        "herd-hub {} listening on ws://{}, state in {} ({state_root_id}), \
+         {unfinished} job(s) not over, a runner reporting every {:?} is lost after {:?}",
         herd_hub::hub_version(),
         hub.local_addr(),
         args.state_dir.display(),
+        policy.health_every,
         policy.lost_after,
     );
     hub.serve().await

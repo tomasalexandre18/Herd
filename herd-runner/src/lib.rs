@@ -70,7 +70,11 @@ use spool::Spooled;
 pub const DEFAULT_HUB_URL: &str = "ws://127.0.0.1:8787";
 
 /// How often a runner says it is alive and what it is doing (E-40).
-pub const HEALTH_EVERY: Duration = Duration::from_secs(15);
+///
+/// The figure lives in `herd-proto`, because the hub's silence threshold is
+/// only meaningful as a multiple of it: two crates each holding their own
+/// 15 s would be two truths about one contract (invariant 4).
+pub use herd_proto::HEALTH_EVERY;
 
 /// How long a runner goes on believing a link on which the hub has said
 /// nothing at all.
@@ -460,8 +464,17 @@ pub struct Session {
     inner: Arc<Mutex<Inner>>,
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug)]
 struct Inner {
+    /// Who this runner *process* is, beside the name its owner gave it.
+    ///
+    /// Minted here because this is the scope it has to match: one Session is
+    /// one runner, for as long as that runner lives, across every connection
+    /// it makes. The hub compares it to tell a redial — the same process,
+    /// dialling again — from a twin, a second process configured with the
+    /// same name. A name cannot tell them apart, and told apart by a name
+    /// alone two live twins supersede each other for ever.
+    instance: String,
     /// Whichever connection to the hub is up now.
     ///
     /// A job outlives the connection it was assigned on (D17), so it must not
@@ -480,9 +493,42 @@ struct Inner {
     draining: bool,
 }
 
+impl Default for Inner {
+    fn default() -> Self {
+        Self {
+            instance: mint_an_instance_id(),
+            link: None,
+            jobs: HashMap::new(),
+            spooled: Vec::new(),
+            draining: false,
+        }
+    }
+}
+
+/// An identity for this runner process, unique among the processes a hub can
+/// be talking to at one time.
+///
+/// The process id plus the clock, which is exactly as much as the comparison
+/// needs: two runners alive at once on one host have different pids, and a
+/// runner restarted onto a pid the kernel has recycled started at a different
+/// nanosecond. Not a random-number library, for the reason the redial
+/// jitter is not one either — a dependency carried into the deployment for
+/// the sake of an identity nothing is secured by.
+fn mint_an_instance_id() -> String {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |since| since.as_nanos() as u64);
+    format!("run-{}-{nanos:x}", std::process::id())
+}
+
 impl Session {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Who this runner process is, as its handshake announces it.
+    pub fn instance(&self) -> String {
+        self.with(|inner| inner.instance.clone())
     }
 
     /// How many results are waiting to be acknowledged.
@@ -911,6 +957,115 @@ impl Session {
         said
     }
 
+    /// Settle, against the state root the hub has just announced, what this
+    /// data root is holding — before a single frame of it is offered.
+    ///
+    /// A job id means something only inside one hub state. A hub whose state
+    /// root is recreated hands out `j0000000001` again, and a verdict this
+    /// runner spooled for the `j0000000001` of the root that is gone is then
+    /// *plausible and false*: it names a job the hub has genuinely minted, for
+    /// an attempt it has genuinely handed out. Offering it would put one job's
+    /// exit code and one job's metrics onto another job's record, and nothing
+    /// in the frame says otherwise. So the state root travels in the handshake
+    /// and this is where it is used:
+    ///
+    /// - the recorded root and the hub's agree: the ordinary case, nothing to
+    ///   do;
+    /// - they differ: every spooled verdict belongs to the root that is gone.
+    ///   None of it is offered, each file is set aside by name, and the new
+    ///   root is written down;
+    /// - nothing is recorded yet and there is a verdict in the spool: it came
+    ///   from a hub this data root cannot vouch for — a planted file, a root
+    ///   copied from somewhere — and the same rule applies, because
+    ///   "unattributable" and "another hub's" are the same thing to a record.
+    ///
+    /// What is held in *memory* goes the same way, and for the same reason: a
+    /// verdict this runner produced for the hub that is gone names a job id
+    /// the new hub hands out to other jobs. It is never offered, its bytes are
+    /// kept under the data root, and a job still running for that vanished
+    /// attempt is ended — nothing it produces can ever be recorded anywhere,
+    /// and the host is not spent on work nobody will collect (invariant 2).
+    ///
+    /// Every line it returns is meant to be loud, and a verdict dealt with
+    /// here is dealt with **by name**: the job, the attempt, the outcome and
+    /// where its bytes went.
+    pub fn settle_against_state_root(&self, root: &root::DataRoot, hub_root: &str) -> Vec<String> {
+        let recorded = root.hub_state_root();
+        let mine = recorded.as_deref();
+        if mine == Some(hub_root) {
+            return Vec::new();
+        }
+        let mut said = Vec::new();
+        let why = match mine {
+            Some(theirs) => format!(
+                "this data root belongs to the hub state root {theirs} and the hub has \
+                 welcomed it to {hub_root}"
+            ),
+            None => format!(
+                "this data root has never been welcomed by a hub and so belongs to no \
+                 recorded state root, while the hub serves {hub_root}"
+            ),
+        };
+        let foreign: Vec<Spooled> = self.with(|inner| take_spooled(inner, |_| true));
+        if !foreign.is_empty() {
+            said.push(format!(
+                "{} spooled verdict(s) here cannot belong to this hub's state: {why}",
+                foreign.len()
+            ));
+            for spooled in foreign {
+                said.extend(spooled.for_a_foreign_state_root(&why));
+            }
+        }
+        let (in_hand, running) = self.with(|inner| {
+            let mut in_hand = Vec::new();
+            let mut running = Vec::new();
+            for (job_id, job) in inner.jobs.iter() {
+                match &job.end {
+                    Some(end) => in_hand.push((
+                        job_id.clone(),
+                        end.outcome.clone(),
+                        finished_frame(job_id, job.attempt, job.next_seq, end),
+                    )),
+                    None => {
+                        job.cancel.end(Ending::Abandoned(why.clone()));
+                        running.push(job_id.clone());
+                    }
+                }
+            }
+            for (job_id, _, _) in &in_hand {
+                inner.jobs.remove(job_id);
+            }
+            (in_hand, running)
+        });
+        if !running.is_empty() {
+            said.push(format!(
+                "{} job(s) still running here belong to attempts of a hub state that is \
+                 gone ({why}); they are ended, because nothing they produce can be \
+                 recorded anywhere: {}",
+                running.len(),
+                running
+                    .iter()
+                    .map(|job_id| job_id.to_string())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ));
+        }
+        said.extend(spool::write_all_for_a_foreign_state_root(
+            root, in_hand, &why,
+        ));
+        if let Err(error) = root.remember_hub_state_root(hub_root) {
+            said.push(format!(
+                "COULD NOT write down which hub state root this data root belongs to: \
+                 {error}. A verdict spooled here would not be attributable to {hub_root}"
+            ));
+        } else if recorded.is_some() {
+            said.push(format!(
+                "this data root now belongs to the hub state root {hub_root}: {why}"
+            ));
+        }
+        said
+    }
+
     /// Write every result the hub has not acknowledged into the data root,
     /// and say where each one went.
     ///
@@ -1002,6 +1157,19 @@ pub async fn run(config: Config) -> Result<()> {
 /// job this runner was running: the one thing a drain may not do is lose a
 /// job silently.
 pub async fn run_until(config: Config, stop: impl Future<Output = String>) -> Result<()> {
+    // The same mistake the hub refuses on its own side, in the one direction a
+    // runner can make it: believing a silent hub for less time than it takes
+    // to send a few reports. The hub answers every report, so a silence limit
+    // shorter than that is a runner that redials for ever on a link that is
+    // perfectly alive — and jobs that keep losing the attempt they are on.
+    if let Some(reason) = herd_proto::silence_threshold_refusal(
+        "this runner's limit on the hub's silence (--hub-silence-limit)",
+        config.hub_silence_limit,
+        "its own health cadence (--health-every)",
+        config.health_every,
+    ) {
+        bail!("{reason}");
+    }
     let confined = Arc::new(
         Confined::prepare(config.confinement.clone())
             .map_err(|reason| anyhow!("this runner cannot confine a job: {reason}"))?,
@@ -1220,13 +1388,27 @@ pub async fn serve_once(config: Config, session: Session, confined: Arc<Confined
         role: Role::Runner,
         token: config.token.clone(),
         name: config.name.clone(),
+        // Which process this is, so the hub can tell this runner dialling
+        // again from a second runner wearing its name.
+        instance: Some(session.instance()),
+        // And which hub state the durable things under this data root belong
+        // to, so that nothing spooled for a hub that no longer exists is
+        // believed by the hub that replaced it.
+        state_root: confined.root().hub_state_root(),
     };
     sink.send(Message::text(to_frame(&hello).context("encoding hello")?))
         .await
         .context("sending hello")?;
 
     match next_message(&mut source, config.hub_silence_limit).await? {
-        Some(FromHub::Welcome { .. }) => {}
+        Some(FromHub::Welcome { state_root, .. }) => {
+            // Before the link is attached and so before anything is offered
+            // on it: what this data root is holding has to be settled against
+            // the state root that has just welcomed it.
+            for line in session.settle_against_state_root(confined.root(), &state_root) {
+                eprintln!("herd-runner: {line}");
+            }
+        }
         Some(FromHub::Refused { reason }) => return Err(Refusal(reason).into()),
         Some(FromHub::StandBy {
             reason,

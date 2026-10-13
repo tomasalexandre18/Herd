@@ -34,6 +34,15 @@ use tokio_tungstenite::{MaybeTlsStream, WebSocketStream};
 /// CI is slow, and never a substitute for waiting on a real condition.
 const PATIENCE: Duration = Duration::from_secs(20);
 
+/// How long a dial waits to find out whether it was turned away.
+///
+/// Short on purpose, and the one place in this file where a duration is
+/// waited out rather than waited on: "the hub said nothing else" has no event
+/// to wait for. A hub that turns a runner away does it in the same breath as
+/// the welcome, so this is milliseconds of real work and the rest is slack
+/// for a loaded CI machine.
+const TURNED_AWAY_PATIENCE: Duration = Duration::from_millis(500);
+
 /// A hub told to lose a runner in a second instead of a minute.
 struct Quick {
     hub_url: String,
@@ -53,6 +62,12 @@ impl Quick {
             Arc::clone(&store) as Arc<dyn JobStore>,
             Policy {
                 lost_after,
+                // Both figures move together, because the hub refuses a
+                // threshold that is not comfortably longer than the cadence
+                // it expects — a second of silence means nothing against
+                // reports fifteen seconds apart. The deployment's shape is
+                // kept: a threshold several reports long.
+                health_every: lost_after / 10,
                 ..Policy::default()
             },
         )
@@ -134,12 +149,48 @@ impl Drop for Quick {
 type Socket = WebSocketStream<MaybeTlsStream<TcpStream>>;
 
 /// A runner that does exactly what a test tells it to, and nothing else.
+#[derive(Debug)]
 struct Puppet {
     socket: Socket,
 }
 
 impl Puppet {
+    /// A runner joining under a name, as one process.
+    ///
+    /// The instance identity is derived from the name, so joining twice under
+    /// one name is one process dialling again — a redial — and a twin is what
+    /// [`Puppet::dial`] makes.
     async fn join(hub_url: &str, name: &str) -> Self {
+        Self::handshake(hub_url, name, &format!("run-{name}"), None).await
+    }
+
+    /// Dial saying exactly which process this is and which hub state root it
+    /// believes it belongs to, and give back what the hub did with it:
+    /// `Ok` when it was admitted, `Err(frame)` when it was told something
+    /// instead.
+    ///
+    /// The welcome always comes first — a hub about to turn a runner away
+    /// sends it anyway, because that frame is how the runner learns which
+    /// state root it is talking to — so the answer is whatever follows it.
+    async fn dial(
+        hub_url: &str,
+        name: &str,
+        instance: &str,
+        state_root: Option<&str>,
+    ) -> Result<Self, Box<FromHub>> {
+        let mut puppet = Self::handshake(hub_url, name, instance, state_root).await;
+        match puppet.next_within(TURNED_AWAY_PATIENCE).await {
+            Some(answer) => Err(Box::new(answer)),
+            None => Ok(puppet),
+        }
+    }
+
+    async fn handshake(
+        hub_url: &str,
+        name: &str,
+        instance: &str,
+        state_root: Option<&str>,
+    ) -> Self {
         let (mut socket, _response) = tokio_tungstenite::connect_async(hub_url)
             .await
             .expect("the hub accepts a connection");
@@ -148,6 +199,8 @@ impl Puppet {
             role: Role::Runner,
             token: None,
             name: Some(name.to_owned()),
+            instance: Some(instance.to_owned()),
+            state_root: state_root.map(str::to_owned),
         };
         socket
             .send(Message::text(to_frame(&hello).expect("encodes")))
@@ -1134,5 +1187,294 @@ async fn a_job_waiting_for_a_runner_is_cancelled_by_the_hub_itself() {
     assert!(
         reason.contains("before it started"),
         "and the record says it never ran: {reason}"
+    );
+}
+
+/// **Who** a frame came from, which the attempt number alone cannot answer.
+///
+/// A job is running as attempt 1 on `runner-x`. Its link goes. Another
+/// machine joins and says that attempt 1 of that job exited 99, with figures
+/// it made up — a frame that is well formed, names a job the hub really has
+/// and an attempt the hub really is waiting for, and is a lie only in its
+/// author. Before this, the hub believed it: it wrote exit 99 and the
+/// invented metrics onto a record that went on naming attempt 1 on
+/// `runner-x`, while the real job's output sat in the log underneath.
+///
+/// An attempt belongs to the runner it was handed to. A log chunk goes
+/// through the same gate, because a foreign paragraph in a build log is a
+/// quieter version of the same falsehood.
+#[tokio::test]
+async fn a_verdict_from_a_runner_the_attempt_was_not_given_to_is_refused_by_name() {
+    // A minute of threshold: nothing here is the watchdog's doing. The
+    // attempt is live and unquestioned throughout.
+    let hub = Quick::start(Duration::from_secs(60)).await;
+    let mut holder = Puppet::join(&hub.hub_url, "runner-x").await;
+    let job_id = hub.submit("true").await;
+    let (_, attempt, _) = holder.take_a_job().await;
+    holder
+        .say(ToHub::JobStarted {
+            job_id: job_id.clone(),
+            attempt,
+        })
+        .await;
+    hub.wait_until("the attempt is running", || {
+        hub.record(&job_id).state == JobState::Running
+    })
+    .await;
+    let before = hub.record(&job_id);
+
+    // `runner-x` is gone without a word, as a `kill -9` leaves it. What is
+    // timed is the attempt, not the connection (D37), so the attempt is
+    // untouched — and that is exactly what makes the next frame dangerous.
+    drop(holder);
+    hub.wait_until("the hub has noticed the link go", || {
+        !hub.handle.runner_connected()
+    })
+    .await;
+
+    let mut other = Puppet::join(&hub.hub_url, "runner-y").await;
+    other
+        .say(ToHub::JobFinished {
+            job_id: job_id.clone(),
+            attempt,
+            outcome: JobOutcome::Exited { code: 99 },
+            chunks_sent: 1,
+            metrics: JobMetrics {
+                log_bytes: 4096,
+                wall_time_ms: 77,
+                ..JobMetrics::default()
+            },
+        })
+        .await;
+    match other.next().await {
+        Some(FromHub::StaleAttempt { reason, .. }) => {
+            assert!(
+                reason.contains("runner-x") && reason.contains("runner-y"),
+                "the refusal must name whose attempt it is and who spoke: {reason}"
+            );
+            assert!(
+                reason.contains("handed to"),
+                "and say why that matters: {reason}"
+            );
+        }
+        other => panic!("a verdict from the wrong runner must be refused by name: {other:?}"),
+    }
+    other
+        .say(ToHub::LogChunk {
+            job_id: job_id.clone(),
+            attempt,
+            stream: LogStream::Stdout,
+            seq: 0,
+            data: b"OUTPUT OF A JOB THIS RUNNER NEVER RAN\n".to_vec(),
+        })
+        .await;
+    assert!(
+        matches!(other.next().await, Some(FromHub::StaleAttempt { .. })),
+        "a log chunk from the wrong runner goes through the same gate"
+    );
+
+    // Nothing of it landed: not the outcome, not the figures, not the log.
+    let after = hub.record(&job_id);
+    assert_eq!(
+        after.state, before.state,
+        "the record took a foreign verdict"
+    );
+    assert_eq!(after.attempts, before.attempts);
+    assert_eq!(
+        after.metrics,
+        JobMetrics::default(),
+        "figures a runner that ran nothing invented must not be in the record"
+    );
+    assert!(
+        !hub.log(&job_id)
+            .contains("OUTPUT OF A JOB THIS RUNNER NEVER RAN"),
+        "another runner wrote into this attempt's log: {}",
+        hub.log(&job_id)
+    );
+
+    // And the honest path is untouched: `runner-x` itself, dialling again
+    // after the gap, is believed — which is the whole of E-44's redelivery.
+    drop(other);
+    hub.wait_until("the hub has noticed the second link go", || {
+        !hub.handle.runner_connected()
+    })
+    .await;
+    let mut back = Puppet::join(&hub.hub_url, "runner-x").await;
+    back.say(ToHub::JobFinished {
+        job_id: job_id.clone(),
+        attempt,
+        outcome: JobOutcome::Exited { code: 0 },
+        chunks_sent: 0,
+        metrics: JobMetrics::default(),
+    })
+    .await;
+    hub.wait_until("the runner holding the attempt is believed", || {
+        matches!(hub.record(&job_id).state, JobState::Finished { .. })
+    })
+    .await;
+    assert_eq!(
+        hub.record(&job_id).state,
+        JobState::Finished {
+            outcome: JobOutcome::Exited { code: 0 }
+        },
+        "the verdict is the holder's, and 99 was never the job's"
+    );
+}
+
+/// A runner holding the state of a hub that no longer exists.
+///
+/// This needs no hand-edited file and no second machine: recreate a hub's
+/// state root and its job ids start again at `j0000000001`, while a runner's
+/// spool from the root that is gone is still on its disk and still names
+/// `j0000000001`. The handshake is where that is caught, because it is the
+/// only place where both sides say what they believe before anything is
+/// recorded.
+#[tokio::test]
+async fn a_runner_announcing_another_state_root_is_turned_away_naming_both() {
+    let hub = Quick::start(Duration::from_secs(60)).await;
+    let mine = hub.store.state_root_id().to_owned();
+    assert!(
+        !mine.is_empty(),
+        "a state root has an identity from its first moment"
+    );
+
+    let turned_away = *Puppet::dial(
+        &hub.hub_url,
+        "wsl-pc",
+        "run-one",
+        Some("root-of-a-hub-that-is-gone"),
+    )
+    .await
+    .expect_err("a runner carrying another state root's state is not served");
+    let FromHub::StandBy {
+        reason,
+        retry_in_ms,
+    } = turned_away
+    else {
+        panic!("waiting is not being refused (D38): {turned_away:?}");
+    };
+    assert!(
+        reason.contains(&mine) && reason.contains("root-of-a-hub-that-is-gone"),
+        "both roots have to be named, or nobody can act on this: {reason}"
+    );
+    assert!(
+        retry_in_ms > 0,
+        "a runner told to stand by is told how long: {reason}"
+    );
+
+    // It was never admitted, so nothing is dispatched onto that connection: a
+    // submission in this window is refused by name rather than handed to a
+    // runner the hub is not serving.
+    assert!(!hub.handle.runner_connected());
+    let refused = herdctl::submit_job(&hub.requester(), vec!["true".to_owned()])
+        .await
+        .expect_err("there is no runner to place a job on");
+    assert!(
+        refused.to_string().contains("no runner is connected"),
+        "the refusal must say why: {refused:#}"
+    );
+
+    // The same runner, once it agrees about which state it is serving, is
+    // welcome and is dispatched to. Being turned away is transient, which is
+    // the whole difference from a refusal.
+    let mut agreed = Puppet::dial(&hub.hub_url, "wsl-pc", "run-one", Some(&mine))
+        .await
+        .expect("a runner of this state root is welcome");
+    let job_id = hub.submit("true").await;
+    let (assigned, attempt, _) = agreed.take_a_job().await;
+    assert_eq!(assigned, job_id);
+    assert_eq!(attempt, 1);
+}
+
+/// One name, two live processes: a configuration mistake, said plainly.
+///
+/// Configured with one name, two runners used to supersede each other for
+/// ever — forty-three dropped connections in eight seconds — because the
+/// handshake carried no instance identity and the hub could not tell a redial
+/// from a twin. A job dispatched in that window rode a connection that was
+/// about to be cut.
+///
+/// So: a twin waits, with the reason; the runner that is alive and holding a
+/// job is not touched; and a genuine redial still supersedes, because that is
+/// the case this hub's whole reconnection story rests on (D38).
+#[tokio::test]
+async fn one_name_claimed_by_two_live_runners_is_said_plainly_and_nobody_is_kicked() {
+    let hub = Quick::start(Duration::from_secs(60)).await;
+    let mut incumbent = Puppet::join(&hub.hub_url, "wsl-pc").await;
+    incumbent.report_health(Vec::new(), false).await;
+    hub.wait_until("the incumbent has been heard from", || {
+        hub.handle
+            .runners()
+            .first()
+            .is_some_and(|runner| runner.reports_seen == 1)
+    })
+    .await;
+    let job_id = hub.submit("sleep 1").await;
+    let (assigned, attempt, _) = incumbent.take_a_job().await;
+    assert_eq!(assigned, job_id);
+
+    let twin = *Puppet::dial(&hub.hub_url, "wsl-pc", "run-the-twin", None)
+        .await
+        .expect_err("a name a live runner holds is not free");
+    let FromHub::StandBy { reason, .. } = twin else {
+        panic!("a twin waits, it is not refused and it does not kick (D38): {twin:?}");
+    };
+    assert!(
+        reason.contains("wsl-pc")
+            && reason.contains("run-the-twin")
+            && reason.contains("run-wsl-pc"),
+        "the reason must name the name and both instances: {reason}"
+    );
+    assert!(
+        reason.contains("configuration mistake") && reason.contains("two names"),
+        "and say plainly what to do about it: {reason}"
+    );
+
+    // The runner that was here is untouched, and still the one the hub has:
+    // no flap, and the job it is running is not riding a doomed link.
+    let runners = hub.handle.runners();
+    assert_eq!(runners.len(), 1);
+    assert_eq!(runners[0].instance.as_deref(), Some("run-wsl-pc"));
+    assert_eq!(runners[0].jobs.len(), 0, "the report named no job yet");
+    incumbent
+        .report_health(
+            vec![RunningJob {
+                job_id: job_id.clone(),
+                attempt,
+                chunks_sent: 0,
+            }],
+            false,
+        )
+        .await;
+    assert!(
+        matches!(incumbent.next().await, Some(FromHub::HealthRecorded {})),
+        "the incumbent's link is alive and the hub is still answering on it"
+    );
+
+    // A redial — the same process, dialling again — does supersede, and
+    // finishes the job it was given before the gap.
+    let mut again = Puppet::join(&hub.hub_url, "wsl-pc").await;
+    assert!(
+        incumbent.next().await.is_none(),
+        "a superseded connection is dropped, not left half alive"
+    );
+    again
+        .say(ToHub::JobFinished {
+            job_id: job_id.clone(),
+            attempt,
+            outcome: JobOutcome::Exited { code: 0 },
+            chunks_sent: 0,
+            metrics: JobMetrics::default(),
+        })
+        .await;
+    hub.wait_until("the redial's verdict is recorded", || {
+        matches!(hub.record(&job_id).state, JobState::Finished { .. })
+    })
+    .await;
+    assert_eq!(
+        hub.record(&job_id).attempts.len(),
+        1,
+        "nothing in this was a lost attempt: {:?}",
+        hub.record(&job_id).attempts
     );
 }

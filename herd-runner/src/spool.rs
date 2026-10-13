@@ -14,9 +14,14 @@
 //! verdict written down by a runner being stopped reaches the hub by itself,
 //! which is the whole point of writing it down.
 //!
-//! Three things can happen to a spooled verdict, and each is said out loud:
+//! Four things can happen to a spooled verdict, and each is said out loud:
 //!
 //! - the hub acknowledges it, and the file goes;
+//! - the hub it was produced for no longer exists — its state root was
+//!   recreated, and the job ids this file names mean other jobs now — so it is
+//!   **never offered**, and its bytes are kept under a name that says why. A
+//!   verdict offered to the wrong state is worse than a verdict nobody
+//!   records: it lands on another job's record and reads like the truth;
 //! - the hub says the attempt is over — an unknown job, a job already
 //!   finished, an attempt superseded by a requeue (D39) — and the file goes
 //!   **by name**, because a verdict the hub will never record must not be
@@ -34,6 +39,15 @@ use crate::root::DataRoot;
 
 /// What a file that could not be decoded is renamed to.
 const UNREADABLE: &str = "unreadable";
+
+/// What a file belonging to another hub's state root is renamed to.
+///
+/// Kept, not deleted, for the same reason as an unreadable one: it is
+/// somebody's verdict, and the hub that could have recorded it is the one
+/// whose state no longer exists. Nobody can record it now, but a human
+/// looking for what happened to a job on a hub that was wiped has to be able
+/// to find it.
+const FOREIGN: &str = "foreign-state-root";
 
 /// One verdict read back from the data root, waiting for the hub.
 #[derive(Debug, Clone)]
@@ -89,6 +103,27 @@ impl Spooled {
         said
     }
 
+    /// This verdict was produced for another hub's state root, so no hub will
+    /// ever record it: it is not offered, and its file is kept under a name
+    /// that says why.
+    ///
+    /// The case this exists for needs no hand-editing of anything. A hub's
+    /// state root is recreated — a new volume, a wiped directory — and its job
+    /// ids start again at `j0000000001`, while this file, written for the
+    /// `j0000000001` of the root that is gone, is still on this disk and still
+    /// looks exactly like a verdict the hub is waiting for. Offering it would
+    /// put an exit code from one job onto the record of another.
+    pub fn for_a_foreign_state_root(&self, reason: &str) -> Vec<String> {
+        vec![format!(
+            "the spooled verdict of {} (attempt {}, {:?}) was produced for another hub's \
+             state root ({reason}); no hub can record it now, so it is NOT offered. {}",
+            self.job_id,
+            self.attempt,
+            self.outcome,
+            set_aside(&self.path, FOREIGN)
+        )]
+    }
+
     fn remove(&self) -> Vec<String> {
         match fs::remove_file(&self.path) {
             Ok(()) => Vec::new(),
@@ -140,7 +175,12 @@ pub fn pick_up(root: &DataRoot) -> (Vec<Spooled>, Vec<String>) {
                 ));
                 spooled.push(one);
             }
-            Err(reason) => said.push(set_aside(&path, &reason)),
+            Err(reason) => said.push(format!(
+                "the spool file {} holds something this runner cannot deliver ({reason}); it \
+                 is not offered to the hub. {}",
+                path.display(),
+                set_aside(&path, UNREADABLE)
+            )),
         }
     }
     (spooled, said)
@@ -173,25 +213,23 @@ fn read_one(path: &Path) -> Result<Spooled, String> {
     })
 }
 
-/// Move a file that cannot be decoded out of the way, keeping its bytes.
+/// Move a spool file out of the way under a name that says why, keeping its
+/// bytes, and say where they went.
 ///
 /// Never deleted: whatever is in there was written as somebody's verdict, and
-/// a human reading this line has to be able to go and look at it.
-fn set_aside(path: &Path, reason: &str) -> String {
+/// a human reading this line has to be able to go and look at it. Two reasons
+/// reach here — a file nobody can decode ([`UNREADABLE`]) and a verdict for a
+/// state root that is gone ([`FOREIGN`]) — and they differ only in the name
+/// the bytes are kept under.
+fn set_aside(path: &Path, extension: &str) -> String {
     let mut aside = path.as_os_str().to_os_string();
     aside.push(".");
-    aside.push(UNREADABLE);
+    aside.push(extension);
     let aside = PathBuf::from(aside);
     match fs::rename(path, &aside) {
-        Ok(()) => format!(
-            "the spool file {} holds something this runner cannot deliver ({reason}); it \
-             is kept as {} and is not offered to the hub",
-            path.display(),
-            aside.display()
-        ),
+        Ok(()) => format!("Its bytes are kept as {}", aside.display()),
         Err(error) => format!(
-            "the spool file {} holds something this runner cannot deliver ({reason}), and \
-             it could not even be moved aside: {error}",
+            "Its bytes could NOT even be moved aside ({error}), so they are still in {}",
             path.display()
         ),
     }
@@ -252,6 +290,50 @@ pub fn write_all(root: &DataRoot, held: Vec<(JobId, JobOutcome, ToHub)>) -> Vec<
         )
     }];
     said.extend(lines);
+    said
+}
+
+/// Write down, under a name that says why, verdicts this runner is holding
+/// for a hub state root that no longer exists.
+///
+/// Not offered to anybody: the hub that could have recorded them is gone, and
+/// the hub that replaced it mints the same job ids for other jobs, so sending
+/// one would put this verdict on another job's record. Not destroyed either —
+/// a verdict is never destroyed (D19) — so the bytes land beside the spool
+/// under [`FOREIGN`], where a human looking for what became of a job on a hub
+/// that was wiped can find them.
+pub fn write_all_for_a_foreign_state_root(
+    root: &DataRoot,
+    held: Vec<(JobId, JobOutcome, ToHub)>,
+    why: &str,
+) -> Vec<String> {
+    let mut said = Vec::new();
+    for (job_id, outcome, frame) in held {
+        let written = match (root.held_result_path(&job_id), to_frame(&frame)) {
+            (Ok(path), Ok(text)) => {
+                let aside = PathBuf::from({
+                    let mut name = path.into_os_string();
+                    name.push(".");
+                    name.push(FOREIGN);
+                    name
+                });
+                match write_fsynced(&aside, text.as_bytes()) {
+                    Ok(()) => format!("its bytes are kept as {}", aside.display()),
+                    Err(error) => format!("and its bytes could NOT be kept: {error}"),
+                }
+            }
+            (path, frame) => format!(
+                "and its bytes could NOT be kept ({}{})",
+                path.err().unwrap_or_default(),
+                frame.err().map(|e| e.to_string()).unwrap_or_default()
+            ),
+        };
+        said.push(format!(
+            "the verdict of {job_id} ({outcome:?}) was produced for another hub's state root \
+             ({why}); no hub can record it now, so it is NOT offered and this line is the \
+             record of it — {written}"
+        ));
+    }
     said
 }
 

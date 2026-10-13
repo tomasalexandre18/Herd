@@ -27,6 +27,16 @@ use tokio::process::{Child, Command};
 /// CI is slow, and never a substitute for waiting on a real condition.
 const PATIENCE: Duration = Duration::from_secs(30);
 
+/// How often the runners here report they are alive, in seconds.
+///
+/// Often enough that a test does not spend a minute proving the hub noticed.
+/// The 15 s of E-40 is the default; this is the same mechanism on a shorter
+/// clock. One figure, given to both sides, because the hub refuses a silence
+/// threshold that is not comfortably longer than the cadence it expects — and
+/// a test that handed the two sides different figures would be testing a
+/// configuration nobody can run.
+const HEALTH_EVERY_IN_THESE_TESTS: &str = "0.2";
+
 /// A process the test started, killed when the test ends however it ends —
 /// so a failure never leaves a hub or a runner behind.
 struct Process {
@@ -185,6 +195,19 @@ impl Herd {
     /// a minute and be the first thing deleted, while the behaviour it proves
     /// is the behaviour whatever the number is.
     async fn start_hub_losing_runners_after(&self, which: &str, seconds: f64) -> Process {
+        self.start_hub_with(which, &["--lost-after", &seconds.to_string()])
+            .await
+    }
+
+    /// A hub with whatever options the test wants, and its output in files.
+    ///
+    /// The health cadence goes with the threshold, because the hub refuses a
+    /// threshold that is not comfortably longer than the cadence it expects
+    /// its runners to report at: a three-second silence means nothing against
+    /// reports fifteen seconds apart. The runners these tests start report
+    /// every 0.2 s, so the hub is told the same, and the deployment's shape —
+    /// a threshold many reports long — is kept.
+    async fn start_hub_with(&self, which: &str, options: &[&str]) -> Process {
         let output = |stream: &str| {
             Stdio::from(
                 File::create(self.logs.path().join(format!("{which}-{stream}")))
@@ -196,8 +219,9 @@ impl Herd {
             .arg(self.addr().to_string())
             .arg("--state-dir")
             .arg(self.state.path())
-            .arg("--lost-after")
-            .arg(seconds.to_string())
+            .arg("--health-every")
+            .arg(HEALTH_EVERY_IN_THESE_TESTS)
+            .args(options)
             .stdout(output("out"))
             .stderr(output("err"))
             .kill_on_drop(true)
@@ -249,11 +273,9 @@ impl Herd {
             // (D32), and these tests run two at a time.
             .arg("--data-root")
             .arg(self.runner_root(root))
-            // Often enough that a test does not spend a minute proving the
-            // hub noticed. The 15 s of E-40 is the default; this is the same
-            // mechanism on a shorter clock.
+            // The same cadence the hub is told to expect.
             .arg("--health-every")
-            .arg("0.2")
+            .arg(HEALTH_EVERY_IN_THESE_TESTS)
             .stdout(Stdio::from(
                 File::create(self.logs.path().join(format!("{which}-out"))).expect("a file"),
             ))
@@ -351,6 +373,28 @@ impl Herd {
 
     fn job_dir(&self, job_id: &str) -> PathBuf {
         self.state.path().join("jobs").join(job_id)
+    }
+
+    /// The identity of the hub's state root, read from its own file as a
+    /// runner learns it from the handshake.
+    fn state_root_id(&self) -> String {
+        let path = self.state.path().join("store.json");
+        let text = std::fs::read_to_string(&path)
+            .unwrap_or_else(|e| panic!("{} reads: {e}", path.display()));
+        let store: serde_json::Value = serde_json::from_str(&text).expect("store.json is json");
+        store["state_root_id"]
+            .as_str()
+            .expect("a state root has an identity")
+            .to_owned()
+    }
+
+    /// Make a runner's data root believe it belongs to this hub's state root,
+    /// as it would after one welcome.
+    fn pretend_the_root_was_welcomed(&self, which: &str) {
+        let root = self.runner_root(which);
+        std::fs::create_dir_all(&root).expect("the fixture makes the data root");
+        std::fs::write(root.join("hub-state-root"), self.state_root_id())
+            .expect("the fixture writes which hub state root it belongs to");
     }
 
     fn record(&self, job_id: &str) -> serde_json::Value {

@@ -10,8 +10,9 @@ herd-proto.workspace = true
 anyhow.workspace = true
 clap.workspace = true
 # flock(2) on the state root: one hub per root, and a lock the kernel drops
-# even when the hub is killed (D21).
-rustix = { version = "1.1.5", features = ["fs"] }
+# even when the hub is killed (D21). And getrandom(2) for the state root's own
+# identity, which has to differ from the identity of the root it replaced.
+rustix = { version = "1.1.5", features = ["fs", "rand"] }
 futures-util.workspace = true
 serde.workspace = true
 serde_json.workspace = true

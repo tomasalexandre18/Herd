@@ -346,6 +346,12 @@ async fn join(config: &Config) -> Result<Socket> {
             role: Role::Requester,
             token: config.token.clone(),
             name: config.name.clone(),
+            // Neither belongs to a requester. It holds nothing between
+            // connections — no attempt, no spooled verdict — so there is
+            // nothing for the hub to tell apart and nothing to attribute to a
+            // state root. A requester is one command's worth of conversation.
+            instance: None,
+            state_root: None,
         },
     )
     .await
