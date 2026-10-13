@@ -814,3 +814,66 @@ because Herd has no verdict to give — consistent with D20.
 
 **Alternative rejected.** Inventing a distinct exit code for each,
 which multiplies sentinels colliding with real exit codes.
+
+---
+
+## 2026-10-13 — D41 A cap carries the reason its figure would misstate
+
+**Context.** A job whose workspace could not be measured was told "stopped this
+job at its disk cap of 21474836480 bytes" when it had written about four
+kilobytes; the figure was true of the cap and false of the job, and the real
+reason reached only the runner's stderr.
+
+**Choice.** `StoppedByCap` gained a `detail`, so the record carries "could not
+measure the workspace" beside the limit. Additive, so `PROTOCOL_VERSION` stays
+1.
+
+**Alternative rejected.** Leaving the figure to speak for itself, which makes a
+record mislead whoever reads it later.
+
+---
+
+## 2026-10-13 — D42 A spooled verdict is delivered, its file cleared on ack
+
+**Context.** D34 had a stopping runner write an unacknowledged verdict to
+`<data root>/held-results/<job>.json`, and nothing read it back.
+
+**Choice.** The runner picks up its spool before its first dial and offers
+every spooled frame on each attach, removing a file only once the hub
+acknowledges it; a verdict the hub rejects — unknown job, already finished,
+superseded attempt — is dropped by name, and an undecodable file is kept as
+`.unreadable` rather than deleted.
+
+**Alternative rejected.** Deleting on send, which trades a stalled verdict for
+a lost one.
+
+---
+
+## 2026-10-13 — D43 A job still running when stopped is an abandoned attempt
+
+**Context.** The stop path used to report the job it killed as `signalled 9`,
+so a requester saw a failure it had not earned and the hub saw a verdict that
+stopped the requeue.
+
+**Choice.** A drain hands the attempt back and the hub attempts the job again
+under D39's limit of two.
+
+**Alternative rejected.** Reporting the kill as the job's outcome, which blames
+a job for its host's owner going to bed.
+
+---
+
+## 2026-10-13 — D44 A memory ceiling has a floor
+
+**Context.** `--job-memory-max 0` was refused while `1kB` was accepted, a
+ceiling under which no job can start, so the runner silently refused
+everything.
+
+**Choice.** A ceiling below a measured 16 MiB floor is refused at startup,
+naming the floor.
+
+**Alternative rejected.** Accepting any figure and letting every job fail,
+which looks like a Herd fault rather than a configuration one.
+
+---
+
