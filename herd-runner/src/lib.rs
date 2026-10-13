@@ -1255,16 +1255,20 @@ pub async fn run_until(config: Config, stop: impl Future<Output = String>) -> Re
     for line in session.pick_up(confined.root()) {
         eprintln!("herd-runner: {line}");
     }
-    // Every probe read once *before* the first dial, so the offer the hub
-    // receives is already true. A capability whose probe has never been read
-    // is suspended, so skipping this would make a correctly configured runner
-    // look busy for one interval.
-    session.capacity().sweep().await;
     {
-        // And read for ever afterwards, beside the redial loop rather than
-        // inside a connection: a lock file an operator removes while the hub
-        // is down must still free the capability, and the next connection
-        // announces it.
+        // The probes are read beside the redial loop rather than inside a
+        // connection: a lock file an operator removes while the hub is down
+        // must still free the capability, and the next connection announces
+        // it.
+        //
+        // And they are read *beside the join* too, not in front of it. The
+        // first sweep used to be awaited here, which made joining cost as
+        // long as reading every probe took — ten probes that hung held the
+        // first dial for twenty seconds, during which the runner was no use
+        // to anybody. Nothing is lost by joining first: a probed capability
+        // with no reading yet is suspended at both ends (D49), so the worst
+        // case is a job that waits the moment it would have waited anyway,
+        // and the readings arrive on this same connection as a snapshot.
         let watching = session.clone();
         tokio::spawn(capability::watch(
             session.capacity().clone(),
