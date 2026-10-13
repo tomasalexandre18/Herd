@@ -979,6 +979,96 @@ async fn an_offer_the_hub_cannot_read_is_refused_with_the_reason_as_the_last_fra
     herd.start_runner(None, &[]).await;
 }
 
+/// The same answer for a first frame that is not text at all, or is too big
+/// to read: a sentence, then the close.
+///
+/// The text path above was fixed and this one was not, so a peer whose first
+/// frame was binary — or 32 MiB — still got a TCP reset: the read failed
+/// inside the hub's own frame reader and the error travelled up out of the
+/// connection before any refusal could be written. From the other end that is
+/// indistinguishable from a hub that is not there, which is the one thing D13
+/// exists to prevent.
+///
+/// The size bound is this project's own figure, [`herd_hub::MAX_FRAME_BYTES`],
+/// and the refusal carries it: "too big" with no number is not something a
+/// peer's owner can act on.
+#[tokio::test]
+async fn an_unreadable_first_frame_is_refused_whatever_is_wrong_with_it() {
+    use futures_util::{SinkExt, StreamExt};
+    use tokio_tungstenite::tungstenite::Message;
+
+    let mut herd = Herd::new();
+    herd.start_hub().await;
+
+    // A frame comfortably past the bound, and one the old default would have
+    // let through, so this pins our figure rather than the library's.
+    let oversized = "x".repeat(32 * 1024 * 1024);
+    assert!(oversized.len() > herd_hub::MAX_FRAME_BYTES);
+    let cases: Vec<(&str, Message, &str)> = vec![
+        (
+            "a binary first frame",
+            Message::binary(vec![0u8, 159, 146, 150, 255]),
+            "text frames only",
+        ),
+        (
+            "a first frame past the size this hub reads",
+            Message::text(oversized),
+            "1048576 bytes",
+        ),
+        (
+            "a first frame that is not a message at all",
+            Message::text("{not json"),
+            "could not read the handshake",
+        ),
+        (
+            "a first frame that is a message but not a hello",
+            Message::text(
+                herd_proto::to_frame(&herd_proto::ToHub::Health {
+                    jobs: Vec::new(),
+                    draining: false,
+                })
+                .expect("a health report encodes"),
+            ),
+            "must be hello",
+        ),
+    ];
+
+    for (what, frame, expected) in cases {
+        let (mut socket, _response) = tokio_tungstenite::connect_async(herd.url())
+            .await
+            .expect("the hub accepts the connection");
+        socket.send(frame).await.expect("the frame is sent");
+        let answer = tokio::time::timeout(PATIENCE, socket.next())
+            .await
+            .unwrap_or_else(|_| panic!("{what} must be answered, not left to time out"))
+            .unwrap_or_else(|| panic!("{what} must get a frame, not a reset"))
+            .unwrap_or_else(|error| panic!("{what} must get a readable frame, not {error}"));
+        let text = answer
+            .to_text()
+            .unwrap_or_else(|_| panic!("{what}: the protocol carries text (D4)"));
+        let refusal: herd_proto::FromHub = herd_proto::from_frame(text)
+            .unwrap_or_else(|error| panic!("{what}: {text} decodes: {error}"));
+        let herd_proto::FromHub::Refused { reason } = refusal else {
+            panic!("{what} is a terminal no (D13), not {text}");
+        };
+        assert!(
+            reason.contains(expected),
+            "{what} must be refused naming {expected}: {reason}"
+        );
+        // Last frame, then the close: a refusal is never followed by anything.
+        let after = tokio::time::timeout(PATIENCE, socket.next())
+            .await
+            .unwrap_or_else(|_| panic!("{what}: the hub must close rather than hold on"));
+        match after {
+            None | Some(Ok(Message::Close(_))) => {}
+            other => panic!("{what}: the refusal must be the last frame, not {other:?}"),
+        }
+    }
+
+    // And the hub is still a hub after all of that.
+    herd.start_runner(None, &[]).await;
+}
+
 /// The other half of D13, from the runner's side: a refused runner says why
 /// before it stops.
 ///

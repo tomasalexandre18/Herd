@@ -74,6 +74,40 @@ pub const DEFAULT_LISTEN_ADDR: &str = "127.0.0.1:8787";
 /// How long a runner may be unheard from before it is lost (E-21).
 pub const LOST_AFTER: Duration = Duration::from_secs(60);
 
+/// The largest first frame this hub accepts, in bytes: **1 MiB**.
+///
+/// A figure of this project's own, named in the refusal a peer gets, rather
+/// than whatever the WebSocket library happens to default to — which is where
+/// "a 32 MiB frame gets a TCP reset" came from: the library's limit, the
+/// library's error, and nobody to explain either.
+///
+/// 1 MiB is two orders of magnitude above anything a peer legitimately sends
+/// *to* a hub. The largest such frame is a runner's `LogChunk`, which carries
+/// 8 KiB of a job's output base64'd; the next largest is a `Hello` whose
+/// capability offer would have to run to some ten thousand names of at most 64
+/// characters to reach this. The hub's own outgoing frames are not bound by it
+/// — a `JobLog` carries a whole job's log at once, up to the runner's log cap
+/// — and need not be: this is a bound on what an unknown peer may ask of this
+/// hub before it has said who it is.
+pub const MAX_FRAME_BYTES: usize = 1 << 20;
+
+/// The point past which this hub stops reading a frame at all: **64 MiB**.
+///
+/// Two figures, because a refusal has to be *deliverable*. A peer past
+/// [`MAX_FRAME_BYTES`] is told so in a sentence, which means the frame has to
+/// be read to its end first: a hub that stops reading mid-frame and closes
+/// leaves unread bytes in the socket, the close becomes a TCP reset, and the
+/// reset throws away the very refusal it was sending. Reading to the end and
+/// then refusing is what makes the sentence arrive.
+///
+/// That cannot be unbounded, so this is where it stops — and past it the peer
+/// does get a reset, which is the honest answer to something shovelling 64 MiB
+/// at a hub that has told it nothing. It is the WebSocket library's own
+/// default for a whole message, so no exposure is being widened; what changes
+/// is that a *single frame* that big is read rather than cut off at the
+/// library's 16 MiB, so the mistake can be answered instead of dropped.
+pub const FRAME_CEILING_BYTES: usize = 64 << 20;
+
 /// How many goes at running one job the hub allows (E-21).
 ///
 /// Two: the attempt, and one more after a loss. The second loss is an end,
@@ -913,7 +947,7 @@ fn said(value: Option<String>) -> Option<String> {
 async fn serve_peer(state: Arc<State>, stream: TcpStream) -> Result<()> {
     // Log chunks are small and must not wait for a full segment.
     let _ = stream.set_nodelay(true);
-    let socket = tokio_tungstenite::accept_async(stream)
+    let socket = tokio_tungstenite::accept_async_with_config(stream, Some(frame_limits()))
         .await
         .context("websocket handshake")?;
     let (mut sink, mut source) = socket.split();
@@ -927,8 +961,20 @@ async fn serve_peer(state: Arc<State>, stream: TcpStream) -> Result<()> {
     // reason on the hub's stdout, where the runner's owner never sees it.
     // It is a terminal no of exactly D13's shape: the offer is on the
     // runner's disk and dialling again will say the same thing.
-    let Some(text) = next_text(&mut source).await? else {
-        bail!("the peer closed before saying hello");
+    //
+    // And "could not read it" covers the frame as well as the text in it. A
+    // first frame that is binary, or larger than this hub reads, used to come
+    // back out of here as an error and cost the peer its socket with nothing
+    // written on it — the same silence, through the one input the text path
+    // did not cover.
+    let text = match first_frame(&mut source).await {
+        FirstFrame::Said(text) => text,
+        FirstFrame::Unreadable(what_went_wrong) => {
+            let reason = unreadable_handshake_reason(&what_went_wrong);
+            eprintln!("herd-hub: {reason}");
+            return refuse(&mut sink, reason).await;
+        }
+        FirstFrame::Gone => bail!("the peer closed before saying hello"),
     };
     let hello = match from_frame::<ToHub>(&text) {
         Ok(hello) => hello,
@@ -2380,6 +2426,98 @@ async fn next_message(source: &mut Source) -> Result<Option<ToHub>> {
     let message =
         from_frame(&text).map_err(|error| anyhow!("undecodable frame {text}: {error}"))?;
     Ok(Some(message))
+}
+
+/// What this hub's accepted sockets are allowed to read: the ceiling, not the
+/// bound.
+///
+/// Set here rather than left to the library's default so that both figures are
+/// this project's own and can be read off one line.
+/// [`FRAME_CEILING_BYTES`] is where reading stops; [`MAX_FRAME_BYTES`] is what
+/// the hub accepts, and it is enforced by [`first_frame`], which has a
+/// refusal to send and so has to have the whole frame in hand.
+fn frame_limits() -> tokio_tungstenite::tungstenite::protocol::WebSocketConfig {
+    tokio_tungstenite::tungstenite::protocol::WebSocketConfig::default()
+        .max_message_size(Some(FRAME_CEILING_BYTES))
+        .max_frame_size(Some(FRAME_CEILING_BYTES))
+}
+
+/// What the peer's first frame was, as far as this hub could read it.
+///
+/// Three outcomes and no fourth, because every one of them has to end in a
+/// sentence or a clean close — never in an error travelling up out of the
+/// connection, which is what left a peer with a reset socket.
+enum FirstFrame {
+    /// The text of the frame, undecoded.
+    Said(String),
+    /// Nothing this hub can read, and what is wrong with it.
+    Unreadable(String),
+    /// The peer closed, or went away, without saying anything.
+    Gone,
+}
+
+/// Read the first frame, reporting what was wrong with it rather than failing.
+///
+/// Every way a first frame can be unreadable lands in
+/// [`FirstFrame::Unreadable`] with a sentence: a binary frame (D4 says the
+/// protocol carries text), a frame past [`MAX_FRAME_BYTES`], a truncated one,
+/// a WebSocket-level protocol error. The caller refuses with it, which is the
+/// one thing a peer can act on — and the figure travels, so an owner whose
+/// tool sends too much learns what it has to stay under instead of guessing
+/// from a reset socket.
+async fn first_frame(source: &mut Source) -> FirstFrame {
+    loop {
+        let frame = match source.next().await {
+            None => return FirstFrame::Gone,
+            Some(Ok(frame)) => frame,
+            Some(Err(error)) => return FirstFrame::Unreadable(unreadable_frame_reason(&error)),
+        };
+        match frame {
+            // Past the bound, and refused with the figure. The frame was read
+            // to its end — that is what [`FRAME_CEILING_BYTES`] is for —
+            // because a refusal nobody receives is the reset this replaces.
+            Message::Text(text) if text.len() > MAX_FRAME_BYTES => {
+                return FirstFrame::Unreadable(oversized_frame_reason(text.len()))
+            }
+            Message::Text(text) => return FirstFrame::Said(text.to_string()),
+            Message::Close(_) => return FirstFrame::Gone,
+            Message::Binary(data) => {
+                return FirstFrame::Unreadable(format!(
+                    "the protocol carries text frames only (D4), and this peer's first \
+                     frame was {} byte(s) of binary",
+                    data.len()
+                ))
+            }
+            // A ping before the handshake is ordinary liveness, not a message.
+            Message::Ping(_) | Message::Pong(_) | Message::Frame(_) => continue,
+        }
+    }
+}
+
+/// What a peer whose first frame is too big is told, with both figures.
+fn oversized_frame_reason(size: usize) -> String {
+    format!(
+        "this peer's first frame is {size} bytes, and this hub accepts a first \
+         frame of at most {MAX_FRAME_BYTES} bytes"
+    )
+}
+
+/// Why a frame would not read, in words.
+///
+/// The library's own text for a frame past the ceiling names the sizes it
+/// compared but not whose ceiling it is, so it is said here: past
+/// [`FRAME_CEILING_BYTES`] the hub stops reading, and this sentence is the one
+/// a peer gets if it is still there to read it.
+fn unreadable_frame_reason(error: &tokio_tungstenite::tungstenite::Error) -> String {
+    use tokio_tungstenite::tungstenite::Error;
+    match error {
+        Error::Capacity(why) => format!(
+            "this frame is past the {FRAME_CEILING_BYTES} bytes this hub reads at all, so \
+             it was not read ({why}); a first frame may carry at most \
+             {MAX_FRAME_BYTES} bytes"
+        ),
+        other => format!("this frame would not read: {other}"),
+    }
 }
 
 /// The text of the next frame that carries any, undecoded.

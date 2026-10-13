@@ -13,6 +13,6 @@ pub use job::{
 };
 pub use server::{
     hub_version, Hub, HubHandle, Policy, RunnerStatus, ATTEMPTS_ALLOWED, DEFAULT_LISTEN_ADDR,
-    LOST_AFTER,
+    FRAME_CEILING_BYTES, LOST_AFTER, MAX_FRAME_BYTES,
 };
 pub use store::{JobDirStore, LAYOUT_VERSION};
