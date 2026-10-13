@@ -12,8 +12,8 @@ closes in M18.
 | E-01 | must | submit by commit, never machine | M10 | planned |  |
 | E-02 | must | ran-on line, verdict unchanged | M10 | planned | format frozen per Q7; results.json's real fields and a worked example are now known (issue #16); real verdict gated (M18) |
 | E-03 | must | stream, detached mode, wait | M2 | merged | foreground streaming itself lands in M1 |
-| E-04 | must | waits explained with figures | M8 | in review (PR #20) | the sentence carries the position, **what is ahead** (the jobs in front by id and level, three named and the rest counted) and why, with the figures E-04 asks for — `1.2 GiB free in tmpfs, 2 GiB needed` comes out of one formatter and is asserted in those words against the real binaries. Said again on its own clock, `--wait-restatement`, 60 s by default and printed at startup: the record keeps M6's news-only rule, the stream gets at most `wait / cadence + 1` lines, which is **eleven over ten minutes** and not one per dispatch pass (D91). Both failure modes are tested by mutation — removing the clock gives 1 line over 20 cadences, restating per pass gives 79 against a bound of 22 |
-| E-05 | must | identical submissions deduplicated | M6 | in review (PR #15) | keyed on the command and the labels, length-prefixed (D69); only an open job is joined — work that is over is rerun (D70); the higher level wins; verified: two waits, one execution, one log |
+| E-04 | must | waits explained with figures | M8 | merged | the sentence carries the position, **what is ahead** (the jobs in front by id and level, three named and the rest counted) and why, with the figures E-04 asks for — `1.2 GiB free in tmpfs, 2 GiB needed` comes out of one formatter and is asserted in those words against the real binaries. Said again on its own clock, `--wait-restatement`, 60 s by default and printed at startup: the record keeps M6's news-only rule, the stream gets at most `wait / cadence + 1` lines, which is **eleven over ten minutes** and not one per dispatch pass (D91). Both failure modes are tested by mutation — removing the clock gives 1 line over 20 cadences, restating per pass gives 79 against a bound of 22 |
+| E-05 | must | identical submissions deduplicated | M6 | merged | keyed on the command and the labels, length-prefixed (D69); only an open job is joined — work that is over is rerun (D70); the higher level wins; verified: two waits, one execution, one log |
 | E-06 | must | cancel kills process tree | M3 | merged | propagation and the sibling-untouched case asserted in M3; the kill becomes a process-tree kill in M4 |
 | E-07 | must | dry run shows placement | M9 | planned |  |
 | E-08 | must | refuse dirty or unpushed | M10 | planned |  |
@@ -26,32 +26,32 @@ closes in M18.
 | E-15 | must | full job record on disk | M2 | merged | byte-faithful logs (D18); a lost log chunk leaves a named marker, and a lost tail is asked for (D36) |
 | E-16 | must | budgets, gc with pinning | M12 | planned | per runner, not central (D10); keepers pin |
 | E-17 | must | atomic publication everywhere | M11 | planned | a manifest registers only once every blob is held; job-record atomicity already in M2 (Q1) |
-| E-18 | must | four priorities with aging | M6 | in review (PR #15) | aging computed, not written (D67); default step 30 min, so the lowest level reaches the top in 90 min; the raise is upwards only (D72); the 90-min figure itself is a simulated-time and 6-second-real-clock assertion, not a measurement on a busy day |
-| E-19 | must | no fallback while available | M7 | in review (PR #18) | preference is one declared integer per runner (D81); a draining runner does not count as available (D80); the limit is `--stickiness-limit`, 3 h, printed at startup and in every waiting sentence; verified against two real runners: the second build never moved while the PC was merely busy, and moved in well under 10 s when it died. Switch-off case retested with E-33 in M9 |
-| E-20 | must | one queue for everything | M6 | in review (PR #15) | the queue is the unfinished job directories; one dispatch pass, which a submission goes through like everything else; no lane for a merger. "Every QEMU on every client listed as a job" needs their executor and the status document (M13, gated M18) |
+| E-18 | must | four priorities with aging | M6 | merged | aging computed, not written (D67); default step 30 min, so the lowest level reaches the top in 90 min; the raise is upwards only (D72); the 90-min figure itself is a simulated-time and 6-second-real-clock assertion, not a measurement on a busy day |
+| E-19 | must | no fallback while available | M7 | merged | preference is one declared integer per runner (D81); a draining runner does not count as available (D80); the limit is `--stickiness-limit`, 3 h, printed at startup and in every waiting sentence; verified against two real runners: the second build never moved while the PC was merely busy, and moved in well under 10 s when it died. Switch-off case retested with E-33 in M9 |
+| E-20 | must | one queue for everything | M6 | merged | the queue is the unfinished job directories; one dispatch pass, which a submission goes through like everything else; no lane for a merger. "Every QEMU on every client listed as a job" needs their executor and the status document (M13, gated M18) |
 | E-21 | must | lost runner, requeue once | M3 | merged | silence threshold is hub policy; a second loss ends the job `lost`; verified: two attempts, never a third, across six alternating runner lives |
-| E-22 | must | build slots, derived -j | M7 | in review (PR #18) | slots are read from the records every pass and counted nowhere, so none can leak and none is rebuilt after a restart (D79); `-j = min(threads, 3/4 of memory / 1792 MiB)` per slot, rounded down, never 0 (D83) — the owner's 17 GiB PC derives E-22's own `-j 7`; the figure is on the record before the job is handed over (D82) and reaches the process through one `{j}` token. Verified: a `kill -9` mid-job gives the slot back, a hub restart does not double-book it. **The memory figure is `MemTotal` unless the owner says otherwise** — whole-job memory admission is M8's (E-29) |
+| E-22 | must | build slots, derived -j | M7 | merged | slots are read from the records every pass and counted nowhere, so none can leak and none is rebuilt after a restart (D79); `-j = min(threads, 3/4 of memory / 1792 MiB)` per slot, rounded down, never 0 (D83) — the owner's 17 GiB PC derives E-22's own `-j 7`; the figure is on the record before the job is handed over (D82) and reaches the process through one `{j}` token. Verified: a `kill -9` mid-job gives the slot back, a hub restart does not double-book it. **The memory figure is `MemTotal` unless the owner says otherwise** — whole-job memory admission is M8's (E-29) |
 | E-23 | should | placement prefers cache locality | M12 | planned | preference only; E-19 governs waiting |
 | E-24 | must | probed/declared/denied labels | M5 | merged | the offer and its origins; matching them at claim time is M7 |
-| E-25 | must | capability kinds and exclusion | M7 | in review (PR #18) | algebra and closure landed in M5 (symmetric, not transitive); enforced at claim time in M7, with the seats carried through a pass so two jobs offered together contend. Verified against the real binaries: two counted jobs serialise on one slot and an exclusive one overlaps neither, including a job that holds no label at all. Note for the consumer: on their declaration `gpu-venus excludes igpu-vfio` is **inert**, because `igpu-vfio` is exclusive and host-wide already blocks everything — what keeps the two apart when something outside Herd holds the iGPU is the busy probe (E-26) |
-| E-26 | must | externally busy capability | M5 | merged | a probe nobody can read suspends too; an unknown *or duplicated* key in the capability file refuses the runner's startup; wait-reason wording polished by M8 |
+| E-25 | must | capability kinds and exclusion | M7 | merged | algebra and closure landed in M5 (symmetric, not transitive); enforced at claim time in M7, with the seats carried through a pass so two jobs offered together contend. Verified against the real binaries: two counted jobs serialise on one slot and an exclusive one overlaps neither, including a job that holds no label at all. Note for the consumer: on their declaration `gpu-venus excludes igpu-vfio` is **inert**, because `igpu-vfio` is exclusive and host-wide already blocks everything — what keeps the two apart when something outside Herd holds the iGPU is the busy probe (E-26) |
+| E-26 | must | externally busy capability | M5 | merged | a probe nobody can read suspends too; an unknown *or duplicated* key in the capability file refuses the runner's startup; wait-reason wording polished by M7 |
 | E-27 | must | metal lease, drain first | M9 | planned | lease model lands in M5 as counted(1) plus a probe; drain-first in M9 |
 | E-28 | must | reference label carried | M5 | merged | a capability like any other; placement preferring it last is M12 |
-| E-29 | must | memory admission with floor | M8 | in review (PR #20) | a running job is costed at what it **declared**, never at what it uses: a job admitted a second ago has allocated nothing, and M4's cap is what makes the declaration honest (D87). The sums are derived from the records every pass through the same filter as the slots, so nothing can leak and nothing is rebuilt after a restart (D79), and the pass carries them forward so two jobs offered together contend. A build's need is its per-thread figure times the `-j` it was given (D82). Floor announced by the machine, a fifth of what is lent between 1 and 8 GiB by default — 6.2 GiB on their server, 3.4 GiB on the PC, against the 6 and 3 they name. An override larger than the real `MemTotal` is **clamped loudly** where it is written, because a floor over memory that does not exist guards nothing (D89). An absent floor is unknown and admits nothing. Verified against the real binaries: 4 GiB held by an inherited job, 3 GiB free of 7, a 5 GiB job told so by figure |
+| E-29 | must | memory admission with floor | M8 | merged | a running job is costed at what it **declared**, never at what it uses: a job admitted a second ago has allocated nothing, and M4's cap is what makes the declaration honest (D87). The sums are derived from the records every pass through the same filter as the slots, so nothing can leak and nothing is rebuilt after a restart (D79), and the pass carries them forward so two jobs offered together contend. A build's need is its per-thread figure times the `-j` it was given (D82). Floor announced by the machine, a fifth of what is lent between 1 and 8 GiB by default — 6.2 GiB on their server, 3.4 GiB on the PC, against the 6 and 3 they name. An override larger than the real `MemTotal` is **clamped loudly** where it is written, because a floor over memory that does not exist guards nothing (D89). An absent floor is unknown and admits nothing. Verified against the real binaries: 4 GiB held by an inherited job, 3 GiB free of 7, a 5 GiB job told so by figure |
 | E-30 | must | kernel memory ceiling | M4 | merged | WSL OOM replay is a manual M17 check; real ceiling asserted only under a delegated cgroup; RLIMIT_AS fallback per D23 |
-| E-31 | must | tmpfs reservation, wait | M8 | in review (PR #20) | the runner announces the mount's **capacity** (`/dev/shm` by default, checked to be a tmpfs, or `--host-tmpfs`); free is that less what the records declare, which is the only arithmetic that cannot leak a reservation (D90). Short → **waits for that machine**, because a job ending there frees the room; more than the machine has in all → *not here ever*, so the job does not stick to a machine that could never hold it (D88). A figure that cannot be read is absent and the job is refused there **by name**, never `Some(0)`. Verified: 3 GiB twice on a 4 GiB tmpfs serialise with no overlap, the second starts when the first ends, and a job needing the whole 4 GiB runs straight afterwards — the proof nothing leaked. **Honest limit:** a job no *connected* runner could ever fit waits rather than ending, with a sentence saying "ever"; the bound on such a wait is E-09's deadline in M9 (D88) |
-| E-32 | must | host-wide bound, load recorded | M8 | in review (PR #20) | the sums are per host and host-wide, carried through a pass so two jobs offered together cannot both be admitted past the bound. Load reaches the hub on the handshake and every health report, lands on the line explaining every placement (`load 0.42 there, recorded and not a gate (E-32)`), and gates nothing: the same job goes to the same machine at load 0.1 and at load 50, the two lines differ in that figure alone, and a test reads the module's own source for any comparison against a load. p90 < 12 figure read after adoption (M18+) |
+| E-31 | must | tmpfs reservation, wait | M8 | merged | the runner announces the mount's **capacity** (`/dev/shm` by default, checked to be a tmpfs, or `--host-tmpfs`); free is that less what the records declare, which is the only arithmetic that cannot leak a reservation (D90). Short → **waits for that machine**, because a job ending there frees the room; more than the machine has in all → *not here ever*, so the job does not stick to a machine that could never hold it (D88). A figure that cannot be read is absent and the job is refused there **by name**, never `Some(0)`. Verified: 3 GiB twice on a 4 GiB tmpfs serialise with no overlap, the second starts when the first ends, and a job needing the whole 4 GiB runs straight afterwards — the proof nothing leaked. **Honest limit:** a job no *connected* runner could ever fit waits rather than ending, with a sentence saying "ever"; the bound on such a wait is E-09's deadline in M9 (D88) |
+| E-32 | must | host-wide bound, load recorded | M8 | merged | the sums are per host and host-wide, carried through a pass so two jobs offered together cannot both be admitted past the bound. Load reaches the hub on the handshake and every health report, lands on the line explaining every placement (`load 0.42 there, recorded and not a gate (E-32)`), and gates nothing: the same job goes to the same machine at load 0.1 and at load 50, the two lines differ in that figure alone, and a test reads the module's own source for any comparison against a load. p90 < 12 figure read after adoption (M18+) |
 | E-33 | must | owner switch in 10 s | M9 | planned | desktop shortcut on the real PC in M17 |
 | E-34 | must | niced, no inbound, disk budget | M4 | merged | D11: "no inbound" = no port on a router; a mesh-bound fetch endpoint is allowed. Windows logon task in M17 |
 | E-35 | must | machine-readable status | M13 | planned | format versioned per Q7 |
-| E-36 | must | every decision explained | M7 | in review (PR #18) | one `claimed by …` line per placement, on the attempt, with the runner, the labels, the slot figures, any derived `-j` and the preference; verified by counting the lines against the attempts over a simulated busy day. "Nobody could ever run this" ends the job (`impossible`, exit 125 with the labels named); everything else waits, a label nothing offers included (D84). Refusal figures for memory and tmpfs completed in M8 |
+| E-36 | must | every decision explained | M7 | merged | one `claimed by …` line per placement, on the attempt, with the runner, the labels, the slot figures, any derived `-j` and the preference; verified by counting the lines against the attempts over a simulated busy day. "Nobody could ever run this" ends the job (`impossible`, exit 125 with the labels named); everything else waits, a label nothing offers included (D84). Refusal figures for memory and tmpfs completed in M8 |
 | E-37 | must | events routable to ntfy | M13 | planned |  |
 | E-38 | should | statistics over a period | — | planned | deferred past M18; raw data already written by M2/M4 records |
 | E-39 | should | results searchable | — | planned | deferred past M18; on-disk records are greppable meanwhile |
 | E-40 | should | health every 15 s | M3 | merged | the age is in the hub's state; surfaced in the status document in M13 |
 | E-41 | must | scheduled nightly, exclusive | M14 | planned | now concrete: 03:00 local, daily, only if main moved, 5 h cap, `nightly` exclusive, 05:00 start deadline else skipped with the reason as an event (issue #16); gated: their nightly command, live at M18 |
 | E-42 | must | push hook submits producer | M14 | planned | Herd side = scriptable detached submit; the hook is theirs; now concrete: `dedup_key` `produce:<commit>`, `coalesce` key `produce:main` superseding a queued older `produce`, never a running one (D75, issue #16) |
-| E-43 | must | merger jobs start first | M6 | in review (PR #15) | a priority, never a side door; verified against the real binaries: a merger submitted last takes the next free slot. Which jobs a merge submits is theirs (M18) |
+| E-43 | must | merger jobs start first | M6 | merged | a priority, never a side door; verified against the real binaries: a merger submitted last takes the next free slot. Which jobs a merge submits is theirs (M18) |
 | E-44 | must | restart loses nothing | M2 | merged | verified: hub killed mid-job, result lands, record complete |
 | E-45 | must | one data root only | M4 | merged | cooperative confinement only — full containment needs a mount namespace E-46 forbids (D28) |
 | E-46 | must | unprivileged, root via helper | M4 | merged |  |
@@ -67,18 +67,19 @@ closes in M18.
 
 ## State of play (2026-10-13)
 
-Six milestones are merged to `main`: M1 (substrate, no must of its
-own), M2, M3, M4, M5 (the capability model) and M6 (the queue and its
-priorities). **12 of 44 musts are merged and verified** against the real
-binaries by an independent adversarial pass (E-03, E-15, E-44 from M2;
-E-06, E-21 from M3; E-30, E-34, E-45, E-46 from M4; E-24, E-26, E-28
-from M5); M6's four (E-05, E-18, E-20, E-43) are merged but have not had
-that pass. M2 and M3 also carry two `should` rows merged alongside them
-(E-53, E-40). Four more musts are written and in review, not merged:
-E-19, E-22, E-25, E-36 (M7, matching and slots). The remaining 24 musts
-are planned.
+Eight milestones are merged to `main`: M1 (substrate, no must of its
+own), M2, M3, M4, M5 (the capability model), M6 (the queue and its
+priorities), M7 (matching, slots and stickiness) and M8 (admission and
+explained waits). **24 of 44 musts are merged**; 12 are verified
+against the real binaries by an independent adversarial pass (E-03,
+E-15, E-44 from M2; E-06, E-21 from M3; E-30, E-34, E-45, E-46 from M4;
+E-24, E-26, E-28 from M5). M6's four (E-05, E-18, E-20, E-43), M7's
+four (E-19, E-22, E-25, E-36) and M8's four (E-04, E-29, E-31, E-32)
+are merged but have not had that pass. M2 and M3 also carry two
+`should` rows merged alongside them (E-53, E-40). The remaining 20
+musts are planned.
 
-Five things a reader must not mistake for done:
+Six things a reader must not mistake for done:
 
 1. **Authentication does not exist until M15.** A runner's name is
    self-asserted, so a hand-crafted peer reaching the hub's port can
@@ -91,26 +92,36 @@ Five things a reader must not mistake for done:
    namespace E-46 forbids the runner the privilege for. On the
    deployment host the runner's user is additionally in the `docker`
    group, root-equivalent through the container socket — the runner
-   now warns about this at startup, and it is the first thing to raise
-   with the first consumer.
+   warns about this at startup. It has been raised and settled: the
+   consumer required it in issue #16 and Herd agreed without
+   reservation (D78). The runner needs no Docker at all; three
+   checkable commitments land in M16, and taking the user out of the
+   group is a change on the host that the owner makes.
 3. **E-30's real kernel ceiling is only asserted under a delegated
    cgroup**; without delegation the runner falls back to `RLIMIT_AS`,
    weaker in three named ways (D23). The WSL replay on real hardware
    is still a manual M17 check.
 4. **Nothing is deployed, so every format is still free to change.**
-   M7 moved both again: `PROTOCOL_VERSION` is **3** and
-   `RECORD_VERSION` is **3**. A runner now announces how big its host is
-   and how preferred it is, a submission may carry the memory one build
-   thread needs, an attempt carries the line explaining its placement
-   and a record carries the `-j` derived for it — all required rather
-   than defaulted, for the reason D71 gives. A state root written before
-   M7 is refused by name with both figures; there is no migration and
-   none is owed (D73). They freeze at M16.
+   M8 moved both again: `PROTOCOL_VERSION` is **4** and
+   `RECORD_VERSION` is **4**. A runner now announces the memory it
+   keeps for itself and the tmpfs room jobs may reserve on it, and a
+   submission may carry the whole-job memory and tmpfs a requester
+   declares — all required rather than defaulted, for the reason D71
+   gives. A state root written before M8 is refused by name with both
+   figures; there is no migration and none is owed (D73). They freeze
+   at M16.
 5. **A fleet, with no authentication.** The hub holds many runners from
    M7, keyed on the name an attempt belongs to. That makes point 1 above
    worse rather than better: a hand-crafted peer can now join *beside*
    the real runners under any name it likes. Loopback only until M15
    still holds.
+6. **E-22's exact `-j 7` is now host-dependent.** It is asserted only
+   on a host with a real 17 GiB of memory, and skipped with its reason
+   elsewhere (D27, D89), so CI shows **three** skips rather than two —
+   GitHub Actions gives the runner 15 989 MiB. What is asserted on
+   every host is stronger than before: the figure on the record, the
+   figure in the explanatory line and the figure the process was given
+   are one value. The exact figure itself is no longer checked by CI.
 
 ## Musts per milestone
 
