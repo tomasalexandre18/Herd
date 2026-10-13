@@ -424,6 +424,22 @@ struct State {
     dispatching: Mutex<()>,
 }
 
+/// What a runner announced about itself in its handshake, past its name.
+///
+/// One struct rather than three arguments carried side by side through the
+/// handshake: they arrive in one frame, they are recorded together, and a
+/// fourth fact about a machine should not be a fourth parameter on four
+/// functions.
+#[derive(Debug, Clone)]
+struct Announced {
+    /// What it offers, and what its probes say (M5, E-24).
+    capacity: RunnerCapacity,
+    /// How big its host is (E-22).
+    host: HostSize,
+    /// How preferred it is when more than one machine could run a job (E-19).
+    preference: i32,
+}
+
 /// What a requester gets when it attaches to a job by its id.
 struct Attached {
     record: JobRecord,
@@ -576,9 +592,7 @@ impl State {
         instance: Option<&str>,
         outbox: &Outbox,
         kick: watch::Sender<bool>,
-        capacity: RunnerCapacity,
-        host: HostSize,
-        preference: i32,
+        announced: Announced,
     ) -> Admitted {
         self.with_peers(|peers| {
             // Only the runner wearing this *name* is in the way. A second
@@ -635,9 +649,9 @@ impl State {
                     name: name.to_owned(),
                     instance: instance.map(str::to_owned),
                     outbox: outbox.clone(),
-                    capacity,
-                    host,
-                    preference,
+                    capacity: announced.capacity,
+                    host: announced.host,
+                    preference: announced.preference,
                     kick,
                     joined_at: now,
                     last_health: now,
@@ -1093,70 +1107,64 @@ async fn serve_peer(state: Arc<State>, stream: TcpStream) -> Result<()> {
             return refuse(&mut sink, reason).await;
         }
     };
-    let (
-        role,
-        peer_name,
-        peer_instance,
-        peer_state_root,
-        peer_health_every,
-        capacity,
-        host,
-        preference,
-    ) = match hello {
-        ToHub::Hello {
-            protocol_version,
-            role,
-            token,
-            name,
-            instance,
-            state_root,
-            health_every_ms,
-            capabilities,
-            host,
-            preference,
-        } => {
-            if protocol_version != PROTOCOL_VERSION {
-                return refuse(&mut sink, version_mismatch_reason(protocol_version)).await;
-            }
-            // The token is carried from M1 and validated from M15 (D6, Q8).
-            let _ = token;
-            // Trimmed once, here, so that every reader below — the ownership
-            // gate, the twin rule, the capability registry's sentences — is
-            // looking at the same name.
-            let name = said(name);
-            (
+    let (role, peer_name, peer_instance, peer_state_root, peer_health_every, announced) =
+        match hello {
+            ToHub::Hello {
+                protocol_version,
                 role,
-                // A blank identity is no identity. `Some("")` — or a name of
-                // spaces — used to walk straight through the refusal below,
-                // because it *has* an instance and *has* a name as far as an
-                // `Option` is concerned, and the peer then wore a blank
-                // effective name: one that matches every other blank-named
-                // peer's attempt, which is the exact hole naming an attempt's
-                // runner was meant to close. So whitespace is stripped and
-                // what is left empty is absent, which is the case the hub
-                // already refuses.
-                //
-                // The offer carries the same trimmed name, not the one as
-                // given: the sentence a human reads about a capability names
-                // the runner, and " wsl-pc " is not a second machine there
-                // either.
-                name.clone().unwrap_or_default(),
-                said(instance),
-                said(state_root),
-                health_every_ms.map(Duration::from_millis),
-                RunnerCapacity::new(name, capabilities),
+                token,
+                name,
+                instance,
+                state_root,
+                health_every_ms,
+                capabilities,
                 host,
                 preference,
-            )
-        }
-        other => {
-            let reason = format!(
-                "the first message must be hello, not {}",
-                message_kind(&other)
-            );
-            return refuse(&mut sink, reason).await;
-        }
-    };
+            } => {
+                if protocol_version != PROTOCOL_VERSION {
+                    return refuse(&mut sink, version_mismatch_reason(protocol_version)).await;
+                }
+                // The token is carried from M1 and validated from M15 (D6, Q8).
+                let _ = token;
+                // Trimmed once, here, so that every reader below — the ownership
+                // gate, the twin rule, the capability registry's sentences — is
+                // looking at the same name.
+                let name = said(name);
+                (
+                    role,
+                    // A blank identity is no identity. `Some("")` — or a name of
+                    // spaces — used to walk straight through the refusal below,
+                    // because it *has* an instance and *has* a name as far as an
+                    // `Option` is concerned, and the peer then wore a blank
+                    // effective name: one that matches every other blank-named
+                    // peer's attempt, which is the exact hole naming an attempt's
+                    // runner was meant to close. So whitespace is stripped and
+                    // what is left empty is absent, which is the case the hub
+                    // already refuses.
+                    //
+                    // The offer carries the same trimmed name, not the one as
+                    // given: the sentence a human reads about a capability names
+                    // the runner, and " wsl-pc " is not a second machine there
+                    // either.
+                    name.clone().unwrap_or_default(),
+                    said(instance),
+                    said(state_root),
+                    health_every_ms.map(Duration::from_millis),
+                    Announced {
+                        capacity: RunnerCapacity::new(name, capabilities),
+                        host,
+                        preference,
+                    },
+                )
+            }
+            other => {
+                let reason = format!(
+                    "the first message must be hello, not {}",
+                    message_kind(&other)
+                );
+                return refuse(&mut sink, reason).await;
+            }
+        };
 
     // A runner has to be a *particular* runner, because that is what an
     // attempt belongs to. With an empty name, the record's `runner` field says
@@ -1275,9 +1283,7 @@ async fn serve_peer(state: Arc<State>, stream: TcpStream) -> Result<()> {
                 peer_instance.as_deref(),
                 &outbox,
                 &mut source,
-                capacity,
-                host,
-                preference,
+                announced,
             )
             .await
         }
@@ -1294,13 +1300,12 @@ async fn serve_runner(
     instance: Option<&str>,
     outbox: &Outbox,
     source: &mut Source,
-    capacity: RunnerCapacity,
-    host: HostSize,
-    preference: i32,
+    announced: Announced,
 ) -> Result<()> {
+    let (host, preference) = (announced.host, announced.preference);
     // What it offers, said out loud with every capability's origin: a denial
     // nobody can see is a denial nobody can trust (E-24).
-    for line in capacity.report() {
+    for line in announced.capacity.report() {
         println!("herd-hub: {line}");
     }
     // And how big it says it is, because that is what every `-j` on this
@@ -1318,7 +1323,7 @@ async fn serve_runner(
         ),
     }
     let (kick, mut kicked) = watch::channel(false);
-    match state.register_runner(name, instance, outbox, kick, capacity, host, preference) {
+    match state.register_runner(name, instance, outbox, kick, announced) {
         Admitted::Yes => {}
         // Not a refusal: a runner told to wait comes back, and one that is
         // refused dies (D13). Telling a redialling runner "a runner is
@@ -1433,7 +1438,7 @@ fn dispatch_a_pass(state: &State) -> Result<()> {
         .context("reading the queue the hub recovered")?;
     // What every runner is already holding, read from those same records and
     // from nothing else: there is no counter of busy slots in this hub, so
-    // there is none to leak and none to rebuild after a restart (D81).
+    // there is none to leak and none to rebuild after a restart (D79).
     let held = matcher::holdings(&unfinished);
     let mut seats = state.seats(&held);
     // One moment for the whole pass, so that the order cannot change halfway
@@ -3179,9 +3184,11 @@ mod tests {
                 Some("run-1"),
                 &outbox,
                 kick,
-                offering_kvm_free(),
-                HostSize::default(),
-                0,
+                Announced {
+                    capacity: offering_kvm_free(),
+                    host: HostSize::default(),
+                    preference: 0,
+                },
             ),
             Admitted::Yes
         ));
