@@ -58,16 +58,16 @@ Four caveats, detailed in `docs/coverage.md`:
    and they are set back to 1 and frozen at M16 (D73).
 
 Booked, not yet fixed: a SIGKILLed runner leaves its in-flight probes
-behind; a verdict the hub could not write, later overtaken by its own
+behind; a verdict the hub could not write, then overtaken by its own
 watchdog, logs "is over" for ever instead of erroring — loud, never a
-false write, but a stall worth a later look; D63's single write-door
-rule is now enforced by review, not the compiler — a future caller of
-`open_unless_over` can skip the wrapper that refuses; D64's probe
-sweep is untested for a probe outliving four rounds, and its `/proc`
-scan with a per-pid `environ` read on every reading is a few
-milliseconds by estimate, not measured — a host with thousands of
-processes and a short `--probe-interval` carries unbenchmarked work. **Q10, the licence**, is the
-owner's only outstanding decision; it blocks nothing before M16.
+false write, but a stall; D63's single write-door rule is now enforced
+by review, not the compiler — a future caller of `open_unless_over`
+can skip the wrapper that refuses; D64's probe sweep is untested for
+a probe outliving four rounds, and its `/proc` scan with a per-pid
+`environ` read on every reading is a few milliseconds by estimate,
+not measured — a host with thousands of processes and a short
+`--probe-interval` carries unbenchmarked work. **Q10, the licence**,
+is the owner's only outstanding decision; it blocks nothing before M16.
 
 ## Environment facts
 
