@@ -1298,6 +1298,7 @@ mod tests {
             updated_at: Timestamp::now(),
             attempts: Vec::new(),
             metrics: JobMetrics::default(),
+            outputs: Default::default(),
         }
     }
 

@@ -50,6 +50,15 @@ pub struct Finished {
     pub job_id: JobId,
     pub outcome: JobOutcome,
     pub metrics: JobMetrics,
+    /// What the job left under its `{out}` directory, as its record holds it
+    /// (D131).
+    ///
+    /// Carried here and written nowhere by default: E-02's stream is the
+    /// `ran on:` line, the job's own bytes, then the verdict, and an output
+    /// file on stdout would be read by the consumer's tooling as the job's
+    /// output. `herdctl run --outputs-to <dir>` is what puts them on a disk,
+    /// and it says on **stderr** which files it wrote.
+    pub outputs: herd_proto::JobOutputs,
 }
 
 /// `herdctl`'s exit code when there is no verdict to report: Herd could not
@@ -377,6 +386,7 @@ pub async fn run_job(
                 job_id,
                 outcome,
                 metrics,
+                outputs,
             } => {
                 if Framing::belongs_to(&outcome) {
                     framing.release(&mut said);
@@ -386,6 +396,7 @@ pub async fn run_job(
                     job_id,
                     outcome,
                     metrics,
+                    outputs,
                 });
             }
             FromHub::Refused { reason } => bail!("the hub refused the job: {reason}"),
@@ -481,6 +492,7 @@ pub async fn wait_for_job(
                 job_id,
                 outcome,
                 metrics,
+                outputs,
             } => {
                 if Framing::belongs_to(&outcome) {
                     framing.release(&mut said);
@@ -490,6 +502,7 @@ pub async fn wait_for_job(
                     job_id,
                     outcome,
                     metrics,
+                    outputs,
                 });
             }
             FromHub::JobLog { data, .. } => {
@@ -523,6 +536,47 @@ pub async fn wait_for_job(
         }
     }
     bail!("the hub closed the connection while {job_id} was still running")
+}
+
+/// Write a job's kept files under `directory`, keeping their relative paths,
+/// and come back with one line per file written (D131).
+///
+/// Three things this deliberately does:
+///
+/// * **It never touches stdout.** The caller puts these lines on stderr. An
+///   output file printed into E-02's stream would be read by the consumer's
+///   own tooling as part of the job's output, which is the one thing E-02
+///   cannot survive.
+/// * **It checks every path again**, with [`herd_proto::check_relative`] —
+///   the same function the runner and the hub use. These paths arrived over a
+///   socket and are about to be joined onto a directory on the requester's
+///   own disk, which is the third place in Herd where that would be a hole
+///   and the third place the one check closes it.
+/// * **It writes nothing when the collection was refused.** Over the cap
+///   there are no files, and a directory the caller can find empty is the
+///   honest shape of that: the sentence is what says why.
+pub fn write_outputs(
+    directory: &std::path::Path,
+    outputs: &herd_proto::JobOutputs,
+) -> Result<Vec<String>> {
+    let mut written = Vec::new();
+    for file in &outputs.files {
+        herd_proto::check_relative(&file.path).map_err(|why| {
+            anyhow!("the hub named an output file this requester will not write: {why}")
+        })?;
+        let path = directory.join(&file.path);
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)
+                .with_context(|| format!("making {}", parent.display()))?;
+        }
+        std::fs::write(&path, &file.data).with_context(|| format!("writing {}", path.display()))?;
+        written.push(format!(
+            "wrote {} ({} bytes)",
+            path.display(),
+            file.data.len()
+        ));
+    }
+    Ok(written)
 }
 
 /// Ask for a job to be cancelled, and come back with what the hub says
@@ -709,11 +763,30 @@ pub async fn raise_job(config: &Config, job_id: JobId, priority: Priority) -> Re
     }
 }
 
+/// What this requester will read off the wire: Herd's own ceiling, not the
+/// library's default.
+///
+/// The WebSocket library's own `max_frame_size` is 16 MiB, which nobody here
+/// chose and which is **smaller than a frame the hub may legitimately send**:
+/// a verdict carrying a job's kept files is one frame, and the hub reads and
+/// writes up to [`herd_proto::FRAME_CEILING`]. Left at the default, a job
+/// whose output was well inside the runner's cap would have arrived as a
+/// closed connection and a 125 — a job with no verdict, for a job that
+/// passed, which is the shape of defect D117 named. So the figure is stated
+/// here, the same one on every socket in Herd.
+fn frame_limits() -> tokio_tungstenite::tungstenite::protocol::WebSocketConfig {
+    let ceiling = usize::try_from(herd_proto::FRAME_CEILING).unwrap_or(usize::MAX);
+    tokio_tungstenite::tungstenite::protocol::WebSocketConfig::default()
+        .max_message_size(Some(ceiling))
+        .max_frame_size(Some(ceiling))
+}
+
 /// Dial the hub and get through the handshake.
 async fn join(config: &Config) -> Result<Socket> {
-    let (mut socket, _response) = tokio_tungstenite::connect_async(&config.hub_url)
-        .await
-        .with_context(|| format!("dialling {}", config.hub_url))?;
+    let (mut socket, _response) =
+        tokio_tungstenite::connect_async_with_config(&config.hub_url, Some(frame_limits()), false)
+            .await
+            .with_context(|| format!("dialling {}", config.hub_url))?;
     send(
         &mut socket,
         &ToHub::Hello {

@@ -108,7 +108,12 @@ pub const MAX_FRAME_BYTES: usize = 1 << 20;
 /// default for a whole message, so no exposure is being widened; what changes
 /// is that a *single frame* that big is read rather than cut off at the
 /// library's 16 MiB, so the mistake can be answered instead of dropped.
-pub const FRAME_CEILING_BYTES: usize = 64 << 20;
+///
+/// Taken from [`herd_proto::FRAME_CEILING`] rather than written again here:
+/// the output cap is **derived** from what a frame can carry (D131), so the
+/// figure has to be one figure in one place or a cap would be computed
+/// against a ceiling the hub no longer has.
+pub const FRAME_CEILING_BYTES: usize = herd_proto::FRAME_CEILING as usize;
 
 /// How many goes at running one job the hub allows (E-21).
 ///
@@ -819,7 +824,15 @@ struct Peers {
     /// that was holding each one. Retried for as long as it takes and never
     /// dropped: a stalled job is recoverable, a destroyed verdict is not
     /// (D19).
-    unwritten: HashMap<JobId, (JobOutcome, JobMetrics)>,
+    ///
+    /// The job's **kept files** are held here with its outcome, and they have
+    /// to be: the runner's workspace is already reclaimed by the time this
+    /// frame exists, so these bytes and the runner's copy of them are the only
+    /// two in the world. A retry that wrote the verdict and forgot the files
+    /// would destroy half a record D19 says is never destroyed. Bounded by
+    /// the output cap times the number of stalled jobs, which is the same
+    /// bargain as holding the outcome itself.
+    unwritten: HashMap<JobId, (JobOutcome, JobMetrics, herd_proto::JobOutputs)>,
     /// Which attempt of each unfinished job this hub is waiting for, **and
     /// which runner it was handed to**.
     ///
@@ -1346,12 +1359,14 @@ impl State {
         reason: String,
         outcome: &JobOutcome,
         metrics: &JobMetrics,
+        outputs: &herd_proto::JobOutputs,
     ) -> Vec<Outbox> {
         self.with_peers(|peers| {
             peers.stalled.insert(id.clone(), reason);
-            peers
-                .unwritten
-                .insert(id.clone(), (outcome.clone(), metrics.clone()));
+            peers.unwritten.insert(
+                id.clone(),
+                (outcome.clone(), metrics.clone(), outputs.clone()),
+            );
             peers.followers_to_write_to(id)
         })
     }
@@ -2549,11 +2564,17 @@ fn end_the_job(state: &State, record: &JobRecord, outcome: JobOutcome, said: &st
         )
         .with_context(|| format!("ending {}", record.id))?;
     eprintln!("herd-hub: {} {said}", record.id);
+    // Whatever the record holds, which for a job the claim step ended is
+    // nothing: no runner ever made it a workspace. Read rather than assumed,
+    // so that there is one answer to "what did this job leave?" and not one
+    // per place a job can end.
+    let kept = read_the_outputs(state, &record.id);
     for follower in state.stop_following(&record.id) {
         let _ = follower.send(FromHub::JobFinished {
             job_id: record.id.clone(),
             outcome: outcome.clone(),
             metrics: JobMetrics::default(),
+            outputs: kept.clone(),
         });
     }
     Ok(())
@@ -3069,6 +3090,7 @@ async fn relay_from_runner(
                 chunks_sent,
                 metrics,
                 steps,
+                outputs,
             } => {
                 if !is_current(state, name, outbox, &job_id, attempt) {
                     continue;
@@ -3131,7 +3153,7 @@ async fn relay_from_runner(
                 // of these two steps is the whole of E-44's promise: nothing
                 // tells the runner to forget a result that is not yet on a
                 // disk.
-                if !record_the_end(state, &job_id, &outcome, &metrics).await {
+                if !record_the_end(state, &job_id, &outcome, &metrics, &outputs).await {
                     // The hub could not write it. Nothing is acknowledged, so
                     // the runner keeps holding it; the hub goes on trying in
                     // the background and never destroys it (D19).
@@ -3141,11 +3163,17 @@ async fn relay_from_runner(
                 let _ = outbox.send(FromHub::JobResultAck {
                     job_id: job_id.clone(),
                 });
+                // Off the record, not out of the frame that just arrived, so
+                // a requester following live and a `herdctl wait` an hour
+                // later are given the same bytes by the same code: one answer
+                // to "what did this job leave?", which is the disk (D131).
+                let kept = read_the_outputs(state, &job_id);
                 for follower in state.stop_following(&job_id) {
                     let _ = follower.send(FromHub::JobFinished {
                         job_id: job_id.clone(),
                         outcome: outcome.clone(),
                         metrics: metrics.clone(),
+                        outputs: kept.clone(),
                     });
                 }
                 // A job that ends gives back whatever it was holding, and
@@ -3364,11 +3392,32 @@ fn the_log_is_whole(
 /// [`keep_trying_to_write_results`], which goes on trying on a growing delay
 /// and never stops. There is no give-up, because the only alternative to
 /// writing a result eventually is losing it.
+/// What a job's record holds under `files/`, for the frame a requester gets.
+///
+/// A read that fails is **not** a reason to withhold the verdict: the files
+/// are part of the record and the verdict is the answer somebody is waiting
+/// for, so a store that will not give them up is said out loud and the job
+/// still ends. Nothing is invented in their place — the requester is given no
+/// file and the sentence is on the hub's stderr, where an operator reads it.
+fn read_the_outputs(state: &State, job_id: &JobId) -> herd_proto::JobOutputs {
+    match state.store.job_outputs(job_id) {
+        Ok(outputs) => outputs,
+        Err(error) => {
+            eprintln!(
+                "herd-hub: the files kept for {job_id} could not be read back, so its \
+                 requester is given none: {error}"
+            );
+            herd_proto::JobOutputs::default()
+        }
+    }
+}
+
 async fn record_the_end(
     state: &State,
     job_id: &JobId,
     outcome: &JobOutcome,
     metrics: &JobMetrics,
+    outputs: &herd_proto::JobOutputs,
 ) -> bool {
     const FAST_TRIES: u32 = 3;
     let end = JobState::Finished {
@@ -3382,9 +3431,17 @@ async fn record_the_end(
         // write what a runner measured must not acknowledge the result
         // either. Failing to store either half is the hub's problem, never
         // the runner's, and never a reason to drop it (D19).
+        //
+        // The job's kept files go down in the same try and for the same
+        // reason (D131). They are part of the record a `finished` state
+        // promises, and a hub that acknowledged a verdict whose
+        // `results.json` it had failed to write would have told the runner to
+        // forget the only copy of it — the workspace is already reclaimed by
+        // the time this frame exists.
         match state
             .store
             .record_metrics(job_id, metrics.clone())
+            .and_then(|()| state.store.record_outputs(job_id, outputs))
             .and_then(|()| state.store.record_state(job_id, end.clone()))
         {
             Ok(()) => {
@@ -3414,7 +3471,7 @@ async fn record_the_end(
     // so does whoever waits for it later: being mute about a job that is
     // going nowhere is not a policy (D19).
     let note = stalled_note(&why);
-    for follower in state.note_a_stall(job_id, why, outcome, metrics) {
+    for follower in state.note_a_stall(job_id, why, outcome, metrics, outputs) {
         let _ = follower.send(FromHub::JobNote {
             job_id: job_id.clone(),
             note: note.clone(),
@@ -3434,25 +3491,39 @@ async fn keep_trying_to_write_results(state: Arc<State>) {
     let mut delay = state.policy.write_retry_first;
     loop {
         tokio::time::sleep(delay).await;
-        let pending: Vec<(JobId, JobOutcome, JobMetrics)> = state.with_peers(|peers| {
-            peers
-                .unwritten
-                .iter()
-                .map(|(id, (outcome, metrics))| (id.clone(), outcome.clone(), metrics.clone()))
-                .collect()
-        });
+        let pending: Vec<(JobId, JobOutcome, JobMetrics, herd_proto::JobOutputs)> = state
+            .with_peers(|peers| {
+                peers
+                    .unwritten
+                    .iter()
+                    .map(|(id, (outcome, metrics, outputs))| {
+                        (
+                            id.clone(),
+                            outcome.clone(),
+                            metrics.clone(),
+                            outputs.clone(),
+                        )
+                    })
+                    .collect()
+            });
         if pending.is_empty() {
             delay = state.policy.write_retry_first;
             continue;
         }
         let mut wrote_something = false;
-        for (job_id, outcome, metrics) in pending {
+        for (job_id, outcome, metrics, outputs) in pending {
             let end = JobState::Finished {
                 outcome: outcome.clone(),
             };
+            // The same three writes in the same order as the first try, kept
+            // deliberately identical: the files are part of the record this
+            // transition promises, so a hub that recovered its disk and wrote
+            // a verdict without them would have lost half a record D19 says
+            // is never lost.
             match state
                 .store
                 .record_metrics(&job_id, metrics.clone())
+                .and_then(|()| state.store.record_outputs(&job_id, &outputs))
                 .and_then(|()| state.store.record_state(&job_id, end))
             {
                 Ok(()) => {
@@ -3468,11 +3539,13 @@ async fn keep_trying_to_write_results(state: Arc<State>) {
                             job_id: job_id.clone(),
                         });
                     }
+                    let kept = read_the_outputs(&state, &job_id);
                     for follower in state.stop_following(&job_id) {
                         let _ = follower.send(FromHub::JobFinished {
                             job_id: job_id.clone(),
                             outcome: outcome.clone(),
                             metrics: metrics.clone(),
+                            outputs: kept.clone(),
                         });
                     }
                     // Written at last, so what it was holding is given back
@@ -3679,14 +3752,17 @@ fn give_the_job_another_go(
         )
         .with_context(|| format!("recording {job_id} as lost"))?;
     eprintln!("herd-hub: {job_id} is lost: {reason}");
+    let kept = read_the_outputs(state, job_id);
     for follower in state.stop_following(job_id) {
         let _ = follower.send(FromHub::JobFinished {
             job_id: job_id.clone(),
             outcome: outcome.clone(),
             // Whatever the record holds, which for a job no runner ever
             // reported on is nothing at all — and nothing is what is sent,
-            // never a zero (D23).
+            // never a zero (D23). The same for its files: a runner that went
+            // away reported no verdict, so it reported no output either.
             metrics: record.metrics.clone(),
+            outputs: kept.clone(),
         });
     }
     Ok(())
@@ -3805,11 +3881,13 @@ async fn requeue_for_a_lost_capability(
         )
         .with_context(|| format!("recording {job_id} as out of requeues"))?;
     eprintln!("herd-hub: {job_id} has spent its requeue budget: {reason}");
+    let kept = read_the_outputs(state, job_id);
     for follower in state.stop_following(job_id) {
         let _ = follower.send(FromHub::JobFinished {
             job_id: job_id.clone(),
             outcome: outcome.clone(),
             metrics: record.metrics.clone(),
+            outputs: kept.clone(),
         });
     }
     Ok(())
@@ -4656,10 +4734,17 @@ fn answer_a_wait(state: &State, outbox: &Outbox, job_id: JobId) -> Result<bool> 
         // the record too, so a wait an hour later reads the same
         // figures the requester that followed the job read (E-15).
         JobState::Finished { outcome } => {
+            // And the files it left, off the same record. This is what makes
+            // the whole mechanism work for a requester that was never
+            // connected while the job ran: `herdctl wait <id>` an hour later
+            // gets the verdict and the bytes in one frame, so there is no
+            // fetch command to add and no second round trip (D131).
+            let kept = read_the_outputs(state, &job_id);
             let _ = outbox.send(FromHub::JobFinished {
                 job_id,
                 outcome,
                 metrics,
+                outputs: kept,
             });
         }
         // Waiting for a job whose attempt was interrupted is
@@ -4898,8 +4983,10 @@ fn cancel_job(state: &State, outbox: &Outbox, job_id: &JobId) -> Result<()> {
                         reason: reason.clone(),
                     },
                     // A job cancelled before it started cost no machine
-                    // anything, so there is nothing measured to send.
+                    // anything, so there is nothing measured to send — and
+                    // nothing left behind either: it never had a workspace.
                     metrics: JobMetrics::default(),
+                    outputs: herd_proto::JobOutputs::default(),
                 });
             }
             format!("{job_id} was queued and is cancelled")
@@ -5262,6 +5349,12 @@ mod tests {
         }
         fn record_metrics(&self, id: &JobId, metrics: JobMetrics) -> StoreResult<()> {
             self.inner.record_metrics(id, metrics)
+        }
+        fn record_outputs(&self, id: &JobId, outputs: &herd_proto::JobOutputs) -> StoreResult<()> {
+            self.inner.record_outputs(id, outputs)
+        }
+        fn job_outputs(&self, id: &JobId) -> StoreResult<herd_proto::JobOutputs> {
+            self.inner.job_outputs(id)
         }
         fn record_step(
             &self,

@@ -698,6 +698,60 @@ pub struct JobRecord {
     /// record's shape by M2 and filled by M4: every figure is unset until the
     /// runner reports it, which it does once, with the outcome.
     pub metrics: JobMetrics,
+    /// What the job left under its `{out}` directory, as the record
+    /// summarises it: the paths and sizes, never the bytes. The bytes are the
+    /// files in `files/` beside this record, which is the directory D8
+    /// reserved for exactly them (E-15's "kept files").
+    ///
+    /// `#[serde(default)]`, and that is why [`RECORD_VERSION`] does not move
+    /// for it: a record written before this field reads as a job that kept
+    /// nothing, which is precisely what such a job did. The live state root
+    /// on the deployed hub is readable unchanged, and `files/` has existed and
+    /// been empty in every job directory since M2 — so a job directory does
+    /// not even gain a *name*, only contents it was already shaped for.
+    #[serde(default, skip_serializing_if = "OutputSummary::is_silent")]
+    pub outputs: OutputSummary,
+}
+
+/// What a job left behind, as `job.json` says it.
+///
+/// The summary and not the files, so a reader of the record alone sees what
+/// is there and how big it is without reading any of it (E-53), and so that a
+/// record stays the kilobytes D8 promised whatever a job wrote.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OutputSummary {
+    /// Every file kept, by its path relative to `files/`, with its size.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub files: Vec<KeptFile>,
+    /// Why nothing was kept although the job left something: the runner's
+    /// output cap, with the figures (D131). Never set beside a non-empty
+    /// `files` — over the cap is all or nothing.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub refused: Option<String>,
+    /// One sentence per thing under `{out}` that was deliberately not kept: a
+    /// symlink, a fifo, a name that is not UTF-8, a path this hub would not
+    /// join onto its own state root.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub skipped: Vec<String>,
+}
+
+impl OutputSummary {
+    /// Whether there is nothing to write down, which is every job that leaves
+    /// no output: the field is then absent from `job.json` entirely, so the
+    /// record of such a job is byte-identical to the one it was before this
+    /// existed.
+    pub fn is_silent(&self) -> bool {
+        self.files.is_empty() && self.refused.is_none() && self.skipped.is_empty()
+    }
+}
+
+/// One file of a job's record, as the record names it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct KeptFile {
+    /// Relative to the job's `files/` directory, directories preserved:
+    /// `files/results.json` under `{out}` is `files/results.json` here.
+    pub path: String,
+    pub bytes: u64,
 }
 
 /// What `submissions` is on a record that predates the field. One, because
@@ -839,6 +893,7 @@ impl JobRecord {
             updated_at: now,
             attempts: Vec::new(),
             metrics: JobMetrics::default(),
+            outputs: OutputSummary::default(),
         }
     }
 
@@ -1318,6 +1373,31 @@ pub trait JobStore: Send + Sync + 'static {
     /// because a runner reports figures the hub never computes, and because a
     /// store that keeps no measurements is still a correct store.
     fn record_metrics(&self, id: &JobId, metrics: JobMetrics) -> Result<()>;
+
+    /// Keep the files a job left under `{out}`, and say so on its record
+    /// (D131).
+    ///
+    /// Written **before** the transition to `finished`, inside the same try,
+    /// for the reason the measurements are: a reader who sees `finished` is
+    /// entitled to find the record's files beside it (E-15), and a hub that
+    /// could not write them must not acknowledge the verdict either — the
+    /// runner keeps holding both until it can (D19, E-44).
+    ///
+    /// A path this store will not join onto its own directory is **dropped
+    /// and named on the record**, not an error: a verdict must never be lost
+    /// over a malformed path, and a path that cannot be written down is a
+    /// fact about one file rather than about the job.
+    fn record_outputs(&self, id: &JobId, outputs: &herd_proto::JobOutputs) -> Result<()>;
+
+    /// The files this job's record holds, read back off the disk.
+    ///
+    /// What a `herdctl wait` that attached long after the job ran is given,
+    /// which is why it comes off the disk and not out of memory: the hub may
+    /// have restarted twice since, and the record is the only thing that
+    /// still knows. `Default` for a job that kept nothing, and for a job this
+    /// store has never heard of — the caller has already dealt with that case
+    /// through [`JobStore::job`].
+    fn job_outputs(&self, id: &JobId) -> Result<herd_proto::JobOutputs>;
 
     /// Record the start of an attempt on a job, and give it its number.
     ///

@@ -228,6 +228,13 @@ timeout_s = 600
 /// made — and prints one line naming itself and its arguments, so a test can
 /// read back what ran with which arguments. It exits 0, except for the name
 /// `fail`, which exits [`FAIL_CODE`].
+///
+/// `--leave <relative path>` is what makes this fixture able to stand for a
+/// consumer whose result contract is a file: the tool writes that path under
+/// `$GROVE_OUT`, which is `{out}`, exactly as the first consumer writes
+/// `{out}/files/results.json`. `--leave-bytes <n>` makes that file about `n`
+/// bytes instead of a short JSON, so a test can put a real collection over a
+/// real cap.
 const STEP_SOURCE: &str = r#"#!/bin/sh
 # The fixture consumer's one tool. Appends the step it was asked for to
 # steps.txt in the directory it runs in, prints one line, prints its verdict,
@@ -238,19 +245,52 @@ const STEP_SOURCE: &str = r#"#!/bin/sh
 # real tool decides that from what it found; a fixture is told, which is how
 # a test can ask for each of the three without a second command. The name
 # `fail` still exits 3, for a code that is none of the three.
+#
+# `--leave <path>` writes that path under $GROVE_OUT, which is {out}: this is
+# the consumer whose result is a file rather than only an exit code.
+# `--leave-bytes <n>` makes it about n bytes, for a test about the cap.
 set -u
 step=${1:?a step name}
 shift
 verdict=0
+leave=
+leave_bytes=
 previous=
 for word in "$@"; do
-    if [ "$previous" = --verdict ]; then
-        verdict=$word
-    fi
+    case $previous in
+    --verdict) verdict=$word ;;
+    --leave) leave=$word ;;
+    --leave-bytes) leave_bytes=$word ;;
+    esac
     previous=$word
 done
 printf '%s %s\n' "$step" "$*" >> steps.txt
 printf 'grove %s: %s\n' "$step" "$*"
+if [ -n "$leave" ]; then
+    # {out} is the directory the runner made and the runner collects; a tool
+    # that cannot find it has been given no place to leave anything, and
+    # saying so is better than writing somewhere else.
+    # No brace in this message: the first one would close the expansion and
+    # the rest would be pasted onto the value, which is how this fixture
+    # first wrote its results file into a directory named with a stray brace.
+    out=${GROVE_OUT:?--leave needs the output directory in GROVE_OUT}
+    case $leave in
+    */*) mkdir -p "$out/${leave%/*}" ;;
+    esac
+    target=$out/$leave
+    if [ -n "$leave_bytes" ]; then
+        # Doubled rather than looped a line at a time: a megabyte written
+        # sixteen bytes at a time is a test that waits.
+        printf '0123456789abcdef' > "$target"
+        while [ "$(wc -c < "$target")" -lt "$leave_bytes" ]; do
+            cat "$target" "$target" > "$target.doubling"
+            mv "$target.doubling" "$target"
+        done
+    else
+        printf '{"step":"%s","verdict":%s}\n' "$step" "$verdict" > "$target"
+    fi
+    printf 'grove %s: left %s\n' "$step" "$leave"
+fi
 if [ "$step" = fail ]; then
     exit 3
 fi
@@ -258,6 +298,13 @@ fi
 printf 'grove %s: verdict %s\n' "$step" "$verdict"
 exit "$verdict"
 "#;
+
+/// What `--leave` writes, for a test that compares bytes rather than a
+/// substring: the exact contents the fixture tool produces for a step and a
+/// verdict.
+pub fn left_bytes(step: &str, verdict: i32) -> String {
+    format!("{{\"step\":\"{step}\",\"verdict\":{verdict}}}\n")
+}
 
 /// What a `labels_from` reading runs: what this commit's own tests need, read
 /// on a machine because only the commit knows (D74).
@@ -682,6 +729,27 @@ impl Harness {
     /// at two seconds, say, so that a reading which never ends can be seen
     /// refusing the job it was read for without waiting five minutes (D74).
     pub async fn with_policy(policy: herd_hub::Policy) -> Harness {
+        Harness::with(policy, |_| {}).await
+    }
+
+    /// The same, with the runner's output cap set by the test (D131).
+    ///
+    /// A cap a test chose rather than the default 8 MiB, so that a real
+    /// collection can be seen going over a real cap without a job writing
+    /// eight megabytes.
+    pub async fn with_output_cap(cap: u64) -> Harness {
+        Harness::with(herd_hub::Policy::default(), move |confinement| {
+            confinement.output_cap = cap
+        })
+        .await
+    }
+
+    /// A hub and a runner, with the hub's timing and the runner's confinement
+    /// both open to the test.
+    pub async fn with(
+        policy: herd_hub::Policy,
+        confine: impl FnOnce(&mut herd_runner::Confinement),
+    ) -> Harness {
         use herd_hub::{Hub, JobDirStore, JobStore};
         use std::sync::Arc;
         use std::time::{Duration, Instant};
@@ -732,7 +800,11 @@ impl Harness {
                 memory_floor_mib: Some(1024),
                 tmpfs_mib: None,
             },
-            confinement: herd_runner::Confinement::with_data_root(root.path()),
+            confinement: {
+                let mut confinement = herd_runner::Confinement::with_data_root(root.path());
+                confine(&mut confinement);
+                confinement
+            },
             ..herd_runner::Config::default()
         };
         tasks.push(tokio::spawn(async move {
@@ -804,6 +876,45 @@ impl Harness {
             "exactly one job was submitted: {records:?}"
         );
         records.remove(0)
+    }
+
+    /// One file of a job's record, byte for byte, read out of `files/` as a
+    /// reader outside Herd would (E-15, D131).
+    ///
+    /// `relative` is the path the job left under `{out}`:
+    /// `files/results.json`.
+    pub fn kept(&self, job_id: &str, relative: &str) -> Option<Vec<u8>> {
+        let path = self
+            .state
+            .path()
+            .join("jobs")
+            .join(job_id)
+            .join("files")
+            .join(relative);
+        std::fs::read(path).ok()
+    }
+
+    /// Every path under a job's `files/`, relative to it and sorted: what the
+    /// record actually holds, as against what it claims to.
+    pub fn kept_paths(&self, job_id: &str) -> Vec<String> {
+        let base = self.state.path().join("jobs").join(job_id).join("files");
+        let mut found = Vec::new();
+        let mut pending = vec![base.clone()];
+        while let Some(directory) = pending.pop() {
+            let Ok(entries) = std::fs::read_dir(&directory) else {
+                continue;
+            };
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    pending.push(path);
+                } else if let Ok(relative) = path.strip_prefix(&base) {
+                    found.push(relative.to_string_lossy().into_owned());
+                }
+            }
+        }
+        found.sort();
+        found
     }
 
     /// One job's log, byte for byte as the hub wrote it (D18).

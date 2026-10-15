@@ -53,6 +53,33 @@ pub const DEFAULT_LOG_CAP: u64 = 64 << 20;
 /// its own budget; this is one job's scratch space.
 pub const DEFAULT_DISK_BUDGET: u64 = 20 << 30;
 
+/// How much declared output a job may have carried into its record: 32 MiB,
+/// which is [`herd_proto::MAX_OUTPUT_CAP`] and therefore the most this
+/// mechanism can carry at all.
+///
+/// **Sized for what the first consumer produces**, which is a results file of
+/// a few kilobytes plus the per-scenario logs a command `leaves`. Not sized
+/// from the log cap beside it: a log is what a person reads, where 64 MiB is
+/// already more than anyone does, and a declared output is what a *program*
+/// reads. Reasoning from the log cap was the first mistake made here and it
+/// produced a figure three orders of magnitude off the real case in one
+/// direction and short of it in the other.
+///
+/// **The default is the ceiling, so the flag only ever lowers it**, and that
+/// is the honest affordance: the ceiling is not a taste, it is what can cross
+/// a frame and be decoded inside the 15 s cadence a quiet link lives by (see
+/// [`herd_proto::MAX_OUTPUT_CAP`] for the arithmetic and the measurements).
+/// An operator who wants her machine to give back less says so; one who wants
+/// more is asking for M11.
+///
+/// **Where the real line is.** The consumer's screenshot-heavy runs reach a
+/// few hundred megabytes, and that is **over** this and refused with figures,
+/// on purpose: at that size the bytes stop travelling like a log and become
+/// artefact distribution through the hub, which is the one thing D10 took
+/// Herd out of. Those belong on M11's direct runner-to-runner transfer. The
+/// refusal says so by name rather than leaving someone to guess.
+pub const DEFAULT_OUTPUT_CAP: u64 = herd_proto::MAX_OUTPUT_CAP;
+
 /// A job is background work on somebody's machine, so it is nice by default.
 /// 10 leaves interactive work ahead of it without starving it.
 pub const DEFAULT_NICE: i32 = 10;
@@ -71,6 +98,11 @@ pub struct Confinement {
     pub timeout: Duration,
     /// Bytes of log a job may produce before it is stopped.
     pub log_cap: u64,
+    /// Bytes of declared output a job may leave under `{out}` and have
+    /// carried into its record. Over it, nothing comes back and the refusal
+    /// names both figures: a cap on an output is **not** a truncation of it
+    /// ([`crate::outputs`]).
+    pub output_cap: u64,
     /// Bytes a job's workspace may hold before it is stopped.
     pub disk_budget: u64,
     /// CPU niceness added to a job's process. IO niceness goes with it.
@@ -108,6 +140,7 @@ impl Confinement {
             memory_max: DEFAULT_MEMORY_MAX,
             timeout: Duration::from_secs(DEFAULT_TIMEOUT_SECONDS),
             log_cap: DEFAULT_LOG_CAP,
+            output_cap: DEFAULT_OUTPUT_CAP,
             disk_budget: DEFAULT_DISK_BUDGET,
             nice: DEFAULT_NICE,
             cpu_weight: DEFAULT_CPU_WEIGHT,
@@ -187,6 +220,24 @@ impl Confined {
         }
         if confinement.timeout.is_zero() {
             return Err("a time cap of 0 s would stop every job before it ran".to_owned());
+        }
+        // An output cap above what a frame can carry, refused here rather
+        // than discovered on the first job that fills it. A collection
+        // travels inside one verdict frame, so a cap past the ceiling would
+        // produce a frame the hub cannot decode at all — and an undecodable
+        // frame is the redial loop D128 names, not a degraded result. The
+        // same shape as `--cgroup-root` above: a precise request this host
+        // cannot honour is a sentence at startup, never a surprise later.
+        if confinement.output_cap > herd_proto::MAX_OUTPUT_CAP {
+            return Err(format!(
+                "--job-output-cap {} is more than a job's output can ever be, which is {}: \
+                 a collection travels inside one control frame, base64-encoded, and a \
+                 larger one would be a verdict frame nothing on the other side can decode. \
+                 Output bigger than that is an artefact and belongs on the direct \
+                 runner-to-runner transfer (M11), not relayed through the hub.",
+                show_bytes(confinement.output_cap),
+                show_bytes(herd_proto::MAX_OUTPUT_CAP)
+            ));
         }
         // The weights are the kernel's own range, checked here so that a
         // figure outside it is one refusal at startup rather than a write the
@@ -314,10 +365,12 @@ impl Confined {
         let mut lines = vec![
             format!("data root: {}", self.root.path().display()),
             format!(
-                "caps per job: {} memory, {} s, {} of log, {} of disk, nice {}",
+                "caps per job: {} memory, {} s, {} of log, {} of declared output, \
+                 {} of disk, nice {}",
                 show_bytes(c.memory_max),
                 c.timeout.as_secs(),
                 show_bytes(c.log_cap),
+                show_bytes(c.output_cap),
                 show_bytes(c.disk_budget),
                 c.nice
             ),
@@ -825,6 +878,37 @@ mod tests {
         confinement.timeout = Duration::ZERO;
         let error = Confined::prepare(confinement).expect_err("0 s is not a cap");
         assert!(error.contains("time cap of 0"), "{error}");
+    }
+
+    /// An output cap past what a frame can carry is refused at startup, with
+    /// both figures, rather than becoming an undecodable verdict later.
+    ///
+    /// The failure it prevents is the worst shape there is: a job runs,
+    /// passes, and its verdict frame is too large for the hub to decode — so
+    /// the link dies and the runner redials into the same frame, which is the
+    /// loop D128 names. One sentence before anything runs instead.
+    #[test]
+    fn an_output_cap_larger_than_a_frame_is_refused_at_startup_with_both_figures() {
+        let _reaping = crate::testing::one_reaper_at_a_time();
+        let temp = TempDir::new("confine-output-cap");
+        let mut confinement = Confinement::with_data_root(temp.path());
+        confinement.output_cap = herd_proto::MAX_OUTPUT_CAP + 1;
+        let error = Confined::prepare(confinement).expect_err("a cap past the ceiling is refused");
+        assert!(error.contains("--job-output-cap"), "{error}");
+        assert!(
+            error.contains(&show_bytes(herd_proto::MAX_OUTPUT_CAP)),
+            "the refusal must name the ceiling: {error}"
+        );
+        assert!(
+            error.contains("M11"),
+            "and where output that big belongs: {error}"
+        );
+        // The ceiling itself is usable, and it is the default: this is a
+        // ceiling, not a second default below it.
+        let mut confinement = Confinement::with_data_root(temp.path());
+        confinement.output_cap = herd_proto::MAX_OUTPUT_CAP;
+        Confined::prepare(confinement).expect("the ceiling is a usable cap");
+        assert_eq!(DEFAULT_OUTPUT_CAP, herd_proto::MAX_OUTPUT_CAP);
     }
 
     /// Finding 5 of M4's verification: `--job-memory-max 1kB` was accepted,

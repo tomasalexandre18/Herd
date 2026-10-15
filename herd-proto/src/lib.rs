@@ -20,6 +20,7 @@ use serde::{de::DeserializeOwned, Deserialize, Serialize};
 
 pub mod capability;
 pub mod declaration;
+pub mod outputs;
 pub mod placement;
 
 pub use capability::{
@@ -31,6 +32,9 @@ pub use declaration::{
     args_as_line, shell_quote, Declaration, Executor, LabelsFrom, Requirements, Step, StepRun,
     ARGS_TOKEN, COMMIT_TOKEN, IN_TOKEN, JOB_TOKEN, LABELS_KEY, LINE_TOKEN, MEMORY_KEY, OUT_TOKEN,
     READING_KEYS, SCENARIOS_KEY, TMPFS_KEY,
+};
+pub use outputs::{
+    check_relative, JobOutputs, OutputFile, FRAME_CEILING, MAX_OUTPUT_CAP, PER_FILE_OVERHEAD,
 };
 pub use placement::{
     default_memory_floor_mib, parallelism_tokens, size_mib, with_parallelism, HostSize,
@@ -1106,6 +1110,16 @@ pub enum ToHub {
         /// its end says it ran. Empty for a job that is not a declared command.
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         steps: Vec<StepRun>,
+        /// What the job left under its `{out}` directory, collected before
+        /// the workspace was reclaimed, up to the runner's output cap
+        /// ([`JobOutputs`]).
+        ///
+        /// Default — nothing — from an ad-hoc job, which has no `{out}`, and
+        /// from any peer that does not say: absence means this runner
+        /// collected no output file, which is exactly what a build predating
+        /// the field means.
+        #[serde(default, skip_serializing_if = "JobOutputs::is_silent")]
+        outputs: JobOutputs,
     },
     /// One executor step of an attempt has ended, with its figures (D77).
     ///
@@ -1606,6 +1620,20 @@ pub enum FromHub {
         outcome: JobOutcome,
         #[serde(default)]
         metrics: JobMetrics,
+        /// The files the job left under `{out}`, read back off the record
+        /// ([`JobOutputs`]).
+        ///
+        /// Off the **record**, not relayed through memory, so a `herdctl
+        /// wait` that attaches an hour after the job ran gets the same bytes
+        /// the requester who followed it got — which is why this is a field
+        /// here and not a subcommand of its own: the frame a late attach
+        /// already receives is the after-the-fact fetch.
+        ///
+        /// Not part of E-02's stream: `herdctl` writes them where it was
+        /// told to and nowhere else, so stdout stays `ran on:`, the job's own
+        /// bytes, then the verdict.
+        #[serde(default, skip_serializing_if = "JobOutputs::is_silent")]
+        outputs: JobOutputs,
     },
     /// The hub has the job's outcome on its disk, and the runner may forget it.
     ///

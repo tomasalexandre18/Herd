@@ -23,7 +23,7 @@ closes in M18.
 | E-12 | must | packs by (commit, key), no shared build trees | M11 | planned | D10: hub registers, peers transfer; the real shape (`manifest.tsv`, `pack.meta`, `objects/<sha256>`, id = sha256 of the manifest) and measured figures (~400 MiB, ~560 files, verified under 2 s) are now known (issue #16); gated on their pack (M18) |
 | E-13 | should | content-addressed, complete or absent | M11 | planned | done with the store: retrofitting CAS would force a migration, and D10 needs it for free diffs |
 | E-14 | must | warm caches ready before job | M12 | planned | Q5/D9: no cache engine in Herd; their own words, "you move packs; our executor owns warm caches" (issue #16), shrink M12 to moving packs, key-aware placement and GC/budgets — the cache-specific prepare step is dropped for the generic step timestamps (D77); gated on their replication (M18) |
-| E-15 | must | full job record on disk | M2 | merged | byte-faithful logs (D18); a lost log chunk leaves a named marker, and a lost tail is asked for (D36) |
+| E-15 | must | full job record on disk | M2 | merged | byte-faithful logs (D18); a lost log chunk leaves a named marker, and a lost tail is asked for (D36). **Kept files are real** (D131): what a job leaves under `{out}` is collected before the workspace goes and written into the record's `files/` directory, capped at 32 MiB with a refusal carrying figures over it |
 | E-16 | must | budgets, gc with pinning | M12 | planned | per runner, not central (D10); keepers pin |
 | E-17 | must | atomic publication everywhere | M11 | planned | a manifest registers only once every blob is held; job-record atomicity already in M2 (Q1) |
 | E-18 | must | four priorities with aging | M6 | merged | aging computed, not written (D67); default step 30 min, so the lowest level reaches the top in 90 min; the raise is upwards only (D72); the 90-min figure itself is a simulated-time and 6-second-real-clock assertion, not a measurement on a busy day |
@@ -62,7 +62,7 @@ closes in M18.
 | E-51 | must | version pin and refusal | M15 | planned | protocol-version refusal exists since M1 |
 | E-52 | should | restarts with its host | M16, M17 | planned | server in M16, the PC's logon task in M17 |
 | E-53 | should | records readable during run | M2 | merged | plain files by Q1. **What a reader may see** (D103): `job.json` is the authority on where a job stands now; `events.jsonl` is the history and may be one transition behind it, never ahead. A reader wanting a state *and* its transition line waits on `events.jsonl` |
-| E-54 | could | offline re-judging | M2 | planned | no Herd work beyond E-15's kept files; the judge is their tool |
+| E-54 | could | offline re-judging | M2 | planned | E-15's kept files are now written (D131), so a record holds the result file a judge re-reads; the judge is their tool |
 | E-55 | could | peer-to-peer artefact exchange | M11 | planned | **promoted to the default** by D10: direct transfer is the only path, the hub never carries bytes |
 
 ## State of play (2026-10-13)
