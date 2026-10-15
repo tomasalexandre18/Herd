@@ -356,9 +356,11 @@ async fn run(args: Args) -> Result<Done> {
                     LogStream::Stdout => write_now(&mut std::io::stdout(), data),
                     LogStream::Stderr => write_now(&mut std::io::stderr(), data),
                 },
-                // Herd's own words, never the job's: stdout stays the job's
-                // alone. A queued job's reason arrives here (E-26).
-                |note| eprintln!("herdctl: {note}"),
+                // Herd's own words go to stderr: stdout stays the job's
+                // alone. A queued job's reason arrives here (E-26). The one
+                // exception is E-02's first line, which *is* part of the
+                // output and goes on stdout ahead of it (D109).
+                say_it,
             )
             .await?;
             Ok(Done::Job(finished.outcome))
@@ -461,7 +463,7 @@ async fn run(args: Args) -> Result<Done> {
                     LogStream::Stdout => write_now(&mut std::io::stdout(), data),
                     LogStream::Stderr => write_now(&mut std::io::stderr(), data),
                 },
-                |note| eprintln!("herdctl: {note}"),
+                say_it,
             )
             .await?;
             Ok(Done::Job(finished.outcome))
@@ -536,6 +538,24 @@ fn labels_of(labels: Vec<String>) -> Result<LabelSet> {
     LabelSet::new(labels)
         .map_err(anyhow::Error::msg)
         .context("--label")
+}
+
+/// Where each thing Herd says about a job goes.
+///
+/// One function for `run` and for `wait`, because the two print the same
+/// job's output and must frame it the same way. A note is Herd speaking, so
+/// it is named and goes to stderr; the framing line is E-02's first line of
+/// the **output**, so it goes to stdout with no prefix of ours — their
+/// tooling reads `^ran on: (\S+) \((.*)\)$` there (D109).
+fn say_it(said: herdctl::Said) {
+    match said {
+        herdctl::Said::Note(note) => eprintln!("herdctl: {note}"),
+        herdctl::Said::Framing(line) => {
+            let mut out = std::io::stdout();
+            let _ = writeln!(out, "{line}");
+            let _ = out.flush();
+        }
+    }
 }
 
 fn write_now(out: &mut impl Write, data: &[u8]) {

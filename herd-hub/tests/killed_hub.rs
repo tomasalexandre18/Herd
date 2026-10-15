@@ -119,7 +119,14 @@ async fn a_killed_hub_loses_nothing(signal: rustix::process::Signal) {
         .herdctl(&["run", "--", "/bin/sh", "-c", "printf 'still here\\n'"])
         .await;
     assert_eq!(after.status.code(), Some(0), "{}", herd.said("runner"));
-    assert_eq!(String::from_utf8_lossy(&after.stdout), "still here\n");
+    // E-02's framing, through the real binary: the output starts with one
+    // line saying where the job ran and why there, and then is the job's own
+    // output unchanged (D109).
+    assert_eq!(
+        real_herd::job_output(&after.stdout),
+        "still here\n",
+        "after E-02's first line, stdout is the job's own output"
+    );
 
     second.signal(rustix::process::Signal::TERM).await;
     runner.signal(rustix::process::Signal::TERM).await;
@@ -492,10 +499,13 @@ async fn a_wait_on_a_job_the_hub_cannot_write_down_says_so() {
     // Still waiting: no verdict has been invented for a job that has one, in
     // the runner's memory, that the hub could not store.
     assert!(waiting.alive(), "the wait must not have answered anything");
+    // Herd's note is on stderr; stdout carries E-02's framing line — a wait
+    // that attached to a job already running prints the same first line,
+    // off the record's own attempt — and then the job's output (D109).
     assert_eq!(
-        String::from_utf8_lossy(&std::fs::read(herd.logs.path().join("wait-out")).unwrap()),
+        real_herd::job_output(&std::fs::read(herd.logs.path().join("wait-out")).unwrap()),
         "working\n",
-        "stdout stays the job's own output; the note is Herd speaking, on stderr"
+        "after E-02's first line, stdout is the job's own output; the note went to stderr"
     );
 
     std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).expect("writable again");

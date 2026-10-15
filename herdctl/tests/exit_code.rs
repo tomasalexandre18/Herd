@@ -186,6 +186,39 @@ fn stdout(output: &Output) -> String {
     String::from_utf8_lossy(&output.stdout).into_owned()
 }
 
+/// The job's **own** output, after E-02's framing line, as bytes.
+///
+/// A requester's stdout begins with one line saying where the job ran and why
+/// there (D109), and what follows it is the bytes the job's process wrote and
+/// nothing else. The split is [`herd_proto::unframe`] — the one definition of
+/// the format — and this insists the line was there, with the shape and the
+/// version a caller's own reader is anchored on.
+fn job_output_bytes(output: &Output) -> Vec<u8> {
+    let (line, rest) = herd_proto::unframe(&output.stdout).unwrap_or_else(|| {
+        panic!(
+            "stdout does not begin with E-02's `ran on: <runner> (<why>)`: {:?}",
+            stdout(output)
+        )
+    });
+    let (runner, why) = herd_proto::ran_on_parts(&line)
+        .unwrap_or_else(|| panic!("E-02's line does not have E-02's shape: {line:?}"));
+    assert_eq!(
+        runner, "exit-code-runner",
+        "the line must name the machine this harness lends: {line:?}"
+    );
+    let version = format!("herd output format {}", herd_proto::OUTPUT_FORMAT_VERSION);
+    assert!(
+        why.contains(&version),
+        "E-02's line must carry the output format version ({version}): {line:?}"
+    );
+    rest.to_vec()
+}
+
+/// The same, as text.
+fn job_output(output: &Output) -> String {
+    String::from_utf8_lossy(&job_output_bytes(output)).into_owned()
+}
+
 fn stderr(output: &Output) -> String {
     String::from_utf8_lossy(&output.stderr).into_owned()
 }
@@ -205,7 +238,11 @@ async fn herdctl_wears_the_job_s_own_exit_code() {
             "herdctl rewrote exit code {code}: {}",
             stderr(&output)
         );
-        assert_eq!(stdout(&output), "done\n", "the job's output is herdctl's");
+        assert_eq!(
+            job_output(&output),
+            "done\n",
+            "after E-02's framing line, stdout is the job's own output and nothing else"
+        );
         // 125 is also herdctl's own code for a job it could not run, and 127
         // is what a shell exits with for a command it could not execute. Both
         // are the job's to choose, and neither makes herdctl claim a failure
@@ -256,10 +293,35 @@ async fn herdctl_exits_125_and_says_on_stderr_that_herd_could_not_run_the_job() 
         said.contains(missing),
         "the message must name what could not be started: {said}"
     );
+    // Empty, framing line and all. E-02's line says where a job's output
+    // came from, and a job that never started has no output to frame: a
+    // `ran on:` line on its own would be something on the stdout of a job
+    // that printed nothing, which is exactly what D16 reserves an empty
+    // stdout for. `herdctl` holds the line until there is output for it to be
+    // the first line of, and lets it go on any ending but this one (D109).
     assert_eq!(
         stdout(&output),
         "",
         "stdout belongs to the job, which never ran"
+    );
+}
+
+/// The other half of the rule above: a job that ran and printed **nothing**
+/// still gets E-02's line, because it ran somewhere and a caller reads that
+/// line to find out where.
+///
+/// The two together are the whole of what the framing line's timing means: it
+/// is released with the verdict of a job that produced no output, and never
+/// released at all for a job that never started.
+#[tokio::test]
+async fn a_job_that_printed_nothing_still_says_where_it_ran() {
+    let harness = Harness::new().await;
+    let output = harness.herdctl_shell("exit 0").await;
+    assert_eq!(status_code(&output), 0, "{}", stderr(&output));
+    assert_eq!(
+        job_output(&output),
+        "",
+        "the job printed nothing, so there is nothing after the framing line"
     );
 }
 
@@ -466,8 +528,10 @@ async fn herdctl_exits_124_for_every_cap_a_test_can_trip() {
         stderr(&output)
     );
     assert!(stderr(&output).contains("log cap"), "{}", stderr(&output));
+    // The job's own output, after E-02's framing line: the cap is on the
+    // job's bytes, and Herd's framing is not one of them.
     assert_eq!(
-        stdout(&output).len(),
+        job_output_bytes(&output).len(),
         1024,
         "the log the requester got must be exactly the cap"
     );

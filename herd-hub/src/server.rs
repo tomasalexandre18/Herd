@@ -2167,6 +2167,16 @@ fn dispatch(
     {
         return Ok(false);
     }
+    // And whoever is following it is told where it went, before a byte of its
+    // output can arrive: that line is the first line of the output E-02
+    // promises, so it cannot come second (D109).
+    for follower in state.followers_of(job_id) {
+        let _ = follower.send(FromHub::RanOn {
+            job_id: job_id.clone(),
+            runner: runner_name.to_owned(),
+            why: why.to_owned(),
+        });
+    }
     println!("herd-hub: {job_id} is attempt {attempt} on runner {runner_name}: {why}");
     Ok(true)
 }
@@ -3599,6 +3609,25 @@ async fn accept_submissions(state: &State, outbox: &Outbox, source: &mut Source)
                     let _ = outbox.send(FromHub::Refused { reason });
                     return Ok(());
                 }
+                // The claim lock is taken **before** the job exists, and held
+                // until this submission has had its place in the followers
+                // and its pass. Not for the pass's sake — that took the lock
+                // on its own before — but for the window between the record
+                // becoming visible and this connection being registered to
+                // follow it. A job is dispatchable the instant `submit`
+                // returns, and a pass fired by anything else (a runner
+                // joining, a job of another test ending, the watchdog) would
+                // dispatch it in that window, send E-02's line to a follower
+                // list this requester is not in yet, and leave it with a job
+                // whose output has no first line (D109). The window is
+                // microseconds wide and a suite submits thousands of jobs,
+                // which is exactly the shape of a defect that reads as
+                // flakiness. One record write is added to a lock that already
+                // carries a whole pass's fsyncs.
+                let _one_pass = state
+                    .dispatching
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
                 let submission = state
                     .store
                     .submit(new_job(asked))
@@ -3650,14 +3679,12 @@ async fn accept_submissions(state: &State, outbox: &Outbox, source: &mut Source)
                 // order (E-20). It starts, or it stays queued with its
                 // reason on its record and a note on this connection: a
                 // submission the runner cannot serve yet is not a submission
-                // that failed (D38).
-                {
-                    let _one_pass = state
-                        .dispatching
-                        .lock()
-                        .unwrap_or_else(|poisoned| poisoned.into_inner());
-                    dispatch_a_pass(state)?;
-                }
+                // that failed (D38). The lock this needs is the one taken
+                // above, around the submission itself, so the pass runs here
+                // without taking it again — and nothing has been able to
+                // dispatch this job between the two.
+                dispatch_a_pass(state)?;
+                drop(_one_pass);
                 // A runner that went away between the check above and the
                 // pass leaves the job queued with nowhere to go, and the
                 // requester is told rather than left watching a job nothing
@@ -3771,6 +3798,18 @@ fn answer_a_wait(state: &State, outbox: &Outbox, job_id: JobId) -> Result<bool> 
         });
         return Ok(false);
     };
+    // Where it ran, before its output: a `herdctl wait` on a job that is
+    // already running, or long over, prints the same first line a requester
+    // that followed it from the start printed (E-02, D109). Off the record's
+    // own attempt, so the sentence is the one that was recorded (E-36), and
+    // the latest attempt because that is where the job is now.
+    if let Some(attempt) = record.attempts.last() {
+        let _ = outbox.send(FromHub::RanOn {
+            job_id: job_id.clone(),
+            runner: attempt.runner.clone(),
+            why: attempt.why.clone(),
+        });
+    }
     // The output the job has already produced, before anything
     // else about it. A detached requester has no other way to get
     // a job's log through the CLI (D22).

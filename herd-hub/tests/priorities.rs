@@ -426,11 +426,26 @@ async fn two_submissions_and_two_waits_share_one_execution() {
             String::from_utf8_lossy(&output.stderr)
         );
     }
+    // The job's own output, after E-02's framing line — which each wait
+    // prints for itself, off the record's own attempt, and which names the
+    // one runner the one execution happened on (D109).
     let said = |output: &std::process::Output| {
-        String::from_utf8_lossy(&output.stdout)
+        real_herd::job_output(&output.stdout)
             .replace("\r\n", "\n")
             .to_string()
     };
+    for (which, output) in [("the first wait", &one), ("the second wait", &two)] {
+        let (runner, _) = real_herd::ran_on_parts(
+            herd_proto::unframe(&output.stdout)
+                .unwrap_or_else(|| panic!("{which} printed no framing line"))
+                .0
+                .as_str(),
+        );
+        assert_eq!(
+            runner, "the-real-runner",
+            "{which} must name the machine the one execution ran on"
+        );
+    }
     assert_eq!(
         said(&one),
         "line 1\nline 2\nline 3\n",
