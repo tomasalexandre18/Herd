@@ -222,6 +222,13 @@ type Outbox = UnboundedSender<FromHub>;
 pub struct Policy {
     /// A runner unheard from for this long is lost, and the jobs it was
     /// running are attempted once more (E-21).
+    ///
+    /// **Unheard from** means nothing at all has arrived on its connection,
+    /// and the same figure answers a second question: figures older than this
+    /// are too old to admit new work against (D113). The two clocks are
+    /// [`ConnectedRunner::last_frame`] and [`ConnectedRunner::last_health`],
+    /// and one threshold serves both because there is only one cadence either
+    /// can be judged against — the one E-40 declares.
     pub lost_after: Duration,
     /// The cadence this hub expects its runners to report at (E-40).
     ///
@@ -362,11 +369,31 @@ impl Policy {
         (self.lost_after / 20).clamp(Duration::from_millis(200), Duration::from_secs(5))
     }
 
-    /// How long a connected runner's last health report may be before the
-    /// hub treats the connection as one it may replace with a new one from a
-    /// runner that is plainly alive.
-    fn health_is_stale_after(&self) -> Duration {
+    /// How long a connected runner's link may be silent before the hub treats
+    /// the connection as one it may replace with a new one from a runner that
+    /// is plainly alive.
+    ///
+    /// Judged on [`ConnectedRunner::last_frame`], because the question is
+    /// whether anything at all comes back on that socket: a runner streaming
+    /// a build log is holding its name for a reason, whatever its health task
+    /// is doing (D113).
+    fn silent_long_enough_to_replace(&self) -> Duration {
         self.lost_after / 2
+    }
+
+    /// How old a runner's figures may be before this hub stops admitting new
+    /// work against them (E-40, D113).
+    ///
+    /// Only a health report carries free memory, free tmpfs and load, so only
+    /// a health report answers "are its figures fresh". Past this the runner
+    /// is given no new job and nothing running on it is touched: admission
+    /// against figures nobody has refreshed is exactly the guess M8 exists to
+    /// refuse. There is deliberately no second timeout behind it — a runner
+    /// streaming for ever without reporting health holds its job until the
+    /// job's own time cap ends it (M4), which is a backstop that already
+    /// exists.
+    fn figures_are_stale_after(&self) -> Duration {
+        self.lost_after
     }
 }
 
@@ -702,7 +729,32 @@ struct ConnectedRunner {
     /// connection is still registered: the new one is the real one.
     kick: watch::Sender<bool>,
     joined_at: Instant,
+    /// When anything last arrived on this connection: the **liveness** clock
+    /// (D113).
+    ///
+    /// **Any** frame resets it, because any frame is this runner talking. The
+    /// clock that used to answer this question was `last_health`, which only
+    /// a health report reset — so a runner streaming a thirty-minute build's
+    /// log steadily, with a health task that was starved or wedged, was
+    /// written off as lost and its live attempt requeued with it. A link
+    /// nothing at all comes back on for [`Policy::lost_after`] is still gone,
+    /// and E-21 is unchanged by this: what stopped is a runner with live
+    /// traffic being written off.
+    last_frame: Instant,
+    /// When this runner last reported its figures: the **freshness** clock
+    /// (E-40, D113).
+    ///
+    /// Only a `Health` frame resets it, because only a `Health` frame carries
+    /// free memory, free tmpfs and load. Past
+    /// [`Policy::figures_are_stale_after`] this runner is given no new job and
+    /// keeps everything it is already running.
     last_health: Instant,
+    /// Whether this hub has already said that this runner's figures are stale.
+    ///
+    /// A latch, so the quarantine is announced when it starts and lifted when
+    /// it ends, rather than restated on every turn of the watchdog — which at
+    /// the watchdog's cadence would be twenty identical lines a second.
+    figures_stale_said: bool,
     reports_seen: u64,
     draining: bool,
     /// Where its owner's switch stands (E-33), as this runner last said.
@@ -872,9 +924,13 @@ impl State {
                 // one-sided — a redial told to wait comes back in a moment,
                 // while a live runner kicked off its job has lost the job.
                 let same_instance = instance.is_some() && incumbent.instance.as_deref() == instance;
-                let quiet_for = incumbent.last_health.elapsed();
-                let gone_quiet =
-                    incumbent.reports_seen > 0 && quiet_for > self.policy.health_is_stale_after();
+                // On the *liveness* clock and not the freshness one: what is
+                // asked here is whether anything comes back on that socket at
+                // all, and a runner whose log is still arriving is holding its
+                // name for a reason (D113).
+                let quiet_for = incumbent.last_frame.elapsed();
+                let gone_quiet = incumbent.reports_seen > 0
+                    && quiet_for > self.policy.silent_long_enough_to_replace();
                 if !same_instance && !gone_quiet {
                     // A twin is waiting for a configuration to change, or
                     // for the runner holding the name to go quiet, and asking
@@ -894,7 +950,7 @@ impl State {
                     eprintln!("herd-hub: {twin}");
                     return Admitted::StandBy {
                         reason: twin,
-                        retry_in: self.policy.health_is_stale_after(),
+                        retry_in: self.policy.silent_long_enough_to_replace(),
                     };
                 }
                 let why = if same_instance {
@@ -921,7 +977,12 @@ impl State {
                     load_milli: announced.load_milli,
                     kick,
                     joined_at: now,
+                    // The handshake is this runner talking, and it carries
+                    // figures of its own — the offer, the host's size, the
+                    // load it read on the way in — so both clocks start here.
+                    last_frame: now,
                     last_health: now,
+                    figures_stale_said: false,
                     reports_seen: 0,
                     draining: false,
                     switch: announced.switch.clone(),
@@ -969,7 +1030,9 @@ impl State {
     /// reservation there is (see `crate::matcher`, D79). A runner that is
     /// draining is in here and marked, not left out: the sentence a waiting
     /// job gets has to be able to say that the machine it would have gone to
-    /// is leaving.
+    /// is leaving. A runner whose figures have gone stale is in here and
+    /// marked for the same reason (D113) — "nothing is going to the server"
+    /// has to have a written answer.
     fn seats(
         &self,
         held: &BTreeMap<String, Vec<(JobId, LabelSet)>>,
@@ -999,6 +1062,10 @@ impl State {
                         reserved: reserved.get(&runner.name).cloned().unwrap_or_default(),
                         load_milli: runner.load_milli,
                         switch: runner.switch.clone(),
+                        // How old the figures the next three checks are made
+                        // of are, when they are too old to be made of (D113).
+                        figures_stale: Some(runner.last_health.elapsed())
+                            .filter(|age| *age > self.policy.figures_are_stale_after()),
                         // Filled by `reservations` before the pass places
                         // anything, from the records alone (D79).
                         reserved_for: None,
@@ -1199,32 +1266,92 @@ impl State {
         })
     }
 
-    fn record_health(
-        &self,
-        outbox: &Outbox,
-        jobs: Vec<RunningJob>,
-        draining: bool,
-        load_milli: Option<u64>,
-    ) {
+    /// Word of the runner itself: this connection is alive (D113).
+    ///
+    /// Called for **every** frame a runner sends, before anything is done
+    /// with it and whatever it is about — a log chunk, a step, an
+    /// acknowledgement, a health report. The frame may turn out to be about
+    /// an attempt this hub has already written off, and it is still evidence
+    /// that the machine at the other end is running: that is the one claim
+    /// this clock makes, and it is separate from whether the runner's figures
+    /// are fresh enough to admit new work against
+    /// ([`Policy::figures_are_stale_after`]).
+    fn runner_was_heard_from(&self, outbox: &Outbox) {
         self.with_peers(|peers| {
             if let Some(runner) = peers
                 .runners
                 .values_mut()
                 .find(|runner| runner.outbox.same_channel(outbox))
             {
-                runner.last_health = Instant::now();
-                runner.reports_seen += 1;
-                runner.draining = draining;
-                runner.jobs = jobs;
-                // A figure that could not be read this time does not erase
-                // the last one that could: an absent load is unknown, and the
-                // most recent figure the machine managed to give is still the
-                // most recent figure there is (E-32).
-                if load_milli.is_some() {
-                    runner.load_milli = load_milli;
-                }
+                runner.last_frame = Instant::now();
             }
         });
+    }
+
+    /// Every runner whose figures have just gone stale, with how old they are
+    /// and how many reports its connection has carried (D113).
+    ///
+    /// The latch is flipped here, so each quarantine is announced once rather
+    /// than on every turn of the watchdog. The other edge belongs to
+    /// [`State::record_health`], which is where a report arriving is noticed.
+    fn figures_just_gone_stale(&self) -> Vec<(String, Duration, u64)> {
+        let stale_after = self.policy.figures_are_stale_after();
+        self.with_peers(|peers| {
+            let mut gone = Vec::new();
+            for runner in peers.runners.values_mut() {
+                let age = runner.last_health.elapsed();
+                if age > stale_after && !runner.figures_stale_said {
+                    runner.figures_stale_said = true;
+                    gone.push((runner.name.clone(), age, runner.reports_seen));
+                }
+            }
+            gone
+        })
+    }
+
+    /// Take a health report, and say so if it lifts a quarantine (D113).
+    ///
+    /// `Some` means this runner's figures had gone stale and are fresh again,
+    /// so it is admitted new work again and the sentence saying so is the
+    /// caller's to print — beside a dispatch pass, because a machine that can
+    /// take work again should take it now rather than at the next thing that
+    /// happens to wake the hub (D80's rule for the owner's switch, for the
+    /// same reason).
+    fn record_health(
+        &self,
+        outbox: &Outbox,
+        jobs: Vec<RunningJob>,
+        draining: bool,
+        load_milli: Option<u64>,
+    ) -> Option<String> {
+        let stale_after = self.policy.figures_are_stale_after();
+        self.with_peers(|peers| {
+            let runner = peers
+                .runners
+                .values_mut()
+                .find(|runner| runner.outbox.same_channel(outbox))?;
+            let since = runner.last_health.elapsed();
+            runner.last_health = Instant::now();
+            runner.reports_seen += 1;
+            runner.draining = draining;
+            runner.jobs = jobs;
+            // A figure that could not be read this time does not erase
+            // the last one that could: an absent load is unknown, and the
+            // most recent figure the machine managed to give is still the
+            // most recent figure there is (E-32).
+            if load_milli.is_some() {
+                runner.load_milli = load_milli;
+            }
+            let was_held_back = runner.figures_stale_said || since > stale_after;
+            runner.figures_stale_said = false;
+            was_held_back.then(|| {
+                format!(
+                    "runner {} is given new work again: its figures are fresh, {since:?} after \
+                     the ones before them (report {} on this connection)",
+                    runner.name, runner.reports_seen
+                )
+            })
+        })
     }
 
     fn follow(&self, id: JobId, outbox: &Outbox) {
@@ -2707,6 +2834,12 @@ async fn relay_from_runner(
                 None => return Ok(()),
             },
         };
+        // Whatever this frame is about, it came from the runner, so the
+        // runner is alive (D113). Recorded here — once, for every frame,
+        // before any of them is judged — because every judgement below can
+        // refuse the frame, and a frame refused by name is still a machine
+        // that is running.
+        state.runner_was_heard_from(outbox);
         match message {
             ToHub::Health {
                 jobs,
@@ -2727,7 +2860,14 @@ async fn relay_from_runner(
                         its_own.push(job);
                     }
                 }
-                state.record_health(outbox, its_own, draining, load_milli);
+                // And a report that lifts a quarantine for stale figures is
+                // said out loud **and** re-judges the queue at once, for the
+                // reason a switch that moved does: this machine can take work
+                // again, and "again" means now (D113, D80).
+                if let Some(said) = state.record_health(outbox, its_own, draining, load_milli) {
+                    println!("herd-hub: {said}");
+                    dispatch_queued_jobs(state)?;
+                }
                 // And the owner's switch, which rides on every report (E-33).
                 // A position that moved is said out loud **and** re-judges the
                 // queue at once: `off` means the jobs waiting for this machine
@@ -3339,10 +3479,19 @@ async fn keep_trying_to_write_results(state: Arc<State>) {
 /// it is evidence, and a health report naming it is evidence too, which is
 /// what that list in the report is for.
 ///
-/// A connected runner that has stopped reporting is also dropped here, which
-/// is a separate thing: a link nothing comes back on is not a link, and
-/// holding it would keep the slot and refuse the runner that is trying to
-/// take its place.
+/// A connected runner that has stopped saying **anything** is also dropped
+/// here, which is a separate thing: a link nothing comes back on is not a
+/// link, and holding it would keep the slot and refuse the runner that is
+/// trying to take its place.
+///
+/// Anything is the word, and D113 is why. The clock on the *connection* used
+/// to be the health report alone, so a runner streaming a build's log with a
+/// starved health task was dropped as lost and its live attempt requeued with
+/// it — a thirty-minute build, visibly alive, written off. Those are two
+/// questions and this loop now asks them separately: any frame says the runner
+/// is alive, and only a health report says its figures are fresh enough to
+/// admit new work against. Stale figures hold work back and touch nothing that
+/// is running.
 async fn watch_for_a_lost_runner(state: Arc<State>) {
     let mut ticker = tokio::time::interval(state.policy.watchdog_every());
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -3355,8 +3504,8 @@ async fn watch_for_a_lost_runner(state: Arc<State>) {
             let silent: Vec<(String, Duration)> = peers
                 .runners
                 .values()
-                .filter(|runner| runner.last_health.elapsed() > state.policy.lost_after)
-                .map(|runner| (runner.name.clone(), runner.last_health.elapsed()))
+                .filter(|runner| runner.last_frame.elapsed() > state.policy.lost_after)
+                .map(|runner| (runner.name.clone(), runner.last_frame.elapsed()))
                 .collect();
             for (name, _) in &silent {
                 if let Some(runner) = peers.runners.remove(name) {
@@ -3369,6 +3518,23 @@ async fn watch_for_a_lost_runner(state: Arc<State>) {
             eprintln!(
                 "herd-hub: dropping the connection to runner {name}: nothing has come back \
                  on it for {quiet_for:?}"
+            );
+        }
+
+        // And every runner that is plainly alive but whose figures nobody has
+        // refreshed: held back from *new* work, said out loud, once (D113).
+        // The job-side half of this is in the sentence of every job waiting
+        // for such a machine; this is the line for an operator with nothing
+        // queued at all, asking why nothing is going to the server.
+        for (name, age, reports) in state.figures_just_gone_stale() {
+            eprintln!(
+                "herd-hub: runner {name} is given no new job: it is alive, but its figures are \
+                 {age:?} old, past the {:?} this hub admits against (--lost-after). Only a \
+                 health report carries free memory, free tmpfs and load (E-40), and this hub \
+                 does not guess at them. Whatever it is already running runs on, and it is \
+                 admitted again at its next report ({reports} reports have come in on this \
+                 connection)",
+                state.policy.figures_are_stale_after()
             );
         }
 

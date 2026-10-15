@@ -134,6 +134,17 @@ pub struct Seat {
     /// in this module — there is no `if load` anywhere, by design and by test.
     /// Absent when the machine could not read it, never zero.
     pub load_milli: Option<u64>,
+    /// How old this machine's figures are, when they are too old to admit
+    /// against (D113). `None` is the ordinary case: they are fresh.
+    ///
+    /// Free memory, free tmpfs and load all arrive on the health report and
+    /// nowhere else, so a machine whose reports have stopped is a machine
+    /// whose three admission figures are a memory of some earlier minute.
+    /// This is not a fact about the *link* — any frame proves the runner is
+    /// alive, and a runner streaming a build's log keeps that build (E-21,
+    /// D113) — it is a fact about the figures, and what it stops is **new**
+    /// work. A job already out here is untouched.
+    pub figures_stale: Option<Duration>,
 }
 
 /// What became of one job in one pass.
@@ -653,6 +664,27 @@ fn judge(record: &JobRecord, seat: &Seat, placing: &Placing, now: Timestamp) -> 
         } else {
             Verdict::NotHere(reason)
         };
+    }
+    // And what D113 adds: figures nobody has refreshed are figures nothing can
+    // be admitted against.
+    //
+    // **After the labels and before the figures**, which is the whole of the
+    // placement. Whether this machine is of this job's kind is a fact about
+    // the machine and is answered above, so a job no runner here could ever
+    // run is still told that rather than told to wait. What is held up is the
+    // three figures below — the size the `-j` is derived from, the memory, the
+    // tmpfs — and `Later` is the verdict because the job sticks to the machine
+    // and goes the moment a report arrives: a runner whose health task was
+    // starved for a minute must not scatter its queue across the fleet.
+    if let Some(age) = seat.figures_stale {
+        return Verdict::Later(format!(
+            "{} is alive but its figures are {age:?} old, so nothing new is claimed there: free \
+             memory, free tmpfs and load come from its health report and from nowhere else \
+             (E-40), and this hub does not admit a job against figures nobody has refreshed \
+             (D113). Whatever is already running there runs on; this job goes there as soon as \
+             a report arrives",
+            seat.name
+        ));
     }
     // And what M7 adds: the parallelism one slot of this machine gets (E-22).
     // **Before admission, always**, because the memory a build needs is that
@@ -1382,6 +1414,10 @@ mod tests {
             // tests build: E-32 says load is recorded and never a gate, and a
             // fleet whose load were always absent could not prove it.
             load_milli: Some(420),
+            // Fresh, which is what a connected runner reporting on its cadence
+            // is. The case where they are not is D113's, and it is asserted on
+            // its own below.
+            figures_stale: None,
         }
     }
 
@@ -1892,6 +1928,64 @@ mod tests {
             runner, "build-host",
             "a draining runner is not available, so nothing sticks to it"
         );
+    }
+
+    /// A machine whose figures nobody has refreshed takes nothing new, and the
+    /// job it would have gone to waits **for that machine** (D113).
+    ///
+    /// `Later` and not `NotHere`, which is the whole of the choice: stale
+    /// figures are a fact about the moment, not about the kind of machine this
+    /// is, so the job sticks here and goes the instant a report lands. A
+    /// runner whose health task was starved for a minute must not scatter its
+    /// queue across the fleet — and must not be refused for being alive.
+    #[test]
+    fn stale_figures_take_nothing_new_and_the_job_waits_for_that_machine() {
+        let mut only_machine = her_pc();
+        only_machine.figures_stale = Some(Duration::from_secs(74));
+        let mut fleet = vec![only_machine];
+        let why = waited(place(
+            &queued("j1", &["build"]),
+            &mut fleet,
+            now(),
+            Stickiness::default(),
+            &Placing::default(),
+        ));
+        assert!(
+            why.contains("waiting for wsl-pc"),
+            "the job sticks to the machine that is alive: {why}"
+        );
+        assert!(
+            why.contains("alive but its figures are 74s old"),
+            "the sentence must say both halves, with the figure: {why}"
+        );
+        assert!(
+            why.contains("nothing new is claimed there") && why.contains("E-40"),
+            "and why that follows from the health report being the only source: {why}"
+        );
+        assert!(
+            why.contains("as soon as a report arrives"),
+            "and what would change it: {why}"
+        );
+
+        // And it is one runner's figures, never the fleet's: the preferred
+        // machine is reporting, so the job goes there and the stale one is
+        // simply not asked.
+        let mut fleet = vec![
+            {
+                let mut server = their_server();
+                server.figures_stale = Some(Duration::from_secs(74));
+                server
+            },
+            her_pc(),
+        ];
+        let (runner, _) = placed(place(
+            &queued("j2", &["build"]),
+            &mut fleet,
+            now(),
+            Stickiness::default(),
+            &Placing::default(),
+        ));
+        assert_eq!(runner, "wsl-pc");
     }
 
     /// The safety limit is a limit: past it the job moves, and the line
