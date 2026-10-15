@@ -346,16 +346,18 @@ side; blocks nothing of ours.
 
 ## Critical path
 
-The longest chain is the **scheduler spine**:
-**M1 → M2 → M5 → M6 → M7 → M8 → M9**, then deployment **M16 → M17 → M18**.
+The scheduler spine, **M1 → M2 → M5 → M6 → M7 → M8 → M9**, is merged.
 
-Off the spine but **not optional** — each carries musts and each must land
-before M16, because the first consumer cannot submit a single real job
-without them: M3 (the link), M4 (confinement), M10 (the command contract),
-M11 and M12 (artefacts), M13 (status and events), M14 (the scheduled job),
-M15 (auth), M15d (self-update). They are parallelisable, not
-deferrable. The only genuinely deferrable items are E-38, E-39 and E-55
-(see `docs/coverage.md`).
+**The path to a deployed hub is now M10 → M15 → M16, then M15d → M17**
+(reordered 2026-10-15, D109: the owner's build server keeps being
+OOM-killed by work Herd is not yet there to bound, so deployment outranks
+breadth).
+
+Deferred to after M16, each with its cost written down in D109: M11 and M12
+(artefacts — so a build and its test must run on one machine), M13 (status
+and events — the consumer keeps its own status files, which E-53 permits),
+M14 (the scheduled job and the hook — the consumer's cron keeps them).
+Still genuinely deferrable for good: E-38, E-39, E-55.
 
 - M1 → M2: the store persists the lifecycle M1 creates; anything built before
   it would be rewritten onto it — the walk-back E-44 exists to forbid.
@@ -369,20 +371,29 @@ deferrable. The only genuinely deferrable items are E-38, E-39 and E-55
   explanations annotate its refusals.
 - M8 → M9: switch, drain and dry run manipulate claim and admission state that
   must exist first.
+- M9, M10, M15 → M16: a first deployment needs a job that can be **declared**
+  (M10), **confined and admitted** (M4, M8), **placed** (M5-M7), **switched
+  off by its owner** (M9) and **authenticated** (M15). It does not need
+  artefacts, a status document or a scheduler's clock — those make Herd
+  broader, not deployable.
 - M15 → M15d: the update instruction is an authenticated instruction.
   Without auth it is a remote code execution channel into every machine of
   the fleet (D66), because runner names are self-asserted until M15 (D57).
-- M15d → M16: a runner can only obey an instruction it already understands,
-  so the update frames must exist before the first deployment. A fleet
-  shipped without them stays manual for ever.
-- M9, M10, M11, M12, M13, M14, M15 → M16: nothing is exposed over `wss://`
-  until a job can be declared, confined, placed, stored, observed and
-  authenticated. Deploying earlier would freeze the public formats (Q7) on a
-  surface still moving.
+- M15d → M17, **not → M16** (corrected 2026-10-15): the server's native
+  runner is updated by Nix (E-47), so self-update buys nothing for the first
+  deployment. It serves the non-Nix hosts, which means it is owed before the
+  PC joins, not before the hub ships.
 - M16 → M17: the PC joins a hub that already works; its switch (E-33) and
   ceiling (E-30, via M4) are the owner's hard conditions and are checked on
   her machine, not simulated.
 - M17 → M18: acceptance needs both machines on the real deployment.
+
+**What M16 does and does not buy.** It bounds what runs on the server: a
+kernel-enforced memory ceiling (M4), admission against a floor (M8), a
+queue with priorities (M6). It does **not** move load off the server — the
+PC has no runner until M17. And M17 before M11 gives a PC that can only
+take `check` work, since without a pack a build there produces nothing the
+server can test from, and the owner's rule denies it `kvm`.
 
 ## Parallel tracks
 

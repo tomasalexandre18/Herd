@@ -3102,3 +3102,53 @@ preparation time invisible in exactly the case someone is looking for it. The
 complete list arrives again with the verdict and takes over, so the frame needs
 no acknowledgement and no spool: it is neither output nor a verdict, and a link
 that dies under it costs the record nothing it does not get back.
+
+---
+
+## 2026-10-15 — D109 Deployment outranks breadth: M16 pulled forward
+
+**Context.** The owner's build server was OOM-killed on 2026-10-15 by a fleet
+of agents running unbounded builds. That is not an accident of the day: it is
+the pain the first consumer's sheet already measured (load median 29, p90 46
+on 12 threads; the PC OOM-killed; 71 % of detached runs red) and it keeps
+happening **because Herd is not yet there to bound it**. Nine milestones are
+merged and none of them is in production, so none of them has prevented
+anything. Alexa's ruling: get to M16 very fast, cleanly but fast.
+
+**Choice.** The path to a deployed hub is **M10 → M15 → M16**, then
+**M15d → M17**. M11, M12, M13 and M14 move to after M16.
+
+Two corrections to the plan's own reasoning that this exposed:
+
+1. **M15d was wrongly placed before M16.** The plan itself says the server's
+   native runner is updated by Nix (E-47), so self-update buys nothing for the
+   first deployment; it serves the non-Nix hosts. It is owed before the PC
+   joins, not before the hub ships. One whole milestone left the critical path.
+2. **"Nothing is exposed until a job can be stored and observed" was too
+   strong.** A first deployment needs a job that can be declared, confined,
+   admitted, placed, switched off and authenticated. Artefacts, a status
+   document and a scheduler's clock make Herd *broader*, not *deployable*.
+
+**What this costs, stated rather than discovered later.**
+
+- No M11/M12: a build and its test must run on the same runner. No
+  build-here-test-there, and no artefact custody.
+- No M13: the consumer's dashboard sees nothing of Herd and keeps its own
+  status files. Their own E-53 permits exactly this for a transition period.
+- No M14: their cron and their push hook keep submitting on their side.
+- No M15d: updating a runner needs a hand on its host. Nix covers the server.
+- **M16 bounds the server; it does not unload it.** The PC has no runner until
+  M17, and M17 before M11 gives a PC good only for `check` work, since without
+  a pack a build there produces nothing the server can test from and the
+  owner's rule denies the PC `kvm`.
+
+**Alternative rejected.** Finishing M11-M14 first, as the plan had it, and
+deploying a complete Herd once. Rejected because every week of breadth is
+another week of the exact failure Herd exists to prevent, on the machine the
+project is built on. Deploying narrow and growing in production is the cheaper
+error here.
+
+**Consequence for Q7.** Deploying earlier freezes the job-record format and
+the `ran on:` line earlier, and M16 still sets `PROTOCOL_VERSION` and
+`RECORD_VERSION` to 1 and freezes them (D73). The status and event formats do
+not exist yet, so they stay free — a benefit of this order, not a cost.
