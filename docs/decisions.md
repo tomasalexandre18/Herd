@@ -3824,3 +3824,69 @@ a plausible ruling made from reading, and each was falsified by someone
 making it real. A prescription I write into a decision is a hypothesis until
 it is built — so an agent told to follow one must be free to come back and
 say it is wrong, which is what happened twice here.
+
+---
+
+## 2026-10-15 — D129 The hub is deployed, and deploying it found two things
+
+**The deployment.** Hub in docker compose on the server, `herd-hub:0.1.0`
+built from the frozen tree, on a fresh volume, loopback only, with a
+requester token. The runner native on the host as a systemd service under a
+dedicated `herd` user — uid 986, group `herd` and nothing else, **not** in
+`docker` — with `Delegate=yes`, its data root on the NVMe (D126).
+
+**What is now proven on the real machine**, read back by a job itself out of
+the kernel rather than asserted:
+
+```
+my cgroup: /system.slice/herd-runner.service/herd-job-507751-7-j0000000008
+memory.max   8589934592      cpu.weight   10
+io.weight    default 10      pids.max     1024
+cpu.max      max 100000
+```
+
+`ulimit -v` inside a job reports `unlimited`, which is how we know the
+ceiling is the cgroup and not the `RLIMIT_AS` fallback. Two assertions that
+**could never be made** on an undelegated dev user are closed. A job at exit
+0, one at exit 7, and a job silent for 50 s — past three keepalive cadences —
+whose follower never went quiet and which returned its verdict normally
+(D118, live). Every `ran on:` line carried real figures: 20 GiB lent, 6 GiB
+floor, load recorded and not a gate.
+
+**Finding 1: a job's `PATH` had no shell and no coreutils.** Herd builds a
+job's environment from scratch, deliberately — that is what stops a stray
+variable in the runner's shell redirecting a job's writes. What the job then
+gets is systemd's service `PATH`, which on this host is zfs-user, dosfstools,
+mtools, e2fsprogs, util-linux-minimal, openssh and systemd. So
+`herdctl run -- sh -c '…'` failed with `sh: No such file or directory` and
+exited **125**, and inside a job `cat` and `cut` were not found either. The
+deployment must therefore *state* a job's `PATH`; the right value is
+host-specific, so it is the unit's to give and not Herd's to guess. Fixed
+with one `Environment=PATH=/run/current-system/sw/bin`, and a bare `sh -c`
+works.
+
+**Finding 2, and it is not ours to close.**
+`/var/run/libvirt/libvirt-sock` on this host is **`srw-rw-rw-`** — mode 0666,
+writable by every user on the machine, and libvirtd runs as root. The runner
+said so itself at startup:
+
+> WARNING: this runner's user can write /var/run/libvirt/libvirt-sock, which
+> is a container or VM runtime and therefore root on this host: a job could
+> start a privileged container and escape every cap. E-46's "unprivileged" is
+> not true of this deployment.
+
+That warning is exactly what `privilege.rs` exists for, and D78's reasoning —
+that a uid is not the whole story — is vindicated by it catching a hole
+nobody was looking for. The `herd` user has no privileged group; the socket
+is simply open to all. **Herd did not introduce this and cannot close it:**
+the fix is the host's libvirtd socket mode, which is `/etc/nixos`, and it
+affects every service on the machine rather than Herd alone. Hiding the path
+from the runner would need a mount namespace, and E-47 is the statement that
+this runner must see the host as it is — so that cure would undo the
+milestone.
+
+Until it is fixed, the honest statement is the runner's own: **every per-job
+cap on this host is sound against a job that stays inside Herd, and bypassable
+by a job that chooses to talk to libvirtd.** It is recorded here rather than
+left in a log line because it is the one thing on this deployment that a
+reader must not discover by accident.
