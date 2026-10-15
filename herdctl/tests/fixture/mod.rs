@@ -259,21 +259,122 @@ printf 'grove %s: verdict %s\n' "$step" "$verdict"
 exit "$verdict"
 "#;
 
-/// What a `labels_from` reading runs: the capabilities this commit's own tests
-/// need, one per line on standard output.
+/// What a `labels_from` reading runs: what this commit's own tests need, read
+/// on a machine because only the commit knows (D74).
 ///
-/// A real consumer runs its own tool and reads its own tree; this one prints a
-/// fixed pair, which is all a fixture has to do. How Herd parses a reading's
-/// output is not settled yet — `Labels::Read` carries the line and nothing
-/// reads it — so this prints the simplest thing a later milestone could want,
-/// and no test here asserts a format Herd has not chosen.
+/// A real consumer runs its own tool over its own tree. This prints the four
+/// keys Herd reads, in the shape D74 states — one `key=value` per line on
+/// standard output — and `--answer <mode>` picks **which** of the answers it
+/// gives, so that one fixture stands for a reading that answers, one that
+/// answers something that is not an answer, one that fails and one that never
+/// ends. A real tool decides what to say from what it found; a fixture is
+/// told, which is how a test asks for each case without a second command.
+///
+/// The mode travels in the command's own arguments, which is not an
+/// accident: the arguments are part of the cache key (D74), so each case is
+/// its own entry and no case is answered out of another's cache.
 const LABELS_SOURCE: &str = r#"#!/bin/sh
-# What `labels_from` runs: the labels this commit's tests need, one per line.
+# What `labels_from` runs: what this commit's tests need, four keys on stdout.
+#
+# `--answer <mode>` says which answer this run gives. The modes are the ones
+# Herd has to tell apart: an answer, four ways of printing something that is
+# not one, a reading that fails, and a reading that never ends.
 set -u
-printf '%s\n' grove-toolchain
-printf '%s\n' linux
+answer=good
+previous=
+for word in "$@"; do
+    if [ "$previous" = --answer ]; then
+        answer=$word
+    fi
+    previous=$word
+done
+# One line of the fixture's own, before the answer: a reading runs through the
+# four executor steps like any other job, so its output is never only its
+# answer.
+printf 'grove labels: reading for %s\n' "$answer"
+case $answer in
+good)
+    printf 'labels=grove-toolchain,linux\n'
+    printf 'memory_mib=2048\n'
+    printf 'tmpfs_mib=0\n'
+    printf 'scenarios=4\n'
+    ;;
+unknown-key)
+    printf 'labels=grove-toolchain,linux\n'
+    printf 'memory_mib=2048\n'
+    printf 'tmpfs_mib=0\n'
+    printf 'scenarios=4\n'
+    printf 'scenario=4\n'
+    ;;
+missing-key)
+    printf 'labels=grove-toolchain,linux\n'
+    printf 'tmpfs_mib=0\n'
+    printf 'scenarios=4\n'
+    ;;
+twice)
+    printf 'labels=grove-toolchain,linux\n'
+    printf 'labels=linux\n'
+    printf 'memory_mib=2048\n'
+    printf 'tmpfs_mib=0\n'
+    printf 'scenarios=4\n'
+    ;;
+not-a-figure)
+    printf 'labels=grove-toolchain,linux\n'
+    printf 'memory_mib=plenty\n'
+    printf 'tmpfs_mib=0\n'
+    printf 'scenarios=4\n'
+    ;;
+refuses)
+    printf 'grove labels: this tree cannot say what it needs\n' >&2
+    exit 7
+    ;;
+never-ends)
+    # Longer than any cap a test gives the reading, and it prints the answer
+    # afterwards: a reading stopped at its cap must refuse the job even though
+    # it would have answered eventually.
+    sleep 60
+    printf 'labels=grove-toolchain,linux\n'
+    printf 'memory_mib=2048\n'
+    printf 'tmpfs_mib=0\n'
+    printf 'scenarios=4\n'
+    ;;
+*)
+    printf 'grove labels: no such answer: %s\n' "$answer" >&2
+    exit 64
+    ;;
+esac
 exit 0
 "#;
+
+/// The answer [`LABELS_SOURCE`] gives in its `good` mode, which is the one
+/// every test that is not about a refusal asks for.
+///
+/// Written here so that the tests compare against the fixture's own figures
+/// rather than against numbers typed into a test file — and so that the
+/// memory figure is visibly **not** the one `probe` declares: the reading is
+/// the thing that knows, and its figure is the one the job is admitted
+/// against.
+pub const READ_LABELS: [&str; 2] = ["grove-toolchain", "linux"];
+pub const READ_MEMORY_MIB: u64 = 2048;
+pub const READ_TMPFS_MIB: u64 = 0;
+pub const READ_SCENARIOS: u64 = 4;
+/// What `probe` declares for the whole job, which the reading's figure
+/// replaces: the two are deliberately different.
+pub const PROBE_DECLARES_MEMORY_MIB: u64 = 4096;
+
+/// The modes [`LABELS_SOURCE`] answers in, as a test names one.
+///
+/// `--answer <mode>` goes in the command's own arguments, so it reaches the
+/// reading through `{args}` exactly as a requester's own argument would.
+pub const ANSWER_GOOD: &str = "good";
+pub const ANSWER_UNKNOWN_KEY: &str = "unknown-key";
+pub const ANSWER_MISSING_KEY: &str = "missing-key";
+pub const ANSWER_TWICE: &str = "twice";
+pub const ANSWER_NOT_A_FIGURE: &str = "not-a-figure";
+pub const ANSWER_REFUSES: &str = "refuses";
+pub const ANSWER_NEVER_ENDS: &str = "never-ends";
+/// The code [`LABELS_SOURCE`] exits with in its `refuses` mode.
+pub const REFUSES_CODE: i32 = 7;
 
 /// The fixture consumer repository: a bare remote, and a work tree that has
 /// pushed to it.
@@ -538,6 +639,185 @@ impl Fixture {
                 .permissions();
             perms.set_mode(0o755);
             std::fs::set_permissions(&path, perms).expect("the script is made executable");
+        }
+    }
+}
+
+/// The runner the harness below lends, named so that E-02's framing line can
+/// be asserted against a name a test chose.
+pub const RUNNER: &str = "declared-runner";
+
+/// What the fixture's commands ask for, offered by the one runner here —
+/// including the two labels the `labels_from` reading answers with, since a
+/// job placed on a reading's answer is placed on machines of *those* labels.
+///
+/// Shared, because nothing in this fixture contends for anything: what is
+/// being asserted is the contract, not the placement, and the placement has
+/// its own suite.
+pub const WHAT_THE_FIXTURE_ASKS_FOR: &str = r#"[
+    {"name":"grove-toolchain","kind":{"type":"shared"},"origins":{"declared":true}},
+    {"name":"linux","kind":{"type":"shared"},"origins":{"declared":true}}
+]"#;
+
+/// A hub with one runner joined, and the means to run `herdctl` in a checkout.
+///
+/// In process rather than as binaries, except for `herdctl` itself: what the
+/// tests here assert is what a **caller** sees — the status its shell read and
+/// the bytes on its stdout — so the requester is the real binary, and the hub
+/// and the runner are the real code with their own state and data roots.
+pub struct Harness {
+    hub_url: String,
+    pub state: TempDir,
+    tasks: Vec<tokio::task::JoinHandle<()>>,
+    _data_root: herd_runner::testing::TempDir,
+}
+
+impl Harness {
+    /// A hub and a runner, with the hub's own default timing.
+    pub async fn new() -> Harness {
+        Harness::with_policy(herd_hub::Policy::default()).await
+    }
+
+    /// The same, with a timing a test chose — a `labels_from` reading capped
+    /// at two seconds, say, so that a reading which never ends can be seen
+    /// refusing the job it was read for without waiting five minutes (D74).
+    pub async fn with_policy(policy: herd_hub::Policy) -> Harness {
+        use herd_hub::{Hub, JobDirStore, JobStore};
+        use std::sync::Arc;
+        use std::time::{Duration, Instant};
+
+        let state = tempfile::tempdir().expect("a temporary state directory");
+        let store = Arc::new(JobDirStore::open(state.path()).expect("the state root opens"));
+        // An unapproved runner is given no job (E-48), so this harness
+        // approves the one runner it lends and hands it the token that
+        // approval minted. Without it the declaration resolves, the job is
+        // minted, and nothing ever claims it — including a `labels_from`
+        // reading, which is an ordinary job on a runner like any other (D74).
+        let token = store
+            .approve_runner(RUNNER)
+            .expect("the state root mints a token");
+        let hub = Hub::bind_with_policy(
+            "127.0.0.1:0".parse().expect("a literal loopback address"),
+            store as Arc<dyn JobStore>,
+            policy,
+        )
+        .await
+        .expect("the hub binds a free port");
+        let hub_url = format!("ws://{}", hub.local_addr());
+        let handle = hub.handle();
+        let mut tasks = vec![tokio::spawn(async move {
+            let _ = hub.serve().await;
+        })];
+
+        // One data root per runner, thrown away with the harness (E-45).
+        let root = herd_runner::testing::TempDir::new("declared-e2e");
+        let offer: herd_proto::CapabilityOffer = serde_json::from_str(WHAT_THE_FIXTURE_ASKS_FOR)
+            .expect("the capabilities this fixture's commands ask for");
+        let config = herd_runner::Config {
+            hub_url: hub_url.clone(),
+            name: Some(RUNNER.to_owned()),
+            token: Some(token),
+            capabilities: offer,
+            // A size the owner states, rather than this host's own. The
+            // fixture's build declares a per-thread figure, so the hub
+            // derives a memory need and admission weighs it (E-29): a runner
+            // that says nothing about the floor it keeps for itself admits
+            // nothing at all, and the job would wait for ever on a machine
+            // that could have run it. Stated figures also make the derived
+            // `-j` the same on every host, which is what keeps these tests
+            // about the contract and not about the machine they ran on.
+            host: herd_proto::HostSize {
+                memory_mib: Some(8192),
+                threads: Some(4),
+                memory_floor_mib: Some(1024),
+                tmpfs_mib: None,
+            },
+            confinement: herd_runner::Confinement::with_data_root(root.path()),
+            ..herd_runner::Config::default()
+        };
+        tasks.push(tokio::spawn(async move {
+            let _ = herd_runner::run(config).await;
+        }));
+        // Wait on the hub's own state, never on a sleep.
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !handle.runner_connected() {
+            assert!(Instant::now() < deadline, "the runner never joined the hub");
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        Harness {
+            hub_url,
+            state,
+            tasks,
+            _data_root: root,
+        }
+    }
+
+    /// Run `herdctl` **in** a checkout, as a requester standing in one does.
+    ///
+    /// The working directory is the whole point: the declaration and the
+    /// commit are read where the repository already is (D106), and nothing
+    /// tells the binary where that is but the directory it was started in.
+    pub async fn herdctl_in(&self, fixture: &Fixture, arguments: &[&str]) -> Output {
+        tokio::process::Command::new(env!("CARGO_BIN_EXE_herdctl"))
+            .arg("--hub")
+            .arg(&self.hub_url)
+            .args(arguments)
+            .current_dir(fixture.root())
+            // A git config of the fixture's own, so the person's identity and
+            // their `~/.gitconfig` are out of the way and the refusals read
+            // the same on every machine.
+            .env("HOME", fixture.home())
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_TERMINAL_PROMPT", "0")
+            .output()
+            .await
+            .expect("herdctl runs")
+    }
+
+    /// Every job record on the hub's disk, oldest id first, read as a reader
+    /// outside Herd would (E-15).
+    pub fn records(&self) -> Vec<serde_json::Value> {
+        let jobs = self.state.path().join("jobs");
+        let mut dirs: Vec<PathBuf> = match std::fs::read_dir(&jobs) {
+            Ok(entries) => entries
+                .map(|entry| entry.expect("a job directory").path())
+                .collect(),
+            // No job was ever minted, which is a state a test may be about.
+            Err(_) => Vec::new(),
+        };
+        dirs.sort();
+        dirs.iter()
+            .map(|dir| {
+                let text = std::fs::read_to_string(dir.join("job.json")).expect("the record reads");
+                serde_json::from_str(&text).expect("the record is json")
+            })
+            .collect()
+    }
+
+    /// The record of the one job this harness ran.
+    pub fn only_record(&self) -> serde_json::Value {
+        let mut records = self.records();
+        assert_eq!(
+            records.len(),
+            1,
+            "exactly one job was submitted: {records:?}"
+        );
+        records.remove(0)
+    }
+
+    /// One job's log, byte for byte as the hub wrote it (D18).
+    pub fn log(&self, job_id: &str) -> String {
+        let path = self.state.path().join("jobs").join(job_id).join("log");
+        std::fs::read_to_string(&path)
+            .unwrap_or_else(|why| panic!("the log of {job_id} at {} reads: {why}", path.display()))
+    }
+}
+
+impl Drop for Harness {
+    fn drop(&mut self) {
+        for task in &self.tasks {
+            task.abort();
         }
     }
 }

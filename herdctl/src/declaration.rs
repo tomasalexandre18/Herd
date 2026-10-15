@@ -173,6 +173,23 @@ impl Labels {
             Labels::Read { line, .. } => Some(line),
         }
     }
+
+    /// The reading a submission carries, when the labels come from one (D74).
+    ///
+    /// The line and the baseline together, in the protocol's own type: the
+    /// hub mints an ordinary job for the line, places it against the
+    /// baseline, and writes what it answered onto the record of the job that
+    /// waits for it. `None` when the declaration states the labels itself,
+    /// and then there is nothing to read.
+    pub fn labels_from(&self) -> Option<herd_proto::LabelsFrom> {
+        match self {
+            Labels::Declared(_) => None,
+            Labels::Read { line, baseline } => Some(herd_proto::LabelsFrom {
+                line: line.clone(),
+                baseline: baseline.clone(),
+            }),
+        }
+    }
 }
 
 /// When a command wants to be submitted without anybody asking (E-41).
@@ -277,6 +294,10 @@ impl Resolved {
             memory_mib: self.memory_mib,
             tmpfs_mib: self.tmpfs_mib,
             declaration: Some(self.declaration.clone()),
+            // The reading, when this command declares one in place of static
+            // labels: the labels the submission carries are then the
+            // baseline it is placed against (D74).
+            labels_from: self.labels.labels_from(),
             timeout_s: self.timeout_s,
             ..crate::Declared::default()
         }

@@ -39,6 +39,16 @@
 //! ([`holdings`]), which is the same fact the watchdog, the requeue and the
 //! restart all already work from. A leaked slot is not a bug that is hard to
 //! make here; it is a state this hub cannot represent.
+//!
+//! ## Where a job's requirements come from
+//!
+//! **Off the record, through [`JobRecord::labels_needed`] and the two figures
+//! beside it, and this module never asks where they came from (D74).** A
+//! requester may have stated them, or a reading may have run on a machine and
+//! answered them; either way they are on the record before anything here is
+//! called, and a job whose reading has not answered is not offered to this
+//! module at all. That is what let D74 land without moving M7 or M8: the
+//! algebra, the slots and the admission are what they were.
 
 use std::collections::BTreeMap;
 use std::time::Duration;
@@ -300,7 +310,7 @@ pub fn holdings(records: &[JobRecord]) -> BTreeMap<String, Vec<(JobId, LabelSet)
     for (runner, record) in out_there(records) {
         held.entry(runner.to_owned())
             .or_default()
-            .push((record.id.clone(), record.labels.clone()));
+            .push((record.id.clone(), record.labels_needed().clone()));
     }
     held
 }
@@ -613,7 +623,7 @@ fn judge(record: &JobRecord, seat: &Seat, placing: &Placing, now: Timestamp) -> 
     }
     // What M5's algebra decides: the kinds, under contention with what is
     // already running here (E-25).
-    let contention = seat.holdings.check(&record.labels);
+    let contention = seat.holdings.check(record.labels_needed());
     // **The impossible case is judged first, before anything about the
     // moment.** A label set that contradicts itself is a fact about the
     // submission, and a job asking for two labels that exclude each other —
@@ -629,7 +639,7 @@ fn judge(record: &JobRecord, seat: &Seat, placing: &Placing, now: Timestamp) -> 
     // What M5 decided: offered and not suspended. A label this runner does
     // not offer is not about the moment; a probe outside Herd holding one is
     // (D48).
-    if let Some(held_up) = seat.capacity.held_up_by(&record.labels) {
+    if let Some(held_up) = seat.capacity.held_up_by(record.labels_needed()) {
         return if held_up.clears_with_time {
             Verdict::Later(held_up.reason)
         } else {
@@ -649,10 +659,10 @@ fn judge(record: &JobRecord, seat: &Seat, placing: &Placing, now: Timestamp) -> 
     // figure times its per-thread declaration and N is chosen first (D82).
     let derived = match record.build_thread_mib {
         None => None,
-        Some(build_thread_mib) => match seat
-            .host
-            .parallelism(build_thread_mib, slots_for(&record.labels, &seat.capacity))
-        {
+        Some(build_thread_mib) => match seat.host.parallelism(
+            build_thread_mib,
+            slots_for(record.labels_needed(), &seat.capacity),
+        ) {
             Ok(derived) => Some(derived),
             // A machine that does not say how big it is cannot be given a job
             // whose `-j` is derived from its size. Not a failure: another
@@ -723,7 +733,7 @@ pub fn eligible(
         })
         .map(|seat| {
             let answered: Vec<&str> = record
-                .labels
+                .labels_needed()
                 .iter()
                 .filter(|label| seat.capacity.offer().available(label).is_some())
                 .collect();
@@ -745,7 +755,7 @@ pub fn eligible(
 /// because the PC's own capability file says `"drain_first": true` about it
 /// (D86). A label the runner does not offer cannot ask for anything.
 fn needs_a_quiet_host(record: &JobRecord, seat: &Seat) -> Option<String> {
-    record.labels.iter().find_map(|label| {
+    record.labels_needed().iter().find_map(|label| {
         seat.capacity
             .offer()
             .available(label)
@@ -1053,11 +1063,11 @@ fn claim(
         memory_mib,
         tmpfs_mib,
     } = fitted;
-    let takes = what_it_takes(&record.labels, seat);
-    let labels = if record.labels.is_empty() {
+    let takes = what_it_takes(record.labels_needed(), seat);
+    let labels = if record.labels_needed().is_empty() {
         "none".to_owned()
     } else {
-        record.labels.to_string()
+        record.labels_needed().to_string()
     };
     let mut why = format!(
         "claimed by {}: labels {labels}; {takes}",
@@ -1087,7 +1097,10 @@ fn claim(
     // next job offered in this pass contends with this one (D79): an
     // exclusive job and a counted job arriving in one pass must not both be
     // admitted.
-    if let Err(contention) = seat.holdings.admit(&record.id, record.labels.clone()) {
+    if let Err(contention) = seat
+        .holdings
+        .admit(&record.id, record.labels_needed().clone())
+    {
         // The judgement above said this was free. Only a bug can get here,
         // and the one thing it must not do is place the job anyway.
         return Placement::Wait {
@@ -1276,6 +1289,7 @@ mod tests {
             requeue_exit_code: None,
             declaration: None,
             timeout_s: None,
+            reading: None,
             parallelism: None,
             submissions: 1,
             state: JobState::Queued,

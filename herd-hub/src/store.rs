@@ -15,6 +15,9 @@
 //!       files/              room for what a job keeps (M11's artefacts)
 //!   index/
 //!     state.json            derived: which jobs are not over yet
+//!   readings/
+//!     answers.json          derived: what every `labels_from` reading
+//!                           answered, by (commit, command, args) (D74)
 //! ```
 //!
 //! **The job directories are the only source of truth.** `index/state.json`
@@ -42,13 +45,13 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
-use herd_proto::{JobId, LabelSet, LogStream, Priority, StepRun};
+use herd_proto::{JobId, LabelSet, LogStream, Priority, Requirements, StepRun};
 use serde::{Deserialize, Serialize};
 
 use crate::durable;
 use crate::job::{
-    Attempt, JobEvent, JobMetrics, JobRecord, JobState, JobStore, LogWrite, NewJob, Raise, Result,
-    StoreError, Submission, Timestamp, RECORD_VERSION,
+    Attempt, JobEvent, JobMetrics, JobRecord, JobState, JobStore, LogWrite, NewJob, Raise, Reading,
+    Result, StoreError, Submission, Timestamp, RECORD_VERSION,
 };
 
 /// The version of the directory layout above. A state root written by a newer
@@ -79,6 +82,14 @@ const LOG_SEQ_FILE: &str = "log.seq";
 const LOG_SEQ_DIGITS: usize = 20;
 const KEPT_FILES_DIR: &str = "files";
 const LOCK_FILE: &str = "hub.lock";
+/// Where the answers of `labels_from` readings are kept, by their (commit,
+/// command, args) key (D74). Derived, like the index: an answer that cannot be
+/// read is one more reading to pay for and never a reason to refuse to start.
+const READINGS_DIR: &str = "readings";
+const READINGS_FILE: &str = "answers.json";
+/// The version of that file. Like [`INDEX_VERSION`], a version this Herd does
+/// not know is one more reason to start again with nothing in it.
+const READINGS_VERSION: u32 = 1;
 
 /// Digits in a job id, after the `j`. Zero-padded so that the directory
 /// listing of `jobs/` is in the order the jobs were minted.
@@ -132,6 +143,16 @@ struct Live {
     /// first time this hub sees a chunk of a job, written through to it
     /// afterwards, and forgotten when the job is over.
     log_chunks: HashMap<JobId, LogAt>,
+    /// What every `labels_from` reading this store has kept answered, by its
+    /// (commit, command, args) key (D74).
+    ///
+    /// Read from `readings/answers.json` once, at every start, and written
+    /// through whenever an answer lands. It is the one thing in this store
+    /// that is a **cache**: an entry that cannot be read is an entry that
+    /// never existed, and the next submission of those three pays for a
+    /// reading of its own. That is why an unreadable file here does not stop
+    /// the hub starting, where an unreadable record does.
+    readings: BTreeMap<String, Requirements>,
     /// The jobs this hub has read and will not act on, with why (D52). Filled
     /// at recovery and never added to afterwards: what quarantines a record is
     /// a judgement about rules that do not change while the hub runs.
@@ -162,6 +183,14 @@ struct IndexFile {
     index_version: u32,
     jobs_accounted: u64,
     pending: Vec<JobId>,
+}
+
+/// `readings/answers.json`: what every reading this store has kept answered,
+/// by its (commit, command, args) key (D74).
+#[derive(Debug, Serialize, Deserialize)]
+struct ReadingsFile {
+    readings_version: u32,
+    answers: BTreeMap<String, Requirements>,
 }
 
 /// `job.json`: the record, with the version of its shape in front of it.
@@ -257,6 +286,8 @@ impl JobDirStore {
         durable::create_dir(&jobs).map_err(|error| failed("creating", &jobs, &error))?;
         let index = root.join(INDEX_DIR);
         durable::create_dir(&index).map_err(|error| failed("creating", &index, &error))?;
+        let readings = root.join(READINGS_DIR);
+        durable::create_dir(&readings).map_err(|error| failed("creating", &readings, &error))?;
 
         // One hub per state root (D21), claimed before anything is written.
         let lock = claim(&root)?;
@@ -265,7 +296,7 @@ impl JobDirStore {
         // index are where every later write lands, and a hub that cannot
         // write them would start and then fail every submission with nothing
         // but its own log to say why.
-        for directory in [&jobs, &index] {
+        for directory in [&jobs, &index, &readings] {
             durable::probe_writable(directory)
                 .map_err(|error| failed("writing in", directory, &error))?;
         }
@@ -312,6 +343,9 @@ impl JobDirStore {
         // for a reason that blames the machines (E-48).
         let roster = crate::roster::Roster::open(&root)?;
 
+        // The cache of readings, read once. Unreadable is empty, loudly: see
+        // [`Live::readings`].
+        let answers = read_the_readings(&root);
         let store = Self {
             root,
             state_root_id,
@@ -323,6 +357,7 @@ impl JobDirStore {
                 pending: BTreeSet::new(),
                 open_work: HashMap::new(),
                 log_chunks: HashMap::new(),
+                readings: answers,
                 quarantined: BTreeMap::new(),
             }),
         };
@@ -372,6 +407,10 @@ impl JobDirStore {
 
     fn jobs_dir(&self) -> PathBuf {
         self.root.join(JOBS_DIR)
+    }
+
+    fn readings_path(&self) -> PathBuf {
+        self.root.join(READINGS_DIR).join(READINGS_FILE)
     }
 
     fn index_path(&self) -> PathBuf {
@@ -911,6 +950,7 @@ impl JobDirStore {
             requeue_exit_code,
             declaration,
             timeout_s,
+            reading,
         } = new;
         let mut live = self.lock()?;
         // `mkdir` is what claims an id: the directories, not the index, decide
@@ -961,6 +1001,7 @@ impl JobDirStore {
             requeue_exit_code,
             declaration,
             timeout_s,
+            reading,
             parallelism: None,
             submissions: 1,
             state: JobState::Queued,
@@ -1118,6 +1159,52 @@ impl JobStore for JobDirStore {
         // name before anything is read off it (D54). An operator raising a
         // job that ended a second ago is told so, and nothing is written.
         self.raise_priority_because(id, to, "an operator raised it")
+    }
+
+    /// Write where this job's requirements come from, and what they are once
+    /// a reading has said (D74).
+    ///
+    /// Through the one write door, so a job that is over refuses it by name:
+    /// a reading that answers after the job it was read for was cancelled has
+    /// nothing to write, and the hub is told rather than quietly writing a
+    /// requirement onto a closed record. The answer is also kept in the
+    /// store's cache by its own key — that is [`JobStore::remember_reading`],
+    /// a separate call, because a *cached* answer landing on a record must
+    /// not write the cache again.
+    fn record_reading(&self, id: &JobId, reading: Reading) -> Result<()> {
+        let (_live, mut record) = self.open_for_writing(id)?;
+        let at = Timestamp::now();
+        record.reading = Some(reading);
+        record.updated_at = at;
+        self.write_record(&record)
+    }
+
+    /// What a reading of these three answered, out of the cache this store
+    /// holds in memory and on its disk (D74).
+    fn reading_answer(&self, key: &str) -> Result<Option<Requirements>> {
+        Ok(self.lock()?.readings.get(key).cloned())
+    }
+
+    /// Keep an answer under its key, in memory and on the disk, so that the
+    /// next submission of those three pays no reading (D74).
+    ///
+    /// Idempotent: an answer already under this key is left alone. Two
+    /// readings of one key can only ever have happened because the first had
+    /// not finished when the second was minted, and the first answer is the
+    /// one every job behind it was already told about.
+    fn remember_reading(&self, key: &str, answer: &Requirements) -> Result<()> {
+        let mut live = self.lock()?;
+        if live.readings.contains_key(key) {
+            return Ok(());
+        }
+        live.readings.insert(key.to_owned(), answer.clone());
+        write_json(
+            &self.readings_path(),
+            &ReadingsFile {
+                readings_version: READINGS_VERSION,
+                answers: live.readings.clone(),
+            },
+        )
     }
 
     /// Write what the runner measured, and nothing else about the job.
@@ -1664,6 +1751,50 @@ fn read_optional_bytes(path: &Path) -> Result<Option<Vec<u8>>> {
         Ok(bytes) => Ok(Some(bytes)),
         Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
         Err(error) => Err(failed("reading", path, &error)),
+    }
+}
+
+/// The cache of readings this state root holds, or nothing at all (D74).
+///
+/// **Never an error.** A cache is derived: a file that does not parse, or that
+/// a newer Herd wrote, is a cache this hub starts without — every submission
+/// then pays for a reading of its own, which is slow and correct. Said on
+/// stderr rather than swallowed, because "the hub is paying for a reading
+/// every time" is a thing an operator wants to know.
+fn read_the_readings(root: &Path) -> BTreeMap<String, Requirements> {
+    let path = root.join(READINGS_DIR).join(READINGS_FILE);
+    let text = match read_optional(&path) {
+        Ok(Some(text)) => text,
+        Ok(None) => return BTreeMap::new(),
+        Err(why) => {
+            eprintln!(
+                "herd-hub: {} could not be read ({why}), so this hub starts with no cached \
+                 reading and every submission of a command with a labels_from pays for one \
+                 until it is read again",
+                path.display()
+            );
+            return BTreeMap::new();
+        }
+    };
+    match serde_json::from_str::<ReadingsFile>(&text) {
+        Ok(file) if file.readings_version == READINGS_VERSION => file.answers,
+        Ok(file) => {
+            eprintln!(
+                "herd-hub: {} carries readings version {} and this hub writes \
+                 {READINGS_VERSION}, so its answers are left alone and read again",
+                path.display(),
+                file.readings_version
+            );
+            BTreeMap::new()
+        }
+        Err(why) => {
+            eprintln!(
+                "herd-hub: {} is not a cache of readings ({why}), so this hub starts with \
+                 none and reads them again",
+                path.display()
+            );
+            BTreeMap::new()
+        }
     }
 }
 
@@ -3044,5 +3175,64 @@ mod tests {
             said.contains(job.id.as_str()) && said.contains('7') && said.contains("up"),
             "the refusal names the job, the attempt and the step: {said}"
         );
+    }
+
+    /// What a reading answered is kept **in the job store**, under the
+    /// (commit, command, args) key, and it outlives the hub that read it
+    /// (D74).
+    ///
+    /// The restart is the point: without it the cache would be a map in one
+    /// process, and the first submission after a deployment would pay for
+    /// every reading again.
+    #[test]
+    fn a_reading_s_answer_is_kept_by_its_key_and_survives_a_restart() {
+        let dir = TempDir::new().expect("a temporary directory");
+        let answer = Requirements {
+            labels: LabelSet::new(["kvm", "metal"]).expect("valid labels"),
+            memory_mib: 4096,
+            tmpfs_mib: 8192,
+            scenarios: 12,
+        };
+        let key = crate::job::reading_key(A_COMMIT, "test", &["--only".to_owned()]);
+        let another = crate::job::reading_key(A_COMMIT, "test", &[]);
+        {
+            let store = JobDirStore::open(dir.path()).expect("the state root opens");
+            assert_eq!(
+                store.reading_answer(&key).expect("the cache reads"),
+                None,
+                "a store that has read nothing answers nothing, never a default"
+            );
+            store
+                .remember_reading(&key, &answer)
+                .expect("the answer is kept");
+            assert_eq!(
+                store.reading_answer(&key).expect("the cache reads"),
+                Some(answer.clone())
+            );
+            assert_eq!(
+                store.reading_answer(&another).expect("the cache reads"),
+                None,
+                "another argument list is another reading"
+            );
+        }
+        // The same state root, a new hub: the answer is still there, so the
+        // next submission of those three pays for no reading.
+        let store = JobDirStore::open(dir.path()).expect("the state root opens again");
+        assert_eq!(
+            store.reading_answer(&key).expect("the cache reads"),
+            Some(answer)
+        );
+
+        // And a cache that cannot be read is an empty cache, not a hub that
+        // will not start: the readings are derived, and the cost of losing
+        // them is paying for them again.
+        drop(store);
+        std::fs::write(
+            dir.path().join("readings").join("answers.json"),
+            "this is not json",
+        )
+        .expect("the cache is made unreadable");
+        let store = JobDirStore::open(dir.path()).expect("an unreadable cache is not a refusal");
+        assert_eq!(store.reading_answer(&key).expect("the cache reads"), None);
     }
 }

@@ -6,7 +6,7 @@ use anyhow::{Context, Result};
 use clap::Parser;
 use herd_hub::{
     Authority, Hub, JobDirStore, JobStore, Policy, Stickiness, AGING_STEP, DEFAULT_LISTEN_ADDR,
-    DRAIN_FIRST_LIMIT, LOST_AFTER, REQUEUE_BUDGET, STICKINESS_LIMIT, WAIT_RESTATEMENT,
+    DRAIN_FIRST_LIMIT, LOST_AFTER, READING_CAP, REQUEUE_BUDGET, STICKINESS_LIMIT, WAIT_RESTATEMENT,
 };
 use herd_proto::HEALTH_EVERY;
 
@@ -106,6 +106,17 @@ struct Args {
     /// E-21's budget for a runner that disappears.
     #[arg(long, env = "HERD_REQUEUE_BUDGET", default_value_t = REQUEUE_BUDGET)]
     requeue_budget: u32,
+    /// Seconds the `run` step of a `labels_from` reading may take (D74).
+    ///
+    /// A command may declare that what its jobs need is read on a machine
+    /// rather than stated in the file. That reading is an ordinary job: it
+    /// goes through the one queue, it is confined like any other, and this is
+    /// the cap on it. Five minutes by default, because a reading builds and
+    /// boots nothing; a reading that overruns it refuses the job it was read
+    /// for, by name, rather than letting it be placed on a guess. The
+    /// runner's own cap still bounds this and is never raised by it (D108).
+    #[arg(long, env = "HERD_READING_CAP", default_value_t = READING_CAP.as_secs_f64())]
+    reading_cap: f64,
 }
 
 /// The shared requester token, from the file the operator named (Q8).
@@ -162,6 +173,7 @@ async fn main() -> Result<()> {
         wait_restatement: seconds(args.wait_restatement),
         drain_first_limit: seconds(args.drain_first_limit),
         requeue_budget: args.requeue_budget,
+        reading_cap: seconds(args.reading_cap),
         ..Policy::default()
     };
     let state_root_id = store.state_root_id().to_owned();
@@ -205,7 +217,7 @@ async fn main() -> Result<()> {
          saying again every {:?} why a job it is following is still queued; a job that \
          needs a quiet host holds one empty for at most {:?}, and a job whose declared \
          requeue code comes back gets {} goes at it, separately from the {} goes it gets \
-         at a runner that goes away",
+         at a runner that goes away; a reading of what a job needs is capped at {:?}",
         herd_hub::hub_version(),
         hub.local_addr(),
         args.state_dir.display(),
@@ -218,6 +230,7 @@ async fn main() -> Result<()> {
         policy.drain_first_limit,
         policy.requeue_budget,
         policy.attempts_allowed,
+        policy.reading_cap,
     );
     hub.serve().await
 }

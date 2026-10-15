@@ -782,6 +782,9 @@ fn declared(
         // runner's own figure: a declared command comes in by its name and
         // its commit, which is M10's own surface (E-11, D106).
         declaration: None,
+        // And a command line a person typed states its own labels: there is
+        // no declaration to read them out of, so there is no reading (D74).
+        labels_from: None,
         timeout_s: None,
     })
 }

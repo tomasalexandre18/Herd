@@ -22,154 +22,16 @@
 //!
 //! No consumer command is named here or in the fixture: every name is
 //! invented (E-11).
+//!
+//! The harness — a hub, a runner, and the means to run the binary in the
+//! fixture's own checkout — lives in the fixture module beside this file,
+//! because the `labels_from` tests next door need the same one (D74).
 
 use std::process::Output;
-use std::sync::Arc;
-use std::time::{Duration, Instant};
-
-use herd_hub::{Hub, JobDirStore, JobStore};
-use herd_runner::testing::TempDir as DataRootDir;
-use tempfile::TempDir;
-use tokio::process::Command;
-use tokio::task::JoinHandle;
 
 mod fixture;
 
-use fixture::{Fixture, ASSEMBLE, BRANCH, SKETCH, TAG, TRACKED};
-
-/// The runner this harness lends, named so the framing line can be asserted
-/// against a name a test chose.
-const RUNNER: &str = "declared-runner";
-
-/// What the fixture's two commands ask for, offered by the one runner here.
-///
-/// Shared, because nothing in this fixture contends for anything: what is
-/// being asserted is the contract, not the placement, and the placement has
-/// its own suite.
-const WHAT_THE_FIXTURE_ASKS_FOR: &str = r#"[
-    {"name":"grove-toolchain","kind":{"type":"shared"},"origins":{"declared":true}},
-    {"name":"linux","kind":{"type":"shared"},"origins":{"declared":true}}
-]"#;
-
-/// A hub with one runner joined, and the means to run `herdctl` in a checkout.
-struct Harness {
-    hub_url: String,
-    state: TempDir,
-    tasks: Vec<JoinHandle<()>>,
-    _data_root: DataRootDir,
-}
-
-impl Harness {
-    async fn new() -> Harness {
-        let state = tempfile::tempdir().expect("a temporary state directory");
-        let store = Arc::new(JobDirStore::open(state.path()).expect("the state root opens"));
-        // An unapproved runner is given no job (E-48), so this harness
-        // approves the one runner it lends and hands it the token that
-        // approval minted. Without it the declaration resolves, the job is
-        // minted, and nothing ever claims it.
-        let token = store
-            .approve_runner(RUNNER)
-            .expect("the state root mints a token");
-        let hub = Hub::bind(
-            "127.0.0.1:0".parse().expect("a literal loopback address"),
-            store as Arc<dyn JobStore>,
-        )
-        .await
-        .expect("the hub binds a free port");
-        let hub_url = format!("ws://{}", hub.local_addr());
-        let handle = hub.handle();
-        let mut tasks = vec![tokio::spawn(async move {
-            let _ = hub.serve().await;
-        })];
-
-        // One data root per runner, thrown away with the harness (E-45).
-        let root = DataRootDir::new("declared-e2e");
-        let offer: herd_proto::CapabilityOffer = serde_json::from_str(WHAT_THE_FIXTURE_ASKS_FOR)
-            .expect("the capabilities this fixture's commands ask for");
-        let config = herd_runner::Config {
-            hub_url: hub_url.clone(),
-            name: Some(RUNNER.to_owned()),
-            token: Some(token),
-            capabilities: offer,
-            // A size the owner states, rather than this host's own. The
-            // fixture's build declares a per-thread figure, so the hub
-            // derives a memory need and admission weighs it (E-29): a runner
-            // that says nothing about the floor it keeps for itself admits
-            // nothing at all, and the job would wait for ever on a machine
-            // that could have run it. Stated figures also make the derived
-            // `-j` the same on every host, which is what keeps this test
-            // about the contract and not about the machine it ran on.
-            host: herd_proto::HostSize {
-                memory_mib: Some(8192),
-                threads: Some(4),
-                memory_floor_mib: Some(1024),
-                tmpfs_mib: None,
-            },
-            confinement: herd_runner::Confinement::with_data_root(root.path()),
-            ..herd_runner::Config::default()
-        };
-        tasks.push(tokio::spawn(async move {
-            let _ = herd_runner::run(config).await;
-        }));
-        // Wait on the hub's own state, never on a sleep.
-        let deadline = Instant::now() + Duration::from_secs(10);
-        while !handle.runner_connected() {
-            assert!(Instant::now() < deadline, "the runner never joined the hub");
-            tokio::time::sleep(Duration::from_millis(5)).await;
-        }
-        Harness {
-            hub_url,
-            state,
-            tasks,
-            _data_root: root,
-        }
-    }
-
-    /// Run `herdctl` **in** a checkout, as a requester standing in one does.
-    ///
-    /// The working directory is the whole point: the declaration and the
-    /// commit are read where the repository already is (D106), and nothing
-    /// tells the binary where that is but the directory it was started in.
-    async fn herdctl_in(&self, fixture: &Fixture, arguments: &[&str]) -> Output {
-        Command::new(env!("CARGO_BIN_EXE_herdctl"))
-            .arg("--hub")
-            .arg(&self.hub_url)
-            .args(arguments)
-            .current_dir(fixture.root())
-            // A git config of the fixture's own, so the person's identity and
-            // their `~/.gitconfig` are out of the way and the refusals read
-            // the same on every machine.
-            .env("HOME", fixture.home())
-            .env("GIT_CONFIG_NOSYSTEM", "1")
-            .env("GIT_CONFIG_GLOBAL", "/dev/null")
-            .env("GIT_TERMINAL_PROMPT", "0")
-            .output()
-            .await
-            .expect("herdctl runs")
-    }
-
-    /// The record of the one job this harness ran, read off the hub's disk as
-    /// a reader outside Herd would (E-15).
-    fn only_record(&self) -> serde_json::Value {
-        let jobs = self.state.path().join("jobs");
-        let mut dirs: Vec<std::path::PathBuf> = std::fs::read_dir(&jobs)
-            .expect("the hub's job directory")
-            .map(|entry| entry.expect("a job directory").path())
-            .collect();
-        dirs.sort();
-        assert_eq!(dirs.len(), 1, "exactly one job was submitted: {dirs:?}");
-        let text = std::fs::read_to_string(dirs[0].join("job.json")).expect("the record reads");
-        serde_json::from_str(&text).expect("the record is json")
-    }
-}
-
-impl Drop for Harness {
-    fn drop(&mut self) {
-        for task in &self.tasks {
-            task.abort();
-        }
-    }
-}
+use fixture::{Fixture, Harness, ASSEMBLE, BRANCH, RUNNER, SKETCH, TAG, TRACKED};
 
 fn status_code(output: &Output) -> i32 {
     output

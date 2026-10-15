@@ -623,14 +623,14 @@ fn the_four_hooks_the_fixture_declares_really_run() {
     );
 }
 
-/// The `labels_from` line the fixture declares is shell too, and it prints
-/// labels.
+/// The `labels_from` line the fixture declares is shell too, and what it
+/// prints is an answer Herd reads (D74).
 ///
-/// D74's reading has not been implemented anywhere yet — `Labels::Read` carries
-/// the line and nothing runs it — so what is asserted here is only what this
-/// test established: the line the declaration holds, filled, runs in the
-/// checkout and prints the two names the fixture's own script prints. No format
-/// Herd has not chosen is asserted.
+/// Two things, and the second is the one worth having: the line the
+/// declaration holds, filled, really runs in the checkout; and what it prints
+/// is what [`herd_proto::Requirements::read`] reads, with the figures the
+/// fixture's own script prints. Where that answer then goes — a reading job,
+/// the cache, the record — is the end-to-end suite's, not this one's.
 #[test]
 fn the_reading_line_the_fixture_declares_really_runs() {
     let Some(fixture) = Fixture::new("the_reading_line_the_fixture_declares_really_runs") else {
@@ -660,16 +660,41 @@ fn the_reading_line_the_fixture_declares_really_runs() {
         "the reading line failed: {reading}\n{}",
         String::from_utf8_lossy(&said.stderr)
     );
-    let printed = String::from_utf8_lossy(&said.stdout);
+    // And what it printed is an answer, read the way the hub reads one.
+    let answer = herd_proto::Requirements::read(&said.stdout).unwrap_or_else(|why| {
+        panic!(
+            "the reading printed something that is not an answer: {why}\n{}",
+            String::from_utf8_lossy(&said.stdout)
+        )
+    });
     assert_eq!(
-        printed.lines().collect::<Vec<&str>>(),
-        vec!["grove-toolchain", "linux"],
-        "the reading printed something else: {printed}"
+        answer,
+        herd_proto::Requirements {
+            labels: LabelSet::new(fixture::READ_LABELS).expect("the fixture prints labels"),
+            memory_mib: fixture::READ_MEMORY_MIB,
+            tmpfs_mib: fixture::READ_TMPFS_MIB,
+            scenarios: fixture::READ_SCENARIOS,
+        },
+        "the reading answered something else: {}",
+        String::from_utf8_lossy(&said.stdout)
     );
-    // Every name it printed is a label Herd could place a job against.
-    for name in printed.lines() {
-        herd_proto::check_label(name).expect("the reading prints labels");
-    }
+
+    // And the submission carries the reading rather than the labels, so that
+    // the hub knows there is one to run (D74).
+    let asked = asked_for(&resolved);
+    assert_eq!(
+        asked.labels_from,
+        Some(herd_proto::LabelsFrom {
+            line: reading.to_owned(),
+            baseline: toolchain(),
+        }),
+        "a submission of a command with a labels_from carries it, filled"
+    );
+    assert_eq!(
+        asked.labels,
+        toolchain(),
+        "and its labels are the baseline the reading is placed against, not the job's own"
+    );
 }
 
 /// What a submission carries for one resolved command, built the one way

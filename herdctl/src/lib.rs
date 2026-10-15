@@ -207,6 +207,15 @@ pub struct Declared {
     pub declaration: Option<Declaration>,
     /// What that command declared its `run` step may take, in seconds (D108).
     pub timeout_s: Option<u64>,
+    /// The reading that will say what this job needs, when its command
+    /// declares `labels_from` in place of static labels (D74).
+    ///
+    /// Carried rather than acted on here: the labels the submission goes out
+    /// with are the command's declared **baseline**, and the hub runs the
+    /// reading as an ordinary job on a runner. `herdctl` fills the line's
+    /// `{commit}` and `{args}` like every other line it resolves (D107), and
+    /// that is the whole of its part in it.
+    pub labels_from: Option<herd_proto::LabelsFrom>,
 }
 
 impl Declared {
@@ -226,6 +235,7 @@ impl Declared {
             after: self.after.map(JobId::new),
             requeue_exit_code: self.requeue_exit_code,
             declaration: self.declaration,
+            labels_from: self.labels_from,
             timeout_s: self.timeout_s,
         }
     }

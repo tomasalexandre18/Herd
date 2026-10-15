@@ -264,6 +264,10 @@ fn every_message_to_the_hub_round_trips() {
             after: Some(JobId::new("j0000000003")),
             requeue_exit_code: Some(75),
             declaration: Some(a_declaration()),
+            labels_from: Some(herd_proto::LabelsFrom {
+                line: "shape --labels".to_owned(),
+                baseline: LabelSet::of("build").expect("a label"),
+            }),
             timeout_s: Some(2700),
         };
         let bare = Asked {
@@ -277,6 +281,7 @@ fn every_message_to_the_hub_round_trips() {
             after: None,
             requeue_exit_code: None,
             declaration: None,
+            labels_from: None,
             timeout_s: None,
         };
         // A dry run carries exactly what a submission carries (E-07).
