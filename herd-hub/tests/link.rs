@@ -46,6 +46,14 @@ const TURNED_AWAY_PATIENCE: Duration = Duration::from_millis(500);
 /// A hub told to lose a runner in a second instead of a minute.
 struct Quick {
     hub_url: String,
+    /// The cadence this hub was told to expect its runners to report at.
+    ///
+    /// Kept because a puppet that is meant to be *alive* has to report at it:
+    /// a peer that says nothing has a hard window of `lost_after` from its
+    /// handshake in which the hub will admit it work, and under load a test
+    /// that spends that window starting up loses it (D113's reading of the
+    /// clocks, and the two link tests it cost).
+    health_every: Duration,
     store: Arc<JobDirStore>,
     /// The token each runner this test approved carries, so that one name is
     /// approved once however many times a puppet dials under it (E-48).
@@ -58,6 +66,7 @@ struct Quick {
 
 impl Quick {
     async fn start(lost_after: Duration) -> Self {
+        let health_every = lost_after / 10;
         let state = tempfile::tempdir().expect("a temporary state directory");
         let store = Arc::new(JobDirStore::open(state.path()).expect("the state root opens"));
         let hub = Hub::bind_with_policy(
@@ -70,7 +79,7 @@ impl Quick {
                 // it expects — a second of silence means nothing against
                 // reports fifteen seconds apart. The deployment's shape is
                 // kept: a threshold several reports long.
-                health_every: lost_after / 10,
+                health_every,
                 ..Policy::default()
             },
         )
@@ -83,6 +92,7 @@ impl Quick {
         });
         Self {
             hub_url,
+            health_every,
             store,
             approved: std::sync::Mutex::new(std::collections::HashMap::new()),
             state,
@@ -187,19 +197,89 @@ impl Drop for Quick {
 type Socket = WebSocketStream<MaybeTlsStream<TcpStream>>;
 
 /// A runner that does exactly what a test tells it to, and nothing else.
+///
+/// The socket is split so that one thing can happen without the test: a
+/// **heartbeat**, for the puppets that are meant to be alive
+/// ([`Puppet::join_reporting_health`]). Everything else is still exactly what
+/// the test says, in the order it says it.
 #[derive(Debug)]
 struct Puppet {
-    socket: Socket,
+    /// What the hub says. The reading half, kept by the test.
+    source: futures_util::stream::SplitStream<Socket>,
+    /// What this puppet says, written by a task of its own so that a
+    /// heartbeat can go out while the test is awaiting something else.
+    outbox: tokio::sync::mpsc::UnboundedSender<ToHub>,
+    writing: tokio::task::JoinHandle<()>,
+    /// The heartbeat, while it is beating.
+    beating: Option<tokio::task::JoinHandle<()>>,
 }
 
 impl Puppet {
-    /// A runner joining under a name, as one process.
+    /// A runner joining under a name, as one process, and **saying nothing
+    /// else** until the test tells it to.
     ///
     /// The instance identity is derived from the name, so joining twice under
     /// one name is one process dialling again — a redial — and a twin is what
     /// [`Puppet::dial`] makes.
+    ///
+    /// A puppet that must be *given work* wants
+    /// [`Puppet::join_reporting_health`] instead: this one's figures are the
+    /// handshake's and nothing refreshes them, so the hub stops admitting it
+    /// work `lost_after` after it joined (D113). That is right of the hub and
+    /// wrong of a test, which is why both exist.
     async fn join(hub: &Quick, name: &str) -> Self {
         Self::handshake(hub, name, &format!("run-{name}"), None, None).await
+    }
+
+    /// The same, reporting health on the cadence this hub expects — which is
+    /// what a real runner does, and what a puppet has to do to be given work
+    /// on a hub whose thresholds are seconds (D113).
+    ///
+    /// The report carries no job, because a puppet that has just joined is
+    /// running none; a test that wants a report *about* a job still sends it
+    /// itself with [`Puppet::report_health`]. The heartbeat stops the moment
+    /// the test asks ([`Puppet::stop_reporting_health`]), which is how every
+    /// test here that is about silence makes the silence deliberate rather
+    /// than incidental.
+    async fn join_reporting_health(hub: &Quick, name: &str) -> Self {
+        let mut puppet = Self::join(hub, name).await;
+        puppet.start_reporting_health(hub.health_every);
+        puppet
+    }
+
+    /// Report health every `every`, from now, until told to stop.
+    fn start_reporting_health(&mut self, every: Duration) {
+        let outbox = self.outbox.clone();
+        self.beating = Some(tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(every);
+            ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            loop {
+                // The first tick is now, so this puppet's figures are fresh
+                // from the moment it is alive rather than one cadence later.
+                ticker.tick().await;
+                let reported = outbox.send(ToHub::Health {
+                    jobs: Vec::new(),
+                    draining: false,
+                    load_milli: None,
+                    switch: herd_proto::Switch::On,
+                });
+                if reported.is_err() {
+                    return;
+                }
+            }
+        }));
+    }
+
+    /// Stop reporting health, and go on being here.
+    ///
+    /// The runner is still connected and still says whatever the test says
+    /// next: this is a health task that has wedged, which is the case D113 is
+    /// about, and it is also how a test that wants the hub to write this
+    /// runner off starts the silence it is timing.
+    fn stop_reporting_health(&mut self) {
+        if let Some(beating) = self.beating.take() {
+            beating.abort();
+        }
     }
 
     /// Dial saying exactly which process this is and which hub state root it
@@ -269,7 +349,29 @@ impl Puppet {
             .send(Message::text(to_frame(&hello).expect("encodes")))
             .await
             .expect("hello goes out");
-        let mut puppet = Self { socket };
+        // Split only once the handshake is done: the hello and its welcome are
+        // one exchange with nothing else allowed in between, and a heartbeat
+        // before the welcome would be a frame the hub has nowhere to put.
+        let (mut sink, source) = socket.split();
+        let (outbox, mut inbox) = tokio::sync::mpsc::unbounded_channel::<ToHub>();
+        let writing = tokio::spawn(async move {
+            while let Some(message) = inbox.recv().await {
+                let frame = Message::text(to_frame(&message).expect("encodes"));
+                if sink.send(frame).await.is_err() {
+                    return;
+                }
+            }
+            // Every sender is gone, so this puppet is finished with: the
+            // socket goes with it, which is what the tests that watch a link
+            // close are watching for.
+            let _ = sink.close().await;
+        });
+        let mut puppet = Self {
+            source,
+            outbox,
+            writing,
+            beating: None,
+        };
         match puppet.next().await {
             Some(FromHub::Welcome { .. }) => puppet,
             other => panic!("the hub answered hello with {other:?}"),
@@ -280,7 +382,7 @@ impl Puppet {
     /// a test asserts that the hub said nothing.
     async fn next(&mut self) -> Option<FromHub> {
         loop {
-            let frame = tokio::time::timeout(PATIENCE, self.socket.next()).await;
+            let frame = tokio::time::timeout(PATIENCE, self.source.next()).await;
             match frame {
                 Ok(Some(Ok(Message::Text(text)))) => {
                     return Some(from_frame(text.as_str()).expect("the hub speaks the protocol"))
@@ -293,7 +395,7 @@ impl Puppet {
 
     /// The next frame if one comes within `patience`, and `None` otherwise.
     async fn next_within(&mut self, patience: Duration) -> Option<FromHub> {
-        match tokio::time::timeout(patience, self.socket.next()).await {
+        match tokio::time::timeout(patience, self.source.next()).await {
             Ok(Some(Ok(Message::Text(text)))) => {
                 Some(from_frame(text.as_str()).expect("the hub speaks the protocol"))
             }
@@ -302,10 +404,7 @@ impl Puppet {
     }
 
     async fn say(&mut self, message: ToHub) {
-        self.socket
-            .send(Message::text(to_frame(&message).expect("encodes")))
-            .await
-            .expect("the frame goes out");
+        self.outbox.send(message).expect("the frame goes out");
     }
 
     /// Wait for the hub to hand this runner a job, ignoring anything else it
@@ -362,6 +461,16 @@ impl Puppet {
             switch: herd_proto::Switch::On,
         })
         .await;
+    }
+}
+
+impl Drop for Puppet {
+    fn drop(&mut self) {
+        // Nothing of a puppet outlives it: no heartbeat going out for a test
+        // that is over, and no task holding the writing half of a socket the
+        // next test is about to assert is closed.
+        self.stop_reporting_health();
+        self.writing.abort();
     }
 }
 
@@ -447,8 +556,8 @@ async fn a_runner_s_health_report_and_its_age_are_in_the_hub_s_state() {
     );
 }
 
-/// D113: a runner streaming a job's log, with **no health report at all**, is
-/// not lost, and the live attempt it is holding is not written off.
+/// D113: a runner streaming a job's log, whose health reports have **stopped**,
+/// is not lost, and the live attempt it is holding is not written off.
 ///
 /// This is the test the correction exists for. The hub used to time a
 /// connection on the health report alone, so a runner whose health task was
@@ -458,16 +567,18 @@ async fn a_runner_s_health_report_and_its_age_are_in_the_hub_s_state() {
 /// thirty-minute build that was visibly alive, and nobody could have explained
 /// why.
 ///
-/// The threshold has to be real time, because the hub's clock is what is under
-/// test. So it is given two seconds and fed a frame every twenty milliseconds:
-/// the gap that would have to open for this test to lie is a hundred times the
-/// gap it keeps, and the assertion is still on a condition — the hub's own
-/// reading of how old the figures it never got are.
+/// The runner reports health like a real one until the job is running, and
+/// then stops: a wedged health task, which is the case, rather than a runner
+/// that never had one. The threshold has to be real time, because the hub's
+/// clock is what is under test. So it is given two seconds and fed a frame
+/// every twenty milliseconds: the gap that would have to open for this test to
+/// lie is a hundred times the gap it keeps, and the assertion is still on a
+/// condition — the hub's own reading of how old the last figures it got are.
 #[tokio::test]
-async fn a_runner_streaming_its_log_is_not_lost_though_it_never_reports_health() {
+async fn a_runner_streaming_its_log_is_not_lost_when_its_health_reports_stop() {
     let lost_after = Duration::from_secs(2);
     let hub = Quick::start(lost_after).await;
-    let mut runner = Puppet::join(&hub, "runner-a").await;
+    let mut runner = Puppet::join_reporting_health(&hub, "runner-a").await;
     let job_id = hub.submit("a build of tens of minutes").await;
     let (assigned, attempt, _) = runner.take_a_job().await;
     assert_eq!(assigned, job_id);
@@ -482,6 +593,16 @@ async fn a_runner_streaming_its_log_is_not_lost_though_it_never_reports_health()
         hub.record(&job_id).state == JobState::Running
     })
     .await;
+    hub.wait_until("the hub has figures for this runner", || {
+        hub.handle
+            .runners()
+            .first()
+            .is_some_and(|runner| runner.reports_seen > 0)
+    })
+    .await;
+
+    // And now the health task wedges, while the log goes on arriving.
+    runner.stop_reporting_health();
 
     // Output, steadily, and nothing else: not one health report for more than
     // twice the threshold. Waiting on the hub's own figure for the age of
@@ -501,7 +622,7 @@ async fn a_runner_streaming_its_log_is_not_lost_though_it_never_reports_health()
         "the stream has to be a stream: {streamed} chunks"
     );
 
-    // The runner is still here, and the hub knows it has never reported.
+    // The runner is still here, and the hub knows its figures have stopped.
     let seen = hub.handle.runners();
     assert_eq!(
         seen.len(),
@@ -509,9 +630,9 @@ async fn a_runner_streaming_its_log_is_not_lost_though_it_never_reports_health()
         "a runner whose log is arriving is a runner that is alive: {seen:?}"
     );
     assert_eq!(seen[0].name, "runner-a");
-    assert_eq!(
-        seen[0].reports_seen, 0,
-        "and it has reported no health at all, which is the whole point: {seen:?}"
+    assert!(
+        seen[0].reports_seen > 0,
+        "it reported while its health task worked: {seen:?}"
     );
     assert!(
         seen[0].last_health_age > lost_after,
@@ -681,14 +802,18 @@ async fn a_runner_reporting_health_again_is_admitted_again() {
     );
 }
 
-/// A runner that is plainly alive — its log is arriving — and has not reported
-/// health since it joined, with one job running on it.
+/// A runner that is plainly alive — its log is arriving — whose health reports
+/// have stopped, with one job running on it.
 ///
-/// The shared ground of the two tests above. It leaves the runner streaming,
-/// so the caller must not dawdle: this is a live link, and a link nothing
-/// comes back on for the threshold is still a link that is gone.
+/// The shared ground of the two tests above. It reports health like a real
+/// runner until its job is running, so that the job is claimed on figures the
+/// hub really has, and only then stops: the staleness under test is the
+/// runner's health task wedging, not a test that was too slow to be given
+/// work. It leaves the runner streaming, so the caller must not dawdle: this
+/// is a live link, and a link nothing comes back on for the threshold is still
+/// a link that is gone.
 async fn a_runner_whose_figures_went_stale(hub: &Quick, lost_after: Duration) -> (Puppet, JobId) {
-    let mut runner = Puppet::join(hub, "runner-a").await;
+    let mut runner = Puppet::join_reporting_health(hub, "runner-a").await;
     let running = hub.submit("a build of tens of minutes").await;
     let (assigned, attempt, _) = runner.take_a_job().await;
     assert_eq!(assigned, running);
@@ -702,6 +827,7 @@ async fn a_runner_whose_figures_went_stale(hub: &Quick, lost_after: Duration) ->
         hub.record(&running).state == JobState::Running
     })
     .await;
+    runner.stop_reporting_health();
     stream_until(
         hub,
         &mut runner,
@@ -769,7 +895,12 @@ async fn stream_until(
 #[tokio::test]
 async fn a_silent_runner_s_job_is_attempted_again_and_the_record_names_both() {
     let hub = Quick::start(Duration::from_secs(1)).await;
-    let mut first = Puppet::join(&hub, "runner-a").await;
+    // Alive, and reporting as a real runner does, until the moment this test
+    // means it to go quiet. Its own second of silence then starts where the
+    // prose below says it starts, instead of at its handshake — under load
+    // this test lost that race, and a job the hub could not place on figures
+    // it had never been given is not what E-21 is about.
+    let mut first = Puppet::join_reporting_health(&hub, "runner-a").await;
     let job_id = hub.submit("true").await;
     let (assigned, attempt, command) = first.take_a_job().await;
     assert_eq!(assigned, job_id);
@@ -801,8 +932,9 @@ async fn a_silent_runner_s_job_is_attempted_again_and_the_record_names_both() {
     .await;
 
     // And now it says nothing at all. Not a disconnection — the socket is
-    // still open, which is the hard case: only the absence of health reports
-    // says this runner is gone.
+    // still open, which is the hard case: only the absence of everything says
+    // this runner is gone.
+    first.stop_reporting_health();
     hub.wait_until("the job is queued again", || {
         hub.record(&job_id).state == JobState::Queued
     })
@@ -822,7 +954,7 @@ async fn a_silent_runner_s_job_is_attempted_again_and_the_record_names_both() {
     assert!(requeued.attempts[0].ended_at.is_some());
 
     // A second runner picks it up as attempt 2 and finishes it.
-    let mut second = Puppet::join(&hub, "runner-b").await;
+    let mut second = Puppet::join_reporting_health(&hub, "runner-b").await;
     let (again, second_attempt, _) = second.take_a_job().await;
     assert_eq!(again, job_id);
     assert_eq!(
@@ -916,7 +1048,7 @@ async fn a_silent_runner_s_job_is_attempted_again_and_the_record_names_both() {
 #[tokio::test]
 async fn a_returning_runner_finishes_nothing_of_the_attempt_it_lost() {
     let hub = Quick::start(Duration::from_secs(1)).await;
-    let mut lost = Puppet::join(&hub, "runner-a").await;
+    let mut lost = Puppet::join_reporting_health(&hub, "runner-a").await;
     let job_id = hub.submit("true").await;
     let (_, first_attempt, _) = lost.take_a_job().await;
     lost.say(ToHub::JobStarted {
@@ -924,14 +1056,13 @@ async fn a_returning_runner_finishes_nothing_of_the_attempt_it_lost() {
         attempt: first_attempt,
     })
     .await;
-    // One report, acknowledged, and then silence — which is also what this
-    // test's own prose says happens: a runner starts a job and *then* goes
-    // quiet. It matters because the second of silence is measured from a
-    // runner's last health report and **only** a health report resets it, so
-    // without this the second was already running from [`Puppet::join`] and
-    // everything above — a real submission over a socket, a claim, a start —
-    // had to fit inside it or the attempt was written off before the
-    // assertion below could ever see it running.
+    // One report of its own, naming the job, acknowledged — and then the
+    // silence. The heartbeat stops first, so that the second of silence is
+    // measured from this report and from nothing later: a runner starts a job
+    // and *then* goes quiet, which is what this test's own prose says
+    // happens. The report also carries what the runner has sent, which the
+    // heartbeat's own empty reports do not (D29).
+    lost.stop_reporting_health();
     lost.report_health(
         vec![RunningJob {
             job_id: job_id.clone(),
@@ -958,13 +1089,14 @@ async fn a_returning_runner_finishes_nothing_of_the_attempt_it_lost() {
     // The runner comes back — the same machine, a new connection — and is
     // handed the job again, as attempt 2. It is still holding everything it
     // never managed to deliver about attempt 1.
-    let mut back = Puppet::join(&hub, "runner-a").await;
+    let mut back = Puppet::join_reporting_health(&hub, "runner-a").await;
     let (_, second_attempt, _) = back.take_a_job().await;
     assert_eq!(second_attempt, 2);
-    // And the same for this connection, for the same reason: its own second
-    // of silence began when it dialled, and everything below has to happen
-    // before it is written off in its turn — a second loss would end the job
-    // `lost` (E-21) and the verdict asserted at the end would never come.
+    // And the same for this connection, for the same reason: everything below
+    // has to happen before it is written off in its turn — a second loss
+    // would end the job `lost` (E-21) and the verdict asserted at the end
+    // would never come. This one keeps reporting, because nothing here is
+    // about its silence.
     back.report_health(
         vec![RunningJob {
             job_id: job_id.clone(),
@@ -1064,7 +1196,7 @@ async fn a_returning_runner_finishes_nothing_of_the_attempt_it_lost() {
 async fn a_second_loss_ends_the_job_rather_than_starting_a_third_attempt() {
     let hub = Quick::start(Duration::from_secs(1)).await;
     let job_id = {
-        let mut first = Puppet::join(&hub, "runner-a").await;
+        let mut first = Puppet::join_reporting_health(&hub, "runner-a").await;
         let job_id = hub.submit("true").await;
         let (_, attempt, _) = first.take_a_job().await;
         first
@@ -1073,6 +1205,8 @@ async fn a_second_loss_ends_the_job_rather_than_starting_a_third_attempt() {
                 attempt,
             })
             .await;
+        // And then the silence this test is timing, which starts here.
+        first.stop_reporting_health();
         hub.wait_until("the first attempt is queued again", || {
             hub.record(&job_id).state == JobState::Queued
         })
@@ -1080,7 +1214,7 @@ async fn a_second_loss_ends_the_job_rather_than_starting_a_third_attempt() {
         job_id
     };
 
-    let mut second = Puppet::join(&hub, "runner-b").await;
+    let mut second = Puppet::join_reporting_health(&hub, "runner-b").await;
     let (_, attempt, _) = second.take_a_job().await;
     assert_eq!(attempt, 2);
     second
@@ -1090,6 +1224,7 @@ async fn a_second_loss_ends_the_job_rather_than_starting_a_third_attempt() {
         })
         .await;
     // And this one goes silent too.
+    second.stop_reporting_health();
     hub.wait_until(
         "the job ends rather than being attempted a third time",
         || matches!(hub.record(&job_id).state, JobState::Finished { .. }),
@@ -1643,7 +1778,7 @@ async fn output_missing_between_two_health_reports_is_asked_for() {
 async fn a_job_waiting_for_a_runner_is_cancelled_by_the_hub_itself() {
     let hub = Quick::start(Duration::from_secs(1)).await;
     let job_id = {
-        let mut lost = Puppet::join(&hub, "runner-a").await;
+        let mut lost = Puppet::join_reporting_health(&hub, "runner-a").await;
         let job_id = hub.submit("true").await;
         let (_, attempt, _) = lost.take_a_job().await;
         lost.say(ToHub::JobStarted {
@@ -1653,6 +1788,7 @@ async fn a_job_waiting_for_a_runner_is_cancelled_by_the_hub_itself() {
         .await;
         // And then silence, until the hub gives up on the attempt and puts
         // the job back in the queue with no runner left to hand it to.
+        lost.stop_reporting_health();
         hub.wait_until("the job is waiting for a runner", || {
             hub.record(&job_id).state == JobState::Queued
         })
@@ -2275,6 +2411,12 @@ async fn a_runner_whose_real_cadence_cannot_satisfy_the_hub_is_refused_by_figure
     )
     .await
     .expect("a runner whose cadence the threshold outlasts three times over");
+    // And it really reports at the cadence it announced, which is the half of
+    // the pairing that makes it welcome: a runner that announced 300 ms and
+    // then said nothing would be a second configuration this hub cannot serve
+    // (D113 — figures nobody refreshes are figures nothing is admitted
+    // against).
+    fast.start_reporting_health(Duration::from_millis(300));
     let job_id = hub.submit("true").await;
     let (assigned, attempt, _) = fast.take_a_job().await;
     assert_eq!(assigned, job_id);
