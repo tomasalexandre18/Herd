@@ -3239,3 +3239,56 @@ deliberately not as `*.out`/`*.err`, since a test fixture may legitimately be
 called `expected.out`. Nothing sensitive was in them, and that is the point
 worth recording: a stray redirection at the root of a public repository is a
 leak waiting for the one time it is not empty.
+
+---
+
+## 2026-10-15 — D113 A connection's liveness clock is the health report alone
+
+**Context.** Found while chasing a test that failed once in five full-suite
+runs and never again in eighty-eight targeted ones. The flake was not the
+finding; this is.
+
+The hub writes a connection off when `last_health.elapsed()` passes
+`lost_after`, and **only** a `Health` frame resets `last_health`. A frame about
+a running attempt resets `attempt_seen`, never the connection's clock. So a
+runner that is streaming a job's log steadily, but whose health task is
+starved or wedged, is written off as lost and its **live** attempt is written
+off with it — requeued once at its priority (E-21).
+
+**Why it is defensible.** The health report is the declared liveness signal
+(E-40: every ~15 s; silence for ~60 s is lost, E-21), and it is also the only
+frame carrying the figures admission needs — free memory, free tmpfs, load. A
+runner that cannot report health is a runner the hub cannot admit against.
+
+**Why it is a limit worth writing down.** It is asymmetric with
+`attempt_seen`, and it is the mechanism that makes any test with a short
+`lost_after` sensitive to machine load. More to the point for the first
+deployment: the first consumer's builds run tens of minutes on a host whose
+measured load p90 is 46 on 12 threads. A starved health task there would
+requeue a thirty-minute build that was visibly alive.
+
+**Decided: leave the behaviour as it is for now, and record the limit.** The
+cheap correction, if it proves needed, is to separate the two questions the
+clock conflates: *is this runner alive* — any frame answers it, so a live
+attempt is never written off — and *are its figures fresh* — only a health
+report answers that, and stale figures should stop **new admissions** rather
+than kill running work. That is the shape to reach for; it is not in M10 and
+it is not in M16's definition, so it is Alexa's call whether it precedes the
+first deployment.
+
+---
+
+## 2026-10-15 — D114 The shared declared-command harness approves its runner
+
+**Context.** M15's E-48 (an unapproved runner is given no job) and D74's
+reading (a job's requirements are read by an ordinary job on a runner) were
+written in parallel and met in the merge.
+
+**The interaction worth naming.** Because a reading *is* an ordinary job, an
+unapproved runner leaves the reading unclaimed, which leaves the real job
+waiting on requirements nobody will ever read — and nothing fails loudly. The
+failure is silence, which is the mode this project keeps legislating against.
+
+**Choice.** Every harness that lends a real runner names it and approves it,
+through the one `approve_runner` path, exactly as `confinement.rs` does. No
+test holds its own notion of an approved runner.
