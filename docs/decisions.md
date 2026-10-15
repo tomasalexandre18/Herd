@@ -3614,3 +3614,54 @@ M16 has been exercised, only the loopback path the server's own runner uses.
 Also cosmetic but real: `herd-runner.service` declares
 `Documentation=file:///etc/herd/joining.md`, which nothing in `deploy/`
 installs, so `systemctl help herd-runner` fails on a fresh install.
+
+---
+
+## 2026-10-15 — D124 An additive frame to a requester is a breaking change
+
+**Context.** Found while closing D118, and it corrects a belief I was about to
+write into the frozen protocol version: that a frame a peer has never heard of
+is harmless because serde has defaults.
+
+**It is not, for a requester.** `herdctl`'s unknown-frame arm is a `bail!` —
+"the hub sent X, which a requester cannot use" — which ends the run with **no
+verdict**, and so exits 125. An old `herdctl` meeting a new frame therefore
+fails a job that may well have succeeded, which is the exact shape of defect
+D117 named and D118 closed. Serde's tolerance never enters it: the frame
+parses, and then the client refuses it on purpose.
+
+**So the rule, from the freeze at version 1 onward:** adding a `FromHub`
+variant that can reach a **requester** is a breaking change and must move
+`PROTOCOL_VERSION`, whatever the wire format would tolerate. A variant that
+only ever reaches a runner is a separate question, to be answered by reading
+the runner's own fallback rather than assuming the two clients behave alike.
+
+**Why the `bail!` stays.** It is the right behaviour: a requester that cannot
+understand what the hub is telling it must not pretend to have a verdict. The
+cost is paid by the *deployment*, in a version bump, which is where D73 wants
+it paid — not by a client guessing.
+
+This is also why D118's frame cost nothing: it is sent only to followers, and
+a peer that has never heard of it is a peer that never receives it. That is a
+property of **where** it is sent, not of it being additive, and the two must
+not be confused again.
+
+---
+
+## 2026-10-15 — D125 A queued job is not safe either
+
+**Correction of my own reasoning in D117 and D118.** Both say a *queued* job's
+follower is protected because the hub restates why it waits. That is wrong in
+one case, and the case is not rare: the restatement is `--wait-restatement`,
+60 s by default — four of D118's cadences — and a job for which the hub has
+not yet found a `waiting_for` reason is restated **never**.
+
+So the keepalive goes to every **non-terminal** job, queued as well as
+running, and a note the hub has just sent postpones the next breath by a
+cadence so the two never double up. The implementation does this; this entry
+is here because the reasoning in the two entries above it is what a reader
+would otherwise carry away.
+
+The general shape of the mistake, worth keeping: "another mechanism already
+covers that case" is only true if that mechanism fires **unconditionally**.
+This one fires once a reason exists.
