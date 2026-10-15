@@ -1281,6 +1281,117 @@ async fn an_io_weight_that_cannot_bite_is_said_out_loud() {
     );
 }
 
+// --------------------------------------------- the room it is in (D119) ----
+
+/// D119: the figure the hub admits against is the room in the cgroup the
+/// runner is **actually in**, not the machine's `MemTotal`. Asserted against
+/// a cgroup the kernel really bounds — a child of this process's own cgroup
+/// with a `memory.max` of 512 MiB — so that the walk, the parse and the
+/// subtraction are checked against the kernel's own files rather than against
+/// a fixture.
+///
+/// The unit tests in `room` prove the walk over a tree a test builds, and
+/// that a host with no enclosing limit keeps its `MemTotal` untouched. This
+/// one proves the remaining half, and it needs the right to make a cgroup.
+#[test]
+fn a_tighter_enclosing_memory_max_lowers_the_room_that_is_announced() {
+    const TEST: &str = "a_tighter_enclosing_memory_max_lowers_the_room_that_is_announced";
+    /// What this assertion is for, said in every skip: a reader of a green
+    /// run has to know what was not checked and how to check it.
+    const WOULD_PROVE: &str = "a host that may make a cgroup — \
+         `systemd-run --user --scope -p Delegate=yes cargo test ...`, or any runner \
+         under a systemd unit with Delegate=yes — would prove that a real \
+         enclosing memory.max read out of /sys/fs/cgroup lowers the memory this \
+         runner announces, which is what stops a slice from being OOM-killed while \
+         the hub believes it admitted carefully (D119)";
+    let ceiling_bytes: u64 = 512 * (1 << 20);
+    // A host that cannot give a job a cgroup of its own cannot be given a
+    // cgroup with a ceiling to stand in either, and the reason is the same
+    // sentence.
+    if let Err(why) = kernel_ceiling_or_reason() {
+        skipped(TEST, &format!("{why} — {WOULD_PROVE}"));
+        return;
+    }
+    // Prepared first, and kept alive, for its side effects on a host that
+    // does delegate: it moves this process out of the base cgroup into a leaf
+    // of its own and hands the memory controller down to the base's children.
+    // cgroup v2 refuses both to a cgroup that still holds processes, so
+    // without this there is no child here that could carry a `memory.max` —
+    // which is the trap D117 names, met from the test's side.
+    let temp = TempDir::new("room-ceiling");
+    let _confined = Confined::prepare(test_confinement(temp.path())).expect("confinable");
+    let mount = Path::new(herd_runner::room::CGROUP_MOUNT);
+    let Some(own) = std::fs::read_to_string("/proc/self/cgroup")
+        .ok()
+        .as_deref()
+        .and_then(herd_runner::room::own_cgroup)
+    else {
+        skipped(
+            TEST,
+            &format!("this host has no cgroup v2 line in /proc/self/cgroup — {WOULD_PROVE}"),
+        );
+        return;
+    };
+    // A sibling of the leaf this process stands in, which is where a cgroup
+    // with a ceiling can exist: the leaf itself holds a process and so can
+    // have no controller-enabled children of its own.
+    let Some(base) = Path::new(&own).parent().map(|at| at.to_owned()) else {
+        skipped(
+            TEST,
+            &format!("this process is in the root cgroup {own} — {WOULD_PROVE}"),
+        );
+        return;
+    };
+    let name = format!("herd-room-test-{}", std::process::id());
+    let cgroup = base.join(&name);
+    let directory = mount.join(cgroup.strip_prefix("/").unwrap_or(&cgroup));
+    let _ = std::fs::remove_dir(&directory);
+    if let Err(error) = std::fs::create_dir(&directory) {
+        skipped(
+            TEST,
+            &format!(
+                "this process may not create a cgroup under {} ({error}) — {WOULD_PROVE}",
+                mount
+                    .join(base.strip_prefix("/").unwrap_or(&base))
+                    .display()
+            ),
+        );
+        return;
+    }
+    let written = std::fs::write(directory.join("memory.max"), ceiling_bytes.to_string());
+    let found = herd_runner::room::enclosing(mount, &cgroup.display().to_string());
+    let _ = std::fs::remove_dir(&directory);
+    if let Err(error) = written {
+        skipped(
+            TEST,
+            &format!(
+                "a cgroup was creatable at {} but its memory.max was not writable \
+                 ({error}), so the memory controller is not handed down there — \
+                 {WOULD_PROVE}",
+                directory.display()
+            ),
+        );
+        return;
+    }
+    let found = found.expect("a cgroup with a memory.max of 512 MiB encloses that path");
+    assert_eq!(found.ceiling_bytes, ceiling_bytes, "{found:?}");
+    assert_eq!(found.knob, "memory.max");
+    assert!(
+        found.room_mib() <= 512,
+        "the room under a 512 MiB ceiling is at most 512 MiB: {found:?}"
+    );
+    // And that figure is what the runner would announce, in place of the
+    // machine's.
+    let host = herd_runner::metrics::total_memory_mib();
+    let (announced, said) = herd_runner::room::announced_memory_mib(host, Some(found.clone()));
+    assert_eq!(announced, Some(found.room_mib()));
+    let said = said.expect("a figure the kernel took down is never announced silently");
+    assert!(
+        said.contains(&name) && said.contains("memory.max"),
+        "{said}"
+    );
+}
+
 // ------------------------------------------------- no inbound socket ----
 
 /// Invariant 3, asserted against the running process rather than against a

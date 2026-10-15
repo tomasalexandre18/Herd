@@ -408,6 +408,20 @@ async fn main() -> Result<()> {
         }
         host.threads = Some(threads);
     }
+    // And whatever is lent, it is clamped to the room in the cgroup this
+    // runner is actually in (D119). A runner inside a slice carrying
+    // `MemoryMax` has less room than the machine advertises, and admitting
+    // against the machine is how a slice gets OOM-killed while Herd believes
+    // it was careful. Applied after the owner's figure and before the floor,
+    // so the floor is derived from — and checked against — the room that can
+    // really bite. On a host with no enclosing limit this reads nothing and
+    // changes nothing: see `room::measure`.
+    let (announced, said) =
+        herd_runner::room::announced_memory_mib(host.memory_mib, herd_runner::room::measure());
+    if let Some(said) = said {
+        println!("herd-runner: {said}");
+    }
+    host.memory_mib = announced;
     // What this host keeps for itself, whatever is queued (E-29). Derived
     // from what is lent when nobody says, so a runner of this version always
     // announces a floor — an absent floor is read by the hub as a figure it
