@@ -125,6 +125,23 @@ pub const PROTOCOL_VERSION: u32 = 8;
 /// (invariant 4).
 pub const HEALTH_EVERY: Duration = Duration::from_secs(15);
 
+/// How often the hub speaks to a follower that would otherwise hear nothing
+/// ([`FromHub::StillThere`]).
+///
+/// **Deliberately the same number as [`HEALTH_EVERY`]**, and the sameness is
+/// the point: "how often a quiet Herd link speaks" is one figure to remember
+/// and not two. The two cadences are the two directions of one problem — a
+/// runner says it is alive to the hub, and the hub says it is alive to
+/// whoever is following a job — so a reader who knows 15 s knows both, and an
+/// operator who shortens one has an obvious name for the other.
+///
+/// Here rather than in the hub because it is part of what a follower is
+/// promised: a connection following a job that is not over carries a frame at
+/// least this often, whatever the job is doing (invariant 4). No client acts
+/// on the figure — nothing dials on it, nothing times out on it — which is
+/// why the frame it paces needed no protocol break to add.
+pub const STILL_THERE_EVERY: Duration = Duration::from_secs(15);
+
 /// How many health reports a silence threshold must be able to miss before
 /// it fires.
 ///
@@ -1484,6 +1501,37 @@ pub enum FromHub {
     /// (D19). Waiting for such a job is never silent. M8's explained waits are
     /// this frame's real home.
     JobNote { job_id: JobId, note: String },
+    /// The hub is still there and this job is not over. **Nothing is printed
+    /// for it.**
+    ///
+    /// A follower hears from the hub when something happens: a line of
+    /// output, the reason a job is still queued, where it was placed, the
+    /// verdict. A job that is *running* and printing nothing produces none of
+    /// those, and a quiet build is the ordinary case rather than the
+    /// exception — so the connection carried **no frames at all** for as long
+    /// as the job stayed quiet. Behind a reverse proxy with an idle timeout
+    /// that is a connection closed under the follower, and `herdctl` then saw
+    /// the stream end with no verdict and exited 125 on a job that had in
+    /// fact succeeded. A *wrong* answer rather than a degraded one: a merger
+    /// reading 125 concludes the work never ran.
+    ///
+    /// So the hub keeps the link warm itself, every [`STILL_THERE_EVERY`], to
+    /// every follower of a job that is not yet over. No client needs a
+    /// heartbeat of its own, none redials on this, and none learns anything
+    /// new about timing from it. A job that has **ended** gets none: its
+    /// stream is over, and a frame after the verdict would be the hub talking
+    /// about something that is finished.
+    ///
+    /// **Not a [`FromHub::JobNote`], and the distinction is not cosmetic.** A
+    /// note is text a person reads, on stderr; this frame is read by nobody.
+    /// A client prints nothing for it — not on stdout, not on stderr, not
+    /// into a log — and it is no part of the job's output: E-02's framing is
+    /// the `ran on:` line, then the job's own bytes, then the verdict, and
+    /// this frame belongs to none of those three. `job_id` is here so that a
+    /// follower of more than one job can tell which link is being kept warm,
+    /// and there is deliberately nothing else to carry: a field a reader
+    /// could act on would make this a message rather than a breath.
+    StillThere { job_id: JobId },
     /// Where this job is running, and why there (E-02, E-36).
     ///
     /// The first consumer's first expectation: "the output starts with one
