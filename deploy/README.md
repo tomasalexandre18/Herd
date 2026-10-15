@@ -1,9 +1,11 @@
 # Deploying Herd
 
-Seven files besides this one, of which you use five — the two
-reverse-proxy fragments are alternatives, and the Traefik override is
-only for a containerised proxy — plus `docs/joining.md` for the person
-who walks a machine in. `/etc/nixos` is the owner's and nothing here
+Eight files besides this one, of which you use five — the two
+reverse-proxy fragments are alternatives, the Traefik override is only
+for a containerised proxy, and `release-notice.md` deploys nothing at
+all: it is what ships with a release, for the person on the machine that
+is joining — plus `docs/joining.md` for the person who walks a machine
+in. `/etc/nixos` is the owner's and nothing here
 ever writes to it: what needs it is either an instruction marked
 **OWNER** in the unit file, or — since D126 — a module he may import if
 he wants it, which is an offering and not an installation.
@@ -17,6 +19,7 @@ he wants it, which is an offering and not an installation.
 | `reverse-proxy/nginx-herd-hub.conf` | the same job on a host that runs nginx instead | pasted into the config he already runs |
 | `herd-runner.service` | the server's runner, native and unprivileged (E-47, E-52) | `/etc/systemd/system/` |
 | `nixos-herd-runner.nix` | the same runner declared: the unit plus the user, the binary's path and the devices the unit marks OWNER | imported from `/etc/nixos`, or not at all |
+| `release-notice.md` | what a release's binaries are and are not: bare binary against unit, the four things a runner needs, the filesystem that decides whether IO is bounded, and the two gaps | quoted into every GitHub release body by `.github/workflows/release.yml`; nothing installs it |
 
 **Two paths for the runner, and a machine is on exactly one.** Either the
 unit file is copied into `/etc/systemd/system/` and the OWNER notes in it
