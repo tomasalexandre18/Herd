@@ -337,6 +337,7 @@ dependencies = [
  "herd-hub",
  "herd-proto",
  "herd-runner",
+ "serde",
  "serde_json",
  "tempfile",
  "time",
