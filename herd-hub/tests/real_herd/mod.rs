@@ -672,3 +672,54 @@ impl Herd {
         bytes
     }
 }
+
+/// The job's own output, out of what the requester's CLI printed on stdout.
+///
+/// E-02 frames a job's output with one line saying where it ran and why there
+/// (D109), so a test about the output itself asserts on what follows that
+/// line — and this asserts, on the way, that the line was there at all and
+/// that it has the shape the first consumer's tooling reads:
+/// `^ran on: (\S+) \((.*)\)$`.
+pub fn job_output(stdout: &[u8]) -> String {
+    String::from_utf8_lossy(&job_output_bytes(stdout)).into_owned()
+}
+
+/// The same, as the bytes the job's process wrote (D18).
+///
+/// The split itself is [`herd_proto::unframe`], so a test reads the format
+/// through the one definition of it rather than through a copy of the format
+/// that could drift (invariant 4). What is added here is the insistence: on
+/// this stdout the line *must* be there, with the shape and the version a
+/// caller's own reader is anchored on.
+pub fn job_output_bytes(stdout: &[u8]) -> Vec<u8> {
+    let (line, rest) = herd_proto::unframe(stdout).unwrap_or_else(|| {
+        panic!(
+            "the first line of the output is not E-02's `ran on: <runner> (<why>)`: {:?}",
+            String::from_utf8_lossy(stdout)
+        )
+    });
+    ran_on_parts(&line);
+    rest.to_vec()
+}
+
+/// The two captures of `^ran on: (\S+) \((.*)\)$`, insisting on that shape.
+///
+/// The first consumer's tooling reads this line with that expression, so the
+/// tests read it the same way rather than with a looser `contains`: a line
+/// that `contains` "ran on:" and does not *match* is a line their reader
+/// drops on the floor. The format version (Q7) is checked here too, because
+/// it rides inside the parentheses and a line without it is a line no reader
+/// can tell apart from a future one (D109).
+pub fn ran_on_parts(line: &str) -> (String, String) {
+    let (runner, why) = herd_proto::ran_on_parts(line)
+        .unwrap_or_else(|| panic!("E-02's line does not have E-02's shape: {line:?}"));
+    assert!(!why.is_empty(), "the reason is not empty: {line:?}");
+    // Q7's version, inside the parentheses where the expression above still
+    // matches around it.
+    let version = format!("herd output format {}", herd_proto::OUTPUT_FORMAT_VERSION);
+    assert!(
+        why.contains(&version),
+        "E-02's line must carry the output format version ({version}): {line:?}"
+    );
+    (runner.to_owned(), why.to_owned())
+}

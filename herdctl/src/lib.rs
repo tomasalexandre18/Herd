@@ -231,6 +231,75 @@ impl Declared {
     }
 }
 
+/// Something Herd itself says about a job, and where it belongs.
+///
+/// Two kinds, because they go to two different places and a caller cannot
+/// tell them apart from the text. A **note** is Herd's own words about the
+/// job — it goes on stderr, because stdout is the job's. The **framing**
+/// line is E-02's first line, and it goes on stdout ahead of the job's first
+/// byte: the first consumer's tooling reads it there.
+///
+/// It is **not** carried by `on_log`, and that is the whole reason this type
+/// exists: `on_log` is the bytes the job's process wrote (D18), and the
+/// stream a requester follows has to equal the `log` file on the hub's disk
+/// byte for byte. A framing line sent down that path would make the two
+/// differ, which two tests in `herd-hub/tests/durability.rs` pin.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Said<'a> {
+    /// Herd's own words about the job: on stderr.
+    Note(&'a str),
+    /// E-02's first line, already built by [`herd_proto::ran_on_line`]: on
+    /// stdout, before the job's output.
+    Framing(&'a str),
+}
+
+/// E-02's framing line, held until there is output for it to be the first
+/// line of.
+///
+/// The hub says where a job went the moment the attempt is handed out, which
+/// is **before** the job has started and so before anybody knows whether it
+/// can start at all. D16 is exact about that case: a job Herd could not run
+/// exits 125 with the reason on stderr, and stdout is left empty — nothing a
+/// caller could read as the job having said anything. Printing the framing
+/// line as the frame arrived would have put a line on the stdout of a job
+/// that never ran.
+///
+/// So the line is held here and released at the first moment it really is a
+/// first line: ahead of the job's first byte of output, or with the verdict
+/// for a job that produced none. The one outcome that releases nothing is
+/// [`JobOutcome::CouldNotStart`] — a job that never started has no output to
+/// frame. Every other ending happened *on a machine*, and where that was is
+/// the line's whole point.
+///
+/// A requeued attempt (E-21) replaces a line still held and sends a second
+/// one once it has output of its own, which is the truth about a job that ran
+/// in two places.
+#[derive(Default)]
+struct Framing {
+    held: Option<String>,
+}
+
+impl Framing {
+    /// The hub handed the job to a runner and said why there.
+    fn placed(&mut self, runner: &str, why: &str) {
+        self.held = Some(herd_proto::ran_on_line(runner, why));
+    }
+
+    /// Let it out, if it is still held. Called ahead of every byte of the
+    /// job's output, so the line cannot come second.
+    fn release(&mut self, said: &mut impl FnMut(Said)) {
+        if let Some(line) = self.held.take() {
+            said(Said::Framing(&line));
+        }
+    }
+
+    /// Whether this ending is one the framing line belongs to: anything but
+    /// a job that never started (D16).
+    fn belongs_to(outcome: &JobOutcome) -> bool {
+        !matches!(outcome, JobOutcome::CouldNotStart { .. })
+    }
+}
+
 pub async fn run_job(
     config: &Config,
     command: Vec<String>,
@@ -238,7 +307,7 @@ pub async fn run_job(
     priority: Priority,
     declared: Declared,
     mut on_log: impl FnMut(LogStream, &[u8]),
-    mut on_note: impl FnMut(&str),
+    mut said: impl FnMut(Said),
 ) -> Result<Finished> {
     if command.is_empty() {
         bail!("a job needs a command to run");
@@ -254,21 +323,40 @@ pub async fn run_job(
     .context("submitting the job")?;
 
     let mut job_id: Option<JobId> = None;
+    let mut framing = Framing::default();
     while let Some(message) = next_message(&mut socket).await? {
         match message {
             FromHub::JobAccepted { job_id: accepted } => job_id = Some(accepted),
-            FromHub::LogChunk { stream, data, .. } => on_log(stream, &data),
+            FromHub::LogChunk { stream, data, .. } => {
+                framing.release(&mut said);
+                on_log(stream, &data);
+            }
             // A job this requester has just submitted has produced nothing
             // before it attached, so neither of these is expected here; both
             // are still shown rather than swallowed, the recorded log as the
             // job's own output and a note as Herd's own words (stderr).
-            FromHub::JobLog { data, .. } => on_log(LogStream::Stdout, &data),
-            FromHub::JobNote { note, .. } => on_note(&note),
+            FromHub::JobLog { data, .. } => {
+                framing.release(&mut said);
+                on_log(LogStream::Stdout, &data);
+            }
+            FromHub::JobNote { note, .. } => said(Said::Note(&note)),
+            // E-02's first line, on **stdout**, ahead of the job's first
+            // byte: the output a requester sees is framed with where the job
+            // ran and why there, and the job's own output follows it
+            // unchanged (D109). It is held rather than printed here — see
+            // [`Framing`] — and it goes through the output callback rather
+            // than through a note because a note is Herd's own words on
+            // stderr, and this line is part of the output the first
+            // consumer's tooling reads.
+            FromHub::RanOn { runner, why, .. } => framing.placed(&runner, &why),
             FromHub::JobFinished {
                 job_id,
                 outcome,
                 metrics,
             } => {
+                if Framing::belongs_to(&outcome) {
+                    framing.release(&mut said);
+                }
                 let _ = socket.close(None).await;
                 return Ok(Finished {
                     job_id,
@@ -350,7 +438,7 @@ pub async fn wait_for_job(
     config: &Config,
     job_id: JobId,
     mut on_log: impl FnMut(LogStream, &[u8]),
-    mut on_note: impl FnMut(&str),
+    mut said: impl FnMut(Said),
 ) -> Result<Finished> {
     let mut socket = join(config).await?;
     send(
@@ -362,6 +450,7 @@ pub async fn wait_for_job(
     .await
     .context("asking to be told how the job ends")?;
 
+    let mut framing = Framing::default();
     while let Some(message) = next_message(&mut socket).await? {
         match message {
             FromHub::JobFinished {
@@ -369,6 +458,9 @@ pub async fn wait_for_job(
                 outcome,
                 metrics,
             } => {
+                if Framing::belongs_to(&outcome) {
+                    framing.release(&mut said);
+                }
                 let _ = socket.close(None).await;
                 return Ok(Finished {
                     job_id,
@@ -376,9 +468,23 @@ pub async fn wait_for_job(
                     metrics,
                 });
             }
-            FromHub::JobLog { data, .. } => on_log(LogStream::Stdout, &data),
-            FromHub::LogChunk { stream, data, .. } => on_log(stream, &data),
-            FromHub::JobNote { note, .. } => on_note(&note),
+            FromHub::JobLog { data, .. } => {
+                framing.release(&mut said);
+                on_log(LogStream::Stdout, &data);
+            }
+            FromHub::LogChunk { stream, data, .. } => {
+                framing.release(&mut said);
+                on_log(stream, &data);
+            }
+            FromHub::JobNote { note, .. } => said(Said::Note(&note)),
+            // E-02's first line, on **stdout**, ahead of the job's first
+            // byte: the output a requester sees is framed with where the job
+            // ran and why there, and the job's own output follows it
+            // unchanged (D109). It is held rather than printed here — see
+            // [`Framing`] — and a wait that attached to a job already running
+            // gets it off the record's own attempt, so the sentence is the
+            // one that was recorded (E-36).
+            FromHub::RanOn { runner, why, .. } => framing.placed(&runner, &why),
             FromHub::Refused { reason } => bail!("the hub refused the wait: {reason}"),
             other => bail!(
                 "the hub sent {}, which a requester cannot use",
@@ -654,6 +760,7 @@ fn message_kind(message: &FromHub) -> &'static str {
         FromHub::ResendLog { .. } => "resend_log",
         FromHub::JobLog { .. } => "job_log",
         FromHub::JobNote { .. } => "job_note",
+        FromHub::RanOn { .. } => "ran_on",
         FromHub::JobFinished { .. } => "job_finished",
         FromHub::JobResultAck { .. } => "job_result_ack",
         FromHub::WouldRun { .. } => "would_run",

@@ -877,12 +877,24 @@ async fn a_busy_runner_asked_to_stop_drains_inside_five_seconds() {
     // The job it was running is named on the record, with the reason, and
     // queued for another go — the one thing a drain may not do is lose a job
     // in silence.
-    hub.wait_until("the drained job's attempt is ended by name", || {
-        hub.record(&job_id)
-            .attempts
-            .first()
-            .is_some_and(|attempt| attempt.ended.is_some())
-    })
+    // Both facts in one wait, because the hub writes them as two record
+    // writes: `end_attempt` names the reason on the attempt, and only then
+    // does `record_state` put the job back in the queue. A wait on the first
+    // alone reads the record in between the two often enough to be a flake,
+    // and sees an attempt that is over on a job still `running` — a real
+    // intermediate state, not a defect. What is asserted below is that the
+    // record *settles* on both; the wait times out loudly if it never does.
+    hub.wait_until(
+        "the drained job's attempt is ended by name and the job is queued again",
+        || {
+            let record = hub.record(&job_id);
+            record
+                .attempts
+                .first()
+                .is_some_and(|attempt| attempt.ended.is_some())
+                && record.state == JobState::Queued
+        },
+    )
     .await;
     let record = hub.record(&job_id);
     let why = record.attempts[0].ended.clone().expect("a reason");
