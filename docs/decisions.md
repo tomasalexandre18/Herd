@@ -3890,3 +3890,50 @@ cap on this host is sound against a job that stays inside Herd, and bypassable
 by a job that chooses to talk to libvirtd.** It is recorded here rather than
 left in a log line because it is the one thing on this deployment that a
 reader must not discover by accident.
+
+---
+
+## 2026-10-15 — D130 On this host there is no imperative path for the unit
+
+**Context.** `deploy/` is written on the principle that `/etc/nixos` is the
+owner's, so everything needing it is an **OWNER** instruction and the module
+added by D126 is "an offering, not an installation". The unit's own header
+says to install it as `/etc/systemd/system/herd-runner.service`. That turns
+out to be impossible here.
+
+**Measured.** `/etc/systemd/system` on this server is **read-only** — NixOS
+manages `/etc` by activation, so a unit file cannot be dropped into it:
+
+```
+tee: /etc/systemd/system/herd-runner.service: Read-only file system
+```
+
+So the two paths `deploy/README.md` offers are not alternatives on this
+machine. The imperative one does not exist. `/run/systemd/system` is
+writable but is cleared on every boot, which fails the one thing the unit is
+for (E-52: back after a reboot, with no hand).
+
+**What is actually running tonight.** A **transient** unit, built with
+`systemd-run` carrying every directive the file carries — `Delegate=yes`,
+`OOMPolicy=continue`, `MemoryMax=22G`, `MemorySwapMax=0`, `KillMode=mixed`,
+`CPUWeight`/`IOWeight=50`, `LimitNOFILE`, `RequiresMountsFor`,
+`Environment=PATH=…`, the token through `EnvironmentFile=` — and the same
+`ExecStart` argument list, against a Nix store path held alive by a gcroot.
+It is a faithful runner and it proves everything D129 records.
+
+**It does not survive a reboot.** That is the honest state: **E-52 is
+unmet on the server until the module is imported and `nixos-rebuild`
+run.** No wording makes a transient unit persistent, and pretending
+otherwise would be the worst kind of green.
+
+**So the module is not an offering here, it is the only route**, and
+`deploy/README.md` must stop presenting a choice it does not have. The step
+needs `/etc/nixos` plus a rebuild on a server running other people's
+services, which is Alexa's by the working agreement and is the one thing
+still outstanding on M16.
+
+**Worth noting for the next host.** A machine with a writable `/etc` has both
+routes and the README is right as written for it; the wording has to name
+which kind of host the reader is on, rather than assuming the imperative one
+always works. That is the general lesson: "install this file there" is a
+claim about the target, not about the file.
