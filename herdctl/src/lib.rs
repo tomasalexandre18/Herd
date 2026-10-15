@@ -5,6 +5,8 @@
 //! to fire and leave with the id, `wait` to come back to an id later, and
 //! `cancel` to ask for a job to be ended wherever it is running (E-06).
 
+pub mod checkout;
+
 use anyhow::{anyhow, bail, Context, Result};
 use futures_util::{SinkExt, StreamExt};
 use herd_proto::{
