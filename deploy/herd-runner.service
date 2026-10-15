@@ -1,0 +1,225 @@
+# The server's runner: native on the host, unprivileged, restarting with the
+# host (E-47, E-52). Not a container, because it needs /dev/kvm, /dev/dri,
+# /dev/vfio and the consumer's own mount namespaces (E-47) — the whole point
+# of this machine.
+#
+# Install as /etc/systemd/system/herd-runner.service, then:
+#
+#   systemctl daemon-reload
+#   systemctl enable --now herd-runner
+#   systemctl status herd-runner
+#
+# On NixOS this file is the reference shape; turning it into a
+# systemd.services.herd-runner block is an /etc/nixos change, which is the
+# owner's. Everything below that /etc/nixos must provide is marked OWNER.
+#
+# Every option on the ExecStart line is in `herd-runner --help`.
+
+[Unit]
+Description=Herd runner (native, unprivileged)
+Documentation=file:///etc/herd/joining.md
+# The runner dials out; it needs a route, and nothing inbound ever
+# (invariant 3). An unreachable hub is not a failure: the runner redials
+# with backoff and gives up only after --give-up-after.
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+
+# OWNER: a system user that exists for this and nothing else, and that is
+# NOT in the `docker` group and never needs to be (D78). The hub runs in
+# docker compose on this same host; that is the operator's deployment and
+# needs nothing from this user. Check it with `id -nG herd`: `docker` must
+# not be in the output.
+#   users.users.herd = { isSystemUser = true; group = "herd"; };
+User=herd
+Group=herd
+
+# The devices this machine is kept native for. Group membership, not
+# privilege: /dev/kvm is root:kvm 0660 and /dev/dri/renderD128 is
+# root:render 0660, so these three groups are the whole of the access.
+# OWNER: /dev/vfio/* is root:root 0600 on a stock kernel and needs a udev
+# rule to carry a group; add `vfio` here once that rule exists.
+SupplementaryGroups=kvm render video
+
+# The one directory this runner may write in (E-45). systemd creates
+# /var/lib/herd-runner owned by User=, 0700, before the runner starts, and
+# %S expands to /var/lib — so the flag and the directory can never drift.
+StateDirectory=herd-runner
+StateDirectoryMode=0700
+
+# OWNER: the token `herdctl runner approve server` printed once, as
+# HERD_TOKEN=..., in a file mode 0400 owned by this user. Never on the
+# command line — /proc makes that readable by every user of the host — and
+# never in this repository (invariant 7). The leading `-` lets the unit
+# start without it, so the refusal comes from the hub by name rather than
+# from systemd.
+EnvironmentFile=-/etc/herd/runner-token.env
+
+# ---------------------------------------------------------------------------
+# cgroup v2 delegation: the point of this unit, not a detail.
+#
+# The runner puts each job in a cgroup of its own carrying memory.max, so an
+# allocation past the ceiling is refused by the kernel and only that job's
+# processes are killed. Without a delegated subtree it falls back to
+# RLIMIT_AS (D23) — a real cap, but per process rather than per tree, and it
+# makes an allocation fail rather than kill. Two assertions of the suite skip
+# on a host that cannot delegate (D27); this is where that is fixed.
+#
+# Delegate=yes is what gives it the subtree: systemd chowns this unit's
+# cgroup directory, cgroup.procs and cgroup.subtree_control to User=, which
+# is exactly the three rights the runner needs to create a job cgroup, move
+# a process into it, and enable the memory controller for its children.
+Delegate=yes
+
+# --cgroup-root is redundant with Delegate=yes — with no flag the runner uses
+# its own cgroup, which is this one. It is given anyway because of what the
+# two failure modes cost: an *absent* root falls back to RLIMIT_AS loudly,
+# while an *explicit* root that cannot be used refuses the startup, naming
+# what the operator must grant (D33). On the machine the whole project
+# builds on, a ceiling quietly weaker than asked for is the wrong failure.
+# If this unit is ever moved into another slice, this path changes with it —
+# and until it does the runner refuses rather than degrades, which is the
+# intent.
+
+# A job hitting its own memory.max is a cgroup OOM kill somewhere under this
+# unit, and memory.events aggregates descendants — so the default
+# OOMPolicy=stop would have a job reaching its ceiling take the runner down
+# with it. That is precisely the case the ceiling exists for.
+OOMPolicy=continue
+
+# The outer bound, because this host has 31 GiB and no swap: an overshoot
+# here is an OOM kill, not a slowdown. Everything Herd runs on this machine
+# lives under this unit, so one figure caps the lot even if every per-job
+# ceiling were bypassed. 22 GiB covers the 20 GiB lent below plus the
+# runner's own footprint, and leaves ~9 GiB for the kernel, Docker, the hub
+# container, the consumer's dashboard and the page cache (invariant 2).
+MemoryAccounting=yes
+MemoryMax=22G
+MemorySwapMax=0
+
+# Herd's whole subtree yields to the dashboard and to interactive work when
+# the host is contended. Per-job niceness is --job-nice below; this is the
+# weight of all of it against everything else on the host.
+CPUWeight=50
+IOWeight=50
+# ---------------------------------------------------------------------------
+
+ExecStart=/run/current-system/sw/bin/herd-runner \
+    --hub ws://127.0.0.1:8787 \
+    --name server \
+    --data-root %S/herd-runner \
+    --cgroup-root /sys/fs/cgroup/system.slice/herd-runner.service \
+    --job-memory-max 8GiB \
+    --job-timeout 5400 \
+    --job-log-cap 64MiB \
+    --job-disk-budget 20GiB \
+    --job-nice 10 \
+    --host-memory 20GiB \
+    --host-memory-floor 6GiB \
+    --host-threads 8 \
+    --host-tmpfs 4GiB \
+    --host-tmpfs-path /dev/shm \
+    --health-every 15 \
+    --drain-grace 3
+
+# Why those figures, on 31 GiB and 12 threads with no swap.
+#
+#   --host-memory 20GiB      What Herd's jobs may use here. Left unset it is
+#                            read from /proc/meminfo, which is the whole
+#                            machine — and this machine is not Herd's alone:
+#                            Docker, the hub container, the consumer's
+#                            dashboard and the owner's shells live on it too.
+#                            20 GiB lends two thirds and keeps a third.
+#
+#   --host-memory-floor 6GiB What stays this host's whatever is queued
+#                            (E-29), subtracted before anything is admitted.
+#                            6 GiB is the figure the first consumer asks of
+#                            this server. So at most 14 GiB of declared job
+#                            memory is ever committed at once.
+#
+#   --host-threads 8         Of 12. Their measured load on this box is a
+#                            median of 29 and a p90 of 46 on 12 threads —
+#                            the pain Herd exists to bound — so four threads
+#                            stay outside Herd for the dashboard, Docker and
+#                            whoever is typing. With two build slots and the
+#                            quarter D83 holds back, a build gets -j 4 here:
+#                            min(8/2, (20 GiB x 3/4 / 2) / 1792 MiB) = 4.
+#
+#   --job-memory-max 8GiB    The kernel ceiling per job. The default is
+#                            2 GiB, small on purpose for a laptop, and far
+#                            under what this consumer's build needs: -j 4 at
+#                            their measured 1 792 MiB a thread peaks around
+#                            7 GiB. 8 GiB clears that and still means a
+#                            runaway job dies instead of the host. Two jobs
+#                            at the ceiling plus the floor is 22 GiB — which
+#                            is what MemoryMax above is set to.
+#
+#   --job-timeout 5400       Ninety minutes. Their cold build is over thirty,
+#                            and under a p90 load of 46 it is longer; the
+#                            default hour would end real work by the clock.
+#                            Still short enough that a wedged job is noticed
+#                            the same morning.
+#
+#   --host-tmpfs 4GiB        /dev/shm defaults to half of RAM — about 15 GiB
+#                            here — and tmpfs pages are RAM. A job allowed
+#                            to reserve 15 GiB of it on top of an 8 GiB
+#                            ceiling, with no swap, is the host falling over.
+#                            4 GiB is a reservation the machine can honour.
+#
+#   --job-disk-budget 20GiB  One job's scratch space on the one NVMe; the
+#   --job-log-cap 64MiB      defaults, written down so they are a decision.
+#   --job-nice 10
+#
+#   --hub ws://127.0.0.1:8787
+#                            This runner is on the hub's own host and reaches
+#                            it on the loopback port docker compose
+#                            publishes. Plain ws over loopback needs no TLS
+#                            and crosses no network: `wss://` is for runners
+#                            on other machines, through the reverse proxy.
+#
+#   --preference is left at its default 0: ordering machines only means
+#   something once there is more than one, which is M17.
+#
+#   --capabilities is deliberately absent. A file that does not exist refuses
+#   the startup, so the operator adds
+#   `--capabilities /etc/herd/capabilities.json` in the same move as writing
+#   the file that declares this machine's counted build slots, kvm and
+#   whatever the consumer's jobs ask for by name. Until then the runner
+#   offers what it detects.
+
+# Asked to stop, the runner drains: no new job, finish what is running, tell
+# the hub, exit inside five seconds (invariant 2). KillMode=mixed is what
+# lets it: the default control-group mode would SIGTERM the running jobs
+# behind its back, and a drain is the runner ending them itself and
+# reporting it. TimeoutStopSec gives --drain-grace room without ever being
+# the thing an owner waits on.
+KillMode=mixed
+KillSignal=SIGTERM
+TimeoutStopSec=10
+
+# E-52: back after a crash, and back after a reboot.
+Restart=always
+RestartSec=5s
+
+# A build opens a lot of files.
+LimitNOFILE=65536
+
+# Deliberately NOT set, each for a reason:
+#
+#   NoNewPrivileges / CapabilityBoundingSet — E-46 lets a job reach root only
+#     through a short fixed list of helper commands (--privileged-helper),
+#     and both of these would break a setuid or sudo helper. The confinement
+#     that matters here is the runner's own: an unprivileged user, one data
+#     root, one cgroup per job.
+#
+#   ProtectSystem / PrivateTmp / PrivateDevices / ProtectHome — each builds a
+#     mount namespace, and E-47 is the statement that this runner must see
+#     the host as it is: its devices and the consumer's own mount
+#     namespaces. Re-containerising it here would undo the milestone. The
+#     runner already gives every job a workspace, a HOME and a TMPDIR inside
+#     the one data root (E-45).
+
+[Install]
+WantedBy=multi-user.target
