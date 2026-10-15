@@ -3937,3 +3937,49 @@ routes and the README is right as written for it; the wording has to name
 which kind of host the reader is on, rather than assuming the imperative one
 always works. That is the general lesson: "install this file there" is a
 claim about the target, not about the file.
+
+---
+
+## 2026-10-15 — D131 A job's small declared outputs travel like its log
+
+**Context.** Measured on the live deployment: Herd returns an exit code and
+logs and **does not return files**. A job wrote `files/results.json` under
+`{out}`, the file existed while it ran, and the workspace was reclaimed with
+everything in it. The first consumer's whole result contract is a
+`results.json` plus `{out}/files/`, so without this they can use Herd for
+pass and fail and nothing else.
+
+**The tension, and which way it resolves.** D10 takes Herd out of the byte
+path **between runners**: a pack must not be relayed hub-wards to reach
+another machine, and that is what M11's registry and direct transfer exist
+for. It says nothing about a job's own **record** — and Herd already carries
+the log runner → hub → requester as part of that record (D8, D18). So a
+declared output that is small is in the same category as a log line, not in
+the same category as a pack.
+
+**Choice.** A job's `{out}` contents, up to a cap, are collected before the
+workspace is reclaimed and written into the job's directory on the hub under
+the same atomic discipline as everything else there (D8). Relative paths are
+preserved — `files/results.json` comes back as `files/results.json` — and a
+requester that attaches long after the job ran gets them, because `herdctl
+wait` is exactly that requester.
+
+Collected on **every** ending that produced a workspace: success, a non-zero
+exit, a cap, a cancel, a death. A job that fails is often the one whose
+output is most wanted, and D108 already fixed a workspace leaking on failure
+for the same class of reason.
+
+**Over the cap is a refusal carrying figures, never a truncation.** A
+truncated `results.json` that still parses is the worst outcome available: it
+reads like the truth. The refusal names the cap and the real size and points
+at M11, in the shape E-04's refusals already use.
+
+**Rejected.** Waiting for M11 and telling the consumer to write outside the
+data root in the meantime. It works — Herd does not stop a job naming an
+absolute path — but it makes every consumer invent its own drop directory,
+and the thing they would be working around is a gap of one afternoon.
+
+**What this is not.** It is not artefact distribution. Large outputs, packs
+and anything another runner needs stay with M11, direct and off the hub's
+path. The cap is what keeps the two apart, and it is a flag so that the line
+is the operator's to draw.
