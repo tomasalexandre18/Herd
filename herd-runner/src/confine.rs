@@ -141,9 +141,11 @@ pub struct Confined {
     live: LiveJobs,
     /// What the startup reaper found of a previous life, for the report.
     reclaimed: Vec<String>,
-    /// Why `io.weight` cannot bite on this host, where it cannot. A bound
-    /// that is written and ignored must be said out loud, not assumed.
-    io_weight_inert: Option<String>,
+    /// Whether the `io.weight` a job carries reaches the device that job
+    /// works on, and why either way. A bound that is written and ignored
+    /// must be said out loud, not assumed — and so must one that does bite,
+    /// because the answer is about a device and not about this host (D120).
+    io_weight_reach: crate::blockio::IoWeightReach,
 }
 
 impl Confined {
@@ -234,7 +236,7 @@ impl Confined {
         // Asked once, at startup, because the answer is about this host's
         // block layer and cannot change under a running runner without
         // somebody changing a scheduler by hand.
-        let io_weight_inert = crate::blockio::io_weight_inert_reason(root.path());
+        let io_weight_reach = crate::blockio::io_weight_reach(root.path());
         // Before the first job and before the hub: a runner that was killed
         // left processes, cgroups and workspaces nothing else will collect.
         let reclaimed = reclaim_a_past_life(&root, &ceiling);
@@ -245,7 +247,7 @@ impl Confined {
             confinement,
             live: LiveJobs::default(),
             reclaimed,
-            io_weight_inert,
+            io_weight_reach,
         })
     }
 
@@ -302,16 +304,26 @@ impl Confined {
                  bounds how many processes it forks.",
                 c.nice
             ));
-        } else if let Some(why) = &self.io_weight_inert {
+        } else if let Some(why) = self.io_weight_reach.inert_reason() {
             // Written and ignored is the failure mode D23 exists to forbid,
             // and the only one of the four that the cgroup core cannot tell
             // us about: the write succeeds whatever the block layer does.
             lines.push(format!(
-                "io.weight {}: WRITTEN BUT INERT on this host, because {}. An absolute \
+                "io.weight {}: WRITTEN BUT INERT for jobs here, because {}. An absolute \
                  io.max is the only IO lever that works whatever the scheduler is, and \
                  this runner sets none: a job's IO here is bounded by the idle IO class \
-                 alone, which a scheduler of none ignores too.",
+                 alone, which a scheduler of none and a ZFS dataset both ignore.",
                 c.io_weight, why
+            ));
+        } else {
+            // And the good news is said too, with the device in it. D116
+            // called this host's NVMe inert on the evidence of the *host's*
+            // schedulers (D120): an operator has to be able to read which
+            // device the answer is about, because moving the data root moves
+            // the answer.
+            lines.push(format!(
+                "io.weight {}: enforced for jobs here, because {}.",
+                c.io_weight, self.io_weight_reach.why
             ));
         }
         match self.ceiling.fallback_reason() {
@@ -375,10 +387,15 @@ impl Confined {
         &self.ceiling
     }
 
-    /// Why `io.weight` cannot bite here, where it cannot. A test asks this to
-    /// know which half of the report it may assert.
+    /// Why `io.weight` cannot bite for a job here, where it cannot. A test
+    /// asks this to know which half of the report it may assert.
     pub fn io_weight_inert(&self) -> Option<&str> {
-        self.io_weight_inert.as_deref()
+        self.io_weight_reach.inert_reason()
+    }
+
+    /// The whole answer, including the one that says the weight does bite.
+    pub fn io_weight_reach(&self) -> &crate::blockio::IoWeightReach {
+        &self.io_weight_reach
     }
 
     pub fn helpers(&self) -> &PrivilegedHelpers {

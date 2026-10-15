@@ -95,6 +95,12 @@ OOMPolicy=continue
 # ceiling were bypassed. 22 GiB covers the 20 GiB lent below plus the
 # runner's own footprint, and leaves ~9 GiB for the kernel, Docker, the hub
 # container, the consumer's dashboard and the page cache (invariant 2).
+# The runner reads this figure at startup and admits against it (D119): it
+# walks up from its own cgroup, takes the tightest memory.max or memory.high
+# it finds, subtracts what is already charged, and announces that instead of
+# the host's MemTotal when it is the lower of the two. So lowering MemoryMax
+# below the 20 GiB lent below lowers what this machine takes, and the runner
+# says so in one startup line rather than being OOM-killed later.
 MemoryAccounting=yes
 MemoryMax=22G
 MemorySwapMax=0

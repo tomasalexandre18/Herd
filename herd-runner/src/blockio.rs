@@ -1,23 +1,44 @@
-//! Whether an `io.weight` written in a job's cgroup can do anything at all
-//! on this host (M16).
+//! Whether an `io.weight` written in a job's cgroup can reach the disk the
+//! job actually works on (M16, D120).
 //!
 //! The cgroup core accepts `io.weight` on every machine that has the `io`
 //! controller. The block layer is what honours it, and only two things in it
-//! do: the **bfq** IO scheduler, and **blk-iocost** — the `io.cost.qos`
-//! model, which is off until an operator turns it on. On a multiqueue NVMe
-//! whose scheduler is `none`, which is the default on this project's own
-//! server, neither is in play: the write succeeds, the file reads back the
-//! number, and no IO is ever weighted by it.
+//! do: the **bfq** IO scheduler, and **blk-iocost**. So the question is about
+//! a device, and the device that matters is the one under the job's working
+//! directory — **not** the host's disks in general. D116 asked the host and
+//! got the wrong answer here: no device on this project's server offers bfq,
+//! so the report said inert, while blk-iocost runs with `ctrl=auto` on the
+//! NVMe that carries the data root and weights its IO per cgroup.
+//!
+//! Two answers rather than one, because they are different facts:
+//!
+//! - **the data root is on ZFS.** No cgroup IO knob can ever reach it: ZFS
+//!   does its pool IO from its own kernel threads and does not attribute it
+//!   to the cgroup of the process that asked, so `io.weight` and `io.max`
+//!   alike are inert there whatever the scheduler says. That is permanent and
+//!   worth its own sentence — an operator told "inert" would go looking for a
+//!   scheduler to change, and there is none that would help.
+//! - **anything else** is a device, named, with the reason its weight does or
+//!   does not bite.
+//!
+//! ## `ctrl=auto` enables itself, so the model is the question
+//!
+//! blk-iocost with `ctrl=auto` is **off until something writes a non-default
+//! `io.weight`**, and that write is what turns it on — for any device whose
+//! cost model is known. A check that only asked `enable=1` in `io.cost.qos`
+//! would therefore read "no iocost" before Herd's first job and be wrong a
+//! moment later, which is how D116 got it wrong. So a **known cost model** in
+//! `io.cost.model` counts as "the weight will bite": the model is what the
+//! controller needs in order to come up, and it is there whether the
+//! controller has been woken yet or not.
 //!
 //! D23's rule is that a runner never claims a bound it does not have, so the
-//! question is asked here and answered in the startup report. The runner
-//! still writes the weight: it costs nothing, and the day an operator sets a
-//! device to bfq or enables `io.cost` it starts to bite without a redeploy.
+//! question is asked here and answered in the startup report either way.
 //!
-//! What is *not* done here: an absolute `io.max` (bytes and IOPS per device),
-//! which is the only IO lever that works whatever the scheduler is. It is a
-//! hard per-device ceiling, so it belongs to the same family as `cpu.max` —
-//! something an operator declares — and nobody has asked for it yet.
+//! What is *not* done here: an absolute `io.max` (bytes and IOPS per device).
+//! It is a hard per-device ceiling, so it belongs to the same family as
+//! `cpu.max` — something an operator declares — and nobody has asked for it
+//! yet. Note that it is no answer on ZFS either (D120).
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -28,28 +49,57 @@ use std::path::{Path, PathBuf};
 /// and that difference is exactly what has to be reported.
 const MOUNTINFO: &str = "/proc/self/mountinfo";
 
-/// Where the block layer's cost model is configured, per device.
+/// Where the block layer's cost model is switched on, per device.
 const IO_COST_QOS: &str = "/sys/fs/cgroup/io.cost.qos";
+
+/// Where the cost of a device's IO is described, per device. A device listed
+/// here is one blk-iocost can come up for.
+const IO_COST_MODEL: &str = "/sys/fs/cgroup/io.cost.model";
 
 /// Where a device number becomes a directory.
 const SYS_DEV_BLOCK: &str = "/sys/dev/block";
 
-/// Why an `io.weight` written for a job under `data_root` cannot bite, or
-/// `None` when this host really does weight IO.
+/// Whether the `io.weight` a job's cgroup carries reaches the disk that job
+/// works on, and why.
 ///
-/// Never `None` out of ignorance: a question that cannot be answered is a
-/// sentence saying so, because "we could not tell" and "it works" must not
-/// look the same in a startup report.
-pub fn io_weight_inert_reason(data_root: &Path) -> Option<String> {
+/// There is always a `why`: "it bites" and "it is written and ignored" are
+/// both facts an operator has to be able to read, and a question that could
+/// not be answered is a sentence saying so rather than a silence — "we could
+/// not tell" and "it works" must never look the same in a startup report.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IoWeightReach {
+    /// Whether the kernel will weight this job's IO by the number written.
+    pub bites: bool,
+    pub why: String,
+}
+
+impl IoWeightReach {
+    fn bites(why: String) -> Self {
+        Self { bites: true, why }
+    }
+
+    fn inert(why: String) -> Self {
+        Self { bites: false, why }
+    }
+
+    /// Why the weight cannot bite, where it cannot — `None` when it does.
+    pub fn inert_reason(&self) -> Option<&str> {
+        (!self.bites).then_some(self.why.as_str())
+    }
+}
+
+/// Whether an `io.weight` written for a job under `data_root` reaches the
+/// device that directory is on.
+pub fn io_weight_reach(data_root: &Path) -> IoWeightReach {
     if !cfg!(target_os = "linux") {
-        return Some(
+        return IoWeightReach::inert(
             "this host is not Linux, so it has no cgroup v2 block-IO weighting".to_owned(),
         );
     }
     let mountinfo = match fs::read_to_string(MOUNTINFO) {
         Ok(text) => text,
         Err(error) => {
-            return Some(format!(
+            return IoWeightReach::inert(format!(
                 "{MOUNTINFO} cannot be read ({error}), so which device {} is on is unknown \
                  and nothing here can say whether an IO weight would reach it",
                 data_root.display()
@@ -58,13 +108,29 @@ pub fn io_weight_inert_reason(data_root: &Path) -> Option<String> {
     };
     let root = fs::canonicalize(data_root).unwrap_or_else(|_| data_root.to_path_buf());
     let Some(mount) = mount_holding(&mountinfo, &root) else {
-        return Some(format!(
+        return IoWeightReach::inert(format!(
             "no mount in {MOUNTINFO} holds {}, so which device it is on is unknown",
             root.display()
         ));
     };
+    // ZFS first, and by name: it has a device number that maps to no block
+    // device, so the generic answer below would be true and useless. This one
+    // says the thing an operator needs — that there is no knob to look for.
+    if mount.kind == "zfs" {
+        return IoWeightReach::inert(format!(
+            "{} is on {} ({} from the ZFS pool {}), and ZFS does its pool IO from its own \
+             kernel threads without attributing it to the cgroup that asked. No cgroup IO \
+             knob reaches a ZFS dataset — not io.weight and not io.max, at any value and \
+             under any scheduler — so this job's IO is bounded by nothing. Put work that \
+             must be bounded on a block-device filesystem instead",
+            root.display(),
+            mount.point,
+            mount.kind,
+            mount.source
+        ));
+    }
     let Some(disk) = disk_of(&mount.device) else {
-        return Some(format!(
+        return IoWeightReach::inert(format!(
             "{} is on {} ({} from {}), which is not one block device with a request queue \
              of its own, so the block layer has no per-cgroup weighting to apply to it",
             root.display(),
@@ -75,21 +141,41 @@ pub fn io_weight_inert_reason(data_root: &Path) -> Option<String> {
     };
     let scheduler = active_scheduler(&disk.queue);
     if scheduler.as_deref() == Some("bfq") {
-        return None;
+        return IoWeightReach::bites(format!(
+            "{} is on {} (device {}), whose IO scheduler is bfq, and bfq weights each \
+             cgroup's IO by the io.weight it carries",
+            root.display(),
+            mount.point,
+            disk.device
+        ));
     }
-    if iocost_is_enabled(&disk.device) {
-        return None;
+    if let Some(how) = iocost_reaches(&disk.device) {
+        return IoWeightReach::bites(format!(
+            "{} is on {} (device {}), where blk-iocost {}, so the kernel weights this \
+             job's IO by the number written",
+            root.display(),
+            mount.point,
+            disk.device,
+            how
+        ));
     }
-    Some(format!(
+    IoWeightReach::inert(format!(
         "{} is on {} ({}, device {}), whose IO scheduler is {} and not bfq, and \
-         blk-iocost is not enabled for that device in {IO_COST_QOS}. Only those two \
-         honour a cgroup's io.weight, so the weight is written and the kernel ignores it",
+         blk-iocost knows no cost model for that device in {IO_COST_MODEL} and is not \
+         enabled for it in {IO_COST_QOS}. Only those two honour a cgroup's io.weight, so \
+         the weight is written and the kernel ignores it",
         root.display(),
         mount.point,
         mount.source,
         disk.device,
         scheduler.unwrap_or_else(|| "unreadable".to_owned()),
     ))
+}
+
+/// Kept for the callers that only care about the bad news.
+pub fn io_weight_inert_reason(data_root: &Path) -> Option<String> {
+    let reach = io_weight_reach(data_root);
+    (!reach.bites).then_some(reach.why)
 }
 
 /// One line of `/proc/self/mountinfo`, as much of it as this is about.
@@ -199,20 +285,58 @@ fn chosen_scheduler(text: &str) -> String {
     text.trim().to_owned()
 }
 
-/// Whether blk-iocost is turned on for this disk, which is the other way a
-/// cgroup's `io.weight` becomes real.
-fn iocost_is_enabled(device: &str) -> bool {
-    let Ok(text) = fs::read_to_string(IO_COST_QOS) else {
-        return false;
-    };
-    iocost_enables(&text, device)
+/// How blk-iocost reaches this disk, or `None` when it does not.
+fn iocost_reaches(device: &str) -> Option<String> {
+    let qos = fs::read_to_string(IO_COST_QOS).unwrap_or_default();
+    let model = fs::read_to_string(IO_COST_MODEL).unwrap_or_default();
+    iocost_reach(&qos, &model, device)
 }
 
-fn iocost_enables(qos: &str, device: &str) -> bool {
-    qos.lines().any(|line| {
+/// The decision, over the two files' contents, so it can be asserted without
+/// a host that has blk-iocost.
+///
+/// `enable=1` is the controller already up. A **cost model** is the other
+/// half: with `ctrl=auto` the controller comes up by itself the first time a
+/// non-default `io.weight` is written, and Herd's own write is what does it
+/// (D120) — so a device with a known model is one whose weight will bite,
+/// even though nothing is enabled at the moment this is read.
+///
+/// The one case where a model is *not* enough: `enable=0 ctrl=user`, an
+/// operator who set the parameters by hand and then switched the controller
+/// off. The kernel keeps user parameters across a refresh, so Herd's write
+/// does not bring it back up, and claiming a bound there would be exactly
+/// the wrong half of D116's mistake made in the other direction.
+fn iocost_reach(qos: &str, model: &str, device: &str) -> Option<String> {
+    if let Some(line) = line_for(qos, device) {
         let mut words = line.split_whitespace();
-        words.next() == Some(device) && words.any(|word| word == "enable=1")
-    })
+        if words.any(|word| word == "enable=1") {
+            return Some(format!("is enabled for it ({})", line.trim()));
+        }
+        if line.split_whitespace().any(|word| word == "ctrl=user") {
+            return None;
+        }
+    }
+    let line = line_for(model, device)?;
+    // A model line with no read throughput in it describes nothing the
+    // controller could cost IO with, so it is not a model.
+    let rbps = line.split_whitespace().find_map(|word| {
+        word.strip_prefix("rbps=")
+            .and_then(|figure| figure.parse::<u64>().ok())
+    })?;
+    if rbps == 0 {
+        return None;
+    }
+    Some(format!(
+        "knows its cost model ({}) and runs with ctrl=auto, so the first non-default \
+         io.weight written — this runner's own, on its first job — brings the controller \
+         up for it",
+        line.trim()
+    ))
+}
+
+fn line_for<'a>(text: &'a str, device: &str) -> Option<&'a str> {
+    text.lines()
+        .find(|line| line.split_whitespace().next() == Some(device))
 }
 
 #[cfg(test)]
@@ -252,31 +376,54 @@ mod tests {
         assert_eq!(chosen_scheduler("bfq\n"), "bfq");
     }
 
-    /// An `io.cost.qos` line exists for a device long before it is turned on,
-    /// so the question is `enable=1` and never "is the device listed".
+    /// D120's correction, as an assertion. `enable=0` on a device with a
+    /// known cost model and `ctrl=auto` is **not** a device whose weight is
+    /// inert: the first non-default `io.weight` written turns the controller
+    /// on, and Herd's own write is that write. Reading `enable=` alone is the
+    /// mistake D116 made.
     #[test]
-    fn a_cost_model_counts_only_when_it_is_enabled() {
-        let qos = "259:0 enable=0 ctrl=auto rpct=95.00 rlat=5000\n8:0 enable=1 ctrl=user\n";
-        assert!(!iocost_enables(qos, "259:0"));
-        assert!(iocost_enables(qos, "8:0"));
-        assert!(!iocost_enables(qos, "253:0"));
-        assert!(!iocost_enables("", "8:0"));
+    fn a_cost_model_under_ctrl_auto_counts_even_before_anything_enabled_it() {
+        let qos = "259:0 enable=0 ctrl=auto rpct=0.00 rlat=5000\n8:0 enable=1 ctrl=user\n";
+        let model = "259:0 ctrl=auto model=linear rbps=3102524156 rseqiops=724816\n";
+        // The NVMe: nothing is enabled yet, and the weight will still bite.
+        let how = iocost_reach(qos, model, "259:0").expect("a known model reaches the device");
+        assert!(how.contains("ctrl=auto"), "{how}");
+        assert!(how.contains("first non-default"), "{how}");
+        // Already enabled, which is the simple case and says so differently.
+        let how = iocost_reach(qos, model, "8:0").expect("enable=1 is the controller up");
+        assert!(how.contains("is enabled for it"), "{how}");
+        // A device with neither: no reach.
+        assert_eq!(iocost_reach(qos, model, "253:0"), None);
+        assert_eq!(iocost_reach("", "", "8:0"), None);
+        // A model line that describes no throughput is not a model.
+        assert_eq!(
+            iocost_reach("", "7:0 ctrl=auto model=linear rbps=0 wbps=0\n", "7:0"),
+            None
+        );
+        // And an operator who set the parameters by hand and switched the
+        // controller off is not somebody whose weight comes back on its own:
+        // the kernel keeps user parameters, so Herd's write changes nothing
+        // and claiming a bound there would be a lie in the other direction.
+        assert_eq!(
+            iocost_reach(
+                "9:0 enable=0 ctrl=user rpct=95.00 rlat=5000\n",
+                "9:0 ctrl=user model=linear rbps=1000000 wbps=1000000\n",
+                "9:0"
+            ),
+            None
+        );
     }
 
-    /// Whatever this host turns out to be, the question is answered with
-    /// either `None` or a sentence — never a panic, and never a `None` that
-    /// means "could not tell".
+    /// Whatever this host turns out to be, the question is answered with a
+    /// sentence either way — never a panic, and never a silence that reads
+    /// the same as "it works".
     #[test]
     fn this_host_answers_whether_its_io_weight_bites() {
-        match io_weight_inert_reason(Path::new(".")) {
-            None => {
-                // bfq or blk-iocost. Nothing more to assert: the next
-                // assertion would be about this machine's disks.
-            }
-            Some(why) => assert!(
-                why.len() > 40 && why.contains('/'),
-                "an inert reason must be a sentence naming what was looked at: {why}"
-            ),
-        }
+        let reach = io_weight_reach(Path::new("."));
+        assert!(
+            reach.why.len() > 40 && reach.why.contains('/'),
+            "the answer must be a sentence naming what was looked at: {reach:?}"
+        );
+        assert_eq!(reach.inert_reason().is_none(), reach.bites);
     }
 }

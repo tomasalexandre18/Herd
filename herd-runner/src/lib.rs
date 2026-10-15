@@ -47,6 +47,7 @@ pub mod job;
 pub mod metrics;
 pub mod privilege;
 pub mod reclaim;
+pub mod room;
 pub mod root;
 pub mod size;
 pub mod spool;
