@@ -1,0 +1,39 @@
+# What a containerised Traefik needs from the hub, and nothing else.
+#
+# Use it beside the base file, never instead of it:
+#
+#   docker compose -f docker-compose.yml -f docker-compose.traefik.yml up -d
+#
+# Why it exists. `docker-compose.yml` publishes the hub on
+# `127.0.0.1:8787`, which is right for the two callers on the host — the
+# server's own runner (`herd-runner.service`) and `herdctl` — and
+# unreachable from a container: a loopback publish is a DNAT rule for
+# 127.0.0.1 alone, so the proxy's packets to the host's bridge address are
+# refused. This file adds the one thing that fixes it: the hub also sits on
+# the network the proxy is already on, under a name the proxy can resolve.
+#
+# It opens no port on any host interface and none on a router (invariant 3).
+# The loopback publish from the base file stays exactly as it is, so the
+# host's runner and `herdctl` are untouched.
+#
+# `herd-hub` is the alias `reverse-proxy/traefik-herd-hub.yml` dials. It is
+# spelled out rather than left to compose's default (`hub`, the service
+# name), because the network is shared with every other stack on the host
+# and `hub` is a name two of them could want.
+#
+# The network is `external: true`: it already exists and belongs to the
+# proxy's own compose project, so Herd joins it and never creates or
+# removes it. Change the name below if that project calls it something
+# else — `docker network ls` says.
+
+services:
+  hub:
+    networks:
+      herd:
+      traefik:
+        aliases:
+          - herd-hub
+
+networks:
+  traefik:
+    external: true

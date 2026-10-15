@@ -64,8 +64,14 @@ services:
     # host connects here; nothing else can. Two documented variants, and
     # neither of them opens a port on a router (invariant 3):
     #
-    #   * his proxy is itself a container — drop `ports:` entirely, use
-    #     `expose: ["8787"]`, and put the hub on a network the proxy shares;
+    #   * his proxy is itself a container — it cannot reach a loopback
+    #     publish at all, because that is a DNAT rule for 127.0.0.1 alone,
+    #     so the hub has to join a network the proxy is on.
+    #     `docker-compose.traefik.yml` is that, as an override, and it
+    #     **keeps** the line below rather than replacing it: this host's own
+    #     runner and `herdctl` both dial `ws://127.0.0.1:8787`, so dropping
+    #     `ports:` for an `expose:` would cut the two callers that work
+    #     today in order to add one that does not yet;
     #   * a runner on another machine has to reach the hub over the mesh
     #     before `wss://` is dialable (see docs/joining.md) — publish on the
     #     mesh address instead of loopback: "100.x.y.z:8787:8787". That is an
