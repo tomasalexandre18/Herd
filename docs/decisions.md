@@ -4041,3 +4041,35 @@ turned out the other way round from the way it was briefed, and is
 written as measured: a job's `PATH` is **fine** bare, because the runner
 carries its own `PATH` into a job, and is the unit's one real trap —
 which is D129's finding, now in the document the deployer reads.
+
+---
+
+## 2026-10-15 — D133 D129's `PATH` finding was half wrong
+
+**Correction.** D129 records that a job's `PATH` had no shell and no
+coreutils, which is true of the **deployment** and was a real exit 125 on a
+real job. What it implies and should not is that Herd gives a job nothing.
+
+`herd-runner/src/confine.rs` carries `PATH`, `LANG`, `LC_ALL`, `TZ` and
+`TERM` from the **runner's own environment** into the job. So a runner
+started from a person's shell hands its jobs a usable `PATH`, and
+`herdctl run -- sh -c '…'` works with no configuration at all. What broke
+was the unit: systemd's default service `PATH` on this host holds no shell,
+and that is what the job inherited.
+
+**So the unit is, on this one point, a risk rather than a gain** — the only
+line in the bare-binary-versus-service comparison that runs that way, and
+`deploy/release-notice.md` says so rather than selling the unit as strictly
+better. Everything else in that comparison still favours the unit, and the
+reason is unchanged: without `Delegate=yes` there is no per-job `memory.max`,
+no `cpu.weight`, no `io.weight`, no `pids.max`, no restart after a reboot,
+and the token sits on a command line that `/proc` shows to every user.
+
+**Why this matters beyond the one variable.** The thing that makes a
+deployment's environment wrong is not that it is empty but that it is
+**different from the one the author tested in**. A `PATH` inherited from a
+developer's shell is why nobody noticed; `Environment=PATH=…` is the fix
+because it states the value instead of inheriting whatever is there.
+
+Found by an agent that was told the opposite in its brief, measured it, and
+wrote down what it measured. That is the behaviour to keep.
