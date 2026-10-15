@@ -4073,3 +4073,46 @@ because it states the value instead of inheriting whatever is there.
 
 Found by an agent that was told the opposite in its brief, measured it, and
 wrote down what it measured. That is the behaviour to keep.
+
+---
+
+## 2026-10-15 — D134 The reaper records what it reaped; it runs no one's code
+
+**Context.** The first consumer reports a real leak. On a runner's death —
+`SIGKILL`, OOM, reboot — the startup reaper removes the job workspace, but
+their `up` step made state **outside** it: a workspace layer and files on a
+RAM tmpfs. Removing the workspace does not undo that, so each death leaks.
+They asked for either of two things: run the declared `down` for every reaped
+job, or at least publish the reaped job ids where a janitor can read them.
+
+**Choice: the second, now; the first never from the reaper.**
+
+Running the consumer's `down` out of the reaper would put arbitrary consumer
+code on a runner's **startup path**, and that path has promises: a runner
+refuses to start on a root it cannot use, and stops cleanly in ≤ 5 s
+(invariant 2). A `down` that hangs would hold a runner's startup open with no
+one watching, and a `down` that needs the workspace would need it **after**
+the reaper's whole reason for existing is to remove it. It also needs the
+declaration, which lives on the **hub's** record, not on the runner's disk —
+so the reaper would have to dial, authenticate and read before it has even
+joined. Each of those is a reason; together they are a different component.
+
+So the reaper **writes down what it reaped**, durably, outside `jobs/` where
+its own sweep cannot clear it — the job id, what was removed, what was killed,
+and when — and says so on stderr as it already does. A janitor reads that
+file and runs whatever the consumer needs. Herd names the mess; the consumer
+owns the cleanup. That is the same division D10 draws for bytes.
+
+**The orchestrator-shaped answer, for later and named here so it is not
+reinvented.** The right home for a `down` after a death is the **hub**
+dispatching it as a **job** — it has the declaration, it knows the attempt
+died, a job carries its own caps and timeout, and a cleanup that fails is then
+a visible verdict rather than a silent hang on somebody's boot. That is a
+feature with a queue, a priority and a test, not a line in the reaper. It
+waits for a milestone of its own.
+
+**What the consumer must know meanwhile**, and it is the honest part: between
+a runner's death and a janitor's next pass, their out-of-workspace state is
+**still there**. Herd is not promising to have cleaned it, only to have told
+them precisely what to clean. Anything that must not outlive a job belongs
+inside the workspace, which Herd does reclaim, whatever the job did to it.
