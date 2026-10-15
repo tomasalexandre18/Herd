@@ -3782,3 +3782,45 @@ failed on a fresh install. It is now the document's URL: nothing in `deploy/`
 copies files onto a host and that should not start, and a URL is true on
 every machine, including one that never saw the repo. The local alternative
 is one `install` command, written on the line above it.
+
+---
+
+## 2026-10-15 — D128 Two of my own rulings, corrected by building them
+
+**D123 named the wrong knob.** Its last paragraph prescribed a Traefik
+`serversTransport` carrying `forwardingTimeouts.readIdleTimeout`. That knob
+drives **HTTP/2 ping frames** and has no effect whatever on an HTTP/1.1
+WebSocket backend, which is what the hub is. It is deliberately absent from
+`traefik-herd-hub.yml`, and the fragment says why where someone would
+otherwise add it back. The knobs that matter are `idleConnTimeout`,
+`dialTimeout` and `responseHeaderTimeout`; the two that would actually cut a
+quiet link, `respondingTimeouts.readTimeout` and `idleTimeout`, are **static
+and shared with every service on the host**, so they are the owner's and are
+left alone — all three of their defaults are already far above the 15 s
+Herd's own cadence has to beat.
+
+**D124 was too narrow, in the direction that matters.** It said an unknown
+`FromHub` variant is a breaking change *for a requester*, and left the runner
+as a separate question. The runner is the same answer, for a stronger reason
+than `herdctl`'s `bail!`: `FromHub` is `#[serde(tag = "type")]` with no
+`#[serde(other)]`, so an unknown frame **does not decode at all** —
+
+```
+Err(Error("unknown variant `still_there`, expected one of `welcome`, …"))
+```
+
+— and the runner's decode error kills the link, which it then redials **into
+the same undecodable frame**. It loops; it does not shrug. The `other =>` arm
+that prints "not a runner's business" covers only variants that build already
+knows, and is not forward compatibility.
+
+So the rule at the frozen constant is the wider one: adding a variant to
+`FromHub` **or** `ToHub` moves `PROTOCOL_VERSION`, whatever serde would
+tolerate. Only a `#[serde(default)]` field whose absence means exactly what
+its default says leaves the number alone.
+
+**What both have in common,** and the reason they are in one entry: each was
+a plausible ruling made from reading, and each was falsified by someone
+making it real. A prescription I write into a decision is a hypothesis until
+it is built — so an agent told to follow one must be free to come back and
+say it is wrong, which is what happened twice here.
