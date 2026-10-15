@@ -31,11 +31,20 @@
 //! invented. "You never interpret a command line" is the consumer's own rule,
 //! and their `fetch` — `git fetch -q origin && git switch -q --detach <hash>`
 //! — is only a command at all to a shell (D107).
+//!
+//! ## The declared line is a template too
+//!
+//! A command's own line may name `{job}`, `{in}` and `{out}` like any hook,
+//! and they are filled — before the line is pasted into `{line}`, and never
+//! over the text a requester's arguments put there. [`line_filled`] is where
+//! that order is kept and why it is the order it is.
 
 use std::path::Path;
 use std::time::Duration;
 
-use herd_proto::{Declaration, JobId, Step, IN_TOKEN, JOB_TOKEN, LINE_TOKEN, OUT_TOKEN};
+use herd_proto::{
+    args_as_line, Declaration, JobId, Step, IN_TOKEN, JOB_TOKEN, LINE_TOKEN, OUT_TOKEN,
+};
 
 /// The shell every hook is handed to.
 const SHELL: &str = "/bin/sh";
@@ -147,11 +156,13 @@ pub(crate) fn planned(
     // they are, and on purpose: it is a requester's own string, and filling it
     // first would make a brace inside it a template — which is the one way a
     // declaration's trust could reach past the declaration.
+    let in_dir = in_dir.display().to_string();
+    let out_dir = out_dir.display().to_string();
     let filled = declaration
         .executor
         .filled(JOB_TOKEN, job_id.as_str())
-        .filled(IN_TOKEN, &in_dir.display().to_string())
-        .filled(OUT_TOKEN, &out_dir.display().to_string());
+        .filled(IN_TOKEN, &in_dir)
+        .filled(OUT_TOKEN, &out_dir);
     // Every token but `{line}`, which is expected to still be there. Checked
     // over the whole executor rather than hook by hook, because a `{down}`
     // nobody could fill would be found after `up` had already made a
@@ -172,7 +183,10 @@ pub(crate) fn planned(
             left.join(" and ")
         ));
     }
-    let filled = filled.filled(LINE_TOKEN, line);
+    // The declared line is a template of its own, and its tokens are filled
+    // before it is pasted in — see [`line_filled`].
+    let line = line_filled(line, &declaration.args, job_id.as_str(), &in_dir, &out_dir);
+    let filled = filled.filled(LINE_TOKEN, &line);
 
     let env: Vec<(String, String)> = filled
         .env
@@ -201,6 +215,48 @@ pub(crate) fn planned(
             },
         })
         .collect())
+}
+
+/// The declared command's own line, with the runner's tokens filled in the
+/// text the **declaration** wrote and in nothing else.
+///
+/// A declared line is a template exactly as the four hooks are: the first
+/// consumer's `tool pack --out {out}/packs` means the directory, not three
+/// characters. So `{job}`, `{in}` and `{out}` are filled here, before the
+/// line is pasted into the `run` hook's `{line}`.
+///
+/// **The order is the whole of it, and the order is D107's.** The
+/// requester's arguments were pasted into this line before the job was
+/// minted, quoted, so that the line on the record is the line that will run
+/// and M6's key sees two submissions with different arguments as two jobs.
+/// D107's property is that a value a substitution put there is never itself
+/// scanned for tokens — `--only '{out}'` is an argument and not a template,
+/// and a fixed point is the one way a declaration's trust could reach past
+/// the declaration. The only order that keeps both is to fill the declared
+/// text *before* `{args}` is in it, so that is what happens: the spans the
+/// requester's arguments contributed are held out of the pass, and the
+/// declared text around them is filled.
+///
+/// The arguments are held out by the only thing that identifies them
+/// exactly — the requester's own words, which already travel beside the line
+/// ([`Declaration::args`]) and are quoted into it by one function
+/// ([`args_as_line`]). Nothing is encoded, escaped or marked, and no frame
+/// changes. An empty argument list, or a line no `{args}` reached, means
+/// there is no requester text in the line at all, and it is filled whole.
+fn line_filled(line: &str, args: &[String], job: &str, in_dir: &str, out_dir: &str) -> String {
+    let fill = |text: &str| {
+        text.replace(JOB_TOKEN, job)
+            .replace(IN_TOKEN, in_dir)
+            .replace(OUT_TOKEN, out_dir)
+    };
+    let pasted = args_as_line(args);
+    if pasted.is_empty() || !line.contains(pasted.as_str()) {
+        return fill(line);
+    }
+    line.split(pasted.as_str())
+        .map(fill)
+        .collect::<Vec<_>>()
+        .join(&pasted)
 }
 
 /// Which figure bounds the `run` step.
@@ -337,18 +393,63 @@ mod tests {
         }
     }
 
-    /// The declared line is filled last, so a brace a requester typed inside
-    /// it stays text rather than becoming a template (D107).
+    /// A declared command's **own line** names the directories like any
+    /// hook: `tool pack --out {out}/packs` means the directory, and reaching
+    /// their hook with three characters is the defect this closes.
     #[test]
-    fn a_brace_inside_the_declared_line_is_not_filled_again() {
+    fn the_declared_line_s_own_tokens_are_filled_before_it_is_pasted_in() {
         let stages = plan(
             &declared(&format!("inside {LINE_TOKEN}")),
-            &format!("tool --only '{OUT_TOKEN}'"),
+            &format!("tool pack --out {OUT_TOKEN}/packs --from {IN_TOKEN}/x --as {JOB_TOKEN}"),
         )
-        .expect("a line holding a brace is a line, not a template");
+        .expect("a declaration with every token filled plans");
         assert_eq!(
             stages[2].arguments[1],
-            format!("inside tool --only '{OUT_TOKEN}'")
+            "inside tool pack --out /data/jobs/j0000000007/out/packs \
+             --from /data/jobs/j0000000007/in/x --as j0000000007"
+        );
+    }
+
+    /// The adversarial half, and the one that proves D107 still holds: the
+    /// declared text around a requester's arguments is filled, the arguments
+    /// themselves are not. A requester who typed `{out}` typed three
+    /// characters, and a value a substitution pasted in is never itself
+    /// scanned for tokens.
+    #[test]
+    fn a_token_a_requester_typed_in_an_argument_is_text_and_stays_text() {
+        let mut declaration = declared(&format!("inside {LINE_TOKEN}"));
+        declaration.args = vec![
+            "--only".to_owned(),
+            OUT_TOKEN.to_owned(),
+            format!("{IN_TOKEN}/{JOB_TOKEN}"),
+        ];
+        // The line as `herdctl` resolved it: the declared template with the
+        // arguments quoted into its `{args}` (D107).
+        let line = format!(
+            "tool pack --out {OUT_TOKEN}/packs {}",
+            args_as_line(&declaration.args)
+        );
+        let stages = plan(&declaration, &line).expect("it plans");
+        assert_eq!(
+            stages[2].arguments[1],
+            format!(
+                "inside tool pack --out /data/jobs/j0000000007/out/packs \
+                 '--only' '{OUT_TOKEN}' '{IN_TOKEN}/{JOB_TOKEN}'"
+            )
+        );
+    }
+
+    /// An argument that is the whole of the line's requester text and holds
+    /// no brace at all leaves the declared tokens filled either side of it.
+    #[test]
+    fn the_declared_text_on_both_sides_of_the_arguments_is_filled() {
+        let mut declaration = declared(&format!("inside {LINE_TOKEN}"));
+        declaration.args = vec!["a b".to_owned()];
+        let line = format!("tool {} --out {OUT_TOKEN}", args_as_line(&declaration.args));
+        let stages = plan(&declaration, &line).expect("it plans");
+        assert_eq!(
+            stages[2].arguments[1],
+            "inside tool 'a b' --out /data/jobs/j0000000007/out"
         );
     }
 
