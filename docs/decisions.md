@@ -4542,3 +4542,48 @@ wrapper writes is "did I get an id?", never the parsing of prose. A command
 that submits nothing — `wait`, `cancel`, `raise`, a dry run, the operator
 commands — prints none of the three: a sentence about submissions there would
 answer a question nobody asked.
+
+---
+
+## 2026-10-16 — D140 A refusal and a wait for the same fleet state
+
+**Found while chasing a flaky test, and it is the more important half of
+that work.** The hub holds two different answers to one question. For a job
+already queued, `matcher.rs` says `Wait { why: "no runner is connected to
+this hub" }`. For a **new** submission in exactly that state, `server.rs`
+refuses outright. Which one a job gets depends only on whether it arrived a
+moment before or after the last link dropped — so that wait sentence is
+**unreachable for a newly submitted job**.
+
+**It contradicts D88.** D88's own "what we did not do" says a job no
+connected runner could ever fit **waits**, because "a fleet is not a closed
+world — the owner's PC is asleep at night and its 17 GiB come back in the
+morning". A *transient* gap is the same situation with **weaker** evidence,
+and it is treated more harshly. The second refusal branch — every runner
+draining or switched off — is worse still, because E-33's switch is
+explicitly a temporary owner action.
+
+**It is concrete now that Herd is deployed.** Every hook that submits during
+a hub restart, a runner restart or a brief disconnection gets **exit 125**.
+With the deployment live and the consumer about to submit from their own
+tooling, that is not a hypothetical.
+
+**The principled shape, for which the hub already holds the facts:** refuse
+when **no runner has ever been approved** on this state root — a
+configuration mistake, which must not wait for ever — and **queue**, with the
+sentence that already exists, when the fleet is merely away. The distinction
+is between "this can never work" and "nobody is here right now", which is
+exactly the distinction D88 draws.
+
+**Not changed.** It alters what a deployed hub does with a submission, which
+is a behaviour the first consumer is about to build against, and it is the
+kind of change Alexa decides. Written here so the next person meets the
+question rather than the symptom.
+
+**A second instance of the same class, in the same area.** `{j}` is filled by
+`with_parallelism` over the **whole** command after the requester's arguments
+are already in it, so an argument containing the literal `{j}` becomes a
+thread count today. That is D107's property broken in the hub, the same way
+it was broken in the runner for `{in}` and `{out}` — and the hub holds
+`declaration.args` on the record, so the same fix applies. Left alone for the
+same reason: it changes a deployed hub, and nobody has hit it.
