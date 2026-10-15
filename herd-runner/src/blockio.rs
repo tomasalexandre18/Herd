@@ -300,10 +300,20 @@ fn iocost_reaches(device: &str) -> Option<String> {
 /// non-default `io.weight` is written, and Herd's own write is what does it
 /// (D120) — so a device with a known model is one whose weight will bite,
 /// even though nothing is enabled at the moment this is read.
+///
+/// The one case where a model is *not* enough: `enable=0 ctrl=user`, an
+/// operator who set the parameters by hand and then switched the controller
+/// off. The kernel keeps user parameters across a refresh, so Herd's write
+/// does not bring it back up, and claiming a bound there would be exactly
+/// the wrong half of D116's mistake made in the other direction.
 fn iocost_reach(qos: &str, model: &str, device: &str) -> Option<String> {
     if let Some(line) = line_for(qos, device) {
-        if line.split_whitespace().any(|word| word == "enable=1") {
+        let mut words = line.split_whitespace();
+        if words.any(|word| word == "enable=1") {
             return Some(format!("is enabled for it ({})", line.trim()));
+        }
+        if line.split_whitespace().any(|word| word == "ctrl=user") {
+            return None;
         }
     }
     let line = line_for(model, device)?;
@@ -388,6 +398,18 @@ mod tests {
         // A model line that describes no throughput is not a model.
         assert_eq!(
             iocost_reach("", "7:0 ctrl=auto model=linear rbps=0 wbps=0\n", "7:0"),
+            None
+        );
+        // And an operator who set the parameters by hand and switched the
+        // controller off is not somebody whose weight comes back on its own:
+        // the kernel keeps user parameters, so Herd's write changes nothing
+        // and claiming a bound there would be a lie in the other direction.
+        assert_eq!(
+            iocost_reach(
+                "9:0 enable=0 ctrl=user rpct=95.00 rlat=5000\n",
+                "9:0 ctrl=user model=linear rbps=1000000 wbps=1000000\n",
+                "9:0"
+            ),
             None
         );
     }
