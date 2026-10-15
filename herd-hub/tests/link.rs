@@ -208,8 +208,12 @@ struct Puppet {
     source: futures_util::stream::SplitStream<Socket>,
     /// What this puppet says, written by a task of its own so that a
     /// heartbeat can go out while the test is awaiting something else.
+    ///
+    /// The writing task is not held here on purpose: it ends when this sender
+    /// is dropped, **after** writing whatever is still queued and closing the
+    /// socket. A puppet dropped straight after saying something therefore
+    /// still says it, which is what every test that ends on a frame expects.
     outbox: tokio::sync::mpsc::UnboundedSender<ToHub>,
-    writing: tokio::task::JoinHandle<()>,
     /// The heartbeat, while it is beating.
     beating: Option<tokio::task::JoinHandle<()>>,
 }
@@ -354,7 +358,8 @@ impl Puppet {
         // before the welcome would be a frame the hub has nowhere to put.
         let (mut sink, source) = socket.split();
         let (outbox, mut inbox) = tokio::sync::mpsc::unbounded_channel::<ToHub>();
-        let writing = tokio::spawn(async move {
+        // Detached: it ends with the channel, having flushed it.
+        tokio::spawn(async move {
             while let Some(message) = inbox.recv().await {
                 let frame = Message::text(to_frame(&message).expect("encodes"));
                 if sink.send(frame).await.is_err() {
@@ -369,7 +374,6 @@ impl Puppet {
         let mut puppet = Self {
             source,
             outbox,
-            writing,
             beating: None,
         };
         match puppet.next().await {
@@ -466,11 +470,10 @@ impl Puppet {
 
 impl Drop for Puppet {
     fn drop(&mut self) {
-        // Nothing of a puppet outlives it: no heartbeat going out for a test
-        // that is over, and no task holding the writing half of a socket the
-        // next test is about to assert is closed.
+        // No heartbeat goes out for a test that is over. The writing task is
+        // left to finish: dropping `outbox` is what ends it, and it flushes
+        // what the test said last before it closes the socket.
         self.stop_reporting_health();
-        self.writing.abort();
     }
 }
 
@@ -1089,14 +1092,20 @@ async fn a_returning_runner_finishes_nothing_of_the_attempt_it_lost() {
     // The runner comes back — the same machine, a new connection — and is
     // handed the job again, as attempt 2. It is still holding everything it
     // never managed to deliver about attempt 1.
-    let mut back = Puppet::join_reporting_health(&hub, "runner-a").await;
+    // No heartbeat on this one, and that is deliberate twice over. It needs
+    // none: the job is already queued, so the pass that claims it runs inside
+    // the hub as this connection registers, with no test-side work in the way
+    // (D113's window is between a join and a *later* submission). And it must
+    // not have one: every frame below is read strictly, as the very next thing
+    // the hub said, and the acknowledgement of a heartbeat would land in the
+    // middle of that.
+    let mut back = Puppet::join(&hub, "runner-a").await;
     let (_, second_attempt, _) = back.take_a_job().await;
     assert_eq!(second_attempt, 2);
-    // And the same for this connection, for the same reason: everything below
-    // has to happen before it is written off in its turn — a second loss
-    // would end the job `lost` (E-21) and the verdict asserted at the end
-    // would never come. This one keeps reporting, because nothing here is
-    // about its silence.
+    // Its own report, for the reason the one above was sent: everything below
+    // has to happen before this connection is written off in its turn — a
+    // second loss would end the job `lost` (E-21) and the verdict asserted at
+    // the end would never come.
     back.report_health(
         vec![RunningJob {
             job_id: job_id.clone(),
