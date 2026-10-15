@@ -59,7 +59,7 @@ and nothing on a runner's machine listens at all (invariant 3, D11).
 5. Make the runner's data root — `install -d -o herd -g herd -m 0700
    /mnt/ssd_980/herd-runner` — then install the unit and walk
    `docs/joining.md`. On the declarative path, importing the module does
-   this step and the three below with it.
+   this step and every other **OWNER** item with it.
 
 ## The first start, exactly
 
