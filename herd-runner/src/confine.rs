@@ -10,8 +10,8 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use crate::cgroup::{
-    Ceiling, CpuQuota, JobLimits, DEFAULT_CPU_WEIGHT, DEFAULT_IO_WEIGHT, DEFAULT_PIDS_MAX,
-    MINIMUM_PIDS_MAX, WEIGHT_RANGE,
+    Ceiling, CpuQuota, IoCeiling, IoMax, JobLimits, DEFAULT_CPU_WEIGHT, DEFAULT_IO_WEIGHT,
+    DEFAULT_PIDS_MAX, MINIMUM_PIDS_MAX, WEIGHT_RANGE,
 };
 use crate::privilege::PrivilegedHelpers;
 use crate::reclaim::{reclaim_a_past_life, JobTag, LiveJobs, MARKER_VARIABLE};
@@ -85,6 +85,12 @@ pub struct Confinement {
     /// whose block layer does not weight IO — which the runner says at
     /// startup rather than leaving to be discovered.
     pub io_weight: u32,
+    /// `io.max` in a job's cgroup: a **hard** per-device IO ceiling, and
+    /// **none by default**. `io.weight` above shares contended bandwidth;
+    /// this caps it. Where one is asked for and this host cannot carry one,
+    /// the startup is refused naming the path and the reason — never reduced
+    /// to the weight and never written as a zero.
+    pub io_max: Option<IoCeiling>,
     /// `pids.max` in a job's cgroup: a fork bomb inside a job must not be
     /// able to take the host down.
     pub pids_max: u64,
@@ -107,20 +113,26 @@ impl Confinement {
             cpu_weight: DEFAULT_CPU_WEIGHT,
             cpu_max: None,
             io_weight: DEFAULT_IO_WEIGHT,
+            io_max: None,
             pids_max: DEFAULT_PIDS_MAX,
             cgroup_root: None,
             privileged_helpers: Vec::new(),
         }
     }
 
-    /// The four controls a job's cgroup carries, as the cgroup code takes
-    /// them.
+    /// The controls a job's cgroup carries, as the cgroup code takes them.
+    ///
+    /// `io.max` is not among them, and that is the per-device difference: it
+    /// is resolved against the device the data root is on and proved against
+    /// the subtree at startup, and only then carried
+    /// ([`Ceiling::carry_io_max`]).
     pub fn job_limits(&self) -> JobLimits {
         JobLimits {
             memory_max: self.memory_max,
             cpu_weight: self.cpu_weight,
             cpu_max: self.cpu_max,
             io_weight: self.io_weight,
+            io_max: None,
             pids_max: self.pids_max,
         }
     }
@@ -202,7 +214,8 @@ impl Confined {
                 confinement.pids_max, MINIMUM_PIDS_MAX
             ));
         }
-        let ceiling = Ceiling::detect(confinement.job_limits(), confinement.cgroup_root.as_deref());
+        let mut ceiling =
+            Ceiling::detect(confinement.job_limits(), confinement.cgroup_root.as_deref());
         // D23's loud fallback is for a host that cannot give the real ceiling.
         // An operator who named `--cgroup-root` asked for a specific subtree:
         // falling back there would answer a precise request with something
@@ -232,6 +245,48 @@ impl Confined {
                      niceness, which need nothing granted."
                 ));
             }
+        }
+        // `io.max` takes the same road as `cpu.max`, one step further: a hard
+        // ceiling an operator declared, so a host that cannot carry one is a
+        // refusal and never a warning. It goes further because the knob is
+        // **per-device**: a value with no device is not a weak ceiling, it is
+        // not a ceiling, so the device under the data root is resolved first
+        // and a path whose device cannot be resolved — ZFS above all, where
+        // no cgroup IO knob reaches at any value — is itself the refusal.
+        //
+        // Deliberately unlike `io.weight`, which is written and reported
+        // inert on such a host: a weight nobody honours costs nothing, and a
+        // ceiling nobody honours is a false promise on the one machine the
+        // first consumer's builds freeze (D116, D120, D129).
+        if let Some(asked) = confinement.io_max {
+            let device = crate::blockio::ceiling_device(root.path()).map_err(|why| {
+                format!(
+                    "--job-io-max asks for a hard IO ceiling and no ceiling can be written \
+                     for {}: {why}. Leave the option out for no ceiling at all, which is \
+                     the default — a job's IO is then shaped by io.weight, which shares \
+                     contended bandwidth and caps nothing.",
+                    root.path().display()
+                )
+            })?;
+            let io_max = IoMax {
+                ceiling: asked,
+                device: device.device,
+            };
+            ceiling.prove_io_max(&io_max).map_err(|why| {
+                format!(
+                    "--job-io-max {} asks for a hard IO ceiling on device {} ({} from {}, \
+                     which is where {} is), and this host would not take it: {why}. Run this \
+                     runner as a systemd unit with Delegate=yes, or inside systemd-run \
+                     --user --scope -p Delegate=yes, or leave the option out — a ceiling \
+                     this host cannot enforce must not be announced as one.",
+                    asked.describe(),
+                    io_max.device,
+                    device.mount_point,
+                    device.source,
+                    root.path().display()
+                )
+            })?;
+            ceiling.carry_io_max(io_max);
         }
         // Asked once, at startup, because the answer is about this host's
         // block layer and cannot change under a running runner without
@@ -311,9 +366,26 @@ impl Confined {
             lines.push(format!(
                 "io.weight {}: WRITTEN BUT INERT for jobs here, because {}. An absolute \
                  io.max is the only IO lever that works whatever the scheduler is, and \
-                 this runner sets none: a job's IO here is bounded by the idle IO class \
-                 alone, which a scheduler of none and a ZFS dataset both ignore.",
-                c.io_weight, why
+                 this runner {}",
+                c.io_weight,
+                why,
+                // Which it is depends on what the operator declared, and
+                // saying "this runner sets none" while a ceiling is written
+                // would be the same kind of stale claim this whole line
+                // exists to prevent. Measured: on this project's SATA disk
+                // blk-iocost knows no cost model, so the weight is inert
+                // there and the ceiling still holds — which is exactly the
+                // difference between the two knobs.
+                match self.ceiling.limits().io_max.as_ref() {
+                    Some(io_max) => format!(
+                        "sets one, on device {}: that ceiling is this host's only effective \
+                         IO bound for a job, and the weight beside it does nothing here.",
+                        io_max.device
+                    ),
+                    None => "sets none: a job's IO here is bounded by the idle IO class \
+                             alone, which a scheduler of none and a ZFS dataset both ignore."
+                        .to_owned(),
+                }
             ));
         } else {
             // And the good news is said too, with the device in it. D116
@@ -325,6 +397,31 @@ impl Confined {
                 "io.weight {}: enforced for jobs here, because {}.",
                 c.io_weight, self.io_weight_reach.why
             ));
+        }
+        // And the hard ceiling beside the share, said in both states. The
+        // distinction is the whole point of the line: a weight shares
+        // contended bandwidth and a ceiling caps it, so a reader who has only
+        // seen the weight has not been told whether this machine can be
+        // saturated by one job.
+        match self.ceiling.limits().io_max.as_ref() {
+            Some(io_max) => lines.push(format!(
+                "io.max for device {} ({}): {} — a hard per-second ceiling the kernel \
+                 enforces whatever the IO scheduler is, proved at startup by writing it. \
+                 It bounds what a job writes under the data root; a job writing an \
+                 absolute path outside the data root writes to another device, which \
+                 neither this ceiling nor io.weight reaches.",
+                io_max.device,
+                self.root.path().display(),
+                io_max.ceiling.describe()
+            )),
+            None => lines.push(
+                "no io.max, so no hard IO ceiling: io.weight is a share of contended \
+                 bandwidth and caps nothing, so one job alone can still saturate this \
+                 disk. Declare a ceiling with --job-io-max rbps=…,wbps=…,riops=…,wiops=… \
+                 if that matters here; there is no default, because a throughput figure \
+                 is right on one machine only."
+                    .to_owned(),
+            ),
         }
         match self.ceiling.fallback_reason() {
             None => lines.push(
@@ -351,6 +448,29 @@ impl Confined {
                         .to_owned(),
                 );
             }
+        }
+        // And the figure that bounds nothing, said beside the ones that do so
+        // that nobody has to guess which it is. E-32 is the first consumer's
+        // own expectation that a load figure is recorded and never a
+        // criterion, and they asked for pressure to brake admission; this
+        // line is the refusal, in the open (D119).
+        match crate::metrics::pressure(None) {
+            Some(_) => lines.push(
+                "pressure: read from /proc/pressure, and from each job's own cgroup where \
+                 the kernel exposes it, recorded with every job's outcome — and a gate on \
+                 nothing. No job is ever refused or delayed here because this host is \
+                 stalled (E-32)."
+                    .to_owned(),
+            ),
+            // Absent, never zero: a row of zeroes would read as a machine
+            // under no pressure at all, which is the opposite of what an
+            // unreadable file says.
+            None => lines.push(
+                "pressure: NOT READABLE on this host, so every job's record here leaves the \
+                 figure absent rather than reporting a zero — this kernel has no \
+                 /proc/pressure (CONFIG_PSI). Nothing gated on it in any case (E-32)."
+                    .to_owned(),
+            ),
         }
         if self.helpers.allowed().is_empty() {
             lines.push("privileged helpers: none configured".to_owned());
@@ -810,6 +930,241 @@ mod tests {
                     "{report}"
                 );
             }
+        }
+    }
+
+    /// **The refusal, which is the whole point of this option.** A hard IO
+    /// ceiling asked for on a path that cannot carry one is a **startup
+    /// refusal naming the path and the reason** — never a warning, never a
+    /// silent fallback to the weight, never a zero.
+    ///
+    /// A tmpfs is the deterministic case on every Linux: a real, writable
+    /// data root on a filesystem that is no block device, so `io.max` has no
+    /// device to hold a line against. ZFS is the same answer by a different
+    /// road and is asserted in [`crate::blockio`], where the mount can be
+    /// stated rather than hoped for.
+    ///
+    /// Contrast this deliberately with `io.weight`, which is written and
+    /// reported inert on such a host: a weight nobody honours costs nothing,
+    /// and a ceiling nobody honours is a false promise on the one machine the
+    /// first consumer's builds freeze (D116, D120, D129).
+    #[test]
+    fn an_io_ceiling_no_device_could_carry_refuses_the_startup_naming_the_path() {
+        if !cfg!(target_os = "linux") {
+            return;
+        }
+        let tmpfs = Path::new("/dev/shm");
+        if !tmpfs.is_dir() {
+            crate::testing::skipped(
+                "an_io_ceiling_no_device_could_carry_refuses_the_startup_naming_the_path",
+                "this host has no /dev/shm, so there is no filesystem here that is certainly \
+                 not a block device — a host with a tmpfs would prove that --job-io-max on \
+                 a path no device backs refuses the startup naming the path",
+            );
+            return;
+        }
+        let _reaping = crate::testing::one_reaper_at_a_time();
+        let root = tmpfs.join(format!("herd-io-max-refusal-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir(&root).expect("a tmpfs is writable");
+        let mut confinement = Confinement::with_data_root(&root);
+        confinement.io_max = Some(IoCeiling::parse("rbps=200MB,wbps=100MB").expect("a ceiling"));
+        let error = Confined::prepare(confinement)
+            .expect_err("no io.max line can be written for a path on a tmpfs");
+        let _ = std::fs::remove_dir_all(&root);
+        assert!(error.contains("--job-io-max"), "{error}");
+        assert!(
+            error.contains(&root.display().to_string()),
+            "the refusal must name the path it is about: {error}"
+        );
+        assert!(
+            error.contains("not one block device"),
+            "the refusal must say why, or it reads as a bug: {error}"
+        );
+        assert!(
+            error.contains("shares contended bandwidth and caps nothing"),
+            "the refusal must say what leaving the option out costs, because that is the \
+             choice it is handing back: {error}"
+        );
+    }
+
+    /// And where this host *can* carry one, the other half of the promise:
+    /// the ceiling is proved by writing it, it names the device the data root
+    /// is on, and the report says which device and that it is a hard cap.
+    #[test]
+    fn a_ceiling_this_host_can_carry_is_proved_and_reported_with_its_device() {
+        let _reaping = crate::testing::one_reaper_at_a_time();
+        let temp = TempDir::new("confine-io-max");
+        let mut confinement = Confinement::with_data_root(temp.path());
+        confinement.io_max = Some(IoCeiling::parse("wbps=64MiB,wiops=500").expect("a ceiling"));
+        match Confined::prepare(confinement) {
+            Err(error) => {
+                // This host cannot carry one, which is a refusal and not a
+                // warning. It still has to name the path and the reason, and
+                // a reader of a green suite has to know what was not proved.
+                assert!(error.contains("--job-io-max"), "{error}");
+                assert!(
+                    error.contains(&temp.path().display().to_string()),
+                    "{error}"
+                );
+                crate::testing::skipped(
+                    "a_ceiling_this_host_can_carry_is_proved_and_reported_with_its_device",
+                    &format!(
+                        "this host refused the ceiling, correctly, because: {error} — a host \
+                         with a delegated cgroup v2 subtree (systemd-run --user --scope -p \
+                         Delegate=yes) and a data root on a block device would prove that \
+                         the ceiling is written, names that device, and is reported as a \
+                         hard cap"
+                    ),
+                );
+            }
+            Ok(confined) => {
+                let io_max = confined
+                    .ceiling()
+                    .limits()
+                    .io_max
+                    .clone()
+                    .expect("a proved ceiling is carried into every job's limits");
+                // Per-device, and the device is the one the data root is on.
+                let expected = crate::blockio::ceiling_device(confined.root().path())
+                    .expect("the ceiling was proved, so the device resolved");
+                assert_eq!(io_max.device, expected.device);
+                assert_eq!(
+                    io_max.control_value(),
+                    format!("{} wbps=67108864 wiops=500", expected.device)
+                );
+                let report = confined.report().join("\n");
+                assert!(
+                    report.contains(&format!("io.max for device {}", expected.device)),
+                    "the report must name the device, because moving the data root moves \
+                     the answer: {report}"
+                );
+                assert!(
+                    report.contains("wbps=67108864 wiops=500"),
+                    "the report must say what the ceiling is: {report}"
+                );
+                assert!(
+                    report.contains("hard per-second ceiling"),
+                    "a reader has to be able to tell this from io.weight: {report}"
+                );
+                assert!(
+                    report.contains("outside the data root"),
+                    "the report must say what the ceiling does not reach: {report}"
+                );
+            }
+        }
+    }
+
+    /// Absent by default, and absent is said out loud rather than left out:
+    /// an operator reading the report has to see that no hard ceiling is a
+    /// choice, and that the weight beside it caps nothing.
+    #[test]
+    fn no_declared_ceiling_is_reported_as_no_ceiling_and_not_as_a_zero() {
+        let _reaping = crate::testing::one_reaper_at_a_time();
+        let temp = TempDir::new("confine-no-io-max");
+        let confinement = Confinement::with_data_root(temp.path());
+        assert_eq!(confinement.io_max, None, "absent by default");
+        let confined = Confined::prepare(confinement).expect("the default needs nothing granted");
+        assert_eq!(
+            confined.ceiling().limits().io_max,
+            None,
+            "absent must mean no line written, never a zero and never a guess"
+        );
+        let report = confined.report().join("\n");
+        assert!(
+            report.contains("no io.max, so no hard IO ceiling"),
+            "{report}"
+        );
+        assert!(
+            report.contains("caps nothing"),
+            "the line has to say what a weight is, or it reads as a bound: {report}"
+        );
+        assert!(
+            report.contains("there is no default"),
+            "and why there is no figure: {report}"
+        );
+    }
+
+    /// A declared ceiling changes the inert-weight line, and must: "an
+    /// absolute io.max is the only lever that works here, and this runner
+    /// sets none" is false the moment one is set, and a stale claim in a
+    /// startup report is the exact defect that whole line exists to prevent.
+    ///
+    /// Measured on this project's server: on its SATA disk blk-iocost knows
+    /// no cost model, so the weight is inert there **and the ceiling still
+    /// holds** — which is the difference between the two knobs, live.
+    #[test]
+    fn a_declared_ceiling_changes_what_the_inert_weight_line_says() {
+        // Over the decision rather than over a host: whether this host's
+        // weight is inert is not this test's question, and a sentence that
+        // contradicts itself is.
+        let inert = "io.weight 10: WRITTEN BUT INERT for jobs here, because the disk says so. \
+                     An absolute io.max is the only IO lever that works whatever the \
+                     scheduler is, and this runner sets none: a job's IO here is bounded by \
+                     the idle IO class alone.";
+        assert!(
+            inert.contains("sets none"),
+            "this is the sentence for a runner with no ceiling"
+        );
+        let _reaping = crate::testing::one_reaper_at_a_time();
+        let temp = TempDir::new("confine-inert-and-ceiling");
+        let mut confinement = Confinement::with_data_root(temp.path());
+        confinement.io_max = Some(IoCeiling::parse("wbps=1MB").expect("a ceiling"));
+        let Ok(confined) = Confined::prepare(confinement) else {
+            crate::testing::skipped(
+                "a_declared_ceiling_changes_what_the_inert_weight_line_says",
+                "this host cannot carry a ceiling, so there is no report with one in it \
+                 here — a delegated scope with its data root on a block device would prove \
+                 that the inert-weight line stops saying \"this runner sets none\" once a \
+                 ceiling is declared",
+            );
+            return;
+        };
+        let report = confined.report().join("\n");
+        assert!(
+            !report.contains("sets none"),
+            "the report claims no ceiling is set while one is: {report}"
+        );
+        if let Some(line) = report
+            .lines()
+            .find(|line| line.contains("WRITTEN BUT INERT"))
+        {
+            assert!(
+                line.contains("sets one, on device"),
+                "an inert weight beside a real ceiling must say which of the two bounds a \
+                 job here: {line}"
+            );
+        }
+    }
+
+    /// Pressure is read, recorded and said out loud — and the line says in
+    /// as many words that it gates nothing (E-32, D119).
+    #[test]
+    fn the_report_says_pressure_is_recorded_and_gates_nothing() {
+        let _reaping = crate::testing::one_reaper_at_a_time();
+        let temp = TempDir::new("confine-pressure");
+        let confined = Confined::prepare(Confinement::with_data_root(temp.path()))
+            .expect("an unprivileged process with a writable root can confine");
+        let report = confined.report().join("\n");
+        let line = report
+            .lines()
+            .find(|line| line.starts_with("pressure:"))
+            .expect("the report says what it does with pressure, either way");
+        assert!(
+            line.contains("E-32"),
+            "the line must name the expectation it is keeping: {line}"
+        );
+        if line.contains("NOT READABLE") {
+            assert!(
+                line.contains("absent rather than reporting a zero"),
+                "an unreadable figure is absent, never zero: {line}"
+            );
+        } else {
+            assert!(
+                line.contains("a gate on nothing")
+                    && line.contains("No job is ever refused or delayed"),
+                "the guarantee is the point of the line: {line}"
+            );
         }
     }
 

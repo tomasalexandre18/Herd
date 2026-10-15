@@ -6,7 +6,9 @@ use clap::Parser;
 use herd_runner::capability::{
     CapabilityConfig, ProbeSettings, DEFAULT_PROBE_INTERVAL_MS, DEFAULT_PROBE_TIMEOUT_MS,
 };
-use herd_runner::cgroup::{CpuQuota, DEFAULT_CPU_WEIGHT, DEFAULT_IO_WEIGHT, DEFAULT_PIDS_MAX};
+use herd_runner::cgroup::{
+    CpuQuota, IoCeiling, DEFAULT_CPU_WEIGHT, DEFAULT_IO_WEIGHT, DEFAULT_PIDS_MAX,
+};
 use herd_runner::confine::{
     DEFAULT_DISK_BUDGET, DEFAULT_LOG_CAP, DEFAULT_MEMORY_MAX, DEFAULT_NICE, DEFAULT_TIMEOUT_SECONDS,
 };
@@ -107,6 +109,41 @@ struct Args {
     /// it must not claim.
     #[arg(long, env = "HERD_JOB_IO_WEIGHT", value_name = "N")]
     job_io_weight: Option<u32>,
+    /// A hard IO ceiling per job, per second, for the device the data root is
+    /// on: `rbps=200MB,wbps=100MB,riops=4000,wiops=2000`. Any subset of those
+    /// four keys, at least one of them. **None by default.**
+    ///
+    /// `io.weight` above is a *share* of contended bandwidth: it decides who
+    /// gets the disk when two cgroups both want it and caps nothing, so one
+    /// job alone still saturates an idle disk. This is a *ceiling*, enforced
+    /// by blk-throttle whatever the IO scheduler is — the lever for a host
+    /// where one build can freeze everything else on it.
+    ///
+    /// There is no default and there will not be one: a throughput figure is
+    /// right on the machine it was measured on and absurd everywhere else, so
+    /// absent means no `io.max` line written at all rather than a guess.
+    ///
+    /// **How to pick one, rather than invent one.** Where blk-iocost is
+    /// enabled, the kernel has already measured the device and left the
+    /// figures in `/sys/fs/cgroup/io.cost.model`, keyed by the same
+    /// `major:minor` this ceiling names: `rbps`, `wbps` and the IOPS beside
+    /// them. A defensible ceiling is a fraction of those — a quarter is a
+    /// reasonable first try — and not a round number somebody liked. The
+    /// figure is a statement about **how much of a shared device this machine
+    /// lends Herd**, which is `--host-memory`'s shape exactly; on a host where
+    /// Herd shares one queue with production services, that fraction is the
+    /// whole question. Include the IOPS keys as well as the bytes: a freeze is
+    /// a latency event, and small random IO is what causes one.
+    ///
+    /// `io.max` is **per-device**, so the ceiling is written for the device
+    /// the data root is on and nothing else. Where this host cannot carry a
+    /// ceiling for that path — a ZFS data root, no cgroup delegation, a path
+    /// whose device cannot be resolved — the startup is **refused** naming
+    /// the path and the reason, never reduced to the weight. A job that
+    /// writes an absolute path *outside* its data root is bounded by neither
+    /// this nor the weight.
+    #[arg(long, env = "HERD_JOB_IO_MAX", value_name = "rbps=…,wbps=…")]
+    job_io_max: Option<String>,
     /// How many processes one job may hold at once: `pids.max` in its cgroup.
     /// 1024 by default.
     ///
@@ -342,6 +379,17 @@ async fn main() -> Result<()> {
         None => None,
     };
     confinement.io_weight = args.job_io_weight.unwrap_or(DEFAULT_IO_WEIGHT);
+    // Absent means absent: no ceiling resolved, no device named, no io.max
+    // written. A default throughput would be wrong on every machine but the
+    // one it was chosen on.
+    confinement.io_max = match &args.job_io_max {
+        Some(spec) => Some(
+            IoCeiling::parse(spec)
+                .map_err(anyhow::Error::msg)
+                .context("--job-io-max")?,
+        ),
+        None => None,
+    };
     confinement.pids_max = args.job_pids_max.unwrap_or(DEFAULT_PIDS_MAX);
     confinement.cgroup_root = args.cgroup_root;
     confinement.privileged_helpers = args.privileged_helpers;

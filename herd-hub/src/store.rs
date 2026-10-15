@@ -1989,7 +1989,12 @@ mod tests {
         );
         // The runner's figures (M4) say "not measured" on a job that has not
         // run: a figure nobody took is absent, never a zero (D23, E-15).
-        for field in ["host_load_milli", "peak_memory_bytes", "bytes_written"] {
+        for field in [
+            "host_load_milli",
+            "peak_memory_bytes",
+            "bytes_written",
+            "pressure",
+        ] {
             assert!(
                 record["metrics"][field].is_null(),
                 "metrics.{field} should be unset, not zero: {}",
@@ -2258,6 +2263,13 @@ mod tests {
             bytes_written: Some(4_096),
             log_bytes: 19,
             wall_time_ms: 250,
+            // E-32's figure, which is recorded like every other and gates
+            // nothing (D119): what matters of it here is that it survives
+            // the trip through job.json.
+            pressure: Some(herd_proto::Pressure {
+                host_io_milli: Some(4_200),
+                ..herd_proto::Pressure::default()
+            }),
         };
         store
             .record_metrics(&job.id, metrics.clone())

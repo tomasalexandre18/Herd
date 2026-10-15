@@ -138,8 +138,177 @@ impl CpuQuota {
     }
 }
 
+/// A hard per-device IO ceiling: exactly what `io.max` takes, in bytes per
+/// second and in IOPS, read and write apart.
+///
+/// **`io.max` is a hard cap; `io.weight` is a share of contended bandwidth.**
+/// The two are not two strengths of one knob. A weight decides who gets the
+/// disk when two cgroups both want it and caps nothing — one job alone on an
+/// idle machine saturates the disk at any weight, which is the first
+/// consumer's freeze. A ceiling is enforced by blk-throttle whatever the IO
+/// scheduler is, and it holds whether or not anything else is asking for the
+/// disk.
+///
+/// **Neither bounds a job writing an absolute path outside its data root.**
+/// `io.max` names one device — the one the data root is on — and a write
+/// somewhere else goes to another device with no line of Herd's on it. Herd
+/// does not stop a job naming an absolute path (D123, D126), so that is a gap
+/// in both knobs rather than a weakness of one.
+///
+/// Absent by default, and absent means **no line written**: never a zero and
+/// never a guess. There is no honest default throughput — a figure chosen on
+/// an NVMe is absurd on a spinning disk and vice versa — so a number here is
+/// always an operator's measurement of his own machine.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct IoCeiling {
+    read_bps: Option<u64>,
+    write_bps: Option<u64>,
+    read_iops: Option<u64>,
+    write_iops: Option<u64>,
+}
+
+impl IoCeiling {
+    /// What `--job-io-max` accepts: `rbps=`, `wbps=`, `riops=`, `wiops=`,
+    /// comma-separated, in any order, at least one of them.
+    pub const KEYS: [&'static str; 4] = ["rbps", "wbps", "riops", "wiops"];
+
+    /// Read an operator's `rbps=200MB,wbps=100MB` into a ceiling, or the
+    /// sentence to refuse the startup with.
+    ///
+    /// Strict on purpose, in the voice the capability file is read in: an
+    /// unknown key, a key written twice, a figure that is not a figure and a
+    /// figure of zero are each a refusal naming what is wrong. A typo that
+    /// was skipped would be a machine running with no ceiling and an operator
+    /// who believes it has one.
+    pub fn parse(spec: &str) -> Result<Self, String> {
+        let mut ceiling = Self {
+            read_bps: None,
+            write_bps: None,
+            read_iops: None,
+            write_iops: None,
+        };
+        for field in spec.split(',').map(str::trim).filter(|f| !f.is_empty()) {
+            let Some((key, value)) = field.split_once('=') else {
+                return Err(format!(
+                    "{field:?} is not a limit: an IO ceiling is written as key=value, one of \
+                     {}, separated by commas — for instance rbps=200MB,wbps=100MB",
+                    Self::KEYS.join(", ")
+                ));
+            };
+            let key = key.trim();
+            let value = value.trim();
+            // Bytes per second go through the same reader as every other
+            // size an operator gives, so `200MB` and `200MiB` differ here
+            // exactly as they do in `--job-memory-max`. IOPS are a count.
+            let figure = match key {
+                "rbps" | "wbps" => crate::size::parse_bytes(value)
+                    .map_err(|why| format!("{key}={value} is not a number of bytes: {why}"))?,
+                "riops" | "wiops" => value.parse::<u64>().map_err(|_| {
+                    format!("{key}={value} is not a number of IO operations per second")
+                })?,
+                other => {
+                    return Err(format!(
+                        "{other:?} is not an IO ceiling this runner knows. The keys are {}; a \
+                         ceiling is per-device bytes and IOPS, nothing else.",
+                        Self::KEYS.join(", ")
+                    ))
+                }
+            };
+            // Zero is refused rather than written: `io.max rbps=0` stops the
+            // device dead for this job, which is a wall and not a cap — the
+            // same rule the memory ceiling and the pid ceiling are held to.
+            if figure == 0 {
+                return Err(format!(
+                    "{key}=0 would stop this job's IO to that device altogether, which is a \
+                     wall and not a cap. Leave the whole option out for no ceiling, which \
+                     is the default."
+                ));
+            }
+            let slot = match key {
+                "rbps" => &mut ceiling.read_bps,
+                "wbps" => &mut ceiling.write_bps,
+                "riops" => &mut ceiling.read_iops,
+                _ => &mut ceiling.write_iops,
+            };
+            if slot.is_some() {
+                return Err(format!(
+                    "{key} is given twice; the second figure would silently replace the \
+                     first, so neither is used"
+                ));
+            }
+            *slot = Some(figure);
+        }
+        if ceiling == Self::nothing() {
+            return Err(format!(
+                "an IO ceiling of nothing is not a ceiling: give at least one of {}, or leave \
+                 the option out, which is the default and writes no io.max at all",
+                Self::KEYS.join(", ")
+            ));
+        }
+        Ok(ceiling)
+    }
+
+    const fn nothing() -> Self {
+        Self {
+            read_bps: None,
+            write_bps: None,
+            read_iops: None,
+            write_iops: None,
+        }
+    }
+
+    /// The limits as the kernel's keys, in the order `io.max` prints them.
+    /// A limit left out is a limit left at `max`, which is why absent is
+    /// written as nothing rather than as a figure.
+    pub fn fields(&self) -> Vec<(&'static str, u64)> {
+        [
+            ("rbps", self.read_bps),
+            ("wbps", self.write_bps),
+            ("riops", self.read_iops),
+            ("wiops", self.write_iops),
+        ]
+        .into_iter()
+        .filter_map(|(key, figure)| figure.map(|figure| (key, figure)))
+        .collect()
+    }
+
+    /// The ceiling as an operator wrote it, for the startup report.
+    pub fn describe(&self) -> String {
+        self.fields()
+            .into_iter()
+            .map(|(key, figure)| format!("{key}={figure}"))
+            .collect::<Vec<_>>()
+            .join(" ")
+    }
+}
+
+/// An `io.max` ceiling together with the device it names.
+///
+/// The two are one thing on purpose: `io.max` is per-device, so a ceiling
+/// that has not been resolved against a device is not something that could be
+/// written. Resolving it is a startup step that either succeeds or refuses
+/// ([`crate::blockio::ceiling_device`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IoMax {
+    pub ceiling: IoCeiling,
+    /// `major:minor` of the disk the data root is on.
+    pub device: String,
+}
+
+impl IoMax {
+    /// What goes in `io.max`: the device, then the limits it is given.
+    pub fn control_value(&self) -> String {
+        let mut line = self.device.clone();
+        for (key, figure) in self.ceiling.fields() {
+            line.push(' ');
+            line.push_str(&format!("{key}={figure}"));
+        }
+        line
+    }
+}
+
 /// Everything one job's cgroup bounds.
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct JobLimits {
     /// Kernel memory ceiling, in bytes (E-30).
     pub memory_max: u64,
@@ -152,6 +321,11 @@ pub struct JobLimits {
     pub cpu_max: Option<CpuQuota>,
     /// `io.weight`: the same share for block IO, where the host honours it.
     pub io_weight: u32,
+    /// `io.max`: a hard per-device IO ceiling, and **absent by default** —
+    /// the same shape as `cpu_max` above and for the same reason. Resolved
+    /// against a device at startup, because `io.max` is per-device and a
+    /// ceiling that names none is no ceiling.
+    pub io_max: Option<IoMax>,
     /// `pids.max`: how many processes one job may hold.
     pub pids_max: u64,
 }
@@ -164,6 +338,7 @@ impl JobLimits {
             cpu_weight: DEFAULT_CPU_WEIGHT,
             cpu_max: None,
             io_weight: DEFAULT_IO_WEIGHT,
+            io_max: None,
             pids_max: DEFAULT_PIDS_MAX,
         }
     }
@@ -273,6 +448,98 @@ impl Ceiling {
         }
     }
 
+    /// Prove that this host would really take the ceiling an operator asked
+    /// for, by writing it — into a probe cgroup under the same base every job
+    /// cgroup will hang under, and reading it back out.
+    ///
+    /// Done rather than inferred, exactly as delegation is
+    /// ([`prepare_base`]'s probe). Three things could each make a ceiling
+    /// vanish and none of them is visible from a file somebody could read:
+    /// the `io` controller is not handed down, the kernel was built without
+    /// blk-throttle so `io.max` does not exist at all, or it exists and
+    /// refuses this device. Writing the real value is the only answer that
+    /// covers all three — and the answer has to be a refusal, because a
+    /// ceiling quietly weaker than asked for is the wrong failure on a
+    /// machine where one job can saturate the disk (D116, D129).
+    pub fn prove_io_max(&self, io_max: &IoMax) -> Result<(), String> {
+        let Ceiling::Cgroups { base, .. } = self else {
+            return Err(
+                "this host has no cgroup v2 subtree for a job to carry an io.max in".to_owned(),
+            );
+        };
+        let probe = base.join(format!(
+            "herd-io-max-probe-{}-{}",
+            std::process::id(),
+            PROBES.fetch_add(1, Ordering::SeqCst)
+        ));
+        fs::create_dir(&probe).map_err(|error| {
+            format!(
+                "no cgroup could be made under {} to try the ceiling in ({error})",
+                base.display()
+            )
+        })?;
+        let control = probe.join("io.max");
+        let written = fs::write(&control, io_max.control_value()).map_err(|error| {
+            if control.exists() {
+                format!(
+                    "the kernel refused {:?} in {}: {error}",
+                    io_max.control_value(),
+                    control.display()
+                )
+            } else {
+                format!(
+                    "{} does not exist, so this kernel has no per-cgroup IO throttling to \
+                     hold a ceiling with (CONFIG_BLK_DEV_THROTTLING), or the io controller \
+                     is not handed down to {}'s children: {error}",
+                    control.display(),
+                    base.display()
+                )
+            }
+        });
+        // Read back before the probe goes, because a write the kernel took
+        // and did not keep would otherwise read as a proof.
+        let readable = written
+            .as_ref()
+            .ok()
+            .and_then(|()| fs::read_to_string(&control).ok());
+        let _ = fs::remove_dir(&probe);
+        written?;
+        let Some(readable) = readable else {
+            return Err(format!(
+                "{} took the ceiling and then could not be read back, so nothing here can \
+                 say the kernel kept it",
+                control.display()
+            ));
+        };
+        if !readable
+            .lines()
+            .any(|line| line.split_whitespace().next() == Some(io_max.device.as_str()))
+        {
+            return Err(format!(
+                "the kernel took the ceiling for device {} and then listed none: {} reads \
+                 {:?}",
+                io_max.device,
+                control.display(),
+                readable.trim()
+            ));
+        }
+        Ok(())
+    }
+
+    /// Carry a proved ceiling into the limits every job cgroup gets.
+    ///
+    /// Separate from [`Ceiling::detect`] because the order is forced: the
+    /// ceiling can only be resolved against a device and proved against a
+    /// subtree once there *is* a subtree, and an unprovable one is a startup
+    /// refusal rather than a limit to carry.
+    pub fn carry_io_max(&mut self, io_max: IoMax) {
+        match self {
+            Ceiling::Cgroups { limits, .. } | Ceiling::Rlimit { limits, .. } => {
+                limits.io_max = Some(io_max)
+            }
+        }
+    }
+
     /// Make this job's cgroup, or `None` on a host that fell back.
     pub fn open_for_job(&self, tag: &JobTag) -> Option<JobCgroup> {
         let Ceiling::Cgroups { base, limits, .. } = self else {
@@ -286,9 +553,20 @@ impl Ceiling {
                 // the rlimit fallback rather than uncapped.
                 eprintln!(
                     "herd-runner: the cgroup for job {} could not be made under {}: \
-                     {error}; this job falls back to an address-space limit",
+                     {error}; this job falls back to an address-space limit{}",
                     tag.as_str(),
-                    base.display()
+                    base.display(),
+                    match &limits.io_max {
+                        // The ceiling an operator declared is gone for this
+                        // job, and that is worse news than the fallback
+                        // itself: it was a cap, not a courtesy.
+                        Some(io_max) => format!(
+                            ", and the io.max ceiling declared for device {} is NOT ENFORCED \
+                             for it — this job's IO is bounded by nothing",
+                            io_max.device
+                        ),
+                        None => String::new(),
+                    }
                 );
                 None
             }
@@ -340,6 +618,16 @@ impl JobCgroup {
             let _ = fs::write(cgroup.dir.join("cpu.max"), quota.control_value());
         }
         let _ = fs::write(cgroup.dir.join("io.weight"), limits.io_weight.to_string());
+        // `io.max` is the one of these that keeps a hard `?`, beside memory,
+        // and for the same reason: it is absent unless an operator declared
+        // it, so a declared ceiling that could not be written is a promise
+        // broken rather than a host limitation already reported. It was
+        // proved writable at startup against this very base
+        // ([`Ceiling::prove_io_max`]), so a failure here is the host having
+        // changed underneath a running runner — loud, not swallowed.
+        if let Some(io_max) = &limits.io_max {
+            fs::write(cgroup.dir.join("io.max"), io_max.control_value())?;
+        }
         let _ = fs::write(cgroup.dir.join("pids.max"), limits.pids_max.to_string());
         Ok(cgroup)
     }
@@ -813,5 +1101,74 @@ mod tests {
                 // before it ever gets here (E-46).
             }
         }
+    }
+    /// `io.max` is per-device: every line of it begins with a `major:minor`,
+    /// and the first thing to get right is that the value written **names
+    /// the device the job's data root is on**. A value with no device is not
+    /// a weaker ceiling; the kernel refuses the write outright.
+    #[test]
+    fn the_value_written_names_the_device_and_then_the_limits() {
+        let ceiling = IoCeiling::parse("rbps=200MB,wbps=100MB,riops=4000,wiops=2000")
+            .expect("four limits are a ceiling");
+        let io_max = IoMax {
+            ceiling,
+            device: "259:0".to_owned(),
+        };
+        // The device first, then the kernel's own keys. This is the exact
+        // text that goes in io.max.
+        assert_eq!(
+            io_max.control_value(),
+            "259:0 rbps=200000000 wbps=100000000 riops=4000 wiops=2000"
+        );
+        // A subset is a subset: a limit left out is left at `max`, so it is
+        // written as nothing rather than as a figure.
+        let write_only = IoMax {
+            ceiling: IoCeiling::parse("wbps=50MiB").expect("one limit is a ceiling"),
+            device: "8:16".to_owned(),
+        };
+        assert_eq!(write_only.control_value(), "8:16 wbps=52428800");
+        // And the device is the first word, whatever the limits are: a line
+        // the kernel would read as a device-less ceiling is no ceiling.
+        for value in [io_max.control_value(), write_only.control_value()] {
+            let device = value.split_whitespace().next().expect("a first word");
+            assert!(
+                device.contains(':') && device.split(':').all(|half| half.parse::<u32>().is_ok()),
+                "io.max is per-device and this line names none: {value}"
+            );
+        }
+    }
+
+    /// Absent by default means **no line written** — never a zero and never a
+    /// guess. A default throughput figure would be right on the machine it
+    /// was chosen on and wrong on every other, and `rbps=0` is a wall rather
+    /// than a cap, so both are refused where they are written.
+    #[test]
+    fn a_ceiling_is_absent_by_default_and_zero_is_refused_not_written() {
+        assert_eq!(JobLimits::with_memory_max(1 << 30).io_max, None);
+        let why = IoCeiling::parse("rbps=0").expect_err("zero is a wall");
+        assert!(why.contains("wall and not a cap"), "{why}");
+        assert!(why.contains("Leave the whole option out"), "{why}");
+        let why = IoCeiling::parse("wiops=0").expect_err("zero IOPS is a wall too");
+        assert!(why.contains("wall and not a cap"), "{why}");
+        // An option given with nothing in it is a refusal rather than a
+        // ceiling of nothing, which would read as a ceiling and bound
+        // nothing.
+        let why = IoCeiling::parse("").expect_err("nothing is not a ceiling");
+        assert!(why.contains("is not a ceiling"), "{why}");
+        // And the strictness the capability file is read with: an unknown
+        // key, a key twice, a figure that is not one.
+        let why = IoCeiling::parse("rbs=10MB").expect_err("a typo is not a limit");
+        assert!(why.contains("\"rbs\"") && why.contains("rbps"), "{why}");
+        let why = IoCeiling::parse("rbps=1MB,rbps=2MB").expect_err("twice is ambiguous");
+        assert!(why.contains("given twice"), "{why}");
+        let why = IoCeiling::parse("riops=plenty").expect_err("plenty is not a figure");
+        assert!(why.contains("IO operations per second"), "{why}");
+        let why = IoCeiling::parse("rbps").expect_err("a key with no value is not a limit");
+        assert!(why.contains("key=value"), "{why}");
+        // Whitespace and order are an operator's business, not the parser's.
+        assert_eq!(
+            IoCeiling::parse(" wbps=1MB , rbps=2MB ").expect("spaces are allowed"),
+            IoCeiling::parse("rbps=2MB,wbps=1MB").expect("order does not matter")
+        );
     }
 }
