@@ -1,8 +1,10 @@
-//! The kernel memory ceiling, and the fallback when there is none (E-30, Q6).
+//! The kernel bounds a job runs inside, and the fallback when there are none
+//! (E-30, Q6).
 //!
 //! All of one job's processes live in one cgroup v2 subtree carrying
-//! `memory.max`. An allocation past the ceiling is refused by the kernel and
-//! the cgroup's processes are killed — **the job's, and only the job's**: the
+//! `memory.max`, `cpu.weight`, `io.weight`, `pids.max` and — where an
+//! operator lent one — `cpu.max`. An allocation past the memory ceiling is
+//! refused by the kernel and the cgroup's processes are killed — **the job's, and only the job's**: the
 //! runner is in a sibling cgroup, and so is every other job. Nothing here
 //! asks a userspace watchdog to notice in time, because by the time a
 //! watchdog notices a 31 GiB host is already swapping.
@@ -25,6 +27,18 @@
 //! still holds, but one that bounds each process rather than the tree, and
 //! that makes an allocation fail rather than kill. The difference is
 //! documented behaviour and is named in the fallback reason.
+//!
+//! ## When a controller is missing rather than the whole subtree
+//!
+//! `memory` is not the only controller a base may withhold. A host can give
+//! `memory` and not `cpu`, and then a job's CPU share is nothing but its
+//! niceness. There is no fallback to offer for that — niceness is already
+//! applied — so what is owed is the truth: every control the subtree cannot
+//! enforce comes back from [`Ceiling::detect`] as a sentence the runner
+//! prints at startup, in the same voice as the memory fallback. The one
+//! exception is `cpu.max`, which is absent by default and therefore a hard
+//! ceiling an operator *asked* for: that one is a refusal at startup rather
+//! than a line in a report (see [`crate::confine::Confined::prepare`]).
 
 use std::fs::{self, File, OpenOptions};
 use std::io;
@@ -44,36 +58,200 @@ const MOUNT_POINT: &str = "/sys/fs/cgroup";
 /// can be the parent of one cgroup per job.
 const RUNNER_LEAF: &str = "herd-runner.leaf";
 
-/// How a runner enforces the memory ceiling on this host.
+/// How much CPU a job gets when something else on the machine wants it.
+///
+/// `cpu.weight` is a share, not a cap: 100 is what an ordinary process gets,
+/// and a job at 10 takes about a tenth of a contended core against it — while
+/// still using every core of a machine nobody else is using, which is the
+/// whole point of a weight and the reason there is no quota by default. The
+/// consumer's two incidents were a host with nothing but `nice 10` between a
+/// twelve-thread build and every docker service on it.
+pub const DEFAULT_CPU_WEIGHT: u32 = 10;
+
+/// The same shape for block IO. Honoured only by bfq or blk-iocost, which is
+/// why the runner says at startup whether this host honours it at all
+/// ([`crate::blockio`]).
+pub const DEFAULT_IO_WEIGHT: u32 = 10;
+
+/// What the kernel accepts in `cpu.weight` and `io.weight`. A figure outside
+/// it is a startup refusal, not a write the kernel turns down per job.
+pub const WEIGHT_RANGE: std::ops::RangeInclusive<u32> = 1..=10_000;
+
+/// How many processes one job may hold at once.
+///
+/// A plain number by default, and not optional: a fork bomb inside a job must
+/// not be able to take the host down, and nothing about a build needs an
+/// unbounded process count. A thousand is far above a twelve-thread build of
+/// the first consumer and far below what it takes to exhaust a host's pid
+/// space.
+pub const DEFAULT_PIDS_MAX: u64 = 1024;
+
+/// The smallest pid ceiling that is a cap rather than a wall: a job is at
+/// least a shell, the command it runs and a child or two of that command.
+pub const MINIMUM_PIDS_MAX: u64 = 8;
+
+/// A hard CPU quota: microseconds of CPU time per period, which is exactly
+/// what `cpu.max` takes.
+///
+/// Said to an operator in cores, because that is the unit `--host-threads`
+/// and a build's `-j` are already in.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct CpuQuota {
+    quota_us: u64,
+    period_us: u64,
+}
+
+impl CpuQuota {
+    /// 100 ms, the kernel's own default period. One number is enough for an
+    /// operator to declare; the period is not a dial anybody has asked for.
+    pub const PERIOD_US: u64 = 100_000;
+
+    /// The smallest quota that is a cap rather than a wall, in cores. A
+    /// hundredth of a core still gets a shell through its own startup; less
+    /// is a promise that nothing finishes.
+    pub const MINIMUM_CORES: f64 = 0.01;
+
+    /// A quota of this many cores, or the sentence to refuse the startup with.
+    pub fn from_cores(cores: f64) -> Result<Self, String> {
+        if !cores.is_finite() || cores < Self::MINIMUM_CORES {
+            return Err(format!(
+                "a hard CPU quota of {cores} cores is a wall and not a cap: the floor is \
+                 {} of a core. Leave the option out for no quota at all, which is the \
+                 default.",
+                Self::MINIMUM_CORES
+            ));
+        }
+        Ok(Self {
+            quota_us: (cores * Self::PERIOD_US as f64).round() as u64,
+            period_us: Self::PERIOD_US,
+        })
+    }
+
+    /// How many cores this quota is worth.
+    pub fn cores(&self) -> f64 {
+        self.quota_us as f64 / self.period_us as f64
+    }
+
+    /// What goes in `cpu.max`: a quota and a period, in microseconds.
+    pub fn control_value(&self) -> String {
+        format!("{} {}", self.quota_us, self.period_us)
+    }
+}
+
+/// Everything one job's cgroup bounds.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct JobLimits {
+    /// Kernel memory ceiling, in bytes (E-30).
+    pub memory_max: u64,
+    /// `cpu.weight`: the share a job gets under contention.
+    pub cpu_weight: u32,
+    /// `cpu.max`: a hard ceiling, and **absent by default**. The reasoning is
+    /// `--host-memory`'s: a hard ceiling is a lend an operator declares, not
+    /// something Herd assumes, and a quota wastes a machine nobody else is
+    /// using.
+    pub cpu_max: Option<CpuQuota>,
+    /// `io.weight`: the same share for block IO, where the host honours it.
+    pub io_weight: u32,
+    /// `pids.max`: how many processes one job may hold.
+    pub pids_max: u64,
+}
+
+impl JobLimits {
+    /// The defaults around one memory ceiling.
+    pub fn with_memory_max(memory_max: u64) -> Self {
+        Self {
+            memory_max,
+            cpu_weight: DEFAULT_CPU_WEIGHT,
+            cpu_max: None,
+            io_weight: DEFAULT_IO_WEIGHT,
+            pids_max: DEFAULT_PIDS_MAX,
+        }
+    }
+}
+
+/// A control this host's subtree cannot enforce, and why.
+///
+/// Carried rather than logged where it is found, because the runner prints
+/// its whole startup report in one place and a line printed from inside
+/// detection would be invisible to the test that asserts the report.
+#[derive(Debug, Clone)]
+pub struct Unenforced {
+    /// The controller that is missing: `cpu`, `io` or `pids`.
+    pub controller: &'static str,
+    /// Which controls go with it, as an operator reads them.
+    pub controls: &'static str,
+    /// One sentence naming what the subtree lacks.
+    pub why: String,
+}
+
+/// How a runner enforces a job's bounds on this host.
 #[derive(Debug)]
 pub enum Ceiling {
     /// One cgroup per job under a delegated base. The ceiling is the
     /// kernel's, applies to the whole process tree, and kills.
-    Cgroups { base: PathBuf, memory_max: u64 },
+    Cgroups {
+        base: PathBuf,
+        limits: JobLimits,
+        /// The controls this base cannot give, each with its reason. Empty on
+        /// a host that enforces all of them.
+        unenforced: Vec<Unenforced>,
+    },
     /// No usable cgroup v2 subtree. `why` is one sentence naming what was
     /// missing, printed at startup and repeated in every job's log.
-    Rlimit { memory_max: u64, why: String },
+    Rlimit { limits: JobLimits, why: String },
 }
 
 impl Ceiling {
-    /// Work out which ceiling this host can give, preparing the subtree if it
-    /// can give the real one.
+    /// Work out which bounds this host can give, preparing the subtree if it
+    /// can give the real ones.
     ///
     /// `base` overrides the cgroup the runner derives from its own
     /// `/proc/self/cgroup`; it exists because a test must be able to point a
     /// runner at a subtree it set up, and because an operator may want the
     /// runner's jobs somewhere other than beside the runner.
-    pub fn detect(memory_max: u64, base: Option<&Path>) -> Self {
+    pub fn detect(limits: JobLimits, base: Option<&Path>) -> Self {
         match prepare_base(base) {
-            Ok(base) => Ceiling::Cgroups { base, memory_max },
-            Err(why) => Ceiling::Rlimit { memory_max, why },
+            Ok((base, unenforced)) => Ceiling::Cgroups {
+                base,
+                limits,
+                unenforced,
+            },
+            Err(why) => Ceiling::Rlimit { limits, why },
         }
     }
 
     /// The ceiling in bytes, whichever mechanism enforces it.
     pub fn memory_max(&self) -> u64 {
+        self.limits().memory_max
+    }
+
+    /// Every bound a job is given here, enforced or not.
+    pub fn limits(&self) -> &JobLimits {
         match self {
-            Ceiling::Cgroups { memory_max, .. } | Ceiling::Rlimit { memory_max, .. } => *memory_max,
+            Ceiling::Cgroups { limits, .. } | Ceiling::Rlimit { limits, .. } => limits,
+        }
+    }
+
+    /// The controls this host cannot enforce, for the startup report. On a
+    /// host with no subtree at all the memory fallback already says why, and
+    /// this is empty: there is one reason, not four.
+    pub fn unenforced(&self) -> &[Unenforced] {
+        match self {
+            Ceiling::Cgroups { unenforced, .. } => unenforced,
+            Ceiling::Rlimit { .. } => &[],
+        }
+    }
+
+    /// Why this host cannot enforce one controller's controls, or `None` when
+    /// it can. A host with no cgroup subtree cannot enforce any of them, and
+    /// says so with the fallback's own reason.
+    pub fn cannot_enforce(&self, controller: &str) -> Option<&str> {
+        match self {
+            Ceiling::Rlimit { why, .. } => Some(why),
+            Ceiling::Cgroups { unenforced, .. } => unenforced
+                .iter()
+                .find(|missing| missing.controller == controller)
+                .map(|missing| missing.why.as_str()),
         }
     }
 
@@ -97,10 +275,10 @@ impl Ceiling {
 
     /// Make this job's cgroup, or `None` on a host that fell back.
     pub fn open_for_job(&self, tag: &JobTag) -> Option<JobCgroup> {
-        let Ceiling::Cgroups { base, memory_max } = self else {
+        let Ceiling::Cgroups { base, limits, .. } = self else {
             return None;
         };
-        match JobCgroup::create(base, tag, *memory_max) {
+        match JobCgroup::create(base, tag, limits) {
             Ok(cgroup) => Some(cgroup),
             Err(error) => {
                 // Detection succeeded and creation failed, which means the
@@ -126,7 +304,7 @@ pub struct JobCgroup {
 }
 
 impl JobCgroup {
-    fn create(base: &Path, tag: &JobTag, memory_max: u64) -> io::Result<Self> {
+    fn create(base: &Path, tag: &JobTag, limits: &JobLimits) -> io::Result<Self> {
         // The job's id is in the tag for a human reading `/sys/fs/cgroup`, but
         // what makes it unique is the runner's pid and a counter. Two runners
         // may share a base — two runners on one machine pointed at the same
@@ -142,13 +320,27 @@ impl JobCgroup {
         let cgroup = Self { dir };
         // memory.max before anything is in the cgroup: a process must never
         // be inside it for even one allocation without the ceiling set.
-        fs::write(cgroup.dir.join("memory.max"), memory_max.to_string())?;
+        fs::write(cgroup.dir.join("memory.max"), limits.memory_max.to_string())?;
         // Swap is part of the ceiling: a job allowed to swap past its memory
         // cap is a job that takes the host's responsiveness with it.
         let _ = fs::write(cgroup.dir.join("memory.swap.max"), "0");
         // Kill the whole cgroup on the first OOM rather than one process at a
         // time, so a job dies as a job and does not limp on half-killed.
         let _ = fs::write(cgroup.dir.join("memory.oom.group"), "1");
+
+        // And the rest of the bounds, before a process is in here too. Each
+        // one is written and its failure ignored on purpose: a controller the
+        // base does not hand down was already named at startup
+        // ([`Ceiling::unenforced`]), and a job refused here for a host
+        // limitation the operator has been told about twice would be a runner
+        // that takes no work rather than a runner that is honest. Memory
+        // keeps its hard `?` above: that one is E-30's promise.
+        let _ = fs::write(cgroup.dir.join("cpu.weight"), limits.cpu_weight.to_string());
+        if let Some(quota) = limits.cpu_max {
+            let _ = fs::write(cgroup.dir.join("cpu.max"), quota.control_value());
+        }
+        let _ = fs::write(cgroup.dir.join("io.weight"), limits.io_weight.to_string());
+        let _ = fs::write(cgroup.dir.join("pids.max"), limits.pids_max.to_string());
         Ok(cgroup)
     }
 
@@ -207,7 +399,7 @@ impl Drop for JobCgroup {
 ///
 /// Every failure returns one sentence naming what was missing, because that
 /// sentence is the whole value of the fallback.
-fn prepare_base(explicit: Option<&Path>) -> Result<PathBuf, String> {
+fn prepare_base(explicit: Option<&Path>) -> Result<(PathBuf, Vec<Unenforced>), String> {
     if !cfg!(target_os = "linux") {
         return Err("this host is not Linux, so there is no cgroup v2 to put a job in".to_owned());
     }
@@ -292,7 +484,55 @@ fn prepare_base(explicit: Option<&Path>) -> Result<PathBuf, String> {
             ));
         }
     }
-    Ok(base)
+
+    // The other three controllers. None of them is worth a fallback and none
+    // is worth refusing a runner over: a host that gives `memory` and not
+    // `cpu` still runs jobs under a real memory ceiling, and what it owes is
+    // the sentence saying the CPU share is nothing but niceness there.
+    let mut unenforced = Vec::new();
+    for (controller, controls) in [
+        ("cpu", "cpu.weight and cpu.max"),
+        ("io", "io.weight"),
+        ("pids", "pids.max"),
+    ] {
+        if let Err(why) = enable_for_children(&base, controller) {
+            unenforced.push(Unenforced {
+                controller,
+                controls,
+                why,
+            });
+        }
+    }
+    Ok((base, unenforced))
+}
+
+/// Hand one controller down to the base's children, or say what stopped it.
+///
+/// Three outcomes, and they are not the same: the controller is already handed
+/// down, the base never had it to give, or the base has it and this runner may
+/// not write `cgroup.subtree_control`. Only the first is silence.
+fn enable_for_children(base: &Path, controller: &str) -> Result<(), String> {
+    if is_enabled_for_children(base, controller) {
+        return Ok(());
+    }
+    let offered = fs::read_to_string(base.join("cgroup.controllers")).unwrap_or_default();
+    if !offered.split_whitespace().any(|name| name == controller) {
+        return Err(format!(
+            "the cgroup {} does not offer the {controller} controller (it offers: {})",
+            base.display(),
+            offered.trim()
+        ));
+    }
+    fs::write(
+        base.join("cgroup.subtree_control"),
+        format!("+{controller}"),
+    )
+    .map_err(|error| {
+        format!(
+            "the {controller} controller cannot be enabled for the children of {}: {error}",
+            base.display()
+        )
+    })
 }
 
 /// Whether this runner could move a process from `own` into a child of `base`,
@@ -333,12 +573,16 @@ fn common_ancestor(one: &Path, other: &Path) -> PathBuf {
     }
 }
 
-/// Whether the base already hands the memory controller to its children, in
-/// which case the runner needs no write to `cgroup.subtree_control` at all.
-fn memory_is_enabled_for_children(base: &Path) -> bool {
+/// Whether the base already hands a controller to its children, in which case
+/// the runner needs no write to `cgroup.subtree_control` at all.
+fn is_enabled_for_children(base: &Path, controller: &str) -> bool {
     fs::read_to_string(base.join("cgroup.subtree_control"))
-        .map(|text| text.split_whitespace().any(|name| name == "memory"))
+        .map(|text| text.split_whitespace().any(|name| name == controller))
         .unwrap_or(false)
+}
+
+fn memory_is_enabled_for_children(base: &Path) -> bool {
+    is_enabled_for_children(base, "memory")
 }
 
 /// Move this runner's processes into a leaf of the base, and say where.
@@ -409,12 +653,41 @@ fn read_number(path: &Path) -> Option<u64> {
 mod tests {
     use super::*;
 
+    /// `cpu.max` takes two numbers and an operator gives one, in the unit a
+    /// `-j` is already in. The conversion is the whole of that promise.
+    #[test]
+    fn a_cpu_quota_is_cores_in_and_a_quota_and_period_out() {
+        let four = CpuQuota::from_cores(4.0).expect("four cores is a quota");
+        assert_eq!(four.control_value(), "400000 100000");
+        assert_eq!(four.cores(), 4.0);
+        let half = CpuQuota::from_cores(1.5).expect("a fraction of a core is a quota");
+        assert_eq!(half.control_value(), "150000 100000");
+        let floor = CpuQuota::from_cores(CpuQuota::MINIMUM_CORES).expect("the floor is a quota");
+        assert_eq!(floor.control_value(), "1000 100000");
+    }
+
+    /// And a quota nothing could run under is refused where it is written,
+    /// exactly as a memory ceiling of 1 kB is — naming the floor and naming
+    /// the way to ask for no quota at all.
+    #[test]
+    fn a_cpu_quota_too_small_to_run_anything_is_refused_naming_the_floor() {
+        for wall in [0.0, -1.0, 0.001, f64::NAN] {
+            let error = CpuQuota::from_cores(wall)
+                .err()
+                .unwrap_or_else(|| panic!("a quota of {wall} cores was accepted"));
+            assert!(
+                error.contains("wall and not a cap") && error.contains("0.01"),
+                "{error}"
+            );
+        }
+    }
+
     /// Whatever this host turns out to offer, detection must answer, and the
     /// answer must be either a prepared subtree or a sentence. Never a panic,
     /// and never a `None` that leaves a job uncapped without saying so.
     #[test]
     fn detection_answers_with_a_subtree_or_a_reason() {
-        let ceiling = Ceiling::detect(64 << 20, None);
+        let ceiling = Ceiling::detect(JobLimits::with_memory_max(64 << 20), None);
         assert_eq!(ceiling.memory_max(), 64 << 20);
         match &ceiling {
             Ceiling::Cgroups { base, .. } => {
@@ -431,12 +704,45 @@ mod tests {
         }
     }
 
+    /// Every control is either enforced or named. On a host with no subtree
+    /// at all there is one reason and not four, and it answers for all of
+    /// them; on a host with a subtree, whatever it withholds comes back as a
+    /// sentence naming the cgroup.
+    #[test]
+    fn a_control_this_host_cannot_enforce_comes_back_named() {
+        let ceiling = Ceiling::detect(JobLimits::with_memory_max(64 << 20), None);
+        for missing in ceiling.unenforced() {
+            assert!(
+                missing.why.contains(MOUNT_POINT),
+                "an unenforced control must name the cgroup that withheld it: {}",
+                missing.why
+            );
+            assert_eq!(
+                ceiling.cannot_enforce(missing.controller),
+                Some(missing.why.as_str())
+            );
+        }
+        if ceiling.fallback_reason().is_some() {
+            assert!(
+                ceiling.unenforced().is_empty(),
+                "a host with no cgroup subtree has one reason, not four"
+            );
+            for controller in ["cpu", "io", "pids"] {
+                assert!(
+                    ceiling.cannot_enforce(controller).is_some(),
+                    "{controller} cannot be enforced without a cgroup, and that must be \
+                     answerable"
+                );
+            }
+        }
+    }
+
     /// A cgroup path that does not exist is a named fallback, not a panic and
     /// not an uncapped job.
     #[test]
     fn a_cgroup_that_does_not_exist_falls_back_naming_it() {
         let missing = Path::new("/sys/fs/cgroup/herd-no-such-cgroup-m4");
-        let ceiling = Ceiling::detect(1 << 20, Some(missing));
+        let ceiling = Ceiling::detect(JobLimits::with_memory_max(1 << 20), Some(missing));
         let why = ceiling
             .fallback_reason()
             .expect("a missing cgroup cannot enforce a ceiling");
@@ -477,7 +783,10 @@ mod tests {
     /// particular not the leaf the runner would have stood in.
     #[test]
     fn a_fallback_leaves_no_leaf_cgroup_behind() {
-        let ceiling = Ceiling::detect(1 << 20, Some(Path::new(MOUNT_POINT)));
+        let ceiling = Ceiling::detect(
+            JobLimits::with_memory_max(1 << 20),
+            Some(Path::new(MOUNT_POINT)),
+        );
         if ceiling.fallback_reason().is_some() {
             assert!(
                 !Path::new(MOUNT_POINT).join(RUNNER_LEAF).exists(),
@@ -492,7 +801,10 @@ mod tests {
         // if memory is among them this assertion is about the other branch,
         // which `a_cgroup_that_does_not_exist` already covers. What matters
         // here is that neither branch panics on a real directory.
-        let ceiling = Ceiling::detect(1 << 20, Some(Path::new(MOUNT_POINT)));
+        let ceiling = Ceiling::detect(
+            JobLimits::with_memory_max(1 << 20),
+            Some(Path::new(MOUNT_POINT)),
+        );
         match ceiling.fallback_reason() {
             Some(why) => assert!(why.contains(MOUNT_POINT), "{why}"),
             None => {

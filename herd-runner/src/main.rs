@@ -6,6 +6,7 @@ use clap::Parser;
 use herd_runner::capability::{
     CapabilityConfig, ProbeSettings, DEFAULT_PROBE_INTERVAL_MS, DEFAULT_PROBE_TIMEOUT_MS,
 };
+use herd_runner::cgroup::{CpuQuota, DEFAULT_CPU_WEIGHT, DEFAULT_IO_WEIGHT, DEFAULT_PIDS_MAX};
 use herd_runner::confine::{
     DEFAULT_DISK_BUDGET, DEFAULT_LOG_CAP, DEFAULT_MEMORY_MAX, DEFAULT_NICE, DEFAULT_TIMEOUT_SECONDS,
 };
@@ -78,6 +79,42 @@ struct Args {
     /// CPU niceness added to a job. IO niceness goes to the idle class with it.
     #[arg(long, env = "HERD_JOB_NICE", value_name = "N")]
     job_nice: Option<i32>,
+    /// How much CPU a job gets when something else on this machine wants it:
+    /// `cpu.weight` in the job's cgroup, 1 to 10000 against the 100 an
+    /// ordinary process has. 10 by default.
+    ///
+    /// A share and not a cap: a job at 10 yields almost all of a contended
+    /// core and still uses every core of a machine nobody else is using,
+    /// which is what niceness alone was failing to do (the first consumer's
+    /// twelve-thread build took a whole host down beside `nice 10`).
+    #[arg(long, env = "HERD_JOB_CPU_WEIGHT", value_name = "N")]
+    job_cpu_weight: Option<u32>,
+    /// A hard CPU ceiling per job, in cores: `4`, `1.5`. **None by default.**
+    ///
+    /// The reasoning is `--host-memory`'s: a hard ceiling is a lend an
+    /// operator declares, not something Herd assumes, and a quota wastes a
+    /// machine nobody else is using. Where it is given and this host cannot
+    /// enforce it, the startup is refused rather than quietly reduced to the
+    /// weight above.
+    #[arg(long, env = "HERD_JOB_CPU_MAX", value_name = "CORES")]
+    job_cpu_max: Option<f64>,
+    /// The same share for block IO: `io.weight` in the job's cgroup, 1 to
+    /// 10000 against 100. 10 by default.
+    ///
+    /// Honoured only by the bfq scheduler or by blk-iocost. On a host where
+    /// neither is in play the runner says at startup that this number is
+    /// written and ignored, because a bound a runner does not have is a bound
+    /// it must not claim.
+    #[arg(long, env = "HERD_JOB_IO_WEIGHT", value_name = "N")]
+    job_io_weight: Option<u32>,
+    /// How many processes one job may hold at once: `pids.max` in its cgroup.
+    /// 1024 by default.
+    ///
+    /// A plain number and not optional: a fork bomb inside a job must not be
+    /// able to take the host down, and no build needs an unbounded process
+    /// count.
+    #[arg(long, env = "HERD_JOB_PIDS_MAX", value_name = "N")]
+    job_pids_max: Option<u64>,
     /// A delegated cgroup v2 directory to hang job cgroups under, instead of
     /// this runner's own. Useful where the runner is not a systemd unit.
     #[arg(long, env = "HERD_CGROUP_ROOT", value_name = "PATH")]
@@ -295,6 +332,17 @@ async fn main() -> Result<()> {
         None => DEFAULT_DISK_BUDGET,
     };
     confinement.nice = args.job_nice.unwrap_or(DEFAULT_NICE);
+    confinement.cpu_weight = args.job_cpu_weight.unwrap_or(DEFAULT_CPU_WEIGHT);
+    confinement.cpu_max = match args.job_cpu_max {
+        Some(cores) => Some(
+            CpuQuota::from_cores(cores)
+                .map_err(anyhow::Error::msg)
+                .context("--job-cpu-max")?,
+        ),
+        None => None,
+    };
+    confinement.io_weight = args.job_io_weight.unwrap_or(DEFAULT_IO_WEIGHT);
+    confinement.pids_max = args.job_pids_max.unwrap_or(DEFAULT_PIDS_MAX);
     confinement.cgroup_root = args.cgroup_root;
     confinement.privileged_helpers = args.privileged_helpers;
 

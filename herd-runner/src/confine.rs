@@ -9,7 +9,10 @@
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use crate::cgroup::Ceiling;
+use crate::cgroup::{
+    Ceiling, CpuQuota, JobLimits, DEFAULT_CPU_WEIGHT, DEFAULT_IO_WEIGHT, DEFAULT_PIDS_MAX,
+    MINIMUM_PIDS_MAX, WEIGHT_RANGE,
+};
 use crate::privilege::PrivilegedHelpers;
 use crate::reclaim::{reclaim_a_past_life, JobTag, LiveJobs, MARKER_VARIABLE};
 use crate::root::{DataRoot, Workspace};
@@ -72,6 +75,19 @@ pub struct Confinement {
     pub disk_budget: u64,
     /// CPU niceness added to a job's process. IO niceness goes with it.
     pub nice: i32,
+    /// `cpu.weight` in a job's cgroup: the share it gets under contention.
+    /// Low by default, so a job yields to everything else on the machine and
+    /// still uses an idle one fully.
+    pub cpu_weight: u32,
+    /// `cpu.max` in a job's cgroup: a hard quota, and none by default.
+    pub cpu_max: Option<CpuQuota>,
+    /// `io.weight` in a job's cgroup, low by default and inert on a host
+    /// whose block layer does not weight IO — which the runner says at
+    /// startup rather than leaving to be discovered.
+    pub io_weight: u32,
+    /// `pids.max` in a job's cgroup: a fork bomb inside a job must not be
+    /// able to take the host down.
+    pub pids_max: u64,
     /// A cgroup to hang job cgroups under, instead of the runner's own.
     pub cgroup_root: Option<PathBuf>,
     /// The fixed list of helper commands allowed to need privilege (E-46).
@@ -88,8 +104,24 @@ impl Confinement {
             log_cap: DEFAULT_LOG_CAP,
             disk_budget: DEFAULT_DISK_BUDGET,
             nice: DEFAULT_NICE,
+            cpu_weight: DEFAULT_CPU_WEIGHT,
+            cpu_max: None,
+            io_weight: DEFAULT_IO_WEIGHT,
+            pids_max: DEFAULT_PIDS_MAX,
             cgroup_root: None,
             privileged_helpers: Vec::new(),
+        }
+    }
+
+    /// The four controls a job's cgroup carries, as the cgroup code takes
+    /// them.
+    pub fn job_limits(&self) -> JobLimits {
+        JobLimits {
+            memory_max: self.memory_max,
+            cpu_weight: self.cpu_weight,
+            cpu_max: self.cpu_max,
+            io_weight: self.io_weight,
+            pids_max: self.pids_max,
         }
     }
 }
@@ -109,6 +141,9 @@ pub struct Confined {
     live: LiveJobs,
     /// What the startup reaper found of a previous life, for the report.
     reclaimed: Vec<String>,
+    /// Why `io.weight` cannot bite on this host, where it cannot. A bound
+    /// that is written and ignored must be said out loud, not assumed.
+    io_weight_inert: Option<String>,
 }
 
 impl Confined {
@@ -139,7 +174,33 @@ impl Confined {
         if confinement.timeout.is_zero() {
             return Err("a time cap of 0 s would stop every job before it ran".to_owned());
         }
-        let ceiling = Ceiling::detect(confinement.memory_max, confinement.cgroup_root.as_deref());
+        // The weights are the kernel's own range, checked here so that a
+        // figure outside it is one refusal at startup rather than a write the
+        // kernel turns down once per job, silently, forever.
+        for (option, weight) in [
+            ("--job-cpu-weight", confinement.cpu_weight),
+            ("--job-io-weight", confinement.io_weight),
+        ] {
+            if !WEIGHT_RANGE.contains(&weight) {
+                return Err(format!(
+                    "{option} {weight} is outside what the kernel accepts for a cgroup \
+                     weight ({}..={}). A weight is a share against the 100 an ordinary \
+                     process has, not a percentage and not a cap.",
+                    WEIGHT_RANGE.start(),
+                    WEIGHT_RANGE.end()
+                ));
+            }
+        }
+        // And a pid ceiling, which is a cap and not a wall for the same
+        // reason the memory ceiling has a floor.
+        if confinement.pids_max < MINIMUM_PIDS_MAX {
+            return Err(format!(
+                "--job-pids-max {} would refuse every job: a job is at least a shell, the \
+                 command it runs and a child or two of that command. The floor is {}.",
+                confinement.pids_max, MINIMUM_PIDS_MAX
+            ));
+        }
+        let ceiling = Ceiling::detect(confinement.job_limits(), confinement.cgroup_root.as_deref());
         // D23's loud fallback is for a host that cannot give the real ceiling.
         // An operator who named `--cgroup-root` asked for a specific subtree:
         // falling back there would answer a precise request with something
@@ -151,6 +212,29 @@ impl Confined {
                 asked.display()
             ));
         }
+        // `cpu.max` is the one control that is absent unless an operator
+        // declares it, which makes asking for it a precise request for a hard
+        // ceiling — the same kind of request `--cgroup-root` is. A runner that
+        // took the option and enforced no quota would be a machine lending a
+        // guarantee it does not have, so it is a refusal naming what is
+        // missing. The three controls that have defaults take the other road:
+        // a loud line in the startup report, because refusing there would
+        // mean a runner that will not start on an ordinary host.
+        if confinement.cpu_max.is_some() {
+            if let Some(why) = ceiling.cannot_enforce("cpu") {
+                return Err(format!(
+                    "--job-cpu-max asks for a hard CPU quota and this host cannot enforce \
+                     one: {why}. Run this runner as a systemd unit with Delegate=yes, or \
+                     inside systemd-run --user --scope -p Delegate=yes, or leave the \
+                     option out — without it a job's CPU is bounded by a weight and by \
+                     niceness, which need nothing granted."
+                ));
+            }
+        }
+        // Asked once, at startup, because the answer is about this host's
+        // block layer and cannot change under a running runner without
+        // somebody changing a scheduler by hand.
+        let io_weight_inert = crate::blockio::io_weight_inert_reason(root.path());
         // Before the first job and before the hub: a runner that was killed
         // left processes, cgroups and workspaces nothing else will collect.
         let reclaimed = reclaim_a_past_life(&root, &ceiling);
@@ -161,6 +245,7 @@ impl Confined {
             confinement,
             live: LiveJobs::default(),
             reclaimed,
+            io_weight_inert,
         })
     }
 
@@ -179,7 +264,56 @@ impl Confined {
                 show_bytes(c.disk_budget),
                 c.nice
             ),
+            format!(
+                "cgroup controls per job: cpu.weight {}, {}, io.weight {}, pids.max {}",
+                c.cpu_weight,
+                match c.cpu_max {
+                    Some(quota) => format!(
+                        "cpu.max {:.2} cores ({})",
+                        quota.cores(),
+                        quota.control_value()
+                    ),
+                    // Said rather than left out: an absent hard ceiling is a
+                    // choice (a quota wastes an idle machine), and an
+                    // operator reading this has to see that it was a choice.
+                    None => "no cpu.max, so no hard CPU quota — declare one with \
+                             --job-cpu-max if this machine must never lend more"
+                        .to_owned(),
+                },
+                c.io_weight,
+                c.pids_max
+            ),
         ];
+        // A control the subtree withholds, in the fallback's own voice: there
+        // is nothing to fall back to for a CPU share, so the only honest
+        // thing is to say it is not there.
+        for missing in self.ceiling.unenforced() {
+            lines.push(format!(
+                "{}: NOT ENFORCED on this host, because {}. A job's only CPU and IO \
+                 courtesy there is nice {} and the idle IO class.",
+                missing.controls, missing.why, c.nice
+            ));
+        }
+        if self.ceiling.fallback_reason().is_some() {
+            lines.push(format!(
+                "cpu.weight, cpu.max, io.weight and pids.max: NOT ENFORCED AT ALL on this \
+                 host: there is no cgroup for a job to carry them. A job here is bounded \
+                 by nice {}, the idle IO class and an address-space limit, and nothing \
+                 bounds how many processes it forks.",
+                c.nice
+            ));
+        } else if let Some(why) = &self.io_weight_inert {
+            // Written and ignored is the failure mode D23 exists to forbid,
+            // and the only one of the four that the cgroup core cannot tell
+            // us about: the write succeeds whatever the block layer does.
+            lines.push(format!(
+                "io.weight {}: WRITTEN BUT INERT on this host, because {}. An absolute \
+                 io.max is the only IO lever that works whatever the scheduler is, and \
+                 this runner sets none: a job's IO here is bounded by the idle IO class \
+                 alone, which a scheduler of none ignores too.",
+                c.io_weight, why
+            ));
+        }
         match self.ceiling.fallback_reason() {
             None => lines.push(
                 "memory ceiling: one cgroup v2 subtree per job, enforced by the kernel".to_owned(),
@@ -239,6 +373,12 @@ impl Confined {
 
     pub fn ceiling(&self) -> &Ceiling {
         &self.ceiling
+    }
+
+    /// Why `io.weight` cannot bite here, where it cannot. A test asks this to
+    /// know which half of the report it may assert.
+    pub fn io_weight_inert(&self) -> Option<&str> {
+        self.io_weight_inert.as_deref()
     }
 
     pub fn helpers(&self) -> &PrivilegedHelpers {
@@ -458,6 +598,14 @@ mod tests {
         assert!(report.contains("64 MiB of log"), "{report}");
         assert!(report.contains("nice 10"), "{report}");
         assert!(report.contains("none configured"), "{report}");
+        // The four cgroup controls, with the one that is absent by default
+        // said rather than left out: an absent hard quota is a decision.
+        assert!(
+            report.contains("cpu.weight 10") && report.contains("io.weight 10"),
+            "{report}"
+        );
+        assert!(report.contains("pids.max 1024"), "{report}");
+        assert!(report.contains("no cpu.max"), "{report}");
         // Either the real ceiling or the fallback, never silence about which.
         assert!(
             report.contains("memory ceiling:"),
@@ -566,6 +714,86 @@ mod tests {
         let mut confinement = Confinement::with_data_root(temp.path());
         confinement.memory_max = MINIMUM_MEMORY_MAX;
         Confined::prepare(confinement).expect("the floor is a usable ceiling");
+    }
+
+    /// A weight outside the kernel's range is a figure that would be refused
+    /// once per job forever, invisibly. It is refused once, at startup,
+    /// naming the range and saying what a weight is.
+    #[test]
+    fn a_weight_outside_the_kernel_s_range_refuses_the_startup() {
+        let _reaping = crate::testing::one_reaper_at_a_time();
+        let temp = TempDir::new("confine-weights");
+        for impossible in [0, 10_001, u32::MAX] {
+            let mut confinement = Confinement::with_data_root(temp.path());
+            confinement.cpu_weight = impossible;
+            let error = Confined::prepare(confinement)
+                .err()
+                .unwrap_or_else(|| panic!("a cpu.weight of {impossible} was accepted"));
+            assert!(
+                error.contains("--job-cpu-weight") && error.contains("1..=10000"),
+                "{error}"
+            );
+
+            let mut confinement = Confinement::with_data_root(temp.path());
+            confinement.io_weight = impossible;
+            let error = Confined::prepare(confinement)
+                .err()
+                .unwrap_or_else(|| panic!("an io.weight of {impossible} was accepted"));
+            assert!(error.contains("--job-io-weight"), "{error}");
+        }
+    }
+
+    /// And a pid ceiling too small to hold a shell and its command is a wall,
+    /// refused with its floor exactly as a 1 kB memory ceiling is.
+    #[test]
+    fn a_pid_ceiling_too_small_to_run_anything_is_refused_naming_the_floor() {
+        let _reaping = crate::testing::one_reaper_at_a_time();
+        let temp = TempDir::new("confine-pids");
+        for wall in [0, 1, MINIMUM_PIDS_MAX - 1] {
+            let mut confinement = Confinement::with_data_root(temp.path());
+            confinement.pids_max = wall;
+            let error = Confined::prepare(confinement)
+                .err()
+                .unwrap_or_else(|| panic!("a pids.max of {wall} was accepted"));
+            assert!(
+                error.contains("--job-pids-max") && error.contains("refuse every job"),
+                "{error}"
+            );
+        }
+        let mut confinement = Confinement::with_data_root(temp.path());
+        confinement.pids_max = MINIMUM_PIDS_MAX;
+        Confined::prepare(confinement).expect("the floor is a usable ceiling");
+    }
+
+    /// `cpu.max` is absent by default, so asking for it is asking for a hard
+    /// guarantee. A host that cannot give one refuses the startup naming what
+    /// to grant, rather than running jobs under the weight and calling it a
+    /// quota.
+    #[test]
+    fn a_cpu_quota_this_host_cannot_enforce_refuses_the_startup() {
+        let _reaping = crate::testing::one_reaper_at_a_time();
+        let temp = TempDir::new("confine-quota");
+        let mut confinement = Confinement::with_data_root(temp.path());
+        confinement.cpu_max = Some(CpuQuota::from_cores(1.5).expect("1.5 cores is a quota"));
+        match Confined::prepare(confinement) {
+            Err(error) => {
+                assert!(error.contains("--job-cpu-max"), "{error}");
+                assert!(
+                    error.contains("Delegate=yes"),
+                    "the refusal must name what to grant: {error}"
+                );
+            }
+            Ok(confined) => {
+                // This host can enforce a quota, so the other half of the
+                // promise is the one to assert: it is in the report, in cores
+                // and in the kernel's own two numbers.
+                let report = confined.report().join("\n");
+                assert!(
+                    report.contains("cpu.max 1.50 cores") && report.contains("150000 100000"),
+                    "{report}"
+                );
+            }
+        }
     }
 
     #[test]
