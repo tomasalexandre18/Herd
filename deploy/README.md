@@ -1,36 +1,62 @@
 # Deploying Herd
 
-Four files, and `docs/joining.md` for the person who walks a machine in.
-None of them is a NixOS module: `/etc/nixos` is the owner's, so anything
-that needs it is written here as an instruction marked **OWNER**, never
-as a file that reaches in.
+Five files, of which you use four — the two reverse-proxy fragments are
+alternatives — and `docs/joining.md` for the person who walks a machine
+in. None of them is a NixOS module: `/etc/nixos` is the owner's, so
+anything that needs it is written here as an instruction marked
+**OWNER**, never as a file that reaches in.
 
 | File | What it is | Where it goes |
 | --- | --- | --- |
 | `docker-compose.yml` | the hub, under docker compose (D5, D8) | the operator's compose directory, say `/srv/herd/` |
 | `env.example` | the variables that file needs, holding paths and no secrets | copy to `.env` beside it |
-| `reverse-proxy/nginx-herd-hub.conf` | a fragment for the nginx that already terminates TLS | pasted into the config he already runs |
+| `docker-compose.traefik.yml` | an override, only when the proxy is a container: puts the hub on the proxy's network | beside `docker-compose.yml`, passed with a second `-f` |
+| `reverse-proxy/traefik-herd-hub.yml` | **this server:** a Traefik v3 dynamic config for `wss://` | the directory Traefik's file provider watches, `conf.d/` |
+| `reverse-proxy/nginx-herd-hub.conf` | the same job on a host that runs nginx instead | pasted into the config he already runs |
 | `herd-runner.service` | the server's runner, native and unprivileged (E-47, E-52) | `/etc/systemd/system/` |
 
-The shape, in one picture:
+Pick exactly one proxy fragment: the one that names the proxy the host
+actually runs. They are not a translation of each other and nothing is
+gained by reading both.
+
+The shape, in one picture — the project's own server, which is the only
+machine this has ever been applied to:
 
 ```
-  requester  --- wss://host/herd --->  nginx (already there, TLS)
-                                         |  ws://127.0.0.1:8787
-                                         v
-                                  herd-hub  (docker compose)
-                                   image herd-hub:0.1.0
-                                   state on the herd-state volume
-                                         ^
-                                         |  ws://127.0.0.1:8787
-                                  herd-runner  (systemd, on the host,
-                                                NOT in a container)
-                                   /dev/kvm, /dev/dri, /dev/vfio
-                                   one cgroup per job, memory.max
+  requester    wss://herd.example.com/herd
+  or runner  ------------------------------>  Cloudflare  (holds the
+  elsewhere                                    certificate, terminates
+                                               TLS, ~100 s idle window)
+                                                   |
+                                                   v
+                                             cloudflared  (dials out;
+                                                   |        no inbound port)
+                                                   |  http, docker network
+                                                   v
+                                             Traefik v3  (router + the
+                                                   |       timeouts; holds
+                                                   |       no certificate
+                                                   |       on this path)
+                                                   |  ws://herd-hub:8787
+                                                   v
+                                         herd-hub  (docker compose)
+                                          image herd-hub:0.1.0
+                                          state on the herd-state volume
+                                            ^                 ^
+         ws://127.0.0.1:8787  -------------'                  |
+          herdctl, on the host                                |
+                                                ws://127.0.0.1:8787
+                                         herd-runner  (systemd, on the
+                                                       host, NOT in a
+                                                       container)
+                                          /dev/kvm, /dev/dri, /dev/vfio
+                                          one cgroup per job, memory.max
 ```
 
-The hub listens; a runner dials out. No port is ever opened on a router,
-and nothing on a runner's machine listens at all (invariant 3, D11).
+The hub listens; everything else dials out. No port is opened on a
+router anywhere in that picture — cloudflared dials Cloudflare, a remote
+runner dials Cloudflare, and nothing on a runner's machine listens at
+all (invariant 3, D11). Herd holds no certificate at any point.
 
 ## The order to do it in
 
@@ -43,7 +69,12 @@ and nothing on a runner's machine listens at all (invariant 3, D11).
 3. `docker compose up -d`, then `docker compose logs hub`. The hub says
    in its first three lines whether a requester token is set, how many
    runners are approved, and where its state is.
-4. Paste the proxy fragment and reload the proxy.
+4. Publish it as `wss://`, if anything will dial from off this host.
+   On a Traefik host that is two commands and one **OWNER** step in the
+   Cloudflare dashboard — "Step 4, exactly", below. On an nginx host it
+   is `reverse-proxy/nginx-herd-hub.conf` pasted in and the proxy
+   reloaded. Skip it entirely while every runner and requester is on
+   this machine: they reach the hub on loopback and want no proxy.
 5. Install the runner's unit and walk `docs/joining.md`.
 
 ## The first start, exactly
@@ -128,14 +159,175 @@ it 0444 in a 0700 directory instead: the directory is what keeps it off
 the host, the mode is only what the container sees, and the image holds
 no users but `herd` and root.
 
+## Step 4, exactly: `wss://` through Traefik and Cloudflare
+
+This is the half of M16 that **has never been run**. The loopback path
+above was walked end to end; everything in this section is written as the
+commands that would prove it, with the output each one must produce, so
+that whoever has the server confirms it in minutes instead of deriving
+it. Nothing below was executed, and it says where that matters.
+
+### Apply it
+
+Two commands on the host, and one step that is the owner's.
+
+```sh
+# 1. the hub also joins the network the proxy is on, keeping its loopback
+#    publish for this host's own runner and herdctl. No new port.
+docker compose -f docker-compose.yml -f docker-compose.traefik.yml up -d
+docker inspect --format \
+  '{{range $n,$v := .NetworkSettings.Networks}}{{$n}} {{$v.Aliases}}
+{{end}}' herd-hub-1
+# traefik [herd-hub ...]      <- the name the fragment dials
+# herd_herd [hub ...]
+
+# 2. the router and its timeouts, into the directory Traefik watches.
+#    Edit the hostname in it first. `watch: true` means this is the whole
+#    of the install: no restart, no reload, nothing else on the host is
+#    touched.
+sudo install -m 0644 reverse-proxy/traefik-herd-hub.yml \
+  /path/to/traefik/conf.d/herd-hub.yml
+docker logs --since 1m traefik-traefik-1 2>&1 | grep -i 'herd\|error'
+# ... Creating server URL=http://herd-hub:8787 routerName=herd-hub@file
+# and no "field not found", no "cannot create service"
+```
+
+**OWNER**, in the Cloudflare dashboard: add the public hostname to the
+tunnel, with the same service target as every other hostname on this
+host, and nothing else enabled on it — no Access policy, no Zero Trust
+application. An Access policy in front of the hub is the same failure as
+forward auth in Traefik: a 302 to a login page where a WebSocket upgrade
+should have been, and no runner can answer it. The zone's WebSockets
+setting (Network → WebSockets) must be on; it is on by default.
+
+### Which certificate — the hour this saves
+
+Cloudflare holds it and terminates TLS; Traefik holds none on this path;
+Herd holds none anywhere, ever. The one rule: **the certificate a Herd
+client sees must be signed by a public CA.** `herd-runner` and `herdctl`
+verify against the webpki roots bundled in the binary and have no
+trust-this-CA flag, by decision (D115), so a Cloudflare **Origin CA**
+certificate, a self-signed one, Traefik's built-in fallback certificate,
+or a hostname two labels deep under Universal SSL each make every runner
+and every requester fail to dial — with a TLS error, before the hub sees
+a byte, so Herd cannot explain it. `reverse-proxy/traefik-herd-hub.yml`
+has the long version at the top.
+
+### 1. The upgrade reaches the hub
+
+From a machine that is not the server:
+
+```sh
+export HERD_TOKEN=$(cat the-requester-token)
+herdctl --hub wss://herd.example.com/herd runner list
+# server   approved   connected   ...
+```
+
+That table can only be printed after a 101, a completed TLS handshake and
+an accepted Herd handshake, so one command settles all three. The useful
+negative control is the same command with no token: the hub must answer
+in words — a refusal naming the token — because a *named refusal is
+itself proof the upgrade worked*. What each wrong answer means:
+
+| What you see | Where it broke |
+| --- | --- |
+| `herd cannot give you a verdict ...: invalid peer certificate: UnknownIssuer` (or another rustls error) | the certificate is not publicly trusted. The section above; no flag will get you past it |
+| `HTTP error: 404 Not Found` | the router rule did not match — hostname or path prefix |
+| `HTTP error: 302 Found` | forward auth or a Cloudflare Access policy is in front of the hub |
+| `HTTP error: 403 Forbidden` | an IP-reputation middleware (crowdsec) is on the router |
+| `HTTP error: 200 OK` | the upgrade was answered as plain HTTP by something that is not the hub — the exact symptom D115 recorded |
+| `HTTP error: 502 Bad Gateway` | Traefik is there and the hub is not reachable from it: step 1 of "Apply it" did not happen, or the alias differs |
+| a refusal from the hub, naming the token | **the whole path works.** This is the pass |
+
+On the host, the same thing seen from the other end — a long-lived
+WebSocket appears in Traefik's access log once, when it *closes*, so an
+absent entry during a live link is normal:
+
+```sh
+grep '"RequestPath":"/herd"' /path/to/traefik/logs/access.log | tail -1
+# ..."DownstreamStatus":101,"RouterName":"herd-hub@file"...
+```
+
+### 2. A link quiet longer than every idle window survives
+
+The point of D117 and D118, and the one test that cannot be replaced by
+reading configuration. Follow a job that prints nothing for four minutes,
+from off the host:
+
+```sh
+time herdctl --hub wss://herd.example.com/herd \
+  run -- sh -c 'sleep 240; echo done'
+# done
+# real 4m0s      and exit 0
+echo $?          # 0
+```
+
+240 s is chosen to be past every figure on the path at once: Cloudflare's
+~100 s idle window, Traefik's 180 s entrypoint `idleTimeout` and its 60 s
+`readTimeout`. It passes because the hub sends a keep-warm frame every
+15 s to the followers of a running job (D118), so the link is never
+actually idle — not because any timeout was raised.
+
+The control, which must also pass, and which tells you whether to blame
+the proxy or Herd: the same command on the host, over loopback.
+
+```sh
+herdctl --hub ws://127.0.0.1:8787 run -- sh -c 'sleep 240; echo done'
+```
+
+**If it fails**, the failure is unmistakable and so is its cause. You get
+
+```
+herdctl: herd cannot give you a verdict for this job: the hub closed the
+connection while <job id> was still running
+```
+
+and **exit 125 on a job that succeeded** — the wrong answer D117 names, and
+the reason a merger must never see it. `herdctl wait <job id>` afterwards
+prints the real verdict, which is how you confirm the job itself was fine.
+Then **the number of seconds it survived names the component**:
+
+| Died at about | Who closed it |
+| --- | --- |
+| 60 s | the entrypoint's `respondingTimeouts.readTimeout` does reach an upgraded connection on this version after all — **OWNER**: raise it, or set it to 0, in Traefik's static `traefik.yml` |
+| 100 s | Cloudflare's idle window, and Herd's keep-warm frames are not arriving: either the hub predates D118 or something between is swallowing them |
+| 180 s | the entrypoint's `idleTimeout` — **OWNER**, same file |
+| exactly `--job-timeout` | not this at all; the job hit its own cap |
+
+Both **OWNER** rows are static per-entrypoint configuration shared with
+every other service on that host, which is why Herd's fragment cannot set
+them and why this walk reports the figure rather than pre-emptively
+changing someone else's entrypoint.
+
+### 3. An idle runner's link survives too
+
+A runner reports health every 15 s, so its link is never idle either —
+but it is the connection that stays up for weeks, so it is worth ten
+minutes:
+
+```sh
+# on the joining machine, dialling wss:// per docs/joining.md
+herd-runner --hub wss://herd.example.com/herd --name wsl-pc ...
+# then, ten minutes later, with no job submitted, from anywhere:
+herdctl runner list
+# wsl-pc   approved   connected
+journalctl -u herd-runner | grep -c 'dialling'   # still 1
+```
+
+A second `dialling` line means the link was closed and the runner
+redialled — which it survives by design (a `Close` spends no failure
+counter), so this is the check that distinguishes "working" from "working
+because it reconnects every ninety seconds".
 ## Known gaps, so nobody debugs them twice
 
-- **`wss://` cannot be dialled.** `herd-runner` and `herdctl` are built
-  without a TLS feature, so a `wss://` URL fails with `URL error: TLS
-  support not compiled in` before it touches the network. The proxy
-  fragment is right and ready; the clients are not. The server's own
-  runner is unaffected — it reaches the hub on loopback. See the last
-  section of `docs/joining.md` for the two ways to join meanwhile.
+- **The `wss://` path is configured and unproven.** The clients can dial
+  it — rustls with the bundled webpki roots, as of D115, so the old
+  `URL error: TLS support not compiled in` is gone — and the Traefik
+  fragment is written for this server's actual proxy. What has never
+  happened is one real dial through Cloudflare into the hub. "Step 4,
+  exactly", above, is that walk written out; until someone runs it, read
+  every claim in it as reasoning from the hub's behaviour and from this
+  host's configuration, not as a measurement.
 - **No health endpoint.** The hub speaks WebSocket and nothing else, so
   there is no `healthcheck:` in the compose file. `herdctl runner list`
   from the host is how you ask whether the hub is answering.

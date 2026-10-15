@@ -1,0 +1,250 @@
+# wss:// for the Herd hub, as a Traefik v3 dynamic-configuration fragment.
+# Assumed proxy: Traefik v3, in a container, with Cloudflare in front of it
+# (cloudflared, a tunnel). That is the machine Herd is deployed on; for a
+# host that runs nginx instead, use `nginx-herd-hub.conf` beside this file
+# and ignore this one. The two are alternatives, not a pair.
+#
+# Where it goes: the directory Traefik's **file provider** watches —
+# `providers.file.directory` in its static `traefik.yml`, typically
+# `conf.d/`, mounted into the container. `watch: true` means copying this
+# file in is the whole of the installation: Traefik picks it up in about a
+# second and no service is restarted or reloaded. If it cannot parse it,
+# Traefik logs the error and keeps the configuration it already had, so a
+# typo here cannot take the host's other routers down.
+#
+# Why the file provider and not docker labels on the hub's container:
+# `serversTransports` — the timeouts below — can only be *defined* in a
+# dynamic-configuration file; labels can reference one by name and no more.
+# It also keeps every proxy-shaped decision in this one reviewed file
+# instead of coupling `docker-compose.yml` to one brand of proxy.
+#
+# Two things have to be true before this file does anything:
+#
+#   1. the hub is reachable from inside the Traefik container — see
+#      "Reaching the hub", below, and `../docker-compose.traefik.yml`;
+#   2. the hostname in the router rule reaches this Traefik. On this server
+#      that means adding it to the Cloudflare tunnel, which is OWNER work
+#      in the Cloudflare dashboard, the same public hostname and the same
+#      service target as every other name on this host.
+#
+# Replace `herd.example.com` with that hostname. Clients then dial
+# `wss://herd.example.com/herd` — `herdctl --hub`, `herd-runner --hub`.
+
+# ---- who holds the certificate -------------------------------------------
+#
+# Herd holds none, ever, on any path (D4, D14). The hub speaks plain
+# `ws://` on loopback and has no TLS code in it at all.
+#
+# On this server, with the hub behind the tunnel, **Cloudflare's edge holds
+# the certificate** and terminates TLS. cloudflared carries the request to
+# Traefik's plain-HTTP entrypoint over the docker network, so Traefik
+# terminates no TLS on this path and holds no certificate for it either.
+# If instead the hub is published on an entrypoint where Traefik does the
+# TLS — one with a `certResolver` — then Traefik holds it, and an ACME
+# certificate from Let's Encrypt is publicly trusted, which is what
+# matters below.
+#
+# **The trap that costs an hour.** `herd-runner` and `herdctl` verify the
+# certificate against the webpki roots bundled in the binary, and there is
+# no trust-this-CA flag and no --insecure (D115, deliberately). So a
+# certificate that is not signed by a public CA makes **every** runner and
+# every requester fail to dial, and the failure is a TLS error from rustls
+# — `invalid peer certificate: UnknownIssuer` — not a refusal Herd can
+# explain, because the connection never reaches the hub's first frame.
+# Three ways to walk into it on a host arranged like this one:
+#
+#   * a Cloudflare **Origin CA** certificate. It is the natural thing to
+#     reach for on a Cloudflare-fronted host and it is a private CA, in no
+#     webpki root set. Fine between Cloudflare and an origin, never on the
+#     side a Herd client dials;
+#   * a router on a TLS entrypoint with **no matching certificate**:
+#     Traefik then serves its own built-in self-signed one rather than
+#     failing, so the symptom is a certificate error, not a 404;
+#   * a hostname **two labels deep** — `herd.hub.example.com`. Cloudflare
+#     Universal SSL covers `*.example.com` and not that, so the name
+#     resolves, answers, and fails verification.
+#
+# Publicly trusted, or no runner joins. There is no third option and no
+# flag to buy one.
+
+
+# ---- the upgrade: Traefik v3 needs nothing for it -------------------------
+#
+# Nothing in this file passes `Upgrade` or `Connection` along, and that is
+# correct, not an omission. Traefik v3 proxies HTTP/1.1 to the backend and
+# handles an upgrade inherently: it sees the client's `Connection: Upgrade`,
+# forwards the handshake, and once the backend answers 101 it hijacks the
+# connection and copies bytes both ways until one side closes. nginx's
+# `map $http_upgrade` / `proxy_set_header Upgrade` ritual exists because
+# nginx proxies as HTTP/1.0 and drops hop-by-hop headers unless told
+# otherwise; copying it here would be cargo.
+#
+# What *can* break the upgrade is a middleware that rewrites those headers.
+# A `headers` middleware setting `Connection: ""` to strip something
+# unrelated — the shape of middleware a host accumulates — removes exactly
+# the header the upgrade is carried by. Hence: no middlewares on this
+# router.
+
+# ---- buffering and sizes: nothing to do, and here is why ------------------
+#
+# Traefik buffers neither request nor response by default. Buffering is an
+# opt-in `buffering` middleware, and `maxRequestBodyBytes` lives inside that
+# same middleware — so with no middleware there is no body cap and no
+# buffer, and a job's log frames leave the proxy as they arrive. There is
+# no equivalent of nginx's `client_max_body_size` to raise.
+#
+# Add the `buffering` middleware to this router and the handshake dies: it
+# reads a request to its end before forwarding, and a WebSocket's request
+# never ends. The frame ceiling that matters is Herd's own (64 MiB, the
+# hub's refusal, not the proxy's); once the connection is hijacked Traefik
+# sees a byte stream and has no notion of a frame at all.
+#
+# The nearest thing to nginx's `proxy_buffering off` is
+# `services.<n>.loadBalancer.responseForwarding.flushInterval`, 100 ms by
+# default, and it is left alone on purpose: it paces flushes of a buffered
+# HTTP response body, and an upgraded connection has none. If a job's log
+# ever arrived in 100 ms lumps, that would be the figure to set to `-1` —
+# and it would mean the connection was not upgraded at all, which the walk
+# in `../README.md` tests first.
+
+# ---- the idle timeouts, and the figure each one has to beat ----------------
+#
+# D117 is the whole reason this section exists: a link quiet for longer than
+# some component's idle window is closed under a follower, and `herdctl`
+# then reports no verdict and exits 125 **on a job that passed** — a wrong
+# answer, not a degraded one.
+#
+# Herd's side of the bargain is that **no link is ever quiet for more than
+# 15 seconds**. A runner reports health every 15 s (E-40), and the hub keeps
+# every follower of a running job warm on the same cadence (D118); both are
+# one constant, `HEALTH_EVERY`. So every figure below only has to beat 15 s,
+# with margin, and the proxy's job is simply never to be the component that
+# closes a connection Herd is holding open on purpose.
+#
+#   what                                     default   must beat   here
+#   Cloudflare edge, idle WebSocket           ~100 s      15 s    not ours
+#   entryPoints.<ep>.respondingTimeouts
+#     .readTimeout                              60 s      15 s    OWNER
+#     .idleTimeout                             180 s      15 s    OWNER
+#     .writeTimeout                          0 (none)      15 s    OWNER
+#   serversTransports.herd-hub
+#     .idleConnTimeout                          90 s   15/100 s     300 s
+#     .dialTimeout                              30 s         —       10 s
+#     .responseHeaderTimeout                 0 (none)        —       30 s
+#
+# **~100 s is Cloudflare's, and it is a figure that can change under us.**
+# It is the idle window Cloudflare applies to a proxied WebSocket, it is
+# not in any contract Herd has, and nothing warns when it moves. Treat it
+# as the outer constraint and treat 15 s as the margin that makes the
+# constraint irrelevant: six keep-warm frames fit inside it. If Cloudflare
+# ever drops below 15 s, Herd's cadence is what changes, in `herd-proto`,
+# and this file does not.
+#
+# **The entrypoint half cannot be set here.** `respondingTimeouts` is
+# *static* configuration, per entrypoint, in Traefik's own `traefik.yml` —
+# and that entrypoint is shared with every other service on the host, so
+# changing it is OWNER work with host-wide reach and is not Herd's to do.
+# It does not need doing: all three defaults are far above 15 s. The one
+# relevant doubt — whether `readTimeout` applies to a connection after it
+# is upgraded — is settled empirically on this host, where long-lived
+# WebSocket applications sit behind the same entrypoint and are not cut
+# every 60 s. Prove it for Herd anyway with the quiet-link walk in
+# `../README.md`: the figure a link dies at names the component that killed
+# it, which is why the walk waits 240 s rather than 30.
+#
+# The other kind of figure: a **non-idle** maximum. A followed job holds one
+# connection for its whole life, up to `--job-timeout`, 5400 s on this
+# server. Neither Traefik nor cloudflared imposes a maximum lifetime on an
+# upgraded connection, and Cloudflare's ~100 s is an idle window and not a
+# lifetime — so there is nothing to raise. If a 90-minute job's follower is
+# ever cut at a round number of minutes while the log is still flowing,
+# that assumption is what broke.
+http:
+  routers:
+    herd-hub:
+      # Name the entrypoint. A file-provider router with no `entryPoints`
+      # attaches to **every** entrypoint Traefik has, which on a host like
+      # this one includes the metrics port and whatever private-interface
+      # listener exists. `web` here is the plain-HTTP entrypoint cloudflared
+      # delivers to; change it to the one this Traefik actually uses.
+      entryPoints:
+        - web
+      # The hub ignores the request path entirely — it accepts the upgrade
+      # and reads the first frame — so the prefix is free, and no
+      # stripPrefix middleware is wanted or needed. Dropping the
+      # PathPrefix and giving the hub a host of its own works just as well.
+      rule: "Host(`herd.example.com`) && PathPrefix(`/herd`)"
+      service: herd-hub
+      # Deliberately no middlewares, and this is not an oversight.
+      #
+      #   * **forward auth (authentik and friends) breaks the hub.** A
+      #     runner carries a Herd bearer token in its first frame and no
+      #     browser session; forward auth answers the handshake with a 302
+      #     to a login page, so the upgrade never happens and the client
+      #     reports an HTTP error it cannot act on. Herd authenticates its
+      #     own callers: one shared requester token, one minted token per
+      #     approved runner, and the hub keeps only hashes.
+      #   * **an IP-reputation bouncer (crowdsec) can ban a runner.** A
+      #     runner that redials with backoff while the hub is down looks
+      #     like a client retrying in a loop. If it is added anyway, the
+      #     runner's address has to be excluded, and a banned runner shows
+      #     up as a 403 on the dial — see the table in `../README.md`.
+      #   * **no rate limit.** One connection per runner and per follower,
+      #     held open; there is nothing here for a per-IP request rate to
+      #     measure.
+      #   * **no buffering middleware, above all.** See below.
+
+  services:
+    herd-hub:
+      loadBalancer:
+        servers:
+          # Reaching the hub. `docker-compose.yml` publishes the hub on
+          # `127.0.0.1:8787` — the host's loopback, for the server's own
+          # runner and for `herdctl`. A containerised Traefik **cannot**
+          # reach that: a loopback-published port is a DNAT rule for
+          # 127.0.0.1 only, so a packet from the proxy's network to the
+          # host's bridge address is refused.
+          #
+          # So the hub joins the network Traefik is on and keeps its
+          # loopback publish for the host. That is one override file,
+          # `../docker-compose.traefik.yml`, which adds the external
+          # network and the alias this URL uses, and nothing else. No port
+          # is opened on any host interface by it, and none on a router
+          # (invariant 3).
+          #
+          # The alternative, in one sentence: publish on the docker bridge
+          # gateway as well (`"172.17.0.1:8787:8787"`) and point this at
+          # `http://host.docker.internal:8787` — fewer moving parts, but it
+          # offers the hub to every container on the host rather than to
+          # the proxy's network, which is why it is not the recommendation.
+          - url: "http://herd-hub:8787"
+        # `http://` and not `h2c://` on purpose: a WebSocket upgrade needs
+        # HTTP/1.1, and h2c to the backend would make the handshake
+        # impossible.
+        serversTransport: herd-hub
+
+  serversTransports:
+    herd-hub:
+      forwardingTimeouts:
+        # Loopback-or-bridge: connecting is immediate or it is broken.
+        # Must beat nothing; 30 s (the default) is just a long wait for an
+        # answer that will not come.
+        dialTimeout: 10s
+        # The hub answers the upgrade with a 101 as soon as it accepts the
+        # connection — milliseconds. This figure only has to be above
+        # that, and exists so a wedged hub is a failed dial rather than a
+        # client waiting forever (the default is 0, no limit).
+        responseHeaderTimeout: 30s
+        # The keep-alive pool. This one **cannot** close a live WebSocket —
+        # an upgraded connection is hijacked and leaves the pool — but it
+        # is raised above every other figure on the path so that nothing
+        # here is below Herd's cadence and no one has to wonder. Must beat
+        # 15 s; set above 100 s as well, so Cloudflare is always the first
+        # to speak if anything does.
+        idleConnTimeout: 300s
+        # Deliberately NOT set: `readIdleTimeout` and `pingTimeout`. Both
+        # drive HTTP/2 ping frames and apply to an h2c or https backend
+        # only; the hub is HTTP/1.1, as a WebSocket backend must be, so
+        # they would be parsed, accepted and have no effect whatever. The
+        # idle problem on this path is solved by Herd speaking every 15 s,
+        # not by the proxy probing.

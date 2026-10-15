@@ -93,8 +93,9 @@ per data root (D32): a second runner pointed at the same directory is
 refused.
 
 The hub's address is a `ws://` or `wss://` URL, with the scheme spelled
-out at the call site on purpose (D14). See **What `wss://` cannot do
-yet**, at the end, before you pick one.
+out at the call site on purpose (D14). See **Picking `ws://` or
+`wss://`**, at the end, before you pick one: which you can use is
+decided by the certificate in front of the hub, not by preference.
 
 ### 3. Probe: dial once, be refused by name
 
@@ -297,23 +298,37 @@ root and delivered on the next start (D34). Stopping loses nothing.
 | `runner <name> is not approved on this hub` | step 4 has not happened, or the name differs from the one approved |
 | `the hub refused this runner` with a token complaint | the token in step 5 is not the one step 4 minted; approve again |
 | `dialling ...: Connection refused` | the hub's URL or the network, not Herd. Nothing on your side listens, so nothing on your side can be the cause |
-| `URL error: TLS support not compiled in` | see the next section |
+| `invalid peer certificate: UnknownIssuer`, or another TLS error | the certificate in front of the hub is not signed by a public CA. See the next section; there is no flag for it |
+| `HTTP error: 302 Found` or `403 Forbidden` on a `wss://` dial | something in front of the hub wants a browser session or has banned the address. The hub's own refusals are sentences, never HTTP codes |
 | `memory ceiling: FALLING BACK` | the runner is not in a delegated cgroup. Start it from systemd, not by hand |
 | `WARNING: ... is in the "docker" group` | use a user that is in no root-equivalent group (D78) |
 | a data root that is refused, naming itself | the directory is not writable by the runner's user, or another runner already holds it (D32) |
 | `herdctl runner list` shows it approved but not connected | the service is not running: `journalctl -u herd-runner` |
 
-## What `wss://` cannot do yet
+## Picking `ws://` or `wss://`, and the certificate that decides it
 
-The runner and `herdctl` cannot dial a `wss://` URL today. The binaries
-are built without a TLS feature, so the dial fails before it reaches the
-network:
+`wss://` works: the clients dial TLS with rustls and verify against the
+webpki roots bundled in the binary (D115). The old `URL error: TLS
+support not compiled in` is gone, and so is the advice that went with
+it.
 
-```
-Error: dialling wss://example/herd: URL error: TLS support not compiled in
-```
+What has not been proven is one real dial through this project's proxy
+and Cloudflare into the hub — `deploy/README.md`, "Step 4, exactly", is
+the walk that proves it, and nobody has run it yet. So if you are the
+first remote runner, expect to be the one who finds out, and read that
+section before you start rather than after.
 
-Two ways to join anyway, both of which keep invariant 3:
+**The one thing that will stop you.** There is no trust-this-CA option
+and no `--insecure`, on purpose (D115). If the certificate your runner
+is shown is not signed by a public CA — a Cloudflare Origin CA
+certificate, a private CA, a self-signed one, a proxy serving a fallback
+certificate because nothing matched the hostname — the dial fails with a
+TLS error and the hub never sees you. Nothing you can pass on the
+command line changes that; the certificate in front of the hub has to
+change.
+
+Two ways to join that need no certificate at all, both keeping
+invariant 3:
 
 1. **On the hub's own host** — the project's server — use
    `ws://127.0.0.1:8787`, the loopback port docker compose publishes.
@@ -327,6 +342,5 @@ Two ways to join anyway, both of which keep invariant 3:
    `deploy/docker-compose.yml`, and the requester token set — without
    TLS the token is the only thing in front of the hub.
 
-The reverse-proxy fragment in `deploy/reverse-proxy/` is correct and
-ready for the day the binaries can dial `wss://`; it is a one-line
-change to the workspace's `tokio-tungstenite` dependency.
+Whichever you pick, the scheme is spelled out at the call site and never
+inferred (D14), so `--hub` says which of these you are doing.

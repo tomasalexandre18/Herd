@@ -3614,3 +3614,87 @@ M16 has been exercised, only the loopback path the server's own runner uses.
 Also cosmetic but real: `herd-runner.service` declares
 `Documentation=file:///etc/herd/joining.md`, which nothing in `deploy/`
 installs, so `systemctl help herd-runner` fails on a fresh install.
+
+---
+
+## 2026-10-15 — D124 The `wss://` half of M16, for the proxy that is there
+
+**Context.** D123's last paragraph: the reverse-proxy fragment is nginx and
+the server runs Traefik v3 behind cloudflared, so the README's proxy step was
+prose rather than an instruction for the only host it will ever be applied
+to. Nothing of the `wss://` path had been exercised.
+
+**Choice.** A Traefik v3 **file-provider** fragment,
+`deploy/reverse-proxy/traefik-herd-hub.yml`, beside the nginx one rather than
+replacing it: one file per proxy, the README sends the reader to the one that
+names his, and the fragment's old claim that Caddy, Traefik and HAProxy "each
+need exactly this" is replaced by what actually differs between them. The
+file provider and not docker labels because a `serversTransport` — the
+timeouts — can only be *defined* in a dynamic-configuration file, and because
+it keeps Herd's compose file free of one proxy's vocabulary.
+
+**The hub has to be reachable from the proxy's container, and was not.** A
+loopback publish is a DNAT rule for 127.0.0.1 alone, so the containerised
+Traefik on this host cannot reach `127.0.0.1:8787` at all — the fragment
+would have 502'd on a first try. `deploy/docker-compose.traefik.yml` is an
+override that puts the hub on the proxy's existing external network under the
+alias `herd-hub`, keeping the loopback publish for the host's own runner and
+`herdctl`. It opens no port on any interface. The alternative, publishing on
+the docker bridge gateway and dialling `host.docker.internal`, is what
+another stack on this host does and is rejected here: it offers the hub to
+every container on the machine rather than to the proxy's network.
+
+**Traefik v3 needs nothing for the upgrade, and `readIdleTimeout` is the
+wrong knob.** v3 proxies HTTP/1.1 and hijacks an upgraded connection
+inherently; nginx's `Upgrade`/`Connection` ritual exists because nginx
+proxies as HTTP/1.0, and copying it over would be cargo. D123 suggested
+`forwardingTimeouts.readIdleTimeout`; that field drives **HTTP/2** ping
+frames and has no effect on an HTTP/1.1 WebSocket backend, so it is
+deliberately absent and the fragment says why. What is set is
+`idleConnTimeout` 300 s, `dialTimeout` 10 s, `responseHeaderTimeout` 30 s.
+The client-side figures (`respondingTimeouts`) are *static*, per entrypoint,
+and shared with every other service on the host: not Herd's to change, and
+not needing it — all three defaults are far above the cadence.
+
+**The cadence is what makes the timeouts a non-problem.** Every Herd link
+carries a frame at least every 15 s — a runner's health report, and since
+D118 the hub's keep-warm to a running job's followers. So each figure on the
+path has only to beat 15 s, and the outer constraint, **Cloudflare's ~100 s
+idle window, is a figure that can change under us** and is named as one. If
+it ever fell below 15 s, `HEALTH_EVERY` is what moves, not this file.
+
+**Nothing buffers.** Traefik buffers neither direction unless the `buffering`
+middleware is added — which would kill the handshake outright — and
+`maxRequestBodyBytes` lives inside that same middleware, so there is no size
+cap to raise. No middleware at all on this router: forward auth answers a
+WebSocket upgrade with a 302 to a login page, which no runner can answer, and
+an IP-reputation bouncer can ban a runner that redials with backoff.
+
+**The certificate, written where the operator chooses one.** Cloudflare holds
+it and terminates TLS; Traefik holds none on the tunnel path; Herd holds none
+anywhere. Because the clients verify against the bundled webpki roots with no
+trust-this-CA option (D115), a Cloudflare **Origin CA** certificate, a
+self-signed one, Traefik's built-in fallback certificate, or a hostname two
+labels deep under Universal SSL each make every runner and requester fail to
+dial — as a TLS error, before the hub sees a byte, so Herd cannot explain it.
+That is the trap most likely to cost an hour and it is stated three times:
+the fragment, `deploy/README.md`, and `docs/joining.md`.
+
+**What is proven and what is written down.** Proven offline: the fragment
+loads in Traefik v3.7.14 — router, service and serversTransport created, no
+unknown field (checked with a deliberate typo, which Traefik rejects by
+name) — and the compose override merges. **Not proven: one real dial through
+Cloudflare**, because proving it means changing a live shared proxy on a host
+full of other people's services. Instead `deploy/README.md` gains "Step 4,
+exactly": the walk, as commands with their expected output, including a
+240-second quiet link — past Cloudflare's ~100 s, Traefik's 180 s and 60 s at
+once — and a table mapping *the second a link dies at* to the component that
+closed it. A guess written as a measurement is worse than a gap, so the
+section says at the top that it has never been run.
+
+**Also.** `herd-runner.service` pointed `Documentation=` at
+`file:///etc/herd/joining.md`, which nothing installs, so `systemctl help`
+failed on a fresh install. It is now the document's URL: nothing in `deploy/`
+copies files onto a host and that should not start, and a URL is true on
+every machine, including one that never saw the repo. The local alternative
+is one `install` command, written on the line above it.
