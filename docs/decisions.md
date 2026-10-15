@@ -3564,3 +3564,53 @@ process rather than a wrong verdict. Recorded so that a leftover process on a
 machine running two runners is recognised instead of investigated — and
 because the reused-pid case is the one that will bite first when M17 puts a
 second runner on one box.
+
+---
+
+## 2026-10-15 — D123 Four things a working first start taught us
+
+**Context.** All four came out of making `docker compose up -d` actually work
+on a fresh volume, and none of them is visible from a green test suite. The
+compose file's own comment had anticipated the first failure mode and still
+did not avoid it, which is the lesson in itself: a comment is not a test.
+
+**One path, not three.** The image bakes `/var/lib/herd`, owned by the hub's
+uid, precisely so docker seeds a fresh named volume from it and the volume
+inherits that ownership. The compose file mounted `/var/lib/herd/state` — a
+subdirectory the image does not contain — so docker created the mount point
+itself, as root, and the non-root hub refused to start, naming the directory.
+Correct refusal, broken deployment. The mount, `HERD_STATE_DIR` and the
+image's baked directory are now the same string. The hub's own relative
+default still resolves inside the volume, so an operator who forgets the
+variable gets a working hub whose state is still on the disk he would back up.
+
+**Docker ignores `uid`, `gid` and `mode` on a file secret outside swarm.** No
+warning, no effect: the host file is bind-mounted as it is. A root-owned 0400
+token — what `env.example` told the operator to make — is unreadable by the
+hub, which fails with `reading the requester token … Permission denied`. The
+token is now 0444 inside a 0700 directory: the **directory** is what keeps it
+off the host, the mode is only what the container sees, and the image holds no
+users but `herd` and root. The runner's `EnvironmentFile=` stays 0400, because
+systemd reads it as root — the two are different for a reason, and both say so
+where they are written.
+
+**The startup reaper is host-wide, not data-root-wide.** A runner on a brand
+new, empty data root reaped a stray process left by an unrelated test suite:
+the sweep walks all of `/proc` for the marker and kills anything whose minting
+runner is dead, whichever root it belonged to. That is deliberate — nothing
+else will ever collect them — but it means a second runner on one box collects
+the first's leftovers. **This is the thing to remember before M17**, and it
+compounds the reused-pid limit in D122: two runners on one machine make the
+"is the minter gone?" question answerable wrongly for the first time.
+
+**The reverse-proxy fragment does not fit the machine it is for.** It is
+nginx; the server runs **Traefik v3 and cloudflared**. The fragment's trailing
+note says Caddy, Traefik and HAProxy "each need exactly this" and then gives
+no Traefik configuration, so the README's proxy step is prose, not an
+instruction, for the only host it will ever be applied to. What is needed is a
+router on the existing TLS entrypoint plus a `serversTransport` carrying
+`forwardingTimeouts.readIdleTimeout` — and nothing about the `wss://` half of
+M16 has been exercised, only the loopback path the server's own runner uses.
+Also cosmetic but real: `herd-runner.service` declares
+`Documentation=file:///etc/herd/joining.md`, which nothing in `deploy/`
+installs, so `systemctl help herd-runner` fails on a fresh install.
