@@ -28,8 +28,9 @@ pub use capability::{
     OfferedCapability,
 };
 pub use declaration::{
-    args_as_line, shell_quote, Declaration, Executor, Step, StepRun, ARGS_TOKEN, COMMIT_TOKEN,
-    IN_TOKEN, JOB_TOKEN, LINE_TOKEN, OUT_TOKEN,
+    args_as_line, shell_quote, Declaration, Executor, LabelsFrom, Requirements, Step, StepRun,
+    ARGS_TOKEN, COMMIT_TOKEN, IN_TOKEN, JOB_TOKEN, LABELS_KEY, LINE_TOKEN, MEMORY_KEY, OUT_TOKEN,
+    READING_KEYS, SCENARIOS_KEY, TMPFS_KEY,
 };
 pub use placement::{
     default_memory_floor_mib, parallelism_tokens, size_mib, with_parallelism, HostSize,
@@ -608,6 +609,12 @@ pub enum JobOutcome {
     /// the labels or the figure, because the only thing to do about one of
     /// these is change the submission.
     ///
+    /// D74 adds one more, and it is of the same kind: a job whose
+    /// requirements are read on a machine, whose reading did not answer. No
+    /// machine can run such a job because nothing knows what it needs, and
+    /// the only thing to do about it is to fix the reading — so `reason`
+    /// names the reading, the command and what was wrong with its answer.
+    ///
     /// Distinct from [`JobOutcome::CouldNotStart`], which is a job Herd tried
     /// to run: this one never reached a machine at all.
     Impossible { reason: String },
@@ -1150,6 +1157,20 @@ pub struct Asked {
     /// real job arrives.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub declaration: Option<Declaration>,
+    /// The reading that will say what this job needs, when its command's
+    /// requirements are not knowable from the declaration (D74).
+    ///
+    /// Present means [`Asked::labels`] is the **baseline** the reading itself
+    /// is placed against and not this job's own requirements: the hub runs the
+    /// reading as an ordinary job on a runner, writes what it answered onto
+    /// the record, and places this job on that. Absent means `labels` and the
+    /// figures beside them are what the requester stated, which is every job
+    /// before D74 and every one whose command declares static labels.
+    ///
+    /// A requester fills the line's `{commit}` and `{args}` like any other
+    /// (D107); everything else about the reading is the hub's.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub labels_from: Option<LabelsFrom>,
     /// How long this job's `run` step may take, in seconds, as its command
     /// declares (E-11).
     ///

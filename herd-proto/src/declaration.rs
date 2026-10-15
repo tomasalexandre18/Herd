@@ -318,6 +318,205 @@ pub fn args_as_line(args: &[String]) -> String {
         .join(" ")
 }
 
+/// A command whose requirements are not knowable from its declaration: the
+/// line that reads them, and the labels that reading is itself placed against
+/// (D74).
+///
+/// Which capabilities one commit's tests need is a property of that commit,
+/// so the declaration names a command of the consumer's own that prints them.
+/// What travels on a submission is this: the line, with `{commit}` and
+/// `{args}` already filled like any other (D107), and the command's
+/// **declared** labels, which are the baseline the *reading* runs against —
+/// the first consumer's reading runs their own tool over their own tree, so it
+/// needs their build capability to run at all, and it is an ordinary job like
+/// any other.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LabelsFrom {
+    /// The shell line that prints the requirements.
+    pub line: String,
+    /// The labels the reading job is placed against — never the labels of the
+    /// job that follows it.
+    #[serde(default, skip_serializing_if = "crate::LabelSet::is_empty")]
+    pub baseline: crate::LabelSet,
+}
+
+/// The one key an answer may carry that is a list: the capabilities the job
+/// needs, comma-separated.
+pub const LABELS_KEY: &str = "labels";
+/// How much memory the whole job needs, in MiB (E-29).
+pub const MEMORY_KEY: &str = "memory_mib";
+/// How much room on the runner's tmpfs it reserves while it runs (E-31).
+pub const TMPFS_KEY: &str = "tmpfs_mib";
+/// How many of the consumer's own scenarios the run covers. Recorded, and
+/// acted on by nothing: it is their figure and Herd has no use for it, but a
+/// record a reader re-judges months later should say what the reading said
+/// (E-15, E-54).
+pub const SCENARIOS_KEY: &str = "scenarios";
+
+/// Every key an answer carries, and the whole vocabulary: a key-shaped line
+/// naming anything else is refused by name (D60's reading, applied here).
+pub const READING_KEYS: [&str; 4] = [LABELS_KEY, MEMORY_KEY, TMPFS_KEY, SCENARIOS_KEY];
+
+/// What a [`LabelsFrom`] reading answered: the requirements of every job of
+/// that command, on that commit, with those arguments (D74).
+///
+/// The hub writes these onto the job's record before it places it, and M7's
+/// matching and M8's admission then read them off the record like any other
+/// job's — which is the whole of D74's consequence for the plan: where a
+/// job's requirements came from is this module's problem and nobody else's.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Requirements {
+    /// The capabilities the job needs (E-25).
+    #[serde(default, skip_serializing_if = "crate::LabelSet::is_empty")]
+    pub labels: crate::LabelSet,
+    /// How much memory the whole job needs, in MiB (E-29).
+    pub memory_mib: u64,
+    /// How much tmpfs it reserves while it runs, in MiB (E-31). Nought is a
+    /// real answer here, unlike the memory figure: `build` and `check` really
+    /// need no tmpfs.
+    pub tmpfs_mib: u64,
+    /// The consumer's own count of the scenarios the run covers.
+    pub scenarios: u64,
+}
+
+impl Requirements {
+    /// The answer, read **strictly**, out of what the reading printed.
+    ///
+    /// Read the way the capability file is read (D60), and for D60's own
+    /// reason: one character is the difference between a job admitted against
+    /// the figure it needs and a job admitted against a figure nobody stated.
+    /// So an unknown key, a missing key, a duplicated key and a figure that is
+    /// not a figure are each a refusal, and the caller refuses the job that
+    /// was waiting for this answer **by name** rather than placing it on a
+    /// guess.
+    ///
+    /// **What counts as an answer line.** `<key>=<value>`, with the key one
+    /// lowercase word of `[a-z0-9_]`. Everything else in the output is the
+    /// consumer's executor talking — their `up` announces a workspace, their
+    /// `fetch` says which commit it went to, their `down` prints a step log —
+    /// and a reading's output is a job's output like any other (D18), so there
+    /// is no second stream to read the answer out of. A line that is not
+    /// key-shaped is therefore not an answer and not a refusal either; a line
+    /// that *is* key-shaped is held to the whole of the rule above.
+    ///
+    /// The bytes are the job's log, so they are not promised to be text: what
+    /// is not valid UTF-8 cannot be a key line and is skipped by the same
+    /// rule, never guessed at.
+    pub fn read(output: &[u8]) -> Result<Requirements, String> {
+        let mut said: BTreeMap<&str, &str> = BTreeMap::new();
+        for line in output.split(|byte| *byte == b'\n') {
+            let Ok(line) = std::str::from_utf8(line) else {
+                continue;
+            };
+            let Some((key, value)) = answer_line(line) else {
+                continue;
+            };
+            if !READING_KEYS.contains(&key) {
+                return Err(format!(
+                    "it printed {key:?}, which is not one of the keys an answer carries \
+                     ({}): a reading's answer is read strictly, because a key nobody checked \
+                     is a requirement nobody stated",
+                    READING_KEYS.join(", ")
+                ));
+            }
+            if let Some(already) = said.insert(key, value) {
+                return Err(format!(
+                    "it printed {key:?} twice, as {already:?} and then as {value:?}: one key \
+                     says one thing, and taking the last of two would be a figure nobody chose"
+                ));
+            }
+        }
+        for key in READING_KEYS {
+            if !said.contains_key(key) {
+                return Err(format!(
+                    "it printed no {key:?} line, and an answer carries all four of {}: a \
+                     missing key is not a default",
+                    READING_KEYS.join(", ")
+                ));
+            }
+        }
+        let labels = read_labels(said[LABELS_KEY])?;
+        let memory_mib = read_figure(MEMORY_KEY, said[MEMORY_KEY])?;
+        if memory_mib == 0 {
+            return Err(format!(
+                "it said the whole job needs 0 MiB of memory, which is not a figure: a job \
+                 that needs no memory in particular declares nothing rather than nought, and \
+                 nothing is not something a reading can say ({MEMORY_KEY})"
+            ));
+        }
+        Ok(Requirements {
+            labels,
+            memory_mib,
+            tmpfs_mib: read_figure(TMPFS_KEY, said[TMPFS_KEY])?,
+            scenarios: read_figure(SCENARIOS_KEY, said[SCENARIOS_KEY])?,
+        })
+    }
+
+    /// The one line a record and an explanation say an answer in (E-15, E-36).
+    pub fn line(&self) -> String {
+        let labels = if self.labels.is_empty() {
+            "no capability in particular".to_owned()
+        } else {
+            format!("labels {}", self.labels)
+        };
+        format!(
+            "{labels}, {} MiB of memory, {} MiB of tmpfs, {} scenario(s)",
+            self.memory_mib, self.tmpfs_mib, self.scenarios
+        )
+    }
+}
+
+/// One `<key>=<value>` out of a line, when the line is one.
+///
+/// The key is one lowercase word: `GROVE_OUT=/data/out` in a shell's own
+/// tracing is not an answer, and neither is a sentence with an equals sign in
+/// it. See [`Requirements::read`] for why this has to be a shape rather than
+/// "every line".
+fn answer_line(line: &str) -> Option<(&str, &str)> {
+    let (key, value) = line.trim().split_once('=')?;
+    if key.is_empty()
+        || !key
+            .bytes()
+            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'_')
+    {
+        return None;
+    }
+    Some((key, value.trim()))
+}
+
+/// The labels of an answer: comma-separated names, each one a label.
+///
+/// An empty value is an empty set — a commit whose tests need no capability in
+/// particular is a real answer — and anything that is not a label is refused
+/// with the name in it, as a submission's labels are.
+fn read_labels(value: &str) -> Result<crate::LabelSet, String> {
+    if value.trim().is_empty() {
+        return Ok(crate::LabelSet::default());
+    }
+    let names: Vec<String> = value
+        .split(',')
+        .map(|name| name.trim().to_owned())
+        .collect();
+    crate::LabelSet::new(names).map_err(|why| {
+        format!("its {LABELS_KEY} line says {value:?}, and that is not a list of labels: {why}")
+    })
+}
+
+/// One figure of an answer: a whole number of MiB, or of scenarios.
+///
+/// Nothing is coerced. A figure with a unit in it, a negative one, a decimal
+/// one and an empty one are all the same refusal, because each of them is a
+/// number Herd would otherwise have had to invent.
+fn read_figure(key: &str, value: &str) -> Result<u64, String> {
+    value.parse::<u64>().map_err(|_| {
+        format!(
+            "its {key} line says {value:?}, which is not a whole number: a figure a job is \
+             admitted against is never guessed at, so the reading is refused rather than \
+             rounded"
+        )
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -435,6 +634,125 @@ mod tests {
             !Step::Run.is_preparation() && !Step::Down.is_preparation(),
             "run carries the verdict and down happens after it"
         );
+    }
+
+    /// What a reading prints, in the shape the first consumer's `--labels`
+    /// prints it: four keys, one per line (D74). The chatter around it is the
+    /// executor's own — a reading's output is a job's output, and their `up`,
+    /// `fetch` and `down` hooks all talk.
+    const AN_ANSWER: &str = "\
+grove: workspace j7 args: --only a b
+grove: at cb5a2e8b4f1d9c7a3e05b8d6f2a1c4e79b0d3f68
+labels=anvil,sprocket
+memory_mib=4096
+tmpfs_mib=8192
+scenarios=37
+up j7
+fetch cb5a2e8b4f1d9c7a3e05b8d6f2a1c4e79b0d3f68
+";
+
+    /// The answer, with the whole of it read and the executor's own lines
+    /// passed over: a reading runs through the four steps like any other job,
+    /// so its output is never only the answer.
+    #[test]
+    fn an_answer_is_read_out_of_a_job_s_own_output() {
+        let read = Requirements::read(AN_ANSWER.as_bytes()).expect("the fixture is an answer");
+        assert_eq!(
+            read.labels.iter().collect::<Vec<_>>(),
+            ["anvil", "sprocket"]
+        );
+        assert_eq!(read.memory_mib, 4096);
+        assert_eq!(read.tmpfs_mib, 8192);
+        assert_eq!(read.scenarios, 37);
+        assert!(
+            read.line().contains("4096 MiB of memory") && read.line().contains("37 scenario"),
+            "{}",
+            read.line()
+        );
+    }
+
+    /// D74's first refusal, all four of its ways. Each one names what is
+    /// wrong, and none of them answers with a requirement nobody stated.
+    #[test]
+    fn an_answer_that_is_not_one_is_refused_rather_than_guessed_at() {
+        let refusal = |text: &str| match Requirements::read(text.as_bytes()) {
+            Ok(read) => panic!("this was read as an answer and is not one: {read:?}"),
+            Err(why) => why,
+        };
+
+        // An unknown key: `scenario` where `scenarios` was meant. D60's own
+        // case, one character wide.
+        let unknown = refusal(&AN_ANSWER.replace("scenarios=", "scenario="));
+        assert!(
+            unknown.contains("\"scenario\"") && unknown.contains(SCENARIOS_KEY),
+            "the refusal must name the key and list the four: {unknown}"
+        );
+
+        // A missing key.
+        let missing = refusal(&AN_ANSWER.replace("memory_mib=4096\n", ""));
+        assert!(
+            missing.contains(MEMORY_KEY) && missing.contains("a missing key is not a default"),
+            "{missing}"
+        );
+
+        // A duplicated key, which taking the last value of would make a
+        // figure nobody chose.
+        let twice = refusal(&AN_ANSWER.replace("tmpfs_mib=8192", "tmpfs_mib=8192\ntmpfs_mib=16"));
+        assert!(
+            twice.contains("twice") && twice.contains("\"8192\"") && twice.contains("\"16\""),
+            "the refusal must name both values: {twice}"
+        );
+
+        // A figure that is not one, in each of the ways a tool gets it wrong.
+        for said in ["4096 MiB", "4.5", "-1", "", "plenty"] {
+            let figure =
+                refusal(&AN_ANSWER.replace("memory_mib=4096", &format!("memory_mib={said}")));
+            assert!(
+                figure.contains(MEMORY_KEY) && figure.contains("not a whole number"),
+                "{said:?} was read as a figure: {figure}"
+            );
+        }
+
+        // And a label that is not a label, which is the same refusal a
+        // submission's own labels earn.
+        let label = refusal(&AN_ANSWER.replace("anvil,sprocket", "anvil,NOT A LABEL"));
+        assert!(label.contains("not a list of labels"), "{label}");
+
+        // Nought where a memory figure was meant: not a job that needs no
+        // memory, which is what declaring nothing says.
+        let nought = refusal(&AN_ANSWER.replace("memory_mib=4096", "memory_mib=0"));
+        assert!(nought.contains("not a figure"), "{nought}");
+    }
+
+    /// A commit whose tests need no capability in particular is a real
+    /// answer, and nought of tmpfs is a real figure — unlike nought of
+    /// memory.
+    #[test]
+    fn an_answer_may_say_no_capability_and_no_tmpfs() {
+        let read =
+            Requirements::read(b"labels=\nmemory_mib=512\ntmpfs_mib=0\nscenarios=0\n" as &[u8])
+                .expect("an answer that asks for nothing in particular");
+        assert!(read.labels.is_empty());
+        assert_eq!((read.tmpfs_mib, read.scenarios), (0, 0));
+        assert!(
+            read.line().contains("no capability in particular"),
+            "{}",
+            read.line()
+        );
+    }
+
+    /// What is not key-shaped is the executor talking, and what is not text
+    /// at all is not an answer either: neither is guessed at, and neither
+    /// refuses a job.
+    #[test]
+    fn nothing_but_a_key_shaped_line_is_read_as_an_answer() {
+        let mut output = b"\xff\xfe not text at all\n".to_vec();
+        output.extend_from_slice(b"GROVE_OUT=/data/jobs/j7/out\n");
+        output.extend_from_slice(b"= nothing before the equals\n");
+        output.extend_from_slice(b"a sentence with = in it\n");
+        output.extend_from_slice(AN_ANSWER.as_bytes());
+        let read = Requirements::read(&output).expect("the answer is still in there");
+        assert_eq!(read.memory_mib, 4096);
     }
 
     #[test]
