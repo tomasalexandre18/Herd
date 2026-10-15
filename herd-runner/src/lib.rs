@@ -39,6 +39,7 @@
 //! inside a connection, because a probe is a fact about the host and goes on
 //! being true while there is no hub to tell.
 
+pub mod blockio;
 pub mod capability;
 pub mod cgroup;
 pub mod confine;

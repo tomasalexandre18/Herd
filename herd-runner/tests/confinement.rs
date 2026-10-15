@@ -942,6 +942,193 @@ async fn the_runner_says_which_memory_ceiling_it_enforces() {
     }
 }
 
+// ------------------------------------------- CPU, IO and pid bounds ----
+
+/// What a delegated scope would prove, said in every skip below, so a reader
+/// of a green run knows exactly what was not checked and how to check it.
+const WHAT_DELEGATION_WOULD_PROVE: &str = "a delegated scope — \
+     `systemd-run --user --scope -p Delegate=yes cargo test ...` — would prove that \
+     a job's own cgroup really carries cpu.weight, cpu.max, io.weight and pids.max, \
+     read back by the job itself out of /sys/fs/cgroup, and that pids.max stops a \
+     job from forking without end";
+
+/// Ask the job itself what its cgroup says, which is the only reading that
+/// cannot agree with the code under test by accident.
+fn read_own_cgroup() -> String {
+    "d=/sys/fs/cgroup$(cut -d: -f3 /proc/self/cgroup); \
+     for f in memory.max cpu.weight cpu.max io.weight pids.max; do \
+       printf '%s=%s\\n' \"$f\" \"$(cat \"$d/$f\" 2>/dev/null | tr '\\n' ' ' || echo MISSING)\"; \
+     done"
+        .to_owned()
+}
+
+/// Pick one `name=value` line out of what that script printed.
+fn control(out: &str, name: &str) -> String {
+    out.lines()
+        .find_map(|line| line.strip_prefix(&format!("{name}=")))
+        .unwrap_or_else(|| panic!("the job printed no {name}: {out}"))
+        .trim()
+        .to_owned()
+}
+
+/// Memory was the only control a job's cgroup carried, and `nice 10` plus the
+/// idle IO class was everything else standing between a job and the host.
+/// Four controls are written now, and this reads all four back out of the
+/// kernel — from inside the job, through `/proc/self/cgroup`.
+#[tokio::test]
+async fn a_job_s_cgroup_carries_the_cpu_io_and_pid_bounds() {
+    if let Err(why) = kernel_ceiling_or_reason() {
+        skipped(
+            "a_job_s_cgroup_carries_the_cpu_io_and_pid_bounds",
+            &format!("{why} — {WHAT_DELEGATION_WOULD_PROVE}"),
+        );
+        return;
+    }
+    let harness = Harness::new("controls", |confinement| {
+        // Each one different from its default, so a value read back is this
+        // test's value and not a figure the kernel or the default supplied.
+        confinement.cpu_weight = 37;
+        confinement.cpu_max =
+            Some(herd_runner::cgroup::CpuQuota::from_cores(1.5).expect("1.5 cores is a quota"));
+        confinement.io_weight = 23;
+        confinement.pids_max = 64;
+    })
+    .await;
+    let ran = harness.run(&read_own_cgroup()).await;
+    assert_eq!(
+        ran.outcome,
+        JobOutcome::Exited { code: 0 },
+        "the job could not read its own cgroup: {} / {}",
+        ran.out,
+        ran.err
+    );
+    assert_eq!(control(&ran.out, "memory.max"), (512 << 20).to_string());
+    assert_eq!(control(&ran.out, "cpu.weight"), "37");
+    assert_eq!(
+        control(&ran.out, "cpu.max"),
+        "150000 100000",
+        "a declared quota is a quota and a period, in microseconds: {}",
+        ran.out
+    );
+    // `io.weight` reads back as "default N", with a line per device where an
+    // operator set one, so the figure is matched inside it.
+    let io = control(&ran.out, "io.weight");
+    assert!(
+        io.contains("23"),
+        "the job's cgroup must carry the io.weight it was given: {io}"
+    );
+    assert_eq!(control(&ran.out, "pids.max"), "64");
+}
+
+/// And with no quota declared, `cpu.max` is the kernel's own `max`: absent by
+/// default is a real absence, not a quota equal to the machine.
+#[tokio::test]
+async fn no_declared_quota_leaves_cpu_max_at_the_kernel_s_max() {
+    if let Err(why) = kernel_ceiling_or_reason() {
+        skipped(
+            "no_declared_quota_leaves_cpu_max_at_the_kernel_s_max",
+            &format!("{why} — {WHAT_DELEGATION_WOULD_PROVE}"),
+        );
+        return;
+    }
+    let harness = Harness::new("no-quota", |confinement| {
+        confinement.cpu_max = None;
+    })
+    .await;
+    let ran = harness.run(&read_own_cgroup()).await;
+    assert_eq!(ran.outcome, JobOutcome::Exited { code: 0 });
+    assert!(
+        control(&ran.out, "cpu.max").starts_with("max"),
+        "a job with no declared quota must have no quota: {}",
+        ran.out
+    );
+    // The weight is still there: yielding under contention is the default,
+    // and it costs an idle machine nothing.
+    assert_eq!(control(&ran.out, "cpu.weight"), "10");
+}
+
+/// The bound the consumer's second incident needed: a job that forks without
+/// end runs out of **its own** pids and the host keeps its own. The job is
+/// asked to reach well past its ceiling and must not get there.
+#[tokio::test]
+async fn a_job_cannot_fork_past_its_own_pid_ceiling() {
+    if let Err(why) = kernel_ceiling_or_reason() {
+        skipped(
+            "a_job_cannot_fork_past_its_own_pid_ceiling",
+            &format!("{why} — {WHAT_DELEGATION_WOULD_PROVE}"),
+        );
+        return;
+    }
+    let harness = Harness::new("pid-ceiling", |confinement| {
+        confinement.pids_max = 16;
+        confinement.timeout = Duration::from_secs(20);
+    })
+    .await;
+    // Not a fork bomb: a counted number of children, well past the ceiling
+    // and far short of anything that could trouble the host even if the
+    // ceiling did nothing. The last line is only reached if all of them
+    // started.
+    let ran = harness
+        .run(
+            "i=0; while [ $i -lt 200 ]; do sleep 20 & i=$((i+1)); done; \
+             echo every child started",
+        )
+        .await;
+    assert!(
+        !ran.out.contains("every child started"),
+        "a job with pids.max 16 started two hundred children: {} / {}",
+        ran.out,
+        ran.err
+    );
+    // And the runner is unharmed: it takes the next job.
+    let after = harness.run("echo the runner lived").await;
+    assert_eq!(after.outcome, JobOutcome::Exited { code: 0 });
+    assert_eq!(after.out.trim(), "the runner lived");
+}
+
+/// `io.weight` is the one control the cgroup core cannot tell the truth
+/// about: the write succeeds on every host, and only bfq or blk-iocost
+/// honours it. A runner that stayed quiet about that would be claiming a
+/// bound it does not have, which is exactly what D23 forbids.
+#[tokio::test]
+async fn an_io_weight_that_cannot_bite_is_said_out_loud() {
+    let temp = TempDir::new("io-weight-report");
+    let confined = Confined::prepare(test_confinement(temp.path())).expect("confinable");
+    let report = confined.report().join("\n");
+    let Some(why) = confined.io_weight_inert().map(|why| why.to_owned()) else {
+        // bfq or blk-iocost: the weight really bites here, and the report
+        // says nothing about it on purpose.
+        assert!(
+            !report.contains("WRITTEN BUT INERT"),
+            "this host weights IO, so the report must not claim otherwise: {report}"
+        );
+        return;
+    };
+    if let Some(no_cgroup) = confined.ceiling().fallback_reason() {
+        // With no cgroup at all the report already says io.weight is not
+        // enforced; the inert sentence would be a second reason for the same
+        // thing.
+        assert!(report.contains("NOT ENFORCED AT ALL"), "{report}");
+        skipped(
+            "an_io_weight_that_cannot_bite_is_said_out_loud",
+            &format!(
+                "{no_cgroup} — this host's io.weight is inert for a second reason too \
+                 ({why}), and inside a delegated scope the startup report would have to \
+                 carry the WRITTEN BUT INERT line for it"
+            ),
+        );
+        return;
+    }
+    assert!(
+        report.contains("WRITTEN BUT INERT") && report.contains(&why),
+        "an io.weight the block layer ignores must be shouted, with its reason: {report}"
+    );
+    assert!(
+        report.contains("io.max"),
+        "the report must name the lever that would work here: {report}"
+    );
+}
+
 // ------------------------------------------------- no inbound socket ----
 
 /// Invariant 3, asserted against the running process rather than against a
