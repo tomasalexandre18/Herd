@@ -2903,3 +2903,65 @@ lasted at least the cap, say. Both counters are in scope, the failure count
 by hand, nothing is deployed, and a runner holds its jobs and its
 unacknowledged output across the gap (D36, D17). But it cannot ship to a real
 fleet, so it is fixed before M16 puts a runner on the server for good.
+
+## 2026-10-15 — D105 A connection that served clears the backoff
+
+**Context.** D104 recorded the defect and left the policy to Alexa: the
+runner's redial counters were cleared only by a hub that closed the
+WebSocket cleanly, which is measurably a case that never happens. He asked
+for it fixed before M10, because everything after this assumes a runner that
+survives its hub.
+
+**Choice. A connection that was welcomed and then lasted at least the cap
+clears both counters, whatever ended it.** Three parts, and each is load-
+bearing:
+
+* **Welcomed, not merely attempted.** A dial that hung for a minute and a
+  link that served for a minute are the same span on the clock and opposite
+  facts about the hub, so the loop cannot time it — the session records the
+  moment the hub welcomed it, and `Session::served_since` answers only for a
+  welcome that arrived during the attempt being judged. Without that bound a
+  runner that served for an hour and then lost its hub for good would read
+  its own stale welcome as proof that every failed dial since had been a
+  connection.
+* **Both counters, not just the delay.** `failing_since` is what the give-up
+  bound measures from, and it was the serious half: it made a day of
+  *unreachability* into a day since this process's first bad dial. Measured
+  before the fix, a runner that had served for five seconds was killed for
+  good by the first `kill -9` of its hub.
+* **The floor is the cap, and that is the whole argument.** A hub that
+  accepts and dies in a loop would otherwise be answered every 500 ms for
+  ever, and the give-up bound would never fire on it, because each short
+  connection would wipe the record of the last. With the floor at the cap, a
+  reset can only follow a connection that lasted at least as long as the
+  longest delay this backoff would ever have waited — so **no reset can make
+  a runner dial faster than once per cap**, whatever a broken hub does. The
+  floor costs nothing in the case it is there for and bounds everything else.
+
+**Alternative rejected.** Resetting on any welcomed connection, however
+short, which is the obvious fix and the one D104 sketched. It turns a
+crash-looping hub into a 2 Hz dial loop per runner and makes `--give-up-after`
+unreachable, so a hub that is broken rather than absent is never reported. A
+separate `--settled-after` figure was rejected for D102's reason: a second
+number that has to be kept paired with the first, to say something the first
+already says.
+
+**Also changed, because it said the opposite.** `Backoff::default`'s comment
+claimed 500 ms was "for the common case, a hub restarted by its deployment".
+That was true of the first restart only; it now says what makes it true.
+
+**Verified.** `Backoff::settled` is pure and unit-tested at and either side
+of the floor, with `None` for an attempt that never got in; a second unit
+test pins the stale-welcome bound. End to end against the real binaries, a
+runner with four failed dials behind it joins, serves a job, has its hub
+killed under it — a reset, never a clean close — and comes back saying
+`attempt 2`, not `attempt 5`. That assertion is on the counter the runner
+itself prints, so a connection that had *not* counted fails it loudly rather
+than passing on an unestablished premise (D101). Mutated back to the old
+behaviour, the test fails.
+
+**What is left.** `a_log_survives_twelve_killed_hubs_whole` keeps
+`--redial-cap 1`. Its hubs live for well under the default 30 s cap, so they
+do not clear the counters — correctly, a hub dying that fast is one to back
+off from — and the cap keeps the test's figures apart from its patience. It
+is a fixture, and it is now the only one.
