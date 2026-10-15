@@ -13,10 +13,12 @@
 //! Every wait is on a condition, never on a sleep, and every process is killed
 //! when its test ends however it ends.
 
+use std::collections::BTreeSet;
 use std::fs::File;
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
+use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 use tempfile::TempDir;
@@ -89,19 +91,36 @@ fn binary(name: &str) -> PathBuf {
     path
 }
 
-/// A port that was free a moment ago.
+/// A port that was free a moment ago, and that this process has not handed
+/// out before.
 ///
 /// It cannot be more than that: the hub under test is a *process*, which binds
 /// the port itself, so the listener has to be let go before it starts and
-/// anything else in the suite may take it in between. [`Herd::start_hub`]
-/// therefore retries on another port rather than failing a test about
-/// capabilities for a reason that has nothing to do with them.
+/// anything else *outside* this process may take it in between.
+/// [`Herd::start_hub`] therefore retries on another port rather than failing a
+/// test about capabilities for a reason that has nothing to do with them.
+///
+/// What is closed here is the collision inside this process, which no retry
+/// can see: two herds on one port is a `herdctl` of one submitting into the
+/// hub of another — these hubs set no requester token, so nothing downstream
+/// refuses it — and an id minted in the wrong state root. See `real_herd`'s
+/// own `free_port`, where the same set is kept for the same reason.
 fn free_port() -> u16 {
-    TcpListener::bind("127.0.0.1:0")
-        .expect("a free loopback port")
-        .local_addr()
-        .expect("a bound listener has an address")
-        .port()
+    static HANDED_OUT: Mutex<BTreeSet<u16>> = Mutex::new(BTreeSet::new());
+    for _ in 0..1_000 {
+        let port = TcpListener::bind("127.0.0.1:0")
+            .expect("a free loopback port")
+            .local_addr()
+            .expect("a bound listener has an address")
+            .port();
+        let mut handed_out = HANDED_OUT
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if handed_out.insert(port) {
+            return port;
+        }
+    }
+    panic!("this host would not give a loopback port this process has not already used");
 }
 
 /// A hub, a runner with the capabilities a test gives it, and a requester.

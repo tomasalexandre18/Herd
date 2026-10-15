@@ -725,8 +725,15 @@ async fn the_derived_j_is_recorded_and_is_what_the_job_is_given() {
         herd_runner::metrics::total_memory_mib().is_some_and(|total| total >= 17 * 1024);
     if lends_seventeen_gibibytes {
         assert_eq!(
-            said, "built with -j7",
-            "the figure E-22 asks for, in the process's own words"
+            said,
+            "built with -j7",
+            "the figure E-22 asks for, in the process's own words. The hub explained the \
+             placement it made, and the figures in that line are the ones to read: {}",
+            herd.said("hub")
+                .lines()
+                .filter(|line| line.contains("is attempt 1 on runner"))
+                .collect::<Vec<_>>()
+                .join("\n")
         );
     } else {
         skipped(
