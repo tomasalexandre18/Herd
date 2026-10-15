@@ -302,10 +302,12 @@ Flake builds the hub image; docker compose beside the consumer's dashboard;
 their budgets (Q9). The server's runner runs natively, unprivileged, with
 `/dev/kvm`, `/dev/dri`, `/dev/vfio` and the consumer's namespaces reachable
 (E-47), restarting with the host (E-52, server side). The runner's user is
-not in the `docker` group and never needs to be (D78): no crate in the
-workspace depends on a Docker client and `docker.sock` appears nowhere in
-it; a test asserts no open file descriptor of the runner resolves to the
-Docker socket while a job runs; and claim, execute, return the result and
+not in the `docker` group and never needs to be (D78, D121): no crate in
+the workspace depends on a Docker client, and the only place the workspace
+names `docker.sock` is the list `privilege.rs` warns about and the test
+that watches it — nothing opens, dials or executes it; a test asserts no
+open file descriptor of the runner resolves to the Docker socket while a
+job runs; and claim, execute, return the result and
 reconnect after a service restart are all exercised with that socket
 unreachable to the runner's user. The hub itself may still run in docker
 compose; that is the operator's deployment and needs nothing from the

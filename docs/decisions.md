@@ -3492,3 +3492,75 @@ only there**.
 from the host's IO schedulers — the check it has today would call the NVMe
 inert. That is the next piece of work, and it is the honest version of the
 line the runner already prints.
+
+---
+
+## 2026-10-15 — D121 D78's Docker promise, restated so it is true
+
+**Context.** D78 commits Herd to three checkable things, and the first is
+"the string `docker.sock` appears nowhere in it". Writing the test for the
+second one proved the first **false as literally written**: `git grep
+docker.sock` finds it in `herd-runner/src/privilege.rs`, as two of the string
+literals in `RUNTIME_SOCKETS`.
+
+**Choice.** Restate the promise rather than keep a claim a `grep` refutes, and
+rather than delete the warning the claim was protecting. The sense of D78 was
+never "the characters are absent"; it was "Herd never talks to that socket".
+So the promise is now:
+
+> No crate in the workspace depends on a Docker client, and the only place
+> the workspace names `docker.sock` is the list `privilege.rs` warns about
+> and the test that watches it — nothing opens, dials or executes it.
+
+Both halves are checkable, which is the point: the whole of `Cargo.lock`
+contains nothing matching `docker|bollard|shiplift|containerd|podman|oci`,
+and there is no HTTP client in the graph beyond `tokio-tungstenite`; and
+`RUNTIME_SOCKETS` has exactly two readers, the startup warning and the test.
+
+**Rejected.** Deleting the warning to make the original sentence true. The
+warning is what tells an owner that a uid is not the whole story — a user in
+`docker` is root through that socket whatever the process's uid says — and
+D78 keeps it on purpose. A promise is worth less than the thing it describes.
+
+`docs/plan.md`'s M16 paragraph carried the same sentence and now carries this
+one.
+
+---
+
+## 2026-10-15 — D122 What the startup reaper cannot tell apart
+
+**Context.** The `reclaim` test failed in isolation as readily as under load,
+and I suspected the reaper. It is sound, but chasing it named three shapes the
+sweep genuinely cannot distinguish. They are written where the sweep reads
+`environ`; they are here because a limit nobody records is rediscovered.
+
+The sweep finds a past life's processes by reading `/proc/<pid>/environ` for a
+marker naming the runner that minted them, and kills those whose minter is
+gone.
+
+**The fork/exec window is not a defect, and the reason is structural.**
+Between `fork` and `exec` a child's `environ` is still its *parent's*. A
+sweep in that window sees a job's process as unmarked — which is exactly why
+the old fixture, which slept 100 ms on the written belief that "the
+environment is readable as soon as the process exists", saw **zero** marked
+processes. But the sweep hunts processes of a runner that is *gone*: those
+`exec`ed long ago, and a child one of them forks during the walk inherits a
+**marked** parent's environ, so it is visible anyway. The only invisible shape
+is a marked child of an unmarked parent, and the only unmarked parent minting
+marked children is a **live** runner starting a job — whose jobs the sweep is
+required to skip. So no job process can be missed.
+
+**Two shapes are permanent when they happen**, because the sweep runs once at
+startup and there is no second pass. A **zombie** minter reads as alive —
+narrow, since it needs a new runner to start before the supervisor reaps the
+old one, and systemd reaps at once. A **reused pid** reads as alive, which is
+inherent to naming a runner by its pid; closing it needs an identity a pid
+alone cannot give, the start time from `/proc/<pid>/stat` kept beside it.
+Neither is covered by the cgroup half either: it asks the same question of the
+same pid.
+
+**Not fixed, deliberately.** Both are narrow, and the cost is a leftover
+process rather than a wrong verdict. Recorded so that a leftover process on a
+machine running two runners is recognised instead of investigated — and
+because the reused-pid case is the one that will bite first when M17 puts a
+second runner on one box.
