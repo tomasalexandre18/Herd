@@ -707,6 +707,17 @@ fn the_link_frames_are_tagged_json_objects() {
         to_frame(&FromHub::HealthRecorded {}).expect("encodes"),
         r#"{"type":"health_recorded"}"#
     );
+    // The hub's breath: a tag, a job, and deliberately nothing else. The shape
+    // is pinned here because "nothing else" is the promise — a field added to
+    // it later would be a field a client might print, and this frame is one
+    // nothing prints.
+    assert_eq!(
+        to_frame(&FromHub::StillThere {
+            job_id: JobId::new("j0000000007"),
+        })
+        .expect("encodes"),
+        r#"{"type":"still_there","job_id":"j0000000007"}"#
+    );
     assert_eq!(
         to_frame(&FromHub::LogAck {
             job_id: JobId::new("j1"),
@@ -854,6 +865,9 @@ fn every_link_frame_round_trips() {
         reason: String::new(),
     });
     round_trip_from_hub(FromHub::HealthRecorded {});
+    round_trip_from_hub(FromHub::StillThere {
+        job_id: JobId::new("j1"),
+    });
     round_trip_from_hub(FromHub::StandBy {
         reason: "a runner is already connected".to_owned(),
         retry_in_ms: u64::MAX,
@@ -878,6 +892,25 @@ fn every_link_frame_round_trips() {
         attempt: 1,
         from_seq: 0,
     });
+}
+
+/// The two cadences of a quiet link are **one number**.
+///
+/// A runner says it is alive to the hub every [`herd_proto::HEALTH_EVERY`],
+/// and the hub says it is alive to a follower every
+/// [`herd_proto::STILL_THERE_EVERY`]. They are the two directions of one
+/// problem, so they are deliberately the same figure: a reader who knows 15 s
+/// knows both. Pinned here because the sameness is a decision and not a
+/// coincidence — if one is ever moved on purpose, this is where that choice
+/// is made rather than discovered.
+#[test]
+fn a_quiet_link_speaks_at_one_cadence_in_both_directions() {
+    assert_eq!(
+        herd_proto::STILL_THERE_EVERY,
+        herd_proto::HEALTH_EVERY,
+        "the cadence the hub keeps a follower warm at and the cadence a runner reports at \
+         are one figure on purpose"
+    );
 }
 
 /// The arithmetic both sides refuse a configuration on, and the figures the

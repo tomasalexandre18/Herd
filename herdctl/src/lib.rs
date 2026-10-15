@@ -350,6 +350,20 @@ pub async fn run_job(
                 on_log(LogStream::Stdout, &data);
             }
             FromHub::JobNote { note, .. } => said(Said::Note(&note)),
+            // The hub keeping this connection warm under a job that is
+            // running and printing nothing. **Nothing happens here, and that
+            // is the whole of it**: not a byte on stdout, not a word on
+            // stderr, no release of the held `ran on:` line — E-02's framing
+            // is the line, the job's own bytes, then the verdict, and a
+            // breath from the hub is in none of those places.
+            //
+            // Handled by name rather than left to the fallback below, which
+            // is a `bail!`: a frame a requester "cannot use" ends the run
+            // with an error, so swallowing this one by accident was never
+            // available. And by name rather than by a wildcard so that the
+            // next frame added to the protocol still meets that `bail!`
+            // instead of being silently ignored.
+            FromHub::StillThere { .. } => {}
             // E-02's first line, on **stdout**, ahead of the job's first
             // byte: the output a requester sees is framed with where the job
             // ran and why there, and the job's own output follows it
@@ -487,6 +501,12 @@ pub async fn wait_for_job(
                 on_log(stream, &data);
             }
             FromHub::JobNote { note, .. } => said(Said::Note(&note)),
+            // The hub keeping a quiet wait's connection warm. Nothing is
+            // printed for it, here as in [`run_job`]: a `herdctl wait` on a
+            // job that runs for an hour in silence is exactly the case the
+            // frame exists for, and exactly the case where one stray
+            // character would break the output a reader is anchored on.
+            FromHub::StillThere { .. } => {}
             // E-02's first line, on **stdout**, ahead of the job's first
             // byte: the output a requester sees is framed with where the job
             // ran and why there, and the job's own output follows it
@@ -874,6 +894,7 @@ fn message_kind(message: &FromHub) -> &'static str {
         FromHub::ResendLog { .. } => "resend_log",
         FromHub::JobLog { .. } => "job_log",
         FromHub::JobNote { .. } => "job_note",
+        FromHub::StillThere { .. } => "still_there",
         FromHub::RanOn { .. } => "ran_on",
         FromHub::JobFinished { .. } => "job_finished",
         FromHub::JobResultAck { .. } => "job_result_ack",

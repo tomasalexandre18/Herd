@@ -2212,6 +2212,7 @@ fn message_kind(message: &FromHub) -> &'static str {
         FromHub::ResendLog { .. } => "resend_log",
         FromHub::JobLog { .. } => "job_log",
         FromHub::JobNote { .. } => "job_note",
+        FromHub::StillThere { .. } => "still_there",
         FromHub::RanOn { .. } => "ran_on",
         FromHub::JobFinished { .. } => "job_finished",
         FromHub::JobResultAck { .. } => "job_result_ack",

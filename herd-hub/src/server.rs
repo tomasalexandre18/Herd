@@ -273,6 +273,21 @@ pub struct Policy {
     /// where the reason is **computed**, and it may run twenty times a minute
     /// or once an hour; this is where it is **said**.
     pub wait_restatement: Duration,
+    /// How long a follower of a job that is not over may hear nothing at all
+    /// before the hub speaks to it ([`herd_proto::FromHub::StillThere`]).
+    ///
+    /// Fifteen seconds, [`herd_proto::STILL_THERE_EVERY`]. A *running* job
+    /// that prints nothing gives its follower no frames whatever — no output,
+    /// no queue reason, no verdict until the end — and through a proxy with an
+    /// idle timeout that connection is closed under the follower, which
+    /// `herdctl` reads as the stream ending with no verdict: exit 125 on a
+    /// job that succeeded.
+    ///
+    /// A setting for the reason every other figure here is one: a test has to
+    /// be able to prove a quiet job keeps its follower warm without running a
+    /// job for a minute, and through the hub's own clock rather than a copy of
+    /// it. Zero is refused.
+    pub still_there_every: Duration,
     /// How long a job may hold a host empty waiting for it to go quiet
     /// (E-27).
     ///
@@ -311,6 +326,7 @@ impl Default for Policy {
             aging_step: crate::queue::AGING_STEP,
             stickiness: Stickiness::default(),
             wait_restatement: WAIT_RESTATEMENT,
+            still_there_every: herd_proto::STILL_THERE_EVERY,
             drain_first_limit: crate::matcher::DRAIN_FIRST_LIMIT,
             requeue_budget: REQUEUE_BUDGET,
             reading_cap: READING_CAP,
@@ -339,6 +355,18 @@ impl Policy {
                 "--wait-restatement 0 would say why a job is waiting as fast as this hub can \
                  loop, which is not a cadence. E-04 asks for at least every 60 s; give that, \
                  or a shorter figure a test can make ten minutes pass under."
+                    .to_owned(),
+            );
+        }
+        // And the same mistake for the liveness cadence: zero would be due on
+        // every turn of the loop, so a follower of one quiet job would be
+        // written to as fast as the hub can run. A frame nobody prints is not
+        // a frame nobody pays for.
+        if self.still_there_every.is_zero() {
+            return Some(
+                "--still-there-every 0 would keep a follower's link warm as fast as this hub \
+                 can loop, which is not a cadence. Give 15 s, or a shorter figure a test can \
+                 make a quiet minute pass under."
                     .to_owned(),
             );
         }
@@ -822,6 +850,50 @@ struct Peers {
     /// watching a ten-minute wait is not left in silence. One instant per
     /// job, pruned when nobody is following it any more.
     wait_told: HashMap<JobId, Instant>,
+    /// When the hub last wrote **anything at all** to the followers of each
+    /// job.
+    ///
+    /// What [`FromHub::StillThere`] is decided on, and it has to be "anything
+    /// at all" rather than "a note": a connection that has just carried eight
+    /// kilobytes of a build log is not a connection a proxy is about to close,
+    /// and one that has carried nothing since the job started is.
+    ///
+    /// Per *job* rather than per connection, because a job is the only thing
+    /// [`Peers::followers`] is keyed on and because every frame the hub writes
+    /// to a follower goes to all the followers of one job in the same breath.
+    /// Kept beside [`Peers::wait_told`] and pruned by the same loop, for the
+    /// same reason: it is a fact about a stream, not about a job.
+    spoke_to_followers: HashMap<JobId, Instant>,
+}
+
+impl Peers {
+    /// The followers of one job, remembering that the hub is about to write
+    /// to them.
+    ///
+    /// One function because the two halves must not drift. Every path that
+    /// asks for a follower list asks in order to *send*, and the liveness
+    /// clock is exactly "nothing was sent": a list handed out without the
+    /// timestamp would be a frame the clock never saw, and the hub would then
+    /// tell a busy connection it was quiet.
+    fn followers_to_write_to(&mut self, id: &JobId) -> Vec<Outbox> {
+        let followers = self.followers.get(id).cloned().unwrap_or_default();
+        if !followers.is_empty() {
+            self.spoke_to_followers.insert(id.clone(), Instant::now());
+        }
+        followers
+    }
+
+    /// A follower has just joined, and whoever registered it is about to say
+    /// something to it — the id it was given, the log so far, where the job
+    /// was placed.
+    ///
+    /// So the clock starts here rather than at the first frame the loop
+    /// happens to see. Without it the first turn of the loop would find a
+    /// follower nothing was ever written to and keep a link warm that was
+    /// warm already.
+    fn joined(&mut self, id: &JobId) {
+        self.spoke_to_followers.insert(id.clone(), Instant::now());
+    }
 }
 
 impl State {
@@ -1228,11 +1300,20 @@ impl State {
     }
 
     fn follow(&self, id: JobId, outbox: &Outbox) {
-        self.with_peers(|peers| peers.followers.entry(id).or_default().push(outbox.clone()));
+        self.with_peers(|peers| {
+            peers.joined(&id);
+            peers.followers.entry(id).or_default().push(outbox.clone());
+        });
     }
 
-    fn followers_of(&self, id: &JobId) -> Vec<Outbox> {
-        self.with_peers(|peers| peers.followers.get(id).cloned().unwrap_or_default())
+    /// Who is following this job, and the hub is about to write to them.
+    ///
+    /// Taking the list is what marks the connection as having spoken
+    /// ([`Peers::followers_to_write_to`]), so this is not a getter: every
+    /// call site here sends on what it gets back, and the liveness clock
+    /// depends on that staying true.
+    fn followers_to_tell(&self, id: &JobId) -> Vec<Outbox> {
+        self.with_peers(|peers| peers.followers_to_write_to(id))
     }
 
     /// Record one chunk of a job's output and take the list of who is
@@ -1252,7 +1333,7 @@ impl State {
     ) -> (crate::job::Result<LogWrite>, Vec<Outbox>) {
         self.with_peers(|peers| {
             let written = self.store.append_log(id, stream, seq, data);
-            let followers = peers.followers.get(id).cloned().unwrap_or_default();
+            let followers = peers.followers_to_write_to(id);
             (written, followers)
         })
     }
@@ -1271,7 +1352,7 @@ impl State {
             peers
                 .unwritten
                 .insert(id.clone(), (outcome.clone(), metrics.clone()));
-            peers.followers.get(id).cloned().unwrap_or_default()
+            peers.followers_to_write_to(id)
         })
     }
 
@@ -1298,6 +1379,7 @@ impl State {
             let log = self.store.job_log(id)?.unwrap_or_default();
             let stalled = peers.stalled.get(id).cloned();
             if !record.state.is_terminal() {
+                peers.joined(id);
                 peers
                     .followers
                     .entry(id.clone())
@@ -1858,7 +1940,7 @@ async fn serve_runner(
         // place: the runner may redeliver the result it is holding, and if it
         // does not the job is attempted again on this same connection's watch.
         for job in attempts_in_the_air(state) {
-            for follower in state.followers_of(&job) {
+            for follower in state.followers_to_tell(&job) {
                 let _ = follower.send(FromHub::JobNote {
                     job_id: job.clone(),
                     note: format!(
@@ -2513,6 +2595,32 @@ async fn let_the_queue_age(state: Arc<State>) {
     }
 }
 
+/// Keep every followed job's stream from going silent: say again why a queued
+/// job is waiting (E-04), and breathe on any job that is not over and is
+/// saying nothing.
+///
+/// Two deadlines, **one timer**, and that is deliberate. They are the same
+/// question asked twice — *is this connection still carrying anything?* — and
+/// a second task would be a second place to get the pruning of
+/// [`Peers::wait_told`] and [`Peers::spoke_to_followers`] wrong. [`Restating`]
+/// already separates the cadence a deadline is measured against from the tick
+/// a loop wakes on, so one loop waking on the shorter of the two ticks serves
+/// both figures with each keeping its own cadence.
+///
+/// E-04's half is explained below. The liveness half is this: a job that is
+/// executing and printing nothing produces no frames at all, so it carries no
+/// bytes for as long as the job is quiet, and a reverse proxy with an idle
+/// timeout closes it under the follower — which `herdctl` reads as the stream
+/// ending with no verdict and reports as 125 on a job that succeeded.
+///
+/// The two are **not** "queued" and "running": the breath covers every state
+/// that is not terminal, queued included. E-04's restatement is paced by a
+/// figure an operator chooses — 60 s by default, four breaths — and a job the
+/// hub has not yet found a reason for is restated never, so a queued stream is
+/// not warm by itself either. What keeps the two from doubling up is the
+/// clock: a note the hub has just written *is* traffic, so it postpones the
+/// next breath by a cadence.
+///
 /// Say again, on a clock, why every followed job is still waiting (E-04).
 ///
 /// E-04 asks for a queued stream to report "at least every 60 s", and the two
@@ -2536,52 +2644,113 @@ async fn say_again_why_jobs_wait(state: Arc<State>) {
     // rather than approached: a loop that woke exactly every 60 s would drift
     // past it by however long a pass of it takes.
     let restating = Restating::every(state.policy.wait_restatement);
+    // The liveness deadline, with a cadence of its own. The loop wakes on
+    // whichever tick is shorter, so neither figure is served by a loop too slow
+    // for it: at the defaults the liveness cadence (15 s) is a quarter of the
+    // restatement's (60 s), so the loop ticks four times as often as it used
+    // to and each deadline still fires inside its own `[cadence - tick,
+    // cadence]`.
+    let breathing = Restating::every(state.policy.still_there_every);
+    let tick = restating.tick.min(breathing.tick);
     loop {
-        tokio::time::sleep(restating.tick).await;
+        tokio::time::sleep(tick).await;
         let followed = state.with_peers(|peers| {
-            // And the pruning, under the same lock: a job nobody follows any
-            // more leaves nothing behind in this map.
-            peers.wait_told.retain(|job, _| {
-                peers
-                    .followers
-                    .get(job)
-                    .is_some_and(|followers| !followers.is_empty())
-            });
-            peers
+            let followed: Vec<JobId> = peers
                 .followers
                 .iter()
                 .filter(|(_, followers)| !followers.is_empty())
                 .map(|(job, _)| job.clone())
-                .collect::<Vec<_>>()
+                .collect();
+            // And the pruning, under the same lock: a job nobody follows any
+            // more leaves nothing behind in either map.
+            let followed_now: HashSet<&JobId> = followed.iter().collect();
+            peers.wait_told.retain(|job, _| followed_now.contains(job));
+            peers
+                .spoke_to_followers
+                .retain(|job, _| followed_now.contains(job));
+            followed
         });
         for job_id in followed {
-            // Only a job that is *queued* and has a reason on it. A running
-            // job is not waiting, and a queued job the hub has not yet had a
-            // reason for says nothing rather than saying nothing useful.
+            // **Both deadlines are judged before the record is read**, and
+            // that order is deliberate: the two clocks live in memory, the
+            // record lives on a disk, and a tick on which neither deadline is
+            // due has no question to ask the disk. Reading first would mean
+            // one file read per followed job per *tick* — and the tick is now
+            // the shorter of two cadences, so the cost of the second deadline
+            // would land on every hub whether anything was following a quiet
+            // job or not.
+            let (wait_due, breath_due) = state.with_peers(|peers| {
+                (
+                    restating.is_due(peers.wait_told.get(&job_id).map(|told| told.elapsed())),
+                    breathing.is_due(
+                        peers
+                            .spoke_to_followers
+                            .get(&job_id)
+                            .map(|spoke| spoke.elapsed()),
+                    ),
+                )
+            });
+            if !wait_due && !breath_due {
+                continue;
+            }
             let Ok(Some(record)) = state.store.job(&job_id) else {
                 continue;
             };
-            if record.state != JobState::Queued {
+            // A job that is **over** gets neither of the two: its stream is
+            // finished, and the hub has nothing left to say about it. A
+            // follower is dropped at the verdict, so this covers the window
+            // between the end being recorded and the list being emptied —
+            // small, and the one place a frame after a verdict could come
+            // from.
+            if record.state.is_terminal() {
                 continue;
             }
-            let Some(reason) = record.waiting_for else {
-                continue;
-            };
-            let due = state.with_peers(|peers| {
-                let due = restating.is_due(peers.wait_told.get(&job_id).map(|told| told.elapsed()));
-                if due {
-                    peers.wait_told.insert(job_id.clone(), Instant::now());
+            // E-04. Only a job that is *queued* and has a reason on it: a
+            // running job is not waiting, and a queued job the hub has not
+            // yet had a reason for says nothing rather than saying nothing
+            // useful.
+            if wait_due && record.state == JobState::Queued {
+                if let Some(reason) = record.waiting_for {
+                    // The clock is reset where the decision is taken, under
+                    // the lock, so two passes cannot both find it due.
+                    state
+                        .with_peers(|peers| peers.wait_told.insert(job_id.clone(), Instant::now()));
+                    let note = format!("this job is queued and has not started: {reason}");
+                    for follower in state.followers_to_tell(&job_id) {
+                        let _ = follower.send(FromHub::JobNote {
+                            job_id: job_id.clone(),
+                            note: note.clone(),
+                        });
+                    }
                 }
-                due
-            });
-            if !due {
+            }
+            // The breath, for **every** job that is not over, queued included. A
+            // queued job is not safe by itself: its reason is restated at a
+            // cadence an operator chooses (60 s by default, four times this
+            // one), and a job the hub has not yet found a reason for is
+            // restated never — either way a link that carries nothing.
+            //
+            // Judged again here rather than reused from above, because a note
+            // that has just gone out is itself something the connection
+            // carried, and a job that is both due at once wants the note and
+            // not a breath behind it.
+            let breath_due = breath_due
+                && state.with_peers(|peers| {
+                    breathing.is_due(
+                        peers
+                            .spoke_to_followers
+                            .get(&job_id)
+                            .map(|spoke| spoke.elapsed()),
+                    )
+                });
+            if !breath_due {
                 continue;
             }
-            let note = format!("this job is queued and has not started: {reason}");
-            for follower in state.followers_of(&job_id) {
-                let _ = follower.send(FromHub::JobNote {
+            // Taking the list is what records that the hub spoke, so the next
+            // breath is a cadence after this one.
+            for follower in state.followers_to_tell(&job_id) {
+                let _ = follower.send(FromHub::StillThere {
                     job_id: job_id.clone(),
-                    note: note.clone(),
                 });
             }
         }
@@ -2610,7 +2779,7 @@ fn say_it_waits(state: &State, job_id: &JobId, reason: &str) -> Result<()> {
     // happened to come round (E-04's flooding half).
     state.with_peers(|peers| peers.wait_told.insert(job_id.clone(), Instant::now()));
     let note = format!("this job is queued and has not started: {reason}");
-    for follower in state.followers_of(job_id) {
+    for follower in state.followers_to_tell(job_id) {
         let _ = follower.send(FromHub::JobNote {
             job_id: job_id.clone(),
             note: note.clone(),
@@ -2675,7 +2844,7 @@ fn dispatch(
     // And whoever is following it is told where it went, before a byte of its
     // output can arrive: that line is the first line of the output E-02
     // promises, so it cannot come second (D109).
-    for follower in state.followers_of(job_id) {
+    for follower in state.followers_to_tell(job_id) {
         let _ = follower.send(FromHub::RanOn {
             job_id: job_id.clone(),
             runner: runner_name.to_owned(),
@@ -2791,7 +2960,7 @@ async fn relay_from_runner(
                     Err(error) => {
                         eprintln!("herd-hub: recording {job_id} as running failed: {error}");
                         let note = stalled_note(&error.to_string());
-                        for follower in state.followers_of(&job_id) {
+                        for follower in state.followers_to_tell(&job_id) {
                             let _ = follower.send(FromHub::JobNote {
                                 job_id: job_id.clone(),
                                 note: note.clone(),
@@ -3467,7 +3636,7 @@ fn give_the_job_another_go(
             goes_taken + 1,
             state.policy.attempts_allowed
         );
-        for follower in state.followers_of(job_id) {
+        for follower in state.followers_to_tell(job_id) {
             let _ = follower.send(FromHub::JobNote {
                 job_id: job_id.clone(),
                 note: format!(
@@ -3591,7 +3760,7 @@ async fn requeue_for_a_lost_capability(
             spent + 1,
             state.policy.requeue_budget
         );
-        for follower in state.followers_of(job_id) {
+        for follower in state.followers_to_tell(job_id) {
             let _ = follower.send(FromHub::JobNote {
                 job_id: job_id.clone(),
                 note: format!(
