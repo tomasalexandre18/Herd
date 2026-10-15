@@ -307,6 +307,23 @@ impl LiveJobs {
         token
     }
 
+    /// Say which process of this job is running now.
+    ///
+    /// A declared command runs four processes, one per executor step, and
+    /// each gets a session of its own: the backstop below kills the process
+    /// group of the pid it holds, so the pid it holds has to be the step that
+    /// is running rather than the one that ran first. The marker sweep would
+    /// reach the right tree anyway; this is what makes the group kill reach
+    /// it *first*, which is the difference between killing a job and killing
+    /// its last step's shell (invariant 2).
+    pub fn now_running(&self, token: u64, pid: u32) {
+        if let Ok(mut jobs) = self.jobs.lock() {
+            if let Some((_, job)) = jobs.iter_mut().find(|(held, _)| *held == token) {
+                job.pid = pid;
+            }
+        }
+    }
+
     /// Take a job off the list, because it has ended and cleaned up itself.
     pub fn remove(&self, token: u64) {
         if let Ok(mut jobs) = self.jobs.lock() {

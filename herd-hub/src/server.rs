@@ -44,7 +44,7 @@
 //!   is retried for as long as it takes and never dropped (D19); output the
 //!   hub is missing is asked for again before the log is declared short (D29).
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -193,6 +193,17 @@ impl Restating {
 /// (D76). See [`Policy::requeue_budget`].
 pub const REQUEUE_BUDGET: u32 = 3;
 
+/// How long a `labels_from` reading's `run` step may take (D74, D108).
+///
+/// Five minutes. A reading builds and boots nothing — the first consumer's
+/// `--labels` reads its arguments and a table compiled into the commit — so
+/// this is a cap that a healthy reading never approaches and a hung one
+/// cannot sit under for an afternoon. It is the hub's figure because a
+/// reading is the hub's own job: nobody declared it, and the declaration's
+/// `timeout_s` is the figure of the command whose *tests* run, which is hours.
+/// The runner's own cap still bounds it and is never raised by it (D108).
+pub const READING_CAP: Duration = Duration::from_secs(5 * 60);
+
 pub fn hub_version() -> &'static str {
     env!("CARGO_PKG_VERSION")
 }
@@ -281,6 +292,12 @@ pub struct Policy {
     /// because a lease somebody else holds all afternoon would otherwise
     /// requeue a job for ever, which is a job nobody is told about.
     pub requeue_budget: u32,
+    /// How long the `run` step of a `labels_from` reading may take (D74).
+    ///
+    /// See [`READING_CAP`]. A setting for the reason the others are: a test
+    /// has to be able to make a reading overrun its cap without waiting five
+    /// minutes, and through the hub's own code rather than a copy of it.
+    pub reading_cap: Duration,
 }
 
 impl Default for Policy {
@@ -296,6 +313,7 @@ impl Default for Policy {
             wait_restatement: WAIT_RESTATEMENT,
             drain_first_limit: crate::matcher::DRAIN_FIRST_LIMIT,
             requeue_budget: REQUEUE_BUDGET,
+            reading_cap: READING_CAP,
         }
     }
 }
@@ -352,6 +370,25 @@ impl Policy {
     }
 }
 
+/// What this hub requires of the peers that dial it (E-48, Q8).
+///
+/// Separate from [`Policy`], which is timings an operator tunes: this is who
+/// is allowed here. A runner's half of it is not in this struct at all — it
+/// lives in the state root, because an approval has to survive a restart
+/// (D8). What is here is the one thing the hub is *given* at startup rather
+/// than keeping: the single shared requester token.
+#[derive(Debug, Default)]
+pub struct Authority {
+    /// The requester token this hub was started with, as a salted hash.
+    ///
+    /// `None` is a hub that authenticates no requester, which is the default
+    /// and is only safe where D14 puts the hub: loopback, behind the reverse
+    /// proxy that M16 adds. The binary says so in one loud line at startup,
+    /// because the failure mode of an open hub is that nothing goes wrong
+    /// until something does.
+    pub requester_token: Option<crate::roster::SharedSecret>,
+}
+
 /// A bound hub, not yet serving.
 pub struct Hub {
     listener: TcpListener,
@@ -372,6 +409,21 @@ impl Hub {
         store: Arc<dyn JobStore>,
         policy: Policy,
     ) -> Result<Self> {
+        Self::bind_with(addr, store, policy, Authority::default()).await
+    }
+
+    /// The same, saying what this hub requires of the peers that dial it
+    /// (E-48, Q8).
+    ///
+    /// What a runner must carry is not a parameter here: it is in the state
+    /// root, where an approval belongs. This is the shared requester token,
+    /// which the hub is handed at startup and never writes down.
+    pub async fn bind_with(
+        addr: SocketAddr,
+        store: Arc<dyn JobStore>,
+        policy: Policy,
+        authority: Authority,
+    ) -> Result<Self> {
         // Before the port, because a hub that cannot keep its promises about
         // a live runner must not be reachable by one. Here rather than in the
         // binary's option parsing so that there is no way to build a hub on
@@ -389,6 +441,7 @@ impl Hub {
             state: Arc::new(State {
                 store,
                 policy,
+                authority,
                 // The clock on every attempt this hub inherited starts here: a
                 // job left `running` by the hub that died is a job this hub
                 // has had no word of since it began.
@@ -554,6 +607,10 @@ pub struct RunnerStatus {
 struct State {
     store: Arc<dyn JobStore>,
     policy: Policy,
+    /// Who is allowed here (E-48, Q8). The runners' half is in the store,
+    /// because an approval outlives the process; this is the requester token
+    /// the hub was handed at startup.
+    authority: Authority,
     /// When this hub started serving: where the clock begins for an attempt
     /// it inherited and has heard nothing about.
     started: Instant,
@@ -1398,6 +1455,54 @@ fn said(value: Option<String>) -> Option<String> {
         .filter(|value| !value.is_empty())
 }
 
+/// The word a sentence about the far side uses for it.
+fn peer_kind(role: Role) -> &'static str {
+    match role {
+        Role::Runner => "runner",
+        Role::Requester => "requester",
+    }
+}
+
+/// Why this peer may not be served, or `None` if it may (E-48, Q8).
+///
+/// A **runner** is admitted by the roster in the state root: an operator
+/// approved its name, which minted a token, and the hub kept the hash. Four
+/// answers, three of which are a no, and each no names what to do.
+///
+/// A **requester** is admitted by the one shared token the hub was started
+/// with, when it was started with one. A hub with no requester token
+/// authenticates no requester — see [`Authority::requester_token`] for why
+/// that is the default and what says so out loud.
+fn admission_refusal(
+    state: &State,
+    role: Role,
+    peer_name: &str,
+    token: Option<&str>,
+) -> Option<String> {
+    match role {
+        Role::Runner => match state.store.admit_runner(peer_name, token) {
+            crate::roster::Admission::Approved => None,
+            crate::roster::Admission::NotApproved => {
+                Some(herd_proto::unapproved_runner_reason(peer_name))
+            }
+            crate::roster::Admission::NoToken => {
+                Some(herd_proto::missing_runner_token_reason(peer_name))
+            }
+            crate::roster::Admission::WrongToken => {
+                Some(herd_proto::wrong_runner_token_reason(peer_name))
+            }
+        },
+        Role::Requester => {
+            let required = state.authority.requester_token.as_ref()?;
+            match token {
+                None => Some(herd_proto::missing_requester_token_reason()),
+                Some(token) if required.matches(token) => None,
+                Some(_) => Some(herd_proto::wrong_requester_token_reason()),
+            }
+        }
+    }
+}
+
 async fn serve_peer(state: Arc<State>, stream: TcpStream) -> Result<()> {
     // Log chunks are small and must not wait for a full segment.
     let _ = stream.set_nodelay(true);
@@ -1438,68 +1543,97 @@ async fn serve_peer(state: Arc<State>, stream: TcpStream) -> Result<()> {
             return refuse(&mut sink, reason).await;
         }
     };
-    let (role, peer_name, peer_instance, peer_state_root, peer_health_every, announced) =
-        match hello {
-            ToHub::Hello {
-                protocol_version,
-                role,
-                token,
-                name,
-                instance,
-                state_root,
-                health_every_ms,
-                capabilities,
-                host,
-                preference,
-                load_milli,
-                switch,
-            } => {
-                if protocol_version != PROTOCOL_VERSION {
-                    return refuse(&mut sink, version_mismatch_reason(protocol_version)).await;
+    #[allow(clippy::type_complexity)]
+    let (
+        role,
+        peer_name,
+        peer_instance,
+        peer_state_root,
+        peer_health_every,
+        announced,
+        peer_token,
+        version_note,
+    ) = match hello {
+        ToHub::Hello {
+            protocol_version,
+            peer_version,
+            role,
+            token,
+            name,
+            instance,
+            state_root,
+            health_every_ms,
+            capabilities,
+            host,
+            preference,
+            load_milli,
+            switch,
+        } => {
+            if protocol_version != PROTOCOL_VERSION {
+                return refuse(&mut sink, version_mismatch_reason(protocol_version)).await;
+            }
+            // And then which *build* is speaking, which the protocol
+            // version does not say (E-51). A major version apart is
+            // refused here, before this peer is registered or given
+            // anything: two builds a major apart can read each other's
+            // frames and still disagree about what they commit to, which
+            // is a worse thing to discover from a job's record than from
+            // a refusal. A minor gap rides out in the welcome.
+            let gap = herd_proto::version_gap(peer_kind(role), hub_version(), &peer_version);
+            let version_note = match gap {
+                Some(gap) if gap.refuse => {
+                    eprintln!("herd-hub: {}", gap.reason);
+                    return refuse(&mut sink, gap.reason).await;
                 }
-                // The token is carried from M1 and validated from M15 (D6, Q8).
-                let _ = token;
-                // Trimmed once, here, so that every reader below — the ownership
-                // gate, the twin rule, the capability registry's sentences — is
-                // looking at the same name.
-                let name = said(name);
-                (
-                    role,
-                    // A blank identity is no identity. `Some("")` — or a name of
-                    // spaces — used to walk straight through the refusal below,
-                    // because it *has* an instance and *has* a name as far as an
-                    // `Option` is concerned, and the peer then wore a blank
-                    // effective name: one that matches every other blank-named
-                    // peer's attempt, which is the exact hole naming an attempt's
-                    // runner was meant to close. So whitespace is stripped and
-                    // what is left empty is absent, which is the case the hub
-                    // already refuses.
-                    //
-                    // The offer carries the same trimmed name, not the one as
-                    // given: the sentence a human reads about a capability names
-                    // the runner, and " wsl-pc " is not a second machine there
-                    // either.
-                    name.clone().unwrap_or_default(),
-                    said(instance),
-                    said(state_root),
-                    health_every_ms.map(Duration::from_millis),
-                    Announced {
-                        capacity: RunnerCapacity::new(name, capabilities),
-                        host,
-                        preference,
-                        load_milli,
-                        switch,
-                    },
-                )
-            }
-            other => {
-                let reason = format!(
-                    "the first message must be hello, not {}",
-                    message_kind(&other)
-                );
-                return refuse(&mut sink, reason).await;
-            }
-        };
+                Some(gap) => {
+                    eprintln!("herd-hub: {}", gap.reason);
+                    Some(gap.reason)
+                }
+                None => None,
+            };
+            // Trimmed once, here, so that every reader below — the ownership
+            // gate, the twin rule, the capability registry's sentences — is
+            // looking at the same name.
+            let name = said(name);
+            (
+                role,
+                // A blank identity is no identity. `Some("")` — or a name of
+                // spaces — used to walk straight through the refusal below,
+                // because it *has* an instance and *has* a name as far as an
+                // `Option` is concerned, and the peer then wore a blank
+                // effective name: one that matches every other blank-named
+                // peer's attempt, which is the exact hole naming an attempt's
+                // runner was meant to close. So whitespace is stripped and
+                // what is left empty is absent, which is the case the hub
+                // already refuses.
+                //
+                // The offer carries the same trimmed name, not the one as
+                // given: the sentence a human reads about a capability names
+                // the runner, and " wsl-pc " is not a second machine there
+                // either.
+                name.clone().unwrap_or_default(),
+                said(instance),
+                said(state_root),
+                health_every_ms.map(Duration::from_millis),
+                Announced {
+                    capacity: RunnerCapacity::new(name, capabilities),
+                    host,
+                    preference,
+                    load_milli,
+                    switch,
+                },
+                said(token),
+                version_note,
+            )
+        }
+        other => {
+            let reason = format!(
+                "the first message must be hello, not {}",
+                message_kind(&other)
+            );
+            return refuse(&mut sink, reason).await;
+        }
+    };
 
     // A runner has to be a *particular* runner, because that is what an
     // attempt belongs to. With an empty name, the record's `runner` field says
@@ -1524,6 +1658,28 @@ async fn serve_peer(state: Arc<State>, stream: TcpStream) -> Result<()> {
         _ => peer_name,
     };
 
+    // And then: is this peer allowed here at all (E-48, Q8)?
+    //
+    // **Before the welcome**, unlike the checks below it, and that is the
+    // point: a peer this hub has never approved gets one frame, the refusal,
+    // and learns nothing else about the hub — not its state root, not its
+    // version. The checks that come after the welcome are about
+    // configurations that cannot be served; this one is about a machine that
+    // may not be served, which is a different answer and deserves a
+    // different shape.
+    //
+    // Terminal (D13) on purpose, in all four of its forms. An unapproved
+    // runner, one carrying no token, one carrying the wrong token and one
+    // whose approval was removed are each waiting for a person to do
+    // something, and a runner told to *stand by* for that would come back
+    // every few seconds for ever with nobody reading the reason. The sentence
+    // carries the command that fixes it, because the person reading it on the
+    // runner's stderr is usually the person who can type it.
+    if let Some(reason) = admission_refusal(&state, role, &peer_name, peer_token.as_deref()) {
+        eprintln!("herd-hub: {reason}");
+        return refuse(&mut sink, reason).await;
+    }
+
     // The hub's own state root goes out with the welcome whatever happens
     // next, including to a peer this hub is about to turn away: that string is
     // how a runner holding a verdict for a hub whose state is gone finds out,
@@ -1536,6 +1692,9 @@ async fn serve_peer(state: Arc<State>, stream: TcpStream) -> Result<()> {
             protocol_version: PROTOCOL_VERSION,
             hub_version: hub_version().to_owned(),
             state_root: hub_state_root.clone(),
+            // A build gap this hub is willing to serve, said where the far
+            // side's owner will read it (E-51). `None` is the ordinary case.
+            version_note,
         },
     )
     .await?;
@@ -1767,10 +1926,22 @@ fn dispatch_queued_jobs(state: &State) -> Result<()> {
 /// pushed ahead through a lane of its own — it is simply first in this order
 /// (E-43).
 fn dispatch_a_pass(state: &State) -> Result<()> {
-    let unfinished = state
+    let mut unfinished = state
         .store
         .unfinished_jobs()
         .context("reading the queue the hub recovered")?;
+    // Before a single job is placed: every job whose requirements are read on
+    // a machine gets its reading minted, or its answer written onto its
+    // record, or is refused by name (D74). Done here, ahead of the ordering,
+    // so that a reading minted now is in *this* pass's queue and goes out to
+    // a runner at once — and so that a job whose answer has just landed is
+    // placed in the same pass that read it.
+    if settle_readings(state, &unfinished)? {
+        unfinished = state
+            .store
+            .unfinished_jobs()
+            .context("reading the queue again, after the readings were settled")?;
+    }
     // What every runner is already holding, read from those same records and
     // from nothing else: there is no counter of busy slots in this hub, so
     // there is none to leak and none to rebuild after a restart (D79).
@@ -1800,6 +1971,23 @@ fn dispatch_a_pass(state: &State) -> Result<()> {
     }
     let total = queue.len();
     for (place, record) in queue.iter().enumerate() {
+        // A job whose requirements are still being read is not placed, by
+        // anything, ever: there is nothing to place it against but the
+        // baseline its reading is running on, and that baseline is not its
+        // own (D74). [`settle_readings`] has already done everything that can
+        // be done for it this pass, so what is left is to say so.
+        if record.awaits_a_reading() {
+            let standing = queue::standing(record, now, state.policy.aging_step);
+            let sentence = queue::waiting_sentence_behind(
+                place + 1,
+                total,
+                &standing,
+                &queue::what_is_ahead(&queue, place, now, state.policy.aging_step),
+                &format!("it is waiting because {}", waiting_for_a_reading(record)),
+            );
+            say_it_waits(state, &record.id, &sentence)?;
+            continue;
+        }
         // The one job this one named, if it named one (E-10). Looked up here
         // rather than inside the claim step, which is a pure function of a
         // record and a fleet: a parent that is finished is not in the queue at
@@ -1889,6 +2077,323 @@ fn dispatch_a_pass(state: &State) -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// Settle every reading the queue is waiting on, and say whether anything was
+/// written (D74).
+///
+/// The whole of D74's mechanism, in one place and under the claim lock the
+/// pass already holds. For each queued job whose command declared a
+/// `labels_from`:
+///
+/// * **no reading yet** — the cache is asked first, because the answer is a
+///   property of (commit, command, args) and nothing else, so a second
+///   submission of those three must not pay for a second reading. On a miss,
+///   an **ordinary job** is minted for it: the one queue, the baseline labels
+///   the command declared, the runner's caps, its own record and its own four
+///   executor steps. It carries **no reading of its own**, which is how "a
+///   command reached through `labels_from` never resolves one" is kept — the
+///   hub is the only thing that mints such a job.
+/// * **a reading that has not ended** — nothing to do; the job waits, and the
+///   pass says so.
+/// * **a reading that ended well** — its output is read strictly
+///   ([`herd_proto::Requirements::read`]), the answer goes into the cache and
+///   onto the job's record, and the pass places the job on it.
+/// * **a reading that ended any other way, or whose answer is not one** — the
+///   job is **refused by name**, with the reading's id and what was wrong in
+///   the sentence. A job is never placed on a guess.
+///
+/// Every write goes through the store's one door, so a job cancelled while
+/// its reading ran is an error naming it rather than a requirement written
+/// onto a closed record — and the pass goes on to the next job instead of
+/// failing.
+fn settle_readings(state: &State, unfinished: &[JobRecord]) -> Result<bool> {
+    let mut written = false;
+    for record in unfinished {
+        if record.state != JobState::Queued || !record.awaits_a_reading() {
+            continue;
+        }
+        let Some(reading) = record.reading.clone() else {
+            continue;
+        };
+        // A reading with no declaration cannot be: the submission gate
+        // refuses one ([`why_that_reading_will_not_do`]). A record that
+        // carries it anyway is said rather than guessed at.
+        let Some(declaration) = record.declaration.clone() else {
+            end_the_job(
+                state,
+                record,
+                JobOutcome::Impossible {
+                    reason: format!(
+                        "{} is refused: its requirements come from a reading ({}) and its \
+                         record carries no declared command, so there is no commit, no \
+                         command and no arguments to read them for (D74)",
+                        record.id, reading.labels_from.line
+                    ),
+                },
+                "has a reading and no declaration",
+            )?;
+            written = true;
+            continue;
+        };
+        let key =
+            crate::job::reading_key(&declaration.commit, &declaration.command, &declaration.args);
+        match reading.by.clone() {
+            None => {
+                // The cache, first and always: this is what makes a second
+                // submission of one (commit, command, args) free (D74).
+                if let Some(answer) = state
+                    .store
+                    .reading_answer(&key)
+                    .with_context(|| format!("asking the cache what {} needs", record.id))?
+                {
+                    let said = format!(
+                        "read before, and kept by (commit, command, args): {}",
+                        answer.line()
+                    );
+                    println!(
+                        "herd-hub: {} needs no reading: command {} of commit {} was read \
+                         before and the answer is {}",
+                        record.id,
+                        declaration.command,
+                        declaration.commit,
+                        answer.line()
+                    );
+                    if let Err(error) = state
+                        .store
+                        .record_reading(&record.id, reading.answered(answer, said))
+                    {
+                        eprintln!(
+                            "herd-hub: {} could not be given the cached answer to its \
+                             reading: {error}",
+                            record.id
+                        );
+                        continue;
+                    }
+                    written = true;
+                    continue;
+                }
+                // And otherwise an ordinary job that reads them.
+                let new = reading_job(state, record, &reading, &declaration);
+                let submission = state
+                    .store
+                    .submit(new)
+                    .with_context(|| format!("minting the reading {} waits for", record.id))?;
+                let by = submission.record().id.clone();
+                println!(
+                    "herd-hub: {by} reads what {} needs — command {} of commit {}, against \
+                     the baseline labels {} its declaration states (D74)",
+                    record.id,
+                    declaration.command,
+                    declaration.commit,
+                    if reading.labels_from.baseline.is_empty() {
+                        "none".to_owned()
+                    } else {
+                        reading.labels_from.baseline.to_string()
+                    }
+                );
+                if let Err(error) = state.store.record_reading(&record.id, reading.read_by(&by)) {
+                    eprintln!(
+                        "herd-hub: {by} was minted to read what {} needs and that could not \
+                         be written onto its record: {error}",
+                        record.id
+                    );
+                }
+                written = true;
+            }
+            Some(by) => {
+                let read = state
+                    .store
+                    .job(&by)
+                    .with_context(|| format!("reading the record of {by}"))?;
+                let Some(read) = read else {
+                    end_the_job(
+                        state,
+                        record,
+                        JobOutcome::Impossible {
+                            reason: refused_for_want_of_requirements(
+                                record,
+                                &declaration,
+                                &by,
+                                &format!("this hub has no record of {by} at all"),
+                            ),
+                        },
+                        "its reading is gone",
+                    )?;
+                    written = true;
+                    continue;
+                };
+                let JobState::Finished { outcome } = &read.state else {
+                    // Still going. The job waits, and the pass says so.
+                    continue;
+                };
+                if !matches!(outcome, JobOutcome::Exited { code: 0 }) {
+                    // D74's second limit: a reading that exits non-zero, or
+                    // that its cap stopped, refuses the job. Both arrive
+                    // here, and the sentence says which it was in the words a
+                    // requester reads everywhere else.
+                    end_the_job(
+                        state,
+                        record,
+                        JobOutcome::Impossible {
+                            reason: refused_for_want_of_requirements(
+                                record,
+                                &declaration,
+                                &by,
+                                &format!("it {}", how_it_ended(outcome)),
+                            ),
+                        },
+                        "its reading did not come off",
+                    )?;
+                    written = true;
+                    continue;
+                }
+                let log = state
+                    .store
+                    .job_log(&by)
+                    .with_context(|| format!("reading the output of {by}"))?
+                    .unwrap_or_default();
+                match herd_proto::Requirements::read(&log) {
+                    // D74's first limit: the answer is read strictly, like
+                    // the capability file (D60).
+                    Err(why) => {
+                        end_the_job(
+                            state,
+                            record,
+                            JobOutcome::Impossible {
+                                reason: refused_for_want_of_requirements(
+                                    record,
+                                    &declaration,
+                                    &by,
+                                    &why,
+                                ),
+                            },
+                            "its reading did not answer",
+                        )?;
+                        written = true;
+                    }
+                    Ok(answer) => {
+                        // The cache before the record, so that a hub which
+                        // stops between the two re-reads nothing: the next
+                        // pass finds the answer under its key and writes it
+                        // onto the record without a second job.
+                        if let Err(error) = state.store.remember_reading(&key, &answer) {
+                            eprintln!(
+                                "herd-hub: {by} answered what {} needs and this hub could \
+                                 not keep the answer ({error}); the job is placed on it all \
+                                 the same and the next submission of the same commit, \
+                                 command and arguments will pay for a reading",
+                                record.id
+                            );
+                        }
+                        println!(
+                            "herd-hub: {} is what {by} read for command {} of commit {}, and \
+                             {} is placed on it",
+                            answer.line(),
+                            declaration.command,
+                            declaration.commit,
+                            record.id
+                        );
+                        let said = format!("read on a runner by {by}: {}", answer.line());
+                        if let Err(error) = state
+                            .store
+                            .record_reading(&record.id, reading.answered(answer, said))
+                        {
+                            eprintln!(
+                                "herd-hub: {by} answered what {} needs and that could not be \
+                                 written onto its record: {error}",
+                                record.id
+                            );
+                            continue;
+                        }
+                        written = true;
+                    }
+                }
+            }
+        }
+    }
+    Ok(written)
+}
+
+/// The job that reads what another job needs: an ordinary job, and the one
+/// thing that makes it one is that nothing here is special (D74).
+///
+/// What it takes from the job it reads for, and why each one:
+///
+/// * the **declaration**, so it runs the consumer's own four executor steps
+///   on the same commit — their reading reads their tree, and `up` and
+///   `fetch` are what put the tree on a machine (D77, D106);
+/// * the **baseline labels** the command declared, which is what it is placed
+///   against (D74) — never the labels the reading is about to answer;
+/// * the **level** of the job that waits for it, so that a nightly's reading
+///   does not go round the queue in front of a merger's job (E-18);
+/// * the **deadline**, so that a reading of a job that is no longer worth
+///   starting is no longer worth running either (E-09).
+///
+/// What it does not take: the parent (E-10 — a reading needs the tree and
+/// nothing a parent makes), the requeue code (the consumer's 75 is about
+/// their tests), the figures (it builds and boots nothing) and — the one that
+/// matters — **a reading of its own**. Hence no recursion.
+fn reading_job(
+    state: &State,
+    record: &JobRecord,
+    reading: &crate::job::Reading,
+    declaration: &herd_proto::Declaration,
+) -> NewJob {
+    NewJob::at(
+        vec![reading.labels_from.line.clone()],
+        reading.labels_from.baseline.clone(),
+        record.priority,
+    )
+    .with_m9(record.deadline, None, None)
+    .declared(
+        Some(declaration.clone()),
+        Some(state.policy.reading_cap.as_secs()),
+    )
+    // Said out loud rather than left to the default: this is D74's third
+    // limit, and it is kept here or nowhere.
+    .reading(None)
+}
+
+/// Why a job whose requirements could not be read is refused, **by name**
+/// (D74, E-36).
+///
+/// It names the job, the command and the commit, the reading that was run for
+/// it, and what was wrong with the answer — because the only thing to do
+/// about one of these is to fix the reading, and whoever reads this sentence
+/// is the person who can.
+fn refused_for_want_of_requirements(
+    record: &JobRecord,
+    declaration: &herd_proto::Declaration,
+    by: &JobId,
+    what_went_wrong: &str,
+) -> String {
+    format!(
+        "{} is refused and was never placed: what command {} of commit {} needs is read on a \
+         runner, {by} ran that reading, and {what_went_wrong}. A job is never placed on \
+         requirements nobody read (D74)",
+        record.id, declaration.command, declaration.commit
+    )
+}
+
+/// Why a job waiting for its requirements is waiting, in the words its record
+/// carries (D74, E-04).
+fn waiting_for_a_reading(record: &JobRecord) -> String {
+    let Some(reading) = record.reading.as_ref() else {
+        return "its requirements are not known".to_owned();
+    };
+    match &reading.by {
+        Some(by) => format!(
+            "what it needs is being read on a runner by {by} ({}), and a job is placed on what \
+             a reading answered rather than on a guess (D74)",
+            reading.labels_from.line
+        ),
+        None => format!(
+            "what it needs has to be read on a runner first ({}), and this hub has not minted \
+             that reading yet (D74)",
+            reading.labels_from.line
+        ),
+    }
 }
 
 /// Where the one job this job named as its parent stands (E-10).
@@ -2156,10 +2661,26 @@ fn dispatch(
             job_id: job_id.clone(),
             attempt,
             command,
+            // Off the record, on every attempt, rather than remembered by
+            // the runner that saw it first: a job requeued onto another
+            // machine (E-21) runs the same four steps on the same commit,
+            // and the record is the only thing that holds them (E-11, D106).
+            declaration: record.declaration.clone(),
+            timeout_s: record.timeout_s,
         })
         .is_err()
     {
         return Ok(false);
+    }
+    // And whoever is following it is told where it went, before a byte of its
+    // output can arrive: that line is the first line of the output E-02
+    // promises, so it cannot come second (D109).
+    for follower in state.followers_of(job_id) {
+        let _ = follower.send(FromHub::RanOn {
+            job_id: job_id.clone(),
+            runner: runner_name.to_owned(),
+            why: why.to_owned(),
+        });
     }
     println!("herd-hub: {job_id} is attempt {attempt} on runner {runner_name}: {why}");
     Ok(true)
@@ -2352,15 +2873,47 @@ async fn relay_from_runner(
                     }
                 }
             }
+            ToHub::StepFinished {
+                job_id,
+                attempt,
+                step,
+            } => {
+                if !is_current(state, name, outbox, &job_id, attempt) {
+                    continue;
+                }
+                // Said out loud and recorded, and a failure to record it is
+                // said rather than retried: a step line is neither output nor
+                // a verdict, the complete list arrives again with the end,
+                // and nothing about a running job may hang on writing one
+                // (D19's rule is about results, and this is not one).
+                println!("herd-hub: {job_id} attempt {attempt} {}", step.line());
+                if let Err(error) = state.store.record_step(&job_id, attempt, step) {
+                    eprintln!("herd-hub: recording an executor step of {job_id} failed: {error}");
+                }
+            }
             ToHub::JobFinished {
                 job_id,
                 attempt,
                 outcome,
                 chunks_sent,
                 metrics,
+                steps,
             } => {
                 if !is_current(state, name, outbox, &job_id, attempt) {
                     continue;
+                }
+                // The steps before the end: the attempt's four lines are part
+                // of the record this verdict is written into, and a reader
+                // that found the verdict first would see a job that ended
+                // with no preparation behind it (D77). Each one replaces the
+                // live line of the same name, so this is the complete list
+                // whatever arrived while the job ran.
+                for step in steps {
+                    if let Err(error) = state.store.record_step(&job_id, attempt, step) {
+                        eprintln!(
+                            "herd-hub: recording an executor step of {job_id} failed: {error}"
+                        );
+                    }
                 }
                 // A result for a job this hub has no record of — a state root
                 // that was replaced under it, say. There is nothing to write
@@ -3188,6 +3741,125 @@ fn new_job(asked: herd_proto::Asked) -> NewJob {
             asked.after,
             asked.requeue_exit_code,
         )
+        .declared(asked.declaration, asked.timeout_s)
+        // The reading its command declared, if it declared one: the labels
+        // above are then the baseline that reading is placed against, and
+        // this job is placed on nothing until the answer is on its record
+        // (D74).
+        .reading(asked.labels_from)
+}
+
+/// Why a declared command this hub was sent will not do, if it will not
+/// (E-11).
+///
+/// The hub **trusts** the requester for the declaration: it holds no
+/// repository and cannot check the file against the commit, and D106 states
+/// that cost out loud. What it can check is that the declaration is a thing a
+/// runner could execute at all, and it does, because each of these would
+/// otherwise become a job that runs something nobody declared:
+///
+/// * a commit that is not forty lowercase hex — the hash `herdctl` resolved is
+///   what the workspace fetches, and anything else is a ref that would be
+///   resolved on a machine, which is what E-01 forbids;
+/// * an empty hook — four named steps run in a fixed order, and a step with
+///   no line is a step that silently does not happen;
+/// * a `run` hook with no `{line}` in it — the declared command line would
+///   never reach the shell, and the job would report the exit code of their
+///   workspace tool as a verdict about their tests.
+///
+/// Refused at the submission, where a requester is standing to be told
+/// (E-36's rule for every refusal here).
+fn why_that_declaration_will_not_do(asked: &herd_proto::Asked) -> Option<String> {
+    if let Some(reason) = why_that_reading_will_not_do(asked) {
+        return Some(reason);
+    }
+    let declaration = asked.declaration.as_ref()?;
+    let commit = &declaration.commit;
+    if commit.len() != 40
+        || !commit
+            .chars()
+            .all(|c| c.is_ascii_hexdigit() && !c.is_uppercase())
+    {
+        return Some(format!(
+            "this submission says command {} runs commit {commit:?}, which is not forty \
+             lowercase hex: a submission carries the hash its own checkout resolved, never a \
+             ref for a machine to resolve",
+            declaration.command
+        ));
+    }
+    for step in herd_proto::Step::ALL {
+        if declaration.executor.hook(step).trim().is_empty() {
+            return Some(format!(
+                "this submission's {} step is an empty line: the four steps run in a fixed \
+                 order and a step with no line is a step that would silently not happen",
+                step
+            ));
+        }
+    }
+    if !declaration
+        .executor
+        .hook(herd_proto::Step::Run)
+        .contains(herd_proto::LINE_TOKEN)
+    {
+        return Some(format!(
+            "this submission's run step does not carry {}, so command {}'s own line would \
+             never be run and whatever the step exited with would be reported as its verdict",
+            herd_proto::LINE_TOKEN,
+            declaration.command
+        ));
+    }
+    None
+}
+
+/// Why the `labels_from` reading a submission carries will not do, if it will
+/// not (D74).
+///
+/// Three rules, and each of them is a job that would otherwise run something
+/// nobody declared, or be placed on a figure nobody chose:
+///
+/// * a reading with no declaration around it — the reading runs the
+///   consumer's four executor steps on a commit, and the cache is keyed on
+///   (commit, command, args), none of which exists without one;
+/// * an empty line, which is a reading that would answer nothing and refuse
+///   every job of that command;
+/// * a line carrying `{j}`. This one is the sharp one. The figure is a
+///   property of the machine the hub chooses, derived as it chooses one
+///   (E-22, D82), and a reading is placed **before** the job whose figure it
+///   would be — so there is no N to put in it, and an answer obtained for the
+///   reading's own machine would be cached under (commit, command, args) as
+///   if it were a property of those three, which D82 says it is not. Refused
+///   by name rather than run with a brace in it or cached as a half-truth.
+///   D74 and D82 together leave this open; M18 settles it with the consumer.
+fn why_that_reading_will_not_do(asked: &herd_proto::Asked) -> Option<String> {
+    let labels_from = asked.labels_from.as_ref()?;
+    let Some(declaration) = asked.declaration.as_ref() else {
+        return Some(format!(
+            "this submission carries a labels_from reading ({}) and no declared command: a \
+             reading runs the four executor steps of a command on a commit, and there is \
+             neither here",
+            labels_from.line
+        ));
+    };
+    if labels_from.line.trim().is_empty() {
+        return Some(format!(
+            "command {}'s labels_from is an empty line: a reading that runs nothing answers \
+             nothing, and every job of that command would then be refused for want of \
+             requirements",
+            declaration.command
+        ));
+    }
+    if labels_from.line.contains(herd_proto::PARALLELISM_TOKEN) {
+        return Some(format!(
+            "command {}'s labels_from line carries {}: that figure is a property of the \
+             machine the hub chooses and is derived as it chooses one (E-22), and the reading \
+             is placed before the job whose figure it would be — so there is none to put in \
+             it, and an answer that depended on one could not be cached by (commit, command, \
+             args) as D74 requires. Declare a reading that does not ask for it",
+            declaration.command,
+            herd_proto::PARALLELISM_TOKEN
+        ));
+    }
+    None
 }
 
 /// Why the job a submission named as its parent will not do, if it will not
@@ -3230,6 +3902,71 @@ fn why_that_parent_will_not_do(state: &State, after: Option<&JobId>) -> Result<O
 /// same reason a real pass holds it: a probe snapshot landing halfway through
 /// would make the answer describe two different fleets.
 fn dry_run(state: &State, asked: herd_proto::Asked) -> Result<Vec<String>> {
+    let Some(labels_from) = asked.labels_from.clone() else {
+        return judge_one(state, new_job(asked));
+    };
+    // A command whose requirements are read cannot be judged as itself: what
+    // it needs is not known here, and judging it against the baseline its
+    // reading runs on would answer about a job nobody submitted (D74). So the
+    // answer is about what would really happen next — the cache, or the
+    // reading.
+    let key = asked.declaration.as_ref().map(|declaration| {
+        crate::job::reading_key(&declaration.commit, &declaration.command, &declaration.args)
+    });
+    let cached = match &key {
+        Some(key) => state
+            .store
+            .reading_answer(key)
+            .context("asking the cache what a dry run's job would need")?,
+        None => None,
+    };
+    if let Some(answer) = cached {
+        let mut lines = vec![format!(
+            "its requirements are already read and kept by (commit, command, args), so no \
+             reading would run: {} (D74)",
+            answer.line()
+        )];
+        let mut new = new_job(asked);
+        new.reading = new
+            .reading
+            .map(|reading| reading.answered(answer, "the cache"));
+        lines.extend(judge_one(state, new)?);
+        return Ok(lines);
+    }
+    let mut lines = vec![format!(
+        "what it needs is not known yet: an ordinary job on a runner reads it first ({}), \
+         against the baseline labels {} its command declares, and this job is then placed on \
+         what that answered (D74). What follows is where that reading would run",
+        labels_from.line,
+        if labels_from.baseline.is_empty() {
+            "none".to_owned()
+        } else {
+            labels_from.baseline.to_string()
+        }
+    )];
+    let hypothetical_record = JobRecord::hypothetical(new_job(asked.clone()), Timestamp::now());
+    let reading = reading_job(
+        state,
+        &hypothetical_record,
+        &crate::job::Reading::of(labels_from),
+        // Judged with the declaration the submission carries, so the reading
+        // this answers about is the reading a submission would really mint.
+        &asked
+            .declaration
+            .unwrap_or_else(|| herd_proto::Declaration {
+                command: String::new(),
+                commit: String::new(),
+                args: Vec::new(),
+                executor: herd_proto::Executor::default(),
+            }),
+    );
+    lines.extend(judge_one(state, reading)?);
+    Ok(lines)
+}
+
+/// Where one job — the one a submission would make, or the reading it would
+/// mint first — would run, said in lines (E-07).
+fn judge_one(state: &State, new: NewJob) -> Result<Vec<String>> {
     let _one_pass = state
         .dispatching
         .lock()
@@ -3242,7 +3979,7 @@ fn dry_run(state: &State, asked: herd_proto::Asked) -> Result<Vec<String>> {
     let reserved = matcher::reserved(&unfinished);
     let mut seats = state.seats(&held, &reserved);
     let now = Timestamp::now();
-    let hypothetical = JobRecord::hypothetical(new_job(asked), now);
+    let hypothetical = JobRecord::hypothetical(new, now);
     let mut queue = queue::order(unfinished.clone(), now, state.policy.aging_step);
     // Inserted where the queue's own ordering function puts it, so "what is
     // queued ahead" is what would really be ahead of it (E-07 asks for that
@@ -3481,6 +4218,10 @@ async fn accept_submissions(state: &State, outbox: &Outbox, source: &mut Source)
                     });
                     return Ok(());
                 }
+                if let Some(reason) = why_that_declaration_will_not_do(&asked) {
+                    let _ = outbox.send(FromHub::Refused { reason });
+                    return Ok(());
+                }
                 if let Some(reason) = state.why_no_runner() {
                     let _ = outbox.send(FromHub::Refused { reason });
                     return Ok(());
@@ -3497,6 +4238,25 @@ async fn accept_submissions(state: &State, outbox: &Outbox, source: &mut Source)
                     let _ = outbox.send(FromHub::Refused { reason });
                     return Ok(());
                 }
+                // The claim lock is taken **before** the job exists, and held
+                // until this submission has had its place in the followers
+                // and its pass. Not for the pass's sake — that took the lock
+                // on its own before — but for the window between the record
+                // becoming visible and this connection being registered to
+                // follow it. A job is dispatchable the instant `submit`
+                // returns, and a pass fired by anything else (a runner
+                // joining, a job of another test ending, the watchdog) would
+                // dispatch it in that window, send E-02's line to a follower
+                // list this requester is not in yet, and leave it with a job
+                // whose output has no first line (D109). The window is
+                // microseconds wide and a suite submits thousands of jobs,
+                // which is exactly the shape of a defect that reads as
+                // flakiness. One record write is added to a lock that already
+                // carries a whole pass's fsyncs.
+                let _one_pass = state
+                    .dispatching
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
                 let submission = state
                     .store
                     .submit(new_job(asked))
@@ -3548,14 +4308,12 @@ async fn accept_submissions(state: &State, outbox: &Outbox, source: &mut Source)
                 // order (E-20). It starts, or it stays queued with its
                 // reason on its record and a note on this connection: a
                 // submission the runner cannot serve yet is not a submission
-                // that failed (D38).
-                {
-                    let _one_pass = state
-                        .dispatching
-                        .lock()
-                        .unwrap_or_else(|poisoned| poisoned.into_inner());
-                    dispatch_a_pass(state)?;
-                }
+                // that failed (D38). The lock this needs is the one taken
+                // above, around the submission itself, so the pass runs here
+                // without taking it again — and nothing has been able to
+                // dispatch this job between the two.
+                dispatch_a_pass(state)?;
+                drop(_one_pass);
                 // A runner that went away between the check above and the
                 // pass leaves the job queued with nowhere to go, and the
                 // requester is told rather than left watching a job nothing
@@ -3583,6 +4341,15 @@ async fn accept_submissions(state: &State, outbox: &Outbox, source: &mut Source)
                     });
                     return Ok(());
                 }
+                // Judged by the same function a submission is, so that a dry
+                // run of a declaration a submission would refuse says so
+                // rather than answering about a job nobody can submit (E-07).
+                if let Some(reason) = why_that_declaration_will_not_do(&asked) {
+                    let _ = outbox.send(FromHub::WouldRun {
+                        lines: vec![format!("it would be refused at submission: {reason}")],
+                    });
+                    return Ok(());
+                }
                 let lines = match why_that_parent_will_not_do(state, asked.after.as_ref())? {
                     Some(reason) => vec![format!("it would be refused at submission: {reason}")],
                     None => dry_run(state, asked)?,
@@ -3597,6 +4364,34 @@ async fn accept_submissions(state: &State, outbox: &Outbox, source: &mut Source)
             ToHub::AskFleetSwitches {} => {
                 let _ = outbox.send(FromHub::FleetSwitches {
                     runners: state.fleet_switches(),
+                });
+            }
+            ToHub::ApproveRunner { runner } => approve_a_runner(state, outbox, &runner),
+            ToHub::RemoveRunner { runner } => remove_a_runner(state, outbox, &runner),
+            ToHub::AskApprovedRunners {} => {
+                let approvals = match state.store.approved_runners() {
+                    Ok(approvals) => approvals,
+                    Err(error) => {
+                        let _ = outbox.send(FromHub::Refused {
+                            reason: format!(
+                                "this hub cannot read which runners it approved: {error}"
+                            ),
+                        });
+                        return Ok(());
+                    }
+                };
+                let connected = state.with_peers(|peers| {
+                    peers.runners.keys().cloned().collect::<BTreeSet<String>>()
+                });
+                let _ = outbox.send(FromHub::ApprovedRunners {
+                    runners: approvals
+                        .into_iter()
+                        .map(|approval| herd_proto::ApprovedRunner {
+                            connected: connected.contains(&approval.name),
+                            name: approval.name,
+                            approved_unix_s: approval.approved_unix_s,
+                        })
+                        .collect(),
                 });
             }
             ToHub::RaiseJob { job_id, priority } => {
@@ -3660,6 +4455,18 @@ fn answer_a_wait(state: &State, outbox: &Outbox, job_id: JobId) -> Result<bool> 
         });
         return Ok(false);
     };
+    // Where it ran, before its output: a `herdctl wait` on a job that is
+    // already running, or long over, prints the same first line a requester
+    // that followed it from the start printed (E-02, D109). Off the record's
+    // own attempt, so the sentence is the one that was recorded (E-36), and
+    // the latest attempt because that is where the job is now.
+    if let Some(attempt) = record.attempts.last() {
+        let _ = outbox.send(FromHub::RanOn {
+            job_id: job_id.clone(),
+            runner: attempt.runner.clone(),
+            why: attempt.why.clone(),
+        });
+    }
     // The output the job has already produced, before anything
     // else about it. A detached requester has no other way to get
     // a job's log through the CLI (D22).
@@ -3729,6 +4536,103 @@ fn answer_a_wait(state: &State, outbox: &Outbox, job_id: JobId) -> Result<bool> 
         }
     }
     Ok(true)
+}
+
+/// Approve one runner, and hand the token back once (E-48, Q8).
+///
+/// **One operator action**, which is the whole of what Q8 asks for: the name
+/// goes in, the token comes out, and the machine is in the fleet as soon as
+/// it dials with it. Nothing is generated on the runner, nothing is
+/// exchanged, no certificate and no second round trip — those are the things
+/// invariant 1 keeps Herd away from.
+///
+/// The hub's own stdout says that the approval happened and never what was
+/// minted: the token travels on this one connection to the operator who asked
+/// for it, and a hub that printed it would put a credential in the container's
+/// log for as long as the log is kept.
+fn approve_a_runner(state: &State, outbox: &Outbox, runner: &str) {
+    match state.store.approve_runner(runner) {
+        Ok(token) => {
+            println!("herd-hub: runner {runner} is approved and a new token was minted for it");
+            let _ = outbox.send(FromHub::RunnerApproved {
+                runner: runner.to_owned(),
+                token,
+                said: format!(
+                    "runner {runner} is approved on this hub. Its token is printed once and \
+                     this hub keeps only a hash of it: give it to that machine as --token or \
+                     HERD_TOKEN. Approving {runner} again mints a new token and revokes this \
+                     one"
+                ),
+            });
+        }
+        // Terminal (D13): a name that is not a name, or a state root that
+        // cannot be written, are both answers that asking again repeats.
+        Err(error) => {
+            let _ = outbox.send(FromHub::Refused {
+                reason: format!("runner {runner} was not approved: {error}"),
+            });
+        }
+    }
+}
+
+/// Remove one runner, revoke its token, and tell the machine on the
+/// connection it is holding (E-48).
+///
+/// The telling is the half that is easy to leave out. A revocation that only
+/// took effect at the next dial would leave a runner Herd no longer trusts
+/// holding a link, claiming jobs, for as long as its process lives — which on
+/// a machine somebody has just taken out of the fleet could be weeks. So the
+/// refusal goes out on its own connection and the connection is dropped,
+/// which is exactly what the hub already does to a runner it supersedes.
+///
+/// A job that runner is executing is **not** cancelled here. It is running on
+/// a machine that was trusted when it started, its verdict is spooled and
+/// will be refused like any other verdict from a runner that is not admitted,
+/// and the hub's own loss detection ends the attempt. Killing work on the way
+/// out would be a removal that destroys a build nobody asked to lose.
+fn remove_a_runner(state: &State, outbox: &Outbox, runner: &str) {
+    let removed = match state.store.remove_runner(runner) {
+        Ok(removed) => removed,
+        Err(error) => {
+            let _ = outbox.send(FromHub::Refused {
+                reason: format!("runner {runner} was not removed: {error}"),
+            });
+            return;
+        }
+    };
+    if !removed {
+        let _ = outbox.send(FromHub::RunnerRemoved {
+            said: format!(
+                "no runner called {runner} is approved on this hub, so there was no token to \
+                 revoke and nothing was changed"
+            ),
+        });
+        return;
+    }
+    let reason = herd_proto::revoked_runner_reason(runner);
+    let told = state.with_peers(|peers| {
+        peers.runners.get(runner).is_some_and(|connected| {
+            let _ = connected.outbox.send(FromHub::Refused {
+                reason: reason.clone(),
+            });
+            let _ = connected.kick.send(true);
+            true
+        })
+    });
+    println!("herd-hub: {reason}");
+    let _ = outbox.send(FromHub::RunnerRemoved {
+        said: if told {
+            format!(
+                "runner {runner} is removed and its token is revoked; it was connected and has \
+                 been told, and claims nothing from here on"
+            )
+        } else {
+            format!(
+                "runner {runner} is removed and its token is revoked; it was not connected, \
+                 and it is refused by name if it dials again"
+            )
+        },
+    });
 }
 
 /// Raise one job's level, as an operator may (E-18).
@@ -4021,12 +4925,16 @@ fn message_kind(message: &ToHub) -> &'static str {
         ToHub::JobStarted { .. } => "job_started",
         ToHub::LogChunk { .. } => "log_chunk",
         ToHub::JobFinished { .. } => "job_finished",
+        ToHub::StepFinished { .. } => "step_finished",
         ToHub::Health { .. } => "health",
         ToHub::AttemptAbandoned { .. } => "attempt_abandoned",
         ToHub::DryRun { .. } => "dry_run",
         ToHub::SwitchApplied { .. } => "switch_applied",
         ToHub::SetSwitch { .. } => "set_switch",
         ToHub::AskFleetSwitches {} => "ask_fleet_switches",
+        ToHub::ApproveRunner { .. } => "approve_runner",
+        ToHub::RemoveRunner { .. } => "remove_runner",
+        ToHub::AskApprovedRunners {} => "ask_approved_runners",
     }
 }
 
@@ -4102,6 +5010,21 @@ mod tests {
         fn state_root_id(&self) -> &str {
             self.inner.state_root_id()
         }
+        fn approve_runner(&self, name: &str) -> StoreResult<String> {
+            self.inner.approve_runner(name)
+        }
+        fn remove_runner(&self, name: &str) -> StoreResult<bool> {
+            self.inner.remove_runner(name)
+        }
+        fn approved_runners(&self) -> StoreResult<Vec<crate::roster::Approval>> {
+            self.inner.approved_runners()
+        }
+        fn admit_runner(&self, name: &str, token: Option<&str>) -> crate::roster::Admission {
+            self.inner.admit_runner(name, token)
+        }
+        fn approved_runner_count(&self) -> usize {
+            self.inner.approved_runner_count()
+        }
         fn submit(&self, new: NewJob) -> StoreResult<crate::job::Submission> {
             self.inner.submit(new)
         }
@@ -4112,11 +5035,32 @@ mod tests {
         fn record_waiting(&self, id: &JobId, reason: &str) -> StoreResult<bool> {
             self.inner.record_waiting(id, reason)
         }
+        fn record_reading(&self, id: &JobId, reading: crate::job::Reading) -> StoreResult<()> {
+            self.inner.record_reading(id, reading)
+        }
+        fn reading_answer(&self, key: &str) -> StoreResult<Option<herd_proto::Requirements>> {
+            self.inner.reading_answer(key)
+        }
+        fn remember_reading(
+            &self,
+            key: &str,
+            answer: &herd_proto::Requirements,
+        ) -> StoreResult<()> {
+            self.inner.remember_reading(key, answer)
+        }
         fn record_state(&self, id: &JobId, state: JobState) -> StoreResult<()> {
             self.inner.record_state(id, state)
         }
         fn record_metrics(&self, id: &JobId, metrics: JobMetrics) -> StoreResult<()> {
             self.inner.record_metrics(id, metrics)
+        }
+        fn record_step(
+            &self,
+            id: &JobId,
+            attempt: u32,
+            step: herd_proto::StepRun,
+        ) -> StoreResult<()> {
+            self.inner.record_step(id, attempt, step)
         }
         fn end_attempt(
             &self,
@@ -4227,6 +5171,7 @@ mod tests {
         let state = Arc::new(State {
             store: Arc::clone(&store) as Arc<dyn JobStore>,
             policy: Policy::default(),
+            authority: Authority::default(),
             started: Instant::now(),
             peers: Mutex::new(Peers::default()),
             dispatching: Mutex::new(()),
@@ -4445,6 +5390,7 @@ mod tests {
         let state = Arc::new(State {
             store: Arc::clone(&store) as Arc<dyn JobStore>,
             policy: Policy::default(),
+            authority: Authority::default(),
             started: Instant::now(),
             peers: Mutex::new(Peers::default()),
             dispatching: Mutex::new(()),
@@ -4473,5 +5419,139 @@ mod tests {
              carry: something is quadratic"
         );
         assert!(steady < writing, "{steady:?} against {writing:?}");
+    }
+
+    /// What the hub can check about a declaration without a repository, and
+    /// each of the three things it must not let past (E-11, D106).
+    ///
+    /// The hub trusts the requester for the *content* of the declaration — it
+    /// holds no repository and cannot check the file against the commit, which
+    /// D106 states as its cost. These three are different: each one is a
+    /// declaration no runner could execute as declared, and each would become
+    /// a job that ran something nobody declared.
+    #[test]
+    fn a_declaration_no_runner_could_execute_is_refused_by_name() {
+        let hook = |run: &str| herd_proto::Executor {
+            up: "tool ws up {job}".to_owned(),
+            fetch: "tool ws fetch {job}".to_owned(),
+            run: run.to_owned(),
+            down: "tool ws down {job}".to_owned(),
+            env: Default::default(),
+        };
+        let asked = |commit: &str, executor: herd_proto::Executor| herd_proto::Asked {
+            command: vec!["a-line".to_owned()],
+            labels: LabelSet::default(),
+            priority: Priority::Step,
+            build_thread_mib: None,
+            memory_mib: None,
+            tmpfs_mib: None,
+            deadline_unix_s: None,
+            after: None,
+            requeue_exit_code: None,
+            declaration: Some(herd_proto::Declaration {
+                command: "a-declared-command".to_owned(),
+                commit: commit.to_owned(),
+                args: Vec::new(),
+                executor,
+            }),
+            labels_from: None,
+            timeout_s: None,
+        };
+        const GOOD: &str = "cb5a2e8b4f1d9c7a3e05b8d6f2a1c4e79b0d3f68";
+
+        assert_eq!(
+            why_that_declaration_will_not_do(&asked(GOOD, hook("tool ws run {job} -- {line}"))),
+            None,
+            "a declaration a runner could execute is let through"
+        );
+
+        // A ref rather than the hash the requester's own checkout resolved:
+        // resolving it would mean resolving it on a machine, which is what
+        // E-01 forbids.
+        let said =
+            why_that_declaration_will_not_do(&asked("main", hook("tool ws run {job} -- {line}")))
+                .expect("a ref is not a commit this hub will take");
+        assert!(
+            said.contains("main") && said.contains("forty"),
+            "the refusal names what it was sent and what it needed: {said}"
+        );
+
+        // A step with no line is a step that would silently not happen, and
+        // the four steps run with no conditions at all (D77).
+        let said =
+            why_that_declaration_will_not_do(&asked(GOOD, hook("   "))).expect("an empty hook");
+        assert!(
+            said.contains("run") && said.contains("empty"),
+            "the refusal names the step: {said}"
+        );
+
+        // The sharpest one: a `run` hook with no {line} would run their
+        // workspace tool and report *its* exit code as a verdict about their
+        // tests (D20).
+        let said = why_that_declaration_will_not_do(&asked(GOOD, hook("tool ws run {job}")))
+            .expect("a run hook that would never run the line");
+        assert!(
+            said.contains(herd_proto::LINE_TOKEN) && said.contains("a-declared-command"),
+            "the refusal names the token and the command: {said}"
+        );
+
+        // And a job that is not a declared command is not judged by this at
+        // all: every job before M10 is one, and so is every `herdctl run --`.
+        let mut ad_hoc = asked(GOOD, hook("tool ws run {job} -- {line}"));
+        ad_hoc.declaration = None;
+        assert_eq!(why_that_declaration_will_not_do(&ad_hoc), None);
+
+        // And the three a `labels_from` reading can earn (D74).
+        let reading = |line: &str| {
+            let mut asked = asked(GOOD, hook("tool ws run {job} -- {line}"));
+            asked.labels_from = Some(herd_proto::LabelsFrom {
+                line: line.to_owned(),
+                baseline: LabelSet::of("build").expect("a label"),
+            });
+            asked
+        };
+        assert_eq!(
+            why_that_declaration_will_not_do(&reading("tool test --labels")),
+            None,
+            "a reading a runner could run is let through"
+        );
+
+        // A reading with no declaration around it: there is no commit, no
+        // command and no arguments, which is the whole of the cache key and
+        // the whole of what a runner would check out.
+        let mut orphan = reading("tool test --labels");
+        orphan.declaration = None;
+        let said =
+            why_that_declaration_will_not_do(&orphan).expect("a reading with no declared command");
+        assert!(
+            said.contains("tool test --labels") && said.contains("no declared command"),
+            "the refusal names the line and what is missing: {said}"
+        );
+
+        // An empty reading would answer nothing, and every job of that
+        // command would then be refused for want of requirements.
+        let said = why_that_declaration_will_not_do(&reading("  ")).expect("an empty reading");
+        assert!(
+            said.contains("a-declared-command") && said.contains("empty line"),
+            "the refusal names the command: {said}"
+        );
+
+        // The sharp one: a reading asking for the figure the hub derives from
+        // the machine it chooses. There is no N when a reading runs — it is
+        // placed before the job whose figure it would be — and an answer that
+        // depended on one could not be a property of (commit, command, args),
+        // which is what D74 caches it as. D82 anticipates this; M18 settles
+        // it with the consumer.
+        let said = why_that_declaration_will_not_do(&reading(&format!(
+            "tool test --labels -j {}",
+            herd_proto::PARALLELISM_TOKEN
+        )))
+        .expect("a reading that asks for a derived -j");
+        assert!(
+            said.contains(herd_proto::PARALLELISM_TOKEN)
+                && said.contains("a-declared-command")
+                && said.contains("cached by (commit, command, args)"),
+            "the refusal names the token, the command and why: {said}"
+        );
     }
 }

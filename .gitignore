@@ -4,3 +4,11 @@ result
 result-*
 .direnv/
 *.log
+
+# Sub-agent worktrees live here; they are branches, not content.
+.claude/
+
+# Stray redirections from driving the binaries by hand. Not a wildcard on
+# purpose: a test fixture may legitimately be called `expected.out`.
+hub.out
+hub.err

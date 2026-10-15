@@ -24,7 +24,13 @@ futures-util = "0.3.34"
 libc = "0.2.180"
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.154"
+sha2 = "0.10.9"
 tempfile = "3.27.0"
 time = { version = "0.3.55", features = ["formatting", "parsing", "serde-well-known"] }
 tokio = "1.53.2"
 tokio-tungstenite = "0.30.0"
+# The consumer declares its commands in TOML, because that is the file format
+# they chose for their own tree. Only `herdctl` parses it: the declaration is
+# read where the repository already is, so the hub and a runner never see TOML
+# and never need a checkout (D106). Easy to swap, shapes nothing.
+toml = { version = "0.9.8", default-features = false, features = ["parse", "serde", "std"] }

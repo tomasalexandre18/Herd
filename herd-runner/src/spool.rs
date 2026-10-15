@@ -360,6 +360,7 @@ mod tests {
                 outcome,
                 chunks_sent: 3,
                 metrics: JobMetrics::default(),
+                steps: Vec::new(),
             },
         )
     }

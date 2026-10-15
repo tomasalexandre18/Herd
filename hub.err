@@ -1,5 +1,0 @@
-error: unexpected argument '--state-root' found
-
-Usage: herd-hub --listen <LISTEN>
-
-For more information, try '--help'.

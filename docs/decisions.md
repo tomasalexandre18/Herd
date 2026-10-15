@@ -2965,3 +2965,330 @@ behaviour, the test fails.
 do not clear the counters — correctly, a hub dying that fast is one to back
 off from — and the cap keeps the test's figures apart from its patience. It
 is a fixture, and it is now the only one.
+
+## 2026-10-15 — D106 The declaration is read where the repository already is
+
+**Context.** M10's plan entry said a submission names "a commit of a
+configured bare repository", which would have given the hub a repository to
+read `commands.toml` from and a ref to resolve. Rereading the consumer's own
+contract (issue #16) before writing any of it: their `[executor]` `fetch`
+hook is `git fetch -q origin && git switch -q --detach {commit}`. **The
+workspace fetches the commit itself.** Herd was about to be given a
+repository it has no use for.
+
+**Choice. `herdctl` reads `tools/herd/commands.toml` in the requester's own
+checkout, resolves a ref to a hash there, and the resolved declaration
+travels with the submission.** The hub and a runner never see TOML, never
+hold a repository and never run git.
+
+* **E-08 needs that working tree anyway.** Refusing a dirty or unpushed
+  submission *naming the files* can only be done where the files are. One
+  place reads git, and it is the CLI.
+* **It keeps invariant 3 free.** No repository on the hub, no fetch, no
+  credential, nothing to keep in sync with a push.
+* **It is their rule, not an inference**: "You never interpret a command
+  line." Herd carries the line and substitutes the placeholders.
+
+**The cost, stated.** The hub trusts the requester for the declaration. That
+is not new — `Asked::command` is already an arbitrary command line from a
+requester — so it opens nothing that was closed, and who may submit at all
+is M15's. What it does mean is that the declaration is **not** a thing Herd
+can enforce against a commit: a requester that sends a line the commit does
+not declare is a requester lying about its own repository, and Herd's answer
+is the record, which keeps what it was sent.
+
+**Alternative rejected.** A bare repository configured on the hub. It buys
+one thing — the hub checking the declaration against the commit — and costs
+git in the hub's container, a repository someone has to keep current, and a
+second copy of the consumer's tree on the machine that holds every record.
+Rejected for the same reason D74 kept the `labels_from` reading off the hub.
+
+**Consequence for `docs/plan.md`.** M10's entry loses the configured bare
+repository and gains the resolution and the two refusals in `herdctl`. Only
+`herdctl` depends on a TOML parser.
+
+## 2026-10-15 — D107 Three places fill a placeholder, each the one that knows
+
+**Context.** The consumer's declaration is a template: their four executor
+hooks and their command lines carry `{job} {commit} {args} {in} {out}`, their
+`run` hook carries `{line}`, and Herd's own `{j}` (E-22) goes in the line.
+Something has to put a value in each, and the obvious reading — "the runner
+substitutes everything, it is the one running the command" — is wrong in a way
+that is invisible until M6 is looked at.
+
+**Choice. Each token is filled by the one place that knows its value, and
+`{args}` and `{commit}` are filled *before the job is minted*.**
+
+| Token | Filled by | Because |
+|---|---|---|
+| `{args}`, `{commit}` | `herdctl` | the requester typed the arguments and resolved the commit in its own checkout (D106) |
+| `{j}` | the hub | a property of the machine it chose, derived as it chooses one (E-22, D82) |
+| `{job}`, `{in}`, `{out}`, `{line}` | the runner | the id is the hub's, the directories are the runner's own |
+
+The sharp one is `{args}`. A line still holding `{args}` when the job is minted
+is a line two submissions of one command with *different arguments* share — and
+M6's deduplication key is computed over the command, so the second submission
+would join the first and two requesters would be handed one run of the wrong
+arguments (E-05 says a second submission of **open work** joins; it does not
+say two different jobs are one). Filling them in `herdctl` makes the line on
+the record the line that will run, which is also what makes a record readable
+years later (E-54) without the declaration file to hand.
+
+**Three limits, each of which matters.**
+
+* **Substitution is one pass per token, never a loop.** A value that itself
+  contains a brace is text, not a template: `--only '{out}'` is an argument.
+  A fixed point would turn a requester's own string into a template, which is
+  the one way a declaration's trust (D106) could reach beyond the declaration.
+* **A hook is one shell line, handed to one shell.** Their `fetch` is
+  `git fetch -q origin && git switch -q --detach {commit}` and their `sh`
+  command is a shell line by definition. "You never interpret a command line"
+  is their rule, and splitting a line into an argv Herd invented is exactly
+  interpreting it.
+* **`{args}` is shell-quoted, one word per argument.** Pasting a requester's
+  argument raw *would* be interpreting it: `--only 'a b'` would reach their
+  tool as two arguments, and a `$(…)` in an argument would run. Single quotes,
+  with the one escape a single quote needs, because inside them a shell
+  expands nothing at all. Quoting is how an argument is preserved, not how it
+  is read.
+
+**Alternative rejected.** Carrying the arguments to the runner and filling them
+there, which looks tidier — one place substitutes everything. Rejected for the
+deduplication defect above, and because the record would then hold a template
+rather than a command.
+
+## 2026-10-15 — D108 The command declares its cap, the owner bounds it
+
+**Context.** Each declared command names a `timeout_s` — 45 min for a build,
+2 h for a test, 5 h for the nightly. A runner already has a time cap of its
+own, given by its owner at startup, and invariant 2 requires every job to run
+under an explicit one. Two figures, one job, and the first consumer's `up` step
+may pull a whole warm cache — ~30 min the first time a machine runs one of
+their jobs — *before* their command starts.
+
+**Choice. `timeout_s` bounds the `run` step. The preparation steps are bounded
+by the runner's own figure. Neither raises the other: the cap on `run` is the
+smaller of the declared figure and the runner's, and the record says which one
+bound the job.**
+
+* A cap over the whole attempt would let a cold cache pull eat a build's 45
+  minutes, and the job would be reported as a slow build — which is precisely
+  the misreading D77's timestamps exist to prevent.
+* A declared figure that could *raise* the runner's would let a requester
+  overrule the owner of a machine she is lending (invariant 2, E-33's spirit).
+  The consumer says what its command needs; the owner says what her machine
+  lends; the smaller wins and is named.
+* Nothing new is invented for the preparation steps. They have no declared
+  figure, and the owner's cap is the explicit bound invariant 2 asks for.
+
+**What a step's ending means, which falls out of the same reading.**
+
+* `up` or `fetch` non-zero → the job **never started**:
+  `could_not_start`, naming the step and its code, and never an exit code a
+  caller could read as a failing test (D20).
+* `run` → **the verdict**, worn untouched: 0, 1 and 75 alike (E-02).
+* `down` non-zero → recorded on its step line and **cannot change the
+  verdict**: the verdict already exists, and a workspace that failed to be
+  taken down is an operator's problem, not a test result.
+* `down` runs however the three before it ended. Not a condition — the
+  opposite: a step that ran only on success would leak a workspace on every
+  failure, and the four steps must have no conditions at all (D77,
+  invariant 1).
+
+**And the steps are reported as they end**, not only with the verdict
+(`ToHub::StepFinished`). A 5 h nightly stopped at its cap, or a runner lost
+under a cache pull, would otherwise leave **no** step on the record — the
+preparation time invisible in exactly the case someone is looking for it. The
+complete list arrives again with the verdict and takes over, so the frame needs
+no acknowledgement and no spool: it is neither output nor a verdict, and a link
+that dies under it costs the record nothing it does not get back.
+
+---
+
+## 2026-10-15 — D109 Deployment outranks breadth: M16 pulled forward
+
+**Context.** The owner's build server was OOM-killed on 2026-10-15 by a fleet
+of agents running unbounded builds. That is not an accident of the day: it is
+the pain the first consumer's sheet already measured (load median 29, p90 46
+on 12 threads; the PC OOM-killed; 71 % of detached runs red) and it keeps
+happening **because Herd is not yet there to bound it**. Nine milestones are
+merged and none of them is in production, so none of them has prevented
+anything. Alexa's ruling: get to M16 very fast, cleanly but fast.
+
+**Choice.** The path to a deployed hub is **M10 → M15 → M16**, then
+**M15d → M17**. M11, M12, M13 and M14 move to after M16.
+
+Two corrections to the plan's own reasoning that this exposed:
+
+1. **M15d was wrongly placed before M16.** The plan itself says the server's
+   native runner is updated by Nix (E-47), so self-update buys nothing for the
+   first deployment; it serves the non-Nix hosts. It is owed before the PC
+   joins, not before the hub ships. One whole milestone left the critical path.
+2. **"Nothing is exposed until a job can be stored and observed" was too
+   strong.** A first deployment needs a job that can be declared, confined,
+   admitted, placed, switched off and authenticated. Artefacts, a status
+   document and a scheduler's clock make Herd *broader*, not *deployable*.
+
+**What this costs, stated rather than discovered later.**
+
+- No M11/M12: a build and its test must run on the same runner. No
+  build-here-test-there, and no artefact custody.
+- No M13: the consumer's dashboard sees nothing of Herd and keeps its own
+  status files. Their own E-53 permits exactly this for a transition period.
+- No M14: their cron and their push hook keep submitting on their side.
+- No M15d: updating a runner needs a hand on its host. Nix covers the server.
+- **M16 bounds the server; it does not unload it.** The PC has no runner until
+  M17, and M17 before M11 gives a PC good only for `check` work, since without
+  a pack a build there produces nothing the server can test from and the
+  owner's rule denies the PC `kvm`.
+
+**Alternative rejected.** Finishing M11-M14 first, as the plan had it, and
+deploying a complete Herd once. Rejected because every week of breadth is
+another week of the exact failure Herd exists to prevent, on the machine the
+project is built on. Deploying narrow and growing in production is the cheaper
+error here.
+
+**Consequence for Q7.** Deploying earlier freezes the job-record format and
+the `ran on:` line earlier, and M16 still sets `PROTOCOL_VERSION` and
+`RECORD_VERSION` to 1 and freezes them (D73). The status and event formats do
+not exist yet, so they stay free — a benefit of this order, not a cost.
+
+---
+
+## 2026-10-15 — D110 E-02's line is a frame, not a log line
+
+**Context.** E-02 wants a job's output to begin with one line
+`ran on: <runner> (<why>)` and to end with the consumer tool's own verdict and
+exit code, unchanged. The first implementation printed the line the moment the
+frame arrived, which put a `ran on:` line on the stdout of a job that **never
+started** — breaking D16's rule that stdout stays empty when Herd could not run
+the job at all.
+
+**Choice.** Three separations, each load-bearing:
+
+1. **The hub reports the placement, `herdctl` writes the sentence.** The hub
+   sends a `RanOn` frame; the human-readable line is composed at the requester.
+2. **The line is not part of the job's log.** The record's log stays exactly
+   the bytes the process wrote (D18). The frame is presentation, not output.
+3. **The line is held until there is output to frame.** It is released just
+   ahead of the job's first output byte, or with the verdict if the job
+   produced none, and **never** for `could_not_start` — which is what keeps
+   D16's empty stdout true. A job that produced no output at all still gets
+   the line: it did run somewhere, and that is what the line says.
+
+`OUTPUT_FORMAT_VERSION` rides **inside** the parentheses (Q7), so a reader
+anchored on the closing `)` still matches `^ran on: (\S+) \((.*)\)$`. The
+inverse of the formatter lives in `herd-proto` beside it; no test and no crate
+keeps a hand-rolled copy of the format.
+
+**A lock widened with it.** The claim lock now covers follower registration: a
+job is dispatchable the instant `submit` returns, so a pass fired by anything
+else would have sent the line to a follower list the requester had not yet
+joined.
+
+**`herdctl`'s declared-command surface.** `--command` is exclusive with
+`--label` and the three `--*-mib` values: the declaration is the authority, and
+a flag silently losing to a file is worse than a refusal. `--priority` is not
+exclusive; which level won is said on stderr.
+
+---
+
+## 2026-10-15 — D111 Two limits of E-02 that Herd cannot enforce
+
+**Context.** Found while making E-02 real against a fixture consumer.
+
+**"Ends with the tool's verdict" is a constraint on the consumer's
+declaration, not on Herd.** The fixture's `down` hook printed its step log on
+stdout, putting teardown chatter after the verdict; moving it to stderr gave
+the fixture E-02's shape. But a consumer whose own teardown writes to stdout
+breaks "ends with the verdict" by itself, and no amount of care on our side
+prevents it. Herd guarantees the *first* line and that it never alters the
+job's bytes; the *last* line is the consumer's to keep. **This belongs in the
+M18 conversation with chatOnS**, not in a silent assumption.
+
+**A runner that names no memory floor admits nothing.** A declared command with
+a build-thread figure makes the hub derive a memory need; a runner started
+without a host size and floor then admits nothing, and the job waits for ever
+on a machine that could have run it. The behaviour is correct — admission
+against an unknown host must refuse — but silence is not. **M16 owes a loud
+failure at startup**: a runner that cannot admit any declared work says so
+when it starts, rather than queueing jobs for ever.
+
+---
+
+## 2026-10-15 — D112 The test-side reader of E-02's format, and one stray file
+
+**Context.** Two findings from integrating M10's framing with M15's
+authentication. Both small; both the kind of thing that rots if unwritten.
+
+**The inverse of E-02's format exists three times on the test side**
+(`herd-hub/tests/real_herd::job_output_bytes`, `herdctl/tests/exit_code.rs`,
+`herdctl/tests/declared_end_to_end.rs::framed`), because a test support module
+cannot cross a crate boundary. Invariant 4 is **not** broken: the format itself
+has exactly one definition, in `herd-proto`, and all three call
+`herd_proto::unframe`. What is duplicated is only the *insistence* — the panic
+message saying the line must be there. **Decision: leave it.** Three thin
+wrappers around one definition is cheaper than a test-only public surface on
+the contract crate, which would then need its own compatibility care. If a
+fourth appears, move the insistence into `herd-proto` behind a test feature.
+
+**`hub.out` and `hub.err` were tracked at the repository root**, committed in
+`213fcf1`: 120 bytes of a `herd-hub` usage error from somebody driving the
+binary by hand, and an empty file. Removed, and named in `.gitignore` —
+deliberately not as `*.out`/`*.err`, since a test fixture may legitimately be
+called `expected.out`. Nothing sensitive was in them, and that is the point
+worth recording: a stray redirection at the root of a public repository is a
+leak waiting for the one time it is not empty.
+
+---
+
+## 2026-10-15 — D113 A connection's liveness clock is the health report alone
+
+**Context.** Found while chasing a test that failed once in five full-suite
+runs and never again in eighty-eight targeted ones. The flake was not the
+finding; this is.
+
+The hub writes a connection off when `last_health.elapsed()` passes
+`lost_after`, and **only** a `Health` frame resets `last_health`. A frame about
+a running attempt resets `attempt_seen`, never the connection's clock. So a
+runner that is streaming a job's log steadily, but whose health task is
+starved or wedged, is written off as lost and its **live** attempt is written
+off with it — requeued once at its priority (E-21).
+
+**Why it is defensible.** The health report is the declared liveness signal
+(E-40: every ~15 s; silence for ~60 s is lost, E-21), and it is also the only
+frame carrying the figures admission needs — free memory, free tmpfs, load. A
+runner that cannot report health is a runner the hub cannot admit against.
+
+**Why it is a limit worth writing down.** It is asymmetric with
+`attempt_seen`, and it is the mechanism that makes any test with a short
+`lost_after` sensitive to machine load. More to the point for the first
+deployment: the first consumer's builds run tens of minutes on a host whose
+measured load p90 is 46 on 12 threads. A starved health task there would
+requeue a thirty-minute build that was visibly alive.
+
+**Decided: leave the behaviour as it is for now, and record the limit.** The
+cheap correction, if it proves needed, is to separate the two questions the
+clock conflates: *is this runner alive* — any frame answers it, so a live
+attempt is never written off — and *are its figures fresh* — only a health
+report answers that, and stale figures should stop **new admissions** rather
+than kill running work. That is the shape to reach for; it is not in M10 and
+it is not in M16's definition, so it is Alexa's call whether it precedes the
+first deployment.
+
+---
+
+## 2026-10-15 — D114 The shared declared-command harness approves its runner
+
+**Context.** M15's E-48 (an unapproved runner is given no job) and D74's
+reading (a job's requirements are read by an ordinary job on a runner) were
+written in parallel and met in the merge.
+
+**The interaction worth naming.** Because a reading *is* an ordinary job, an
+unapproved runner leaves the reading unclaimed, which leaves the real job
+waiting on requirements nobody will ever read — and nothing fails loudly. The
+failure is silence, which is the mode this project keeps legislating against.
+
+**Choice.** Every harness that lends a real runner names it and approves it,
+through the one `approve_runner` path, exactly as `confinement.rs` does. No
+test holds its own notion of an approved runner.

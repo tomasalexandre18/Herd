@@ -19,12 +19,18 @@ use std::time::Duration;
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 
 pub mod capability;
+pub mod declaration;
 pub mod placement;
 
 pub use capability::{
     check_label, metal_label, Availability, BusyProbe, Capability, CapabilityError, CapabilityKind,
     CapabilityOffer, CapabilityOrigins, CapabilityState, Contention, Holdings, LabelSet,
     OfferedCapability,
+};
+pub use declaration::{
+    args_as_line, shell_quote, Declaration, Executor, LabelsFrom, Requirements, Step, StepRun,
+    ARGS_TOKEN, COMMIT_TOKEN, IN_TOKEN, JOB_TOKEN, LABELS_KEY, LINE_TOKEN, MEMORY_KEY, OUT_TOKEN,
+    READING_KEYS, SCENARIOS_KEY, TMPFS_KEY,
 };
 pub use placement::{
     default_memory_floor_mib, parallelism_tokens, size_mib, with_parallelism, HostSize,
@@ -81,7 +87,34 @@ pub use placement::{
 /// default is a lie in one direction. So the number moves, a version 5 peer is
 /// refused by name, and there is no migration — M16 sets both numbers back to
 /// 1 (D73).
-pub const PROTOCOL_VERSION: u32 = 6;
+///
+/// **7 is M10's**, the command declaration contract (E-11). A submission may
+/// carry a [`declaration::Declaration`] — a declared command's name, its
+/// commit, the requester's arguments and the consumer's four executor hooks —
+/// and the time cap that command declares; the hub hands both back with the
+/// attempt ([`FromHub::AssignJob`]); the runner reports each step as it ends
+/// ([`ToHub::StepFinished`]) and the four again with the verdict. None of it
+/// may be read as absent, and the sharp one is the cap: a version 6 runner
+/// handed a declared job would ignore the four steps, exec the line directly
+/// and cap it at its own figure — a job that ran something other than what the
+/// declaration says, reported as if it had. So the number moves, a version 6
+/// peer is refused by name, and there is no migration (D73).
+///
+/// 7 also carries [`FromHub::RanOn`], which is E-02's first line: where the
+/// job is running and why there. It rides on 7 because it is the same
+/// milestone and nothing is deployed to be caught in between.
+///
+/// **8 is M15's**, and it is the handshake learning to say which *build* is
+/// speaking (E-51). A peer announces its own version beside the protocol's
+/// ([`ToHub::Hello::peer_version`]), and the hub answers a minor gap with a
+/// note it carries in the welcome ([`FromHub::Welcome::version_note`]) and a
+/// major one with a refusal. Neither field may be read as absent: a missing
+/// build version read as "the same as mine" is a hub that never warns and
+/// never refuses, which is the whole of what E-51 asks for, and a missing
+/// note read as "nothing to say" would hide the one line that tells an owner
+/// which side to move. So the number moves, a version 7 peer is refused by
+/// name, and there is no migration (D73).
+pub const PROTOCOL_VERSION: u32 = 8;
 
 /// How often a runner says it is alive and what it is doing (E-40).
 ///
@@ -355,6 +388,20 @@ pub struct RunnerSwitch {
     pub stopping: bool,
 }
 
+/// One approved runner, as `herdctl runner list` prints it (E-48).
+///
+/// No token and no hash: the hub holds a hash and hands out neither. What an
+/// operator needs is the name she approved, when she approved it, and whether
+/// the machine is here now.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ApprovedRunner {
+    pub name: String,
+    /// When the approval was made, in seconds since the epoch.
+    pub approved_unix_s: u64,
+    /// Whether a runner of that name is connected to this hub right now.
+    pub connected: bool,
+}
+
 /// How a log payload travels inside the JSON frame: standard base64, padded.
 ///
 /// JSON cannot carry an arbitrary byte, and a JSON string cannot carry one
@@ -587,6 +634,12 @@ pub enum JobOutcome {
     /// the labels or the figure, because the only thing to do about one of
     /// these is change the submission.
     ///
+    /// D74 adds one more, and it is of the same kind: a job whose
+    /// requirements are read on a machine, whose reading did not answer. No
+    /// machine can run such a job because nothing knows what it needs, and
+    /// the only thing to do about it is to fix the reading — so `reason`
+    /// names the reading, the command and what was wrong with its answer.
+    ///
     /// Distinct from [`JobOutcome::CouldNotStart`], which is a job Herd tried
     /// to run: this one never reached a machine at all.
     Impossible { reason: String },
@@ -709,8 +762,35 @@ pub enum ToHub {
     /// First frame on every connection, from either role.
     Hello {
         protocol_version: u32,
+        /// Which **build** is speaking, beside which protocol it speaks
+        /// (E-51).
+        ///
+        /// The protocol version says whether two peers can read each other's
+        /// frames; it says nothing about whether they agree on what the
+        /// frames *mean*. A runner built three releases ago reads every field
+        /// of today's `AssignJob` and may still confine a job differently,
+        /// report a step differently, or spool a verdict in a shape the hub
+        /// has stopped reading — all of it inside one protocol version. So
+        /// the build travels too, and the hub answers a minor gap with a note
+        /// and a major one with a refusal, both naming the two versions so
+        /// that one line says which side to move.
+        ///
+        /// **Required**, for the reason the switch is: a hub that read a
+        /// missing build version as "the same as mine" would warn about
+        /// nothing and refuse nothing, which is E-51 not implemented. That is
+        /// what moved [`PROTOCOL_VERSION`] to 8.
+        peer_version: String,
         role: Role,
-        /// Bearer token. Carried from M1, validated from M15 (D6, Q8).
+        /// Bearer token: what says this peer is allowed here (E-48, Q8).
+        ///
+        /// Carried from M1 and **validated from M15**. A runner's token is
+        /// the one minted when an operator approved it by name (`herdctl
+        /// runner approve`), kept at the hub only as a hash, and a runner
+        /// that carries none — or the wrong one, or one that was revoked when
+        /// the runner was removed — is refused terminally (D13) with a
+        /// sentence saying what to do about it. A requester's is the one
+        /// shared token the hub was started with, when it was started with
+        /// one.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         token: Option<String>,
         /// Human-readable name of the peer, for logs and reports.
@@ -878,6 +958,23 @@ pub enum ToHub {
     },
     /// Requester asks where every runner's switch stands (E-33).
     AskFleetSwitches {},
+    /// An operator approves one runner by name, and the hub mints its token
+    /// (E-48, Q8).
+    ///
+    /// **One action.** Approving a runner that is already approved mints it a
+    /// new token and forgets the old one, which is how a token that has
+    /// leaked is replaced: there is no second command for that, because a
+    /// second command is a second thing to get wrong.
+    ApproveRunner { runner: String },
+    /// An operator removes one runner, which revokes its token (E-48).
+    ///
+    /// The machine is told, on the connection it is holding, and claims
+    /// nothing from that moment: a revocation that only took effect at the
+    /// next dial would leave a runner Herd no longer trusts holding a link
+    /// and taking work.
+    RemoveRunner { runner: String },
+    /// An operator asks which runners are approved on this hub (E-48).
+    AskApprovedRunners {},
     /// An operator raises one job above what its requester asked for (E-18).
     ///
     /// Only ever upwards. Lowering a job is not offered: it is the way to
@@ -938,6 +1035,35 @@ pub enum ToHub {
         /// a figure that was simply not readable (see [`JobMetrics`]).
         #[serde(default)]
         metrics: JobMetrics,
+        /// Every executor step this attempt ran, in the order it ran them
+        /// (D77).
+        ///
+        /// The authoritative copy: [`ToHub::StepFinished`] fills the record as
+        /// the attempt goes, so a job stopped at a cap or lost with its runner
+        /// still shows the preparation it did — and this list, which the hub
+        /// takes over the ones it already has, is what an attempt that reached
+        /// its end says it ran. Empty for a job that is not a declared command.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        steps: Vec<StepRun>,
+    },
+    /// One executor step of an attempt has ended, with its figures (D77).
+    ///
+    /// Sent as the step ends rather than only with the verdict, for two
+    /// reasons. A 5 h nightly stopped at its cap, or a runner lost under a
+    /// 30-minute cache pull, would otherwise leave **no** step on the record —
+    /// the preparation time invisible in exactly the case someone is looking
+    /// for it. And E-04's and E-36's explanations may quote preparation time
+    /// (D77), which they can only do if the hub holds the step before the job
+    /// ends.
+    ///
+    /// Not acknowledged and not spooled, unlike a log chunk or a verdict: a
+    /// step line is neither output nor a verdict, and the complete list
+    /// arrives again with [`ToHub::JobFinished`]. A link that dies under it
+    /// costs the record nothing it does not get back.
+    StepFinished {
+        job_id: JobId,
+        attempt: u32,
+        step: StepRun,
     },
     /// Runner reports that it is alive and what it is doing (E-40).
     ///
@@ -1086,6 +1212,48 @@ pub struct Asked {
     /// verdict, reported verbatim (D20).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub requeue_exit_code: Option<i32>,
+    /// The declared command this job is, when it is one (E-11, D106).
+    ///
+    /// Present means the job is a declared command on a commit: the runner
+    /// runs it through the consumer's four executor steps, and `command` is
+    /// the declared line going into the `run` hook's [`LINE_TOKEN`]. Absent
+    /// means `command` is the whole of what runs, which is every job Herd ran
+    /// before M10 and every `herdctl run -- …` after it.
+    ///
+    /// Both forms stay, deliberately. The ad-hoc one is how Herd is tested
+    /// against itself without a consumer tree in the picture (E-11 wants no
+    /// consumer command in Herd's own code), and the declared one is how a
+    /// real job arrives.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub declaration: Option<Declaration>,
+    /// The reading that will say what this job needs, when its command's
+    /// requirements are not knowable from the declaration (D74).
+    ///
+    /// Present means [`Asked::labels`] is the **baseline** the reading itself
+    /// is placed against and not this job's own requirements: the hub runs the
+    /// reading as an ordinary job on a runner, writes what it answered onto
+    /// the record, and places this job on that. Absent means `labels` and the
+    /// figures beside them are what the requester stated, which is every job
+    /// before D74 and every one whose command declares static labels.
+    ///
+    /// A requester fills the line's `{commit}` and `{args}` like any other
+    /// (D107); everything else about the reading is the hub's.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub labels_from: Option<LabelsFrom>,
+    /// How long this job's `run` step may take, in seconds, as its command
+    /// declares (E-11).
+    ///
+    /// The consumer's own figures: 45 min for a build, 2 h for a test, 5 h for
+    /// the nightly. It bounds the `run` step and nothing else — the
+    /// preparation steps are bounded by the runner's own cap, which is its
+    /// owner's figure and not a requester's to raise (invariant 2, D108).
+    ///
+    /// Absent means the job is capped at the runner's own figure, which is
+    /// what every job before M10 was. A figure **above** the runner's own does
+    /// not raise it: the smaller of the two wins, because the machine belongs
+    /// to its owner and the record says which of the two bound the job.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timeout_s: Option<u64>,
 }
 
 /// Sent by the hub to a runner or a requester.
@@ -1105,6 +1273,19 @@ pub enum FromHub {
         /// instead of offering a verdict for a vanished hub on every link it
         /// ever makes.
         state_root: String,
+        /// What the hub has to say about the gap between its build and this
+        /// peer's, when there is a gap it is willing to serve (E-51).
+        ///
+        /// A major gap is a refusal and never arrives here. A minor one is
+        /// served — the frames mean the same thing — and still worth one
+        /// line, because the two sides drifting is how a fleet ends up with
+        /// one machine behaving unlike the others. It travels rather than
+        /// being left on the hub's own stdout so that it reaches the person
+        /// who can act on it: the owner of the machine, reading her runner's
+        /// stderr. The hub says it too.
+        ///
+        /// `None` is the ordinary case: the two builds agree.
+        version_note: Option<String>,
     },
     /// The hub declines to go on, and says why. Always the last frame.
     Refused { reason: String },
@@ -1137,6 +1318,22 @@ pub enum FromHub {
     },
     /// Where every runner's switch stands (E-33).
     FleetSwitches { runners: Vec<RunnerSwitch> },
+    /// One runner is approved, and here is the token it is to carry (E-48).
+    ///
+    /// **The only time the token is ever readable.** The hub keeps a hash of
+    /// it and nothing else (invariant 7, Q8), so an operator who loses this
+    /// line approves the runner again rather than looking the token up — and
+    /// the thing nobody can do is read it off the hub's disk.
+    RunnerApproved {
+        runner: String,
+        token: String,
+        said: String,
+    },
+    /// One runner is removed and its token revoked (E-48), or it was never
+    /// approved and nothing changed. `said` is which.
+    RunnerRemoved { said: String },
+    /// Which runners are approved on this hub (E-48).
+    ApprovedRunners { runners: Vec<ApprovedRunner> },
     /// The owner, through the hub, moves this runner's switch (E-33).
     ///
     /// A runner that receives it **writes the position to its own switch file
@@ -1165,6 +1362,19 @@ pub enum FromHub {
         job_id: JobId,
         attempt: u32,
         command: Vec<String>,
+        /// The declared command, when the job is one (E-11, D106).
+        ///
+        /// Handed back with every attempt rather than held by the runner that
+        /// first saw it: a job requeued onto another machine must run the same
+        /// four steps on the same commit, and the record is the only thing
+        /// that knows them both.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        declaration: Option<Declaration>,
+        /// What the declaration says this job's `run` step may take, in
+        /// seconds. The runner caps it at the smaller of this and its own
+        /// figure (D108).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        timeout_s: Option<u64>,
     },
     /// The runner is asked to end a job it is executing, and told why.
     ///
@@ -1274,6 +1484,29 @@ pub enum FromHub {
     /// (D19). Waiting for such a job is never silent. M8's explained waits are
     /// this frame's real home.
     JobNote { job_id: JobId, note: String },
+    /// Where this job is running, and why there (E-02, E-36).
+    ///
+    /// The first consumer's first expectation: "the output starts with one
+    /// line `ran on: <client> (<why>)` and ends with our tool's own verdict
+    /// and exit code". This frame is what that line is made of, and it is a
+    /// frame rather than a line because Herd must **not** write it into the
+    /// job's log: a record's log is the bytes the job's process wrote, and
+    /// nothing else (D18, E-15). The requester's CLI builds the sentence and
+    /// prints it on its own stdout, ahead of the job's first byte.
+    ///
+    /// Sent when the attempt is handed out, and sent again to a requester
+    /// that attaches later — a `herdctl wait` on a job that is already
+    /// running has to be able to print the same first line. A job that is
+    /// requeued onto another machine (E-21) produces a **second** one, which
+    /// is the truth about a job that ran in two places and is worth a line.
+    ///
+    /// `why` is the one line that explains the placement (E-36) — the same
+    /// sentence the record's attempt carries, so the two cannot drift.
+    RanOn {
+        job_id: JobId,
+        runner: String,
+        why: String,
+    },
     /// How the job ended, relayed to the requester that submitted it, with
     /// what the runner measured while it ran.
     JobFinished {
@@ -1292,6 +1525,65 @@ pub enum FromHub {
     /// acknowledgement of something still in memory would be a lie the next
     /// power cut collects on.
     JobResultAck { job_id: JobId },
+}
+
+/// The version of the output Herd frames a job's own output with (Q7).
+///
+/// 1, and it freezes at M16 (Q7, D73). It is carried **inside the
+/// parentheses** of [`ran_on_line`], which is the one place it can go: E-02
+/// asks that the output *start* with one line `ran on: <runner> (<why>)`, so
+/// a version on a line of its own would push that line down, and a version
+/// after the closing parenthesis would break a reader anchored on it. Inside,
+/// it is part of the free text the `why` already is, and
+/// `^ran on: (\S+) \((.*)\)$` is satisfied exactly (D109).
+pub const OUTPUT_FORMAT_VERSION: u32 = 1;
+
+/// E-02's first line: where this job ran, and why there.
+///
+/// Built here rather than in the requester's CLI because the hub's tests
+/// assert on it and the CLI prints it, and two places writing one sentence is
+/// what invariant 4 exists to prevent. Printed on the requester's **stdout**,
+/// ahead of the job's first byte, and never written into the record's log —
+/// that log is the bytes the job's process wrote and nothing else (D18).
+pub fn ran_on_line(runner: &str, why: &str) -> String {
+    format!("ran on: {runner} ({why}; herd output format {OUTPUT_FORMAT_VERSION})")
+}
+
+/// What is in front of [`ran_on_line`], so that a reader can be anchored on
+/// it and not on a substring that could appear in a job's own output.
+pub const RAN_ON_PREFIX: &str = "ran on: ";
+
+/// The two parts of [`ran_on_line`]: the runner, and the reason with its
+/// format version. `None` for a line that is not E-02's.
+///
+/// The inverse of `ran_on_line` lives beside it rather than in whoever reads
+/// the output, because that is the only way the format has one definition
+/// (invariant 4). The shape is exactly `^ran on: (\S+) \((.*)\)$`, which is
+/// what a caller writing its own reader would use — anything looser would
+/// accept a line their reader drops on the floor.
+pub fn ran_on_parts(line: &str) -> Option<(&str, &str)> {
+    let inside = line.strip_prefix(RAN_ON_PREFIX)?.strip_suffix(')')?;
+    let (runner, why) = inside.split_once(" (")?;
+    // `\S+`: one word, so a runner's name can never swallow the parenthesis.
+    if runner.is_empty() || runner.contains(char::is_whitespace) {
+        return None;
+    }
+    Some((runner, why))
+}
+
+/// Split what a requester's CLI wrote on stdout into E-02's framing line and
+/// the job's **own** output, which follows it byte for byte.
+///
+/// `None` when there is no framing line, which is a job that produced no
+/// output and never started (D16): the line frames output, so with none to
+/// frame there is nothing on stdout at all. The remainder is bytes, never a
+/// string — a job's output is bytes and is not re-encoded on the way through
+/// (D18).
+pub fn unframe(stdout: &[u8]) -> Option<(String, &[u8])> {
+    let end = stdout.iter().position(|byte| *byte == b'\n')?;
+    let line = std::str::from_utf8(&stdout[..end]).ok()?;
+    ran_on_parts(line)?;
+    Some((line.to_owned(), &stdout[end + 1..]))
 }
 
 /// The one sentence a cap refusal reads as, so that the runner, the record
@@ -1330,6 +1622,159 @@ pub fn version_mismatch_reason(announced: u32) -> String {
         "protocol version mismatch: the hub speaks version {PROTOCOL_VERSION}, \
          the peer announced version {announced}"
     )
+}
+
+/// What the hub does about the gap between its build and a peer's (E-51).
+///
+/// Two answers and one of them is not an answer: a major gap is refused, a
+/// minor gap is served with a note, and builds that agree say nothing at all.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VersionGap {
+    /// Whether this gap ends the connection. `true` is a [`FromHub::Refused`]
+    /// and therefore terminal (D13): nothing but a new build changes it.
+    pub refuse: bool,
+    /// The one line a human reads, naming **both** versions.
+    pub reason: String,
+}
+
+/// What to do about a peer announcing `peer_version` to a hub built as
+/// `hub_version`, and nothing when the two agree (E-51).
+///
+/// A *major* difference refuses. A major version is where Herd's own
+/// behaviour is allowed to change under an unchanged protocol — how a job is
+/// confined, what a spooled verdict looks like, which of its steps a runner
+/// reports — so two peers a major apart can read each other's frames and
+/// still disagree about what they commit to. That is the failure a refusal
+/// prevents, and it is the one a protocol version cannot see.
+///
+/// A *minor* difference is served, because within a major version Herd
+/// promises the behaviour is the same; it is still said out loud, because a
+/// fleet whose machines drift apart is a fleet where one machine's results
+/// are not the others'.
+///
+/// A version string this hub cannot read — not `major.minor…` — is **served
+/// with a note**, never refused: turning a working machine away over the
+/// shape of a string would be a hub refusing what it merely does not
+/// understand, and the credential, not the version, is what says a peer is
+/// allowed here. The note says the gap could not be judged, which is the
+/// honest thing to put in front of a human.
+///
+/// `peer_kind` is the word the sentence uses for the far side — "runner" or
+/// "requester" — because an operator reading one line needs to know which
+/// machine to go to.
+pub fn version_gap(peer_kind: &str, hub_version: &str, peer_version: &str) -> Option<VersionGap> {
+    if hub_version == peer_version {
+        return None;
+    }
+    match (major_minor(hub_version), major_minor(peer_version)) {
+        (Some((hub_major, _)), Some((peer_major, _))) if hub_major != peer_major => {
+            Some(VersionGap {
+                refuse: true,
+                reason: format!(
+                    "build version mismatch: this hub is version {hub_version} and this \
+                     {peer_kind} is version {peer_version}, a major version apart. Within one \
+                     major version Herd promises its behaviour is the same, and across one it \
+                     promises nothing — so this {peer_kind} is refused rather than served \
+                     differently from the rest of the fleet. Move the {peer_kind} to \
+                     {hub_major}.x, or move the hub to {peer_major}.x"
+                ),
+            })
+        }
+        (Some(_), Some(_)) => Some(VersionGap {
+            refuse: false,
+            reason: format!(
+                "build version mismatch: this hub is version {hub_version} and this \
+                 {peer_kind} is version {peer_version}. The major versions agree, so the two \
+                 behave alike and this connection is served; move one side to the other's \
+                 version so the fleet does not drift"
+            ),
+        }),
+        _ => Some(VersionGap {
+            refuse: false,
+            reason: format!(
+                "build version unreadable: this hub is version {hub_version} and this \
+                 {peer_kind} announced {peer_version:?}, which is not a major.minor version. \
+                 It is served — a version string this hub cannot read is not a reason to turn \
+                 a working machine away — but nothing about the gap between the two builds \
+                 could be judged"
+            ),
+        }),
+    }
+}
+
+/// The major and minor of a version string, or `None` if it has neither.
+///
+/// Deliberately small: Herd compares two of its own build numbers, and
+/// pre-release tags, build metadata and the rest of semver's grammar are
+/// things it has never produced. Anything it cannot read is handled as
+/// unreadable by [`version_gap`] rather than guessed at.
+fn major_minor(version: &str) -> Option<(u64, u64)> {
+    let mut parts = version.split('.');
+    let major = parts.next()?.parse().ok()?;
+    let minor = parts.next()?.parse().ok()?;
+    Some((major, minor))
+}
+
+/// Why a runner nobody approved is given nothing, and what to do about it
+/// (E-48, Q8).
+///
+/// Terminal (D13): the machine is not on this hub's roster, and dialling
+/// again says the same thing. The sentence carries the command that fixes it,
+/// because the person reading it on a runner's stderr is usually the person
+/// who can type it.
+pub fn unapproved_runner_reason(name: &str) -> String {
+    format!(
+        "runner {name} is not approved on this hub, so it is given no job: an operator \
+         approves it with `herdctl runner approve {name}`, which mints the token this runner \
+         then carries as --token or HERD_TOKEN"
+    )
+}
+
+/// Why an approved runner that carried no token is still given nothing.
+pub fn missing_runner_token_reason(name: &str) -> String {
+    format!(
+        "runner {name} is approved on this hub but carried no token, so it is given no job: \
+         give it the token `herdctl runner approve {name}` printed, as --token or HERD_TOKEN"
+    )
+}
+
+/// Why an approved runner carrying the wrong token is given nothing.
+///
+/// It says the name is known and the token is not the one that was minted,
+/// and nothing about the token itself: a sentence that quoted what it
+/// received would put a credential in every log that caught it.
+pub fn wrong_runner_token_reason(name: &str) -> String {
+    format!(
+        "runner {name} is approved on this hub, but the token it carried is not the one that \
+         approval minted, so it is given no job: run `herdctl runner approve {name}` and give \
+         the machine the token it prints"
+    )
+}
+
+/// Why a runner an operator has just removed stops claiming, said on the
+/// connection it is still holding (E-48).
+pub fn revoked_runner_reason(name: &str) -> String {
+    format!(
+        "runner {name} has been removed from this hub and its token is revoked, so it claims \
+         nothing from here on: `herdctl runner approve {name}` mints a new token if this \
+         machine is to come back"
+    )
+}
+
+/// Why a requester that carried no token is refused, when the hub was started
+/// with one (Q8).
+pub fn missing_requester_token_reason() -> String {
+    "this hub requires a requester token and this requester carried none: give it as \
+     --token or HERD_TOKEN, from the file the hub was started with \
+     (--requester-token-file)"
+        .to_owned()
+}
+
+/// Why a requester carrying the wrong token is refused (Q8).
+pub fn wrong_requester_token_reason() -> String {
+    "this requester's token is not the one this hub was started with: take it from the file \
+     named by --requester-token-file (HERD_REQUESTER_TOKEN_FILE) on the hub"
+        .to_owned()
 }
 
 /// Why a frame about an attempt was not acted on, when the attempt was handed

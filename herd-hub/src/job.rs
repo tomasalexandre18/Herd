@@ -9,7 +9,10 @@
 use std::error::Error;
 use std::fmt;
 
-use herd_proto::{JobId, JobOutcome, LabelSet, LogStream, Priority};
+use herd_proto::{
+    Declaration, JobId, JobOutcome, LabelSet, LabelsFrom, LogStream, Priority, Requirements,
+    StepRun,
+};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 /// What a runner measured while a job ran.
@@ -59,7 +62,20 @@ pub use herd_proto::JobMetrics;
 /// let a leased machine spend the budget that exists for a runner that
 /// disappears. A pre-M9 state root is refused by name and no migration is
 /// written for it (D73).
-pub const RECORD_VERSION: u32 = 5;
+///
+/// 6 since M10: a record carries the declared command it is, if it is one, and
+/// the time cap that command declared (E-11, D106, D108), and an attempt
+/// carries one timestamped line per executor step (D77). The declaration is a
+/// required field for the reason the others are — a reader must be able to
+/// tell a job that was an ad-hoc command line from a record written before
+/// commands were declared — and it is load-bearing beyond readability: the
+/// declaration is **what a requeue onto another machine runs**, so a record
+/// that lost it would re-run the job as a bare command line on a machine with
+/// no workspace, and report whatever came out as the consumer's verdict. The
+/// steps are `#[serde(default)]`, purely additive, and an attempt with none is
+/// an attempt of a job that is not a declared command. A pre-M10 state root is
+/// refused by name and no migration is written for it (D73).
+pub const RECORD_VERSION: u32 = 6;
 
 /// A moment, as the record files carry it: RFC 3339 in UTC, to the
 /// nanosecond. A string a human and the consumer can both read, so that a
@@ -245,6 +261,20 @@ pub struct Attempt {
     /// one is rewritten whenever the job's place changes (M6), which is why a
     /// placement must not be recorded there.
     pub why: String,
+    /// Every executor step this attempt ran, in order (D77).
+    ///
+    /// On the attempt rather than on the job, because a job attempted twice
+    /// prepared twice — and the first consumer's `up` may pull a whole warm
+    /// cache the first time a machine runs one of their jobs, which is
+    /// minutes on one attempt and seconds on the next. Each line says the
+    /// step's name, when it started, how long it took and what it exited
+    /// with, and nothing reorders them.
+    ///
+    /// Filled as the attempt goes, from [`herd_proto::ToHub::StepFinished`],
+    /// and taken over by the complete list the verdict carries. Empty for an
+    /// attempt of a job that is not a declared command.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub steps: Vec<StepRun>,
 }
 
 /// What a requester asked for, as the hub takes it in.
@@ -278,6 +308,14 @@ pub struct NewJob {
     pub after: Option<JobId>,
     /// The exit code this job's command means "requeue me" by (D76).
     pub requeue_exit_code: Option<i32>,
+    /// The declared command this job is, if it is one (E-11); see
+    /// [`JobRecord::declaration`].
+    pub declaration: Option<Declaration>,
+    /// What that command declared its `run` step may take, in seconds (D108).
+    pub timeout_s: Option<u64>,
+    /// The reading that will say what this job needs, when its command
+    /// declares one (D74); see [`JobRecord::reading`].
+    pub reading: Option<Reading>,
 }
 
 impl NewJob {
@@ -310,6 +348,9 @@ impl NewJob {
             deadline: None,
             after: None,
             requeue_exit_code: None,
+            declaration: None,
+            timeout_s: None,
+            reading: None,
         }
     }
 
@@ -325,6 +366,26 @@ impl NewJob {
         self.deadline = deadline;
         self.after = after;
         self.requeue_exit_code = requeue_exit_code;
+        self
+    }
+
+    /// The same, as the declared command a requester named (E-11): the four
+    /// executor steps it runs through, and the time cap its command declared
+    /// (D106, D108).
+    pub fn declared(mut self, declaration: Option<Declaration>, timeout_s: Option<u64>) -> Self {
+        self.declaration = declaration;
+        self.timeout_s = timeout_s;
+        self
+    }
+
+    /// The same, with the reading its command declared in place of static
+    /// labels (D74).
+    ///
+    /// The labels it was built with are then the **baseline** the reading
+    /// itself is placed against, and this job is not placed at all until the
+    /// answer is on its record.
+    pub fn reading(mut self, labels_from: Option<herd_proto::LabelsFrom>) -> Self {
+        self.reading = labels_from.map(Reading::of);
         self
     }
 
@@ -365,6 +426,92 @@ impl NewJob {
     pub fn dedup_key(&self) -> String {
         dedup_key(&self.command, &self.labels)
     }
+}
+
+/// Where a job's requirements come from, when they are read on a machine
+/// rather than stated by a requester (D74).
+///
+/// One field on the record, carrying the whole of it: what the declaration
+/// said, which job is doing the reading, and what came back. A reader of
+/// `job.json` alone can then answer "why is this job queued" and "where did
+/// these figures come from", which is what E-15 and E-54 ask of a record.
+///
+/// The job this names in [`Reading::by`] is an **ordinary job**: it went
+/// through the one queue, it was confined by the runner's caps, and its own
+/// record carries its four executor steps (D74, D77). It carries no reading
+/// of its own, and that is how "no recursion" is kept: a command reached
+/// through `labels_from` cannot resolve a `labels_from`, because the hub is
+/// the only thing that mints such a job and it mints it with none.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Reading {
+    /// What the declaration said: the line that prints the requirements, and
+    /// the baseline the reading is placed against (D74).
+    pub labels_from: LabelsFrom,
+    /// The job doing the reading, once one is.
+    ///
+    /// `None` on a record whose answer came out of the store's cache: nothing
+    /// ran for it, which is the whole point of the cache.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub by: Option<JobId>,
+    /// What the reading answered, once it has answered.
+    ///
+    /// While this is `None` the job is **not placed**: a job placed on the
+    /// baseline would be a job placed on a guess, and D74 forbids exactly
+    /// that.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub answer: Option<Requirements>,
+    /// Where the answer came from, in the record's own words (E-15).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub from: Option<String>,
+}
+
+impl Reading {
+    /// The reading a submission asked for, with nothing read yet.
+    pub fn of(labels_from: LabelsFrom) -> Self {
+        Self {
+            labels_from,
+            by: None,
+            answer: None,
+            from: None,
+        }
+    }
+
+    /// The same, now being read by this job.
+    pub fn read_by(mut self, job: &JobId) -> Self {
+        self.by = Some(job.clone());
+        self
+    }
+
+    /// The same, answered, with where the answer came from.
+    pub fn answered(mut self, answer: Requirements, from: impl Into<String>) -> Self {
+        self.answer = Some(answer);
+        self.from = Some(from.into());
+        self
+    }
+}
+
+/// The key a reading's answer is cached under: the commit, the command and
+/// the arguments, and nothing else (D74).
+///
+/// It is a property of those three alone — the first consumer's `--labels`
+/// reads the arguments and the scenario table compiled into that commit, and
+/// nothing on the machine — so two submissions of the same three are one
+/// reading, and without the cache every submission would pay one.
+///
+/// Encoded exactly as [`dedup_key`] is, and for the same reason: length
+/// before bytes, so that no two different triples can ever produce one key.
+/// This is M6's key family, which is what D74 asks for.
+pub fn reading_key(commit: &str, command: &str, args: &[String]) -> String {
+    let mut key = String::new();
+    key.push_str("commit ");
+    push_counted(&mut key, commit);
+    key.push_str(" command ");
+    push_counted(&mut key, command);
+    key.push_str(" args ");
+    for arg in args {
+        push_counted(&mut key, arg);
+    }
+    key
 }
 
 /// The key E-05 deduplicates on, for a command and a label set that are
@@ -500,6 +647,45 @@ pub struct JobRecord {
     /// re-probed. Absent means every code the command exits with is its own
     /// verdict, passed through untouched (D20).
     pub requeue_exit_code: Option<i32>,
+    /// The declared command this job is, when it is one (E-11, D106).
+    ///
+    /// Written at birth from what `herdctl` resolved in the requester's own
+    /// checkout, and never changed: the commit, the arguments and the four
+    /// executor hooks are part of what this job *was*. It is handed back with
+    /// every attempt, which is the whole reason it is on the record rather
+    /// than held by the runner that first saw it — a job requeued onto another
+    /// machine (E-21) has to run the same four steps on the same commit, and
+    /// nothing else in Herd remembers them.
+    ///
+    /// `None` is an ad-hoc command line: [`JobRecord::command`] is then the
+    /// whole of what runs. Required, not `#[serde(default)]`, so that a reader
+    /// can tell the two apart from a record written before M10.
+    pub declaration: Option<Declaration>,
+    /// How long this job's `run` step may take, in seconds, as its command
+    /// declared (E-11, D108).
+    ///
+    /// The runner caps the step at the smaller of this and its own figure: the
+    /// consumer says what its command needs, the owner of the machine says
+    /// what her machine lends, and neither raises the other. `None` is a job
+    /// bounded by the runner's figure alone, which is every job before M10.
+    pub timeout_s: Option<u64>,
+    /// Where this job's requirements come from, when they are read on a
+    /// machine rather than stated by its requester (D74).
+    ///
+    /// The one field a reader looks at to understand a job that is queued
+    /// behind a reading: it carries the line, the job doing the reading and
+    /// the answer. While the answer is absent the job is not placed, and
+    /// [`JobRecord::labels_needed`], [`JobRecord::memory_need_mib`] and
+    /// [`JobRecord::tmpfs_need_mib`] all read the answer in preference to
+    /// what the submission carried — which is the whole of D74's consequence
+    /// for M7 and M8: they consume the requirements **on the record** and
+    /// stay where they are.
+    ///
+    /// `None` for every job whose requirements its requester stated, which is
+    /// every job before D74. `#[serde(default)]`, because a record written
+    /// before this field existed is a record of such a job.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reading: Option<Reading>,
     /// How many submissions this one execution answers (E-05).
     ///
     /// 1 for an ordinary job; 2 after a second identical submission joined
@@ -575,6 +761,13 @@ impl JobRecord {
         &self,
         threads: Option<u32>,
     ) -> std::result::Result<Option<u64>, String> {
+        // What a reading answered wins over what the submission carried, and
+        // over the per-thread derivation with it: the reading is the thing
+        // that knows, and it computed its figure for the `-j` the job was
+        // given (D74, D82).
+        if let Some(read) = self.requirements() {
+            return Ok(Some(read.memory_mib));
+        }
         if let Some(mib) = self.memory_mib {
             return Ok(Some(mib));
         }
@@ -596,9 +789,47 @@ impl JobRecord {
         self.memory_need_mib(self.parallelism)
     }
 
-    /// The tmpfs this job reserves, in MiB (E-31). Absent is no reservation.
+    /// The tmpfs this job reserves, in MiB (E-31). Absent is no reservation,
+    /// and a reading's answer takes the place of the declaration's figure
+    /// (D74).
     pub fn tmpfs_need_mib(&self) -> u64 {
-        self.tmpfs_mib.unwrap_or(0)
+        match self.requirements() {
+            Some(read) => read.tmpfs_mib,
+            None => self.tmpfs_mib.unwrap_or(0),
+        }
+    }
+
+    /// What a reading answered about this job, once it has (D74).
+    ///
+    /// `None` for every job whose requirements its requester stated, **and**
+    /// for one whose reading has not answered yet. The two are told apart by
+    /// [`JobRecord::awaits_a_reading`], and a caller that confused them would
+    /// place a job on its baseline.
+    pub fn requirements(&self) -> Option<&Requirements> {
+        self.reading.as_ref()?.answer.as_ref()
+    }
+
+    /// Whether this job is waiting for a reading to say what it needs (D74).
+    ///
+    /// A job that is is never placed: not by the claim step, not by a dry
+    /// run, not by anything. There is nothing to place it against.
+    pub fn awaits_a_reading(&self) -> bool {
+        self.reading.is_some() && self.requirements().is_none()
+    }
+
+    /// The capabilities this job needs: what a reading answered, or what its
+    /// submission carried (E-25, D74).
+    ///
+    /// **The one thing M7's matching and M8's admission read**, which is how
+    /// both of them consume a reading's answer without moving in the plan:
+    /// [`JobRecord::labels`] stays what the submission said for ever — it is
+    /// what the job was, and M6's deduplication key is computed over it — and
+    /// this is what the job *needs*.
+    pub fn labels_needed(&self) -> &LabelSet {
+        match self.requirements() {
+            Some(read) => &read.labels,
+            None => &self.labels,
+        }
     }
 
     /// The record a job **would** have, for a dry run to be judged on (E-07).
@@ -623,6 +854,9 @@ impl JobRecord {
             deadline: new.deadline,
             after: new.after,
             requeue_exit_code: new.requeue_exit_code,
+            declaration: new.declaration,
+            timeout_s: new.timeout_s,
+            reading: new.reading,
             parallelism: None,
             submissions: 1,
             state: JobState::Queued,
@@ -1024,6 +1258,28 @@ pub trait JobStore: Send + Sync + 'static {
     /// could also answer with.
     fn state_root_id(&self) -> &str;
 
+    /// Approve one runner by name and mint its token (E-48, Q8).
+    ///
+    /// On this trait rather than beside it because the approvals are part of
+    /// the state this store keeps, written through the one writer the records
+    /// go through (D8): a hub with a second way to persist would be a hub
+    /// with a second way to lose things. Answers with the token, which is the
+    /// only time it is readable — what is kept is a hash.
+    fn approve_runner(&self, name: &str) -> Result<String>;
+
+    /// Remove one runner, revoking its token. `false` if it was not approved.
+    fn remove_runner(&self, name: &str) -> Result<bool>;
+
+    /// Who is approved here, by name, for `herdctl runner list`.
+    fn approved_runners(&self) -> Result<Vec<crate::roster::Approval>>;
+
+    /// Whether a runner announcing this name and this token may be served,
+    /// and which way it may not be (E-48).
+    fn admit_runner(&self, name: &str, token: Option<&str>) -> crate::roster::Admission;
+
+    /// How many runners are approved, for the line the hub prints at startup.
+    fn approved_runner_count(&self) -> usize;
+
     /// Take a submission in: mint a job for it, or join it to the one
     /// already doing that work (E-05).
     ///
@@ -1061,6 +1317,29 @@ pub trait JobStore: Send + Sync + 'static {
     /// (D42), rather than writing the same ending twice.
     fn record_state(&self, id: &JobId, state: JobState) -> Result<()>;
 
+    /// Record where this job's requirements come from, and what they are once
+    /// they are known (D74).
+    ///
+    /// The one write that moves a job from "waiting for its reading" to
+    /// placeable, so it is the one write that must be on the disk before the
+    /// job is handed anywhere: a hub that placed the job and then failed to
+    /// write the answer would have a running job whose record cannot say what
+    /// it was admitted against. Refused on a job that is over, like every
+    /// other write here.
+    fn record_reading(&self, id: &JobId, reading: Reading) -> Result<()>;
+
+    /// What a reading of this (commit, command, args) answered, if this store
+    /// has it (D74).
+    ///
+    /// `None` is "pay for a reading", never "needs nothing": a store that
+    /// cannot read its own cache answers `None` and the reading runs again,
+    /// which costs a job and never a wrong figure.
+    fn reading_answer(&self, key: &str) -> Result<Option<Requirements>>;
+
+    /// Keep a reading's answer under its (commit, command, args) key, so that
+    /// the next submission of those three pays no reading (D74).
+    fn remember_reading(&self, key: &str, answer: &Requirements) -> Result<()>;
+
     /// Record what the runner measured (E-15). Separate from the transition
     /// because a runner reports figures the hub never computes, and because a
     /// store that keeps no measurements is still a correct store.
@@ -1091,6 +1370,20 @@ pub trait JobStore: Send + Sync + 'static {
         why: &str,
         parallelism: Option<u32>,
     ) -> Result<u32>;
+
+    /// Record one executor step of an attempt, with its figures (D77).
+    ///
+    /// Called as each step ends, so that a job stopped at its cap or lost
+    /// with its runner still shows the preparation it did — the case the
+    /// timestamps exist for, since the first consumer's `up` may pull a whole
+    /// warm cache before anything of theirs runs.
+    ///
+    /// Appends, and **replaces a step of the same name** rather than keeping
+    /// two: the complete list arrives again with the verdict, and a record
+    /// that held `up` twice would read as a job that prepared twice in one
+    /// attempt. A step for an attempt the record does not hold is an error,
+    /// not a silent no-op, for the reason every other write here is.
+    fn record_step(&self, id: &JobId, attempt: u32, step: StepRun) -> Result<()>;
 
     /// Record that an attempt ended without the job's verdict, and why.
     ///
@@ -1164,4 +1457,134 @@ pub trait JobStore: Send + Sync + 'static {
     /// Every job that has not reached a terminal state, oldest first. This is
     /// the queue: after a restart it is what the hub has left to do.
     fn unfinished_jobs(&self) -> Result<Vec<JobRecord>>;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const A_COMMIT: &str = "cb5a2e8b4f1d9c7a3e05b8d6f2a1c4e79b0d3f68";
+
+    fn labels(names: &[&str]) -> LabelSet {
+        LabelSet::new(names.iter().map(|name| (*name).to_owned())).expect("valid labels")
+    }
+
+    fn args(words: &[&str]) -> Vec<String> {
+        words.iter().map(|word| (*word).to_owned()).collect()
+    }
+
+    /// An answer, as a reading would have printed it.
+    fn answer() -> Requirements {
+        Requirements {
+            labels: labels(&["kvm", "metal"]),
+            memory_mib: 4096,
+            tmpfs_mib: 8192,
+            scenarios: 12,
+        }
+    }
+
+    /// A job whose command declares a reading, as a submission makes one: its
+    /// labels are the baseline, and nothing is read yet.
+    fn waiting_for_a_reading() -> JobRecord {
+        let new = NewJob::at(
+            vec!["their-tool test".to_owned()],
+            labels(&["build"]),
+            Priority::Step,
+        )
+        .with_admission(Some(512), Some(16))
+        .reading(Some(LabelsFrom {
+            line: "their-tool test --labels".to_owned(),
+            baseline: labels(&["build"]),
+        }));
+        JobRecord::hypothetical(new, Timestamp::now())
+    }
+
+    /// The cache key is the three things D74 names and nothing else, and no
+    /// two different triples can produce one key.
+    #[test]
+    fn a_reading_is_keyed_on_the_commit_the_command_and_the_arguments() {
+        let key = reading_key(A_COMMIT, "test", &args(&["--only", "posix"]));
+        assert_eq!(
+            key,
+            format!("commit 40:{A_COMMIT} command 4:test args 6:--only5:posix")
+        );
+        // The same three, again: a second submission of one triple finds the
+        // first one's answer.
+        assert_eq!(
+            key,
+            reading_key(A_COMMIT, "test", &args(&["--only", "posix"]))
+        );
+        // And each of the three really keys it.
+        let another_commit = A_COMMIT.replace("cb5a", "0000");
+        assert_ne!(
+            key,
+            reading_key(&another_commit, "test", &args(&["--only", "posix"]))
+        );
+        assert_ne!(
+            key,
+            reading_key(A_COMMIT, "test-pack", &args(&["--only", "posix"]))
+        );
+        assert_ne!(key, reading_key(A_COMMIT, "test", &args(&["--only"])));
+        // Length before bytes, like M6's key: two argument lists that would
+        // be one string joined on a separator are two keys (D74 asks for the
+        // same key family, and this is what makes it one).
+        assert_ne!(
+            reading_key(A_COMMIT, "test", &args(&["a b", "c"])),
+            reading_key(A_COMMIT, "test", &args(&["a", "b c"]))
+        );
+    }
+
+    /// Before the answer: the job needs the requirements nobody has read yet,
+    /// so it is not placeable, and what it holds is still what it was
+    /// submitted with.
+    #[test]
+    fn a_job_waiting_for_a_reading_is_not_placed_on_its_baseline() {
+        let record = waiting_for_a_reading();
+        assert!(record.awaits_a_reading());
+        assert_eq!(record.requirements(), None);
+        assert_eq!(
+            record.labels_needed(),
+            &labels(&["build"]),
+            "the baseline is what it carries, and awaits_a_reading is what stops it being \
+             placed on it"
+        );
+    }
+
+    /// After the answer: M7's matching and M8's admission read the
+    /// requirements **off the record**, so the answer takes the place of what
+    /// the submission carried — labels, memory and tmpfs alike (D74).
+    #[test]
+    fn an_answer_takes_the_place_of_what_the_submission_carried() {
+        let mut record = waiting_for_a_reading();
+        record.reading = record
+            .reading
+            .map(|reading| reading.answered(answer(), "read on a runner by j2"));
+        assert!(!record.awaits_a_reading());
+        assert_eq!(record.labels_needed(), &labels(&["kvm", "metal"]));
+        assert_eq!(record.memory_need_mib(None), Ok(Some(4096)));
+        assert_eq!(record.tmpfs_need_mib(), 8192);
+        // And the labels it was submitted with are still on the record: that
+        // is what the job *was*, and M6's deduplication key is over it.
+        assert_eq!(record.labels, labels(&["build"]));
+        assert_eq!(
+            record.dedup_key(),
+            dedup_key(&record.command, &record.labels)
+        );
+    }
+
+    /// A job with no reading is every job before D74, and nothing about it
+    /// changes.
+    #[test]
+    fn a_job_whose_requester_stated_its_requirements_is_untouched() {
+        let record = JobRecord::hypothetical(
+            NewJob::at(vec!["true".to_owned()], labels(&["build"]), Priority::Step)
+                .with_admission(Some(512), Some(16)),
+            Timestamp::now(),
+        );
+        assert!(!record.awaits_a_reading());
+        assert_eq!(record.requirements(), None);
+        assert_eq!(record.labels_needed(), &labels(&["build"]));
+        assert_eq!(record.memory_need_mib(None), Ok(Some(512)));
+        assert_eq!(record.tmpfs_need_mib(), 16);
+    }
 }

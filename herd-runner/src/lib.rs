@@ -49,6 +49,7 @@ pub mod reclaim;
 pub mod root;
 pub mod size;
 pub mod spool;
+mod step;
 pub mod switch;
 #[doc(hidden)]
 pub mod testing;
@@ -64,7 +65,7 @@ use futures_util::stream::{SplitSink, SplitStream};
 use futures_util::{SinkExt, StreamExt};
 use herd_proto::{
     from_frame, to_frame, FromHub, JobId, JobMetrics, JobOutcome, LogStream, Role, RunningJob,
-    ToHub, PROTOCOL_VERSION,
+    StepRun, ToHub, PROTOCOL_VERSION,
 };
 use tokio::net::TcpStream;
 use tokio::sync::mpsc::{self, UnboundedReceiver, UnboundedSender};
@@ -265,6 +266,17 @@ fn jitter_fraction() -> f64 {
     (state >> 11) as f64 / (1u64 << 53) as f64
 }
 
+/// Which build of `herd-runner` this is, as the handshake announces it
+/// (E-51).
+///
+/// The crate's own version, not the hub's and not `herd-proto`'s: the point
+/// of the figure is that the two sides of a connection can be different
+/// builds, and a runner that reported a number it read from the same source
+/// the hub reads would never report a gap at all.
+pub fn runner_version() -> &'static str {
+    env!("CARGO_PKG_VERSION")
+}
+
 /// What a runner needs to know to join a hub and to confine what it runs.
 #[derive(Debug, Clone)]
 pub struct Config {
@@ -458,6 +470,9 @@ impl CancelToken {
 struct Ended {
     outcome: JobOutcome,
     metrics: JobMetrics,
+    /// Every executor step this attempt ran, in order (D77). Empty for a job
+    /// that is not a declared command, which is every job before M10.
+    steps: Vec<StepRun>,
 }
 
 /// One job this runner has in hand, and everything the hub may still need
@@ -518,6 +533,7 @@ fn finished_frame(job_id: &JobId, attempt: u32, chunks_sent: u64, end: &Ended) -
         outcome: end.outcome.clone(),
         chunks_sent,
         metrics: end.metrics.clone(),
+        steps: end.steps.clone(),
     }
 }
 
@@ -878,12 +894,28 @@ impl Session {
     }
 
     /// Hold a job's end and report it (E-44).
-    pub(crate) fn finish(&self, job_id: &JobId, outcome: JobOutcome, metrics: JobMetrics) {
+    ///
+    /// `steps` is every executor step this attempt ran, in order — the
+    /// authoritative list, which the hub takes over the lines it already has
+    /// from [`ToHub::StepFinished`] (D77). Empty for a job that is not a
+    /// declared command: it ran no executor step, and an empty list says
+    /// exactly that.
+    pub(crate) fn finish(
+        &self,
+        job_id: &JobId,
+        outcome: JobOutcome,
+        metrics: JobMetrics,
+        steps: Vec<StepRun>,
+    ) {
         self.with(|inner| {
             let Some(job) = inner.jobs.get_mut(job_id) else {
                 return;
             };
-            let end = Ended { outcome, metrics };
+            let end = Ended {
+                outcome,
+                metrics,
+                steps,
+            };
             job.end = Some(end.clone());
             let (attempt, chunks_sent) = (job.attempt, job.next_seq);
             if !send_on(
@@ -1877,6 +1909,11 @@ pub async fn serve_once(config: Config, session: Session, confined: Arc<Confined
 
     let hello = ToHub::Hello {
         protocol_version: PROTOCOL_VERSION,
+        // Which build this is, beside which protocol it speaks (E-51). The
+        // protocol version says the hub can read these frames; this says
+        // whether the two sides agree on what they mean, which is the thing
+        // a fleet drifting apart gets wrong.
+        peer_version: runner_version().to_owned(),
         role: Role::Runner,
         token: config.token.clone(),
         name: config.name.clone(),
@@ -1916,7 +1953,18 @@ pub async fn serve_once(config: Config, session: Session, confined: Arc<Confined
         .context("sending hello")?;
 
     match next_message(&mut source, config.hub_silence_limit).await? {
-        Some(FromHub::Welcome { state_root, .. }) => {
+        Some(FromHub::Welcome {
+            state_root,
+            version_note,
+            ..
+        }) => {
+            // What the hub has to say about the gap between its build and
+            // this one (E-51). On this machine's stderr, because the person
+            // who can move this runner to another version is the person
+            // reading it here; the hub says it on its own side too.
+            if let Some(note) = &version_note {
+                eprintln!("herd-runner: {note}");
+            }
             // This connection is serving: what ends it from here on is a link
             // that was up, which is not the same thing as a hub that cannot
             // be reached (D104).
@@ -1999,13 +2047,29 @@ async fn serve_hub(
                 job_id,
                 attempt,
                 command,
+                declaration,
+                timeout_s,
             } => {
                 let session = session.clone();
                 let confined = Arc::clone(&confined);
+                // A declared command runs through the consumer's four
+                // executor steps; an ad-hoc one is the whole of what runs.
+                // Both go through [`job::execute`], which is where the caps,
+                // the log, the cancellation and the verdict live (D108).
+                let declared_timeout = timeout_s.map(Duration::from_secs);
                 // One task per job: a long job must not stop the runner from
                 // hearing the hub, and must not end when the link does.
                 tokio::spawn(async move {
-                    job::execute(job_id, attempt, command, session, confined).await
+                    job::execute(
+                        job_id,
+                        attempt,
+                        command,
+                        declaration,
+                        declared_timeout,
+                        session,
+                        confined,
+                    )
+                    .await
                 });
             }
             FromHub::JobResultAck { job_id } => session.release(&job_id),
@@ -2147,11 +2211,15 @@ fn message_kind(message: &FromHub) -> &'static str {
         FromHub::ResendLog { .. } => "resend_log",
         FromHub::JobLog { .. } => "job_log",
         FromHub::JobNote { .. } => "job_note",
+        FromHub::RanOn { .. } => "ran_on",
         FromHub::JobFinished { .. } => "job_finished",
         FromHub::JobResultAck { .. } => "job_result_ack",
         FromHub::WouldRun { .. } => "would_run",
         FromHub::SwitchSet { .. } => "switch_set",
         FromHub::FleetSwitches { .. } => "fleet_switches",
+        FromHub::RunnerApproved { .. } => "runner_approved",
+        FromHub::RunnerRemoved { .. } => "runner_removed",
+        FromHub::ApprovedRunners { .. } => "approved_runners",
         FromHub::SetSwitch { .. } => "set_switch",
         FromHub::ReadProbesAgain { .. } => "read_probes_again",
     }

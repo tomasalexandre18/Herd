@@ -187,6 +187,9 @@ pub struct Herd {
     /// over one directory, and the second would refuse to start.
     pub data_root: TempDir,
     pub port: u16,
+    /// The token each runner of this herd carries, so one name is approved
+    /// once however many times it is started (E-48).
+    approved: std::sync::Mutex<std::collections::HashMap<String, String>>,
 }
 
 impl Herd {
@@ -196,7 +199,76 @@ impl Herd {
             logs: tempfile::tempdir().expect("a temporary directory for the logs"),
             data_root: tempfile::tempdir().expect("a temporary data root"),
             port: free_port(),
+            approved: std::sync::Mutex::new(std::collections::HashMap::new()),
         }
+    }
+
+    /// Approve one runner through the real command, and come back with the
+    /// token it printed (E-48).
+    ///
+    /// `herdctl runner approve <name>`, as an operator types it once per
+    /// machine, against the hub that is already running: an unapproved runner
+    /// claims nothing, so every runner these tests start goes through this
+    /// first. The token is on stdout alone, which is what makes this one line.
+    ///
+    /// Blocking rather than `async`, so that starting a runner stays the one
+    /// synchronous line it has always been at forty-odd call sites. The hub is
+    /// a separate process, so there is nothing here for a runtime to deadlock
+    /// on.
+    pub fn approve(&self, name: &str) -> String {
+        let mut approved = self
+            .approved
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        approved
+            .entry(name.to_owned())
+            .or_insert_with(|| match TcpStream::connect(self.addr()) {
+                // The hub is up: the operator's own command, over the wire.
+                Ok(_) => {
+                    let output = std::process::Command::new(binary("herdctl"))
+                        .arg("--hub")
+                        .arg(self.url())
+                        .args(["runner", "approve", name])
+                        .output()
+                        .expect("herdctl runs");
+                    assert!(
+                        output.status.success(),
+                        "approving {name} failed: {}",
+                        String::from_utf8_lossy(&output.stderr)
+                    );
+                    let token = String::from_utf8_lossy(&output.stdout).trim().to_owned();
+                    assert!(!token.is_empty(), "an approval prints the token it minted");
+                    token
+                }
+                // No hub yet, which some of these tests want on purpose: a
+                // runner started against a port nothing is listening on.
+                // Approving is then done on the state root itself, which is
+                // also what a deployment does before it starts the hub for
+                // the first time — the approval is a file in the root, so the
+                // hub reads it when it comes up.
+                Err(_) => {
+                    use herd_hub::JobStore;
+                    herd_hub::JobDirStore::open(self.state.path())
+                        .expect("the state root opens")
+                        .approve_runner(name)
+                        .expect("the state root mints a token")
+                }
+            })
+            .clone()
+    }
+
+    /// Forget which runners this herd approved (E-48).
+    ///
+    /// For the one case where the approvals really are gone: a state root that
+    /// has been **recreated**, which is the volume somebody rebuilt. The
+    /// tokens minted against the old root mean nothing to the new one, so the
+    /// next runner this harness starts is approved again — as an operator
+    /// would have to.
+    pub fn forget_approvals(&self) {
+        self.approved
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clear();
     }
 
     pub fn url(&self) -> String {
@@ -294,6 +366,16 @@ impl Herd {
         self.start_runner_with(name, which, root, &[])
     }
 
+    /// A runner carrying **no token at all**: the machine nobody has approved
+    /// yet (E-48).
+    ///
+    /// The one way into this harness that does not approve first, because the
+    /// thing M15 has to prove is what happens to a machine an operator has
+    /// not let in.
+    pub fn start_runner_unapproved(&self, name: &str, which: &str) -> Process {
+        self.spawn_runner(name, which, which, &[], None)
+    }
+
     /// The same, with whatever options the test wants — its own cadence above
     /// all, because the pairing of the two sides' timings is itself something
     /// the hub judges.
@@ -304,7 +386,27 @@ impl Herd {
         root: &str,
         options: &[&str],
     ) -> Process {
-        let child = Command::new(binary("herd-runner"))
+        let token = self.approve(name);
+        self.spawn_runner(name, which, root, options, Some(token))
+    }
+
+    fn spawn_runner(
+        &self,
+        name: &str,
+        which: &str,
+        root: &str,
+        options: &[&str],
+        token: Option<String>,
+    ) -> Process {
+        let mut command = Command::new(binary("herd-runner"));
+        // The token this machine's approval minted, when it has one (E-48).
+        // Through the environment rather than the command line, as a
+        // deployment passes it: a token on argv is readable out of `/proc` by
+        // every user of the host. `None` is the machine nobody approved.
+        if let Some(token) = token {
+            command.env("HERD_TOKEN", token);
+        }
+        let child = command
             .arg("--hub")
             .arg(self.url())
             .arg("--name")
@@ -671,4 +773,55 @@ impl Herd {
         walk(self.state.path(), self.state.path(), &mut bytes);
         bytes
     }
+}
+
+/// The job's own output, out of what the requester's CLI printed on stdout.
+///
+/// E-02 frames a job's output with one line saying where it ran and why there
+/// (D109), so a test about the output itself asserts on what follows that
+/// line — and this asserts, on the way, that the line was there at all and
+/// that it has the shape the first consumer's tooling reads:
+/// `^ran on: (\S+) \((.*)\)$`.
+pub fn job_output(stdout: &[u8]) -> String {
+    String::from_utf8_lossy(&job_output_bytes(stdout)).into_owned()
+}
+
+/// The same, as the bytes the job's process wrote (D18).
+///
+/// The split itself is [`herd_proto::unframe`], so a test reads the format
+/// through the one definition of it rather than through a copy of the format
+/// that could drift (invariant 4). What is added here is the insistence: on
+/// this stdout the line *must* be there, with the shape and the version a
+/// caller's own reader is anchored on.
+pub fn job_output_bytes(stdout: &[u8]) -> Vec<u8> {
+    let (line, rest) = herd_proto::unframe(stdout).unwrap_or_else(|| {
+        panic!(
+            "the first line of the output is not E-02's `ran on: <runner> (<why>)`: {:?}",
+            String::from_utf8_lossy(stdout)
+        )
+    });
+    ran_on_parts(&line);
+    rest.to_vec()
+}
+
+/// The two captures of `^ran on: (\S+) \((.*)\)$`, insisting on that shape.
+///
+/// The first consumer's tooling reads this line with that expression, so the
+/// tests read it the same way rather than with a looser `contains`: a line
+/// that `contains` "ran on:" and does not *match* is a line their reader
+/// drops on the floor. The format version (Q7) is checked here too, because
+/// it rides inside the parentheses and a line without it is a line no reader
+/// can tell apart from a future one (D109).
+pub fn ran_on_parts(line: &str) -> (String, String) {
+    let (runner, why) = herd_proto::ran_on_parts(line)
+        .unwrap_or_else(|| panic!("E-02's line does not have E-02's shape: {line:?}"));
+    assert!(!why.is_empty(), "the reason is not empty: {line:?}");
+    // Q7's version, inside the parentheses where the expression above still
+    // matches around it.
+    let version = format!("herd output format {}", herd_proto::OUTPUT_FORMAT_VERSION);
+    assert!(
+        why.contains(&version),
+        "E-02's line must carry the output format version ({version}): {line:?}"
+    );
+    (runner.to_owned(), why.to_owned())
 }

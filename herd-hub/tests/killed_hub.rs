@@ -119,7 +119,14 @@ async fn a_killed_hub_loses_nothing(signal: rustix::process::Signal) {
         .herdctl(&["run", "--", "/bin/sh", "-c", "printf 'still here\\n'"])
         .await;
     assert_eq!(after.status.code(), Some(0), "{}", herd.said("runner"));
-    assert_eq!(String::from_utf8_lossy(&after.stdout), "still here\n");
+    // E-02's framing, through the real binary: the output starts with one
+    // line saying where the job ran and why there, and then is the job's own
+    // output unchanged (D109).
+    assert_eq!(
+        real_herd::job_output(&after.stdout),
+        "still here\n",
+        "after E-02's first line, stdout is the job's own output"
+    );
 
     second.signal(rustix::process::Signal::TERM).await;
     runner.signal(rustix::process::Signal::TERM).await;
@@ -492,10 +499,13 @@ async fn a_wait_on_a_job_the_hub_cannot_write_down_says_so() {
     // Still waiting: no verdict has been invented for a job that has one, in
     // the runner's memory, that the hub could not store.
     assert!(waiting.alive(), "the wait must not have answered anything");
+    // Herd's note is on stderr; stdout carries E-02's framing line — a wait
+    // that attached to a job already running prints the same first line,
+    // off the record's own attempt — and then the job's output (D109).
     assert_eq!(
-        String::from_utf8_lossy(&std::fs::read(herd.logs.path().join("wait-out")).unwrap()),
+        real_herd::job_output(&std::fs::read(herd.logs.path().join("wait-out")).unwrap()),
         "working\n",
-        "stdout stays the job's own output; the note is Herd speaking, on stderr"
+        "after E-02's first line, stdout is the job's own output; the note went to stderr"
     );
 
     std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).expect("writable again");
@@ -733,10 +743,18 @@ async fn a_busy_runner_asked_to_stop_is_gone_in_five_seconds() {
     // handed to a runner that is leaving. Polled, because the refusal becomes
     // true the moment the hub hears the runner is draining — which is the
     // first thing a draining runner says.
+    //
+    // `submit` and not `run`: both go through the same gate and get the same
+    // refusal, but `run` *waits* for a job it was given, and one accepted in
+    // the moment before the hub hears the runner is draining is a job nothing
+    // will pick up — which made this poll hang until its own patience ran out
+    // instead of trying again.
     let mut refusal = String::new();
     let deadline = Instant::now() + Duration::from_secs(5);
     while Instant::now() < deadline {
-        let attempt = herd.herdctl(&["run", "--", "/bin/sh", "-c", "true"]).await;
+        let attempt = herd
+            .herdctl(&["submit", "--", "/bin/sh", "-c", "true"])
+            .await;
         if !attempt.status.success() {
             refusal = String::from_utf8_lossy(&attempt.stderr).into_owned();
             assert_eq!(
@@ -1166,6 +1184,7 @@ async fn a_verdict_planted_in_another_runner_s_spool_is_refused_by_name() {
                 wall_time_ms: 77,
                 ..herd_proto::JobMetrics::default()
             },
+            steps: Vec::new(),
         })
         .expect("the fixture frame encodes"),
     )
@@ -1285,6 +1304,11 @@ async fn a_verdict_spooled_for_a_state_root_that_was_recreated_is_never_believed
     // The state root is recreated. Nobody touches the runner's disk.
     std::fs::remove_dir_all(herd.state.path()).expect("the fixture wipes the state root");
     std::fs::create_dir_all(herd.state.path()).expect("and leaves an empty one");
+    // Which took the approvals with it: a token minted against the root that
+    // is gone means nothing to the one that replaced it, so the machine is
+    // approved again, as an operator rebuilding a volume would have to
+    // (E-48).
+    herd.forget_approvals();
     let mut hub = herd.start_hub_losing_runners_after("second", 3.0).await;
     let second_root_id = herd.state_root_id();
     assert_ne!(

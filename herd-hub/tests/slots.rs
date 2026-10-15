@@ -718,7 +718,9 @@ async fn the_derived_j_is_recorded_and_is_what_the_job_is_given() {
     // at all in `herd_proto::placement`; what is asserted here on *every*
     // host is the thing only the real binaries can show: that the figure on
     // the record is the figure the process was given.
-    let said = String::from_utf8_lossy(&ran.stdout).trim().to_owned();
+    // After E-02's framing line, which is what the requester's stdout begins
+    // with: the `-j` the hub derived is in the *job's* own words (D109).
+    let said = real_herd::job_output(&ran.stdout).trim().to_owned();
     let lends_seventeen_gibibytes =
         herd_runner::metrics::total_memory_mib().is_some_and(|total| total >= 17 * 1024);
     if lends_seventeen_gibibytes {

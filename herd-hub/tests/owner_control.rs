@@ -318,7 +318,7 @@ async fn a_switch_off_on_the_machine_stops_claims_in_ten_seconds_and_spares_the_
         String::from_utf8_lossy(&waited.stderr)
     );
     assert_eq!(
-        String::from_utf8_lossy(&waited.stdout).trim(),
+        real_herd::job_output(&waited.stdout).trim(),
         "done",
         "the job ran to its end"
     );
@@ -628,7 +628,7 @@ async fn a_drain_finishes_its_job_and_then_the_runner_leaves() {
         "a drain must finish what it holds, never kill it: {}",
         String::from_utf8_lossy(&waited.stderr)
     );
-    assert_eq!(String::from_utf8_lossy(&waited.stdout).trim(), "finished");
+    assert_eq!(real_herd::job_output(&waited.stdout).trim(), "finished");
     let gone = tokio::time::timeout(Duration::from_secs(20), runner.gone())
         .await
         .expect("a draining runner leaves once it holds nothing");
@@ -979,7 +979,7 @@ async fn a_deadline_cancels_a_queued_job_and_never_a_running_one() {
         "a deadline must never kill a job that has started (E-09): {}",
         String::from_utf8_lossy(&waited.stderr)
     );
-    assert_eq!(String::from_utf8_lossy(&waited.stdout).trim(), "survived");
+    assert_eq!(real_herd::job_output(&waited.stdout).trim(), "survived");
 }
 
 /// A deadline already past when the job is submitted fires on the first

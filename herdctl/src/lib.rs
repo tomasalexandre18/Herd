@@ -5,11 +5,15 @@
 //! to fire and leave with the id, `wait` to come back to an id later, and
 //! `cancel` to ask for a job to be ended wherever it is running (E-06).
 
+pub mod checkout;
+pub mod declaration;
+
 use anyhow::{anyhow, bail, Context, Result};
 use futures_util::{SinkExt, StreamExt};
 use herd_proto::{
-    cap_stop_reason, from_frame, to_frame, Asked, Cap, CapabilityOffer, FromHub, JobId, JobMetrics,
-    JobOutcome, LabelSet, LogStream, Priority, Role, RunnerSwitch, Switch, ToHub, PROTOCOL_VERSION,
+    cap_stop_reason, from_frame, to_frame, ApprovedRunner, Asked, Cap, CapabilityOffer,
+    Declaration, FromHub, JobId, JobMetrics, JobOutcome, LabelSet, LogStream, Priority, Role,
+    RunnerSwitch, Switch, ToHub, PROTOCOL_VERSION,
 };
 use tokio::net::TcpStream;
 use tokio_tungstenite::tungstenite::Message;
@@ -198,6 +202,20 @@ pub struct Declared {
     /// The exit code this job's command means "what you gave me has gone" by
     /// (D76). 75 for the first consumer.
     pub requeue_exit_code: Option<i32>,
+    /// The declared command this job is, read in the requester's own checkout
+    /// (E-11, D106). `None` for an ad-hoc command line.
+    pub declaration: Option<Declaration>,
+    /// What that command declared its `run` step may take, in seconds (D108).
+    pub timeout_s: Option<u64>,
+    /// The reading that will say what this job needs, when its command
+    /// declares `labels_from` in place of static labels (D74).
+    ///
+    /// Carried rather than acted on here: the labels the submission goes out
+    /// with are the command's declared **baseline**, and the hub runs the
+    /// reading as an ordinary job on a runner. `herdctl` fills the line's
+    /// `{commit}` and `{args}` like every other line it resolves (D107), and
+    /// that is the whole of its part in it.
+    pub labels_from: Option<herd_proto::LabelsFrom>,
 }
 
 impl Declared {
@@ -216,7 +234,79 @@ impl Declared {
             deadline_unix_s: self.deadline_unix_s,
             after: self.after.map(JobId::new),
             requeue_exit_code: self.requeue_exit_code,
+            declaration: self.declaration,
+            labels_from: self.labels_from,
+            timeout_s: self.timeout_s,
         }
+    }
+}
+
+/// Something Herd itself says about a job, and where it belongs.
+///
+/// Two kinds, because they go to two different places and a caller cannot
+/// tell them apart from the text. A **note** is Herd's own words about the
+/// job — it goes on stderr, because stdout is the job's. The **framing**
+/// line is E-02's first line, and it goes on stdout ahead of the job's first
+/// byte: the first consumer's tooling reads it there.
+///
+/// It is **not** carried by `on_log`, and that is the whole reason this type
+/// exists: `on_log` is the bytes the job's process wrote (D18), and the
+/// stream a requester follows has to equal the `log` file on the hub's disk
+/// byte for byte. A framing line sent down that path would make the two
+/// differ, which two tests in `herd-hub/tests/durability.rs` pin.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Said<'a> {
+    /// Herd's own words about the job: on stderr.
+    Note(&'a str),
+    /// E-02's first line, already built by [`herd_proto::ran_on_line`]: on
+    /// stdout, before the job's output.
+    Framing(&'a str),
+}
+
+/// E-02's framing line, held until there is output for it to be the first
+/// line of.
+///
+/// The hub says where a job went the moment the attempt is handed out, which
+/// is **before** the job has started and so before anybody knows whether it
+/// can start at all. D16 is exact about that case: a job Herd could not run
+/// exits 125 with the reason on stderr, and stdout is left empty — nothing a
+/// caller could read as the job having said anything. Printing the framing
+/// line as the frame arrived would have put a line on the stdout of a job
+/// that never ran.
+///
+/// So the line is held here and released at the first moment it really is a
+/// first line: ahead of the job's first byte of output, or with the verdict
+/// for a job that produced none. The one outcome that releases nothing is
+/// [`JobOutcome::CouldNotStart`] — a job that never started has no output to
+/// frame. Every other ending happened *on a machine*, and where that was is
+/// the line's whole point.
+///
+/// A requeued attempt (E-21) replaces a line still held and sends a second
+/// one once it has output of its own, which is the truth about a job that ran
+/// in two places.
+#[derive(Default)]
+struct Framing {
+    held: Option<String>,
+}
+
+impl Framing {
+    /// The hub handed the job to a runner and said why there.
+    fn placed(&mut self, runner: &str, why: &str) {
+        self.held = Some(herd_proto::ran_on_line(runner, why));
+    }
+
+    /// Let it out, if it is still held. Called ahead of every byte of the
+    /// job's output, so the line cannot come second.
+    fn release(&mut self, said: &mut impl FnMut(Said)) {
+        if let Some(line) = self.held.take() {
+            said(Said::Framing(&line));
+        }
+    }
+
+    /// Whether this ending is one the framing line belongs to: anything but
+    /// a job that never started (D16).
+    fn belongs_to(outcome: &JobOutcome) -> bool {
+        !matches!(outcome, JobOutcome::CouldNotStart { .. })
     }
 }
 
@@ -227,7 +317,7 @@ pub async fn run_job(
     priority: Priority,
     declared: Declared,
     mut on_log: impl FnMut(LogStream, &[u8]),
-    mut on_note: impl FnMut(&str),
+    mut said: impl FnMut(Said),
 ) -> Result<Finished> {
     if command.is_empty() {
         bail!("a job needs a command to run");
@@ -243,21 +333,40 @@ pub async fn run_job(
     .context("submitting the job")?;
 
     let mut job_id: Option<JobId> = None;
+    let mut framing = Framing::default();
     while let Some(message) = next_message(&mut socket).await? {
         match message {
             FromHub::JobAccepted { job_id: accepted } => job_id = Some(accepted),
-            FromHub::LogChunk { stream, data, .. } => on_log(stream, &data),
+            FromHub::LogChunk { stream, data, .. } => {
+                framing.release(&mut said);
+                on_log(stream, &data);
+            }
             // A job this requester has just submitted has produced nothing
             // before it attached, so neither of these is expected here; both
             // are still shown rather than swallowed, the recorded log as the
             // job's own output and a note as Herd's own words (stderr).
-            FromHub::JobLog { data, .. } => on_log(LogStream::Stdout, &data),
-            FromHub::JobNote { note, .. } => on_note(&note),
+            FromHub::JobLog { data, .. } => {
+                framing.release(&mut said);
+                on_log(LogStream::Stdout, &data);
+            }
+            FromHub::JobNote { note, .. } => said(Said::Note(&note)),
+            // E-02's first line, on **stdout**, ahead of the job's first
+            // byte: the output a requester sees is framed with where the job
+            // ran and why there, and the job's own output follows it
+            // unchanged (D109). It is held rather than printed here — see
+            // [`Framing`] — and it goes through the output callback rather
+            // than through a note because a note is Herd's own words on
+            // stderr, and this line is part of the output the first
+            // consumer's tooling reads.
+            FromHub::RanOn { runner, why, .. } => framing.placed(&runner, &why),
             FromHub::JobFinished {
                 job_id,
                 outcome,
                 metrics,
             } => {
+                if Framing::belongs_to(&outcome) {
+                    framing.release(&mut said);
+                }
                 let _ = socket.close(None).await;
                 return Ok(Finished {
                     job_id,
@@ -339,7 +448,7 @@ pub async fn wait_for_job(
     config: &Config,
     job_id: JobId,
     mut on_log: impl FnMut(LogStream, &[u8]),
-    mut on_note: impl FnMut(&str),
+    mut said: impl FnMut(Said),
 ) -> Result<Finished> {
     let mut socket = join(config).await?;
     send(
@@ -351,6 +460,7 @@ pub async fn wait_for_job(
     .await
     .context("asking to be told how the job ends")?;
 
+    let mut framing = Framing::default();
     while let Some(message) = next_message(&mut socket).await? {
         match message {
             FromHub::JobFinished {
@@ -358,6 +468,9 @@ pub async fn wait_for_job(
                 outcome,
                 metrics,
             } => {
+                if Framing::belongs_to(&outcome) {
+                    framing.release(&mut said);
+                }
                 let _ = socket.close(None).await;
                 return Ok(Finished {
                     job_id,
@@ -365,9 +478,23 @@ pub async fn wait_for_job(
                     metrics,
                 });
             }
-            FromHub::JobLog { data, .. } => on_log(LogStream::Stdout, &data),
-            FromHub::LogChunk { stream, data, .. } => on_log(stream, &data),
-            FromHub::JobNote { note, .. } => on_note(&note),
+            FromHub::JobLog { data, .. } => {
+                framing.release(&mut said);
+                on_log(LogStream::Stdout, &data);
+            }
+            FromHub::LogChunk { stream, data, .. } => {
+                framing.release(&mut said);
+                on_log(stream, &data);
+            }
+            FromHub::JobNote { note, .. } => said(Said::Note(&note)),
+            // E-02's first line, on **stdout**, ahead of the job's first
+            // byte: the output a requester sees is framed with where the job
+            // ran and why there, and the job's own output follows it
+            // unchanged (D109). It is held rather than printed here — see
+            // [`Framing`] — and a wait that attached to a job already running
+            // gets it off the record's own attempt, so the sentence is the
+            // one that was recorded (E-36).
+            FromHub::RanOn { runner, why, .. } => framing.placed(&runner, &why),
             FromHub::Refused { reason } => bail!("the hub refused the wait: {reason}"),
             other => bail!(
                 "the hub sent {}, which a requester cannot use",
@@ -571,6 +698,8 @@ async fn join(config: &Config) -> Result<Socket> {
         &mut socket,
         &ToHub::Hello {
             protocol_version: PROTOCOL_VERSION,
+            // Which build is asking, beside which protocol it speaks (E-51).
+            peer_version: requester_version().to_owned(),
             role: Role::Requester,
             token: config.token.clone(),
             name: config.name.clone(),
@@ -600,10 +729,112 @@ async fn join(config: &Config) -> Result<Socket> {
     .await
     .context("sending hello")?;
     match next_message(&mut socket).await? {
-        Some(FromHub::Welcome { .. }) => Ok(socket),
+        Some(FromHub::Welcome { version_note, .. }) => {
+            // What the hub says about the gap between its build and this
+            // one, when it says anything (E-51). On stderr, where every one
+            // of Herd's own words goes: stdout belongs to the answer the
+            // caller asked for.
+            if let Some(note) = version_note {
+                eprintln!("herdctl: {note}");
+            }
+            Ok(socket)
+        }
         Some(FromHub::Refused { reason }) => bail!("the hub refused this requester: {reason}"),
         Some(other) => bail!("the hub answered hello with {}", message_kind(&other)),
         None => bail!("the hub closed the connection during the handshake"),
+    }
+}
+
+/// Which build of `herdctl` this is, as the handshake announces it (E-51).
+pub fn requester_version() -> &'static str {
+    env!("CARGO_PKG_VERSION")
+}
+
+/// Approve one runner by name, and come back with the token the hub minted
+/// for it (E-48, Q8).
+///
+/// One operator action. The token is readable here and nowhere else: the hub
+/// keeps a hash of it, so an operator who loses it approves the runner again
+/// rather than looking it up.
+pub async fn approve_runner(config: &Config, runner: String) -> Result<(String, String)> {
+    let mut socket = join(config).await?;
+    send(&mut socket, &ToHub::ApproveRunner { runner })
+        .await
+        .context("approving a runner")?;
+    match next_message(&mut socket).await? {
+        Some(FromHub::RunnerApproved { token, said, .. }) => {
+            let _ = socket.close(None).await;
+            Ok((token, said))
+        }
+        Some(FromHub::Refused { reason }) => bail!("the hub refused the approval: {reason}"),
+        Some(other) => bail!("the hub answered an approval with {}", message_kind(&other)),
+        None => bail!("the hub closed the connection without answering"),
+    }
+}
+
+/// Remove one runner, which revokes its token (E-48).
+pub async fn remove_runner(config: &Config, runner: String) -> Result<String> {
+    let mut socket = join(config).await?;
+    send(&mut socket, &ToHub::RemoveRunner { runner })
+        .await
+        .context("removing a runner")?;
+    match next_message(&mut socket).await? {
+        Some(FromHub::RunnerRemoved { said }) => {
+            let _ = socket.close(None).await;
+            Ok(said)
+        }
+        Some(FromHub::Refused { reason }) => bail!("the hub refused the removal: {reason}"),
+        Some(other) => bail!("the hub answered a removal with {}", message_kind(&other)),
+        None => bail!("the hub closed the connection without answering"),
+    }
+}
+
+/// Which runners are approved on this hub (E-48).
+pub async fn approved_runners(config: &Config) -> Result<Vec<ApprovedRunner>> {
+    let mut socket = join(config).await?;
+    send(&mut socket, &ToHub::AskApprovedRunners {})
+        .await
+        .context("asking which runners are approved")?;
+    match next_message(&mut socket).await? {
+        Some(FromHub::ApprovedRunners { runners }) => {
+            let _ = socket.close(None).await;
+            Ok(runners)
+        }
+        Some(FromHub::Refused { reason }) => bail!("the hub refused: {reason}"),
+        Some(other) => bail!("the hub answered with {}", message_kind(&other)),
+        None => bail!("the hub closed the connection without answering"),
+    }
+}
+
+/// One approved runner, as `herdctl runner list` prints it (E-48).
+///
+/// No token and no hash: there is nothing to print, which is the property
+/// E-48 is built on.
+pub fn approved_runner_line(runner: &ApprovedRunner) -> String {
+    format!(
+        "{}: approved {}, {}",
+        runner.name,
+        approved_at(runner.approved_unix_s),
+        if runner.connected {
+            "connected now"
+        } else {
+            "not connected"
+        }
+    )
+}
+
+/// When an approval was made, as a human reads it, falling back to the raw
+/// figure rather than inventing a date.
+fn approved_at(unix_s: u64) -> String {
+    let seconds = i64::try_from(unix_s).unwrap_or(i64::MAX);
+    match time::OffsetDateTime::from_unix_timestamp(seconds)
+        .ok()
+        .and_then(|at| {
+            at.format(&time::format_description::well_known::Rfc3339)
+                .ok()
+        }) {
+        Some(at) => at,
+        None => format!("at unix second {unix_s}"),
     }
 }
 
@@ -643,11 +874,15 @@ fn message_kind(message: &FromHub) -> &'static str {
         FromHub::ResendLog { .. } => "resend_log",
         FromHub::JobLog { .. } => "job_log",
         FromHub::JobNote { .. } => "job_note",
+        FromHub::RanOn { .. } => "ran_on",
         FromHub::JobFinished { .. } => "job_finished",
         FromHub::JobResultAck { .. } => "job_result_ack",
         FromHub::WouldRun { .. } => "would_run",
         FromHub::SwitchSet { .. } => "switch_set",
         FromHub::FleetSwitches { .. } => "fleet_switches",
+        FromHub::RunnerApproved { .. } => "runner_approved",
+        FromHub::RunnerRemoved { .. } => "runner_removed",
+        FromHub::ApprovedRunners { .. } => "approved_runners",
         FromHub::SetSwitch { .. } => "set_switch",
         FromHub::ReadProbesAgain { .. } => "read_probes_again",
     }

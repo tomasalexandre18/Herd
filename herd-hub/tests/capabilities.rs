@@ -237,6 +237,29 @@ impl Herd {
     /// Detection off by default on purpose: what this host happens to have
     /// under `/dev` must not decide whether an assertion about the algebra
     /// holds. The one test that *is* about detection turns it on.
+    /// Approve the runner these tests start, through the real command, and
+    /// come back with the token it printed (E-48).
+    ///
+    /// An unapproved runner claims nothing, so the one machine this file
+    /// starts is approved first — `herdctl runner approve`, against the hub
+    /// that is already up, exactly as an operator types it once.
+    fn approve(&self, name: &str) -> String {
+        let output = std::process::Command::new(binary("herdctl"))
+            .arg("--hub")
+            .arg(self.url())
+            .args(["runner", "approve", name])
+            .output()
+            .expect("herdctl runs");
+        assert!(
+            output.status.success(),
+            "approving {name} failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let token = String::from_utf8_lossy(&output.stdout).trim().to_owned();
+        assert!(!token.is_empty(), "an approval prints the token it minted");
+        token
+    }
+
     async fn start_runner(&mut self, file: Option<&str>, extra: &[&str]) {
         let mut command = Command::new(binary("herd-runner"));
         command
@@ -244,6 +267,7 @@ impl Herd {
             .arg(self.url())
             .arg("--name")
             .arg("the-real-runner")
+            .env("HERD_TOKEN", self.approve("the-real-runner"))
             .arg("--data-root")
             .arg(self.data_root.path())
             .arg("--probe-interval")
@@ -978,7 +1002,7 @@ async fn an_offer_the_hub_cannot_read_is_refused_with_the_reason_as_the_last_fra
     // One name, two entries, each with a kind of its own: a runner offers a
     // capability once, and the algebra says so where it is decoded.
     let hello = format!(
-        r#"{{"type":"hello","protocol_version":{},"role":"runner",
+        r#"{{"type":"hello","protocol_version":{},"peer_version":"0.1.0","role":"runner",
             "name":"the-wrong-runner","instance":"run-1",
             "capabilities":[
               {{"name":"build","kind":{{"type":"shared"}},"origins":{{"declared":true}}}},
@@ -1236,6 +1260,9 @@ async fn ten_hanging_probes_do_not_delay_the_runner_joining() {
     let mut herd = Herd::new();
     herd.start_hub().await;
 
+    // Approved before the clock starts: what is being measured is how long
+    // the runner takes to join, not how long an operator takes to approve it.
+    let token = herd.approve("the-slow-probed-runner");
     // Measured from spawning the process to the hub saying it has joined:
     // everything the runner does before it is a runner is inside this.
     let dialled_at = Instant::now();
@@ -1246,6 +1273,7 @@ async fn ten_hanging_probes_do_not_delay_the_runner_joining() {
         .arg(herd.url())
         .arg("--name")
         .arg("the-slow-probed-runner")
+        .env("HERD_TOKEN", token)
         .arg("--data-root")
         .arg(herd.data_root.path())
         .arg("--capabilities")

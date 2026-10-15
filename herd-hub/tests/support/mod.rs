@@ -110,6 +110,9 @@ pub async fn submit_job(
 pub struct Harness {
     pub hub_url: String,
     pub store: Arc<JobDirStore>,
+    /// The token each runner this harness approved carries, so one name is
+    /// approved once however many times a test asks for it (E-48).
+    approved: std::sync::Mutex<std::collections::HashMap<String, String>>,
     /// Removed when the harness drops, so the suite writes nothing lasting.
     pub state: TempDir,
     handle: HubHandle,
@@ -136,8 +139,11 @@ impl Harness {
         let config = herd_runner::Config {
             hub_url: harness.hub_url.clone(),
             name: Some("test-runner".to_owned()),
-            // Carried, not checked: M15 gives tokens meaning.
-            token: Some("not-validated-yet".to_owned()),
+            // An unapproved runner claims nothing (E-48), so every harness
+            // approves the runner it starts and carries the token that
+            // approval minted — exactly what an operator does once with
+            // `herdctl runner approve`.
+            token: Some(harness.approve("test-runner")),
             confinement: confinement(&data_root),
             ..herd_runner::Config::default()
         };
@@ -172,11 +178,38 @@ impl Harness {
         Self {
             hub_url,
             store,
+            approved: std::sync::Mutex::new(std::collections::HashMap::new()),
             state,
             handle,
             tasks: vec![serving],
             _data_root: None,
         }
+    }
+
+    /// The token one runner carries, approving it the first time it is asked
+    /// for (E-48).
+    ///
+    /// What `herdctl runner approve` does, through the store rather than
+    /// through a connection, because most of this suite is about something
+    /// else and needs one line to get a runner admitted. The tests that are
+    /// about approval itself go through the real command.
+    ///
+    /// **Approved once per name**, and that matters: approving a name again
+    /// mints a new token and revokes the old one, so a test that asked twice
+    /// for one name would quietly cut the runner it had already started.
+    pub fn approve(&self, name: &str) -> String {
+        let mut approved = self
+            .approved
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        approved
+            .entry(name.to_owned())
+            .or_insert_with(|| {
+                self.store
+                    .approve_runner(name)
+                    .expect("the state root mints a token")
+            })
+            .clone()
     }
 
     /// Whether a runner has finished its handshake with this hub.
@@ -195,6 +228,7 @@ impl Harness {
         let config = herd_runner::Config {
             hub_url: harness.hub_url.clone(),
             name: Some("test-runner".to_owned()),
+            token: Some(harness.approve("test-runner")),
             confinement: confinement(&data_root),
             capabilities,
             probes,
@@ -348,6 +382,21 @@ impl Drop for HubProcess {
     fn drop(&mut self) {
         self.stop_now();
     }
+}
+
+/// Approve one runner on a state root nobody is holding, and come back with
+/// its token (E-48).
+///
+/// For the tests that drive a hub as a separate runtime or a separate
+/// process: the operator approves the machine before the hub starts, or
+/// between two of its lives, which is what a deployment really does. The
+/// approval is a file in the state root, so a hub started on that root
+/// afterwards reads it.
+pub fn approve_on_disk(state_dir: &Path, name: &str) -> String {
+    let store = open_when_free(state_dir);
+    store
+        .approve_runner(name)
+        .expect("the state root mints a token")
 }
 
 /// Open a state root, waiting for whoever held it to let go.

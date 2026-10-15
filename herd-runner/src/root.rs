@@ -301,6 +301,8 @@ impl DataRoot {
         }
         Ok(Workspace {
             root: self.path.clone(),
+            exchange_in: base.join("in"),
+            exchange_out: base.join("out"),
             base,
             work,
             home,
@@ -319,6 +321,10 @@ pub struct Workspace {
     work: PathBuf,
     home: PathBuf,
     tmp: PathBuf,
+    /// `{in}` and `{out}`, named but not created until a declared command
+    /// asks for them ([`Workspace::open_exchange`]).
+    exchange_in: PathBuf,
+    exchange_out: PathBuf,
 }
 
 impl Workspace {
@@ -341,6 +347,41 @@ impl Workspace {
     /// The `TMPDIR` the job is given, for the same reason.
     pub fn tmp_dir(&self) -> &Path {
         &self.tmp
+    }
+
+    /// What a declared command's steps consume, for `{in}` (D107).
+    ///
+    /// Empty this milestone — nothing fills it until the content store (M11)
+    /// — and that is the whole of what it is: a directory that exists, inside
+    /// the root, so a hook naming `{in}` names somewhere real.
+    pub fn in_dir(&self) -> &Path {
+        &self.exchange_in
+    }
+
+    /// What a declared command's steps leave behind, for `{out}` (D107).
+    pub fn out_dir(&self) -> &Path {
+        &self.exchange_out
+    }
+
+    /// Make `{in}` and `{out}`, or say which one could not be made.
+    ///
+    /// Separate from [`DataRoot::open_workspace`] because only a declared
+    /// command has steps to exchange anything between: an ad-hoc job is
+    /// Herd's own command line and gets what it always got (E-11's reason for
+    /// keeping both shapes). Both live under the job's own base directory,
+    /// which [`DataRoot::resolve`] already put inside the data root, so there
+    /// is one gate for "nothing outside the root" and not a second habit here
+    /// (E-45).
+    pub fn open_exchange(&self) -> Result<(), String> {
+        for directory in [&self.exchange_in, &self.exchange_out] {
+            fs::create_dir_all(directory).map_err(|error| {
+                format!(
+                    "the directory {} cannot be created: {error}",
+                    directory.display()
+                )
+            })?;
+        }
+        Ok(())
     }
 
     /// How many bytes the job has written and not deleted, or why the figure
@@ -803,6 +844,49 @@ mod tests {
         again.reclaim().expect("reclaimed");
         assert!(!again.base_dir().exists());
         again.reclaim().expect("reclaiming twice is not a failure");
+    }
+
+    /// `{in}` and `{out}` are made only when a declared command asks for them,
+    /// and they are inside the one data root like everything else a job is
+    /// given (E-45, D107).
+    #[test]
+    fn the_exchange_directories_are_asked_for_and_are_inside_the_root() {
+        let temp = TempDir::new("exchange");
+        let root = DataRoot::open(temp.path()).expect("usable");
+        let workspace = root
+            .open_workspace(&JobId::new("j8"))
+            .expect("a workspace is made");
+        assert!(
+            !workspace.in_dir().exists() && !workspace.out_dir().exists(),
+            "an ad-hoc job gets what it always got, and nothing more"
+        );
+
+        workspace
+            .open_exchange()
+            .expect("the two directories are made");
+        for directory in [workspace.in_dir(), workspace.out_dir()] {
+            assert!(directory.is_dir(), "{}", directory.display());
+            assert!(
+                directory.starts_with(root.path()),
+                "{} has to be inside the data root {}",
+                directory.display(),
+                root.path().display()
+            );
+            assert!(directory.starts_with(workspace.base_dir()));
+        }
+        assert_eq!(
+            workspace.measure(),
+            Ok(0),
+            "two empty directories hold no bytes of anybody's budget"
+        );
+        // Asked for twice is not a failure: an attempt that was given back
+        // and tried again finds them already there.
+        workspace
+            .open_exchange()
+            .expect("asking twice is not an error");
+
+        workspace.reclaim().expect("reclaimed");
+        assert!(!workspace.in_dir().exists() && !workspace.out_dir().exists());
     }
 
     /// Defect 1 of the M4 review, as a unit: a job that hides what it wrote
