@@ -1086,25 +1086,177 @@ async fn a_job_cannot_fork_past_its_own_pid_ceiling() {
     assert_eq!(after.out.trim(), "the runner lived");
 }
 
+/// Where a test may put a data root when the suite's own temporary directory
+/// is on a filesystem the assertion is not about.
+///
+/// `/tmp` is ZFS on this project's server, and a ZFS dataset is a place where
+/// no cgroup IO knob can bite (D120) — so the assertion that a weighted
+/// device *is* reported as weighted had nowhere to stand and skipped. An
+/// operator who has a writable directory on a block-device filesystem points
+/// this at it; without it the assertions below say what they could not check.
+fn scratch_root() -> Option<PathBuf> {
+    let path = PathBuf::from(std::env::var_os("HERD_TEST_SCRATCH")?);
+    path.is_dir().then_some(path)
+}
+
+/// Every mount point in this process's mount table, with its filesystem type.
+fn mount_points() -> Vec<(PathBuf, String)> {
+    let Ok(text) = std::fs::read_to_string("/proc/self/mountinfo") else {
+        return Vec::new();
+    };
+    text.lines()
+        .filter_map(|line| {
+            let point = line.split_whitespace().nth(4)?;
+            let kind = line.split(" - ").nth(1)?.split_whitespace().next()?;
+            Some((PathBuf::from(point), kind.to_owned()))
+        })
+        .collect()
+}
+
+/// D120: whether `io.weight` bites is a fact about **the device the job's
+/// directory is on**, and not about the host's disks in general. D116 read
+/// the host's IO schedulers, found no bfq anywhere, and called this server's
+/// NVMe inert — while blk-iocost weights it per cgroup.
+///
+/// Two devices, two different answers, asserted against this host's real
+/// `/proc/self/mountinfo`, `/sys/fs/cgroup/io.cost.*` and request queues. No
+/// cgroup and no writable directory are needed for either: the verdict is
+/// read, not written.
+#[test]
+fn the_io_weight_verdict_follows_the_device_the_job_works_on() {
+    const TEST: &str = "the_io_weight_verdict_follows_the_device_the_job_works_on";
+    let mounts = mount_points();
+
+    // Half one: a ZFS dataset, where no cgroup IO knob reaches and the
+    // sentence must say *that* rather than a generic "inert" — an operator
+    // told "inert" would go looking for a scheduler to change, and there is
+    // none that would help.
+    match mounts.iter().find(|(_, kind)| kind == "zfs") {
+        Some((point, _)) => {
+            let reach = herd_runner::blockio::io_weight_reach(point);
+            assert!(!reach.bites, "no cgroup IO knob reaches ZFS: {reach:?}");
+            let why = reach.why;
+            assert!(why.contains("ZFS"), "the ZFS answer must name ZFS: {why}");
+            assert!(
+                why.contains("io.max"),
+                "it must also say that the other IO lever cannot reach it: {why}"
+            );
+        }
+        None => skipped(
+            TEST,
+            "this host has no ZFS mount — a host with one would prove that a data root on \
+             a ZFS dataset is reported as reached by no cgroup IO knob at all, rather than \
+             as generically inert (D120)",
+        ),
+    }
+
+    // Half two: a device the block layer really does weight. The evidence is
+    // read here, independently of the code under test: a cost model or an
+    // enabled qos line in /sys/fs/cgroup, or a request queue set to bfq.
+    let weighted_devices = std::fs::read_to_string("/sys/fs/cgroup/io.cost.model")
+        .unwrap_or_default()
+        .lines()
+        .filter(|line| line.contains("model=") && !line.contains("rbps=0 "))
+        .count();
+    let candidates: Vec<PathBuf> = scratch_root()
+        .into_iter()
+        .chain(
+            mounts
+                .iter()
+                .filter(|(_, kind)| matches!(kind.as_str(), "ext4" | "xfs" | "btrfs"))
+                .map(|(point, _)| point.clone()),
+        )
+        .collect();
+    let biting = candidates
+        .iter()
+        .map(|path| (path, herd_runner::blockio::io_weight_reach(path)))
+        .find(|(_, reach)| reach.bites);
+    match (biting, weighted_devices) {
+        (Some((path, reach)), _) => {
+            let why = reach.why;
+            assert!(
+                why.contains(&path.display().to_string()),
+                "the answer must name the directory it is about: {why}"
+            );
+            assert!(
+                why.contains("blk-iocost") || why.contains("bfq"),
+                "and which of the two honours the weight there: {why}"
+            );
+            assert!(
+                why.contains("device ") || why.contains("scheduler is bfq"),
+                "and the device the job's IO is weighted on: {why}"
+            );
+        }
+        (None, 0) => skipped(
+            TEST,
+            "no device on this host offers bfq or a blk-iocost cost model, so there is no \
+             directory here whose io.weight could bite — a host with one (this project's \
+             own server: blk-iocost with ctrl=auto on nvme0n1) would prove that a data \
+             root on it is reported as weighted rather than inert",
+        ),
+        (None, _) => panic!(
+            "this host weights IO on {weighted_devices} device(s) and yet no directory \
+             among {candidates:?} was reported as weighted — which is the D116 defect \
+             over again"
+        ),
+    }
+}
+
 /// `io.weight` is the one control the cgroup core cannot tell the truth
 /// about: the write succeeds on every host, and only bfq or blk-iocost
 /// honours it. A runner that stayed quiet about that would be claiming a
-/// bound it does not have, which is exactly what D23 forbids.
+/// bound it does not have, which is exactly what D23 forbids — and a runner
+/// that stayed quiet when it *does* have the bound would leave an operator
+/// unable to tell which of its two disks the job should work on (D120).
 #[tokio::test]
 async fn an_io_weight_that_cannot_bite_is_said_out_loud() {
     let temp = TempDir::new("io-weight-report");
-    let confined = Confined::prepare(test_confinement(temp.path())).expect("confinable");
+    // On a host whose temporary directory is ZFS, the data root this test
+    // would use by default is the one place where nothing can ever bite. A
+    // scratch root on a block-device filesystem is what lets the other half
+    // of the report be asserted.
+    let data_root = scratch_root().map_or_else(
+        || temp.path().to_path_buf(),
+        |scratch| scratch.join(format!("herd-io-weight-report-{}", std::process::id())),
+    );
+    std::fs::create_dir_all(&data_root).expect("a data root under the scratch root");
+    let confined = Confined::prepare(test_confinement(&data_root)).expect("confinable");
     let report = confined.report().join("\n");
+    let no_cgroup = confined
+        .ceiling()
+        .fallback_reason()
+        .map(|why| why.to_owned());
     let Some(why) = confined.io_weight_inert().map(|why| why.to_owned()) else {
-        // bfq or blk-iocost: the weight really bites here, and the report
-        // says nothing about it on purpose.
+        // bfq or blk-iocost: the weight really bites for a job working here,
+        // and the report has to say so plainly and name the device — moving
+        // the data root is what moves this answer (D120).
         assert!(
             !report.contains("WRITTEN BUT INERT"),
-            "this host weights IO, so the report must not claim otherwise: {report}"
+            "a job here is weighted, so the report must not claim otherwise: {report}"
         );
+        let plainly = confined.io_weight_reach().why.clone();
+        match no_cgroup {
+            Some(no_cgroup) => {
+                skipped(
+                    "an_io_weight_that_cannot_bite_is_said_out_loud \
+                     (the weighted-device branch)",
+                    &format!(
+                        "{no_cgroup} — a job's directory here IS on a weighted device \
+                         ({plainly}), and inside a delegated scope the startup report \
+                         would have to carry that line instead of the inert one"
+                    ),
+                );
+            }
+            None => assert!(
+                report.contains("enforced for jobs here") && report.contains(&plainly),
+                "an io.weight that does bite must say so, with the device: {report}"
+            ),
+        }
+        let _ = std::fs::remove_dir_all(&data_root);
         return;
     };
-    if let Some(no_cgroup) = confined.ceiling().fallback_reason() {
+    let _ = std::fs::remove_dir_all(&data_root);
+    if let Some(no_cgroup) = no_cgroup {
         // With no cgroup at all the report already says io.weight is not
         // enforced; the inert sentence would be a second reason for the same
         // thing.
@@ -1112,7 +1264,7 @@ async fn an_io_weight_that_cannot_bite_is_said_out_loud() {
         skipped(
             "an_io_weight_that_cannot_bite_is_said_out_loud",
             &format!(
-                "{no_cgroup} — this host's io.weight is inert for a second reason too \
+                "{no_cgroup} — a job's directory here is on a device whose io.weight is inert too \
                  ({why}), and inside a delegated scope the startup report would have to \
                  carry the WRITTEN BUT INERT line for it"
             ),
