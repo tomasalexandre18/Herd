@@ -5,13 +5,31 @@
 #
 # Install as /etc/systemd/system/herd-runner.service, then:
 #
+#   install -d -o herd -g herd -m 0700 /mnt/ssd_980/herd-runner
 #   systemctl daemon-reload
 #   systemctl enable --now herd-runner
 #   systemctl status herd-runner
 #
-# On NixOS this file is the reference shape; turning it into a
-# systemd.services.herd-runner block is an /etc/nixos change, which is the
-# owner's. Everything below that /etc/nixos must provide is marked OWNER.
+# That first line is not optional any more; DATA ROOT below says why, and
+# what a half-done version of it costs.
+#
+# On NixOS there are two ways to carry this unit, and a machine is on exactly
+# one of them:
+#
+#   1. this file, copied into /etc/systemd/system/, with every OWNER note
+#      below satisfied by hand. It works and it survives a reboot, but the
+#      user and the unit are then unmanaged state outside the NixOS
+#      generation. This is what the project's server runs today.
+#   2. deploy/nixos-herd-runner.nix, imported from /etc/nixos: the same unit
+#      declared, with the user, the groups and the binary's path along with
+#      it, and no OWNER steps left over. Importing it is an /etc/nixos
+#      change, which is the owner's; Herd never writes there.
+#
+# The two must be changed together. The module is written to produce exactly
+# this unit, and a figure edited in one and not the other gives a machine
+# whose real limits are not the ones documented here — these comments stay
+# true of the file and quietly stop being true of the host. Everything that
+# /etc/nixos must provide for *this* file is marked OWNER.
 #
 # Every option on the ExecStart line is in `herd-runner --help`.
 
@@ -23,6 +41,13 @@ Documentation=file:///etc/herd/joining.md
 # with backoff and gives up only after --give-up-after.
 After=network-online.target
 Wants=network-online.target
+# The data root is on a filesystem of its own (DATA ROOT below), and
+# /mnt/ssd_980 is in fstab with `nofail`: local-fs.target is reached whether
+# that mount came up or not. This pulls the mount unit in and orders the
+# service after it, so a missing NVMe stops the runner from starting at all
+# instead of letting it build a data root on the bare mount point — which is
+# on the ZFS pool, where no IO weight reaches (D120, D126).
+RequiresMountsFor=/mnt/ssd_980/herd-runner
 
 [Service]
 Type=simple
@@ -43,11 +68,27 @@ Group=herd
 # rule to carry a group; add `vfio` here once that rule exists.
 SupplementaryGroups=kvm render video
 
-# The one directory this runner may write in (E-45). systemd creates
-# /var/lib/herd-runner owned by User=, 0700, before the runner starts, and
-# %S expands to /var/lib — so the flag and the directory can never drift.
-StateDirectory=herd-runner
-StateDirectoryMode=0700
+# DATA ROOT: the one directory this runner may write in (E-45), and which
+# disk it is on is a decision rather than a detail. An `io.weight` reaches
+# ext4 on this host's NVMe and reaches nothing at all on the ZFS pool that
+# carries /var/lib (D120), so the root is on the NVMe and the IOWeight below
+# is a real bound rather than a decorative line (D126). It is also simply the
+# right disk for build scratch: the fast one, and off the pool that carries /.
+#
+# OWNER: `StateDirectory=herd-runner` is gone with it, and so is `%S`, which
+# would now name the wrong disk — neither appears anywhere in this file. That
+# directive is what created /var/lib/herd-runner owned by User= and mode 0700
+# before the runner started, so the flag and the directory could not drift.
+# Off the state directory nothing creates the root for us. Make it in the
+# same step as the user, before the first start:
+#
+#   install -d -o herd -g herd -m 0700 /mnt/ssd_980/herd-runner
+#
+# Owner and mode are both load-bearing. A root the runner cannot create, or
+# cannot write, is a refusal naming the path — so forgetting this entirely is
+# loud. Getting it half right is not: the runner creates a missing root
+# itself, as its own user and under its own umask, which is 0755 and leaves
+# every job's workspace, HOME and TMPDIR readable by every user of the host.
 
 # OWNER: the token `herdctl runner approve server` printed once, as
 # HERD_TOKEN=..., in a file mode 0400 owned by this user. Never on the
@@ -109,13 +150,26 @@ MemorySwapMax=0
 # the host is contended. Per-job niceness is --job-nice below; this is the
 # weight of all of it against everything else on the host.
 CPUWeight=50
+#
+# IOWeight bites on this host only because the data root is on the NVMe:
+# blk-iocost holds a linear cost model for nvme0n1 and weights each cgroup's
+# IO there, while ZFS attributes no pool IO to the cgroup that asked and so
+# takes no IO knob at any value (D120, D126). Which of the two it got is in
+# the runner's startup report, so this is checkable rather than assumed.
+#
+# Read as a cap it would be wrong twice. It is a share: 50 against a default
+# cgroup's 100 is half the claim on *contended* bandwidth, and when nothing
+# else wants the disk Herd uses all of it. And it only covers IO to the data
+# root — a job naming an absolute path outside the root writes with no bound
+# at all, here or on the pool (D126). `io.max` is the only hard IO lever and
+# is unbuilt.
 IOWeight=50
 # ---------------------------------------------------------------------------
 
 ExecStart=/run/current-system/sw/bin/herd-runner \
     --hub ws://127.0.0.1:8787 \
     --name server \
-    --data-root %S/herd-runner \
+    --data-root /mnt/ssd_980/herd-runner \
     --cgroup-root /sys/fs/cgroup/system.slice/herd-runner.service \
     --job-memory-max 8GiB \
     --job-timeout 5400 \
@@ -174,9 +228,27 @@ ExecStart=/run/current-system/sw/bin/herd-runner \
 #                            ceiling, with no swap, is the host falling over.
 #                            4 GiB is a reservation the machine can honour.
 #
-#   --job-disk-budget 20GiB  One job's scratch space on the one NVMe; the
-#   --job-log-cap 64MiB      defaults, written down so they are a decision.
-#   --job-nice 10
+#   --data-root              The ext4 NVMe, not /var/lib, because an
+#     /mnt/ssd_980/          io.weight reaches a block device and never the
+#     herd-runner            ZFS pool that carries /var/lib (D120, D126).
+#                            DATA ROOT above has the whole of it, including
+#                            the one command the operator must run first.
+#
+#   --job-disk-budget 20GiB  One job's scratch space, measured under the data
+#                            root on /mnt/ssd_980: 347 GiB free of 916 GiB,
+#                            so two build slots at the budget is 40 GiB,
+#                            about a ninth of what is free. The same figure
+#                            against the pool was a different sentence —
+#                            /var/lib has 43 GiB free, and two jobs at the
+#                            budget would have filled it and taken / with
+#                            them. It caps what one job writes; it reserves
+#                            nothing. This disk also carries Docker's data
+#                            root, the libvirt images and the project's own
+#                            checkout, so the free space above is shared and
+#                            the budget only stops one job from eating it.
+#
+#   --job-log-cap 64MiB      The defaults, written down so they are a
+#   --job-nice 10            decision.
 #
 #   --hub ws://127.0.0.1:8787
 #                            This runner is on the hub's own host and reaches

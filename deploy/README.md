@@ -1,9 +1,10 @@
 # Deploying Herd
 
-Four files, and `docs/joining.md` for the person who walks a machine in.
-None of them is a NixOS module: `/etc/nixos` is the owner's, so anything
-that needs it is written here as an instruction marked **OWNER**, never
-as a file that reaches in.
+Five files, and `docs/joining.md` for the person who walks a machine in.
+`/etc/nixos` is the owner's and nothing here ever writes to it: what needs
+it is either an instruction marked **OWNER** in the unit file, or — since
+D126 — a module he may import if he wants it, which is an offering and
+not an installation.
 
 | File | What it is | Where it goes |
 | --- | --- | --- |
@@ -11,6 +12,17 @@ as a file that reaches in.
 | `env.example` | the variables that file needs, holding paths and no secrets | copy to `.env` beside it |
 | `reverse-proxy/nginx-herd-hub.conf` | a fragment for the nginx that already terminates TLS | pasted into the config he already runs |
 | `herd-runner.service` | the server's runner, native and unprivileged (E-47, E-52) | `/etc/systemd/system/` |
+| `nixos-herd-runner.nix` | the same runner declared: the unit plus the user, the binary's path and the devices the unit marks OWNER | imported from `/etc/nixos`, or not at all |
+
+**Two paths for the runner, and a machine is on exactly one.** Either the
+unit file is copied into `/etc/systemd/system/` and the OWNER notes in it
+are satisfied by hand, or the module is imported and declares them. The
+project's server is on the **first**: tonight's `herd` user was made with
+`useradd --system` and the unit was dropped into `/etc/systemd/system/`,
+which works and survives a reboot but is unmanaged state outside the
+NixOS generation. The module is how that becomes declarative whenever the
+owner wants; its header says how to import it and what the flake already
+exposes. The two must be changed together — see the header of either.
 
 The shape, in one picture:
 
@@ -44,7 +56,10 @@ and nothing on a runner's machine listens at all (invariant 3, D11).
    in its first three lines whether a requester token is set, how many
    runners are approved, and where its state is.
 4. Paste the proxy fragment and reload the proxy.
-5. Install the runner's unit and walk `docs/joining.md`.
+5. Make the runner's data root — `install -d -o herd -g herd -m 0700
+   /mnt/ssd_980/herd-runner` — then install the unit and walk
+   `docs/joining.md`. On the declarative path, importing the module does
+   this step and the three below with it.
 
 ## The first start, exactly
 
@@ -150,19 +165,34 @@ no users but `herd` and root.
 
 ## What stays the owner's to do
 
-Each of these is in `/etc/nixos`, and each is marked **OWNER** in the
-unit file where it bites:
+This is the **imperative** path's list — the one the server is on. Each
+is marked **OWNER** in the unit file where it bites, and
+`nixos-herd-runner.nix` declares every one of them instead:
 
 - a system user `herd`, `isSystemUser`, in group `herd` — and **not** in
   the `docker` group, now or ever (D78). `id -nG herd` must not print
   `docker`. The runner itself warns at startup if it is, naming the
-  group, so this is checkable from the journal as well.
+  group, so this is checkable from the journal as well. The module
+  asserts it at evaluation for every declarative route into that group,
+  but Nix cannot make the membership impossible and no assertion sees a
+  `usermod -aG` run by hand, so `id -nG herd` stays the answer.
+- the data root, `/mnt/ssd_980/herd-runner`, owned by that user and mode
+  0700, made before the first start: `install -d -o herd -g herd -m 0700
+  /mnt/ssd_980/herd-runner`. It is on the NVMe because an `io.weight`
+  reaches ext4 and never ZFS (D120, D126), and it is the operator's to
+  create because the unit no longer has a `StateDirectory=` to do it. A
+  root the runner cannot write is a refusal naming the path; a root left
+  at the default 0755 is not, and leaves every job's workspace readable
+  by every user of the host. The module uses `systemd.tmpfiles` and
+  re-asserts owner and mode at every boot.
 - `environment.systemPackages` carrying the runner, so that
   `/run/current-system/sw/bin/herd-runner` — the path in the unit —
-  exists.
+  exists. The module does not need it: its `ExecStart` is the package's
+  own store path, which cannot be missing.
 - a udev rule giving `/dev/vfio/*` a group, if VFIO work is wanted. It
   is `root:root 0600` on a stock kernel, which no supplementary group
-  can reach.
+  can reach. The module writes that rule behind
+  `services.herd-runner.vfio = true`.
 
 ## Confirming the cgroup delegation, and the two skips it closes
 

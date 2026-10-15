@@ -78,6 +78,11 @@ lands in `/run/current-system/sw/bin` — which is the path the service
 unit in `deploy/herd-runner.service` expects. That is an `/etc/nixos`
 change and belongs to whoever owns that file.
 
+Or import `deploy/nixos-herd-runner.nix`, which declares the same unit
+and names the package's own store path, so there is no
+`systemPackages` step to forget. Step 6 says which of the two paths you
+are on; the project's server is on the file, not the module.
+
 ### 2. Give it a data root and the hub's address
 
 The data root is the **one** directory this runner may write in (E-45):
@@ -91,6 +96,14 @@ install -d -m 0700 ~/.local/state/herd-runner
 That is also the default, so you may leave `--data-root` out. One runner
 per data root (D32): a second runner pointed at the same directory is
 refused.
+
+Which filesystem it is on is not neutral. A job's IO is weighted per
+cgroup only on a single block device the kernel can cost — ext4 or xfs on
+one disk — and never on ZFS, which does its pool IO without attributing
+it to the cgroup that asked (D120). So if this machine's IO must be
+bounded at all, put the root on a plain disk; the project's server puts
+it on its NVMe for exactly that reason (D126). The runner says which of
+the two it got in its startup report, so you do not have to guess.
 
 The hub's address is a `ws://` or `wss://` URL, with the scheme spelled
 out at the call site on purpose (D14). See **What `wss://` cannot do
@@ -183,9 +196,12 @@ and it must come back with the host (E-52). Under systemd it also gets
 the **delegated cgroup** that makes the memory ceiling kernel-enforced
 rather than the fallback step 3 warned about.
 
-**On a machine that is a server**, use the system unit:
+**On a machine that is a server**, use the system unit. The data root is
+made first, with the owner and the mode, because the unit no longer has a
+`StateDirectory=` to make it (D126):
 
 ```sh
+sudo install -d -o herd -g herd -m 0700 /mnt/ssd_980/herd-runner
 sudo cp deploy/herd-runner.service /etc/systemd/system/
 sudoedit /etc/systemd/system/herd-runner.service   # read every OWNER note
 sudo systemctl daemon-reload
@@ -198,7 +214,17 @@ server — 31 GiB, 12 threads, no swap — with the reasoning for each one
 beside it in a comment. On a different machine, change the figures and
 nothing else. The ones to change are `--host-memory`,
 `--host-memory-floor`, `--host-threads`, `--job-memory-max` and
-`MemoryMax`.
+`MemoryMax` — and `--data-root` with the `RequiresMountsFor=` that names
+the same path.
+
+**On NixOS, this is one of two paths**, and a machine is on exactly one:
+the copy above, with its OWNER notes done by hand, or
+`deploy/nixos-herd-runner.nix` imported from `/etc/nixos`, which declares
+the same unit plus the user, the data root and the devices. The copy is
+what the project's server runs today, which means its `herd` user and its
+unit are state outside the NixOS generation; the module is how that stops
+being true, and importing it is the owner's call. The file and the module
+must be changed together — both headers say what drifting costs.
 
 **On your own desktop or laptop**, a user service is the right shape,
 because stopping it must be yours alone:
@@ -207,7 +233,7 @@ because stopping it must be yours alone:
 mkdir -p ~/.config/systemd/user
 cp deploy/herd-runner.service ~/.config/systemd/user/
 # then, in your copy: delete User=, Group=, SupplementaryGroups=,
-# StateDirectory= and the [Install] section's WantedBy=, and set
+# RequiresMountsFor= and the [Install] section's WantedBy=, and set
 #   --data-root ~/.local/state/herd-runner
 #   WantedBy=default.target
 systemctl --user daemon-reload
@@ -301,6 +327,7 @@ root and delivered on the next start (D34). Stopping loses nothing.
 | `memory ceiling: FALLING BACK` | the runner is not in a delegated cgroup. Start it from systemd, not by hand |
 | `WARNING: ... is in the "docker" group` | use a user that is in no root-equivalent group (D78) |
 | a data root that is refused, naming itself | the directory is not writable by the runner's user, or another runner already holds it (D32) |
+| the unit will not start, and systemd names a mount rather than the runner | the data root's filesystem is not mounted. `RequiresMountsFor=` holds the service back on purpose, so it cannot build a root on a bare mount point |
 | `herdctl runner list` shows it approved but not connected | the service is not running: `journalctl -u herd-runner` |
 
 ## What `wss://` cannot do yet
