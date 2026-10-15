@@ -15,7 +15,7 @@
 //! the CI run. So the difference between "asserted" and "not asserted here"
 //! is visible from the terminal and on the pull request.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -1281,6 +1281,183 @@ fn no_module_of_the_runner_can_bind_a_socket() {
     assert!(checked > 4, "only {checked} files were checked");
 }
 
+// ---------------------------------------------- no Docker socket (D78) ----
+
+/// D78's last clause, and one of M16's deliverables: while a job is
+/// **genuinely running**, no open descriptor of the runner — and none of the
+/// job's own process — resolves to a container-runtime socket.
+///
+/// The claim is about what Herd opens, never about what the host forbids, so
+/// nothing here consults a group: this server's user is in `docker` because
+/// the hub runs under compose, which means the socket is sitting there
+/// writable, and the assertion reads the same on a host where it is not.
+/// Where the host cannot prove a part of the claim — no such socket on it at
+/// all, or none this user could have opened anyway — that part is skipped out
+/// loud with what a host that could run it would have proved (D27).
+///
+/// The paths come from `privilege::runtime_sockets`, the list the production
+/// code already warns about, so a path added there is a path this test starts
+/// watching rather than a second list to keep in step.
+///
+/// Only the job's own process is walked, not its children: a child inherits
+/// its descriptors from that process, which is checked, and a job that opened
+/// the socket itself would be the consumer's own code doing it rather than
+/// Herd (E-45 is what bounds that, and this is D78).
+#[tokio::test]
+async fn no_descriptor_of_the_runner_or_its_job_reaches_a_runtime_socket() {
+    const TEST: &str = "no_descriptor_of_the_runner_or_its_job_reaches_a_runtime_socket";
+    if !cfg!(target_os = "linux") {
+        skipped(
+            TEST,
+            "this host is not Linux, so /proc/<pid>/fd cannot be walked",
+        );
+        return;
+    }
+    let watched = watched_runtime_sockets();
+    assert!(
+        !watched.is_empty(),
+        "privilege::runtime_sockets() named nothing, so this test would watch nothing"
+    );
+    // Before anything is asserted about the runner: the walk is made to find
+    // a descriptor planted on purpose, so that an empty result below is a
+    // fact about the runner and not about a walk that finds nothing ever.
+    the_walk_finds_a_planted_descriptor(TEST);
+    say_what_this_host_cannot_prove(TEST, &watched);
+
+    let data_root = TempDir::new("no-docker-fd");
+    let state = TempDir::new("no-docker-fd-state");
+    let store = Arc::new(JobDirStore::open(state.path()).expect("the state root opens"));
+    let hub = Hub::bind(
+        "127.0.0.1:0".parse().expect("a literal loopback address"),
+        Arc::clone(&store) as Arc<dyn JobStore>,
+    )
+    .await
+    .expect("the hub binds a free port");
+    let hub_url = format!("ws://{}", hub.local_addr());
+    let handle = hub.handle();
+    let serving = tokio::spawn(async move {
+        let _ = hub.serve().await;
+    });
+
+    // The real binary, because the claim is about a runner *process*: an
+    // in-process runner would share this test's own descriptors and prove
+    // nothing about either of them. A name of its own, and the token its
+    // approval minted (E-48), so that no other test's reaper or restart ever
+    // takes this runner's job for a leftover of its own.
+    let token = store
+        .approve_runner("no-docker-fd")
+        .expect("the state root mints a token");
+    let mut runner = tokio::process::Command::new(env!("CARGO_BIN_EXE_herd-runner"))
+        .arg("--hub")
+        .arg(&hub_url)
+        .arg("--name")
+        .arg("no-docker-fd")
+        .env("HERD_TOKEN", token)
+        .arg("--data-root")
+        .arg(data_root.path())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .kill_on_drop(true)
+        .spawn()
+        .expect("the real runner binary runs");
+    let runner_pid = runner.id().expect("a spawned process has a pid");
+
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while !handle.runner_connected() {
+        assert!(
+            Instant::now() < deadline,
+            "the runner never joined the hub (pid {runner_pid})"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+
+    // Held open by two files, as the no-listener test holds its own: the job
+    // says when it has started and then waits to be let go, so the walk
+    // happens with the job in flight. A window with no job in it has no
+    // descriptors to find and would pass on its own (D101).
+    let started = data_root.path().join("the-job-has-started");
+    let release = data_root.path().join("the-job-may-end");
+    let script = format!(
+        ": > {}; while [ ! -e {} ]; do sleep 0.05; done",
+        started.display(),
+        release.display()
+    );
+    let requester = herdctl::Config {
+        hub_url,
+        token: None,
+        name: Some("no-docker-fd-requester".to_owned()),
+    };
+    let job = tokio::spawn({
+        let command = shell(&script);
+        async move {
+            let _ = herdctl::run_job(
+                &requester,
+                command,
+                herd_proto::LabelSet::default(),
+                herd_proto::Priority::Step,
+                herdctl::Declared::default(),
+                |_, _| {},
+                |_| {},
+            )
+            .await;
+        }
+    });
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while !started.exists() {
+        assert!(
+            Instant::now() < deadline,
+            "the job never started, so there was nothing to walk the runner against"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    // The job's own process is the shell the runner executed, and the whole
+    // script is one of its arguments — unique, because the paths in it are in
+    // a data root of this process's own.
+    let job_pids = processes_with_argument(&script);
+    assert_eq!(
+        job_pids.len(),
+        1,
+        "expected exactly one live process to be running the job's script, found \
+         {job_pids:?}"
+    );
+
+    let mut unaccounted = Vec::new();
+    for (whose, pid) in [("the runner", runner_pid), ("the job", job_pids[0])] {
+        let found = runtime_socket_descriptors_of(pid, &watched);
+        assert!(
+            found.on_a_runtime_socket.is_empty(),
+            "{whose} (pid {pid}) holds a descriptor on a container-runtime socket \
+             while a job runs, which D78 says never happens: {}",
+            found.on_a_runtime_socket.join("; ")
+        );
+        unaccounted.extend(
+            found
+                .unix_sockets_nothing_could_account_for
+                .iter()
+                .map(|descriptor| format!("{whose} (pid {pid}) {descriptor}")),
+        );
+    }
+    if !unaccounted.is_empty() {
+        skipped(
+            TEST,
+            &format!(
+                "these AF_UNIX descriptors could be checked by path and by nothing else, \
+                 because the kernel's socket diagnostics did not account for them and \
+                 procfs publishes the path of a bound socket but never the peer of a \
+                 connected one: {}. A host where `ss -xa` answers for every socket would \
+                 have proved each of these is not dialled at a container-runtime socket \
+                 either",
+                unaccounted.join("; ")
+            ),
+        );
+    }
+
+    std::fs::write(&release, b"walked").expect("the job is let go");
+    let _ = job.await;
+    let _ = runner.kill().await;
+    serving.abort();
+}
+
 // ------------------------------------- a runner's own death (defect 5) ----
 
 /// A hub, and a *real* runner binary joined to it, so that a signal can be
@@ -1647,3 +1824,374 @@ fn listening_sockets_of(pid: u32) -> Vec<String> {
     }
     listening
 }
+
+/// Every path a descriptor must never resolve to: the container-runtime
+/// sockets the runner's own code lists (D78), under both names each of them
+/// has on this host.
+fn watched_runtime_sockets() -> Vec<PathBuf> {
+    both_names_of(
+        herd_runner::privilege::runtime_sockets()
+            .iter()
+            .map(PathBuf::from),
+    )
+}
+
+/// Each path as it is written and as it canonicalises, deduplicated, so that
+/// `/var/run/docker.sock` and `/run/docker.sock` — two names for one socket
+/// on most hosts — are one thing to compare against, whichever name a
+/// descriptor happens to carry.
+fn both_names_of(paths: impl Iterator<Item = PathBuf>) -> Vec<PathBuf> {
+    let mut watched: Vec<PathBuf> = Vec::new();
+    for listed in paths {
+        let canonical = listed.canonicalize().unwrap_or_else(|_| listed.clone());
+        for name in [listed, canonical] {
+            if !watched.contains(&name) {
+                watched.push(name);
+            }
+        }
+    }
+    watched
+}
+
+/// What a walk of one process's open descriptors found about D78's claim.
+#[derive(Debug)]
+struct FoundDescriptors {
+    /// Descriptors that reach a watched socket, each as one line naming which
+    /// descriptor and how it got there. Any one of these is a failure.
+    on_a_runtime_socket: Vec<String>,
+    /// Descriptors on an AF_UNIX socket that this host could not be made to
+    /// account for: procfs names the path of a socket that is **bound** and
+    /// never the peer of one that is **connected**, so a connected descriptor
+    /// needs the kernel's socket diagnostics, and those are not everywhere.
+    /// Not a failure — it is what this host cannot answer, and the caller
+    /// says so out loud rather than quietly (D27).
+    unix_sockets_nothing_could_account_for: Vec<String>,
+}
+
+/// Walk `/proc/<pid>/fd`, resolve every link, and compare what it reached.
+///
+/// Three shapes, because a descriptor reaches a unix socket in three ways and
+/// `/proc/<pid>/fd` alone shows only the first:
+///
+/// 1. a descriptor on the socket **file** resolves to its path, so the path
+///    itself is compared, canonicalised;
+/// 2. a descriptor on a **bound** socket resolves to `socket:[inode]` and
+///    names no path — `/proc/net/unix` holds the path against that inode;
+/// 3. a descriptor **connected** to a socket resolves to `socket:[inode]`
+///    too, and procfs publishes no peer for it at all. The kernel gives the
+///    accepted end of a connection the listener's own address, so the peer's
+///    line in `/proc/net/unix` carries the path that was dialled — and the
+///    peer's inode comes from the kernel's socket diagnostics, which is what
+///    `ss -x` reads. Where those cannot be asked, such a descriptor is
+///    reported as unaccounted for instead of being passed over.
+///
+/// `/proc/net/unix` lists every AF_UNIX socket on the host and nothing else,
+/// which is also how an inode of one is told from a TCP socket's.
+fn runtime_socket_descriptors_of(pid: u32, watched: &[PathBuf]) -> FoundDescriptors {
+    let unix_sockets = unix_socket_paths();
+    let peers = unix_socket_peers();
+    let mut found = FoundDescriptors {
+        on_a_runtime_socket: Vec::new(),
+        unix_sockets_nothing_could_account_for: Vec::new(),
+    };
+    let watches = |path: &str| {
+        let named = PathBuf::from(path);
+        let canonical = named.canonicalize().unwrap_or_else(|_| named.clone());
+        watched.contains(&named) || watched.contains(&canonical)
+    };
+    let entries = std::fs::read_dir(format!("/proc/{pid}/fd")).unwrap_or_else(|error| {
+        panic!(
+            "the descriptors of pid {pid} cannot be read ({error}), so this test is \
+             asserting nothing"
+        )
+    });
+    for entry in entries.flatten() {
+        let fd = entry.file_name().to_string_lossy().into_owned();
+        // A descriptor closed while the directory was being read: gone, so
+        // held by nothing.
+        let Ok(target) = std::fs::read_link(entry.path()) else {
+            continue;
+        };
+        let shown = target.to_string_lossy().into_owned();
+        let Some(inode) = shown
+            .strip_prefix("socket:[")
+            .and_then(|rest| rest.strip_suffix(']'))
+        else {
+            // Shape 1: an ordinary descriptor, which names where it points.
+            let canonical = target.canonicalize().unwrap_or_else(|_| target.clone());
+            if watched.contains(&target) || watched.contains(&canonical) {
+                found.on_a_runtime_socket.push(format!(
+                    "fd {fd} -> {shown} (canonically {})",
+                    canonical.display()
+                ));
+            }
+            continue;
+        };
+        let Some(bound_to) = unix_sockets.get(inode) else {
+            // Not AF_UNIX at all, so none of these paths.
+            continue;
+        };
+        // Shape 2: this socket's own name, where it has one.
+        if !bound_to.is_empty() {
+            if watches(bound_to) {
+                found
+                    .on_a_runtime_socket
+                    .push(format!("fd {fd} -> socket:[{inode}] bound to {bound_to}"));
+            }
+            continue;
+        }
+        // Shape 3: whatever it is connected to, named by its peer.
+        let Some(peers) = peers.as_ref() else {
+            found
+                .unix_sockets_nothing_could_account_for
+                .push(format!("fd {fd} -> socket:[{inode}]"));
+            continue;
+        };
+        let Some(peer) = peers.get(inode) else {
+            found
+                .unix_sockets_nothing_could_account_for
+                .push(format!("fd {fd} -> socket:[{inode}]"));
+            continue;
+        };
+        // Nobody on the other end — a socket that is listening, or one nobody
+        // has dialled — or a peer with no name of its own: either way this
+        // descriptor reaches no path, and its own name was compared above.
+        let Some(dialled) = unix_sockets.get(peer).filter(|path| !path.is_empty()) else {
+            continue;
+        };
+        if watches(dialled) {
+            found.on_a_runtime_socket.push(format!(
+                "fd {fd} -> socket:[{inode}] connected to socket:[{peer}], which is \
+                 {dialled}"
+            ));
+        }
+    }
+    found
+}
+
+/// The path of every AF_UNIX socket on this host, by inode, empty for the
+/// ones the kernel publishes no path for. `/proc/net/unix` is `Num RefCount
+/// Protocol Flags Type St Inode Path`, behind one header line.
+fn unix_socket_paths() -> HashMap<String, String> {
+    let mut by_inode = HashMap::new();
+    let Ok(text) = std::fs::read_to_string("/proc/net/unix") else {
+        return by_inode;
+    };
+    for line in text.lines().skip(1) {
+        let fields: Vec<&str> = line.split_whitespace().collect();
+        if fields.len() < 7 {
+            continue;
+        }
+        by_inode.insert(
+            fields[6].to_owned(),
+            fields.get(7).copied().unwrap_or_default().to_owned(),
+        );
+    }
+    by_inode
+}
+
+/// The peer inode of every connected AF_UNIX socket, by inode, or `None`
+/// where this host cannot be asked.
+///
+/// Asked of `ss -xa`, which reads the kernel's socket diagnostics over
+/// netlink: that is the only place a connected socket's peer appears, and
+/// without it a descriptor dialled at a socket is a descriptor with no name.
+/// A socket with no peer — listening, or never dialled — is in the table with
+/// `*` where its peer would be, which is enough to account for it.
+fn unix_socket_peers() -> Option<HashMap<String, String>> {
+    let shown = std::process::Command::new("ss").arg("-xa").output().ok()?;
+    if !shown.status.success() {
+        return None;
+    }
+    let text = String::from_utf8_lossy(&shown.stdout).into_owned();
+    let mut by_inode = HashMap::new();
+    for line in text.lines() {
+        // netid state recv-q send-q local-address local-inode peer-address
+        // peer-inode [process], where an address is a path or `*` and an
+        // inode of 0 means there is nobody on the other end. The header line
+        // has no netid of this shape and is left out by that alone.
+        let fields: Vec<&str> = line.split_whitespace().collect();
+        if fields.len() < 8 || !fields[0].starts_with("u_") {
+            continue;
+        }
+        let (Ok(inode), Ok(peer)) = (fields[5].parse::<u64>(), fields[7].parse::<u64>()) else {
+            continue;
+        };
+        by_inode.insert(
+            inode.to_string(),
+            if peer == 0 {
+                String::new()
+            } else {
+                peer.to_string()
+            },
+        );
+    }
+    // An empty table is a tool that answered without answering; treating it
+    // as an answer would turn "nothing could be asked" into "nothing found".
+    if by_inode.is_empty() {
+        return None;
+    }
+    Some(by_inode)
+}
+
+/// The parts of D78's claim this host may be unable to prove, each skipped
+/// out loud with what a host that could would have proved (D27). The
+/// assertion itself runs either way: it is about what the runner opens, not
+/// about what the host allows.
+fn say_what_this_host_cannot_prove(test: &str, watched: &[PathBuf]) {
+    let present: Vec<String> = watched
+        .iter()
+        .filter(|path| path.exists())
+        .map(|path| path.display().to_string())
+        .collect();
+    if present.is_empty() {
+        skipped(
+            test,
+            &format!(
+                "none of the {} container-runtime socket paths the runner's code lists \
+                 exists on this host, so an empty walk cannot tell a runner that never \
+                 opens the Docker socket from a host that has no socket to open. A host \
+                 running Docker would have proved the first",
+                watched.len()
+            ),
+        );
+        return;
+    }
+    if !present
+        .iter()
+        .any(|path| this_user_can_write(Path::new(path)))
+    {
+        skipped(
+            test,
+            &format!(
+                "the container-runtime sockets on this host ({}) are not writable by \
+                 this user, so a descriptor on one was out of reach anyway. A host whose \
+                 user is in the docker group — this server is one, because the hub runs \
+                 under compose — would have proved the runner declines a socket it could \
+                 have used",
+                present.join(", ")
+            ),
+        );
+    }
+}
+
+/// Whether this user may write a path, asked of the kernel rather than
+/// guessed from the mode bits — the same question `privilege` asks, asked
+/// here about the host instead of about the runner.
+#[cfg(unix)]
+fn this_user_can_write(path: &Path) -> bool {
+    use std::os::unix::ffi::OsStrExt;
+
+    let Ok(c_path) = std::ffi::CString::new(path.as_os_str().as_bytes()) else {
+        return false;
+    };
+    // Safe: access(2) reads one path and returns an integer.
+    unsafe { libc::access(c_path.as_ptr(), libc::W_OK) == 0 }
+}
+
+#[cfg(not(unix))]
+fn this_user_can_write(_path: &Path) -> bool {
+    false
+}
+
+/// The walk run against descriptors this test plants on purpose, so that an
+/// empty result about the runner is a fact about the runner rather than about
+/// a walk that could never find anything.
+///
+/// Planted in *this* test process and against a stand-in path in a temporary
+/// directory of its own: no production path is touched and the real assertion
+/// stays exactly as strict as it was. One plant per shape the walk claims to
+/// see — the file, under the name of a **symlink** to it, which is the
+/// `/var/run` against `/run` case the canonicalisation exists for; a **bound**
+/// socket, which names no path in `/proc/<pid>/fd`; and a socket
+/// **connected** to one, which names no path anywhere and is found through
+/// its peer. Each is then closed and the walk must stop reporting it, because
+/// a walk that always finds something is no better than one that never does.
+#[cfg(unix)]
+fn the_walk_finds_a_planted_descriptor(test: &str) {
+    let temp = TempDir::new("planted-descriptor");
+    let me = std::process::id();
+
+    let real = temp.path().join("stand-in.sock");
+    std::fs::write(&real, b"a stand-in for a socket file").expect("the fixture writes");
+    let by_another_name = temp.path().join("by-another-name.sock");
+    std::os::unix::fs::symlink(&real, &by_another_name).expect("the fixture links");
+    let watched = both_names_of(std::iter::once(by_another_name));
+    let held = std::fs::File::open(&real).expect("the fixture opens its own stand-in");
+    let found = runtime_socket_descriptors_of(me, &watched);
+    assert!(
+        found
+            .on_a_runtime_socket
+            .iter()
+            .any(|line| line.starts_with("fd ") && line.contains(&real.display().to_string())),
+        "the walk missed the descriptor this test planted on {}, or did not name it and \
+         where it resolved: {found:?}",
+        real.display()
+    );
+    drop(held);
+    let after = runtime_socket_descriptors_of(me, &watched);
+    assert!(
+        after.on_a_runtime_socket.is_empty(),
+        "the walk reports a descriptor that is closed: {after:?}"
+    );
+
+    let planted = temp.path().join("planted.sock");
+    let watched = both_names_of(std::iter::once(planted.clone()));
+    let listener =
+        std::os::unix::net::UnixListener::bind(&planted).expect("the fixture binds a socket");
+    let found = runtime_socket_descriptors_of(me, &watched);
+    assert!(
+        found
+            .on_a_runtime_socket
+            .iter()
+            .any(|line| line.starts_with("fd ") && line.contains(&planted.display().to_string())),
+        "the walk missed the socket this test bound at {}, which only /proc/net/unix \
+         names: {found:?}",
+        planted.display()
+    );
+
+    // The third shape, and the only one neither `/proc/<pid>/fd` nor
+    // `/proc/net/unix` can answer: a descriptor *connected* to the socket,
+    // which is how a Docker client would hold it.
+    let dialled =
+        std::os::unix::net::UnixStream::connect(&planted).expect("the fixture dials its socket");
+    let accepted = listener.accept().expect("the fixture accepts its own dial");
+    if unix_socket_peers().is_some() {
+        let found = runtime_socket_descriptors_of(me, &watched);
+        assert!(
+            found
+                .on_a_runtime_socket
+                .iter()
+                .any(|line| line.contains("connected to")),
+            "the walk missed the descriptor this test dialled at {}, so a descriptor \
+             connected to a container-runtime socket would not have been found either: \
+             {found:?}",
+            planted.display()
+        );
+    } else {
+        skipped(
+            test,
+            &format!(
+                "the kernel's socket diagnostics cannot be asked on this host — `ss -xa` \
+                 is missing or answered nothing — and they are the only place a connected \
+                 AF_UNIX socket's peer appears. A descriptor the runner had *dialled* at \
+                 {} would not have been found by this walk, and this test planted one to \
+                 prove it. A host with iproute2 would have proved that shape too",
+                planted.display()
+            ),
+        );
+    }
+    drop(accepted);
+    drop(dialled);
+    drop(listener);
+    std::fs::remove_file(&planted).expect("the fixture removes its socket");
+    let after = runtime_socket_descriptors_of(me, &watched);
+    assert!(
+        after.on_a_runtime_socket.is_empty(),
+        "the walk reports a socket that is closed: {after:?}"
+    );
+}
+
+/// Linux-only; the test that calls it has already returned on any other host.
+#[cfg(not(unix))]
+fn the_walk_finds_a_planted_descriptor(_test: &str) {}
