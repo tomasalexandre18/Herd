@@ -447,9 +447,325 @@ async fn a_runner_s_health_report_and_its_age_are_in_the_hub_s_state() {
     );
 }
 
+/// D113: a runner streaming a job's log, with **no health report at all**, is
+/// not lost, and the live attempt it is holding is not written off.
+///
+/// This is the test the correction exists for. The hub used to time a
+/// connection on the health report alone, so a runner whose health task was
+/// starved or wedged while its log kept arriving was declared lost and its
+/// attempt requeued at its priority (E-21). On the first consumer's host —
+/// builds of tens of minutes, load p90 of 46 on 12 threads — that requeues a
+/// thirty-minute build that was visibly alive, and nobody could have explained
+/// why.
+///
+/// The threshold has to be real time, because the hub's clock is what is under
+/// test. So it is given two seconds and fed a frame every twenty milliseconds:
+/// the gap that would have to open for this test to lie is a hundred times the
+/// gap it keeps, and the assertion is still on a condition — the hub's own
+/// reading of how old the figures it never got are.
+#[tokio::test]
+async fn a_runner_streaming_its_log_is_not_lost_though_it_never_reports_health() {
+    let lost_after = Duration::from_secs(2);
+    let hub = Quick::start(lost_after).await;
+    let mut runner = Puppet::join(&hub, "runner-a").await;
+    let job_id = hub.submit("a build of tens of minutes").await;
+    let (assigned, attempt, _) = runner.take_a_job().await;
+    assert_eq!(assigned, job_id);
+    assert_eq!(attempt, 1);
+    runner
+        .say(ToHub::JobStarted {
+            job_id: job_id.clone(),
+            attempt,
+        })
+        .await;
+    hub.wait_until("the attempt is running", || {
+        hub.record(&job_id).state == JobState::Running
+    })
+    .await;
+
+    // Output, steadily, and nothing else: not one health report for more than
+    // twice the threshold. Waiting on the hub's own figure for the age of
+    // those reports is what makes "well past it" a condition rather than a
+    // sleep.
+    let streamed = stream_until(
+        &hub,
+        &mut runner,
+        &job_id,
+        attempt,
+        0,
+        2 * lost_after + lost_after / 2,
+    )
+    .await;
+    assert!(
+        streamed > 10,
+        "the stream has to be a stream: {streamed} chunks"
+    );
+
+    // The runner is still here, and the hub knows it has never reported.
+    let seen = hub.handle.runners();
+    assert_eq!(
+        seen.len(),
+        1,
+        "a runner whose log is arriving is a runner that is alive: {seen:?}"
+    );
+    assert_eq!(seen[0].name, "runner-a");
+    assert_eq!(
+        seen[0].reports_seen, 0,
+        "and it has reported no health at all, which is the whole point: {seen:?}"
+    );
+    assert!(
+        seen[0].last_health_age > lost_after,
+        "its figures are stale by its own clock: {:?}",
+        seen[0].last_health_age
+    );
+
+    // And the job is exactly where it was: one attempt, running, on this
+    // runner, with nothing said about losing it.
+    let record = hub.record(&job_id);
+    assert_eq!(
+        record.state,
+        JobState::Running,
+        "a live attempt must not be requeued: {record:?}"
+    );
+    assert_eq!(record.attempts.len(), 1, "{record:?}");
+    assert_eq!(record.attempts[0].number, 1);
+    assert_eq!(record.attempts[0].runner, "runner-a");
+    assert!(
+        record.attempts[0].ended.is_none(),
+        "nothing has been written off: {record:?}"
+    );
+    assert!(
+        record.attempts[0].ended_at.is_none(),
+        "the attempt has not ended: {record:?}"
+    );
+    let states: Vec<&str> = hub
+        .events(&job_id)
+        .iter()
+        .filter_map(|event| event.state().map(|state| state.name()))
+        .collect();
+    assert_eq!(
+        states,
+        ["queued", "assigned", "running"],
+        "the job never went round: {states:?}"
+    );
+
+    // And it finishes, on the attempt it has had all along.
+    runner
+        .say(ToHub::JobFinished {
+            job_id: job_id.clone(),
+            attempt,
+            outcome: JobOutcome::Exited { code: 0 },
+            chunks_sent: streamed,
+            metrics: JobMetrics::default(),
+            steps: Vec::new(),
+        })
+        .await;
+    runner.wait_for_the_result_ack(&job_id).await;
+    assert_eq!(
+        hub.record(&job_id).state,
+        JobState::Finished {
+            outcome: JobOutcome::Exited { code: 0 }
+        }
+    );
+}
+
+/// D113's other half: a runner whose **figures** are stale is given no new
+/// job, says so where a reader already looks, and keeps what it is running.
+///
+/// Free memory, free tmpfs and load arrive on the health report and nowhere
+/// else (E-40), so a runner that has stopped reporting is a runner the hub has
+/// no figures to admit against — and admitting against figures nobody has
+/// refreshed is the guess M8 exists to refuse. What that stops is **new** work
+/// only. The job already out there runs on, and the reason the next one is not
+/// going there is on the waiting job's record, in the same explained-decision
+/// style as a placement (E-36).
+#[tokio::test]
+async fn a_runner_whose_figures_are_stale_is_given_no_new_job_and_keeps_the_one_it_has() {
+    let lost_after = Duration::from_secs(2);
+    let hub = Quick::start(lost_after).await;
+    let (mut runner, running) = a_runner_whose_figures_went_stale(&hub, lost_after).await;
+
+    // A second job, submitted to a fleet of one machine that is alive and out
+    // of date. It is queued — not refused, because waiting is not a refusal
+    // (D38) — and the record says why.
+    let waiting = hub.submit("true").await;
+    hub.wait_until("the second job is waiting with a reason", || {
+        hub.record(&waiting).state == JobState::Queued && hub.record(&waiting).waiting_for.is_some()
+    })
+    .await;
+    let why = hub
+        .record(&waiting)
+        .waiting_for
+        .expect("the hub said why this job is waiting");
+    assert!(
+        why.contains("runner-a is alive but its figures are"),
+        "the sentence must say the machine is alive and its figures are not: {why}"
+    );
+    assert!(
+        why.contains("nothing new is claimed there"),
+        "and what that costs this job: {why}"
+    );
+    assert!(
+        why.contains("E-40") && why.contains("D113"),
+        "and where the rule is written: {why}"
+    );
+    assert!(
+        why.contains("as soon as a report arrives"),
+        "and what would change it: {why}"
+    );
+
+    // While the one already out there is untouched: still running, still
+    // attempt 1, and its output is still being taken.
+    let record = hub.record(&running);
+    assert_eq!(record.state, JobState::Running, "{record:?}");
+    assert_eq!(record.attempts.len(), 1, "{record:?}");
+    runner
+        .say(ToHub::LogChunk {
+            job_id: running.clone(),
+            attempt: 1,
+            stream: LogStream::Stdout,
+            seq: 10_000,
+            data: b"still building\n".to_vec(),
+        })
+        .await;
+    hub.wait_until("the running job's output is still taken", || {
+        hub.log(&running).contains("still building")
+    })
+    .await;
+    assert_eq!(
+        hub.record(&waiting).state,
+        JobState::Queued,
+        "and the waiting job is still waiting, not placed on stale figures"
+    );
+}
+
+/// And the quarantine lifts itself: one health report, and the runner is
+/// admitted again.
+///
+/// There is no second timeout behind it and no state to clear by hand — the
+/// figures are either fresh or they are not. The report is also the moment the
+/// queue is re-judged, for the reason a moved switch is (D80): a machine that
+/// can take work again should take it now, not at whatever next wakes the hub.
+#[tokio::test]
+async fn a_runner_reporting_health_again_is_admitted_again() {
+    let lost_after = Duration::from_secs(2);
+    let hub = Quick::start(lost_after).await;
+    let (mut runner, _running) = a_runner_whose_figures_went_stale(&hub, lost_after).await;
+
+    let waiting = hub.submit("true").await;
+    hub.wait_until("the second job is held back", || {
+        hub.record(&waiting).state == JobState::Queued
+            && hub
+                .record(&waiting)
+                .waiting_for
+                .is_some_and(|why| why.contains("its figures are"))
+    })
+    .await;
+
+    // Fresh figures.
+    runner.report_health(Vec::new(), false).await;
+
+    // And the job goes, on the report rather than on a timer.
+    let (assigned, attempt, _) = runner.take_a_job().await;
+    assert_eq!(
+        assigned, waiting,
+        "the job held back for stale figures is the one that goes"
+    );
+    assert_eq!(attempt, 1, "it was never attempted anywhere: {attempt}");
+    assert!(
+        hub.handle
+            .runners()
+            .first()
+            .is_some_and(|r| r.reports_seen >= 1),
+        "and the hub has the figures it judged that on"
+    );
+}
+
+/// A runner that is plainly alive — its log is arriving — and has not reported
+/// health since it joined, with one job running on it.
+///
+/// The shared ground of the two tests above. It leaves the runner streaming,
+/// so the caller must not dawdle: this is a live link, and a link nothing
+/// comes back on for the threshold is still a link that is gone.
+async fn a_runner_whose_figures_went_stale(hub: &Quick, lost_after: Duration) -> (Puppet, JobId) {
+    let mut runner = Puppet::join(hub, "runner-a").await;
+    let running = hub.submit("a build of tens of minutes").await;
+    let (assigned, attempt, _) = runner.take_a_job().await;
+    assert_eq!(assigned, running);
+    runner
+        .say(ToHub::JobStarted {
+            job_id: running.clone(),
+            attempt,
+        })
+        .await;
+    hub.wait_until("the attempt is running", || {
+        hub.record(&running).state == JobState::Running
+    })
+    .await;
+    stream_until(
+        hub,
+        &mut runner,
+        &running,
+        attempt,
+        0,
+        lost_after + lost_after / 2,
+    )
+    .await;
+    (runner, running)
+}
+
+/// Stream a job's output until the hub's reading of this runner's figures is
+/// `age` old, and answer with how many chunks that took.
+///
+/// The condition is the hub's own figure, never a sleep: the point being
+/// proved is what that figure does *not* decide any more. The cadence is
+/// twenty milliseconds, two orders of magnitude under any threshold these
+/// tests give the hub, so the stream is a stream and not a coincidence.
+async fn stream_until(
+    hub: &Quick,
+    runner: &mut Puppet,
+    job_id: &JobId,
+    attempt: u32,
+    from_seq: u64,
+    age: Duration,
+) -> u64 {
+    let deadline = Instant::now() + PATIENCE;
+    let mut seq = from_seq;
+    loop {
+        let old_enough = hub
+            .handle
+            .runners()
+            .iter()
+            .any(|r| r.last_health_age >= age);
+        if old_enough {
+            return seq - from_seq;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "timed out waiting for the hub's figures on this runner to reach {age:?}"
+        );
+        runner
+            .say(ToHub::LogChunk {
+                job_id: job_id.clone(),
+                attempt,
+                stream: LogStream::Stdout,
+                seq,
+                data: format!("chunk {seq}\n").into_bytes(),
+            })
+            .await;
+        seq += 1;
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
 /// E-21, the whole of it: a runner that stops answering has its job attempted
 /// once more, and the record names both attempts — which runner each was on,
 /// and why the first one ended.
+///
+/// **Unchanged by D113**, and that is half of what it is pinning now: a runner
+/// that says nothing at all is still lost, its attempt is still marked lost
+/// with the reason, and the job still goes round exactly once. What D113
+/// widened is what counts as speaking, not what silence costs.
 #[tokio::test]
 async fn a_silent_runner_s_job_is_attempted_again_and_the_record_names_both() {
     let hub = Quick::start(Duration::from_secs(1)).await;
