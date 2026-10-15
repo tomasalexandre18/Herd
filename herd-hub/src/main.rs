@@ -1,11 +1,11 @@
 use std::net::SocketAddr;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use clap::Parser;
 use herd_hub::{
-    Hub, JobDirStore, JobStore, Policy, Stickiness, AGING_STEP, DEFAULT_LISTEN_ADDR,
+    Authority, Hub, JobDirStore, JobStore, Policy, Stickiness, AGING_STEP, DEFAULT_LISTEN_ADDR,
     DRAIN_FIRST_LIMIT, LOST_AFTER, REQUEUE_BUDGET, STICKINESS_LIMIT, WAIT_RESTATEMENT,
 };
 use herd_proto::HEALTH_EVERY;
@@ -27,6 +27,21 @@ struct Args {
     /// written.
     #[arg(long, env = "HERD_STATE_DIR", default_value = DEFAULT_STATE_DIR)]
     state_dir: PathBuf,
+    /// File holding the one shared token every requester must carry (Q8).
+    ///
+    /// A **path**, never the token itself: a secret on a command line is
+    /// readable out of `/proc` by every user of the host, and invariant 7
+    /// names a file path given at startup as the way to pass one. The hub
+    /// reads it once, keeps a hash, and refuses every requester that does not
+    /// carry it. Left out, this hub authenticates no requester — which is
+    /// only safe where it listens by default, on loopback behind the reverse
+    /// proxy (D14) — and says so in one line as it starts.
+    ///
+    /// Runners are not covered by this: each one carries a token of its own,
+    /// minted by `herdctl runner approve` and kept hashed in the state root
+    /// (E-48). An unapproved runner is refused whatever this option says.
+    #[arg(long, env = "HERD_REQUESTER_TOKEN_FILE", value_name = "PATH")]
+    requester_token_file: Option<PathBuf>,
     /// Seconds without a health report after which a runner is lost and the
     /// jobs it was running are attempted once more (E-21). It must outlast
     /// three health reports, or a healthy runner is declared lost between two
@@ -93,6 +108,27 @@ struct Args {
     requeue_budget: u32,
 }
 
+/// The shared requester token, from the file the operator named (Q8).
+///
+/// Trimmed, because a file written with `echo` ends in a newline and a token
+/// that differed from itself by one byte would be a refusal nobody could
+/// explain. Empty is an error and not "no token": a hub told to require a
+/// token and handed an empty file must not quietly serve everyone.
+fn read_requester_token(path: &Path) -> Result<herd_hub::SharedSecret> {
+    let text = std::fs::read_to_string(path)
+        .with_context(|| format!("reading the requester token from {}", path.display()))?;
+    let token = text.trim();
+    if token.is_empty() {
+        anyhow::bail!(
+            "the requester token file {} is empty: this hub was told to require a token and \
+             an empty one would admit every requester",
+            path.display()
+        );
+    }
+    herd_hub::SharedSecret::of(token)
+        .map_err(|error| anyhow::anyhow!("hashing the requester token: {error}"))
+}
+
 /// Seconds as a duration, with a negative figure read as zero rather than
 /// silently becoming a very long wait.
 fn seconds(value: f64) -> std::time::Duration {
@@ -129,9 +165,38 @@ async fn main() -> Result<()> {
         ..Policy::default()
     };
     let state_root_id = store.state_root_id().to_owned();
+    let approved = store.approved_runner_count();
+    // Who is allowed here (E-48, Q8). Read before the port is bound: a hub
+    // that started, accepted requesters and then found its token file
+    // unreadable would be an open hub nobody meant to run.
+    let authority = Authority {
+        requester_token: match &args.requester_token_file {
+            Some(path) => Some(read_requester_token(path)?),
+            None => None,
+        },
+    };
+    match &args.requester_token_file {
+        Some(path) => println!(
+            "herd-hub: every requester must carry the token in {} (--requester-token-file); \
+             this hub keeps only a hash of it",
+            path.display()
+        ),
+        None => println!(
+            "herd-hub: NO requester token is set, so anything that can reach this hub may \
+             submit, cancel and approve runners. That is only safe on loopback behind the \
+             reverse proxy; set --requester-token-file (HERD_REQUESTER_TOKEN_FILE) before \
+             this hub is reachable from anywhere else"
+        ),
+    }
+    println!(
+        "herd-hub: {approved} runner(s) are approved on this state root; a runner that is not \
+         approved, or that carries the wrong token, is refused by name and claims nothing \
+         (`herdctl runner approve <name>` mints one, `herdctl runner list` says who is \
+         approved)"
+    );
     // A timing that cannot mean what it says is refused here, before the port
     // is bound and before any runner can join (E-21, E-40).
-    let hub = Hub::bind_with_policy(args.listen, Arc::new(store), policy).await?;
+    let hub = Hub::bind_with(args.listen, Arc::new(store), policy, authority).await?;
     println!(
         "herd-hub {} listening on ws://{}, state in {} ({state_root_id}), \
          {unfinished} job(s) not over, {} quarantined, a runner reporting every {:?} is \

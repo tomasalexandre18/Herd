@@ -47,6 +47,9 @@ const TURNED_AWAY_PATIENCE: Duration = Duration::from_millis(500);
 struct Quick {
     hub_url: String,
     store: Arc<JobDirStore>,
+    /// The token each runner this test approved carries, so that one name is
+    /// approved once however many times a puppet dials under it (E-48).
+    approved: std::sync::Mutex<std::collections::HashMap<String, String>>,
     #[allow(dead_code)]
     state: TempDir,
     handle: HubHandle,
@@ -81,6 +84,7 @@ impl Quick {
         Self {
             hub_url,
             store,
+            approved: std::sync::Mutex::new(std::collections::HashMap::new()),
             state,
             handle,
             serving,
@@ -93,6 +97,37 @@ impl Quick {
             token: None,
             name: Some("test-requester".to_owned()),
         }
+    }
+
+    /// The token one runner carries, approving it the first time it is asked
+    /// for (E-48).
+    ///
+    /// An unapproved runner claims nothing, so every runner in this file is
+    /// approved first, exactly as an operator does once. **Once** is the
+    /// point of the cache: approving a name again mints a new token and
+    /// revokes the old one, and a twin dialling under a name somebody else
+    /// holds must not be able to change what the incumbent carries.
+    ///
+    /// `None` for a peer with no effective name at all, which is refused for
+    /// that reason before anything about a token is asked.
+    fn token_for(&self, name: &str) -> Option<String> {
+        if name.is_empty() {
+            return None;
+        }
+        let mut approved = self
+            .approved
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        Some(
+            approved
+                .entry(name.to_owned())
+                .or_insert_with(|| {
+                    self.store
+                        .approve_runner(name)
+                        .expect("the state root mints a token")
+                })
+                .clone(),
+        )
     }
 
     fn record(&self, job_id: &JobId) -> JobRecord {
@@ -163,8 +198,8 @@ impl Puppet {
     /// The instance identity is derived from the name, so joining twice under
     /// one name is one process dialling again — a redial — and a twin is what
     /// [`Puppet::dial`] makes.
-    async fn join(hub_url: &str, name: &str) -> Self {
-        Self::handshake(hub_url, name, &format!("run-{name}"), None, None).await
+    async fn join(hub: &Quick, name: &str) -> Self {
+        Self::handshake(hub, name, &format!("run-{name}"), None, None).await
     }
 
     /// Dial saying exactly which process this is and which hub state root it
@@ -176,12 +211,12 @@ impl Puppet {
     /// sends it anyway, because that frame is how the runner learns which
     /// state root it is talking to — so the answer is whatever follows it.
     async fn dial(
-        hub_url: &str,
+        hub: &Quick,
         name: &str,
         instance: &str,
         state_root: Option<&str>,
     ) -> Result<Self, Box<FromHub>> {
-        Self::dial_saying(hub_url, name, instance, state_root, None).await
+        Self::dial_saying(hub, name, instance, state_root, None).await
     }
 
     /// The same, announcing the cadence this runner really reports at — the
@@ -189,13 +224,13 @@ impl Puppet {
     /// configurations that each pass their own startup check can still be
     /// fatal together.
     async fn dial_saying(
-        hub_url: &str,
+        hub: &Quick,
         name: &str,
         instance: &str,
         state_root: Option<&str>,
         health_every: Option<Duration>,
     ) -> Result<Self, Box<FromHub>> {
-        let mut puppet = Self::handshake(hub_url, name, instance, state_root, health_every).await;
+        let mut puppet = Self::handshake(hub, name, instance, state_root, health_every).await;
         match puppet.next_within(TURNED_AWAY_PATIENCE).await {
             Some(answer) => Err(Box::new(answer)),
             None => Ok(puppet),
@@ -203,19 +238,23 @@ impl Puppet {
     }
 
     async fn handshake(
-        hub_url: &str,
+        hub: &Quick,
         name: &str,
         instance: &str,
         state_root: Option<&str>,
         health_every: Option<Duration>,
     ) -> Self {
-        let (mut socket, _response) = tokio_tungstenite::connect_async(hub_url)
+        // The name the hub will judge this peer by: its own, or the process
+        // identity it falls back on when it gave none.
+        let effective = if name.is_empty() { instance } else { name };
+        let (mut socket, _response) = tokio_tungstenite::connect_async(&hub.hub_url)
             .await
             .expect("the hub accepts a connection");
         let hello = ToHub::Hello {
             protocol_version: PROTOCOL_VERSION,
+            peer_version: herd_runner::runner_version().to_owned(),
             role: Role::Runner,
-            token: None,
+            token: hub.token_for(effective),
             name: Some(name.to_owned()),
             instance: Some(instance.to_owned()),
             state_root: state_root.map(str::to_owned),
@@ -332,7 +371,7 @@ impl Puppet {
 #[tokio::test]
 async fn a_runner_s_health_report_and_its_age_are_in_the_hub_s_state() {
     let hub = Quick::start(Duration::from_secs(60)).await;
-    let mut runner = Puppet::join(&hub.hub_url, "wsl-pc").await;
+    let mut runner = Puppet::join(&hub, "wsl-pc").await;
 
     // Before any report: the runner is here, and the hub says it has heard
     // nothing from it yet — which is not the same as a runner gone quiet.
@@ -414,7 +453,7 @@ async fn a_runner_s_health_report_and_its_age_are_in_the_hub_s_state() {
 #[tokio::test]
 async fn a_silent_runner_s_job_is_attempted_again_and_the_record_names_both() {
     let hub = Quick::start(Duration::from_secs(1)).await;
-    let mut first = Puppet::join(&hub.hub_url, "runner-a").await;
+    let mut first = Puppet::join(&hub, "runner-a").await;
     let job_id = hub.submit("true").await;
     let (assigned, attempt, command) = first.take_a_job().await;
     assert_eq!(assigned, job_id);
@@ -467,7 +506,7 @@ async fn a_silent_runner_s_job_is_attempted_again_and_the_record_names_both() {
     assert!(requeued.attempts[0].ended_at.is_some());
 
     // A second runner picks it up as attempt 2 and finishes it.
-    let mut second = Puppet::join(&hub.hub_url, "runner-b").await;
+    let mut second = Puppet::join(&hub, "runner-b").await;
     let (again, second_attempt, _) = second.take_a_job().await;
     assert_eq!(again, job_id);
     assert_eq!(
@@ -561,7 +600,7 @@ async fn a_silent_runner_s_job_is_attempted_again_and_the_record_names_both() {
 #[tokio::test]
 async fn a_returning_runner_finishes_nothing_of_the_attempt_it_lost() {
     let hub = Quick::start(Duration::from_secs(1)).await;
-    let mut lost = Puppet::join(&hub.hub_url, "runner-a").await;
+    let mut lost = Puppet::join(&hub, "runner-a").await;
     let job_id = hub.submit("true").await;
     let (_, first_attempt, _) = lost.take_a_job().await;
     lost.say(ToHub::JobStarted {
@@ -581,7 +620,7 @@ async fn a_returning_runner_finishes_nothing_of_the_attempt_it_lost() {
     // The runner comes back — the same machine, a new connection — and is
     // handed the job again, as attempt 2. It is still holding everything it
     // never managed to deliver about attempt 1.
-    let mut back = Puppet::join(&hub.hub_url, "runner-a").await;
+    let mut back = Puppet::join(&hub, "runner-a").await;
     let (_, second_attempt, _) = back.take_a_job().await;
     assert_eq!(second_attempt, 2);
     let before = hub.record(&job_id);
@@ -670,7 +709,7 @@ async fn a_returning_runner_finishes_nothing_of_the_attempt_it_lost() {
 async fn a_second_loss_ends_the_job_rather_than_starting_a_third_attempt() {
     let hub = Quick::start(Duration::from_secs(1)).await;
     let job_id = {
-        let mut first = Puppet::join(&hub.hub_url, "runner-a").await;
+        let mut first = Puppet::join(&hub, "runner-a").await;
         let job_id = hub.submit("true").await;
         let (_, attempt, _) = first.take_a_job().await;
         first
@@ -686,7 +725,7 @@ async fn a_second_loss_ends_the_job_rather_than_starting_a_third_attempt() {
         job_id
     };
 
-    let mut second = Puppet::join(&hub.hub_url, "runner-b").await;
+    let mut second = Puppet::join(&hub, "runner-b").await;
     let (_, attempt, _) = second.take_a_job().await;
     assert_eq!(attempt, 2);
     second
@@ -744,7 +783,7 @@ async fn a_cancel_ends_one_job_within_ten_seconds_and_a_sibling_runs_on() {
     let runner = tokio::spawn(herd_runner::run(herd_runner::Config {
         hub_url: hub.hub_url.clone(),
         name: Some("test-runner".to_owned()),
-        token: None,
+        token: hub.token_for("test-runner"),
         confinement: herd_runner::Confinement::with_data_root(data_root.path()),
         ..herd_runner::Config::default()
     }));
@@ -839,7 +878,7 @@ async fn a_busy_runner_asked_to_stop_drains_inside_five_seconds() {
         herd_runner::Config {
             hub_url: hub.hub_url.clone(),
             name: Some("test-runner".to_owned()),
-            token: None,
+            token: hub.token_for("test-runner"),
             // A data root of its own: a runner locks its root for the life of
             // the process (D32), and `Config::default()` points at the real
             // one under $XDG_STATE_HOME — which two tests would fight over
@@ -920,7 +959,7 @@ async fn a_draining_runner_refuses_a_job_submitted_in_the_meantime() {
         herd_runner::Config {
             hub_url: hub.hub_url.clone(),
             name: Some("test-runner".to_owned()),
-            token: None,
+            token: hub.token_for("test-runner"),
             // A data root of its own: a runner locks its root for the life of
             // the process (D32), and `Config::default()` points at the real
             // one under $XDG_STATE_HOME — which two tests would fight over
@@ -978,7 +1017,7 @@ async fn a_draining_runner_refuses_a_job_submitted_in_the_meantime() {
 #[tokio::test]
 async fn output_lost_with_nothing_behind_it_is_asked_for_and_recovered() {
     let hub = Quick::start(Duration::from_secs(60)).await;
-    let mut runner = Puppet::join(&hub.hub_url, "runner-a").await;
+    let mut runner = Puppet::join(&hub, "runner-a").await;
     let job_id = hub.submit("true").await;
     let (_, attempt, _) = runner.take_a_job().await;
     runner
@@ -1079,7 +1118,7 @@ async fn output_lost_with_nothing_behind_it_is_asked_for_and_recovered() {
 #[tokio::test]
 async fn output_that_cannot_be_recovered_is_named_in_the_log() {
     let hub = Quick::start(Duration::from_secs(60)).await;
-    let mut runner = Puppet::join(&hub.hub_url, "runner-a").await;
+    let mut runner = Puppet::join(&hub, "runner-a").await;
     let job_id = hub.submit("true").await;
     let (_, attempt, _) = runner.take_a_job().await;
     runner
@@ -1163,7 +1202,7 @@ async fn output_that_cannot_be_recovered_is_named_in_the_log() {
 #[tokio::test]
 async fn output_missing_between_two_health_reports_is_asked_for() {
     let hub = Quick::start(Duration::from_secs(60)).await;
-    let mut runner = Puppet::join(&hub.hub_url, "runner-a").await;
+    let mut runner = Puppet::join(&hub, "runner-a").await;
     let job_id = hub.submit("true").await;
     let (_, attempt, _) = runner.take_a_job().await;
     runner
@@ -1249,7 +1288,7 @@ async fn output_missing_between_two_health_reports_is_asked_for() {
 async fn a_job_waiting_for_a_runner_is_cancelled_by_the_hub_itself() {
     let hub = Quick::start(Duration::from_secs(1)).await;
     let job_id = {
-        let mut lost = Puppet::join(&hub.hub_url, "runner-a").await;
+        let mut lost = Puppet::join(&hub, "runner-a").await;
         let job_id = hub.submit("true").await;
         let (_, attempt, _) = lost.take_a_job().await;
         lost.say(ToHub::JobStarted {
@@ -1308,7 +1347,7 @@ async fn a_verdict_from_a_runner_the_attempt_was_not_given_to_is_refused_by_name
     // A minute of threshold: nothing here is the watchdog's doing. The
     // attempt is live and unquestioned throughout.
     let hub = Quick::start(Duration::from_secs(60)).await;
-    let mut holder = Puppet::join(&hub.hub_url, "runner-x").await;
+    let mut holder = Puppet::join(&hub, "runner-x").await;
     let job_id = hub.submit("true").await;
     let (_, attempt, _) = holder.take_a_job().await;
     holder
@@ -1332,7 +1371,7 @@ async fn a_verdict_from_a_runner_the_attempt_was_not_given_to_is_refused_by_name
     })
     .await;
 
-    let mut other = Puppet::join(&hub.hub_url, "runner-y").await;
+    let mut other = Puppet::join(&hub, "runner-y").await;
     other
         .say(ToHub::JobFinished {
             job_id: job_id.clone(),
@@ -1400,7 +1439,7 @@ async fn a_verdict_from_a_runner_the_attempt_was_not_given_to_is_refused_by_name
         !hub.handle.runner_connected()
     })
     .await;
-    let mut back = Puppet::join(&hub.hub_url, "runner-x").await;
+    let mut back = Puppet::join(&hub, "runner-x").await;
     back.say(ToHub::JobFinished {
         job_id: job_id.clone(),
         attempt,
@@ -1441,7 +1480,7 @@ async fn a_runner_announcing_another_state_root_is_turned_away_naming_both() {
     );
 
     let turned_away = *Puppet::dial(
-        &hub.hub_url,
+        &hub,
         "wsl-pc",
         "run-one",
         Some("root-of-a-hub-that-is-gone"),
@@ -1485,7 +1524,7 @@ async fn a_runner_announcing_another_state_root_is_turned_away_naming_both() {
     // The same runner, once it agrees about which state it is serving, is
     // welcome and is dispatched to. Being turned away is transient, which is
     // the whole difference from a refusal.
-    let mut agreed = Puppet::dial(&hub.hub_url, "wsl-pc", "run-one", Some(&mine))
+    let mut agreed = Puppet::dial(&hub, "wsl-pc", "run-one", Some(&mine))
         .await
         .expect("a runner of this state root is welcome");
     let job_id = hub.submit("true").await;
@@ -1508,7 +1547,7 @@ async fn a_runner_announcing_another_state_root_is_turned_away_naming_both() {
 #[tokio::test]
 async fn one_name_claimed_by_two_live_runners_is_said_plainly_and_nobody_is_kicked() {
     let hub = Quick::start(Duration::from_secs(60)).await;
-    let mut incumbent = Puppet::join(&hub.hub_url, "wsl-pc").await;
+    let mut incumbent = Puppet::join(&hub, "wsl-pc").await;
     incumbent.report_health(Vec::new(), false).await;
     hub.wait_until("the incumbent has been heard from", || {
         hub.handle
@@ -1521,7 +1560,7 @@ async fn one_name_claimed_by_two_live_runners_is_said_plainly_and_nobody_is_kick
     let (assigned, attempt, _) = incumbent.take_a_job().await;
     assert_eq!(assigned, job_id);
 
-    let twin = *Puppet::dial(&hub.hub_url, "wsl-pc", "run-the-twin", None)
+    let twin = *Puppet::dial(&hub, "wsl-pc", "run-the-twin", None)
         .await
         .expect_err("a name a live runner holds is not free");
     let FromHub::StandBy { reason, .. } = twin else {
@@ -1561,7 +1600,7 @@ async fn one_name_claimed_by_two_live_runners_is_said_plainly_and_nobody_is_kick
 
     // A redial — the same process, dialling again — does supersede, and
     // finishes the job it was given before the gap.
-    let mut again = Puppet::join(&hub.hub_url, "wsl-pc").await;
+    let mut again = Puppet::join(&hub, "wsl-pc").await;
     assert!(
         incumbent.next().await.is_none(),
         "a superseded connection is dropped, not left half alive"
@@ -1605,7 +1644,7 @@ async fn one_name_claimed_by_two_live_runners_is_said_plainly_and_nobody_is_kick
 #[tokio::test]
 async fn nothing_is_written_to_a_job_that_is_over_not_even_by_its_own_runner() {
     let hub = Quick::start(Duration::from_secs(60)).await;
-    let mut runner = Puppet::join(&hub.hub_url, "runner-x").await;
+    let mut runner = Puppet::join(&hub, "runner-x").await;
     let job_id = hub.submit("true").await;
     let (_, attempt, _) = runner.take_a_job().await;
     runner
@@ -1750,6 +1789,7 @@ async fn the_hub_s_first_answer(hub_url: &str, name: &str, instance: &str) -> Fr
         .expect("the hub accepts a connection");
     let hello = ToHub::Hello {
         protocol_version: PROTOCOL_VERSION,
+        peer_version: herd_runner::runner_version().to_owned(),
         role: Role::Runner,
         token: None,
         name: Some(name.to_owned()),
@@ -1821,7 +1861,7 @@ async fn a_peer_whose_name_and_instance_are_blank_is_refused_like_a_nameless_one
 
     // A runner with no name but a real instance still wears it: that is the
     // case M3 kept, and it is not this one.
-    let nameless = Puppet::dial(&hub.hub_url, "", "run-3fa91c", None)
+    let nameless = Puppet::dial(&hub, "", "run-3fa91c", None)
         .await
         .expect("a runner that says which process it is has an identity");
     drop(nameless);
@@ -1849,7 +1889,7 @@ async fn a_runner_whose_real_cadence_cannot_satisfy_the_hub_is_refused_by_figure
     let hub = Quick::start(Duration::from_secs(3)).await;
 
     let turned_away = *Puppet::dial_saying(
-        &hub.hub_url,
+        &hub,
         "wsl-pc",
         "run-one",
         None,
@@ -1872,7 +1912,7 @@ async fn a_runner_whose_real_cadence_cannot_satisfy_the_hub_is_refused_by_figure
     // The same runner, reporting often enough, is welcome and is dispatched
     // to: what was refused is a pairing, not a machine.
     let mut fast = Puppet::dial_saying(
-        &hub.hub_url,
+        &hub,
         "wsl-pc",
         "run-two",
         None,
@@ -1917,7 +1957,7 @@ async fn a_declared_command_is_handed_over_whole_on_every_attempt() {
     // A runner is connected before the submission: the hub refuses a job it
     // has no machine for at all, so without this the test would be about
     // that instead.
-    let mut holder = Puppet::join(&hub.hub_url, "runner-x").await;
+    let mut holder = Puppet::join(&hub, "runner-x").await;
     let job_id = herdctl::submit_job(
         &hub.requester(),
         vec!["a-line --only one".to_owned()],
@@ -2007,7 +2047,7 @@ async fn a_run_hook_that_would_never_run_the_line_is_refused_at_submission() {
     let hub = Quick::start(Duration::from_secs(60)).await;
     // A runner has to be connected, or the refusal would be about that
     // instead and this test would pass for the wrong reason.
-    let _runner = Puppet::join(&hub.hub_url, "runner-x").await;
+    let _runner = Puppet::join(&hub, "runner-x").await;
     let refused = herdctl::submit_job(
         &hub.requester(),
         vec!["a-line".to_owned()],

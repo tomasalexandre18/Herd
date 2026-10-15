@@ -447,6 +447,7 @@ async fn requester_socket(
         .expect("the hub accepts a connection");
     let hello = ToHub::Hello {
         protocol_version: PROTOCOL_VERSION,
+        peer_version: herdctl::requester_version().to_owned(),
         role: Role::Requester,
         token: None,
         name: Some("a-requester-with-its-own-frames".to_owned()),

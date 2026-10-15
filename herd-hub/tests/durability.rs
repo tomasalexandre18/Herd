@@ -18,11 +18,21 @@ use support::{
     events_of, file_state_of, job_dir, log_of, record_of, shell, wait_until, Harness, HubProcess,
 };
 
-fn runner_config(hub_url: &str, data_root: &support::DataRootDir) -> herd_runner::Config {
+/// The runner these tests start, carrying the token its approval minted.
+///
+/// An unapproved runner claims nothing (E-48), so the approval is made on the
+/// state root before the hub is started on it — which is what an operator
+/// really does, and what makes the approval survive the restarts this file is
+/// about.
+fn runner_config(
+    hub_url: &str,
+    token: &str,
+    data_root: &support::DataRootDir,
+) -> herd_runner::Config {
     herd_runner::Config {
         hub_url: hub_url.to_owned(),
         name: Some("durable-runner".to_owned()),
-        token: None,
+        token: Some(token.to_owned()),
         confinement: support::confinement(data_root),
         ..herd_runner::Config::default()
     }
@@ -35,6 +45,10 @@ fn runner_config(hub_url: &str, data_root: &support::DataRootDir) -> herd_runner
 #[tokio::test]
 async fn a_hub_that_restarts_loses_no_result_and_no_queued_job() {
     let state = tempfile::tempdir().expect("a temporary state directory");
+    // The operator approves the machine before the hub is started on this
+    // root: an unapproved runner claims nothing (E-48), and an approval is a
+    // file in the root, so it outlives every hub this test kills.
+    let token = support::approve_on_disk(state.path(), "durable-runner");
 
     // ---- The hub that is about to die.
     let first_hub = HubProcess::start(state.path());
@@ -45,7 +59,7 @@ async fn a_hub_that_restarts_loses_no_result_and_no_queued_job() {
     let (data_root, confined) = support::prepared_runner("durable-runner");
     let first_link = tokio::spawn({
         let (config, session) = (
-            runner_config(&first_hub.hub_url, &data_root),
+            runner_config(&first_hub.hub_url, &token, &data_root),
             session.clone(),
         );
         let confined = Arc::clone(&confined);
@@ -132,7 +146,7 @@ async fn a_hub_that_restarts_loses_no_result_and_no_queued_job() {
     let second_hub = HubProcess::start(state.path());
     let second_link = tokio::spawn({
         let (config, session) = (
-            runner_config(&second_hub.hub_url, &data_root),
+            runner_config(&second_hub.hub_url, &token, &data_root),
             session.clone(),
         );
         let confined = Arc::clone(&confined);
@@ -526,13 +540,17 @@ impl Wreck {
 async fn a_result_for_a_job_of_a_state_root_that_is_gone_is_never_offered() {
     let first_root = tempfile::tempdir().expect("a temporary state directory");
     let second_root = tempfile::tempdir().expect("another one");
+    // Approved on both roots, because this test is about a verdict crossing
+    // from one to the other and not about who is allowed on either (E-48).
+    let token = support::approve_on_disk(first_root.path(), "durable-runner");
+    let on_the_second_root = support::approve_on_disk(second_root.path(), "durable-runner");
 
     let first_hub = HubProcess::start(first_root.path());
     let session = Session::new();
     let (data_root, confined) = support::prepared_runner("durable-runner");
     let first_link = tokio::spawn({
         let (config, session) = (
-            runner_config(&first_hub.hub_url, &data_root),
+            runner_config(&first_hub.hub_url, &token, &data_root),
             session.clone(),
         );
         let confined = Arc::clone(&confined);
@@ -563,7 +581,7 @@ async fn a_result_for_a_job_of_a_state_root_that_is_gone_is_never_offered() {
     );
     let second_hub = HubProcess::start(second_root.path());
     let turned_away = herd_runner::serve_once(
-        runner_config(&second_hub.hub_url, &data_root),
+        runner_config(&second_hub.hub_url, &on_the_second_root, &data_root),
         session.clone(),
         Arc::clone(&confined),
     )
@@ -600,7 +618,7 @@ async fn a_result_for_a_job_of_a_state_root_that_is_gone_is_never_offered() {
     // state root now, and runs jobs for it.
     let second_link = tokio::spawn({
         let (config, session) = (
-            runner_config(&second_hub.hub_url, &data_root),
+            runner_config(&second_hub.hub_url, &on_the_second_root, &data_root),
             session.clone(),
         );
         let confined = Arc::clone(&confined);
@@ -727,10 +745,11 @@ async fn a_record_whose_labels_the_rules_reject_is_quarantined_not_fatal() {
 
     // ---- And the hub itself serves, on that same state root, with the
     // quarantined job sitting in it.
+    let token = support::approve_on_disk(state.path(), "durable-runner");
     let hub = HubProcess::start(state.path());
     let (data_root, confined) = support::prepared_runner("quarantine-runner");
     let link = tokio::spawn({
-        let config = runner_config(&hub.hub_url, &data_root);
+        let config = runner_config(&hub.hub_url, &token, &data_root);
         let confined = Arc::clone(&confined);
         async move { herd_runner::serve_once(config, Session::new(), confined).await }
     });

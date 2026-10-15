@@ -187,6 +187,9 @@ pub struct Herd {
     /// over one directory, and the second would refuse to start.
     pub data_root: TempDir,
     pub port: u16,
+    /// The token each runner of this herd carries, so one name is approved
+    /// once however many times it is started (E-48).
+    approved: std::sync::Mutex<std::collections::HashMap<String, String>>,
 }
 
 impl Herd {
@@ -196,7 +199,76 @@ impl Herd {
             logs: tempfile::tempdir().expect("a temporary directory for the logs"),
             data_root: tempfile::tempdir().expect("a temporary data root"),
             port: free_port(),
+            approved: std::sync::Mutex::new(std::collections::HashMap::new()),
         }
+    }
+
+    /// Approve one runner through the real command, and come back with the
+    /// token it printed (E-48).
+    ///
+    /// `herdctl runner approve <name>`, as an operator types it once per
+    /// machine, against the hub that is already running: an unapproved runner
+    /// claims nothing, so every runner these tests start goes through this
+    /// first. The token is on stdout alone, which is what makes this one line.
+    ///
+    /// Blocking rather than `async`, so that starting a runner stays the one
+    /// synchronous line it has always been at forty-odd call sites. The hub is
+    /// a separate process, so there is nothing here for a runtime to deadlock
+    /// on.
+    pub fn approve(&self, name: &str) -> String {
+        let mut approved = self
+            .approved
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        approved
+            .entry(name.to_owned())
+            .or_insert_with(|| match TcpStream::connect(self.addr()) {
+                // The hub is up: the operator's own command, over the wire.
+                Ok(_) => {
+                    let output = std::process::Command::new(binary("herdctl"))
+                        .arg("--hub")
+                        .arg(self.url())
+                        .args(["runner", "approve", name])
+                        .output()
+                        .expect("herdctl runs");
+                    assert!(
+                        output.status.success(),
+                        "approving {name} failed: {}",
+                        String::from_utf8_lossy(&output.stderr)
+                    );
+                    let token = String::from_utf8_lossy(&output.stdout).trim().to_owned();
+                    assert!(!token.is_empty(), "an approval prints the token it minted");
+                    token
+                }
+                // No hub yet, which some of these tests want on purpose: a
+                // runner started against a port nothing is listening on.
+                // Approving is then done on the state root itself, which is
+                // also what a deployment does before it starts the hub for
+                // the first time — the approval is a file in the root, so the
+                // hub reads it when it comes up.
+                Err(_) => {
+                    use herd_hub::JobStore;
+                    herd_hub::JobDirStore::open(self.state.path())
+                        .expect("the state root opens")
+                        .approve_runner(name)
+                        .expect("the state root mints a token")
+                }
+            })
+            .clone()
+    }
+
+    /// Forget which runners this herd approved (E-48).
+    ///
+    /// For the one case where the approvals really are gone: a state root that
+    /// has been **recreated**, which is the volume somebody rebuilt. The
+    /// tokens minted against the old root mean nothing to the new one, so the
+    /// next runner this harness starts is approved again — as an operator
+    /// would have to.
+    pub fn forget_approvals(&self) {
+        self.approved
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clear();
     }
 
     pub fn url(&self) -> String {
@@ -294,6 +366,16 @@ impl Herd {
         self.start_runner_with(name, which, root, &[])
     }
 
+    /// A runner carrying **no token at all**: the machine nobody has approved
+    /// yet (E-48).
+    ///
+    /// The one way into this harness that does not approve first, because the
+    /// thing M15 has to prove is what happens to a machine an operator has
+    /// not let in.
+    pub fn start_runner_unapproved(&self, name: &str, which: &str) -> Process {
+        self.spawn_runner(name, which, which, &[], None)
+    }
+
     /// The same, with whatever options the test wants — its own cadence above
     /// all, because the pairing of the two sides' timings is itself something
     /// the hub judges.
@@ -304,7 +386,27 @@ impl Herd {
         root: &str,
         options: &[&str],
     ) -> Process {
-        let child = Command::new(binary("herd-runner"))
+        let token = self.approve(name);
+        self.spawn_runner(name, which, root, options, Some(token))
+    }
+
+    fn spawn_runner(
+        &self,
+        name: &str,
+        which: &str,
+        root: &str,
+        options: &[&str],
+        token: Option<String>,
+    ) -> Process {
+        let mut command = Command::new(binary("herd-runner"));
+        // The token this machine's approval minted, when it has one (E-48).
+        // Through the environment rather than the command line, as a
+        // deployment passes it: a token on argv is readable out of `/proc` by
+        // every user of the host. `None` is the machine nobody approved.
+        if let Some(token) = token {
+            command.env("HERD_TOKEN", token);
+        }
+        let child = command
             .arg("--hub")
             .arg(self.url())
             .arg("--name")

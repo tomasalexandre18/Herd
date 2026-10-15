@@ -743,10 +743,18 @@ async fn a_busy_runner_asked_to_stop_is_gone_in_five_seconds() {
     // handed to a runner that is leaving. Polled, because the refusal becomes
     // true the moment the hub hears the runner is draining — which is the
     // first thing a draining runner says.
+    //
+    // `submit` and not `run`: both go through the same gate and get the same
+    // refusal, but `run` *waits* for a job it was given, and one accepted in
+    // the moment before the hub hears the runner is draining is a job nothing
+    // will pick up — which made this poll hang until its own patience ran out
+    // instead of trying again.
     let mut refusal = String::new();
     let deadline = Instant::now() + Duration::from_secs(5);
     while Instant::now() < deadline {
-        let attempt = herd.herdctl(&["run", "--", "/bin/sh", "-c", "true"]).await;
+        let attempt = herd
+            .herdctl(&["submit", "--", "/bin/sh", "-c", "true"])
+            .await;
         if !attempt.status.success() {
             refusal = String::from_utf8_lossy(&attempt.stderr).into_owned();
             assert_eq!(
@@ -1296,6 +1304,11 @@ async fn a_verdict_spooled_for_a_state_root_that_was_recreated_is_never_believed
     // The state root is recreated. Nobody touches the runner's disk.
     std::fs::remove_dir_all(herd.state.path()).expect("the fixture wipes the state root");
     std::fs::create_dir_all(herd.state.path()).expect("and leaves an empty one");
+    // Which took the approvals with it: a token minted against the root that
+    // is gone means nothing to the one that replaced it, so the machine is
+    // approved again, as an operator rebuilding a volume would have to
+    // (E-48).
+    herd.forget_approvals();
     let mut hub = herd.start_hub_losing_runners_after("second", 3.0).await;
     let second_root_id = herd.state_root_id();
     assert_ne!(

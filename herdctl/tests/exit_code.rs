@@ -96,6 +96,11 @@ impl Harness {
         shape: Option<impl FnOnce(&mut herd_runner::Confinement)>,
     ) -> Self {
         let store = JobDirStore::open(state.path()).expect("the state root opens");
+        // An unapproved runner claims nothing (E-48), so the runner this
+        // harness may start is approved here, before the hub serves.
+        let token = store
+            .approve_runner("exit-code-runner")
+            .expect("the state root mints a token");
         let hub = Hub::bind(
             "127.0.0.1:0".parse().expect("a literal loopback address"),
             Arc::new(store) as Arc<dyn JobStore>,
@@ -120,7 +125,7 @@ impl Harness {
                 let config = herd_runner::Config {
                     hub_url: hub_url.clone(),
                     name: Some("exit-code-runner".to_owned()),
-                    token: None,
+                    token: Some(token),
                     confinement,
                     ..herd_runner::Config::default()
                 };

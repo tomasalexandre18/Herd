@@ -100,9 +100,20 @@ pub use placement::{
 /// peer is refused by name, and there is no migration (D73).
 ///
 /// 7 also carries [`FromHub::RanOn`], which is E-02's first line: where the
-/// job is running and why there. It rides on the same number because it is the
-/// same milestone and nothing is deployed to be caught in between.
-pub const PROTOCOL_VERSION: u32 = 7;
+/// job is running and why there. It rides on 7 because it is the same
+/// milestone and nothing is deployed to be caught in between.
+///
+/// **8 is M15's**, and it is the handshake learning to say which *build* is
+/// speaking (E-51). A peer announces its own version beside the protocol's
+/// ([`ToHub::Hello::peer_version`]), and the hub answers a minor gap with a
+/// note it carries in the welcome ([`FromHub::Welcome::version_note`]) and a
+/// major one with a refusal. Neither field may be read as absent: a missing
+/// build version read as "the same as mine" is a hub that never warns and
+/// never refuses, which is the whole of what E-51 asks for, and a missing
+/// note read as "nothing to say" would hide the one line that tells an owner
+/// which side to move. So the number moves, a version 7 peer is refused by
+/// name, and there is no migration (D73).
+pub const PROTOCOL_VERSION: u32 = 8;
 
 /// How often a runner says it is alive and what it is doing (E-40).
 ///
@@ -374,6 +385,20 @@ pub struct RunnerSwitch {
     pub jobs: u32,
     /// Whether it is also stopping for good (`SIGTERM`, invariant 2).
     pub stopping: bool,
+}
+
+/// One approved runner, as `herdctl runner list` prints it (E-48).
+///
+/// No token and no hash: the hub holds a hash and hands out neither. What an
+/// operator needs is the name she approved, when she approved it, and whether
+/// the machine is here now.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ApprovedRunner {
+    pub name: String,
+    /// When the approval was made, in seconds since the epoch.
+    pub approved_unix_s: u64,
+    /// Whether a runner of that name is connected to this hub right now.
+    pub connected: bool,
 }
 
 /// How a log payload travels inside the JSON frame: standard base64, padded.
@@ -730,8 +755,35 @@ pub enum ToHub {
     /// First frame on every connection, from either role.
     Hello {
         protocol_version: u32,
+        /// Which **build** is speaking, beside which protocol it speaks
+        /// (E-51).
+        ///
+        /// The protocol version says whether two peers can read each other's
+        /// frames; it says nothing about whether they agree on what the
+        /// frames *mean*. A runner built three releases ago reads every field
+        /// of today's `AssignJob` and may still confine a job differently,
+        /// report a step differently, or spool a verdict in a shape the hub
+        /// has stopped reading — all of it inside one protocol version. So
+        /// the build travels too, and the hub answers a minor gap with a note
+        /// and a major one with a refusal, both naming the two versions so
+        /// that one line says which side to move.
+        ///
+        /// **Required**, for the reason the switch is: a hub that read a
+        /// missing build version as "the same as mine" would warn about
+        /// nothing and refuse nothing, which is E-51 not implemented. That is
+        /// what moved [`PROTOCOL_VERSION`] to 8.
+        peer_version: String,
         role: Role,
-        /// Bearer token. Carried from M1, validated from M15 (D6, Q8).
+        /// Bearer token: what says this peer is allowed here (E-48, Q8).
+        ///
+        /// Carried from M1 and **validated from M15**. A runner's token is
+        /// the one minted when an operator approved it by name (`herdctl
+        /// runner approve`), kept at the hub only as a hash, and a runner
+        /// that carries none — or the wrong one, or one that was revoked when
+        /// the runner was removed — is refused terminally (D13) with a
+        /// sentence saying what to do about it. A requester's is the one
+        /// shared token the hub was started with, when it was started with
+        /// one.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         token: Option<String>,
         /// Human-readable name of the peer, for logs and reports.
@@ -899,6 +951,23 @@ pub enum ToHub {
     },
     /// Requester asks where every runner's switch stands (E-33).
     AskFleetSwitches {},
+    /// An operator approves one runner by name, and the hub mints its token
+    /// (E-48, Q8).
+    ///
+    /// **One action.** Approving a runner that is already approved mints it a
+    /// new token and forgets the old one, which is how a token that has
+    /// leaked is replaced: there is no second command for that, because a
+    /// second command is a second thing to get wrong.
+    ApproveRunner { runner: String },
+    /// An operator removes one runner, which revokes its token (E-48).
+    ///
+    /// The machine is told, on the connection it is holding, and claims
+    /// nothing from that moment: a revocation that only took effect at the
+    /// next dial would leave a runner Herd no longer trusts holding a link
+    /// and taking work.
+    RemoveRunner { runner: String },
+    /// An operator asks which runners are approved on this hub (E-48).
+    AskApprovedRunners {},
     /// An operator raises one job above what its requester asked for (E-18).
     ///
     /// Only ever upwards. Lowering a job is not offered: it is the way to
@@ -1183,6 +1252,19 @@ pub enum FromHub {
         /// instead of offering a verdict for a vanished hub on every link it
         /// ever makes.
         state_root: String,
+        /// What the hub has to say about the gap between its build and this
+        /// peer's, when there is a gap it is willing to serve (E-51).
+        ///
+        /// A major gap is a refusal and never arrives here. A minor one is
+        /// served — the frames mean the same thing — and still worth one
+        /// line, because the two sides drifting is how a fleet ends up with
+        /// one machine behaving unlike the others. It travels rather than
+        /// being left on the hub's own stdout so that it reaches the person
+        /// who can act on it: the owner of the machine, reading her runner's
+        /// stderr. The hub says it too.
+        ///
+        /// `None` is the ordinary case: the two builds agree.
+        version_note: Option<String>,
     },
     /// The hub declines to go on, and says why. Always the last frame.
     Refused { reason: String },
@@ -1215,6 +1297,22 @@ pub enum FromHub {
     },
     /// Where every runner's switch stands (E-33).
     FleetSwitches { runners: Vec<RunnerSwitch> },
+    /// One runner is approved, and here is the token it is to carry (E-48).
+    ///
+    /// **The only time the token is ever readable.** The hub keeps a hash of
+    /// it and nothing else (invariant 7, Q8), so an operator who loses this
+    /// line approves the runner again rather than looking the token up — and
+    /// the thing nobody can do is read it off the hub's disk.
+    RunnerApproved {
+        runner: String,
+        token: String,
+        said: String,
+    },
+    /// One runner is removed and its token revoked (E-48), or it was never
+    /// approved and nothing changed. `said` is which.
+    RunnerRemoved { said: String },
+    /// Which runners are approved on this hub (E-48).
+    ApprovedRunners { runners: Vec<ApprovedRunner> },
     /// The owner, through the hub, moves this runner's switch (E-33).
     ///
     /// A runner that receives it **writes the position to its own switch file
@@ -1503,6 +1601,159 @@ pub fn version_mismatch_reason(announced: u32) -> String {
         "protocol version mismatch: the hub speaks version {PROTOCOL_VERSION}, \
          the peer announced version {announced}"
     )
+}
+
+/// What the hub does about the gap between its build and a peer's (E-51).
+///
+/// Two answers and one of them is not an answer: a major gap is refused, a
+/// minor gap is served with a note, and builds that agree say nothing at all.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VersionGap {
+    /// Whether this gap ends the connection. `true` is a [`FromHub::Refused`]
+    /// and therefore terminal (D13): nothing but a new build changes it.
+    pub refuse: bool,
+    /// The one line a human reads, naming **both** versions.
+    pub reason: String,
+}
+
+/// What to do about a peer announcing `peer_version` to a hub built as
+/// `hub_version`, and nothing when the two agree (E-51).
+///
+/// A *major* difference refuses. A major version is where Herd's own
+/// behaviour is allowed to change under an unchanged protocol — how a job is
+/// confined, what a spooled verdict looks like, which of its steps a runner
+/// reports — so two peers a major apart can read each other's frames and
+/// still disagree about what they commit to. That is the failure a refusal
+/// prevents, and it is the one a protocol version cannot see.
+///
+/// A *minor* difference is served, because within a major version Herd
+/// promises the behaviour is the same; it is still said out loud, because a
+/// fleet whose machines drift apart is a fleet where one machine's results
+/// are not the others'.
+///
+/// A version string this hub cannot read — not `major.minor…` — is **served
+/// with a note**, never refused: turning a working machine away over the
+/// shape of a string would be a hub refusing what it merely does not
+/// understand, and the credential, not the version, is what says a peer is
+/// allowed here. The note says the gap could not be judged, which is the
+/// honest thing to put in front of a human.
+///
+/// `peer_kind` is the word the sentence uses for the far side — "runner" or
+/// "requester" — because an operator reading one line needs to know which
+/// machine to go to.
+pub fn version_gap(peer_kind: &str, hub_version: &str, peer_version: &str) -> Option<VersionGap> {
+    if hub_version == peer_version {
+        return None;
+    }
+    match (major_minor(hub_version), major_minor(peer_version)) {
+        (Some((hub_major, _)), Some((peer_major, _))) if hub_major != peer_major => {
+            Some(VersionGap {
+                refuse: true,
+                reason: format!(
+                    "build version mismatch: this hub is version {hub_version} and this \
+                     {peer_kind} is version {peer_version}, a major version apart. Within one \
+                     major version Herd promises its behaviour is the same, and across one it \
+                     promises nothing — so this {peer_kind} is refused rather than served \
+                     differently from the rest of the fleet. Move the {peer_kind} to \
+                     {hub_major}.x, or move the hub to {peer_major}.x"
+                ),
+            })
+        }
+        (Some(_), Some(_)) => Some(VersionGap {
+            refuse: false,
+            reason: format!(
+                "build version mismatch: this hub is version {hub_version} and this \
+                 {peer_kind} is version {peer_version}. The major versions agree, so the two \
+                 behave alike and this connection is served; move one side to the other's \
+                 version so the fleet does not drift"
+            ),
+        }),
+        _ => Some(VersionGap {
+            refuse: false,
+            reason: format!(
+                "build version unreadable: this hub is version {hub_version} and this \
+                 {peer_kind} announced {peer_version:?}, which is not a major.minor version. \
+                 It is served — a version string this hub cannot read is not a reason to turn \
+                 a working machine away — but nothing about the gap between the two builds \
+                 could be judged"
+            ),
+        }),
+    }
+}
+
+/// The major and minor of a version string, or `None` if it has neither.
+///
+/// Deliberately small: Herd compares two of its own build numbers, and
+/// pre-release tags, build metadata and the rest of semver's grammar are
+/// things it has never produced. Anything it cannot read is handled as
+/// unreadable by [`version_gap`] rather than guessed at.
+fn major_minor(version: &str) -> Option<(u64, u64)> {
+    let mut parts = version.split('.');
+    let major = parts.next()?.parse().ok()?;
+    let minor = parts.next()?.parse().ok()?;
+    Some((major, minor))
+}
+
+/// Why a runner nobody approved is given nothing, and what to do about it
+/// (E-48, Q8).
+///
+/// Terminal (D13): the machine is not on this hub's roster, and dialling
+/// again says the same thing. The sentence carries the command that fixes it,
+/// because the person reading it on a runner's stderr is usually the person
+/// who can type it.
+pub fn unapproved_runner_reason(name: &str) -> String {
+    format!(
+        "runner {name} is not approved on this hub, so it is given no job: an operator \
+         approves it with `herdctl runner approve {name}`, which mints the token this runner \
+         then carries as --token or HERD_TOKEN"
+    )
+}
+
+/// Why an approved runner that carried no token is still given nothing.
+pub fn missing_runner_token_reason(name: &str) -> String {
+    format!(
+        "runner {name} is approved on this hub but carried no token, so it is given no job: \
+         give it the token `herdctl runner approve {name}` printed, as --token or HERD_TOKEN"
+    )
+}
+
+/// Why an approved runner carrying the wrong token is given nothing.
+///
+/// It says the name is known and the token is not the one that was minted,
+/// and nothing about the token itself: a sentence that quoted what it
+/// received would put a credential in every log that caught it.
+pub fn wrong_runner_token_reason(name: &str) -> String {
+    format!(
+        "runner {name} is approved on this hub, but the token it carried is not the one that \
+         approval minted, so it is given no job: run `herdctl runner approve {name}` and give \
+         the machine the token it prints"
+    )
+}
+
+/// Why a runner an operator has just removed stops claiming, said on the
+/// connection it is still holding (E-48).
+pub fn revoked_runner_reason(name: &str) -> String {
+    format!(
+        "runner {name} has been removed from this hub and its token is revoked, so it claims \
+         nothing from here on: `herdctl runner approve {name}` mints a new token if this \
+         machine is to come back"
+    )
+}
+
+/// Why a requester that carried no token is refused, when the hub was started
+/// with one (Q8).
+pub fn missing_requester_token_reason() -> String {
+    "this hub requires a requester token and this requester carried none: give it as \
+     --token or HERD_TOKEN, from the file the hub was started with \
+     (--requester-token-file)"
+        .to_owned()
+}
+
+/// Why a requester carrying the wrong token is refused (Q8).
+pub fn wrong_requester_token_reason() -> String {
+    "this requester's token is not the one this hub was started with: take it from the file \
+     named by --requester-token-file (HERD_REQUESTER_TOKEN_FILE) on the hub"
+        .to_owned()
 }
 
 /// Why a frame about an attempt was not acted on, when the attempt was handed

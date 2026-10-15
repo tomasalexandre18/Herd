@@ -266,6 +266,16 @@ enum Action {
         #[arg(long)]
         reason: Option<String>,
     },
+    /// Approve, remove or list the runners this hub will serve (E-48).
+    ///
+    /// An unapproved runner claims nothing: it is refused by name, with a
+    /// sentence telling whoever reads its stderr to run `herdctl runner
+    /// approve <name>`. Approving mints that runner's token and prints it
+    /// once — the hub keeps only a hash of it (invariant 7).
+    Runner {
+        #[command(subcommand)]
+        action: RunnerAction,
+    },
     /// Wait for a job that already exists, and exit with its code.
     Wait {
         /// The id a submission printed.
@@ -296,6 +306,41 @@ enum Action {
         #[arg(long, value_name = "LEVEL")]
         priority: Priority,
     },
+}
+
+/// What an operator does about which runners this hub serves (E-48, Q8).
+///
+/// Three verbs and no more: approve a machine, remove it, see who is
+/// approved. There is no "rotate" — approving again mints a new token and
+/// revokes the old — and no "show me the token", because the hub keeps a hash
+/// and has nothing to show.
+#[derive(Debug, Subcommand)]
+enum RunnerAction {
+    /// Approve one runner and print the token it is to carry, once.
+    ///
+    /// The token goes to **stdout**, alone, so that `token=$(herdctl runner
+    /// approve wsl-pc)` is all a deployment script needs; the sentence
+    /// explaining it goes to stderr. Give it to that machine as
+    /// `herd-runner --token <token>` or `HERD_TOKEN`.
+    ///
+    /// Approving a runner that is already approved mints a new token and
+    /// revokes the old one, which is how a token that has leaked is replaced.
+    Approve {
+        /// The name that runner announces — `herd-runner --name`.
+        name: String,
+    },
+    /// Remove one runner, revoking its token (E-48).
+    ///
+    /// If it is connected it is told, on the link it is holding, and claims
+    /// nothing from that moment. A job it is already executing is left to
+    /// finish or to be lost the ordinary way: a removal is not a way to kill
+    /// a build.
+    Remove {
+        /// The name that runner announces.
+        name: String,
+    },
+    /// Say which runners are approved, and which of them are connected.
+    List,
 }
 
 /// What a subcommand leaves the process to exit with.
@@ -530,6 +575,35 @@ async fn run(args: Args) -> Result<Done> {
                         return Ok(Done::SaidOnlyHalf);
                     }
                     println!("{said}");
+                }
+            }
+            Ok(Done::Said)
+        }
+        Action::Runner { action } => {
+            match action {
+                RunnerAction::Approve { name } => {
+                    let (token, said) = herdctl::approve_runner(&config, name).await?;
+                    // The sentence on stderr and the token alone on stdout,
+                    // so that a deployment script can take the token and a
+                    // person reading a terminal still gets told what it is
+                    // and that it is shown once.
+                    eprintln!("herdctl: {said}");
+                    println!("{token}");
+                }
+                RunnerAction::Remove { name } => {
+                    println!("{}", herdctl::remove_runner(&config, name).await?);
+                }
+                RunnerAction::List => {
+                    let runners = herdctl::approved_runners(&config).await?;
+                    if runners.is_empty() {
+                        println!(
+                            "no runner is approved on this hub, so no runner can claim a job: \
+                             `herdctl runner approve <name>` mints one a token"
+                        );
+                    }
+                    for runner in &runners {
+                        println!("{}", herdctl::approved_runner_line(runner));
+                    }
                 }
             }
             Ok(Done::Said)

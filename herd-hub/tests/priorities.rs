@@ -76,7 +76,8 @@ async fn a_merger_submitted_last_takes_the_next_free_slot() {
     // The runner is up once the hub has heard its offer: a submission before
     // that is refused for want of a runner, which is not what is under test.
     herd.wait_until("the runner has joined", || {
-        herd.said("first").contains("runner the-real-runner")
+        herd.said("first")
+            .contains("runner the-real-runner has joined")
     })
     .await;
 
@@ -179,7 +180,8 @@ async fn a_hub_killed_while_a_job_ages_does_not_lose_its_wait() {
         ],
     );
     herd.wait_until("the runner has joined", || {
-        herd.said("first").contains("runner the-real-runner")
+        herd.said("first")
+            .contains("runner the-real-runner has joined")
     })
     .await;
 
@@ -284,7 +286,8 @@ async fn the_queue_its_priorities_and_its_joins_all_come_back() {
     let mut hub = herd.start_hub("first").await;
     let mut runner = herd.start_runner_with("the-real-runner", "runner", "runner", &runner_options);
     herd.wait_until("the runner has joined", || {
-        herd.said("first").contains("runner the-real-runner")
+        herd.said("first")
+            .contains("runner the-real-runner has joined")
     })
     .await;
 
@@ -325,7 +328,8 @@ async fn the_queue_its_priorities_and_its_joins_all_come_back() {
     let _hub = herd.start_hub("second").await;
     let _runner = herd.start_runner_with("the-real-runner", "runner2", "runner", &runner_options);
     herd.wait_until("the runner has joined the hub that came back", || {
-        herd.said("second").contains("runner the-real-runner")
+        herd.said("second")
+            .contains("runner the-real-runner has joined")
     })
     .await;
 
@@ -549,7 +553,8 @@ async fn the_lowest_priority_job_runs_within_the_aging_bound_on_the_real_clock()
         ],
     );
     herd.wait_until("the runner has joined", || {
-        herd.said("first").contains("runner the-real-runner")
+        herd.said("first")
+            .contains("runner the-real-runner has joined")
     })
     .await;
 
@@ -557,11 +562,22 @@ async fn the_lowest_priority_job_runs_within_the_aging_bound_on_the_real_clock()
         .submit_needing(HELD, "producer", "printf 'the producer ran\\n'")
         .await;
     // A steady stream of step jobs, submitted after it, for as long as it
-    // takes the producer to climb three levels.
+    // takes the producer to climb three levels — and then until the hub says
+    // it has.
+    //
+    // Waited on as a condition rather than measured off the clock. The
+    // sentence on a record is rewritten only when a dispatch pass finds
+    // something new (M6), and a submission is what causes a pass, so the
+    // stream is also what makes the hub restate the queue: reading the record
+    // the moment the clock passes the bound reads whichever pass happened
+    // last, which on a busy host is a pass from a second earlier. The
+    // assertion below is unchanged — it is the loop's exit condition now, and
+    // a run where it never becomes true fails naming the sentence it got.
     let bound = Duration::from_secs(2 * 3);
     let started = std::time::Instant::now();
+    let deadline = started + real_herd::PATIENCE;
     let mut stream = Vec::new();
-    while started.elapsed() < bound + Duration::from_millis(500) {
+    let said = loop {
         stream.push(
             herd.submit_needing(
                 HELD,
@@ -571,17 +587,27 @@ async fn the_lowest_priority_job_runs_within_the_aging_bound_on_the_real_clock()
             .await,
         );
         tokio::time::sleep(Duration::from_millis(300)).await;
-    }
+        let said = herd.record(&producer)["waiting_for"]
+            .as_str()
+            .expect("a sentence")
+            .to_owned();
+        // By now the producer is at the top and in front of every one of them.
+        if started.elapsed() >= bound
+            && said.contains("weighed as merger")
+            && said.contains("queued 1st of")
+        {
+            break said;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "a producer past the bound must be at the front of the queue: {said}"
+        );
+    };
     assert!(
         stream.len() > 5,
         "the stream should be a stream: {} jobs",
         stream.len()
     );
-    // By now the producer is at the top and in front of every one of them.
-    let said = herd.record(&producer)["waiting_for"]
-        .as_str()
-        .expect("a sentence")
-        .to_owned();
     assert!(
         said.contains("weighed as merger") && said.contains("queued 1st of"),
         "a producer past the bound must be at the front of the queue: {said}"

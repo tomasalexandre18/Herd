@@ -42,10 +42,16 @@ impl Harness {
         let state = TempDir::new(&format!("{label}-state"));
         let mut confinement = test_confinement(data_root.path());
         shape(&mut confinement);
+        let store = Arc::new(JobDirStore::open(state.path()).expect("the state root opens"));
+        // An unapproved runner claims nothing (E-48), so this harness
+        // approves the one runner it starts and hands it the token that
+        // approval minted.
+        let token = store
+            .approve_runner(&format!("m4-{label}"))
+            .expect("the state root mints a token");
         let hub = Hub::bind(
             "127.0.0.1:0".parse().expect("a literal loopback address"),
-            Arc::new(JobDirStore::open(state.path()).expect("the state root opens"))
-                as Arc<dyn JobStore>,
+            store as Arc<dyn JobStore>,
         )
         .await
         .expect("the hub binds a free port");
@@ -58,7 +64,7 @@ impl Harness {
             let config = herd_runner::Config {
                 hub_url: hub_url.clone(),
                 name: Some(format!("m4-{label}")),
-                token: None,
+                token: Some(token),
                 confinement,
                 ..herd_runner::Config::default()
             };
@@ -969,9 +975,18 @@ async fn the_runner_binds_no_listening_socket() {
         let _ = hub.serve().await;
     });
 
+    // A name, and the token its approval minted: an unapproved runner claims
+    // nothing (E-48), and a runner that gave no name would wear a process
+    // identity nobody could have approved in advance.
+    let token = store
+        .approve_runner("no-listener")
+        .expect("the state root mints a token");
     let mut runner = tokio::process::Command::new(env!("CARGO_BIN_EXE_herd-runner"))
         .arg("--hub")
         .arg(&hub_url)
+        .arg("--name")
+        .arg("no-listener")
+        .env("HERD_TOKEN", token)
         .arg("--data-root")
         .arg(data_root.path())
         .stdout(std::process::Stdio::piped())
@@ -1089,11 +1104,23 @@ struct RealRunner {
     stderr: JoinHandle<String>,
 }
 
+/// The name the real runner in these tests answers to, and therefore the name
+/// its approval is minted for (E-48).
+const REAL_RUNNER_NAME: &str = "the-runner-under-test";
+
 impl RealRunner {
-    async fn join(hub_url: String, handle: herd_hub::HubHandle, data_root: &Path) -> Self {
+    async fn join(
+        hub_url: String,
+        handle: herd_hub::HubHandle,
+        data_root: &Path,
+        token: &str,
+    ) -> Self {
         let mut process = tokio::process::Command::new(env!("CARGO_BIN_EXE_herd-runner"))
             .arg("--hub")
             .arg(&hub_url)
+            .arg("--name")
+            .arg(REAL_RUNNER_NAME)
+            .env("HERD_TOKEN", token)
             .arg("--data-root")
             .arg(data_root)
             .stdout(std::process::Stdio::null())
@@ -1152,12 +1179,18 @@ impl RealRunner {
 /// A hub on a free port, with its serving task and the state root it keeps
 /// its records in (M2). The caller holds the directory: dropping it removes
 /// the records, so no test of confinement leaves a state root behind.
-async fn hub_on_a_free_port() -> (String, herd_hub::HubHandle, JoinHandle<()>, TempDir) {
+async fn hub_on_a_free_port() -> (String, herd_hub::HubHandle, JoinHandle<()>, TempDir, String) {
     let state = TempDir::new("hub-state");
+    let store = Arc::new(JobDirStore::open(state.path()).expect("the state root opens"));
+    // The runner these tests start is approved here, before the hub serves:
+    // an unapproved runner claims nothing (E-48). One name, so that a runner
+    // started again on the same data root is the same machine coming back.
+    let token = store
+        .approve_runner(REAL_RUNNER_NAME)
+        .expect("the state root mints a token");
     let hub = Hub::bind(
         "127.0.0.1:0".parse().expect("a literal loopback address"),
-        Arc::new(JobDirStore::open(state.path()).expect("the state root opens"))
-            as Arc<dyn JobStore>,
+        store as Arc<dyn JobStore>,
     )
     .await
     .expect("the hub binds a free port");
@@ -1166,7 +1199,7 @@ async fn hub_on_a_free_port() -> (String, herd_hub::HubHandle, JoinHandle<()>, T
     let serving = tokio::spawn(async move {
         let _ = hub.serve().await;
     });
-    (hub_url, handle, serving, state)
+    (hub_url, handle, serving, state, token)
 }
 
 /// A runner asked to stop ends its jobs. Without this, `systemctl stop` or a
@@ -1176,8 +1209,8 @@ async fn hub_on_a_free_port() -> (String, herd_hub::HubHandle, JoinHandle<()>, T
 async fn a_runner_told_to_stop_ends_its_jobs_rather_than_orphaning_them() {
     let marker = &a_sleep_nobody_else_is_sleeping(2);
     let data_root = TempDir::new("sigterm");
-    let (hub_url, handle, serving, _hub_state) = hub_on_a_free_port().await;
-    let mut runner = RealRunner::join(hub_url, handle, data_root.path()).await;
+    let (hub_url, handle, serving, _hub_state, token) = hub_on_a_free_port().await;
+    let mut runner = RealRunner::join(hub_url, handle, data_root.path(), &token).await;
     let job = runner.submit(&format!(
         "setsid sleep {marker} >/dev/null 2>&1 & sleep 120"
     ));
@@ -1223,8 +1256,8 @@ async fn a_runner_told_to_stop_ends_its_jobs_rather_than_orphaning_them() {
 async fn a_restarted_runner_reclaims_what_a_killed_one_left() {
     let marker = &a_sleep_nobody_else_is_sleeping(3);
     let data_root = TempDir::new("sigkill");
-    let (hub_url, handle, serving, _hub_state) = hub_on_a_free_port().await;
-    let first = RealRunner::join(hub_url.clone(), handle.clone(), data_root.path()).await;
+    let (hub_url, handle, serving, _hub_state, token) = hub_on_a_free_port().await;
+    let first = RealRunner::join(hub_url.clone(), handle.clone(), data_root.path(), &token).await;
     let job = first.submit(&format!(
         "setsid sleep {marker} >/dev/null 2>&1 & sleep 120"
     ));
@@ -1261,7 +1294,7 @@ async fn a_restarted_runner_reclaims_what_a_killed_one_left() {
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
 
-    let second = RealRunner::join(hub_url, handle, data_root.path()).await;
+    let second = RealRunner::join(hub_url, handle, data_root.path(), &token).await;
     let deadline = Instant::now() + Duration::from_secs(15);
     while !processes_with_argument(marker).is_empty() {
         assert!(
