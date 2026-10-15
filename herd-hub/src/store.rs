@@ -1680,7 +1680,7 @@ mod tests {
     use super::*;
     use crate::job::JobEventKind;
     use crate::job::Mint;
-    use herd_proto::JobOutcome;
+    use herd_proto::{Declaration, Executor, JobOutcome, Step};
     use tempfile::TempDir;
 
     /// A store in a directory that goes away with the test.
@@ -1692,6 +1692,39 @@ mod tests {
 
     fn read(path: &Path) -> String {
         fs::read_to_string(path).unwrap_or_else(|e| panic!("{} reads: {e}", path.display()))
+    }
+
+    /// The commit a declared submission carries: forty hex, resolved in the
+    /// requester's own checkout (D106).
+    const A_COMMIT: &str = "cb5a2e8b4f1d9c7a3e05b8d6f2a1c4e79b0d3f68";
+
+    /// A declared command as a submission carries it, shaped like the first
+    /// consumer's and named like nothing of theirs (E-11).
+    fn a_declaration() -> Declaration {
+        Declaration {
+            command: "a-declared-command".to_owned(),
+            commit: A_COMMIT.to_owned(),
+            args: vec!["--only".to_owned(), "one".to_owned()],
+            executor: Executor {
+                up: format!("tool ws up {{job}} {A_COMMIT}"),
+                fetch: format!("tool ws run {{job}} -- 'git switch --detach {A_COMMIT}'"),
+                run: "tool ws run {job} -- {line}".to_owned(),
+                down: "tool ws down {job} --purge".to_owned(),
+                env: BTreeMap::from([("RESULTS".to_owned(), "{out}/results.json".to_owned())]),
+            },
+        }
+    }
+
+    fn step(step: Step, duration_ms: u64, exit_code: Option<i32>) -> StepRun {
+        StepRun {
+            step,
+            started_unix_ms: 1_791_878_153_000,
+            duration_ms,
+            exit_code,
+            ended: exit_code
+                .is_none()
+                .then(|| "stopped at the time cap, 2700 s".to_owned()),
+        }
     }
 
     /// The identity a job id only means anything inside.
@@ -2860,6 +2893,125 @@ mod tests {
                 minted[2].id.clone(),
                 minted[3].id.clone()
             ]
+        );
+    }
+
+    /// A declared command on the record, and the four step lines of its
+    /// attempt (E-11, D77).
+    ///
+    /// The declaration is written at birth and read back off the disk, because
+    /// it is what a requeue onto another machine runs: a record that lost it
+    /// would re-run the job as a bare command line with no workspace.
+    #[test]
+    fn a_declared_command_and_its_step_lines_survive_a_write_and_a_read() {
+        let (_dir, store) = store();
+        let declared = store
+            .create_job(
+                NewJob::new(vec!["a-line --only one".to_owned()])
+                    .declared(Some(a_declaration()), Some(2700)),
+            )
+            .expect("minted");
+        let read_back = store
+            .job(&declared.id)
+            .expect("readable")
+            .expect("a record was written");
+        assert_eq!(
+            read_back.declaration.as_ref().map(|d| d.commit.as_str()),
+            Some(A_COMMIT),
+            "the commit the requester resolved is on the record"
+        );
+        assert_eq!(
+            read_back
+                .declaration
+                .as_ref()
+                .map(|d| d.executor.run.as_str()),
+            Some("tool ws run {job} -- {line}"),
+            "and so are the four hooks, with the tokens the runner fills left alone"
+        );
+        assert_eq!(read_back.timeout_s, Some(2700));
+
+        let attempt = store
+            .begin_attempt(&declared.id, "runner-x", "the only runner", None)
+            .expect("an attempt is numbered");
+        for step in [
+            step(Step::Up, 95_400, Some(0)),
+            step(Step::Fetch, 1_200, Some(0)),
+            step(Step::Run, 17_500, Some(1)),
+            step(Step::Down, 400, Some(0)),
+        ] {
+            store
+                .record_step(&declared.id, attempt, step)
+                .expect("the step is recorded");
+        }
+        let lines: Vec<String> = store
+            .job(&declared.id)
+            .expect("readable")
+            .expect("a record")
+            .attempts[0]
+            .steps
+            .iter()
+            .map(|ran| ran.line())
+            .collect();
+        assert_eq!(
+            lines,
+            [
+                "up: 95.400 s, exit 0",
+                "fetch: 1.200 s, exit 0",
+                "run: 17.500 s, exit 1",
+                "down: 0.400 s, exit 0",
+            ],
+            "one line per step, in the order they ran, with the figures D77 asks for"
+        );
+    }
+
+    /// A step said twice is one step: the complete list arrives again with the
+    /// verdict, and a record holding `up` twice would read as a job that
+    /// prepared twice in one attempt.
+    #[test]
+    fn a_step_said_again_replaces_the_line_it_already_had() {
+        let (_dir, store) = store();
+        let job = store
+            .create_job(NewJob::new(vec!["true".to_owned()]))
+            .expect("minted");
+        let attempt = store
+            .begin_attempt(&job.id, "runner-x", "the only runner", None)
+            .expect("an attempt is numbered");
+        store
+            .record_step(&job.id, attempt, step(Step::Up, 95_400, None))
+            .expect("recorded");
+        store
+            .record_step(&job.id, attempt, step(Step::Up, 95_400, Some(0)))
+            .expect("recorded again");
+        let steps = store
+            .job(&job.id)
+            .expect("readable")
+            .expect("a record")
+            .attempts[0]
+            .steps
+            .clone();
+        assert_eq!(steps.len(), 1, "one step, not two: {steps:?}");
+        assert_eq!(
+            steps[0].exit_code,
+            Some(0),
+            "and it is the later line that stands"
+        );
+    }
+
+    /// A step for an attempt the record does not hold is an error, not a
+    /// silent no-op: the hub says so rather than losing the line.
+    #[test]
+    fn a_step_of_an_attempt_that_is_not_there_is_refused_by_name() {
+        let (_dir, store) = store();
+        let job = store
+            .create_job(NewJob::new(vec!["true".to_owned()]))
+            .expect("minted");
+        let refused = store
+            .record_step(&job.id, 7, step(Step::Up, 10, Some(0)))
+            .expect_err("there is no attempt 7");
+        let said = refused.to_string();
+        assert!(
+            said.contains(job.id.as_str()) && said.contains('7') && said.contains("up"),
+            "the refusal names the job, the attempt and the step: {said}"
         );
     }
 }

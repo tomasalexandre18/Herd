@@ -1873,3 +1873,158 @@ async fn a_runner_whose_real_cadence_cannot_satisfy_the_hub_is_refused_by_figure
     assert_eq!(assigned, job_id);
     assert_eq!(attempt, 1);
 }
+
+/// A declared command reaches the runner as a declaration, and the next
+/// attempt of it is handed the same one (E-11, D106, E-21).
+///
+/// What this is really about is the requeue. The declaration is held on the
+/// record, not by the runner that first saw it, so that a job whose runner
+/// disappears runs the same four steps on the same commit on the next
+/// machine. A hub that kept it in memory beside the live attempt would pass
+/// for attempt 1 and hand attempt 2 a bare command line — a job that ran
+/// something nobody declared, reported as if it had not.
+#[tokio::test]
+async fn a_declared_command_is_handed_over_whole_on_every_attempt() {
+    let hub = Quick::start(Duration::from_secs(60)).await;
+    const COMMIT: &str = "cb5a2e8b4f1d9c7a3e05b8d6f2a1c4e79b0d3f68";
+    let declaration = herd_proto::Declaration {
+        command: "a-declared-command".to_owned(),
+        commit: COMMIT.to_owned(),
+        args: vec!["--only".to_owned(), "one".to_owned()],
+        executor: herd_proto::Executor {
+            up: format!("tool ws up {{job}} {COMMIT}"),
+            fetch: format!("tool ws run {{job}} -- 'git switch --detach {COMMIT}'"),
+            run: "tool ws run {job} -- {line}".to_owned(),
+            down: "tool ws down {job} --purge".to_owned(),
+            env: std::collections::BTreeMap::from([(
+                "RESULTS".to_owned(),
+                "{out}/results.json".to_owned(),
+            )]),
+        },
+    };
+    // A runner is connected before the submission: the hub refuses a job it
+    // has no machine for at all, so without this the test would be about
+    // that instead.
+    let mut holder = Puppet::join(&hub.hub_url, "runner-x").await;
+    let job_id = herdctl::submit_job(
+        &hub.requester(),
+        vec!["a-line --only one".to_owned()],
+        LabelSet::default(),
+        Priority::Step,
+        herdctl::Declared {
+            declaration: Some(declaration.clone()),
+            timeout_s: Some(2700),
+            ..herdctl::Declared::default()
+        },
+    )
+    .await
+    .expect("the submission is accepted");
+
+    let first = loop {
+        match holder.next().await {
+            Some(FromHub::AssignJob {
+                job_id: assigned,
+                attempt,
+                command,
+                declaration: carried,
+                timeout_s,
+            }) => break (assigned, attempt, command, carried, timeout_s),
+            Some(_) => continue,
+            None => panic!("the hub never handed this runner the job"),
+        }
+    };
+    let (assigned, attempt, command, carried, timeout_s) = first;
+    assert_eq!(assigned, job_id);
+    assert_eq!(attempt, 1);
+    assert_eq!(
+        command,
+        vec!["a-line --only one".to_owned()],
+        "a declared job's command is the line going into the run hook's {{line}}"
+    );
+    assert_eq!(
+        carried.as_ref(),
+        Some(&declaration),
+        "the four hooks, the commit and the arguments, unchanged"
+    );
+    assert_eq!(timeout_s, Some(2700), "and the cap the command declared");
+
+    // The runner gives the attempt back without a verdict, and E-21 gives
+    // the job one more go. Nothing in the hub holds a declaration anywhere
+    // but the record, so what the next attempt is handed is what the record
+    // says — and this is the assertion that would fail if a hub ever kept it
+    // beside the live attempt.
+    holder
+        .say(ToHub::AttemptAbandoned {
+            job_id: job_id.clone(),
+            attempt,
+            reason: "this runner is draining".to_owned(),
+        })
+        .await;
+    let second = loop {
+        match holder.next().await {
+            Some(FromHub::AssignJob {
+                attempt,
+                declaration: carried,
+                timeout_s,
+                ..
+            }) => break (attempt, carried, timeout_s),
+            Some(_) => continue,
+            None => panic!("the hub never handed the job out a second time"),
+        }
+    };
+    let (attempt, carried, timeout_s) = second;
+    assert_eq!(attempt, 2, "the second go");
+    assert_eq!(
+        carried.as_ref(),
+        Some(&declaration),
+        "the second attempt is handed the same four hooks and the same commit"
+    );
+    assert_eq!(timeout_s, Some(2700));
+
+    // And it is on the record, which is where a reader with no Herd running
+    // finds what the job was (E-53, E-54).
+    let record = hub.record(&job_id);
+    assert_eq!(record.declaration.as_ref(), Some(&declaration));
+    assert_eq!(record.timeout_s, Some(2700));
+}
+
+/// A declaration no runner could execute is refused at the submission, with
+/// the requester standing there to be told (E-11, E-36).
+#[tokio::test]
+async fn a_run_hook_that_would_never_run_the_line_is_refused_at_submission() {
+    let hub = Quick::start(Duration::from_secs(60)).await;
+    // A runner has to be connected, or the refusal would be about that
+    // instead and this test would pass for the wrong reason.
+    let _runner = Puppet::join(&hub.hub_url, "runner-x").await;
+    let refused = herdctl::submit_job(
+        &hub.requester(),
+        vec!["a-line".to_owned()],
+        LabelSet::default(),
+        Priority::Step,
+        herdctl::Declared {
+            declaration: Some(herd_proto::Declaration {
+                command: "a-declared-command".to_owned(),
+                commit: "cb5a2e8b4f1d9c7a3e05b8d6f2a1c4e79b0d3f68".to_owned(),
+                args: Vec::new(),
+                executor: herd_proto::Executor {
+                    up: "tool ws up {job}".to_owned(),
+                    fetch: "tool ws fetch {job}".to_owned(),
+                    // No {line}: their workspace tool would run and its own
+                    // exit code would be reported as a verdict about the
+                    // consumer's tests.
+                    run: "tool ws run {job}".to_owned(),
+                    down: "tool ws down {job}".to_owned(),
+                    env: std::collections::BTreeMap::new(),
+                },
+            }),
+            ..herdctl::Declared::default()
+        },
+    )
+    .await
+    .expect_err("a run hook with no {line} is refused");
+    let said = format!("{refused:#}");
+    assert!(
+        said.contains("{line}") && said.contains("a-declared-command"),
+        "the refusal names the token and the command: {said}"
+    );
+}

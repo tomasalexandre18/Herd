@@ -4594,4 +4594,84 @@ mod tests {
         );
         assert!(steady < writing, "{steady:?} against {writing:?}");
     }
+
+    /// What the hub can check about a declaration without a repository, and
+    /// each of the three things it must not let past (E-11, D106).
+    ///
+    /// The hub trusts the requester for the *content* of the declaration — it
+    /// holds no repository and cannot check the file against the commit, which
+    /// D106 states as its cost. These three are different: each one is a
+    /// declaration no runner could execute as declared, and each would become
+    /// a job that ran something nobody declared.
+    #[test]
+    fn a_declaration_no_runner_could_execute_is_refused_by_name() {
+        let hook = |run: &str| herd_proto::Executor {
+            up: "tool ws up {job}".to_owned(),
+            fetch: "tool ws fetch {job}".to_owned(),
+            run: run.to_owned(),
+            down: "tool ws down {job}".to_owned(),
+            env: Default::default(),
+        };
+        let asked = |commit: &str, executor: herd_proto::Executor| herd_proto::Asked {
+            command: vec!["a-line".to_owned()],
+            labels: LabelSet::default(),
+            priority: Priority::Step,
+            build_thread_mib: None,
+            memory_mib: None,
+            tmpfs_mib: None,
+            deadline_unix_s: None,
+            after: None,
+            requeue_exit_code: None,
+            declaration: Some(herd_proto::Declaration {
+                command: "a-declared-command".to_owned(),
+                commit: commit.to_owned(),
+                args: Vec::new(),
+                executor,
+            }),
+            timeout_s: None,
+        };
+        const GOOD: &str = "cb5a2e8b4f1d9c7a3e05b8d6f2a1c4e79b0d3f68";
+
+        assert_eq!(
+            why_that_declaration_will_not_do(&asked(GOOD, hook("tool ws run {job} -- {line}"))),
+            None,
+            "a declaration a runner could execute is let through"
+        );
+
+        // A ref rather than the hash the requester's own checkout resolved:
+        // resolving it would mean resolving it on a machine, which is what
+        // E-01 forbids.
+        let said =
+            why_that_declaration_will_not_do(&asked("main", hook("tool ws run {job} -- {line}")))
+                .expect("a ref is not a commit this hub will take");
+        assert!(
+            said.contains("main") && said.contains("forty"),
+            "the refusal names what it was sent and what it needed: {said}"
+        );
+
+        // A step with no line is a step that would silently not happen, and
+        // the four steps run with no conditions at all (D77).
+        let said =
+            why_that_declaration_will_not_do(&asked(GOOD, hook("   "))).expect("an empty hook");
+        assert!(
+            said.contains("run") && said.contains("empty"),
+            "the refusal names the step: {said}"
+        );
+
+        // The sharpest one: a `run` hook with no {line} would run their
+        // workspace tool and report *its* exit code as a verdict about their
+        // tests (D20).
+        let said = why_that_declaration_will_not_do(&asked(GOOD, hook("tool ws run {job}")))
+            .expect("a run hook that would never run the line");
+        assert!(
+            said.contains(herd_proto::LINE_TOKEN) && said.contains("a-declared-command"),
+            "the refusal names the token and the command: {said}"
+        );
+
+        // And a job that is not a declared command is not judged by this at
+        // all: every job before M10 is one, and so is every `herdctl run --`.
+        let mut ad_hoc = asked(GOOD, hook("tool ws run {job} -- {line}"));
+        ad_hoc.declaration = None;
+        assert_eq!(why_that_declaration_will_not_do(&ad_hoc), None);
+    }
 }
