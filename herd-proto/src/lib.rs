@@ -38,83 +38,47 @@ pub use placement::{
 };
 
 /// The version announced in [`ToHub::Hello`] and echoed in
-/// [`FromHub::Welcome`]. It is bumped whenever a message shape changes in a
-/// way an older peer could not read.
+/// [`FromHub::Welcome`], and the first thing the hub checks: a peer that does
+/// not announce exactly this number is refused by name
+/// ([`version_mismatch_reason`]), whatever else it got right.
 ///
-/// 2 since M6: [`ToHub::SubmitJob`] carries a [`Priority`], and carries it
-/// *required*, so that a submission can never acquire a level nobody chose
-/// (E-18). That is not an additive change — a version 1 submission has no
-/// priority field at all — so the number moves, which is exactly what the
-/// handshake's version is for.
+/// **1 is the first deployed protocol, and it is frozen here** (D73). The
+/// numbers 2 to 8 each existed for a real format break, but every one of those
+/// breaks was made on a protocol nothing spoke outside this repository;
+/// carrying eight compatibility eras into a deployment would have described a
+/// history no peer ever lived. M16 sets the number back to 1, and from M16 on
+/// it is not a development counter.
 ///
-/// 3 since M7: a runner announces how big its host is and how preferred it
-/// is ([`HostSize`], `preference`), and a submission may carry the memory one
-/// of its build threads needs, from which the hub derives the job's `-j`
-/// (E-22). Both are new fields on existing messages, so an older peer would
-/// be *served* rather than refused — and served wrongly: a version 2 runner
-/// announces no size, and a hub reading that as a machine of no size would
-/// derive nothing for it and place nothing on it. The number moves instead.
-/// Both numbers are free-running development counters until M16, where they
-/// are set back to 1 (D73).
+/// **What moving it now costs.** The handshake tests equality, not a floor:
+/// the day this becomes 2, every runner and every `herdctl` still built
+/// against 1 is refused at the handshake and stays refused until its host is
+/// rebuilt — a fleet going quiet machine by machine, and requesters that
+/// cannot submit, out of one constant. So a bump is a compatibility statement:
+/// it needs Alexa's approval, and the order in which the hub and its peers are
+/// moved is decided before it lands.
 ///
-/// 4 since M8: a runner announces the memory it keeps for itself and the
-/// tmpfs room jobs may reserve on it ([`HostSize::memory_floor_mib`],
-/// [`HostSize::tmpfs_mib`]) and the load it last measured; a submission may
-/// carry the whole-job memory and the tmpfs its requester declares. The
-/// reason the number moves is the same as M7's, and sharper: a version 3
-/// runner announces no floor and no tmpfs, and a hub that read either as zero
-/// would admit a job into the memory its host needs to stay alive
-/// (invariant 2) or take a reservation on room nobody said was there.
+/// **What still has to move it.** "Additive" is not the same as "an older peer
+/// survives it", and serde does not close the gap. [`FromHub`] and [`ToHub`]
+/// are tagged enums with no catch-all variant, so a frame whose `type` an
+/// older build has never heard of does not decode at all — a read error, not
+/// an ignored message. **Adding a variant to either enum is a breaking change
+/// and moves this number**, whatever serde would tolerate on the wire. The two
+/// clients fail differently and neither failure is acceptable: `herdctl` ends
+/// the run it was following with "undecodable frame" and exits 125, reporting
+/// no verdict for a job that may well have passed — the shape of D117, closed
+/// by D118 — while `herd-runner` drops the link and redials into the same
+/// undecodable frame, so it loops rather than shrugs. The runner's `other =>`
+/// arm, which ignores "what is not a runner's business", only covers variants
+/// that build already knows about; it is not forward compatibility. A new
+/// *field* on an existing variant is the one change that may leave the number
+/// alone, and only when it is `#[serde(default)]` *and* means, when absent,
+/// exactly what its default says.
 ///
-/// **5 is M9's**, and it moves for four reasons at once, every one of them a
-/// field that must never be read as absent. A runner announces its owner's
-/// [`Switch`] in the handshake and on every health report, and a hub that read
-/// a missing switch as `on` would hand work to a machine its owner has
-/// withdrawn (E-33). A submission may carry a deadline, one named parent and
-/// the exit code its command means "requeue me" by (E-09, E-10, D76), and for
-/// each of those the absence of the field means something no value of it could
-/// mean. Both numbers are still free-running before M16 (D73): a version 4
-/// peer is refused by name, there is no migration and none is owed.
-///
-/// **6 closes the window D99 found**: a runner says it has *written* the
-/// position down ([`ToHub::SwitchApplied`]) and the hub's answer to
-/// `herdctl switch` says whether it heard that ([`FromHub::SwitchSet`]'s
-/// `confirmed`). Both are additive in shape and neither may be read as absent.
-/// A version 5 runner would never acknowledge, so every `herdctl switch`
-/// against it would report a position nobody confirmed — a true sentence about
-/// a peer that is simply old, which reads to an owner as a fault on her
-/// machine. And `confirmed` missing would default to *something*, and either
-/// default is a lie in one direction. So the number moves, a version 5 peer is
-/// refused by name, and there is no migration — M16 sets both numbers back to
-/// 1 (D73).
-///
-/// **7 is M10's**, the command declaration contract (E-11). A submission may
-/// carry a [`declaration::Declaration`] — a declared command's name, its
-/// commit, the requester's arguments and the consumer's four executor hooks —
-/// and the time cap that command declares; the hub hands both back with the
-/// attempt ([`FromHub::AssignJob`]); the runner reports each step as it ends
-/// ([`ToHub::StepFinished`]) and the four again with the verdict. None of it
-/// may be read as absent, and the sharp one is the cap: a version 6 runner
-/// handed a declared job would ignore the four steps, exec the line directly
-/// and cap it at its own figure — a job that ran something other than what the
-/// declaration says, reported as if it had. So the number moves, a version 6
-/// peer is refused by name, and there is no migration (D73).
-///
-/// 7 also carries [`FromHub::RanOn`], which is E-02's first line: where the
-/// job is running and why there. It rides on 7 because it is the same
-/// milestone and nothing is deployed to be caught in between.
-///
-/// **8 is M15's**, and it is the handshake learning to say which *build* is
-/// speaking (E-51). A peer announces its own version beside the protocol's
-/// ([`ToHub::Hello::peer_version`]), and the hub answers a minor gap with a
-/// note it carries in the welcome ([`FromHub::Welcome::version_note`]) and a
-/// major one with a refusal. Neither field may be read as absent: a missing
-/// build version read as "the same as mine" is a hub that never warns and
-/// never refuses, which is the whole of what E-51 asks for, and a missing
-/// note read as "nothing to say" would hide the one line that tells an owner
-/// which side to move. So the number moves, a version 7 peer is refused by
-/// name, and there is no migration (D73).
-pub const PROTOCOL_VERSION: u32 = 8;
+/// The gap between two *builds* speaking the same protocol is a separate
+/// question with a separate answer ([`version_gap`], E-51): a minor gap is
+/// served with a note, a major one refused. This number only says whether two
+/// peers can read each other's frames at all.
+pub const PROTOCOL_VERSION: u32 = 1;
 
 /// How often a runner says it is alive and what it is doing (E-40).
 ///

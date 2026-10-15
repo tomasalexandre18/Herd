@@ -50,10 +50,10 @@ real job until M10 through M15 land.
    Docker at all (D78); three checks land in M16.
 3. E-30's real kernel ceiling needs a delegated cgroup; the WSL
    replay is a manual M17 check.
-4. Both numbers are free-running: `PROTOCOL_VERSION` **6** (D99 added
-   the switch acknowledgement), `RECORD_VERSION` **5**. An older root
-   or peer is refused by name, no migration; both go back to 1 and
-   freeze at M16 (D73).
+4. Both numbers are frozen at **1** — the first deployed protocol
+   (D73), set back from 8 and 6 in M16. A peer announcing another
+   number is refused at the handshake, a record at another version
+   stops the hub starting, and a bump is Alexa's to approve.
 5. The whole-pass `dispatching` lock is measured, not fixed (D92), and
    M9's dry run costs one more such pass, unmeasured.
 6. `off` does not stop serving content: no endpoint exists before M11,
