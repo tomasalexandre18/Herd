@@ -2860,11 +2860,17 @@ async fn relay_from_runner(
                         its_own.push(job);
                     }
                 }
+                let admitted_again = state.record_health(outbox, its_own, draining, load_milli);
+                // The answer first, and before any of the work below: it is
+                // what tells the runner this link is alive — a socket can stay
+                // open onto a hub that is gone — and it must not queue behind a
+                // dispatch pass, which writes records and fsyncs them.
+                let _ = outbox.send(FromHub::HealthRecorded {});
                 // And a report that lifts a quarantine for stale figures is
                 // said out loud **and** re-judges the queue at once, for the
                 // reason a switch that moved does: this machine can take work
                 // again, and "again" means now (D113, D80).
-                if let Some(said) = state.record_health(outbox, its_own, draining, load_milli) {
+                if let Some(said) = admitted_again {
                     println!("herd-hub: {said}");
                     dispatch_queued_jobs(state)?;
                 }
@@ -2878,9 +2884,6 @@ async fn relay_from_runner(
                     println!("herd-hub: {said}");
                     dispatch_queued_jobs(state)?;
                 }
-                // The answer is what tells the runner this link is alive: a
-                // socket can stay open onto a hub that is gone.
-                let _ = outbox.send(FromHub::HealthRecorded {});
             }
             // What the runner did with a position this hub asked it for, and
             // the one thing `herdctl switch` may read as success (E-33, D99).
