@@ -446,6 +446,45 @@ pub fn reclaim_a_past_life(root: &DataRoot, ceiling: &Ceiling) -> Vec<String> {
 }
 
 /// Every live process carrying a Herd job marker whose runner is gone.
+///
+/// Read from `/proc/<pid>/environ`, and this sweep runs **once**, from
+/// [`reclaim_a_past_life`] at startup. So anything it cannot see here it does
+/// not see later either, and the three limits below are worth naming
+/// separately: one of them cannot cost a job process, two of them can.
+///
+/// **A process between `fork` and `exec` carries its parent's environment,
+/// not its own.** So a child spawned in that instant shows whatever its
+/// parent showed, and the marker it was given is not there yet. This one
+/// **cannot** hide a process this sweep ought to kill, and the reason is
+/// structural rather than lucky: the processes it hunts belong to a runner
+/// that is *gone*, which means they `exec`ed long ago, and a child one of
+/// them forks in the middle of this walk inherits a *marked* parent's
+/// environment and is therefore visible anyway. The only invisible shape is a
+/// marked child of an **unmarked** parent, and the only unmarked parent that
+/// spawns marked children is a live runner starting a job — whose jobs this
+/// sweep is required to leave alone (the `minter_is_gone` test below). A test
+/// planting an orphan from the test binary is exactly that shape, which is
+/// why the fixture waits for the marker rather than guessing at the `exec`.
+///
+/// **A zombie minter reads as alive**, because `/proc/<pid>` is still there
+/// for a process that has exited and not been reaped — so a runner killed
+/// whose supervisor has not waited on it yet is read as holding its jobs, and
+/// they are spared. Narrow: it needs a new runner to start inside that window,
+/// and systemd reaps its own children at once. Permanent when it happens,
+/// because this sweep does not run again.
+///
+/// **A reused pid reads as alive** for the same reason: the kernel hands pids
+/// out again, and a marker naming a pid that now belongs to something else is
+/// read as a live runner's. Inherent to naming a runner by its pid; closing it
+/// needs an identity a pid alone cannot give — the process start time in
+/// `/proc/<pid>/stat` beside it, so that "pid 4211 as it was then" is
+/// distinguishable from "pid 4211 now".
+///
+/// The last two are **not** covered by the cgroup half of
+/// [`reclaim_a_past_life`] either: that reads the runner's pid out of the
+/// cgroup's name and asks the same `minter_is_gone`. A job whose own command
+/// scrubs its environment (`env -i`) is a third thing and *is* covered there,
+/// because a cgroup is killed wholesale by name and needs no marker.
 fn orphaned_job_processes() -> Vec<(u32, String)> {
     let needle = format!("{MARKER_VARIABLE}=");
     let mut orphans = Vec::new();
