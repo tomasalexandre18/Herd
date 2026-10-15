@@ -3213,3 +3213,29 @@ on a machine that could have run it. The behaviour is correct — admission
 against an unknown host must refuse — but silence is not. **M16 owes a loud
 failure at startup**: a runner that cannot admit any declared work says so
 when it starts, rather than queueing jobs for ever.
+
+---
+
+## 2026-10-15 — D112 The test-side reader of E-02's format, and one stray file
+
+**Context.** Two findings from integrating M10's framing with M15's
+authentication. Both small; both the kind of thing that rots if unwritten.
+
+**The inverse of E-02's format exists three times on the test side**
+(`herd-hub/tests/real_herd::job_output_bytes`, `herdctl/tests/exit_code.rs`,
+`herdctl/tests/declared_end_to_end.rs::framed`), because a test support module
+cannot cross a crate boundary. Invariant 4 is **not** broken: the format itself
+has exactly one definition, in `herd-proto`, and all three call
+`herd_proto::unframe`. What is duplicated is only the *insistence* — the panic
+message saying the line must be there. **Decision: leave it.** Three thin
+wrappers around one definition is cheaper than a test-only public surface on
+the contract crate, which would then need its own compatibility care. If a
+fourth appears, move the insistence into `herd-proto` behind a test feature.
+
+**`hub.out` and `hub.err` were tracked at the repository root**, committed in
+`213fcf1`: 120 bytes of a `herd-hub` usage error from somebody driving the
+binary by hand, and an empty file. Removed, and named in `.gitignore` —
+deliberately not as `*.out`/`*.err`, since a test fixture may legitimately be
+called `expected.out`. Nothing sensitive was in them, and that is the point
+worth recording: a stray redirection at the root of a public repository is a
+leak waiting for the one time it is not empty.
