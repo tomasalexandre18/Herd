@@ -4211,3 +4211,52 @@ one — a fraction of the kernel's own measurement of the device in
 `/sys/fs/cgroup/io.cost.model` (`rbps=3102524156`, `wbps=1742780862` here),
 with the IOPS keys included, because a freeze is a latency event and small
 random IO is what causes one.
+
+---
+
+## 2026-10-15 — D136 Why this host freezes, and the one line that would fix it
+
+**This is the sharpest measurement of the night and it is not about Herd.**
+`/sys/fs/cgroup/io.cost.qos` on this server reads:
+
+```
+259:0 enable=1 ctrl=auto rpct=0.00 rlat=5000 wpct=0.00 wlat=5000 …
+```
+
+`rpct` and `wpct` are the **latency percentiles blk-iocost watches** to decide
+a device has fallen behind. At **zero** it watches none: the controller runs
+purely off its cost model, **apportions** the disk by weight, and never
+**reduces** the total load offered to it.
+
+**So every weight on this machine can be honoured exactly while
+`/proc/pressure/io` reads `full avg60=43`.** `full` means every non-idle task
+stalled — including the consumer's own weight-20 slice, which is why their
+`IOWeight` mitigation did not stop the freezes. Putting everything in a
+weighted cgroup would make the stalls **fair, not absent**, and a frozen
+service does not need fairness.
+
+**The single largest win available is one line of `/etc/nixos`, and it is not
+ours.** Give `io.cost.qos` a real `rpct`/`wpct` and iocost becomes a
+**latency-targeting throttle for every cgroup at once** — it adapts to the
+device instead of guessing a number, and it protects the consumer's services
+from everything on the host, Herd included. That is Alexa's to apply, like
+D129's libvirtd socket, and it is worth more to them than anything Herd can
+ship.
+
+**Herd still needs its own ceiling, for a reason independent of the host.** A
+weight is a promise about a **ratio**, and a ratio with an unknown denominator
+is not a bound. Invariant 2 — a runner never destabilises its host — cannot be
+kept with a knob whose effect depends on who else happens to be in a cgroup.
+The ceiling is the only IO bound Herd can state about *itself* while knowing
+nothing about the rest of the machine, which is also exactly why it is
+optional and off by default.
+
+Proof the two knobs are not redundant, measured on one host in one run: on
+`/mnt/hdd` (`sdb`) blk-iocost knows no cost model, so `io.weight` there is
+genuinely inert — and the `io.max` ceiling was written and held anyway.
+
+**Its honest limits.** It bounds **rate**, not volume, and only on the device
+the data root is on. Disk saturation it addresses; a disk filling up it does
+not — that is the workspace budget, and only inside the data root. The
+absolute-path gap of D123 is untouched. All of that is now in the runner's
+startup report rather than left to be discovered.
