@@ -6,6 +6,7 @@
 //! `cancel` to ask for a job to be ended wherever it is running (E-06).
 
 pub mod checkout;
+pub mod declaration;
 
 use anyhow::{anyhow, bail, Context, Result};
 use futures_util::{SinkExt, StreamExt};
