@@ -3292,3 +3292,102 @@ failure is silence, which is the mode this project keeps legislating against.
 **Choice.** Every harness that lends a real runner names it and approves it,
 through the one `approve_runner` path, exactly as `confinement.rs` does. No
 test holds its own notion of an approved runner.
+
+---
+
+## 2026-10-15 — D115 `wss://` with rustls and the bundled webpki roots
+
+**Context.** `wss://` did not work at all: `tokio-tungstenite` was pulled with
+default features, so **no TLS crate existed in `Cargo.lock`** — no rustls, no
+native-tls, no openssl. The hub never needed TLS (Cloudflare terminates it in
+front), but `herd-runner` and `herdctl` are the side that *dials*, and a client
+with no TLS cannot begin a connection it is Cloudflare's job to end. M16 is
+unaffected — the server's runner and every requester reach the hub on loopback
+`ws://` — but M17, the owner's PC dialling in from another machine, was
+impossible.
+
+**Choice.** rustls, with the **bundled webpki roots**, and no trust-this-CA
+option. The reason is specifically that Cloudflare fronts the hub: the only
+`wss://` dial is to a publicly trusted certificate, and a frozen Mozilla root
+set verifies it on a host whose own trust store we know nothing about. Not a
+general preference — if the hub were ever fronted by a private CA instead, this
+is the decision to revisit, and it would need a flag.
+
+`rustls` is named in the workspace manifest **for its crypto provider alone**
+(`ring`): tokio-tungstenite pulls rustls with no provider, and
+`ClientConfig::builder()` *panics* without one — a latent process abort on the
+first `wss://` dial, not a connection error.
+
+**Alternative rejected.** The host's trust store, and OpenSSL or native-tls —
+the latter for the system library a runner would then need on every machine it
+is dropped onto.
+
+**Proof, not argument.** Before: `URL error: TLS support not compiled in`.
+After, against a real endpoint: `HTTP error: 200 OK` — the handshake completed
+and the certificate verified; the server merely answered HTTP instead of a
+WebSocket upgrade. Tests assert a real ClientHello reaches the wire and that
+the failure is the peer's alert, never the missing-feature string.
+
+---
+
+## 2026-10-16 — D116 A job's cgroup bounds cpu, io and pids, and says so
+
+**Context.** The runner wrote exactly one cgroup control, `memory.max`. CPU and
+IO were left to `nice 10` and the idle IO class, so a job ignoring the `-j` it
+is handed took every core. The first consumer's two incidents of 2026-10-15
+were a global OOM and a two-minute swap and IO freeze that took every docker
+service on the host down; Alexa approved these bounds and the consumer asked
+for them in writing.
+
+**Choice.** Beside `memory.max`, in each job's cgroup: `cpu.weight` **10** by
+default, `io.weight` **10**, `pids.max` **1024**, and `cpu.max` **absent** by
+default. The split matters: the three with defaults report loudly when the
+controller is withheld, while `cpu.max` — which claims nothing unless asked —
+**refuses the startup** when it is asked for on a host that cannot enforce it
+(D23's refusal over silent degradation). Weights outside `1..=10000` refuse the
+startup naming the range. Nothing gates on load: the consumer's E-32 says the
+load figure is recorded and never a criterion.
+
+**`io.weight` is written and ignored on this host, and the runner says so.**
+Measured: no device offers `bfq` anywhere (`[none] mq-deadline kyber`), and
+`/sys/fs/cgroup/io.cost.qos` is empty — blk-iocost enabled for no device. So
+the block layer has no per-cgroup weighting to apply. Worse, and this is the
+part to carry forward: **the idle IO priority the runner already sets is itself
+inert on a `none` scheduler.** As it stands Herd therefore has *no* effective
+IO bound on this machine, and the runner prints that in its startup report
+rather than implying a bound it does not have.
+
+**Deliberately not built.** `io.max`, an absolute throughput or IOPS ceiling,
+which is the one IO lever that works whatever the scheduler is. It is the
+honest next step if IO must actually be bounded, and it was not asked for.
+
+---
+
+## 2026-10-16 — D117 Two traps between a green suite and a working deployment
+
+**Context.** Both found while making M16 real; both would have cost hours on
+the server and neither is visible from a test run.
+
+**`Delegate=yes` only delegates to the scope's *only* process.** The
+measurement that cgroup delegation closes the two memory skips holds for a
+*bare* command: `systemd-run --user --scope -p Delegate=yes -- herd-runner`.
+Put a wrapper in the scope — `… -- timeout 5 herd-runner` — and enabling
+`+memory` returns `EBUSY`, the runner falls back, and the run silently proves
+nothing. Whoever verifies the ceiling on the real machine must check the
+runner's own startup line (`memory ceiling: one cgroup v2 subtree per job,
+enforced by the kernel`) rather than trusting the scope.
+
+**`herdctl` has no heartbeat and no redial.** The runner is fine: a `Close`
+frame returns success, spending no failure counter, and its health report every
+15 s means its link is never idle — Cloudflare's idle timeout, around 100
+seconds, cannot reach it. A requester is different. A *queued* job is safe,
+because the hub restates why it waits every 60 s. But a **running** job that
+prints nothing for 100 s sends its follower no frames at all, so a requester
+dialling `wss://` through Cloudflare would take the close, report that it has
+no verdict and **exit 125 while the job succeeds**. A wrong answer, not a
+degraded one — and a merger reading 125 would conclude the work never ran.
+
+Unreachable at M16, where every requester is on loopback `ws://`. **It must be
+closed before the first requester is remote**, and the cheap shape is the hub
+keeping a running job's followers warm on the same cadence it already uses to
+restate a wait, so that no client needs its own heartbeat.
