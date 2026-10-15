@@ -1588,9 +1588,11 @@ fn admission_refusal(
 async fn serve_peer(state: Arc<State>, stream: TcpStream) -> Result<()> {
     // Log chunks are small and must not wait for a full segment.
     let _ = stream.set_nodelay(true);
-    let socket = tokio_tungstenite::accept_async_with_config(stream, Some(frame_limits()))
-        .await
-        .context("websocket handshake")?;
+    let socket =
+        match tokio_tungstenite::accept_async_with_config(stream, Some(frame_limits())).await {
+            Ok(socket) => socket,
+            Err(error) => bail!("{}", unfinished_handshake_reason(&error)),
+        };
     let (mut sink, mut source) = socket.split();
 
     // The handshake is read as text first, because a handshake this hub
@@ -5062,6 +5064,44 @@ fn unreadable_frame_reason(error: &tokio_tungstenite::tungstenite::Error) -> Str
              {MAX_FRAME_BYTES} bytes"
         ),
         other => format!("this frame would not read: {other}"),
+    }
+}
+
+/// Why a websocket handshake did not finish, in words an operator can act on.
+///
+/// The common cause is not a broken peer: it is something that connected to
+/// the port and went away without saying who it was — a deployment's TCP
+/// health check, a reverse proxy's probe, or a runner dialling a hub that is
+/// still coming up, which retries on its own backoff and gets in (that is what
+/// its 500 ms first delay is for). **There is nothing here for this hub to
+/// refuse**, which is the question this wording answers: the peer never said
+/// anything, so there is no name to turn away and nothing to record against
+/// it. Said plainly, so that a line on every health check is not read as a
+/// fault — and so that the case which *is* one, a peer that spoke and spoke
+/// wrongly, still arrives in the library's own words.
+fn unfinished_handshake_reason(error: &tokio_tungstenite::tungstenite::Error) -> String {
+    use tokio_tungstenite::tungstenite::error::ProtocolError;
+    use tokio_tungstenite::tungstenite::Error;
+    let went_away = match error {
+        Error::Protocol(ProtocolError::HandshakeIncomplete) => true,
+        Error::Io(io) => matches!(
+            io.kind(),
+            std::io::ErrorKind::UnexpectedEof
+                | std::io::ErrorKind::ConnectionReset
+                | std::io::ErrorKind::BrokenPipe
+        ),
+        _ => false,
+    };
+    if went_away {
+        format!(
+            "a peer connected and went away before finishing its websocket handshake, so \
+             this hub never learnt who it was and has nothing to answer ({error}). A TCP \
+             health check looks exactly like this, and so does a runner dialling while this \
+             hub is still coming up; it is worth reading only if it repeats for a peer that \
+             should be getting in"
+        )
+    } else {
+        format!("this peer's websocket handshake would not complete: {error}")
     }
 }
 
