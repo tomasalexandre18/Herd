@@ -293,6 +293,7 @@ mod tests {
             requeue_exit_code: None,
             declaration: None,
             timeout_s: None,
+            reading: None,
             parallelism: None,
             submissions: 1,
             state: JobState::Queued,

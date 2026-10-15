@@ -193,6 +193,17 @@ impl Restating {
 /// (D76). See [`Policy::requeue_budget`].
 pub const REQUEUE_BUDGET: u32 = 3;
 
+/// How long a `labels_from` reading's `run` step may take (D74, D108).
+///
+/// Five minutes. A reading builds and boots nothing — the first consumer's
+/// `--labels` reads its arguments and a table compiled into the commit — so
+/// this is a cap that a healthy reading never approaches and a hung one
+/// cannot sit under for an afternoon. It is the hub's figure because a
+/// reading is the hub's own job: nobody declared it, and the declaration's
+/// `timeout_s` is the figure of the command whose *tests* run, which is hours.
+/// The runner's own cap still bounds it and is never raised by it (D108).
+pub const READING_CAP: Duration = Duration::from_secs(5 * 60);
+
 pub fn hub_version() -> &'static str {
     env!("CARGO_PKG_VERSION")
 }
@@ -281,6 +292,12 @@ pub struct Policy {
     /// because a lease somebody else holds all afternoon would otherwise
     /// requeue a job for ever, which is a job nobody is told about.
     pub requeue_budget: u32,
+    /// How long the `run` step of a `labels_from` reading may take (D74).
+    ///
+    /// See [`READING_CAP`]. A setting for the reason the others are: a test
+    /// has to be able to make a reading overrun its cap without waiting five
+    /// minutes, and through the hub's own code rather than a copy of it.
+    pub reading_cap: Duration,
 }
 
 impl Default for Policy {
@@ -296,6 +313,7 @@ impl Default for Policy {
             wait_restatement: WAIT_RESTATEMENT,
             drain_first_limit: crate::matcher::DRAIN_FIRST_LIMIT,
             requeue_budget: REQUEUE_BUDGET,
+            reading_cap: READING_CAP,
         }
     }
 }
@@ -1767,10 +1785,22 @@ fn dispatch_queued_jobs(state: &State) -> Result<()> {
 /// pushed ahead through a lane of its own — it is simply first in this order
 /// (E-43).
 fn dispatch_a_pass(state: &State) -> Result<()> {
-    let unfinished = state
+    let mut unfinished = state
         .store
         .unfinished_jobs()
         .context("reading the queue the hub recovered")?;
+    // Before a single job is placed: every job whose requirements are read on
+    // a machine gets its reading minted, or its answer written onto its
+    // record, or is refused by name (D74). Done here, ahead of the ordering,
+    // so that a reading minted now is in *this* pass's queue and goes out to
+    // a runner at once — and so that a job whose answer has just landed is
+    // placed in the same pass that read it.
+    if settle_readings(state, &unfinished)? {
+        unfinished = state
+            .store
+            .unfinished_jobs()
+            .context("reading the queue again, after the readings were settled")?;
+    }
     // What every runner is already holding, read from those same records and
     // from nothing else: there is no counter of busy slots in this hub, so
     // there is none to leak and none to rebuild after a restart (D79).
@@ -1800,6 +1830,23 @@ fn dispatch_a_pass(state: &State) -> Result<()> {
     }
     let total = queue.len();
     for (place, record) in queue.iter().enumerate() {
+        // A job whose requirements are still being read is not placed, by
+        // anything, ever: there is nothing to place it against but the
+        // baseline its reading is running on, and that baseline is not its
+        // own (D74). [`settle_readings`] has already done everything that can
+        // be done for it this pass, so what is left is to say so.
+        if record.awaits_a_reading() {
+            let standing = queue::standing(record, now, state.policy.aging_step);
+            let sentence = queue::waiting_sentence_behind(
+                place + 1,
+                total,
+                &standing,
+                &queue::what_is_ahead(&queue, place, now, state.policy.aging_step),
+                &format!("it is waiting because {}", waiting_for_a_reading(record)),
+            );
+            say_it_waits(state, &record.id, &sentence)?;
+            continue;
+        }
         // The one job this one named, if it named one (E-10). Looked up here
         // rather than inside the claim step, which is a pure function of a
         // record and a fleet: a parent that is finished is not in the queue at
@@ -1889,6 +1936,323 @@ fn dispatch_a_pass(state: &State) -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// Settle every reading the queue is waiting on, and say whether anything was
+/// written (D74).
+///
+/// The whole of D74's mechanism, in one place and under the claim lock the
+/// pass already holds. For each queued job whose command declared a
+/// `labels_from`:
+///
+/// * **no reading yet** — the cache is asked first, because the answer is a
+///   property of (commit, command, args) and nothing else, so a second
+///   submission of those three must not pay for a second reading. On a miss,
+///   an **ordinary job** is minted for it: the one queue, the baseline labels
+///   the command declared, the runner's caps, its own record and its own four
+///   executor steps. It carries **no reading of its own**, which is how "a
+///   command reached through `labels_from` never resolves one" is kept — the
+///   hub is the only thing that mints such a job.
+/// * **a reading that has not ended** — nothing to do; the job waits, and the
+///   pass says so.
+/// * **a reading that ended well** — its output is read strictly
+///   ([`herd_proto::Requirements::read`]), the answer goes into the cache and
+///   onto the job's record, and the pass places the job on it.
+/// * **a reading that ended any other way, or whose answer is not one** — the
+///   job is **refused by name**, with the reading's id and what was wrong in
+///   the sentence. A job is never placed on a guess.
+///
+/// Every write goes through the store's one door, so a job cancelled while
+/// its reading ran is an error naming it rather than a requirement written
+/// onto a closed record — and the pass goes on to the next job instead of
+/// failing.
+fn settle_readings(state: &State, unfinished: &[JobRecord]) -> Result<bool> {
+    let mut written = false;
+    for record in unfinished {
+        if record.state != JobState::Queued || !record.awaits_a_reading() {
+            continue;
+        }
+        let Some(reading) = record.reading.clone() else {
+            continue;
+        };
+        // A reading with no declaration cannot be: the submission gate
+        // refuses one ([`why_that_reading_will_not_do`]). A record that
+        // carries it anyway is said rather than guessed at.
+        let Some(declaration) = record.declaration.clone() else {
+            end_the_job(
+                state,
+                record,
+                JobOutcome::Impossible {
+                    reason: format!(
+                        "{} is refused: its requirements come from a reading ({}) and its \
+                         record carries no declared command, so there is no commit, no \
+                         command and no arguments to read them for (D74)",
+                        record.id, reading.labels_from.line
+                    ),
+                },
+                "has a reading and no declaration",
+            )?;
+            written = true;
+            continue;
+        };
+        let key =
+            crate::job::reading_key(&declaration.commit, &declaration.command, &declaration.args);
+        match reading.by.clone() {
+            None => {
+                // The cache, first and always: this is what makes a second
+                // submission of one (commit, command, args) free (D74).
+                if let Some(answer) = state
+                    .store
+                    .reading_answer(&key)
+                    .with_context(|| format!("asking the cache what {} needs", record.id))?
+                {
+                    let said = format!(
+                        "read before, and kept by (commit, command, args): {}",
+                        answer.line()
+                    );
+                    println!(
+                        "herd-hub: {} needs no reading: command {} of commit {} was read \
+                         before and the answer is {}",
+                        record.id,
+                        declaration.command,
+                        declaration.commit,
+                        answer.line()
+                    );
+                    if let Err(error) = state
+                        .store
+                        .record_reading(&record.id, reading.answered(answer, said))
+                    {
+                        eprintln!(
+                            "herd-hub: {} could not be given the cached answer to its \
+                             reading: {error}",
+                            record.id
+                        );
+                        continue;
+                    }
+                    written = true;
+                    continue;
+                }
+                // And otherwise an ordinary job that reads them.
+                let new = reading_job(state, record, &reading, &declaration);
+                let submission = state
+                    .store
+                    .submit(new)
+                    .with_context(|| format!("minting the reading {} waits for", record.id))?;
+                let by = submission.record().id.clone();
+                println!(
+                    "herd-hub: {by} reads what {} needs — command {} of commit {}, against \
+                     the baseline labels {} its declaration states (D74)",
+                    record.id,
+                    declaration.command,
+                    declaration.commit,
+                    if reading.labels_from.baseline.is_empty() {
+                        "none".to_owned()
+                    } else {
+                        reading.labels_from.baseline.to_string()
+                    }
+                );
+                if let Err(error) = state.store.record_reading(&record.id, reading.read_by(&by)) {
+                    eprintln!(
+                        "herd-hub: {by} was minted to read what {} needs and that could not \
+                         be written onto its record: {error}",
+                        record.id
+                    );
+                }
+                written = true;
+            }
+            Some(by) => {
+                let read = state
+                    .store
+                    .job(&by)
+                    .with_context(|| format!("reading the record of {by}"))?;
+                let Some(read) = read else {
+                    end_the_job(
+                        state,
+                        record,
+                        JobOutcome::Impossible {
+                            reason: refused_for_want_of_requirements(
+                                record,
+                                &declaration,
+                                &by,
+                                &format!("this hub has no record of {by} at all"),
+                            ),
+                        },
+                        "its reading is gone",
+                    )?;
+                    written = true;
+                    continue;
+                };
+                let JobState::Finished { outcome } = &read.state else {
+                    // Still going. The job waits, and the pass says so.
+                    continue;
+                };
+                if !matches!(outcome, JobOutcome::Exited { code: 0 }) {
+                    // D74's second limit: a reading that exits non-zero, or
+                    // that its cap stopped, refuses the job. Both arrive
+                    // here, and the sentence says which it was in the words a
+                    // requester reads everywhere else.
+                    end_the_job(
+                        state,
+                        record,
+                        JobOutcome::Impossible {
+                            reason: refused_for_want_of_requirements(
+                                record,
+                                &declaration,
+                                &by,
+                                &format!("it {}", how_it_ended(outcome)),
+                            ),
+                        },
+                        "its reading did not come off",
+                    )?;
+                    written = true;
+                    continue;
+                }
+                let log = state
+                    .store
+                    .job_log(&by)
+                    .with_context(|| format!("reading the output of {by}"))?
+                    .unwrap_or_default();
+                match herd_proto::Requirements::read(&log) {
+                    // D74's first limit: the answer is read strictly, like
+                    // the capability file (D60).
+                    Err(why) => {
+                        end_the_job(
+                            state,
+                            record,
+                            JobOutcome::Impossible {
+                                reason: refused_for_want_of_requirements(
+                                    record,
+                                    &declaration,
+                                    &by,
+                                    &why,
+                                ),
+                            },
+                            "its reading did not answer",
+                        )?;
+                        written = true;
+                    }
+                    Ok(answer) => {
+                        // The cache before the record, so that a hub which
+                        // stops between the two re-reads nothing: the next
+                        // pass finds the answer under its key and writes it
+                        // onto the record without a second job.
+                        if let Err(error) = state.store.remember_reading(&key, &answer) {
+                            eprintln!(
+                                "herd-hub: {by} answered what {} needs and this hub could \
+                                 not keep the answer ({error}); the job is placed on it all \
+                                 the same and the next submission of the same commit, \
+                                 command and arguments will pay for a reading",
+                                record.id
+                            );
+                        }
+                        println!(
+                            "herd-hub: {} is what {by} read for command {} of commit {}, and \
+                             {} is placed on it",
+                            answer.line(),
+                            declaration.command,
+                            declaration.commit,
+                            record.id
+                        );
+                        let said = format!("read on a runner by {by}: {}", answer.line());
+                        if let Err(error) = state
+                            .store
+                            .record_reading(&record.id, reading.answered(answer, said))
+                        {
+                            eprintln!(
+                                "herd-hub: {by} answered what {} needs and that could not be \
+                                 written onto its record: {error}",
+                                record.id
+                            );
+                            continue;
+                        }
+                        written = true;
+                    }
+                }
+            }
+        }
+    }
+    Ok(written)
+}
+
+/// The job that reads what another job needs: an ordinary job, and the one
+/// thing that makes it one is that nothing here is special (D74).
+///
+/// What it takes from the job it reads for, and why each one:
+///
+/// * the **declaration**, so it runs the consumer's own four executor steps
+///   on the same commit — their reading reads their tree, and `up` and
+///   `fetch` are what put the tree on a machine (D77, D106);
+/// * the **baseline labels** the command declared, which is what it is placed
+///   against (D74) — never the labels the reading is about to answer;
+/// * the **level** of the job that waits for it, so that a nightly's reading
+///   does not go round the queue in front of a merger's job (E-18);
+/// * the **deadline**, so that a reading of a job that is no longer worth
+///   starting is no longer worth running either (E-09).
+///
+/// What it does not take: the parent (E-10 — a reading needs the tree and
+/// nothing a parent makes), the requeue code (the consumer's 75 is about
+/// their tests), the figures (it builds and boots nothing) and — the one that
+/// matters — **a reading of its own**. Hence no recursion.
+fn reading_job(
+    state: &State,
+    record: &JobRecord,
+    reading: &crate::job::Reading,
+    declaration: &herd_proto::Declaration,
+) -> NewJob {
+    NewJob::at(
+        vec![reading.labels_from.line.clone()],
+        reading.labels_from.baseline.clone(),
+        record.priority,
+    )
+    .with_m9(record.deadline, None, None)
+    .declared(
+        Some(declaration.clone()),
+        Some(state.policy.reading_cap.as_secs()),
+    )
+    // Said out loud rather than left to the default: this is D74's third
+    // limit, and it is kept here or nowhere.
+    .reading(None)
+}
+
+/// Why a job whose requirements could not be read is refused, **by name**
+/// (D74, E-36).
+///
+/// It names the job, the command and the commit, the reading that was run for
+/// it, and what was wrong with the answer — because the only thing to do
+/// about one of these is to fix the reading, and whoever reads this sentence
+/// is the person who can.
+fn refused_for_want_of_requirements(
+    record: &JobRecord,
+    declaration: &herd_proto::Declaration,
+    by: &JobId,
+    what_went_wrong: &str,
+) -> String {
+    format!(
+        "{} is refused and was never placed: what command {} of commit {} needs is read on a \
+         runner, {by} ran that reading, and {what_went_wrong}. A job is never placed on \
+         requirements nobody read (D74)",
+        record.id, declaration.command, declaration.commit
+    )
+}
+
+/// Why a job waiting for its requirements is waiting, in the words its record
+/// carries (D74, E-04).
+fn waiting_for_a_reading(record: &JobRecord) -> String {
+    let Some(reading) = record.reading.as_ref() else {
+        return "its requirements are not known".to_owned();
+    };
+    match &reading.by {
+        Some(by) => format!(
+            "what it needs is being read on a runner by {by} ({}), and a job is placed on what \
+             a reading answered rather than on a guess (D74)",
+            reading.labels_from.line
+        ),
+        None => format!(
+            "what it needs has to be read on a runner first ({}), and this hub has not minted \
+             that reading yet (D74)",
+            reading.labels_from.line
+        ),
+    }
 }
 
 /// Where the one job this job named as its parent stands (E-10).
@@ -3237,6 +3601,11 @@ fn new_job(asked: herd_proto::Asked) -> NewJob {
             asked.requeue_exit_code,
         )
         .declared(asked.declaration, asked.timeout_s)
+        // The reading its command declared, if it declared one: the labels
+        // above are then the baseline that reading is placed against, and
+        // this job is placed on nothing until the answer is on its record
+        // (D74).
+        .reading(asked.labels_from)
 }
 
 /// Why a declared command this hub was sent will not do, if it will not
@@ -3260,6 +3629,9 @@ fn new_job(asked: herd_proto::Asked) -> NewJob {
 /// Refused at the submission, where a requester is standing to be told
 /// (E-36's rule for every refusal here).
 fn why_that_declaration_will_not_do(asked: &herd_proto::Asked) -> Option<String> {
+    if let Some(reason) = why_that_reading_will_not_do(asked) {
+        return Some(reason);
+    }
     let declaration = asked.declaration.as_ref()?;
     let commit = &declaration.commit;
     if commit.len() != 40
@@ -3293,6 +3665,57 @@ fn why_that_declaration_will_not_do(asked: &herd_proto::Asked) -> Option<String>
              never be run and whatever the step exited with would be reported as its verdict",
             herd_proto::LINE_TOKEN,
             declaration.command
+        ));
+    }
+    None
+}
+
+/// Why the `labels_from` reading a submission carries will not do, if it will
+/// not (D74).
+///
+/// Three rules, and each of them is a job that would otherwise run something
+/// nobody declared, or be placed on a figure nobody chose:
+///
+/// * a reading with no declaration around it — the reading runs the
+///   consumer's four executor steps on a commit, and the cache is keyed on
+///   (commit, command, args), none of which exists without one;
+/// * an empty line, which is a reading that would answer nothing and refuse
+///   every job of that command;
+/// * a line carrying `{j}`. This one is the sharp one. The figure is a
+///   property of the machine the hub chooses, derived as it chooses one
+///   (E-22, D82), and a reading is placed **before** the job whose figure it
+///   would be — so there is no N to put in it, and an answer obtained for the
+///   reading's own machine would be cached under (commit, command, args) as
+///   if it were a property of those three, which D82 says it is not. Refused
+///   by name rather than run with a brace in it or cached as a half-truth.
+///   D74 and D82 together leave this open; M18 settles it with the consumer.
+fn why_that_reading_will_not_do(asked: &herd_proto::Asked) -> Option<String> {
+    let labels_from = asked.labels_from.as_ref()?;
+    let Some(declaration) = asked.declaration.as_ref() else {
+        return Some(format!(
+            "this submission carries a labels_from reading ({}) and no declared command: a \
+             reading runs the four executor steps of a command on a commit, and there is \
+             neither here",
+            labels_from.line
+        ));
+    };
+    if labels_from.line.trim().is_empty() {
+        return Some(format!(
+            "command {}'s labels_from is an empty line: a reading that runs nothing answers \
+             nothing, and every job of that command would then be refused for want of \
+             requirements",
+            declaration.command
+        ));
+    }
+    if labels_from.line.contains(herd_proto::PARALLELISM_TOKEN) {
+        return Some(format!(
+            "command {}'s labels_from line carries {}: that figure is a property of the \
+             machine the hub chooses and is derived as it chooses one (E-22), and the reading \
+             is placed before the job whose figure it would be — so there is none to put in \
+             it, and an answer that depended on one could not be cached by (commit, command, \
+             args) as D74 requires. Declare a reading that does not ask for it",
+            declaration.command,
+            herd_proto::PARALLELISM_TOKEN
         ));
     }
     None
@@ -3338,6 +3761,71 @@ fn why_that_parent_will_not_do(state: &State, after: Option<&JobId>) -> Result<O
 /// same reason a real pass holds it: a probe snapshot landing halfway through
 /// would make the answer describe two different fleets.
 fn dry_run(state: &State, asked: herd_proto::Asked) -> Result<Vec<String>> {
+    let Some(labels_from) = asked.labels_from.clone() else {
+        return judge_one(state, new_job(asked));
+    };
+    // A command whose requirements are read cannot be judged as itself: what
+    // it needs is not known here, and judging it against the baseline its
+    // reading runs on would answer about a job nobody submitted (D74). So the
+    // answer is about what would really happen next — the cache, or the
+    // reading.
+    let key = asked.declaration.as_ref().map(|declaration| {
+        crate::job::reading_key(&declaration.commit, &declaration.command, &declaration.args)
+    });
+    let cached = match &key {
+        Some(key) => state
+            .store
+            .reading_answer(key)
+            .context("asking the cache what a dry run's job would need")?,
+        None => None,
+    };
+    if let Some(answer) = cached {
+        let mut lines = vec![format!(
+            "its requirements are already read and kept by (commit, command, args), so no \
+             reading would run: {} (D74)",
+            answer.line()
+        )];
+        let mut new = new_job(asked);
+        new.reading = new
+            .reading
+            .map(|reading| reading.answered(answer, "the cache"));
+        lines.extend(judge_one(state, new)?);
+        return Ok(lines);
+    }
+    let mut lines = vec![format!(
+        "what it needs is not known yet: an ordinary job on a runner reads it first ({}), \
+         against the baseline labels {} its command declares, and this job is then placed on \
+         what that answered (D74). What follows is where that reading would run",
+        labels_from.line,
+        if labels_from.baseline.is_empty() {
+            "none".to_owned()
+        } else {
+            labels_from.baseline.to_string()
+        }
+    )];
+    let hypothetical_record = JobRecord::hypothetical(new_job(asked.clone()), Timestamp::now());
+    let reading = reading_job(
+        state,
+        &hypothetical_record,
+        &crate::job::Reading::of(labels_from),
+        // Judged with the declaration the submission carries, so the reading
+        // this answers about is the reading a submission would really mint.
+        &asked
+            .declaration
+            .unwrap_or_else(|| herd_proto::Declaration {
+                command: String::new(),
+                commit: String::new(),
+                args: Vec::new(),
+                executor: herd_proto::Executor::default(),
+            }),
+    );
+    lines.extend(judge_one(state, reading)?);
+    Ok(lines)
+}
+
+/// Where one job — the one a submission would make, or the reading it would
+/// mint first — would run, said in lines (E-07).
+fn judge_one(state: &State, new: NewJob) -> Result<Vec<String>> {
     let _one_pass = state
         .dispatching
         .lock()
@@ -3350,7 +3838,7 @@ fn dry_run(state: &State, asked: herd_proto::Asked) -> Result<Vec<String>> {
     let reserved = matcher::reserved(&unfinished);
     let mut seats = state.seats(&held, &reserved);
     let now = Timestamp::now();
-    let hypothetical = JobRecord::hypothetical(new_job(asked), now);
+    let hypothetical = JobRecord::hypothetical(new, now);
     let mut queue = queue::order(unfinished.clone(), now, state.policy.aging_step);
     // Inserted where the queue's own ordering function puts it, so "what is
     // queued ahead" is what would really be ahead of it (E-07 asks for that
@@ -4263,6 +4751,19 @@ mod tests {
         fn record_waiting(&self, id: &JobId, reason: &str) -> StoreResult<bool> {
             self.inner.record_waiting(id, reason)
         }
+        fn record_reading(&self, id: &JobId, reading: crate::job::Reading) -> StoreResult<()> {
+            self.inner.record_reading(id, reading)
+        }
+        fn reading_answer(&self, key: &str) -> StoreResult<Option<herd_proto::Requirements>> {
+            self.inner.reading_answer(key)
+        }
+        fn remember_reading(
+            &self,
+            key: &str,
+            answer: &herd_proto::Requirements,
+        ) -> StoreResult<()> {
+            self.inner.remember_reading(key, answer)
+        }
         fn record_state(&self, id: &JobId, state: JobState) -> StoreResult<()> {
             self.inner.record_state(id, state)
         }
@@ -4667,6 +5168,7 @@ mod tests {
                 args: Vec::new(),
                 executor,
             }),
+            labels_from: None,
             timeout_s: None,
         };
         const GOOD: &str = "cb5a2e8b4f1d9c7a3e05b8d6f2a1c4e79b0d3f68";
@@ -4712,5 +5214,58 @@ mod tests {
         let mut ad_hoc = asked(GOOD, hook("tool ws run {job} -- {line}"));
         ad_hoc.declaration = None;
         assert_eq!(why_that_declaration_will_not_do(&ad_hoc), None);
+
+        // And the three a `labels_from` reading can earn (D74).
+        let reading = |line: &str| {
+            let mut asked = asked(GOOD, hook("tool ws run {job} -- {line}"));
+            asked.labels_from = Some(herd_proto::LabelsFrom {
+                line: line.to_owned(),
+                baseline: LabelSet::of("build").expect("a label"),
+            });
+            asked
+        };
+        assert_eq!(
+            why_that_declaration_will_not_do(&reading("tool test --labels")),
+            None,
+            "a reading a runner could run is let through"
+        );
+
+        // A reading with no declaration around it: there is no commit, no
+        // command and no arguments, which is the whole of the cache key and
+        // the whole of what a runner would check out.
+        let mut orphan = reading("tool test --labels");
+        orphan.declaration = None;
+        let said =
+            why_that_declaration_will_not_do(&orphan).expect("a reading with no declared command");
+        assert!(
+            said.contains("tool test --labels") && said.contains("no declared command"),
+            "the refusal names the line and what is missing: {said}"
+        );
+
+        // An empty reading would answer nothing, and every job of that
+        // command would then be refused for want of requirements.
+        let said = why_that_declaration_will_not_do(&reading("  ")).expect("an empty reading");
+        assert!(
+            said.contains("a-declared-command") && said.contains("empty line"),
+            "the refusal names the command: {said}"
+        );
+
+        // The sharp one: a reading asking for the figure the hub derives from
+        // the machine it chooses. There is no N when a reading runs — it is
+        // placed before the job whose figure it would be — and an answer that
+        // depended on one could not be a property of (commit, command, args),
+        // which is what D74 caches it as. D82 anticipates this; M18 settles
+        // it with the consumer.
+        let said = why_that_declaration_will_not_do(&reading(&format!(
+            "tool test --labels -j {}",
+            herd_proto::PARALLELISM_TOKEN
+        )))
+        .expect("a reading that asks for a derived -j");
+        assert!(
+            said.contains(herd_proto::PARALLELISM_TOKEN)
+                && said.contains("a-declared-command")
+                && said.contains("cached by (commit, command, args)"),
+            "the refusal names the token, the command and why: {said}"
+        );
     }
 }
