@@ -86,6 +86,12 @@
           herd-runner = binary "herd-runner";
           herdctl = binary "herdctl";
 
+          # `herd-hub:<version>`, which is how the deployment names it.
+          hub-image = pkgs.callPackage ./nix/hub-image.nix {
+            hub = herd-hub;
+            inherit version;
+          };
+
           default = herd-hub;
         }
       );
