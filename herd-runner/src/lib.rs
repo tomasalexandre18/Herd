@@ -174,6 +174,12 @@ impl Default for Backoff {
     /// bounding a runner pointed at a URL that will never answer. A runner
     /// that never gives up hides a typo in its configuration for ever; one
     /// that gives up in five minutes needs a human for an ordinary reboot.
+    ///
+    /// The 500 ms claim is only true because of [`Backoff::settled`]: it is
+    /// the delay after the *first* failure, so it is what a hub restarted by
+    /// its deployment gets only if the connection it ended counted as having
+    /// served. Without that the figure described the first restart and
+    /// nothing after it (D104).
     fn default() -> Self {
         Self {
             first: Duration::from_millis(500),
@@ -193,6 +199,27 @@ impl Backoff {
         let capped = grown.min(self.cap);
         let half = capped / 2;
         half + scale(half, jitter_fraction())
+    }
+
+    /// Whether a connection that lasted `served` has earned the counters a
+    /// fresh start (D104).
+    ///
+    /// `None` means the attempt was never welcomed at all — a dial that was
+    /// refused, or one that hung until it timed out. That is the case the
+    /// backoff exists for, and it looks identical on the clock to a link that
+    /// served for the same span, which is why the caller has to say which it
+    /// was rather than time it.
+    ///
+    /// **The floor is the cap, and that is the whole argument.** A hub that
+    /// accepts and dies in a loop would otherwise be answered every `first`
+    /// for ever, and the give-up bound would never fire on it, because each
+    /// short connection would wipe the record of the last. With the floor
+    /// here, a reset can only follow a connection that lasted at least as
+    /// long as the longest delay this backoff would ever have waited — so no
+    /// reset can make a runner dial faster than once per cap, whatever a
+    /// broken hub does.
+    pub fn settled(&self, served: Option<Duration>) -> bool {
+        served.is_some_and(|served| served >= self.cap)
     }
 
     /// What a runner says when it stops trying.
@@ -548,6 +575,13 @@ struct Inner {
     spooled: Vec<Spooled>,
     /// The runner is stopping: it takes no new job (invariant 2).
     draining: bool,
+    /// When the hub last welcomed a connection of this session, if ever.
+    ///
+    /// Here rather than on a connection because the thing it is asked about
+    /// outlives every one of them: whether *this* runner has ever been
+    /// serving, and for how long, which is what tells a hub that is down
+    /// from one that is up and restarting (D104).
+    welcomed_at: Option<Instant>,
     /// Where its owner's switch stands (E-33).
     ///
     /// Separate from `draining` above, which is the process stopping. This is
@@ -566,6 +600,7 @@ impl Default for Inner {
             jobs: HashMap::new(),
             spooled: Vec::new(),
             draining: false,
+            welcomed_at: None,
             switch: herd_proto::Switch::On,
         }
     }
@@ -1033,6 +1068,32 @@ impl Session {
                 eprintln!("herd-runner: {line}");
             }
         }
+    }
+
+    /// Note that the hub has welcomed this connection (D104).
+    ///
+    /// The one fact `serve_forever` cannot work out for itself: whether a
+    /// connection that has just ended had ever been *serving*. A dial that
+    /// hung for a minute and a link that served for a minute take the same
+    /// wall-clock time, and only one of them says the hub is up.
+    fn welcomed(&self) {
+        self.with(|inner| inner.welcomed_at = Some(Instant::now()));
+    }
+
+    /// How long this session has been welcomed, if that welcome arrived no
+    /// earlier than `began` — the moment the attempt being judged started.
+    ///
+    /// The `began` bound is what keeps a stale welcome from excusing a hub
+    /// that has since gone: without it, a runner that served for an hour and
+    /// then found the hub gone for ever would read its own old welcome as
+    /// proof that every failed dial since had been a connection.
+    fn served_since(&self, began: Instant) -> Option<Duration> {
+        self.with(|inner| {
+            inner
+                .welcomed_at
+                .filter(|at| *at >= began)
+                .map(|at| at.elapsed())
+        })
     }
 
     /// Everything the hub is told at the start of a connection, in order:
@@ -1636,18 +1697,43 @@ async fn owner_asks_to_stop() -> String {
 }
 
 /// Dial, serve, redial, until a refusal or the give-up bound.
+///
+/// **What resets the backoff, and why it is not a clean close (D104).** Both
+/// counters below — how many failures in a row, and when the run of them
+/// started — are about *a hub that cannot be reached*. A connection that was
+/// welcomed and then served is the opposite of that, however it ended, so it
+/// is what clears them. It used to be a clean WebSocket close instead, which
+/// measurement showed is a case that never happens: a hub stopped with
+/// `SIGTERM`, which is how a deployment stops it, ends the link as a reset.
+/// Both counters were therefore monotonic for the life of the process, which
+/// walked the delay to its cap for ever and — worse — let the give-up bound
+/// kill a runner that had been serving happily for a day.
+///
+/// **A connection has to have lasted the cap to count.** Otherwise a hub that
+/// accepts and dies in a loop is answered by a dial every `first`, which is
+/// the thundering herd the backoff exists to prevent, and the give-up bound
+/// never fires on a hub that is broken rather than absent. With the floor at
+/// the cap, the reset can never make this runner dial faster than once per
+/// cap — which is the slowest the backoff was ever going to settle at anyway,
+/// so the floor costs nothing and bounds everything.
 async fn serve_forever(config: Config, session: Session, confined: Arc<Confined>) -> Result<()> {
     let mut failures = 0u32;
     let mut failing_since: Option<Instant> = None;
     loop {
-        let delay = match serve_once(config.clone(), session.clone(), Arc::clone(&confined)).await {
+        let began = Instant::now();
+        let outcome = serve_once(config.clone(), session.clone(), Arc::clone(&confined)).await;
+        // Whether this attempt was ever a connection, and for how long. Read
+        // before anything is decided, because every arm below wants it and
+        // one of them returns.
+        let settled = config.redial.settled(session.served_since(began));
+        if settled {
+            failures = 0;
+            failing_since = None;
+        }
+        let delay = match outcome {
             // The hub closed the connection. Nothing says the runner is done,
             // so it waits and joins the hub that comes back.
-            Ok(()) => {
-                failures = 0;
-                failing_since = None;
-                config.redial.delay(1)
-            }
+            Ok(()) => config.redial.delay(failures.max(1)),
             Err(error) if error.downcast_ref::<Refusal>().is_some() => return Err(error),
             // Asked to come back, which is not a failure at all: the budget
             // for a hub that cannot be reached is not spent on a hub that
@@ -1831,6 +1917,10 @@ pub async fn serve_once(config: Config, session: Session, confined: Arc<Confined
 
     match next_message(&mut source, config.hub_silence_limit).await? {
         Some(FromHub::Welcome { state_root, .. }) => {
+            // This connection is serving: what ends it from here on is a link
+            // that was up, which is not the same thing as a hub that cannot
+            // be reached (D104).
+            session.welcomed();
             // Before the link is attached and so before anything is offered
             // on it: what this data root is holding has to be settled against
             // the state root that has just welcomed it.
@@ -2106,6 +2196,61 @@ mod tests {
             delays.iter().any(|delay| *delay != delays[0]),
             "a jittered delay that never varies is not jittered: {delays:?}"
         );
+    }
+
+    /// What earns a fresh start, and what does not (D104).
+    #[test]
+    fn only_a_connection_that_lasted_the_cap_clears_the_backoff() {
+        let backoff = Backoff {
+            first: Duration::from_millis(500),
+            cap: Duration::from_secs(30),
+            give_up_after: Duration::from_secs(60),
+        };
+        // An attempt that was never welcomed is the case the backoff is for,
+        // however long it took to fail. A dial that hangs for a minute and a
+        // link that serves for a minute are the same span and opposite facts.
+        assert!(!backoff.settled(None));
+        // A connection shorter than the cap does not count: a hub that
+        // accepts and dies in a loop must still be backed off, and must still
+        // reach the give-up bound.
+        assert!(!backoff.settled(Some(Duration::ZERO)));
+        assert!(!backoff.settled(Some(backoff.cap - Duration::from_millis(1))));
+        // At the cap and beyond it does.
+        assert!(backoff.settled(Some(backoff.cap)));
+        assert!(backoff.settled(Some(Duration::from_secs(60 * 60))));
+        // And the property that makes the floor defensible: a reset can never
+        // let this runner dial more often than the cap already allowed. Even
+        // in the worst case — a hub that serves for exactly the floor and then
+        // dies, for ever — each round costs a connection of `cap` before the
+        // delay returns to `first`.
+        assert!(
+            backoff.cap >= backoff.delay(1),
+            "the floor is the slower of the two"
+        );
+    }
+
+    /// A welcome from an earlier connection does not excuse this attempt
+    /// (D104).
+    #[test]
+    fn a_stale_welcome_is_not_read_as_a_connection_that_served() {
+        let session = Session::new();
+        let before = Instant::now();
+        session.welcomed();
+        // Judged against a moment at or before the welcome: this attempt was
+        // the one that got in.
+        let served = session
+            .served_since(before)
+            .expect("the welcome belongs to this attempt");
+        assert!(served < Duration::from_secs(1), "{served:?}");
+        // Judged against a later moment — a dial that failed after that
+        // connection had ended — it says nothing, which is the point: a
+        // runner that served for an hour and then lost its hub for good must
+        // not read its own old welcome as proof that every dial since was a
+        // connection.
+        assert_eq!(session.served_since(Instant::now()), None);
+        // And a session that has never been welcomed has nothing to say
+        // either way.
+        assert_eq!(Session::new().served_since(before), None);
     }
 
     #[test]

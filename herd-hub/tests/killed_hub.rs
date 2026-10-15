@@ -235,15 +235,17 @@ async fn a_log_survives_twelve_killed_hubs_whole() {
     let herd = Herd::new();
     let mut hub = herd.start_hub("hub-0").await;
     // **The redial delay is capped at a second here, and that matters.** A
-    // hub killed with `SIGKILL` ends the connection as a failure, and the
-    // runner's failure count is reset only by a hub that closes *cleanly*
-    // (`serve_forever`): twelve kills in a row therefore walk the default
-    // backoff up 0.5, 1, 2, 4, 8, 16 and then 30 s a round. This test's own
-    // patience is 30 s, so from the seventh kill on the two figures are
-    // equal and the test fails whenever a jittered delay lands near the cap
-    // — which it did, unpinned, in one run of four. It is not a test of the
-    // redial policy, so it does not wait one out; the policy itself is a
-    // product question, written down in D101 rather than changed here.
+    // hub killed with `SIGKILL` ends the connection as a failure, and a
+    // connection only clears the failure count if it lasted at least the cap
+    // (D104, `Backoff::settled`). The hubs of this test live for far less
+    // than the default cap of 30 s, so twelve kills in a row walk the default
+    // backoff up 0.5, 1, 2, 4, 8, 16 and then 30 s a round — correctly, a hub
+    // dying this fast *is* a hub to back off from, but this test's own
+    // patience is also 30 s, and two equal figures fail the instant a
+    // jittered delay lands near the cap. It did, unpinned, in one run of
+    // four. Capping the delay at a second is a fixture, not a weakened
+    // assertion: what this test is about is a log surviving twelve kills, and
+    // the policy those figures belong to has its own tests.
     let mut runner = herd.start_runner_with(
         "the-real-runner",
         "runner",
@@ -1603,4 +1605,82 @@ async fn a_health_cadence_of_zero_is_refused_on_both_sides() {
     );
 
     hub.signal(rustix::process::Signal::TERM).await;
+}
+
+/// A connection that served starts the redial counters over (D104).
+///
+/// The defect this forbids was in the loop's resetting, not its delays: both
+/// counters — the run of consecutive failures and the moment that run began —
+/// were cleared only by a hub that closed the WebSocket *cleanly*, which this
+/// file's whole premise is that a killed hub does not do. So a runner's
+/// backoff only ever climbed, and the give-up bound stopped measuring how
+/// long the hub had been unreachable and started measuring how long ago this
+/// runner's first bad dial had been — which killed runners that were serving
+/// happily. `Backoff::settled` is the rule; this is the loop using it against
+/// the real binaries.
+///
+/// It asserts on the attempt number the runner prints, which is the counter
+/// itself. That is deliberate: if the connection had not counted as having
+/// served, the runner would come back at a *higher* number and this fails
+/// loudly, rather than passing on a premise it never established (D101).
+#[tokio::test(flavor = "multi_thread")]
+async fn a_connection_that_served_starts_the_redial_counters_over() {
+    let herd = Herd::new();
+    // The runner first, onto a port nothing is listening on yet, so that it
+    // has a run of real failures behind it before it ever gets in. The cap is
+    // small because it is twice over the figure under test: it is the floor a
+    // connection has to clear to count as having served, and the ceiling on
+    // how long these failures take.
+    let mut runner = herd.start_runner_with(
+        "the-real-runner",
+        "runner",
+        "runner",
+        &["--redial-first", "0.05", "--redial-cap", "0.05"],
+    );
+    let out = herd.logs.path().join("runner-out");
+    let said = || std::fs::read_to_string(&out).unwrap_or_default();
+    herd.wait_until("the runner has failed to dial four times over", || {
+        said().contains("(attempt 4)")
+    })
+    .await;
+
+    // Now a hub, and a job, which is what proves the connection was welcomed
+    // and carried work rather than merely opening.
+    let mut hub = herd.start_hub("hub").await;
+    herd.wait_for_runner().await;
+    let climbed = said();
+    assert!(
+        climbed.contains("(attempt 4)"),
+        "the run of failures this test is about never happened: {climbed}"
+    );
+
+    // The hub dies under it, which is a reset and never a clean close.
+    hub.signal(rustix::process::Signal::KILL).await;
+    assert!(!hub.alive(), "the hub is gone");
+    let from_here = climbed.len();
+    herd.wait_until("the runner has redialled after the kill", || {
+        said()[from_here.min(said().len())..].contains("again in")
+    })
+    .await;
+
+    // And it comes back at the second attempt, not the fifth: the connection
+    // it just lost was a connection, so the failures before it are spent.
+    let after = said();
+    let after = &after[from_here.min(after.len())..];
+    assert!(
+        after.contains("(attempt 2)"),
+        "a runner that had been serving must redial as if this were its first \
+         failure, not carry on from the four dials that preceded it: {after}"
+    );
+    assert!(
+        !after.contains("giving up"),
+        "and it must not give up on a hub it was serving a moment ago: {after}"
+    );
+    assert!(runner.alive(), "D17: a runner outlives its hub");
+
+    // The end state, which is the one that matters to an owner: the hub comes
+    // back and the runner is there.
+    let mut second = herd.start_hub("second").await;
+    herd.wait_for_runner().await;
+    assert!(second.alive() && runner.alive());
 }
