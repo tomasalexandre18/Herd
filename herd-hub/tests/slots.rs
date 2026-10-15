@@ -262,6 +262,23 @@ async fn a_runner_killed_mid_job_gives_its_slot_back() {
     // And it is taken again, which is the other half: a slot released twice
     // would be a machine that runs two builds. A third build waits, with the
     // figures.
+    //
+    // Submitted only once the hub has a runner **now**, which is not what
+    // "has joined" above proves. This hub loses a runner after two seconds of
+    // silence, and on a host where a healthy runner's whole process can be
+    // descheduled for that long — a two-core CI runner, or anything running
+    // at a low CPU weight — the hub drops it, correctly, and it rejoins. A
+    // submission landing in that gap is refused outright, `no runner is
+    // connected`, and this test then dies of a fleet that was empty for a
+    // moment rather than of anything it is about. Counting the hub's own
+    // joins against its own departures is the exact condition; a residual
+    // window of one `herdctl` spawn remains, and only the question in the
+    // report — whether that refusal should be a wait (D88) — can close it.
+    herd.wait_until("a runner is connected to the hub now", || {
+        let said = herd.said("hub");
+        said.matches("has joined").count() > said.matches(" is gone; an attempt").count()
+    })
+    .await;
     let waiting = herd
         .submit_needing("build", "step", "printf 'must not start\\n'")
         .await;
