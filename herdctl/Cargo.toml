@@ -11,7 +11,14 @@ anyhow.workspace = true
 clap.workspace = true
 futures-util.workspace = true
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "net", "io-util"] }
-tokio-tungstenite.workspace = true
+# `wss://` on the side that dials, verified against the webpki roots bundled
+# in the binary rather than the host's trust store. The reasoning is written
+# out once, in `herd-runner/Cargo.toml`; a requester and a runner must make
+# the same choice or `wss://` would mean two different things in one fleet.
+tokio-tungstenite = { workspace = true, features = ["rustls-tls-webpki-roots"] }
+# Not used by name: it chooses rustls' crypto provider. See the workspace
+# manifest.
+rustls.workspace = true
 time.workspace = true
 # The declaration file is deserialized into this crate's own structs, so that
 # an unknown key is refused by name (`deny_unknown_fields`) rather than read
