@@ -3152,3 +3152,64 @@ error here.
 the `ran on:` line earlier, and M16 still sets `PROTOCOL_VERSION` and
 `RECORD_VERSION` to 1 and freezes them (D73). The status and event formats do
 not exist yet, so they stay free — a benefit of this order, not a cost.
+
+---
+
+## 2026-10-15 — D110 E-02's line is a frame, not a log line
+
+**Context.** E-02 wants a job's output to begin with one line
+`ran on: <runner> (<why>)` and to end with the consumer tool's own verdict and
+exit code, unchanged. The first implementation printed the line the moment the
+frame arrived, which put a `ran on:` line on the stdout of a job that **never
+started** — breaking D16's rule that stdout stays empty when Herd could not run
+the job at all.
+
+**Choice.** Three separations, each load-bearing:
+
+1. **The hub reports the placement, `herdctl` writes the sentence.** The hub
+   sends a `RanOn` frame; the human-readable line is composed at the requester.
+2. **The line is not part of the job's log.** The record's log stays exactly
+   the bytes the process wrote (D18). The frame is presentation, not output.
+3. **The line is held until there is output to frame.** It is released just
+   ahead of the job's first output byte, or with the verdict if the job
+   produced none, and **never** for `could_not_start` — which is what keeps
+   D16's empty stdout true. A job that produced no output at all still gets
+   the line: it did run somewhere, and that is what the line says.
+
+`OUTPUT_FORMAT_VERSION` rides **inside** the parentheses (Q7), so a reader
+anchored on the closing `)` still matches `^ran on: (\S+) \((.*)\)$`. The
+inverse of the formatter lives in `herd-proto` beside it; no test and no crate
+keeps a hand-rolled copy of the format.
+
+**A lock widened with it.** The claim lock now covers follower registration: a
+job is dispatchable the instant `submit` returns, so a pass fired by anything
+else would have sent the line to a follower list the requester had not yet
+joined.
+
+**`herdctl`'s declared-command surface.** `--command` is exclusive with
+`--label` and the three `--*-mib` values: the declaration is the authority, and
+a flag silently losing to a file is worse than a refusal. `--priority` is not
+exclusive; which level won is said on stderr.
+
+---
+
+## 2026-10-15 — D111 Two limits of E-02 that Herd cannot enforce
+
+**Context.** Found while making E-02 real against a fixture consumer.
+
+**"Ends with the tool's verdict" is a constraint on the consumer's
+declaration, not on Herd.** The fixture's `down` hook printed its step log on
+stdout, putting teardown chatter after the verdict; moving it to stderr gave
+the fixture E-02's shape. But a consumer whose own teardown writes to stdout
+breaks "ends with the verdict" by itself, and no amount of care on our side
+prevents it. Herd guarantees the *first* line and that it never alters the
+job's bytes; the *last* line is the consumer's to keep. **This belongs in the
+M18 conversation with chatOnS**, not in a silent assumption.
+
+**A runner that names no memory floor admits nothing.** A declared command with
+a build-thread figure makes the hub derive a memory need; a runner started
+without a host size and floor then admits nothing, and the job waits for ever
+on a machine that could have run it. The behaviour is correct — admission
+against an unknown host must refuse — but silence is not. **M16 owes a loud
+failure at startup**: a runner that cannot admit any declared work says so
+when it starts, rather than queueing jobs for ever.
