@@ -199,10 +199,11 @@ type Socket = WebSocketStream<MaybeTlsStream<TcpStream>>;
 
 /// A runner that does exactly what a test tells it to, and nothing else.
 ///
-/// The socket is split so that one thing can happen without the test: a
+/// The socket is split so that two things can happen without the test: a
 /// **heartbeat**, for the puppets that are meant to be alive
-/// ([`Puppet::join_reporting_health`]). Everything else is still exactly what
-/// the test says, in the order it says it.
+/// ([`Puppet::join_reporting_health`]), and a **log**, for the ones that are
+/// meant to be busy ([`Puppet::start_streaming_log`]). Everything else is
+/// still exactly what the test says, in the order it says it.
 #[derive(Debug)]
 struct Puppet {
     /// What the hub says. The reading half, kept by the test.
