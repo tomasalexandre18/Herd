@@ -144,9 +144,12 @@ the same commit), `leaves` (artefacts to keep, with a key), `coalesce`,
 `dedup_key`, `schedule`, plus the `[executor]` hooks (`up`, `fetch`, `run`,
 `down`) and the `{job} {commit} {args} {in} {out}` placeholders Herd must
 provide (`{in}` and `{out}` two directories under the runner's data root). A
-submission names a declared command and a commit of a configured bare
-repository — a branch resolves to a recorded hash, never a machine (E-01);
-dirty or unpushed trees refused naming the files (E-08). The runner
+submission names a declared command and a commit, both read by `herdctl` in
+the requester's own checkout (D106): the declaration file is parsed there, a
+ref resolves to a recorded hash, never a machine (E-01), and the resolved
+declaration travels with the submission, so the hub and a runner never see
+TOML and never hold a repository. `herdctl` refuses a dirty or an unpushed
+tree naming the files (E-08). The runner
 materializes the commit, runs the command inside `nix develop` with the
 consumer's environment, confined per M4, through its four named executor
 steps in fixed order — the record gains one timestamped line per step: name,
@@ -162,7 +165,9 @@ args) in the job store (D74). Output framing: first line
 no consumer command (E-11).
 **Done when** a fixture consumer repo declares two commands and adding a third
 changes nothing on Herd's side; e2e asserts the `ran on:` line, the verbatim
-verdict, exit codes 0/1/75; a dirty submission is refused naming the files;
+verdict, exit codes 0/1/75; a submission naming a ref resolves it to the hash
+the fixture's git holds; a dirty submission and an unpushed one are each
+refused naming the files;
 a `labels_from` reading lands as its own recorded job, caches by (commit,
 command, args), and a malformed answer refuses the real job by name; the
 record shows a timestamped line per executor step.

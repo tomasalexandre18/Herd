@@ -2965,3 +2965,44 @@ behaviour, the test fails.
 do not clear the counters — correctly, a hub dying that fast is one to back
 off from — and the cap keeps the test's figures apart from its patience. It
 is a fixture, and it is now the only one.
+
+## 2026-10-15 — D106 The declaration is read where the repository already is
+
+**Context.** M10's plan entry said a submission names "a commit of a
+configured bare repository", which would have given the hub a repository to
+read `commands.toml` from and a ref to resolve. Rereading the consumer's own
+contract (issue #16) before writing any of it: their `[executor]` `fetch`
+hook is `git fetch -q origin && git switch -q --detach {commit}`. **The
+workspace fetches the commit itself.** Herd was about to be given a
+repository it has no use for.
+
+**Choice. `herdctl` reads `tools/herd/commands.toml` in the requester's own
+checkout, resolves a ref to a hash there, and the resolved declaration
+travels with the submission.** The hub and a runner never see TOML, never
+hold a repository and never run git.
+
+* **E-08 needs that working tree anyway.** Refusing a dirty or unpushed
+  submission *naming the files* can only be done where the files are. One
+  place reads git, and it is the CLI.
+* **It keeps invariant 3 free.** No repository on the hub, no fetch, no
+  credential, nothing to keep in sync with a push.
+* **It is their rule, not an inference**: "You never interpret a command
+  line." Herd carries the line and substitutes the placeholders.
+
+**The cost, stated.** The hub trusts the requester for the declaration. That
+is not new — `Asked::command` is already an arbitrary command line from a
+requester — so it opens nothing that was closed, and who may submit at all
+is M15's. What it does mean is that the declaration is **not** a thing Herd
+can enforce against a commit: a requester that sends a line the commit does
+not declare is a requester lying about its own repository, and Herd's answer
+is the record, which keeps what it was sent.
+
+**Alternative rejected.** A bare repository configured on the hub. It buys
+one thing — the hub checking the declaration against the commit — and costs
+git in the hub's container, a repository someone has to keep current, and a
+second copy of the consumer's tree on the machine that holds every record.
+Rejected for the same reason D74 kept the `labels_from` reading off the hub.
+
+**Consequence for `docs/plan.md`.** M10's entry loses the configured bare
+repository and gains the resolution and the two refusals in `herdctl`. Only
+`herdctl` depends on a TOML parser.
