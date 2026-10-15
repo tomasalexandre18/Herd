@@ -1,4 +1,4 @@
-# Status — 2026-10-13
+# Status — 2026-10-15
 
 State now. Replaced every session, never appended to. Per-expectation
 detail is in `docs/coverage.md`, the reasoning in `docs/decisions.md`,
@@ -8,12 +8,12 @@ the order of work in `docs/plan.md`.
 
 Nine milestones are merged to `main`: M1 through M9. Nothing else is
 written and waiting. M1-M5 are additionally verified against the real
-binaries by a separate independent adversarial pass; M6-M9 by their
-own milestone tests only — the cost of dropping the separate pass
-after M5, deliberate, and now measured: a two-core CI host found one
-product defect (D99) and, in M9 alone, eight tests asserting what they
-had never established (D100). A twelve-thread host does not test what
-a two-core one does, and CI is the only slow machine we have.
+binaries by a separate adversarial pass; M6-M9 by their own milestone
+tests only — the cost of dropping that pass after M5, and now measured
+twice: a two-core host under load found eight tests in M9 asserting
+what they never established (D100), then the same class in six of the
+other ten files (D101), and behind one of those a product defect that
+would have killed every runner of a real fleet (D104, fixed by D105).
 
 What a requester can do today, end to end, against the real binaries:
 submit and follow or detach; get the job's own exit code untouched, 124 for
@@ -33,8 +33,10 @@ lease is read as a busy probe, so a leased trial waits instead of failing.
 Nothing is deployed: no runner but this host's has ever connected, and
 no job of the first consumer's has ever run.
 
-`fmt`, `clippy -D warnings` and `./scripts/test.sh` are green: **410
-passed**, 2 skipped here, a third on CI (E-22 needs a 17 GiB host).
+`fmt`, `clippy -D warnings` and `./scripts/test.sh` are green: **413
+passed**, 2 skipped here, a third on CI (E-22 needs a 17 GiB host). The
+suite is also run pinned to two cores under five spinners, which is
+where every lying test so far was caught.
 
 ## What is not done, and why
 
@@ -63,15 +65,13 @@ real job until M10 through M15 land.
    joining runner declares, and a deadline missed because its machine
    was off.
 
-Booked debt that no decision records, so it lives here: `job.json` says
-`running` before `events.jsonl` carries its line, a reader-visible
-window nobody has ruled on (E-53); a SIGKILLed runner leaves its
-in-flight probes behind; a verdict the hub could not write, overtaken
-by its own watchdog, logs "is over" for ever instead of erroring;
-`a_job_assigned_as_the_switch_moves_…` proves D80 placement, not the
-hand-back its name claims; and nobody traced how M8's leaked `flock`
-reached the one state root that complained. Debt that **is** recorded,
-and still open: D63, D64, D92, D98, D100.
+Booked debt that no decision records, so it lives here: a SIGKILLed
+runner leaves its in-flight probes behind; a verdict the hub could not
+write, overtaken by its own watchdog, logs "is over" for ever instead
+of erroring; `a_job_assigned_as_the_switch_moves_…` proves D80
+placement, not the hand-back its name claims; and nobody traced how
+M8's leaked `flock` reached the one state root that complained. Debt
+that **is** recorded and still open: D63, D64, D92, D98, D101.
 
 ## Environment facts
 
