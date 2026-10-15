@@ -8,7 +8,8 @@ use herd_runner::capability::{
 };
 use herd_runner::cgroup::{CpuQuota, DEFAULT_CPU_WEIGHT, DEFAULT_IO_WEIGHT, DEFAULT_PIDS_MAX};
 use herd_runner::confine::{
-    DEFAULT_DISK_BUDGET, DEFAULT_LOG_CAP, DEFAULT_MEMORY_MAX, DEFAULT_NICE, DEFAULT_TIMEOUT_SECONDS,
+    DEFAULT_DISK_BUDGET, DEFAULT_LOG_CAP, DEFAULT_MEMORY_MAX, DEFAULT_NICE, DEFAULT_OUTPUT_CAP,
+    DEFAULT_TIMEOUT_SECONDS,
 };
 use herd_runner::root::DataRoot;
 use herd_runner::size::parse_bytes;
@@ -73,6 +74,23 @@ struct Args {
     /// How much log one job may produce before the runner stops it.
     #[arg(long, env = "HERD_JOB_LOG_CAP", value_name = "SIZE")]
     job_log_cap: Option<String>,
+    /// How much declared output one job may have carried into its record:
+    /// everything it leaves under `{out}`, with its relative paths.
+    ///
+    /// 32 MiB by default, which is also the most this can be — the figure is
+    /// what fits one control frame and decodes inside the cadence a quiet
+    /// link lives by, so the flag only ever lowers it. A higher value is
+    /// refused at startup with both figures rather than producing a frame
+    /// nobody can read.
+    ///
+    /// Over the cap **no file comes back** and the job's record says so with
+    /// both figures: a cap on an output is not a truncation of it, and a
+    /// cut-down results file that still parses reads like the truth. Output
+    /// of a few hundred megabytes is over this on purpose and belongs on the
+    /// direct runner-to-runner transfer (M11), never relayed through the hub.
+    /// `0` returns a verdict and nothing else.
+    #[arg(long, env = "HERD_JOB_OUTPUT_CAP", value_name = "SIZE")]
+    job_output_cap: Option<String>,
     /// How much one job's workspace may hold before the runner stops it.
     #[arg(long, env = "HERD_JOB_DISK_BUDGET", value_name = "SIZE")]
     job_disk_budget: Option<String>,
@@ -325,6 +343,14 @@ async fn main() -> Result<()> {
             .context("--job-log-cap")?,
         None => DEFAULT_LOG_CAP,
     };
+    confinement.output_cap = match args.job_output_cap {
+        Some(size) => parse_bytes(&size)
+            .map_err(anyhow::Error::msg)
+            .context("--job-output-cap")?,
+        None => DEFAULT_OUTPUT_CAP,
+    };
+    // A cap past what a frame can carry is refused by `Confined::prepare`
+    // with every other unusable figure, so there is nothing to check here.
     confinement.disk_budget = match args.job_disk_budget {
         Some(size) => parse_bytes(&size)
             .map_err(anyhow::Error::msg)

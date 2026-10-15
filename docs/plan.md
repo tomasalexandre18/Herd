@@ -163,6 +163,15 @@ args) in the job store (D74). Output framing: first line
 `ran on: <runner> (<why>)`, then the tool's verdict and exit code unchanged,
 0/1/75 passed through, format versioned (Q7) (E-02). Herd's code and docs name
 no consumer command (E-11).
+**And the job's `{out}` comes home** (D131): what a job leaves there is
+collected before the workspace is reclaimed — on every ending that produced
+one, a failure above all — written into the job's `files/` directory on the
+hub by D8's discipline, and handed to a requester on the frame that already
+carries the verdict, so `herdctl wait <id> --outputs-to <dir>` works for a
+requester that was never connected while the job ran. Keyed by job id with
+relative paths kept, never by `leaves`. Capped at 32 MiB, which is what one
+frame carries and decodes inside the 15 s cadence; over it no file comes back
+and the refusal names both figures. Nothing of it touches E-02's stream.
 **Done when** a fixture consumer repo declares two commands and adding a third
 changes nothing on Herd's side; e2e asserts the `ran on:` line, the verbatim
 verdict, exit codes 0/1/75; a submission naming a ref resolves it to the hash
@@ -174,6 +183,13 @@ record shows a timestamped line per executor step.
 The real chatOnS declaration closes in M18.
 
 ### M11 — Content registry, direct transfer (`m11-content-registry`)
+**And the far side of D131's line.** A job's small declared output now rides
+its record through the hub, capped at 32 MiB. Everything bigger — the first
+consumer's screenshot-heavy runs reach a few hundred MB — is refused there by
+name and is **this** milestone's: at that size the bytes stop travelling like
+a log and become artefact distribution, which costs over a gigabyte per party
+and tens of seconds of blocked event loop on a relayed path, past the cadence
+a quiet link lives by. M11 is what makes those move runner to runner instead.
 The hub is the registry and the authority, never the byte path (D10). It holds
 manifests — a pack is a list of content hashes keyed by (commit, key) — and
 which runners hold which blobs; it issues a short-lived, scoped fetch

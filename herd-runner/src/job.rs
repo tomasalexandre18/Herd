@@ -498,6 +498,31 @@ pub async fn execute(
             .unwrap_or(0),
     };
 
+    // What the job left under `{out}`, taken **before** the workspace goes
+    // and on every ending that produced one: a success, a non-zero exit, a
+    // cap, a cancel. D108 fixed a workspace leaking on failure for this class
+    // of reason, and the reasoning runs the same way here — the job that
+    // fails is very often the one whose output you most want, so this has no
+    // success condition (see [`crate::outputs`]).
+    //
+    // Nothing is collected for an **abandoned** attempt, and that is not an
+    // omission: an abandoned attempt says nothing about the job at all, there
+    // is no frame for its outputs to ride on, and the attempt that follows
+    // makes its own `{out}` from nothing. A runner that is *killed* leaves no
+    // frame either, and its workspace is reclaimed by the next start's reaper
+    // — that is the lost-attempt case the hub requeues (E-21), not an output
+    // Herd dropped on the floor.
+    let outputs = match &ran.ending {
+        Some(Ending::Abandoned(_)) => herd_proto::JobOutputs::default(),
+        _ => crate::outputs::collect(workspace.out_dir(), confined.root().path(), caps.output_cap),
+    };
+    if let Some(refusal) = &outputs.refused {
+        eprintln!("herd-runner: job {job_id} {refusal}");
+    }
+    for said in &outputs.skipped {
+        eprintln!("herd-runner: job {job_id} output: {said}");
+    }
+
     // The cgroup goes away with its guard; the workspace is reclaimed here.
     // A workspace that will not go away is a disk filling up, which is
     // exactly what a runner must not do to its host — so it is said in the
@@ -529,9 +554,9 @@ pub async fn execute(
                 JobOutcome::StoppedByCap { .. } => outcome,
                 _ => JobOutcome::Cancelled { reason },
             };
-            session.finish(&job_id, outcome, metrics, ran.steps);
+            session.finish(&job_id, outcome, metrics, ran.steps, outputs);
         }
-        None => session.finish(&job_id, outcome, metrics, ran.steps),
+        None => session.finish(&job_id, outcome, metrics, ran.steps, outputs),
     }
     if let Some(token) = live {
         confined.live().remove(token);
@@ -1111,12 +1136,17 @@ fn outcome_of(status: std::process::ExitStatus) -> JobOutcome {
 /// Report a job that never ran. No `JobStarted`, because nothing started, and
 /// no log chunk: the job wrote nothing, and Herd's own failure belongs in the
 /// outcome rather than in the job's output.
+///
+/// And no output file either: every caller here is a job whose `{out}` was
+/// never made, or was made and could not be run in. There is nothing under it
+/// to collect, and saying so with the default is the same statement.
 fn report_could_not_start(job_id: &JobId, session: &Session, reason: String) {
     session.finish(
         job_id,
         JobOutcome::CouldNotStart { reason },
         JobMetrics::default(),
         Vec::new(),
+        herd_proto::JobOutputs::default(),
     );
 }
 

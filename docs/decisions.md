@@ -3937,3 +3937,154 @@ routes and the README is right as written for it; the wording has to name
 which kind of host the reader is on, rather than assuming the imperative one
 always works. That is the general lesson: "install this file there" is a
 claim about the target, not about the file.
+
+## 2026-10-15 — D131 A job's declared output travels like its log
+
+**Context.** Herd returns an exit code and logs. It does not return files.
+A job's `{out}` directory is handed to its steps and the whole workspace is
+reclaimed when the job ends — success, failure or death. Measured on the
+deployed server: `…/jobs/j0000000012/work/out/files/results.json` existed
+during the run and the whole of `jobs/` was empty after it. The first
+consumer's entire result contract is a `results.json` plus `{out}/files/`,
+so without this they can use Herd for nothing but pass/fail.
+
+**Choice. A job's declared outputs, up to a cap, are part of its record,
+exactly like its log.** They are collected on the runner before the
+workspace is reclaimed, written into the job's `files/` directory on the hub
+under D8's discipline (temp, fsync, rename, fsync the directory), and handed
+to a requester on the frame that already carries the verdict.
+
+**This is not the byte path D10 removed.** D10 takes Herd out of the byte
+path *between runners*: a pack must not be relayed hub-wards so another
+machine can have it. It says nothing about a job's own **record**, and Herd
+already carries the log runner → hub → requester as part of that record
+(D8, D18, E-15). What makes the two different is size and purpose, which is
+why the cap below is the whole of the boundary and not a detail of it.
+
+**The mechanism, and why no new frame.** `PROTOCOL_VERSION` is frozen at 1
+and a hub is deployed. D128's rule is that a new variant on either enum
+moves the number, and only a `#[serde(default)]` field whose absence means
+what its default says leaves it alone. So this adds **one defaulted field**
+to `ToHub::JobFinished` and one to `FromHub::JobFinished`, and no variant:
+absence means "this peer collected nothing", which is exactly true of every
+build that predates it. **`PROTOCOL_VERSION` stays 1 and no deployed binary
+has to be rebuilt to keep working.**
+
+`RECORD_VERSION` stays 1 for the matching reason. A job directory gains no
+*name*: `files/` has been created, empty, in every job directory since M2 —
+D8 called it "kept files beside it" and E-15 asks for exactly that. `job.json`
+gains one `#[serde(default, skip_serializing_if)]` summary, so a job that
+keeps nothing writes a record byte-identical to the one it wrote before, and
+every record already on the live state root reads unchanged.
+
+**Keyed by the job id, with relative paths preserved.** The consumer asked
+whether this is a directory fetched by job id or keyed by the declaration's
+`leaves` names. It is the id: a requester attaching with `herdctl wait <id>`
+has the id and nothing else — it never saw the declaration — so the id is
+the only key that always works; `leaves` is a declaration concern and keying
+the transport on it would make the record's shape depend on a file the hub
+does not own (D74); and `leaves`-keyed, content-addressed retrieval is
+precisely M11, which this must not blur into. `files/results.json` comes
+back as `files/results.json`, never flattened.
+
+**How a requester gets them: the verdict frame, not a subcommand.** The
+deciding case is a requester that was never connected while the job ran, and
+`herdctl wait <id>` is already that case — so `herdctl wait <id>
+--outputs-to <dir>` *is* the after-the-fact fetch, with no new command, no
+new frame and no second round trip. The hub reads them off the record for
+both the live follower and the late attach, so there is one answer to "what
+did this job leave" and it is the disk.
+
+**E-02 is untouched.** Nothing is written to stdout. `--outputs-to <dir>`
+writes the files there and reports them on **stderr**, one line each; with
+no flag nothing is written. An output file in E-02's stream would be read by
+the consumer's own tooling as their tool's output.
+
+**Collected on every ending that produced a workspace**, with no success
+condition: a success, a non-zero exit, a cap, a cancel. D108 fixed a
+workspace leaking on failure for this class of reason and it runs the same
+way here — the job that fails is the one whose results you most want, and
+the consumer's current workaround exists for exactly that case. An abandoned
+attempt collects nothing: it says nothing about the job, there is no frame
+for its files to ride, and the next attempt makes its own `{out}`.
+
+**What is collected.** Every regular file under `{out}`, relative paths
+kept. A **symlink is never followed, wherever it points** — not "unless it
+leaves the workspace": telling a safe link from one aimed at `/etc/shadow`
+means resolving it, resolving it races a job still being killed, and the
+only safe rule has no exception. An empty directory is not represented. A
+fifo, a socket or a device is skipped **by its type before anything is
+opened**, because opening a fifo nobody writes blocks for ever and would
+hang the job's own report. A name that is not UTF-8 is skipped. Each of
+these earns a sentence on the record rather than silence, because
+"`results.json` did not come back" and "it is a symlink" are different facts.
+A job killed mid-write leaves a half-written file and it is collected as it
+stands: Herd cannot know what the writer meant, the partial file is the
+evidence in the case someone is debugging, and the verdict already says the
+job was capped or cancelled. A consumer wanting all-or-nothing renames into
+place.
+
+**Over the cap is a refusal with figures, never a truncation.** No file at
+all comes back and the sentence names the cap, the measured size and the
+file count, and says that large artefacts are M11's direct transfer. A
+truncated `results.json` that still parses is the worst possible outcome: it
+reads like the truth. The verdict is **not** touched by it — the tests
+really did pass or fail, and turning a cap on a side channel into a verdict
+is the mistake D20 exists to prevent — so it is a loud sentence and never an
+exit code.
+
+**The cap is 32 MiB, derived and measured, and it is also the ceiling.**
+The first reasoning here was wrong twice over: 64 MiB was taken from the log
+cap, which is the wrong neighbour — a log is what a person reads, a declared
+output is what a program reads — and then 8 MiB was picked from "a results
+file is kilobytes", which is short of what the consumer actually produces.
+Their real figures are a results file of a few kB plus per-scenario logs and
+screenshots reaching a few hundred MB. So the figure is derived from what
+the mechanism can carry rather than from an analogy:
+
+- a collection rides one JSON frame, base64-encoded, against a 64 MiB frame
+  ceiling, which puts the arithmetic bound at 48 MiB; measured, 32 MiB of
+  payload in 200 files encodes to a 42 MiB frame, leaving 22 MiB for
+  everything else on the frame;
+- measured, 32 MiB costs about 140 MiB of peak memory and a few hundred ms
+  to encode and to decode, on each of the three parties;
+- both curves are linear, so a few hundred MB would cost over a gigabyte per
+  party and **tens of seconds of blocked event loop** — past the 15 s
+  cadence a health report and a quiet link both live by, which would make a
+  large output indistinguishable from a lost runner.
+
+**So a few hundred megabytes is over the cap on purpose, and that is the
+boundary this entry exists to hold.** At 32 MiB a job's output travels like
+its log. Past it, the same mechanism is artefact distribution wearing the
+record's clothes, and it is M11's direct runner-to-runner transfer — with
+the hub's volume to size and a retention policy to write, since Q9 says the
+hub holds kilobytes. The consumer's screenshot-heavy runs land on the far
+side of that line and are refused by name with figures.
+
+Because 32 MiB is a ceiling and not a taste, **the default is the ceiling
+and the flag only lowers it**, and a `--job-output-cap` above it is refused
+at startup with both figures — a cap past the frame would otherwise produce
+a verdict frame the hub cannot decode, which is D128's redial loop and not a
+degraded result. `0` returns a verdict and nothing else. A test builds a
+collection at the cap and puts it through the real encoder, so the figure is
+checked rather than reasoned about.
+
+**Two things found while building it.** The clients dialled with the
+WebSocket library's defaults, whose `max_frame_size` is **16 MiB** — smaller
+than what the hub is configured to send, so a legitimate verdict frame over
+16 MiB would have reached `herdctl` as a closed connection and a 125, a job
+with no verdict for a job that passed (D117's shape). Both clients now state
+Herd's own ceiling, which is one constant in `herd-proto` that the hub takes
+too. And D19's promise needed widening: the ends the hub holds in memory
+when it cannot write them now carry the job's **files**, because the
+workspace is already reclaimed by then and a retry that wrote the verdict
+and forgot the files would destroy half a record D19 says is never
+destroyed.
+
+**Alternative rejected.** A `herdctl outputs <id>` subcommand fetching the
+files afterwards. Rejected because `herdctl wait` already attaches to a job
+long after it ran, so the fetch exists either way and a second command would
+be a second thing to keep working — and because a frame that arrives with
+the verdict cannot be forgotten by a caller that got its exit code and left.
+
+---

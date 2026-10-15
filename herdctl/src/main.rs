@@ -109,6 +109,32 @@ struct Declaring {
     checkout: Option<std::path::PathBuf>,
 }
 
+/// Where a requester wants the job's own output **files** put (D131).
+///
+/// A flattened group shared by `run` and `wait`, because the two are the same
+/// question asked at two moments: `run` follows a job to its end, `wait`
+/// attaches to one by its id — often long after it ran — and both are handed
+/// the job's kept files in the frame that carries the verdict. That is exactly
+/// why there is no `herdctl outputs <id>` subcommand: `herdctl wait <id>
+/// --outputs-to <dir>` already *is* the after-the-fact fetch.
+#[derive(Debug, Clone, clap::Args)]
+struct Keeping {
+    /// Where to write the files the job left under `{out}`, keeping their
+    /// relative paths: `files/results.json` lands at
+    /// `<DIR>/files/results.json`.
+    ///
+    /// Left out, nothing is written and the job's files stay on the hub, in
+    /// its record. They are **never** printed: stdout is the `ran on:` line,
+    /// the job's own bytes and its verdict, and nothing else (E-02). What
+    /// this option writes is reported on stderr, one line per file.
+    ///
+    /// A job whose output was over the runner's cap writes no file at all and
+    /// says so on stderr with both figures — never a truncated file, which
+    /// would read like a whole one.
+    #[arg(long = "outputs-to", value_name = "DIR")]
+    outputs_to: Option<std::path::PathBuf>,
+}
+
 /// The requester CLI: submit a job, follow its log, exit with its code.
 #[derive(Debug, Parser)]
 #[command(name = "herdctl", version, about)]
@@ -167,6 +193,8 @@ enum Action {
         asking: Asking,
         #[command(flatten)]
         declaring: Declaring,
+        #[command(flatten)]
+        keeping: Keeping,
         /// The command, after `--` — or, with `--command`, the arguments
         /// that declared line's `{args}` stands for.
         #[arg(trailing_var_arg = true, num_args = 0..)]
@@ -280,6 +308,8 @@ enum Action {
     Wait {
         /// The id a submission printed.
         job_id: String,
+        #[command(flatten)]
+        keeping: Keeping,
     },
     /// Ask for a job to be cancelled, wherever it is running (E-06).
     ///
@@ -441,6 +471,7 @@ async fn run(args: Args) -> Result<Done> {
             tmpfs_mib,
             asking,
             declaring,
+            keeping,
             command,
         } => {
             let job = submitting(
@@ -479,6 +510,7 @@ async fn run(args: Args) -> Result<Done> {
                 say_it,
             )
             .await?;
+            keep_the_outputs(&keeping, &finished);
             Ok(Done::Job(finished.outcome))
         }
         Action::Submit {
@@ -608,7 +640,7 @@ async fn run(args: Args) -> Result<Done> {
             }
             Ok(Done::Said)
         }
-        Action::Wait { job_id } => {
+        Action::Wait { job_id, keeping } => {
             // A wait prints the job's output exactly as `run` does: the log
             // the hub had recorded before this wait attached, then whatever
             // arrives afterwards. Without it a detached requester could only
@@ -624,6 +656,7 @@ async fn run(args: Args) -> Result<Done> {
                 say_it,
             )
             .await?;
+            keep_the_outputs(&keeping, &finished);
             Ok(Done::Job(finished.outcome))
         }
         Action::Cancel { job_id } => {
@@ -802,6 +835,64 @@ fn labels_of(labels: Vec<String>) -> Result<LabelSet> {
 /// it is named and goes to stderr; the framing line is E-02's first line of
 /// the **output**, so it goes to stdout with no prefix of ours — their
 /// tooling reads `^ran on: (\S+) \((.*)\)$` there (D109).
+/// What a job left behind, on **stderr** and on a disk if one was named
+/// (D131).
+///
+/// Everything here goes to stderr and nothing to stdout. E-02's stream is the
+/// `ran on:` line, then the job's own bytes, then the verdict — a file written
+/// into it, or even a sentence about one, would be read by the consumer's own
+/// tooling as output their tool produced.
+///
+/// Three things are said, and each of them only when it is true:
+///
+/// * the refusal, **always**, whether or not `--outputs-to` was given: a
+///   requester whose `results.json` did not come back has to hear it, and the
+///   verdict is not the place to say it — the tests really did pass or fail,
+///   and D20 forbids turning a cap on a side channel into a verdict about the
+///   job. So this is a loud sentence and never an exit code.
+/// * what was skipped, **always**, for the same reason: "it is a symlink and
+///   a symlink is not followed" is the fact somebody needs and the record
+///   alone would not reach them.
+/// * one line per file written, only with `--outputs-to`.
+fn keep_the_outputs(keeping: &Keeping, finished: &herdctl::Finished) {
+    let outputs = &finished.outputs;
+    if let Some(refusal) = &outputs.refused {
+        eprintln!("herdctl: {refusal}");
+    }
+    for said in &outputs.skipped {
+        eprintln!("herdctl: this job's output: {said}");
+    }
+    let Some(directory) = &keeping.outputs_to else {
+        // Nothing asked for, so nothing written — and still one line when
+        // there was something to write, because a requester that forgot the
+        // option would otherwise never learn the files exist at all.
+        if !outputs.files.is_empty() {
+            eprintln!(
+                "herdctl: {} kept {} output file(s); pass --outputs-to <DIR> to write them",
+                finished.job_id,
+                outputs.count()
+            );
+        }
+        return;
+    };
+    match herdctl::write_outputs(directory, outputs) {
+        Ok(written) => {
+            for line in written {
+                eprintln!("herdctl: {line}");
+            }
+        }
+        // Said and not fatal: the verdict is the answer the caller is waiting
+        // for and it has already been established. A requester that cannot
+        // write to the directory it named has a problem with that directory,
+        // not with the job.
+        Err(error) => eprintln!(
+            "herdctl: the files {} left could not be written under {}: {error:#}",
+            finished.job_id,
+            directory.display()
+        ),
+    }
+}
+
 fn say_it(said: herdctl::Said) {
     match said {
         herdctl::Said::Note(note) => eprintln!("herdctl: {note}"),

@@ -450,7 +450,15 @@ fn measure_tree(path: &Path, up_to: &Path) -> Result<u64, String> {
 /// Read a directory the runner owns, putting back the access a job removed.
 ///
 /// `Ok(None)` means the directory is gone, which is not a failure to measure.
-fn read_dir_restoring(directory: &Path, up_to: &Path) -> Result<Option<Vec<fs::DirEntry>>, String> {
+///
+/// Shared with [`crate::outputs`], which walks `{out}` for the same reason
+/// the measurement walks the workspace: a job must not be able to `chmod` its
+/// way out of a figure the runner enforces, nor out of the record its own
+/// output belongs in.
+pub(crate) fn read_dir_restoring(
+    directory: &Path,
+    up_to: &Path,
+) -> Result<Option<Vec<fs::DirEntry>>, String> {
     match collect_dir(directory) {
         Ok(entries) => return Ok(Some(entries)),
         Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),

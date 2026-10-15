@@ -191,6 +191,49 @@ fn every_metrics() -> Vec<JobMetrics> {
     ]
 }
 
+/// Every shape a job's declared outputs can have (D131): nothing at all, a
+/// file under a directory, bytes that are not text, a refusal with figures,
+/// and something skipped.
+///
+/// `every_payload` is reused for the bytes on purpose: an output file is as
+/// much "not text" as a log chunk is — a `results.json` is UTF-8 only if the
+/// consumer made it so, and Herd promises the bytes it was given (D18, E-15).
+fn every_output_set() -> Vec<herd_proto::JobOutputs> {
+    let mut sets = vec![
+        herd_proto::JobOutputs::default(),
+        herd_proto::JobOutputs::refusing(
+            "this job's output is not in its record: 1 GiB in 3 file(s), and this runner's \
+             output cap is 8 MiB"
+                .to_owned(),
+            vec!["files/link is a symlink, and a symlink is never followed".to_owned()],
+        ),
+        herd_proto::JobOutputs {
+            files: Vec::new(),
+            refused: None,
+            skipped: vec!["out/pipe is not a regular file".to_owned()],
+        },
+    ];
+    for payload in every_payload() {
+        sets.push(herd_proto::JobOutputs {
+            files: vec![
+                herd_proto::OutputFile {
+                    // The path the first consumer's contract is about, with
+                    // its directory kept.
+                    path: "files/results.json".to_owned(),
+                    data: payload.clone(),
+                },
+                herd_proto::OutputFile {
+                    path: "deep/under/here.bin".to_owned(),
+                    data: payload,
+                },
+            ],
+            refused: None,
+            skipped: Vec::new(),
+        });
+    }
+    sets
+}
+
 fn round_trip_to_hub(message: ToHub) {
     let frame = to_frame(&message).expect("message encodes");
     let back: ToHub = from_frame(&frame).unwrap_or_else(|e| panic!("{frame} decodes: {e}"));
@@ -332,6 +375,7 @@ fn every_message_to_the_hub_round_trips() {
                 chunks_sent: 97,
                 metrics,
                 steps: every_step(),
+                outputs: herd_proto::JobOutputs::default(),
             });
         }
         // The same verdict from a job that is not a declared command: no
@@ -343,7 +387,22 @@ fn every_message_to_the_hub_round_trips() {
             chunks_sent: 0,
             metrics: JobMetrics::default(),
             steps: Vec::new(),
+            outputs: herd_proto::JobOutputs::default(),
         });
+        // And every shape a job's declared outputs can have, byte for byte
+        // (D131): a path with its directories kept, a payload that is not
+        // text, a refusal, a skip.
+        for outputs in every_output_set() {
+            round_trip_to_hub(ToHub::JobFinished {
+                job_id: JobId::new("j1"),
+                attempt: 2,
+                outcome: outcome.clone(),
+                chunks_sent: 1,
+                metrics: JobMetrics::default(),
+                steps: Vec::new(),
+                outputs,
+            });
+        }
     }
 }
 
@@ -413,6 +472,17 @@ fn every_message_from_the_hub_round_trips() {
                 job_id: JobId::new("j1"),
                 outcome: outcome.clone(),
                 metrics,
+                outputs: herd_proto::JobOutputs::default(),
+            });
+        }
+        // The requester's half of D131: whatever the record holds reaches the
+        // requester unchanged, including a payload that is not text.
+        for outputs in every_output_set() {
+            round_trip_from_hub(FromHub::JobFinished {
+                job_id: JobId::new("j1"),
+                outcome: outcome.clone(),
+                metrics: JobMetrics::default(),
+                outputs,
             });
         }
     }
@@ -444,6 +514,7 @@ fn each_outcome_is_a_tagged_object_inside_the_frame() {
             chunks_sent: 0,
             metrics: JobMetrics::default(),
             steps: Vec::new(),
+            outputs: herd_proto::JobOutputs::default(),
         })
         .expect("encodes")
     };
@@ -536,6 +607,7 @@ fn a_figure_that_was_not_measured_is_absent_rather_than_zero() {
             wall_time_ms: 34,
         },
         steps: Vec::new(),
+        outputs: herd_proto::JobOutputs::default(),
     })
     .expect("encodes");
     assert!(
@@ -1111,4 +1183,49 @@ fn the_exclusion_closure_survives_the_wire() {
         .capability
         .excludes
         .contains("build"));
+}
+
+/// The claim that keeps `PROTOCOL_VERSION` at 1 while a hub is deployed
+/// (D131): a `job_finished` frame written by a build that has never heard of
+/// a job's outputs still decodes, and means "this peer collected nothing".
+///
+/// This is the one test standing between an additive field and D128's redial
+/// loop. The frames below are the bytes the **deployed** binaries send — no
+/// `outputs` key anywhere — and they are written out literally rather than
+/// built from today's types, because a frame built from today's types would
+/// pass even if the field had been made required.
+#[test]
+fn a_verdict_from_a_build_that_predates_a_job_s_outputs_still_decodes() {
+    let to_hub = r#"{"type":"job_finished","job_id":"j0000000012","attempt":1,
+        "outcome":{"type":"exited","code":0},"chunks_sent":7}"#;
+    match from_frame::<ToHub>(to_hub).expect("an older runner's verdict decodes") {
+        ToHub::JobFinished { outputs, .. } => assert!(
+            outputs.is_silent(),
+            "an absent field means this peer collected nothing: {outputs:?}"
+        ),
+        other => panic!("that is not a verdict: {other:?}"),
+    }
+
+    let from_hub = r#"{"type":"job_finished","job_id":"j0000000012",
+        "outcome":{"type":"exited","code":1}}"#;
+    match from_frame::<FromHub>(from_hub).expect("an older hub's verdict decodes") {
+        FromHub::JobFinished { outputs, .. } => assert!(outputs.is_silent(), "{outputs:?}"),
+        other => panic!("that is not a verdict: {other:?}"),
+    }
+
+    // And the other direction: a job that keeps nothing puts no `outputs` key
+    // on the wire at all, so today's build sends an older peer exactly the
+    // bytes it sent before. That is what makes this additive in both
+    // directions rather than only in one.
+    let today = to_frame(&FromHub::JobFinished {
+        job_id: JobId::new("j0000000012"),
+        outcome: JobOutcome::Exited { code: 0 },
+        metrics: JobMetrics::default(),
+        outputs: herd_proto::JobOutputs::default(),
+    })
+    .expect("encodes");
+    assert!(
+        !today.contains("outputs"),
+        "a job that kept nothing must put nothing on the wire: {today}"
+    );
 }

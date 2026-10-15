@@ -302,6 +302,7 @@ mod tests {
             updated_at: submitted_at,
             attempts: Vec::new(),
             metrics: JobMetrics::default(),
+            outputs: Default::default(),
         }
     }
 

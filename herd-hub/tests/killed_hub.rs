@@ -1199,6 +1199,7 @@ async fn a_verdict_planted_in_another_runner_s_spool_is_refused_by_name() {
                 ..herd_proto::JobMetrics::default()
             },
             steps: Vec::new(),
+            outputs: Default::default(),
         })
         .expect("the fixture frame encodes"),
     )

@@ -1010,6 +1010,7 @@ impl JobDirStore {
             updated_at: at,
             attempts: Vec::new(),
             metrics: JobMetrics::default(),
+            outputs: Default::default(),
         };
         self.write_record(&record)?;
         self.append_event(&id, &JobEvent::transition(at, JobState::Queued))?;
@@ -1218,6 +1219,89 @@ impl JobStore for JobDirStore {
         let (_live, mut record) = self.open_for_writing(id)?;
         record.metrics = metrics;
         self.write_record(&record)
+    }
+
+    /// The files first, under the same discipline as everything else here
+    /// (D8: temporary, fsync, rename, fsync the directory), then the summary
+    /// on the record.
+    ///
+    /// That order, and not the other: the record names a file only once the
+    /// file is on the disk, so a reader of `job.json` never finds a path that
+    /// is not there. The reverse would publish a promise before its contents.
+    fn record_outputs(&self, id: &JobId, outputs: &herd_proto::JobOutputs) -> Result<()> {
+        let (_live, mut record) = self.open_for_writing(id)?;
+        let kept = self.job_dir(id).join(KEPT_FILES_DIR);
+        let mut summary = crate::job::OutputSummary {
+            files: Vec::new(),
+            refused: outputs.refused.clone(),
+            skipped: outputs.skipped.clone(),
+        };
+        for file in &outputs.files {
+            // Asked before the string is joined onto anything. A walk on a
+            // runner cannot produce `..`, but this is not a walk — it is a
+            // path a peer sent — and the hub must never find that out by
+            // writing outside the job's own directory (D131).
+            let relative = match file.relative_path() {
+                Ok(relative) => relative,
+                Err(why) => {
+                    summary
+                        .skipped
+                        .push(format!("a path this hub will not write: {why}"));
+                    continue;
+                }
+            };
+            let path = kept.join(&relative);
+            if let Some(parent) = path.parent() {
+                durable::create_dir_all(parent)
+                    .map_err(|error| failed("creating", parent, &error))?;
+            }
+            durable::write_file(&path, &file.data)
+                .map_err(|error| failed("writing", &path, &error))?;
+            summary.files.push(crate::job::KeptFile {
+                path: file.path.clone(),
+                bytes: file.data.len() as u64,
+            });
+        }
+        summary.skipped.sort();
+        record.outputs = summary;
+        self.write_record(&record)
+    }
+
+    fn job_outputs(&self, id: &JobId) -> Result<herd_proto::JobOutputs> {
+        let Some(record) = JobStore::job(self, id)? else {
+            return Ok(herd_proto::JobOutputs::default());
+        };
+        let kept = self.job_dir(id).join(KEPT_FILES_DIR);
+        let mut outputs = herd_proto::JobOutputs {
+            files: Vec::new(),
+            refused: record.outputs.refused.clone(),
+            skipped: record.outputs.skipped.clone(),
+        };
+        for file in &record.outputs.files {
+            // The same check on the way out as on the way in: the record is a
+            // file an operator may have edited, and a path read off a disk is
+            // no more trustworthy than one read off a socket.
+            if let Err(why) = herd_proto::check_relative(&file.path) {
+                outputs.skipped.push(why);
+                continue;
+            }
+            let path = kept.join(&file.path);
+            match fs::read(&path) {
+                Ok(data) => outputs.files.push(herd_proto::OutputFile {
+                    path: file.path.clone(),
+                    data,
+                }),
+                // Named rather than silently absent: a record that says a
+                // file is there and a directory that does not have it is
+                // something an operator has to see, and a requester given a
+                // short list with no word about it would read it as whole.
+                Err(error) => outputs.skipped.push(format!(
+                    "{} is named on this job's record and could not be read back: {error}",
+                    file.path
+                )),
+            }
+        }
+        Ok(outputs)
     }
 
     /// Why a queued job is not starting, on its record and in its history.
@@ -3234,5 +3318,289 @@ mod tests {
         .expect("the cache is made unreadable");
         let store = JobDirStore::open(dir.path()).expect("an unreadable cache is not a refusal");
         assert_eq!(store.reading_answer(&key).expect("the cache reads"), None);
+    }
+
+    // --- D131: a job's declared outputs are part of its record ---
+
+    /// A collection as a runner reports one, with the first consumer's shape:
+    /// a file under a directory.
+    fn collected(files: &[(&str, &[u8])]) -> herd_proto::JobOutputs {
+        herd_proto::JobOutputs {
+            files: files
+                .iter()
+                .map(|(path, data)| herd_proto::OutputFile {
+                    path: (*path).to_owned(),
+                    data: data.to_vec(),
+                })
+                .collect(),
+            refused: None,
+            skipped: Vec::new(),
+        }
+    }
+
+    /// The whole promise, on the disk and back: `files/results.json` is
+    /// written at `files/results.json` under the job's own `files/`
+    /// directory, byte for byte, and comes back under that same path.
+    #[test]
+    fn a_kept_file_lands_under_the_job_s_own_directory_with_its_path_kept() {
+        let (dir, store) = store();
+        let job = store
+            .create_job(NewJob::at(
+                vec!["true".to_owned()],
+                LabelSet::default(),
+                Priority::Step,
+            ))
+            .expect("minted");
+        // Bytes that are not text, for the reason a log's are not (D18): a
+        // results file is UTF-8 only if the consumer made it so.
+        let odd: Vec<u8> = vec![0, 1, 0xff, 0xfe, b'{', b'}'];
+        store
+            .record_outputs(
+                &job.id,
+                &collected(&[
+                    ("files/results.json", br#"{"ok":true}"#),
+                    ("files/deep/under.bin", &odd),
+                ]),
+            )
+            .expect("the files are kept");
+
+        // On the disk, where a reader outside Herd finds them (E-15, D8).
+        let kept = dir
+            .path()
+            .join(JOBS_DIR)
+            .join(job.id.as_str())
+            .join(KEPT_FILES_DIR);
+        assert_eq!(
+            fs::read(kept.join("files/results.json")).expect("the results file is there"),
+            br#"{"ok":true}"#.to_vec(),
+            "the path is preserved, not flattened"
+        );
+        assert_eq!(
+            fs::read(kept.join("files/deep/under.bin")).expect("the nested file is there"),
+            odd,
+            "and the bytes are the bytes"
+        );
+
+        // On the record, as the summary a reader of `job.json` alone sees.
+        let record = store
+            .job(&job.id)
+            .expect("the record reads")
+            .expect("there");
+        assert_eq!(
+            record
+                .outputs
+                .files
+                .iter()
+                .map(|file| (file.path.as_str(), file.bytes))
+                .collect::<Vec<_>>(),
+            [("files/results.json", 11), ("files/deep/under.bin", 6)]
+        );
+
+        // And back out, which is what a requester attaching later is given.
+        let back = store.job_outputs(&job.id).expect("they read back");
+        assert_eq!(back.refused, None);
+        assert!(back.skipped.is_empty(), "{:?}", back.skipped);
+        assert_eq!(
+            back.files
+                .iter()
+                .map(|file| (file.path.as_str(), file.data.clone()))
+                .collect::<Vec<_>>(),
+            [
+                ("files/results.json", br#"{"ok":true}"#.to_vec()),
+                ("files/deep/under.bin", odd),
+            ]
+        );
+    }
+
+    /// A refusal is recorded as a refusal, with no file beside it.
+    ///
+    /// The thing being pinned is that the two never appear together: a caller
+    /// that found a short list of files *and* a sentence saying the cap was
+    /// exceeded would have a partial result set reading like a whole one.
+    #[test]
+    fn a_refusal_is_kept_with_its_figures_and_no_file() {
+        let (_dir, store) = store();
+        let job = store
+            .create_job(NewJob::at(
+                vec!["true".to_owned()],
+                LabelSet::default(),
+                Priority::Step,
+            ))
+            .expect("minted");
+        let refusal = "this job's output is not in its record: 1 GiB in 3 file(s), and this \
+                       runner's output cap is 8 MiB";
+        store
+            .record_outputs(
+                &job.id,
+                &herd_proto::JobOutputs::refusing(
+                    refusal.to_owned(),
+                    vec!["files/link is a symlink, and a symlink is never followed".to_owned()],
+                ),
+            )
+            .expect("the refusal is recorded");
+        let back = store.job_outputs(&job.id).expect("it reads back");
+        assert!(back.files.is_empty(), "{back:?}");
+        assert_eq!(back.refused.as_deref(), Some(refusal));
+        assert_eq!(back.skipped.len(), 1, "{back:?}");
+        let record = store.job(&job.id).expect("reads").expect("there");
+        assert_eq!(record.outputs.refused.as_deref(), Some(refusal));
+        assert!(record.outputs.files.is_empty());
+    }
+
+    /// A path that would climb out of the job's directory is **dropped and
+    /// named**, and the verdict is not lost over it.
+    ///
+    /// The walk on a runner cannot produce one; a frame can, because a frame
+    /// is a string a peer sent. What this pins is the pair of answers: the
+    /// hub writes nothing outside the job's own directory, and
+    /// `record_outputs` still returns `Ok` — because the next write in that
+    /// chain is the verdict, and a malformed path must never cost a record
+    /// its outcome (D19's rule, read the other way round).
+    #[test]
+    fn a_path_climbing_out_of_the_record_is_dropped_and_named_and_costs_no_verdict() {
+        let (dir, store) = store();
+        let job = store
+            .create_job(NewJob::at(
+                vec!["true".to_owned()],
+                LabelSet::default(),
+                Priority::Step,
+            ))
+            .expect("minted");
+        store
+            .record_outputs(
+                &job.id,
+                &collected(&[
+                    ("../../escaped.json", b"this must never be written"),
+                    ("/etc/herd-was-here", b"nor this"),
+                    ("files/results.json", b"this one is fine"),
+                ]),
+            )
+            .expect("a bad path is not an error: the verdict comes after this write");
+
+        // Nothing outside the job's own directory, and nothing at all under
+        // the two names.
+        assert!(
+            !dir.path().join("escaped.json").exists()
+                && !dir.path().join(JOBS_DIR).join("escaped.json").exists(),
+            "a path with `..` in it was written somewhere"
+        );
+        let kept = dir
+            .path()
+            .join(JOBS_DIR)
+            .join(job.id.as_str())
+            .join(KEPT_FILES_DIR);
+        assert_eq!(
+            fs::read(kept.join("files/results.json")).expect("the good file is still kept"),
+            b"this one is fine".to_vec(),
+            "one bad path does not cost the files beside it"
+        );
+
+        // And each refusal is named on the record, so an operator sees it.
+        let record = store.job(&job.id).expect("reads").expect("there");
+        assert_eq!(
+            record.outputs.files.len(),
+            1,
+            "only the good path is kept: {:?}",
+            record.outputs.files
+        );
+        assert_eq!(
+            record.outputs.skipped.len(),
+            2,
+            "both bad paths are named: {:?}",
+            record.outputs.skipped
+        );
+        assert!(
+            record
+                .outputs
+                .skipped
+                .iter()
+                .any(|said| said.contains("escaped.json")),
+            "{:?}",
+            record.outputs.skipped
+        );
+    }
+
+    /// A job that kept nothing has no `outputs` in its record at all.
+    ///
+    /// This is the property that makes the whole change additive to the
+    /// frozen record format (D73): every record written before the field
+    /// existed reads as a job that kept nothing, and every job that keeps
+    /// nothing writes a record byte-identical to the one it would have
+    /// written before. [`RECORD_VERSION`] therefore does not move.
+    #[test]
+    fn a_job_that_keeps_nothing_writes_no_outputs_field_and_reads_back_silent() {
+        let (dir, store) = store();
+        let job = store
+            .create_job(NewJob::at(
+                vec!["true".to_owned()],
+                LabelSet::default(),
+                Priority::Step,
+            ))
+            .expect("minted");
+        store
+            .record_outputs(&job.id, &herd_proto::JobOutputs::default())
+            .expect("nothing is recorded");
+        let path = dir
+            .path()
+            .join(JOBS_DIR)
+            .join(job.id.as_str())
+            .join(RECORD_FILE);
+        let written: serde_json::Value =
+            serde_json::from_str(&read(&path)).expect("the record is json");
+        assert!(
+            written.get("outputs").is_none(),
+            "a silent collection must leave the record exactly as it was: {written}"
+        );
+        assert_eq!(written["record_version"], RECORD_VERSION);
+        assert!(store
+            .job_outputs(&job.id)
+            .expect("it reads back")
+            .is_silent());
+
+        // And a record written without the field — which is every record on
+        // the live state root — still reads.
+        let older = written
+            .to_string()
+            .replace(",\"outputs\":", ",\"ignored\":");
+        fs::write(&path, &older).expect("an older-shaped record is written");
+        let record = store
+            .job(&job.id)
+            .expect("a record with no outputs field reads")
+            .expect("there");
+        assert!(record.outputs.is_silent());
+    }
+
+    /// A file the record names and the directory does not have is **named**,
+    /// never a short list read as a whole one.
+    #[test]
+    fn a_file_named_on_the_record_and_missing_on_the_disk_is_said_rather_than_dropped() {
+        let (dir, store) = store();
+        let job = store
+            .create_job(NewJob::at(
+                vec!["true".to_owned()],
+                LabelSet::default(),
+                Priority::Step,
+            ))
+            .expect("minted");
+        store
+            .record_outputs(&job.id, &collected(&[("files/results.json", b"mine")]))
+            .expect("kept");
+        fs::remove_file(
+            dir.path()
+                .join(JOBS_DIR)
+                .join(job.id.as_str())
+                .join(KEPT_FILES_DIR)
+                .join("files/results.json"),
+        )
+        .expect("somebody removed it from under the record");
+        let back = store.job_outputs(&job.id).expect("it still reads");
+        assert!(back.files.is_empty());
+        assert_eq!(back.skipped.len(), 1, "{back:?}");
+        assert!(
+            back.skipped[0].contains("files/results.json")
+                && back.skipped[0].contains("could not be read back"),
+            "{:?}",
+            back.skipped
+        );
     }
 }
