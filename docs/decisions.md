@@ -3665,3 +3665,39 @@ would otherwise carry away.
 The general shape of the mistake, worth keeping: "another mechanism already
 covers that case" is only true if that mechanism fires **unconditionally**.
 This one fires once a reason exists.
+
+---
+
+## 2026-10-15 — D126 The server runner's data root goes on the NVMe
+
+**Context.** D120 established that `io.weight` bites on `nvme0n1` and never on
+ZFS. `deploy/herd-runner.service` sets `--data-root %S/herd-runner`, which is
+`/var/lib/herd-runner` — and `/var/lib` on this server is `rpool/root`, ZFS.
+So the unit's own `IOWeight=50`, and every per-job `io.weight` under it, would
+have been decorative: a runner whose jobs work on ZFS has no IO bound at all,
+and the startup report would have said so in as many words.
+
+**Choice.** The server runner's data root moves to the ext4 NVMe —
+`/mnt/ssd_980/herd-runner`, 347 GiB free against a 20 GiB per-job disk budget
+— created ahead of time, owned by the runner's user, mode 0700. That is also
+simply the right disk for build scratch: it is the fast one, and a build's
+writes stop competing with the pool that carries `/`.
+
+**What is given up.** `StateDirectory=herd-runner` created the directory,
+owned it and set its mode before the runner started, so the flag and the
+directory could never drift. Off the state directory, that becomes the
+operator's to get right — so the directory is made with the user, in the same
+step, and the runner refuses to start on a root it cannot use, naming the
+path. The failure mode is loud either way; what is lost is that it could not
+happen at all.
+
+**Why not leave it and accept no IO bound.** Because the first consumer's
+freezes are IO, this is the one machine they build on, and an `IOWeight` line
+that does nothing is worse than no line: it reads, to whoever looks next, as
+a bound that exists.
+
+**Not fixed by this.** ZFS still gets no cgroup IO knob, so anything a job
+writes *outside* the data root — and D123's note that Herd does not stop a
+job naming an absolute path — is still unbounded. And `io.weight` is a
+weight, not a ceiling: it shares contended bandwidth, it does not cap it.
+`io.max` remains unbuilt and remains the only hard IO lever.
