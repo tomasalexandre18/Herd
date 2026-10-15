@@ -79,3 +79,39 @@ unit file where it bites:
 - a udev rule giving `/dev/vfio/*` a group, if VFIO work is wanted. It
   is `root:root 0600` on a stock kernel, which no supplementary group
   can reach.
+
+## Confirming the cgroup delegation, and the two skips it closes
+
+Two assertions of the suite skip on a host that cannot delegate a
+cgroup v2 subtree (D27), and both are about the kernel memory ceiling:
+
+```
+an_allocation_past_the_ceiling_kills_the_job_and_only_the_job
+  (the named memory outcome)
+the_runner_says_which_memory_ceiling_it_enforces
+  (the cgroup branch of the report)
+```
+
+`Delegate=yes` in the unit is what closes them, and it is checkable in
+two ways. First, against the running service — the line must say the
+cgroup, not the fallback:
+
+```sh
+journalctl -u herd-runner -n 40 | grep 'memory ceiling'
+# herd-runner: memory ceiling: one cgroup v2 subtree per job,
+#   enforced by the kernel
+```
+
+Second, against the suite, by giving it the same delegation the unit
+gives the runner. Outside a delegated scope this prints the two skips;
+inside one it prints `Every assertion ran on this host`:
+
+```sh
+nix develop --command ./scripts/test.sh                       # 2 skips
+systemd-run --user --scope -p Delegate=yes --setenv=HERD_SKIP_LOG=/tmp/skips \
+  nix develop --command ./scripts/test.sh                     # none
+```
+
+Both were run here: the `confinement` binary reports 27 passed and the
+two skips outside a delegated scope, and 27 passed with an empty skip
+log inside one.
