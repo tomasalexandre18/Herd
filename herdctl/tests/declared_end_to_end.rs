@@ -62,10 +62,17 @@ struct Harness {
 impl Harness {
     async fn new() -> Harness {
         let state = tempfile::tempdir().expect("a temporary state directory");
-        let store = JobDirStore::open(state.path()).expect("the state root opens");
+        let store = Arc::new(JobDirStore::open(state.path()).expect("the state root opens"));
+        // An unapproved runner is given no job (E-48), so this harness
+        // approves the one runner it lends and hands it the token that
+        // approval minted. Without it the declaration resolves, the job is
+        // minted, and nothing ever claims it.
+        let token = store
+            .approve_runner(RUNNER)
+            .expect("the state root mints a token");
         let hub = Hub::bind(
             "127.0.0.1:0".parse().expect("a literal loopback address"),
-            Arc::new(store) as Arc<dyn JobStore>,
+            store as Arc<dyn JobStore>,
         )
         .await
         .expect("the hub binds a free port");
@@ -82,7 +89,7 @@ impl Harness {
         let config = herd_runner::Config {
             hub_url: hub_url.clone(),
             name: Some(RUNNER.to_owned()),
-            token: None,
+            token: Some(token),
             capabilities: offer,
             // A size the owner states, rather than this host's own. The
             // fixture's build declares a per-thread figure, so the hub
