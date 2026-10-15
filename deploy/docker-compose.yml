@@ -34,7 +34,10 @@ services:
     # of this is loopback-only: see `ports:`.
     environment:
       HERD_LISTEN: 0.0.0.0:8787
-      HERD_STATE_DIR: /var/lib/herd/state
+      # `/var/lib/herd` exactly, and nothing under it: that is the one
+      # directory the image creates and gives to its own non-root user, and
+      # the path the volume below is mounted on. See `volumes:`.
+      HERD_STATE_DIR: /var/lib/herd
       # One shared token every requester must carry (Q8). A path, never the
       # token: a secret on a command line is readable out of /proc by every
       # user of the host (invariant 7).
@@ -47,7 +50,15 @@ services:
       # D8: one directory per job, on a volume of its own. This is the only
       # place the hub writes, which is what makes `read_only: true` below
       # true rather than hopeful.
-      - herd-state:/var/lib/herd/state
+      #
+      # The path must be `/var/lib/herd` and must match HERD_STATE_DIR above,
+      # because the image creates exactly that directory and gives it to the
+      # hub's uid: docker seeds a fresh named volume from the directory it
+      # mounts over, so the volume comes up owned by the hub. Mount a
+      # subdirectory the image does not contain and docker makes the mount
+      # point itself, root-owned, and the first start dies — see the first
+      # start in `README.md` for the error that follows.
+      - herd-state:/var/lib/herd
 
     # Loopback only. The reverse proxy the operator already runs on this
     # host connects here; nothing else can. Two documented variants, and
@@ -101,7 +112,13 @@ services:
 secrets:
   herd-requester-token:
     # A path on the host, given in .env. The file holds the token and
-    # nothing else, mode 0400. It is never in this repository (invariant 7).
+    # nothing else. It is never in this repository (invariant 7).
+    #
+    # No `uid:`/`gid:`/`mode:` here, because they would be a lie: outside
+    # swarm, docker bind-mounts the host file unchanged and ignores all three
+    # without a word. The hub is uid 1000 and not root, so the *host* file
+    # must be one it can read — `env.example` says 0444 inside a 0700
+    # directory, and says why.
     file: ${HERD_REQUESTER_TOKEN_FILE:?set HERD_REQUESTER_TOKEN_FILE in .env to the host path of the file holding the requester token}
 
 volumes:

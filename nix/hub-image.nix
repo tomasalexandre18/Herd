@@ -47,6 +47,15 @@ let
   # owned by the hub's own uid, for the deployment to mount a volume over.
   # Docker seeds a fresh named volume from it, so the volume inherits that
   # ownership instead of landing root-owned under a non-root process.
+  #
+  # This is the deployment's second contract after the image name, and it is
+  # exact: the volume is mounted **on this path and not under it**, and
+  # `HERD_STATE_DIR` is **this path**, so that the directory docker seeds the
+  # volume from is the directory the hub writes. Mounting a subdirectory
+  # instead — `/var/lib/herd/state`, which this image does not contain —
+  # makes docker create the mount point itself, root-owned, and the hub
+  # refuses to start with `Permission denied` on its first job directory. See
+  # `deploy/README.md`, "the first start", for that failure in full.
   stateDir = "/var/lib/herd";
 in
 dockerTools.buildLayeredImage {
@@ -68,8 +77,12 @@ dockerTools.buildLayeredImage {
   config = {
     Entrypoint = [ "/bin/herd-hub" ];
     User = user;
-    # So that the hub's own relative default for `--state-dir` lands in the
-    # volume rather than somewhere nothing may be written.
+    # So that the hub's own relative default for `--state-dir` — `herd-state`
+    # — lands inside the volume rather than somewhere nothing may be written.
+    # The deployment sets `HERD_STATE_DIR` and never relies on this, but an
+    # operator who forgets it gets `/var/lib/herd/herd-state`: a hub that
+    # starts, and whose state is still on the volume anyone would back up,
+    # rather than one that dies on a read-only root.
     WorkingDir = stateDir;
     # No `ExposedPorts` on purpose: the port is `--listen`, given at startup,
     # and an image that advertised one would be advertising a guess. The
