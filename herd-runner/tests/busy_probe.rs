@@ -17,14 +17,18 @@ use std::time::{Duration, Instant};
 use herd_proto::{Availability, BusyProbe};
 use herd_runner::capability::evaluate;
 
-/// How long a hanging probe of these tests sleeps for. Numbers nobody else on
-/// this host would be sleeping, so that finding one is finding ours — and one
-/// each, because these tests run in one binary at the same time.
-const HANGS_FOR: &str = "444442";
-const HANGS_AND_IS_SWEPT_FOR: &str = "444443";
-const HANGS_WHILE_THE_RUNNER_STOPS_FOR: &str = "444444";
-const LEAVES_ITS_SESSION_ON_A_TIMEOUT_FOR: &str = "444445";
-const LEAVES_ITS_SESSION_WHILE_THE_RUNNER_STOPS_FOR: &str = "444446";
+/// How long a hanging probe of these tests sleeps for: a number **this test
+/// process** alone is sleeping, so that finding one is finding ours.
+///
+/// One each, because these tests run in one binary at the same time — and
+/// the pid, because a constant is not unique enough. `confinement.rs`
+/// declared two of the same figures, and a second checkout of this
+/// repository running its own suite declares all of them: either one turns
+/// a sweep of `/proc` into an assertion about somebody else`s leavings
+/// (D101).
+fn a_sleep_nobody_else_is_sleeping(which: u32) -> String {
+    (1_000_000 + std::process::id() * 10 + which).to_string()
+}
 
 /// Two numbers, both configuration, and nothing else is read: not the
 /// probe's output, not its name, not what the capability means.
@@ -99,8 +103,9 @@ async fn a_broken_probe_is_unknown_and_never_free() {
     // forbids is a probe holding a runner — and through it a hub — for ever.
     // It sleeps for a number nobody else would, because the assertion that it
     // left nothing behind is made below.
+    let hangs_for = a_sleep_nobody_else_is_sleeping(2);
     let started = std::time::Instant::now();
-    let hangs = BusyProbe::command(["/bin/sh", "-c", &format!("sleep {HANGS_FOR}")]);
+    let hangs = BusyProbe::command(["/bin/sh", "-c", &format!("sleep {hangs_for}")]);
     let read = evaluate(&hangs, timeout).await;
     assert!(
         started.elapsed() < Duration::from_secs(5),
@@ -146,10 +151,11 @@ async fn a_killed_probe_leaves_nothing_of_itself_behind() {
     // `sleep & wait` rather than a bare `sleep`, which a shell execs into
     // itself: what is asserted here is a probe with a *child*, which is the
     // shape that leaked. The hanging probe asserted above is the execed one.
+    let hangs_and_is_swept_for = a_sleep_nobody_else_is_sleeping(3);
     let hangs = BusyProbe::command([
         "/bin/sh",
         "-c",
-        &format!("sleep {HANGS_AND_IS_SWEPT_FOR} & wait"),
+        &format!("sleep {hangs_and_is_swept_for} & wait"),
     ]);
     let read = evaluate(&hangs, Duration::from_millis(200)).await;
     assert!(
@@ -160,7 +166,7 @@ async fn a_killed_probe_leaves_nothing_of_itself_behind() {
     // has been read: this waits for them rather than racing them.
     let deadline = Instant::now() + Duration::from_secs(10);
     loop {
-        let survivors = processes_with_argument(HANGS_AND_IS_SWEPT_FOR);
+        let survivors = processes_with_argument(&hangs_and_is_swept_for);
         if survivors.is_empty() {
             break;
         }
@@ -189,6 +195,7 @@ async fn a_killed_probe_leaves_nothing_of_itself_behind() {
 /// process exiting, which nothing short of the process can show.
 #[tokio::test]
 async fn a_runner_told_to_stop_takes_its_probes_children_with_it() {
+    let hangs_while_the_runner_stops_for = a_sleep_nobody_else_is_sleeping(4);
     let data_root = herd_runner::testing::TempDir::new("probe-stop");
     let capabilities = data_root.path().join("capabilities.json");
     // A probe of the ordinary shape (D51): a shell line with a child. The
@@ -200,7 +207,7 @@ async fn a_runner_told_to_stop_takes_its_probes_children_with_it() {
             r#"{{"capabilities":[
                 {{"name":"metal-pc","kind":{{"type":"counted","slots":1}},
                  "busy_probe":{{"type":"command",
-                   "command":["/bin/sh","-c","sleep {HANGS_WHILE_THE_RUNNER_STOPS_FOR} & wait"]}}}}
+                   "command":["/bin/sh","-c","sleep {hangs_while_the_runner_stops_for} & wait"]}}}}
             ]}}"#
         ),
     )
@@ -228,7 +235,7 @@ async fn a_runner_told_to_stop_takes_its_probes_children_with_it() {
     let pid = runner.id().expect("a spawned process has a pid");
 
     let deadline = Instant::now() + Duration::from_secs(20);
-    while processes_with_argument(HANGS_WHILE_THE_RUNNER_STOPS_FOR).is_empty() {
+    while processes_with_argument(&hangs_while_the_runner_stops_for).is_empty() {
         assert!(Instant::now() < deadline, "the probe never ran");
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
@@ -255,7 +262,7 @@ async fn a_runner_told_to_stop_takes_its_probes_children_with_it() {
     // this waits for them rather than racing them.
     let deadline = Instant::now() + Duration::from_secs(10);
     loop {
-        let survivors = processes_with_argument(HANGS_WHILE_THE_RUNNER_STOPS_FOR);
+        let survivors = processes_with_argument(&hangs_while_the_runner_stops_for);
         if survivors.is_empty() {
             break;
         }
@@ -279,6 +286,7 @@ async fn a_runner_told_to_stop_takes_its_probes_children_with_it() {
 /// environment and a sweep of `/proc` — rather than a second one.
 #[tokio::test]
 async fn a_probe_child_that_left_the_group_dies_on_the_timeout_too() {
+    let leaves_its_session_on_a_timeout_for = a_sleep_nobody_else_is_sleeping(5);
     let Some(setsid) = setsid_on_this_host() else {
         herd_runner::testing::skipped(
             "a_probe_child_that_left_the_group_dies_on_the_timeout_too",
@@ -290,7 +298,7 @@ async fn a_probe_child_that_left_the_group_dies_on_the_timeout_too() {
     let hangs = BusyProbe::command([
         "/bin/sh",
         "-c",
-        &format!("{setsid} sleep {LEAVES_ITS_SESSION_ON_A_TIMEOUT_FOR} & wait"),
+        &format!("{setsid} sleep {leaves_its_session_on_a_timeout_for} & wait"),
     ]);
     let read = evaluate(&hangs, Duration::from_millis(200)).await;
     assert!(
@@ -298,7 +306,7 @@ async fn a_probe_child_that_left_the_group_dies_on_the_timeout_too() {
         "a hanging probe is unknown: {read:?}"
     );
     wait_until_gone(
-        LEAVES_ITS_SESSION_ON_A_TIMEOUT_FOR,
+        &leaves_its_session_on_a_timeout_for,
         "outlived the probe that started them by leaving its process group; the group \
          kill cannot reach a new session and the marker sweep is what must",
     )
@@ -318,6 +326,7 @@ async fn a_probe_child_that_left_the_group_dies_on_the_timeout_too() {
 /// which nothing short of the process can show.
 #[tokio::test]
 async fn a_probe_child_that_left_the_group_dies_when_the_runner_is_stopped() {
+    let leaves_its_session_while_the_runner_stops_for = a_sleep_nobody_else_is_sleeping(6);
     let Some(setsid) = setsid_on_this_host() else {
         herd_runner::testing::skipped(
             "a_probe_child_that_left_the_group_dies_when_the_runner_is_stopped",
@@ -337,7 +346,7 @@ async fn a_probe_child_that_left_the_group_dies_when_the_runner_is_stopped() {
                 {{"name":"metal-pc","kind":{{"type":"counted","slots":1}},
                  "busy_probe":{{"type":"command",
                    "command":["/bin/sh","-c",
-                     "{setsid} sleep {LEAVES_ITS_SESSION_WHILE_THE_RUNNER_STOPS_FOR} & wait"]}}}}
+                     "{setsid} sleep {leaves_its_session_while_the_runner_stops_for} & wait"]}}}}
             ]}}"#
         ),
     )
@@ -364,7 +373,7 @@ async fn a_probe_child_that_left_the_group_dies_when_the_runner_is_stopped() {
     let deadline = Instant::now() + Duration::from_secs(20);
     let escaped = loop {
         if let Some(found) =
-            processes_with_argument(LEAVES_ITS_SESSION_WHILE_THE_RUNNER_STOPS_FOR).first()
+            processes_with_argument(&leaves_its_session_while_the_runner_stops_for).first()
         {
             break *found;
         }
@@ -399,7 +408,7 @@ async fn a_probe_child_that_left_the_group_dies_when_the_runner_is_stopped() {
     );
 
     wait_until_gone(
-        LEAVES_ITS_SESSION_WHILE_THE_RUNNER_STOPS_FOR,
+        &leaves_its_session_while_the_runner_stops_for,
         "outlived the runner whose probe started them, in a session of their own at \
          ppid 1; a clean stop may not leave one of these behind",
     )

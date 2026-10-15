@@ -164,10 +164,36 @@ async fn a_runner_that_offers_nothing_still_runs_a_job_that_needs_nothing() {
 /// Make `suspends` read `unknown` as free and this test fails.
 #[tokio::test]
 async fn a_probe_the_runner_cannot_read_keeps_a_job_queued_on_the_hub() {
-    let offer = CapabilityOffer::new(vec![OfferedCapability::new(
-        Capability::lease("metal-pc", BusyProbe::command(["/nonexistent/herd-probe"])),
-        CapabilityOrigins::declared(),
-    )])
+    // A second capability whose probe can be read, and which writes a line
+    // every time it is. A sweep reads every probe of the offer at once, so
+    // counting this one counts the sweeps — which is how the last assertion
+    // here knows that the unreadable probe was read many times over, rather
+    // than sleeping for a stretch of wall clock and calling it that (D101).
+    let run = herd_runner::testing::TempDir::new("probe-sweeps");
+    let tally = run.path().join("sweeps");
+    let sweeps = || {
+        std::fs::read_to_string(&tally)
+            .unwrap_or_default()
+            .lines()
+            .count()
+    };
+    let offer = CapabilityOffer::new(vec![
+        OfferedCapability::new(
+            Capability::lease("metal-pc", BusyProbe::command(["/nonexistent/herd-probe"])),
+            CapabilityOrigins::declared(),
+        ),
+        OfferedCapability::new(
+            Capability::lease(
+                "counts-the-sweeps",
+                BusyProbe::command([
+                    "/bin/sh",
+                    "-c",
+                    &format!("echo swept >> {}; exit 1", tally.display()),
+                ]),
+            ),
+            CapabilityOrigins::declared(),
+        ),
+    ])
     .expect("a valid offer");
     let harness = Harness::with_hub_and_runner_offering(
         offer,
@@ -243,8 +269,13 @@ async fn a_probe_the_runner_cannot_read_keeps_a_job_queued_on_the_hub() {
     assert_eq!(waits.len(), 1, "{waits:?}");
 
     // It stays queued across many probe sweeps: every one of them reads the
-    // same unreadable probe, and not one of them hands the job out.
-    tokio::time::sleep(Duration::from_millis(400)).await;
+    // same unreadable probe, and not one of them hands the job out. Eight
+    // sweeps counted, not a stretch of wall clock assumed to hold eight.
+    let eight_more = sweeps() + 8;
+    wait_until("eight more probe sweeps have been read", || {
+        sweeps() >= eight_more
+    })
+    .await;
     assert_eq!(
         harness
             .store

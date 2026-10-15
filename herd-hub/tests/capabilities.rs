@@ -303,6 +303,26 @@ impl Herd {
         self.runner = None;
     }
 
+    /// Kill the runner and wait until the **hub** says it has gone.
+    ///
+    /// For a test that starts a replacement under the same name. The hub is
+    /// the only authority on whether that name is free: until it has released
+    /// the connection it was holding, a second process wearing the name is a
+    /// twin and is told to stand by for `lost_after / 2`. Waiting on the
+    /// runner's own death is not waiting on that — the process is gone some
+    /// hundreds of milliseconds before the hub has read the close.
+    async fn stop_runner_and_wait_for_the_hub_to_let_go(&mut self) {
+        let Some(mut process) = self.runner.take() else {
+            return;
+        };
+        let _ = process.child.start_kill();
+        let _ = tokio::time::timeout(PATIENCE, process.child.wait()).await;
+        self.wait_until("the hub has let go of the runner that died", || {
+            self.said("hub").contains("is gone")
+        })
+        .await;
+    }
+
     async fn herdctl(&self, arguments: &[&str]) -> std::process::Output {
         tokio::time::timeout(
             PATIENCE,
@@ -421,14 +441,19 @@ async fn a_held_lock_file_keeps_a_job_queued_until_it_is_released() {
         herd.said("runner").contains("qemu is suspended")
     })
     .await;
-    assert!(
-        // Named, since M7: this hub holds a fleet, and "the runner" is a lie
-        // about which machine is holding the lock file.
+    // Named, since M7: this hub holds a fleet, and "the runner" is a lie
+    // about which machine is holding the lock file.
+    //
+    // Waited for, not asserted on sight: the line above is the *runner*
+    // saying what it read, which it prints before the report reaches the hub.
+    // Reading one as proof of the other is the mistake D100 found eight times
+    // in one file, and it is the hub's view that the rest of this test is
+    // about.
+    herd.wait_until("the hub has been told which machine suspended qemu", || {
         herd.said("hub")
-            .contains("qemu is suspended on the-real-runner"),
-        "the hub must record what it was told, and on which machine: {}",
-        herd.said("hub")
-    );
+            .contains("qemu is suspended on the-real-runner")
+    })
+    .await;
 
     let job = herd
         .submit("qemu", "printf 'it ran after all\\n'; exit 7")
@@ -660,9 +685,26 @@ async fn a_label_no_runner_offers_leaves_the_job_queued() {
 
     // A runner that does offer it joins, and the job that was waiting runs
     // with nobody resubmitting it.
-    drop(herd.runner.take());
+    //
+    // The replacement wears the **same name**, so it may only dial once the
+    // hub has let go of the connection the first one had: while the hub still
+    // holds it the newcomer is a twin, and a twin is told to stand by for
+    // `lost_after / 2` — thirty seconds at this hub's default, which is this
+    // file's whole [`PATIENCE`]. Killing the process and dialling straight
+    // after is a race between the hub noticing the close and the replacement
+    // finishing its startup; measured under load on two cores, the hub had
+    // **not** let go at that instant in eight runs of eight, and took 220 to
+    // 640 ms to notice. The test won only because spawning a process took
+    // longer still. So it waits for the hub's own view of the loss (D101).
+    herd.stop_runner_and_wait_for_the_hub_to_let_go().await;
     herd.start_runner(None, &["--no-detect", "--declare-capability", "vfio"])
         .await;
+    assert!(
+        !herd.said("hub").contains("asked to stand by"),
+        "the replacement was told to stand by, so the hub still held the dead \
+         runner's connection when it dialled: {}",
+        herd.said("hub")
+    );
     let waited = herd.herdctl(&["wait", &job]).await;
     assert_eq!(
         waited.status.code(),

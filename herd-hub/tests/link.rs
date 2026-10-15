@@ -757,6 +757,16 @@ async fn a_cancel_ends_one_job_within_ten_seconds_and_a_sibling_runs_on() {
             && hub.record(&sibling).state == JobState::Running
     })
     .await;
+    // And the doomed job has actually printed its line, which `Running` does
+    // not say: the runner reports a job started when it has *spawned* the
+    // shell, and the shell has still to reach its first `printf`. Cancelling
+    // on `Running` alone killed it in between on two pinned cores — the log
+    // below was empty and the test failed claiming output had been lost,
+    // when the job had never produced any (D101).
+    hub.wait_until("the doomed job has printed its line", || {
+        hub.log(&doomed).contains("working")
+    })
+    .await;
 
     let asked_at = Instant::now();
     let said = herdctl::cancel_job(&hub.requester(), doomed.clone())

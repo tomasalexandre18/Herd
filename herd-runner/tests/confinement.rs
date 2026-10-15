@@ -647,7 +647,7 @@ async fn a_job_killed_by_the_pipe_the_log_cap_closed_still_names_the_cap() {
 async fn a_job_s_child_in_its_own_session_does_not_outlive_the_job() {
     // A sleep nobody else on this host would be running, so that finding one
     // is finding ours.
-    let marker = "444441";
+    let marker = &a_sleep_nobody_else_is_sleeping(1);
     let harness = Harness::new("setsid-child", |_| {}).await;
     let ran = harness
         .run(&format!(
@@ -997,10 +997,23 @@ async fn the_runner_binds_no_listening_socket() {
         token: None,
         name: Some("no-listener-requester".to_owned()),
     };
+    // Held by two files rather than by a sleep: the job says when it has
+    // started and waits to be let go. A 400 ms sleep in front of the check
+    // was a guess that the job had started by then — and a host slow enough
+    // to lose that guess ran the whole assertion against a runner with
+    // nothing in flight, which is precisely the state the comment above says
+    // it must not be in. It would have passed (D101).
+    let started = data_root.path().join("the-job-has-started");
+    let release = data_root.path().join("the-job-may-end");
+    let script = format!(
+        ": > {}; while [ ! -e {} ]; do sleep 0.05; done",
+        started.display(),
+        release.display()
+    );
     let job = tokio::spawn(async move {
         let _ = herdctl::run_job(
             &requester,
-            shell("sleep 1.5"),
+            shell(&script),
             herd_proto::LabelSet::default(),
             herd_proto::Priority::Step,
             herdctl::Declared::default(),
@@ -1009,7 +1022,14 @@ async fn the_runner_binds_no_listening_socket() {
         )
         .await;
     });
-    tokio::time::sleep(Duration::from_millis(400)).await;
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while !started.exists() {
+        assert!(
+            Instant::now() < deadline,
+            "the job never started, so there was nothing to check the runner against"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
 
     let listening = listening_sockets_of(pid);
     assert!(
@@ -1018,6 +1038,7 @@ async fn the_runner_binds_no_listening_socket() {
          and binds nothing (the mesh endpoint of D10/D11 arrives in M11)"
     );
 
+    std::fs::write(&release, b"checked").expect("the job is let go");
     let _ = job.await;
     let _ = runner.kill().await;
     serving.abort();
@@ -1153,7 +1174,7 @@ async fn hub_on_a_free_port() -> (String, herd_hub::HubHandle, JoinHandle<()>, T
 /// workspace on disk and nobody to collect either.
 #[tokio::test]
 async fn a_runner_told_to_stop_ends_its_jobs_rather_than_orphaning_them() {
-    let marker = "444442";
+    let marker = &a_sleep_nobody_else_is_sleeping(2);
     let data_root = TempDir::new("sigterm");
     let (hub_url, handle, serving, _hub_state) = hub_on_a_free_port().await;
     let mut runner = RealRunner::join(hub_url, handle, data_root.path()).await;
@@ -1200,7 +1221,7 @@ async fn a_runner_told_to_stop_ends_its_jobs_rather_than_orphaning_them() {
 /// predecessor could not, and says what it reclaimed.
 #[tokio::test]
 async fn a_restarted_runner_reclaims_what_a_killed_one_left() {
-    let marker = "444443";
+    let marker = &a_sleep_nobody_else_is_sleeping(3);
     let data_root = TempDir::new("sigkill");
     let (hub_url, handle, serving, _hub_state) = hub_on_a_free_port().await;
     let first = RealRunner::join(hub_url.clone(), handle.clone(), data_root.path()).await;
@@ -1296,6 +1317,18 @@ fn nothing_left_in(data_root: &Path) -> Vec<PathBuf> {
 
 /// Every live process whose command line carries this argument. Used to find
 /// a job's detached children: a sleep of 444441 seconds is nobody else's.
+/// A sleep duration **this test process** alone is sleeping.
+///
+/// The sweep below finds a process by one of its arguments, so the argument
+/// has to belong to this process and to nothing else. A constant does not:
+/// `busy_probe.rs` declared two of these same figures, and a second checkout
+/// of this repository running its own suite declares all of them — either
+/// one turns the sweep into an assertion about somebody else`s leavings
+/// (D101).
+fn a_sleep_nobody_else_is_sleeping(which: u32) -> String {
+    (1_000_000 + std::process::id() * 10 + which).to_string()
+}
+
 fn processes_with_argument(needle: &str) -> Vec<u32> {
     let Ok(entries) = std::fs::read_dir("/proc") else {
         return Vec::new();
