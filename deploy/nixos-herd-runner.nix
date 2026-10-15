@@ -46,22 +46,24 @@
 # flake change and has deliberately not been made here, because a module
 # output is a promise about this file's option names and those are new today.
 #
-# TWO DIFFERENCES FROM THE COPIED FILE, both real and neither a drift to fix:
+# A JOB'S PATH IS STATED, NOT INHERITED FROM EITHER DEFAULT. The runner
+# builds a job's environment from scratch and carries five variables into it —
+# PATH, LANG, LC_ALL, TZ and TERM — so the service's PATH is every job's PATH.
+# Neither default is usable: systemd's compiled-in one is /usr/bin and friends
+# (on NixOS: `sh` and `env`, nothing else), and NixOS's own is coreutils,
+# findutils, gnugrep, gnused and systemd with no shell at all. A real job
+# proved the first half by exiting 125 on `sh: No such file or directory`. So
+# both files name the same string, `services.herd-runner.jobPath` here and
+# Environment=PATH= there, and the comment beside that line in the unit has
+# the rest — including the four variables that were checked and deliberately
+# not added.
 #
-#   * PATH. A job inherits the runner's PATH (herd-runner/src/confine.rs
-#     carries PATH, LANG, LC_ALL, TZ and TERM into a job's otherwise empty
-#     environment). Under the copied unit that is systemd's compiled-in
-#     default — /usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin,
-#     of which a NixOS host has /bin/sh and /usr/bin/env and nothing else.
-#     Under this module it is whatever NixOS gives a service: coreutils,
-#     findutils, gnugrep, gnused and systemd from the store, plus `path`
-#     below. So a job is better off here, and a job that works here may need
-#     its own PATH there. Either way a job should name its tools itself.
-#   * `nixos-rebuild switch` restarts the service when this module changes,
-#     which is a drain: jobs in flight are ended inside --drain-grace and the
-#     runner comes back. Copying a file over another does nothing until
-#     someone runs systemctl. Set `restartIfChanged = false` in an override if
-#     a rebuild must never touch a running build.
+# ONE DIFFERENCE FROM THE COPIED FILE, real and not a drift to fix:
+# `nixos-rebuild switch` restarts the service when this module changes, which
+# is a drain — jobs in flight are ended inside --drain-grace and the runner
+# comes back. Copying a file over another does nothing until someone runs
+# systemctl. Set `restartIfChanged = false` in an override if a rebuild must
+# never touch a running build.
 {
   config,
   lib,
@@ -248,6 +250,20 @@ in
       '';
     };
 
+    jobPath = lib.mkOption {
+      type = lib.types.str;
+      default = "/run/current-system/sw/bin";
+      description = ''
+        The service's PATH, which is also every job's PATH: the runner builds
+        a job's environment from scratch and carries only PATH, LANG, LC_ALL,
+        TZ and TERM through it. /run/current-system/sw/bin is the NixOS
+        answer; on a host with a different system profile, say so here.
+        Setting it to NixOS's own service PATH is not an option worth having
+        — it is coreutils, findutils, gnugrep, gnused and systemd, with no
+        shell.
+      '';
+    };
+
     extraArgs = lib.mkOption {
       type = lib.types.listOf lib.types.str;
       default = [ ];
@@ -361,11 +377,22 @@ in
       # filesystem is the ZFS pool, where no IO weight reaches (D120, D126).
       unitConfig.RequiresMountsFor = cfg.dataRoot;
 
-      # Left at NixOS's default [ ]: the service still gets coreutils,
-      # findutils, gnugrep, gnused and systemd on PATH, which is the first of
-      # the two differences named in the header. Named here so it is a choice
-      # and not an oversight.
+      # A job's PATH is this service's PATH — the runner carries PATH, LANG,
+      # LC_ALL, TZ and TERM into a job's otherwise built-from-scratch
+      # environment and nothing else — and NixOS's own answer has no shell in
+      # it: `path` is coreutils, findutils, gnugrep, gnused and systemd, so
+      # `sh -c '...'` would fail to exec exactly as it did under the copied
+      # unit's default. So the value is stated, the same string on both paths.
+      #
+      # mkForce rather than a definition, because NixOS always defines
+      # environment.PATH itself (the `path` option's own `apply` appends those
+      # five packages, so it is never empty and never undefined). Overriding
+      # it is the only way to say an exact value, and an exact value is what
+      # keeps this module and deploy/herd-runner.service from drifting. `path`
+      # is left empty for the same reason: everything on PATH comes from the
+      # one string.
       path = [ ];
+      environment.PATH = lib.mkForce cfg.jobPath;
 
       serviceConfig = {
         Type = "simple";

@@ -217,6 +217,18 @@ nothing else. The ones to change are `--host-memory`,
 `MemoryMax` — and `--data-root` with the `RequiresMountsFor=` that names
 the same path.
 
+**Your jobs' `PATH` is the unit's `PATH`, so read that line before step
+7.** A runner builds each job's environment from scratch instead of
+passing its own on — a variable of yours must never be able to redirect a
+job's writes — and carries only `PATH`, `LANG`, `LC_ALL`, `TZ` and `TERM`
+into it. systemd's default `PATH` has no shell on a NixOS host, so a job
+as ordinary as `sh -c 'echo hi'` fails to exec and exits 125. The unit
+states the value instead: `Environment=PATH=/run/current-system/sw/bin`,
+which is right on NixOS and wrong everywhere else —
+`/usr/local/bin:/usr/bin:/bin` is the Debian-shaped answer. Set it to
+whatever holds your host's tools, and have jobs that need more bring
+their own toolchain.
+
 **On NixOS, this is one of two paths**, and a machine is on exactly one:
 the copy above, with its OWNER notes done by hand, or
 `deploy/nixos-herd-runner.nix` imported from `/etc/nixos`, which declares
@@ -235,6 +247,7 @@ cp deploy/herd-runner.service ~/.config/systemd/user/
 # then, in your copy: delete User=, Group=, SupplementaryGroups=,
 # RequiresMountsFor= and the [Install] section's WantedBy=, and set
 #   --data-root ~/.local/state/herd-runner
+#   Environment=PATH=... whatever holds your host's tools
 #   WantedBy=default.target
 systemctl --user daemon-reload
 systemctl --user enable --now herd-runner
@@ -325,6 +338,7 @@ root and delivered on the next start (D34). Stopping loses nothing.
 | `dialling ...: Connection refused` | the hub's URL or the network, not Herd. Nothing on your side listens, so nothing on your side can be the cause |
 | `URL error: TLS support not compiled in` | see the next section |
 | `memory ceiling: FALLING BACK` | the runner is not in a delegated cgroup. Start it from systemd, not by hand |
+| a job exits 125 with `sh: No such file or directory`, or a command inside a job is not found | the unit's `Environment=PATH=` is not right for this host. A job's `PATH` is the unit's, and systemd's default holds no shell on NixOS |
 | `WARNING: ... is in the "docker" group` | use a user that is in no root-equivalent group (D78) |
 | a data root that is refused, naming itself | the directory is not writable by the runner's user, or another runner already holds it (D32) |
 | the unit will not start, and systemd names a mount rather than the runner | the data root's filesystem is not mounted. `RequiresMountsFor=` holds the service back on purpose, so it cannot build a root on a bare mount point |

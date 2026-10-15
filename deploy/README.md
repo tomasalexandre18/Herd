@@ -145,6 +145,16 @@ no users but `herd` and root.
 
 ## Known gaps, so nobody debugs them twice
 
+- **A job's `PATH` is the unit's `PATH`** — fixed, and written down
+  because it cost one real job an exit 125. The runner builds each job's
+  environment from scratch and carries only `PATH`, `LANG`, `LC_ALL`,
+  `TZ` and `TERM` into it, and systemd's default `PATH` holds no shell
+  on a NixOS host, so `herdctl run -- sh -c '…'` failed with `sh: No
+  such file or directory`. The unit now states
+  `Environment=PATH=/run/current-system/sw/bin`; the value is
+  host-specific, the module mirrors it as
+  `services.herd-runner.jobPath`, and the comment beside it says which
+  other variables were checked and deliberately not added.
 - **`wss://` cannot be dialled.** `herd-runner` and `herdctl` are built
   without a TLS feature, so a `wss://` URL fails with `URL error: TLS
   support not compiled in` before it touches the network. The proxy
