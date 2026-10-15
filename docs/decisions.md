@@ -3449,3 +3449,46 @@ introduce is worse than the queueing it would prevent.
 
 **Rejected.** Making PSI a gate behind a switch: a switch whose default is off
 is not a feature, and whose default is on breaks E-32 for everyone.
+
+---
+
+## 2026-10-15 — D120 `io.weight` does bite, on one of this host's two disks
+
+**Correction of D116.** D116 recorded `io.weight` as inert here on the
+evidence that no device offers `bfq` and that `/sys/fs/cgroup/io.cost.qos` was
+empty. The first half is still true. The second was a reading taken **before
+anything had written an `io.weight`**, and that is the whole mistake:
+blk-iocost runs with `ctrl=auto`, so the first non-default `io.weight` written
+to a cgroup **enables the controller itself** on any device whose cost model is
+known. Herd's own write is what turns it on. After the M16 suite ran, that
+file reads:
+
+```
+259:0 enable=1 ctrl=auto rpct=0.00 rlat=5000 wpct=0.00 wlat=5000 …
+```
+
+**The real shape, measured.** `259:0` is `nvme0n1`, the ext4 disk that carries
+`/mnt/ssd_980`, and it has a populated linear cost model. IO to that disk
+**is** weighted per cgroup. `rpool` — ZFS, a mirror of two SATA SSDs, carrying
+`/` and `/tmp` — has no iocost entry and gets none: ZFS does not attribute its
+pool IO to the writing cgroup, so no cgroup IO knob reaches it, `io.weight`
+and `io.max` alike.
+
+So whether Herd has an effective IO bound **depends on where the job works**,
+not on the host. On the NVMe it has one. On ZFS it has none and never will.
+That is also why the suite's `io.weight` assertion skipped rather than proved
+anything: its scratch path was under `/tmp`, which is ZFS — the skip said so
+in as many words, which is exactly what D27's loud skips are for.
+
+**Consequence for the first consumer.** Their slice-level `IOWeight`, the
+mitigation for the 19:15 freeze, is **not** inert as a mechanism — but it is
+inert for everything their build does on ZFS. If that freeze was ZFS IO, the
+knob cannot reach it at any value. The lever that works is to put the work
+that must be bounded on the NVMe, and `io.max` is a second lever **there and
+only there**.
+
+**What this changes in Herd.** The runner's startup report must decide
+"written but inert" from the **device its job directory is actually on**, not
+from the host's IO schedulers — the check it has today would call the NVMe
+inert. That is the next piece of work, and it is the honest version of the
+line the runner already prints.
