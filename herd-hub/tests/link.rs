@@ -15,6 +15,7 @@
 //! asked to do that, and a test that cannot make a peer misbehave cannot prove
 //! the hub survives it.
 
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -216,6 +217,8 @@ struct Puppet {
     outbox: tokio::sync::mpsc::UnboundedSender<ToHub>,
     /// The heartbeat, while it is beating.
     beating: Option<tokio::task::JoinHandle<()>>,
+    /// The log it is streaming, while it is streaming one.
+    streaming: Option<tokio::task::JoinHandle<()>>,
 }
 
 impl Puppet {
@@ -375,6 +378,7 @@ impl Puppet {
             source,
             outbox,
             beating: None,
+            streaming: None,
         };
         match puppet.next().await {
             Some(FromHub::Welcome { .. }) => puppet,
@@ -466,14 +470,61 @@ impl Puppet {
         })
         .await;
     }
+
+    /// Stream a job's output, steadily, in the background, and answer with
+    /// the count of what has gone out so far.
+    ///
+    /// This is the live traffic of D113: a runner whose log keeps arriving
+    /// while its health reports have stopped. It runs in a task of its own so
+    /// that **no** assertion afterwards sits on a clock — a test that streamed
+    /// inline had to get everything it did next done inside `lost_after`, or
+    /// its own link went quiet and the hub rightly wrote it off. The cadence
+    /// is twenty milliseconds, two orders of magnitude under any threshold
+    /// these tests give the hub, so the stream is a stream and not a
+    /// coincidence.
+    fn start_streaming_log(&mut self, job_id: &JobId, attempt: u32) -> Arc<AtomicU64> {
+        let sent = Arc::new(AtomicU64::new(0));
+        let counted = Arc::clone(&sent);
+        let outbox = self.outbox.clone();
+        let job_id = job_id.clone();
+        self.streaming = Some(tokio::spawn(async move {
+            let mut seq = 0;
+            loop {
+                let chunk = outbox.send(ToHub::LogChunk {
+                    job_id: job_id.clone(),
+                    attempt,
+                    stream: LogStream::Stdout,
+                    seq,
+                    data: format!("chunk {seq}\n").into_bytes(),
+                });
+                if chunk.is_err() {
+                    return;
+                }
+                seq += 1;
+                counted.store(seq, Ordering::Relaxed);
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        }));
+        sent
+    }
+
+    /// Stop streaming, and go on being here.
+    fn stop_streaming_log(&mut self) {
+        if let Some(streaming) = self.streaming.take() {
+            streaming.abort();
+        }
+    }
 }
 
 impl Drop for Puppet {
     fn drop(&mut self) {
-        // No heartbeat goes out for a test that is over. The writing task is
-        // left to finish: dropping `outbox` is what ends it, and it flushes
-        // what the test said last before it closes the socket.
+        // Nothing of a puppet goes on talking for a test that is over. The
+        // writing task is left to finish: dropping `outbox` is what ends it,
+        // and it flushes what the test said last before it closes the socket.
         self.stop_reporting_health();
+        if let Some(streaming) = self.streaming.take() {
+            streaming.abort();
+        }
     }
 }
 
@@ -577,6 +628,11 @@ async fn a_runner_s_health_report_and_its_age_are_in_the_hub_s_state() {
 /// every twenty milliseconds: the gap that would have to open for this test to
 /// lie is a hundred times the gap it keeps, and the assertion is still on a
 /// condition — the hub's own reading of how old the last figures it got are.
+///
+/// Half a threshold past it is the condition, not two: the watchdog sweeps
+/// every twentieth of one, so thirty sweeps have judged this runner by then,
+/// and every second this test does not spend is a second its own process
+/// cannot be starved in.
 #[tokio::test]
 async fn a_runner_streaming_its_log_is_not_lost_when_its_health_reports_stop() {
     let lost_after = Duration::from_secs(2);
@@ -606,24 +662,27 @@ async fn a_runner_streaming_its_log_is_not_lost_when_its_health_reports_stop() {
 
     // And now the health task wedges, while the log goes on arriving.
     runner.stop_reporting_health();
+    let streamed = runner.start_streaming_log(&job_id, attempt);
 
     // Output, steadily, and nothing else: not one health report for more than
     // twice the threshold. Waiting on the hub's own figure for the age of
     // those reports is what makes "well past it" a condition rather than a
     // sleep.
-    let streamed = stream_until(
-        &hub,
-        &mut runner,
-        &job_id,
-        attempt,
-        0,
-        2 * lost_after + lost_after / 2,
+    let well_past = lost_after + lost_after / 2;
+    hub.wait_until(
+        "the hub's figures for this runner are well past stale",
+        || {
+            hub.handle
+                .runners()
+                .first()
+                .is_some_and(|runner| runner.last_health_age >= well_past)
+        },
     )
     .await;
-    assert!(
-        streamed > 10,
-        "the stream has to be a stream: {streamed} chunks"
-    );
+    hub.wait_until("the stream has become a stream", || {
+        streamed.load(Ordering::Relaxed) > 10
+    })
+    .await;
 
     // The runner is still here, and the hub knows its figures have stopped.
     let seen = hub.handle.runners();
@@ -673,13 +732,15 @@ async fn a_runner_streaming_its_log_is_not_lost_when_its_health_reports_stop() {
         "the job never went round: {states:?}"
     );
 
-    // And it finishes, on the attempt it has had all along.
+    // And it finishes, on the attempt it has had all along. The stream stops
+    // first, so the count it reports is the count it sent.
+    runner.stop_streaming_log();
     runner
         .say(ToHub::JobFinished {
             job_id: job_id.clone(),
             attempt,
             outcome: JobOutcome::Exited { code: 0 },
-            chunks_sent: streamed,
+            chunks_sent: streamed.load(Ordering::Relaxed),
             metrics: JobMetrics::default(),
             steps: Vec::new(),
         })
@@ -812,9 +873,9 @@ async fn a_runner_reporting_health_again_is_admitted_again() {
 /// runner until its job is running, so that the job is claimed on figures the
 /// hub really has, and only then stops: the staleness under test is the
 /// runner's health task wedging, not a test that was too slow to be given
-/// work. It leaves the runner streaming, so the caller must not dawdle: this
-/// is a live link, and a link nothing comes back on for the threshold is still
-/// a link that is gone.
+/// work. It leaves the runner streaming its log in the background, so the
+/// caller may take as long as it likes: the link stays plainly alive while the
+/// figures stay stale, which is the whole state D113 describes.
 async fn a_runner_whose_figures_went_stale(hub: &Quick, lost_after: Duration) -> (Puppet, JobId) {
     let mut runner = Puppet::join_reporting_health(hub, "runner-a").await;
     let running = hub.submit("a build of tens of minutes").await;
@@ -831,60 +892,16 @@ async fn a_runner_whose_figures_went_stale(hub: &Quick, lost_after: Duration) ->
     })
     .await;
     runner.stop_reporting_health();
-    stream_until(
-        hub,
-        &mut runner,
-        &running,
-        attempt,
-        0,
-        lost_after + lost_after / 2,
-    )
+    runner.start_streaming_log(&running, attempt);
+    let stale = lost_after + lost_after / 2;
+    hub.wait_until("this runner's figures have gone stale", || {
+        hub.handle
+            .runners()
+            .first()
+            .is_some_and(|runner| runner.last_health_age >= stale)
+    })
     .await;
     (runner, running)
-}
-
-/// Stream a job's output until the hub's reading of this runner's figures is
-/// `age` old, and answer with how many chunks that took.
-///
-/// The condition is the hub's own figure, never a sleep: the point being
-/// proved is what that figure does *not* decide any more. The cadence is
-/// twenty milliseconds, two orders of magnitude under any threshold these
-/// tests give the hub, so the stream is a stream and not a coincidence.
-async fn stream_until(
-    hub: &Quick,
-    runner: &mut Puppet,
-    job_id: &JobId,
-    attempt: u32,
-    from_seq: u64,
-    age: Duration,
-) -> u64 {
-    let deadline = Instant::now() + PATIENCE;
-    let mut seq = from_seq;
-    loop {
-        let old_enough = hub
-            .handle
-            .runners()
-            .iter()
-            .any(|r| r.last_health_age >= age);
-        if old_enough {
-            return seq - from_seq;
-        }
-        assert!(
-            Instant::now() < deadline,
-            "timed out waiting for the hub's figures on this runner to reach {age:?}"
-        );
-        runner
-            .say(ToHub::LogChunk {
-                job_id: job_id.clone(),
-                attempt,
-                stream: LogStream::Stdout,
-                seq,
-                data: format!("chunk {seq}\n").into_bytes(),
-            })
-            .await;
-        seq += 1;
-        tokio::time::sleep(Duration::from_millis(20)).await;
-    }
 }
 
 /// E-21, the whole of it: a runner that stops answering has its job attempted
