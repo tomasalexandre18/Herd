@@ -1,7 +1,7 @@
 use std::io::Write;
 use std::process::ExitCode;
 
-use anyhow::{Context, Result};
+use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand};
 use herd_proto::{JobId, JobOutcome, LabelSet, LogStream, Priority};
 use herdctl::{
@@ -60,6 +60,55 @@ struct Asking {
     requeue_exit_code: Option<i32>,
 }
 
+/// How a submission names a command the **consumer** declared, rather than a
+/// command line of its own (E-11, D106).
+///
+/// A flattened group, like [`Asking`], because `run`, `submit` and
+/// `would-run` have to take exactly the same set or a dry run would answer
+/// about a job no submission makes (E-07).
+///
+/// Everything here is read **in the requester's own checkout**: the
+/// declaration file, and the commit a ref stands for. The hub and a runner
+/// never see TOML and never hold a repository (D106), which is also what
+/// makes the two refusals E-08 asks for possible at all — naming the files
+/// can only be done where the files are.
+#[derive(Debug, Clone, clap::Args)]
+struct Declaring {
+    /// A command this checkout declares, by name, instead of a command line
+    /// after `--` (E-11).
+    ///
+    /// Its line, its labels, its level and its three figures all come from
+    /// `tools/herd/commands.toml` in the checkout, so none of `--label`,
+    /// `--memory-mib`, `--build-thread-mib` or `--tmpfs-mib` may be given
+    /// with it: the declaration is the authority on what its own command
+    /// needs. `--priority` still may — a command that fixes its level
+    /// overrules it, and one that does not takes it.
+    #[arg(
+        long = "command",
+        value_name = "NAME",
+        conflicts_with_all = ["labels", "build_thread_mib", "memory_mib", "tmpfs_mib"]
+    )]
+    declared_command: Option<String>,
+    /// The commit to run it on: a branch, a tag or a hash this checkout
+    /// holds, resolved here to the hash the job records (E-01).
+    ///
+    /// A dirty tree is refused naming the files that changed, and a commit no
+    /// remote-tracking ref holds is refused naming the hash — a runner
+    /// fetches the commit from your own origin, so one only this checkout has
+    /// is a job that could never start (E-08).
+    #[arg(
+        long,
+        value_name = "REF",
+        default_value = "HEAD",
+        requires = "declared_command"
+    )]
+    commit: String,
+    /// Which checkout to read the declaration and the commit in. The working
+    /// directory by default, which is where a requester already stands.
+    #[arg(long, value_name = "PATH", requires = "declared_command")]
+    checkout: Option<std::path::PathBuf>,
+}
+
 /// The requester CLI: submit a job, follow its log, exit with its code.
 #[derive(Debug, Parser)]
 #[command(name = "herdctl", version, about)]
@@ -116,8 +165,11 @@ enum Action {
         tmpfs_mib: Option<u64>,
         #[command(flatten)]
         asking: Asking,
-        /// The command, after `--`.
-        #[arg(trailing_var_arg = true, required = true, num_args = 1..)]
+        #[command(flatten)]
+        declaring: Declaring,
+        /// The command, after `--` — or, with `--command`, the arguments
+        /// that declared line's `{args}` stands for.
+        #[arg(trailing_var_arg = true, num_args = 0..)]
         command: Vec<String>,
     },
     /// Submit a command and print its job id, without waiting for it.
@@ -156,8 +208,11 @@ enum Action {
         tmpfs_mib: Option<u64>,
         #[command(flatten)]
         asking: Asking,
-        /// The command, after `--`.
-        #[arg(trailing_var_arg = true, required = true, num_args = 1..)]
+        #[command(flatten)]
+        declaring: Declaring,
+        /// The command, after `--` — or, with `--command`, the arguments
+        /// that declared line's `{args}` stands for.
+        #[arg(trailing_var_arg = true, num_args = 0..)]
         command: Vec<String>,
     },
     /// Say where a job **would** run, and run nothing (E-07).
@@ -186,8 +241,11 @@ enum Action {
         tmpfs_mib: Option<u64>,
         #[command(flatten)]
         asking: Asking,
-        /// The command, after `--`.
-        #[arg(trailing_var_arg = true, required = true, num_args = 1..)]
+        #[command(flatten)]
+        declaring: Declaring,
+        /// The command, after `--` — or, with `--command`, the arguments
+        /// that declared line's `{args}` stands for.
+        #[arg(trailing_var_arg = true, num_args = 0..)]
         command: Vec<String>,
     },
     /// Read or move a runner's owner switch (E-33).
@@ -337,21 +395,34 @@ async fn run(args: Args) -> Result<Done> {
             memory_mib,
             tmpfs_mib,
             asking,
+            declaring,
             command,
         } => {
+            let job = submitting(
+                declaring,
+                labels,
+                priority,
+                build_thread_mib,
+                memory_mib,
+                tmpfs_mib,
+                asking,
+                command,
+            )?;
             // Said out loud, on stderr, before anything runs: a level is
             // what decides whether this job goes before or after somebody
             // else's, and a default nobody can see is the defect E-18 is
-            // most easily broken by. stdout stays the job's own.
-            eprintln!("herdctl: {}", submitting_at(priority));
+            // most easily broken by. stdout stays the job's own. A declared
+            // command may have fixed the level, so this says the level the
+            // job really carries and not the one that was asked for.
+            eprintln!("herdctl: {}", submitting_at(job.priority));
             // Each stream is written to its own, so a caller's pipes and
             // redirections behave as if the command had run here.
             let finished = herdctl::run_job(
                 &config,
-                command,
-                labels_of(labels)?,
-                priority,
-                declared(build_thread_mib, memory_mib, tmpfs_mib, asking)?,
+                job.command,
+                job.labels,
+                job.priority,
+                job.declared,
                 |stream, data| match stream {
                     LogStream::Stdout => write_now(&mut std::io::stdout(), data),
                     LogStream::Stderr => write_now(&mut std::io::stderr(), data),
@@ -372,17 +443,23 @@ async fn run(args: Args) -> Result<Done> {
             memory_mib,
             tmpfs_mib,
             asking,
+            declaring,
             command,
         } => {
-            eprintln!("herdctl: {}", submitting_at(priority));
-            let job_id = herdctl::submit_job(
-                &config,
-                command,
-                labels_of(labels)?,
+            let job = submitting(
+                declaring,
+                labels,
                 priority,
-                declared(build_thread_mib, memory_mib, tmpfs_mib, asking)?,
-            )
-            .await?;
+                build_thread_mib,
+                memory_mib,
+                tmpfs_mib,
+                asking,
+                command,
+            )?;
+            eprintln!("herdctl: {}", submitting_at(job.priority));
+            let job_id =
+                herdctl::submit_job(&config, job.command, job.labels, job.priority, job.declared)
+                    .await?;
             // The id alone on stdout, so that `id=$(herdctl submit -- ...)`
             // is all a hook needs (E-42).
             println!("{job_id}");
@@ -395,13 +472,20 @@ async fn run(args: Args) -> Result<Done> {
             memory_mib,
             tmpfs_mib,
             asking,
+            declaring,
             command,
         } => {
-            let asked = declared(build_thread_mib, memory_mib, tmpfs_mib, asking)?.asked(
-                command,
-                labels_of(labels)?,
+            let job = submitting(
+                declaring,
+                labels,
                 priority,
-            );
+                build_thread_mib,
+                memory_mib,
+                tmpfs_mib,
+                asking,
+                command,
+            )?;
+            let asked = job.declared.asked(job.command, job.labels, job.priority);
             // On stdout, because this *is* the answer the caller asked for —
             // unlike `run`, where stdout belongs to the job.
             for line in herdctl::would_run(&config, asked).await? {
@@ -503,12 +587,106 @@ fn submitting_at(priority: Priority) -> String {
     }
 }
 
+/// One submission, however it was named: a command line typed after `--`, or
+/// a command the consumer's own checkout declares.
+struct Submitting {
+    command: Vec<String>,
+    labels: LabelSet,
+    priority: Priority,
+    declared: herdctl::Declared,
+}
+
+/// Turn what a person typed into the one submission it means.
+///
+/// One function for `run`, `submit` **and** `would-run`, which is what makes
+/// a dry run answer about the job a submission would really make (E-07) — and
+/// what makes a dry run of a *declared* command refuse the same dirty tree a
+/// submission would.
+///
+/// The two shapes it takes, and nothing in between:
+///
+/// * a **command line** after `--`, which declares nothing beyond the
+///   figures the person typed and is capped by the runner's own figure;
+/// * `--command <name>`, which is read in the requester's own checkout
+///   (D106): the ref resolves to the hash the job will record, a dirty tree
+///   and an unpushed commit are refused naming what is wrong (E-08), and the
+///   declaration supplies the line, the labels, the level and the figures.
+///   The trailing arguments are that line's `{args}`.
+#[allow(clippy::too_many_arguments)]
+fn submitting(
+    declaring: Declaring,
+    labels: Vec<String>,
+    priority: Priority,
+    build_thread_mib: Option<u32>,
+    memory_mib: Option<u64>,
+    tmpfs_mib: Option<u64>,
+    asking: Asking,
+    command: Vec<String>,
+) -> Result<Submitting> {
+    let requester = declared(build_thread_mib, memory_mib, tmpfs_mib, asking)?;
+    let Some(named) = declaring.declared_command.clone() else {
+        // A command line of the requester's own. Refused here rather than by
+        // clap, because `--command` makes the trailing arguments optional and
+        // a person who gave neither needs to be told which of the two to give.
+        if command.is_empty() {
+            bail!(
+                "nothing to run: give a command line after `--`, or name one this checkout \
+                 declares with `--command <name>`"
+            );
+        }
+        return Ok(Submitting {
+            command,
+            labels: labels_of(labels)?,
+            priority,
+            declared: requester,
+        });
+    };
+
+    // The checkout the requester is standing in, unless it named another.
+    let from = match declaring.checkout {
+        Some(path) => path,
+        None => {
+            std::env::current_dir().context("finding the checkout to read the declaration in")?
+        }
+    };
+    let checkout = herdctl::checkout::Checkout::found_from(&from)?;
+    // E-01 and both of E-08's refusals, in that order: a person who mistyped
+    // a branch is told about the branch and not about their tree.
+    let commit = checkout
+        .resolve(&declaring.commit)
+        .with_context(|| format!("--commit {}", declaring.commit))?;
+    let commands = herdctl::declaration::Commands::read_in(checkout.root())?;
+    let resolved = commands
+        .resolve(&named, &commit.hash, &command)
+        .with_context(|| format!("--command {named}"))?;
+    // Said out loud, because a declared submission is a job whose command
+    // line the person did not type: what resolved, and to which commit.
+    eprintln!(
+        "herdctl: {named} of {} ({}), as {} declares it",
+        commit.hash,
+        commit.named,
+        commands.path().display()
+    );
+    Ok(Submitting {
+        command: resolved.command(),
+        labels: resolved.labels.at_submission().clone(),
+        priority: resolved.priority(priority),
+        // The declaration's figures, with the three fields that are the
+        // requester's own — the deadline, the parent, the requeue code —
+        // kept from what the person typed.
+        declared: herdctl::Declared {
+            after: requester.after,
+            deadline_unix_s: requester.deadline_unix_s,
+            requeue_exit_code: requester.requeue_exit_code,
+            ..resolved.declared()
+        },
+    })
+}
+
 /// Everything a requester declares about a job, from the options it typed.
 ///
-/// One function, for `run`, `submit` **and** `would-run`, which is what makes
-/// a dry run answer about the job a submission would make (E-07). A deadline
-/// is resolved here, against this machine's clock, so what travels is an
-/// instant (E-09).
+/// A deadline is resolved here, against this machine's clock, so what travels
+/// is an instant (E-09).
 fn declared(
     build_thread_mib: Option<u32>,
     memory_mib: Option<u64>,

@@ -122,8 +122,11 @@ const REMOTE_PLACEHOLDER: &str = "@REMOTE@";
 ///   rather than decorative.
 /// * `run` logs the step and then runs `{line}` — the declared command line,
 ///   pasted whole, which is the one thing Herd never interprets.
-/// * `down` logs the step and prints the whole log, so a reader of the job's
-///   output sees the four steps that ran. It runs however `run` ended.
+/// * `down` logs the step and prints the whole log **on stderr**, so a reader
+///   of the job's output sees the four steps that ran without anything of the
+///   workspace's coming after the tool's verdict: E-02's output *ends* with
+///   that verdict, and a teardown that printed on stdout would come after it.
+///   It runs however `run` ended.
 ///
 /// # The environment
 ///
@@ -157,7 +160,7 @@ const DECLARATION: &str = r#"# The commands Herd may run for this repository.
 up = "mkdir -p '{job}' && printf 'up %s\\n' '{job}' >> '{job}/steps.txt' && echo 'grove: workspace' '{job}' 'args:' {args}"
 fetch = "cd '{job}' && git init -q . && git fetch -q --no-tags \"$GROVE_REMOTE\" '+refs/heads/*:refs/remotes/origin/*' && git checkout -q -f {commit} && printf 'fetch %s\\n' '{commit}' >> steps.txt && printf 'grove: at %s\\n' '{commit}'"
 run = "cd '{job}' && printf 'run\\n' >> steps.txt && {line}"
-down = "printf 'down %s\\n' '{job}' >> '{job}/steps.txt' && cat '{job}/steps.txt'"
+down = "printf 'down %s\\n' '{job}' >> '{job}/steps.txt' && cat '{job}/steps.txt' >&2"
 
 [executor.env]
 # The commit and the arguments, filled by herdctl before the job is minted, so
@@ -227,18 +230,33 @@ timeout_s = 600
 /// `fail`, which exits [`FAIL_CODE`].
 const STEP_SOURCE: &str = r#"#!/bin/sh
 # The fixture consumer's one tool. Appends the step it was asked for to
-# steps.txt in the directory it runs in, prints one line, and exits 0 — except
-# for the name `fail`, which exits 3 so that a job with a verdict can be asked
-# for.
+# steps.txt in the directory it runs in, prints one line, prints its verdict,
+# and exits with it.
+#
+# `--verdict <code>` anywhere in its arguments says which of the consumer's
+# three codes this run reports: 0 a pass, 1 a fail, 75 absent-or-leased. A
+# real tool decides that from what it found; a fixture is told, which is how
+# a test can ask for each of the three without a second command. The name
+# `fail` still exits 3, for a code that is none of the three.
 set -u
 step=${1:?a step name}
 shift
+verdict=0
+previous=
+for word in "$@"; do
+    if [ "$previous" = --verdict ]; then
+        verdict=$word
+    fi
+    previous=$word
+done
 printf '%s %s\n' "$step" "$*" >> steps.txt
 printf 'grove %s: %s\n' "$step" "$*"
 if [ "$step" = fail ]; then
     exit 3
 fi
-exit 0
+# Last, because a caller reads the verdict off the end of the output (E-02).
+printf 'grove %s: verdict %s\n' "$step" "$verdict"
+exit "$verdict"
 "#;
 
 /// What a `labels_from` reading runs: the capabilities this commit's own tests

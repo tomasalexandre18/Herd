@@ -200,7 +200,10 @@ fn a_commit_and_a_declared_command_become_one_asked() {
         resolved.dedup_key,
         Some(format!("{ASSEMBLE}-{held}-{}", args_as_line(&args)))
     );
-    assert_eq!(resolved.coalesce, None, "{ASSEMBLE} declares no coalesce key");
+    assert_eq!(
+        resolved.coalesce, None,
+        "{ASSEMBLE} declares no coalesce key"
+    );
 }
 
 #[test]
@@ -263,11 +266,7 @@ fn the_two_commands_carry_the_figures_and_the_levels_they_declare() {
     assert_eq!(
         test.labels,
         Labels::Read {
-            line: format!(
-                "sh {LABELS_SCRIPT} {} {}",
-                commit.hash,
-                args_as_line(&args)
-            ),
+            line: format!("sh {LABELS_SCRIPT} {} {}", commit.hash, args_as_line(&args)),
             baseline: toolchain(),
         }
     );
@@ -288,9 +287,7 @@ fn the_two_commands_carry_the_figures_and_the_levels_they_declare() {
 
     // The build leaves what the test run needs, which is the pair M11 reads.
     assert!(
-        test.needs
-            .iter()
-            .all(|key| build.leaves.contains_key(key)),
+        test.needs.iter().all(|key| build.leaves.contains_key(key)),
         "the fixture's two commands do not line up: {:?} against {:?}",
         test.needs,
         build.leaves
@@ -585,7 +582,7 @@ fn the_four_hooks_the_fixture_declares_really_run() {
     let steps: Vec<&str> = log.lines().collect();
     assert_eq!(
         steps,
-        vec![
+        [
             format!("up {job}"),
             format!("fetch {}", commit.hash),
             "run".to_owned(),
