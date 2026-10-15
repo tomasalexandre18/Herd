@@ -608,6 +608,28 @@ async fn a_returning_runner_finishes_nothing_of_the_attempt_it_lost() {
         attempt: first_attempt,
     })
     .await;
+    // One report, acknowledged, and then silence — which is also what this
+    // test's own prose says happens: a runner starts a job and *then* goes
+    // quiet. It matters because the second of silence is measured from a
+    // runner's last health report and **only** a health report resets it, so
+    // without this the second was already running from [`Puppet::join`] and
+    // everything above — a real submission over a socket, a claim, a start —
+    // had to fit inside it or the attempt was written off before the
+    // assertion below could ever see it running.
+    lost.report_health(
+        vec![RunningJob {
+            job_id: job_id.clone(),
+            attempt: first_attempt,
+            chunks_sent: 0,
+        }],
+        false,
+    )
+    .await;
+    assert!(
+        matches!(lost.next().await, Some(FromHub::HealthRecorded {})),
+        "the hub answers a health report, so the silence below starts where this test \
+         says it starts"
+    );
     hub.wait_until("the attempt is running", || {
         hub.record(&job_id).state == JobState::Running
     })
@@ -623,6 +645,23 @@ async fn a_returning_runner_finishes_nothing_of_the_attempt_it_lost() {
     let mut back = Puppet::join(&hub, "runner-a").await;
     let (_, second_attempt, _) = back.take_a_job().await;
     assert_eq!(second_attempt, 2);
+    // And the same for this connection, for the same reason: its own second
+    // of silence began when it dialled, and everything below has to happen
+    // before it is written off in its turn — a second loss would end the job
+    // `lost` (E-21) and the verdict asserted at the end would never come.
+    back.report_health(
+        vec![RunningJob {
+            job_id: job_id.clone(),
+            attempt: second_attempt,
+            chunks_sent: 0,
+        }],
+        false,
+    )
+    .await;
+    assert!(
+        matches!(back.next().await, Some(FromHub::HealthRecorded {})),
+        "the hub answers a health report"
+    );
     let before = hub.record(&job_id);
 
     back.say(ToHub::LogChunk {
