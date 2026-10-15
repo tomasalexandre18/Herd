@@ -3330,7 +3330,7 @@ the failure is the peer's alert, never the missing-feature string.
 
 ---
 
-## 2026-10-16 — D116 A job's cgroup bounds cpu, io and pids, and says so
+## 2026-10-15 — D116 A job's cgroup bounds cpu, io and pids, and says so
 
 **Context.** The runner wrote exactly one cgroup control, `memory.max`. CPU and
 IO were left to `nice 10` and the idle IO class, so a job ignoring the `-j` it
@@ -3363,7 +3363,7 @@ honest next step if IO must actually be bounded, and it was not asked for.
 
 ---
 
-## 2026-10-16 — D117 Two traps between a green suite and a working deployment
+## 2026-10-15 — D117 Two traps between a green suite and a working deployment
 
 **Context.** Both found while making M16 real; both would have cost hours on
 the server and neither is visible from a test run.
@@ -3391,3 +3391,61 @@ Unreachable at M16, where every requester is on loopback `ws://`. **It must be
 closed before the first requester is remote**, and the cheap shape is the hub
 keeping a running job's followers warm on the same cadence it already uses to
 restate a wait, so that no client needs its own heartbeat.
+
+---
+
+## 2026-10-15 — D118 The hub keeps a running job's followers warm
+
+**Context.** D117 named the defect and left it for "before the first remote
+requester". Closing it is half a session and leaving it open means the first
+real deployment can answer 125 on a job that passed. It is being closed now
+rather than being carried as a known wrong answer.
+
+**Choice.** A new additive `FromHub` frame, silent, carrying only the job id,
+sent by the **hub** to every follower of a **non-terminal** job when nothing
+has gone out on that connection for the cadence. The cadence is a `pub const`
+next to `HEALTH_EVERY` and deliberately the same 15 s, so there is one number
+to remember for how often a quiet Herd link speaks. `herdctl` handles it by
+name and prints nothing: not stdout, not stderr, not counted as job output,
+and it cannot disturb E-02's framing. A terminal job gets none — its stream
+is over.
+
+**Why at the hub and not in the client.** Every future requester inherits the
+fix without learning anything about timing, and there is one place where the
+cadence lives. A client-side heartbeat would have to be added again to every
+tool that follows a job, and a tool that forgot it would fail exactly the way
+D117 describes.
+
+**Rejected.** Reusing `JobNote`: a note is text a person reads, and a liveness
+frame is read by nobody — a client that printed it would put noise between
+E-02's first line and the job's first byte. Also rejected: making `herdctl`
+redial and resume, which is strictly more code for the same symptom and still
+leaves a silent link silent.
+
+The cadence is injectable so the end-to-end test does not sleep 15 s.
+
+---
+
+## 2026-10-15 — D119 Admission reads the room it is in; PSI is a figure
+
+**Context.** The first consumer asked for two things in one breath: that
+admission read `MemAvailable` and PSI, and that PSI act as a brake. The second
+half collides with E-32, which says the load figure is **recorded, never a
+gate**.
+
+**Choice, split in two.** The memory half is taken, and in a stronger form
+than asked: admission reads the room in **the cgroup the runner is actually
+in**, not the host's `MemAvailable`. A runner inside a systemd slice carrying
+`MemoryMax` has less room than the host advertises, and admitting against the
+host's figure is how a slice gets OOM-killed while Herd believes it was
+careful. Where there is no enclosing limit the host figure is the answer, so
+the stricter read costs nothing on a bare machine.
+
+The PSI half is refused as a gate and taken as a figure: pressure is recorded
+with the job and reported, and it never refuses an admission. E-32 is the
+consumer's own expectation, and a brake that silently stops dispatching is
+indistinguishable from a hub that has died — the failure mode it would
+introduce is worse than the queueing it would prevent.
+
+**Rejected.** Making PSI a gate behind a switch: a switch whose default is off
+is not a feature, and whose default is on breaks E-32 for everyone.
