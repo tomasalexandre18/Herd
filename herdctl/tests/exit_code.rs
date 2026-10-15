@@ -19,6 +19,42 @@ use tempfile::TempDir;
 use tokio::process::Command;
 use tokio::task::JoinHandle;
 
+/// Open a state root, waiting for whoever holds it to let go.
+///
+/// One hub owns a state root at a time, claimed with `flock` (D21), and the
+/// kernel releases that claim only when **every** file description referring
+/// to it is closed. That is not the same as "when this harness drops its
+/// store": every other test in this binary spawns `herdctl` and
+/// `herd-runner`, and a `fork` hands the child a copy of every open
+/// descriptor. Rust opens files `O_CLOEXEC`, so the copy is gone the instant
+/// the child `exec`s — but between the `fork` and the `exec` the lock is held
+/// by a process that knows nothing about it, and a harness that opened the
+/// same root twice in that window was refused by its own lock, naming its own
+/// pid: "the state root … is already in use by herd-hub, process <itself>".
+/// Measured: with its ten sibling tests running beside it, twice in forty
+/// runs; alone in its process, never in forty, even at load 145.
+///
+/// So this waits for the root rather than racing it — the same decision the
+/// hub's own suite took in `herd-hub/tests/support`, for the same reason. The
+/// wait is on the condition, and a root that never comes free fails loudly
+/// naming the holder.
+fn open_when_free(root: &std::path::Path) -> JobDirStore {
+    let deadline = Instant::now() + Duration::from_secs(20);
+    loop {
+        match JobDirStore::open(root) {
+            Ok(store) => return store,
+            Err(error) => {
+                assert!(
+                    Instant::now() < deadline,
+                    "{} never came free: {error}",
+                    root.display()
+                );
+                std::thread::sleep(Duration::from_millis(20));
+            }
+        }
+    }
+}
+
 /// A hub with one runner joined, and the means to run `herdctl` against it.
 struct Harness {
     hub_url: String,
@@ -52,7 +88,7 @@ impl Harness {
     async fn with_a_quarantined_job() -> (Self, String) {
         let state = tempfile::tempdir().expect("a temporary state directory");
         let quarantined = {
-            let store = JobDirStore::open(state.path()).expect("the state root opens");
+            let store = open_when_free(state.path());
             let id = store
                 .create_job(herd_hub::NewJob::new(vec![
                     "/bin/sh".to_owned(),
@@ -95,7 +131,7 @@ impl Harness {
         state: TempDir,
         shape: Option<impl FnOnce(&mut herd_runner::Confinement)>,
     ) -> Self {
-        let store = JobDirStore::open(state.path()).expect("the state root opens");
+        let store = open_when_free(state.path());
         // An unapproved runner claims nothing (E-48), so the runner this
         // harness may start is approved here, before the hub serves.
         let token = store
