@@ -180,8 +180,18 @@ jobs:
             install -m 0755 "bin/$b" "dist/$b-$version-$triple"
           done
           cd dist
-          sha256sum herd-* > SHA256SUMS
+          # `herd*` and not `herd-*`: `herdctl` has no hyphen, and the first
+          # release this workflow cut shipped a SHA256SUMS of two binaries
+          # out of three because of it. Hence the count below — a sums file
+          # that silently covers less than it should is exactly the kind of
+          # green this workflow exists to refuse.
+          sha256sum herd* > SHA256SUMS
           cat SHA256SUMS
+          summed=$(wc -l < SHA256SUMS)
+          if [ "$summed" -ne 3 ]; then
+            echo "SHA256SUMS covers $summed files, not 3" >&2
+            exit 1
+          fi
 
       # Every run leaves the binaries behind, tag or no tag: that is what
       # makes a hand-run useful, and what lets this workflow be tested
@@ -214,8 +224,9 @@ jobs:
             echo "chmod +x herd-runner-$version-$triple"
             echo '```'
             echo
-            echo "The notice in full is [deploy/release-notice.md]("
-            echo "https://github.com/${{ github.repository }}/blob/$TAG/deploy/release-notice.md)."
+            # One line: a markdown link destination cannot be broken across
+            # two.
+            echo "The notice in full, as of this tag: <https://github.com/${{ github.repository }}/blob/$TAG/deploy/release-notice.md>"
             echo
             echo "---"
             echo
