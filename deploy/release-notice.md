@@ -266,6 +266,42 @@ A job *can* exit 124 or 125 by itself, which is why the reason is always on
 stderr as well, and why the wire carries a typed outcome rather than a
 number. Read the sentence, not just the code.
 
+### Falling back after 125: the id is the answer, not the code
+
+125 is one code for two situations that call for **opposite** actions: a job
+that exists and may still be running, and a submission that never left. Run
+the first again and the work is done twice; decline to run the second and it
+is never done at all. There is no spare exit code to split them with — 0‑255
+belongs to the job, 124 is the caps, 126 and 127 are what a *shell* returns
+for "not executable" and "not found", and 128+n is a signal — so the
+discriminator is on **stderr**, which a job's own output never shares:
+
+| Line on stderr | What it means | What to do |
+| --- | --- | --- |
+| `herdctl: job-id: <id>` | a job exists, and that is its id | **do not submit again.** `herdctl wait <id>` picks it back up, output, verdict and all |
+| `herdctl: no-job: …` | nothing was submitted | running the work again is safe and starts no second job |
+| `herdctl: job-unknown: …` | the submission left and was never acknowledged, so a job may exist whose id nobody learned | submitting the same work again **joins** that job rather than starting a second one (E-05) |
+
+Three rules about that line, and they are the contract:
+
+* **The id is printed the moment the hub says it**, before anything can go
+  wrong — so it is already out when the link dies mid-run, when the hub goes
+  away, when a cancel races the verdict, and when the wrapper itself gives up
+  and kills `herdctl`.
+* **The test is the presence of an id, never the wording of a sentence.** The
+  prefixes above are stable; the prose after them is not.
+* **None of the three** means `herdctl` died before it could say. Treat that
+  as `job-unknown`.
+
+```sh
+out=$(herdctl run --command build --commit "$sha" 2>&1 >/dev/null) || {
+  id=$(printf '%s\n' "$out" | sed -n 's/^herdctl: job-id: //p' | tail -1)
+  if [ -n "$id" ]; then herdctl wait "$id"; else run_it_locally; fi
+}
+```
+
+`herdctl --help` carries the same thing, for whoever is at a terminal.
+
 ## Taking the machine back
 
 Yours at any time, needing neither the hub nor the operator (E-33). The

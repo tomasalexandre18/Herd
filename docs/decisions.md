@@ -4464,3 +4464,81 @@ constant in `herd-proto` now states Herd's own ceiling and all three take it.
 turning a cap on a side channel into a verdict about the job — so it is a
 loud sentence on stderr and on the record, never an exit code. A consumer who
 wants a missing `results.json` to be fatal makes that check themselves.
+## 2026-10-16 — D139 Two defects the first consumer found, and one order
+
+Both reported by the first consumer, who has finished their side. Neither
+needed the wire: `PROTOCOL_VERSION` and `RECORD_VERSION` stay at 1 and no
+`FromHub` or `ToHub` variant moved (D124, D128).
+
+**A declared command's own line is a template, and its tokens are filled
+before `{args}` is in it.** `tool pack --out {out}/packs` reached their hook
+with the three characters `{out}`: the runner filled `{job}`, `{in}` and
+`{out}` in the four hooks, then pasted the line into `{line}` last, and the
+line itself was never looked at. The fix is not to fill the line wholesale.
+D107's property is that **a value a substitution pasted in is never itself
+scanned for tokens** — `--only '{out}'` is an argument, not a template — and
+the requester's arguments were quoted into that line before the job was
+minted, which is itself D107's and which M6 keys on. Filling the line
+wholesale would turn a requester's own string into a template, which is the
+one way a declaration's trust could reach past the declaration.
+
+So the order is: fill the declared text, then the arguments. The three
+figures that make the order the only possible one are worth writing down,
+because they look independent and are not:
+
+* `{args}` is filled **before the job is minted**, for M6 (D107);
+* `{in}` and `{out}` are knowable only **after** it is placed, on the runner;
+* D107 forbids a pass over a value a previous pass pasted in.
+
+Taken together, a single pass over the whole line cannot satisfy all three.
+What makes it possible with no new frame and no escaping is that the
+requester's words already travel beside the line — `Declaration::args`, which
+D74's cache key needed — and are quoted into it by one function. So the
+runner holds the argument spans out of the pass and fills the declared text
+around them. Nothing is encoded, escaped or marked; the failure direction is
+conservative, a declared token left literal, never a requester's text turned
+into a path.
+
+**Known gap, not closed here:** `{j}` is filled by the hub over the whole
+command, *after* the arguments are in it (`with_parallelism`), so an argument
+that says `{j}` already becomes a thread count. Same shape, different place,
+and the hub holds `declaration.args` on the record, so it is fixable the same
+way. Left alone because it is a hub change on a deployed hub and nobody has
+hit it.
+
+**"Nothing was submitted" and "submitted, no verdict" are told apart by an
+id, not by a code.** Both exit 125, and they ask a falling-back requester for
+opposite actions: re-run the second and the work is done twice, decline the
+first and it is never done. For a build and test system work run twice is a
+wrong answer, not a slow one.
+
+**No new exit code, and the reason is that the space is genuinely full.**
+0‑255 belongs to the job, 124 is the caps, 128+n is a signal, and 126/127 are
+what a **shell** returns for "not executable" and "not found" — so a wrapper
+invoking `herdctl` through `sh` could see those from the shell itself and
+misread them. Anything below 124 collides with a real verdict, and the
+collision matters precisely because the wrapper cannot tell the two apart.
+
+The discriminator is a line on **stderr**, which a job's own bytes never
+share, so it cannot collide with a job's output and does not disturb E-02's
+stdout order:
+
+* `herdctl: job-id: <id>` — a job exists. Printed **the moment the hub says
+  the id**, not at the end: a line printed only on the failures that were
+  thought of cannot cover the one that was not, and it has to survive a
+  wrapper that gives up and kills `herdctl`.
+* `herdctl: no-job: …` — nothing was submitted; running the work again is
+  safe.
+* `herdctl: job-unknown: …` — the submission left and was never
+  acknowledged. **A third state, and it is real**: a job may exist whose id
+  nobody learned. Said rather than hidden, because a line claiming no job
+  exists would be the same defect wearing the other mask. E-05 is what makes
+  it actionable — the same submission joins the open job rather than starting
+  a second one.
+
+It is strictly better than a code would have been: an id lets them recover
+with `herdctl wait <id>` instead of merely declining to duplicate. The rule a
+wrapper writes is "did I get an id?", never the parsing of prose. A command
+that submits nothing — `wait`, `cancel`, `raise`, a dry run, the operator
+commands — prints none of the three: a sentence about submissions there would
+answer a question nobody asked.

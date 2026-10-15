@@ -406,6 +406,117 @@ async fn submit_prints_an_id_and_wait_exits_with_the_job_s_code() {
     }
 }
 
+/// 125 cannot say whether a job exists, so stderr does — and the discriminator
+/// is an **id**, not a sentence to parse.
+///
+/// This is the consumer's most dangerous item: a requester that falls back on
+/// 125 either runs the work twice or never runs it at all, depending on which
+/// of the two 125s it got, and for a build and test system a job silently run
+/// twice is a wrong answer. Every path where a job exists names it; the paths
+/// where nothing was submitted say so and name nothing.
+#[tokio::test]
+async fn a_job_that_exists_is_named_on_stderr_and_a_submission_that_never_left_is_not() {
+    let harness = Harness::new().await;
+
+    // A job that exists. Its id is on stderr the moment the hub minted it,
+    // on `submit` as on `run`, and it is the same id `submit` prints on
+    // stdout for a script to read.
+    let submitted = harness
+        .herdctl_args(&["submit", "--", "/bin/sh", "-c", "sleep 30"])
+        .await;
+    assert_eq!(status_code(&submitted), 0, "{}", stderr(&submitted));
+    let job_id = stdout(&submitted).trim().to_owned();
+    assert!(
+        stderr(&submitted).contains(&format!("{}{job_id}\n", herdctl::JOB_ID_PREFIX)),
+        "a job that exists must name itself on stderr, in the one documented \
+         form: {}",
+        stderr(&submitted)
+    );
+
+    // Cancelled under a follower: a real end, no verdict, exit 125 — and the
+    // id is there, so a wrapper comes back with `herdctl wait <id>` instead
+    // of running the work a second time.
+    let cancelled = harness.herdctl_args(&["cancel", &job_id]).await;
+    assert_eq!(status_code(&cancelled), 0, "{}", stderr(&cancelled));
+    let waited = harness.herdctl_args(&["wait", &job_id]).await;
+    assert_eq!(
+        status_code(&waited),
+        125,
+        "a cancelled job has no verdict: {}",
+        stderr(&waited)
+    );
+    assert!(
+        stderr(&waited).contains(&format!("{}{job_id}\n", herdctl::JOB_ID_PREFIX)),
+        "a 125 for a job that exists must name it: {}",
+        stderr(&waited)
+    );
+    assert!(
+        !stderr(&waited).contains(herdctl::NO_JOB_LINE),
+        "a job exists, so nothing may say otherwise: {}",
+        stderr(&waited)
+    );
+
+    // Nothing submitted: a hub that cannot be dialled at all. No id, and the
+    // line that says plainly that running the work again is safe.
+    let nowhere = Command::new(env!("CARGO_BIN_EXE_herdctl"))
+        .args(["--hub", "ws://127.0.0.1:1", "run", "--", "/bin/true"])
+        .output()
+        .await
+        .expect("herdctl runs");
+    assert_eq!(status_code(&nowhere), 125, "{}", stderr(&nowhere));
+    assert!(
+        !stderr(&nowhere).contains(herdctl::JOB_ID_PREFIX),
+        "nothing was submitted, so there is no id to name: {}",
+        stderr(&nowhere)
+    );
+    assert!(
+        stderr(&nowhere).contains(herdctl::NO_JOB_LINE),
+        "the one case where re-running is safe has to say so: {}",
+        stderr(&nowhere)
+    );
+    assert!(
+        !stderr(&nowhere).contains(herdctl::JOB_UNKNOWN_LINE),
+        "the submission never left, and that is not the unknown case: {}",
+        stderr(&nowhere)
+    );
+
+    // A usage error, which is the other half of "nothing was submitted".
+    let nonsense = harness
+        .herdctl_args(&["run", "--label", "Not A Label", "--", "/bin/true"])
+        .await;
+    assert_eq!(status_code(&nonsense), 125, "{}", stderr(&nonsense));
+    assert!(
+        !stderr(&nonsense).contains(herdctl::JOB_ID_PREFIX)
+            && stderr(&nonsense).contains(herdctl::NO_JOB_LINE),
+        "a submission refused before it left leaves no job: {}",
+        stderr(&nonsense)
+    );
+}
+
+/// A command that submits nothing says nothing about submissions.
+///
+/// `cancel`, `raise` and `wait` name a job somebody else made, so a line
+/// about whether *this* invocation left one behind would be an answer to a
+/// question nobody asked — and "no job exists" would be false besides.
+#[tokio::test]
+async fn a_command_that_submits_nothing_says_nothing_about_a_job_existing() {
+    let harness = Harness::new().await;
+    let output = harness.herdctl_args(&["wait", "j0000009999"]).await;
+    assert_eq!(status_code(&output), 125, "{}", stderr(&output));
+    for line in [herdctl::NO_JOB_LINE, herdctl::JOB_UNKNOWN_LINE] {
+        assert!(
+            !stderr(&output).contains(line),
+            "a wait submits nothing and must not talk about submissions: {}",
+            stderr(&output)
+        );
+    }
+    assert!(
+        !stderr(&output).contains(herdctl::JOB_ID_PREFIX),
+        "the hub refused: there is no such job to name: {}",
+        stderr(&output)
+    );
+}
+
 /// D22: a wait prints the job's output, the way `run` does. Without this a
 /// requester on another machine cannot get a detached job's log through the
 /// CLI at all — only by reading the hub's state directory, which it cannot
