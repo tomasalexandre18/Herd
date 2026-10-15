@@ -594,9 +594,53 @@ mod tests {
             .stdout(std::process::Stdio::null())
             .spawn()
             .expect("the fixture starts");
-        // The environment is readable as soon as the process exists.
-        std::thread::sleep(std::time::Duration::from_millis(100));
+        // **The environment is not readable as soon as the process exists.**
+        // Between `fork` and `exec` the child's `/proc/<pid>/environ` is still
+        // its parent's, and the parent does not carry the marker — so a sweep
+        // run in that window finds nothing at all, which is exactly how this
+        // test failed: "the orphan was not found among []", an empty list
+        // rather than a race lost to another reaper. A hundred milliseconds
+        // stood here, which was a guess at how long an `exec` takes. This
+        // waits for the thing the sweep reads, and says which way it went
+        // wrong if it never comes.
+        wait_until_marked(child.id(), marker);
         child
+    }
+
+    /// Wait until `pid` carries `marker` where [`orphaned_job_processes`]
+    /// looks for it.
+    #[cfg(unix)]
+    fn wait_until_marked(pid: u32, marker: &str) {
+        let wanted = format!("{MARKER_VARIABLE}={marker}");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+        loop {
+            let carried = fs::read(format!("/proc/{pid}/environ"))
+                .map(|environ| {
+                    environ
+                        .split(|byte| *byte == 0)
+                        .filter_map(|entry| std::str::from_utf8(entry).ok())
+                        .any(|entry| entry == wanted)
+                })
+                .unwrap_or(false);
+            if carried {
+                return;
+            }
+            // Which of the two ways it failed, because they need different
+            // fixes: a fixture that is gone never ran `sleep` at all, and a
+            // fixture that is there but unmarked is a sweep reading the wrong
+            // place.
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the fixture {pid} never carried {wanted} where the sweep reads it, and {}",
+                if minter_is_gone(pid) {
+                    "it is gone: it exited before it could be swept, so this host's PATH may \
+                     not reach a `sleep`"
+                } else {
+                    "it is still running, so its environ never showed the marker"
+                }
+            );
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
     }
 
     /// The sweep is the whole of the fallback's new strength, so it is
