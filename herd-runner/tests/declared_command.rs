@@ -816,6 +816,83 @@ async fn a_cancel_during_the_run_step_still_takes_the_workspace_down() {
     );
 }
 
+/// A step reaches the record **as it ends**, not only with the verdict
+/// (`ToHub::StepFinished`, D108). That is the whole reason the frame exists: a
+/// 5 h nightly stopped at its cap, or a runner lost under a 30-minute cache
+/// pull, would otherwise leave no step on the record at all — the preparation
+/// time invisible in exactly the case someone is looking for it.
+///
+/// Asserted while the job is still running, which is the only moment at which
+/// it can be asserted: the complete list arrives again at the end and would
+/// hide a frame that never went out.
+#[tokio::test]
+async fn the_steps_reach_the_record_as_they_end_rather_than_only_with_the_verdict() {
+    if let Err(why) = a_sleeping_hook_or_reason() {
+        skipped(
+            "the_steps_reach_the_record_as_they_end_rather_than_only_with_the_verdict",
+            &why,
+        );
+        return;
+    }
+    let harness = Harness::new("steps-as-they-end", |_| {}).await;
+    let fixture = Fixture::new("steps-as-they-end");
+    let job_id = herdctl::submit_job(
+        &harness.requester(),
+        line("sleep 30"),
+        herd_proto::LabelSet::default(),
+        herd_proto::Priority::Step,
+        fixture.declared(None),
+    )
+    .await
+    .expect("the hub accepts the submission");
+
+    // The `run` step has started — its own hook said so on a disk — so `up`
+    // and `fetch` have both ended and the job has certainly not.
+    let deadline = Instant::now() + PATIENCE;
+    while !fixture.trace().iter().any(|name| name == "run") {
+        assert!(
+            Instant::now() < deadline,
+            "the run step never started: {:?}",
+            fixture.trace()
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    let deadline = Instant::now() + PATIENCE;
+    loop {
+        let names: Vec<&str> = harness
+            .steps_of(&job_id)
+            .iter()
+            .map(|ran| ran.step.name())
+            .collect();
+        if names == ["up", "fetch"] {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the record should already hold up and fetch while the run step is still \
+             going, and holds {names:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    let record = harness
+        .store
+        .job(&job_id)
+        .expect("the record is readable")
+        .expect("the hub minted this job");
+    assert!(
+        !record.state.is_terminal(),
+        "the two step lines have to be on the record *before* the job ends: {:?}",
+        record.state
+    );
+
+    // Ended here rather than waited out: this test is about when a step line
+    // lands, not about a half-hour sleep.
+    herdctl::cancel_job(&harness.requester(), job_id.clone())
+        .await
+        .expect("the hub answers the cancel");
+    let _ = herdctl::wait_for_job(&harness.requester(), job_id, |_, _| {}, |_| {}).await;
+}
+
 /// An ad-hoc job — no declaration — ends with **no step at all**. That is not
 /// a leftover: it is how Herd is tested against itself with no consumer tree
 /// in the picture, which is what E-11 asks of Herd's own code.
