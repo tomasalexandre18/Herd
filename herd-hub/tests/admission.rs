@@ -60,6 +60,35 @@ fn marks_its_interval(which: &str, seconds: &str) -> String {
     format!("printf '{which}\\n' >/dev/null; date +%s.%N; sleep {seconds}; date +%s.%N")
 }
 
+/// A job that holds whatever it reserved until the test lets it go.
+///
+/// For the tests whose subject is a reservation that is **still held** while
+/// something else is judged against it. A `sleep` cannot do that job: it makes
+/// the window a duration, and every one of those tests then has a race between
+/// how long the sleep is and how long its own steps take. `sleep 4` across a
+/// `kill -9`, a hub restart, a rejoin and two submissions is the shape that
+/// actually failed in the suite — and it failed in the way that is hardest to
+/// read, because once the holder has ended there is room, the job under test
+/// is claimed instead of refused, and the wait is left looking for a sentence
+/// that will never be written.
+///
+/// Returns the file that releases it and the script to submit.
+fn a_job_held_until_the_test_says_so(herd: &Herd, which: &str) -> (std::path::PathBuf, String) {
+    let release = herd.logs.path().join(format!("release-{which}"));
+    (
+        release.clone(),
+        format!(
+            "printf '{which}\\n'; until [ -e {} ]; do sleep 0.05; done",
+            release.display()
+        ),
+    )
+}
+
+/// Let one of those jobs finish.
+fn let_it_finish(release: &std::path::Path) {
+    std::fs::write(release, b"go").expect("the test releases the job it was holding");
+}
+
 /// E-04 and E-31: a job that cannot be given the room it asks for is told so
 /// **with both figures**, and the two ways of not fitting say different
 /// things.
@@ -298,14 +327,18 @@ async fn a_killed_hub_reads_the_reservations_back_off_the_records() {
     herd.wait_for_runner().await;
 
     // A job holding 3 of the 4 gibibytes of tmpfs and 4 of the 7 admissible
-    // gibibytes of memory, and still running when the hub dies.
+    // gibibytes of memory, and **still running** when the hub dies and for as
+    // long as the assertions below need it: held on a file rather than on a
+    // `sleep`, because everything from here to the last judgement has to
+    // happen while it is in flight, and a `kill -9`, a hub restart, a rejoin
+    // and two submissions do not fit inside a figure chosen in advance. With
+    // `sleep 4` here the suite timed out at load 19, looking for a sentence
+    // the hub had no reason to write any more (D100's lesson, in M8's test).
+    let (release, script) = a_job_held_until_the_test_says_so(&herd, "inherited");
     let holding = herd
-        .submit_reserving(
-            Some(4 * 1024),
-            Some(3 * 1024),
-            &marks_its_interval("inherited", "4"),
-        )
+        .submit_reserving(Some(4 * 1024), Some(3 * 1024), &script)
         .await;
+
     herd.wait_until("the job is running", || {
         state_of(&herd, &holding) == "running"
     })
@@ -349,9 +382,26 @@ async fn a_killed_hub_reads_the_reservations_back_off_the_records() {
         said.contains("3 GiB free of its 7 GiB memory admission, 5 GiB needed"),
         "the inherited job's 4 GiB of declared memory must still be held: {said}"
     );
+    // Both sentences above are only worth anything while the attempt whose
+    // reservation they count is still out there, so that is asserted rather
+    // than assumed: if it had ended there would be room, and the hub would
+    // have been right to claim these two instead of refusing them.
+    //
+    // Either state proves it. `running` is a hub that has been told so on a
+    // live link; `interrupted` is this hub's own reading of an attempt it
+    // inherited from a record and has not heard about yet — which is the very
+    // thing this test is about, and it holds the reservation exactly as
+    // `running` does (D79).
+    let holder = state_of(&herd, &holding);
+    assert!(
+        matches!(holder.as_str(), "running" | "interrupted"),
+        "the inherited attempt has to still be out there for the two sentences above to \
+         prove anything about a reservation read back off its record; it is {holder}"
+    );
 
     // When the inherited job ends, both get their room back — nothing was
     // pinned by the restart.
+    let_it_finish(&release);
     for job in [&holding, &would_not_fit, &too_much_memory] {
         let job = job.clone();
         herd.wait_until(&format!("{job} is over"), || {
