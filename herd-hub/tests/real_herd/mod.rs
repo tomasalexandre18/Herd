@@ -672,3 +672,56 @@ impl Herd {
         bytes
     }
 }
+
+/// The job's own output, out of what the requester's CLI printed on stdout.
+///
+/// E-02 frames a job's output with one line saying where it ran and why there
+/// (D109), so a test about the output itself asserts on what follows that
+/// line — and this asserts, on the way, that the line was there at all and
+/// that it has the shape the first consumer's tooling reads:
+/// `^ran on: (\S+) \((.*)\)$`.
+pub fn job_output(stdout: &[u8]) -> String {
+    let said = String::from_utf8_lossy(stdout).into_owned();
+    let (first, rest) = said
+        .split_once('\n')
+        .unwrap_or_else(|| panic!("stdout carries no first line at all: {said:?}"));
+    let (runner, why) = ran_on_parts(first);
+    assert!(
+        !why.is_empty(),
+        "the reason is not empty: {first:?} (runner {runner:?})"
+    );
+    rest.to_owned()
+}
+
+/// The two captures of `^ran on: (\S+) \((.*)\)$`, insisting on that shape.
+///
+/// The first consumer's tooling reads this line with that expression, so the
+/// tests read it the same way rather than with a looser `contains`: a line
+/// that `contains` "ran on:" and does not *match* is a line their reader
+/// drops on the floor. The format version (Q7) is checked here too, because
+/// it rides inside the parentheses and a line without it is a line no reader
+/// can tell apart from a future one (D109).
+pub fn ran_on_parts(line: &str) -> (String, String) {
+    let runner_and_why = line
+        .strip_prefix("ran on: ")
+        .unwrap_or_else(|| panic!("the first line of the output is not E-02's: {line:?}"));
+    let inside = runner_and_why
+        .strip_suffix(')')
+        .unwrap_or_else(|| panic!("E-02's line does not close its parenthesis: {line:?}"));
+    let (runner, why) = inside
+        .split_once(" (")
+        .unwrap_or_else(|| panic!("E-02's line names no reason: {line:?}"));
+    // `\S+`: one word, so a runner's name can never swallow the parenthesis.
+    assert!(
+        !runner.is_empty() && !runner.contains(char::is_whitespace),
+        "the runner must match \\S+: {line:?}"
+    );
+    // And Q7's version, inside the parentheses where the expression above
+    // still matches around it.
+    let version = format!("herd output format {}", herd_proto::OUTPUT_FORMAT_VERSION);
+    assert!(
+        why.contains(&version),
+        "E-02's line must carry the output format version ({version}): {line:?}"
+    );
+    (runner.to_owned(), why.to_owned())
+}

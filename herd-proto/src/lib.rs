@@ -98,6 +98,10 @@ pub use placement::{
 /// and cap it at its own figure — a job that ran something other than what the
 /// declaration says, reported as if it had. So the number moves, a version 6
 /// peer is refused by name, and there is no migration (D73).
+///
+/// 7 also carries [`FromHub::RanOn`], which is E-02's first line: where the
+/// job is running and why there. It rides on the same number because it is the
+/// same milestone and nothing is deployed to be caught in between.
 pub const PROTOCOL_VERSION: u32 = 7;
 
 /// How often a runner says it is alive and what it is doing (E-40).
@@ -1361,6 +1365,29 @@ pub enum FromHub {
     /// (D19). Waiting for such a job is never silent. M8's explained waits are
     /// this frame's real home.
     JobNote { job_id: JobId, note: String },
+    /// Where this job is running, and why there (E-02, E-36).
+    ///
+    /// The first consumer's first expectation: "the output starts with one
+    /// line `ran on: <client> (<why>)` and ends with our tool's own verdict
+    /// and exit code". This frame is what that line is made of, and it is a
+    /// frame rather than a line because Herd must **not** write it into the
+    /// job's log: a record's log is the bytes the job's process wrote, and
+    /// nothing else (D18, E-15). The requester's CLI builds the sentence and
+    /// prints it on its own stdout, ahead of the job's first byte.
+    ///
+    /// Sent when the attempt is handed out, and sent again to a requester
+    /// that attaches later — a `herdctl wait` on a job that is already
+    /// running has to be able to print the same first line. A job that is
+    /// requeued onto another machine (E-21) produces a **second** one, which
+    /// is the truth about a job that ran in two places and is worth a line.
+    ///
+    /// `why` is the one line that explains the placement (E-36) — the same
+    /// sentence the record's attempt carries, so the two cannot drift.
+    RanOn {
+        job_id: JobId,
+        runner: String,
+        why: String,
+    },
     /// How the job ended, relayed to the requester that submitted it, with
     /// what the runner measured while it ran.
     JobFinished {
@@ -1379,6 +1406,28 @@ pub enum FromHub {
     /// acknowledgement of something still in memory would be a lie the next
     /// power cut collects on.
     JobResultAck { job_id: JobId },
+}
+
+/// The version of the output Herd frames a job's own output with (Q7).
+///
+/// 1, and it freezes at M16 (Q7, D73). It is carried **inside the
+/// parentheses** of [`ran_on_line`], which is the one place it can go: E-02
+/// asks that the output *start* with one line `ran on: <runner> (<why>)`, so
+/// a version on a line of its own would push that line down, and a version
+/// after the closing parenthesis would break a reader anchored on it. Inside,
+/// it is part of the free text the `why` already is, and
+/// `^ran on: (\S+) \((.*)\)$` is satisfied exactly (D109).
+pub const OUTPUT_FORMAT_VERSION: u32 = 1;
+
+/// E-02's first line: where this job ran, and why there.
+///
+/// Built here rather than in the requester's CLI because the hub's tests
+/// assert on it and the CLI prints it, and two places writing one sentence is
+/// what invariant 4 exists to prevent. Printed on the requester's **stdout**,
+/// ahead of the job's first byte, and never written into the record's log —
+/// that log is the bytes the job's process wrote and nothing else (D18).
+pub fn ran_on_line(runner: &str, why: &str) -> String {
+    format!("ran on: {runner} ({why}; herd output format {OUTPUT_FORMAT_VERSION})")
 }
 
 /// The one sentence a cap refusal reads as, so that the runner, the record

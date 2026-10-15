@@ -231,6 +231,28 @@ impl Declared {
     }
 }
 
+/// Something Herd itself says about a job, and where it belongs.
+///
+/// Two kinds, because they go to two different places and a caller cannot
+/// tell them apart from the text. A **note** is Herd's own words about the
+/// job — it goes on stderr, because stdout is the job's. The **framing**
+/// line is E-02's first line, and it goes on stdout ahead of the job's first
+/// byte: the first consumer's tooling reads it there.
+///
+/// It is **not** carried by `on_log`, and that is the whole reason this type
+/// exists: `on_log` is the bytes the job's process wrote (D18), and the
+/// stream a requester follows has to equal the `log` file on the hub's disk
+/// byte for byte. A framing line sent down that path would make the two
+/// differ, which two tests in `herd-hub/tests/durability.rs` pin.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Said<'a> {
+    /// Herd's own words about the job: on stderr.
+    Note(&'a str),
+    /// E-02's first line, already built by [`herd_proto::ran_on_line`]: on
+    /// stdout, before the job's output.
+    Framing(&'a str),
+}
+
 pub async fn run_job(
     config: &Config,
     command: Vec<String>,
@@ -238,7 +260,7 @@ pub async fn run_job(
     priority: Priority,
     declared: Declared,
     mut on_log: impl FnMut(LogStream, &[u8]),
-    mut on_note: impl FnMut(&str),
+    mut said: impl FnMut(Said),
 ) -> Result<Finished> {
     if command.is_empty() {
         bail!("a job needs a command to run");
@@ -263,7 +285,17 @@ pub async fn run_job(
             // are still shown rather than swallowed, the recorded log as the
             // job's own output and a note as Herd's own words (stderr).
             FromHub::JobLog { data, .. } => on_log(LogStream::Stdout, &data),
-            FromHub::JobNote { note, .. } => on_note(&note),
+            FromHub::JobNote { note, .. } => said(Said::Note(&note)),
+            // E-02's first line, on **stdout**, ahead of the job's first
+            // byte: the output a requester sees is framed with where the job
+            // ran and why there, and the job's own output follows it
+            // unchanged (D109). It goes through the output callback rather
+            // than through `on_note` because a note is Herd's own words on
+            // stderr, and this line is part of the output the first
+            // consumer's tooling reads.
+            FromHub::RanOn { runner, why, .. } => {
+                said(Said::Framing(&herd_proto::ran_on_line(&runner, &why)));
+            }
             FromHub::JobFinished {
                 job_id,
                 outcome,
@@ -350,7 +382,7 @@ pub async fn wait_for_job(
     config: &Config,
     job_id: JobId,
     mut on_log: impl FnMut(LogStream, &[u8]),
-    mut on_note: impl FnMut(&str),
+    mut said: impl FnMut(Said),
 ) -> Result<Finished> {
     let mut socket = join(config).await?;
     send(
@@ -378,7 +410,17 @@ pub async fn wait_for_job(
             }
             FromHub::JobLog { data, .. } => on_log(LogStream::Stdout, &data),
             FromHub::LogChunk { stream, data, .. } => on_log(stream, &data),
-            FromHub::JobNote { note, .. } => on_note(&note),
+            FromHub::JobNote { note, .. } => said(Said::Note(&note)),
+            // E-02's first line, on **stdout**, ahead of the job's first
+            // byte: the output a requester sees is framed with where the job
+            // ran and why there, and the job's own output follows it
+            // unchanged (D109). It goes through the output callback rather
+            // than through `on_note` because a note is Herd's own words on
+            // stderr, and this line is part of the output the first
+            // consumer's tooling reads.
+            FromHub::RanOn { runner, why, .. } => {
+                said(Said::Framing(&herd_proto::ran_on_line(&runner, &why)));
+            }
             FromHub::Refused { reason } => bail!("the hub refused the wait: {reason}"),
             other => bail!(
                 "the hub sent {}, which a requester cannot use",
@@ -654,6 +696,7 @@ fn message_kind(message: &FromHub) -> &'static str {
         FromHub::ResendLog { .. } => "resend_log",
         FromHub::JobLog { .. } => "job_log",
         FromHub::JobNote { .. } => "job_note",
+        FromHub::RanOn { .. } => "ran_on",
         FromHub::JobFinished { .. } => "job_finished",
         FromHub::JobResultAck { .. } => "job_result_ack",
         FromHub::WouldRun { .. } => "would_run",

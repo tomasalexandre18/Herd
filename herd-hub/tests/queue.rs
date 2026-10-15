@@ -71,7 +71,11 @@ async fn two_identical_submissions_are_one_execution_with_one_log_for_both() {
         Priority::Step,
         herdctl::Declared::default(),
         |_, data| joined_log.extend_from_slice(data),
-        |note| joined_notes.push(note.to_owned()),
+        |said| {
+            if let herdctl::Said::Note(note) = said {
+                joined_notes.push(note.to_owned());
+            }
+        },
     )
     .await
     .expect("the second submission runs");
