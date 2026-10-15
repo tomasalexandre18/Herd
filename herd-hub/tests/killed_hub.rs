@@ -301,6 +301,20 @@ async fn a_log_survives_twelve_killed_hubs_whole() {
     })
     .await;
 
+    // Enough of the job's own lines to check the log against its intent.
+    //
+    // Waited for, not assumed: the hundred below is a count of lines the job
+    // printed, and the kills above are bounded by conditions rather than by
+    // the clock, so on a host where the twelve restarts went quickly — or
+    // where the job's own shell loop was starved while they did — the log
+    // held sixty lines and the assertion failed with nothing wrong. The job
+    // is still printing at this point, so this ends.
+    herd.wait_until(
+        "the job has printed more than a hundred of its lines",
+        || whole_lines() > 105,
+    )
+    .await;
+
     // The job ends, on the twelfth hub, and keeps its own exit code.
     File::create(&stop).expect("the stop file");
     let waited = herd.herdctl(&["wait", &job]).await;

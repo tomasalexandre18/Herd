@@ -14,10 +14,12 @@
 //! helper that only one of them needs is still worth having in one place.
 #![allow(dead_code)]
 
+use std::collections::BTreeSet;
 use std::fs::File;
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
+use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 use tempfile::TempDir;
@@ -170,12 +172,41 @@ pub fn cadence_unless_given(options: &[&str]) -> Vec<String> {
 
 /// A port nothing is listening on, kept for the hub that is restarted: a
 /// runner dials one URL, so the hub that comes back has to take the same one.
+///
+/// **Never one this process has handed out before.** The kernel is free to
+/// give `bind(0)` back a port it handed out a moment earlier, and these tests
+/// run a dozen herds at once in one process: two herds on one port is two
+/// hubs where the second fails to bind, or — worse, because it is silent — a
+/// `herdctl` of one herd submitting into the hub of another. These hubs set
+/// no requester token ("anything that can reach this hub may submit"), so
+/// nothing downstream would refuse it: the requester would be handed an id
+/// minted in the *other* herd's state root, and the test would then read its
+/// own root for a job that was never there. That is exactly the shape of
+/// `jobs/j0000000004/job.json reads: No such file or directory`, which this
+/// suite has seen once.
+///
+/// So every port this process hands out is remembered, and a repeat is passed
+/// over. One `HashSet` in one process closes the whole class; across processes
+/// there is nothing to close, because `cargo test` runs one test binary at a
+/// time.
 pub fn free_port() -> u16 {
-    let listener = TcpListener::bind("127.0.0.1:0").expect("a free loopback port");
-    listener
-        .local_addr()
-        .expect("a bound listener has an address")
-        .port()
+    static HANDED_OUT: Mutex<BTreeSet<u16>> = Mutex::new(BTreeSet::new());
+    for _ in 0..1_000 {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("a free loopback port");
+        let port = listener
+            .local_addr()
+            .expect("a bound listener has an address")
+            .port();
+        // Released before it is handed out, and remembered before it is
+        // released, so that a second caller cannot be given it in between.
+        let mut handed_out = HANDED_OUT
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if handed_out.insert(port) {
+            return port;
+        }
+    }
+    panic!("this host would not give a loopback port this process has not already used");
 }
 
 pub struct Herd {
@@ -542,10 +573,36 @@ impl Herd {
             .expect("the fixture writes which hub state root it belongs to");
     }
 
+    /// A job's record, read from this herd's own state root.
+    ///
+    /// A record that is not there is reported with what *is*, because the two
+    /// explanations need different fixes and the bare `No such file or
+    /// directory` told them apart for nobody. The hub writes a record and
+    /// fsyncs it **before** it answers the submission with the id, and it
+    /// replaces one by rename, so a reader that has an id can always read its
+    /// record here: an id this root has never heard of means the id was minted
+    /// somewhere else — another herd's hub, reached because two herds were
+    /// given one port — which is what the neighbouring jobs listed here will
+    /// show at a glance.
     pub fn record(&self, job_id: &str) -> serde_json::Value {
         let path = self.job_dir(job_id).join("job.json");
-        let text = std::fs::read_to_string(&path)
-            .unwrap_or_else(|e| panic!("{} reads: {e}", path.display()));
+        let text = std::fs::read_to_string(&path).unwrap_or_else(|e| {
+            panic!(
+                "{} reads: {e}. This herd's state root is {} and holds the jobs {:?}",
+                path.display(),
+                self.state.path().display(),
+                std::fs::read_dir(self.state.path().join("jobs"))
+                    .map(|entries| {
+                        let mut names: Vec<String> = entries
+                            .flatten()
+                            .map(|entry| entry.file_name().to_string_lossy().into_owned())
+                            .collect();
+                        names.sort();
+                        names
+                    })
+                    .unwrap_or_default()
+            )
+        });
         serde_json::from_str(&text).unwrap_or_else(|e| panic!("{} is json: {e}", path.display()))
     }
 
