@@ -222,15 +222,24 @@ jobs:
             cat deploy/release-notice.md
           } > release-body.md
 
+          # A tag carrying a suffix — `v0.1.0-rc1`, and the throwaway tag this
+          # workflow was first proven with — is published as a pre-release,
+          # so a rehearsal never sits in the place a reader looks for the
+          # current version.
+          prerelease=
+          if [ "${TAG#*-}" != "$TAG" ]; then
+            prerelease=--prerelease
+          fi
+
           # --notes-file, never --notes with a shell variable: the notice is
           # a long document with backticks and dollars in it.
           if gh release view "$TAG" >/dev/null 2>&1; then
-            gh release edit "$TAG" --notes-file release-body.md
+            gh release edit "$TAG" --notes-file release-body.md $prerelease
             gh release upload "$TAG" dist/* --clobber
           else
             gh release create "$TAG" dist/* \
               --title "Herd $TAG" \
               --notes-file release-body.md \
-              --verify-tag
+              --verify-tag $prerelease
           fi
           gh release view "$TAG"
