@@ -88,6 +88,27 @@ fn a_job_held_until_the_test_says_so(herd: &Herd, which: &str) -> (std::path::Pa
 fn let_it_finish(release: &std::path::Path) {
     std::fs::write(release, b"go").expect("the test releases the job it was holding");
 }
+/// The same, for a test that also measures *when* the job held its room.
+///
+/// It prints the two moments [`interval`] reads, around a wait on the release
+/// file instead of around a `sleep`: the room is held until the test has
+/// proved what it needed to prove, and the non-overlap assertion is then made
+/// over a window the test controls rather than one it hoped would be long
+/// enough.
+fn a_job_that_marks_its_interval_until_the_test_says_so(
+    herd: &Herd,
+    which: &str,
+) -> (std::path::PathBuf, String) {
+    let release = herd.logs.path().join(format!("release-{which}"));
+    (
+        release.clone(),
+        format!(
+            "printf '{which}\\n' >/dev/null; date +%s.%N; until [ -e {} ]; do sleep 0.05; \
+             done; date +%s.%N",
+            release.display()
+        ),
+    )
+}
 
 /// E-04 and E-31: a job that cannot be given the room it asks for is told so
 /// **with both figures**, and the two ways of not fitting say different
@@ -119,9 +140,11 @@ async fn a_refusal_carries_the_free_figure_and_the_needed_figure() {
 
     // And a job short of room *now*: 4 GiB there, 3 GiB held by a job that
     // is running, 2 GiB wanted. E-04's own sentence, with its own figures.
-    let holding = herd
-        .submit_reserving(None, Some(3 * 1024), "sleep 10")
-        .await;
+    // Held until this test is done with it, not for ten seconds: the sentence
+    // below is about room this job is holding, so it has to still be holding
+    // it when the sentence is read (the same shape as attack 10).
+    let (release, script) = a_job_held_until_the_test_says_so(&herd, "holder");
+    let holding = herd.submit_reserving(None, Some(3 * 1024), &script).await;
     herd.wait_until("the holder is running", || {
         state_of(&herd, &holding) == "running"
     })
@@ -159,6 +182,9 @@ async fn a_refusal_carries_the_free_figure_and_the_needed_figure() {
         "{said}"
     );
 
+    // The holder has done its work; it ends by being let go rather than by
+    // running out of sleep, and the cancels below then have nothing to kill.
+    let_it_finish(&release);
     let _ = herd.herdctl(&["cancel", &holding]).await;
     let _ = herd.herdctl(&["cancel", &short]).await;
     let _ = herd.herdctl(&["cancel", &impossible_here]).await;
@@ -176,9 +202,15 @@ async fn a_starved_reservation_waits_then_starts_and_leaks_nothing() {
     herd.wait_for_runner().await;
 
     // Two 3 GiB reservations on a 4 GiB tmpfs. They cannot overlap.
-    let first = herd
-        .submit_reserving(None, Some(3 * 1024), &marks_its_interval("first", "1.5"))
-        .await;
+    //
+    // The first holds its room until this test has proved the second is
+    // waiting for it, rather than for a second and a half: the submission and
+    // the judgement below are a real process and a dispatch pass, which on a
+    // loaded host take longer than that — and then the second job is claimed
+    // because the room is free, which is correct of the hub and proves nothing
+    // about E-31. It still prints the two moments [`interval`] reads.
+    let (release, script) = a_job_that_marks_its_interval_until_the_test_says_so(&herd, "first");
+    let first = herd.submit_reserving(None, Some(3 * 1024), &script).await;
     herd.wait_until("the first reservation is taken", || {
         state_of(&herd, &first) == "running"
     })
@@ -197,6 +229,9 @@ async fn a_starved_reservation_waits_then_starts_and_leaks_nothing() {
         herd.waiting_for(&second)
     );
 
+    // Proved. The first may have its room back now, and the second starts
+    // only after it does — which is what the intervals below check.
+    let_it_finish(&release);
     for job in [&first, &second] {
         let job = job.clone();
         herd.wait_until(&format!("{job} is over"), || {
@@ -253,9 +288,12 @@ async fn a_waiting_job_says_why_again_on_a_clock_and_does_not_flood() {
     let _runner = herd.start_runner_with("lender", "runner", "runner", &a_small_lender());
     herd.wait_for_runner().await;
 
-    let holding = herd
-        .submit_reserving(None, Some(3 * 1024), "sleep 30")
-        .await;
+    // Held until this test is done with it. Thirty seconds stood here, which
+    // was five times the work below — a submission, a judgement, a `herdctl
+    // wait` and four seconds of watching — and five times is a margin, not a
+    // condition.
+    let (_release, script) = a_job_held_until_the_test_says_so(&herd, "holder");
+    let holding = herd.submit_reserving(None, Some(3 * 1024), &script).await;
     herd.wait_until("the holder is running", || {
         state_of(&herd, &holding) == "running"
     })
