@@ -76,7 +76,8 @@ async fn a_merger_submitted_last_takes_the_next_free_slot() {
     // The runner is up once the hub has heard its offer: a submission before
     // that is refused for want of a runner, which is not what is under test.
     herd.wait_until("the runner has joined", || {
-        herd.said("first").contains("runner the-real-runner")
+        herd.said("first")
+            .contains("runner the-real-runner has joined")
     })
     .await;
 
@@ -179,7 +180,8 @@ async fn a_hub_killed_while_a_job_ages_does_not_lose_its_wait() {
         ],
     );
     herd.wait_until("the runner has joined", || {
-        herd.said("first").contains("runner the-real-runner")
+        herd.said("first")
+            .contains("runner the-real-runner has joined")
     })
     .await;
 
@@ -284,7 +286,8 @@ async fn the_queue_its_priorities_and_its_joins_all_come_back() {
     let mut hub = herd.start_hub("first").await;
     let mut runner = herd.start_runner_with("the-real-runner", "runner", "runner", &runner_options);
     herd.wait_until("the runner has joined", || {
-        herd.said("first").contains("runner the-real-runner")
+        herd.said("first")
+            .contains("runner the-real-runner has joined")
     })
     .await;
 
@@ -325,7 +328,8 @@ async fn the_queue_its_priorities_and_its_joins_all_come_back() {
     let _hub = herd.start_hub("second").await;
     let _runner = herd.start_runner_with("the-real-runner", "runner2", "runner", &runner_options);
     herd.wait_until("the runner has joined the hub that came back", || {
-        herd.said("second").contains("runner the-real-runner")
+        herd.said("second")
+            .contains("runner the-real-runner has joined")
     })
     .await;
 
@@ -534,7 +538,8 @@ async fn the_lowest_priority_job_runs_within_the_aging_bound_on_the_real_clock()
         ],
     );
     herd.wait_until("the runner has joined", || {
-        herd.said("first").contains("runner the-real-runner")
+        herd.said("first")
+            .contains("runner the-real-runner has joined")
     })
     .await;
 

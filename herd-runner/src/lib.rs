@@ -266,6 +266,17 @@ fn jitter_fraction() -> f64 {
     (state >> 11) as f64 / (1u64 << 53) as f64
 }
 
+/// Which build of `herd-runner` this is, as the handshake announces it
+/// (E-51).
+///
+/// The crate's own version, not the hub's and not `herd-proto`'s: the point
+/// of the figure is that the two sides of a connection can be different
+/// builds, and a runner that reported a number it read from the same source
+/// the hub reads would never report a gap at all.
+pub fn runner_version() -> &'static str {
+    env!("CARGO_PKG_VERSION")
+}
+
 /// What a runner needs to know to join a hub and to confine what it runs.
 #[derive(Debug, Clone)]
 pub struct Config {
@@ -1898,6 +1909,11 @@ pub async fn serve_once(config: Config, session: Session, confined: Arc<Confined
 
     let hello = ToHub::Hello {
         protocol_version: PROTOCOL_VERSION,
+        // Which build this is, beside which protocol it speaks (E-51). The
+        // protocol version says the hub can read these frames; this says
+        // whether the two sides agree on what they mean, which is the thing
+        // a fleet drifting apart gets wrong.
+        peer_version: runner_version().to_owned(),
         role: Role::Runner,
         token: config.token.clone(),
         name: config.name.clone(),
@@ -1937,7 +1953,18 @@ pub async fn serve_once(config: Config, session: Session, confined: Arc<Confined
         .context("sending hello")?;
 
     match next_message(&mut source, config.hub_silence_limit).await? {
-        Some(FromHub::Welcome { state_root, .. }) => {
+        Some(FromHub::Welcome {
+            state_root,
+            version_note,
+            ..
+        }) => {
+            // What the hub has to say about the gap between its build and
+            // this one (E-51). On this machine's stderr, because the person
+            // who can move this runner to another version is the person
+            // reading it here; the hub says it on its own side too.
+            if let Some(note) = &version_note {
+                eprintln!("herd-runner: {note}");
+            }
             // This connection is serving: what ends it from here on is a link
             // that was up, which is not the same thing as a hub that cannot
             // be reached (D104).
@@ -2189,6 +2216,9 @@ fn message_kind(message: &FromHub) -> &'static str {
         FromHub::WouldRun { .. } => "would_run",
         FromHub::SwitchSet { .. } => "switch_set",
         FromHub::FleetSwitches { .. } => "fleet_switches",
+        FromHub::RunnerApproved { .. } => "runner_approved",
+        FromHub::RunnerRemoved { .. } => "runner_removed",
+        FromHub::ApprovedRunners { .. } => "approved_runners",
         FromHub::SetSwitch { .. } => "set_switch",
         FromHub::ReadProbesAgain { .. } => "read_probes_again",
     }

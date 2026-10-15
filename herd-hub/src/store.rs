@@ -95,6 +95,10 @@ pub struct JobDirStore {
     /// (D21). Never read: holding it *is* the point, and the kernel takes it
     /// back the moment this process ends, however it ends.
     _lock: fs::File,
+    /// Which runners an operator has approved, and the hash of each one's
+    /// token (E-48, Q8). One file in this root, written through the same
+    /// writer the records go through (D8).
+    roster: crate::roster::Roster,
     live: Mutex<Live>,
 }
 
@@ -302,10 +306,17 @@ impl JobDirStore {
             },
         )?;
 
+        // Who may connect, read before the first handshake can be answered.
+        // A roster this hub cannot read is an error here, where it names the
+        // file, rather than an empty roster that would refuse every runner
+        // for a reason that blames the machines (E-48).
+        let roster = crate::roster::Roster::open(&root)?;
+
         let store = Self {
             root,
             state_root_id,
             _lock: lock,
+            roster,
             live: Mutex::new(Live {
                 next_sequence: 1,
                 jobs_accounted: 0,
@@ -1043,6 +1054,26 @@ impl JobDirStore {
 impl JobStore for JobDirStore {
     fn state_root_id(&self) -> &str {
         JobDirStore::state_root_id(self)
+    }
+
+    fn approve_runner(&self, name: &str) -> Result<String> {
+        self.roster.approve(name)
+    }
+
+    fn remove_runner(&self, name: &str) -> Result<bool> {
+        self.roster.remove(name)
+    }
+
+    fn approved_runners(&self) -> Result<Vec<crate::roster::Approval>> {
+        Ok(self.roster.approvals())
+    }
+
+    fn admit_runner(&self, name: &str, token: Option<&str>) -> crate::roster::Admission {
+        self.roster.admit(name, token)
+    }
+
+    fn approved_runner_count(&self) -> usize {
+        self.roster.len()
     }
 
     /// Mint a job, or join the open one already doing this work (E-05).

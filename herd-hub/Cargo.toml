@@ -16,6 +16,13 @@ rustix = { version = "1.1.5", features = ["fs", "rand"] }
 futures-util.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+# SHA-256 for the per-runner tokens: the hub stores a hash and never the token
+# itself (E-48, invariant 7). A plain digest and not a password hash on
+# purpose — a token is 32 bytes this hub minted from the kernel's random
+# source, so there is no guessable secret behind it to slow an attacker down
+# over, and the thing that must be impossible is reading the token back out of
+# the hub's state. Easy to swap, shapes nothing.
+sha2.workspace = true
 time.workspace = true
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "net", "sync", "time"] }
 tokio-tungstenite.workspace = true

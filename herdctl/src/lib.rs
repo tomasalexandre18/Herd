@@ -11,9 +11,9 @@ pub mod declaration;
 use anyhow::{anyhow, bail, Context, Result};
 use futures_util::{SinkExt, StreamExt};
 use herd_proto::{
-    cap_stop_reason, from_frame, to_frame, Asked, Cap, CapabilityOffer, Declaration, FromHub,
-    JobId, JobMetrics, JobOutcome, LabelSet, LogStream, Priority, Role, RunnerSwitch, Switch,
-    ToHub, PROTOCOL_VERSION,
+    cap_stop_reason, from_frame, to_frame, ApprovedRunner, Asked, Cap, CapabilityOffer,
+    Declaration, FromHub, JobId, JobMetrics, JobOutcome, LabelSet, LogStream, Priority, Role,
+    RunnerSwitch, Switch, ToHub, PROTOCOL_VERSION,
 };
 use tokio::net::TcpStream;
 use tokio_tungstenite::tungstenite::Message;
@@ -582,6 +582,8 @@ async fn join(config: &Config) -> Result<Socket> {
         &mut socket,
         &ToHub::Hello {
             protocol_version: PROTOCOL_VERSION,
+            // Which build is asking, beside which protocol it speaks (E-51).
+            peer_version: requester_version().to_owned(),
             role: Role::Requester,
             token: config.token.clone(),
             name: config.name.clone(),
@@ -611,10 +613,112 @@ async fn join(config: &Config) -> Result<Socket> {
     .await
     .context("sending hello")?;
     match next_message(&mut socket).await? {
-        Some(FromHub::Welcome { .. }) => Ok(socket),
+        Some(FromHub::Welcome { version_note, .. }) => {
+            // What the hub says about the gap between its build and this
+            // one, when it says anything (E-51). On stderr, where every one
+            // of Herd's own words goes: stdout belongs to the answer the
+            // caller asked for.
+            if let Some(note) = version_note {
+                eprintln!("herdctl: {note}");
+            }
+            Ok(socket)
+        }
         Some(FromHub::Refused { reason }) => bail!("the hub refused this requester: {reason}"),
         Some(other) => bail!("the hub answered hello with {}", message_kind(&other)),
         None => bail!("the hub closed the connection during the handshake"),
+    }
+}
+
+/// Which build of `herdctl` this is, as the handshake announces it (E-51).
+pub fn requester_version() -> &'static str {
+    env!("CARGO_PKG_VERSION")
+}
+
+/// Approve one runner by name, and come back with the token the hub minted
+/// for it (E-48, Q8).
+///
+/// One operator action. The token is readable here and nowhere else: the hub
+/// keeps a hash of it, so an operator who loses it approves the runner again
+/// rather than looking it up.
+pub async fn approve_runner(config: &Config, runner: String) -> Result<(String, String)> {
+    let mut socket = join(config).await?;
+    send(&mut socket, &ToHub::ApproveRunner { runner })
+        .await
+        .context("approving a runner")?;
+    match next_message(&mut socket).await? {
+        Some(FromHub::RunnerApproved { token, said, .. }) => {
+            let _ = socket.close(None).await;
+            Ok((token, said))
+        }
+        Some(FromHub::Refused { reason }) => bail!("the hub refused the approval: {reason}"),
+        Some(other) => bail!("the hub answered an approval with {}", message_kind(&other)),
+        None => bail!("the hub closed the connection without answering"),
+    }
+}
+
+/// Remove one runner, which revokes its token (E-48).
+pub async fn remove_runner(config: &Config, runner: String) -> Result<String> {
+    let mut socket = join(config).await?;
+    send(&mut socket, &ToHub::RemoveRunner { runner })
+        .await
+        .context("removing a runner")?;
+    match next_message(&mut socket).await? {
+        Some(FromHub::RunnerRemoved { said }) => {
+            let _ = socket.close(None).await;
+            Ok(said)
+        }
+        Some(FromHub::Refused { reason }) => bail!("the hub refused the removal: {reason}"),
+        Some(other) => bail!("the hub answered a removal with {}", message_kind(&other)),
+        None => bail!("the hub closed the connection without answering"),
+    }
+}
+
+/// Which runners are approved on this hub (E-48).
+pub async fn approved_runners(config: &Config) -> Result<Vec<ApprovedRunner>> {
+    let mut socket = join(config).await?;
+    send(&mut socket, &ToHub::AskApprovedRunners {})
+        .await
+        .context("asking which runners are approved")?;
+    match next_message(&mut socket).await? {
+        Some(FromHub::ApprovedRunners { runners }) => {
+            let _ = socket.close(None).await;
+            Ok(runners)
+        }
+        Some(FromHub::Refused { reason }) => bail!("the hub refused: {reason}"),
+        Some(other) => bail!("the hub answered with {}", message_kind(&other)),
+        None => bail!("the hub closed the connection without answering"),
+    }
+}
+
+/// One approved runner, as `herdctl runner list` prints it (E-48).
+///
+/// No token and no hash: there is nothing to print, which is the property
+/// E-48 is built on.
+pub fn approved_runner_line(runner: &ApprovedRunner) -> String {
+    format!(
+        "{}: approved {}, {}",
+        runner.name,
+        approved_at(runner.approved_unix_s),
+        if runner.connected {
+            "connected now"
+        } else {
+            "not connected"
+        }
+    )
+}
+
+/// When an approval was made, as a human reads it, falling back to the raw
+/// figure rather than inventing a date.
+fn approved_at(unix_s: u64) -> String {
+    let seconds = i64::try_from(unix_s).unwrap_or(i64::MAX);
+    match time::OffsetDateTime::from_unix_timestamp(seconds)
+        .ok()
+        .and_then(|at| {
+            at.format(&time::format_description::well_known::Rfc3339)
+                .ok()
+        }) {
+        Some(at) => at,
+        None => format!("at unix second {unix_s}"),
     }
 }
 
@@ -659,6 +763,9 @@ fn message_kind(message: &FromHub) -> &'static str {
         FromHub::WouldRun { .. } => "would_run",
         FromHub::SwitchSet { .. } => "switch_set",
         FromHub::FleetSwitches { .. } => "fleet_switches",
+        FromHub::RunnerApproved { .. } => "runner_approved",
+        FromHub::RunnerRemoved { .. } => "runner_removed",
+        FromHub::ApprovedRunners { .. } => "approved_runners",
         FromHub::SetSwitch { .. } => "set_switch",
         FromHub::ReadProbesAgain { .. } => "read_probes_again",
     }

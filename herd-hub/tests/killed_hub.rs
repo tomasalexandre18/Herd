@@ -1286,6 +1286,11 @@ async fn a_verdict_spooled_for_a_state_root_that_was_recreated_is_never_believed
     // The state root is recreated. Nobody touches the runner's disk.
     std::fs::remove_dir_all(herd.state.path()).expect("the fixture wipes the state root");
     std::fs::create_dir_all(herd.state.path()).expect("and leaves an empty one");
+    // Which took the approvals with it: a token minted against the root that
+    // is gone means nothing to the one that replaced it, so the machine is
+    // approved again, as an operator rebuilding a volume would have to
+    // (E-48).
+    herd.forget_approvals();
     let mut hub = herd.start_hub_losing_runners_after("second", 3.0).await;
     let second_root_id = herd.state_root_id();
     assert_ne!(

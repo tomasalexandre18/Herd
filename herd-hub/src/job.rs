@@ -1091,6 +1091,28 @@ pub trait JobStore: Send + Sync + 'static {
     /// could also answer with.
     fn state_root_id(&self) -> &str;
 
+    /// Approve one runner by name and mint its token (E-48, Q8).
+    ///
+    /// On this trait rather than beside it because the approvals are part of
+    /// the state this store keeps, written through the one writer the records
+    /// go through (D8): a hub with a second way to persist would be a hub
+    /// with a second way to lose things. Answers with the token, which is the
+    /// only time it is readable — what is kept is a hash.
+    fn approve_runner(&self, name: &str) -> Result<String>;
+
+    /// Remove one runner, revoking its token. `false` if it was not approved.
+    fn remove_runner(&self, name: &str) -> Result<bool>;
+
+    /// Who is approved here, by name, for `herdctl runner list`.
+    fn approved_runners(&self) -> Result<Vec<crate::roster::Approval>>;
+
+    /// Whether a runner announcing this name and this token may be served,
+    /// and which way it may not be (E-48).
+    fn admit_runner(&self, name: &str, token: Option<&str>) -> crate::roster::Admission;
+
+    /// How many runners are approved, for the line the hub prints at startup.
+    fn approved_runner_count(&self) -> usize;
+
     /// Take a submission in: mint a job for it, or join it to the one
     /// already doing that work (E-05).
     ///

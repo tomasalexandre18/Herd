@@ -44,7 +44,7 @@
 //!   is retried for as long as it takes and never dropped (D19); output the
 //!   hub is missing is asked for again before the log is declared short (D29).
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -352,6 +352,25 @@ impl Policy {
     }
 }
 
+/// What this hub requires of the peers that dial it (E-48, Q8).
+///
+/// Separate from [`Policy`], which is timings an operator tunes: this is who
+/// is allowed here. A runner's half of it is not in this struct at all — it
+/// lives in the state root, because an approval has to survive a restart
+/// (D8). What is here is the one thing the hub is *given* at startup rather
+/// than keeping: the single shared requester token.
+#[derive(Debug, Default)]
+pub struct Authority {
+    /// The requester token this hub was started with, as a salted hash.
+    ///
+    /// `None` is a hub that authenticates no requester, which is the default
+    /// and is only safe where D14 puts the hub: loopback, behind the reverse
+    /// proxy that M16 adds. The binary says so in one loud line at startup,
+    /// because the failure mode of an open hub is that nothing goes wrong
+    /// until something does.
+    pub requester_token: Option<crate::roster::SharedSecret>,
+}
+
 /// A bound hub, not yet serving.
 pub struct Hub {
     listener: TcpListener,
@@ -372,6 +391,21 @@ impl Hub {
         store: Arc<dyn JobStore>,
         policy: Policy,
     ) -> Result<Self> {
+        Self::bind_with(addr, store, policy, Authority::default()).await
+    }
+
+    /// The same, saying what this hub requires of the peers that dial it
+    /// (E-48, Q8).
+    ///
+    /// What a runner must carry is not a parameter here: it is in the state
+    /// root, where an approval belongs. This is the shared requester token,
+    /// which the hub is handed at startup and never writes down.
+    pub async fn bind_with(
+        addr: SocketAddr,
+        store: Arc<dyn JobStore>,
+        policy: Policy,
+        authority: Authority,
+    ) -> Result<Self> {
         // Before the port, because a hub that cannot keep its promises about
         // a live runner must not be reachable by one. Here rather than in the
         // binary's option parsing so that there is no way to build a hub on
@@ -389,6 +423,7 @@ impl Hub {
             state: Arc::new(State {
                 store,
                 policy,
+                authority,
                 // The clock on every attempt this hub inherited starts here: a
                 // job left `running` by the hub that died is a job this hub
                 // has had no word of since it began.
@@ -554,6 +589,10 @@ pub struct RunnerStatus {
 struct State {
     store: Arc<dyn JobStore>,
     policy: Policy,
+    /// Who is allowed here (E-48, Q8). The runners' half is in the store,
+    /// because an approval outlives the process; this is the requester token
+    /// the hub was handed at startup.
+    authority: Authority,
     /// When this hub started serving: where the clock begins for an attempt
     /// it inherited and has heard nothing about.
     started: Instant,
@@ -1398,6 +1437,54 @@ fn said(value: Option<String>) -> Option<String> {
         .filter(|value| !value.is_empty())
 }
 
+/// The word a sentence about the far side uses for it.
+fn peer_kind(role: Role) -> &'static str {
+    match role {
+        Role::Runner => "runner",
+        Role::Requester => "requester",
+    }
+}
+
+/// Why this peer may not be served, or `None` if it may (E-48, Q8).
+///
+/// A **runner** is admitted by the roster in the state root: an operator
+/// approved its name, which minted a token, and the hub kept the hash. Four
+/// answers, three of which are a no, and each no names what to do.
+///
+/// A **requester** is admitted by the one shared token the hub was started
+/// with, when it was started with one. A hub with no requester token
+/// authenticates no requester — see [`Authority::requester_token`] for why
+/// that is the default and what says so out loud.
+fn admission_refusal(
+    state: &State,
+    role: Role,
+    peer_name: &str,
+    token: Option<&str>,
+) -> Option<String> {
+    match role {
+        Role::Runner => match state.store.admit_runner(peer_name, token) {
+            crate::roster::Admission::Approved => None,
+            crate::roster::Admission::NotApproved => {
+                Some(herd_proto::unapproved_runner_reason(peer_name))
+            }
+            crate::roster::Admission::NoToken => {
+                Some(herd_proto::missing_runner_token_reason(peer_name))
+            }
+            crate::roster::Admission::WrongToken => {
+                Some(herd_proto::wrong_runner_token_reason(peer_name))
+            }
+        },
+        Role::Requester => {
+            let required = state.authority.requester_token.as_ref()?;
+            match token {
+                None => Some(herd_proto::missing_requester_token_reason()),
+                Some(token) if required.matches(token) => None,
+                Some(_) => Some(herd_proto::wrong_requester_token_reason()),
+            }
+        }
+    }
+}
+
 async fn serve_peer(state: Arc<State>, stream: TcpStream) -> Result<()> {
     // Log chunks are small and must not wait for a full segment.
     let _ = stream.set_nodelay(true);
@@ -1438,68 +1525,97 @@ async fn serve_peer(state: Arc<State>, stream: TcpStream) -> Result<()> {
             return refuse(&mut sink, reason).await;
         }
     };
-    let (role, peer_name, peer_instance, peer_state_root, peer_health_every, announced) =
-        match hello {
-            ToHub::Hello {
-                protocol_version,
-                role,
-                token,
-                name,
-                instance,
-                state_root,
-                health_every_ms,
-                capabilities,
-                host,
-                preference,
-                load_milli,
-                switch,
-            } => {
-                if protocol_version != PROTOCOL_VERSION {
-                    return refuse(&mut sink, version_mismatch_reason(protocol_version)).await;
+    #[allow(clippy::type_complexity)]
+    let (
+        role,
+        peer_name,
+        peer_instance,
+        peer_state_root,
+        peer_health_every,
+        announced,
+        peer_token,
+        version_note,
+    ) = match hello {
+        ToHub::Hello {
+            protocol_version,
+            peer_version,
+            role,
+            token,
+            name,
+            instance,
+            state_root,
+            health_every_ms,
+            capabilities,
+            host,
+            preference,
+            load_milli,
+            switch,
+        } => {
+            if protocol_version != PROTOCOL_VERSION {
+                return refuse(&mut sink, version_mismatch_reason(protocol_version)).await;
+            }
+            // And then which *build* is speaking, which the protocol
+            // version does not say (E-51). A major version apart is
+            // refused here, before this peer is registered or given
+            // anything: two builds a major apart can read each other's
+            // frames and still disagree about what they commit to, which
+            // is a worse thing to discover from a job's record than from
+            // a refusal. A minor gap rides out in the welcome.
+            let gap = herd_proto::version_gap(peer_kind(role), hub_version(), &peer_version);
+            let version_note = match gap {
+                Some(gap) if gap.refuse => {
+                    eprintln!("herd-hub: {}", gap.reason);
+                    return refuse(&mut sink, gap.reason).await;
                 }
-                // The token is carried from M1 and validated from M15 (D6, Q8).
-                let _ = token;
-                // Trimmed once, here, so that every reader below — the ownership
-                // gate, the twin rule, the capability registry's sentences — is
-                // looking at the same name.
-                let name = said(name);
-                (
-                    role,
-                    // A blank identity is no identity. `Some("")` — or a name of
-                    // spaces — used to walk straight through the refusal below,
-                    // because it *has* an instance and *has* a name as far as an
-                    // `Option` is concerned, and the peer then wore a blank
-                    // effective name: one that matches every other blank-named
-                    // peer's attempt, which is the exact hole naming an attempt's
-                    // runner was meant to close. So whitespace is stripped and
-                    // what is left empty is absent, which is the case the hub
-                    // already refuses.
-                    //
-                    // The offer carries the same trimmed name, not the one as
-                    // given: the sentence a human reads about a capability names
-                    // the runner, and " wsl-pc " is not a second machine there
-                    // either.
-                    name.clone().unwrap_or_default(),
-                    said(instance),
-                    said(state_root),
-                    health_every_ms.map(Duration::from_millis),
-                    Announced {
-                        capacity: RunnerCapacity::new(name, capabilities),
-                        host,
-                        preference,
-                        load_milli,
-                        switch,
-                    },
-                )
-            }
-            other => {
-                let reason = format!(
-                    "the first message must be hello, not {}",
-                    message_kind(&other)
-                );
-                return refuse(&mut sink, reason).await;
-            }
-        };
+                Some(gap) => {
+                    eprintln!("herd-hub: {}", gap.reason);
+                    Some(gap.reason)
+                }
+                None => None,
+            };
+            // Trimmed once, here, so that every reader below — the ownership
+            // gate, the twin rule, the capability registry's sentences — is
+            // looking at the same name.
+            let name = said(name);
+            (
+                role,
+                // A blank identity is no identity. `Some("")` — or a name of
+                // spaces — used to walk straight through the refusal below,
+                // because it *has* an instance and *has* a name as far as an
+                // `Option` is concerned, and the peer then wore a blank
+                // effective name: one that matches every other blank-named
+                // peer's attempt, which is the exact hole naming an attempt's
+                // runner was meant to close. So whitespace is stripped and
+                // what is left empty is absent, which is the case the hub
+                // already refuses.
+                //
+                // The offer carries the same trimmed name, not the one as
+                // given: the sentence a human reads about a capability names
+                // the runner, and " wsl-pc " is not a second machine there
+                // either.
+                name.clone().unwrap_or_default(),
+                said(instance),
+                said(state_root),
+                health_every_ms.map(Duration::from_millis),
+                Announced {
+                    capacity: RunnerCapacity::new(name, capabilities),
+                    host,
+                    preference,
+                    load_milli,
+                    switch,
+                },
+                said(token),
+                version_note,
+            )
+        }
+        other => {
+            let reason = format!(
+                "the first message must be hello, not {}",
+                message_kind(&other)
+            );
+            return refuse(&mut sink, reason).await;
+        }
+    };
 
     // A runner has to be a *particular* runner, because that is what an
     // attempt belongs to. With an empty name, the record's `runner` field says
@@ -1524,6 +1640,28 @@ async fn serve_peer(state: Arc<State>, stream: TcpStream) -> Result<()> {
         _ => peer_name,
     };
 
+    // And then: is this peer allowed here at all (E-48, Q8)?
+    //
+    // **Before the welcome**, unlike the checks below it, and that is the
+    // point: a peer this hub has never approved gets one frame, the refusal,
+    // and learns nothing else about the hub — not its state root, not its
+    // version. The checks that come after the welcome are about
+    // configurations that cannot be served; this one is about a machine that
+    // may not be served, which is a different answer and deserves a
+    // different shape.
+    //
+    // Terminal (D13) on purpose, in all four of its forms. An unapproved
+    // runner, one carrying no token, one carrying the wrong token and one
+    // whose approval was removed are each waiting for a person to do
+    // something, and a runner told to *stand by* for that would come back
+    // every few seconds for ever with nobody reading the reason. The sentence
+    // carries the command that fixes it, because the person reading it on the
+    // runner's stderr is usually the person who can type it.
+    if let Some(reason) = admission_refusal(&state, role, &peer_name, peer_token.as_deref()) {
+        eprintln!("herd-hub: {reason}");
+        return refuse(&mut sink, reason).await;
+    }
+
     // The hub's own state root goes out with the welcome whatever happens
     // next, including to a peer this hub is about to turn away: that string is
     // how a runner holding a verdict for a hub whose state is gone finds out,
@@ -1536,6 +1674,9 @@ async fn serve_peer(state: Arc<State>, stream: TcpStream) -> Result<()> {
             protocol_version: PROTOCOL_VERSION,
             hub_version: hub_version().to_owned(),
             state_root: hub_state_root.clone(),
+            // A build gap this hub is willing to serve, said where the far
+            // side's owner will read it (E-51). `None` is the ordinary case.
+            version_note,
         },
     )
     .await?;
@@ -3710,6 +3851,34 @@ async fn accept_submissions(state: &State, outbox: &Outbox, source: &mut Source)
                     runners: state.fleet_switches(),
                 });
             }
+            ToHub::ApproveRunner { runner } => approve_a_runner(state, outbox, &runner),
+            ToHub::RemoveRunner { runner } => remove_a_runner(state, outbox, &runner),
+            ToHub::AskApprovedRunners {} => {
+                let approvals = match state.store.approved_runners() {
+                    Ok(approvals) => approvals,
+                    Err(error) => {
+                        let _ = outbox.send(FromHub::Refused {
+                            reason: format!(
+                                "this hub cannot read which runners it approved: {error}"
+                            ),
+                        });
+                        return Ok(());
+                    }
+                };
+                let connected = state.with_peers(|peers| {
+                    peers.runners.keys().cloned().collect::<BTreeSet<String>>()
+                });
+                let _ = outbox.send(FromHub::ApprovedRunners {
+                    runners: approvals
+                        .into_iter()
+                        .map(|approval| herd_proto::ApprovedRunner {
+                            connected: connected.contains(&approval.name),
+                            name: approval.name,
+                            approved_unix_s: approval.approved_unix_s,
+                        })
+                        .collect(),
+                });
+            }
             ToHub::RaiseJob { job_id, priority } => {
                 if let Some(reason) = quarantine_refusal(state, &job_id)? {
                     let _ = outbox.send(FromHub::Refused { reason });
@@ -3840,6 +4009,103 @@ fn answer_a_wait(state: &State, outbox: &Outbox, job_id: JobId) -> Result<bool> 
         }
     }
     Ok(true)
+}
+
+/// Approve one runner, and hand the token back once (E-48, Q8).
+///
+/// **One operator action**, which is the whole of what Q8 asks for: the name
+/// goes in, the token comes out, and the machine is in the fleet as soon as
+/// it dials with it. Nothing is generated on the runner, nothing is
+/// exchanged, no certificate and no second round trip — those are the things
+/// invariant 1 keeps Herd away from.
+///
+/// The hub's own stdout says that the approval happened and never what was
+/// minted: the token travels on this one connection to the operator who asked
+/// for it, and a hub that printed it would put a credential in the container's
+/// log for as long as the log is kept.
+fn approve_a_runner(state: &State, outbox: &Outbox, runner: &str) {
+    match state.store.approve_runner(runner) {
+        Ok(token) => {
+            println!("herd-hub: runner {runner} is approved and a new token was minted for it");
+            let _ = outbox.send(FromHub::RunnerApproved {
+                runner: runner.to_owned(),
+                token,
+                said: format!(
+                    "runner {runner} is approved on this hub. Its token is printed once and \
+                     this hub keeps only a hash of it: give it to that machine as --token or \
+                     HERD_TOKEN. Approving {runner} again mints a new token and revokes this \
+                     one"
+                ),
+            });
+        }
+        // Terminal (D13): a name that is not a name, or a state root that
+        // cannot be written, are both answers that asking again repeats.
+        Err(error) => {
+            let _ = outbox.send(FromHub::Refused {
+                reason: format!("runner {runner} was not approved: {error}"),
+            });
+        }
+    }
+}
+
+/// Remove one runner, revoke its token, and tell the machine on the
+/// connection it is holding (E-48).
+///
+/// The telling is the half that is easy to leave out. A revocation that only
+/// took effect at the next dial would leave a runner Herd no longer trusts
+/// holding a link, claiming jobs, for as long as its process lives — which on
+/// a machine somebody has just taken out of the fleet could be weeks. So the
+/// refusal goes out on its own connection and the connection is dropped,
+/// which is exactly what the hub already does to a runner it supersedes.
+///
+/// A job that runner is executing is **not** cancelled here. It is running on
+/// a machine that was trusted when it started, its verdict is spooled and
+/// will be refused like any other verdict from a runner that is not admitted,
+/// and the hub's own loss detection ends the attempt. Killing work on the way
+/// out would be a removal that destroys a build nobody asked to lose.
+fn remove_a_runner(state: &State, outbox: &Outbox, runner: &str) {
+    let removed = match state.store.remove_runner(runner) {
+        Ok(removed) => removed,
+        Err(error) => {
+            let _ = outbox.send(FromHub::Refused {
+                reason: format!("runner {runner} was not removed: {error}"),
+            });
+            return;
+        }
+    };
+    if !removed {
+        let _ = outbox.send(FromHub::RunnerRemoved {
+            said: format!(
+                "no runner called {runner} is approved on this hub, so there was no token to \
+                 revoke and nothing was changed"
+            ),
+        });
+        return;
+    }
+    let reason = herd_proto::revoked_runner_reason(runner);
+    let told = state.with_peers(|peers| {
+        peers.runners.get(runner).is_some_and(|connected| {
+            let _ = connected.outbox.send(FromHub::Refused {
+                reason: reason.clone(),
+            });
+            let _ = connected.kick.send(true);
+            true
+        })
+    });
+    println!("herd-hub: {reason}");
+    let _ = outbox.send(FromHub::RunnerRemoved {
+        said: if told {
+            format!(
+                "runner {runner} is removed and its token is revoked; it was connected and has \
+                 been told, and claims nothing from here on"
+            )
+        } else {
+            format!(
+                "runner {runner} is removed and its token is revoked; it was not connected, \
+                 and it is refused by name if it dials again"
+            )
+        },
+    });
 }
 
 /// Raise one job's level, as an operator may (E-18).
@@ -4139,6 +4405,9 @@ fn message_kind(message: &ToHub) -> &'static str {
         ToHub::SwitchApplied { .. } => "switch_applied",
         ToHub::SetSwitch { .. } => "set_switch",
         ToHub::AskFleetSwitches {} => "ask_fleet_switches",
+        ToHub::ApproveRunner { .. } => "approve_runner",
+        ToHub::RemoveRunner { .. } => "remove_runner",
+        ToHub::AskApprovedRunners {} => "ask_approved_runners",
     }
 }
 
@@ -4213,6 +4482,21 @@ mod tests {
 
         fn state_root_id(&self) -> &str {
             self.inner.state_root_id()
+        }
+        fn approve_runner(&self, name: &str) -> StoreResult<String> {
+            self.inner.approve_runner(name)
+        }
+        fn remove_runner(&self, name: &str) -> StoreResult<bool> {
+            self.inner.remove_runner(name)
+        }
+        fn approved_runners(&self) -> StoreResult<Vec<crate::roster::Approval>> {
+            self.inner.approved_runners()
+        }
+        fn admit_runner(&self, name: &str, token: Option<&str>) -> crate::roster::Admission {
+            self.inner.admit_runner(name, token)
+        }
+        fn approved_runner_count(&self) -> usize {
+            self.inner.approved_runner_count()
         }
         fn submit(&self, new: NewJob) -> StoreResult<crate::job::Submission> {
             self.inner.submit(new)
@@ -4347,6 +4631,7 @@ mod tests {
         let state = Arc::new(State {
             store: Arc::clone(&store) as Arc<dyn JobStore>,
             policy: Policy::default(),
+            authority: Authority::default(),
             started: Instant::now(),
             peers: Mutex::new(Peers::default()),
             dispatching: Mutex::new(()),
@@ -4565,6 +4850,7 @@ mod tests {
         let state = Arc::new(State {
             store: Arc::clone(&store) as Arc<dyn JobStore>,
             policy: Policy::default(),
+            authority: Authority::default(),
             started: Instant::now(),
             peers: Mutex::new(Peers::default()),
             dispatching: Mutex::new(()),

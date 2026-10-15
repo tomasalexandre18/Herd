@@ -208,6 +208,7 @@ fn every_message_to_the_hub_round_trips() {
     for role in [Role::Runner, Role::Requester] {
         round_trip_to_hub(ToHub::Hello {
             protocol_version: PROTOCOL_VERSION,
+            peer_version: "0.1.0".to_owned(),
             role,
             token: Some("a-token".to_owned()),
             name: Some("wsl-pc".to_owned()),
@@ -226,6 +227,7 @@ fn every_message_to_the_hub_round_trips() {
         });
         // The optional fields really are optional.
         round_trip_to_hub(ToHub::Hello {
+            peer_version: "0.1.0".to_owned(),
             protocol_version: PROTOCOL_VERSION,
             role,
             token: None,
@@ -346,6 +348,7 @@ fn every_message_from_the_hub_round_trips() {
         protocol_version: PROTOCOL_VERSION,
         hub_version: "0.1.0".to_owned(),
         state_root: "root-0123456789abcdef0123456789abcdef".to_owned(),
+        version_note: None,
     });
     round_trip_from_hub(FromHub::Refused {
         reason: herd_proto::version_mismatch_reason(PROTOCOL_VERSION + 1),
@@ -777,6 +780,33 @@ fn every_link_frame_round_trips() {
         },
     });
     round_trip_to_hub(ToHub::AskFleetSwitches {});
+    // M15's operator surface: approving a runner, removing it, and asking who
+    // is approved (E-48).
+    round_trip_to_hub(ToHub::ApproveRunner {
+        runner: "wsl-pc".to_owned(),
+    });
+    round_trip_to_hub(ToHub::RemoveRunner {
+        runner: "wsl-pc".to_owned(),
+    });
+    round_trip_to_hub(ToHub::AskApprovedRunners {});
+    round_trip_from_hub(FromHub::RunnerApproved {
+        runner: "wsl-pc".to_owned(),
+        token: "herd-runner-0123456789abcdef".to_owned(),
+        said: "runner wsl-pc is approved on this hub".to_owned(),
+    });
+    round_trip_from_hub(FromHub::RunnerRemoved {
+        said: "runner wsl-pc is removed and its token is revoked".to_owned(),
+    });
+    for runners in [
+        Vec::new(),
+        vec![herd_proto::ApprovedRunner {
+            name: "wsl-pc".to_owned(),
+            approved_unix_s: 1_760_000_000,
+            connected: true,
+        }],
+    ] {
+        round_trip_from_hub(FromHub::ApprovedRunners { runners });
+    }
     for confirmed in [true, false] {
         round_trip_from_hub(FromHub::SwitchSet {
             said: "runner wsl-pc is switched off (she is gaming)".to_owned(),

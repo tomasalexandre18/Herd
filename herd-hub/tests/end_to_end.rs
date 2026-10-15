@@ -306,6 +306,7 @@ async fn a_version_mismatch_is_refused_naming_both_versions() {
             .expect("the hub accepts the connection");
         let hello = ToHub::Hello {
             protocol_version: announced,
+            peer_version: herd_runner::runner_version().to_owned(),
             role,
             token: None,
             name: Some("from-the-future".to_owned()),
@@ -381,7 +382,7 @@ async fn a_twin_of_a_live_runner_is_told_to_stand_by_rather_than_refused() {
             // The name the harness's own runner is answering to, from a
             // different process: a twin.
             name: Some("test-runner".to_owned()),
-            token: None,
+            token: Some(harness.approve("test-runner")),
             confinement: confinement(&data_root),
             ..herd_runner::Config::default()
         },
@@ -434,7 +435,7 @@ async fn the_same_runner_dialling_again_replaces_its_own_dead_connection() {
     let config = herd_runner::Config {
         hub_url: harness.hub_url.clone(),
         name: Some("test-runner".to_owned()),
-        token: None,
+        token: Some(harness.approve("test-runner")),
         confinement: confinement(&data_root),
         ..herd_runner::Config::default()
     };

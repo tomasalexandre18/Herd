@@ -42,10 +42,16 @@ impl Harness {
         let state = TempDir::new(&format!("{label}-state"));
         let mut confinement = test_confinement(data_root.path());
         shape(&mut confinement);
+        let store = Arc::new(JobDirStore::open(state.path()).expect("the state root opens"));
+        // An unapproved runner claims nothing (E-48), so this harness
+        // approves the one runner it starts and hands it the token that
+        // approval minted.
+        let token = store
+            .approve_runner(&format!("m4-{label}"))
+            .expect("the state root mints a token");
         let hub = Hub::bind(
             "127.0.0.1:0".parse().expect("a literal loopback address"),
-            Arc::new(JobDirStore::open(state.path()).expect("the state root opens"))
-                as Arc<dyn JobStore>,
+            store as Arc<dyn JobStore>,
         )
         .await
         .expect("the hub binds a free port");
@@ -58,7 +64,7 @@ impl Harness {
             let config = herd_runner::Config {
                 hub_url: hub_url.clone(),
                 name: Some(format!("m4-{label}")),
-                token: None,
+                token: Some(token),
                 confinement,
                 ..herd_runner::Config::default()
             };
