@@ -1,10 +1,12 @@
 # Deploying Herd
 
-Five files, of which you use four — the two reverse-proxy fragments are
-alternatives — and `docs/joining.md` for the person who walks a machine
-in. None of them is a NixOS module: `/etc/nixos` is the owner's, so
-anything that needs it is written here as an instruction marked
-**OWNER**, never as a file that reaches in.
+Seven files besides this one, of which you use five — the two
+reverse-proxy fragments are alternatives, and the Traefik override is
+only for a containerised proxy — plus `docs/joining.md` for the person
+who walks a machine in. `/etc/nixos` is the owner's and nothing here
+ever writes to it: what needs it is either an instruction marked
+**OWNER** in the unit file, or — since D126 — a module he may import if
+he wants it, which is an offering and not an installation.
 
 | File | What it is | Where it goes |
 | --- | --- | --- |
@@ -14,6 +16,17 @@ anything that needs it is written here as an instruction marked
 | `reverse-proxy/traefik-herd-hub.yml` | **this server:** a Traefik v3 dynamic config for `wss://` | the directory Traefik's file provider watches, `conf.d/` |
 | `reverse-proxy/nginx-herd-hub.conf` | the same job on a host that runs nginx instead | pasted into the config he already runs |
 | `herd-runner.service` | the server's runner, native and unprivileged (E-47, E-52) | `/etc/systemd/system/` |
+| `nixos-herd-runner.nix` | the same runner declared: the unit plus the user, the binary's path and the devices the unit marks OWNER | imported from `/etc/nixos`, or not at all |
+
+**Two paths for the runner, and a machine is on exactly one.** Either the
+unit file is copied into `/etc/systemd/system/` and the OWNER notes in it
+are satisfied by hand, or the module is imported and declares them. The
+project's server is on the **first**: tonight's `herd` user was made with
+`useradd --system` and the unit was dropped into `/etc/systemd/system/`,
+which works and survives a reboot but is unmanaged state outside the
+NixOS generation. The module is how that becomes declarative whenever the
+owner wants; its header says how to import it and what the flake already
+exposes. The two must be changed together — see the header of either.
 
 Pick exactly one proxy fragment: the one that names the proxy the host
 actually runs. They are not a translation of each other and nothing is
@@ -75,7 +88,10 @@ all (invariant 3, D11). Herd holds no certificate at any point.
    is `reverse-proxy/nginx-herd-hub.conf` pasted in and the proxy
    reloaded. Skip it entirely while every runner and requester is on
    this machine: they reach the hub on loopback and want no proxy.
-5. Install the runner's unit and walk `docs/joining.md`.
+5. Make the runner's data root — `install -d -o herd -g herd -m 0700
+   /mnt/ssd_980/herd-runner` — then install the unit and walk
+   `docs/joining.md`. On the declarative path, importing the module does
+   this step and every other **OWNER** item with it.
 
 ## The first start, exactly
 
@@ -318,8 +334,19 @@ A second `dialling` line means the link was closed and the runner
 redialled — which it survives by design (a `Close` spends no failure
 counter), so this is the check that distinguishes "working" from "working
 because it reconnects every ninety seconds".
+
 ## Known gaps, so nobody debugs them twice
 
+- **A job's `PATH` is the unit's `PATH`** — fixed, and written down
+  because it cost one real job an exit 125. The runner builds each job's
+  environment from scratch and carries only `PATH`, `LANG`, `LC_ALL`,
+  `TZ` and `TERM` into it, and systemd's default `PATH` holds no shell
+  on a NixOS host, so `herdctl run -- sh -c '…'` failed with `sh: No
+  such file or directory`. The unit now states
+  `Environment=PATH=/run/current-system/sw/bin`; the value is
+  host-specific, the module mirrors it as
+  `services.herd-runner.jobPath`, and the comment beside it says which
+  other variables were checked and deliberately not added.
 - **The `wss://` path is configured and unproven.** The clients can dial
   it — rustls with the bundled webpki roots, as of D115, so the old
   `URL error: TLS support not compiled in` is gone — and the Traefik
@@ -342,19 +369,34 @@ because it reconnects every ninety seconds".
 
 ## What stays the owner's to do
 
-Each of these is in `/etc/nixos`, and each is marked **OWNER** in the
-unit file where it bites:
+This is the **imperative** path's list — the one the server is on. Each
+is marked **OWNER** in the unit file where it bites, and
+`nixos-herd-runner.nix` declares every one of them instead:
 
 - a system user `herd`, `isSystemUser`, in group `herd` — and **not** in
   the `docker` group, now or ever (D78). `id -nG herd` must not print
   `docker`. The runner itself warns at startup if it is, naming the
-  group, so this is checkable from the journal as well.
+  group, so this is checkable from the journal as well. The module
+  asserts it at evaluation for every declarative route into that group,
+  but Nix cannot make the membership impossible and no assertion sees a
+  `usermod -aG` run by hand, so `id -nG herd` stays the answer.
+- the data root, `/mnt/ssd_980/herd-runner`, owned by that user and mode
+  0700, made before the first start: `install -d -o herd -g herd -m 0700
+  /mnt/ssd_980/herd-runner`. It is on the NVMe because an `io.weight`
+  reaches ext4 and never ZFS (D120, D126), and it is the operator's to
+  create because the unit no longer has a `StateDirectory=` to do it. A
+  root the runner cannot write is a refusal naming the path; a root left
+  at the default 0755 is not, and leaves every job's workspace readable
+  by every user of the host. The module uses `systemd.tmpfiles` and
+  re-asserts owner and mode at every boot.
 - `environment.systemPackages` carrying the runner, so that
   `/run/current-system/sw/bin/herd-runner` — the path in the unit —
-  exists.
+  exists. The module does not need it: its `ExecStart` is the package's
+  own store path, which cannot be missing.
 - a udev rule giving `/dev/vfio/*` a group, if VFIO work is wanted. It
   is `root:root 0600` on a stock kernel, which no supplementary group
-  can reach.
+  can reach. The module writes that rule behind
+  `services.herd-runner.vfio = true`.
 
 ## Confirming the cgroup delegation, and the two skips it closes
 
