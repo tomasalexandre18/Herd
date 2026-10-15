@@ -53,7 +53,10 @@ left the `is_dir` refusal unreachable for the commonest way of getting this
 wrong.
 
 Inside it, `jobs/<job>/` holds `work` (the job's working directory), `home`
-(its `HOME`) and `tmp` (its `TMPDIR`), and `held-results/` holds a verdict
+(its `HOME`) and `tmp` (its `TMPDIR`). A **declared command** gets two more,
+made before its `up` step runs and empty until M11 fills them: `in` and `out`,
+which are what its hooks receive as `{in}` and `{out}` (D107). An ad-hoc job
+gets the first three and nothing else. `held-results/` holds a verdict
 the hub never acknowledged — deliberately outside `jobs/`, so the startup
 reaper cannot clear it (D34, and "A runner's own death" below).
 

@@ -49,6 +49,7 @@ pub mod reclaim;
 pub mod root;
 pub mod size;
 pub mod spool;
+mod step;
 pub mod switch;
 #[doc(hidden)]
 pub mod testing;
@@ -882,17 +883,27 @@ impl Session {
     }
 
     /// Hold a job's end and report it (E-44).
-    pub(crate) fn finish(&self, job_id: &JobId, outcome: JobOutcome, metrics: JobMetrics) {
+    ///
+    /// `steps` is every executor step this attempt ran, in order — the
+    /// authoritative list, which the hub takes over the lines it already has
+    /// from [`ToHub::StepFinished`] (D77). Empty for a job that is not a
+    /// declared command: it ran no executor step, and an empty list says
+    /// exactly that.
+    pub(crate) fn finish(
+        &self,
+        job_id: &JobId,
+        outcome: JobOutcome,
+        metrics: JobMetrics,
+        steps: Vec<StepRun>,
+    ) {
         self.with(|inner| {
             let Some(job) = inner.jobs.get_mut(job_id) else {
                 return;
             };
-            // No step: a job that is not a declared command ran no executor
-            // step, and an empty list says exactly that (D77).
             let end = Ended {
                 outcome,
                 metrics,
-                steps: Vec::new(),
+                steps,
             };
             job.end = Some(end.clone());
             let (attempt, chunks_sent) = (job.attempt, job.next_seq);
@@ -2012,32 +2023,26 @@ async fn serve_hub(
                 declaration,
                 timeout_s,
             } => {
-                // M10's runner half — the four executor steps, timestamped
-                // (D77) — is not written yet. Until it is, a declared command
-                // is **given back** rather than run: executing its line
-                // directly would run the consumer's command with no
-                // workspace, outside their `nix develop`, on whatever the
-                // runner's working directory happens to be, and report
-                // whatever came out as a verdict about their tests.
-                if let Some(declaration) = &declaration {
-                    session.abandon(
-                        &job_id,
-                        attempt,
-                        &format!(
-                            "this runner does not run declared commands yet, and command {} \
-                             of commit {} is one: its four executor steps would be skipped",
-                            declaration.command, declaration.commit
-                        ),
-                    );
-                    continue;
-                }
-                let _ = timeout_s;
                 let session = session.clone();
                 let confined = Arc::clone(&confined);
+                // A declared command runs through the consumer's four
+                // executor steps; an ad-hoc one is the whole of what runs.
+                // Both go through [`job::execute`], which is where the caps,
+                // the log, the cancellation and the verdict live (D108).
+                let declared_timeout = timeout_s.map(Duration::from_secs);
                 // One task per job: a long job must not stop the runner from
                 // hearing the hub, and must not end when the link does.
                 tokio::spawn(async move {
-                    job::execute(job_id, attempt, command, session, confined).await
+                    job::execute(
+                        job_id,
+                        attempt,
+                        command,
+                        declaration,
+                        declared_timeout,
+                        session,
+                        confined,
+                    )
+                    .await
                 });
             }
             FromHub::JobResultAck { job_id } => session.release(&job_id),
