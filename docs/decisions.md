@@ -4410,3 +4410,57 @@ be a second thing to keep working — and because a frame that arrives with
 the verdict cannot be forgotten by a caller that got its exit code and left.
 
 ---
+
+---
+
+## 2026-10-15 — D138 My cap instruction was wrong, and the 16 MiB bug
+
+**I told the agent the wrong number and it refused me with measurements.**
+D131 reasoned the cap from the log cap; then the consumer said they produce
+"at most a few hundred MB", so I told the agent to size for that figure and
+said 64 MiB would refuse the normal case. Both of us were reasoning about
+*their* files. Neither of us was reasoning about **the frame**.
+
+Measured: 32 MiB of payload in 200 files becomes a **42 MiB frame** and about
+140 MiB of peak memory per party, base64 on one JSON frame against a 64 MiB
+ceiling. Both curves are linear, so a few hundred megabytes is a **>400 MiB
+frame** — rejected outright — **>1 GiB per party**, and **tens of seconds of
+blocked event loop**. That last one is the real objection: it is past the
+15 s cadence that a health report and a quiet follower's link both live by,
+so a large output would be **indistinguishable from a lost runner**. The
+feature would have manufactured D117's defect.
+
+So the cap is **32 MiB**, derived from what can actually arrive rather than
+from what anybody wants, and a `--job-output-cap` above it is refused at
+startup with both figures rather than becoming an undecodable frame and
+D128's redial loop.
+
+**And that number is the boundary D131 was trying to name.** At 32 MiB a
+job's output travels like its log. Past it, the same mechanism is artefact
+distribution wearing the record's clothes — and the cost is not only CPU: Q9
+says the hub volume holds job records and manifests, kilobytes and no
+payloads, and there is **no retention or GC on job records** before M12. At a
+few hundred megabytes a job, hundreds of jobs a day fills the hub's disk in
+days with nothing to collect it.
+
+**So the consumer's screenshots do not fit, and I have to tell them so after
+saying they would.** `results.json` at a few kB comes home today. Their
+per-scenario logs and screenshots are refused by name with figures. Carrying
+those needs three things together — chunked output frames, which moves
+`PROTOCOL_VERSION` to 2; hub-side streaming to disk instead of a frame held
+whole; and a retention policy, which is M12. That is a milestone, and the
+agent was right not to build it blind.
+
+**A real bug found on the way, and it was already there.** Both clients
+dialled with the WebSocket library's default `max_frame_size` of **16 MiB** —
+*smaller than the 64 MiB the hub is configured to send*. Any legitimate frame
+over 16 MiB would have reached `herdctl` as a closed connection and exit
+**125**: no verdict for a job that passed, D117's exact shape, on a path
+nobody had exercised because nothing yet sent a frame that large. One
+constant in `herd-proto` now states Herd's own ceiling and all three take it.
+
+**One thing the agent decided that I am keeping.** An over-cap refusal does
+**not** change the verdict. The tests really did pass or fail, and D20 forbids
+turning a cap on a side channel into a verdict about the job — so it is a
+loud sentence on stderr and on the record, never an exit code. A consumer who
+wants a missing `results.json` to be fatal makes that check themselves.
