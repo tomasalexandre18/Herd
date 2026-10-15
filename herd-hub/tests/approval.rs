@@ -112,9 +112,9 @@ async fn an_unapproved_runner_gets_no_job_and_one_approval_lets_it_run() {
         String::from_utf8_lossy(&ran.stderr)
     );
     assert_eq!(
-        String::from_utf8_lossy(&ran.stdout),
+        real_herd::job_output(&ran.stdout),
         "ran\n",
-        "and its output is the job's"
+        "and its output is the job's, behind E-02's framing line"
     );
 }
 
