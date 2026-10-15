@@ -429,6 +429,10 @@ pub async fn execute(
         .and_then(JobCgroup::peak_bytes)
         .or(ran.peak_rss);
 
+    // E-32's figure, taken while the job's own cgroup is still there:
+    // recorded with the job, reported, and a gate on nothing (D119).
+    let pressure = crate::metrics::pressure(cgroup.as_ref().map(JobCgroup::dir));
+
     // Whatever the job left behind dies with it, every time: the job's own
     // processes being gone is not the same thing as the job being over
     // (E-34, E-06's kill hardened). Every step's process group, because each
@@ -496,6 +500,7 @@ pub async fn execute(
         wall_time_ms: started
             .map(|started| u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX))
             .unwrap_or(0),
+        pressure,
     };
 
     // The cgroup goes away with its guard; the workspace is reclaimed here.

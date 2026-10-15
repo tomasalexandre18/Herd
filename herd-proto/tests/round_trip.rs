@@ -7,8 +7,8 @@ use herd_proto::{
     cap_exceeded_reason, cap_stop_reason, from_frame, to_frame, Asked, Availability, BusyProbe,
     Cap, Capability, CapabilityOffer, CapabilityOrigins, CapabilityState, Declaration, Executor,
     FromHub, HostSize, JobId, JobMetrics, JobOutcome, LabelSet, LogStream, OfferedCapability,
-    Priority, Role, RunnerSwitch, RunningJob, Step, StepRun, Switch, SwitchPersistence, ToHub,
-    PROTOCOL_VERSION,
+    Pressure, Priority, Role, RunnerSwitch, RunningJob, Step, StepRun, Switch, SwitchPersistence,
+    ToHub, PROTOCOL_VERSION,
 };
 
 /// A declared command as a submission carries it (E-11): the name their own
@@ -180,6 +180,14 @@ fn every_metrics() -> Vec<JobMetrics> {
             bytes_written: Some(4_096),
             log_bytes: 65_536,
             wall_time_ms: 1_234,
+            pressure: Some(Pressure {
+                host_cpu_milli: Some(1_120),
+                host_memory_milli: Some(0),
+                host_io_milli: Some(100_000),
+                job_cpu_milli: Some(12_340),
+                job_memory_milli: None,
+                job_io_milli: Some(5),
+            }),
         },
         JobMetrics {
             host_load_milli: Some(0),
@@ -187,6 +195,9 @@ fn every_metrics() -> Vec<JobMetrics> {
             bytes_written: Some(0),
             log_bytes: u64::MAX,
             wall_time_ms: u64::MAX,
+            // A reading with nothing in it: every figure absent, which is
+            // what a kernel without PSI reports, and not a row of zeroes.
+            pressure: Some(Pressure::default()),
         },
     ]
 }
@@ -534,6 +545,13 @@ fn a_figure_that_was_not_measured_is_absent_rather_than_zero() {
             bytes_written: Some(4_096),
             log_bytes: 12,
             wall_time_ms: 34,
+            // The same rule, one level down: a stall figure nobody could
+            // read is not in the frame, and a measured zero is.
+            pressure: Some(Pressure {
+                host_cpu_milli: None,
+                host_memory_milli: Some(0),
+                ..Pressure::default()
+            }),
         },
         steps: Vec::new(),
     })

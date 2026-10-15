@@ -99,6 +99,10 @@ impl Harness {
     async fn run(&self, script: &str) -> Ran {
         let mut out = String::new();
         let mut err = String::new();
+        // Everything Herd said about this job while it was happening. Kept
+        // because a job *delayed* is a job the hub explained a wait for, and
+        // an assertion that nothing was delayed has to be able to look.
+        let mut notes = Vec::new();
         let finished = herdctl::run_job(
             &self.requester(),
             shell(script),
@@ -111,7 +115,11 @@ impl Harness {
                 LogStream::Stdout => out.push_str(&String::from_utf8_lossy(data)),
                 LogStream::Stderr => err.push_str(&String::from_utf8_lossy(data)),
             },
-            |_note| {},
+            |said| {
+                if let herdctl::Said::Note(note) = said {
+                    notes.push(note.to_owned());
+                }
+            },
         )
         .await
         .expect("the hub answers with an outcome");
@@ -120,6 +128,7 @@ impl Harness {
             metrics: finished.metrics,
             out,
             err,
+            notes,
         }
     }
 
@@ -141,6 +150,9 @@ struct Ran {
     metrics: herd_proto::JobMetrics,
     out: String,
     err: String,
+    /// What Herd said about this job, in order. Every wait the hub makes a
+    /// job serve is explained in one of these (E-04).
+    notes: Vec<String>,
 }
 
 fn shell(script: &str) -> Vec<String> {
@@ -956,7 +968,7 @@ const WHAT_DELEGATION_WOULD_PROVE: &str = "a delegated scope — \
 /// cannot agree with the code under test by accident.
 fn read_own_cgroup() -> String {
     "d=/sys/fs/cgroup$(cut -d: -f3 /proc/self/cgroup); \
-     for f in memory.max cpu.weight cpu.max io.weight pids.max; do \
+     for f in memory.max cpu.weight cpu.max io.weight io.max pids.max; do \
        printf '%s=%s\\n' \"$f\" \"$(cat \"$d/$f\" 2>/dev/null | tr '\\n' ' ' || echo MISSING)\"; \
      done"
         .to_owned()
@@ -1018,6 +1030,119 @@ async fn a_job_s_cgroup_carries_the_cpu_io_and_pid_bounds() {
         "the job's cgroup must carry the io.weight it was given: {io}"
     );
     assert_eq!(control(&ran.out, "pids.max"), "64");
+}
+
+/// What a delegated scope **with its data root on a block device** would
+/// prove about the hard IO ceiling, said in every skip below.
+///
+/// Two conditions and not one, because `io.max` is per-device: a scope with
+/// its temporary directory on ZFS proves nothing here, and the skip has to
+/// say so rather than reading as "no delegation" (D120).
+const WHAT_A_CEILING_WOULD_PROVE: &str = "a delegated scope whose temporary directory is on a \
+     block device — `TMPDIR=/mnt/ssd_980/tmp systemd-run --user --scope -p Delegate=yes \
+     cargo test ...`, and note that Delegate=yes delegates only to the scope's single \
+     process (D117) — would prove that a job's own cgroup carries the io.max ceiling it was \
+     given, read back by the job itself out of /sys/fs/cgroup, and that the line names the \
+     device the data root is on";
+
+/// Whether a hard IO ceiling could be written for a data root on the
+/// filesystem this suite's temporary directories land on, and why not if it
+/// could not. Asked before a harness is built, because a runner that refuses
+/// a ceiling refuses to start at all — which is the point of the refusal.
+fn io_ceiling_or_reason() -> Result<String, String> {
+    let probe = TempDir::new("io-ceiling-question");
+    herd_runner::blockio::ceiling_device(probe.path()).map(|device| device.device)
+}
+
+/// The ceiling the consumer's freeze actually needs: a **hard** per-device
+/// cap, not the share `io.weight` gives. Written for the device the data root
+/// is on, and read back out of the kernel by the job itself.
+///
+/// `io.weight` decides who gets the disk when two cgroups want it and caps
+/// nothing, so one job alone saturates an idle disk; `io.max` holds whatever
+/// else is asking. The job printing its own `io.max` is the only reading that
+/// cannot agree with the code under test by accident.
+#[tokio::test]
+async fn a_job_s_cgroup_carries_the_hard_io_ceiling_it_was_given() {
+    if let Err(why) = kernel_ceiling_or_reason() {
+        skipped(
+            "a_job_s_cgroup_carries_the_hard_io_ceiling_it_was_given",
+            &format!("{why} — {WHAT_A_CEILING_WOULD_PROVE}"),
+        );
+        return;
+    }
+    let device = match io_ceiling_or_reason() {
+        Ok(device) => device,
+        Err(why) => {
+            skipped(
+                "a_job_s_cgroup_carries_the_hard_io_ceiling_it_was_given",
+                &format!("{why} — {WHAT_A_CEILING_WOULD_PROVE}"),
+            );
+            return;
+        }
+    };
+    let harness = Harness::new("io-ceiling", |confinement| {
+        confinement.io_max = Some(
+            herd_runner::cgroup::IoCeiling::parse("rbps=100MB,wbps=50MB,riops=3000,wiops=1500")
+                .expect("four limits are a ceiling"),
+        );
+    })
+    .await;
+    let ran = harness.run(&read_own_cgroup()).await;
+    assert_eq!(
+        ran.outcome,
+        JobOutcome::Exited { code: 0 },
+        "the job could not read its own cgroup: {} / {}",
+        ran.out,
+        ran.err
+    );
+    let io_max = control(&ran.out, "io.max");
+    // The device first: io.max is per-device, and a line naming another
+    // device — or none — would be a ceiling the kernel keeps and never
+    // applies to this job's writes.
+    assert!(
+        io_max.contains(&device),
+        "the ceiling must name the device the data root is on ({device}): {io_max}"
+    );
+    for limit in [
+        "rbps=100000000",
+        "wbps=50000000",
+        "riops=3000",
+        "wiops=1500",
+    ] {
+        assert!(
+            io_max.contains(limit),
+            "the job's cgroup must carry {limit}: {io_max}"
+        );
+    }
+}
+
+/// And with no ceiling declared, `io.max` is **empty**: absent by default is
+/// a real absence, not a figure somebody guessed. A default throughput would
+/// be right on the machine it was chosen on and wrong on every other.
+#[tokio::test]
+async fn no_declared_ceiling_leaves_io_max_empty() {
+    if let Err(why) = kernel_ceiling_or_reason() {
+        skipped(
+            "no_declared_ceiling_leaves_io_max_empty",
+            &format!("{why} — {WHAT_A_CEILING_WOULD_PROVE}"),
+        );
+        return;
+    }
+    let harness = Harness::new("no-ceiling", |confinement| {
+        confinement.io_max = None;
+    })
+    .await;
+    let ran = harness.run(&read_own_cgroup()).await;
+    assert_eq!(ran.outcome, JobOutcome::Exited { code: 0 });
+    let io_max = control(&ran.out, "io.max");
+    assert!(
+        io_max.is_empty() || io_max == "MISSING",
+        "a job with no declared ceiling must have no io.max line at all, and certainly not \
+         a zero: {io_max:?}"
+    );
+    // The weight is still there, and it is the thing that is not a cap.
+    assert!(control(&ran.out, "io.weight").contains("10"), "{}", ran.out);
 }
 
 /// And with no quota declared, `cpu.max` is the kernel's own `max`: absent by
@@ -2458,3 +2583,233 @@ fn the_walk_finds_a_planted_descriptor(test: &str) {
 /// Linux-only; the test that calls it has already returned on any other host.
 #[cfg(not(unix))]
 fn the_walk_finds_a_planted_descriptor(_test: &str) {}
+
+// ------------------------------------------------- pressure (E-32) ----
+
+/// The figure travels with the verdict, which is the whole shape of D119's
+/// answer: the first consumer asked for PSI to **brake** admission, and E-32
+/// — their own expectation — says a load figure is recorded and never a
+/// criterion. So it is measured, it reaches the record, and it decides
+/// nothing.
+#[tokio::test]
+async fn a_job_s_record_carries_the_pressure_it_ran_under() {
+    let harness = Harness::new("pressure", |_| {}).await;
+    let ran = harness.run("echo measured").await;
+    assert_eq!(ran.outcome, JobOutcome::Exited { code: 0 });
+    if !Path::new("/proc/pressure").is_dir() {
+        skipped(
+            "a_job_s_record_carries_the_pressure_it_ran_under",
+            "this kernel has no /proc/pressure (CONFIG_PSI), so there is no figure to \
+             record — a kernel with PSI would prove that the host's cpu, memory and io \
+             stall figures travel with the job's outcome. The figure is absent here, which \
+             is asserted, rather than reported as a zero",
+        );
+        assert_eq!(
+            ran.metrics.pressure, None,
+            "a host with no PSI must report no figure at all, never a row of zeroes"
+        );
+        return;
+    }
+    let pressure = ran
+        .metrics
+        .pressure
+        .expect("a kernel with PSI records the figure with the job");
+    // The host's three are there, and each one is a share of time.
+    for (name, figure) in pressure.named() {
+        assert!(
+            figure <= 100_000,
+            "{name} is {figure} thousandths of a percent, which is not a share of time"
+        );
+    }
+    assert!(
+        pressure.host_cpu_milli.is_some()
+            && pressure.host_memory_milli.is_some()
+            && pressure.host_io_milli.is_some(),
+        "{pressure:?}"
+    );
+    // The job's own three come out of its own cgroup, so they are there
+    // exactly where there was a cgroup to read.
+    match kernel_ceiling_or_reason() {
+        Ok(()) => assert!(
+            pressure.job_cpu_milli.is_some()
+                && pressure.job_memory_milli.is_some()
+                && pressure.job_io_milli.is_some(),
+            "a job with a cgroup of its own carries its own stall figures too: {pressure:?}"
+        ),
+        Err(why) => skipped(
+            "a_job_s_record_carries_the_pressure_it_ran_under",
+            &format!(
+                "{why}, so this job had no cgroup of its own and only the host's three \
+                 figures could be asserted — a delegated scope (`systemd-run --user \
+                 --scope -p Delegate=yes cargo test ...`) would prove that the job's own \
+                 cpu.pressure, memory.pressure and io.pressure are read out of its own \
+                 cgroup and recorded with it"
+            ),
+        ),
+    }
+}
+
+/// **The guarantee E-32 asks for, and the important test of the two.**
+///
+/// Nothing is ever refused or delayed because this host is under pressure. A
+/// hub that silently stopped dispatching under load would be
+/// indistinguishable from a hub that had died, which is a worse failure than
+/// the queueing it would prevent (D119).
+///
+/// Asserted by making the host really stall and then asking for work anyway:
+/// a job that keeps every thread busy and writes synchronously runs
+/// *alongside* a second job, and that second job is admitted, runs, explains
+/// no wait and returns its verdict. The recorded figure is what proves the
+/// host was in fact stalled while that happened — so this is not an
+/// assertion about an idle machine.
+#[tokio::test]
+async fn pressure_refuses_nothing_and_delays_nothing() {
+    let harness = Harness::new("pressure-gates-nothing", |confinement| {
+        confinement.timeout = Duration::from_secs(30);
+    })
+    .await;
+    // The hog: every thread spinning, and a synchronous write loop under it,
+    // for about two seconds. Bounded on purpose — a runner must never be the
+    // reason its host falls over, test or not (invariant 2) — and inside its
+    // own job's caps, so the kernel stops it whatever it does.
+    let hog = harness.run(
+        "i=0; while [ $i -lt 8 ]; do (end=$(( $(date +%s) + 2 )); \
+           while [ $(date +%s) -lt $end ]; do :; done) & i=$((i+1)); done; \
+         j=0; while [ $j -lt 40 ]; do dd if=/dev/zero of=./churn bs=256k count=4 \
+           conv=fsync 2>/dev/null; j=$((j+1)); done; wait; echo hog done",
+    );
+    // And the question, asked while that is happening.
+    let asking = harness.run("echo admitted under pressure");
+    let (hog, asked) = tokio::join!(hog, asking);
+    assert_eq!(
+        hog.outcome,
+        JobOutcome::Exited { code: 0 },
+        "the hog itself must finish inside its caps: {} / {}",
+        hog.out,
+        hog.err
+    );
+    // Refused nothing: the job ran and returned its own verdict.
+    assert_eq!(
+        asked.outcome,
+        JobOutcome::Exited { code: 0 },
+        "a job asked for while this host was stalled was not run: {} / {}",
+        asked.out,
+        asked.err
+    );
+    assert!(
+        asked.out.contains("admitted under pressure"),
+        "{}",
+        asked.out
+    );
+    // Delayed nothing: every wait the hub makes a job serve is explained in a
+    // note (E-04), and there is no note here about load, pressure or a
+    // stalled host — because no such reason exists anywhere in Herd.
+    for note in &asked.notes {
+        let said = note.to_lowercase();
+        assert!(
+            !said.contains("pressure") && !said.contains("stall"),
+            "a job was made to wait for pressure, which E-32 forbids: {note}"
+        );
+    }
+    // And the figure that proves the host really was stalled while all that
+    // was allowed to happen. Where it could not be read, or where this host
+    // would not stall at all, the skip says what a stalling host would have
+    // shown — never a weakened claim.
+    let highest = asked
+        .metrics
+        .pressure
+        .map(|pressure| {
+            pressure
+                .named()
+                .into_iter()
+                .map(|(_, figure)| figure)
+                .max()
+                .unwrap_or(0)
+        })
+        .unwrap_or(0);
+    if highest == 0 {
+        skipped(
+            "pressure_refuses_nothing_and_delays_nothing",
+            "this host recorded no stall at all while eight spinning threads and a \
+             synchronous write loop ran, so the job above was admitted on a machine that \
+             was never under pressure: it proves that nothing is refused or delayed, but \
+             not that the figure it would have been refused for was non-zero. A host with \
+             CONFIG_PSI that can be made to stall would have shown both at once",
+        );
+    }
+}
+
+/// And the same guarantee read off the code rather than off one run: **no
+/// module anywhere in Herd compares a pressure figure against anything.**
+///
+/// The behavioural test above proves one job was not refused on one host.
+/// This one proves there is no code that could refuse one: the figure is
+/// read in `metrics`, carried in `herd-proto`'s `JobMetrics`, handed to the
+/// record once in `job`, and mentioned nowhere a decision is taken. It is
+/// the shape of `no_module_but_this_one_can_reach_an_escalation_tool`, and
+/// it is here because E-32 is a promise about Herd and not about a Tuesday.
+#[test]
+fn nothing_in_herd_reads_a_pressure_figure_to_decide_anything() {
+    // Where a decision about a job is taken: admission, placement, claiming,
+    // queueing. Every one of these is a file the figure must not appear in.
+    let deciders = [
+        "herd-hub/src/matcher.rs",
+        "herd-hub/src/queue.rs",
+        "herd-hub/src/server.rs",
+        "herd-runner/src/room.rs",
+        "herd-runner/src/capability.rs",
+        "herd-runner/src/switch.rs",
+    ];
+    let Some(workspace) = workspace_root() else {
+        skipped(
+            "nothing_in_herd_reads_a_pressure_figure_to_decide_anything",
+            "the workspace root could not be found from this test's manifest directory, so \
+             the hub's own sources could not be read — a checkout would have proved that no \
+             module that decides anything about a job so much as mentions the figure",
+        );
+        return;
+    };
+    let mut read = 0;
+    for decider in deciders {
+        let path = workspace.join(decider);
+        let Ok(text) = std::fs::read_to_string(&path) else {
+            continue;
+        };
+        read += 1;
+        for (number, line) in text.lines().enumerate() {
+            // A comment saying the figure gates nothing is the opposite of a
+            // gate, and is exactly what should be written there.
+            let code = line.split("//").next().unwrap_or_default();
+            assert!(
+                !code.contains("pressure"),
+                "{}:{} reads a pressure figure where a job is decided about, which E-32 \
+                 forbids: {line}",
+                path.display(),
+                number + 1
+            );
+        }
+    }
+    assert!(
+        read >= 4,
+        "only {read} of the {} files that decide about a job could be read, so this \
+         assertion did not cover what it claims",
+        deciders.len()
+    );
+}
+
+/// The workspace root, found by walking up from this crate until `Cargo.toml`
+/// names a workspace. `CARGO_MANIFEST_DIR` is the crate, and the hub is a
+/// sibling of it.
+fn workspace_root() -> Option<PathBuf> {
+    let mut here = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    loop {
+        if std::fs::read_to_string(here.join("Cargo.toml"))
+            .is_ok_and(|text| text.contains("[workspace]"))
+        {
+            return Some(here);
+        }
+        if !here.pop() {
+            return None;
+        }
+    }
+}

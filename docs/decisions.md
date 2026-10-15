@@ -3937,3 +3937,101 @@ routes and the README is right as written for it; the wording has to name
 which kind of host the reader is on, rather than assuming the imperative one
 always works. That is the general lesson: "install this file there" is a
 claim about the target, not about the file.
+
+---
+
+## 2026-10-15 — D131 A hard IO ceiling, and pressure that gates nothing
+
+**Context.** The first consumer's build server froze three times on disk
+saturation. Herd bounded a job's memory by the kernel and its IO by a
+**weight** — and a weight shares contended bandwidth, it never caps it, so on
+a host where one job can saturate a disk Herd had no answer. D116 named
+`io.max` as "the honest next step if IO must actually be bounded"; it must.
+Separately, the consumer asked for PSI to brake admission, which E-32 forbids
+(D119).
+
+**`io.max`, optional and absent by default.** `--job-io-max
+rbps=…,wbps=…,riops=…,wiops=…`, any subset of the four keys, written to the
+job's cgroup `io.max` for **the device the data root is on**. Absent means
+**no line written** — never a zero, never a guess: there is no honest default
+throughput, because a figure measured on an NVMe is absurd on a spinning disk.
+Zero in any key is refused where it is written, like a memory ceiling of zero:
+it is a wall and not a cap.
+
+**It refuses rather than misleads, and that is the deliberate difference from
+`io.weight`.** A weight nobody honours costs nothing, so it is written and
+reported inert (D120). A *ceiling* nobody honours is a false promise, so a
+ceiling asked for on a host that cannot carry one is a **startup refusal
+naming the path and the reason** — a ZFS data root (no cgroup IO knob reaches
+a ZFS dataset at any value), no cgroup delegation, no blk-throttle in the
+kernel, a path whose device cannot be resolved. `cpu.max` already took this
+road; `io.max` goes one step further because the knob is **per-device**: a
+value with no device is not a weaker ceiling, it is not a ceiling, so the
+device is resolved first and an unresolvable path is itself the refusal.
+
+**Proved by writing it, not inferred.** Three different things could make a
+ceiling vanish — the `io` controller not handed down, a kernel without
+`CONFIG_BLK_DEV_THROTTLING` so `io.max` does not exist, or a device the kernel
+refuses — and none is visible from a file somebody could read. So startup
+writes the real value into a probe cgroup under the same base every job hangs
+under and reads it back, exactly as delegation is probed. Measured on this
+host, inside a delegated scope, by a job reading its own cgroup: `io.max` on
+`259:0` carries the four limits it was given.
+
+**Not fixed by this.** A job writing an absolute path **outside** its data
+root writes to another device, which neither the ceiling nor the weight
+reaches (D123, D126). That is said in the startup report rather than left to
+be discovered.
+
+**PSI is recorded and gates nothing.** `/proc/pressure/{cpu,memory,io}` and
+the job's own cgroup `*.pressure`, as `some avg10` in thousandths of a
+percent, on one new `#[serde(default)]` field of `JobMetrics` — which is the
+one change allowed to leave the frozen `PROTOCOL_VERSION` and `RECORD_VERSION`
+alone (D73), and the reason this is a field and not a frame. An unreadable or
+absent file leaves the figure **absent, never zero**: a zero reads as "no
+pressure", which is a lie told to whoever is looking into a freeze. Nothing
+compares it to anything, and there is a test that says so over the sources of
+every module that decides about a job — because E-32 is a promise about Herd
+and not about one Tuesday's run.
+
+**Whether a ceiling is the right answer to a freeze.** It is the right
+*bound* and it is not a complete answer. A ceiling caps throughput and
+nothing caps the size of what a job writes to a device other than its data
+root, so a disk can still fill; a 20 GiB per-job workspace budget is what
+bounds that, and only inside the root. The cheap figure a throttled host
+still owes its operator is how long a job spent stalled, which is now
+recorded.
+
+**Why the weight is not enough, measured on this host and not argued.**
+`/sys/fs/cgroup/io.cost.qos` reads `259:0 enable=1 ctrl=auto rpct=0.00
+rlat=5000 wpct=0.00 wlat=5000`. `rpct` and `wpct` are the latency percentiles
+blk-iocost watches to decide a device is saturated, and at **zero** it watches
+none: the controller apportions the device by weight and never lowers the
+total load to protect latency. So every weight on this machine can be honoured
+exactly while `/proc/pressure/io` reads `full avg60=43.7` — which is the
+freeze, with the knob working as designed. A weight decides *who* gets a
+saturated device; nothing in the weight path decides *whether* it gets
+saturated. The runner now says that in its startup report where it finds
+`rpct=0 wpct=0`, rather than printing "io.weight is enforced" and leaving the
+reader to assume more than that means.
+
+**What is still not Herd's to fix.** The systemic answer on a shared host is
+host hygiene: every workload in a weighted cgroup, and `io.cost.qos` given a
+real latency percentile so iocost throttles instead of only apportioning.
+That would protect everything on the machine, Herd included, and it is
+`/etc/nixos` — the owner's, like D129's libvirtd socket. Herd's own part is
+the bound it can place on itself without knowing who else exists: a weight is
+a promise about a ratio, and a ratio with an unknown denominator is not a
+bound, so invariant 2 cannot be kept with a weight alone.
+
+**What sharing one queue changes about the figure.** On this server a job's
+data root, the consumer's docker data root, their work and this checkout are
+all on `/dev/nvme0n1p1` — one request queue. A per-job ceiling there bounds a
+job against **their services** and not merely against other Herd jobs, which
+is the useful direction and also the reason there is no default: a ceiling
+that is right where Herd is the only tenant is wrong where it shares a queue
+with production. So the help text says how to derive one instead of offering
+one — a fraction of the kernel's own measurement of the device in
+`/sys/fs/cgroup/io.cost.model` (`rbps=3102524156`, `wbps=1742780862` here),
+with the IOPS keys included, because a freeze is a latency event and small
+random IO is what causes one.

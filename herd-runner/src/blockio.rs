@@ -35,10 +35,25 @@
 //! D23's rule is that a runner never claims a bound it does not have, so the
 //! question is asked here and answered in the startup report either way.
 //!
-//! What is *not* done here: an absolute `io.max` (bytes and IOPS per device).
-//! It is a hard per-device ceiling, so it belongs to the same family as
-//! `cpu.max` — something an operator declares — and nobody has asked for it
-//! yet. Note that it is no answer on ZFS either (D120).
+//! ## The other knob, and the difference that matters
+//!
+//! `io.weight` is a **share of contended bandwidth**: it decides who gets the
+//! disk when two cgroups both want it, and it caps nothing — one job alone on
+//! an idle machine saturates the disk at any weight. `io.max` is a **hard
+//! ceiling** in bytes and IOPS per second, enforced by blk-throttle whatever
+//! the IO scheduler is, which is why it is the lever for a host where one job
+//! can saturate a disk. It is declared by an operator and absent by default
+//! ([`crate::cgroup::IoCeiling`]).
+//!
+//! Neither bounds a job that writes an **absolute path outside its data
+//! root**: that write lands on whatever device that path is on, and this
+//! module's whole answer — and the device `io.max` names — is about the one
+//! device the data root is on. Herd does not stop a job naming a path (D123,
+//! D126), so that is a gap in both knobs and not a weakness of one.
+//!
+//! [`ceiling_device`] is the `io.max` half: which device a ceiling must name,
+//! or why no ceiling can be written for a path at all. Note that ZFS is no
+//! more reachable by `io.max` than by `io.weight` (D120).
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -178,6 +193,95 @@ pub fn io_weight_inert_reason(data_root: &Path) -> Option<String> {
     (!reach.bites).then_some(reach.why)
 }
 
+/// The device an `io.max` ceiling for jobs under `data_root` must name, and
+/// where that device was found.
+///
+/// `io.max` is **per-device**: every line of it begins with a `major:minor`,
+/// and a ceiling with no device is not a weaker ceiling but no ceiling at all.
+/// So the first thing a ceiling needs is this answer, and the second thing it
+/// needs is for the answer to be a refusal where there is none.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CeilingDevice {
+    /// `major:minor` of the **whole disk**, which is what `io.max` is keyed
+    /// on: a partition has no request queue of its own, and the kernel
+    /// accounts a partition's IO to its disk.
+    pub device: String,
+    /// The mount point the data root is on, for the startup report.
+    pub mount_point: String,
+    /// What that mount is made of, as `/proc/self/mountinfo` names it.
+    pub source: String,
+}
+
+/// Which device a ceiling for `data_root` must name, or **why no ceiling can
+/// be written for that path at all**.
+///
+/// The `Err` side is a startup refusal and not a warning, which is the one
+/// place this parts company with [`io_weight_reach`]. A weight nobody honours
+/// costs nothing — it is reported inert and the job runs — but a *ceiling*
+/// nobody honours is a false promise: an operator who wrote `--job-io-max`
+/// did it because one job can saturate this disk, and a runner that took the
+/// option and bounded nothing would be the exact failure D116 and D129 are
+/// about, on the one machine the whole project builds on.
+pub fn ceiling_device(data_root: &Path) -> Result<CeilingDevice, String> {
+    if !cfg!(target_os = "linux") {
+        return Err(
+            "this host is not Linux, so it has no cgroup v2 io.max to write a ceiling in"
+                .to_owned(),
+        );
+    }
+    let mountinfo = fs::read_to_string(MOUNTINFO).map_err(|error| {
+        format!(
+            "{MOUNTINFO} cannot be read ({error}), so which device {} is on is unknown — and \
+             io.max is per-device, so there is no line to write",
+            data_root.display()
+        )
+    })?;
+    let root = fs::canonicalize(data_root).unwrap_or_else(|_| data_root.to_path_buf());
+    let mount = ceiling_mount(&mountinfo, &root)?;
+    let disk = disk_of(&mount.device).ok_or_else(|| {
+        format!(
+            "{} is on {} ({} from {}), which is not one block device with a request queue of \
+             its own, so blk-throttle has no device to hold a ceiling against",
+            root.display(),
+            mount.point,
+            mount.kind,
+            mount.source
+        )
+    })?;
+    Ok(CeilingDevice {
+        device: disk.device,
+        mount_point: mount.point,
+        source: mount.source,
+    })
+}
+
+/// The mount a ceiling for `root` would be written against, or the sentence
+/// to refuse the startup with. Over the text of `mountinfo`, so the refusals
+/// can be asserted on a host whose own disks are something else.
+fn ceiling_mount(mountinfo: &str, root: &Path) -> Result<Mount, String> {
+    let mount = mount_holding(mountinfo, root).ok_or_else(|| {
+        format!(
+            "no mount in {MOUNTINFO} holds {}, so which device it is on is unknown — and \
+             io.max is per-device, so there is no line to write",
+            root.display()
+        )
+    })?;
+    if mount.kind == "zfs" {
+        return Err(format!(
+            "{} is on {} ({} from the ZFS pool {}), and ZFS does its pool IO from its own \
+             kernel threads without attributing it to the cgroup that asked. No cgroup IO \
+             knob reaches a ZFS dataset — not io.weight and not io.max, at any value — so a \
+             ceiling written here would bound nothing. Put the data root on a block-device \
+             filesystem, or leave the option out",
+            root.display(),
+            mount.point,
+            mount.kind,
+            mount.source
+        ));
+    }
+    Ok(mount)
+}
+
 /// One line of `/proc/self/mountinfo`, as much of it as this is about.
 #[derive(Debug, PartialEq)]
 struct Mount {
@@ -310,7 +414,11 @@ fn iocost_reach(qos: &str, model: &str, device: &str) -> Option<String> {
     if let Some(line) = line_for(qos, device) {
         let mut words = line.split_whitespace();
         if words.any(|word| word == "enable=1") {
-            return Some(format!("is enabled for it ({})", line.trim()));
+            return Some(format!(
+                "is enabled for it ({}){}",
+                line.trim(),
+                no_latency_target(line)
+            ));
         }
         if line.split_whitespace().any(|word| word == "ctrl=user") {
             return None;
@@ -332,6 +440,39 @@ fn iocost_reach(qos: &str, model: &str, device: &str) -> Option<String> {
          up for it",
         line.trim()
     ))
+}
+
+/// The sentence to add where blk-iocost is enabled with **no latency
+/// target**, and nothing where it has one.
+///
+/// Measured on this project's server: `259:0 enable=1 ctrl=auto rpct=0.00
+/// wpct=0.00 rlat=5000 wlat=5000`. `rpct` and `wpct` are the latency
+/// percentiles iocost watches to decide the device is saturated, and at zero
+/// it watches nothing: the controller **apportions** the device by weight and
+/// never lowers the total load to protect latency.
+///
+/// That distinction is the whole reason `io.max` exists. A weight decides who
+/// gets a saturated device; nothing in the weight path decides whether the
+/// device gets saturated — so every weight on this host can be honoured
+/// exactly while `/proc/pressure/io` reads `full avg60=43`, which is the
+/// first consumer's freeze with the knob working as designed. An operator
+/// reading "io.weight is enforced" has to be able to see that.
+fn no_latency_target(qos_line: &str) -> &'static str {
+    let percentile = |key: &str| {
+        qos_line
+            .split_whitespace()
+            .find_map(|word| word.strip_prefix(key))
+            .and_then(|figure| figure.parse::<f64>().ok())
+    };
+    match (percentile("rpct="), percentile("wpct=")) {
+        (Some(read), Some(write)) if read == 0.0 && write == 0.0 => {
+            ". Note rpct=0 and wpct=0: iocost watches no latency percentile here, so it \
+             apportions this device by weight and never lowers the total load to protect \
+             latency — every weight can be honoured while the device is saturated, which \
+             is what io.max and nothing else bounds"
+        }
+        _ => "",
+    }
 }
 
 fn line_for<'a>(text: &'a str, device: &str) -> Option<&'a str> {
@@ -392,6 +533,31 @@ mod tests {
         // Already enabled, which is the simple case and says so differently.
         let how = iocost_reach(qos, model, "8:0").expect("enable=1 is the controller up");
         assert!(how.contains("is enabled for it"), "{how}");
+        // And a controller enabled with no latency percentile to watch says
+        // so, because a weight that is perfectly honoured on a saturated
+        // device is the first consumer's freeze. Measured on this host:
+        // `enable=1 ctrl=auto rpct=0.00 wpct=0.00`.
+        let how = iocost_reach(
+            "259:0 enable=1 ctrl=auto rpct=0.00 rlat=5000 wpct=0.00 wlat=5000 min=1.00\n",
+            "",
+            "259:0",
+        )
+        .expect("the controller is up");
+        assert!(how.contains("rpct=0 and wpct=0"), "{how}");
+        assert!(
+            how.contains("never lowers the total load"),
+            "the line has to say what the weight cannot do, or it reads as a bound \
+             against saturation: {how}"
+        );
+        // A controller watching a real percentile says nothing extra: it is
+        // doing what a reader would assume it does.
+        let how = iocost_reach(
+            "7:0 enable=1 ctrl=user rpct=95.00 rlat=5000 wpct=95.00 wlat=5000\n",
+            "",
+            "7:0",
+        )
+        .expect("the controller is up");
+        assert!(!how.contains("rpct=0"), "{how}");
         // A device with neither: no reach.
         assert_eq!(iocost_reach(qos, model, "253:0"), None);
         assert_eq!(iocost_reach("", "", "8:0"), None);
@@ -412,6 +578,95 @@ mod tests {
             ),
             None
         );
+    }
+
+    /// `io.max` is per-device, and the device it must name is the **disk**
+    /// the data root is on, never the partition: a partition has no request
+    /// queue of its own and the kernel accounts its IO to the disk. So a
+    /// ceiling for a path on `nvme0n1p1` is written against `nvme0n1`'s
+    /// number, and a ceiling that named the partition would be a line the
+    /// kernel keeps and never applies.
+    #[test]
+    fn a_ceiling_names_the_disk_its_path_is_on_and_not_the_partition() {
+        if !cfg!(target_os = "linux") {
+            return;
+        }
+        // The whole answer for this host, whatever it is: a device or a
+        // refusal naming the path, never a silence and never a panic.
+        let here = std::env::current_dir().expect("this test has a working directory");
+        match ceiling_device(&here) {
+            Ok(device) => {
+                // The device number is a device number, and it is the one
+                // `/sys/dev/block` agrees is a disk with a queue.
+                let (major, minor) = device
+                    .device
+                    .split_once(':')
+                    .expect("a device is major:minor");
+                assert!(major.parse::<u32>().is_ok(), "{device:?}");
+                assert!(minor.parse::<u32>().is_ok(), "{device:?}");
+                assert!(
+                    Path::new(SYS_DEV_BLOCK)
+                        .join(&device.device)
+                        .join("queue")
+                        .is_dir(),
+                    "a ceiling must name a device with a request queue of its own, and \
+                     {} has none — io.max would keep the line and apply nothing: {device:?}",
+                    device.device
+                );
+                assert!(here.starts_with(&device.mount_point), "{device:?}");
+            }
+            Err(why) => {
+                assert!(
+                    why.contains(&here.display().to_string()) || why.contains("mountinfo"),
+                    "a refusal names the path it is about: {why}"
+                );
+            }
+        }
+    }
+
+    /// The refusal, which is the half that matters: a ceiling asked for on a
+    /// path that cannot carry one must be a startup refusal naming the path
+    /// and the reason, not a warning and a weaker bound. ZFS is the case this
+    /// project actually has (D120, D126) — `/` and `/tmp` here — and no
+    /// cgroup IO knob reaches it at any value.
+    #[test]
+    fn a_path_no_ceiling_can_reach_is_a_refusal_naming_it_and_why() {
+        let mountinfo = "\
+25 1 0:24 / / rw,relatime shared:1 - zfs rpool/root rw,xattr
+48 25 259:1 / /mnt/ssd_980 rw,relatime shared:2 - ext4 /dev/nvme0n1p1 rw
+";
+        // `/var/lib/herd-runner` is the path D126 moved the deployment off,
+        // and it is ZFS. A ceiling asked for there is a refusal, and the
+        // refusal has to carry four things: the path, the filesystem, that
+        // **neither** knob reaches it at any value, and what to do instead.
+        let why = ceiling_mount(mountinfo, Path::new("/var/lib/herd-runner"))
+            .expect_err("no cgroup IO knob reaches a ZFS dataset");
+        assert!(why.contains("/var/lib/herd-runner"), "{why}");
+        assert!(why.contains("zfs") && why.contains("rpool/root"), "{why}");
+        assert!(
+            why.contains("not io.weight and not io.max"),
+            "the refusal must say that no value would help, or the operator goes looking \
+             for a knob to turn: {why}"
+        );
+        assert!(why.contains("block-device filesystem"), "{why}");
+        // The same path on the ext4 NVMe is a device, not a refusal: whether
+        // a ceiling can be written depends on where the job works and not on
+        // the host (D120).
+        let mount = ceiling_mount(mountinfo, Path::new("/mnt/ssd_980/herd-runner"))
+            .expect("an ext4 mount can carry a ceiling");
+        assert_eq!(mount.device, "259:1");
+        // A mount nothing holds, and a path on a filesystem that is no block
+        // device, are each a sentence naming the path.
+        let why = ceiling_mount("", Path::new("/anywhere")).expect_err("no mount holds it at all");
+        assert!(
+            why.contains("/anywhere") && why.contains("per-device"),
+            "{why}"
+        );
+        if cfg!(target_os = "linux") {
+            let why = ceiling_device(Path::new("/proc/self"))
+                .expect_err("/proc is no block device, so no ceiling can be written for it");
+            assert!(why.contains("/proc"), "{why}");
+        }
     }
 
     /// Whatever this host turns out to be, the question is answered with a

@@ -692,6 +692,86 @@ pub struct JobMetrics {
     pub log_bytes: u64,
     /// Wall-clock milliseconds from the spawn to the outcome.
     pub wall_time_ms: u64,
+    /// How stalled the host and the job's own cgroup were when the job ended
+    /// (E-32, D119). Absent on a kernel without PSI, or where no figure at
+    /// all could be read — never a zero, which reads as "no pressure".
+    ///
+    /// `#[serde(default)]` and absent means exactly that: a peer that has
+    /// never heard of pressure sends none and a peer reading an older frame
+    /// or an older record finds none, which is the truth in both cases. That
+    /// is the one change allowed to leave [`PROTOCOL_VERSION`] and the hub's
+    /// record version alone (D73), and it is why this is a field on an
+    /// existing variant rather than a frame of its own.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pressure: Option<Pressure>,
+}
+
+/// How much time was lost to waiting for a resource, as the kernel's pressure
+/// stall information reports it (E-32, D119).
+///
+/// **Recorded, never a gate.** The first consumer asked for pressure to brake
+/// admission and that was refused: E-32 is their own expectation that the load
+/// figure is recorded and never a criterion, and a hub that silently stopped
+/// dispatching would be indistinguishable from a hub that had died. So these
+/// figures travel with a job's outcome, land in its record, and are compared
+/// against nothing anywhere in Herd.
+///
+/// Each figure is `some avg10` from one `pressure` file — the share of the
+/// last ten seconds in which **at least one** task was stalled on that
+/// resource — as a percentage times 1000, the same `_milli` scale
+/// [`JobMetrics::host_load_milli`] uses. `12.34 %` is `12340`, and the full
+/// range is `0..=100_000`. An integer because it lands in a record a consumer
+/// compares, and two equal measurements must not print differently.
+///
+/// The `host_*` figures come from `/proc/pressure/*` and are about the whole
+/// machine, including everything on it that is not Herd. The `job_*` figures
+/// come from the job's own cgroup and are about that job alone; they are
+/// absent where the kernel does not expose per-cgroup pressure or where the
+/// job had no cgroup of its own.
+///
+/// **Every figure is absent rather than zero when it could not be read**
+/// (D23): a zero says "nothing was stalled", which is a measurement, and a
+/// consumer reading one off an unreadable file would be reading a lie.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Pressure {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub host_cpu_milli: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub host_memory_milli: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub host_io_milli: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub job_cpu_milli: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub job_memory_milli: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub job_io_milli: Option<u64>,
+}
+
+impl Pressure {
+    /// Whether nothing at all could be read. A reading with no figure in it
+    /// is **not** a reading of no pressure, so the caller reports `None`
+    /// rather than an empty one.
+    pub fn is_empty(&self) -> bool {
+        *self == Self::default()
+    }
+
+    /// The figures that are there, named as an operator reads them. Empty for
+    /// a host that exposes no pressure at all, which is how the absence stays
+    /// visible instead of printing as zeroes.
+    pub fn named(&self) -> Vec<(&'static str, u64)> {
+        [
+            ("host cpu", self.host_cpu_milli),
+            ("host memory", self.host_memory_milli),
+            ("host io", self.host_io_milli),
+            ("job cpu", self.job_cpu_milli),
+            ("job memory", self.job_memory_milli),
+            ("job io", self.job_io_milli),
+        ]
+        .into_iter()
+        .filter_map(|(name, figure)| figure.map(|figure| (name, figure)))
+        .collect()
+    }
 }
 
 /// A job's identity, minted by the hub.

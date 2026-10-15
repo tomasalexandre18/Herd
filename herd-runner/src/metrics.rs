@@ -8,6 +8,107 @@
 //! read stays absent — never zero, because zero is a measurement.
 
 use std::fs;
+use std::path::Path;
+
+use herd_proto::Pressure;
+
+/// Where the kernel publishes the whole machine's pressure stall information.
+/// One file per resource, each with a `some` and (except on older kernels for
+/// cpu) a `full` line.
+const HOST_PRESSURE: &str = "/proc/pressure";
+
+/// The three resources Herd records pressure for, as both `/proc/pressure/*`
+/// and a cgroup's `*.pressure` name them.
+const RESOURCES: [&str; 3] = ["cpu", "memory", "io"];
+
+/// How stalled the host and this job's own cgroup were (E-32, D119).
+///
+/// **Read and recorded; a gate on nothing.** The first consumer asked for
+/// pressure to brake admission and E-32 — their own expectation — says the
+/// load figure is recorded and never a criterion, so this figure reaches the
+/// record, is reported with the job, and is compared against nothing. A hub
+/// that silently stopped dispatching under pressure would be indistinguishable
+/// from a hub that had died, which is a worse failure than the queueing it
+/// would prevent.
+///
+/// `cgroup` is the job's own cgroup directory where it had one. Where it did
+/// not — the `RLIMIT_AS` fallback of D23 — the host figures still stand on
+/// their own and the job's own are absent.
+///
+/// `None` when **nothing** could be read: a kernel without `CONFIG_PSI`, or a
+/// `/proc` this process cannot see. An empty reading is absent rather than a
+/// row of zeroes, because a zero says "nothing was stalled" and that is a
+/// measurement nobody took.
+pub fn pressure(cgroup: Option<&Path>) -> Option<Pressure> {
+    let host = |resource: &str| some_avg10_milli(Path::new(HOST_PRESSURE).join(resource));
+    let job = |resource: &str| {
+        cgroup.and_then(|dir| some_avg10_milli(dir.join(format!("{resource}.pressure"))))
+    };
+    let reading = Pressure {
+        host_cpu_milli: host(RESOURCES[0]),
+        host_memory_milli: host(RESOURCES[1]),
+        host_io_milli: host(RESOURCES[2]),
+        job_cpu_milli: job(RESOURCES[0]),
+        job_memory_milli: job(RESOURCES[1]),
+        job_io_milli: job(RESOURCES[2]),
+    };
+    (!reading.is_empty()).then_some(reading)
+}
+
+/// `some avg10` out of one pressure file, as a percentage times 1000, or
+/// nothing at all.
+///
+/// A file that is not there, cannot be read, or does not carry the line is
+/// **absent** — never zero. That rule is D23's and it is the whole reason
+/// this returns an `Option`: `0` would be reported as a machine under no
+/// pressure, which is exactly the wrong thing to tell somebody looking into a
+/// freeze.
+fn some_avg10_milli(file: impl AsRef<Path>) -> Option<u64> {
+    let text = fs::read_to_string(file).ok()?;
+    some_avg10_milli_of(&text)
+}
+
+/// The decision over the file's contents, so it can be asserted without a
+/// kernel that has PSI.
+///
+/// The format is fixed and has not changed since 4.20:
+///
+/// ```text
+/// some avg10=1.12 avg60=0.45 avg300=0.94 total=119085947242
+/// full avg10=0.42 avg60=0.25 avg300=0.67 total=95804638406
+/// ```
+///
+/// `some` is the share of the window in which at least one task was stalled
+/// on the resource, which is the figure that moves first and therefore the
+/// one worth recording. `full` — everybody stalled — is a later and much
+/// rarer signal, and recording six figures where three say the same thing
+/// would be a surface nobody asked for (invariant 1).
+fn some_avg10_milli_of(text: &str) -> Option<u64> {
+    let line = text
+        .lines()
+        .find(|line| line.split_whitespace().next() == Some("some"))?;
+    let figure = line
+        .split_whitespace()
+        .find_map(|word| word.strip_prefix("avg10="))?;
+    // Two decimals, as the kernel prints them, read as thousandths so that
+    // nothing is lost and no float lands in a record (E-15's figures are
+    // integers on purpose). A line this cannot parse is absent, not zero.
+    let (whole, fraction) = match figure.split_once('.') {
+        Some((whole, fraction)) => (whole, fraction),
+        None => (figure, ""),
+    };
+    let whole: u64 = whole.parse().ok()?;
+    if !fraction.chars().all(|c| c.is_ascii_digit()) {
+        return None;
+    }
+    let mut digits = fraction.chars();
+    let mut milli = 0u64;
+    for scale in [100u64, 10, 1] {
+        let digit = digits.next().and_then(|c| c.to_digit(10)).unwrap_or(0);
+        milli += u64::from(digit) * scale;
+    }
+    Some(whole.saturating_mul(1000).saturating_add(milli))
+}
 
 /// The host's one-minute load average, times 1000.
 ///
@@ -248,6 +349,119 @@ mod tests {
                 "a load of {load} thousandths is not a load"
             );
         }
+    }
+
+    /// The kernel's two decimals, read as thousandths so nothing is lost and
+    /// no float lands in a record. `some` is the line that is read; `full`
+    /// sits under it and is a different question.
+    #[test]
+    fn a_pressure_line_is_read_as_thousandths_of_a_percent() {
+        let real = "\
+some avg10=1.12 avg60=0.45 avg300=0.94 total=119085947242
+full avg10=0.42 avg60=0.25 avg300=0.67 total=95804638406
+";
+        assert_eq!(some_avg10_milli_of(real), Some(1_120));
+        // The two ends of the range, exactly.
+        assert_eq!(
+            some_avg10_milli_of("some avg10=0.00 avg60=0.00 avg300=0.00 total=0\n"),
+            Some(0)
+        );
+        assert_eq!(
+            some_avg10_milli_of("some avg10=100.00 avg60=99.99 avg300=50.00 total=5\n"),
+            Some(100_000)
+        );
+        // A reading of zero from a file that *was* read is a measurement and
+        // stays one: the host really was not stalled. That is the figure the
+        // rule below is carefully not about.
+        assert_eq!(
+            some_avg10_milli_of("some avg10=0.00 avg60=0.00 avg300=0.00 total=0\n"),
+            Some(0)
+        );
+        // cpu on an older kernel has no `full` line at all, which changes
+        // nothing about the line that is read.
+        assert_eq!(
+            some_avg10_milli_of("some avg10=12.34 avg60=1.00 avg300=1.00 total=1\n"),
+            Some(12_340)
+        );
+    }
+
+    /// **D23's rule, for this figure.** A file that is not there, cannot be
+    /// read, or does not say what was expected leaves the figure **absent**
+    /// — never zero. A zero reads as "nothing was stalled", which is a
+    /// measurement, and reporting one off an unreadable file would be telling
+    /// somebody looking into a freeze that the machine was idle.
+    #[test]
+    fn an_unreadable_pressure_file_leaves_the_figure_absent_and_never_zero() {
+        // Nothing in it, no `some` line, a figure that is not a figure: each
+        // one absent, and none of them zero.
+        for text in [
+            "",
+            "full avg10=0.42 avg60=0.25 avg300=0.67 total=95804638406\n",
+            "some avg60=0.45 avg300=0.94 total=1\n",
+            "some avg10= avg60=0.45\n",
+            "some avg10=lots avg60=0.45\n",
+            "some avg10=1.2x avg60=0.45\n",
+        ] {
+            assert_eq!(
+                some_avg10_milli_of(text),
+                None,
+                "a reading nobody could take must be absent and not zero: {text:?}"
+            );
+        }
+        // And a path that does not exist, through the whole reader.
+        assert_eq!(some_avg10_milli(Path::new("/herd-no-such-pressure")), None);
+        // A job whose cgroup is not there leaves the job's own three figures
+        // absent while the host's stand on their own: the two are different
+        // questions and one failing is not the other failing.
+        let reading = pressure(Some(Path::new("/herd-no-such-cgroup")));
+        if let Some(reading) = reading {
+            assert_eq!(reading.job_cpu_milli, None);
+            assert_eq!(reading.job_memory_milli, None);
+            assert_eq!(reading.job_io_milli, None);
+        }
+        // A reading with nothing in it is absent as a whole, rather than a
+        // row of zeroes that would read as a machine under no pressure.
+        assert!(herd_proto::Pressure::default().is_empty());
+        assert!(herd_proto::Pressure::default().named().is_empty());
+    }
+
+    /// E-32's figure, on this host. Present on a Linux kernel with PSI, in
+    /// range, and a sentence rather than a silence where it is not — never a
+    /// zero in either case.
+    #[test]
+    fn this_host_s_pressure_is_read_or_absent_and_never_invented() {
+        let reading = pressure(None);
+        if !Path::new(HOST_PRESSURE).is_dir() {
+            crate::testing::skipped(
+                "this_host_s_pressure_is_read_or_absent_and_never_invented",
+                &format!(
+                    "{HOST_PRESSURE} does not exist on this host, so this kernel has no PSI \
+                     (CONFIG_PSI) — a kernel with it would prove that the host's cpu, memory \
+                     and io stall figures are read and recorded with every job"
+                ),
+            );
+            assert_eq!(
+                reading, None,
+                "a host with no /proc/pressure must report no figure, not a zero"
+            );
+            return;
+        }
+        let reading = reading.expect("a kernel with /proc/pressure has figures in it");
+        for (name, figure) in reading.named() {
+            assert!(
+                figure <= 100_000,
+                "{name} is {figure} thousandths of a percent, which is not a share of time"
+            );
+        }
+        assert!(
+            reading.host_cpu_milli.is_some()
+                && reading.host_memory_milli.is_some()
+                && reading.host_io_milli.is_some(),
+            "all three host figures are there on a host with PSI: {reading:?}"
+        );
+        // The job's own three are absent, because this reading was taken
+        // with no job cgroup to ask.
+        assert_eq!(reading.job_cpu_milli, None);
     }
 
     /// **Attack 5.** An override larger than the machine would make the
