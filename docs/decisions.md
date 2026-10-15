@@ -3937,3 +3937,64 @@ routes and the README is right as written for it; the wording has to name
 which kind of host the reader is on, rather than assuming the imperative one
 always works. That is the general lesson: "install this file there" is a
 claim about the target, not about the file.
+
+---
+
+## 2026-10-15 — D131 A release is three static musl binaries and a notice
+
+**Why at all.** The first consumer's team deploys on their own machines —
+an Arch box, a Windows PC's WSL2 — so a release has to be something a
+person downloads and runs. What the flake builds by default is not:
+
+```
+ld-linux-x86-64.so.2 => /nix/store/…-glibc-2.42-67/lib64/…
+libc.so.6            => /nix/store/…-glibc-2.44-25/lib/…
+```
+
+Those binaries exec only on a host with a Nix store, which makes a
+release that contains them useless to whoever is joining.
+
+**The route: `pkgsStatic` through the existing flake**, as
+`packages.<system>.static`, and not a second toolchain in the workflow.
+The reason is that it cost nothing to keep D12: nixpkgs' musl cross set
+has `rustc`, `cargo`, `gcc` and `binutils` in the public cache — 141 MiB
+of download, measured — so **one** derivation is built and the workspace
+compiles in 50 s. A `rustup` step in the workflow would have been a
+second pinning of the toolchain for no gain in speed. `nix eval --raw
+.#static.version` is then where the artefact names get their version,
+which is `Cargo.toml`'s `workspace.package.version` by the same route as
+the image's tag (`nix/hub-image.nix`), so a release cannot be named for a
+version its binaries do not answer to.
+
+**What the workflow asserts, because a green release of unusable
+binaries is worse than no release.** `file` must say static, `ldd` must
+find no loader, `readelf -l` must show no `PT_INTERP`, and the bytes must
+name no `/nix/store` path. Then `scripts/release-smoke.sh` runs a hub, a
+runner and two real jobs out of the release binaries inside an
+`archlinux` container and an `alpine` one — glibc and musl, neither with
+any Nix — so the claim "runs on any distribution" is a test and not a
+hope. `--help` three times would only have proved the loader; a job that
+execs a shell proves musl's own resolver, its sockets and its `/etc`
+reading as well.
+
+**x86_64 only, deliberately.** Every machine in the herd today is
+x86_64. The cost of adding aarch64 is known and is not a cross-compile:
+`pkgsCross.aarch64-multiplatform-musl` has to **build `rustc` from
+source** — the cache has no `aarch64-unknown-linux-musl-rustc`, so it is
+LLVM and a full bootstrap, 1.7 GiB and far past a 30-minute job — while
+a native `ubuntu-24.04-arm` runner needs only a matrix entry and an
+arm64 container image, because `flake.nix` already lists
+`aarch64-linux`. So when the first non-x86_64 machine appears, the answer
+is a second runner in the matrix, not a cross build.
+
+**And a notice, treated as half of the release:**
+`deploy/release-notice.md`, quoted into the release body. Its subject is
+the thing a binary cannot say about itself — that run bare the runner
+works, and that without a unit carrying `Delegate=yes` there is no
+per-job `memory.max`, no `cpu.weight`, `io.weight` or `pids.max`, no
+cgroup kill, no restart after a reboot and a token on a command line that
+every user of the host can read out of `/proc`. One row of its table
+turned out the other way round from the way it was briefed, and is
+written as measured: a job's `PATH` is **fine** bare, because the runner
+carries its own `PATH` into a job, and is the unit's one real trap —
+which is D129's finding, now in the document the deployer reads.

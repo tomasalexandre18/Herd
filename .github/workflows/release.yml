@@ -1,0 +1,236 @@
+# What a release is: three statically linked binaries and a SHA256SUMS, built
+# on a pushed tag, plus `deploy/release-notice.md` quoted into the release
+# body. The first consumer's team deploys on their own machines, so a release
+# has to be something a person can download onto an Arch box or a WSL2 PC and
+# run — which the flake's default packages are not: they are linked against
+# glibc out of the Nix store and do not exec on a host without Nix.
+#
+# This file is **not** the merge gate. `ci.yml` is, with its `check` and
+# `docs` jobs, and nothing here touches it.
+name: release
+
+on:
+  push:
+    tags:
+      - "v*"
+    # TEMPORARY, and deliberately here rather than left for later:
+    # `workflow_dispatch` cannot be triggered on a branch that is not the
+    # default one, so a branch push is the only way to make this workflow run
+    # on GitHub before it is merged — and a release workflow that has never
+    # run is a release workflow that does not work. Delete this `branches:`
+    # key once this file is on `main`; nothing else refers to it, and from
+    # `main` the two triggers above are how a release is cut and how a change
+    # to this file is tested.
+    branches:
+      - cd-release-binaries
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: >-
+          Tag to publish the release on, e.g. v0.1.0. Left empty, the
+          binaries are built and verified and attached to this run, and no
+          release is created.
+        required: false
+        default: ""
+
+concurrency:
+  group: release-${{ github.ref }}
+  # Never cancelled: a half-uploaded release is worse than a slow one.
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+
+jobs:
+  binaries:
+    name: static binaries
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      # One place where "which tag, if any" is decided. A tag push releases
+      # under its own name; a hand-run releases only if it was given one.
+      TAG: ${{ github.ref_type == 'tag' && github.ref_name || github.event.inputs.tag }}
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: cachix/install-nix-action@v31
+        with:
+          extra_nix_config: |
+            experimental-features = nix-command flakes
+            accept-flake-config = true
+
+      # The version comes from `Cargo.toml`'s `workspace.package.version`,
+      # read through the flake — `flake.nix` reads it once and every package
+      # takes it from there, so this is the same figure as the hub image's
+      # tag and cannot be a number somebody typed here. The triple comes from
+      # the derivation's own host platform for the same reason.
+      - name: the version and the target, from the workspace
+        run: |
+          set -euo pipefail
+          version=$(nix eval --raw .#static.version)
+          triple=$(nix eval --raw .#static.stdenv.hostPlatform.config)
+          echo "version=$version" >> "$GITHUB_ENV"
+          echo "triple=$triple" >> "$GITHUB_ENV"
+          echo "the workspace says $version, built for $triple"
+
+          # A tag that does not match the workspace is a release whose file
+          # names would lie about what is inside them. A pre-release suffix
+          # is allowed — `v0.1.0-rc1` for 0.1.0 — because that is how a
+          # release gets rehearsed; a different version is not.
+          if [ -n "${TAG:-}" ] && [ "${TAG#v$version}" = "$TAG" ]; then
+            echo "tag $TAG is not v$version or a pre-release of it:" \
+                 "bump workspace.package.version, or tag what the workspace says" >&2
+            exit 1
+          fi
+
+      # ~1 minute, and no toolchain is installed to do it: `pkgsStatic` is
+      # nixpkgs' own musl cross set, so D12 still holds and the musl rustc,
+      # cargo, gcc and binutils come out of the public cache.
+      - name: build the three binaries, static against musl
+        run: nix build .#static --print-build-logs
+
+      - name: take them out of the store
+        run: |
+          set -euo pipefail
+          mkdir -p bin
+          for b in herd-runner herdctl herd-hub; do
+            # A copy, writable and executable: a store path is 0555 and read
+            # only, and these are about to be mounted into a container and
+            # uploaded.
+            install -m 0755 "result/bin/$b" "bin/$b"
+          done
+          ls -l bin
+
+      # The assertion that keeps this workflow honest. A change that quietly
+      # makes these binaries dynamic again — a dependency growing a C
+      # library, `pkgsStatic` dropped in a refactor — must fail the build
+      # here rather than ship a release that cannot exec on the machines it
+      # was made for. Four questions, because each catches a different way of
+      # getting it wrong.
+      - name: assert every binary is statically linked
+        run: |
+          set -uo pipefail
+          fail=0
+          for b in bin/*; do
+            echo "--- $b"
+            file -b "$b"
+            ldd "$b" 2>&1 || true
+            readelf -ld "$b" | grep -E 'INTERP|NEEDED|Shared library' || true
+
+            if ! file -b "$b" | grep -q 'static'; then
+              echo "NOT STATIC: file(1) does not call $b static" >&2
+              fail=1
+            fi
+            if ! ldd "$b" 2>&1 | grep -qE 'not a dynamic executable|statically linked'; then
+              echo "NOT STATIC: ldd(1) found a dynamic loader for $b" >&2
+              fail=1
+            fi
+            # The one that cannot be talked around: a binary with a
+            # PT_INTERP segment names an interpreter, and on a host that
+            # does not have that interpreter it does not start at all.
+            if readelf -l "$b" | grep -q 'INTERP'; then
+              echo "NOT STATIC: $b has a PT_INTERP segment" >&2
+              fail=1
+            fi
+            # And no Nix store path anywhere in the bytes: that is how the
+            # default packages fail, and a static binary that still names one
+            # is a static binary that was built against something it will not
+            # find.
+            if grep -qa '/nix/store' "$b"; then
+              echo "NOT PORTABLE: $b names a /nix/store path" >&2
+              fail=1
+            fi
+          done
+          exit "$fail"
+
+      # Static or not, the only proof that counts is a binary doing its job
+      # on a distribution that has never had Nix on it. Two of them, with
+      # different C libraries, so neither "it happened to find a glibc" nor
+      # "it was really a musl host all along" can explain a pass:
+      # `archlinux` is glibc, `alpine` is musl, and neither has a /nix/store.
+      #
+      # `--user 1000:1000` because a runner refuses to start as root
+      # (privilege.rs), which is also true of the image's default user.
+      # scripts/release-smoke.sh says what it proves; it is a hub, a runner
+      # and two real jobs, not `--help` three times.
+      - name: run them on Arch Linux, which has no Nix
+        run: |
+          docker run --rm --user 1000:1000 -e HOME=/tmp \
+            -v "$PWD/bin:/herd:ro" \
+            -v "$PWD/scripts/release-smoke.sh:/release-smoke.sh:ro" \
+            archlinux:latest /release-smoke.sh /herd
+
+      - name: run them on Alpine, which has no Nix and no glibc
+        run: |
+          docker run --rm --user 1000:1000 -e HOME=/tmp \
+            -v "$PWD/bin:/herd:ro" \
+            -v "$PWD/scripts/release-smoke.sh:/release-smoke.sh:ro" \
+            alpine:latest /release-smoke.sh /herd
+
+      # The names carry the version and the target triple, so a file on
+      # somebody's disk six months from now still says what it is. SHA256SUMS
+      # is what lets a reader verify what they downloaded instead of trusting
+      # a URL: `sha256sum -c SHA256SUMS` in the directory they downloaded
+      # into.
+      - name: name them and sum them
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          for b in herd-runner herdctl herd-hub; do
+            install -m 0755 "bin/$b" "dist/$b-$version-$triple"
+          done
+          cd dist
+          sha256sum herd-* > SHA256SUMS
+          cat SHA256SUMS
+
+      # Every run leaves the binaries behind, tag or no tag: that is what
+      # makes a hand-run useful, and what lets this workflow be tested
+      # without creating a release.
+      - uses: actions/upload-artifact@v4
+        with:
+          name: herd-${{ env.version }}-${{ env.triple }}
+          path: dist/
+          if-no-files-found: error
+
+      # `gh` rather than a third-party action: it is on the runner already,
+      # and a release is the one step here that cannot be undone quietly.
+      # The notice is quoted into the body rather than linked, because
+      # whoever downloads a tarball six months from now may not have the
+      # repository — and linked, as well, so they can read the current one.
+      - name: publish the release
+        if: env.TAG != ''
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          {
+            echo "Static x86_64 Linux binaries for Herd $version, linked"
+            echo "against musl: they run on any distribution and need no Nix."
+            echo
+            echo "Verify what you downloaded, then read the notice below:"
+            echo
+            echo '```sh'
+            echo "sha256sum -c SHA256SUMS"
+            echo "chmod +x herd-runner-$version-$triple"
+            echo '```'
+            echo
+            echo "The notice in full is [deploy/release-notice.md]("
+            echo "https://github.com/${{ github.repository }}/blob/$TAG/deploy/release-notice.md)."
+            echo
+            echo "---"
+            echo
+            cat deploy/release-notice.md
+          } > release-body.md
+
+          # --notes-file, never --notes with a shell variable: the notice is
+          # a long document with backticks and dollars in it.
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release edit "$TAG" --notes-file release-body.md
+            gh release upload "$TAG" dist/* --clobber
+          else
+            gh release create "$TAG" dist/* \
+              --title "Herd $TAG" \
+              --notes-file release-body.md \
+              --verify-tag
+          fi
+          gh release view "$TAG"
