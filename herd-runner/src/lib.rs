@@ -64,7 +64,7 @@ use futures_util::stream::{SplitSink, SplitStream};
 use futures_util::{SinkExt, StreamExt};
 use herd_proto::{
     from_frame, to_frame, FromHub, JobId, JobMetrics, JobOutcome, LogStream, Role, RunningJob,
-    ToHub, PROTOCOL_VERSION,
+    StepRun, ToHub, PROTOCOL_VERSION,
 };
 use tokio::net::TcpStream;
 use tokio::sync::mpsc::{self, UnboundedReceiver, UnboundedSender};
@@ -458,6 +458,9 @@ impl CancelToken {
 struct Ended {
     outcome: JobOutcome,
     metrics: JobMetrics,
+    /// Every executor step this attempt ran, in order (D77). Empty for a job
+    /// that is not a declared command, which is every job before M10.
+    steps: Vec<StepRun>,
 }
 
 /// One job this runner has in hand, and everything the hub may still need
@@ -518,6 +521,7 @@ fn finished_frame(job_id: &JobId, attempt: u32, chunks_sent: u64, end: &Ended) -
         outcome: end.outcome.clone(),
         chunks_sent,
         metrics: end.metrics.clone(),
+        steps: end.steps.clone(),
     }
 }
 
@@ -883,7 +887,13 @@ impl Session {
             let Some(job) = inner.jobs.get_mut(job_id) else {
                 return;
             };
-            let end = Ended { outcome, metrics };
+            // No step: a job that is not a declared command ran no executor
+            // step, and an empty list says exactly that (D77).
+            let end = Ended {
+                outcome,
+                metrics,
+                steps: Vec::new(),
+            };
             job.end = Some(end.clone());
             let (attempt, chunks_sent) = (job.attempt, job.next_seq);
             if !send_on(
@@ -1999,7 +2009,29 @@ async fn serve_hub(
                 job_id,
                 attempt,
                 command,
+                declaration,
+                timeout_s,
             } => {
+                // M10's runner half — the four executor steps, timestamped
+                // (D77) — is not written yet. Until it is, a declared command
+                // is **given back** rather than run: executing its line
+                // directly would run the consumer's command with no
+                // workspace, outside their `nix develop`, on whatever the
+                // runner's working directory happens to be, and report
+                // whatever came out as a verdict about their tests.
+                if let Some(declaration) = &declaration {
+                    session.abandon(
+                        &job_id,
+                        attempt,
+                        &format!(
+                            "this runner does not run declared commands yet, and command {} \
+                             of commit {} is one: its four executor steps would be skipped",
+                            declaration.command, declaration.commit
+                        ),
+                    );
+                    continue;
+                }
+                let _ = timeout_s;
                 let session = session.clone();
                 let confined = Arc::clone(&confined);
                 // One task per job: a long job must not stop the runner from

@@ -19,12 +19,17 @@ use std::time::Duration;
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 
 pub mod capability;
+pub mod declaration;
 pub mod placement;
 
 pub use capability::{
     check_label, metal_label, Availability, BusyProbe, Capability, CapabilityError, CapabilityKind,
     CapabilityOffer, CapabilityOrigins, CapabilityState, Contention, Holdings, LabelSet,
     OfferedCapability,
+};
+pub use declaration::{
+    args_as_line, shell_quote, Declaration, Executor, Step, StepRun, ARGS_TOKEN, COMMIT_TOKEN,
+    IN_TOKEN, JOB_TOKEN, LINE_TOKEN, OUT_TOKEN,
 };
 pub use placement::{
     default_memory_floor_mib, parallelism_tokens, size_mib, with_parallelism, HostSize,
@@ -81,7 +86,19 @@ pub use placement::{
 /// default is a lie in one direction. So the number moves, a version 5 peer is
 /// refused by name, and there is no migration — M16 sets both numbers back to
 /// 1 (D73).
-pub const PROTOCOL_VERSION: u32 = 6;
+///
+/// **7 is M10's**, the command declaration contract (E-11). A submission may
+/// carry a [`declaration::Declaration`] — a declared command's name, its
+/// commit, the requester's arguments and the consumer's four executor hooks —
+/// and the time cap that command declares; the hub hands both back with the
+/// attempt ([`FromHub::AssignJob`]); the runner reports each step as it ends
+/// ([`ToHub::StepFinished`]) and the four again with the verdict. None of it
+/// may be read as absent, and the sharp one is the cap: a version 6 runner
+/// handed a declared job would ignore the four steps, exec the line directly
+/// and cap it at its own figure — a job that ran something other than what the
+/// declaration says, reported as if it had. So the number moves, a version 6
+/// peer is refused by name, and there is no migration (D73).
+pub const PROTOCOL_VERSION: u32 = 7;
 
 /// How often a runner says it is alive and what it is doing (E-40).
 ///
@@ -938,6 +955,35 @@ pub enum ToHub {
         /// a figure that was simply not readable (see [`JobMetrics`]).
         #[serde(default)]
         metrics: JobMetrics,
+        /// Every executor step this attempt ran, in the order it ran them
+        /// (D77).
+        ///
+        /// The authoritative copy: [`ToHub::StepFinished`] fills the record as
+        /// the attempt goes, so a job stopped at a cap or lost with its runner
+        /// still shows the preparation it did — and this list, which the hub
+        /// takes over the ones it already has, is what an attempt that reached
+        /// its end says it ran. Empty for a job that is not a declared command.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        steps: Vec<StepRun>,
+    },
+    /// One executor step of an attempt has ended, with its figures (D77).
+    ///
+    /// Sent as the step ends rather than only with the verdict, for two
+    /// reasons. A 5 h nightly stopped at its cap, or a runner lost under a
+    /// 30-minute cache pull, would otherwise leave **no** step on the record —
+    /// the preparation time invisible in exactly the case someone is looking
+    /// for it. And E-04's and E-36's explanations may quote preparation time
+    /// (D77), which they can only do if the hub holds the step before the job
+    /// ends.
+    ///
+    /// Not acknowledged and not spooled, unlike a log chunk or a verdict: a
+    /// step line is neither output nor a verdict, and the complete list
+    /// arrives again with [`ToHub::JobFinished`]. A link that dies under it
+    /// costs the record nothing it does not get back.
+    StepFinished {
+        job_id: JobId,
+        attempt: u32,
+        step: StepRun,
     },
     /// Runner reports that it is alive and what it is doing (E-40).
     ///
@@ -1086,6 +1132,34 @@ pub struct Asked {
     /// verdict, reported verbatim (D20).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub requeue_exit_code: Option<i32>,
+    /// The declared command this job is, when it is one (E-11, D106).
+    ///
+    /// Present means the job is a declared command on a commit: the runner
+    /// runs it through the consumer's four executor steps, and `command` is
+    /// the declared line going into the `run` hook's [`LINE_TOKEN`]. Absent
+    /// means `command` is the whole of what runs, which is every job Herd ran
+    /// before M10 and every `herdctl run -- …` after it.
+    ///
+    /// Both forms stay, deliberately. The ad-hoc one is how Herd is tested
+    /// against itself without a consumer tree in the picture (E-11 wants no
+    /// consumer command in Herd's own code), and the declared one is how a
+    /// real job arrives.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub declaration: Option<Declaration>,
+    /// How long this job's `run` step may take, in seconds, as its command
+    /// declares (E-11).
+    ///
+    /// The consumer's own figures: 45 min for a build, 2 h for a test, 5 h for
+    /// the nightly. It bounds the `run` step and nothing else — the
+    /// preparation steps are bounded by the runner's own cap, which is its
+    /// owner's figure and not a requester's to raise (invariant 2, D108).
+    ///
+    /// Absent means the job is capped at the runner's own figure, which is
+    /// what every job before M10 was. A figure **above** the runner's own does
+    /// not raise it: the smaller of the two wins, because the machine belongs
+    /// to its owner and the record says which of the two bound the job.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timeout_s: Option<u64>,
 }
 
 /// Sent by the hub to a runner or a requester.
@@ -1165,6 +1239,19 @@ pub enum FromHub {
         job_id: JobId,
         attempt: u32,
         command: Vec<String>,
+        /// The declared command, when the job is one (E-11, D106).
+        ///
+        /// Handed back with every attempt rather than held by the runner that
+        /// first saw it: a job requeued onto another machine must run the same
+        /// four steps on the same commit, and the record is the only thing
+        /// that knows them both.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        declaration: Option<Declaration>,
+        /// What the declaration says this job's `run` step may take, in
+        /// seconds. The runner caps it at the smaller of this and its own
+        /// figure (D108).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        timeout_s: Option<u64>,
     },
     /// The runner is asked to end a job it is executing, and told why.
     ///

@@ -2156,6 +2156,12 @@ fn dispatch(
             job_id: job_id.clone(),
             attempt,
             command,
+            // Off the record, on every attempt, rather than remembered by
+            // the runner that saw it first: a job requeued onto another
+            // machine (E-21) runs the same four steps on the same commit,
+            // and the record is the only thing that holds them (E-11, D106).
+            declaration: record.declaration.clone(),
+            timeout_s: record.timeout_s,
         })
         .is_err()
     {
@@ -2352,15 +2358,47 @@ async fn relay_from_runner(
                     }
                 }
             }
+            ToHub::StepFinished {
+                job_id,
+                attempt,
+                step,
+            } => {
+                if !is_current(state, name, outbox, &job_id, attempt) {
+                    continue;
+                }
+                // Said out loud and recorded, and a failure to record it is
+                // said rather than retried: a step line is neither output nor
+                // a verdict, the complete list arrives again with the end,
+                // and nothing about a running job may hang on writing one
+                // (D19's rule is about results, and this is not one).
+                println!("herd-hub: {job_id} attempt {attempt} {}", step.line());
+                if let Err(error) = state.store.record_step(&job_id, attempt, step) {
+                    eprintln!("herd-hub: recording an executor step of {job_id} failed: {error}");
+                }
+            }
             ToHub::JobFinished {
                 job_id,
                 attempt,
                 outcome,
                 chunks_sent,
                 metrics,
+                steps,
             } => {
                 if !is_current(state, name, outbox, &job_id, attempt) {
                     continue;
+                }
+                // The steps before the end: the attempt's four lines are part
+                // of the record this verdict is written into, and a reader
+                // that found the verdict first would see a job that ended
+                // with no preparation behind it (D77). Each one replaces the
+                // live line of the same name, so this is the complete list
+                // whatever arrived while the job ran.
+                for step in steps {
+                    if let Err(error) = state.store.record_step(&job_id, attempt, step) {
+                        eprintln!(
+                            "herd-hub: recording an executor step of {job_id} failed: {error}"
+                        );
+                    }
                 }
                 // A result for a job this hub has no record of — a state root
                 // that was replaced under it, say. There is nothing to write
@@ -3188,6 +3226,66 @@ fn new_job(asked: herd_proto::Asked) -> NewJob {
             asked.after,
             asked.requeue_exit_code,
         )
+        .declared(asked.declaration, asked.timeout_s)
+}
+
+/// Why a declared command this hub was sent will not do, if it will not
+/// (E-11).
+///
+/// The hub **trusts** the requester for the declaration: it holds no
+/// repository and cannot check the file against the commit, and D106 states
+/// that cost out loud. What it can check is that the declaration is a thing a
+/// runner could execute at all, and it does, because each of these would
+/// otherwise become a job that runs something nobody declared:
+///
+/// * a commit that is not forty lowercase hex — the hash `herdctl` resolved is
+///   what the workspace fetches, and anything else is a ref that would be
+///   resolved on a machine, which is what E-01 forbids;
+/// * an empty hook — four named steps run in a fixed order, and a step with
+///   no line is a step that silently does not happen;
+/// * a `run` hook with no `{line}` in it — the declared command line would
+///   never reach the shell, and the job would report the exit code of their
+///   workspace tool as a verdict about their tests.
+///
+/// Refused at the submission, where a requester is standing to be told
+/// (E-36's rule for every refusal here).
+fn why_that_declaration_will_not_do(asked: &herd_proto::Asked) -> Option<String> {
+    let declaration = asked.declaration.as_ref()?;
+    let commit = &declaration.commit;
+    if commit.len() != 40
+        || !commit
+            .chars()
+            .all(|c| c.is_ascii_hexdigit() && !c.is_uppercase())
+    {
+        return Some(format!(
+            "this submission says command {} runs commit {commit:?}, which is not forty \
+             lowercase hex: a submission carries the hash its own checkout resolved, never a \
+             ref for a machine to resolve",
+            declaration.command
+        ));
+    }
+    for step in herd_proto::Step::ALL {
+        if declaration.executor.hook(step).trim().is_empty() {
+            return Some(format!(
+                "this submission's {} step is an empty line: the four steps run in a fixed \
+                 order and a step with no line is a step that would silently not happen",
+                step
+            ));
+        }
+    }
+    if !declaration
+        .executor
+        .hook(herd_proto::Step::Run)
+        .contains(herd_proto::LINE_TOKEN)
+    {
+        return Some(format!(
+            "this submission's run step does not carry {}, so command {}'s own line would \
+             never be run and whatever the step exited with would be reported as its verdict",
+            herd_proto::LINE_TOKEN,
+            declaration.command
+        ));
+    }
+    None
 }
 
 /// Why the job a submission named as its parent will not do, if it will not
@@ -3481,6 +3579,10 @@ async fn accept_submissions(state: &State, outbox: &Outbox, source: &mut Source)
                     });
                     return Ok(());
                 }
+                if let Some(reason) = why_that_declaration_will_not_do(&asked) {
+                    let _ = outbox.send(FromHub::Refused { reason });
+                    return Ok(());
+                }
                 if let Some(reason) = state.why_no_runner() {
                     let _ = outbox.send(FromHub::Refused { reason });
                     return Ok(());
@@ -3580,6 +3682,15 @@ async fn accept_submissions(state: &State, outbox: &Outbox, source: &mut Source)
                 if asked.command.is_empty() {
                     let _ = outbox.send(FromHub::Refused {
                         reason: "a dry run needs a command to judge".to_owned(),
+                    });
+                    return Ok(());
+                }
+                // Judged by the same function a submission is, so that a dry
+                // run of a declaration a submission would refuse says so
+                // rather than answering about a job nobody can submit (E-07).
+                if let Some(reason) = why_that_declaration_will_not_do(&asked) {
+                    let _ = outbox.send(FromHub::WouldRun {
+                        lines: vec![format!("it would be refused at submission: {reason}")],
                     });
                     return Ok(());
                 }
@@ -4021,6 +4132,7 @@ fn message_kind(message: &ToHub) -> &'static str {
         ToHub::JobStarted { .. } => "job_started",
         ToHub::LogChunk { .. } => "log_chunk",
         ToHub::JobFinished { .. } => "job_finished",
+        ToHub::StepFinished { .. } => "step_finished",
         ToHub::Health { .. } => "health",
         ToHub::AttemptAbandoned { .. } => "attempt_abandoned",
         ToHub::DryRun { .. } => "dry_run",
@@ -4117,6 +4229,14 @@ mod tests {
         }
         fn record_metrics(&self, id: &JobId, metrics: JobMetrics) -> StoreResult<()> {
             self.inner.record_metrics(id, metrics)
+        }
+        fn record_step(
+            &self,
+            id: &JobId,
+            attempt: u32,
+            step: herd_proto::StepRun,
+        ) -> StoreResult<()> {
+            self.inner.record_step(id, attempt, step)
         }
         fn end_attempt(
             &self,

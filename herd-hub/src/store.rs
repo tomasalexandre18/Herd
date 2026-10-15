@@ -42,7 +42,7 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
-use herd_proto::{JobId, LabelSet, LogStream, Priority};
+use herd_proto::{JobId, LabelSet, LogStream, Priority, StepRun};
 use serde::{Deserialize, Serialize};
 
 use crate::durable;
@@ -898,6 +898,8 @@ impl JobDirStore {
             deadline,
             after,
             requeue_exit_code,
+            declaration,
+            timeout_s,
         } = new;
         let mut live = self.lock()?;
         // `mkdir` is what claims an id: the directories, not the index, decide
@@ -946,6 +948,8 @@ impl JobDirStore {
             deadline,
             after,
             requeue_exit_code,
+            declaration,
+            timeout_s,
             parallelism: None,
             submissions: 1,
             state: JobState::Queued,
@@ -1188,6 +1192,7 @@ impl JobStore for JobDirStore {
             requeue_code: None,
             ended: None,
             why: why.to_owned(),
+            steps: Vec::new(),
         });
         // The figure travels with the job, not only inside the attempt's
         // sentence: whatever reads this job's requirements reads the N it was
@@ -1197,6 +1202,30 @@ impl JobStore for JobDirStore {
         self.write_record(&record)?;
         self.append_event(id, &JobEvent::attempt_started(at, number, runner, why))?;
         Ok(number)
+    }
+
+    fn record_step(&self, id: &JobId, attempt: u32, step: StepRun) -> Result<()> {
+        let (_live, mut record) = self.open_for_writing(id)?;
+        let Some(entry) = record
+            .attempts
+            .iter_mut()
+            .find(|entry| entry.number == attempt)
+        else {
+            return Err(StoreError::new(format!(
+                "{id} has no attempt {attempt} to record a {} step on",
+                step.step
+            )));
+        };
+        // Replaced rather than appended twice: the complete list arrives
+        // again with the verdict, and four steps are four steps however many
+        // times the runner says so. The order is the order they ran in, which
+        // is the order the first of each arrived in.
+        match entry.steps.iter_mut().find(|held| held.step == step.step) {
+            Some(held) => *held = step,
+            None => entry.steps.push(step),
+        }
+        record.updated_at = Timestamp::now();
+        self.write_record(&record)
     }
 
     fn end_attempt(

@@ -3006,3 +3006,99 @@ Rejected for the same reason D74 kept the `labels_from` reading off the hub.
 **Consequence for `docs/plan.md`.** M10's entry loses the configured bare
 repository and gains the resolution and the two refusals in `herdctl`. Only
 `herdctl` depends on a TOML parser.
+
+## 2026-10-15 — D107 Three places fill a placeholder, each the one that knows
+
+**Context.** The consumer's declaration is a template: their four executor
+hooks and their command lines carry `{job} {commit} {args} {in} {out}`, their
+`run` hook carries `{line}`, and Herd's own `{j}` (E-22) goes in the line.
+Something has to put a value in each, and the obvious reading — "the runner
+substitutes everything, it is the one running the command" — is wrong in a way
+that is invisible until M6 is looked at.
+
+**Choice. Each token is filled by the one place that knows its value, and
+`{args}` and `{commit}` are filled *before the job is minted*.**
+
+| Token | Filled by | Because |
+|---|---|---|
+| `{args}`, `{commit}` | `herdctl` | the requester typed the arguments and resolved the commit in its own checkout (D106) |
+| `{j}` | the hub | a property of the machine it chose, derived as it chooses one (E-22, D82) |
+| `{job}`, `{in}`, `{out}`, `{line}` | the runner | the id is the hub's, the directories are the runner's own |
+
+The sharp one is `{args}`. A line still holding `{args}` when the job is minted
+is a line two submissions of one command with *different arguments* share — and
+M6's deduplication key is computed over the command, so the second submission
+would join the first and two requesters would be handed one run of the wrong
+arguments (E-05 says a second submission of **open work** joins; it does not
+say two different jobs are one). Filling them in `herdctl` makes the line on
+the record the line that will run, which is also what makes a record readable
+years later (E-54) without the declaration file to hand.
+
+**Three limits, each of which matters.**
+
+* **Substitution is one pass per token, never a loop.** A value that itself
+  contains a brace is text, not a template: `--only '{out}'` is an argument.
+  A fixed point would turn a requester's own string into a template, which is
+  the one way a declaration's trust (D106) could reach beyond the declaration.
+* **A hook is one shell line, handed to one shell.** Their `fetch` is
+  `git fetch -q origin && git switch -q --detach {commit}` and their `sh`
+  command is a shell line by definition. "You never interpret a command line"
+  is their rule, and splitting a line into an argv Herd invented is exactly
+  interpreting it.
+* **`{args}` is shell-quoted, one word per argument.** Pasting a requester's
+  argument raw *would* be interpreting it: `--only 'a b'` would reach their
+  tool as two arguments, and a `$(…)` in an argument would run. Single quotes,
+  with the one escape a single quote needs, because inside them a shell
+  expands nothing at all. Quoting is how an argument is preserved, not how it
+  is read.
+
+**Alternative rejected.** Carrying the arguments to the runner and filling them
+there, which looks tidier — one place substitutes everything. Rejected for the
+deduplication defect above, and because the record would then hold a template
+rather than a command.
+
+## 2026-10-15 — D108 The command declares its cap, the owner bounds it
+
+**Context.** Each declared command names a `timeout_s` — 45 min for a build,
+2 h for a test, 5 h for the nightly. A runner already has a time cap of its
+own, given by its owner at startup, and invariant 2 requires every job to run
+under an explicit one. Two figures, one job, and the first consumer's `up` step
+may pull a whole warm cache — ~30 min the first time a machine runs one of
+their jobs — *before* their command starts.
+
+**Choice. `timeout_s` bounds the `run` step. The preparation steps are bounded
+by the runner's own figure. Neither raises the other: the cap on `run` is the
+smaller of the declared figure and the runner's, and the record says which one
+bound the job.**
+
+* A cap over the whole attempt would let a cold cache pull eat a build's 45
+  minutes, and the job would be reported as a slow build — which is precisely
+  the misreading D77's timestamps exist to prevent.
+* A declared figure that could *raise* the runner's would let a requester
+  overrule the owner of a machine she is lending (invariant 2, E-33's spirit).
+  The consumer says what its command needs; the owner says what her machine
+  lends; the smaller wins and is named.
+* Nothing new is invented for the preparation steps. They have no declared
+  figure, and the owner's cap is the explicit bound invariant 2 asks for.
+
+**What a step's ending means, which falls out of the same reading.**
+
+* `up` or `fetch` non-zero → the job **never started**:
+  `could_not_start`, naming the step and its code, and never an exit code a
+  caller could read as a failing test (D20).
+* `run` → **the verdict**, worn untouched: 0, 1 and 75 alike (E-02).
+* `down` non-zero → recorded on its step line and **cannot change the
+  verdict**: the verdict already exists, and a workspace that failed to be
+  taken down is an operator's problem, not a test result.
+* `down` runs however the three before it ended. Not a condition — the
+  opposite: a step that ran only on success would leak a workspace on every
+  failure, and the four steps must have no conditions at all (D77,
+  invariant 1).
+
+**And the steps are reported as they end**, not only with the verdict
+(`ToHub::StepFinished`). A 5 h nightly stopped at its cap, or a runner lost
+under a cache pull, would otherwise leave **no** step on the record — the
+preparation time invisible in exactly the case someone is looking for it. The
+complete list arrives again with the verdict and takes over, so the frame needs
+no acknowledgement and no spool: it is neither output nor a verdict, and a link
+that dies under it costs the record nothing it does not get back.

@@ -4,3 +4,6 @@ result
 result-*
 .direnv/
 *.log
+
+# Sub-agent worktrees live here; they are branches, not content.
+.claude/

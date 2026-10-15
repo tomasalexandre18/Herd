@@ -9,7 +9,7 @@
 use std::error::Error;
 use std::fmt;
 
-use herd_proto::{JobId, JobOutcome, LabelSet, LogStream, Priority};
+use herd_proto::{Declaration, JobId, JobOutcome, LabelSet, LogStream, Priority, StepRun};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 /// What a runner measured while a job ran.
@@ -59,7 +59,20 @@ pub use herd_proto::JobMetrics;
 /// let a leased machine spend the budget that exists for a runner that
 /// disappears. A pre-M9 state root is refused by name and no migration is
 /// written for it (D73).
-pub const RECORD_VERSION: u32 = 5;
+///
+/// 6 since M10: a record carries the declared command it is, if it is one, and
+/// the time cap that command declared (E-11, D106, D108), and an attempt
+/// carries one timestamped line per executor step (D77). The declaration is a
+/// required field for the reason the others are — a reader must be able to
+/// tell a job that was an ad-hoc command line from a record written before
+/// commands were declared — and it is load-bearing beyond readability: the
+/// declaration is **what a requeue onto another machine runs**, so a record
+/// that lost it would re-run the job as a bare command line on a machine with
+/// no workspace, and report whatever came out as the consumer's verdict. The
+/// steps are `#[serde(default)]`, purely additive, and an attempt with none is
+/// an attempt of a job that is not a declared command. A pre-M10 state root is
+/// refused by name and no migration is written for it (D73).
+pub const RECORD_VERSION: u32 = 6;
 
 /// A moment, as the record files carry it: RFC 3339 in UTC, to the
 /// nanosecond. A string a human and the consumer can both read, so that a
@@ -245,6 +258,20 @@ pub struct Attempt {
     /// one is rewritten whenever the job's place changes (M6), which is why a
     /// placement must not be recorded there.
     pub why: String,
+    /// Every executor step this attempt ran, in order (D77).
+    ///
+    /// On the attempt rather than on the job, because a job attempted twice
+    /// prepared twice — and the first consumer's `up` may pull a whole warm
+    /// cache the first time a machine runs one of their jobs, which is
+    /// minutes on one attempt and seconds on the next. Each line says the
+    /// step's name, when it started, how long it took and what it exited
+    /// with, and nothing reorders them.
+    ///
+    /// Filled as the attempt goes, from [`herd_proto::ToHub::StepFinished`],
+    /// and taken over by the complete list the verdict carries. Empty for an
+    /// attempt of a job that is not a declared command.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub steps: Vec<StepRun>,
 }
 
 /// What a requester asked for, as the hub takes it in.
@@ -278,6 +305,11 @@ pub struct NewJob {
     pub after: Option<JobId>,
     /// The exit code this job's command means "requeue me" by (D76).
     pub requeue_exit_code: Option<i32>,
+    /// The declared command this job is, if it is one (E-11); see
+    /// [`JobRecord::declaration`].
+    pub declaration: Option<Declaration>,
+    /// What that command declared its `run` step may take, in seconds (D108).
+    pub timeout_s: Option<u64>,
 }
 
 impl NewJob {
@@ -310,6 +342,8 @@ impl NewJob {
             deadline: None,
             after: None,
             requeue_exit_code: None,
+            declaration: None,
+            timeout_s: None,
         }
     }
 
@@ -325,6 +359,15 @@ impl NewJob {
         self.deadline = deadline;
         self.after = after;
         self.requeue_exit_code = requeue_exit_code;
+        self
+    }
+
+    /// The same, as the declared command a requester named (E-11): the four
+    /// executor steps it runs through, and the time cap its command declared
+    /// (D106, D108).
+    pub fn declared(mut self, declaration: Option<Declaration>, timeout_s: Option<u64>) -> Self {
+        self.declaration = declaration;
+        self.timeout_s = timeout_s;
         self
     }
 
@@ -500,6 +543,28 @@ pub struct JobRecord {
     /// re-probed. Absent means every code the command exits with is its own
     /// verdict, passed through untouched (D20).
     pub requeue_exit_code: Option<i32>,
+    /// The declared command this job is, when it is one (E-11, D106).
+    ///
+    /// Written at birth from what `herdctl` resolved in the requester's own
+    /// checkout, and never changed: the commit, the arguments and the four
+    /// executor hooks are part of what this job *was*. It is handed back with
+    /// every attempt, which is the whole reason it is on the record rather
+    /// than held by the runner that first saw it — a job requeued onto another
+    /// machine (E-21) has to run the same four steps on the same commit, and
+    /// nothing else in Herd remembers them.
+    ///
+    /// `None` is an ad-hoc command line: [`JobRecord::command`] is then the
+    /// whole of what runs. Required, not `#[serde(default)]`, so that a reader
+    /// can tell the two apart from a record written before M10.
+    pub declaration: Option<Declaration>,
+    /// How long this job's `run` step may take, in seconds, as its command
+    /// declared (E-11, D108).
+    ///
+    /// The runner caps the step at the smaller of this and its own figure: the
+    /// consumer says what its command needs, the owner of the machine says
+    /// what her machine lends, and neither raises the other. `None` is a job
+    /// bounded by the runner's figure alone, which is every job before M10.
+    pub timeout_s: Option<u64>,
     /// How many submissions this one execution answers (E-05).
     ///
     /// 1 for an ordinary job; 2 after a second identical submission joined
@@ -623,6 +688,8 @@ impl JobRecord {
             deadline: new.deadline,
             after: new.after,
             requeue_exit_code: new.requeue_exit_code,
+            declaration: new.declaration,
+            timeout_s: new.timeout_s,
             parallelism: None,
             submissions: 1,
             state: JobState::Queued,
@@ -1091,6 +1158,20 @@ pub trait JobStore: Send + Sync + 'static {
         why: &str,
         parallelism: Option<u32>,
     ) -> Result<u32>;
+
+    /// Record one executor step of an attempt, with its figures (D77).
+    ///
+    /// Called as each step ends, so that a job stopped at its cap or lost
+    /// with its runner still shows the preparation it did — the case the
+    /// timestamps exist for, since the first consumer's `up` may pull a whole
+    /// warm cache before anything of theirs runs.
+    ///
+    /// Appends, and **replaces a step of the same name** rather than keeping
+    /// two: the complete list arrives again with the verdict, and a record
+    /// that held `up` twice would read as a job that prepared twice in one
+    /// attempt. A step for an attempt the record does not hold is an error,
+    /// not a silent no-op, for the reason every other write here is.
+    fn record_step(&self, id: &JobId, attempt: u32, step: StepRun) -> Result<()>;
 
     /// Record that an attempt ended without the job's verdict, and why.
     ///

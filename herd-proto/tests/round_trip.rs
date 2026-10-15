@@ -1,12 +1,76 @@
 //! Every message must survive a trip through JSON unchanged. The protocol is
 //! the contract: a field that silently fails to round-trip is a lost field.
 
+use std::collections::BTreeMap;
+
 use herd_proto::{
     cap_exceeded_reason, cap_stop_reason, from_frame, to_frame, Asked, Availability, BusyProbe,
-    Cap, Capability, CapabilityOffer, CapabilityOrigins, CapabilityState, FromHub, HostSize, JobId,
-    JobMetrics, JobOutcome, LabelSet, LogStream, OfferedCapability, Priority, Role, RunnerSwitch,
-    RunningJob, Switch, SwitchPersistence, ToHub, PROTOCOL_VERSION,
+    Cap, Capability, CapabilityOffer, CapabilityOrigins, CapabilityState, Declaration, Executor,
+    FromHub, HostSize, JobId, JobMetrics, JobOutcome, LabelSet, LogStream, OfferedCapability,
+    Priority, Role, RunnerSwitch, RunningJob, Step, StepRun, Switch, SwitchPersistence, ToHub,
+    PROTOCOL_VERSION,
 };
+
+/// A declared command as a submission carries it (E-11): the name their own
+/// file gave it, a commit resolved in the requester's checkout, the arguments
+/// as typed, and their four hooks with `{args}` and `{commit}` already filled
+/// (D106).
+///
+/// The hooks are shaped like the consumer's own, with no consumer command in
+/// them (E-11): what crosses the wire has to be tested against the shape they
+/// asked for — a shell line each, an environment, and the tokens Herd fills
+/// later still in place.
+fn a_declaration() -> Declaration {
+    Declaration {
+        command: "a-declared-command".to_owned(),
+        commit: "cb5a2e8b4f1d9c7a3e05b8d6f2a1c4e79b0d3f68".to_owned(),
+        args: vec!["--only".to_owned(), "one,two".to_owned()],
+        executor: Executor {
+            up: "tool ws up {job} cb5a2e8b4f1d9c7a3e05b8d6f2a1c4e79b0d3f68".to_owned(),
+            fetch: "tool ws run {job} --no-nix -- 'git fetch -q origin && git switch -q --detach \
+                    cb5a2e8b4f1d9c7a3e05b8d6f2a1c4e79b0d3f68'"
+                .to_owned(),
+            run: "tool ws run {job} -- {line}".to_owned(),
+            down: "tool ws down {job} --purge".to_owned(),
+            env: BTreeMap::from([("RESULTS".to_owned(), "{out}/results.json".to_owned())]),
+        },
+    }
+}
+
+/// Every step of an attempt, as a runner reports them (D77): one that exited,
+/// and one a cap stopped with no code to report.
+fn every_step() -> Vec<StepRun> {
+    vec![
+        StepRun {
+            step: Step::Up,
+            started_unix_ms: 1_791_878_153_000,
+            duration_ms: 95_400,
+            exit_code: Some(0),
+            ended: None,
+        },
+        StepRun {
+            step: Step::Fetch,
+            started_unix_ms: 1_791_878_248_400,
+            duration_ms: 1_200,
+            exit_code: Some(0),
+            ended: None,
+        },
+        StepRun {
+            step: Step::Run,
+            started_unix_ms: 1_791_878_249_600,
+            duration_ms: 2_700_000,
+            exit_code: None,
+            ended: Some("stopped at the time cap, 2700 s".to_owned()),
+        },
+        StepRun {
+            step: Step::Down,
+            started_unix_ms: 1_791_880_949_600,
+            duration_ms: 400,
+            exit_code: Some(1),
+            ended: None,
+        },
+    ]
+}
 
 /// An offer carrying one of each kind, each origin and each probe, so that
 /// nothing in the algebra crosses the wire untested.
@@ -197,6 +261,8 @@ fn every_message_to_the_hub_round_trips() {
             deadline_unix_s: Some(1_792_000_000),
             after: Some(JobId::new("j0000000003")),
             requeue_exit_code: Some(75),
+            declaration: Some(a_declaration()),
+            timeout_s: Some(2700),
         };
         let bare = Asked {
             command: vec![],
@@ -208,6 +274,8 @@ fn every_message_to_the_hub_round_trips() {
             deadline_unix_s: None,
             after: None,
             requeue_exit_code: None,
+            declaration: None,
+            timeout_s: None,
         };
         // A dry run carries exactly what a submission carries (E-07).
         round_trip_to_hub(ToHub::SubmitJob {
@@ -256,8 +324,19 @@ fn every_message_to_the_hub_round_trips() {
                 outcome: outcome.clone(),
                 chunks_sent: 97,
                 metrics,
+                steps: every_step(),
             });
         }
+        // The same verdict from a job that is not a declared command: no
+        // step ran, and an empty list must survive the trip as an empty list.
+        round_trip_to_hub(ToHub::JobFinished {
+            job_id: JobId::new("j1"),
+            attempt: 2,
+            outcome: outcome.clone(),
+            chunks_sent: 0,
+            metrics: JobMetrics::default(),
+            steps: Vec::new(),
+        });
     }
 }
 
@@ -281,7 +360,25 @@ fn every_message_from_the_hub_round_trips() {
         job_id: JobId::new("j1"),
         attempt: 1,
         command: vec!["true".to_owned()],
+        declaration: None,
+        timeout_s: None,
     });
+    // The same assignment for a declared command: the four hooks, the commit,
+    // the arguments and the cap the declaration asked for (E-11, D108).
+    round_trip_from_hub(FromHub::AssignJob {
+        job_id: JobId::new("j1"),
+        attempt: 2,
+        command: vec!["a-line --only {j}".to_owned()],
+        declaration: Some(a_declaration()),
+        timeout_s: Some(7200),
+    });
+    for step in every_step() {
+        round_trip_to_hub(ToHub::StepFinished {
+            job_id: JobId::new("j1"),
+            attempt: 2,
+            step,
+        });
+    }
     for stream in [LogStream::Stdout, LogStream::Stderr] {
         for data in every_payload() {
             round_trip_from_hub(FromHub::LogChunk {
@@ -338,6 +435,7 @@ fn each_outcome_is_a_tagged_object_inside_the_frame() {
             outcome,
             chunks_sent: 0,
             metrics: JobMetrics::default(),
+            steps: Vec::new(),
         })
         .expect("encodes")
     };
@@ -429,6 +527,7 @@ fn a_figure_that_was_not_measured_is_absent_rather_than_zero() {
             log_bytes: 12,
             wall_time_ms: 34,
         },
+        steps: Vec::new(),
     })
     .expect("encodes");
     assert!(

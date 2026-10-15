@@ -291,6 +291,8 @@ mod tests {
             deadline: None,
             after: None,
             requeue_exit_code: None,
+            declaration: None,
+            timeout_s: None,
             parallelism: None,
             submissions: 1,
             state: JobState::Queued,

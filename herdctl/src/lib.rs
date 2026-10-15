@@ -8,8 +8,9 @@
 use anyhow::{anyhow, bail, Context, Result};
 use futures_util::{SinkExt, StreamExt};
 use herd_proto::{
-    cap_stop_reason, from_frame, to_frame, Asked, Cap, CapabilityOffer, FromHub, JobId, JobMetrics,
-    JobOutcome, LabelSet, LogStream, Priority, Role, RunnerSwitch, Switch, ToHub, PROTOCOL_VERSION,
+    cap_stop_reason, from_frame, to_frame, Asked, Cap, CapabilityOffer, Declaration, FromHub,
+    JobId, JobMetrics, JobOutcome, LabelSet, LogStream, Priority, Role, RunnerSwitch, Switch,
+    ToHub, PROTOCOL_VERSION,
 };
 use tokio::net::TcpStream;
 use tokio_tungstenite::tungstenite::Message;
@@ -198,6 +199,11 @@ pub struct Declared {
     /// The exit code this job's command means "what you gave me has gone" by
     /// (D76). 75 for the first consumer.
     pub requeue_exit_code: Option<i32>,
+    /// The declared command this job is, read in the requester's own checkout
+    /// (E-11, D106). `None` for an ad-hoc command line.
+    pub declaration: Option<Declaration>,
+    /// What that command declared its `run` step may take, in seconds (D108).
+    pub timeout_s: Option<u64>,
 }
 
 impl Declared {
@@ -216,6 +222,8 @@ impl Declared {
             deadline_unix_s: self.deadline_unix_s,
             after: self.after.map(JobId::new),
             requeue_exit_code: self.requeue_exit_code,
+            declaration: self.declaration,
+            timeout_s: self.timeout_s,
         }
     }
 }

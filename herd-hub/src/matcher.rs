@@ -1274,6 +1274,8 @@ mod tests {
             deadline: None,
             after: None,
             requeue_exit_code: None,
+            declaration: None,
+            timeout_s: None,
             parallelism: None,
             submissions: 1,
             state: JobState::Queued,
@@ -2074,6 +2076,7 @@ mod tests {
             ended: None,
             requeue_code: None,
             why: "claimed by wsl-pc: labels build".to_owned(),
+            steps: Vec::new(),
         }];
         let held = holdings(std::slice::from_ref(&running));
         assert_eq!(held["wsl-pc"].len(), 1);
@@ -2178,6 +2181,7 @@ mod tests {
             ended: None,
             requeue_code: None,
             why: format!("claimed by {runner}"),
+            steps: Vec::new(),
         }];
         record
     }
@@ -3238,6 +3242,7 @@ mod tests {
             requeue_code,
             ended: Some("ended".to_owned()),
             why: "claimed by somebody".to_owned(),
+            steps: Vec::new(),
         };
         record.attempts = vec![
             attempt(1, "wsl-pc", Some(75)),

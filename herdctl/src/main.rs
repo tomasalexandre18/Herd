@@ -524,6 +524,11 @@ fn declared(
         deadline_unix_s,
         after: asking.after,
         requeue_exit_code: asking.requeue_exit_code,
+        // An ad-hoc command line declares nothing and is capped by the
+        // runner's own figure: a declared command comes in by its name and
+        // its commit, which is M10's own surface (E-11, D106).
+        declaration: None,
+        timeout_s: None,
     })
 }
 
