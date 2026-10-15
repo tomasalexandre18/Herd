@@ -360,12 +360,30 @@ impl Herd {
             .spawn()
             .expect("herd-hub starts");
         let hub = Process { what: "hub", child };
-        // Waiting on the port, not on a sleep: the hub is up when it accepts.
+        // Waiting for the hub to **say** it is listening, not for a connect to
+        // succeed.
+        //
+        // The port answers before the hub has finished saying what it read:
+        // `bind` comes first, and the one line carrying the state root, the
+        // policy and `N job(s) not over` is printed after it. A harness that
+        // returned on a successful connect therefore handed the test a hub
+        // whose startup lines were not necessarily in the file yet, and every
+        // test that asserts on one of those lines straight after `start_hub`
+        // was a coin flip — on twelve cores the `println!` wins, on CI's two
+        // it need not. That is one of the three ways this suite failed on a
+        // two-core runner having passed on a twelve-core one.
+        //
+        // Strictly the stronger condition, not a different one: the line is
+        // printed after the state root has been read and after the port has
+        // been bound, so a hub that has said it is listening is listening and
+        // has finished saying everything it says about starting. It also ends
+        // the connect-and-drop probe this used to make, which arrived in every
+        // hub's own log as a websocket handshake that never finished.
         let deadline = Instant::now() + PATIENCE;
-        while TcpStream::connect(self.addr()).is_err() {
+        while !self.said(which).contains("listening on ws://") {
             assert!(
                 Instant::now() < deadline,
-                "the hub never listened on {}: {}",
+                "the hub never said it was listening on {}: {}",
                 self.addr(),
                 self.said(which)
             );
