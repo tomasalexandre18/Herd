@@ -237,12 +237,17 @@ right hash.
 
 **This is where the protocol break is spent, and it is spent once** (D148).
 Streaming files needs new variants on both enums, which D124 and D128 make
-breaking whatever serde tolerates, so `PROTOCOL_VERSION` moves to **2** —
-Alexa's to approve. The registry's own frames above ride the same break, and
-so does a catch-all arm on the runner so an unknown frame is logged and
-ignored rather than redialled into for ever (D128's recorded defect).
-`herdctl`'s `bail!` stays: a requester that cannot read what the hub tells it
-must not report a verdict (D124). Nothing from M15 is guessed at here.
+breaking whatever serde tolerates, so `PROTOCOL_VERSION` moves to **2**,
+approved by Alexa on 2026-10-16. The registry's own frames above ride the
+same break, and so does a catch-all arm so an unknown frame no longer means
+"does not decode at all" (D128's recorded defect). The arm reads three ways,
+one per direction, and the difference is the point: a **runner** logs and
+ignores what it cannot read, because a frame it does not know is work it is
+not needed for; a **requester** still refuses the run, because one that
+cannot read what the hub is telling it must not report a verdict (D124's
+`bail!`, which stays); and the **hub** refuses by name rather than ignoring,
+because a request it cannot read is work that will never be done and the
+peer has to be told. Nothing from M15 is guessed at here.
 
 **Done when** a two-runner e2e produces a fixture pack on runner A and
 consumes it on runner B with the hub seeing no payload byte (asserted by
@@ -299,10 +304,14 @@ long do I have to fetch yesterday's failing screenshots?* Two numbers,
 because there are two kinds of thing (D148). The record proper — `job.json`,
 `events.jsonl`, the log, the inline files — keeps retention by priority
 class, 14/90 days, configurable (closes E-15). A job's **large files** get
-their own budget on the hub's volume, in bytes, with a floor in days: seven
-days or the budget, whichever runs out first, oldest job first, both figures
+their own budget on the hub's volume, with a floor in days: **200 GB or
+seven days, whichever runs out first**, oldest job first, both figures
 printed at startup and shown as use against budget in M13's status document.
-Evicting inside the floor is a named line and an event, never a silent trim.
+The 200 GB is Alexa's, chosen on 2026-10-16 without a measurement and
+written down as such (D148): the one figure that would change it is the
+consumer's own output size per job per day, and it is to be adjusted when
+they send it. Evicting inside the floor is a named line and an event, never
+a silent trim.
 And the **manifest outlives the bytes**: each file's path, length and sha256
 stay on the record for as long as the record does, so a requester asking for
 something already gone is told how many files there were, how big, and when
@@ -402,7 +411,11 @@ docker compose re-asserts M2's no-loss test on the real volume; a reboot of
 the server brings the runner back with no hand; the no-Docker-socket test
 passes with the runner's user removed from `docker`. This milestone also
 sets `PROTOCOL_VERSION` and `RECORD_VERSION` back to 1 and freezes them: the
-first deployed protocol is version 1 (D73).
+first deployed protocol is version 1 (D73). Frozen means a bump is a
+compatibility statement needing Alexa's word, not that neither moves again —
+M11 is the first to spend one, `PROTOCOL_VERSION` to 2 (D148), while
+`RECORD_VERSION` stays at 1 because every field it adds is defaulted and a
+record already on the live state root reads unchanged.
 
 ### M17 — The owner's PC joins (`m17-pc-runner`)
 The second machine, and the one with the hard conditions. Runner on WSL2: a

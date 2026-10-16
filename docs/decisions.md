@@ -5235,7 +5235,7 @@ this: the manifest outlives the bytes.** `job.json` keeps every file's path,
 length and sha256 — kilobytes, so there is never a reason to delete it — and
 retention removes only the bytes. So `herdctl wait <id> --outputs-to <dir>`
 on an evicted job answers *12 files, 338 MiB, removed 2026-10-30 under the
-200 GiB output budget*, with the names. It never returns an empty directory
+200 GB output budget*, with the names. It never returns an empty directory
 and never returns a short one, and the same shape answers the runner that
 never came back: *4 of 12 files never arrived; `pc` has not been seen since
 …*. **A record that had files says so for as long as the record exists.**
@@ -5251,7 +5251,7 @@ input to future work, genuinely runner-to-runner, with D10's keeper, its
 named no-reachable-holder state, and per-runner budgets. So M12 carries
 custody of packs, GC of runner disks, and the hub's own output budget, and
 carries no custody of records at all.
-
+**The frame cost: yes, this needs version 2, and version 2 is approved.**
 **The frame cost: yes, this needs version 2.** Plainly, with no dodge
 available. It needs new variants on both enums — `ToHub` for a runner
 announcing a file and sending its bytes, `FromHub` for the hub telling a
@@ -5288,22 +5288,33 @@ moving the log cap upward. Each is derived from what one party can hold in
 memory at once, and a new carriage beside them changes none of those
 derivations.
 
-**Two things for Alexa, each with a recommendation.**
+**Two rulings from Alexa, both taken on 2026-10-16, both decided rather
+than deferred.**
 
-1. **The protocol break itself**, which CLAUDE.md makes his.
-   *Recommended: approve it for M11, bundling 1 and 2 above.* The cost is
-   that the hub and both runners restart together and `herdctl` is rebuilt;
-   the version refusal already names both numbers (E-51), so a stale peer is
-   told rather than broken.
-2. **The hub's output budget, in gigabytes.** *Recommended: ask the consumer
-   for jobs per day times typical output size before setting it, and until
-   they answer run a figure that is printed as the placeholder it is.* This
-   is the one number in this design that is a guess, and D138's lesson is
-   precisely that a cap reasoned from what somebody wants rather than from
-   what a mechanism can carry is how the last two went wrong. A few hundred
-   MB times hundreds of jobs a day is tens of GB a day, and whether that is
-   five such jobs or five hundred is the difference between a 50 GiB budget
-   and an unservable one.
+1. **`PROTOCOL_VERSION` moves to 2, approved for M11**, bundled exactly as
+   recommended: this entry's file frames, M11's registry frames, and the
+   catch-all arm. He accepts that the hub and both runners restart together
+   and that `herdctl` is rebuilt. The version refusal already names both
+   numbers (E-51), so a stale peer is told rather than broken, and that
+   property is asserted rather than assumed.
+2. **The hub's output budget is 200 GB, with the seven-day floor above.**
+   He chose the figure rather than wait for the consumer's, and it is to be
+   adjusted when they send jobs per day times typical output size.
+
+**The budget is a chosen number and must never read as a derived one.**
+200 GB is not computed from anything: no measurement produced it, and the
+arithmetic that would — a few hundred MB times the number of jobs a day
+that really leave that much — needs a figure only the consumer has. **The
+one measurement that would change it** is their distribution of output size
+per job per day; at five such jobs a day 200 GB is months of headroom, at
+five hundred it is under two days and the floor breaks every day. Every
+other figure in this design is derived from what a mechanism can carry —
+`FRAME_CEILING` from what one party can hold in memory, the 32 MiB inline
+threshold from base64 against that ceiling — and this one is not, which is
+why it sits in its own paragraph instead of beside them. D138's lesson is
+not "never choose": it is that a chosen number must not wear a derived
+number's clothes, because whoever reasons from it next will reason from the
+clothes.
 
 **What is unproven, so this entry does not overstate.** No byte of a few
 hundred MB has gone through the hub; the log path has now carried 56 MiB end
@@ -5343,7 +5354,8 @@ which is the one change D128 leaves the number alone for. 8 MiB and not
 this — and because D138's real objection to a big frame was never the
 ceiling but the event loop.
 
-This is also the first slice of the design above, and the only one that is
-genuinely separable: the hub learning to hand a requester large record
-content in bounded pieces, proved on bytes, with nothing of the transfer
-presupposed.
+It is also the one slice of this design that was separable **without the
+protocol move**, which is why it went to `main` on its own (PR #37) instead
+of waiting here: the first consumer has removed their fallback, so a fix
+they get without redeploying anything is worth more than a tidy one they do
+not. Everything else above needs version 2 and lands together.
