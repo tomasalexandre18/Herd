@@ -2343,7 +2343,7 @@ fn settle_readings(state: &State, unfinished: &[JobRecord]) -> Result<bool> {
                     // Still going. The job waits, and the pass says so.
                     continue;
                 };
-                if !matches!(outcome, JobOutcome::Exited { code: 0 }) {
+                if !outcome.is_success() {
                     // D74's second limit: a reading that exits non-zero, or
                     // that its cap stopped, refuses the job. Both arrive
                     // here, and the sentence says which it was in the words a
@@ -2530,12 +2530,12 @@ fn parent_of(state: &State, record: &JobRecord, unfinished: &[JobRecord]) -> mat
         return matcher::Parent::Gone { id: parent_id };
     };
     match &parent.state {
-        JobState::Finished { outcome } => match outcome {
-            JobOutcome::Exited { code: 0 } => matcher::Parent::Succeeded { id: parent_id },
-            other => matcher::Parent::DidNot {
-                id: parent_id,
-                how: how_it_ended(other),
-            },
+        JobState::Finished { outcome } if outcome.is_success() => {
+            matcher::Parent::Succeeded { id: parent_id }
+        }
+        JobState::Finished { outcome } => matcher::Parent::DidNot {
+            id: parent_id,
+            how: how_it_ended(outcome),
         },
         state => matcher::Parent::NotYet {
             id: parent_id,
@@ -3680,6 +3680,17 @@ fn files_may_land(
              file of it"
         ));
     }
+    // A collection the sweeper has taken is not one this hub will take
+    // back (D152). A runner redialling with a spool of something that was
+    // evicted while it was away would otherwise refill the disk the sweep
+    // had just freed, and the sweep would take it again on the next
+    // verdict: two correct mechanisms in a loop.
+    if let Some(removed) = &record.outputs.removed {
+        return Err(format!(
+            "{job_id}'s collection was {}, so this hub will not write it again",
+            removed.why
+        ));
+    }
     let Some(ran) = record.attempts.last() else {
         return Err(format!(
             "{job_id} has no attempt that could have produced files"
@@ -3730,6 +3741,15 @@ fn send_the_files(state: &State, job_id: &JobId, paths: &[String], outbox: &Outb
         }
     };
     let coming = owed.is_some();
+    // **Why the bytes are gone, when they are gone on purpose** (D152). The
+    // sweeper writes one sentence on the record, with the date and the
+    // budget in it, and this is where a requester reads it: "not on this
+    // hub's disk" is true of an evicted collection and useless, because the
+    // reader's next question is whether Herd lost it.
+    let removed = match state.store.job(job_id) {
+        Ok(Some(record)) => record.outputs.removed.map(|removed| removed.why),
+        _ => None,
+    };
     let held_of = |path: &str| -> u64 {
         owed.as_ref()
             .and_then(|owed| owed.held.iter().find(|file| file.path == path))
@@ -3737,6 +3757,7 @@ fn send_the_files(state: &State, job_id: &JobId, paths: &[String], outbox: &Outb
             .unwrap_or(0)
     };
     let mut absent = Vec::new();
+    let mut sent = 0usize;
     for file in &manifest.files {
         // An empty `paths` means the whole collection; anything else is a
         // requester saying what it is missing, which is how a `--outputs-to`
@@ -3756,18 +3777,34 @@ fn send_the_files(state: &State, job_id: &JobId, paths: &[String], outbox: &Outb
             continue;
         }
         match send_one_file(state, job_id, &file.path, outbox) {
-            Ok(()) => {}
+            Ok(()) => sent += 1,
             Err(why) => absent.push(herd_proto::AbsentFile {
                 path: file.path.clone(),
                 len: file.len,
-                why: if coming {
-                    "its runner has not finished sending it to this hub yet".to_owned()
-                } else {
-                    why
+                why: match (&removed, coming) {
+                    (Some(removed), _) => removed.clone(),
+                    (None, true) => {
+                        "its runner has not finished sending it to this hub yet".to_owned()
+                    }
+                    (None, false) => why,
                 },
                 held: held_of(&file.path),
-                still_coming: coming,
+                // Never: the sweeper is the one absence that is final by
+                // construction, and telling a requester to wait for it
+                // would be thirty seconds of silence and then a worse
+                // sentence (D150's stall bound).
+                still_coming: coming && removed.is_none(),
             }),
+        }
+    }
+    // **Somebody has now read this collection** (D152). Written once ever,
+    // and only when bytes really went: a `--outputs-to` polls while a
+    // transfer crosses, and a round that handed over nothing is not a read.
+    // The sweeper keeps a collection nobody has opened longer than one
+    // that has been, so this figure decides what survives.
+    if sent > 0 {
+        if let Err(error) = state.store.note_outputs_fetched(job_id) {
+            eprintln!("herd-hub: {job_id} was fetched and the record will not say so: {error}");
         }
     }
     let _ = outbox.send(FromHub::JobFilesSent {
@@ -5865,6 +5902,15 @@ mod tests {
         }
         fn collections_owed(&self) -> StoreResult<Vec<crate::job::CollectionOwed>> {
             self.inner.collections_owed()
+        }
+        fn output_budget(&self) -> crate::job::Budget {
+            self.inner.output_budget()
+        }
+        fn note_outputs_fetched(&self, id: &JobId) -> StoreResult<()> {
+            self.inner.note_outputs_fetched(id)
+        }
+        fn sweep_outputs(&self) -> StoreResult<crate::job::Sweep> {
+            self.inner.sweep_outputs()
         }
         fn read_output_chunk(
             &self,

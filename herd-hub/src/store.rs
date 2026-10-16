@@ -92,6 +92,21 @@ const KEPT_FILES_DIR: &str = "files";
 /// `files/`, after its digest has been checked, and until then it is in here
 /// where nothing looks for it.
 const OUTPUT_PARTS_DIR: &str = "files.part";
+/// Where a collection the sweeper has taken waits while it is unlinked
+/// (D152).
+///
+/// **D8's discipline, run backwards.** A write becomes visible by one
+/// rename; a removal becomes invisible by one too. `remove_dir_all` over a
+/// collection of several hundred files is not instantaneous on a loaded
+/// host, and a reader arriving halfway through it would find a directory
+/// holding four of twelve files with nothing saying so — a short collection
+/// that reads like a whole one, which is the one failure this whole design
+/// refuses. So `files/` is renamed here first, which is atomic, and the
+/// unlinking happens afterwards with no lock held and nothing looking.
+///
+/// A directory of this name left behind is a hub that stopped mid-eviction.
+/// The next sweep removes it, and the first sweep runs at startup.
+const OUTPUT_GONE_DIR: &str = "files.gone";
 const LOCK_FILE: &str = "hub.lock";
 /// Where the answers of `labels_from` readings are kept, by their (commit,
 /// command, args) key (D74). Derived, like the index: an answer that cannot be
@@ -110,6 +125,9 @@ const ID_DIGITS: usize = 10;
 #[derive(Debug)]
 pub struct JobDirStore {
     root: PathBuf,
+    /// How much room a job's output files have here, and how long a fresh
+    /// collection is promised (D148, D152).
+    budget: crate::job::Budget,
     /// Who this state root is: minted when the root is created, kept in
     /// `store.json`, never changed afterwards.
     state_root_id: String,
@@ -168,6 +186,25 @@ struct Live {
     /// at recovery and never added to afterwards: what quarantines a record is
     /// a judgement about rules that do not change while the hub runs.
     quarantined: BTreeMap<JobId, String>,
+    /// Roughly how many bytes of whole collections this hub holds (D152).
+    ///
+    /// **A trigger, not an answer.** It says when it is worth looking, and
+    /// the looking is what decides anything: every sweep walks
+    /// `jobs/*/files` and overwrites this with what it measured. So the
+    /// figure may drift — a part file thrown away for a bad digest, a
+    /// directory an operator removed by hand — and the drift costs a sweep
+    /// that runs a little early or a little late, never a collection
+    /// deleted on a number nobody checked. That is the whole reason the
+    /// expensive, authoritative thing is on the rare path and the cheap,
+    /// fallible thing is on the common one.
+    held_bytes: u64,
+    /// Whether this hub has already said it is over budget with nothing it
+    /// may remove. Cleared the moment a sweep comes back inside it.
+    said_over_budget: bool,
+    /// Whether a sweep is already walking. Two collections completing
+    /// together would otherwise start two walks that reach the same verdict,
+    /// and the second would find its victims already gone.
+    sweeping: bool,
 }
 
 /// How far a job has got in its log, as the hub counts it.
@@ -290,6 +327,26 @@ impl JobDirStore {
     /// over. Otherwise it is ignored and every record is read, which is what
     /// rebuilds it.
     pub fn open(root: impl AsRef<Path>) -> Result<Self> {
+        Self::open_with(root, crate::job::Budget::default())
+    }
+
+    /// The same, with the output budget an operator set (D152).
+    ///
+    /// Separate so that every existing caller keeps the shipped figures and
+    /// a test can make 200 GB happen inside a kilobyte. The budget belongs
+    /// to the store because the sweeper does: the bytes it governs are this
+    /// store's own files, written under this store's one lock and through
+    /// the one writer D8 describes.
+    ///
+    /// **It sweeps once before it answers.** A hub restarted onto a volume
+    /// that is already over budget — because the figure was lowered, or
+    /// because the hub was down while a disk filled — has to come back
+    /// inside it before it accepts the next job, not at the next verdict:
+    /// waiting for the next job means the disk is full when the next job
+    /// arrives, which is the outage this whole mechanism exists to prevent.
+    /// It is also what establishes the running total the sweeper is later
+    /// triggered by, and what clears any `files.gone` a crash left behind.
+    pub fn open_with(root: impl AsRef<Path>, budget: crate::job::Budget) -> Result<Self> {
         let root = root.as_ref().to_path_buf();
         durable::create_dir_all(&root)
             .map_err(|error| failed("creating the state root", &root, &error))?;
@@ -359,6 +416,7 @@ impl JobDirStore {
         let answers = read_the_readings(&root);
         let store = Self {
             root,
+            budget,
             state_root_id,
             _lock: lock,
             roster,
@@ -370,9 +428,15 @@ impl JobDirStore {
                 log_chunks: HashMap::new(),
                 readings: answers,
                 quarantined: BTreeMap::new(),
+                held_bytes: 0,
+                said_over_budget: false,
+                sweeping: false,
             }),
         };
         store.recover()?;
+        // The first sweep, which is also the first measurement: see the
+        // paragraph above.
+        JobStore::sweep_outputs(&store)?;
         Ok(store)
     }
 
@@ -449,6 +513,332 @@ impl JobDirStore {
             .files
             .iter()
             .all(|file| file_length(&kept.join(&file.path)) == Some(file.bytes))
+    }
+
+    /// Add bytes that have just become whole to the running total, and sweep
+    /// if that has put the hub over its budget (D152).
+    ///
+    /// **The one trigger, and it is an event rather than a clock.** The only
+    /// thing that can put a hub over its output budget is a collection
+    /// arriving, so a timer would be a second writer waking up on a quiet
+    /// hub to find nothing to do — and a walk of the whole store on every
+    /// verdict would be the same work done for the ninety-nine verdicts that
+    /// changed nothing. Nothing is removed for merely being old: the floor
+    /// is a floor, not a lifetime.
+    ///
+    /// Called with no lock held, because the sweep takes its own.
+    fn held_more(&self, bytes: u64) -> Result<()> {
+        let over = {
+            let mut live = self.lock()?;
+            live.held_bytes = live.held_bytes.saturating_add(bytes);
+            live.held_bytes > self.budget.bytes
+        };
+        if over {
+            JobStore::sweep_outputs(self)?;
+        }
+        Ok(())
+    }
+
+    /// Take one job's output bytes, with the record saying so first.
+    ///
+    /// Everything that makes this safe is the order of four steps:
+    ///
+    /// 1. the record is **re-read under the lock**, because the sweep's walk
+    ///    is deliberately unlocked and a collection can have been written,
+    ///    fetched or already evicted since it was measured;
+    /// 2. `files/` is **renamed** to [`OUTPUT_GONE_DIR`], which is atomic,
+    ///    so the collection stops being half-there the instant it stops
+    ///    being there;
+    /// 3. the record is written and the job's own history gets its line —
+    ///    the manifest is untouched, so every path, length and digest
+    ///    outlives the bytes exactly as D148 promised;
+    /// 4. the unlinking happens **with no lock held**, because several
+    ///    hundred `unlink` calls on a loaded host is the one part of this
+    ///    that takes real time, and nothing is waiting on it.
+    ///
+    /// `None` when the record has changed under the walk and this is no
+    /// longer a collection the sweeper may take. That is a skip and not an
+    /// error: the next sweep will look again.
+    fn evict(&self, id: &JobId, why: &str) -> Result<Option<u64>> {
+        let dir = self.job_dir(id);
+        let kept = dir.join(KEPT_FILES_DIR);
+        let gone = dir.join(OUTPUT_GONE_DIR);
+        let bytes = {
+            let mut live = self.lock()?;
+            let Some(mut record) = self.read_record(id)? else {
+                return Ok(None);
+            };
+            if !record.state.is_terminal()
+                || record.outputs.removed.is_some()
+                || record.outputs.files.is_empty()
+                || !self.collection_is_whole(id, &record)
+            {
+                return Ok(None);
+            }
+            let bytes = directory_bytes(&kept);
+            fs::rename(&kept, &gone).map_err(|error| failed("renaming", &kept, &error))?;
+            // `files/` exists in every job directory and has since M2, so it
+            // is put back empty rather than left missing: a reader of the
+            // record's directory sees the shape it has always had, with
+            // nothing in it, and the record says why.
+            durable::create_dir(&kept).map_err(|error| failed("creating", &kept, &error))?;
+            let at = Timestamp::now();
+            let files = record.outputs.files.len();
+            record.outputs.removed = Some(crate::job::OutputsRemoved {
+                at,
+                why: why.to_owned(),
+                bytes,
+            });
+            self.write_record(&record)?;
+            self.append_event(id, &JobEvent::outputs_removed(at, files, bytes, why))?;
+            live.held_bytes = live.held_bytes.saturating_sub(bytes);
+            bytes
+        };
+        remove_tree(&gone)?;
+        Ok(Some(bytes))
+    }
+
+    /// One sweep, with the one-at-a-time flag already taken.
+    ///
+    /// ## What it walks, and when
+    ///
+    /// `jobs/*/files` and nothing else — one `read_dir` per job directory,
+    /// and a record read only for a job that actually holds bytes. A hub
+    /// inside its budget reads **no records at all**: it measures, finds
+    /// nothing to do, writes the figure down and stops. That is what makes
+    /// the walk affordable on the rare path and the running total enough on
+    /// the common one.
+    ///
+    /// ## The order, which is the whole decision (D152)
+    ///
+    /// Four keys, and the first of them outranks the other three:
+    ///
+    /// 1. **outside the floor before inside it.** Seven days is a promise,
+    ///    so nothing inside it goes while anything outside it remains.
+    /// 2. **a job that passed before a job that did not.** The consumer's
+    ///    own sentence is *"results.json alone is not enough to diagnose a
+    ///    red test"* — the artefacts of a green run are the ones nobody ever
+    ///    opens, and the artefacts of a red one are the reason this whole
+    ///    mechanism exists.
+    /// 3. **fetched before never fetched.** This is where the obvious cache
+    ///    answer is backwards: an LRU evicts what nothing has touched, and
+    ///    here a collection nobody has fetched is evidence **nobody has
+    ///    seen**, while one a requester read yesterday is already on that
+    ///    requester's disk.
+    /// 4. **oldest first**, which is only the tie-break. On its own it would
+    ///    delete last week's one red test to keep this morning's thousand
+    ///    green ones, which is the wrong thousand bytes every time.
+    ///
+    /// A collection still arriving is never a candidate under any of them:
+    /// its bytes are the writer's, and taking them would destroy the thing
+    /// the hub is in the middle of being given. The collection that
+    /// *triggered* the sweep is a candidate once it is whole, and it is the
+    /// last of its rank — so a hub whose budget is smaller than one
+    /// collection takes that collection back the moment it completes,
+    /// records why, and tells its requester with the figures. That is
+    /// pathological at 200 GB and it is still the honest behaviour: the
+    /// budget is a fact about a disk, and a collection that will not fit
+    /// does not fit.
+    fn sweep_now(&self) -> Result<crate::job::Sweep> {
+        let jobs_dir = self.jobs_dir();
+        let names =
+            durable::names_in(&jobs_dir).map_err(|error| failed("listing", &jobs_dir, &error))?;
+        let mut held = 0u64;
+        let mut holders: Vec<(JobId, u64)> = Vec::new();
+        let mut leftovers: Vec<PathBuf> = Vec::new();
+        for name in names {
+            if sequence_of(&name).is_none() {
+                continue;
+            }
+            let dir = jobs_dir.join(&name);
+            let gone = dir.join(OUTPUT_GONE_DIR);
+            if gone.is_dir() {
+                // A hub that stopped mid-eviction. The bytes are already
+                // unreachable from `files/`, so they are nobody's evidence
+                // any more — only disk to give back.
+                leftovers.push(gone);
+            }
+            let bytes = directory_bytes(&dir.join(KEPT_FILES_DIR));
+            if bytes == 0 {
+                continue;
+            }
+            held += bytes;
+            holders.push((JobId::new(name), bytes));
+        }
+        for gone in &leftovers {
+            remove_tree(gone)?;
+        }
+        {
+            let mut live = self.lock()?;
+            live.held_bytes = held;
+        }
+        let budget = self.budget.bytes;
+        if held <= budget {
+            let swept = crate::job::Sweep {
+                held,
+                ..crate::job::Sweep::default()
+            };
+            self.say_what_the_sweep_did(&swept)?;
+            return Ok(swept);
+        }
+
+        // Over budget, so the records are worth reading: this is the rare
+        // path, and everything below it is about choosing well rather than
+        // choosing fast.
+        let now = Timestamp::now();
+        struct Candidate {
+            id: JobId,
+            inside_the_floor: bool,
+            /// Sorted on, so the field names what the order means rather
+            /// than what it is: `true` goes first.
+            passed: bool,
+            fetched: bool,
+            ended_at: Timestamp,
+        }
+        let mut candidates = Vec::new();
+        let mut could_not_free = 0u64;
+        for (id, bytes) in holders {
+            let Ok(Some(record)) = self.read_record(&id) else {
+                // A record that will not read is a louder problem than this
+                // and recovery says so where it belongs (D52). What it is
+                // not is a licence to delete the files it describes.
+                could_not_free += bytes;
+                continue;
+            };
+            let JobState::Finished { outcome } = &record.state else {
+                could_not_free += bytes;
+                continue;
+            };
+            if record.outputs.removed.is_some() || !self.collection_is_whole(&id, &record) {
+                could_not_free += bytes;
+                continue;
+            }
+            // The bytes this job holds are measured again inside `evict`,
+            // under the lock, because the walk is deliberately unlocked:
+            // the figure that decides how far the loop below goes has to be
+            // the one the rename actually freed, not the one a walk saw a
+            // moment earlier — so this candidate carries no size at all.
+            candidates.push(Candidate {
+                inside_the_floor: now.since(record.updated_at) < self.budget.floor,
+                passed: outcome.is_success(),
+                fetched: record.outputs.first_fetched_at.is_some(),
+                ended_at: record.updated_at,
+                id,
+            });
+        }
+        candidates.sort_by(|a, b| {
+            (a.inside_the_floor, !a.passed, !a.fetched, a.ended_at).cmp(&(
+                b.inside_the_floor,
+                !b.passed,
+                !b.fetched,
+                b.ended_at,
+            ))
+        });
+
+        let mut swept = crate::job::Sweep {
+            held,
+            could_not_free,
+            ..crate::job::Sweep::default()
+        };
+        for candidate in candidates {
+            if swept.held <= budget {
+                break;
+            }
+            let why = self.removal_sentence(now, candidate.inside_the_floor, candidate.ended_at);
+            let Some(freed) = self.evict(&candidate.id, &why)? else {
+                continue;
+            };
+            swept.held = swept.held.saturating_sub(freed);
+            swept.freed += freed;
+            swept.removed.push(candidate.id);
+            if candidate.inside_the_floor {
+                swept.inside_the_floor += 1;
+            }
+        }
+        self.say_what_the_sweep_did(&swept)?;
+        Ok(swept)
+    }
+
+    /// The sentence a requester is handed for a collection that is gone.
+    ///
+    /// **It names the figures, every time.** *"Removed"* with no date and no
+    /// budget is the one report nobody can act on, and a quiet retention
+    /// policy is a trap: the next thing that happens after evidence
+    /// disappears without a reason is somebody concluding Herd lost it.
+    fn removal_sentence(
+        &self,
+        at: Timestamp,
+        inside_the_floor: bool,
+        ended_at: Timestamp,
+    ) -> String {
+        let budget = herd_proto::show_bytes(self.budget.bytes);
+        if !inside_the_floor {
+            return format!("removed {} under the {budget} output budget", at.date());
+        }
+        format!(
+            "removed {} under the {budget} output budget, {} old and so inside this hub's \
+             {} floor: the fleet produced more than the budget in less than the floor, \
+             and the budget is what the disk enforces",
+            at.date(),
+            crate::job::in_days(at.since(ended_at)),
+            crate::job::in_days(self.budget.floor),
+        )
+    }
+
+    /// One line per sweep, never one per collection (D151).
+    ///
+    /// A sweep that frees fifty collections is one event an operator reads
+    /// once, not fifty journal writes onto a host that is already short of
+    /// IO — which is precisely the defect D151 spent a day on, on both sides
+    /// of the link. What is per-collection is the **record**: each evicted
+    /// job's own `job.json` and `events.jsonl` say what went and why, for
+    /// ever, which is where the answer to "what happened to this job's
+    /// screenshots" belongs a week later.
+    fn say_what_the_sweep_did(&self, swept: &crate::job::Sweep) -> Result<()> {
+        let budget = herd_proto::show_bytes(self.budget.bytes);
+        let floor = crate::job::in_days(self.budget.floor);
+        if !swept.is_quiet() {
+            println!(
+                "herd-hub: the output sweeper removed {} collection(s), {}, to stay inside \
+                 the {budget} budget; {} held now. Every one of those records still names \
+                 every file it had, with its size and digest.",
+                swept.removed.len(),
+                herd_proto::show_bytes(swept.freed),
+                herd_proto::show_bytes(swept.held),
+            );
+        }
+        if swept.inside_the_floor > 0 {
+            eprintln!(
+                "herd-hub: {} of those collection(s) were still inside this hub's {floor} \
+                 retention floor. {floor} is what this hub promises unless the fleet \
+                 produces more than the {budget} budget in less than that — it just did, \
+                 and the budget is what the disk enforces. Raise --output-budget, or \
+                 expect this again.",
+                swept.inside_the_floor,
+            );
+        }
+        // **Said once per episode, not once per sweep** (D151). A hub that
+        // is over budget with nothing it may remove is triggered again by
+        // every file that lands, and a line each time would be the
+        // per-frame-line defect in a new place. The flag is cleared the
+        // moment a sweep comes back inside the budget, so a second episode
+        // is a second line — which is right, because it is news again.
+        let over = swept.held > self.budget.bytes;
+        let mut live = self.lock()?;
+        if over && !live.said_over_budget {
+            live.said_over_budget = true;
+            eprintln!(
+                "herd-hub: {} of job output is held against a {budget} budget and nothing \
+                 more may be removed: {} of it belongs to collections that are still \
+                 arriving or whose records will not read, and a transfer in flight is \
+                 never taken. The volume will stay over budget until those finish.",
+                herd_proto::show_bytes(swept.held),
+                herd_proto::show_bytes(swept.could_not_free),
+            );
+        } else if !over {
+            live.said_over_budget = false;
+        }
+        Ok(())
     }
 
     fn collection_state(&self, id: &JobId, record: &JobRecord) -> crate::job::ChunkLanded {
@@ -1279,64 +1669,82 @@ impl JobStore for JobDirStore {
     /// file is on the disk, so a reader of `job.json` never finds a path that
     /// is not there. The reverse would publish a promise before its contents.
     fn record_outputs(&self, id: &JobId, outputs: &herd_proto::JobOutputs) -> Result<()> {
-        let (_live, mut record) = self.open_for_writing(id)?;
-        let kept = self.job_dir(id).join(KEPT_FILES_DIR);
-        let mut summary = crate::job::OutputSummary {
-            files: Vec::new(),
-            refused: outputs.refused.clone(),
-            skipped: outputs.skipped.clone(),
-            streamed: outputs.streamed,
-        };
-        for file in &outputs.files {
-            // Asked before the string is joined onto anything. A walk on a
-            // runner cannot produce `..`, but this is not a walk — it is a
-            // path a peer sent — and the hub must never find that out by
-            // writing outside the job's own directory (D131).
-            let relative = match file.relative_path() {
-                Ok(relative) => relative,
-                Err(why) => {
+        // The manifest and the inline bytes, in one scope, so that the lock
+        // is given back before the sweeper is told about the bytes: it takes
+        // the lock itself, and it must never be able to run against a record
+        // this call has not finished writing (D152).
+        let landed = {
+            let (_live, mut record) = self.open_for_writing(id)?;
+            let kept = self.job_dir(id).join(KEPT_FILES_DIR);
+            let mut landed = 0u64;
+            let mut summary = crate::job::OutputSummary {
+                files: Vec::new(),
+                refused: outputs.refused.clone(),
+                skipped: outputs.skipped.clone(),
+                streamed: outputs.streamed,
+                // A verdict being recorded is a collection that has not been
+                // fetched and has not been swept, whatever was on the record
+                // before: these two are the sweeper's, and the sweeper has not
+                // seen this job yet.
+                first_fetched_at: None,
+                removed: None,
+            };
+            for file in &outputs.files {
+                // Asked before the string is joined onto anything. A walk on a
+                // runner cannot produce `..`, but this is not a walk — it is a
+                // path a peer sent — and the hub must never find that out by
+                // writing outside the job's own directory (D131).
+                let relative = match file.relative_path() {
+                    Ok(relative) => relative,
+                    Err(why) => {
+                        summary
+                            .skipped
+                            .push(format!("a path this hub will not write: {why}"));
+                        continue;
+                    }
+                };
+                // The bytes on this frame have to be the file the manifest beside
+                // them describes. A length and a digest that nobody compares are
+                // worth nothing, and the comparison is cheap next to the write.
+                if let Some(why) = file.disagreement() {
                     summary
                         .skipped
-                        .push(format!("a path this hub will not write: {why}"));
+                        .push(format!("a frame this hub will not believe: {why}"));
                     continue;
                 }
-            };
-            // The bytes on this frame have to be the file the manifest beside
-            // them describes. A length and a digest that nobody compares are
-            // worth nothing, and the comparison is cheap next to the write.
-            if let Some(why) = file.disagreement() {
-                summary
-                    .skipped
-                    .push(format!("a frame this hub will not believe: {why}"));
-                continue;
+                // **The manifest first, the bytes if they are here.** A streamed
+                // collection's verdict carries every path, length and digest and
+                // none of the data: the entry is written down now, so a record is
+                // complete about what the job produced from the moment the
+                // verdict lands, and the bytes fill in behind it (D148). What a
+                // reader of `job.json` must never find is a path that is not
+                // there *and* no way to tell why — which is why the entry and
+                // the file's absence are both readable rather than one being
+                // inferred from the other.
+                summary.files.push(crate::job::KeptFile {
+                    path: file.path.clone(),
+                    bytes: file.len,
+                    sha256: file.sha256.clone(),
+                });
+                let Some(data) = &file.data else {
+                    continue;
+                };
+                let path = kept.join(&relative);
+                if let Some(parent) = path.parent() {
+                    durable::create_dir_all(parent)
+                        .map_err(|error| failed("creating", parent, &error))?;
+                }
+                durable::write_file(&path, data)
+                    .map_err(|error| failed("writing", &path, &error))?;
+                landed += data.len() as u64;
             }
-            // **The manifest first, the bytes if they are here.** A streamed
-            // collection's verdict carries every path, length and digest and
-            // none of the data: the entry is written down now, so a record is
-            // complete about what the job produced from the moment the
-            // verdict lands, and the bytes fill in behind it (D148). What a
-            // reader of `job.json` must never find is a path that is not
-            // there *and* no way to tell why — which is why the entry and
-            // the file's absence are both readable rather than one being
-            // inferred from the other.
-            summary.files.push(crate::job::KeptFile {
-                path: file.path.clone(),
-                bytes: file.len,
-                sha256: file.sha256.clone(),
-            });
-            let Some(data) = &file.data else {
-                continue;
-            };
-            let path = kept.join(&relative);
-            if let Some(parent) = path.parent() {
-                durable::create_dir_all(parent)
-                    .map_err(|error| failed("creating", parent, &error))?;
-            }
-            durable::write_file(&path, data).map_err(|error| failed("writing", &path, &error))?;
-        }
-        summary.skipped.sort();
-        record.outputs = summary;
-        self.write_record(&record)
+            summary.skipped.sort();
+            record.outputs = summary;
+            self.write_record(&record)?;
+            landed
+        };
+        self.held_more(landed)?;
+        Ok(())
     }
 
     fn job_outputs(&self, id: &JobId, with_bytes: bool) -> Result<herd_proto::JobOutputs> {
@@ -1484,7 +1892,14 @@ impl JobStore for JobDirStore {
         if let Some(parent) = whole.parent() {
             durable::sync_dir(parent).map_err(|error| failed("syncing", parent, &error))?;
         }
-        Ok(self.collection_state(id, &record))
+        let landed = self.collection_state(id, &record);
+        // **Counted at the rename and not at the chunk**, so the running
+        // total and the sweeper's own walk measure the same thing: whole,
+        // verified files in `files/`. Part-written bytes are a transfer in
+        // flight — real on the disk, outside the budget, and never evicted
+        // (see [`crate::job::Budget::bytes`]).
+        self.held_more(entry.bytes)?;
+        Ok(landed)
     }
 
     fn output_holdings(&self, id: &JobId) -> Result<Vec<herd_proto::FileHeld>> {
@@ -1899,6 +2314,46 @@ impl JobStore for JobDirStore {
         Ok(records)
     }
 
+    fn output_budget(&self) -> crate::job::Budget {
+        self.budget
+    }
+
+    fn note_outputs_fetched(&self, id: &JobId) -> Result<()> {
+        let _live = self.lock()?;
+        let Some(mut record) = self.read_record(id)? else {
+            return Ok(());
+        };
+        if record.outputs.files.is_empty() || record.outputs.first_fetched_at.is_some() {
+            return Ok(());
+        }
+        // **Not through `open_for_writing`**, and that is deliberate. The
+        // one gate refuses every write to a job that is over, because a late
+        // frame about a finished job is a mistake. This is not a frame about
+        // the job: it is the hub writing down something that can only ever
+        // happen *after* the job is over, about the record's own files and
+        // nothing else. The state, the outcome, the metrics and the manifest
+        // are untouched here, which is what keeps that gate meaning what it
+        // means — the same licence `write_output_chunk` already takes, for
+        // the same reason (D148, D152).
+        record.outputs.first_fetched_at = Some(Timestamp::now());
+        self.write_record(&record)
+    }
+
+    fn sweep_outputs(&self) -> Result<crate::job::Sweep> {
+        {
+            let mut live = self.lock()?;
+            if live.sweeping {
+                return Ok(crate::job::Sweep::default());
+            }
+            live.sweeping = true;
+        }
+        let swept = self.sweep_now();
+        if let Ok(mut live) = self.lock() {
+            live.sweeping = false;
+        }
+        swept
+    }
+
     fn collections_owed(&self) -> Result<Vec<crate::job::CollectionOwed>> {
         let mut owed = Vec::new();
         // A scan of the job directories, like the one that rebuilds the queue
@@ -1917,6 +2372,16 @@ impl JobStore for JobDirStore {
                 continue;
             };
             if !record.outputs.streamed || record.outputs.files.is_empty() {
+                continue;
+            }
+            // **A collection the sweeper took is not one anybody still owes**
+            // (D152). Without this the two mechanisms would fight: an
+            // evicted collection fails `collection_is_whole` for exactly the
+            // same reason an unfinished one does, so the hub would ask its
+            // runner to send the bytes again and sweep them again, for ever
+            // — and a requester asking for it would be told to keep waiting
+            // for something that is never coming back.
+            if record.outputs.removed.is_some() {
                 continue;
             }
             // The one definition of complete, shared with every other
@@ -2199,6 +2664,48 @@ fn write_json<T: Serialize>(path: &Path, value: &T) -> Result<()> {
 /// empty file is a real file a collection may contain, and reading its
 /// absence as "0 bytes held" would tell a runner to resume a file it had
 /// never started.
+/// Every byte under a directory, counting nothing that is not a regular
+/// file.
+///
+/// Read off the disk rather than off the manifest, because the budget is
+/// about the volume and not about what a record claims: a file the record
+/// forgot still fills the disk, and a file the record names and the disk
+/// does not have fills nothing. A directory that is not there is nought
+/// bytes and not an error — most job directories hold no output at all, and
+/// that is the common case this walk has to be cheap for.
+fn directory_bytes(path: &Path) -> u64 {
+    let Ok(entries) = fs::read_dir(path) else {
+        return 0;
+    };
+    let mut bytes = 0u64;
+    for entry in entries.flatten() {
+        let Ok(kind) = entry.file_type() else {
+            continue;
+        };
+        if kind.is_dir() {
+            bytes += directory_bytes(&entry.path());
+        } else if kind.is_file() {
+            bytes += entry.metadata().map(|meta| meta.len()).unwrap_or(0);
+        }
+    }
+    bytes
+}
+
+/// Unlink a directory and everything in it, with the path in the error.
+///
+/// A failure here is a real one and is reported: the bytes are already
+/// invisible to every reader, so nothing is *wrong* — but a sweeper that
+/// could not actually free the disk has to say so, or the next sweep finds
+/// the same figure and the operator finds a full volume with a hub that
+/// claimed to be tidying it.
+fn remove_tree(path: &Path) -> Result<()> {
+    match fs::remove_dir_all(path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(failed("removing", path, &error)),
+    }
+}
+
 fn file_length(path: &Path) -> Option<u64> {
     fs::metadata(path)
         .ok()
@@ -4362,6 +4869,509 @@ mod tests {
                 && back.skipped[0].contains("could not be read back"),
             "{:?}",
             back.skipped
+        );
+    }
+
+    // ---------------------------------------------------------------- D152
+    // The output budget and its sweeper.
+    //
+    // **These tests assert what is kept at least as hard as what goes.**
+    // Deleting a requester's evidence is irreversible, so a sweeper that
+    // evicts one collection too many is a worse defect than one that evicts
+    // none at all — and a test that only counted what was freed would pass
+    // for both.
+
+    /// A store whose budget and floor are the test's own.
+    fn store_holding(bytes: u64, floor: std::time::Duration) -> (TempDir, JobDirStore) {
+        let dir = tempfile::tempdir().expect("a temporary directory");
+        let budget = crate::job::Budget { bytes, floor };
+        let store = JobDirStore::open_with(dir.path(), budget).expect("the state root opens");
+        (dir, store)
+    }
+
+    /// A finished job holding one file of `bytes` bytes, by the inline
+    /// carriage, with the outcome the test asked for.
+    fn a_collection(store: &JobDirStore, bytes: usize, outcome: JobOutcome) -> JobId {
+        let job = a_job(store);
+        let data = vec![b'x'; bytes];
+        store
+            .record_outputs(&job.id, &collected(&[("files/results.json", &data)]))
+            .expect("kept");
+        store
+            .record_state(&job.id, JobState::Finished { outcome })
+            .expect("finished");
+        job.id
+    }
+
+    /// Whether this job's bytes are still on the disk.
+    fn bytes_are_there(dir: &TempDir, id: &JobId) -> bool {
+        dir.path()
+            .join(JOBS_DIR)
+            .join(id.as_str())
+            .join(KEPT_FILES_DIR)
+            .join("files/results.json")
+            .exists()
+    }
+
+    /// Make a record look older than it is, the way a week looks.
+    ///
+    /// Through the file, because there is no API for it and there must not
+    /// be: nothing in Herd may move a job's own moments. The floor is judged
+    /// against `updated_at`, which is when the job ended.
+    fn aged_by(dir: &TempDir, id: &JobId, how_long: std::time::Duration) {
+        let path = dir
+            .path()
+            .join(JOBS_DIR)
+            .join(id.as_str())
+            .join(RECORD_FILE);
+        let mut record: serde_json::Value =
+            serde_json::from_str(&read(&path)).expect("the record parses");
+        let was = Timestamp::now().after(std::time::Duration::ZERO);
+        let then = Timestamp::at_unix_seconds(was.unix_seconds() - how_long.as_secs() as i64);
+        record["updated_at"] = serde_json::Value::String(then.to_string());
+        fs::write(&path, serde_json::to_string(&record).expect("rewrites")).expect("written");
+    }
+
+    /// Nothing is removed while the hub is inside its budget — and nothing
+    /// is removed for being old, either.
+    ///
+    /// The floor is a floor and not a lifetime (D148): a collection from
+    /// last month is still there if there is room for it, because the only
+    /// thing that makes room worth taking is a shortage of it.
+    #[test]
+    fn a_hub_inside_its_budget_removes_nothing_however_old_the_bytes_are() {
+        let (dir, store) = store_holding(1 << 20, crate::job::OUTPUT_FLOOR);
+        let old = a_collection(&store, 1024, JobOutcome::Exited { code: 0 });
+        aged_by(&dir, &old, std::time::Duration::from_secs(400 * 24 * 3600));
+
+        let swept = store.sweep_outputs().expect("sweeps");
+        assert!(
+            swept.is_quiet(),
+            "a hub with room to spare removes nothing: {swept:?}"
+        );
+        assert!(
+            bytes_are_there(&dir, &old),
+            "a collection from last year is still evidence while there is room for it"
+        );
+        assert_eq!(swept.held, 1024, "and the sweep measured what is there");
+    }
+
+    /// **The eviction order, which is the decision D152 is about.**
+    ///
+    /// Four collections, all the same size, all outside the floor, and only
+    /// room for one. What goes is the passing job that somebody has already
+    /// read; what survives is the failing job nobody has opened. Oldest
+    /// first is the tie-break and never the rule — on its own it would have
+    /// taken the red one, which is the collection the first consumer asked
+    /// for this whole mechanism to keep.
+    #[test]
+    fn the_sweeper_takes_a_read_green_collection_before_an_unread_red_one() {
+        // No floor, so the order alone decides: the floor's own rank is the
+        // next test.
+        let (dir, store) = store_holding(4096, std::time::Duration::ZERO);
+        // Minted oldest first, so `updated_at` orders them the way they are
+        // written here — and so a pure oldest-first sweeper would take
+        // `green_read` and then `green_unread` and then `red_read`.
+        let green_read = a_collection(&store, 1024, JobOutcome::Exited { code: 0 });
+        let green_unread = a_collection(&store, 1024, JobOutcome::Exited { code: 0 });
+        let red_read = a_collection(&store, 1024, JobOutcome::Exited { code: 1 });
+        let red_unread = a_collection(&store, 1024, JobOutcome::Exited { code: 1 });
+        for fetched in [&green_read, &red_read] {
+            store.note_outputs_fetched(fetched).expect("noted");
+        }
+        // One more collection, which is what puts the hub over its budget.
+        let newcomer = a_collection(&store, 1024, JobOutcome::Exited { code: 0 });
+
+        // Recording the newcomer swept already — the budget is enforced
+        // where bytes land — so this asserts the state that left, not a
+        // sweep of its own.
+        let swept = store.sweep_outputs().expect("sweeps");
+        assert!(
+            swept.is_quiet(),
+            "the hub is back inside its budget, so a second sweep has nothing to do: \
+             {swept:?}"
+        );
+        assert!(
+            !bytes_are_there(&dir, &green_read),
+            "a passing job whose evidence has already been read goes first"
+        );
+        // And every one of these is what the sweeper had to leave alone.
+        for kept in [&green_unread, &red_read, &red_unread, &newcomer] {
+            assert!(
+                bytes_are_there(&dir, kept),
+                "{kept} must still be here: only one collection had to go, and the order \
+                 says which"
+            );
+        }
+        // The manifest of the one that went is untouched, which is the
+        // whole of "the manifest outlives the bytes" (D148).
+        let record = store
+            .job(&green_read)
+            .expect("reads")
+            .expect("the record is still there");
+        assert_eq!(
+            record.outputs.files.len(),
+            1,
+            "the record still names every file it had: {record:?}"
+        );
+        assert_eq!(record.outputs.files[0].bytes, 1024);
+        assert!(
+            !record.outputs.files[0].sha256.is_empty(),
+            "with its digest, which is what a judge re-reading it needs (E-54)"
+        );
+        let removed = record
+            .outputs
+            .removed
+            .expect("and the record says what became of the bytes");
+        assert_eq!(removed.bytes, 1024);
+        assert!(
+            removed.why.contains("removed") && removed.why.contains("4 KiB"),
+            "the sentence names the date and the budget: {}",
+            removed.why
+        );
+        assert!(
+            removed.why.contains(&Timestamp::now().date()),
+            "and the day it happened: {}",
+            removed.why
+        );
+        // The job's own history carries it too, because that is where an
+        // irreversible deletion belongs a week later (D151: the journal
+        // gets one line per *sweep*).
+        let events = store
+            .job_events(&green_read)
+            .expect("reads")
+            .expect("the job has a history");
+        let line = events
+            .iter()
+            .find_map(|event| match &event.what {
+                JobEventKind::OutputsRemoved { files, bytes, why } => Some((*files, *bytes, why)),
+                _ => None,
+            })
+            .expect("one line says the bytes went");
+        assert_eq!((line.0, line.1), (1, 1024));
+        assert_eq!(line.2, &removed.why, "the same sentence in both places");
+    }
+
+    /// Nothing inside the floor goes while anything outside it remains.
+    ///
+    /// Seven days is a promise, so it outranks every other key in the order:
+    /// a *failing* collection from last month is taken before a *passing*
+    /// one from this morning, which is the one place the outcome does not
+    /// win.
+    #[test]
+    fn the_floor_outranks_the_rest_of_the_order() {
+        let (dir, store) = store_holding(2048, crate::job::OUTPUT_FLOOR);
+        let old_red = a_collection(&store, 1024, JobOutcome::Exited { code: 1 });
+        aged_by(
+            &dir,
+            &old_red,
+            std::time::Duration::from_secs(30 * 24 * 3600),
+        );
+        let fresh_green = a_collection(&store, 1024, JobOutcome::Exited { code: 0 });
+        let newcomer = a_collection(&store, 1024, JobOutcome::Exited { code: 0 });
+
+        assert!(
+            !bytes_are_there(&dir, &old_red),
+            "a collection past the floor goes before one inside it, whatever it says"
+        );
+        assert!(
+            bytes_are_there(&dir, &fresh_green),
+            "and this morning's is kept, because the floor is what it is"
+        );
+        assert!(bytes_are_there(&dir, &newcomer));
+        let removed = store
+            .job(&old_red)
+            .expect("reads")
+            .expect("record")
+            .outputs
+            .removed
+            .expect("removed");
+        assert!(
+            !removed.why.contains("floor"),
+            "nothing was promised about this one, so the sentence does not mention the \
+             floor: {}",
+            removed.why
+        );
+    }
+
+    /// When the floor and the budget disagree, the budget wins and the hub
+    /// says so, naming both figures.
+    ///
+    /// This is the one place a quiet policy would be a trap: a floor that
+    /// broke silently is worse than no floor, because the next thing that
+    /// happens is a full disk nobody saw coming (D148).
+    #[test]
+    fn the_budget_breaks_the_floor_and_the_sentence_names_both_figures() {
+        let (dir, store) = store_holding(2048, crate::job::OUTPUT_FLOOR);
+        // Everything here is minutes old, so the floor covers all of it.
+        let first = a_collection(&store, 1024, JobOutcome::Exited { code: 0 });
+        let second = a_collection(&store, 1024, JobOutcome::Exited { code: 0 });
+        let third = a_collection(&store, 1024, JobOutcome::Exited { code: 0 });
+
+        assert!(
+            !bytes_are_there(&dir, &first),
+            "the budget is what the disk enforces, so the floor is broken rather than the \
+             volume filled"
+        );
+        assert!(bytes_are_there(&dir, &second) && bytes_are_there(&dir, &third));
+        let removed = store
+            .job(&first)
+            .expect("reads")
+            .expect("record")
+            .outputs
+            .removed
+            .expect("removed");
+        assert!(
+            removed.why.contains("floor")
+                && removed.why.contains("2 KiB")
+                && removed.why.contains("hour(s)"),
+            "the sentence names the budget, the floor and how far inside it this was: {}",
+            removed.why
+        );
+        // And the sweep reports it, which is what the hub's own line is
+        // built from.
+        let swept = store.sweep_outputs().expect("sweeps");
+        assert!(swept.is_quiet(), "there is nothing left to do: {swept:?}");
+    }
+
+    /// A collection still arriving is never taken, however far over budget
+    /// the hub is.
+    ///
+    /// Those bytes belong to the writer. Evicting them would destroy the
+    /// thing the hub is in the middle of being given — and the runner, told
+    /// nothing, would go on sending into a directory that keeps being
+    /// deleted.
+    #[test]
+    fn a_collection_still_arriving_is_never_swept() {
+        // A budget below what has already landed, so the sweeper really
+        // does go looking rather than stopping at the first measurement.
+        let (dir, store) = store_holding(4, std::time::Duration::ZERO);
+        let files: &[(&str, &[u8])] = &[
+            ("files/here.json", b"complete"),
+            ("files/coming.bin", &[b'y'; 2048]),
+        ];
+        let job = a_job(&store);
+        store
+            .record_outputs(&job.id, &announced(files))
+            .expect("the manifest lands");
+        store
+            .record_state(
+                &job.id,
+                JobState::Finished {
+                    outcome: JobOutcome::Exited { code: 0 },
+                },
+            )
+            .expect("finished");
+        // One of the two files arrives; the other never does.
+        store
+            .write_output_chunk(&job.id, "files/here.json", 0, b"complete")
+            .expect("written");
+
+        let swept = store.sweep_outputs().expect("sweeps");
+        assert!(
+            swept.is_quiet(),
+            "a half-arrived collection is not the sweeper's to take: {swept:?}"
+        );
+        assert!(
+            dir.path()
+                .join(JOBS_DIR)
+                .join(job.id.as_str())
+                .join(KEPT_FILES_DIR)
+                .join("files/here.json")
+                .exists(),
+            "and the half that did arrive is still here"
+        );
+        assert_eq!(
+            swept.could_not_free, 8,
+            "the figure is reported rather than hidden, because an operator looking at a \
+             volume that will not come down has to be able to see why: {swept:?}"
+        );
+    }
+
+    /// Eviction takes the bytes and nothing else: the log, the history and
+    /// every other field of the record are what they were.
+    #[test]
+    fn eviction_takes_the_bytes_and_leaves_the_rest_of_the_record() {
+        let (dir, store) = store_holding(1024, std::time::Duration::ZERO);
+        let job = a_job(&store);
+        store
+            .append_log(&job.id, LogStream::Stdout, 0, b"a line of output\n")
+            .expect("logged");
+        let data = vec![b'x'; 1024];
+        store
+            .record_outputs(&job.id, &collected(&[("files/results.json", &data)]))
+            .expect("kept");
+        store
+            .record_state(
+                &job.id,
+                JobState::Finished {
+                    outcome: JobOutcome::Exited { code: 0 },
+                },
+            )
+            .expect("finished");
+        let before = store.job(&job.id).expect("reads").expect("record");
+        // Something bigger arrives and the budget has to give.
+        let _newcomer = a_collection(&store, 1024, JobOutcome::Exited { code: 0 });
+
+        assert!(!bytes_are_there(&dir, &job.id), "the bytes went");
+        assert_eq!(
+            store.job_log(&job.id).expect("reads"),
+            Some(b"a line of output\n".to_vec()),
+            "the log is not output files and has a cap of its own (D137): the sweeper \
+             does not touch it"
+        );
+        let after = store.job(&job.id).expect("reads").expect("record");
+        assert_eq!(after.state, before.state, "the verdict is untouched");
+        assert_eq!(after.metrics, before.metrics);
+        assert_eq!(
+            after.outputs.files, before.outputs.files,
+            "and so is every entry of the manifest"
+        );
+        // The directory is still shaped the way every job directory has been
+        // since M2: `files/`, empty.
+        let kept = dir
+            .path()
+            .join(JOBS_DIR)
+            .join(job.id.as_str())
+            .join(KEPT_FILES_DIR);
+        assert!(
+            kept.is_dir(),
+            "files/ is put back empty, never left missing"
+        );
+        assert_eq!(
+            durable::names_in(&kept).expect("lists").len(),
+            0,
+            "and there is nothing in it"
+        );
+        assert!(
+            !dir.path()
+                .join(JOBS_DIR)
+                .join(job.id.as_str())
+                .join(OUTPUT_GONE_DIR)
+                .exists(),
+            "and nothing is left half-unlinked"
+        );
+    }
+
+    /// A collection the sweeper took is not one a runner still owes.
+    ///
+    /// Without this the two mechanisms fight: an evicted collection fails
+    /// the completeness test for the same reason an unfinished one does, so
+    /// the hub would ask for the bytes again, sweep them again, and tell a
+    /// requester to keep waiting for something that is never coming.
+    #[test]
+    fn an_evicted_collection_is_not_owed_by_anybody() {
+        let (dir, store) = store_holding(1024, std::time::Duration::ZERO);
+        let data = [b'z'; 1024];
+        let job = a_job(&store);
+        store
+            .record_outputs(&job.id, &announced(&[("files/shot.png", &data)]))
+            .expect("the manifest lands");
+        store
+            .record_state(
+                &job.id,
+                JobState::Finished {
+                    outcome: JobOutcome::Exited { code: 0 },
+                },
+            )
+            .expect("finished");
+        store
+            .write_output_chunk(&job.id, "files/shot.png", 0, &data)
+            .expect("written");
+        assert!(bytes_are_there_at(&dir, &job.id, "files/shot.png"));
+        assert!(
+            store.collections_owed().expect("reads").is_empty(),
+            "a complete collection is owed by nobody"
+        );
+
+        let _newcomer = a_collection(&store, 1024, JobOutcome::Exited { code: 0 });
+        assert!(!bytes_are_there_at(&dir, &job.id, "files/shot.png"));
+        assert!(
+            store.collections_owed().expect("reads").is_empty(),
+            "and an evicted one is owed by nobody either, or the hub would ask its runner \
+             to refill the disk the sweep just freed"
+        );
+    }
+
+    fn bytes_are_there_at(dir: &TempDir, id: &JobId, path: &str) -> bool {
+        dir.path()
+            .join(JOBS_DIR)
+            .join(id.as_str())
+            .join(KEPT_FILES_DIR)
+            .join(path)
+            .exists()
+    }
+
+    /// A hub that stopped mid-eviction gives the disk back when it starts.
+    ///
+    /// `files.gone` is the rename that makes a removal atomic; a directory
+    /// of that name on the disk is a hub that was killed between the rename
+    /// and the unlink, and its bytes are nobody's evidence any more.
+    #[test]
+    fn a_half_finished_eviction_is_finished_at_the_next_start() {
+        let dir = tempfile::tempdir().expect("a temporary directory");
+        let budget = crate::job::Budget {
+            bytes: 1 << 20,
+            floor: std::time::Duration::ZERO,
+        };
+        let gone = {
+            let store = JobDirStore::open_with(dir.path(), budget).expect("the state root opens");
+            let job = a_job(&store);
+            let left_behind = dir
+                .path()
+                .join(JOBS_DIR)
+                .join(job.id.as_str())
+                .join(OUTPUT_GONE_DIR);
+            fs::create_dir_all(&left_behind).expect("made");
+            fs::write(left_behind.join("orphan.bin"), [0u8; 4096]).expect("written");
+            left_behind
+        };
+        assert!(gone.exists(), "the fixture really left one behind");
+
+        let store = JobDirStore::open_with(dir.path(), budget).expect("the state root reopens");
+        assert!(
+            !gone.exists(),
+            "a start finishes what an eviction began, so the disk comes back"
+        );
+        assert_eq!(
+            store.sweep_outputs().expect("sweeps").held,
+            0,
+            "and those bytes were never counted as evidence"
+        );
+    }
+
+    /// A requester that has read a collection is written down once and only
+    /// once.
+    #[test]
+    fn a_fetch_is_written_down_once_and_never_again() {
+        let (_dir, store) = store_holding(1 << 20, crate::job::OUTPUT_FLOOR);
+        let id = a_collection(&store, 16, JobOutcome::Exited { code: 0 });
+        assert!(store
+            .job(&id)
+            .expect("reads")
+            .expect("record")
+            .outputs
+            .first_fetched_at
+            .is_none());
+        store.note_outputs_fetched(&id).expect("noted");
+        let first = store
+            .job(&id)
+            .expect("reads")
+            .expect("record")
+            .outputs
+            .first_fetched_at
+            .expect("written down");
+        store.note_outputs_fetched(&id).expect("noted again");
+        assert_eq!(
+            store
+                .job(&id)
+                .expect("reads")
+                .expect("record")
+                .outputs
+                .first_fetched_at,
+            Some(first),
+            "the second fetch writes nothing: what the sweeper needs is the boolean, and a \
+             record write per poll on a path that polls is what this avoids"
         );
     }
 }

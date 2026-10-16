@@ -313,3 +313,140 @@ async fn a_streamed_collection_reaches_a_requester_that_attaches_afterwards() {
         "what reached the requester is what the verdict promised"
     );
 }
+
+/// **The sweeper, end to end: a collection written, evicted, and then asked
+/// for** (D148, D152).
+///
+/// Two real jobs through a real runner, a hub whose output budget only has
+/// room for one of them, and then a late `herdctl wait --outputs-to` on the
+/// one that went. Everything about eviction that reaches a requester is
+/// here, and most of it is about what is **kept**:
+///
+/// * the second job's files are untouched, because a sweeper that freed
+///   more than it had to would be a worse defect than one that freed
+///   nothing at all;
+/// * the first job's **manifest** is whole — path, length and digest —
+///   because that is what makes an absent collection answerable instead of
+///   empty;
+/// * the answer names the figures and says `removed`, so the reader's next
+///   question is not "did Herd lose it";
+/// * the fetch writes **no file**, and the directory it was pointed at is
+///   empty rather than short;
+/// * and the job's exit code is still its own (D20): a side channel never
+///   becomes a verdict, not even when the bytes are gone.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_collection_the_sweeper_took_is_answered_with_its_figures() {
+    let Some(fixture) = Fixture::new("a_collection_the_sweeper_took_is_answered_with_its_figures")
+    else {
+        return;
+    };
+    // Room for one collection of this size and not two. Both jobs pass and
+    // neither is fetched before the sweep, so what decides between them is
+    // age — the tie-break doing its job, which is the only key two
+    // identical jobs can differ on.
+    const LEAVES: u64 = 4096;
+    let harness = Harness::with_output_budget(LEAVES + 1024).await;
+
+    for tag in ["first", "second"] {
+        let size = LEAVES.to_string();
+        let output = harness
+            .herdctl_in(
+                &fixture,
+                &[
+                    "run",
+                    "--command",
+                    ASSEMBLE,
+                    "--commit",
+                    BRANCH,
+                    "--",
+                    "--leave",
+                    RESULTS,
+                    "--leave-bytes",
+                    &size,
+                    "--verdict",
+                    "0",
+                    // Two different argument lines, so these are two jobs
+                    // and not one submission joining another (E-05): the
+                    // fixture's `dedup_key` is keyed on the arguments.
+                    "--tag",
+                    tag,
+                ],
+            )
+            .await;
+        assert_eq!(status_code(&output), 0, "{}", stderr(&output));
+    }
+    let records = harness.records();
+    assert_eq!(records.len(), 2, "two jobs ran: {records:?}");
+    let first = records[0]["id"].as_str().expect("an id").to_owned();
+    let second = records[1]["id"].as_str().expect("an id").to_owned();
+
+    // **What is kept.** The second job's bytes are where it left them.
+    let survivor = harness
+        .kept(&second, RESULTS)
+        .expect("the newer collection is untouched");
+    assert!(survivor.len() as u64 >= LEAVES, "{} bytes", survivor.len());
+
+    // **What went**, and the record that still describes it.
+    assert!(
+        harness.kept(&first, RESULTS).is_none(),
+        "the older collection's bytes made room for the newer one"
+    );
+    let record = harness.records().remove(0);
+    let manifest = record["outputs"]["files"]
+        .as_array()
+        .expect("the manifest is still there");
+    assert_eq!(
+        manifest.len(),
+        1,
+        "the manifest outlives the bytes: {record}"
+    );
+    assert!(
+        manifest[0]["bytes"].as_u64().unwrap_or(0) >= LEAVES
+            && !manifest[0]["sha256"].as_str().unwrap_or("").is_empty(),
+        "with its size and its digest: {record}"
+    );
+    let why = record["outputs"]["removed"]["why"]
+        .as_str()
+        .expect("and the record says what became of them");
+    assert!(
+        why.contains("removed") && why.contains("output budget"),
+        "naming the figures: {why}"
+    );
+
+    // **And now the question a consumer actually asks**, later, holding the
+    // job id and nothing else.
+    let into = herd_runner::testing::TempDir::new("carriage-swept");
+    let waited = harness
+        .herdctl_in(
+            &fixture,
+            &[
+                "wait",
+                &first,
+                "--outputs-to",
+                &into.path().to_string_lossy(),
+            ],
+        )
+        .await;
+    let said = stderr(&waited);
+    assert_eq!(
+        status_code(&waited),
+        0,
+        "the job passed and still passed: a side channel never becomes a verdict (D20). \
+         {said}"
+    );
+    assert!(
+        said.contains(RESULTS) && said.contains("removed") && said.contains("output budget"),
+        "the answer names the file and why it is gone, never an empty directory: {said}"
+    );
+    assert!(
+        !into.path().join(RESULTS).exists(),
+        "and nothing was invented to fill the gap"
+    );
+    // Never "still coming": a collection the sweeper took is the one
+    // absence that is final, and a requester told to wait for it would wait
+    // out the stall bound and then be told something worse (D150).
+    assert!(
+        !said.contains("stopped sending"),
+        "an evicted collection is not a transfer that stalled: {said}"
+    );
+}

@@ -744,10 +744,37 @@ impl Harness {
         .await
     }
 
+    /// The same, with the hub's output budget set by the test (D152).
+    ///
+    /// A budget a test chose rather than 200 GB, so that a real sweep can be
+    /// seen taking a real collection without a fleet writing two hundred
+    /// gigabytes — and with **no floor**, which is the ordinary case: the
+    /// floor only decides whether an eviction is also news.
+    pub async fn with_output_budget(bytes: u64) -> Harness {
+        Harness::with_all(
+            herd_hub::Policy::default(),
+            herd_hub::Budget {
+                bytes,
+                floor: std::time::Duration::ZERO,
+            },
+            |_| {},
+        )
+        .await
+    }
+
     /// A hub and a runner, with the hub's timing and the runner's confinement
     /// both open to the test.
     pub async fn with(
         policy: herd_hub::Policy,
+        confine: impl FnOnce(&mut herd_runner::Confinement),
+    ) -> Harness {
+        Harness::with_all(policy, herd_hub::Budget::default(), confine).await
+    }
+
+    /// The same, with the hub's output budget open to the test as well.
+    pub async fn with_all(
+        policy: herd_hub::Policy,
+        budget: herd_hub::Budget,
         confine: impl FnOnce(&mut herd_runner::Confinement),
     ) -> Harness {
         use herd_hub::{Hub, JobDirStore, JobStore};
@@ -755,7 +782,8 @@ impl Harness {
         use std::time::{Duration, Instant};
 
         let state = tempfile::tempdir().expect("a temporary state directory");
-        let store = Arc::new(JobDirStore::open(state.path()).expect("the state root opens"));
+        let store =
+            Arc::new(JobDirStore::open_with(state.path(), budget).expect("the state root opens"));
         // An unapproved runner is given no job (E-48), so this harness
         // approves the one runner it lends and hands it the token that
         // approval minted. Without it the declaration resolves, the job is

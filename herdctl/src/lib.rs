@@ -1009,6 +1009,29 @@ pub async fn fetch_missing_outputs(
     }
 }
 
+/// The one sentence for a whole collection that is gone for one reason, or
+/// `None` when the absences do not share one.
+///
+/// Two or more files missing for the same reason is a *collection* that is
+/// gone, and that is what the reader needs told once: how many files, how
+/// much, and why. Different reasons mean different facts, and summarising
+/// them would be the kind of tidy sentence that hides one of them — so then
+/// there is no summary and the per-file lines stand on their own.
+fn one_reason_for(job_id: &JobId, absent: &[herd_proto::AbsentFile]) -> Option<String> {
+    let first = absent.first()?;
+    if absent.len() < 2 || absent.iter().any(|gone| gone.why != first.why) {
+        return None;
+    }
+    let bytes: u64 = absent.iter().map(|gone| gone.len).sum();
+    Some(format!(
+        "{job_id}: {} file(s), {}, {} — every path, size and digest is still on this \
+         job's record, and they are named below",
+        absent.len(),
+        herd_proto::show_bytes(bytes),
+        first.why,
+    ))
+}
+
 /// One round of asking. Returns how many bytes of the collection the hub
 /// holds and whether any of it is still on its way.
 async fn fetch_once(
@@ -1062,6 +1085,7 @@ async fn fetch_once(
             }
             Some(FromHub::JobFilesSent { absent, .. }) => {
                 let _ = socket.close(None).await;
+                let mut final_absences = Vec::new();
                 for gone in absent {
                     progress += gone.held;
                     if gone.still_coming {
@@ -1072,6 +1096,21 @@ async fn fetch_once(
                         coming = true;
                         continue;
                     }
+                    final_absences.push(gone);
+                }
+                // **The one line first, then the names.** A collection the
+                // hub's sweeper took is gone all at once and for one
+                // reason, and the sentence a requester needs is the
+                // collection's — *12 files, 338 MiB, removed 2026-10-30
+                // under the 200 GB output budget* (D148, D152). Printing
+                // only the per-file lines would make somebody count twelve
+                // of them to learn one fact. The per-file lines stay,
+                // because which paths are gone is the other half: a short
+                // directory must never read as a whole one.
+                if let Some(summary) = one_reason_for(job_id, &final_absences) {
+                    said.push(summary);
+                }
+                for gone in final_absences {
                     said.push(format!(
                         "{} ({} bytes on this job's record) is not on the hub: {}",
                         gone.path, gone.len, gone.why
@@ -1365,6 +1404,46 @@ fn message_kind(message: &FromHub) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A whole collection gone for one reason is one sentence, with the
+    /// count, the size and the reason in it (D148's own example, D152).
+    #[test]
+    fn a_collection_that_went_all_at_once_is_said_in_one_line() {
+        let gone = |path: &str, len: u64, why: &str| herd_proto::AbsentFile {
+            path: path.to_owned(),
+            len,
+            why: why.to_owned(),
+            held: 0,
+            still_coming: false,
+        };
+        let swept = "removed 2026-10-30 under the 200 GB output budget";
+        let said = one_reason_for(
+            &JobId::new("j0000000012"),
+            &[
+                gone("files/a.png", 300 << 20, swept),
+                gone("files/b.png", 38 << 20, swept),
+            ],
+        )
+        .expect("two files gone for one reason is one fact");
+        assert!(said.contains("j0000000012"), "{said}");
+        assert!(said.contains("2 file(s)"), "{said}");
+        assert!(said.contains("338 MiB"), "the size, added up: {said}");
+        assert!(said.contains(swept), "and the reason, verbatim: {said}");
+
+        // Two reasons are two facts, and a tidy sentence over them would
+        // hide one. There is then no summary and the per-file lines stand.
+        assert!(one_reason_for(
+            &JobId::new("j0000000012"),
+            &[
+                gone("files/a.png", 1, swept),
+                gone("files/b.png", 1, "never reached this hub"),
+            ],
+        )
+        .is_none());
+        // And one file needs no summary: its own line already says it all.
+        assert!(one_reason_for(&JobId::new("j1"), &[gone("a", 1, swept)]).is_none());
+        assert!(one_reason_for(&JobId::new("j1"), &[]).is_none());
+    }
 
     #[test]
     fn an_exit_code_is_worn_untouched() {

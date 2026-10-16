@@ -22,6 +22,7 @@ pub mod capability;
 pub mod declaration;
 pub mod outputs;
 pub mod placement;
+pub mod size;
 
 pub use capability::{
     check_label, metal_label, Availability, BusyProbe, Capability, CapabilityError, CapabilityKind,
@@ -41,6 +42,7 @@ pub use placement::{
     default_memory_floor_mib, parallelism_tokens, size_mib, with_parallelism, HostSize,
     Parallelism, PARALLELISM_TOKEN,
 };
+pub use size::{parse_bytes, show_bytes};
 
 /// The version announced in [`ToHub::Hello`] and echoed in
 /// [`FromHub::Welcome`], and the first thing the hub checks: a peer that does
@@ -777,6 +779,22 @@ pub enum JobOutcome {
     /// Distinct from [`JobOutcome::CouldNotStart`], which is a job Herd tried
     /// to run: this one never reached a machine at all.
     Impossible { reason: String },
+}
+
+impl JobOutcome {
+    /// Whether this is a job that **passed**: it ran and exited nought.
+    ///
+    /// The one definition, because three places needed it and two of them
+    /// had written it out (D79). Everything else is a job that did not pass,
+    /// and the distinction is deliberately that coarse: a test that exited 1,
+    /// a step that could not start, a runner that went away and a job somebody
+    /// cancelled are four different failures, and what they have in common is
+    /// the only thing a reader of a *green* dashboard cares about. The
+    /// sweeper reads it to decide which evidence is worth keeping longest
+    /// (D152), and a passing job's evidence is the evidence nobody ever opens.
+    pub fn is_success(&self) -> bool {
+        matches!(self, JobOutcome::Exited { code: 0 })
+    }
 }
 
 /// Which cap a runner enforced against a job.
