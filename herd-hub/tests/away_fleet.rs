@@ -225,11 +225,16 @@ async fn a_submission_with_an_empty_roster_is_refused_by_name() {
         !why.contains(herdctl::JOB_ID_PREFIX),
         "a refused submission names no job: {why}"
     );
-    // **Not asserted, and found here:** `herdctl` says `job-unknown` for a
-    // submission the hub *refused in a frame*, where `no-job` is the true
-    // answer — the refusal is the hub saying it minted nothing. That is
-    // D139's discriminator, it predates this change, and it is left alone
-    // because it is a `herdctl` behaviour and not what D140 rules on.
+    // And which of D139's three states this is: the refusal is the hub
+    // saying it minted nothing, so running the work again is safe. Found
+    // while writing this test, and fixed with it — every `Refused` on the
+    // submission path now precedes the minting, which is what makes the
+    // line provable (D142).
+    assert!(
+        why.contains(herdctl::NO_JOB_LINE) && !why.contains(herdctl::JOB_UNKNOWN_LINE),
+        "a refused submission leaves no job, and must not send a requester \
+         looking for one: {why}"
+    );
 
     // And a dry run says the same thing, which is E-07's own requirement: a
     // dry run answering "it would wait" about the one state a submission

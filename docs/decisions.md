@@ -4679,8 +4679,47 @@ preserved is D107's: **a value a substitution pasted in is never itself
 scanned for tokens** — the failure direction is a declared token left
 literal, never a requester's text turned into a figure.
 
-**Found on the way, not fixed.** `herdctl` prints `job-unknown` for a
-submission the hub **refused in a frame**, where `no-job` is the true answer:
-a refusal is the hub saying it minted nothing. That is D139's discriminator
-and it predates this change. Left alone because it is a `herdctl` behaviour
-D140 does not rule on, and noted in `away_fleet.rs` where it shows.
+**Found on the way, and fixed here because here is where it became
+provable.** `herdctl` printed `job-unknown` for a submission the hub
+**refused in a frame** — "a job may exist whose id you never learned" —
+where `no-job` is the true answer: a refusal *is* the hub saying it minted
+nothing. D139's two lines ask a falling-back requester for opposite actions,
+so this was not a wording slip; it sent a wrapper looking for a job that does
+not exist, in the one case where re-running the work is safe.
+
+It predates this change, and the reason it belongs to it anyway is the first
+commit above. A `Refused` frame is proof the hub minted nothing **only if no
+refusal can follow a minting** — and until the post-pass refusal was deleted,
+one could: that branch answered 125 about a job that already had its wait on
+its record. Every `FromHub::Refused` on the `SubmitJob` path now precedes the
+minting, so the proof holds, and this correction is the last step of the same
+change rather than a tidy-up somewhere else.
+
+**It is not a two-line fix, because the ratchet it steps on is deliberate.**
+`learn()` only ever moves forward, and rightly: once a submission has left,
+no later failure can make it not have left — not a dropped socket, not a
+killed process, not a frame nobody can read. So the step back is **authorised
+by proof rather than expressed as an ordering**: a new `Said::Refused`,
+emitted from both submission paths, and a `refused()` in the binary that does
+*not* go through `learn()` and moves `Unknown` → `Nothing` and nothing else.
+`AJob` stays `AJob` — an id has been printed and no frame can unprint it —
+and `NotASubmission` stays itself.
+
+And the emitting side guards it too: `run_job` says it **only while no id has
+been learned**, so a `Refused` arriving after a `JobAccepted`, for any reason
+a future hub might have, can never make `herdctl` claim no job exists about a
+job that does. That would be the same defect wearing the other mask, and it
+is the more dangerous mask: work declined is work never done. In
+`submit_job_saying` the guard is kept by the shape of the match — the refusal
+is the first frame after the submission and `JobAccepted` returns above it.
+
+**What is asserted, and what is not.** A submission against a genuinely empty
+roster exits 125 with the `no-job` line and **without** the `job-unknown`
+line, both directions, for `run` and `submit` alike
+(`herdctl/tests/exit_code.rs`, and again through the real binaries in
+`herd-hub/tests/away_fleet.rs`). The narrowness of the step back is a unit
+test of its own. What is **not** asserted is the emitting guard: it would need
+a hub that answers `JobAccepted` and then refuses, which no hub does, and a
+fixture built to misbehave would be testing the fixture. The half of that
+guard which makes such a hub harmless anyway — `AJob` does not move — is
+asserted.

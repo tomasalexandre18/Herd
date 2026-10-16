@@ -334,6 +334,25 @@ pub enum Said<'a> {
     /// exist?" stops being *no* and becomes *possibly*, and only the caller
     /// that wrote the frame knows when that was.
     Submitting,
+    /// The hub **refused the submission in a frame**, before any job was
+    /// minted: proof that nothing was submitted, and the one thing that may
+    /// walk [`Said::Submitting`] back.
+    ///
+    /// Nothing is printed for it either — the refusal itself is already on
+    /// stderr as the error this run ends with. What it carries is the
+    /// correction: a refusal arriving in answer to a submission means the
+    /// hub minted nothing, so the caller may say so (`no-job`) instead of
+    /// `job-unknown`, which asks a falling-back requester to go and look for
+    /// a job that does not exist.
+    ///
+    /// **It is only ever sound because every `Refused` on the submission
+    /// path precedes the minting.** The hub used to carry one that did not —
+    /// a second refusal *after* the submission's own dispatch pass, answering
+    /// 125 about a job that already had its wait on its record (D140, D142).
+    /// A caller that learns this from a frame that could follow a minting
+    /// would be claiming no job exists about a job that does, which is the
+    /// same defect wearing the other mask, so the emitting side guards it.
+    Refused,
     /// A job certainly exists and this is its id: the hub minted it and said
     /// so, or — on a wait — answered about it at all. Printed on stderr as
     /// [`job_id_line`], immediately: see [`JOB_ID_PREFIX`] for why it cannot
@@ -476,7 +495,19 @@ pub async fn run_job(
                     outputs,
                 });
             }
-            FromHub::Refused { reason } => bail!("the hub refused the job: {reason}"),
+            FromHub::Refused { reason } => {
+                // **Only when no id has been learned**, and the guard is the
+                // whole of what makes this sound. A refusal in answer to the
+                // submission is proof the hub minted nothing; a refusal
+                // arriving *after* a `JobAccepted` is about something else,
+                // for whatever reason a future hub might have, and must never
+                // make this process claim no job exists about a job that
+                // does (D142).
+                if job_id.is_none() {
+                    said(Said::Refused);
+                }
+                bail!("the hub refused the job: {reason}")
+            }
             other => bail!(
                 "the hub sent {}, which a requester cannot use",
                 message_kind(&other)
@@ -544,7 +575,14 @@ pub async fn submit_job_saying(
             let _ = socket.close(None).await;
             Ok(job_id)
         }
-        Some(FromHub::Refused { reason }) => bail!("the hub refused the job: {reason}"),
+        Some(FromHub::Refused { reason }) => {
+            // The first frame after the submission, so no id can have been
+            // learned here by construction — `JobAccepted` returns above.
+            // The guard `run_job` needs is therefore already kept by the
+            // shape of this match (D142).
+            said(Said::Refused);
+            bail!("the hub refused the job: {reason}")
+        }
         Some(other) => bail!(
             "the hub answered a submission with {}",
             message_kind(&other)
