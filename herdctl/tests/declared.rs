@@ -535,7 +535,7 @@ fn the_four_hooks_the_fixture_declares_really_run() {
 
     // What the hub fills: the `-j` it derived for the machine it picked.
     let threads = 4;
-    let filled = with_parallelism(&resolved.command(), threads);
+    let filled = with_parallelism(&resolved.command(), &args, threads);
     assert_eq!(filled.len(), 1, "a declared line is one shell line");
     let line = &filled[0];
     assert!(
@@ -620,6 +620,52 @@ fn the_four_hooks_the_fixture_declares_really_run() {
     assert!(
         printed.contains(&format!("grove {ASSEMBLE}: -j 4 -- --only a b")),
         "the output does not carry the declared line's own run: {printed}"
+    );
+}
+
+/// The adversarial half of the hub's `{j}`, through the **real declaration**:
+/// an argument that says `{j}` is three characters a requester typed, and the
+/// declared `{j}` beside it is still a thread count (D107, D139, D140).
+///
+/// Here rather than only in `herd_proto` because this is the whole chain the
+/// defect lived in: the fixture's own declared line, resolved with real
+/// arguments quoted into it before the job is minted, then the hub's one pass
+/// over it. The failure direction is conservative — a declared token left
+/// literal, never a requester's text turned into a figure.
+#[test]
+fn a_parallelism_token_in_an_argument_is_not_filled_by_the_hub_s_pass() {
+    let Some(fixture) =
+        Fixture::new("a_parallelism_token_in_an_argument_is_not_filled_by_the_hub_s_pass")
+    else {
+        return;
+    };
+    let commit = fixture
+        .checkout()
+        .resolve(BRANCH)
+        .expect("the branch resolves");
+    let args = vec!["--only".to_owned(), PARALLELISM_TOKEN.to_owned()];
+    let resolved = fixture
+        .commands()
+        .resolve(ASSEMBLE, &commit.hash, &args)
+        .expect("the build resolves");
+    let line = resolved.command();
+    assert_eq!(
+        herd_proto::parallelism_tokens(&line, &args),
+        1,
+        "the declaration wrote one {PARALLELISM_TOKEN}; the argument's is not Herd's to count \
+         — two would end the job by name: {line:?}"
+    );
+    let filled = with_parallelism(&line, &args, 4);
+    assert_eq!(filled.len(), 1, "a declared line is one shell line");
+    assert!(
+        filled[0].contains("-j 4"),
+        "the declared token is the figure: {}",
+        filled[0]
+    );
+    assert!(
+        filled[0].contains(&format!("'{PARALLELISM_TOKEN}'")),
+        "and the requester's own word is untouched: {}",
+        filled[0]
     );
 }
 

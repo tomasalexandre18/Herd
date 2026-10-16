@@ -860,6 +860,22 @@ impl JobRecord {
         }
     }
 
+    /// The words the requester typed, as they were quoted into this job's
+    /// command line before it was minted (D107, D139).
+    ///
+    /// What the hub's own `{j}` pass has to hold out of itself: the arguments
+    /// are already *in* [`JobRecord::command`], and a pass over the whole of
+    /// it would turn an argument that says `{j}` into a thread count. Empty
+    /// for an ad-hoc command line, which no requester's arguments were spliced
+    /// into — the whole of it is then the text its submitter wrote, and the
+    /// hub fills `{j}` across all of it as it always has.
+    pub fn requester_args(&self) -> &[String] {
+        match &self.declaration {
+            Some(declaration) => &declaration.args,
+            None => &[],
+        }
+    }
+
     /// The record a job **would** have, for a dry run to be judged on (E-07).
     ///
     /// Not minted and never written. Its id is
