@@ -35,7 +35,15 @@ pub fn skipped(test: &str, why: &str) {
         .append(true)
         .open(&path)
     {
-        let _ = writeln!(file, "{line}");
+        // One `write`, newline included, and not `writeln!`: the macro puts
+        // the text and the `\n` on the wire as separate calls, and two tests
+        // skipping at the same moment interleaved between them — two
+        // assertions landing on one line of the log. `scripts/test.sh` counts
+        // lines, so the header under-reported: 13 skipped assertions
+        // announced as 12. A count of what was *not* checked that is itself
+        // wrong is the exact thing D27 exists to prevent, so the whole line
+        // goes in one append, which is atomic on a regular file (D151).
+        let _ = file.write_all(format!("{line}\n").as_bytes());
     }
 }
 
@@ -56,6 +64,70 @@ pub fn skipped(test: &str, why: &str) {
 pub fn one_reaper_at_a_time() -> std::sync::MutexGuard<'static, ()> {
     static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
     LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+/// Run `body` with this process's stderr diverted to a file, and give back
+/// every line of it that mentions `about`.
+///
+/// For the one kind of assertion that cannot be made any other way: *how many
+/// lines* a code path writes to the journal. D151 is about a runner that said
+/// one true thing 1497 times onto a host whose IO had already stalled, and a
+/// test that counted a return value rather than the writing itself would go
+/// green again the moment somebody put the loop back with a `eprintln!` of
+/// its own. So this counts the writes.
+///
+/// `about` is what keeps it honest under `cargo test`'s thread pool: fd 2 is
+/// process-wide, so another test writing at the same moment lands in the same
+/// capture. Filtering on a marker the caller owns — a job id minted for the
+/// one test — leaves a count that is the caller's and nobody else's.
+///
+/// Stderr is restored whatever `body` does, including panicking: `dup2` back
+/// happens before the panic is resumed, or a failing assertion would take the
+/// rest of the run's output down with it.
+///
+/// Only lines written to the descriptor are seen, which is why the path under
+/// test writes there ([`crate::journal`]): `eprintln!` consults libtest's
+/// output capture, and that capture is per-thread **and inherited by every
+/// thread a test spawns**, so there is no thread from which the macro's
+/// output can be made to reach fd 2 inside a test binary.
+#[cfg(unix)]
+pub fn stderr_lines_about<T>(about: &str, body: impl FnOnce() -> T) -> (T, Vec<String>) {
+    use std::io::Write;
+    use std::os::fd::AsRawFd;
+
+    static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    let _held = LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+
+    let temp = TempDir::new("captured-stderr");
+    let path = temp.path().join("stderr");
+    let file = std::fs::File::create(&path).expect("a capture file opens");
+
+    // Safe: three fd calls on fds this function owns or is restoring.
+    let saved = unsafe { libc::dup(libc::STDERR_FILENO) };
+    assert!(saved >= 0, "stderr must be duplicable to be captured");
+    assert!(
+        unsafe { libc::dup2(file.as_raw_fd(), libc::STDERR_FILENO) } >= 0,
+        "stderr must be divertible to be captured"
+    );
+
+    let out = std::panic::catch_unwind(std::panic::AssertUnwindSafe(body));
+
+    let _ = std::io::stderr().flush();
+    unsafe {
+        libc::dup2(saved, libc::STDERR_FILENO);
+        libc::close(saved);
+    }
+
+    let written = std::fs::read_to_string(&path).unwrap_or_default();
+    let lines = written
+        .lines()
+        .filter(|line| line.contains(about))
+        .map(ToOwned::to_owned)
+        .collect();
+    match out {
+        Ok(out) => (out, lines),
+        Err(panic) => std::panic::resume_unwind(panic),
+    }
 }
 
 /// A directory under the system temporary directory, removed on drop.

@@ -132,6 +132,33 @@ const FINAL_FLUSH: Duration = Duration::from_millis(200);
 /// takes.
 const HELD_BYTES_PER_JOB: usize = 4 * 1024 * 1024;
 
+/// One line of the runner's journal, written to the descriptor rather than
+/// through `eprintln!`.
+///
+/// The same bytes to the same place; the difference is that they can be
+/// counted. `eprintln!` consults libtest's per-thread output capture, which
+/// is also inherited by every thread a test spawns, so under `cargo test` the
+/// macro's lines never reach file descriptor 2 and no test can measure how
+/// many of them a path wrote. For D151's second defect that count is the only
+/// thing worth measuring — the defect was never what the line said, it was
+/// that one true line was written 1497 times — so this path writes where a
+/// test can divert it ([`testing::stderr_lines_about`]).
+fn journal(line: &str) {
+    use std::io::Write;
+    // A journal that cannot be written to is not worth a panic in a runner
+    // whose job is to keep running: the line is lost, the work is not.
+    let _ = writeln!(std::io::stderr().lock(), "{line}");
+}
+
+/// How many written-off attempts a runner remembers having already announced
+/// (D151).
+///
+/// Only wide enough that the floods of every job a runner could plausibly be
+/// holding at once cannot push each other out and start repeating. It is a
+/// ring: the oldest is forgotten, and the only cost of forgetting one is a
+/// second line about an attempt whose frames stopped arriving long ago.
+const REFUSALS_REMEMBERED: usize = 32;
+
 /// How long a dead connection's writer is given to finish before it is
 /// dropped. The link is over by then; what matters is not waiting for the jobs
 /// that are still running, because their frames go to the next link.
@@ -502,6 +529,15 @@ struct JobInHand {
     /// How the job ended, once it has, until the hub acknowledges it (E-44).
     end: Option<Ended>,
     cancel: CancelToken,
+    /// How many chunks of this attempt the held-bytes cap has dropped.
+    ///
+    /// Counted rather than announced one by one, for the reason given on
+    /// [`Inner::said_stale`]: the cap bites once per chunk for as long as the
+    /// link is down, so a chatty job on a broken link wrote a journal line
+    /// per chunk — the same flood, on the same trigger, reached by a
+    /// different path (D151). The first drop says what the cap is; the total
+    /// is said once, when the job is let go.
+    trimmed: u64,
 }
 
 impl JobInHand {
@@ -512,11 +548,15 @@ impl JobInHand {
             match self.unacked.pop_front() {
                 Some((dropped, _, bytes)) => {
                     self.unacked_bytes -= bytes.len();
-                    eprintln!(
-                        "herd-runner: chunk {dropped} is no longer held: this runner holds \
-                         {HELD_BYTES_PER_JOB} bytes of a job's output against an \
-                         acknowledgement and no more"
-                    );
+                    self.trimmed += 1;
+                    if self.trimmed == 1 {
+                        eprintln!(
+                            "herd-runner: chunk {dropped} is no longer held: this runner holds \
+                             {HELD_BYTES_PER_JOB} bytes of a job's output against an \
+                             acknowledgement and no more; further chunks it drops are counted, \
+                             not announced"
+                        );
+                    }
                 }
                 None => break,
             }
@@ -742,6 +782,28 @@ struct Inner {
     /// serving, and for how long, which is what tells a hub that is down
     /// from one that is up and restarting (D104).
     welcomed_at: Option<Instant>,
+    /// Attempts this runner has already said out loud the hub has written
+    /// off, newest last (D151).
+    ///
+    /// The hub answers **every** frame about a stale attempt with its own
+    /// `StaleAttempt`, which is right — a frame it will not record must be
+    /// refused by name. But a runner that buffered a thousand log chunks
+    /// while the link was down flushes all of them the moment it is back and
+    /// gets a thousand refusals, one per chunk, inside the same millisecond.
+    /// Said once per chunk that is a thousand journal writes onto a host
+    /// which is, by construction, the host whose IO just stalled long enough
+    /// to break the link. The runner would be making the stall worse at the
+    /// worst possible moment, which is the opposite of what invariant 2
+    /// promises. So the sentence is said once per attempt and the rest are
+    /// silent.
+    ///
+    /// Not on [`JobInHand`], because the job entry is dropped by the first
+    /// refusal and every repeat arrives after it: the memory has to outlive
+    /// the job. Bounded at [`REFUSALS_REMEMBERED`] rather than a set that
+    /// grows for the life of the process — and more than one slot because two
+    /// jobs' floods can interleave, and a single slot would ping-pong and
+    /// flood all over again.
+    said_stale: VecDeque<(JobId, u32)>,
     /// Where its owner's switch stands (E-33).
     ///
     /// Separate from `draining` above, which is the process stopping. This is
@@ -763,6 +825,7 @@ impl Default for Inner {
             spooled: Vec::new(),
             draining: false,
             welcomed_at: None,
+            said_stale: VecDeque::new(),
             switch: herd_proto::Switch::On,
         }
     }
@@ -995,6 +1058,7 @@ impl Session {
                     unacked_bytes: 0,
                     end: None,
                     cancel: cancel.clone(),
+                    trimmed: 0,
                 },
             );
             Some(cancel)
@@ -1243,10 +1307,22 @@ impl Session {
     /// The hub has this job's end on its disk: let the job go, output and all,
     /// and remove the spool file if the verdict came from one.
     fn release(&self, job_id: &JobId) {
-        let delivered: Vec<Spooled> = self.with(|inner| {
-            inner.jobs.remove(job_id);
-            take_spooled(inner, |spooled| spooled.job_id() == job_id)
+        let (delivered, trimmed): (Vec<Spooled>, u64) = self.with(|inner| {
+            let trimmed = inner.jobs.remove(job_id).map_or(0, |job| job.trimmed);
+            (
+                take_spooled(inner, |spooled| spooled.job_id() == job_id),
+                trimmed,
+            )
         });
+        // The one line the per-chunk announcements were replaced by: how much
+        // of this job's output the held-bytes cap dropped, said once (D151).
+        if trimmed > 0 {
+            eprintln!(
+                "herd-runner: {trimmed} chunks of {job_id} were dropped unacknowledged: the \
+                 hub was not taking them fast enough to stay inside the \
+                 {HELD_BYTES_PER_JOB} bytes this runner holds per job"
+            );
+        }
         // Only now, after the hub has said the verdict is on its disk: a file
         // removed before the acknowledgement would be a verdict destroyed by
         // the one mechanism that exists to keep it (D19, D34).
@@ -1354,22 +1430,47 @@ impl Session {
     /// A verdict spooled for that attempt is exactly the same case — a runner
     /// coming back with the result of an attempt the hub gave up on (D39) —
     /// so its file goes too, by name, rather than being offered for ever.
-    fn drop_stale(&self, job_id: &JobId, attempt: u32, reason: &str) {
-        let running = self.with(|inner| {
+    ///
+    /// Returns whether this call was the one that announced the attempt. The
+    /// caller in `serve_forever` has no use for it; it is how a test counts
+    /// the lines a flood of refusals produces without reading the journal,
+    /// and counting is the assertion that matters — a test that only checked
+    /// the wording would pass again the day the loop comes back saying
+    /// something else (D151).
+    fn drop_stale(&self, job_id: &JobId, attempt: u32, reason: &str) -> bool {
+        let (running, say_it) = self.with(|inner| {
+            // Taken whether or not the job is still here: the repeats this
+            // silences arrive *after* the first refusal released it.
+            let say_it = !inner
+                .said_stale
+                .iter()
+                .any(|(said, at)| said == job_id && *at == attempt);
+            if say_it {
+                if inner.said_stale.len() == REFUSALS_REMEMBERED {
+                    inner.said_stale.pop_front();
+                }
+                inner.said_stale.push_back((job_id.clone(), attempt));
+            }
             let Some(job) = inner.jobs.get(job_id) else {
-                return false;
+                return (false, say_it);
             };
             if job.attempt != attempt {
-                return false;
+                return (false, say_it);
             }
             job.cancel
                 .end(Ending::Abandoned(format!("stale attempt: {reason}")));
-            job.end.is_none()
+            (job.end.is_none(), say_it)
         });
-        eprintln!(
-            "herd-runner: attempt {attempt} of {job_id} is over as far as the hub is \
-             concerned ({reason}); nothing of it is sent again"
-        );
+        // Once per attempt, not once per frame the hub refused: the hub
+        // answers every buffered chunk of a dead attempt, and a runner that
+        // echoed each answer would write a line per chunk onto a host whose
+        // IO is already the reason the attempt died (D151).
+        if say_it {
+            journal(&format!(
+                "herd-runner: attempt {attempt} of {job_id} is over as far as the hub is \
+                 concerned ({reason}); nothing of it is sent again"
+            ));
+        }
         self.spool_refused(job_id, attempt, reason);
         // A job still running is left to notice the ending and clean up after
         // itself; one that had already finished is dropped here and now,
@@ -1377,6 +1478,7 @@ impl Session {
         if !running {
             self.release(job_id);
         }
+        say_it
     }
 
     /// A spooled verdict the hub will never record: the attempt is over, so
@@ -2464,7 +2566,9 @@ async fn serve_hub(
                 job_id,
                 attempt,
                 reason,
-            } => session.drop_stale(&job_id, attempt, &reason),
+            } => {
+                session.drop_stale(&job_id, attempt, &reason);
+            }
             FromHub::HealthRecorded {} => {}
             // The orchestrator's half of E-33, arriving through the hub. It is
             // written down **and then** applied, so that the two ways of
@@ -2746,6 +2850,7 @@ mod tests {
             unacked_bytes: 0,
             end: None,
             cancel: CancelToken::new(),
+            trimmed: 0,
         };
         let chunk = vec![b'x'; 1024 * 1024];
         for seq in 0..8 {
@@ -2771,6 +2876,7 @@ mod tests {
             unacked_bytes: 0,
             end: None,
             cancel: CancelToken::new(),
+            trimmed: 0,
         };
         for seq in 0..5 {
             job.remember(seq, LogStream::Stdout, b"hello");
@@ -2791,6 +2897,90 @@ mod tests {
         assert_eq!(
             token.ended().await,
             Ending::Cancelled("a requester asked".to_owned())
+        );
+    }
+
+    /// An attempt the hub has written off is announced **once**, however many
+    /// frames of it the hub refuses (D151).
+    ///
+    /// The shape this is about: the runner buffers a job's output while the
+    /// link is down, flushes all of it the instant the link is back, and the
+    /// hub — correctly — answers every single chunk with its own
+    /// `StaleAttempt`. On the real failure that found this, that was 1497
+    /// refusals inside the same millisecond, and the runner echoed every one
+    /// of them to the journal of a host whose IO was already stalled at 96 %.
+    ///
+    /// So the assertion is the **count**, not the wording. A test that
+    /// checked the sentence would go green again the day somebody
+    /// reintroduces the loop with different words; a test that counts cannot.
+    #[tokio::test]
+    async fn a_stale_attempt_is_announced_once_however_many_frames_it_buffered() {
+        let session = Session::new();
+        let job_id = JobId::new("j0000000057");
+        let _cancel = session
+            .take_job(&job_id, 1)
+            .expect("a fresh session is not draining");
+
+        // The buffered output, as the runner holds it with no link up. These
+        // are the items that each draw a refusal out of the hub.
+        let buffered = 1497;
+        for _ in 0..buffered {
+            session.send_chunk(&job_id, LogStream::Stdout, b"a line of a build\n".to_vec());
+        }
+
+        // One refusal per buffered item, which is what the hub really sends —
+        // and the journal is read back, so what is counted is the writing
+        // itself and not some return value a reintroduced loop could leave
+        // untouched.
+        let (returned, written) = testing::stderr_lines_about("j0000000057", || {
+            (0..buffered)
+                .filter(|_| {
+                    session.drop_stale(
+                        &job_id,
+                        1,
+                        "attempt 1 of j0000000057 is not the attempt this hub is waiting for; \
+                         nothing of it is recorded",
+                    )
+                })
+                .count()
+        });
+        assert_eq!(
+            written.len(),
+            1,
+            "{buffered} refusals of one attempt must write one journal line, not {}: {written:#?}",
+            written.len()
+        );
+        assert_eq!(
+            returned, 1,
+            "and exactly one call may claim to have said it"
+        );
+
+        // A different attempt of the same job is a different fact and is
+        // still worth a line: the silence is per attempt, not per job.
+        assert!(
+            session.drop_stale(&job_id, 2, "a second attempt, written off too"),
+            "silencing the repeats must not silence another attempt"
+        );
+    }
+
+    /// The memory that keeps the repeats quiet is bounded: a runner that has
+    /// seen more written-off attempts than it remembers must still not be
+    /// able to grow that list for ever (invariant 2 again, in memory rather
+    /// than in journal writes).
+    #[tokio::test]
+    async fn the_attempts_already_announced_are_remembered_in_a_bounded_ring() {
+        let session = Session::new();
+        // Diverted only to keep a hundred-odd true lines out of the suite's
+        // own output; what this test is about is the length of the ring.
+        testing::stderr_lines_about("", || {
+            for n in 0..(REFUSALS_REMEMBERED * 4) {
+                session.drop_stale(&JobId::new(format!("j{n:010}")), 1, "written off");
+            }
+        });
+        let held = session.with(|inner| inner.said_stale.len());
+        assert_eq!(
+            held, REFUSALS_REMEMBERED,
+            "the ring must stop at {REFUSALS_REMEMBERED}, not grow to {held}"
         );
     }
 
