@@ -26,22 +26,20 @@ What you never need, so do not go looking for it:
 | What | Why |
 | --- | --- |
 | Linux with systemd and cgroup v2 | the memory ceiling is a cgroup |
-| Nix, with flakes enabled | the toolchain comes from the flake, D12 |
+| Nothing to build with | a release is a download; Nix only if you build from source (D12) |
 | A name for the machine | `server`, `wsl-pc`; the operator approves it |
 | The hub's URL | `ws://127.0.0.1:8787` on the hub's own host, else ask |
 | 10 GB free, and somewhere to put a data root | one job's workspace |
 
-Check the two that are not obvious:
+Check the one that is not obvious:
 
 ```sh
 stat -fc %T /sys/fs/cgroup       # must print: cgroup2fs
-nix --version                    # any recent version with flakes
 ```
 
-**If the machine is a Windows PC**, it joins inside WSL2 (D145) and the
-Nix row above does not apply to it: its binary comes from a release.
+**If the machine is a Windows PC**, it joins inside WSL2 (D145).
 Read **If the machine is a Windows PC: the WSL2 path**, after step 7,
-before you start — it is the same seven steps and five things that
+before you start — it is the same seven steps and seven things that
 differ.
 
 ## The seven steps
@@ -333,14 +331,14 @@ starts a transient systemd scope and removes one directory, and its own
 header says so — then prints a block to paste back. `UNKNOWN` lines are
 questions it could not answer; they are information, not faults.
 
-### The binary comes from a release, and the PC needs no Nix
+### The binary comes from a release, and it goes in her own home
 
-Step 1 above is the Nix route, and so is the `Nix, with flakes enabled`
-row of **Before you start**. Neither applies here. A release carries
-three static musl binaries that depend on no libc, no dynamic loader and
-no Nix store, and the release workflow proves it by running a hub, a
-runner and two real jobs out of those exact bytes in containers that have
-no Nix on them (D132). Take `herd-runner`, verify it, and keep it in her
+Step 1 above is already the release download, so the only difference here
+is **where the binary lands**. A release carries three static musl binaries
+that depend on no libc, no dynamic loader and no Nix store, and the
+release workflow proves it by running a hub, a runner and two real jobs
+out of those exact bytes in containers that have no Nix on them (D132).
+Take `herd-runner`, verify it, and keep it in her
 own home, because a user unit needs no root anywhere on this path:
 
 ```sh
