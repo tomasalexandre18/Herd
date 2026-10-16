@@ -43,22 +43,19 @@ test scope, ZFS on `/`, no root-equivalent group.
    wrappers directory on `jobPath` (D144) — so the rebuild is a no-op
    rather than a weakening. It needs `/etc/nixos` plus a
    `nixos-rebuild`: Alexa's.
-2. **Herd returns an exit code and logs, not files.** A job's `{out}` is
-   reclaimed with its workspace, so the consumer's `results.json` does
-   not come home. Ruled (D131) and being built.
+2. **File return is built and merged, and unproven on the live
+   deployment.** A job's small declared outputs travel like its log
+   (D131, D137), the suite proves it with real binaries, and a job's
+   record keeps an empty `files/` honestly where nothing was written.
+   What has not happened is one real declared job on the server writing
+   a file we then read off the hub's disk. The first consumer's first
+   successful `up` step is that proof.
 3. **`wss://` is configured and never dialled.** The Traefik fragment is
    written for this host's real proxy and loads in Traefik, but no real
    dial through Cloudflare has happened. The tailnet makes it optional.
-4. **The one open host item: any user of this host can become root.**
-   `/var/run/libvirt/libvirt-sock` is mode 0666 and libvirtd runs as
-   root, so a job could escape every cap (D129). Not Herd's to close —
-   it is the host's, and it predates us. The runner says so at every
-   start. D136's other half is closed: `io.cost.qos` now reads
-   `ctrl=user rpct=95.00 wpct=95.00`, so blk-iocost throttles this NVMe
-   to a latency target instead of only apportioning it.
-5. No authentication ceiling per requester: one shared token means any
+4. No authentication ceiling per requester: one shared token means any
    requester may ask for the merger level.
-6. A test that cannot be made honestly on a loaded host **skips loudly**
+5. A test that cannot be made honestly on a loaded host **skips loudly**
    and never passes quietly (D27). Thirteen do here.
 
 Open and recorded: D63, D64, D92, D98, D101, D122's two reaper blind
@@ -83,8 +80,11 @@ executor cycle — are accepted and unbuilt.
 
 ## Next action
 
-The consumer's four blocking items: files home, `{out}` in a declared
-line, the reaper's janitor list, and telling "nothing submitted" from
-"no verdict". Alexa's own, both outward-facing: the `nixos-rebuild` that
-makes the server's unit permanent (E-52, and the module now says every
-figure that unit carries), and the libvirtd socket.
+Three of the consumer's four blocking items are in review (#31): files
+home, `{out}` in a declared line, and telling "nothing submitted" from
+"no verdict". The fourth, the reaper's janitor list (D134), is accepted
+and unbuilt — and their failing `up` walked into it, since nothing here
+sweeps after a `down` that fails too. Then: one real declared job on the
+server that writes a file, read back off the hub's disk — the only claim
+here still standing on the suite alone. Alexa's own: the `nixos-rebuild`
+that makes the unit permanent (E-52), and merging #31 and #32.
