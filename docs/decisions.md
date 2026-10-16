@@ -4618,3 +4618,102 @@ holder name was needed and none was guessed. If Herd should assert attribution
 it goes in a `NOTICE` file or in file headers, with a name only Alexa can
 give. That is a one-line addition whenever he wants it, and its absence
 changes nothing about the grant.
+
+---
+
+## 2026-10-16 — D144 The server runner's real caps, and the module behind them
+
+**What the server runner carries now, with Alexa's approval.** The first
+consumer asked for settings on the `server` runner before submitting their
+first declared job, he approved them, and the unit was restarted with them:
+`--job-timeout 10800`, `--job-pids-max 4096`,
+`--job-io-max rbps=775MB,wbps=435MB,riops=180000,wiops=105000`,
+`--capabilities /mnt/ssd_980/herd-etc/chatons-runner.json`, and
+`PATH=/run/wrappers/bin:/run/current-system/sw/bin` where it had been the
+system profile alone — the setuid wrappers live only in the first of those,
+and the profile carries the same names (`sudo`, `su`, `mount`, `fusermount`)
+as plain `r-xr-xr-x` binaries that fail for want of the bit, so the order is
+load-bearing and not a preference. Everything else is unchanged: 8 GiB per
+job, 20 GiB of host memory over a 6 GiB floor, 8 threads, 64 MiB of log,
+20 GiB of disk, 4 GiB of tmpfs measured on /dev/shm.
+
+**The `io.max` figures are theirs, and their correction to mine is the part
+worth keeping.** They are a quarter of the kernel's own cost model for device
+`259:0`, which is the derivation the help text asks for rather than a round
+number somebody liked (D135). `/sys/fs/cgroup/io.cost.model` reads
+`rbps=3102524156 rseqiops=724816 rrandiops=778122 wbps=1742780862
+wseqiops=425702 wrandiops=443193`. The bytes are arithmetic and we agreed:
+775 MB and 435 MB. The IOPS are not, because the model gives **two** columns
+and I had read the wrong one — `wiops=110000` is a quarter of 443193, the
+random column. They take each IOPS key as the **lower of the two columns**,
+which here is the sequential one both times: 724816/4 → `riops=180000` and
+425702/4 → `wiops=105000`. Theirs is right. A ceiling derived from the higher
+column promises throughput the device only reaches on its best-case access
+pattern, so it would be a ceiling that does not bind where it matters; the
+lower column is a figure the device holds whatever a job's IO looks like.
+
+**The ceiling is proved by writing it, and the startup line names the whole
+device.** `herd-runner: io.max for device 259:0
+(/mnt/ssd_980/herd-runner): rbps=775000000 wbps=435000000 riops=180000
+wiops=105000 — … proved at startup by writing it.` `259:0` is `nvme0n1`, the
+whole NVMe, and not the partition the data root is actually on: a cgroup's IO
+knobs live on the device with the request queue, and `259:1` has no
+`queue/` directory of its own. So reading `259:0` in that line is correct and
+not a resolution bug.
+
+**What the per-device ceiling does and does not cover here, which is the fact
+to keep.** On this host `/mnt/ssd_980/chatons` — the consumer's whole tree —
+is the *same mount* as the data root, `/dev/nvme0n1p1` on `/mnt/ssd_980`. So
+the ceiling, which is per cgroup *and* per device, covers everything a job
+touches under that mount and not merely the data root: wider than D135's
+caution reads. But `/nix/store` is `rpool/nix`, ZFS, which **no** cgroup IO
+knob reaches at any value. The consequence is sharp and worth saying in one
+line: a job whose heavy phase is `nix build` is outside the ceiling, and a job
+whose heavy phase is cargo under `/mnt/ssd_980` is inside it. For this
+consumer, whose answer to toolchains is `nix develop`, that is not a corner
+case.
+
+**The module could not say three of those figures, so a rebuild would have
+weakened the deployment.** `deploy/nixos-herd-runner.nix` hardcoded
+`--job-timeout 5400` and had no way at all to ask for `--job-pids-max` or
+`--job-io-max` except as strings in `extraArgs`. Alexa's next
+`nixos-rebuild` — the one whose whole purpose is to make the deployment
+survive a reboot (E-52, D130) — would therefore have replaced an agreed 3 h
+cap with 1.5 h, 4096 pids with 1024, and **a hard IO ceiling with none at
+all**, which is the single thing this consumer most needs from us. So the
+module moved in the same breath: `jobTimeout` (default still 5400, so no
+other machine changes), `jobPidsMax` and `jobIoMax` both absent by default so
+that absent means the flag is off the line and the runner's own default
+stands, `jobPath` defaulting to the wrappers directory first, and the server's
+five values written out as the worked example in the header. The general
+lesson is not about these three options: **a transient unit and a module that
+disagree is a deployment that regresses the moment it is made permanent.** The
+module's header already said the copied unit and it must be changed together;
+nothing said the *running* unit and the module must be.
+
+**`--host-tmpfs-path` was asked for and refused.** The request was to point
+it at a directory of the consumer's. That option only says **where
+`--host-tmpfs` is measured** — one admission figure, read once from the
+filesystem at that path and announced to the hub — and it never places a
+single byte a job writes. The path asked for is mode `0700` and owned by
+another user, so the runner, which runs as `herd`, cannot `statfs` it at all.
+The exact consequence, read off the code rather than assumed: because
+`--host-tmpfs 4GiB` **is** given on this unit, an unmeasurable path does not
+blank the figure — the runner lends the 4 GiB as asked and prints that it was
+not checked against the mount, so the only effect is to drop the clamp that
+keeps the announcement no larger than the mount really is. The figure goes
+**absent**, and every job declaring a tmpfs reservation is then refused on
+this machine by name, only if `--host-tmpfs` is dropped in the same move.
+Either way the change buys nothing a job can use. What they actually want is
+their declared command's own `TMPDIR` — and the runner builds a job's
+environment from scratch, so a job's `TMPDIR` is the one it creates under that
+job's workspace, never one inherited from the unit and never this option's.
+That is a different request and it stays open.
+
+**One mistake in their capability file, caught before it emptied the
+machine.** `reference` — a fact about this host, a checkout that is simply
+*there* — was declared `exclusive`. `exclusive` means a job holding it runs
+alone: declaring it on a permanent fact would have made every `reference` job
+drain the runner to itself. `shared` is the kind for a fact about a machine,
+and the file now says so. `rig-cpu` stays `exclusive` on purpose: it is the
+machine, and a job that wants the machine does want it empty.

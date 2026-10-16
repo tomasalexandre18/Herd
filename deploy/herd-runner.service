@@ -117,14 +117,19 @@ SupplementaryGroups=kvm render video
 # The right value is host-specific, which is exactly why it is the
 # deployment's to state and not Herd's to guess. On NixOS it is
 # /run/current-system/sw/bin, the system profile — 1 196 commands here,
-# including sh, coreutils, git, nix and tar. On a Debian-shaped host it is
+# including sh, coreutils, git, nix and tar — and /run/wrappers/bin ahead of
+# it, which is the only place the setuid wrappers are: `sudo`, `su`, `mount`,
+# `pkexec`, `newuidmap`, `fusermount`. The profile carries those same names
+# as plain r-xr-xr-x binaries that fail for want of the bit, so a job without
+# this directory first reaches a broken copy rather than nothing — which is
+# the harder failure to read. On a Debian-shaped host the value is
 # /usr/local/bin:/usr/bin:/bin. A job needing more than the host offers
 # brings its own toolchain and extends PATH itself; `nix develop` is the
 # first consumer's answer (M10).
 #
 # One variable with a stated value, and deliberately not a step towards
 # inheriting the runner's environment — that is the thing being prevented.
-Environment=PATH=/run/current-system/sw/bin
+Environment=PATH=/run/wrappers/bin:/run/current-system/sw/bin
 #
 # Nothing else is added, and each of these was checked on this host rather
 # than assumed:
@@ -216,8 +221,8 @@ CPUWeight=50
 # cgroup's 100 is half the claim on *contended* bandwidth, and when nothing
 # else wants the disk Herd uses all of it. And it only covers IO to the data
 # root — a job naming an absolute path outside the root writes with no bound
-# at all, here or on the pool (D126). `io.max` is the only hard IO lever and
-# is unbuilt.
+# at all, here or on the pool (D126). The one hard IO lever is `io.max`, per
+# job and per device, asked for with --job-io-max (D135, D144).
 IOWeight=50
 # ---------------------------------------------------------------------------
 

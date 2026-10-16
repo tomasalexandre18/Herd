@@ -40,6 +40,31 @@
 #     }
 #   ];
 #
+# WHAT THE PROJECT'S OWN SERVER SAYS, as the worked example. These are the
+# figures the live transient unit on that host already carries (D144), so the
+# rebuild that makes it permanent is a no-op and not a change:
+#
+#     {
+#       services.herd-runner.enable = true;
+#       services.herd-runner.package =
+#         inputs.herd.packages.x86_64-linux.herd-runner;
+#       services.herd-runner.jobTimeout = 10800;
+#       services.herd-runner.jobPidsMax = 4096;
+#       services.herd-runner.jobIoMax =
+#         "rbps=775MB,wbps=435MB,riops=180000,wiops=105000";
+#       services.herd-runner.jobPath =
+#         "/run/wrappers/bin:/run/current-system/sw/bin";
+#       services.herd-runner.extraArgs = [
+#         "--capabilities /mnt/ssd_980/herd-etc/chatons-runner.json"
+#       ];
+#     }
+#
+# jobPath is spelled out there although it is the default, because it is the
+# one string a job sees and a host with another system profile must notice it.
+# The io.max figures are the first consumer's, a quarter of the kernel's own
+# cost model for the device the data root is on; D144 has where they come from
+# and what they do not cover.
+#
 # The flake does *not* expose `nixosModules.herd-runner`. Adding
 # `nixosModules.herd-runner = ./deploy/nixos-herd-runner.nix` to flake.nix
 # would make the import one line instead of a path join; it is a one-line
@@ -87,10 +112,20 @@ let
     # path is the same on both paths.
     "--cgroup-root /sys/fs/cgroup/system.slice/herd-runner.service"
     "--job-memory-max ${cfg.jobMemoryMax}"
-    "--job-timeout 5400"
+    "--job-timeout ${toString cfg.jobTimeout}"
     "--job-log-cap 64MiB"
     "--job-disk-budget 20GiB"
     "--job-nice 10"
+  ]
+  # The two that are absent unless a machine names them, and absent means the
+  # flag itself is not on the line: the runner's own default then stands
+  # (pids.max 1024, and no io.max line written at all), where a value here
+  # would put a figure nobody chose into the unit. `lib.optional` yields an
+  # empty list for null, so the ExecStart order above is also the order on the
+  # real command line.
+  ++ lib.optional (cfg.jobPidsMax != null) "--job-pids-max ${toString cfg.jobPidsMax}"
+  ++ lib.optional (cfg.jobIoMax != null) "--job-io-max ${cfg.jobIoMax}"
+  ++ [
     "--host-memory ${cfg.hostMemory}"
     "--host-memory-floor ${cfg.hostMemoryFloor}"
     "--host-threads ${toString cfg.hostThreads}"
@@ -221,6 +256,50 @@ in
       description = "The kernel memory ceiling per job (--job-memory-max).";
     };
 
+    jobTimeout = lib.mkOption {
+      type = lib.types.int;
+      default = 5400;
+      description = ''
+        The wall-clock cap on one job, in seconds (--job-timeout). 5400 is
+        the figure deploy/herd-runner.service explains and the default here
+        so that no machine's behaviour changes by this option existing; a
+        consumer whose cold build is long says its own number instead of
+        passing one through extraArgs.
+      '';
+    };
+
+    jobPidsMax = lib.mkOption {
+      type = lib.types.nullOr lib.types.int;
+      default = null;
+      example = 4096;
+      description = ''
+        How many processes one job may hold at once: `pids.max` in its cgroup
+        (--job-pids-max). Null leaves the flag off the line, so the runner's
+        own default of 1024 stands — which is deliberate, because a figure in
+        the unit should be one somebody chose.
+      '';
+    };
+
+    jobIoMax = lib.mkOption {
+      type = lib.types.nullOr lib.types.str;
+      default = null;
+      example = "rbps=775MB,wbps=435MB,riops=180000,wiops=105000";
+      description = ''
+        A hard per-second IO ceiling for every job, any subset of `rbps`,
+        `wbps`, `riops` and `wiops` (--job-io-max). Null leaves the flag off
+        the line and there is then no ceiling at all, only the IOWeight
+        below, which shares contended bandwidth and caps nothing (D135).
+
+        This is a promise about the filesystem under `dataRoot` and not a
+        hint: `io.max` is per-device, so the runner resolves the device that
+        path is on and **refuses to start** when it cannot write the ceiling
+        there — a ZFS data root, no cgroup delegation, a path whose device it
+        cannot resolve. Setting this on a host whose data root cannot carry
+        it is a service that never comes up, by design: a ceiling nobody
+        honours is a false promise.
+      '';
+    };
+
     hostMemory = lib.mkOption {
       type = lib.types.str;
       default = "20GiB";
@@ -252,15 +331,24 @@ in
 
     jobPath = lib.mkOption {
       type = lib.types.str;
-      default = "/run/current-system/sw/bin";
+      default = "/run/wrappers/bin:/run/current-system/sw/bin";
       description = ''
         The service's PATH, which is also every job's PATH: the runner builds
         a job's environment from scratch and carries only PATH, LANG, LC_ALL,
-        TZ and TERM through it. /run/current-system/sw/bin is the NixOS
-        answer; on a host with a different system profile, say so here.
-        Setting it to NixOS's own service PATH is not an option worth having
-        — it is coreutils, findutils, gnugrep, gnused and systemd, with no
-        shell.
+        TZ and TERM through it. Those two directories are the NixOS answer;
+        on a host with a different system profile, say so here. Setting it to
+        NixOS's own service PATH is not an option worth having — it is
+        coreutils, findutils, gnugrep, gnused and systemd, with no shell.
+
+        /run/wrappers/bin comes first, and the order is the point. The
+        setuid wrappers live only there — `sudo`, `su`, `mount`, `pkexec`,
+        `newuidmap`, `fusermount` — and the system profile carries the same
+        names as plain `r-xr-xr-x` binaries that fail at runtime for want of
+        the bit. So a job whose PATH is /run/current-system/sw/bin alone
+        cannot reach a working one at all, and a job whose PATH has the
+        wrappers *after* the profile reaches the broken one first. A job's
+        PATH is this string and nothing else, so what is missing or
+        mis-ordered here is missing or mis-ordered for every job.
       '';
     };
 
@@ -432,8 +520,8 @@ in
         # bites only because the data root is on a block device whose cost
         # model blk-iocost knows; it is a share of contended bandwidth and
         # never a ceiling, and it covers nothing a job writes outside the data
-        # root by absolute path (D120, D126). io.max is the only hard IO lever
-        # and is unbuilt.
+        # root by absolute path (D120, D126). The one hard IO lever is
+        # `io.max`, per job and per device: `jobIoMax` above (D135).
         CPUWeight = 50;
         IOWeight = 50;
 
