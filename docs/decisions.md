@@ -5051,3 +5051,93 @@ reaper's janitor list is unbuilt (D134) and the consumer's failing `up` steps
 walked into it: when a `down` step fails too, nothing here sweeps after it.
 No `wss://` dial has happened. And the runner's unit is still transient
 (D130), so every cap in D144 survives exactly until the next reboot.
+
+---
+
+## 2026-10-16 — D149 M17 prepared without the machine, and what is unproven
+
+**The consumer's top priority is the second machine, and the owner's time
+has to be booked for it.** So everything M17 needs that can be prepared
+without a WSL2 host is prepared now, and the valuable half of this entry
+is the other list: what is still guesswork, and the exact command that
+ends each guess. The machine is Alexa's own PC — Windows, WSL2 with
+kernel 6.18 and systemd, outbound only, behind NAT, on the tailnet — and
+it joins as a runner *inside* WSL2 by D145.
+
+**What that machine must end up with, and where each of the four lives
+now.** Her switch (E-33) is a file under the data root, and
+`docs/joining.md` gives it a section written for her rather than for an
+operator, with the two desktop shortcuts and the one trap that was
+verified here: `herd-runner switch` creates the data root if it is
+missing and reports success either way, so a shortcut with a typo'd path
+is cheerful and inert. A kernel-enforced ceiling of about 12 GiB (Q6,
+invariant 2) is `MemoryMax=12G` on a user unit carrying `Delegate=yes`,
+with `--host-memory 11GiB` under it so that the runner announces the
+figure that was written instead of clamping and saying so (D119). One
+build slot and `kvm` denied are `deploy/capabilities-wsl-pc.json`, four
+lines, validated by running the real binary against it — it resolves to
+`build: declared` and `kvm: present, denied`.
+
+**The memory ceiling is the whole milestone, and the runner says which
+one it got.** Delegation present and the startup report reads `memory
+ceiling: one cgroup v2 subtree per job, enforced by the kernel`. Absent
+and it reads `memory ceiling: FALLING BACK to a per-process
+address-space limit`, followed by the process-group kill and by
+`cpu.weight, cpu.max, io.weight and pids.max: NOT ENFORCED AT ALL on
+this host`. The document says plainly that the fallback is **not
+acceptable on this machine**: `RLIMIT_AS` caps each process, so a build
+forking eight compilers holds the ceiling eight times over, it makes an
+allocation fail rather than killing the job, and with no cgroup nothing
+bounds a fork bomb. On a server that is arguable; on the PC somebody
+plays on it is not invariant 2.
+
+**Two ceilings, and conflating them is the likely mistake.**
+`.wslconfig`'s `memory=` is what Windows gives the WSL2 VM; everything
+Herd sets is inside that. The chain is written down outside in — PC RAM,
+VM RAM, `MemoryMax`, `--host-memory`, `--host-memory-floor`,
+`--job-memory-max` — with a coherent set for a 32 GiB PC, and with the
+statement that **on a 16 GiB PC the 12 GiB of Q6 has to be revisited
+rather than squeezed**: a 12 GiB ceiling on a 16 GiB machine is not
+lending capacity, it is taking the machine. The number Alexa has to look
+up is the PC's RAM.
+
+**One script, run once on the PC, and we both learn the truth.**
+`deploy/wsl2-check.sh` answers in one block: systemd as PID 1, cgroup v2
+mounted, whether a `--user --scope -p Delegate=yes` really gets a subtree
+with the `memory` controller in it, what `.wslconfig` gave the VM against
+what `/proc/meminfo` says it got, whether the hub's address answers a TCP
+connection from inside the distribution, and whether `herd-runner
+--version` runs. It is bash, read-only but for one transient scope and
+one probe directory it removes, and it marks what it could not find out
+as `UNKNOWN` rather than passing it. Run on this NixOS host it prints
+`0 FAILED, 4 UNKNOWN`, correctly says this is not WSL2, and correctly
+fails to make the delegation assertion — which is the behaviour wanted of
+it. There is no `shellcheck` in the dev shell or on this host, so it was
+checked with `bash -n` and by running it, and that is all.
+
+**What nobody has verified, with the command that settles each.** This is
+the half of the entry to read before booking his time.
+
+| Unverified | What ends it |
+| --- | --- |
+| whether this distribution already boots systemd | `cat /etc/wsl.conf`, then `ps -p 1 -o comm=` — must print `systemd` |
+| whether this PC's WSL is new enough to honour `[boot] systemd=true` | `wsl --version`, from Windows |
+| whether a user scope on WSL2 gets a delegated subtree at all | the `delegation` line of `deploy/wsl2-check.sh` |
+| whether the `memory` controller reaches a user unit there, which is what makes `MemoryMax=12G` and the per-job ceiling real | the controller list on that same line; no `memory`, no ceiling, and the answer is a system unit instead |
+| what WSL2 gives the VM with no `.wslconfig` — the rule has changed between versions | `grep MemTotal /proc/meminfo` inside, and treat it as the answer |
+| the PC's actual RAM, on which every figure depends | `powershell -c "(Get-CimInstance Win32_ComputerSystem).TotalPhysicalMemory"` |
+| whether the WSL2 VM keeps running after the logon task's `wsl.exe` exits | log in, close everything, wait two minutes, then `wsl.exe -d <distro> -- systemctl --user --no-pager status herd-runner` |
+| whether `loginctl enable-linger` behaves there | `loginctl show-user "$USER" -p Linger` must print `Linger=yes` |
+| whether the VM is killed under her on idle, sleep or hibernate | the same status command after each; `[wsl2] vmIdleTimeout` is the first thing to read if it is |
+| whether a Windows shortcut carries the quoted `--reason` through | double-click it once, then `cat ~/.local/state/herd-runner/switch` |
+| whether the tailnet reaches the hub from inside the distribution, and by which of the two shapes | the `hub-tcp`, `tailscale` and `/dev/net/tun` lines of the script |
+| whether an `io.weight` reaches a WSL2 data root at all | the runner's own `io.weight` line at startup (D120) |
+| the 30-minute join, the OOM replay (E-30) and the switch inside 10 s | M17's three manual checks, on the machine, recorded in `docs/status.md` |
+
+**One thing found while reading, reported and not fixed.** Nothing in the
+runner needs changing for WSL2: the code paths this machine exercises are
+the same ones the server exercises, and the only Windows-specific surface
+is a logon task that starts a distribution. The one real sharp edge is
+the `switch` command creating its own data root, which is a product
+question and not a WSL2 one — it is written down in `docs/joining.md` as
+a trap to check for rather than changed here.
