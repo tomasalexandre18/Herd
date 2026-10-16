@@ -4621,6 +4621,111 @@ changes nothing about the grant.
 
 ---
 
+## 2026-10-16 — D142 D140 carried out: the roster refuses, the fleet waits
+
+**What changed.** A submission is refused in **one** fleet state now: no
+runner is approved on this state root. Everything else about a fleet that is
+away — nobody connected this second, every runner draining, every runner
+switched off by its owner — **queues** the job. Alexa approved D140; this is
+the ruling built, and no frame moved: `PROTOCOL_VERSION` and `RECORD_VERSION`
+stay at 1 (D124, D128).
+
+**The sentence is the one that already existed, and that is the point.** A
+queued job's words come from `matcher::place` and are wrapped in M8's
+explained wait by the one path every queued job goes through — the position,
+what is ahead, and why (E-04, E-36). So a job queued a moment after the last
+link dropped reads exactly like one queued a minute before it, which is what
+the two answers to one fleet state had made impossible.
+
+**The second check after the pass is gone.** The submission path used to
+re-ask "is there a runner?" *after* its dispatch pass and refuse if not. That
+was the half of the defect that is hardest to see: the pass had already
+written the job's wait on its record, and the refusal then threw the
+follower away and answered 125 about a job that exists.
+
+**What bounds such a job, asserted rather than assumed.** E-09's deadline is
+D88's only bound on a job nothing can run, and it is judged in
+`matcher::place` **before** anything about the fleet — so a pass fired by the
+queue's own ageing loop cancels a job waiting for an empty fleet with no
+runner connected at all. A cancel reaches it where it stands, because
+cancelling a queued job is a store write and asks no machine. Both are in
+`herd-hub/tests/away_fleet.rs`, with the real binaries, beside E-04's
+restatement reaching a `herdctl wait` on such a job.
+
+**Not touched: the unplaceable-forever case M7 and D88 settled.** A job
+needing a capability no connected runner declares still **waits**, with `no
+connected runner can run it: …`, and a job whose own figures contradict each
+other still ends terminally (`Placement::Impossible`). Neither was in D140's
+scope and neither moved.
+
+**What an existing requester notices.** A submission that used to exit 125
+during a hub restart, a runner restart or a brief disconnection now returns an
+id and the job runs when the fleet comes back. A wrapper that read 125 as
+"decline, do not duplicate" gets a verdict instead — strictly better, and
+E-05 already made retrying safe. The only refusal left is the one a person has
+to fix, and it quotes the hub's own startup line: `0 runner(s) are approved on
+this state root`. A requester that wants a bound on waiting passes
+`--deadline`, which is where D88 says a bound on waiting belongs.
+
+**And `{j}`, the second instance of D107's defect.** `with_parallelism` filled
+`{j}` over the whole command *after* `herdctl` had quoted the requester's
+arguments into it, so an argument saying `{j}` became a thread count — and
+`parallelism_tokens` counted it, which was worse: two of them end the job by
+name. Fixed the way D139 fixed `{in}` and `{out}` in the runner, and with the
+*same function*: `herd_proto::declared_spans` holds the argument spans out of
+the pass and the declared text around them is filled. `herd-runner`'s own
+`line_filled` now calls it too, so the two paths cannot drift. The property
+preserved is D107's: **a value a substitution pasted in is never itself
+scanned for tokens** — the failure direction is a declared token left
+literal, never a requester's text turned into a figure.
+
+**Found on the way, and fixed here because here is where it became
+provable.** `herdctl` printed `job-unknown` for a submission the hub
+**refused in a frame** — "a job may exist whose id you never learned" —
+where `no-job` is the true answer: a refusal *is* the hub saying it minted
+nothing. D139's two lines ask a falling-back requester for opposite actions,
+so this was not a wording slip; it sent a wrapper looking for a job that does
+not exist, in the one case where re-running the work is safe.
+
+It predates this change, and the reason it belongs to it anyway is the first
+commit above. A `Refused` frame is proof the hub minted nothing **only if no
+refusal can follow a minting** — and until the post-pass refusal was deleted,
+one could: that branch answered 125 about a job that already had its wait on
+its record. Every `FromHub::Refused` on the `SubmitJob` path now precedes the
+minting, so the proof holds, and this correction is the last step of the same
+change rather than a tidy-up somewhere else.
+
+**It is not a two-line fix, because the ratchet it steps on is deliberate.**
+`learn()` only ever moves forward, and rightly: once a submission has left,
+no later failure can make it not have left — not a dropped socket, not a
+killed process, not a frame nobody can read. So the step back is **authorised
+by proof rather than expressed as an ordering**: a new `Said::Refused`,
+emitted from both submission paths, and a `refused()` in the binary that does
+*not* go through `learn()` and moves `Unknown` → `Nothing` and nothing else.
+`AJob` stays `AJob` — an id has been printed and no frame can unprint it —
+and `NotASubmission` stays itself.
+
+And the emitting side guards it too: `run_job` says it **only while no id has
+been learned**, so a `Refused` arriving after a `JobAccepted`, for any reason
+a future hub might have, can never make `herdctl` claim no job exists about a
+job that does. That would be the same defect wearing the other mask, and it
+is the more dangerous mask: work declined is work never done. In
+`submit_job_saying` the guard is kept by the shape of the match — the refusal
+is the first frame after the submission and `JobAccepted` returns above it.
+
+**What is asserted, and what is not.** A submission against a genuinely empty
+roster exits 125 with the `no-job` line and **without** the `job-unknown`
+line, both directions, for `run` and `submit` alike
+(`herdctl/tests/exit_code.rs`, and again through the real binaries in
+`herd-hub/tests/away_fleet.rs`). The narrowness of the step back is a unit
+test of its own. What is **not** asserted is the emitting guard: it would need
+a hub that answers `JobAccepted` and then refuses, which no hub does, and a
+fixture built to misbehave would be testing the fixture. The half of that
+guard which makes such a hub harmless anyway — `AJob` does not move — is
+asserted.
+
+---
+
 ## 2026-10-16 — D144 The server runner's real caps, and the module behind them
 
 **What the server runner carries now, with Alexa's approval.** The first

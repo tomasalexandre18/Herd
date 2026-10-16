@@ -432,7 +432,10 @@ async fn a_runner_s_health_report_and_its_age_are_in_the_hub_s_state() {
         hub.handle.runners().first().is_some_and(|r| r.draining)
     })
     .await;
-    let refused = herdctl::submit_job(
+    // The new job is therefore **queued**, with the drain named on its
+    // record: a machine on its way out is away, not a configuration mistake,
+    // so it waits rather than being refused (D88, D140).
+    let queued = herdctl::submit_job(
         &hub.requester(),
         vec!["true".to_owned()],
         LabelSet::default(),
@@ -440,11 +443,15 @@ async fn a_runner_s_health_report_and_its_age_are_in_the_hub_s_state() {
         herdctl::Declared::default(),
     )
     .await
-    .expect_err("a draining runner takes no new job");
-    assert!(
-        refused.to_string().contains("draining"),
-        "the refusal must say why: {refused:#}"
-    );
+    .expect("a runner on its way out is away, not broken");
+    hub.wait_until("the hub says why the new job is waiting", || {
+        hub.record(&queued)
+            .waiting_for
+            .unwrap_or_default()
+            .contains("draining")
+    })
+    .await;
+    assert_eq!(hub.record(&queued).state, JobState::Queued);
 }
 
 /// E-21, the whole of it: a runner that stops answering has its job attempted
@@ -1036,7 +1043,11 @@ async fn a_draining_runner_refuses_a_job_submitted_in_the_meantime() {
             || !hub.handle.runner_connected()
     })
     .await;
-    let refused = herdctl::submit_job(
+    // A draining runner takes no new job — and the new job therefore
+    // **waits** rather than being refused (D140): a machine its owner is
+    // restarting is a fleet that is away, which is D88's own case, and the
+    // roster still carries it.
+    let queued = herdctl::submit_job(
         &hub.requester(),
         vec!["true".to_owned()],
         LabelSet::default(),
@@ -1044,11 +1055,16 @@ async fn a_draining_runner_refuses_a_job_submitted_in_the_meantime() {
         herdctl::Declared::default(),
     )
     .await
-    .expect_err("a draining runner takes no new job");
-    let said = format!("{refused:#}");
-    assert!(
-        said.contains("draining") || said.contains("no runner is connected"),
-        "the refusal must name the reason: {said}"
+    .expect("a runner on its way out is away, not broken");
+    hub.wait_until("the hub says why the new job is waiting", || {
+        let why = hub.record(&queued).waiting_for.unwrap_or_default();
+        why.contains("draining") || why.contains("no runner is connected")
+    })
+    .await;
+    assert_eq!(
+        hub.record(&queued).state,
+        JobState::Queued,
+        "and nothing was handed to the runner that is leaving"
     );
     let _ = runner.await;
 }
@@ -1551,10 +1567,12 @@ async fn a_runner_announcing_another_state_root_is_turned_away_naming_both() {
     );
 
     // It was never admitted, so nothing is dispatched onto that connection: a
-    // submission in this window is refused by name rather than handed to a
-    // runner the hub is not serving.
+    // submission in this window **waits** rather than being handed to a
+    // runner the hub is not serving. Queued and not refused, because the
+    // machine is on the roster and a runner told to stand by comes back
+    // (D88, D140).
     assert!(!hub.handle.runner_connected());
-    let refused = herdctl::submit_job(
+    let queued = herdctl::submit_job(
         &hub.requester(),
         vec!["true".to_owned()],
         LabelSet::default(),
@@ -1562,11 +1580,20 @@ async fn a_runner_announcing_another_state_root_is_turned_away_naming_both() {
         herdctl::Declared::default(),
     )
     .await
-    .expect_err("there is no runner to place a job on");
-    assert!(
-        refused.to_string().contains("no runner is connected"),
-        "the refusal must say why: {refused:#}"
-    );
+    .expect("a runner standing by is away, not broken");
+    hub.wait_until("the hub says why the job is waiting", || {
+        hub.record(&queued)
+            .waiting_for
+            .unwrap_or_default()
+            .contains("no runner is connected to this hub")
+    })
+    .await;
+    assert_eq!(hub.record(&queued).state, JobState::Queued);
+    // And a cancel reaches it where it stands, with nothing connected — which
+    // is also what keeps it out of the queue the next assertion walks.
+    herdctl::cancel_job(&hub.requester(), queued.clone())
+        .await
+        .expect("a job waiting for an away fleet is cancellable");
 
     // The same runner, once it agrees about which state it is serving, is
     // welcome and is dispatched to. Being turned away is transient, which is
@@ -1892,9 +1919,10 @@ async fn a_peer_whose_name_and_instance_are_blank_is_refused_like_a_nameless_one
         );
     }
 
-    // There is therefore no blank-named runner for a second one to write onto:
-    // a job submitted in this window is refused by name, not placed on a peer
-    // the hub is not serving.
+    // There is therefore no blank-named runner for a second one to write
+    // onto, and nothing is placed on a peer the hub is not serving. This hub
+    // has approved nobody either, so the submission is refused by name — the
+    // one fleet state that still is (D140).
     let refused = herdctl::submit_job(
         &hub.requester(),
         vec!["true".to_owned()],
@@ -1903,9 +1931,11 @@ async fn a_peer_whose_name_and_instance_are_blank_is_refused_like_a_nameless_one
         herdctl::Declared::default(),
     )
     .await
-    .expect_err("there is no runner to place a job on");
+    .expect_err("nothing submitted to a hub with an empty roster could ever start");
     assert!(
-        refused.to_string().contains("no runner is connected"),
+        refused
+            .to_string()
+            .contains("0 runner(s) are approved on this state root"),
         "the refusal must say why: {refused:#}"
     );
 

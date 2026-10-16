@@ -65,8 +65,22 @@ fn outcome_of(herd: &Herd, job: &str) -> serde_json::Value {
     herd.record(job)["state"]["outcome"].clone()
 }
 
-/// How long until a submission is refused because no machine will take it —
-/// which is what "the hub stopped claiming" means from the outside (E-33).
+/// Why a queued job says the machine would not take it, if that is what it
+/// says (E-33, D140).
+///
+/// The sentences the claim step writes for a withdrawn machine and for a
+/// fleet that has gone, and nothing else: a job queued because its *slot* is
+/// taken, or because a host is being emptied for it (E-27), is a machine that
+/// is still claiming work and must not be read as one that has stopped.
+fn would_not_take_it(why: &str) -> bool {
+    why.contains("is draining and takes no new job")
+        || why.contains("by its owner and claims nothing")
+        || why.contains("no runner is connected to this hub")
+}
+
+/// How long until nothing is claimed any more, because no machine will take
+/// it — which is what "the hub stopped claiming" means from the outside
+/// (E-33).
 async fn until_nothing_is_claimed(herd: &Herd, began: Instant) -> (Duration, String) {
     until_nothing_of_this_kind_is_claimed(herd, began, &[]).await
 }
@@ -80,18 +94,36 @@ async fn until_nothing_is_claimed(herd: &Herd, began: Instant) -> (Duration, Str
 /// the test started. Each accepted probe then queues instead of running, and
 /// the only thing ever claimed on that machine is the job the test created
 /// (D100).
+/// A withdrawn machine no longer *refuses* a submission — since D140 the
+/// submission is accepted and the job waits, because a machine its owner
+/// switched off is away and E-33's switch is a temporary action. So what is
+/// watched here is the **record**: a job this machine never claimed, with the
+/// owner's own position named as the reason it did not.
 async fn until_nothing_of_this_kind_is_claimed(
     herd: &Herd,
     began: Instant,
     options: &[&str],
 ) -> (Duration, String) {
     loop {
-        let output = herd.submit_with(options, "printf nothing").await;
-        if !output.status.success() {
-            return (
-                began.elapsed(),
-                String::from_utf8_lossy(&output.stderr).into_owned(),
-            );
+        let job = herd.submit_ok(options, "printf nothing").await;
+        // The pass that judges it runs inside the submission, but `herdctl
+        // submit` leaves on the id rather than on the pass, so the verdict is
+        // waited for rather than read (D100).
+        let judged = Instant::now() + Duration::from_secs(2);
+        let claimed = loop {
+            if state_of(herd, &job) != "queued" {
+                break true;
+            }
+            if would_not_take_it(&herd.waiting_for(&job)) {
+                break false;
+            }
+            if Instant::now() >= judged {
+                break true;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        };
+        if !claimed {
+            return (began.elapsed(), herd.waiting_for(&job));
         }
         assert!(
             began.elapsed() < TEN_SECONDS,
@@ -189,33 +221,44 @@ async fn until_the_state_root_is_quiet(herd: &Herd) -> Vec<(String, Vec<u8>)> {
     }
 }
 
-/// Submit until the hub refuses **for this reason**, and come back with what
-/// it said.
+/// Submit until a job waits **for this reason**, and come back with the
+/// sentence its record carries.
 ///
 /// What a runner prints as it dials is the runner's own news; a submission
 /// means something only once the *hub* has that runner, and nothing in the
 /// runner's log says when that is. So the condition waited on here is the
-/// refusal itself: refused for her reason is the answer, refused because
-/// nothing is connected yet is a wait, and a submission the hub **accepts**
-/// fails at once rather than being retried — a machine that claims work after
-/// its owner switched it off is exactly the defect these tests watch for
-/// (D100).
-async fn until_a_submission_is_refused_saying(herd: &Herd, reason: &str) -> String {
+/// wait itself: waiting for her reason is the answer, waiting because nothing
+/// is connected yet is a retry, and a job the machine **claims** fails at
+/// once rather than being retried — a machine that claims work after its
+/// owner switched it off is exactly the defect these tests watch for (D100).
+///
+/// A wait and not a refusal since D140: a machine its owner withdrew for the
+/// evening is away, and a submission that landed then used to get exit 125.
+async fn until_a_submission_waits_saying(herd: &Herd, reason: &str) -> String {
     let deadline = Instant::now() + PATIENCE;
     loop {
-        let output = herd.submit_with(&[], "printf nothing").await;
-        assert!(
-            !output.status.success(),
-            "the machine claimed work it had to refuse; it says: {}",
-            herd.switches().await
-        );
-        let refusal = String::from_utf8_lossy(&output.stderr).into_owned();
-        if refusal.contains(reason) {
-            return refusal;
+        let job = herd.submit_ok(&[], "printf nothing").await;
+        let judged = Instant::now() + Duration::from_secs(2);
+        let mut why = String::new();
+        while Instant::now() < judged {
+            assert_eq!(
+                state_of(herd, &job),
+                "queued",
+                "the machine claimed work it had to leave alone; it says: {}",
+                herd.switches().await
+            );
+            why = herd.waiting_for(&job);
+            if would_not_take_it(&why) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        if why.contains(reason) {
+            return why;
         }
         assert!(
             Instant::now() < deadline,
-            "no refusal ever carried {reason:?}; the last one said: {refusal}"
+            "no wait ever carried {reason:?}; the last one said: {why}"
         );
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
@@ -569,7 +612,7 @@ async fn a_runner_restarted_while_switched_off_comes_back_switched_off() {
     // That line is the runner's own: it says the machine read its file, not
     // that the hub has the connection yet. So the refusal is what is waited
     // on, and a submission the hub accepts fails at once (D100).
-    let refusal = until_a_submission_is_refused_saying(&herd, "she is gaming").await;
+    let refusal = until_a_submission_waits_saying(&herd, "she is gaming").await;
     assert!(
         refusal.contains("wsl-pc"),
         "and the refusal names the machine: {refusal}"
@@ -1579,7 +1622,7 @@ async fn a_switch_survives_a_kill_nine_on_the_runner() {
     // in three runs. So the refusal is the condition — and a submission the
     // hub **accepts** is the defect this test exists for and fails at once
     // (D100).
-    let refusal = until_a_submission_is_refused_saying(&herd, "she is gaming").await;
+    let refusal = until_a_submission_waits_saying(&herd, "she is gaming").await;
     assert!(
         refusal.contains("wsl-pc"),
         "a runner killed in the instant `herdctl switch` returned comes back switched off, \

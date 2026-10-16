@@ -318,6 +318,53 @@ pub fn args_as_line(args: &[String]) -> String {
         .join(" ")
 }
 
+/// The spans of a line the **declaration itself** wrote, with the text a
+/// requester's arguments put there held out (D107, D139).
+///
+/// Every pass over an already-resolved line has the same problem — the
+/// runner's `{job}`, `{in}` and `{out}`, the hub's `{j}` — so it is answered
+/// once, here. `{args}` is filled **before the job is minted**, for M6's key
+/// (D107), and D107's property is that a value a substitution pasted in is
+/// never itself scanned for tokens: `--only '{out}'` is an argument, not a
+/// template. A single pass over the whole line cannot keep both, so the pass
+/// is made over the declared text only.
+///
+/// The arguments are held out by the only thing that identifies them
+/// exactly — the requester's own words, which already travel beside the line
+/// ([`Declaration::args`]) and were quoted into it by one function
+/// ([`args_as_line`]). Nothing is encoded, escaped or marked, and no frame
+/// changes. An empty argument list, or a line no `{args}` reached, means
+/// there is no requester text in the line at all and the whole of it is
+/// declared.
+///
+/// Given back as the declared spans and the text between them, so that
+/// filling a token ([`filled_outside_the_arguments`]) and *counting* one are
+/// the same idea of what "declared" means rather than two. The failure
+/// direction is conservative either way: a declared token left literal, never
+/// a requester's own text read as Herd's.
+pub fn declared_spans<'line>(line: &'line str, args: &[String]) -> (Vec<&'line str>, String) {
+    let pasted = args_as_line(args);
+    if pasted.is_empty() || !line.contains(pasted.as_str()) {
+        return (vec![line], pasted);
+    }
+    (line.split(pasted.as_str()).collect(), pasted)
+}
+
+/// `line` with `fill` applied to the text the declaration wrote and to
+/// nothing a requester's arguments put there (D107, D139).
+pub fn filled_outside_the_arguments(
+    line: &str,
+    args: &[String],
+    fill: impl Fn(&str) -> String,
+) -> String {
+    let (spans, pasted) = declared_spans(line, args);
+    spans
+        .into_iter()
+        .map(fill)
+        .collect::<Vec<_>>()
+        .join(&pasted)
+}
+
 /// A command whose requirements are not knowable from its declaration: the
 /// line that reads them, and the labels that reading is itself placed against
 /// (D74).
