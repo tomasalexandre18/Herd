@@ -18,6 +18,11 @@ than asserted: `memory.max 8589934592`, `cpu.weight 10`, `io.weight 10`,
 in one cgroup per job under the delegated service. A job at exit 0, one
 at exit 7, and one silent for 50 s whose follower never went quiet.
 
+**A job's files come home, proved live and not only by the suite.**
+The first consumer's j0000000030 and j0000000031 ended at exit 0 and
+their `results.json` — 50 and 616 bytes — are on the hub's disk under
+`jobs/<id>/files/`, read there rather than reported (D131, D137).
+
 **The caps the `server` runner carries, approved by Alexa (D144):** 3 h
 per job, `pids.max 4096`, and a hard `io.max` on device `259:0` —
 `rbps=775MB wbps=435MB riops=180000 wiops=105000`, a quarter of the
@@ -43,19 +48,12 @@ test scope, ZFS on `/`, no root-equivalent group.
    wrappers directory on `jobPath` (D144) — so the rebuild is a no-op
    rather than a weakening. It needs `/etc/nixos` plus a
    `nixos-rebuild`: Alexa's.
-2. **File return is built and merged, and unproven on the live
-   deployment.** A job's small declared outputs travel like its log
-   (D131, D137), the suite proves it with real binaries, and a job's
-   record keeps an empty `files/` honestly where nothing was written.
-   What has not happened is one real declared job on the server writing
-   a file we then read off the hub's disk. The first consumer's first
-   successful `up` step is that proof.
-3. **`wss://` is configured and never dialled.** The Traefik fragment is
+2. **`wss://` is configured and never dialled.** The Traefik fragment is
    written for this host's real proxy and loads in Traefik, but no real
    dial through Cloudflare has happened. The tailnet makes it optional.
-4. No authentication ceiling per requester: one shared token means any
+3. No authentication ceiling per requester: one shared token means any
    requester may ask for the merger level.
-5. A test that cannot be made honestly on a loaded host **skips loudly**
+4. A test that cannot be made honestly on a loaded host **skips loudly**
    and never passes quietly (D27). Thirteen do here.
 
 Open and recorded: D63, D64, D92, D98, D101, D122's two reaper blind
@@ -80,11 +78,12 @@ executor cycle — are accepted and unbuilt.
 
 ## Next action
 
-Three of the consumer's four blocking items are in review (#31): files
-home, `{out}` in a declared line, and telling "nothing submitted" from
-"no verdict". The fourth, the reaper's janitor list (D134), is accepted
-and unbuilt — and their failing `up` walked into it, since nothing here
-sweeps after a `down` that fails too. Then: one real declared job on the
-server that writes a file, read back off the hub's disk — the only claim
-here still standing on the suite alone. Alexa's own: the `nixos-rebuild`
-that makes the unit permanent (E-52), and merging #31 and #32.
+The reaper's janitor list (D134) is the first consumer's last blocking
+item, and their first failing `up` walked straight into it: when a
+`down` step fails too, nothing here sweeps after it. Then the second
+machine (M17) — the hub is already on the tailnet, so that is a runner
+on the Windows PC's WSL2 and the Arch box, not a `wss://` dial (D145).
+
+Behind those: per-token priority ceilings, a `flock` probe type, and
+`docs/joining.md` step 1, which still says "build it in the dev shell"
+where a release is now one download.
