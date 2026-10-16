@@ -126,6 +126,25 @@ const RUNTIME_SOCKETS: &[&str] = &[
     "/var/run/libvirt/libvirt-sock",
 ];
 
+/// The runtime socket paths this crate knows about, as the code itself lists
+/// them.
+///
+/// Exposed because D78 promises more than a warning: a test asserts that
+/// while a job runs, **no open descriptor of the runner — nor of the job —
+/// resolves to the Docker socket**. That test compares against this list
+/// rather than against a second copy of it, or the proof drifts away from
+/// what the code believes the moment a path is added here.
+#[cfg(unix)]
+pub fn runtime_sockets() -> &'static [&'static str] {
+    RUNTIME_SOCKETS
+}
+
+/// Nothing to name where there is no such notion.
+#[cfg(not(unix))]
+pub fn runtime_sockets() -> &'static [&'static str] {
+    &[]
+}
+
 /// Everything about this deployment that makes E-46's "unprivileged" less
 /// than true, each as one sentence naming the specific reason.
 ///

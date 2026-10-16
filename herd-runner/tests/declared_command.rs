@@ -188,6 +188,11 @@ impl Ran {
 struct Fixture {
     dir: TempDir,
     extra: BTreeMap<&'static str, String>,
+    /// The arguments the requester typed, as they travel beside the line
+    /// (D107). They are already quoted into the line by then; the runner
+    /// holds them so that it can fill the declared text around them without
+    /// filling them.
+    args: Vec<String>,
 }
 
 impl Fixture {
@@ -195,7 +200,14 @@ impl Fixture {
         Self {
             dir: TempDir::new(&format!("{label}-fixture")),
             extra: BTreeMap::new(),
+            args: Vec::new(),
         }
+    }
+
+    /// The arguments this submission carries.
+    fn with_args(mut self, args: &[&str]) -> Self {
+        self.args = args.iter().map(|arg| (*arg).to_owned()).collect();
+        self
     }
 
     /// Append a shell line to one hook, after the line that records the step.
@@ -236,7 +248,7 @@ impl Fixture {
             // Forty lowercase hex, as `herdctl` resolved it: the hub refuses
             // anything else (E-01).
             commit: "cb5a".repeat(10),
-            args: Vec::new(),
+            args: self.args.clone(),
             executor: Executor {
                 up: self.hook(Step::Up),
                 fetch: self.hook(Step::Fetch),
@@ -421,6 +433,39 @@ async fn the_declared_environment_reaches_the_steps_with_the_runner_s_tokens_fil
     assert!(
         !ran.log.contains(OUT_TOKEN),
         "no brace may reach a step:\n{}",
+        ran.log
+    );
+}
+
+/// A declared command's **own line** may name `{out}` and `{in}`, and the
+/// step gets the directory rather than the three characters — while an
+/// argument the requester typed that says the same three characters is text
+/// and stays text (D107).
+///
+/// Both halves in one job on purpose: they are one property, and a fix for
+/// the first that broke the second would turn a requester's own string into
+/// a template.
+#[tokio::test]
+async fn a_declared_line_s_own_tokens_are_filled_and_a_requester_s_arguments_are_not() {
+    let harness = Harness::new("declared-line-tokens", |_| {}).await;
+    let typed = ["--only", OUT_TOKEN];
+    let fixture = Fixture::new("declared-line-tokens").with_args(&typed);
+    // The line as `herdctl` resolves it: the declared template, with the
+    // arguments already quoted into its `{args}` (D107).
+    let said = format!(
+        "printf 'out is %s\\n' {OUT_TOKEN}/packs; printf 'args are %s %s\\n' {}",
+        herd_proto::args_as_line(&typed.map(str::to_owned))
+    );
+    let ran = harness.run(line(&said), fixture.declared(None)).await;
+    assert_eq!(ran.outcome, JobOutcome::Exited { code: 0 }, "{}", ran.log);
+    assert!(
+        ran.log.contains("out is /") && ran.log.contains("/out/packs"),
+        "the declared line's own {OUT_TOKEN} should have reached the hook as a path:\n{}",
+        ran.log
+    );
+    assert!(
+        ran.log.contains(&format!("args are --only {OUT_TOKEN}")),
+        "an argument the requester typed is text and must arrive as typed:\n{}",
         ran.log
     );
 }

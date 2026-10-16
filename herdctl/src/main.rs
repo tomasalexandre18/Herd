@@ -1,3 +1,4 @@
+use std::cell::Cell;
 use std::io::Write;
 use std::process::ExitCode;
 
@@ -5,9 +6,40 @@ use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand};
 use herd_proto::{JobId, JobOutcome, LabelSet, LogStream, Priority};
 use herdctl::{
-    could_not_start_message, exit_code_for, impossible_exit_code_reason, no_verdict_message,
-    no_verdict_reason, stopped_by_cap_message, Config, DEFAULT_HUB_URL, NO_VERDICT_CODE,
+    could_not_start_message, exit_code_for, impossible_exit_code_reason, job_id_line,
+    no_verdict_message, no_verdict_reason, stopped_by_cap_message, Config, DEFAULT_HUB_URL,
+    JOB_UNKNOWN_LINE, NO_JOB_LINE, NO_VERDICT_CODE,
 };
+
+/// What this invocation knows about whether a job of its own exists.
+///
+/// The one question a requester that falls back has to answer, and the
+/// reason [`herdctl::JOB_ID_PREFIX`] exists: 125 alone says "no verdict",
+/// which is true both of a job that is running somewhere and of a submission
+/// that never left, and those two call for opposite actions.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord)]
+enum WhatExists {
+    /// This command submits nothing, so the question does not arise and no
+    /// line is printed for it. `cancel`, `raise`, `wait`, `would-run` and
+    /// the operator commands: none of them can leave a job behind that was
+    /// not already there, and a sentence about submissions on one of them
+    /// would be a sentence about the wrong thing.
+    #[default]
+    NotASubmission,
+    /// Nothing was submitted. Running the work again starts no second job.
+    Nothing,
+    /// The submission left and was never acknowledged: a job may exist, and
+    /// E-05 means re-submitting the same work joins it.
+    Unknown,
+    /// A job exists and its id has been printed.
+    AJob,
+}
+
+/// It only ever moves forward: once a submission has left, no later failure
+/// can make it not have left.
+fn learn(known: &Cell<WhatExists>, now: WhatExists) {
+    known.set(known.get().max(now));
+}
 
 /// The level a submission that does not name one is weighed at: the ordinary
 /// branch step (E-18).
@@ -109,9 +141,77 @@ struct Declaring {
     checkout: Option<std::path::PathBuf>,
 }
 
+/// Where a requester wants the job's own output **files** put (D131).
+///
+/// A flattened group shared by `run` and `wait`, because the two are the same
+/// question asked at two moments: `run` follows a job to its end, `wait`
+/// attaches to one by its id — often long after it ran — and both are handed
+/// the job's kept files in the frame that carries the verdict. That is exactly
+/// why there is no `herdctl outputs <id>` subcommand: `herdctl wait <id>
+/// --outputs-to <dir>` already *is* the after-the-fact fetch.
+#[derive(Debug, Clone, clap::Args)]
+struct Keeping {
+    /// Where to write the files the job left under `{out}`, keeping their
+    /// relative paths: `files/results.json` lands at
+    /// `<DIR>/files/results.json`.
+    ///
+    /// Left out, nothing is written and the job's files stay on the hub, in
+    /// its record. They are **never** printed: stdout is the `ran on:` line,
+    /// the job's own bytes and its verdict, and nothing else (E-02). What
+    /// this option writes is reported on stderr, one line per file.
+    ///
+    /// A job whose output was over the runner's cap writes no file at all and
+    /// says so on stderr with both figures — never a truncated file, which
+    /// would read like a whole one.
+    #[arg(long = "outputs-to", value_name = "DIR")]
+    outputs_to: Option<std::path::PathBuf>,
+}
+/// What `herdctl --help` says about exit codes, and about the one thing a
+/// code cannot say.
+///
+/// Written out in `--help` rather than left to a document, because the
+/// person who needs it is writing a wrapper around this binary and `--help`
+/// is where they are already looking. `deploy/release-notice.md` carries the
+/// same table for whoever is reading that instead.
+const EXIT_CODES: &str = "\
+Exit codes:
+  the job's own  worn untouched — 0, 1, 75, whatever the process exited with
+  124            a runner stopped the job at a cap: time, memory, log or disk
+  125            Herd has no verdict: it could not run the job, lost it,
+                 refused it, or could not be reached. Never a failing build
+  128 + n        the job was killed by signal n, as a shell reports one
+  2              a command did part of what it says and named the rest
+
+Falling back after 125:
+  125 is one code for two opposite situations — a job that exists and may
+  still be running, and a submission that never left. Re-running the first
+  does the work twice; declining to re-run the second does it never. The
+  code cannot tell them apart, so stderr does, in one documented line:
+
+    herdctl: job-id: <id>      a job exists. Do not submit again:
+                               `herdctl wait <id>` picks it back up
+    herdctl: no-job: ...       nothing was submitted. Running again is safe
+    herdctl: job-unknown: ...  the submission left unacknowledged. A job may
+                               exist; submitting the same work again joins
+                               it rather than starting a second one (E-05)
+
+  The rule is the presence of an id, never the wording of a sentence. The
+  line is on stderr, which a job's own output never shares, and appears as
+  soon as the hub says the id — so it survives a wrapper that gives up and
+  kills herdctl. Seeing none of the three means herdctl died before it could
+  say; treat that as job-unknown.
+
+  A wrapper reads it like this:
+
+    out=$(herdctl run --command build --commit \"$sha\" 2>&1 >/dev/null) || {
+      id=$(printf '%s\\n' \"$out\" | sed -n 's/^herdctl: job-id: //p' | tail -1)
+      if [ -n \"$id\" ]; then herdctl wait \"$id\"; else run_it_locally; fi
+    }
+";
+
 /// The requester CLI: submit a job, follow its log, exit with its code.
 #[derive(Debug, Parser)]
-#[command(name = "herdctl", version, about)]
+#[command(name = "herdctl", version, about, after_long_help = EXIT_CODES)]
 struct Args {
     /// The hub to submit to.
     #[arg(long, env = "HERD_HUB_URL", default_value = DEFAULT_HUB_URL, global = true)]
@@ -167,6 +267,8 @@ enum Action {
         asking: Asking,
         #[command(flatten)]
         declaring: Declaring,
+        #[command(flatten)]
+        keeping: Keeping,
         /// The command, after `--` — or, with `--command`, the arguments
         /// that declared line's `{args}` stands for.
         #[arg(trailing_var_arg = true, num_args = 0..)]
@@ -280,6 +382,8 @@ enum Action {
     Wait {
         /// The id a submission printed.
         job_id: String,
+        #[command(flatten)]
+        keeping: Keeping,
     },
     /// Ask for a job to be cancelled, wherever it is running (E-06).
     ///
@@ -376,7 +480,8 @@ const NOT_SETTLED_CODE: u8 = 2;
 #[tokio::main]
 async fn main() -> ExitCode {
     let args = Args::parse();
-    match run(args).await {
+    let known = Cell::new(WhatExists::default());
+    match run(args, &known).await {
         Ok(Done::Job(outcome)) => {
             // The reason goes to stderr, never to stdout: stdout carried the
             // job's own output and must stay the job's alone.
@@ -421,12 +526,21 @@ async fn main() -> ExitCode {
         // failed (D20). One code, one meaning, and the reason on stderr.
         Err(error) => {
             eprintln!("herdctl: {}", no_verdict_message(&format!("{error:#}")));
+            // And then the one thing a falling-back requester has to know,
+            // which the code cannot say. A job that exists has already named
+            // itself on stderr, the moment the hub said its id; the other
+            // two states are said here, where they become final.
+            match known.get() {
+                WhatExists::NotASubmission | WhatExists::AJob => {}
+                WhatExists::Unknown => eprintln!("{JOB_UNKNOWN_LINE}"),
+                WhatExists::Nothing => eprintln!("{NO_JOB_LINE}"),
+            }
             ExitCode::from(NO_VERDICT_CODE)
         }
     }
 }
 
-async fn run(args: Args) -> Result<Done> {
+async fn run(args: Args, known: &Cell<WhatExists>) -> Result<Done> {
     let config = Config {
         hub_url: args.hub,
         token: args.token,
@@ -441,8 +555,13 @@ async fn run(args: Args) -> Result<Done> {
             tmpfs_mib,
             asking,
             declaring,
+            keeping,
             command,
         } => {
+            // This command can leave a job behind, so the question "does one
+            // exist?" is live from here on, and its answer is said on stderr
+            // whichever way this ends (`JOB_ID_PREFIX`).
+            learn(known, WhatExists::Nothing);
             let job = submitting(
                 declaring,
                 labels,
@@ -476,9 +595,10 @@ async fn run(args: Args) -> Result<Done> {
                 // alone. A queued job's reason arrives here (E-26). The one
                 // exception is E-02's first line, which *is* part of the
                 // output and goes on stdout ahead of it (D109).
-                say_it,
+                |said| say_it(known, said),
             )
             .await?;
+            keep_the_outputs(&keeping, &finished);
             Ok(Done::Job(finished.outcome))
         }
         Action::Submit {
@@ -491,6 +611,10 @@ async fn run(args: Args) -> Result<Done> {
             declaring,
             command,
         } => {
+            // This command can leave a job behind, so the question "does one
+            // exist?" is live from here on, and its answer is said on stderr
+            // whichever way this ends (`JOB_ID_PREFIX`).
+            learn(known, WhatExists::Nothing);
             let job = submitting(
                 declaring,
                 labels,
@@ -502,9 +626,15 @@ async fn run(args: Args) -> Result<Done> {
                 command,
             )?;
             eprintln!("herdctl: {}", submitting_at(job.priority));
-            let job_id =
-                herdctl::submit_job(&config, job.command, job.labels, job.priority, job.declared)
-                    .await?;
+            let job_id = herdctl::submit_job_saying(
+                &config,
+                job.command,
+                job.labels,
+                job.priority,
+                job.declared,
+                |said| say_it(known, said),
+            )
+            .await?;
             // The id alone on stdout, so that `id=$(herdctl submit -- ...)`
             // is all a hook needs (E-42).
             println!("{job_id}");
@@ -520,6 +650,8 @@ async fn run(args: Args) -> Result<Done> {
             declaring,
             command,
         } => {
+            // A dry run submits nothing by construction (E-07), so it stays
+            // `NotASubmission` and says nothing about jobs that exist.
             let job = submitting(
                 declaring,
                 labels,
@@ -608,7 +740,7 @@ async fn run(args: Args) -> Result<Done> {
             }
             Ok(Done::Said)
         }
-        Action::Wait { job_id } => {
+        Action::Wait { job_id, keeping } => {
             // A wait prints the job's output exactly as `run` does: the log
             // the hub had recorded before this wait attached, then whatever
             // arrives afterwards. Without it a detached requester could only
@@ -621,9 +753,10 @@ async fn run(args: Args) -> Result<Done> {
                     LogStream::Stdout => write_now(&mut std::io::stdout(), data),
                     LogStream::Stderr => write_now(&mut std::io::stderr(), data),
                 },
-                say_it,
+                |said| say_it(known, said),
             )
             .await?;
+            keep_the_outputs(&keeping, &finished);
             Ok(Done::Job(finished.outcome))
         }
         Action::Cancel { job_id } => {
@@ -802,13 +935,81 @@ fn labels_of(labels: Vec<String>) -> Result<LabelSet> {
 /// it is named and goes to stderr; the framing line is E-02's first line of
 /// the **output**, so it goes to stdout with no prefix of ours — their
 /// tooling reads `^ran on: (\S+) \((.*)\)$` there (D109).
-fn say_it(said: herdctl::Said) {
+/// What a job left behind, on **stderr** and on a disk if one was named
+/// (D131).
+///
+/// Everything here goes to stderr and nothing to stdout. E-02's stream is the
+/// `ran on:` line, then the job's own bytes, then the verdict — a file written
+/// into it, or even a sentence about one, would be read by the consumer's own
+/// tooling as output their tool produced.
+///
+/// Three things are said, and each of them only when it is true:
+///
+/// * the refusal, **always**, whether or not `--outputs-to` was given: a
+///   requester whose `results.json` did not come back has to hear it, and the
+///   verdict is not the place to say it — the tests really did pass or fail,
+///   and D20 forbids turning a cap on a side channel into a verdict about the
+///   job. So this is a loud sentence and never an exit code.
+/// * what was skipped, **always**, for the same reason: "it is a symlink and
+///   a symlink is not followed" is the fact somebody needs and the record
+///   alone would not reach them.
+/// * one line per file written, only with `--outputs-to`.
+fn keep_the_outputs(keeping: &Keeping, finished: &herdctl::Finished) {
+    let outputs = &finished.outputs;
+    if let Some(refusal) = &outputs.refused {
+        eprintln!("herdctl: {refusal}");
+    }
+    for said in &outputs.skipped {
+        eprintln!("herdctl: this job's output: {said}");
+    }
+    let Some(directory) = &keeping.outputs_to else {
+        // Nothing asked for, so nothing written — and still one line when
+        // there was something to write, because a requester that forgot the
+        // option would otherwise never learn the files exist at all.
+        if !outputs.files.is_empty() {
+            eprintln!(
+                "herdctl: {} kept {} output file(s); pass --outputs-to <DIR> to write them",
+                finished.job_id,
+                outputs.count()
+            );
+        }
+        return;
+    };
+    match herdctl::write_outputs(directory, outputs) {
+        Ok(written) => {
+            for line in written {
+                eprintln!("herdctl: {line}");
+            }
+        }
+        // Said and not fatal: the verdict is the answer the caller is waiting
+        // for and it has already been established. A requester that cannot
+        // write to the directory it named has a problem with that directory,
+        // not with the job.
+        Err(error) => eprintln!(
+            "herdctl: the files {} left could not be written under {}: {error:#}",
+            finished.job_id,
+            directory.display()
+        ),
+    }
+}
+
+fn say_it(known: &Cell<WhatExists>, said: herdctl::Said) {
     match said {
         herdctl::Said::Note(note) => eprintln!("herdctl: {note}"),
         herdctl::Said::Framing(line) => {
             let mut out = std::io::stdout();
             let _ = writeln!(out, "{line}");
             let _ = out.flush();
+        }
+        // Nothing is printed: the state is remembered, and said at the end
+        // only if nothing better was learned (`JOB_UNKNOWN_LINE`).
+        herdctl::Said::Submitting => learn(known, WhatExists::Unknown),
+        // Printed here and now, on stderr, because every failure that could
+        // swallow it — including one that kills this process — is after
+        // this point (`JOB_ID_PREFIX`).
+        herdctl::Said::Submitted(job_id) => {
+            learn(known, WhatExists::AJob);
+            eprintln!("{}", job_id_line(job_id));
         }
     }
 }

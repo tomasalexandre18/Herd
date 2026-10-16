@@ -536,6 +536,7 @@ async fn a_silent_runner_s_job_is_attempted_again_and_the_record_names_both() {
             chunks_sent: 1,
             metrics: JobMetrics::default(),
             steps: Vec::new(),
+            outputs: Default::default(),
         })
         .await;
     hub.wait_until("the second attempt is recorded", || {
@@ -695,6 +696,7 @@ async fn a_returning_runner_finishes_nothing_of_the_attempt_it_lost() {
         chunks_sent: 1,
         metrics: JobMetrics::default(),
         steps: Vec::new(),
+        outputs: Default::default(),
     })
     .await;
     assert!(
@@ -726,6 +728,7 @@ async fn a_returning_runner_finishes_nothing_of_the_attempt_it_lost() {
         chunks_sent: 0,
         metrics: JobMetrics::default(),
         steps: Vec::new(),
+        outputs: Default::default(),
     })
     .await;
     hub.wait_until("the attempt that is current ends normally", || {
@@ -1091,6 +1094,7 @@ async fn output_lost_with_nothing_behind_it_is_asked_for_and_recovered() {
             chunks_sent: 2,
             metrics: JobMetrics::default(),
             steps: Vec::new(),
+            outputs: Default::default(),
         })
         .await;
     let asked = loop {
@@ -1134,6 +1138,7 @@ async fn output_lost_with_nothing_behind_it_is_asked_for_and_recovered() {
             chunks_sent: 2,
             metrics: JobMetrics::default(),
             steps: Vec::new(),
+            outputs: Default::default(),
         })
         .await;
     hub.wait_until("the end is recorded once the log is whole", || {
@@ -1192,6 +1197,7 @@ async fn output_that_cannot_be_recovered_is_named_in_the_log() {
                 chunks_sent: 3,
                 metrics: JobMetrics::default(),
                 steps: Vec::new(),
+                outputs: Default::default(),
             })
             .await;
         // Drain whatever the hub says back, so the second end is a second ask.
@@ -1423,6 +1429,7 @@ async fn a_verdict_from_a_runner_the_attempt_was_not_given_to_is_refused_by_name
                 ..JobMetrics::default()
             },
             steps: Vec::new(),
+            outputs: Default::default(),
         })
         .await;
     match other.next().await {
@@ -1486,6 +1493,7 @@ async fn a_verdict_from_a_runner_the_attempt_was_not_given_to_is_refused_by_name
         chunks_sent: 0,
         metrics: JobMetrics::default(),
         steps: Vec::new(),
+        outputs: Default::default(),
     })
     .await;
     hub.wait_until("the runner holding the attempt is believed", || {
@@ -1652,6 +1660,7 @@ async fn one_name_claimed_by_two_live_runners_is_said_plainly_and_nobody_is_kick
             chunks_sent: 0,
             metrics: JobMetrics::default(),
             steps: Vec::new(),
+            outputs: Default::default(),
         })
         .await;
     hub.wait_until("the redial's verdict is recorded", || {
@@ -1716,6 +1725,7 @@ async fn nothing_is_written_to_a_job_that_is_over_not_even_by_its_own_runner() {
             chunks_sent: 1,
             metrics: measured.clone(),
             steps: Vec::new(),
+            outputs: Default::default(),
         })
         .await;
     // Waited on the acknowledgement, not on a poll: when it arrives the end
@@ -1779,6 +1789,7 @@ async fn nothing_is_written_to_a_job_that_is_over_not_even_by_its_own_runner() {
                 ..JobMetrics::default()
             },
             steps: Vec::new(),
+            outputs: Default::default(),
         })
         .await;
     let refused = runner.next_refusal().await;

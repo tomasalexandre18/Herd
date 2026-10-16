@@ -1,0 +1,135 @@
+# The Herd hub, under docker compose, beside the consumer's own dashboard.
+#
+# D5: the hub ships as a container image built from the Nix flake and runs
+# under docker compose like any other app on the server, with no state
+# outside its own volume (D8).
+#
+# The image `herd-hub:0.1.0` is built and loaded by the packaging half of
+# M16 (`nix/`, `flake.nix`). Nothing here ever pulls from a registry.
+#
+# Where this file goes: anywhere the operator keeps his compose projects —
+# `/srv/herd/` on the server. It is a file, not a NixOS module: `/etc/nixos`
+# is not Herd's to change.
+#
+#   cp env.example .env     # then edit .env; it is yours, not the repo's
+#   docker compose up -d
+#   docker compose logs -f hub
+#
+# TLS is the reverse proxy's job (D4, D14). This file never publishes the
+# hub beyond loopback, so no port is ever opened on a router (invariant 3).
+
+name: herd
+
+services:
+  hub:
+    image: herd-hub:0.1.0
+    # Built locally by Nix and `docker load`ed. Never reach for a registry:
+    # a pull here would either fail or, worse, find something else.
+    pull_policy: never
+    restart: unless-stopped
+
+    # The hub listens on every interface *inside its network namespace*,
+    # because that is the only way the published loopback port below can
+    # reach it. D14's loopback default is about the host, and the host side
+    # of this is loopback-only: see `ports:`.
+    environment:
+      HERD_LISTEN: 0.0.0.0:8787
+      # `/var/lib/herd` exactly, and nothing under it: that is the one
+      # directory the image creates and gives to its own non-root user, and
+      # the path the volume below is mounted on. See `volumes:`.
+      HERD_STATE_DIR: /var/lib/herd
+      # One shared token every requester must carry (Q8). A path, never the
+      # token: a secret on a command line is readable out of /proc by every
+      # user of the host (invariant 7).
+      HERD_REQUESTER_TOKEN_FILE: /run/secrets/herd-requester-token
+
+    secrets:
+      - herd-requester-token
+
+    volumes:
+      # D8: one directory per job, on a volume of its own. This is the only
+      # place the hub writes, which is what makes `read_only: true` below
+      # true rather than hopeful.
+      #
+      # The path must be `/var/lib/herd` and must match HERD_STATE_DIR above,
+      # because the image creates exactly that directory and gives it to the
+      # hub's uid: docker seeds a fresh named volume from the directory it
+      # mounts over, so the volume comes up owned by the hub. Mount a
+      # subdirectory the image does not contain and docker makes the mount
+      # point itself, root-owned, and the first start dies — see the first
+      # start in `README.md` for the error that follows.
+      - herd-state:/var/lib/herd
+
+    # Loopback only. The reverse proxy the operator already runs on this
+    # host connects here; nothing else can. Two documented variants, and
+    # neither of them opens a port on a router (invariant 3):
+    #
+    #   * his proxy is itself a container — it cannot reach a loopback
+    #     publish at all, because that is a DNAT rule for 127.0.0.1 alone,
+    #     so the hub has to join a network the proxy is on.
+    #     `docker-compose.traefik.yml` is that, as an override, and it
+    #     **keeps** the line below rather than replacing it: this host's own
+    #     runner and `herdctl` both dial `ws://127.0.0.1:8787`, so dropping
+    #     `ports:` for an `expose:` would cut the two callers that work
+    #     today in order to add one that does not yet;
+    #   * a runner on another machine has to reach the hub over the mesh
+    #     before `wss://` is dialable (see docs/joining.md) — publish on the
+    #     mesh address instead of loopback: "100.x.y.z:8787:8787". That is an
+    #     address on the owner's tailnet, not a default or public interface,
+    #     which is the condition D11 sets.
+    ports:
+      - "127.0.0.1:8787:8787"
+
+    networks:
+      - herd
+
+    # The hub needs nothing but its state volume.
+    read_only: true
+    tmpfs:
+      - /tmp
+    cap_drop:
+      - ALL
+    security_opt:
+      - "no-new-privileges:true"
+
+    # Invariant 2 is about runners, but the host has 31 GiB and no swap, so
+    # nothing on it gets to be unbounded. The hub holds a queue and file
+    # handles, not builds; 2 GiB is generous. memswap_limit equal to
+    # mem_limit is how docker says "no swap for this container".
+    mem_limit: 2g
+    memswap_limit: 2g
+
+    # A runner holds a finished result until the hub acknowledges it (D8),
+    # so a hub stopped mid-flight loses nothing — but give it room to
+    # finish its writes rather than being killed inside a rename.
+    stop_grace_period: 20s
+
+    # Bounded, so the hub's own logs can never be what fills the NVMe.
+    logging:
+      driver: json-file
+      options:
+        max-size: "20m"
+        max-file: "5"
+
+    # The image's own user applies. The state volume must be writable by it,
+    # and the hub refuses to start if it is not, naming the directory — so a
+    # mismatch is a loud first start, not a silent one.
+
+secrets:
+  herd-requester-token:
+    # A path on the host, given in .env. The file holds the token and
+    # nothing else. It is never in this repository (invariant 7).
+    #
+    # No `uid:`/`gid:`/`mode:` here, because they would be a lie: outside
+    # swarm, docker bind-mounts the host file unchanged and ignores all three
+    # without a word. The hub is uid 1000 and not root, so the *host* file
+    # must be one it can read — `env.example` says 0444 inside a 0700
+    # directory, and says why.
+    file: ${HERD_REQUESTER_TOKEN_FILE:?set HERD_REQUESTER_TOKEN_FILE in .env to the host path of the file holding the requester token}
+
+volumes:
+  herd-state:
+
+networks:
+  herd:
+    driver: bridge

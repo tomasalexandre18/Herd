@@ -361,6 +361,7 @@ mod tests {
                 chunks_sent: 3,
                 metrics: JobMetrics::default(),
                 steps: Vec::new(),
+                outputs: Default::default(),
             },
         )
     }

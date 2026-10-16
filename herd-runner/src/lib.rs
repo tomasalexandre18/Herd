@@ -39,13 +39,16 @@
 //! inside a connection, because a probe is a fact about the host and goes on
 //! being true while there is no hub to tell.
 
+pub mod blockio;
 pub mod capability;
 pub mod cgroup;
 pub mod confine;
 pub mod job;
 pub mod metrics;
+mod outputs;
 pub mod privilege;
 pub mod reclaim;
+pub mod room;
 pub mod root;
 pub mod size;
 pub mod spool;
@@ -64,8 +67,8 @@ use anyhow::{anyhow, bail, Context, Result};
 use futures_util::stream::{SplitSink, SplitStream};
 use futures_util::{SinkExt, StreamExt};
 use herd_proto::{
-    from_frame, to_frame, FromHub, JobId, JobMetrics, JobOutcome, LogStream, Role, RunningJob,
-    StepRun, ToHub, PROTOCOL_VERSION,
+    from_frame, to_frame, FromHub, JobId, JobMetrics, JobOutcome, JobOutputs, LogStream, Role,
+    RunningJob, StepRun, ToHub, PROTOCOL_VERSION,
 };
 use tokio::net::TcpStream;
 use tokio::sync::mpsc::{self, UnboundedReceiver, UnboundedSender};
@@ -473,6 +476,16 @@ struct Ended {
     /// Every executor step this attempt ran, in order (D77). Empty for a job
     /// that is not a declared command, which is every job before M10.
     steps: Vec<StepRun>,
+    /// What the job left under `{out}`, collected before the workspace was
+    /// reclaimed ([`crate::outputs`]).
+    ///
+    /// Held here with the verdict, and therefore spooled with it (D34): a
+    /// runner asked to stop between a job's end and the hub's acknowledgement
+    /// writes the whole `job_finished` frame to its data root, so the output
+    /// comes back on the next start along with the verdict it belongs to.
+    /// There is no second place a result's files could be held, and that is
+    /// the point of putting them on the frame.
+    outputs: JobOutputs,
 }
 
 /// One job this runner has in hand, and everything the hub may still need
@@ -534,6 +547,7 @@ fn finished_frame(job_id: &JobId, attempt: u32, chunks_sent: u64, end: &Ended) -
         chunks_sent,
         metrics: end.metrics.clone(),
         steps: end.steps.clone(),
+        outputs: end.outputs.clone(),
     }
 }
 
@@ -900,12 +914,18 @@ impl Session {
     /// from [`ToHub::StepFinished`] (D77). Empty for a job that is not a
     /// declared command: it ran no executor step, and an empty list says
     /// exactly that.
+    ///
+    /// `outputs` is what the job left under `{out}`, already capped by the
+    /// runner's own figure: it is held against the acknowledgement exactly
+    /// like the verdict, because a file that only exists in a workspace that
+    /// has been reclaimed is a file nothing can produce again (E-44).
     pub(crate) fn finish(
         &self,
         job_id: &JobId,
         outcome: JobOutcome,
         metrics: JobMetrics,
         steps: Vec<StepRun>,
+        outputs: JobOutputs,
     ) {
         self.with(|inner| {
             let Some(job) = inner.jobs.get_mut(job_id) else {
@@ -915,6 +935,7 @@ impl Session {
                 outcome,
                 metrics,
                 steps,
+                outputs,
             };
             job.end = Some(end.clone());
             let (attempt, chunks_sent) = (job.attempt, job.next_seq);
@@ -1902,9 +1923,19 @@ async fn watch_the_switch(config: Config, session: Session) {
 /// connection's: the data root is locked for the life of the process, so one
 /// `Confined` serves every connection a runner ever makes.
 pub async fn serve_once(config: Config, session: Session, confined: Arc<Confined>) -> Result<()> {
-    let (socket, _response) = tokio_tungstenite::connect_async(&config.hub_url)
-        .await
-        .with_context(|| format!("dialling {}", config.hub_url))?;
+    // Herd's own frame ceiling, not the library's: its `max_frame_size`
+    // default is 16 MiB, which nobody here chose, and a runner must be able
+    // to read anything the hub may legitimately send. Stated on this socket
+    // for the same reason the hub states it on the ones it accepts — one
+    // number for the whole system, readable off one line.
+    let ceiling = usize::try_from(herd_proto::FRAME_CEILING).unwrap_or(usize::MAX);
+    let limits = tokio_tungstenite::tungstenite::protocol::WebSocketConfig::default()
+        .max_message_size(Some(ceiling))
+        .max_frame_size(Some(ceiling));
+    let (socket, _response) =
+        tokio_tungstenite::connect_async_with_config(&config.hub_url, Some(limits), false)
+            .await
+            .with_context(|| format!("dialling {}", config.hub_url))?;
     let (mut sink, mut source) = socket.split();
 
     let hello = ToHub::Hello {
@@ -2211,6 +2242,7 @@ fn message_kind(message: &FromHub) -> &'static str {
         FromHub::ResendLog { .. } => "resend_log",
         FromHub::JobLog { .. } => "job_log",
         FromHub::JobNote { .. } => "job_note",
+        FromHub::StillThere { .. } => "still_there",
         FromHub::RanOn { .. } => "ran_on",
         FromHub::JobFinished { .. } => "job_finished",
         FromHub::JobResultAck { .. } => "job_result_ack",

@@ -446,6 +446,45 @@ pub fn reclaim_a_past_life(root: &DataRoot, ceiling: &Ceiling) -> Vec<String> {
 }
 
 /// Every live process carrying a Herd job marker whose runner is gone.
+///
+/// Read from `/proc/<pid>/environ`, and this sweep runs **once**, from
+/// [`reclaim_a_past_life`] at startup. So anything it cannot see here it does
+/// not see later either, and the three limits below are worth naming
+/// separately: one of them cannot cost a job process, two of them can.
+///
+/// **A process between `fork` and `exec` carries its parent's environment,
+/// not its own.** So a child spawned in that instant shows whatever its
+/// parent showed, and the marker it was given is not there yet. This one
+/// **cannot** hide a process this sweep ought to kill, and the reason is
+/// structural rather than lucky: the processes it hunts belong to a runner
+/// that is *gone*, which means they `exec`ed long ago, and a child one of
+/// them forks in the middle of this walk inherits a *marked* parent's
+/// environment and is therefore visible anyway. The only invisible shape is a
+/// marked child of an **unmarked** parent, and the only unmarked parent that
+/// spawns marked children is a live runner starting a job — whose jobs this
+/// sweep is required to leave alone (the `minter_is_gone` test below). A test
+/// planting an orphan from the test binary is exactly that shape, which is
+/// why the fixture waits for the marker rather than guessing at the `exec`.
+///
+/// **A zombie minter reads as alive**, because `/proc/<pid>` is still there
+/// for a process that has exited and not been reaped — so a runner killed
+/// whose supervisor has not waited on it yet is read as holding its jobs, and
+/// they are spared. Narrow: it needs a new runner to start inside that window,
+/// and systemd reaps its own children at once. Permanent when it happens,
+/// because this sweep does not run again.
+///
+/// **A reused pid reads as alive** for the same reason: the kernel hands pids
+/// out again, and a marker naming a pid that now belongs to something else is
+/// read as a live runner's. Inherent to naming a runner by its pid; closing it
+/// needs an identity a pid alone cannot give — the process start time in
+/// `/proc/<pid>/stat` beside it, so that "pid 4211 as it was then" is
+/// distinguishable from "pid 4211 now".
+///
+/// The last two are **not** covered by the cgroup half of
+/// [`reclaim_a_past_life`] either: that reads the runner's pid out of the
+/// cgroup's name and asks the same `minter_is_gone`. A job whose own command
+/// scrubs its environment (`env -i`) is a third thing and *is* covered there,
+/// because a cgroup is killed wholesale by name and needs no marker.
 fn orphaned_job_processes() -> Vec<(u32, String)> {
     let needle = format!("{MARKER_VARIABLE}=");
     let mut orphans = Vec::new();
@@ -594,9 +633,53 @@ mod tests {
             .stdout(std::process::Stdio::null())
             .spawn()
             .expect("the fixture starts");
-        // The environment is readable as soon as the process exists.
-        std::thread::sleep(std::time::Duration::from_millis(100));
+        // **The environment is not readable as soon as the process exists.**
+        // Between `fork` and `exec` the child's `/proc/<pid>/environ` is still
+        // its parent's, and the parent does not carry the marker — so a sweep
+        // run in that window finds nothing at all, which is exactly how this
+        // test failed: "the orphan was not found among []", an empty list
+        // rather than a race lost to another reaper. A hundred milliseconds
+        // stood here, which was a guess at how long an `exec` takes. This
+        // waits for the thing the sweep reads, and says which way it went
+        // wrong if it never comes.
+        wait_until_marked(child.id(), marker);
         child
+    }
+
+    /// Wait until `pid` carries `marker` where [`orphaned_job_processes`]
+    /// looks for it.
+    #[cfg(unix)]
+    fn wait_until_marked(pid: u32, marker: &str) {
+        let wanted = format!("{MARKER_VARIABLE}={marker}");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+        loop {
+            let carried = fs::read(format!("/proc/{pid}/environ"))
+                .map(|environ| {
+                    environ
+                        .split(|byte| *byte == 0)
+                        .filter_map(|entry| std::str::from_utf8(entry).ok())
+                        .any(|entry| entry == wanted)
+                })
+                .unwrap_or(false);
+            if carried {
+                return;
+            }
+            // Which of the two ways it failed, because they need different
+            // fixes: a fixture that is gone never ran `sleep` at all, and a
+            // fixture that is there but unmarked is a sweep reading the wrong
+            // place.
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the fixture {pid} never carried {wanted} where the sweep reads it, and {}",
+                if minter_is_gone(pid) {
+                    "it is gone: it exited before it could be swept, so this host's PATH may \
+                     not reach a `sleep`"
+                } else {
+                    "it is still running, so its environ never showed the marker"
+                }
+            );
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
     }
 
     /// The sweep is the whole of the fallback's new strength, so it is

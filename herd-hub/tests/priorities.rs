@@ -19,6 +19,7 @@ mod real_herd;
 
 use std::time::Duration;
 
+use herd_runner::testing::skipped;
 use real_herd::Herd;
 
 /// How long a job waits before it counts as one level higher, in the tests
@@ -200,14 +201,45 @@ async fn a_hub_killed_while_a_job_ages_does_not_lose_its_wait() {
         .expect("a moment")
         .to_owned();
 
-    // Let it age one step, and no more, so that "it came back maximally
-    // aged" is a thing this test can see.
-    herd.wait_until("the producer has aged one level", || {
+    // Let it age, and not all the way to the top, so that "it came back
+    // maximally aged" is a thing this test can see.
+    //
+    // **One level *or more*, which is what the assertions below claim**, and
+    // not the one transient level the wait used to look for. At a two-second
+    // step `nightly` lasts from two seconds to four, and a poller that did not
+    // get the processor inside that window waited for a sentence that would
+    // never be written again — thirty seconds, then a timeout with nothing
+    // wrong anywhere. The window this accepts is twice as wide and is exactly
+    // the window the assertions accept.
+    let aged = |said: &str| said.contains("weighed as nightly") || said.contains("weighed as step");
+    let topped_out = |said: &str| said.contains("weighed as merger");
+    herd.wait_until("the producer has aged at least one level", || {
         herd.record(&producer)["waiting_for"]
             .as_str()
-            .is_some_and(|said| said.contains("weighed as nightly"))
+            .is_some_and(|said| aged(said) || topped_out(said))
     })
     .await;
+    // And if even that window went by unobserved, this host cannot hold the
+    // fixture this test needs: said so through the skip mechanism (D27),
+    // because a test that only passes on an idle machine must not pass by
+    // luck and must not be read as having run.
+    let before_the_kill = herd.record(&producer)["waiting_for"]
+        .as_str()
+        .expect("a sentence")
+        .to_owned();
+    if topped_out(&before_the_kill) {
+        skipped(
+            "a_hub_killed_while_a_job_ages_does_not_lose_its_wait (the restart's accumulated wait)",
+            &format!(
+                "this host did not look at the producer's record between two seconds and six \
+                 after it was submitted, so it had already aged to the top before the hub \
+                 could be killed and 'it did not come back maximally aged' cannot be told \
+                 from 'it was already there'. The sentence was {before_the_kill:?}. The aging \
+                 arithmetic itself is asserted without a clock in herd_hub::queue"
+            ),
+        );
+        return;
+    }
 
     // Killed outright, with no chance to write anything down.
     hub.signal(rustix::process::Signal::KILL).await;
@@ -591,8 +623,14 @@ async fn the_lowest_priority_job_runs_within_the_aging_bound_on_the_real_clock()
             .as_str()
             .expect("a sentence")
             .to_owned();
-        // By now the producer is at the top and in front of every one of them.
+        // By now the producer is at the top and in front of every one of them —
+        // and the stream is a stream. That last clause is here rather than
+        // only in the assertion below because it is a count, not a duration:
+        // six seconds of wall clock buys six submissions on an idle host and
+        // one or two on a loaded one, so a loop that exited on the clock
+        // alone could leave the assertion false with nothing wrong.
         if started.elapsed() >= bound
+            && stream.len() > 5
             && said.contains("weighed as merger")
             && said.contains("queued 1st of")
         {

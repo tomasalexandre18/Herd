@@ -6,8 +6,12 @@ use clap::Parser;
 use herd_runner::capability::{
     CapabilityConfig, ProbeSettings, DEFAULT_PROBE_INTERVAL_MS, DEFAULT_PROBE_TIMEOUT_MS,
 };
+use herd_runner::cgroup::{
+    CpuQuota, IoCeiling, DEFAULT_CPU_WEIGHT, DEFAULT_IO_WEIGHT, DEFAULT_PIDS_MAX,
+};
 use herd_runner::confine::{
-    DEFAULT_DISK_BUDGET, DEFAULT_LOG_CAP, DEFAULT_MEMORY_MAX, DEFAULT_NICE, DEFAULT_TIMEOUT_SECONDS,
+    DEFAULT_DISK_BUDGET, DEFAULT_LOG_CAP, DEFAULT_MEMORY_MAX, DEFAULT_NICE, DEFAULT_OUTPUT_CAP,
+    DEFAULT_TIMEOUT_SECONDS,
 };
 use herd_runner::root::DataRoot;
 use herd_runner::size::parse_bytes;
@@ -72,12 +76,100 @@ struct Args {
     /// How much log one job may produce before the runner stops it.
     #[arg(long, env = "HERD_JOB_LOG_CAP", value_name = "SIZE")]
     job_log_cap: Option<String>,
+    /// How much declared output one job may have carried into its record:
+    /// everything it leaves under `{out}`, with its relative paths.
+    ///
+    /// 32 MiB by default, which is also the most this can be — the figure is
+    /// what fits one control frame and decodes inside the cadence a quiet
+    /// link lives by, so the flag only ever lowers it. A higher value is
+    /// refused at startup with both figures rather than producing a frame
+    /// nobody can read.
+    ///
+    /// Over the cap **no file comes back** and the job's record says so with
+    /// both figures: a cap on an output is not a truncation of it, and a
+    /// cut-down results file that still parses reads like the truth. Output
+    /// of a few hundred megabytes is over this on purpose and belongs on the
+    /// direct runner-to-runner transfer (M11), never relayed through the hub.
+    /// `0` returns a verdict and nothing else.
+    #[arg(long, env = "HERD_JOB_OUTPUT_CAP", value_name = "SIZE")]
+    job_output_cap: Option<String>,
     /// How much one job's workspace may hold before the runner stops it.
     #[arg(long, env = "HERD_JOB_DISK_BUDGET", value_name = "SIZE")]
     job_disk_budget: Option<String>,
     /// CPU niceness added to a job. IO niceness goes to the idle class with it.
     #[arg(long, env = "HERD_JOB_NICE", value_name = "N")]
     job_nice: Option<i32>,
+    /// How much CPU a job gets when something else on this machine wants it:
+    /// `cpu.weight` in the job's cgroup, 1 to 10000 against the 100 an
+    /// ordinary process has. 10 by default.
+    ///
+    /// A share and not a cap: a job at 10 yields almost all of a contended
+    /// core and still uses every core of a machine nobody else is using,
+    /// which is what niceness alone was failing to do (the first consumer's
+    /// twelve-thread build took a whole host down beside `nice 10`).
+    #[arg(long, env = "HERD_JOB_CPU_WEIGHT", value_name = "N")]
+    job_cpu_weight: Option<u32>,
+    /// A hard CPU ceiling per job, in cores: `4`, `1.5`. **None by default.**
+    ///
+    /// The reasoning is `--host-memory`'s: a hard ceiling is a lend an
+    /// operator declares, not something Herd assumes, and a quota wastes a
+    /// machine nobody else is using. Where it is given and this host cannot
+    /// enforce it, the startup is refused rather than quietly reduced to the
+    /// weight above.
+    #[arg(long, env = "HERD_JOB_CPU_MAX", value_name = "CORES")]
+    job_cpu_max: Option<f64>,
+    /// The same share for block IO: `io.weight` in the job's cgroup, 1 to
+    /// 10000 against 100. 10 by default.
+    ///
+    /// Honoured only by the bfq scheduler or by blk-iocost. On a host where
+    /// neither is in play the runner says at startup that this number is
+    /// written and ignored, because a bound a runner does not have is a bound
+    /// it must not claim.
+    #[arg(long, env = "HERD_JOB_IO_WEIGHT", value_name = "N")]
+    job_io_weight: Option<u32>,
+    /// A hard IO ceiling per job, per second, for the device the data root is
+    /// on: `rbps=200MB,wbps=100MB,riops=4000,wiops=2000`. Any subset of those
+    /// four keys, at least one of them. **None by default.**
+    ///
+    /// `io.weight` above is a *share* of contended bandwidth: it decides who
+    /// gets the disk when two cgroups both want it and caps nothing, so one
+    /// job alone still saturates an idle disk. This is a *ceiling*, enforced
+    /// by blk-throttle whatever the IO scheduler is — the lever for a host
+    /// where one build can freeze everything else on it.
+    ///
+    /// There is no default and there will not be one: a throughput figure is
+    /// right on the machine it was measured on and absurd everywhere else, so
+    /// absent means no `io.max` line written at all rather than a guess.
+    ///
+    /// **How to pick one, rather than invent one.** Where blk-iocost is
+    /// enabled, the kernel has already measured the device and left the
+    /// figures in `/sys/fs/cgroup/io.cost.model`, keyed by the same
+    /// `major:minor` this ceiling names: `rbps`, `wbps` and the IOPS beside
+    /// them. A defensible ceiling is a fraction of those — a quarter is a
+    /// reasonable first try — and not a round number somebody liked. The
+    /// figure is a statement about **how much of a shared device this machine
+    /// lends Herd**, which is `--host-memory`'s shape exactly; on a host where
+    /// Herd shares one queue with production services, that fraction is the
+    /// whole question. Include the IOPS keys as well as the bytes: a freeze is
+    /// a latency event, and small random IO is what causes one.
+    ///
+    /// `io.max` is **per-device**, so the ceiling is written for the device
+    /// the data root is on and nothing else. Where this host cannot carry a
+    /// ceiling for that path — a ZFS data root, no cgroup delegation, a path
+    /// whose device cannot be resolved — the startup is **refused** naming
+    /// the path and the reason, never reduced to the weight. A job that
+    /// writes an absolute path *outside* its data root is bounded by neither
+    /// this nor the weight.
+    #[arg(long, env = "HERD_JOB_IO_MAX", value_name = "rbps=…,wbps=…")]
+    job_io_max: Option<String>,
+    /// How many processes one job may hold at once: `pids.max` in its cgroup.
+    /// 1024 by default.
+    ///
+    /// A plain number and not optional: a fork bomb inside a job must not be
+    /// able to take the host down, and no build needs an unbounded process
+    /// count.
+    #[arg(long, env = "HERD_JOB_PIDS_MAX", value_name = "N")]
+    job_pids_max: Option<u64>,
     /// A delegated cgroup v2 directory to hang job cgroups under, instead of
     /// this runner's own. Useful where the runner is not a systemd unit.
     #[arg(long, env = "HERD_CGROUP_ROOT", value_name = "PATH")]
@@ -288,6 +380,14 @@ async fn main() -> Result<()> {
             .context("--job-log-cap")?,
         None => DEFAULT_LOG_CAP,
     };
+    confinement.output_cap = match args.job_output_cap {
+        Some(size) => parse_bytes(&size)
+            .map_err(anyhow::Error::msg)
+            .context("--job-output-cap")?,
+        None => DEFAULT_OUTPUT_CAP,
+    };
+    // A cap past what a frame can carry is refused by `Confined::prepare`
+    // with every other unusable figure, so there is nothing to check here.
     confinement.disk_budget = match args.job_disk_budget {
         Some(size) => parse_bytes(&size)
             .map_err(anyhow::Error::msg)
@@ -295,6 +395,28 @@ async fn main() -> Result<()> {
         None => DEFAULT_DISK_BUDGET,
     };
     confinement.nice = args.job_nice.unwrap_or(DEFAULT_NICE);
+    confinement.cpu_weight = args.job_cpu_weight.unwrap_or(DEFAULT_CPU_WEIGHT);
+    confinement.cpu_max = match args.job_cpu_max {
+        Some(cores) => Some(
+            CpuQuota::from_cores(cores)
+                .map_err(anyhow::Error::msg)
+                .context("--job-cpu-max")?,
+        ),
+        None => None,
+    };
+    confinement.io_weight = args.job_io_weight.unwrap_or(DEFAULT_IO_WEIGHT);
+    // Absent means absent: no ceiling resolved, no device named, no io.max
+    // written. A default throughput would be wrong on every machine but the
+    // one it was chosen on.
+    confinement.io_max = match &args.job_io_max {
+        Some(spec) => Some(
+            IoCeiling::parse(spec)
+                .map_err(anyhow::Error::msg)
+                .context("--job-io-max")?,
+        ),
+        None => None,
+    };
+    confinement.pids_max = args.job_pids_max.unwrap_or(DEFAULT_PIDS_MAX);
     confinement.cgroup_root = args.cgroup_root;
     confinement.privileged_helpers = args.privileged_helpers;
 
@@ -360,6 +482,20 @@ async fn main() -> Result<()> {
         }
         host.threads = Some(threads);
     }
+    // And whatever is lent, it is clamped to the room in the cgroup this
+    // runner is actually in (D119). A runner inside a slice carrying
+    // `MemoryMax` has less room than the machine advertises, and admitting
+    // against the machine is how a slice gets OOM-killed while Herd believes
+    // it was careful. Applied after the owner's figure and before the floor,
+    // so the floor is derived from — and checked against — the room that can
+    // really bite. On a host with no enclosing limit this reads nothing and
+    // changes nothing: see `room::measure`.
+    let (announced, said) =
+        herd_runner::room::announced_memory_mib(host.memory_mib, herd_runner::room::measure());
+    if let Some(said) = said {
+        println!("herd-runner: {said}");
+    }
+    host.memory_mib = announced;
     // What this host keeps for itself, whatever is queued (E-29). Derived
     // from what is lent when nobody says, so a runner of this version always
     // announces a floor — an absent floor is read by the hub as a figure it

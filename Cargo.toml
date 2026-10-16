@@ -22,12 +22,29 @@ futures-util = "0.3.34"
 # cgroup.procs between fork and exec (M4). libc is the thin, stable way to
 # reach them and shapes nothing about the architecture.
 libc = "0.2.180"
+# The crypto provider behind `wss://`, named here because nothing names it for
+# us. `tokio-tungstenite`'s rustls features pull rustls with
+# `default-features = false`, which means **no provider at all**, and
+# `ClientConfig::builder()` panics when none is installed — so a `wss://` dial
+# would have aborted the process instead of connecting. Enabling `ring` here
+# is rustls' documented way to make that choice: the builder installs the
+# provider the crate features selected.
+#
+# `ring` rather than `aws-lc-rs`: it needs a C compiler and nothing else — no
+# OpenSSL, no cmake, no system library and no development headers — which is
+# what keeps a runner droppable on a strange machine and the Nix packaging
+# plain. Only the two crates that dial depend on it; the hub keeps listening
+# in plain `ws://` behind the reverse proxy.
+rustls = { version = "0.23.46", default-features = false, features = ["ring", "std", "tls12"] }
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.154"
 sha2 = "0.10.9"
 tempfile = "3.27.0"
 time = { version = "0.3.55", features = ["formatting", "parsing", "serde-well-known"] }
 tokio = "1.53.2"
+# Default features here, and TLS asked for by the two crates that dial: see
+# `herd-runner/Cargo.toml`. The hub takes this same entry and never wraps its
+# listener, because the reverse proxy terminates TLS (D14).
 tokio-tungstenite = "0.30.0"
 # The consumer declares its commands in TOML, because that is the file format
 # they chose for their own tree. Only `herdctl` parses it: the declaration is

@@ -301,6 +301,20 @@ async fn a_log_survives_twelve_killed_hubs_whole() {
     })
     .await;
 
+    // Enough of the job's own lines to check the log against its intent.
+    //
+    // Waited for, not assumed: the hundred below is a count of lines the job
+    // printed, and the kills above are bounded by conditions rather than by
+    // the clock, so on a host where the twelve restarts went quickly — or
+    // where the job's own shell loop was starved while they did — the log
+    // held sixty lines and the assertion failed with nothing wrong. The job
+    // is still printing at this point, so this ends.
+    herd.wait_until(
+        "the job has printed more than a hundred of its lines",
+        || whole_lines() > 105,
+    )
+    .await;
+
     // The job ends, on the twelfth hub, and keeps its own exit code.
     File::create(&stop).expect("the stop file");
     let waited = herd.herdctl(&["wait", &job]).await;
@@ -1009,14 +1023,32 @@ async fn a_spooled_verdict_reaches_the_hub_when_the_runner_comes_back() {
 
     // Acknowledged, and only then removed: the file is the one copy until the
     // hub has it on a disk (D19).
-    herd.wait_until("the spool file is gone once the hub has it", || {
-        std::fs::read_dir(&held).into_iter().flatten().count() == 0
+    //
+    // **Waited for in the order the runner publishes them**, which is the
+    // reverse of the order they read in. `Spooled::delivered` unlinks the file
+    // while it composes the sentence, and its caller prints the sentence
+    // afterwards — so the file goes first and the line arrives last, with a
+    // process boundary and a write to a log file in between. Waiting for the
+    // file to vanish and asserting the sentence in the next breath is
+    // asserting an effect published *after* the one just waited for: it is
+    // what failed on CI's two-core runner, on the same code that had passed
+    // as a pull request minutes earlier.
+    herd.wait_until("the runner says the verdict was acknowledged", || {
+        herd.said("second-runner").contains("been acknowledged")
     })
     .await;
     assert!(
         herd.said("second-runner").contains("been acknowledged"),
         "delivering a verdict a restart late is said out loud: {}",
         herd.said("second-runner")
+    );
+    // And the file is gone by then — which is now an assertion rather than a
+    // wait, because the order above makes it one: the unlink happens inside
+    // the call that produced the sentence.
+    assert_eq!(
+        std::fs::read_dir(&held).into_iter().flatten().count(),
+        0,
+        "the spool file is the one copy until the hub has it, and goes only then (D19)"
     );
 
     // And a requester coming back by id is given that code, not Herd's own.
@@ -1185,6 +1217,7 @@ async fn a_verdict_planted_in_another_runner_s_spool_is_refused_by_name() {
                 ..herd_proto::JobMetrics::default()
             },
             steps: Vec::new(),
+            outputs: Default::default(),
         })
         .expect("the fixture frame encodes"),
     )
@@ -1322,11 +1355,24 @@ async fn a_verdict_spooled_for_a_state_root_that_was_recreated_is_never_believed
         said.contains(&first_root_id) && said.contains(&second_root_id)
     })
     .await;
+    // The runner's two effects here come out in this order: the file is set
+    // aside *inside* the sentence that reports it — `for_a_foreign_state_root`
+    // renames it while formatting — and the caller prints that sentence
+    // afterwards. So the sentence is the last thing published, and it is what
+    // this waits for; the rename is then guaranteed, and is asserted. Waiting
+    // on the earlier line about which state root the runner holds and reading
+    // both of these in the next breath is the same defect as the one in the
+    // test above, and this file has had two sightings of it.
+    herd.wait_until("the runner says the foreign verdict is not offered", || {
+        herd.said("second-runner").contains("NOT offered")
+    })
+    .await;
     assert!(
         herd.said("second-runner").contains("NOT offered"),
         "a verdict for a vanished hub is never offered, and that is said: {}",
         herd.said("second-runner")
     );
+
     assert!(
         std::fs::read_dir(&spool)
             .into_iter()

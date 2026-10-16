@@ -6,85 +6,83 @@ the order of work in `docs/plan.md`.
 
 ## What works
 
-Nine milestones are merged to `main`: M1 through M9. Nothing else is
-written and waiting. M1-M5 are additionally verified against the real
-binaries by a separate adversarial pass; M6-M9 by their own milestone
-tests only — the cost of dropping that pass after M5, and now measured
-twice: a two-core host under load found eight tests in M9 asserting
-what they never established (D100), then the same class in six of the
-other ten files (D101), and behind one of those a product defect that
-would have killed every runner of a real fleet (D104, fixed by D105).
+**Herd is deployed and running on the server.** Hub in docker compose,
+runner native on the host under a dedicated `herd` user that is not in
+`docker`. The hub listens on loopback *and* on the tailnet address, bound
+to those two interfaces and nothing else (invariant 3, D11). The protocol
+is frozen at **version 1** (D73), so this is the shape a second machine
+joins.
 
-What a requester can do today, end to end, against the real binaries:
-submit and follow or detach; get the job's own exit code untouched, 124 for
-a cap, 125 when Herd has no verdict, 128+n for a signal; read a complete
-byte-faithful record while the job runs, and after a hub killed mid-job;
-cancel it and have the whole tree die. One durable queue orders everything
-by four priorities aging off the record, joins a second submission of open
-work, and never gives a job twice. Placement matches one capability algebra,
-counts build slots, derives `-j`, admits against memory and tmpfs costed
-from the records, sticks to a preferred runner while it is merely busy,
-and explains every decision in one line with its figures. A lost runner
-gets one more go and no more. An owner switches her machine off with a
-reason and is obeyed in under a second, the position persisted before the
-command returns; a job may carry a deadline and one named parent; a `metal-*`
-lease is read as a busy probe, so a leased trial waits instead of failing.
+Proven on that deployment, read back by a job out of the kernel rather
+than asserted: `memory.max 8589934592`, `cpu.weight 10`, `io.weight 10`,
+`pids.max 1024`, in one cgroup per job under the delegated service. A job
+at exit 0, one at exit 7, and one silent for 50 s whose follower never
+went quiet.
 
-Nothing is deployed: no runner but this host's has ever connected, and
-no job of the first consumer's has ever run.
+`main` carries M1-M10 and M15. The M16 branch `m16-deploy-hub` adds: the
+flake's packages and the hub image, the compose deployment, the runner
+unit and a NixOS module for it, `wss://` in the clients (rustls, webpki
+roots), the four cgroup controls plus an optional hard `io.max`, pressure
+recorded and gating nothing, a keepalive so a quiet follower is never
+cut, and release binaries built by CD as **static musl** — proven by a
+real hub, runner and two jobs on Arch and Alpine with no Nix anywhere.
 
-`fmt`, `clippy -D warnings` and `./scripts/test.sh` are green: **413
-passed**, 2 skipped here, a third on CI (E-22 needs a 17 GiB host). The
-suite is also run pinned to two cores under five spinners, which is
-where every lying test so far was caught.
+`fmt`, `clippy -D warnings` and `./scripts/test.sh` are green on that
+branch: **575 passed**, 7 loud skips, all one cause — this user cannot
+delegate a cgroup.
 
 ## What is not done, and why
 
-17 of 44 musts are planned, from M10 on; the consumer cannot submit a
-real job until M10 through M15 land.
+1. **`main` is red**, on `killed_hub.rs`, and the same code passed as a
+   pull request and failed as a push. A two-core CI host decides every
+   merge, so this blocks M16's own pull request. Being fixed.
+2. **E-52 is unmet on the server.** `/etc/systemd/system` is read-only
+   here — NixOS manages `/etc` by activation — so the running unit is
+   **transient** and will not survive a reboot (D130). The module in
+   `deploy/` is the only route, and it needs `/etc/nixos` plus a
+   rebuild: Alexa's.
+3. **Herd returns an exit code and logs, not files.** A job's `{out}` is
+   reclaimed with its workspace, so the consumer's `results.json` does
+   not come home. Ruled (D131) and being built.
+4. **`wss://` is configured and never dialled.** The Traefik fragment is
+   written for this host's real proxy and loads in Traefik, but no real
+   dial through Cloudflare has happened. The tailnet makes it optional.
+5. **Any user of this host can become root.**
+   `/var/run/libvirt/libvirt-sock` is mode 0666 and libvirtd runs as
+   root, so a job could escape every cap (D129). Not Herd's to close —
+   it is the host's, and it predates us. The runner says so at startup.
+6. **The host's disk freezes are not a Herd problem.**
+   `io.cost.qos` reads `rpct=0 wpct=0`, so blk-iocost apportions the NVMe
+   and never throttles it to a latency target — every weight is honoured
+   while `io.pressure full` sits at 43 (D136). One `/etc/nixos` line
+   would protect every cgroup on the machine.
+7. No authentication ceiling per requester: one shared token means any
+   requester may ask for the merger level.
+8. A test that cannot be made honestly on a loaded host **skips loudly**
+   and never passes quietly (D27). Seven do here.
 
-1. **No authentication before M15.** The hub holds a fleet (M7), so a
-   hand-crafted peer can join beside real runners under any name and
-   write a false verdict. **Stay on loopback.**
-2. E-45's confinement is cooperative only (D28). The runner needs no
-   Docker at all (D78); three checks land in M16.
-3. E-30's real kernel ceiling needs a delegated cgroup; the WSL
-   replay is a manual M17 check.
-4. Both numbers are free-running: `PROTOCOL_VERSION` **6** (D99 added
-   the switch acknowledgement), `RECORD_VERSION` **5**. An older root
-   or peer is refused by name, no migration; both go back to 1 and
-   freeze at M16 (D73).
-5. The whole-pass `dispatching` lock is measured, not fixed (D92), and
-   M9's dry run costs one more such pass, unmeasured.
-6. `off` does not stop serving content: no endpoint exists before M11,
-   and the gate waits behind `Switch::serves_content` (D97).
-7. A job no *connected* runner could ever fit **waits**, not ends
-   (D88): a fleet is not a closed world, so its only bound is E-09's
-   deadline — which is why that `should` is load-bearing. Two new ways
-   a queued job can die, both explained: mutually exclusive labels a
-   joining runner declares, and a deadline missed because its machine
-   was off.
-
-Booked debt that no decision records, so it lives here: a SIGKILLed
-runner leaves its in-flight probes behind; a verdict the hub could not
-write, overtaken by its own watchdog, logs "is over" for ever instead
-of erroring; `a_job_assigned_as_the_switch_moves_…` proves D80
-placement, not the hand-back its name claims; and nobody traced how
-M8's leaked `flock` reached the one state root that complained. Debt
-that **is** recorded and still open: D63, D64, D92, D98, D101.
+Open and recorded: D63, D64, D92, D98, D101, D122's two reaper blind
+spots, D134's janitor gap. The consumer's items 7, 8 and 9 — a flock
+probe, per-capability probe budgets, and `labels_from` costing a whole
+executor cycle — are accepted and unbuilt.
 
 ## Environment facts
 
-- Server: NixOS 6.18, i5-10600K, 12 threads, 31 GB RAM, no swap,
-  `/dev/kvm`, Intel iGPU, docker 29.7. Rust 1.98.1 from the flake
-  (D12). CI runs on two cores, which is the only slow host we have.
-- Issues #1 and #16 are **open**; #16 holds the six gated deliverables
-  (M18). The SSH key here is a deploy key for another repository, so
-  git uses the HTTPS remote with the `gh` credential helper.
+- Server: NixOS 6.18, 12 threads, 31 GB RAM, **and swap** — 16 GB zvol
+  plus 7.8 GB zram, the zram saturated. Rust from the flake (D12).
+- **Everything is on one device.** The consumer's docker root, their
+  work, this checkout and the runner's data root all sit on
+  `/dev/nvme0n1p1` (ext4, `259:0`), where blk-iocost is live so a cgroup
+  weight is honoured. `/` and `/tmp` are ZFS, where **no** cgroup IO knob
+  reaches, ever (D120, D126).
+- A low-weight scope reproduces the two-core CI host locally:
+  `systemd-run --scope -p IOWeight=20 -p CPUWeight=20`.
+- CI runs on two cores. Issues #1 and #16 are open.
 
 ## Next action
 
-M10, the command declaration contract: the field set, the
-`labels_from` reading run on a runner (D74), the timestamped executor
-steps (D77). Alexa's own: the runner's user out of `docker` (D78), and
-**Q10, the licence**.
+Fix `main`, then open M16's pull request. Then the consumer's four
+blocking items: files home, `{out}` in a declared line, the reaper's
+janitor list, and telling "nothing submitted" from "no verdict".
+Alexa's own: the `nixos-rebuild` for E-52, the libvirtd socket, the
+`io.cost.qos` latency target, and **Q10, the licence**.

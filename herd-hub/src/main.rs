@@ -8,7 +8,7 @@ use herd_hub::{
     Authority, Hub, JobDirStore, JobStore, Policy, Stickiness, AGING_STEP, DEFAULT_LISTEN_ADDR,
     DRAIN_FIRST_LIMIT, LOST_AFTER, READING_CAP, REQUEUE_BUDGET, STICKINESS_LIMIT, WAIT_RESTATEMENT,
 };
-use herd_proto::HEALTH_EVERY;
+use herd_proto::{HEALTH_EVERY, STILL_THERE_EVERY};
 
 /// Where the hub keeps its state unless told otherwise. Relative on purpose:
 /// a development hub writes beside the repository, and the deployment names
@@ -85,6 +85,19 @@ struct Args {
     /// of W a follower gets at most W / this + 1 lines. Zero is refused.
     #[arg(long, env = "HERD_WAIT_RESTATEMENT", default_value_t = WAIT_RESTATEMENT.as_secs_f64())]
     wait_restatement: f64,
+    /// Seconds a follower of a job that is not over may hear nothing at all
+    /// before this hub speaks to it.
+    ///
+    /// A job that is *running* and printing nothing sends its follower no
+    /// frames whatever, and behind a reverse proxy with an idle timeout that
+    /// connection is closed under the follower — which `herdctl` reads as the
+    /// stream ending with no verdict and reports as exit 125 on a job that
+    /// succeeded. So the hub breathes on the link at this cadence instead.
+    /// Nothing is printed for it and no client acts on the figure. Fifteen
+    /// seconds, the same number as `--health-every` on purpose. Zero is
+    /// refused.
+    #[arg(long, env = "HERD_STILL_THERE_EVERY", default_value_t = STILL_THERE_EVERY.as_secs_f64())]
+    still_there_every: f64,
     /// Seconds a job may hold a runner empty while it waits for that host to
     /// go quiet (E-27).
     ///
@@ -171,6 +184,7 @@ async fn main() -> Result<()> {
             limit: seconds(args.stickiness_limit),
         },
         wait_restatement: seconds(args.wait_restatement),
+        still_there_every: seconds(args.still_there_every),
         drain_first_limit: seconds(args.drain_first_limit),
         requeue_budget: args.requeue_budget,
         reading_cap: seconds(args.reading_cap),
@@ -214,7 +228,8 @@ async fn main() -> Result<()> {
          {unfinished} job(s) not over, {} quarantined, a runner reporting every {:?} is \
          lost after {:?}, a queued job rising one priority level every {:?}, and waiting \
          up to {:?} for the runner it is sticking to before it is placed elsewhere, and \
-         saying again every {:?} why a job it is following is still queued; a job that \
+         saying again every {:?} why a job it is following is still queued and breathing \
+         on a quiet follower's link every {:?}; a job that \
          needs a quiet host holds one empty for at most {:?}, and a job whose declared \
          requeue code comes back gets {} goes at it, separately from the {} goes it gets \
          at a runner that goes away; a reading of what a job needs is capped at {:?}",
@@ -227,6 +242,7 @@ async fn main() -> Result<()> {
         policy.aging_step,
         policy.stickiness.limit,
         policy.wait_restatement,
+        policy.still_there_every,
         policy.drain_first_limit,
         policy.requeue_budget,
         policy.attempts_allowed,

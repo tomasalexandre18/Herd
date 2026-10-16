@@ -17,7 +17,26 @@ futures-util.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "net", "process", "signal", "sync", "time", "io-util"] }
-tokio-tungstenite.workspace = true
+# `wss://` on the side that dials. Without a TLS feature here tokio-tungstenite
+# compiles no TLS at all and every `wss://` dial fails with "TLS support not
+# compiled in", which is what M16's own "done when" and M17's second machine
+# need.
+#
+# **The webpki roots bundled in the binary, not the host's trust store.**
+# Cloudflare fronts the hub and terminates TLS there, so the only `wss://`
+# dial Herd will ever make is to a publicly trusted certificate: the server's
+# own runner and every requester reach the hub on loopback `ws://`, and the
+# one client that dials `wss://` is a runner on another machine (M17) going
+# through Cloudflare. Against a public certificate the bundled Mozilla root
+# set is enough, and it is the same set on every machine — so a runner drops
+# onto a host whose trust store we know nothing about and still verifies the
+# hub. There is deliberately no "trust this CA" option: with Cloudflare in
+# front there is no private CA to trust, and an option nobody needs is surface
+# invariant 1 says to refuse.
+tokio-tungstenite = { workspace = true, features = ["rustls-tls-webpki-roots"] }
+# Not used by name: it is here to choose rustls' crypto provider, which
+# nothing else in the graph chooses. See the workspace manifest.
+rustls.workspace = true
 
 [target.'cfg(unix)'.dependencies]
 libc.workspace = true

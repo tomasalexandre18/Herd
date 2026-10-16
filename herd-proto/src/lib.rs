@@ -20,6 +20,7 @@ use serde::{de::DeserializeOwned, Deserialize, Serialize};
 
 pub mod capability;
 pub mod declaration;
+pub mod outputs;
 pub mod placement;
 
 pub use capability::{
@@ -32,89 +33,56 @@ pub use declaration::{
     ARGS_TOKEN, COMMIT_TOKEN, IN_TOKEN, JOB_TOKEN, LABELS_KEY, LINE_TOKEN, MEMORY_KEY, OUT_TOKEN,
     READING_KEYS, SCENARIOS_KEY, TMPFS_KEY,
 };
+pub use outputs::{
+    check_relative, JobOutputs, OutputFile, FRAME_CEILING, MAX_OUTPUT_CAP, PER_FILE_OVERHEAD,
+};
 pub use placement::{
     default_memory_floor_mib, parallelism_tokens, size_mib, with_parallelism, HostSize,
     Parallelism, PARALLELISM_TOKEN,
 };
 
 /// The version announced in [`ToHub::Hello`] and echoed in
-/// [`FromHub::Welcome`]. It is bumped whenever a message shape changes in a
-/// way an older peer could not read.
+/// [`FromHub::Welcome`], and the first thing the hub checks: a peer that does
+/// not announce exactly this number is refused by name
+/// ([`version_mismatch_reason`]), whatever else it got right.
 ///
-/// 2 since M6: [`ToHub::SubmitJob`] carries a [`Priority`], and carries it
-/// *required*, so that a submission can never acquire a level nobody chose
-/// (E-18). That is not an additive change — a version 1 submission has no
-/// priority field at all — so the number moves, which is exactly what the
-/// handshake's version is for.
+/// **1 is the first deployed protocol, and it is frozen here** (D73). The
+/// numbers 2 to 8 each existed for a real format break, but every one of those
+/// breaks was made on a protocol nothing spoke outside this repository;
+/// carrying eight compatibility eras into a deployment would have described a
+/// history no peer ever lived. M16 sets the number back to 1, and from M16 on
+/// it is not a development counter.
 ///
-/// 3 since M7: a runner announces how big its host is and how preferred it
-/// is ([`HostSize`], `preference`), and a submission may carry the memory one
-/// of its build threads needs, from which the hub derives the job's `-j`
-/// (E-22). Both are new fields on existing messages, so an older peer would
-/// be *served* rather than refused — and served wrongly: a version 2 runner
-/// announces no size, and a hub reading that as a machine of no size would
-/// derive nothing for it and place nothing on it. The number moves instead.
-/// Both numbers are free-running development counters until M16, where they
-/// are set back to 1 (D73).
+/// **What moving it now costs.** The handshake tests equality, not a floor:
+/// the day this becomes 2, every runner and every `herdctl` still built
+/// against 1 is refused at the handshake and stays refused until its host is
+/// rebuilt — a fleet going quiet machine by machine, and requesters that
+/// cannot submit, out of one constant. So a bump is a compatibility statement:
+/// it needs Alexa's approval, and the order in which the hub and its peers are
+/// moved is decided before it lands.
 ///
-/// 4 since M8: a runner announces the memory it keeps for itself and the
-/// tmpfs room jobs may reserve on it ([`HostSize::memory_floor_mib`],
-/// [`HostSize::tmpfs_mib`]) and the load it last measured; a submission may
-/// carry the whole-job memory and the tmpfs its requester declares. The
-/// reason the number moves is the same as M7's, and sharper: a version 3
-/// runner announces no floor and no tmpfs, and a hub that read either as zero
-/// would admit a job into the memory its host needs to stay alive
-/// (invariant 2) or take a reservation on room nobody said was there.
+/// **What still has to move it.** "Additive" is not the same as "an older peer
+/// survives it", and serde does not close the gap. [`FromHub`] and [`ToHub`]
+/// are tagged enums with no catch-all variant, so a frame whose `type` an
+/// older build has never heard of does not decode at all — a read error, not
+/// an ignored message. **Adding a variant to either enum is a breaking change
+/// and moves this number**, whatever serde would tolerate on the wire. The two
+/// clients fail differently and neither failure is acceptable: `herdctl` ends
+/// the run it was following with "undecodable frame" and exits 125, reporting
+/// no verdict for a job that may well have passed — the shape of D117, closed
+/// by D118 — while `herd-runner` drops the link and redials into the same
+/// undecodable frame, so it loops rather than shrugs. The runner's `other =>`
+/// arm, which ignores "what is not a runner's business", only covers variants
+/// that build already knows about; it is not forward compatibility. A new
+/// *field* on an existing variant is the one change that may leave the number
+/// alone, and only when it is `#[serde(default)]` *and* means, when absent,
+/// exactly what its default says.
 ///
-/// **5 is M9's**, and it moves for four reasons at once, every one of them a
-/// field that must never be read as absent. A runner announces its owner's
-/// [`Switch`] in the handshake and on every health report, and a hub that read
-/// a missing switch as `on` would hand work to a machine its owner has
-/// withdrawn (E-33). A submission may carry a deadline, one named parent and
-/// the exit code its command means "requeue me" by (E-09, E-10, D76), and for
-/// each of those the absence of the field means something no value of it could
-/// mean. Both numbers are still free-running before M16 (D73): a version 4
-/// peer is refused by name, there is no migration and none is owed.
-///
-/// **6 closes the window D99 found**: a runner says it has *written* the
-/// position down ([`ToHub::SwitchApplied`]) and the hub's answer to
-/// `herdctl switch` says whether it heard that ([`FromHub::SwitchSet`]'s
-/// `confirmed`). Both are additive in shape and neither may be read as absent.
-/// A version 5 runner would never acknowledge, so every `herdctl switch`
-/// against it would report a position nobody confirmed — a true sentence about
-/// a peer that is simply old, which reads to an owner as a fault on her
-/// machine. And `confirmed` missing would default to *something*, and either
-/// default is a lie in one direction. So the number moves, a version 5 peer is
-/// refused by name, and there is no migration — M16 sets both numbers back to
-/// 1 (D73).
-///
-/// **7 is M10's**, the command declaration contract (E-11). A submission may
-/// carry a [`declaration::Declaration`] — a declared command's name, its
-/// commit, the requester's arguments and the consumer's four executor hooks —
-/// and the time cap that command declares; the hub hands both back with the
-/// attempt ([`FromHub::AssignJob`]); the runner reports each step as it ends
-/// ([`ToHub::StepFinished`]) and the four again with the verdict. None of it
-/// may be read as absent, and the sharp one is the cap: a version 6 runner
-/// handed a declared job would ignore the four steps, exec the line directly
-/// and cap it at its own figure — a job that ran something other than what the
-/// declaration says, reported as if it had. So the number moves, a version 6
-/// peer is refused by name, and there is no migration (D73).
-///
-/// 7 also carries [`FromHub::RanOn`], which is E-02's first line: where the
-/// job is running and why there. It rides on 7 because it is the same
-/// milestone and nothing is deployed to be caught in between.
-///
-/// **8 is M15's**, and it is the handshake learning to say which *build* is
-/// speaking (E-51). A peer announces its own version beside the protocol's
-/// ([`ToHub::Hello::peer_version`]), and the hub answers a minor gap with a
-/// note it carries in the welcome ([`FromHub::Welcome::version_note`]) and a
-/// major one with a refusal. Neither field may be read as absent: a missing
-/// build version read as "the same as mine" is a hub that never warns and
-/// never refuses, which is the whole of what E-51 asks for, and a missing
-/// note read as "nothing to say" would hide the one line that tells an owner
-/// which side to move. So the number moves, a version 7 peer is refused by
-/// name, and there is no migration (D73).
-pub const PROTOCOL_VERSION: u32 = 8;
+/// The gap between two *builds* speaking the same protocol is a separate
+/// question with a separate answer ([`version_gap`], E-51): a minor gap is
+/// served with a note, a major one refused. This number only says whether two
+/// peers can read each other's frames at all.
+pub const PROTOCOL_VERSION: u32 = 1;
 
 /// How often a runner says it is alive and what it is doing (E-40).
 ///
@@ -124,6 +92,23 @@ pub const PROTOCOL_VERSION: u32 = 8;
 /// holding their own 15 s would be two truths about one contract
 /// (invariant 4).
 pub const HEALTH_EVERY: Duration = Duration::from_secs(15);
+
+/// How often the hub speaks to a follower that would otherwise hear nothing
+/// ([`FromHub::StillThere`]).
+///
+/// **Deliberately the same number as [`HEALTH_EVERY`]**, and the sameness is
+/// the point: "how often a quiet Herd link speaks" is one figure to remember
+/// and not two. The two cadences are the two directions of one problem — a
+/// runner says it is alive to the hub, and the hub says it is alive to
+/// whoever is following a job — so a reader who knows 15 s knows both, and an
+/// operator who shortens one has an obvious name for the other.
+///
+/// Here rather than in the hub because it is part of what a follower is
+/// promised: a connection following a job that is not over carries a frame at
+/// least this often, whatever the job is doing (invariant 4). No client acts
+/// on the figure — nothing dials on it, nothing times out on it — which is
+/// why the frame it paces needed no protocol break to add.
+pub const STILL_THERE_EVERY: Duration = Duration::from_secs(15);
 
 /// How many health reports a silence threshold must be able to miss before
 /// it fires.
@@ -711,6 +696,86 @@ pub struct JobMetrics {
     pub log_bytes: u64,
     /// Wall-clock milliseconds from the spawn to the outcome.
     pub wall_time_ms: u64,
+    /// How stalled the host and the job's own cgroup were when the job ended
+    /// (E-32, D119). Absent on a kernel without PSI, or where no figure at
+    /// all could be read — never a zero, which reads as "no pressure".
+    ///
+    /// `#[serde(default)]` and absent means exactly that: a peer that has
+    /// never heard of pressure sends none and a peer reading an older frame
+    /// or an older record finds none, which is the truth in both cases. That
+    /// is the one change allowed to leave [`PROTOCOL_VERSION`] and the hub's
+    /// record version alone (D73), and it is why this is a field on an
+    /// existing variant rather than a frame of its own.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pressure: Option<Pressure>,
+}
+
+/// How much time was lost to waiting for a resource, as the kernel's pressure
+/// stall information reports it (E-32, D119).
+///
+/// **Recorded, never a gate.** The first consumer asked for pressure to brake
+/// admission and that was refused: E-32 is their own expectation that the load
+/// figure is recorded and never a criterion, and a hub that silently stopped
+/// dispatching would be indistinguishable from a hub that had died. So these
+/// figures travel with a job's outcome, land in its record, and are compared
+/// against nothing anywhere in Herd.
+///
+/// Each figure is `some avg10` from one `pressure` file — the share of the
+/// last ten seconds in which **at least one** task was stalled on that
+/// resource — as a percentage times 1000, the same `_milli` scale
+/// [`JobMetrics::host_load_milli`] uses. `12.34 %` is `12340`, and the full
+/// range is `0..=100_000`. An integer because it lands in a record a consumer
+/// compares, and two equal measurements must not print differently.
+///
+/// The `host_*` figures come from `/proc/pressure/*` and are about the whole
+/// machine, including everything on it that is not Herd. The `job_*` figures
+/// come from the job's own cgroup and are about that job alone; they are
+/// absent where the kernel does not expose per-cgroup pressure or where the
+/// job had no cgroup of its own.
+///
+/// **Every figure is absent rather than zero when it could not be read**
+/// (D23): a zero says "nothing was stalled", which is a measurement, and a
+/// consumer reading one off an unreadable file would be reading a lie.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Pressure {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub host_cpu_milli: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub host_memory_milli: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub host_io_milli: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub job_cpu_milli: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub job_memory_milli: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub job_io_milli: Option<u64>,
+}
+
+impl Pressure {
+    /// Whether nothing at all could be read. A reading with no figure in it
+    /// is **not** a reading of no pressure, so the caller reports `None`
+    /// rather than an empty one.
+    pub fn is_empty(&self) -> bool {
+        *self == Self::default()
+    }
+
+    /// The figures that are there, named as an operator reads them. Empty for
+    /// a host that exposes no pressure at all, which is how the absence stays
+    /// visible instead of printing as zeroes.
+    pub fn named(&self) -> Vec<(&'static str, u64)> {
+        [
+            ("host cpu", self.host_cpu_milli),
+            ("host memory", self.host_memory_milli),
+            ("host io", self.host_io_milli),
+            ("job cpu", self.job_cpu_milli),
+            ("job memory", self.job_memory_milli),
+            ("job io", self.job_io_milli),
+        ]
+        .into_iter()
+        .filter_map(|(name, figure)| figure.map(|figure| (name, figure)))
+        .collect()
+    }
 }
 
 /// A job's identity, minted by the hub.
@@ -1045,6 +1110,16 @@ pub enum ToHub {
         /// its end says it ran. Empty for a job that is not a declared command.
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         steps: Vec<StepRun>,
+        /// What the job left under its `{out}` directory, collected before
+        /// the workspace was reclaimed, up to the runner's output cap
+        /// ([`JobOutputs`]).
+        ///
+        /// Default — nothing — from an ad-hoc job, which has no `{out}`, and
+        /// from any peer that does not say: absence means this runner
+        /// collected no output file, which is exactly what a build predating
+        /// the field means.
+        #[serde(default, skip_serializing_if = "JobOutputs::is_silent")]
+        outputs: JobOutputs,
     },
     /// One executor step of an attempt has ended, with its figures (D77).
     ///
@@ -1484,6 +1559,37 @@ pub enum FromHub {
     /// (D19). Waiting for such a job is never silent. M8's explained waits are
     /// this frame's real home.
     JobNote { job_id: JobId, note: String },
+    /// The hub is still there and this job is not over. **Nothing is printed
+    /// for it.**
+    ///
+    /// A follower hears from the hub when something happens: a line of
+    /// output, the reason a job is still queued, where it was placed, the
+    /// verdict. A job that is *running* and printing nothing produces none of
+    /// those, and a quiet build is the ordinary case rather than the
+    /// exception — so the connection carried **no frames at all** for as long
+    /// as the job stayed quiet. Behind a reverse proxy with an idle timeout
+    /// that is a connection closed under the follower, and `herdctl` then saw
+    /// the stream end with no verdict and exited 125 on a job that had in
+    /// fact succeeded. A *wrong* answer rather than a degraded one: a merger
+    /// reading 125 concludes the work never ran.
+    ///
+    /// So the hub keeps the link warm itself, every [`STILL_THERE_EVERY`], to
+    /// every follower of a job that is not yet over. No client needs a
+    /// heartbeat of its own, none redials on this, and none learns anything
+    /// new about timing from it. A job that has **ended** gets none: its
+    /// stream is over, and a frame after the verdict would be the hub talking
+    /// about something that is finished.
+    ///
+    /// **Not a [`FromHub::JobNote`], and the distinction is not cosmetic.** A
+    /// note is text a person reads, on stderr; this frame is read by nobody.
+    /// A client prints nothing for it — not on stdout, not on stderr, not
+    /// into a log — and it is no part of the job's output: E-02's framing is
+    /// the `ran on:` line, then the job's own bytes, then the verdict, and
+    /// this frame belongs to none of those three. `job_id` is here so that a
+    /// follower of more than one job can tell which link is being kept warm,
+    /// and there is deliberately nothing else to carry: a field a reader
+    /// could act on would make this a message rather than a breath.
+    StillThere { job_id: JobId },
     /// Where this job is running, and why there (E-02, E-36).
     ///
     /// The first consumer's first expectation: "the output starts with one
@@ -1514,6 +1620,20 @@ pub enum FromHub {
         outcome: JobOutcome,
         #[serde(default)]
         metrics: JobMetrics,
+        /// The files the job left under `{out}`, read back off the record
+        /// ([`JobOutputs`]).
+        ///
+        /// Off the **record**, not relayed through memory, so a `herdctl
+        /// wait` that attaches an hour after the job ran gets the same bytes
+        /// the requester who followed it got — which is why this is a field
+        /// here and not a subcommand of its own: the frame a late attach
+        /// already receives is the after-the-fact fetch.
+        ///
+        /// Not part of E-02's stream: `herdctl` writes them where it was
+        /// told to and nowhere else, so stdout stays `ran on:`, the job's own
+        /// bytes, then the verdict.
+        #[serde(default, skip_serializing_if = "JobOutputs::is_silent")]
+        outputs: JobOutputs,
     },
     /// The hub has the job's outcome on its disk, and the runner may forget it.
     ///

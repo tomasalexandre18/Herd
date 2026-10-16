@@ -50,6 +50,15 @@ pub struct Finished {
     pub job_id: JobId,
     pub outcome: JobOutcome,
     pub metrics: JobMetrics,
+    /// What the job left under its `{out}` directory, as its record holds it
+    /// (D131).
+    ///
+    /// Carried here and written nowhere by default: E-02's stream is the
+    /// `ran on:` line, the job's own bytes, then the verdict, and an output
+    /// file on stdout would be read by the consumer's tooling as the job's
+    /// output. `herdctl run --outputs-to <dir>` is what puts them on a disk,
+    /// and it says on **stderr** which files it wrote.
+    pub outputs: herd_proto::JobOutputs,
 }
 
 /// `herdctl`'s exit code when there is no verdict to report: Herd could not
@@ -66,6 +75,61 @@ pub struct Finished {
 /// printed on stderr, and why the wire carries a typed outcome rather than a
 /// number.
 pub const NO_VERDICT_CODE: u8 = 125;
+
+/// The stable prefix of the one stderr line that names a job's id.
+///
+/// **The whole of the fallback contract is this line's presence.** 125 says
+/// "Herd has no verdict", and it says it both for a job that exists and ran
+/// somewhere and for a submission that never left — which are opposite
+/// instructions to a requester that falls back. One would have it decline to
+/// re-run; the other would have it re-run safely. A caller that cannot tell
+/// them apart runs the work twice, and work run twice is a wrong answer for
+/// a build and test system, not a slow one.
+///
+/// So: **whenever a job exists, `herdctl` names its id on this line, on
+/// stderr, as soon as the hub has said it** — before anything can go wrong,
+/// because a line printed only on the failures that were thought of cannot
+/// cover the one that was not. The rule a wrapper writes is "did I get an
+/// id?", and the answer is worth more than a code would be: an id is a
+/// handle, so the fallback is `herdctl wait <id>` rather than merely
+/// declining to duplicate.
+///
+/// It is on **stderr**, which the job's own bytes never share (E-02's
+/// framing — `ran on: …`, the job's output, the verdict — is all stdout), so
+/// it cannot collide with a job's output and does not disturb that stream's
+/// order.
+pub const JOB_ID_PREFIX: &str = "herdctl: job-id: ";
+
+/// The other half of the contract: the one stderr line printed when nothing
+/// was submitted, so no job of this requester's exists.
+///
+/// A refusal before the job was minted, a bad token, an unreachable hub, a
+/// usage error. These are the cases where running the work again is safe,
+/// and a falling-back requester needs that certainty more than anything
+/// else here.
+pub const NO_JOB_LINE: &str =
+    "herdctl: no-job: nothing was submitted, so no job of yours exists and running this again \
+     starts no second one";
+
+/// The third state, and it is real: the submission left and was never
+/// acknowledged, so a job may exist whose id nobody learned.
+///
+/// Said rather than hidden, because the honest answer to "is there a job?"
+/// here is "possibly", and a line claiming no job exists would be the
+/// duplicate-work defect wearing the other mask. What makes it safe to act
+/// on is E-05: submitting the same work again **joins** the open job rather
+/// than starting a second one, so a requester that retries after this line
+/// duplicates nothing.
+pub const JOB_UNKNOWN_LINE: &str =
+    "herdctl: job-unknown: the submission left but was never acknowledged, so a job may exist \
+     whose id this requester never learned; submitting the same job again joins that one \
+     rather than starting a second (E-05)";
+
+/// The one stderr line that names a job's id, built in one place so that a
+/// test and a wrapper read the same thing. See [`JOB_ID_PREFIX`].
+pub fn job_id_line(job_id: &JobId) -> String {
+    format!("{JOB_ID_PREFIX}{job_id}")
+}
 
 /// `herdctl`'s exit code when a runner stopped the job at one of its caps
 /// (M4): the time cap, the memory ceiling, the log cap or the disk budget.
@@ -261,6 +325,20 @@ pub enum Said<'a> {
     /// E-02's first line, already built by [`herd_proto::ran_on_line`]: on
     /// stdout, before the job's output.
     Framing(&'a str),
+    /// The submission frame has left this process. **Nothing is printed for
+    /// it**, and that is deliberate: a submission about to be acknowledged
+    /// has nothing to say, and a submission that is never acknowledged is
+    /// reported once, at the end, by [`JOB_UNKNOWN_LINE`].
+    ///
+    /// It is said at all because it is the moment the answer to "does a job
+    /// exist?" stops being *no* and becomes *possibly*, and only the caller
+    /// that wrote the frame knows when that was.
+    Submitting,
+    /// A job certainly exists and this is its id: the hub minted it and said
+    /// so, or — on a wait — answered about it at all. Printed on stderr as
+    /// [`job_id_line`], immediately: see [`JOB_ID_PREFIX`] for why it cannot
+    /// wait until the end.
+    Submitted(&'a JobId),
 }
 
 /// E-02's framing line, held until there is output for it to be the first
@@ -331,12 +409,20 @@ pub async fn run_job(
     )
     .await
     .context("submitting the job")?;
+    // From here a job may exist whatever happens next, including nothing.
+    said(Said::Submitting);
 
     let mut job_id: Option<JobId> = None;
     let mut framing = Framing::default();
     while let Some(message) = next_message(&mut socket).await? {
         match message {
-            FromHub::JobAccepted { job_id: accepted } => job_id = Some(accepted),
+            // The id, out on stderr the moment the hub says it: every way
+            // this run can end without a verdict is downstream of here, and
+            // so is every way it can be killed from outside (JOB_ID_PREFIX).
+            FromHub::JobAccepted { job_id: accepted } => {
+                said(Said::Submitted(&accepted));
+                job_id = Some(accepted);
+            }
             FromHub::LogChunk { stream, data, .. } => {
                 framing.release(&mut said);
                 on_log(stream, &data);
@@ -350,6 +436,20 @@ pub async fn run_job(
                 on_log(LogStream::Stdout, &data);
             }
             FromHub::JobNote { note, .. } => said(Said::Note(&note)),
+            // The hub keeping this connection warm under a job that is
+            // running and printing nothing. **Nothing happens here, and that
+            // is the whole of it**: not a byte on stdout, not a word on
+            // stderr, no release of the held `ran on:` line — E-02's framing
+            // is the line, the job's own bytes, then the verdict, and a
+            // breath from the hub is in none of those places.
+            //
+            // Handled by name rather than left to the fallback below, which
+            // is a `bail!`: a frame a requester "cannot use" ends the run
+            // with an error, so swallowing this one by accident was never
+            // available. And by name rather than by a wildcard so that the
+            // next frame added to the protocol still meets that `bail!`
+            // instead of being silently ignored.
+            FromHub::StillThere { .. } => {}
             // E-02's first line, on **stdout**, ahead of the job's first
             // byte: the output a requester sees is framed with where the job
             // ran and why there, and the job's own output follows it
@@ -363,6 +463,7 @@ pub async fn run_job(
                 job_id,
                 outcome,
                 metrics,
+                outputs,
             } => {
                 if Framing::belongs_to(&outcome) {
                     framing.release(&mut said);
@@ -372,6 +473,7 @@ pub async fn run_job(
                     job_id,
                     outcome,
                     metrics,
+                    outputs,
                 });
             }
             FromHub::Refused { reason } => bail!("the hub refused the job: {reason}"),
@@ -383,7 +485,11 @@ pub async fn run_job(
     }
     match job_id {
         Some(job_id) => bail!("the hub closed the connection while {job_id} was still running"),
-        None => bail!("the hub closed the connection without accepting the job"),
+        // Not "no job exists": the submission left, and whether the hub
+        // minted one before the link went is exactly what is unknown here.
+        // The id line was never printed, so the caller reads this as the
+        // third state and E-05 makes retrying safe (JOB_UNKNOWN_LINE).
+        None => bail!("the hub closed the connection without saying whether it accepted the job"),
     }
 }
 
@@ -401,6 +507,23 @@ pub async fn submit_job(
     priority: Priority,
     declared: Declared,
 ) -> Result<JobId> {
+    submit_job_saying(config, command, labels, priority, declared, |_| {}).await
+}
+
+/// [`submit_job`], telling the caller what it knows about whether a job
+/// exists as it learns it (see [`JOB_ID_PREFIX`]).
+///
+/// A separate entry point rather than one more argument on `submit_job`:
+/// a test that only wants an id should not have to say so, and the binary
+/// is the one caller that has to answer "is there a job?" after a failure.
+pub async fn submit_job_saying(
+    config: &Config,
+    command: Vec<String>,
+    labels: LabelSet,
+    priority: Priority,
+    declared: Declared,
+    mut said: impl FnMut(Said),
+) -> Result<JobId> {
     if command.is_empty() {
         bail!("a job needs a command to run");
     }
@@ -413,8 +536,11 @@ pub async fn submit_job(
     )
     .await
     .context("submitting the job")?;
+    // From here a job may exist whatever happens next, including nothing.
+    said(Said::Submitting);
     match next_message(&mut socket).await? {
         Some(FromHub::JobAccepted { job_id }) => {
+            said(Said::Submitted(&job_id));
             let _ = socket.close(None).await;
             Ok(job_id)
         }
@@ -423,7 +549,9 @@ pub async fn submit_job(
             "the hub answered a submission with {}",
             message_kind(&other)
         ),
-        None => bail!("the hub closed the connection without accepting the job"),
+        // As in `run_job`: the submission left, so whether a job exists is
+        // unknown and must not be said to be no.
+        None => bail!("the hub closed the connection without saying whether it accepted the job"),
     }
 }
 
@@ -461,12 +589,23 @@ pub async fn wait_for_job(
     .context("asking to be told how the job ends")?;
 
     let mut framing = Framing::default();
+    // A wait submits nothing, so there is nothing new to duplicate — but a
+    // wait that ends without a verdict is still a job left running
+    // somewhere, and the contract is one rule everywhere: if the job exists,
+    // its id is on stderr (JOB_ID_PREFIX). The hub answering about it at all
+    // is what proves it exists; a refusal says it does not.
+    let mut named = false;
     while let Some(message) = next_message(&mut socket).await? {
+        if !named && !matches!(message, FromHub::Refused { .. }) {
+            said(Said::Submitted(&job_id));
+            named = true;
+        }
         match message {
             FromHub::JobFinished {
                 job_id,
                 outcome,
                 metrics,
+                outputs,
             } => {
                 if Framing::belongs_to(&outcome) {
                     framing.release(&mut said);
@@ -476,6 +615,7 @@ pub async fn wait_for_job(
                     job_id,
                     outcome,
                     metrics,
+                    outputs,
                 });
             }
             FromHub::JobLog { data, .. } => {
@@ -487,6 +627,12 @@ pub async fn wait_for_job(
                 on_log(stream, &data);
             }
             FromHub::JobNote { note, .. } => said(Said::Note(&note)),
+            // The hub keeping a quiet wait's connection warm. Nothing is
+            // printed for it, here as in [`run_job`]: a `herdctl wait` on a
+            // job that runs for an hour in silence is exactly the case the
+            // frame exists for, and exactly the case where one stray
+            // character would break the output a reader is anchored on.
+            FromHub::StillThere { .. } => {}
             // E-02's first line, on **stdout**, ahead of the job's first
             // byte: the output a requester sees is framed with where the job
             // ran and why there, and the job's own output follows it
@@ -502,7 +648,55 @@ pub async fn wait_for_job(
             ),
         }
     }
+    // The hub closed without ever answering. The job this wait names is not
+    // this invocation's to duplicate, and coming back to it is idempotent,
+    // so it is named here too rather than left to the sentence below: one
+    // rule, every path (JOB_ID_PREFIX).
+    if !named {
+        said(Said::Submitted(&job_id));
+    }
     bail!("the hub closed the connection while {job_id} was still running")
+}
+
+/// Write a job's kept files under `directory`, keeping their relative paths,
+/// and come back with one line per file written (D131).
+///
+/// Three things this deliberately does:
+///
+/// * **It never touches stdout.** The caller puts these lines on stderr. An
+///   output file printed into E-02's stream would be read by the consumer's
+///   own tooling as part of the job's output, which is the one thing E-02
+///   cannot survive.
+/// * **It checks every path again**, with [`herd_proto::check_relative`] —
+///   the same function the runner and the hub use. These paths arrived over a
+///   socket and are about to be joined onto a directory on the requester's
+///   own disk, which is the third place in Herd where that would be a hole
+///   and the third place the one check closes it.
+/// * **It writes nothing when the collection was refused.** Over the cap
+///   there are no files, and a directory the caller can find empty is the
+///   honest shape of that: the sentence is what says why.
+pub fn write_outputs(
+    directory: &std::path::Path,
+    outputs: &herd_proto::JobOutputs,
+) -> Result<Vec<String>> {
+    let mut written = Vec::new();
+    for file in &outputs.files {
+        herd_proto::check_relative(&file.path).map_err(|why| {
+            anyhow!("the hub named an output file this requester will not write: {why}")
+        })?;
+        let path = directory.join(&file.path);
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)
+                .with_context(|| format!("making {}", parent.display()))?;
+        }
+        std::fs::write(&path, &file.data).with_context(|| format!("writing {}", path.display()))?;
+        written.push(format!(
+            "wrote {} ({} bytes)",
+            path.display(),
+            file.data.len()
+        ));
+    }
+    Ok(written)
 }
 
 /// Ask for a job to be cancelled, and come back with what the hub says
@@ -689,11 +883,30 @@ pub async fn raise_job(config: &Config, job_id: JobId, priority: Priority) -> Re
     }
 }
 
+/// What this requester will read off the wire: Herd's own ceiling, not the
+/// library's default.
+///
+/// The WebSocket library's own `max_frame_size` is 16 MiB, which nobody here
+/// chose and which is **smaller than a frame the hub may legitimately send**:
+/// a verdict carrying a job's kept files is one frame, and the hub reads and
+/// writes up to [`herd_proto::FRAME_CEILING`]. Left at the default, a job
+/// whose output was well inside the runner's cap would have arrived as a
+/// closed connection and a 125 — a job with no verdict, for a job that
+/// passed, which is the shape of defect D117 named. So the figure is stated
+/// here, the same one on every socket in Herd.
+fn frame_limits() -> tokio_tungstenite::tungstenite::protocol::WebSocketConfig {
+    let ceiling = usize::try_from(herd_proto::FRAME_CEILING).unwrap_or(usize::MAX);
+    tokio_tungstenite::tungstenite::protocol::WebSocketConfig::default()
+        .max_message_size(Some(ceiling))
+        .max_frame_size(Some(ceiling))
+}
+
 /// Dial the hub and get through the handshake.
 async fn join(config: &Config) -> Result<Socket> {
-    let (mut socket, _response) = tokio_tungstenite::connect_async(&config.hub_url)
-        .await
-        .with_context(|| format!("dialling {}", config.hub_url))?;
+    let (mut socket, _response) =
+        tokio_tungstenite::connect_async_with_config(&config.hub_url, Some(frame_limits()), false)
+            .await
+            .with_context(|| format!("dialling {}", config.hub_url))?;
     send(
         &mut socket,
         &ToHub::Hello {
@@ -874,6 +1087,7 @@ fn message_kind(message: &FromHub) -> &'static str {
         FromHub::ResendLog { .. } => "resend_log",
         FromHub::JobLog { .. } => "job_log",
         FromHub::JobNote { .. } => "job_note",
+        FromHub::StillThere { .. } => "still_there",
         FromHub::RanOn { .. } => "ran_on",
         FromHub::JobFinished { .. } => "job_finished",
         FromHub::JobResultAck { .. } => "job_result_ack",
@@ -902,6 +1116,35 @@ mod tests {
                 u8::try_from(code).expect("a code in range"),
                 "exit code {code} was not worn as it was"
             );
+        }
+    }
+
+    /// The three lines a falling-back requester reads are told apart by
+    /// their prefix alone, never by their prose, and none of them is a
+    /// prefix of another — a wrapper grepping for one must not match a
+    /// second.
+    #[test]
+    fn the_three_lines_of_the_fallback_contract_cannot_be_confused() {
+        let named = job_id_line(&JobId::new("j0000000007"));
+        assert_eq!(named, "herdctl: job-id: j0000000007");
+        assert!(named.starts_with(JOB_ID_PREFIX));
+        let lines = [JOB_ID_PREFIX, NO_JOB_LINE, JOB_UNKNOWN_LINE];
+        for (i, one) in lines.iter().enumerate() {
+            for (j, other) in lines.iter().enumerate() {
+                assert!(
+                    i == j || !other.starts_with(one),
+                    "{other:?} begins with {one:?}, so one grep matches both"
+                );
+            }
+        }
+        // Every one of them is `herdctl`'s own voice and says so, so a
+        // reader of a mixed stream knows who is speaking.
+        for line in lines {
+            assert!(line.starts_with("herdctl: "), "{line:?}");
+        }
+        // The two that mean "no id" never look like one.
+        for line in [NO_JOB_LINE, JOB_UNKNOWN_LINE] {
+            assert!(!line.contains(JOB_ID_PREFIX), "{line:?}");
         }
     }
 

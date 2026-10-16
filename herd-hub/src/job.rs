@@ -25,57 +25,31 @@ use serde::{Deserialize, Deserializer, Serialize, Serializer};
 pub use herd_proto::JobMetrics;
 
 /// The version of the shape of a job's recorded data: `job.json` and every
-/// line of `events.jsonl`. Bumped whenever an older reader could not read
-/// what a newer Herd writes.
+/// line of `events.jsonl`. A version probe sits in front of every record
+/// file, and a file whose version is not exactly this one is **not read**: the
+/// store returns an error naming the path and both numbers, and because that
+/// error comes out of recovery, the hub refuses to start on that state root
+/// rather than read it.
 ///
-/// 2 since M6: a record carries the [`Priority`] its requester named (E-18).
-/// It is a *required* field, not a defaulted one, so a record written before
-/// M6 is refused by name — with its path and both version numbers — rather
-/// than read as if its requester had asked for the middle level. A guessed
-/// priority on a durable record is a lie a reader cannot see, and the version
-/// probe in front of every record file exists for exactly this.
+/// **1 is the first deployed record format, and it is frozen here** (D73). It
+/// reached 6 while nothing was deployed — M6's priority, M7's placement
+/// reason, M8's memory and tmpfs, M9's deadline and requeue code, M10's
+/// declaration and executor steps — and every one of those breaks was real,
+/// on records that only ever existed in a test directory. M16 sets the number
+/// back to 1, and from M16 on it is not a development counter.
 ///
-/// 3 since M7: an attempt carries the one line explaining why it was placed
-/// where it was (E-36), and a record carries the per-build-thread memory its
-/// requester declared, if it declared one (E-22). Both are required fields,
-/// for the same reason the priority is: an attempt with no explanation is
-/// precisely what E-36 forbids, and a reader must be able to tell "this job
-/// asked for no derived `-j`" from "this record predates the question". A
-/// pre-M7 state root is refused by name, with both figures, and no migration
-/// is written for it (D73).
-///
-/// 4 since M8: a record carries the whole-job memory and the tmpfs its
-/// requester declared (E-29, E-31). Required fields, and this time the reason
-/// is load-bearing twice over: a running job's **declared** need is what
-/// admission subtracts from the next job's room, read back off the record at
-/// the start of every pass (D79), and a record that defaulted its two figures
-/// to zero would read as a job holding nothing while it held gibibytes. A
-/// pre-M8 state root is refused by name and no migration is written for it
-/// (D73).
-/// 5 since M9: a record carries its deadline, the one job it starts after and
-/// the exit code its command means "requeue me" by (E-09, E-10, D76), and an
-/// attempt says whether it ended *because of* that code. Required fields,
-/// again, and the requeue code is the one that makes it load-bearing: the
-/// budget for such a requeue is counted by reading the attempts off the record
-/// every time, separately from E-21's two goes at a lost runner (D79), so a
-/// record whose attempts could not say which kind of ending each one was would
-/// let a leased machine spend the budget that exists for a runner that
-/// disappears. A pre-M9 state root is refused by name and no migration is
-/// written for it (D73).
-///
-/// 6 since M10: a record carries the declared command it is, if it is one, and
-/// the time cap that command declared (E-11, D106, D108), and an attempt
-/// carries one timestamped line per executor step (D77). The declaration is a
-/// required field for the reason the others are — a reader must be able to
-/// tell a job that was an ad-hoc command line from a record written before
-/// commands were declared — and it is load-bearing beyond readability: the
-/// declaration is **what a requeue onto another machine runs**, so a record
-/// that lost it would re-run the job as a bare command line on a machine with
-/// no workspace, and report whatever came out as the consumer's verdict. The
-/// steps are `#[serde(default)]`, purely additive, and an attempt with none is
-/// an attempt of a job that is not a declared command. A pre-M10 state root is
-/// refused by name and no migration is written for it (D73).
-pub const RECORD_VERSION: u32 = 6;
+/// **What moving it now costs.** A record is written once and read much later
+/// (E-53, E-54), so the two sides of a bump are one hub at two different
+/// times: a hub at version 2 will not read what the version 1 hub wrote, and a
+/// rollback to version 1 will not read what version 2 wrote. What stops being
+/// readable is the operator's whole state root — every queued job, every
+/// verdict the consumer has not collected yet — and the hub says so by not
+/// starting, never by guessing. So a bump is a compatibility statement: it
+/// needs Alexa's approval, and it ships with either a migration or an explicit
+/// instruction for the operator. Only a field that is `#[serde(default)]`
+/// *and* means, when absent, exactly what its default says is additive enough
+/// to leave the number alone.
+pub const RECORD_VERSION: u32 = 1;
 
 /// A moment, as the record files carry it: RFC 3339 in UTC, to the
 /// nanosecond. A string a human and the consumer can both read, so that a
@@ -713,17 +687,71 @@ pub struct JobRecord {
     /// only queued, one entry in the ordinary case, two when the first
     /// runner was lost.
     ///
-    /// `#[serde(default)]`, so a record written before M3 reads as a job with
-    /// no attempt recorded rather than as a read error. [`RECORD_VERSION`]
-    /// stays 1 for the same reason D15 and D18 kept `PROTOCOL_VERSION` at 1:
-    /// the field is purely additive, an older reader ignores it, and nothing
-    /// is deployed to read it wrongly.
+    /// `#[serde(default)]`, so the record of a job not yet attempted reads as
+    /// a job with no attempt rather than as a read error. Purely additive in
+    /// that sense, which is why M3 added it without moving
+    /// [`RECORD_VERSION`] — the one kind of change still allowed to leave the
+    /// frozen number alone (D73).
     #[serde(default)]
     pub attempts: Vec<Attempt>,
     /// What the runner measured while the job ran (E-15). Reserved in the
     /// record's shape by M2 and filled by M4: every figure is unset until the
     /// runner reports it, which it does once, with the outcome.
     pub metrics: JobMetrics,
+    /// What the job left under its `{out}` directory, as the record
+    /// summarises it: the paths and sizes, never the bytes. The bytes are the
+    /// files in `files/` beside this record, which is the directory D8
+    /// reserved for exactly them (E-15's "kept files").
+    ///
+    /// `#[serde(default)]`, and that is why [`RECORD_VERSION`] does not move
+    /// for it: a record written before this field reads as a job that kept
+    /// nothing, which is precisely what such a job did. The live state root
+    /// on the deployed hub is readable unchanged, and `files/` has existed and
+    /// been empty in every job directory since M2 — so a job directory does
+    /// not even gain a *name*, only contents it was already shaped for.
+    #[serde(default, skip_serializing_if = "OutputSummary::is_silent")]
+    pub outputs: OutputSummary,
+}
+
+/// What a job left behind, as `job.json` says it.
+///
+/// The summary and not the files, so a reader of the record alone sees what
+/// is there and how big it is without reading any of it (E-53), and so that a
+/// record stays the kilobytes D8 promised whatever a job wrote.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OutputSummary {
+    /// Every file kept, by its path relative to `files/`, with its size.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub files: Vec<KeptFile>,
+    /// Why nothing was kept although the job left something: the runner's
+    /// output cap, with the figures (D131). Never set beside a non-empty
+    /// `files` — over the cap is all or nothing.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub refused: Option<String>,
+    /// One sentence per thing under `{out}` that was deliberately not kept: a
+    /// symlink, a fifo, a name that is not UTF-8, a path this hub would not
+    /// join onto its own state root.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub skipped: Vec<String>,
+}
+
+impl OutputSummary {
+    /// Whether there is nothing to write down, which is every job that leaves
+    /// no output: the field is then absent from `job.json` entirely, so the
+    /// record of such a job is byte-identical to the one it was before this
+    /// existed.
+    pub fn is_silent(&self) -> bool {
+        self.files.is_empty() && self.refused.is_none() && self.skipped.is_empty()
+    }
+}
+
+/// One file of a job's record, as the record names it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct KeptFile {
+    /// Relative to the job's `files/` directory, directories preserved:
+    /// `files/results.json` under `{out}` is `files/results.json` here.
+    pub path: String,
+    pub bytes: u64,
 }
 
 /// What `submissions` is on a record that predates the field. One, because
@@ -865,6 +893,7 @@ impl JobRecord {
             updated_at: now,
             attempts: Vec::new(),
             metrics: JobMetrics::default(),
+            outputs: OutputSummary::default(),
         }
     }
 
@@ -1344,6 +1373,31 @@ pub trait JobStore: Send + Sync + 'static {
     /// because a runner reports figures the hub never computes, and because a
     /// store that keeps no measurements is still a correct store.
     fn record_metrics(&self, id: &JobId, metrics: JobMetrics) -> Result<()>;
+
+    /// Keep the files a job left under `{out}`, and say so on its record
+    /// (D131).
+    ///
+    /// Written **before** the transition to `finished`, inside the same try,
+    /// for the reason the measurements are: a reader who sees `finished` is
+    /// entitled to find the record's files beside it (E-15), and a hub that
+    /// could not write them must not acknowledge the verdict either — the
+    /// runner keeps holding both until it can (D19, E-44).
+    ///
+    /// A path this store will not join onto its own directory is **dropped
+    /// and named on the record**, not an error: a verdict must never be lost
+    /// over a malformed path, and a path that cannot be written down is a
+    /// fact about one file rather than about the job.
+    fn record_outputs(&self, id: &JobId, outputs: &herd_proto::JobOutputs) -> Result<()>;
+
+    /// The files this job's record holds, read back off the disk.
+    ///
+    /// What a `herdctl wait` that attached long after the job ran is given,
+    /// which is why it comes off the disk and not out of memory: the hub may
+    /// have restarted twice since, and the record is the only thing that
+    /// still knows. `Default` for a job that kept nothing, and for a job this
+    /// store has never heard of — the caller has already dealt with that case
+    /// through [`JobStore::job`].
+    fn job_outputs(&self, id: &JobId) -> Result<herd_proto::JobOutputs>;
 
     /// Record the start of an attempt on a job, and give it its number.
     ///

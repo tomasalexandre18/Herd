@@ -3292,3 +3292,1298 @@ failure is silence, which is the mode this project keeps legislating against.
 **Choice.** Every harness that lends a real runner names it and approves it,
 through the one `approve_runner` path, exactly as `confinement.rs` does. No
 test holds its own notion of an approved runner.
+
+---
+
+## 2026-10-15 — D115 `wss://` with rustls and the bundled webpki roots
+
+**Context.** `wss://` did not work at all: `tokio-tungstenite` was pulled with
+default features, so **no TLS crate existed in `Cargo.lock`** — no rustls, no
+native-tls, no openssl. The hub never needed TLS (Cloudflare terminates it in
+front), but `herd-runner` and `herdctl` are the side that *dials*, and a client
+with no TLS cannot begin a connection it is Cloudflare's job to end. M16 is
+unaffected — the server's runner and every requester reach the hub on loopback
+`ws://` — but M17, the owner's PC dialling in from another machine, was
+impossible.
+
+**Choice.** rustls, with the **bundled webpki roots**, and no trust-this-CA
+option. The reason is specifically that Cloudflare fronts the hub: the only
+`wss://` dial is to a publicly trusted certificate, and a frozen Mozilla root
+set verifies it on a host whose own trust store we know nothing about. Not a
+general preference — if the hub were ever fronted by a private CA instead, this
+is the decision to revisit, and it would need a flag.
+
+`rustls` is named in the workspace manifest **for its crypto provider alone**
+(`ring`): tokio-tungstenite pulls rustls with no provider, and
+`ClientConfig::builder()` *panics* without one — a latent process abort on the
+first `wss://` dial, not a connection error.
+
+**Alternative rejected.** The host's trust store, and OpenSSL or native-tls —
+the latter for the system library a runner would then need on every machine it
+is dropped onto.
+
+**Proof, not argument.** Before: `URL error: TLS support not compiled in`.
+After, against a real endpoint: `HTTP error: 200 OK` — the handshake completed
+and the certificate verified; the server merely answered HTTP instead of a
+WebSocket upgrade. Tests assert a real ClientHello reaches the wire and that
+the failure is the peer's alert, never the missing-feature string.
+
+---
+
+## 2026-10-15 — D116 A job's cgroup bounds cpu, io and pids, and says so
+
+**Context.** The runner wrote exactly one cgroup control, `memory.max`. CPU and
+IO were left to `nice 10` and the idle IO class, so a job ignoring the `-j` it
+is handed took every core. The first consumer's two incidents of 2026-10-15
+were a global OOM and a two-minute swap and IO freeze that took every docker
+service on the host down; Alexa approved these bounds and the consumer asked
+for them in writing.
+
+**Choice.** Beside `memory.max`, in each job's cgroup: `cpu.weight` **10** by
+default, `io.weight` **10**, `pids.max` **1024**, and `cpu.max` **absent** by
+default. The split matters: the three with defaults report loudly when the
+controller is withheld, while `cpu.max` — which claims nothing unless asked —
+**refuses the startup** when it is asked for on a host that cannot enforce it
+(D23's refusal over silent degradation). Weights outside `1..=10000` refuse the
+startup naming the range. Nothing gates on load: the consumer's E-32 says the
+load figure is recorded and never a criterion.
+
+**`io.weight` is written and ignored on this host, and the runner says so.**
+Measured: no device offers `bfq` anywhere (`[none] mq-deadline kyber`), and
+`/sys/fs/cgroup/io.cost.qos` is empty — blk-iocost enabled for no device. So
+the block layer has no per-cgroup weighting to apply. Worse, and this is the
+part to carry forward: **the idle IO priority the runner already sets is itself
+inert on a `none` scheduler.** As it stands Herd therefore has *no* effective
+IO bound on this machine, and the runner prints that in its startup report
+rather than implying a bound it does not have.
+
+**Deliberately not built.** `io.max`, an absolute throughput or IOPS ceiling,
+which is the one IO lever that works whatever the scheduler is. It is the
+honest next step if IO must actually be bounded, and it was not asked for.
+
+---
+
+## 2026-10-15 — D117 Two traps between a green suite and a working deployment
+
+**Context.** Both found while making M16 real; both would have cost hours on
+the server and neither is visible from a test run.
+
+**`Delegate=yes` only delegates to the scope's *only* process.** The
+measurement that cgroup delegation closes the two memory skips holds for a
+*bare* command: `systemd-run --user --scope -p Delegate=yes -- herd-runner`.
+Put a wrapper in the scope — `… -- timeout 5 herd-runner` — and enabling
+`+memory` returns `EBUSY`, the runner falls back, and the run silently proves
+nothing. Whoever verifies the ceiling on the real machine must check the
+runner's own startup line (`memory ceiling: one cgroup v2 subtree per job,
+enforced by the kernel`) rather than trusting the scope.
+
+**`herdctl` has no heartbeat and no redial.** The runner is fine: a `Close`
+frame returns success, spending no failure counter, and its health report every
+15 s means its link is never idle — Cloudflare's idle timeout, around 100
+seconds, cannot reach it. A requester is different. A *queued* job is safe,
+because the hub restates why it waits every 60 s. But a **running** job that
+prints nothing for 100 s sends its follower no frames at all, so a requester
+dialling `wss://` through Cloudflare would take the close, report that it has
+no verdict and **exit 125 while the job succeeds**. A wrong answer, not a
+degraded one — and a merger reading 125 would conclude the work never ran.
+
+Unreachable at M16, where every requester is on loopback `ws://`. **It must be
+closed before the first requester is remote**, and the cheap shape is the hub
+keeping a running job's followers warm on the same cadence it already uses to
+restate a wait, so that no client needs its own heartbeat.
+
+---
+
+## 2026-10-15 — D118 The hub keeps a running job's followers warm
+
+**Context.** D117 named the defect and left it for "before the first remote
+requester". Closing it is half a session and leaving it open means the first
+real deployment can answer 125 on a job that passed. It is being closed now
+rather than being carried as a known wrong answer.
+
+**Choice.** A new additive `FromHub` frame, silent, carrying only the job id,
+sent by the **hub** to every follower of a **non-terminal** job when nothing
+has gone out on that connection for the cadence. The cadence is a `pub const`
+next to `HEALTH_EVERY` and deliberately the same 15 s, so there is one number
+to remember for how often a quiet Herd link speaks. `herdctl` handles it by
+name and prints nothing: not stdout, not stderr, not counted as job output,
+and it cannot disturb E-02's framing. A terminal job gets none — its stream
+is over.
+
+**Why at the hub and not in the client.** Every future requester inherits the
+fix without learning anything about timing, and there is one place where the
+cadence lives. A client-side heartbeat would have to be added again to every
+tool that follows a job, and a tool that forgot it would fail exactly the way
+D117 describes.
+
+**Rejected.** Reusing `JobNote`: a note is text a person reads, and a liveness
+frame is read by nobody — a client that printed it would put noise between
+E-02's first line and the job's first byte. Also rejected: making `herdctl`
+redial and resume, which is strictly more code for the same symptom and still
+leaves a silent link silent.
+
+The cadence is injectable so the end-to-end test does not sleep 15 s.
+
+---
+
+## 2026-10-15 — D119 Admission reads the room it is in; PSI is a figure
+
+**Context.** The first consumer asked for two things in one breath: that
+admission read `MemAvailable` and PSI, and that PSI act as a brake. The second
+half collides with E-32, which says the load figure is **recorded, never a
+gate**.
+
+**Choice, split in two.** The memory half is taken, and in a stronger form
+than asked: admission reads the room in **the cgroup the runner is actually
+in**, not the host's `MemAvailable`. A runner inside a systemd slice carrying
+`MemoryMax` has less room than the host advertises, and admitting against the
+host's figure is how a slice gets OOM-killed while Herd believes it was
+careful. Where there is no enclosing limit the host figure is the answer, so
+the stricter read costs nothing on a bare machine.
+
+The PSI half is refused as a gate and taken as a figure: pressure is recorded
+with the job and reported, and it never refuses an admission. E-32 is the
+consumer's own expectation, and a brake that silently stops dispatching is
+indistinguishable from a hub that has died — the failure mode it would
+introduce is worse than the queueing it would prevent.
+
+**Rejected.** Making PSI a gate behind a switch: a switch whose default is off
+is not a feature, and whose default is on breaks E-32 for everyone.
+
+---
+
+## 2026-10-15 — D120 `io.weight` does bite, on one of this host's two disks
+
+**Correction of D116.** D116 recorded `io.weight` as inert here on the
+evidence that no device offers `bfq` and that `/sys/fs/cgroup/io.cost.qos` was
+empty. The first half is still true. The second was a reading taken **before
+anything had written an `io.weight`**, and that is the whole mistake:
+blk-iocost runs with `ctrl=auto`, so the first non-default `io.weight` written
+to a cgroup **enables the controller itself** on any device whose cost model is
+known. Herd's own write is what turns it on. After the M16 suite ran, that
+file reads:
+
+```
+259:0 enable=1 ctrl=auto rpct=0.00 rlat=5000 wpct=0.00 wlat=5000 …
+```
+
+**The real shape, measured.** `259:0` is `nvme0n1`, the ext4 disk that carries
+`/mnt/ssd_980`, and it has a populated linear cost model. IO to that disk
+**is** weighted per cgroup. `rpool` — ZFS, a mirror of two SATA SSDs, carrying
+`/` and `/tmp` — has no iocost entry and gets none: ZFS does not attribute its
+pool IO to the writing cgroup, so no cgroup IO knob reaches it, `io.weight`
+and `io.max` alike.
+
+So whether Herd has an effective IO bound **depends on where the job works**,
+not on the host. On the NVMe it has one. On ZFS it has none and never will.
+That is also why the suite's `io.weight` assertion skipped rather than proved
+anything: its scratch path was under `/tmp`, which is ZFS — the skip said so
+in as many words, which is exactly what D27's loud skips are for.
+
+**Consequence for the first consumer.** Their slice-level `IOWeight`, the
+mitigation for the 19:15 freeze, is **not** inert as a mechanism — but it is
+inert for everything their build does on ZFS. If that freeze was ZFS IO, the
+knob cannot reach it at any value. The lever that works is to put the work
+that must be bounded on the NVMe, and `io.max` is a second lever **there and
+only there**.
+
+**What this changes in Herd.** The runner's startup report must decide
+"written but inert" from the **device its job directory is actually on**, not
+from the host's IO schedulers — the check it has today would call the NVMe
+inert. That is the next piece of work, and it is the honest version of the
+line the runner already prints.
+
+---
+
+## 2026-10-15 — D121 D78's Docker promise, restated so it is true
+
+**Context.** D78 commits Herd to three checkable things, and the first is
+"the string `docker.sock` appears nowhere in it". Writing the test for the
+second one proved the first **false as literally written**: `git grep
+docker.sock` finds it in `herd-runner/src/privilege.rs`, as two of the string
+literals in `RUNTIME_SOCKETS`.
+
+**Choice.** Restate the promise rather than keep a claim a `grep` refutes, and
+rather than delete the warning the claim was protecting. The sense of D78 was
+never "the characters are absent"; it was "Herd never talks to that socket".
+So the promise is now:
+
+> No crate in the workspace depends on a Docker client, and the only place
+> the workspace names `docker.sock` is the list `privilege.rs` warns about
+> and the test that watches it — nothing opens, dials or executes it.
+
+Both halves are checkable, which is the point: the whole of `Cargo.lock`
+contains nothing matching `docker|bollard|shiplift|containerd|podman|oci`,
+and there is no HTTP client in the graph beyond `tokio-tungstenite`; and
+`RUNTIME_SOCKETS` has exactly two readers, the startup warning and the test.
+
+**Rejected.** Deleting the warning to make the original sentence true. The
+warning is what tells an owner that a uid is not the whole story — a user in
+`docker` is root through that socket whatever the process's uid says — and
+D78 keeps it on purpose. A promise is worth less than the thing it describes.
+
+`docs/plan.md`'s M16 paragraph carried the same sentence and now carries this
+one.
+
+---
+
+## 2026-10-15 — D122 What the startup reaper cannot tell apart
+
+**Context.** The `reclaim` test failed in isolation as readily as under load,
+and I suspected the reaper. It is sound, but chasing it named three shapes the
+sweep genuinely cannot distinguish. They are written where the sweep reads
+`environ`; they are here because a limit nobody records is rediscovered.
+
+The sweep finds a past life's processes by reading `/proc/<pid>/environ` for a
+marker naming the runner that minted them, and kills those whose minter is
+gone.
+
+**The fork/exec window is not a defect, and the reason is structural.**
+Between `fork` and `exec` a child's `environ` is still its *parent's*. A
+sweep in that window sees a job's process as unmarked — which is exactly why
+the old fixture, which slept 100 ms on the written belief that "the
+environment is readable as soon as the process exists", saw **zero** marked
+processes. But the sweep hunts processes of a runner that is *gone*: those
+`exec`ed long ago, and a child one of them forks during the walk inherits a
+**marked** parent's environ, so it is visible anyway. The only invisible shape
+is a marked child of an unmarked parent, and the only unmarked parent minting
+marked children is a **live** runner starting a job — whose jobs the sweep is
+required to skip. So no job process can be missed.
+
+**Two shapes are permanent when they happen**, because the sweep runs once at
+startup and there is no second pass. A **zombie** minter reads as alive —
+narrow, since it needs a new runner to start before the supervisor reaps the
+old one, and systemd reaps at once. A **reused pid** reads as alive, which is
+inherent to naming a runner by its pid; closing it needs an identity a pid
+alone cannot give, the start time from `/proc/<pid>/stat` kept beside it.
+Neither is covered by the cgroup half either: it asks the same question of the
+same pid.
+
+**Not fixed, deliberately.** Both are narrow, and the cost is a leftover
+process rather than a wrong verdict. Recorded so that a leftover process on a
+machine running two runners is recognised instead of investigated — and
+because the reused-pid case is the one that will bite first when M17 puts a
+second runner on one box.
+
+---
+
+## 2026-10-15 — D123 Four things a working first start taught us
+
+**Context.** All four came out of making `docker compose up -d` actually work
+on a fresh volume, and none of them is visible from a green test suite. The
+compose file's own comment had anticipated the first failure mode and still
+did not avoid it, which is the lesson in itself: a comment is not a test.
+
+**One path, not three.** The image bakes `/var/lib/herd`, owned by the hub's
+uid, precisely so docker seeds a fresh named volume from it and the volume
+inherits that ownership. The compose file mounted `/var/lib/herd/state` — a
+subdirectory the image does not contain — so docker created the mount point
+itself, as root, and the non-root hub refused to start, naming the directory.
+Correct refusal, broken deployment. The mount, `HERD_STATE_DIR` and the
+image's baked directory are now the same string. The hub's own relative
+default still resolves inside the volume, so an operator who forgets the
+variable gets a working hub whose state is still on the disk he would back up.
+
+**Docker ignores `uid`, `gid` and `mode` on a file secret outside swarm.** No
+warning, no effect: the host file is bind-mounted as it is. A root-owned 0400
+token — what `env.example` told the operator to make — is unreadable by the
+hub, which fails with `reading the requester token … Permission denied`. The
+token is now 0444 inside a 0700 directory: the **directory** is what keeps it
+off the host, the mode is only what the container sees, and the image holds no
+users but `herd` and root. The runner's `EnvironmentFile=` stays 0400, because
+systemd reads it as root — the two are different for a reason, and both say so
+where they are written.
+
+**The startup reaper is host-wide, not data-root-wide.** A runner on a brand
+new, empty data root reaped a stray process left by an unrelated test suite:
+the sweep walks all of `/proc` for the marker and kills anything whose minting
+runner is dead, whichever root it belonged to. That is deliberate — nothing
+else will ever collect them — but it means a second runner on one box collects
+the first's leftovers. **This is the thing to remember before M17**, and it
+compounds the reused-pid limit in D122: two runners on one machine make the
+"is the minter gone?" question answerable wrongly for the first time.
+
+**The reverse-proxy fragment does not fit the machine it is for.** It is
+nginx; the server runs **Traefik v3 and cloudflared**. The fragment's trailing
+note says Caddy, Traefik and HAProxy "each need exactly this" and then gives
+no Traefik configuration, so the README's proxy step is prose, not an
+instruction, for the only host it will ever be applied to. What is needed is a
+router on the existing TLS entrypoint plus a `serversTransport` carrying
+`forwardingTimeouts.readIdleTimeout` — and nothing about the `wss://` half of
+M16 has been exercised, only the loopback path the server's own runner uses.
+Also cosmetic but real: `herd-runner.service` declares
+`Documentation=file:///etc/herd/joining.md`, which nothing in `deploy/`
+installs, so `systemctl help herd-runner` fails on a fresh install.
+
+---
+
+## 2026-10-15 — D124 An additive frame to a requester is a breaking change
+
+**Context.** Found while closing D118, and it corrects a belief I was about to
+write into the frozen protocol version: that a frame a peer has never heard of
+is harmless because serde has defaults.
+
+**It is not, for a requester.** `herdctl`'s unknown-frame arm is a `bail!` —
+"the hub sent X, which a requester cannot use" — which ends the run with **no
+verdict**, and so exits 125. An old `herdctl` meeting a new frame therefore
+fails a job that may well have succeeded, which is the exact shape of defect
+D117 named and D118 closed. Serde's tolerance never enters it: the frame
+parses, and then the client refuses it on purpose.
+
+**So the rule, from the freeze at version 1 onward:** adding a `FromHub`
+variant that can reach a **requester** is a breaking change and must move
+`PROTOCOL_VERSION`, whatever the wire format would tolerate. A variant that
+only ever reaches a runner is a separate question, to be answered by reading
+the runner's own fallback rather than assuming the two clients behave alike.
+
+**Why the `bail!` stays.** It is the right behaviour: a requester that cannot
+understand what the hub is telling it must not pretend to have a verdict. The
+cost is paid by the *deployment*, in a version bump, which is where D73 wants
+it paid — not by a client guessing.
+
+This is also why D118's frame cost nothing: it is sent only to followers, and
+a peer that has never heard of it is a peer that never receives it. That is a
+property of **where** it is sent, not of it being additive, and the two must
+not be confused again.
+
+---
+
+## 2026-10-15 — D125 A queued job is not safe either
+
+**Correction of my own reasoning in D117 and D118.** Both say a *queued* job's
+follower is protected because the hub restates why it waits. That is wrong in
+one case, and the case is not rare: the restatement is `--wait-restatement`,
+60 s by default — four of D118's cadences — and a job for which the hub has
+not yet found a `waiting_for` reason is restated **never**.
+
+So the keepalive goes to every **non-terminal** job, queued as well as
+running, and a note the hub has just sent postpones the next breath by a
+cadence so the two never double up. The implementation does this; this entry
+is here because the reasoning in the two entries above it is what a reader
+would otherwise carry away.
+
+The general shape of the mistake, worth keeping: "another mechanism already
+covers that case" is only true if that mechanism fires **unconditionally**.
+This one fires once a reason exists.
+
+---
+
+## 2026-10-15 — D126 The server runner's data root goes on the NVMe
+
+**Context.** D120 established that `io.weight` bites on `nvme0n1` and never on
+ZFS. `deploy/herd-runner.service` sets `--data-root %S/herd-runner`, which is
+`/var/lib/herd-runner` — and `/var/lib` on this server is `rpool/root`, ZFS.
+So the unit's own `IOWeight=50`, and every per-job `io.weight` under it, would
+have been decorative: a runner whose jobs work on ZFS has no IO bound at all,
+and the startup report would have said so in as many words.
+
+**Choice.** The server runner's data root moves to the ext4 NVMe —
+`/mnt/ssd_980/herd-runner`, 347 GiB free against a 20 GiB per-job disk budget
+— created ahead of time, owned by the runner's user, mode 0700. That is also
+simply the right disk for build scratch: it is the fast one, and a build's
+writes stop competing with the pool that carries `/`.
+
+**What is given up.** `StateDirectory=herd-runner` created the directory,
+owned it and set its mode before the runner started, so the flag and the
+directory could never drift. Off the state directory, that becomes the
+operator's to get right — so the directory is made with the user, in the same
+step, and the runner refuses to start on a root it cannot use, naming the
+path. The failure mode is loud either way; what is lost is that it could not
+happen at all.
+
+**Why not leave it and accept no IO bound.** Because the first consumer's
+freezes are IO, this is the one machine they build on, and an `IOWeight` line
+that does nothing is worse than no line: it reads, to whoever looks next, as
+a bound that exists.
+
+**Not fixed by this.** ZFS still gets no cgroup IO knob, so anything a job
+writes *outside* the data root — and D123's note that Herd does not stop a
+job naming an absolute path — is still unbounded. And `io.weight` is a
+weight, not a ceiling: it shares contended bandwidth, it does not cap it.
+`io.max` remains unbuilt and remains the only hard IO lever.
+## 2026-10-15 — D127 The `wss://` half of M16, for the proxy that is there
+
+**Context.** D123's last paragraph: the reverse-proxy fragment is nginx and
+the server runs Traefik v3 behind cloudflared, so the README's proxy step was
+prose rather than an instruction for the only host it will ever be applied
+to. Nothing of the `wss://` path had been exercised.
+
+**Choice.** A Traefik v3 **file-provider** fragment,
+`deploy/reverse-proxy/traefik-herd-hub.yml`, beside the nginx one rather than
+replacing it: one file per proxy, the README sends the reader to the one that
+names his, and the fragment's old claim that Caddy, Traefik and HAProxy "each
+need exactly this" is replaced by what actually differs between them. The
+file provider and not docker labels because a `serversTransport` — the
+timeouts — can only be *defined* in a dynamic-configuration file, and because
+it keeps Herd's compose file free of one proxy's vocabulary.
+
+**The hub has to be reachable from the proxy's container, and was not.** A
+loopback publish is a DNAT rule for 127.0.0.1 alone, so the containerised
+Traefik on this host cannot reach `127.0.0.1:8787` at all — the fragment
+would have 502'd on a first try. `deploy/docker-compose.traefik.yml` is an
+override that puts the hub on the proxy's existing external network under the
+alias `herd-hub`, keeping the loopback publish for the host's own runner and
+`herdctl`. It opens no port on any interface. The alternative, publishing on
+the docker bridge gateway and dialling `host.docker.internal`, is what
+another stack on this host does and is rejected here: it offers the hub to
+every container on the machine rather than to the proxy's network.
+
+**Traefik v3 needs nothing for the upgrade, and `readIdleTimeout` is the
+wrong knob.** v3 proxies HTTP/1.1 and hijacks an upgraded connection
+inherently; nginx's `Upgrade`/`Connection` ritual exists because nginx
+proxies as HTTP/1.0, and copying it over would be cargo. D123 suggested
+`forwardingTimeouts.readIdleTimeout`; that field drives **HTTP/2** ping
+frames and has no effect on an HTTP/1.1 WebSocket backend, so it is
+deliberately absent and the fragment says why. What is set is
+`idleConnTimeout` 300 s, `dialTimeout` 10 s, `responseHeaderTimeout` 30 s.
+The client-side figures (`respondingTimeouts`) are *static*, per entrypoint,
+and shared with every other service on the host: not Herd's to change, and
+not needing it — all three defaults are far above the cadence.
+
+**The cadence is what makes the timeouts a non-problem.** Every Herd link
+carries a frame at least every 15 s — a runner's health report, and since
+D118 the hub's keep-warm to a running job's followers. So each figure on the
+path has only to beat 15 s, and the outer constraint, **Cloudflare's ~100 s
+idle window, is a figure that can change under us** and is named as one. If
+it ever fell below 15 s, `HEALTH_EVERY` is what moves, not this file.
+
+**Nothing buffers.** Traefik buffers neither direction unless the `buffering`
+middleware is added — which would kill the handshake outright — and
+`maxRequestBodyBytes` lives inside that same middleware, so there is no size
+cap to raise. No middleware at all on this router: forward auth answers a
+WebSocket upgrade with a 302 to a login page, which no runner can answer, and
+an IP-reputation bouncer can ban a runner that redials with backoff.
+
+**The certificate, written where the operator chooses one.** Cloudflare holds
+it and terminates TLS; Traefik holds none on the tunnel path; Herd holds none
+anywhere. Because the clients verify against the bundled webpki roots with no
+trust-this-CA option (D115), a Cloudflare **Origin CA** certificate, a
+self-signed one, Traefik's built-in fallback certificate, or a hostname two
+labels deep under Universal SSL each make every runner and requester fail to
+dial — as a TLS error, before the hub sees a byte, so Herd cannot explain it.
+That is the trap most likely to cost an hour and it is stated three times:
+the fragment, `deploy/README.md`, and `docs/joining.md`.
+
+**What is proven and what is written down.** Proven offline: the fragment
+loads in Traefik v3.7.14 — router, service and serversTransport created, no
+unknown field (checked with a deliberate typo, which Traefik rejects by
+name) — and the compose override merges. **Not proven: one real dial through
+Cloudflare**, because proving it means changing a live shared proxy on a host
+full of other people's services. Instead `deploy/README.md` gains "Step 4,
+exactly": the walk, as commands with their expected output, including a
+240-second quiet link — past Cloudflare's ~100 s, Traefik's 180 s and 60 s at
+once — and a table mapping *the second a link dies at* to the component that
+closed it. A guess written as a measurement is worse than a gap, so the
+section says at the top that it has never been run.
+
+**Also.** `herd-runner.service` pointed `Documentation=` at
+`file:///etc/herd/joining.md`, which nothing installs, so `systemctl help`
+failed on a fresh install. It is now the document's URL: nothing in `deploy/`
+copies files onto a host and that should not start, and a URL is true on
+every machine, including one that never saw the repo. The local alternative
+is one `install` command, written on the line above it.
+
+---
+
+## 2026-10-15 — D128 Two of my own rulings, corrected by building them
+
+**D123 named the wrong knob.** Its last paragraph prescribed a Traefik
+`serversTransport` carrying `forwardingTimeouts.readIdleTimeout`. That knob
+drives **HTTP/2 ping frames** and has no effect whatever on an HTTP/1.1
+WebSocket backend, which is what the hub is. It is deliberately absent from
+`traefik-herd-hub.yml`, and the fragment says why where someone would
+otherwise add it back. The knobs that matter are `idleConnTimeout`,
+`dialTimeout` and `responseHeaderTimeout`; the two that would actually cut a
+quiet link, `respondingTimeouts.readTimeout` and `idleTimeout`, are **static
+and shared with every service on the host**, so they are the owner's and are
+left alone — all three of their defaults are already far above the 15 s
+Herd's own cadence has to beat.
+
+**D124 was too narrow, in the direction that matters.** It said an unknown
+`FromHub` variant is a breaking change *for a requester*, and left the runner
+as a separate question. The runner is the same answer, for a stronger reason
+than `herdctl`'s `bail!`: `FromHub` is `#[serde(tag = "type")]` with no
+`#[serde(other)]`, so an unknown frame **does not decode at all** —
+
+```
+Err(Error("unknown variant `still_there`, expected one of `welcome`, …"))
+```
+
+— and the runner's decode error kills the link, which it then redials **into
+the same undecodable frame**. It loops; it does not shrug. The `other =>` arm
+that prints "not a runner's business" covers only variants that build already
+knows, and is not forward compatibility.
+
+So the rule at the frozen constant is the wider one: adding a variant to
+`FromHub` **or** `ToHub` moves `PROTOCOL_VERSION`, whatever serde would
+tolerate. Only a `#[serde(default)]` field whose absence means exactly what
+its default says leaves the number alone.
+
+**What both have in common,** and the reason they are in one entry: each was
+a plausible ruling made from reading, and each was falsified by someone
+making it real. A prescription I write into a decision is a hypothesis until
+it is built — so an agent told to follow one must be free to come back and
+say it is wrong, which is what happened twice here.
+
+---
+
+## 2026-10-15 — D129 The hub is deployed, and deploying it found two things
+
+**The deployment.** Hub in docker compose on the server, `herd-hub:0.1.0`
+built from the frozen tree, on a fresh volume, loopback only, with a
+requester token. The runner native on the host as a systemd service under a
+dedicated `herd` user — uid 986, group `herd` and nothing else, **not** in
+`docker` — with `Delegate=yes`, its data root on the NVMe (D126).
+
+**What is now proven on the real machine**, read back by a job itself out of
+the kernel rather than asserted:
+
+```
+my cgroup: /system.slice/herd-runner.service/herd-job-507751-7-j0000000008
+memory.max   8589934592      cpu.weight   10
+io.weight    default 10      pids.max     1024
+cpu.max      max 100000
+```
+
+`ulimit -v` inside a job reports `unlimited`, which is how we know the
+ceiling is the cgroup and not the `RLIMIT_AS` fallback. Two assertions that
+**could never be made** on an undelegated dev user are closed. A job at exit
+0, one at exit 7, and a job silent for 50 s — past three keepalive cadences —
+whose follower never went quiet and which returned its verdict normally
+(D118, live). Every `ran on:` line carried real figures: 20 GiB lent, 6 GiB
+floor, load recorded and not a gate.
+
+**Finding 1: a job's `PATH` had no shell and no coreutils.** Herd builds a
+job's environment from scratch, deliberately — that is what stops a stray
+variable in the runner's shell redirecting a job's writes. What the job then
+gets is systemd's service `PATH`, which on this host is zfs-user, dosfstools,
+mtools, e2fsprogs, util-linux-minimal, openssh and systemd. So
+`herdctl run -- sh -c '…'` failed with `sh: No such file or directory` and
+exited **125**, and inside a job `cat` and `cut` were not found either. The
+deployment must therefore *state* a job's `PATH`; the right value is
+host-specific, so it is the unit's to give and not Herd's to guess. Fixed
+with one `Environment=PATH=/run/current-system/sw/bin`, and a bare `sh -c`
+works.
+
+**Finding 2, and it is not ours to close.**
+`/var/run/libvirt/libvirt-sock` on this host is **`srw-rw-rw-`** — mode 0666,
+writable by every user on the machine, and libvirtd runs as root. The runner
+said so itself at startup:
+
+> WARNING: this runner's user can write /var/run/libvirt/libvirt-sock, which
+> is a container or VM runtime and therefore root on this host: a job could
+> start a privileged container and escape every cap. E-46's "unprivileged" is
+> not true of this deployment.
+
+That warning is exactly what `privilege.rs` exists for, and D78's reasoning —
+that a uid is not the whole story — is vindicated by it catching a hole
+nobody was looking for. The `herd` user has no privileged group; the socket
+is simply open to all. **Herd did not introduce this and cannot close it:**
+the fix is the host's libvirtd socket mode, which is `/etc/nixos`, and it
+affects every service on the machine rather than Herd alone. Hiding the path
+from the runner would need a mount namespace, and E-47 is the statement that
+this runner must see the host as it is — so that cure would undo the
+milestone.
+
+Until it is fixed, the honest statement is the runner's own: **every per-job
+cap on this host is sound against a job that stays inside Herd, and bypassable
+by a job that chooses to talk to libvirtd.** It is recorded here rather than
+left in a log line because it is the one thing on this deployment that a
+reader must not discover by accident.
+
+---
+
+## 2026-10-15 — D130 On this host there is no imperative path for the unit
+
+**Context.** `deploy/` is written on the principle that `/etc/nixos` is the
+owner's, so everything needing it is an **OWNER** instruction and the module
+added by D126 is "an offering, not an installation". The unit's own header
+says to install it as `/etc/systemd/system/herd-runner.service`. That turns
+out to be impossible here.
+
+**Measured.** `/etc/systemd/system` on this server is **read-only** — NixOS
+manages `/etc` by activation, so a unit file cannot be dropped into it:
+
+```
+tee: /etc/systemd/system/herd-runner.service: Read-only file system
+```
+
+So the two paths `deploy/README.md` offers are not alternatives on this
+machine. The imperative one does not exist. `/run/systemd/system` is
+writable but is cleared on every boot, which fails the one thing the unit is
+for (E-52: back after a reboot, with no hand).
+
+**What is actually running tonight.** A **transient** unit, built with
+`systemd-run` carrying every directive the file carries — `Delegate=yes`,
+`OOMPolicy=continue`, `MemoryMax=22G`, `MemorySwapMax=0`, `KillMode=mixed`,
+`CPUWeight`/`IOWeight=50`, `LimitNOFILE`, `RequiresMountsFor`,
+`Environment=PATH=…`, the token through `EnvironmentFile=` — and the same
+`ExecStart` argument list, against a Nix store path held alive by a gcroot.
+It is a faithful runner and it proves everything D129 records.
+
+**It does not survive a reboot.** That is the honest state: **E-52 is
+unmet on the server until the module is imported and `nixos-rebuild`
+run.** No wording makes a transient unit persistent, and pretending
+otherwise would be the worst kind of green.
+
+**So the module is not an offering here, it is the only route**, and
+`deploy/README.md` must stop presenting a choice it does not have. The step
+needs `/etc/nixos` plus a rebuild on a server running other people's
+services, which is Alexa's by the working agreement and is the one thing
+still outstanding on M16.
+
+**Worth noting for the next host.** A machine with a writable `/etc` has both
+routes and the README is right as written for it; the wording has to name
+which kind of host the reader is on, rather than assuming the imperative one
+always works. That is the general lesson: "install this file there" is a
+claim about the target, not about the file.
+
+---
+
+## 2026-10-15 — D131 A job's small declared outputs travel like its log
+
+**Context.** Measured on the live deployment: Herd returns an exit code and
+logs and **does not return files**. A job wrote `files/results.json` under
+`{out}`, the file existed while it ran, and the workspace was reclaimed with
+everything in it. The first consumer's whole result contract is a
+`results.json` plus `{out}/files/`, so without this they can use Herd for
+pass and fail and nothing else.
+
+**The tension, and which way it resolves.** D10 takes Herd out of the byte
+path **between runners**: a pack must not be relayed hub-wards to reach
+another machine, and that is what M11's registry and direct transfer exist
+for. It says nothing about a job's own **record** — and Herd already carries
+the log runner → hub → requester as part of that record (D8, D18). So a
+declared output that is small is in the same category as a log line, not in
+the same category as a pack.
+
+**Choice.** A job's `{out}` contents, up to a cap, are collected before the
+workspace is reclaimed and written into the job's directory on the hub under
+the same atomic discipline as everything else there (D8). Relative paths are
+preserved — `files/results.json` comes back as `files/results.json` — and a
+requester that attaches long after the job ran gets them, because `herdctl
+wait` is exactly that requester.
+
+Collected on **every** ending that produced a workspace: success, a non-zero
+exit, a cap, a cancel, a death. A job that fails is often the one whose
+output is most wanted, and D108 already fixed a workspace leaking on failure
+for the same class of reason.
+
+**Over the cap is a refusal carrying figures, never a truncation.** A
+truncated `results.json` that still parses is the worst outcome available: it
+reads like the truth. The refusal names the cap and the real size and points
+at M11, in the shape E-04's refusals already use.
+
+**Rejected.** Waiting for M11 and telling the consumer to write outside the
+data root in the meantime. It works — Herd does not stop a job naming an
+absolute path — but it makes every consumer invent its own drop directory,
+and the thing they would be working around is a gap of one afternoon.
+
+**What this is not.** It is not artefact distribution. Large outputs, packs
+and anything another runner needs stay with M11, direct and off the hub's
+path. The cap is what keeps the two apart, and it is a flag so that the line
+is the operator's to draw.
+## 2026-10-15 — D132 A release is three static musl binaries and a notice
+
+**Why at all.** The first consumer's team deploys on their own machines —
+an Arch box, a Windows PC's WSL2 — so a release has to be something a
+person downloads and runs. What the flake builds by default is not:
+
+```
+ld-linux-x86-64.so.2 => /nix/store/…-glibc-2.42-67/lib64/…
+libc.so.6            => /nix/store/…-glibc-2.44-25/lib/…
+```
+
+Those binaries exec only on a host with a Nix store, which makes a
+release that contains them useless to whoever is joining.
+
+**The route: `pkgsStatic` through the existing flake**, as
+`packages.<system>.static`, and not a second toolchain in the workflow.
+The reason is that it cost nothing to keep D12: nixpkgs' musl cross set
+has `rustc`, `cargo`, `gcc` and `binutils` in the public cache — 141 MiB
+of download, measured — so **one** derivation is built and the workspace
+compiles in 50 s. A `rustup` step in the workflow would have been a
+second pinning of the toolchain for no gain in speed. `nix eval --raw
+.#static.version` is then where the artefact names get their version,
+which is `Cargo.toml`'s `workspace.package.version` by the same route as
+the image's tag (`nix/hub-image.nix`), so a release cannot be named for a
+version its binaries do not answer to.
+
+**What the workflow asserts, because a green release of unusable
+binaries is worse than no release.** `file` must say static, `ldd` must
+find no loader, `readelf -l` must show no `PT_INTERP`, and the bytes must
+name no `/nix/store` path. Then `scripts/release-smoke.sh` runs a hub, a
+runner and two real jobs out of the release binaries inside an
+`archlinux` container and an `alpine` one — glibc and musl, neither with
+any Nix — so the claim "runs on any distribution" is a test and not a
+hope. `--help` three times would only have proved the loader; a job that
+execs a shell proves musl's own resolver, its sockets and its `/etc`
+reading as well.
+
+**x86_64 only, deliberately.** Every machine in the herd today is
+x86_64. The cost of adding aarch64 is known and is not a cross-compile:
+`pkgsCross.aarch64-multiplatform-musl` has to **build `rustc` from
+source** — the cache has no `aarch64-unknown-linux-musl-rustc`, so it is
+LLVM and a full bootstrap, 1.7 GiB and far past a 30-minute job — while
+a native `ubuntu-24.04-arm` runner needs only a matrix entry and an
+arm64 container image, because `flake.nix` already lists
+`aarch64-linux`. So when the first non-x86_64 machine appears, the answer
+is a second runner in the matrix, not a cross build.
+
+**And a notice, treated as half of the release:**
+`deploy/release-notice.md`, quoted into the release body. Its subject is
+the thing a binary cannot say about itself — that run bare the runner
+works, and that without a unit carrying `Delegate=yes` there is no
+per-job `memory.max`, no `cpu.weight`, `io.weight` or `pids.max`, no
+cgroup kill, no restart after a reboot and a token on a command line that
+every user of the host can read out of `/proc`. One row of its table
+turned out the other way round from the way it was briefed, and is
+written as measured: a job's `PATH` is **fine** bare, because the runner
+carries its own `PATH` into a job, and is the unit's one real trap —
+which is D129's finding, now in the document the deployer reads.
+
+---
+
+## 2026-10-15 — D133 D129's `PATH` finding was half wrong
+
+**Correction.** D129 records that a job's `PATH` had no shell and no
+coreutils, which is true of the **deployment** and was a real exit 125 on a
+real job. What it implies and should not is that Herd gives a job nothing.
+
+`herd-runner/src/confine.rs` carries `PATH`, `LANG`, `LC_ALL`, `TZ` and
+`TERM` from the **runner's own environment** into the job. So a runner
+started from a person's shell hands its jobs a usable `PATH`, and
+`herdctl run -- sh -c '…'` works with no configuration at all. What broke
+was the unit: systemd's default service `PATH` on this host holds no shell,
+and that is what the job inherited.
+
+**So the unit is, on this one point, a risk rather than a gain** — the only
+line in the bare-binary-versus-service comparison that runs that way, and
+`deploy/release-notice.md` says so rather than selling the unit as strictly
+better. Everything else in that comparison still favours the unit, and the
+reason is unchanged: without `Delegate=yes` there is no per-job `memory.max`,
+no `cpu.weight`, no `io.weight`, no `pids.max`, no restart after a reboot,
+and the token sits on a command line that `/proc` shows to every user.
+
+**Why this matters beyond the one variable.** The thing that makes a
+deployment's environment wrong is not that it is empty but that it is
+**different from the one the author tested in**. A `PATH` inherited from a
+developer's shell is why nobody noticed; `Environment=PATH=…` is the fix
+because it states the value instead of inheriting whatever is there.
+
+Found by an agent that was told the opposite in its brief, measured it, and
+wrote down what it measured. That is the behaviour to keep.
+
+---
+
+## 2026-10-15 — D134 The reaper records what it reaped; it runs no one's code
+
+**Context.** The first consumer reports a real leak. On a runner's death —
+`SIGKILL`, OOM, reboot — the startup reaper removes the job workspace, but
+their `up` step made state **outside** it: a workspace layer and files on a
+RAM tmpfs. Removing the workspace does not undo that, so each death leaks.
+They asked for either of two things: run the declared `down` for every reaped
+job, or at least publish the reaped job ids where a janitor can read them.
+
+**Choice: the second, now; the first never from the reaper.**
+
+Running the consumer's `down` out of the reaper would put arbitrary consumer
+code on a runner's **startup path**, and that path has promises: a runner
+refuses to start on a root it cannot use, and stops cleanly in ≤ 5 s
+(invariant 2). A `down` that hangs would hold a runner's startup open with no
+one watching, and a `down` that needs the workspace would need it **after**
+the reaper's whole reason for existing is to remove it. It also needs the
+declaration, which lives on the **hub's** record, not on the runner's disk —
+so the reaper would have to dial, authenticate and read before it has even
+joined. Each of those is a reason; together they are a different component.
+
+So the reaper **writes down what it reaped**, durably, outside `jobs/` where
+its own sweep cannot clear it — the job id, what was removed, what was killed,
+and when — and says so on stderr as it already does. A janitor reads that
+file and runs whatever the consumer needs. Herd names the mess; the consumer
+owns the cleanup. That is the same division D10 draws for bytes.
+
+**The orchestrator-shaped answer, for later and named here so it is not
+reinvented.** The right home for a `down` after a death is the **hub**
+dispatching it as a **job** — it has the declaration, it knows the attempt
+died, a job carries its own caps and timeout, and a cleanup that fails is then
+a visible verdict rather than a silent hang on somebody's boot. That is a
+feature with a queue, a priority and a test, not a line in the reaper. It
+waits for a milestone of its own.
+
+**What the consumer must know meanwhile**, and it is the honest part: between
+a runner's death and a janitor's next pass, their out-of-workspace state is
+**still there**. Herd is not promising to have cleaned it, only to have told
+them precisely what to clean. Anything that must not outlive a job belongs
+inside the workspace, which Herd does reclaim, whatever the job did to it.
+## 2026-10-15 — D135 A hard IO ceiling, and pressure that gates nothing
+
+**Context.** The first consumer's build server froze three times on disk
+saturation. Herd bounded a job's memory by the kernel and its IO by a
+**weight** — and a weight shares contended bandwidth, it never caps it, so on
+a host where one job can saturate a disk Herd had no answer. D116 named
+`io.max` as "the honest next step if IO must actually be bounded"; it must.
+Separately, the consumer asked for PSI to brake admission, which E-32 forbids
+(D119).
+
+**`io.max`, optional and absent by default.** `--job-io-max
+rbps=…,wbps=…,riops=…,wiops=…`, any subset of the four keys, written to the
+job's cgroup `io.max` for **the device the data root is on**. Absent means
+**no line written** — never a zero, never a guess: there is no honest default
+throughput, because a figure measured on an NVMe is absurd on a spinning disk.
+Zero in any key is refused where it is written, like a memory ceiling of zero:
+it is a wall and not a cap.
+
+**It refuses rather than misleads, and that is the deliberate difference from
+`io.weight`.** A weight nobody honours costs nothing, so it is written and
+reported inert (D120). A *ceiling* nobody honours is a false promise, so a
+ceiling asked for on a host that cannot carry one is a **startup refusal
+naming the path and the reason** — a ZFS data root (no cgroup IO knob reaches
+a ZFS dataset at any value), no cgroup delegation, no blk-throttle in the
+kernel, a path whose device cannot be resolved. `cpu.max` already took this
+road; `io.max` goes one step further because the knob is **per-device**: a
+value with no device is not a weaker ceiling, it is not a ceiling, so the
+device is resolved first and an unresolvable path is itself the refusal.
+
+**Proved by writing it, not inferred.** Three different things could make a
+ceiling vanish — the `io` controller not handed down, a kernel without
+`CONFIG_BLK_DEV_THROTTLING` so `io.max` does not exist, or a device the kernel
+refuses — and none is visible from a file somebody could read. So startup
+writes the real value into a probe cgroup under the same base every job hangs
+under and reads it back, exactly as delegation is probed. Measured on this
+host, inside a delegated scope, by a job reading its own cgroup: `io.max` on
+`259:0` carries the four limits it was given.
+
+**Not fixed by this.** A job writing an absolute path **outside** its data
+root writes to another device, which neither the ceiling nor the weight
+reaches (D123, D126). That is said in the startup report rather than left to
+be discovered.
+
+**PSI is recorded and gates nothing.** `/proc/pressure/{cpu,memory,io}` and
+the job's own cgroup `*.pressure`, as `some avg10` in thousandths of a
+percent, on one new `#[serde(default)]` field of `JobMetrics` — which is the
+one change allowed to leave the frozen `PROTOCOL_VERSION` and `RECORD_VERSION`
+alone (D73), and the reason this is a field and not a frame. An unreadable or
+absent file leaves the figure **absent, never zero**: a zero reads as "no
+pressure", which is a lie told to whoever is looking into a freeze. Nothing
+compares it to anything, and there is a test that says so over the sources of
+every module that decides about a job — because E-32 is a promise about Herd
+and not about one Tuesday's run.
+
+**Whether a ceiling is the right answer to a freeze.** It is the right
+*bound* and it is not a complete answer. A ceiling caps throughput and
+nothing caps the size of what a job writes to a device other than its data
+root, so a disk can still fill; a 20 GiB per-job workspace budget is what
+bounds that, and only inside the root. The cheap figure a throttled host
+still owes its operator is how long a job spent stalled, which is now
+recorded.
+
+**Why the weight is not enough, measured on this host and not argued.**
+`/sys/fs/cgroup/io.cost.qos` reads `259:0 enable=1 ctrl=auto rpct=0.00
+rlat=5000 wpct=0.00 wlat=5000`. `rpct` and `wpct` are the latency percentiles
+blk-iocost watches to decide a device is saturated, and at **zero** it watches
+none: the controller apportions the device by weight and never lowers the
+total load to protect latency. So every weight on this machine can be honoured
+exactly while `/proc/pressure/io` reads `full avg60=43.7` — which is the
+freeze, with the knob working as designed. A weight decides *who* gets a
+saturated device; nothing in the weight path decides *whether* it gets
+saturated. The runner now says that in its startup report where it finds
+`rpct=0 wpct=0`, rather than printing "io.weight is enforced" and leaving the
+reader to assume more than that means.
+
+**What is still not Herd's to fix.** The systemic answer on a shared host is
+host hygiene: every workload in a weighted cgroup, and `io.cost.qos` given a
+real latency percentile so iocost throttles instead of only apportioning.
+That would protect everything on the machine, Herd included, and it is
+`/etc/nixos` — the owner's, like D129's libvirtd socket. Herd's own part is
+the bound it can place on itself without knowing who else exists: a weight is
+a promise about a ratio, and a ratio with an unknown denominator is not a
+bound, so invariant 2 cannot be kept with a weight alone.
+
+**What sharing one queue changes about the figure.** On this server a job's
+data root, the consumer's docker data root, their work and this checkout are
+all on `/dev/nvme0n1p1` — one request queue. A per-job ceiling there bounds a
+job against **their services** and not merely against other Herd jobs, which
+is the useful direction and also the reason there is no default: a ceiling
+that is right where Herd is the only tenant is wrong where it shares a queue
+with production. So the help text says how to derive one instead of offering
+one — a fraction of the kernel's own measurement of the device in
+`/sys/fs/cgroup/io.cost.model` (`rbps=3102524156`, `wbps=1742780862` here),
+with the IOPS keys included, because a freeze is a latency event and small
+random IO is what causes one.
+
+---
+
+## 2026-10-15 — D136 Why this host freezes, and the one line that would fix it
+
+**This is the sharpest measurement of the night and it is not about Herd.**
+`/sys/fs/cgroup/io.cost.qos` on this server reads:
+
+```
+259:0 enable=1 ctrl=auto rpct=0.00 rlat=5000 wpct=0.00 wlat=5000 …
+```
+
+`rpct` and `wpct` are the **latency percentiles blk-iocost watches** to decide
+a device has fallen behind. At **zero** it watches none: the controller runs
+purely off its cost model, **apportions** the disk by weight, and never
+**reduces** the total load offered to it.
+
+**So every weight on this machine can be honoured exactly while
+`/proc/pressure/io` reads `full avg60=43`.** `full` means every non-idle task
+stalled — including the consumer's own weight-20 slice, which is why their
+`IOWeight` mitigation did not stop the freezes. Putting everything in a
+weighted cgroup would make the stalls **fair, not absent**, and a frozen
+service does not need fairness.
+
+**The single largest win available is one line of `/etc/nixos`, and it is not
+ours.** Give `io.cost.qos` a real `rpct`/`wpct` and iocost becomes a
+**latency-targeting throttle for every cgroup at once** — it adapts to the
+device instead of guessing a number, and it protects the consumer's services
+from everything on the host, Herd included. That is Alexa's to apply, like
+D129's libvirtd socket, and it is worth more to them than anything Herd can
+ship.
+
+**Herd still needs its own ceiling, for a reason independent of the host.** A
+weight is a promise about a **ratio**, and a ratio with an unknown denominator
+is not a bound. Invariant 2 — a runner never destabilises its host — cannot be
+kept with a knob whose effect depends on who else happens to be in a cgroup.
+The ceiling is the only IO bound Herd can state about *itself* while knowing
+nothing about the rest of the machine, which is also exactly why it is
+optional and off by default.
+
+Proof the two knobs are not redundant, measured on one host in one run: on
+`/mnt/hdd` (`sdb`) blk-iocost knows no cost model, so `io.weight` there is
+genuinely inert — and the `io.max` ceiling was written and held anyway.
+
+**Its honest limits.** It bounds **rate**, not volume, and only on the device
+the data root is on. Disk saturation it addresses; a disk filling up it does
+not — that is the workspace budget, and only inside the data root. The
+absolute-path gap of D123 is untouched. All of that is now in the runner's
+startup report rather than left to be discovered.
+## 2026-10-15 — D137 What the output cap had to be, and why
+
+**Context.** Herd returns an exit code and logs. It does not return files.
+A job's `{out}` directory is handed to its steps and the whole workspace is
+reclaimed when the job ends — success, failure or death. Measured on the
+deployed server: `…/jobs/j0000000012/work/out/files/results.json` existed
+during the run and the whole of `jobs/` was empty after it. The first
+consumer's entire result contract is a `results.json` plus `{out}/files/`,
+so without this they can use Herd for nothing but pass/fail.
+
+**Choice. A job's declared outputs, up to a cap, are part of its record,
+exactly like its log.** They are collected on the runner before the
+workspace is reclaimed, written into the job's `files/` directory on the hub
+under D8's discipline (temp, fsync, rename, fsync the directory), and handed
+to a requester on the frame that already carries the verdict.
+
+**This is not the byte path D10 removed.** D10 takes Herd out of the byte
+path *between runners*: a pack must not be relayed hub-wards so another
+machine can have it. It says nothing about a job's own **record**, and Herd
+already carries the log runner → hub → requester as part of that record
+(D8, D18, E-15). What makes the two different is size and purpose, which is
+why the cap below is the whole of the boundary and not a detail of it.
+
+**The mechanism, and why no new frame.** `PROTOCOL_VERSION` is frozen at 1
+and a hub is deployed. D128's rule is that a new variant on either enum
+moves the number, and only a `#[serde(default)]` field whose absence means
+what its default says leaves it alone. So this adds **one defaulted field**
+to `ToHub::JobFinished` and one to `FromHub::JobFinished`, and no variant:
+absence means "this peer collected nothing", which is exactly true of every
+build that predates it. **`PROTOCOL_VERSION` stays 1 and no deployed binary
+has to be rebuilt to keep working.**
+
+`RECORD_VERSION` stays 1 for the matching reason. A job directory gains no
+*name*: `files/` has been created, empty, in every job directory since M2 —
+D8 called it "kept files beside it" and E-15 asks for exactly that. `job.json`
+gains one `#[serde(default, skip_serializing_if)]` summary, so a job that
+keeps nothing writes a record byte-identical to the one it wrote before, and
+every record already on the live state root reads unchanged.
+
+**Keyed by the job id, with relative paths preserved.** The consumer asked
+whether this is a directory fetched by job id or keyed by the declaration's
+`leaves` names. It is the id: a requester attaching with `herdctl wait <id>`
+has the id and nothing else — it never saw the declaration — so the id is
+the only key that always works; `leaves` is a declaration concern and keying
+the transport on it would make the record's shape depend on a file the hub
+does not own (D74); and `leaves`-keyed, content-addressed retrieval is
+precisely M11, which this must not blur into. `files/results.json` comes
+back as `files/results.json`, never flattened.
+
+**How a requester gets them: the verdict frame, not a subcommand.** The
+deciding case is a requester that was never connected while the job ran, and
+`herdctl wait <id>` is already that case — so `herdctl wait <id>
+--outputs-to <dir>` *is* the after-the-fact fetch, with no new command, no
+new frame and no second round trip. The hub reads them off the record for
+both the live follower and the late attach, so there is one answer to "what
+did this job leave" and it is the disk.
+
+**E-02 is untouched.** Nothing is written to stdout. `--outputs-to <dir>`
+writes the files there and reports them on **stderr**, one line each; with
+no flag nothing is written. An output file in E-02's stream would be read by
+the consumer's own tooling as their tool's output.
+
+**Collected on every ending that produced a workspace**, with no success
+condition: a success, a non-zero exit, a cap, a cancel. D108 fixed a
+workspace leaking on failure for this class of reason and it runs the same
+way here — the job that fails is the one whose results you most want, and
+the consumer's current workaround exists for exactly that case. An abandoned
+attempt collects nothing: it says nothing about the job, there is no frame
+for its files to ride, and the next attempt makes its own `{out}`.
+
+**What is collected.** Every regular file under `{out}`, relative paths
+kept. A **symlink is never followed, wherever it points** — not "unless it
+leaves the workspace": telling a safe link from one aimed at `/etc/shadow`
+means resolving it, resolving it races a job still being killed, and the
+only safe rule has no exception. An empty directory is not represented. A
+fifo, a socket or a device is skipped **by its type before anything is
+opened**, because opening a fifo nobody writes blocks for ever and would
+hang the job's own report. A name that is not UTF-8 is skipped. Each of
+these earns a sentence on the record rather than silence, because
+"`results.json` did not come back" and "it is a symlink" are different facts.
+A job killed mid-write leaves a half-written file and it is collected as it
+stands: Herd cannot know what the writer meant, the partial file is the
+evidence in the case someone is debugging, and the verdict already says the
+job was capped or cancelled. A consumer wanting all-or-nothing renames into
+place.
+
+**Over the cap is a refusal with figures, never a truncation.** No file at
+all comes back and the sentence names the cap, the measured size and the
+file count, and says that large artefacts are M11's direct transfer. A
+truncated `results.json` that still parses is the worst possible outcome: it
+reads like the truth. The verdict is **not** touched by it — the tests
+really did pass or fail, and turning a cap on a side channel into a verdict
+is the mistake D20 exists to prevent — so it is a loud sentence and never an
+exit code.
+
+**The cap is 32 MiB, derived and measured, and it is also the ceiling.**
+The first reasoning here was wrong twice over: 64 MiB was taken from the log
+cap, which is the wrong neighbour — a log is what a person reads, a declared
+output is what a program reads — and then 8 MiB was picked from "a results
+file is kilobytes", which is short of what the consumer actually produces.
+Their real figures are a results file of a few kB plus per-scenario logs and
+screenshots reaching a few hundred MB. So the figure is derived from what
+the mechanism can carry rather than from an analogy:
+
+- a collection rides one JSON frame, base64-encoded, against a 64 MiB frame
+  ceiling, which puts the arithmetic bound at 48 MiB; measured, 32 MiB of
+  payload in 200 files encodes to a 42 MiB frame, leaving 22 MiB for
+  everything else on the frame;
+- measured, 32 MiB costs about 140 MiB of peak memory and a few hundred ms
+  to encode and to decode, on each of the three parties;
+- both curves are linear, so a few hundred MB would cost over a gigabyte per
+  party and **tens of seconds of blocked event loop** — past the 15 s
+  cadence a health report and a quiet link both live by, which would make a
+  large output indistinguishable from a lost runner.
+
+**So a few hundred megabytes is over the cap on purpose, and that is the
+boundary this entry exists to hold.** At 32 MiB a job's output travels like
+its log. Past it, the same mechanism is artefact distribution wearing the
+record's clothes, and it is M11's direct runner-to-runner transfer — with
+the hub's volume to size and a retention policy to write, since Q9 says the
+hub holds kilobytes. The consumer's screenshot-heavy runs land on the far
+side of that line and are refused by name with figures.
+
+Because 32 MiB is a ceiling and not a taste, **the default is the ceiling
+and the flag only lowers it**, and a `--job-output-cap` above it is refused
+at startup with both figures — a cap past the frame would otherwise produce
+a verdict frame the hub cannot decode, which is D128's redial loop and not a
+degraded result. `0` returns a verdict and nothing else. A test builds a
+collection at the cap and puts it through the real encoder, so the figure is
+checked rather than reasoned about.
+
+**Two things found while building it.** The clients dialled with the
+WebSocket library's defaults, whose `max_frame_size` is **16 MiB** — smaller
+than what the hub is configured to send, so a legitimate verdict frame over
+16 MiB would have reached `herdctl` as a closed connection and a 125, a job
+with no verdict for a job that passed (D117's shape). Both clients now state
+Herd's own ceiling, which is one constant in `herd-proto` that the hub takes
+too. And D19's promise needed widening: the ends the hub holds in memory
+when it cannot write them now carry the job's **files**, because the
+workspace is already reclaimed by then and a retry that wrote the verdict
+and forgot the files would destroy half a record D19 says is never
+destroyed.
+
+**Alternative rejected.** A `herdctl outputs <id>` subcommand fetching the
+files afterwards. Rejected because `herdctl wait` already attaches to a job
+long after it ran, so the fetch exists either way and a second command would
+be a second thing to keep working — and because a frame that arrives with
+the verdict cannot be forgotten by a caller that got its exit code and left.
+
+---
+
+---
+
+## 2026-10-15 — D138 My cap instruction was wrong, and the 16 MiB bug
+
+**I told the agent the wrong number and it refused me with measurements.**
+D131 reasoned the cap from the log cap; then the consumer said they produce
+"at most a few hundred MB", so I told the agent to size for that figure and
+said 64 MiB would refuse the normal case. Both of us were reasoning about
+*their* files. Neither of us was reasoning about **the frame**.
+
+Measured: 32 MiB of payload in 200 files becomes a **42 MiB frame** and about
+140 MiB of peak memory per party, base64 on one JSON frame against a 64 MiB
+ceiling. Both curves are linear, so a few hundred megabytes is a **>400 MiB
+frame** — rejected outright — **>1 GiB per party**, and **tens of seconds of
+blocked event loop**. That last one is the real objection: it is past the
+15 s cadence that a health report and a quiet follower's link both live by,
+so a large output would be **indistinguishable from a lost runner**. The
+feature would have manufactured D117's defect.
+
+So the cap is **32 MiB**, derived from what can actually arrive rather than
+from what anybody wants, and a `--job-output-cap` above it is refused at
+startup with both figures rather than becoming an undecodable frame and
+D128's redial loop.
+
+**And that number is the boundary D131 was trying to name.** At 32 MiB a
+job's output travels like its log. Past it, the same mechanism is artefact
+distribution wearing the record's clothes — and the cost is not only CPU: Q9
+says the hub volume holds job records and manifests, kilobytes and no
+payloads, and there is **no retention or GC on job records** before M12. At a
+few hundred megabytes a job, hundreds of jobs a day fills the hub's disk in
+days with nothing to collect it.
+
+**So the consumer's screenshots do not fit, and I have to tell them so after
+saying they would.** `results.json` at a few kB comes home today. Their
+per-scenario logs and screenshots are refused by name with figures. Carrying
+those needs three things together — chunked output frames, which moves
+`PROTOCOL_VERSION` to 2; hub-side streaming to disk instead of a frame held
+whole; and a retention policy, which is M12. That is a milestone, and the
+agent was right not to build it blind.
+
+**A real bug found on the way, and it was already there.** Both clients
+dialled with the WebSocket library's default `max_frame_size` of **16 MiB** —
+*smaller than the 64 MiB the hub is configured to send*. Any legitimate frame
+over 16 MiB would have reached `herdctl` as a closed connection and exit
+**125**: no verdict for a job that passed, D117's exact shape, on a path
+nobody had exercised because nothing yet sent a frame that large. One
+constant in `herd-proto` now states Herd's own ceiling and all three take it.
+
+**One thing the agent decided that I am keeping.** An over-cap refusal does
+**not** change the verdict. The tests really did pass or fail, and D20 forbids
+turning a cap on a side channel into a verdict about the job — so it is a
+loud sentence on stderr and on the record, never an exit code. A consumer who
+wants a missing `results.json` to be fatal makes that check themselves.
+## 2026-10-16 — D139 Two defects the first consumer found, and one order
+
+Both reported by the first consumer, who has finished their side. Neither
+needed the wire: `PROTOCOL_VERSION` and `RECORD_VERSION` stay at 1 and no
+`FromHub` or `ToHub` variant moved (D124, D128).
+
+**A declared command's own line is a template, and its tokens are filled
+before `{args}` is in it.** `tool pack --out {out}/packs` reached their hook
+with the three characters `{out}`: the runner filled `{job}`, `{in}` and
+`{out}` in the four hooks, then pasted the line into `{line}` last, and the
+line itself was never looked at. The fix is not to fill the line wholesale.
+D107's property is that **a value a substitution pasted in is never itself
+scanned for tokens** — `--only '{out}'` is an argument, not a template — and
+the requester's arguments were quoted into that line before the job was
+minted, which is itself D107's and which M6 keys on. Filling the line
+wholesale would turn a requester's own string into a template, which is the
+one way a declaration's trust could reach past the declaration.
+
+So the order is: fill the declared text, then the arguments. The three
+figures that make the order the only possible one are worth writing down,
+because they look independent and are not:
+
+* `{args}` is filled **before the job is minted**, for M6 (D107);
+* `{in}` and `{out}` are knowable only **after** it is placed, on the runner;
+* D107 forbids a pass over a value a previous pass pasted in.
+
+Taken together, a single pass over the whole line cannot satisfy all three.
+What makes it possible with no new frame and no escaping is that the
+requester's words already travel beside the line — `Declaration::args`, which
+D74's cache key needed — and are quoted into it by one function. So the
+runner holds the argument spans out of the pass and fills the declared text
+around them. Nothing is encoded, escaped or marked; the failure direction is
+conservative, a declared token left literal, never a requester's text turned
+into a path.
+
+**Known gap, not closed here:** `{j}` is filled by the hub over the whole
+command, *after* the arguments are in it (`with_parallelism`), so an argument
+that says `{j}` already becomes a thread count. Same shape, different place,
+and the hub holds `declaration.args` on the record, so it is fixable the same
+way. Left alone because it is a hub change on a deployed hub and nobody has
+hit it.
+
+**"Nothing was submitted" and "submitted, no verdict" are told apart by an
+id, not by a code.** Both exit 125, and they ask a falling-back requester for
+opposite actions: re-run the second and the work is done twice, decline the
+first and it is never done. For a build and test system work run twice is a
+wrong answer, not a slow one.
+
+**No new exit code, and the reason is that the space is genuinely full.**
+0‑255 belongs to the job, 124 is the caps, 128+n is a signal, and 126/127 are
+what a **shell** returns for "not executable" and "not found" — so a wrapper
+invoking `herdctl` through `sh` could see those from the shell itself and
+misread them. Anything below 124 collides with a real verdict, and the
+collision matters precisely because the wrapper cannot tell the two apart.
+
+The discriminator is a line on **stderr**, which a job's own bytes never
+share, so it cannot collide with a job's output and does not disturb E-02's
+stdout order:
+
+* `herdctl: job-id: <id>` — a job exists. Printed **the moment the hub says
+  the id**, not at the end: a line printed only on the failures that were
+  thought of cannot cover the one that was not, and it has to survive a
+  wrapper that gives up and kills `herdctl`.
+* `herdctl: no-job: …` — nothing was submitted; running the work again is
+  safe.
+* `herdctl: job-unknown: …` — the submission left and was never
+  acknowledged. **A third state, and it is real**: a job may exist whose id
+  nobody learned. Said rather than hidden, because a line claiming no job
+  exists would be the same defect wearing the other mask. E-05 is what makes
+  it actionable — the same submission joins the open job rather than starting
+  a second one.
+
+It is strictly better than a code would have been: an id lets them recover
+with `herdctl wait <id>` instead of merely declining to duplicate. The rule a
+wrapper writes is "did I get an id?", never the parsing of prose. A command
+that submits nothing — `wait`, `cancel`, `raise`, a dry run, the operator
+commands — prints none of the three: a sentence about submissions there would
+answer a question nobody asked.
+
+---
+
+## 2026-10-16 — D140 A refusal and a wait for the same fleet state
+
+**Found while chasing a flaky test, and it is the more important half of
+that work.** The hub holds two different answers to one question. For a job
+already queued, `matcher.rs` says `Wait { why: "no runner is connected to
+this hub" }`. For a **new** submission in exactly that state, `server.rs`
+refuses outright. Which one a job gets depends only on whether it arrived a
+moment before or after the last link dropped — so that wait sentence is
+**unreachable for a newly submitted job**.
+
+**It contradicts D88.** D88's own "what we did not do" says a job no
+connected runner could ever fit **waits**, because "a fleet is not a closed
+world — the owner's PC is asleep at night and its 17 GiB come back in the
+morning". A *transient* gap is the same situation with **weaker** evidence,
+and it is treated more harshly. The second refusal branch — every runner
+draining or switched off — is worse still, because E-33's switch is
+explicitly a temporary owner action.
+
+**It is concrete now that Herd is deployed.** Every hook that submits during
+a hub restart, a runner restart or a brief disconnection gets **exit 125**.
+With the deployment live and the consumer about to submit from their own
+tooling, that is not a hypothetical.
+
+**The principled shape, for which the hub already holds the facts:** refuse
+when **no runner has ever been approved** on this state root — a
+configuration mistake, which must not wait for ever — and **queue**, with the
+sentence that already exists, when the fleet is merely away. The distinction
+is between "this can never work" and "nobody is here right now", which is
+exactly the distinction D88 draws.
+
+**Not changed.** It alters what a deployed hub does with a submission, which
+is a behaviour the first consumer is about to build against, and it is the
+kind of change Alexa decides. Written here so the next person meets the
+question rather than the symptom.
+
+**A second instance of the same class, in the same area.** `{j}` is filled by
+`with_parallelism` over the **whole** command after the requester's arguments
+are already in it, so an argument containing the literal `{j}` becomes a
+thread count today. That is D107's property broken in the hub, the same way
+it was broken in the runner for `{in}` and `{out}` — and the hub holds
+`declaration.args` on the record, so the same fix applies. Left alone for the
+same reason: it changes a deployed hub, and nobody has hit it.

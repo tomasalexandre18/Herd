@@ -15,7 +15,7 @@
 //! the CI run. So the difference between "asserted" and "not asserted here"
 //! is visible from the terminal and on the pull request.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -99,6 +99,10 @@ impl Harness {
     async fn run(&self, script: &str) -> Ran {
         let mut out = String::new();
         let mut err = String::new();
+        // Everything Herd said about this job while it was happening. Kept
+        // because a job *delayed* is a job the hub explained a wait for, and
+        // an assertion that nothing was delayed has to be able to look.
+        let mut notes = Vec::new();
         let finished = herdctl::run_job(
             &self.requester(),
             shell(script),
@@ -111,7 +115,11 @@ impl Harness {
                 LogStream::Stdout => out.push_str(&String::from_utf8_lossy(data)),
                 LogStream::Stderr => err.push_str(&String::from_utf8_lossy(data)),
             },
-            |_note| {},
+            |said| {
+                if let herdctl::Said::Note(note) = said {
+                    notes.push(note.to_owned());
+                }
+            },
         )
         .await
         .expect("the hub answers with an outcome");
@@ -120,6 +128,7 @@ impl Harness {
             metrics: finished.metrics,
             out,
             err,
+            notes,
         }
     }
 
@@ -141,6 +150,9 @@ struct Ran {
     metrics: herd_proto::JobMetrics,
     out: String,
     err: String,
+    /// What Herd said about this job, in order. Every wait the hub makes a
+    /// job serve is explained in one of these (E-04).
+    notes: Vec<String>,
 }
 
 fn shell(script: &str) -> Vec<String> {
@@ -942,6 +954,569 @@ async fn the_runner_says_which_memory_ceiling_it_enforces() {
     }
 }
 
+// ------------------------------------------- CPU, IO and pid bounds ----
+
+/// What a delegated scope would prove, said in every skip below, so a reader
+/// of a green run knows exactly what was not checked and how to check it.
+const WHAT_DELEGATION_WOULD_PROVE: &str = "a delegated scope — \
+     `systemd-run --user --scope -p Delegate=yes cargo test ...` — would prove that \
+     a job's own cgroup really carries cpu.weight, cpu.max, io.weight and pids.max, \
+     read back by the job itself out of /sys/fs/cgroup, and that pids.max stops a \
+     job from forking without end";
+
+/// Ask the job itself what its cgroup says, which is the only reading that
+/// cannot agree with the code under test by accident.
+fn read_own_cgroup() -> String {
+    "d=/sys/fs/cgroup$(cut -d: -f3 /proc/self/cgroup); \
+     for f in memory.max cpu.weight cpu.max io.weight io.max pids.max; do \
+       printf '%s=%s\\n' \"$f\" \"$(cat \"$d/$f\" 2>/dev/null | tr '\\n' ' ' || echo MISSING)\"; \
+     done"
+        .to_owned()
+}
+
+/// Pick one `name=value` line out of what that script printed.
+fn control(out: &str, name: &str) -> String {
+    out.lines()
+        .find_map(|line| line.strip_prefix(&format!("{name}=")))
+        .unwrap_or_else(|| panic!("the job printed no {name}: {out}"))
+        .trim()
+        .to_owned()
+}
+
+/// Memory was the only control a job's cgroup carried, and `nice 10` plus the
+/// idle IO class was everything else standing between a job and the host.
+/// Four controls are written now, and this reads all four back out of the
+/// kernel — from inside the job, through `/proc/self/cgroup`.
+#[tokio::test]
+async fn a_job_s_cgroup_carries_the_cpu_io_and_pid_bounds() {
+    if let Err(why) = kernel_ceiling_or_reason() {
+        skipped(
+            "a_job_s_cgroup_carries_the_cpu_io_and_pid_bounds",
+            &format!("{why} — {WHAT_DELEGATION_WOULD_PROVE}"),
+        );
+        return;
+    }
+    let harness = Harness::new("controls", |confinement| {
+        // Each one different from its default, so a value read back is this
+        // test's value and not a figure the kernel or the default supplied.
+        confinement.cpu_weight = 37;
+        confinement.cpu_max =
+            Some(herd_runner::cgroup::CpuQuota::from_cores(1.5).expect("1.5 cores is a quota"));
+        confinement.io_weight = 23;
+        confinement.pids_max = 64;
+    })
+    .await;
+    let ran = harness.run(&read_own_cgroup()).await;
+    assert_eq!(
+        ran.outcome,
+        JobOutcome::Exited { code: 0 },
+        "the job could not read its own cgroup: {} / {}",
+        ran.out,
+        ran.err
+    );
+    assert_eq!(control(&ran.out, "memory.max"), (512 << 20).to_string());
+    assert_eq!(control(&ran.out, "cpu.weight"), "37");
+    assert_eq!(
+        control(&ran.out, "cpu.max"),
+        "150000 100000",
+        "a declared quota is a quota and a period, in microseconds: {}",
+        ran.out
+    );
+    // `io.weight` reads back as "default N", with a line per device where an
+    // operator set one, so the figure is matched inside it.
+    let io = control(&ran.out, "io.weight");
+    assert!(
+        io.contains("23"),
+        "the job's cgroup must carry the io.weight it was given: {io}"
+    );
+    assert_eq!(control(&ran.out, "pids.max"), "64");
+}
+
+/// What a delegated scope **with its data root on a block device** would
+/// prove about the hard IO ceiling, said in every skip below.
+///
+/// Two conditions and not one, because `io.max` is per-device: a scope with
+/// its temporary directory on ZFS proves nothing here, and the skip has to
+/// say so rather than reading as "no delegation" (D120).
+const WHAT_A_CEILING_WOULD_PROVE: &str = "a delegated scope whose temporary directory is on a \
+     block device — `TMPDIR=/mnt/ssd_980/tmp systemd-run --user --scope -p Delegate=yes \
+     cargo test ...`, and note that Delegate=yes delegates only to the scope's single \
+     process (D117) — would prove that a job's own cgroup carries the io.max ceiling it was \
+     given, read back by the job itself out of /sys/fs/cgroup, and that the line names the \
+     device the data root is on";
+
+/// Whether a hard IO ceiling could be written for a data root on the
+/// filesystem this suite's temporary directories land on, and why not if it
+/// could not. Asked before a harness is built, because a runner that refuses
+/// a ceiling refuses to start at all — which is the point of the refusal.
+fn io_ceiling_or_reason() -> Result<String, String> {
+    let probe = TempDir::new("io-ceiling-question");
+    herd_runner::blockio::ceiling_device(probe.path()).map(|device| device.device)
+}
+
+/// The ceiling the consumer's freeze actually needs: a **hard** per-device
+/// cap, not the share `io.weight` gives. Written for the device the data root
+/// is on, and read back out of the kernel by the job itself.
+///
+/// `io.weight` decides who gets the disk when two cgroups want it and caps
+/// nothing, so one job alone saturates an idle disk; `io.max` holds whatever
+/// else is asking. The job printing its own `io.max` is the only reading that
+/// cannot agree with the code under test by accident.
+#[tokio::test]
+async fn a_job_s_cgroup_carries_the_hard_io_ceiling_it_was_given() {
+    if let Err(why) = kernel_ceiling_or_reason() {
+        skipped(
+            "a_job_s_cgroup_carries_the_hard_io_ceiling_it_was_given",
+            &format!("{why} — {WHAT_A_CEILING_WOULD_PROVE}"),
+        );
+        return;
+    }
+    let device = match io_ceiling_or_reason() {
+        Ok(device) => device,
+        Err(why) => {
+            skipped(
+                "a_job_s_cgroup_carries_the_hard_io_ceiling_it_was_given",
+                &format!("{why} — {WHAT_A_CEILING_WOULD_PROVE}"),
+            );
+            return;
+        }
+    };
+    let harness = Harness::new("io-ceiling", |confinement| {
+        confinement.io_max = Some(
+            herd_runner::cgroup::IoCeiling::parse("rbps=100MB,wbps=50MB,riops=3000,wiops=1500")
+                .expect("four limits are a ceiling"),
+        );
+    })
+    .await;
+    let ran = harness.run(&read_own_cgroup()).await;
+    assert_eq!(
+        ran.outcome,
+        JobOutcome::Exited { code: 0 },
+        "the job could not read its own cgroup: {} / {}",
+        ran.out,
+        ran.err
+    );
+    let io_max = control(&ran.out, "io.max");
+    // The device first: io.max is per-device, and a line naming another
+    // device — or none — would be a ceiling the kernel keeps and never
+    // applies to this job's writes.
+    assert!(
+        io_max.contains(&device),
+        "the ceiling must name the device the data root is on ({device}): {io_max}"
+    );
+    for limit in [
+        "rbps=100000000",
+        "wbps=50000000",
+        "riops=3000",
+        "wiops=1500",
+    ] {
+        assert!(
+            io_max.contains(limit),
+            "the job's cgroup must carry {limit}: {io_max}"
+        );
+    }
+}
+
+/// And with no ceiling declared, `io.max` is **empty**: absent by default is
+/// a real absence, not a figure somebody guessed. A default throughput would
+/// be right on the machine it was chosen on and wrong on every other.
+#[tokio::test]
+async fn no_declared_ceiling_leaves_io_max_empty() {
+    if let Err(why) = kernel_ceiling_or_reason() {
+        skipped(
+            "no_declared_ceiling_leaves_io_max_empty",
+            &format!("{why} — {WHAT_A_CEILING_WOULD_PROVE}"),
+        );
+        return;
+    }
+    let harness = Harness::new("no-ceiling", |confinement| {
+        confinement.io_max = None;
+    })
+    .await;
+    let ran = harness.run(&read_own_cgroup()).await;
+    assert_eq!(ran.outcome, JobOutcome::Exited { code: 0 });
+    let io_max = control(&ran.out, "io.max");
+    assert!(
+        io_max.is_empty() || io_max == "MISSING",
+        "a job with no declared ceiling must have no io.max line at all, and certainly not \
+         a zero: {io_max:?}"
+    );
+    // The weight is still there, and it is the thing that is not a cap.
+    assert!(control(&ran.out, "io.weight").contains("10"), "{}", ran.out);
+}
+
+/// And with no quota declared, `cpu.max` is the kernel's own `max`: absent by
+/// default is a real absence, not a quota equal to the machine.
+#[tokio::test]
+async fn no_declared_quota_leaves_cpu_max_at_the_kernel_s_max() {
+    if let Err(why) = kernel_ceiling_or_reason() {
+        skipped(
+            "no_declared_quota_leaves_cpu_max_at_the_kernel_s_max",
+            &format!("{why} — {WHAT_DELEGATION_WOULD_PROVE}"),
+        );
+        return;
+    }
+    let harness = Harness::new("no-quota", |confinement| {
+        confinement.cpu_max = None;
+    })
+    .await;
+    let ran = harness.run(&read_own_cgroup()).await;
+    assert_eq!(ran.outcome, JobOutcome::Exited { code: 0 });
+    assert!(
+        control(&ran.out, "cpu.max").starts_with("max"),
+        "a job with no declared quota must have no quota: {}",
+        ran.out
+    );
+    // The weight is still there: yielding under contention is the default,
+    // and it costs an idle machine nothing.
+    assert_eq!(control(&ran.out, "cpu.weight"), "10");
+}
+
+/// The bound the consumer's second incident needed: a job that forks without
+/// end runs out of **its own** pids and the host keeps its own. The job is
+/// asked to reach well past its ceiling and must not get there.
+#[tokio::test]
+async fn a_job_cannot_fork_past_its_own_pid_ceiling() {
+    if let Err(why) = kernel_ceiling_or_reason() {
+        skipped(
+            "a_job_cannot_fork_past_its_own_pid_ceiling",
+            &format!("{why} — {WHAT_DELEGATION_WOULD_PROVE}"),
+        );
+        return;
+    }
+    let harness = Harness::new("pid-ceiling", |confinement| {
+        confinement.pids_max = 16;
+        confinement.timeout = Duration::from_secs(20);
+    })
+    .await;
+    // Not a fork bomb: a counted number of children, well past the ceiling
+    // and far short of anything that could trouble the host even if the
+    // ceiling did nothing. The last line is only reached if all of them
+    // started.
+    let ran = harness
+        .run(
+            "i=0; while [ $i -lt 200 ]; do sleep 20 & i=$((i+1)); done; \
+             echo every child started",
+        )
+        .await;
+    assert!(
+        !ran.out.contains("every child started"),
+        "a job with pids.max 16 started two hundred children: {} / {}",
+        ran.out,
+        ran.err
+    );
+    // And the runner is unharmed: it takes the next job.
+    let after = harness.run("echo the runner lived").await;
+    assert_eq!(after.outcome, JobOutcome::Exited { code: 0 });
+    assert_eq!(after.out.trim(), "the runner lived");
+}
+
+/// Where a test may put a data root when the suite's own temporary directory
+/// is on a filesystem the assertion is not about.
+///
+/// `/tmp` is ZFS on this project's server, and a ZFS dataset is a place where
+/// no cgroup IO knob can bite (D120) — so the assertion that a weighted
+/// device *is* reported as weighted had nowhere to stand and skipped. An
+/// operator who has a writable directory on a block-device filesystem points
+/// this at it; without it the assertions below say what they could not check.
+fn scratch_root() -> Option<PathBuf> {
+    let path = PathBuf::from(std::env::var_os("HERD_TEST_SCRATCH")?);
+    path.is_dir().then_some(path)
+}
+
+/// Every mount point in this process's mount table, with its filesystem type.
+fn mount_points() -> Vec<(PathBuf, String)> {
+    let Ok(text) = std::fs::read_to_string("/proc/self/mountinfo") else {
+        return Vec::new();
+    };
+    text.lines()
+        .filter_map(|line| {
+            let point = line.split_whitespace().nth(4)?;
+            let kind = line.split(" - ").nth(1)?.split_whitespace().next()?;
+            Some((PathBuf::from(point), kind.to_owned()))
+        })
+        .collect()
+}
+
+/// D120: whether `io.weight` bites is a fact about **the device the job's
+/// directory is on**, and not about the host's disks in general. D116 read
+/// the host's IO schedulers, found no bfq anywhere, and called this server's
+/// NVMe inert — while blk-iocost weights it per cgroup.
+///
+/// Two devices, two different answers, asserted against this host's real
+/// `/proc/self/mountinfo`, `/sys/fs/cgroup/io.cost.*` and request queues. No
+/// cgroup and no writable directory are needed for either: the verdict is
+/// read, not written.
+#[test]
+fn the_io_weight_verdict_follows_the_device_the_job_works_on() {
+    const TEST: &str = "the_io_weight_verdict_follows_the_device_the_job_works_on";
+    let mounts = mount_points();
+
+    // Half one: a ZFS dataset, where no cgroup IO knob reaches and the
+    // sentence must say *that* rather than a generic "inert" — an operator
+    // told "inert" would go looking for a scheduler to change, and there is
+    // none that would help.
+    match mounts.iter().find(|(_, kind)| kind == "zfs") {
+        Some((point, _)) => {
+            let reach = herd_runner::blockio::io_weight_reach(point);
+            assert!(!reach.bites, "no cgroup IO knob reaches ZFS: {reach:?}");
+            let why = reach.why;
+            assert!(why.contains("ZFS"), "the ZFS answer must name ZFS: {why}");
+            assert!(
+                why.contains("io.max"),
+                "it must also say that the other IO lever cannot reach it: {why}"
+            );
+        }
+        None => skipped(
+            TEST,
+            "this host has no ZFS mount — a host with one would prove that a data root on \
+             a ZFS dataset is reported as reached by no cgroup IO knob at all, rather than \
+             as generically inert (D120)",
+        ),
+    }
+
+    // Half two: a device the block layer really does weight. The evidence is
+    // read here, independently of the code under test: a cost model or an
+    // enabled qos line in /sys/fs/cgroup, or a request queue set to bfq.
+    let weighted_devices = std::fs::read_to_string("/sys/fs/cgroup/io.cost.model")
+        .unwrap_or_default()
+        .lines()
+        .filter(|line| line.contains("model=") && !line.contains("rbps=0 "))
+        .count();
+    let candidates: Vec<PathBuf> = scratch_root()
+        .into_iter()
+        .chain(
+            mounts
+                .iter()
+                .filter(|(_, kind)| matches!(kind.as_str(), "ext4" | "xfs" | "btrfs"))
+                .map(|(point, _)| point.clone()),
+        )
+        .collect();
+    let biting = candidates
+        .iter()
+        .map(|path| (path, herd_runner::blockio::io_weight_reach(path)))
+        .find(|(_, reach)| reach.bites);
+    match (biting, weighted_devices) {
+        (Some((path, reach)), _) => {
+            let why = reach.why;
+            assert!(
+                why.contains(&path.display().to_string()),
+                "the answer must name the directory it is about: {why}"
+            );
+            assert!(
+                why.contains("blk-iocost") || why.contains("bfq"),
+                "and which of the two honours the weight there: {why}"
+            );
+            assert!(
+                why.contains("device ") || why.contains("scheduler is bfq"),
+                "and the device the job's IO is weighted on: {why}"
+            );
+        }
+        (None, 0) => skipped(
+            TEST,
+            "no device on this host offers bfq or a blk-iocost cost model, so there is no \
+             directory here whose io.weight could bite — a host with one (this project's \
+             own server: blk-iocost with ctrl=auto on nvme0n1) would prove that a data \
+             root on it is reported as weighted rather than inert",
+        ),
+        (None, _) => panic!(
+            "this host weights IO on {weighted_devices} device(s) and yet no directory \
+             among {candidates:?} was reported as weighted — which is the D116 defect \
+             over again"
+        ),
+    }
+}
+
+/// `io.weight` is the one control the cgroup core cannot tell the truth
+/// about: the write succeeds on every host, and only bfq or blk-iocost
+/// honours it. A runner that stayed quiet about that would be claiming a
+/// bound it does not have, which is exactly what D23 forbids — and a runner
+/// that stayed quiet when it *does* have the bound would leave an operator
+/// unable to tell which of its two disks the job should work on (D120).
+#[tokio::test]
+async fn an_io_weight_that_cannot_bite_is_said_out_loud() {
+    let temp = TempDir::new("io-weight-report");
+    // On a host whose temporary directory is ZFS, the data root this test
+    // would use by default is the one place where nothing can ever bite. A
+    // scratch root on a block-device filesystem is what lets the other half
+    // of the report be asserted.
+    let data_root = scratch_root().map_or_else(
+        || temp.path().to_path_buf(),
+        |scratch| scratch.join(format!("herd-io-weight-report-{}", std::process::id())),
+    );
+    std::fs::create_dir_all(&data_root).expect("a data root under the scratch root");
+    let confined = Confined::prepare(test_confinement(&data_root)).expect("confinable");
+    let report = confined.report().join("\n");
+    let no_cgroup = confined
+        .ceiling()
+        .fallback_reason()
+        .map(|why| why.to_owned());
+    let Some(why) = confined.io_weight_inert().map(|why| why.to_owned()) else {
+        // bfq or blk-iocost: the weight really bites for a job working here,
+        // and the report has to say so plainly and name the device — moving
+        // the data root is what moves this answer (D120).
+        assert!(
+            !report.contains("WRITTEN BUT INERT"),
+            "a job here is weighted, so the report must not claim otherwise: {report}"
+        );
+        let plainly = confined.io_weight_reach().why.clone();
+        match no_cgroup {
+            Some(no_cgroup) => {
+                skipped(
+                    "an_io_weight_that_cannot_bite_is_said_out_loud \
+                     (the weighted-device branch)",
+                    &format!(
+                        "{no_cgroup} — a job's directory here IS on a weighted device \
+                         ({plainly}), and inside a delegated scope the startup report \
+                         would have to carry that line instead of the inert one"
+                    ),
+                );
+            }
+            None => assert!(
+                report.contains("enforced for jobs here") && report.contains(&plainly),
+                "an io.weight that does bite must say so, with the device: {report}"
+            ),
+        }
+        let _ = std::fs::remove_dir_all(&data_root);
+        return;
+    };
+    let _ = std::fs::remove_dir_all(&data_root);
+    if let Some(no_cgroup) = no_cgroup {
+        // With no cgroup at all the report already says io.weight is not
+        // enforced; the inert sentence would be a second reason for the same
+        // thing.
+        assert!(report.contains("NOT ENFORCED AT ALL"), "{report}");
+        skipped(
+            "an_io_weight_that_cannot_bite_is_said_out_loud",
+            &format!(
+                "{no_cgroup} — a job's directory here is on a device whose io.weight is inert too \
+                 ({why}), and inside a delegated scope the startup report would have to \
+                 carry the WRITTEN BUT INERT line for it"
+            ),
+        );
+        return;
+    }
+    assert!(
+        report.contains("WRITTEN BUT INERT") && report.contains(&why),
+        "an io.weight the block layer ignores must be shouted, with its reason: {report}"
+    );
+    assert!(
+        report.contains("io.max"),
+        "the report must name the lever that would work here: {report}"
+    );
+}
+
+// --------------------------------------------- the room it is in (D119) ----
+
+/// D119: the figure the hub admits against is the room in the cgroup the
+/// runner is **actually in**, not the machine's `MemTotal`. Asserted against
+/// a cgroup the kernel really bounds — a child of this process's own cgroup
+/// with a `memory.max` of 512 MiB — so that the walk, the parse and the
+/// subtraction are checked against the kernel's own files rather than against
+/// a fixture.
+///
+/// The unit tests in `room` prove the walk over a tree a test builds, and
+/// that a host with no enclosing limit keeps its `MemTotal` untouched. This
+/// one proves the remaining half, and it needs the right to make a cgroup.
+#[test]
+fn a_tighter_enclosing_memory_max_lowers_the_room_that_is_announced() {
+    const TEST: &str = "a_tighter_enclosing_memory_max_lowers_the_room_that_is_announced";
+    /// What this assertion is for, said in every skip: a reader of a green
+    /// run has to know what was not checked and how to check it.
+    const WOULD_PROVE: &str = "a host that may make a cgroup — \
+         `systemd-run --user --scope -p Delegate=yes cargo test ...`, or any runner \
+         under a systemd unit with Delegate=yes — would prove that a real \
+         enclosing memory.max read out of /sys/fs/cgroup lowers the memory this \
+         runner announces, which is what stops a slice from being OOM-killed while \
+         the hub believes it admitted carefully (D119)";
+    let ceiling_bytes: u64 = 512 * (1 << 20);
+    // A host that cannot give a job a cgroup of its own cannot be given a
+    // cgroup with a ceiling to stand in either, and the reason is the same
+    // sentence.
+    if let Err(why) = kernel_ceiling_or_reason() {
+        skipped(TEST, &format!("{why} — {WOULD_PROVE}"));
+        return;
+    }
+    // Prepared first, and kept alive, for its side effects on a host that
+    // does delegate: it moves this process out of the base cgroup into a leaf
+    // of its own and hands the memory controller down to the base's children.
+    // cgroup v2 refuses both to a cgroup that still holds processes, so
+    // without this there is no child here that could carry a `memory.max` —
+    // which is the trap D117 names, met from the test's side.
+    let temp = TempDir::new("room-ceiling");
+    let _confined = Confined::prepare(test_confinement(temp.path())).expect("confinable");
+    let mount = Path::new(herd_runner::room::CGROUP_MOUNT);
+    let Some(own) = std::fs::read_to_string("/proc/self/cgroup")
+        .ok()
+        .as_deref()
+        .and_then(herd_runner::room::own_cgroup)
+    else {
+        skipped(
+            TEST,
+            &format!("this host has no cgroup v2 line in /proc/self/cgroup — {WOULD_PROVE}"),
+        );
+        return;
+    };
+    // A sibling of the leaf this process stands in, which is where a cgroup
+    // with a ceiling can exist: the leaf itself holds a process and so can
+    // have no controller-enabled children of its own.
+    let Some(base) = Path::new(&own).parent().map(|at| at.to_owned()) else {
+        skipped(
+            TEST,
+            &format!("this process is in the root cgroup {own} — {WOULD_PROVE}"),
+        );
+        return;
+    };
+    let name = format!("herd-room-test-{}", std::process::id());
+    let cgroup = base.join(&name);
+    let directory = mount.join(cgroup.strip_prefix("/").unwrap_or(&cgroup));
+    let _ = std::fs::remove_dir(&directory);
+    if let Err(error) = std::fs::create_dir(&directory) {
+        skipped(
+            TEST,
+            &format!(
+                "this process may not create a cgroup under {} ({error}) — {WOULD_PROVE}",
+                mount
+                    .join(base.strip_prefix("/").unwrap_or(&base))
+                    .display()
+            ),
+        );
+        return;
+    }
+    let written = std::fs::write(directory.join("memory.max"), ceiling_bytes.to_string());
+    let found = herd_runner::room::enclosing(mount, &cgroup.display().to_string());
+    let _ = std::fs::remove_dir(&directory);
+    if let Err(error) = written {
+        skipped(
+            TEST,
+            &format!(
+                "a cgroup was creatable at {} but its memory.max was not writable \
+                 ({error}), so the memory controller is not handed down there — \
+                 {WOULD_PROVE}",
+                directory.display()
+            ),
+        );
+        return;
+    }
+    let found = found.expect("a cgroup with a memory.max of 512 MiB encloses that path");
+    assert_eq!(found.ceiling_bytes, ceiling_bytes, "{found:?}");
+    assert_eq!(found.knob, "memory.max");
+    assert!(
+        found.room_mib() <= 512,
+        "the room under a 512 MiB ceiling is at most 512 MiB: {found:?}"
+    );
+    // And that figure is what the runner would announce, in place of the
+    // machine's.
+    let host = herd_runner::metrics::total_memory_mib();
+    let (announced, said) = herd_runner::room::announced_memory_mib(host, Some(found.clone()));
+    assert_eq!(announced, Some(found.room_mib()));
+    let said = said.expect("a figure the kernel took down is never announced silently");
+    assert!(
+        said.contains(&name) && said.contains("memory.max"),
+        "{said}"
+    );
+}
+
 // ------------------------------------------------- no inbound socket ----
 
 /// Invariant 3, asserted against the running process rather than against a
@@ -1092,6 +1667,183 @@ fn no_module_of_the_runner_can_bind_a_socket() {
         }
     }
     assert!(checked > 4, "only {checked} files were checked");
+}
+
+// ---------------------------------------------- no Docker socket (D78) ----
+
+/// D78's last clause, and one of M16's deliverables: while a job is
+/// **genuinely running**, no open descriptor of the runner — and none of the
+/// job's own process — resolves to a container-runtime socket.
+///
+/// The claim is about what Herd opens, never about what the host forbids, so
+/// nothing here consults a group: this server's user is in `docker` because
+/// the hub runs under compose, which means the socket is sitting there
+/// writable, and the assertion reads the same on a host where it is not.
+/// Where the host cannot prove a part of the claim — no such socket on it at
+/// all, or none this user could have opened anyway — that part is skipped out
+/// loud with what a host that could run it would have proved (D27).
+///
+/// The paths come from `privilege::runtime_sockets`, the list the production
+/// code already warns about, so a path added there is a path this test starts
+/// watching rather than a second list to keep in step.
+///
+/// Only the job's own process is walked, not its children: a child inherits
+/// its descriptors from that process, which is checked, and a job that opened
+/// the socket itself would be the consumer's own code doing it rather than
+/// Herd (E-45 is what bounds that, and this is D78).
+#[tokio::test]
+async fn no_descriptor_of_the_runner_or_its_job_reaches_a_runtime_socket() {
+    const TEST: &str = "no_descriptor_of_the_runner_or_its_job_reaches_a_runtime_socket";
+    if !cfg!(target_os = "linux") {
+        skipped(
+            TEST,
+            "this host is not Linux, so /proc/<pid>/fd cannot be walked",
+        );
+        return;
+    }
+    let watched = watched_runtime_sockets();
+    assert!(
+        !watched.is_empty(),
+        "privilege::runtime_sockets() named nothing, so this test would watch nothing"
+    );
+    // Before anything is asserted about the runner: the walk is made to find
+    // a descriptor planted on purpose, so that an empty result below is a
+    // fact about the runner and not about a walk that finds nothing ever.
+    the_walk_finds_a_planted_descriptor(TEST);
+    say_what_this_host_cannot_prove(TEST, &watched);
+
+    let data_root = TempDir::new("no-docker-fd");
+    let state = TempDir::new("no-docker-fd-state");
+    let store = Arc::new(JobDirStore::open(state.path()).expect("the state root opens"));
+    let hub = Hub::bind(
+        "127.0.0.1:0".parse().expect("a literal loopback address"),
+        Arc::clone(&store) as Arc<dyn JobStore>,
+    )
+    .await
+    .expect("the hub binds a free port");
+    let hub_url = format!("ws://{}", hub.local_addr());
+    let handle = hub.handle();
+    let serving = tokio::spawn(async move {
+        let _ = hub.serve().await;
+    });
+
+    // The real binary, because the claim is about a runner *process*: an
+    // in-process runner would share this test's own descriptors and prove
+    // nothing about either of them. A name of its own, and the token its
+    // approval minted (E-48), so that no other test's reaper or restart ever
+    // takes this runner's job for a leftover of its own.
+    let token = store
+        .approve_runner("no-docker-fd")
+        .expect("the state root mints a token");
+    let mut runner = tokio::process::Command::new(env!("CARGO_BIN_EXE_herd-runner"))
+        .arg("--hub")
+        .arg(&hub_url)
+        .arg("--name")
+        .arg("no-docker-fd")
+        .env("HERD_TOKEN", token)
+        .arg("--data-root")
+        .arg(data_root.path())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .kill_on_drop(true)
+        .spawn()
+        .expect("the real runner binary runs");
+    let runner_pid = runner.id().expect("a spawned process has a pid");
+
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while !handle.runner_connected() {
+        assert!(
+            Instant::now() < deadline,
+            "the runner never joined the hub (pid {runner_pid})"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+
+    // Held open by two files, as the no-listener test holds its own: the job
+    // says when it has started and then waits to be let go, so the walk
+    // happens with the job in flight. A window with no job in it has no
+    // descriptors to find and would pass on its own (D101).
+    let started = data_root.path().join("the-job-has-started");
+    let release = data_root.path().join("the-job-may-end");
+    let script = format!(
+        ": > {}; while [ ! -e {} ]; do sleep 0.05; done",
+        started.display(),
+        release.display()
+    );
+    let requester = herdctl::Config {
+        hub_url,
+        token: None,
+        name: Some("no-docker-fd-requester".to_owned()),
+    };
+    let job = tokio::spawn({
+        let command = shell(&script);
+        async move {
+            let _ = herdctl::run_job(
+                &requester,
+                command,
+                herd_proto::LabelSet::default(),
+                herd_proto::Priority::Step,
+                herdctl::Declared::default(),
+                |_, _| {},
+                |_| {},
+            )
+            .await;
+        }
+    });
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while !started.exists() {
+        assert!(
+            Instant::now() < deadline,
+            "the job never started, so there was nothing to walk the runner against"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    // The job's own process is the shell the runner executed, and the whole
+    // script is one of its arguments — unique, because the paths in it are in
+    // a data root of this process's own.
+    let job_pids = processes_with_argument(&script);
+    assert_eq!(
+        job_pids.len(),
+        1,
+        "expected exactly one live process to be running the job's script, found \
+         {job_pids:?}"
+    );
+
+    let mut unaccounted = Vec::new();
+    for (whose, pid) in [("the runner", runner_pid), ("the job", job_pids[0])] {
+        let found = runtime_socket_descriptors_of(pid, &watched);
+        assert!(
+            found.on_a_runtime_socket.is_empty(),
+            "{whose} (pid {pid}) holds a descriptor on a container-runtime socket \
+             while a job runs, which D78 says never happens: {}",
+            found.on_a_runtime_socket.join("; ")
+        );
+        unaccounted.extend(
+            found
+                .unix_sockets_nothing_could_account_for
+                .iter()
+                .map(|descriptor| format!("{whose} (pid {pid}) {descriptor}")),
+        );
+    }
+    if !unaccounted.is_empty() {
+        skipped(
+            TEST,
+            &format!(
+                "these AF_UNIX descriptors could be checked by path and by nothing else, \
+                 because the kernel's socket diagnostics did not account for them and \
+                 procfs publishes the path of a bound socket but never the peer of a \
+                 connected one: {}. A host where `ss -xa` answers for every socket would \
+                 have proved each of these is not dialled at a container-runtime socket \
+                 either",
+                unaccounted.join("; ")
+            ),
+        );
+    }
+
+    std::fs::write(&release, b"walked").expect("the job is let go");
+    let _ = job.await;
+    let _ = runner.kill().await;
+    serving.abort();
 }
 
 // ------------------------------------- a runner's own death (defect 5) ----
@@ -1459,4 +2211,605 @@ fn listening_sockets_of(pid: u32) -> Vec<String> {
         }
     }
     listening
+}
+
+/// Every path a descriptor must never resolve to: the container-runtime
+/// sockets the runner's own code lists (D78), under both names each of them
+/// has on this host.
+fn watched_runtime_sockets() -> Vec<PathBuf> {
+    both_names_of(
+        herd_runner::privilege::runtime_sockets()
+            .iter()
+            .map(PathBuf::from),
+    )
+}
+
+/// Each path as it is written and as it canonicalises, deduplicated, so that
+/// `/var/run/docker.sock` and `/run/docker.sock` — two names for one socket
+/// on most hosts — are one thing to compare against, whichever name a
+/// descriptor happens to carry.
+fn both_names_of(paths: impl Iterator<Item = PathBuf>) -> Vec<PathBuf> {
+    let mut watched: Vec<PathBuf> = Vec::new();
+    for listed in paths {
+        let canonical = listed.canonicalize().unwrap_or_else(|_| listed.clone());
+        for name in [listed, canonical] {
+            if !watched.contains(&name) {
+                watched.push(name);
+            }
+        }
+    }
+    watched
+}
+
+/// What a walk of one process's open descriptors found about D78's claim.
+#[derive(Debug)]
+struct FoundDescriptors {
+    /// Descriptors that reach a watched socket, each as one line naming which
+    /// descriptor and how it got there. Any one of these is a failure.
+    on_a_runtime_socket: Vec<String>,
+    /// Descriptors on an AF_UNIX socket that this host could not be made to
+    /// account for: procfs names the path of a socket that is **bound** and
+    /// never the peer of one that is **connected**, so a connected descriptor
+    /// needs the kernel's socket diagnostics, and those are not everywhere.
+    /// Not a failure — it is what this host cannot answer, and the caller
+    /// says so out loud rather than quietly (D27).
+    unix_sockets_nothing_could_account_for: Vec<String>,
+}
+
+/// Walk `/proc/<pid>/fd`, resolve every link, and compare what it reached.
+///
+/// Three shapes, because a descriptor reaches a unix socket in three ways and
+/// `/proc/<pid>/fd` alone shows only the first:
+///
+/// 1. a descriptor on the socket **file** resolves to its path, so the path
+///    itself is compared, canonicalised;
+/// 2. a descriptor on a **bound** socket resolves to `socket:[inode]` and
+///    names no path — `/proc/net/unix` holds the path against that inode;
+/// 3. a descriptor **connected** to a socket resolves to `socket:[inode]`
+///    too, and procfs publishes no peer for it at all. The kernel gives the
+///    accepted end of a connection the listener's own address, so the peer's
+///    line in `/proc/net/unix` carries the path that was dialled — and the
+///    peer's inode comes from the kernel's socket diagnostics, which is what
+///    `ss -x` reads. Where those cannot be asked, such a descriptor is
+///    reported as unaccounted for instead of being passed over.
+///
+/// `/proc/net/unix` lists every AF_UNIX socket on the host and nothing else,
+/// which is also how an inode of one is told from a TCP socket's.
+fn runtime_socket_descriptors_of(pid: u32, watched: &[PathBuf]) -> FoundDescriptors {
+    let unix_sockets = unix_socket_paths();
+    let peers = unix_socket_peers();
+    let mut found = FoundDescriptors {
+        on_a_runtime_socket: Vec::new(),
+        unix_sockets_nothing_could_account_for: Vec::new(),
+    };
+    let watches = |path: &str| {
+        let named = PathBuf::from(path);
+        let canonical = named.canonicalize().unwrap_or_else(|_| named.clone());
+        watched.contains(&named) || watched.contains(&canonical)
+    };
+    let entries = std::fs::read_dir(format!("/proc/{pid}/fd")).unwrap_or_else(|error| {
+        panic!(
+            "the descriptors of pid {pid} cannot be read ({error}), so this test is \
+             asserting nothing"
+        )
+    });
+    for entry in entries.flatten() {
+        let fd = entry.file_name().to_string_lossy().into_owned();
+        // A descriptor closed while the directory was being read: gone, so
+        // held by nothing.
+        let Ok(target) = std::fs::read_link(entry.path()) else {
+            continue;
+        };
+        let shown = target.to_string_lossy().into_owned();
+        let Some(inode) = shown
+            .strip_prefix("socket:[")
+            .and_then(|rest| rest.strip_suffix(']'))
+        else {
+            // Shape 1: an ordinary descriptor, which names where it points.
+            let canonical = target.canonicalize().unwrap_or_else(|_| target.clone());
+            if watched.contains(&target) || watched.contains(&canonical) {
+                found.on_a_runtime_socket.push(format!(
+                    "fd {fd} -> {shown} (canonically {})",
+                    canonical.display()
+                ));
+            }
+            continue;
+        };
+        let Some(bound_to) = unix_sockets.get(inode) else {
+            // Not AF_UNIX at all, so none of these paths.
+            continue;
+        };
+        // Shape 2: this socket's own name, where it has one.
+        if !bound_to.is_empty() {
+            if watches(bound_to) {
+                found
+                    .on_a_runtime_socket
+                    .push(format!("fd {fd} -> socket:[{inode}] bound to {bound_to}"));
+            }
+            continue;
+        }
+        // Shape 3: whatever it is connected to, named by its peer.
+        let Some(peers) = peers.as_ref() else {
+            found
+                .unix_sockets_nothing_could_account_for
+                .push(format!("fd {fd} -> socket:[{inode}]"));
+            continue;
+        };
+        let Some(peer) = peers.get(inode) else {
+            found
+                .unix_sockets_nothing_could_account_for
+                .push(format!("fd {fd} -> socket:[{inode}]"));
+            continue;
+        };
+        // Nobody on the other end — a socket that is listening, or one nobody
+        // has dialled — or a peer with no name of its own: either way this
+        // descriptor reaches no path, and its own name was compared above.
+        let Some(dialled) = unix_sockets.get(peer).filter(|path| !path.is_empty()) else {
+            continue;
+        };
+        if watches(dialled) {
+            found.on_a_runtime_socket.push(format!(
+                "fd {fd} -> socket:[{inode}] connected to socket:[{peer}], which is \
+                 {dialled}"
+            ));
+        }
+    }
+    found
+}
+
+/// The path of every AF_UNIX socket on this host, by inode, empty for the
+/// ones the kernel publishes no path for. `/proc/net/unix` is `Num RefCount
+/// Protocol Flags Type St Inode Path`, behind one header line.
+fn unix_socket_paths() -> HashMap<String, String> {
+    let mut by_inode = HashMap::new();
+    let Ok(text) = std::fs::read_to_string("/proc/net/unix") else {
+        return by_inode;
+    };
+    for line in text.lines().skip(1) {
+        let fields: Vec<&str> = line.split_whitespace().collect();
+        if fields.len() < 7 {
+            continue;
+        }
+        by_inode.insert(
+            fields[6].to_owned(),
+            fields.get(7).copied().unwrap_or_default().to_owned(),
+        );
+    }
+    by_inode
+}
+
+/// The peer inode of every connected AF_UNIX socket, by inode, or `None`
+/// where this host cannot be asked.
+///
+/// Asked of `ss -xa`, which reads the kernel's socket diagnostics over
+/// netlink: that is the only place a connected socket's peer appears, and
+/// without it a descriptor dialled at a socket is a descriptor with no name.
+/// A socket with no peer — listening, or never dialled — is in the table with
+/// `*` where its peer would be, which is enough to account for it.
+fn unix_socket_peers() -> Option<HashMap<String, String>> {
+    let shown = std::process::Command::new("ss").arg("-xa").output().ok()?;
+    if !shown.status.success() {
+        return None;
+    }
+    let text = String::from_utf8_lossy(&shown.stdout).into_owned();
+    let mut by_inode = HashMap::new();
+    for line in text.lines() {
+        // netid state recv-q send-q local-address local-inode peer-address
+        // peer-inode [process], where an address is a path or `*` and an
+        // inode of 0 means there is nobody on the other end. The header line
+        // has no netid of this shape and is left out by that alone.
+        let fields: Vec<&str> = line.split_whitespace().collect();
+        if fields.len() < 8 || !fields[0].starts_with("u_") {
+            continue;
+        }
+        let (Ok(inode), Ok(peer)) = (fields[5].parse::<u64>(), fields[7].parse::<u64>()) else {
+            continue;
+        };
+        by_inode.insert(
+            inode.to_string(),
+            if peer == 0 {
+                String::new()
+            } else {
+                peer.to_string()
+            },
+        );
+    }
+    // An empty table is a tool that answered without answering; treating it
+    // as an answer would turn "nothing could be asked" into "nothing found".
+    if by_inode.is_empty() {
+        return None;
+    }
+    Some(by_inode)
+}
+
+/// The parts of D78's claim this host may be unable to prove, each skipped
+/// out loud with what a host that could would have proved (D27). The
+/// assertion itself runs either way: it is about what the runner opens, not
+/// about what the host allows.
+fn say_what_this_host_cannot_prove(test: &str, watched: &[PathBuf]) {
+    let present: Vec<String> = watched
+        .iter()
+        .filter(|path| path.exists())
+        .map(|path| path.display().to_string())
+        .collect();
+    if present.is_empty() {
+        skipped(
+            test,
+            &format!(
+                "none of the {} container-runtime socket paths the runner's code lists \
+                 exists on this host, so an empty walk cannot tell a runner that never \
+                 opens the Docker socket from a host that has no socket to open. A host \
+                 running Docker would have proved the first",
+                watched.len()
+            ),
+        );
+        return;
+    }
+    if !present
+        .iter()
+        .any(|path| this_user_can_write(Path::new(path)))
+    {
+        skipped(
+            test,
+            &format!(
+                "the container-runtime sockets on this host ({}) are not writable by \
+                 this user, so a descriptor on one was out of reach anyway. A host whose \
+                 user is in the docker group — this server is one, because the hub runs \
+                 under compose — would have proved the runner declines a socket it could \
+                 have used",
+                present.join(", ")
+            ),
+        );
+    }
+}
+
+/// Whether this user may write a path, asked of the kernel rather than
+/// guessed from the mode bits — the same question `privilege` asks, asked
+/// here about the host instead of about the runner.
+#[cfg(unix)]
+fn this_user_can_write(path: &Path) -> bool {
+    use std::os::unix::ffi::OsStrExt;
+
+    let Ok(c_path) = std::ffi::CString::new(path.as_os_str().as_bytes()) else {
+        return false;
+    };
+    // Safe: access(2) reads one path and returns an integer.
+    unsafe { libc::access(c_path.as_ptr(), libc::W_OK) == 0 }
+}
+
+#[cfg(not(unix))]
+fn this_user_can_write(_path: &Path) -> bool {
+    false
+}
+
+/// The walk run against descriptors this test plants on purpose, so that an
+/// empty result about the runner is a fact about the runner rather than about
+/// a walk that could never find anything.
+///
+/// Planted in *this* test process and against a stand-in path in a temporary
+/// directory of its own: no production path is touched and the real assertion
+/// stays exactly as strict as it was. One plant per shape the walk claims to
+/// see — the file, under the name of a **symlink** to it, which is the
+/// `/var/run` against `/run` case the canonicalisation exists for; a **bound**
+/// socket, which names no path in `/proc/<pid>/fd`; and a socket
+/// **connected** to one, which names no path anywhere and is found through
+/// its peer. Each is then closed and the walk must stop reporting it, because
+/// a walk that always finds something is no better than one that never does.
+#[cfg(unix)]
+fn the_walk_finds_a_planted_descriptor(test: &str) {
+    let temp = TempDir::new("planted-descriptor");
+    let me = std::process::id();
+
+    let real = temp.path().join("stand-in.sock");
+    std::fs::write(&real, b"a stand-in for a socket file").expect("the fixture writes");
+    let by_another_name = temp.path().join("by-another-name.sock");
+    std::os::unix::fs::symlink(&real, &by_another_name).expect("the fixture links");
+    let watched = both_names_of(std::iter::once(by_another_name));
+    let held = std::fs::File::open(&real).expect("the fixture opens its own stand-in");
+    let found = runtime_socket_descriptors_of(me, &watched);
+    assert!(
+        found
+            .on_a_runtime_socket
+            .iter()
+            .any(|line| line.starts_with("fd ") && line.contains(&real.display().to_string())),
+        "the walk missed the descriptor this test planted on {}, or did not name it and \
+         where it resolved: {found:?}",
+        real.display()
+    );
+    drop(held);
+    let after = runtime_socket_descriptors_of(me, &watched);
+    assert!(
+        after.on_a_runtime_socket.is_empty(),
+        "the walk reports a descriptor that is closed: {after:?}"
+    );
+
+    let planted = temp.path().join("planted.sock");
+    let watched = both_names_of(std::iter::once(planted.clone()));
+    let listener =
+        std::os::unix::net::UnixListener::bind(&planted).expect("the fixture binds a socket");
+    let found = runtime_socket_descriptors_of(me, &watched);
+    assert!(
+        found
+            .on_a_runtime_socket
+            .iter()
+            .any(|line| line.starts_with("fd ") && line.contains(&planted.display().to_string())),
+        "the walk missed the socket this test bound at {}, which only /proc/net/unix \
+         names: {found:?}",
+        planted.display()
+    );
+
+    // The third shape, and the only one neither `/proc/<pid>/fd` nor
+    // `/proc/net/unix` can answer: a descriptor *connected* to the socket,
+    // which is how a Docker client would hold it.
+    let dialled =
+        std::os::unix::net::UnixStream::connect(&planted).expect("the fixture dials its socket");
+    let accepted = listener.accept().expect("the fixture accepts its own dial");
+    if unix_socket_peers().is_some() {
+        let found = runtime_socket_descriptors_of(me, &watched);
+        assert!(
+            found
+                .on_a_runtime_socket
+                .iter()
+                .any(|line| line.contains("connected to")),
+            "the walk missed the descriptor this test dialled at {}, so a descriptor \
+             connected to a container-runtime socket would not have been found either: \
+             {found:?}",
+            planted.display()
+        );
+    } else {
+        skipped(
+            test,
+            &format!(
+                "the kernel's socket diagnostics cannot be asked on this host — `ss -xa` \
+                 is missing or answered nothing — and they are the only place a connected \
+                 AF_UNIX socket's peer appears. A descriptor the runner had *dialled* at \
+                 {} would not have been found by this walk, and this test planted one to \
+                 prove it. A host with iproute2 would have proved that shape too",
+                planted.display()
+            ),
+        );
+    }
+    drop(accepted);
+    drop(dialled);
+    drop(listener);
+    std::fs::remove_file(&planted).expect("the fixture removes its socket");
+    let after = runtime_socket_descriptors_of(me, &watched);
+    assert!(
+        after.on_a_runtime_socket.is_empty(),
+        "the walk reports a socket that is closed: {after:?}"
+    );
+}
+
+/// Linux-only; the test that calls it has already returned on any other host.
+#[cfg(not(unix))]
+fn the_walk_finds_a_planted_descriptor(_test: &str) {}
+
+// ------------------------------------------------- pressure (E-32) ----
+
+/// The figure travels with the verdict, which is the whole shape of D119's
+/// answer: the first consumer asked for PSI to **brake** admission, and E-32
+/// — their own expectation — says a load figure is recorded and never a
+/// criterion. So it is measured, it reaches the record, and it decides
+/// nothing.
+#[tokio::test]
+async fn a_job_s_record_carries_the_pressure_it_ran_under() {
+    let harness = Harness::new("pressure", |_| {}).await;
+    let ran = harness.run("echo measured").await;
+    assert_eq!(ran.outcome, JobOutcome::Exited { code: 0 });
+    if !Path::new("/proc/pressure").is_dir() {
+        skipped(
+            "a_job_s_record_carries_the_pressure_it_ran_under",
+            "this kernel has no /proc/pressure (CONFIG_PSI), so there is no figure to \
+             record — a kernel with PSI would prove that the host's cpu, memory and io \
+             stall figures travel with the job's outcome. The figure is absent here, which \
+             is asserted, rather than reported as a zero",
+        );
+        assert_eq!(
+            ran.metrics.pressure, None,
+            "a host with no PSI must report no figure at all, never a row of zeroes"
+        );
+        return;
+    }
+    let pressure = ran
+        .metrics
+        .pressure
+        .expect("a kernel with PSI records the figure with the job");
+    // The host's three are there, and each one is a share of time.
+    for (name, figure) in pressure.named() {
+        assert!(
+            figure <= 100_000,
+            "{name} is {figure} thousandths of a percent, which is not a share of time"
+        );
+    }
+    assert!(
+        pressure.host_cpu_milli.is_some()
+            && pressure.host_memory_milli.is_some()
+            && pressure.host_io_milli.is_some(),
+        "{pressure:?}"
+    );
+    // The job's own three come out of its own cgroup, so they are there
+    // exactly where there was a cgroup to read.
+    match kernel_ceiling_or_reason() {
+        Ok(()) => assert!(
+            pressure.job_cpu_milli.is_some()
+                && pressure.job_memory_milli.is_some()
+                && pressure.job_io_milli.is_some(),
+            "a job with a cgroup of its own carries its own stall figures too: {pressure:?}"
+        ),
+        Err(why) => skipped(
+            "a_job_s_record_carries_the_pressure_it_ran_under",
+            &format!(
+                "{why}, so this job had no cgroup of its own and only the host's three \
+                 figures could be asserted — a delegated scope (`systemd-run --user \
+                 --scope -p Delegate=yes cargo test ...`) would prove that the job's own \
+                 cpu.pressure, memory.pressure and io.pressure are read out of its own \
+                 cgroup and recorded with it"
+            ),
+        ),
+    }
+}
+
+/// **The guarantee E-32 asks for, and the important test of the two.**
+///
+/// Nothing is ever refused or delayed because this host is under pressure. A
+/// hub that silently stopped dispatching under load would be
+/// indistinguishable from a hub that had died, which is a worse failure than
+/// the queueing it would prevent (D119).
+///
+/// Asserted by making the host really stall and then asking for work anyway:
+/// a job that keeps every thread busy and writes synchronously runs
+/// *alongside* a second job, and that second job is admitted, runs, explains
+/// no wait and returns its verdict. The recorded figure is what proves the
+/// host was in fact stalled while that happened — so this is not an
+/// assertion about an idle machine.
+#[tokio::test]
+async fn pressure_refuses_nothing_and_delays_nothing() {
+    let harness = Harness::new("pressure-gates-nothing", |confinement| {
+        confinement.timeout = Duration::from_secs(30);
+    })
+    .await;
+    // The hog: every thread spinning, and a synchronous write loop under it,
+    // for about two seconds. Bounded on purpose — a runner must never be the
+    // reason its host falls over, test or not (invariant 2) — and inside its
+    // own job's caps, so the kernel stops it whatever it does.
+    let hog = harness.run(
+        "i=0; while [ $i -lt 8 ]; do (end=$(( $(date +%s) + 2 )); \
+           while [ $(date +%s) -lt $end ]; do :; done) & i=$((i+1)); done; \
+         j=0; while [ $j -lt 40 ]; do dd if=/dev/zero of=./churn bs=256k count=4 \
+           conv=fsync 2>/dev/null; j=$((j+1)); done; wait; echo hog done",
+    );
+    // And the question, asked while that is happening.
+    let asking = harness.run("echo admitted under pressure");
+    let (hog, asked) = tokio::join!(hog, asking);
+    assert_eq!(
+        hog.outcome,
+        JobOutcome::Exited { code: 0 },
+        "the hog itself must finish inside its caps: {} / {}",
+        hog.out,
+        hog.err
+    );
+    // Refused nothing: the job ran and returned its own verdict.
+    assert_eq!(
+        asked.outcome,
+        JobOutcome::Exited { code: 0 },
+        "a job asked for while this host was stalled was not run: {} / {}",
+        asked.out,
+        asked.err
+    );
+    assert!(
+        asked.out.contains("admitted under pressure"),
+        "{}",
+        asked.out
+    );
+    // Delayed nothing: every wait the hub makes a job serve is explained in a
+    // note (E-04), and there is no note here about load, pressure or a
+    // stalled host — because no such reason exists anywhere in Herd.
+    for note in &asked.notes {
+        let said = note.to_lowercase();
+        assert!(
+            !said.contains("pressure") && !said.contains("stall"),
+            "a job was made to wait for pressure, which E-32 forbids: {note}"
+        );
+    }
+    // And the figure that proves the host really was stalled while all that
+    // was allowed to happen. Where it could not be read, or where this host
+    // would not stall at all, the skip says what a stalling host would have
+    // shown — never a weakened claim.
+    let highest = asked
+        .metrics
+        .pressure
+        .map(|pressure| {
+            pressure
+                .named()
+                .into_iter()
+                .map(|(_, figure)| figure)
+                .max()
+                .unwrap_or(0)
+        })
+        .unwrap_or(0);
+    if highest == 0 {
+        skipped(
+            "pressure_refuses_nothing_and_delays_nothing",
+            "this host recorded no stall at all while eight spinning threads and a \
+             synchronous write loop ran, so the job above was admitted on a machine that \
+             was never under pressure: it proves that nothing is refused or delayed, but \
+             not that the figure it would have been refused for was non-zero. A host with \
+             CONFIG_PSI that can be made to stall would have shown both at once",
+        );
+    }
+}
+
+/// And the same guarantee read off the code rather than off one run: **no
+/// module anywhere in Herd compares a pressure figure against anything.**
+///
+/// The behavioural test above proves one job was not refused on one host.
+/// This one proves there is no code that could refuse one: the figure is
+/// read in `metrics`, carried in `herd-proto`'s `JobMetrics`, handed to the
+/// record once in `job`, and mentioned nowhere a decision is taken. It is
+/// the shape of `no_module_but_this_one_can_reach_an_escalation_tool`, and
+/// it is here because E-32 is a promise about Herd and not about a Tuesday.
+#[test]
+fn nothing_in_herd_reads_a_pressure_figure_to_decide_anything() {
+    // Where a decision about a job is taken: admission, placement, claiming,
+    // queueing. Every one of these is a file the figure must not appear in.
+    let deciders = [
+        "herd-hub/src/matcher.rs",
+        "herd-hub/src/queue.rs",
+        "herd-hub/src/server.rs",
+        "herd-runner/src/room.rs",
+        "herd-runner/src/capability.rs",
+        "herd-runner/src/switch.rs",
+    ];
+    let Some(workspace) = workspace_root() else {
+        skipped(
+            "nothing_in_herd_reads_a_pressure_figure_to_decide_anything",
+            "the workspace root could not be found from this test's manifest directory, so \
+             the hub's own sources could not be read — a checkout would have proved that no \
+             module that decides anything about a job so much as mentions the figure",
+        );
+        return;
+    };
+    let mut read = 0;
+    for decider in deciders {
+        let path = workspace.join(decider);
+        let Ok(text) = std::fs::read_to_string(&path) else {
+            continue;
+        };
+        read += 1;
+        for (number, line) in text.lines().enumerate() {
+            // A comment saying the figure gates nothing is the opposite of a
+            // gate, and is exactly what should be written there.
+            let code = line.split("//").next().unwrap_or_default();
+            assert!(
+                !code.contains("pressure"),
+                "{}:{} reads a pressure figure where a job is decided about, which E-32 \
+                 forbids: {line}",
+                path.display(),
+                number + 1
+            );
+        }
+    }
+    assert!(
+        read >= 4,
+        "only {read} of the {} files that decide about a job could be read, so this \
+         assertion did not cover what it claims",
+        deciders.len()
+    );
+}
+
+/// The workspace root, found by walking up from this crate until `Cargo.toml`
+/// names a workspace. `CARGO_MANIFEST_DIR` is the crate, and the hub is a
+/// sibling of it.
+fn workspace_root() -> Option<PathBuf> {
+    let mut here = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    loop {
+        if std::fs::read_to_string(here.join("Cargo.toml"))
+            .is_ok_and(|text| text.contains("[workspace]"))
+        {
+            return Some(here);
+        }
+        if !here.pop() {
+            return None;
+        }
+    }
 }
