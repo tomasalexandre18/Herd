@@ -5573,8 +5573,9 @@ sweeper.
 
 ## 2026-10-16 — D151 The two ways a failure lies to the reader
 
-**One real failure on the live deployment, two defects, and they are the same
-defect wearing different clothes.** Job `j0000000057` — the first consumer's
+**One real failure on the live deployment, two defects reported, four
+instances found, and all four are one defect wearing different clothes.**
+Job `j0000000057` — the first consumer's
 `test web-firefox,unit -j 1` — ran while the host was at **load 306** with IO
 pressure `full avg10` near **96 %**, none of it Herd's: another agent's GPU
 QEMU and a Minecraft server. The hub lost the runner twice, E-21 spent its
@@ -5645,6 +5646,48 @@ count of what was *not* checked that is itself wrong is precisely what D27
 exists to prevent. One `write_all` per line fixes it, and the gate run for
 this branch reports 13.
 
+**And the hub had it too, independently.** `is_current` in `herd-hub` wrote
+`herd-hub: {reason}` once per refused frame, so during the very same burst
+the hub made its own ~1497 writes — into Docker's logging stack, which is if
+anything the heavier path, on the same stalled host. The first scoping of
+this work was "fix the runner", and that was wrong: the defect is *a
+per-frame path emitting a per-frame line where the path is reached in bulk*,
+and half a fix still drowns the next person to read a stalled host.
+
+**The hub's memory is not shaped like the runner's, and should not be.** The
+runner has one hub, so a ring in its `Inner` keyed on `(job, attempt)` is
+enough. The hub serves every runner at once, so the same key would have two
+runners silencing each other's refusals. Rather than putting the runner's
+name *in* the key, `AlreadySaid` lives inside `relay_from_runner`, which
+serves exactly one connection: the name is in the key implicitly, and the
+bound gets a structural half the runner's ring cannot have — when the
+connection ends the memory goes with it, with no eviction policy and no lock
+on a hot path. It is still a ring (`REFUSALS_REMEMBERED`, 32) for the long
+tail of a link that stays up for days. A reconnect buys one line per attempt
+again, and that is right rather than a leak: a runner that dialled back and
+is still flushing a dead attempt is a *new* fact about a flapping link.
+
+The key carries the *kind* of refusal as well — superseded, the job is over,
+another runner's attempt, the standing could not be read. Collapsing those
+would be the opposite error to the one being fixed: an attempt that was
+superseded and whose job then ended is refused for a genuinely different
+reason the second time, and repeating the first reason for ever would make
+the journal wrong instead of merely quiet. At most four lines per attempt,
+one in practice. The refusal **on the wire** is untouched and still goes out
+once per frame — that is what stops the runner resending, so it is E-21 and
+not a logging question. The test asserts all three counts: one journal line,
+1497 refusals, 1497 `StaleAttempt` frames.
+
+**The lesson that generalises past this entry: a defect found on one side of
+a protocol is worth looking for on the other.** That is twice in one day. The
+`{j}` fill was the first — the runner's `{in}`/`{out}` handling and the hub's
+`{j}` turned out to be the same defect sitting in two places — and this is
+the second, with both ends of the link having grown the same per-frame line
+without either one copying the other. Two implementations of one
+conversation make the same mistakes about it, because the mistake is in how
+the conversation is thought about rather than in either codebase. Looking
+across is cheap; it has now paid twice.
+
 **On testing a count rather than a sentence.** The defect was never what the
 line said; it was that one true line was written 1497 times. A test asserting
 the wording would go green again the day somebody reintroduces the loop
@@ -5660,3 +5703,15 @@ to the descriptor, where `testing::stderr_lines_about` can divert and count
 it. Same bytes, same place, and the invariant is now measurable rather than
 merely asserted. With the gate removed the test reports `1497`, which is the
 field failure reproduced exactly.
+
+The hub's test is built the same way and proved the same way:
+`a_burst_of_refused_frames_leaves_one_line_in_the_hub_s_journal` drives the
+real `is_current` with a job the store has never heard of — which is exactly
+what a written-off attempt looks like from the hub — and with the dedupe
+removed it reports `1497` as well. `herd-hub` therefore has a `journal()` of
+its own, a deliberate twin of the runner's rather than something shared: a
+logging helper is not a protocol message, so it has no business in
+`herd-proto`, and four lines in each binary is cheaper than a crate that
+exists to hold them. The hub's unit tests reach
+`herd_runner::testing::stderr_lines_about` through the dev-dependency on
+`herd-runner` that its end-to-end tests already need.

@@ -46,7 +46,7 @@
 //!   is retried for as long as it takes and never dropped (D19); output the
 //!   hub is missing is asked for again before the log is declared short (D29).
 
-use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -2905,6 +2905,10 @@ async fn relay_from_runner(
     source: &mut Source,
     kicked: &mut watch::Receiver<bool>,
 ) -> Result<()> {
+    // Lives exactly as long as this connection, which is what makes the
+    // runner's name part of its key without being in it, and what frees it
+    // with no eviction policy when the runner goes (D151).
+    let mut said = AlreadySaid::new();
     loop {
         let message = tokio::select! {
             // The hub has accepted a newer connection from this runner; this
@@ -2932,7 +2936,7 @@ async fn relay_from_runner(
                 // rather than landing in the hub's picture of this runner.
                 let mut its_own = Vec::new();
                 for job in jobs {
-                    if mind_a_reported_job(state, name, outbox, &job) {
+                    if mind_a_reported_job(state, name, outbox, &mut said, &job) {
                         its_own.push(job);
                     }
                 }
@@ -2988,7 +2992,7 @@ async fn relay_from_runner(
                 );
             }
             ToHub::JobStarted { job_id, attempt } => {
-                if !is_current(state, name, outbox, &job_id, attempt) {
+                if !is_current(state, name, outbox, &mut said, &job_id, attempt) {
                     continue;
                 }
                 // A failure here is the hub's disk, not the runner's doing, so
@@ -3032,7 +3036,7 @@ async fn relay_from_runner(
                 seq,
                 data,
             } => {
-                if !is_current(state, name, outbox, &job_id, attempt) {
+                if !is_current(state, name, outbox, &mut said, &job_id, attempt) {
                     continue;
                 }
                 let (written, followers) = state.record_chunk(&job_id, stream, seq, &data);
@@ -3164,7 +3168,7 @@ async fn relay_from_runner(
                 attempt,
                 step,
             } => {
-                if !is_current(state, name, outbox, &job_id, attempt) {
+                if !is_current(state, name, outbox, &mut said, &job_id, attempt) {
                     continue;
                 }
                 // Said out loud and recorded, and a failure to record it is
@@ -3186,7 +3190,7 @@ async fn relay_from_runner(
                 steps,
                 outputs,
             } => {
-                if !is_current(state, name, outbox, &job_id, attempt) {
+                if !is_current(state, name, outbox, &mut said, &job_id, attempt) {
                     continue;
                 }
                 // The steps before the end: the attempt's four lines are part
@@ -3284,7 +3288,7 @@ async fn relay_from_runner(
                 attempt,
                 reason,
             } => {
-                if !is_current(state, name, outbox, &job_id, attempt) {
+                if !is_current(state, name, outbox, &mut said, &job_id, attempt) {
                     continue;
                 }
                 println!("herd-hub: attempt {attempt} of {job_id} was abandoned: {reason}");
@@ -3302,6 +3306,99 @@ async fn relay_from_runner(
     }
 }
 
+/// One line of the hub's journal, written to the descriptor rather than
+/// through `eprintln!`.
+///
+/// The same bytes to the same place; the difference is that they can be
+/// counted. `eprintln!` consults libtest's per-thread output capture, which
+/// std also hands to every thread a test spawns, so under `cargo test` the
+/// macro's lines never reach file descriptor 2 and no test can measure how
+/// many of them a path wrote. For D151 that count is the whole assertion —
+/// the defect was never what the line said, it was that one true line was
+/// written once per frame — so this path writes where a test can divert it.
+///
+/// The twin of `herd_runner::journal`, and deliberately a twin rather than
+/// something shared: a logging helper is not a protocol message, so it has no
+/// business in `herd-proto`, and four lines in each binary is cheaper than a
+/// crate that exists to hold them.
+fn journal(line: &str) {
+    use std::io::Write;
+    // A journal that cannot be written to is not worth bringing a hub down
+    // over: the line is lost, the service is not.
+    let _ = writeln!(std::io::stderr().lock(), "{line}");
+}
+
+/// Why a frame about an attempt was refused, to the precision the journal
+/// needs to avoid repeating itself (D151).
+///
+/// Only the *kind*, not the sentence: two frames refused for the same reason
+/// about the same attempt produce the same line, and the second one is worth
+/// nothing to a reader. A change of kind is worth a line, which is why this
+/// is part of the key rather than collapsed away — an attempt that was
+/// superseded and whose job then ended is refused for a genuinely different
+/// reason the second time, and saying the first reason for ever would make
+/// the hub's journal wrong rather than merely quiet.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Refusal {
+    Superseded,
+    JobIsOver,
+    AnotherRunner,
+    Unreadable,
+}
+
+/// How many refusals one connection remembers having already written down
+/// (D151).
+///
+/// A connection holds a handful of a runner's attempts at a time, so this is
+/// wide enough that the refusals in flight cannot push each other out; the
+/// ring exists for the long tail, a link that stays up for days and
+/// accumulates written-off attempts one at a time. Forgetting the oldest
+/// costs at most a second line about an attempt whose frames stopped arriving
+/// long ago.
+const REFUSALS_REMEMBERED: usize = 32;
+
+/// The refusals this **one connection** has already written to the journal.
+///
+/// Per connection, and that is the whole design rather than an accident of
+/// where it is declared. The hub refuses frames from every runner it serves,
+/// so a memory of "attempts already announced" has to be keyed by runner as
+/// well as by attempt or two runners would silence each other. Living inside
+/// [`relay_from_runner`], which serves exactly one connection, makes the
+/// runner's name part of the key implicitly and for free — and gives the
+/// bound a structural half the runner's own ring cannot have: when the
+/// connection ends the memory goes with it, so nothing survives a runner that
+/// is gone.
+///
+/// A reconnect therefore allows one line again per attempt. That is right,
+/// not a leak: a runner that dialled back and is still flushing a dead
+/// attempt is a new fact about a link that is flapping, and exactly what
+/// somebody reading a stalled host wants to see once.
+struct AlreadySaid {
+    said: VecDeque<(JobId, u32, Refusal)>,
+}
+
+impl AlreadySaid {
+    fn new() -> Self {
+        Self {
+            said: VecDeque::new(),
+        }
+    }
+
+    /// Write `line`, unless this connection has already written one about
+    /// this attempt for this reason. Returns whether it wrote.
+    fn say_once(&mut self, job_id: &JobId, attempt: u32, why: Refusal, line: &str) -> bool {
+        let key = (job_id.clone(), attempt, why);
+        if self.said.contains(&key) {
+            return false;
+        }
+        if self.said.len() == REFUSALS_REMEMBERED {
+            self.said.pop_front();
+        }
+        self.said.push_back(key);
+        journal(line);
+        true
+    }
+}
 /// Whether a frame about an attempt is one the hub will act on, telling the
 /// runner by name when it is not (E-21).
 ///
@@ -3312,7 +3409,32 @@ async fn relay_from_runner(
 /// naming a live attempt is believed whoever sends it — the hub records the
 /// exit code, writes metrics it was handed, and leaves the record naming the
 /// runner that was really running the job.
-fn is_current(state: &State, from: &str, outbox: &Outbox, job_id: &JobId, attempt: u32) -> bool {
+///
+/// `said` is this connection's memory of what it has already written down,
+/// so that a burst of refused frames about one attempt leaves one line and
+/// not one per frame (D151).
+fn is_current(
+    state: &State,
+    from: &str,
+    outbox: &Outbox,
+    said: &mut AlreadySaid,
+    job_id: &JobId,
+    attempt: u32,
+) -> bool {
+    // Every arm below refuses by name on the wire **every time**, and is
+    // quiet in the journal after the first: the frame the runner gets back is
+    // what stops it resending, so silencing that would break E-21, while
+    // silencing the repeated journal line costs a reader nothing and costs a
+    // stalled host 1496 writes it did not need to make.
+    let mut refused = |why: Refusal, reason: String| {
+        said.say_once(job_id, attempt, why, &format!("herd-hub: {reason}"));
+        let _ = outbox.send(FromHub::StaleAttempt {
+            job_id: job_id.clone(),
+            attempt,
+            reason,
+        });
+        false
+    };
     match state.standing_of(job_id, attempt, from) {
         // Every frame about the attempt that is current — a start, a chunk, an
         // end, a health report naming it — is word that the attempt is alive,
@@ -3321,51 +3443,40 @@ fn is_current(state: &State, from: &str, outbox: &Outbox, job_id: &JobId, attemp
             state.attempt_was_heard_of(job_id);
             true
         }
-        Ok(Standing::Superseded) => {
-            let reason = format!(
+        Ok(Standing::Superseded) => refused(
+            Refusal::Superseded,
+            format!(
                 "attempt {attempt} of {job_id} is not the attempt this hub is waiting for; \
                  nothing of it is recorded"
-            );
-            eprintln!("herd-hub: {reason}");
-            let _ = outbox.send(FromHub::StaleAttempt {
-                job_id: job_id.clone(),
-                attempt,
-                reason,
-            });
-            false
-        }
+            ),
+        ),
         // A record that is over. Refused by name, with the state it reached:
         // whoever sent this is holding something about a job whose story is
         // told, and the one thing that must not happen is for it to be
         // appended to a log a reader has already been given as complete.
-        Ok(Standing::JobIsOver { state }) => {
-            let reason = a_frame_about_a_job_that_is_over_reason(job_id, &state, attempt);
-            eprintln!("herd-hub: {reason}");
-            let _ = outbox.send(FromHub::StaleAttempt {
-                job_id: job_id.clone(),
-                attempt,
-                reason,
-            });
-            false
-        }
+        Ok(Standing::JobIsOver { state }) => refused(
+            Refusal::JobIsOver,
+            a_frame_about_a_job_that_is_over_reason(job_id, &state, attempt),
+        ),
         // Somebody else's attempt. Refused by name, and the clock on the real
         // attempt is untouched: a frame from the wrong runner is not evidence
         // that the attempt is alive, and letting it count would have a
         // bystander keep a dead attempt from ever being requeued.
-        Ok(Standing::AnotherRunner { holder }) => {
-            let reason = not_this_runner_s_attempt_reason(job_id, attempt, &holder, from);
-            eprintln!("herd-hub: {reason}");
-            let _ = outbox.send(FromHub::StaleAttempt {
-                job_id: job_id.clone(),
-                attempt,
-                reason,
-            });
-            false
-        }
+        Ok(Standing::AnotherRunner { holder }) => refused(
+            Refusal::AnotherRunner,
+            not_this_runner_s_attempt_reason(job_id, attempt, &holder, from),
+        ),
         // Not knowing is not a licence to write: the frame is left alone and
-        // the runner keeps holding whatever it was about.
+        // the runner keeps holding whatever it was about. Said once too — a
+        // store that cannot be read is read no better on the second frame of
+        // a burst, and this arm floods on exactly the same trigger.
         Err(error) => {
-            eprintln!("herd-hub: reading which attempt {job_id} is on failed: {error}");
+            said.say_once(
+                job_id,
+                attempt,
+                Refusal::Unreadable,
+                &format!("herd-hub: reading which attempt {job_id} is on failed: {error}"),
+            );
             false
         }
     }
@@ -3383,8 +3494,14 @@ fn is_current(state: &State, from: &str, outbox: &Outbox, job_id: &JobId, attemp
 /// that it has sent more. Asking on sight would have the hub ask for output
 /// it is in the middle of recording, every fifteen seconds, for every running
 /// job.
-fn mind_a_reported_job(state: &State, from: &str, outbox: &Outbox, job: &RunningJob) -> bool {
-    if !is_current(state, from, outbox, &job.job_id, job.attempt) {
+fn mind_a_reported_job(
+    state: &State,
+    from: &str,
+    outbox: &Outbox,
+    said: &mut AlreadySaid,
+    job: &RunningJob,
+) -> bool {
+    if !is_current(state, from, outbox, said, &job.job_id, job.attempt) {
         return false;
     }
     let recorded = match state.store.chunks_recorded(&job.job_id) {
@@ -6259,6 +6376,104 @@ mod tests {
                 && said.contains("a-declared-command")
                 && said.contains("cached by (commit, command, args)"),
             "the refusal names the token, the command and why: {said}"
+        );
+    }
+
+    /// The hub's half of D151: a burst of frames about one written-off
+    /// attempt leaves **one** line in the journal, not one line per frame.
+    ///
+    /// The same field failure as the runner's, from the other end of the
+    /// link. The hub answers every frame of a dead attempt with its own
+    /// `StaleAttempt` — which is correct and is not touched here — and it
+    /// also wrote `herd-hub: {reason}` beside each one, so the 1497 buffered
+    /// chunks of `j0000000057` cost the hub 1497 writes into Docker's
+    /// logging stack while the host it shares with the runner was stalled at
+    /// 96 %.
+    ///
+    /// The assertion is the **count of writes**, not the wording: a test on
+    /// the sentence would pass again the day the per-frame line comes back
+    /// phrased differently. The refusal *on the wire* is counted too, and
+    /// must stay at one per frame — silencing that would stop the runner
+    /// learning its attempt is dead, which is E-21 and not a logging
+    /// question.
+    #[tokio::test]
+    async fn a_burst_of_refused_frames_leaves_one_line_in_the_hub_s_journal() {
+        let dir = tempfile::tempdir().expect("a temporary state directory");
+        let state = State {
+            store: Arc::new(JobDirStore::open(dir.path()).expect("the state root opens"))
+                as Arc<dyn JobStore>,
+            policy: Policy::default(),
+            authority: Authority::default(),
+            started: Instant::now(),
+            peers: Mutex::new(Peers::default()),
+            dispatching: Mutex::new(()),
+        };
+        let (outbox, mut inbox) = mpsc::unbounded_channel();
+        // A job this hub has no record of is exactly what a written-off
+        // attempt looks like from here: superseded, nothing to record.
+        let job_id = JobId::new("j0000000057");
+        let mut said = AlreadySaid::new();
+
+        let frames = 1497;
+        let (refused, written) = herd_runner::testing::stderr_lines_about("j0000000057", || {
+            (0..frames)
+                .filter(|_| !is_current(&state, "the-runner", &outbox, &mut said, &job_id, 1))
+                .count()
+        });
+
+        assert_eq!(
+            written.len(),
+            1,
+            "{frames} refused frames about one attempt must write one journal line, not {}: \
+             {written:#?}",
+            written.len()
+        );
+        assert_eq!(
+            refused, frames,
+            "every one of them must still be refused: the quiet is in the journal, not on \
+             the wire"
+        );
+        let mut told = 0;
+        while inbox.try_recv().is_ok() {
+            told += 1;
+        }
+        assert_eq!(
+            told, frames,
+            "and the runner must be told every time, or it never learns the attempt is dead"
+        );
+
+        // Another attempt of the same job is a different fact and is worth
+        // its own line: the quiet is per attempt, not per job.
+        let (_, written) = herd_runner::testing::stderr_lines_about("j0000000057", || {
+            is_current(&state, "the-runner", &outbox, &mut said, &job_id, 2)
+        });
+        assert_eq!(
+            written.len(),
+            1,
+            "silencing the repeats must not silence another attempt: {written:#?}"
+        );
+    }
+
+    /// What one connection remembers is bounded, and it is freed with the
+    /// connection rather than by an eviction policy — so the only bound that
+    /// has to be proved is the ring's (D151).
+    #[test]
+    fn what_a_connection_remembers_about_refusals_is_bounded() {
+        let mut said = AlreadySaid::new();
+        herd_runner::testing::stderr_lines_about("", || {
+            for n in 0..(REFUSALS_REMEMBERED * 4) {
+                said.say_once(
+                    &JobId::new(format!("j{n:010}")),
+                    1,
+                    Refusal::Superseded,
+                    "herd-hub: written off",
+                );
+            }
+        });
+        assert_eq!(
+            said.said.len(),
+            REFUSALS_REMEMBERED,
+            "the ring must stop at {REFUSALS_REMEMBERED}, not grow with the connection"
         );
     }
 }
