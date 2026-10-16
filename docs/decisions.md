@@ -4992,3 +4992,62 @@ left alone.
 that had claimed 146 was on a branch this one overtook, and it is now 147.
 The file is read in order, so order is what is kept — the same collision
 D145 describes, resolved the same way.
+
+---
+
+## 2026-10-16 — D147 The first files home, and the first figures under qos
+
+**A job's files come home on the real deployment, and this is the entry
+that stops that being a claim about a test suite.** The first consumer's
+`j0000000030` (declared `sh`) and `j0000000031` (declared `test posix -j 1`,
+labels `build`+`kvm`) both ended at exit 0, and their `results.json` — 50 and
+616 bytes — are in `jobs/<id>/files/` on the hub's disk. I read them there
+rather than taking the report: the 616-byte one carries the consumer's own
+verdict object, `"verdict":"ok"`, `"seconds":189.1`, and a `load_after` of
+**118.34**. So D131's ruling and D137's cap are not merely built; the path
+from a job's `{out}` to a requester's directory has run end to end on this
+host, which is the one claim M16's deployment could not make this morning.
+
+**What that job's own figures say about the host.** It ran `posix` in 57.5 s
+of a 189 s job while the machine's load reached 118, and it neither failed nor
+was throttled out of existence. The job's cgroup carried the caps and the
+scheduler did the rest.
+
+**The first measurement of `io.cost.qos` under load, from the consumer.**
+D136 asked for a latency target and somebody set it; D135 built the hard
+ceiling. Their first data point, during an ACL walk plus a QEMU: IO pressure
+`full avg10` reached **95 % for one to two minutes**, spread **evenly** across
+`docker.service`, `user.slice`, `herd-runner.service` and their own slice
+(60-80 % `full avg60` each), with NVMe `inflight` at 0 at the sample — and it
+fell back to 4.8 % within about 20 s. **No freeze of the kind this host used
+to have.**
+
+Three things worth keeping from that, in order of how much they cost us to
+learn:
+
+- **Even spread is the signature of apportionment working**, not of a
+  bottleneck. Before the latency target, `rpct=0.00 wpct=0.00` meant
+  blk-iocost apportioned the device and never reduced total load (D120,
+  D136), so one writer could hold the disk while the pressure figure said
+  everyone was stalled. Four slices each at 60-80 % with the device *idle*
+  at the sample is the controller holding each of them to a share.
+- **A pressure figure near 100 % is not a verdict about the machine.** E-32
+  says pressure is recorded and gates nothing, and this is the first live
+  evidence for why: 95 % `full avg10` for two minutes, and the host stayed
+  usable. A gate on that number would have refused every job for two minutes
+  and been wrong each time.
+- **`inflight` 0 under 95 % pressure** means the stall was in waiting, not in
+  the device. Pressure measures time processes could not make progress; it
+  does not say the disk was busy. Anyone reading these numbers later should
+  not infer saturation from them.
+
+This is one data point, taken during an unusual operation, and it is not a
+heavy window. The consumer will send figures from a real one. Recorded now
+because it is the first evidence either way, and because the shape of it —
+even, brief, recovered — is what we would want to see again.
+
+**What is still unproven, so that this entry does not overstate.** The
+reaper's janitor list is unbuilt (D134) and the consumer's failing `up` steps
+walked into it: when a `down` step fails too, nothing here sweeps after it.
+No `wss://` dial has happened. And the runner's unit is still transient
+(D130), so every cap in D144 survives exactly until the next reboot.
