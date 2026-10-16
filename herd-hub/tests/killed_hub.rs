@@ -753,36 +753,33 @@ async fn a_busy_runner_asked_to_stop_is_gone_in_five_seconds() {
     let asked_at = Instant::now();
     runner.ask_it_to_stop();
 
-    // A job submitted while it is draining is refused by name, rather than
-    // handed to a runner that is leaving. Polled, because the refusal becomes
-    // true the moment the hub hears the runner is draining — which is the
-    // first thing a draining runner says.
+    // A job submitted while it is draining is **queued and explained**, not
+    // refused (D140): a runner that is leaving is a fleet that is away, and
+    // D88's reason applies — it will dial back. It used to be refused, which
+    // meant this very test's own submission got exit 125 for a machine whose
+    // owner was restarting it.
     //
-    // `submit` and not `run`: both go through the same gate and get the same
-    // refusal, but `run` *waits* for a job it was given, and one accepted in
-    // the moment before the hub hears the runner is draining is a job nothing
-    // will pick up — which made this poll hang until its own patience ran out
-    // instead of trying again.
-    let mut refusal = String::new();
-    let deadline = Instant::now() + Duration::from_secs(5);
-    while Instant::now() < deadline {
-        let attempt = herd
-            .herdctl(&["submit", "--", "/bin/sh", "-c", "true"])
-            .await;
-        if !attempt.status.success() {
-            refusal = String::from_utf8_lossy(&attempt.stderr).into_owned();
-            assert_eq!(
-                attempt.status.code(),
-                Some(125),
-                "a refused submission has no verdict to report (D20): {refusal}"
-            );
-            break;
-        }
-    }
+    // `submit` and not `run`, still: `run` would follow a job nothing here
+    // will ever pick up, and this test is about the five seconds, not about
+    // that wait.
+    let while_draining = herd
+        .herdctl(&["submit", "--", "/bin/sh", "-c", "true"])
+        .await;
     assert!(
-        refusal.contains("draining") || refusal.contains("no runner is connected"),
-        "a job submitted while the runner is stopping must be refused by name: {refusal:?}"
+        while_draining.status.success(),
+        "a runner on its way out is away, not broken (D88, D140): {}",
+        String::from_utf8_lossy(&while_draining.stderr)
     );
+    let queued_anyway = String::from_utf8_lossy(&while_draining.stdout)
+        .trim()
+        .to_owned();
+    // Named on its record, whichever side of the departure the pass landed
+    // on: a runner that says it is draining, or one that has gone.
+    herd.wait_until("the hub says why the new job is waiting", || {
+        let why = herd.waiting_for(&queued_anyway);
+        why.contains("draining") || why.contains("no runner is connected")
+    })
+    .await;
 
     // ---- And it is gone, inside the five seconds invariant 2 promises.
     let status = tokio::time::timeout(Duration::from_secs(5), runner.gone())
@@ -1549,21 +1546,31 @@ async fn a_runner_reporting_too_rarely_for_the_hub_s_threshold_is_refused_by_fig
     );
 
     // Nothing was placed on it, so no job was ever put at risk: the
-    // submission is refused by name instead of being handed to a runner whose
-    // job the hub would declare lost between two of its own reports.
-    let output = herd
-        .herdctl(&["run", "--", "/bin/sh", "-c", "sleep 30"])
-        .await;
-    assert_eq!(
-        output.status.code(),
-        Some(125),
-        "Herd's own failure to place a job is 125: {}",
-        String::from_utf8_lossy(&output.stderr)
-    );
+    // submission **waits** instead of being handed to a runner whose job the
+    // hub would declare lost between two of its own reports (D140 — the
+    // machine is approved, so this is a fleet that is away and not a roster
+    // that is empty).
+    let waiting = herd.submit("printf 'not on that runner\\n'").await;
+    herd.wait_until("the hub says why the job is waiting", || {
+        herd.waiting_for(&waiting)
+            .contains("no runner is connected to this hub")
+    })
+    .await;
+    let record = herd.record(&waiting);
+    assert_eq!(record["state"]["type"], "queued", "{record}");
     assert!(
-        String::from_utf8_lossy(&output.stderr).contains("no runner is connected"),
-        "and it says why: {}",
-        String::from_utf8_lossy(&output.stderr)
+        record["attempts"]
+            .as_array()
+            .is_none_or(|made| made.is_empty()),
+        "a runner the hub turned away is never handed a job: {record}"
+    );
+    // Cancelled before the machine is let back in, so this test's own queue
+    // cannot get in the way of the next thing it asserts.
+    let cancelled = herd.herdctl(&["cancel", &waiting]).await;
+    assert!(
+        cancelled.status.success(),
+        "a cancel reaches a job waiting for an away fleet: {}",
+        String::from_utf8_lossy(&cancelled.stderr)
     );
 
     // The same machine, reporting often enough, is welcome: what was refused

@@ -4618,3 +4618,69 @@ holder name was needed and none was guessed. If Herd should assert attribution
 it goes in a `NOTICE` file or in file headers, with a name only Alexa can
 give. That is a one-line addition whenever he wants it, and its absence
 changes nothing about the grant.
+
+---
+
+## 2026-10-16 — D142 D140 carried out: the roster refuses, the fleet waits
+
+**What changed.** A submission is refused in **one** fleet state now: no
+runner is approved on this state root. Everything else about a fleet that is
+away — nobody connected this second, every runner draining, every runner
+switched off by its owner — **queues** the job. Alexa approved D140; this is
+the ruling built, and no frame moved: `PROTOCOL_VERSION` and `RECORD_VERSION`
+stay at 1 (D124, D128).
+
+**The sentence is the one that already existed, and that is the point.** A
+queued job's words come from `matcher::place` and are wrapped in M8's
+explained wait by the one path every queued job goes through — the position,
+what is ahead, and why (E-04, E-36). So a job queued a moment after the last
+link dropped reads exactly like one queued a minute before it, which is what
+the two answers to one fleet state had made impossible.
+
+**The second check after the pass is gone.** The submission path used to
+re-ask "is there a runner?" *after* its dispatch pass and refuse if not. That
+was the half of the defect that is hardest to see: the pass had already
+written the job's wait on its record, and the refusal then threw the
+follower away and answered 125 about a job that exists.
+
+**What bounds such a job, asserted rather than assumed.** E-09's deadline is
+D88's only bound on a job nothing can run, and it is judged in
+`matcher::place` **before** anything about the fleet — so a pass fired by the
+queue's own ageing loop cancels a job waiting for an empty fleet with no
+runner connected at all. A cancel reaches it where it stands, because
+cancelling a queued job is a store write and asks no machine. Both are in
+`herd-hub/tests/away_fleet.rs`, with the real binaries, beside E-04's
+restatement reaching a `herdctl wait` on such a job.
+
+**Not touched: the unplaceable-forever case M7 and D88 settled.** A job
+needing a capability no connected runner declares still **waits**, with `no
+connected runner can run it: …`, and a job whose own figures contradict each
+other still ends terminally (`Placement::Impossible`). Neither was in D140's
+scope and neither moved.
+
+**What an existing requester notices.** A submission that used to exit 125
+during a hub restart, a runner restart or a brief disconnection now returns an
+id and the job runs when the fleet comes back. A wrapper that read 125 as
+"decline, do not duplicate" gets a verdict instead — strictly better, and
+E-05 already made retrying safe. The only refusal left is the one a person has
+to fix, and it quotes the hub's own startup line: `0 runner(s) are approved on
+this state root`. A requester that wants a bound on waiting passes
+`--deadline`, which is where D88 says a bound on waiting belongs.
+
+**And `{j}`, the second instance of D107's defect.** `with_parallelism` filled
+`{j}` over the whole command *after* `herdctl` had quoted the requester's
+arguments into it, so an argument saying `{j}` became a thread count — and
+`parallelism_tokens` counted it, which was worse: two of them end the job by
+name. Fixed the way D139 fixed `{in}` and `{out}` in the runner, and with the
+*same function*: `herd_proto::declared_spans` holds the argument spans out of
+the pass and the declared text around them is filled. `herd-runner`'s own
+`line_filled` now calls it too, so the two paths cannot drift. The property
+preserved is D107's: **a value a substitution pasted in is never itself
+scanned for tokens** — the failure direction is a declared token left
+literal, never a requester's text turned into a figure.
+
+**Found on the way, not fixed.** `herdctl` prints `job-unknown` for a
+submission the hub **refused in a frame**, where `no-job` is the true answer:
+a refusal is the hub saying it minted nothing. That is D139's discriminator
+and it predates this change. Left alone because it is a `herdctl` behaviour
+D140 does not rule on, and noted in `away_fleet.rs` where it shows.
