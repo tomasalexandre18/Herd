@@ -43,7 +43,8 @@ use std::path::Path;
 use std::time::Duration;
 
 use herd_proto::{
-    args_as_line, Declaration, JobId, Step, IN_TOKEN, JOB_TOKEN, LINE_TOKEN, OUT_TOKEN,
+    filled_outside_the_arguments, Declaration, JobId, Step, IN_TOKEN, JOB_TOKEN, LINE_TOKEN,
+    OUT_TOKEN,
 };
 
 /// The shell every hook is handed to.
@@ -237,26 +238,15 @@ pub(crate) fn planned(
 /// requester's arguments contributed are held out of the pass, and the
 /// declared text around them is filled.
 ///
-/// The arguments are held out by the only thing that identifies them
-/// exactly — the requester's own words, which already travel beside the line
-/// ([`Declaration::args`]) and are quoted into it by one function
-/// ([`args_as_line`]). Nothing is encoded, escaped or marked, and no frame
-/// changes. An empty argument list, or a line no `{args}` reached, means
-/// there is no requester text in the line at all, and it is filled whole.
+/// Holding the arguments out of the pass is [`filled_outside_the_arguments`],
+/// in `herd-proto`, because the hub's `{j}` has the same problem and one of
+/// the two solving it alone is how the two would drift.
 fn line_filled(line: &str, args: &[String], job: &str, in_dir: &str, out_dir: &str) -> String {
-    let fill = |text: &str| {
+    filled_outside_the_arguments(line, args, |text| {
         text.replace(JOB_TOKEN, job)
             .replace(IN_TOKEN, in_dir)
             .replace(OUT_TOKEN, out_dir)
-    };
-    let pasted = args_as_line(args);
-    if pasted.is_empty() || !line.contains(pasted.as_str()) {
-        return fill(line);
-    }
-    line.split(pasted.as_str())
-        .map(fill)
-        .collect::<Vec<_>>()
-        .join(&pasted)
+    })
 }
 
 /// Which figure bounds the `run` step.
@@ -315,7 +305,7 @@ fn run_cap(declared: Option<Duration>, own: Duration, command: &str) -> RunCap {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use herd_proto::{Executor, COMMIT_TOKEN};
+    use herd_proto::{args_as_line, Executor, COMMIT_TOKEN};
     use std::collections::BTreeMap;
     use std::path::PathBuf;
 

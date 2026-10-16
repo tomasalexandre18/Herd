@@ -36,9 +36,32 @@ enum WhatExists {
 }
 
 /// It only ever moves forward: once a submission has left, no later failure
-/// can make it not have left.
+/// can make it not have left. The one step back there is does not come
+/// through here — see [`refused`], which is narrow on purpose.
 fn learn(known: &Cell<WhatExists>, now: WhatExists) {
     known.set(known.get().max(now));
+}
+
+/// The hub refused the submission in a frame, which is **proof** that it
+/// minted nothing: `Unknown` becomes `Nothing`, and nothing else moves.
+///
+/// Deliberately not [`learn`]. The ratchet exists because a submission that
+/// has left cannot be made not to have left by a later failure, and that is
+/// still true of every failure — a dropped socket, a killed process, a frame
+/// nobody can read. A refusal is the single case where the hub has *said*
+/// what happened, and it is the case that matters most: it is the only one
+/// where re-running the work is safe, and `job-unknown` asks a falling-back
+/// requester to go looking for a job that does not exist (D139, D142).
+///
+/// So the step back is written out rather than expressed as an ordering, and
+/// it is written to be read: `AJob` stays `AJob` — an id has been printed and
+/// no later frame can unprint it — and `NotASubmission` stays itself, because
+/// a command that submits nothing has nothing to be refused about. Only the
+/// middle state moves, and only in the one direction.
+fn refused(known: &Cell<WhatExists>) {
+    if known.get() == WhatExists::Unknown {
+        known.set(WhatExists::Nothing);
+    }
 }
 
 /// The level a submission that does not name one is weighed at: the ordinary
@@ -1004,6 +1027,10 @@ fn say_it(known: &Cell<WhatExists>, said: herdctl::Said) {
         // Nothing is printed: the state is remembered, and said at the end
         // only if nothing better was learned (`JOB_UNKNOWN_LINE`).
         herdctl::Said::Submitting => learn(known, WhatExists::Unknown),
+        // Nothing is printed: the refusal is already the error this run ends
+        // with. **Not through `learn`** — this is the one step back, and it
+        // is narrow by construction (see `refused`).
+        herdctl::Said::Refused => refused(known),
         // Printed here and now, on stderr, because every failure that could
         // swallow it — including one that kills this process — is after
         // this point (`JOB_ID_PREFIX`).
@@ -1017,4 +1044,56 @@ fn say_it(known: &Cell<WhatExists>, said: herdctl::Said) {
 fn write_now(out: &mut impl Write, data: &[u8]) {
     let _ = out.write_all(data);
     let _ = out.flush();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The step back a refusal authorises is **one** transition, and the
+    /// ratchet keeps its meaning everywhere else (D139, D142).
+    ///
+    /// The emitting half of the guard — that `run_job` says this only while
+    /// no id has been learned — needs a hub that answers `JobAccepted` and
+    /// then refuses, which no hub does and which is not worth a fixture that
+    /// misbehaves on purpose. What *is* asserted here is the half that would
+    /// make such a hub harmless anyway: `AJob` does not move.
+    #[test]
+    fn a_refusal_walks_back_only_the_one_state_it_proves() {
+        // The case this exists for: the submission left, the hub refused it
+        // in a frame, so nothing was minted and re-running is safe.
+        let known = Cell::new(WhatExists::NotASubmission);
+        learn(&known, WhatExists::Nothing);
+        learn(&known, WhatExists::Unknown);
+        refused(&known);
+        assert_eq!(known.get(), WhatExists::Nothing);
+
+        // An id has been printed. No frame can unprint it, and a requester
+        // told no job exists would decline work that is already running.
+        let known = Cell::new(WhatExists::AJob);
+        refused(&known);
+        assert_eq!(known.get(), WhatExists::AJob);
+
+        // A command that submits nothing has nothing to be refused about,
+        // and must not start claiming otherwise.
+        let known = Cell::new(WhatExists::NotASubmission);
+        refused(&known);
+        assert_eq!(known.get(), WhatExists::NotASubmission);
+
+        // Already proven: idempotent, because nothing is printed for it and
+        // a second refusal says the same thing.
+        let known = Cell::new(WhatExists::Nothing);
+        refused(&known);
+        assert_eq!(known.get(), WhatExists::Nothing);
+
+        // And the ratchet itself is untouched: a later failure still cannot
+        // make a submission not have left.
+        let known = Cell::new(WhatExists::Unknown);
+        learn(&known, WhatExists::Nothing);
+        assert_eq!(
+            known.get(),
+            WhatExists::Unknown,
+            "only a refusal walks this back, and only because the hub said so"
+        );
+    }
 }

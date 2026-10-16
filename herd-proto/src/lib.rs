@@ -29,9 +29,9 @@ pub use capability::{
     OfferedCapability,
 };
 pub use declaration::{
-    args_as_line, shell_quote, Declaration, Executor, LabelsFrom, Requirements, Step, StepRun,
-    ARGS_TOKEN, COMMIT_TOKEN, IN_TOKEN, JOB_TOKEN, LABELS_KEY, LINE_TOKEN, MEMORY_KEY, OUT_TOKEN,
-    READING_KEYS, SCENARIOS_KEY, TMPFS_KEY,
+    args_as_line, declared_spans, filled_outside_the_arguments, shell_quote, Declaration, Executor,
+    LabelsFrom, Requirements, Step, StepRun, ARGS_TOKEN, COMMIT_TOKEN, IN_TOKEN, JOB_TOKEN,
+    LABELS_KEY, LINE_TOKEN, MEMORY_KEY, OUT_TOKEN, READING_KEYS, SCENARIOS_KEY, TMPFS_KEY,
 };
 pub use outputs::{
     check_relative, JobOutputs, OutputFile, FRAME_CEILING, MAX_OUTPUT_CAP, PER_FILE_OVERHEAD,

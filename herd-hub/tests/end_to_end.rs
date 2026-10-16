@@ -345,15 +345,58 @@ async fn a_version_mismatch_is_refused_naming_both_versions() {
     }
 }
 
+/// The one fleet state a submission is refused in: a state root on which no
+/// runner is approved (D140).
+///
+/// Not "no runner is connected" any more. A fleet that is merely away queues
+/// the job with the sentence the queue already had for it, because D88 says a
+/// fleet is not a closed world; an **empty roster** is a configuration
+/// mistake, and a job queued against it would wait for nobody coming. Which
+/// of the two a hub is in is a fact on its disk, not a guess about the moment.
+/// `away_fleet.rs` drives the other half against the real binaries.
 #[tokio::test]
-async fn a_submission_with_no_runner_is_refused_by_name() {
+async fn a_submission_with_an_empty_roster_is_refused_by_name() {
     let harness = Harness::with_hub().await;
     let error = support::run_job(&harness.requester(), shell("true"), |_, _| {})
         .await
-        .expect_err("there is nothing to run the job on");
+        .expect_err("nothing submitted to a hub with an empty roster could ever start");
+    let said = format!("{error:#}");
     assert!(
-        error.to_string().contains("no runner is connected"),
-        "a wait with no runner must be named, not silent: {error:#}"
+        said.contains("0 runner(s) are approved on this state root"),
+        "the refusal must name the state the hub is in: {said}"
+    );
+    assert!(
+        said.contains("herdctl runner approve"),
+        "and what to do about it: {said}"
+    );
+}
+
+/// And with the roster populated and nothing connected, the same submission
+/// is **queued** — the state that used to decide a job's fate by whether it
+/// arrived a moment before or after the last link dropped (D88, D140).
+#[tokio::test]
+async fn a_submission_with_the_roster_populated_and_nobody_connected_is_queued() {
+    let harness = Harness::with_hub().await;
+    let _token = harness.approve("the-machine-that-is-away");
+    let job = herdctl::submit_job(
+        &harness.requester(),
+        shell("true"),
+        herd_proto::LabelSet::default(),
+        herd_proto::Priority::Step,
+        herdctl::Declared::default(),
+    )
+    .await
+    .expect("a fleet that is away queues a job, it does not refuse one");
+    let record = harness
+        .store
+        .job(&job)
+        .expect("the record reads")
+        .expect("the submission minted a record");
+    assert_eq!(record.state, JobState::Queued);
+    let why = record.waiting_for.unwrap_or_default();
+    assert!(
+        why.contains("no runner is connected to this hub"),
+        "and it gets the one sentence the queue already had, not a second one: {why}"
     );
 }
 

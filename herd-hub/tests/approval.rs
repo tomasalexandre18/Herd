@@ -62,9 +62,12 @@ async fn an_unapproved_runner_gets_no_job_and_one_approval_lets_it_run() {
         "a submission must not succeed when the only machine is unapproved"
     );
     let why = String::from_utf8_lossy(&refused.stderr).into_owned();
+    // By the roster, which is the fact that makes this a refusal rather than
+    // a wait: nobody is approved here, so nothing submitted could ever start
+    // (D140). A machine that *is* approved and merely away queues the job.
     assert!(
-        why.contains("no runner is connected"),
-        "and the requester is told there is nowhere to run it: {why}"
+        why.contains("0 runner(s) are approved on this state root"),
+        "and the requester is told there is nowhere to run it, ever: {why}"
     );
 
     // ---- One operator action.
@@ -186,7 +189,8 @@ async fn a_removed_runner_can_no_longer_claim_and_is_told_why() {
         "a submission must not succeed when the fleet has been emptied"
     );
     assert!(
-        String::from_utf8_lossy(&after.stderr).contains("no runner is connected"),
+        String::from_utf8_lossy(&after.stderr)
+            .contains("0 runner(s) are approved on this state root"),
         "and the requester is told why: {}",
         String::from_utf8_lossy(&after.stderr)
     );

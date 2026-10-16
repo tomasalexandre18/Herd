@@ -1116,7 +1116,9 @@ fn claim(
     // of this is M7's; these are the two figures M8 adds.
     seat.reserved.take(memory_mib, tmpfs_mib);
     let command = match derived {
-        Some(derived) => herd_proto::with_parallelism(&record.command, derived.threads),
+        Some(derived) => {
+            herd_proto::with_parallelism(&record.command, record.requester_args(), derived.threads)
+        }
         None => record.command.clone(),
     };
     Placement::Claim {
@@ -1238,7 +1240,7 @@ fn nothing_can_ever_run_this(record: &JobRecord) -> Option<String> {
                 .to_owned(),
         );
     }
-    match herd_proto::parallelism_tokens(&record.command) {
+    match herd_proto::parallelism_tokens(&record.command, record.requester_args()) {
         1 => None,
         0 => Some(format!(
             "this job asks for a -j derived from {mib} MiB per build thread, and its command \
@@ -1724,6 +1726,50 @@ mod tests {
         ));
         assert!(why.contains("-j 6"), "two slots halve the share: {why}");
         assert!(why.contains("shared between 2 slots"), "{why}");
+    }
+
+    /// **The hub's own instance of D107's defect, closed (D139, D140).**
+    ///
+    /// `{j}` is filled here, *after* `herdctl` quoted the requester's
+    /// arguments into the line (D107) — so a pass over the whole command
+    /// turned an argument that said `{j}` into a thread count, and the count
+    /// read two tokens where the declaration wrote one, which ends the job by
+    /// name. The declared `{j}` is filled and the argument is not: D107's
+    /// property is that a value a substitution pasted in is never itself
+    /// scanned for tokens.
+    #[test]
+    fn a_parallelism_token_a_requester_typed_in_an_argument_stays_text() {
+        let args = vec!["--only".to_owned(), "{j}".to_owned()];
+        let mut record = a_build("j1", 1792);
+        // The line as `herdctl` resolved it, before the job was minted: one
+        // declared `{j}`, and the arguments quoted in beside it.
+        record.command = vec![format!(
+            "cargo xtask pack -j {} {}",
+            herd_proto::PARALLELISM_TOKEN,
+            herd_proto::args_as_line(&args)
+        )];
+        record.declaration = Some(herd_proto::Declaration {
+            command: "fixture".to_owned(),
+            commit: "a".repeat(40),
+            args,
+            executor: herd_proto::Executor::default(),
+        });
+        let mut fleet = vec![her_pc()];
+        let placement = place(
+            &record,
+            &mut fleet,
+            now(),
+            Stickiness::default(),
+            &Placing::default(),
+        );
+        match &placement {
+            Placement::Claim { command, .. } => assert_eq!(
+                command,
+                &vec!["cargo xtask pack -j 7 '--only' '{j}'".to_owned()],
+                "the declared token is a figure and the requester's is three characters"
+            ),
+            other => panic!("one declared token is one place for the figure: {other:?}"),
+        }
     }
 
     /// **Attack 8 and 10.** A machine that does not say how big it is takes
