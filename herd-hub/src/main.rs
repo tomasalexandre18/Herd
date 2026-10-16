@@ -5,8 +5,9 @@ use std::sync::Arc;
 use anyhow::{Context, Result};
 use clap::Parser;
 use herd_hub::{
-    Authority, Hub, JobDirStore, JobStore, Policy, Stickiness, AGING_STEP, DEFAULT_LISTEN_ADDR,
-    DRAIN_FIRST_LIMIT, LOST_AFTER, READING_CAP, REQUEUE_BUDGET, STICKINESS_LIMIT, WAIT_RESTATEMENT,
+    Authority, Budget, Hub, JobDirStore, JobStore, Policy, Stickiness, AGING_STEP,
+    DEFAULT_LISTEN_ADDR, DRAIN_FIRST_LIMIT, LOST_AFTER, OUTPUT_BUDGET, OUTPUT_FLOOR, READING_CAP,
+    REQUEUE_BUDGET, STICKINESS_LIMIT, WAIT_RESTATEMENT,
 };
 use herd_proto::{HEALTH_EVERY, STILL_THERE_EVERY};
 
@@ -130,6 +131,44 @@ struct Args {
     /// runner's own cap still bounds this and is never raised by it (D108).
     #[arg(long, env = "HERD_READING_CAP", default_value_t = READING_CAP.as_secs_f64())]
     reading_cap: f64,
+    /// How much of this hub's volume a job's output files may hold, in all
+    /// (D148, D152). `200GB`, `64MiB`, or a plain number of bytes.
+    ///
+    /// **The output files only**, not the state root: a record is kilobytes
+    /// and a log has a cap of its own (`--job-log-cap` on the runner), and
+    /// one number answering for three different things would be a number
+    /// nobody can reason about. It counts whole, verified collections in
+    /// every job's `files/`; a collection still crossing is outside it,
+    /// because evicting a transfer in flight would destroy the thing the
+    /// hub is being given.
+    ///
+    /// **It is a chosen figure and not a derived one.** Nothing computed
+    /// 200 GB: the arithmetic that would — a few hundred megabytes times the
+    /// jobs a day that really leave that much — needs a distribution only
+    /// the first consumer has. D148 says at length why that matters.
+    #[arg(
+        long,
+        env = "HERD_OUTPUT_BUDGET",
+        default_value_t = herd_proto::show_bytes(OUTPUT_BUDGET),
+        value_name = "SIZE",
+    )]
+    output_budget: String,
+    /// Seconds a job's output files are promised before the sweeper may
+    /// take them (D148, D152). Seven days.
+    ///
+    /// **A floor, not a lifetime.** Nothing is removed for merely being
+    /// older than this, and a collection outlives it by as long as the
+    /// budget allows; what it does is keep a fresh collection safe while
+    /// there is anything older to take instead. When honouring it would
+    /// mean going over the budget, the budget wins and this hub **says so
+    /// on the day**, naming both figures — a floor that broke quietly would
+    /// be worse than no floor, because the next thing that happens is a
+    /// full disk nobody saw coming.
+    ///
+    /// Zero turns the promise off, in the way `--aging-step 0` turns aging
+    /// off: everything is then evictable by the order alone.
+    #[arg(long, env = "HERD_OUTPUT_FLOOR", default_value_t = OUTPUT_FLOOR.as_secs_f64())]
+    output_floor: f64,
 }
 
 /// The shared requester token, from the file the operator named (Q8).
@@ -162,7 +201,15 @@ fn seconds(value: f64) -> std::time::Duration {
 #[tokio::main]
 async fn main() -> Result<()> {
     let args = Args::parse();
-    let store = JobDirStore::open(&args.state_dir).with_context(|| {
+    // Read before the state root is opened, because opening it sweeps: a
+    // budget that does not parse must stop the hub here, where the message
+    // names the figure the operator typed, and not after bytes have gone.
+    let budget = Budget {
+        bytes: herd_proto::parse_bytes(&args.output_budget)
+            .map_err(|why| anyhow::anyhow!("--output-budget: {why}"))?,
+        floor: seconds(args.output_floor),
+    };
+    let store = JobDirStore::open_with(&args.state_dir, budget).with_context(|| {
         format!(
             "the hub's state directory {} is not usable",
             args.state_dir.display()
@@ -219,6 +266,21 @@ async fn main() -> Result<()> {
          approved, or that carries the wrong token, is refused by name and claims nothing \
          (`herdctl runner approve <name>` mints one, `herdctl runner list` says who is \
          approved)"
+    );
+    // The two retention figures, printed like every other setting this hub
+    // has (D148). An operator reading one line has to be able to answer the
+    // consumer's own question — *how long do I have to fetch yesterday's
+    // failing screenshots?* — and the honest answer is two numbers and the
+    // sentence that joins them.
+    println!(
+        "herd-hub: a job's output files have {} on this volume, with the newest {} of them \
+         kept while there is anything older to remove instead; past the budget the oldest \
+         go first among the jobs that passed and were already fetched, and a collection \
+         still arriving is never removed. When honouring the floor would mean going over \
+         the budget, the budget wins and this hub says so on the day. A record keeps every \
+         path, size and digest for ever: only the bytes are ever removed.",
+        herd_proto::show_bytes(budget.bytes),
+        herd_hub::in_days(budget.floor),
     );
     // A timing that cannot mean what it says is refused here, before the port
     // is bound and before any runner can join (E-21, E-40).

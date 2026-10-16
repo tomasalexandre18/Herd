@@ -5715,3 +5715,221 @@ logging helper is not a protocol message, so it has no business in
 exists to hold them. The hub's unit tests reach
 `herd_runner::testing::stderr_lines_about` through the dev-dependency on
 `herd-runner` that its end-to-end tests already need.
+
+---
+
+## 2026-10-16 — D152 The output budget, and what order evidence goes in
+
+**D150 shipped the carriage and left the half that makes it safe to
+release: large outputs landed on the hub's disk and nothing removed
+them.** The first consumer runs long jobs many times a day and wants a few
+hundred MB per job, so an unbounded store fills the volume in days — on a
+host whose IO is already its sore point (D136), whose hub shares a device
+with the runner's data root (D126) and with the consumer's own tree.
+Streaming without a sweeper is a disk-full outage with a delay fuse. This
+entry is the sweeper, and Alexa's two figures carried out: **200 GB, with a
+seven-day floor** (D148).
+
+**What the budget counts, and the three things it deliberately does not.**
+`--output-budget` bounds the **whole, verified collections** in every job's
+`files/` directory, across the state root. Not the state root itself: a
+record is kilobytes, a log has a cap of its own (`--job-log-cap`, D137),
+and one number answering for three things that fail in three different ways
+is a number nobody can reason about. Not part-written bytes either, and
+that one is a choice with a cost — a transfer in flight is real on the disk
+and outside the budget, so the volume may sit above it by one
+`--job-output-cap` per connected runner while collections cross. The
+alternative was evicting the thing the hub is in the middle of being given,
+which is not an alternative. At two runners and the shipped cap that is
+2 GiB against 200 GB; it is named rather than hidden, and the hub says so
+when it is over budget with nothing it may take.
+
+**The sweeper is triggered by an event and never by a clock.** The only
+thing that can put a hub over its output budget is a collection arriving,
+so a timer would be a second writer waking up on a quiet hub to find
+nothing to do — and a second writer against D8's one-writer discipline is
+exactly the shape the brief warned about. So the sweep runs where bytes
+become whole: the last chunk of a streamed file, the inline write of a
+small one, and once at startup. **Nothing is removed for merely being
+old.** Seven days is a floor, not a lifetime: a collection from last year
+is still there if there is room for it, because the only thing that makes
+room worth taking is a shortage of it. That is a test
+(`a_hub_inside_its_budget_removes_nothing_however_old_the_bytes_are`).
+
+**And it does not walk the store on every verdict, because a cheap wrong
+number decides when to look and an expensive right one decides what to
+do.** A running total lives in the store's `Live` state and is added to
+wherever a file becomes whole. It is a **trigger**: past the budget, a
+sweep runs, and the sweep walks `jobs/*/files` and overwrites the total
+with what it measured. So the figure may drift — a part file thrown away
+for a bad digest, a directory an operator removed by hand — and the drift
+costs a sweep that runs a little early or a little late, never a collection
+deleted on a number nobody checked. Self-correcting by construction, which
+is the property that let me put a walk in at all.
+
+The cost of that walk is measured rather than argued, on this host, with
+100 000 job directories of which 1 000 hold bytes:
+
+```
+sweep 1: 1.96 s   (cold)
+sweep 2: 1.15 s
+sweep 3: 1.18 s
+collections_owed 1: 1.31 s   (cold)
+collections_owed 2: 0.91 s
+collections_owed 3: 0.87 s
+```
+
+**The second half of that measurement is a finding about code already on
+`main`, and it is worse than the thing I was measuring.**
+`collections_owed` reads **every record** in the store, and
+`send_the_files` calls it on every fetch — including every 200 ms poll of a
+`herdctl --outputs-to` waiting for a transfer. A 400 MiB collection
+crossing at 100 000 jobs of history would spend roughly a second of hub
+time per poll doing nothing but re-reading history. The sweep's walk is
+cheaper than that and runs orders of magnitude less often, so this work
+does not make the hub's scaling worse — but the poll does, it is D148's
+own code, and it is written down here rather than quietly left. It is not
+fixed in this branch: it is not what the branch is about, the fix is a
+derived index with its own staleness question, and inventing one while
+holding a sweeper is how two half-built mechanisms happen.
+
+**The lock discipline, in the order the steps happen.** The walk is
+deliberately **unlocked** — it only reads the disk, and holding the store's
+one mutex across a second of `read_dir` would stall every log chunk of
+every running job. Each eviction then takes the lock and does four things:
+re-reads the record (because the walk was unlocked and the collection may
+have been fetched, completed or already evicted since), **renames**
+`files/` to `files.gone/`, writes the record and the job's history line,
+and gives the lock back. The unlinking happens after that, with nothing
+held: several hundred `unlink` calls on a loaded host is the one part of
+this that takes real time and nothing is waiting on it.
+
+The rename is D8's discipline run backwards. A write becomes visible by one
+atomic rename; a removal becomes invisible by one. Without it a reader
+arriving in the middle of `remove_dir_all` over a 560-file collection would
+find four of twelve files and nothing saying so — a short collection that
+reads like a whole one, which is the single failure this whole design
+refuses. A `files.gone` directory left on the disk is a hub that was killed
+between the rename and the unlink; the next sweep removes it, and the first
+sweep runs at startup, so a crash costs disk until the next start and never
+an inconsistent answer.
+
+**The eviction order is the real decision, and oldest-first is wrong in
+exactly the way that matters.** On its own it deletes last week's one red
+test to keep this morning's thousand green ones — and the red one is the
+reason the consumer asked for any of this: *"results.json alone is not
+enough to diagnose a red test."* **LRU is worse, and backwards.** A cache
+evicts what nothing has touched because untouched means unwanted; here a
+collection nobody has fetched is evidence **nobody has seen**, while one a
+requester read yesterday is already on that requester's disk. The classic
+answer has the sign flipped.
+
+So the order is four keys, and the first outranks the other three:
+
+1. **outside the floor before inside it.** Seven days is a promise, so
+   nothing inside it goes while anything outside it remains — even a
+   failing collection from last month before a passing one from this
+   morning. That is the one place the outcome does not win, and it is what
+   makes the floor a floor rather than a preference.
+2. **a job that passed before a job that did not.** Green artefacts are
+   the ones nobody ever opens.
+3. **fetched before never fetched**, for the reason above.
+4. **oldest first**, which is only the tie-break — the only key two
+   identical jobs can differ on.
+
+Four keys is more machinery than two, and it is still **one order with no
+knob**: an operator sets a size and a floor, and nothing anywhere lets one
+job's evidence be declared more important than another's. A per-job
+retention class would be the first line of a policy language and invariant
+1 refuses it. What is kept is asserted at least as hard as what goes —
+`the_sweeper_takes_a_read_green_collection_before_an_unread_red_one` names
+four survivors and one victim, because a sweeper that freed more than it
+had to would be a worse defect than one that freed nothing at all.
+
+Two signals had to become durable for this. `first_fetched_at` on the
+record is written **once ever**, on the first fetch that really handed
+bytes over: the sweeper only needs the boolean, and a last-read stamp would
+be a record write per poll on a path that already polls. The outcome was
+already there; `JobOutcome::is_success` is now one function instead of the
+two places that had written `Exited { code: 0 }` out (D79).
+
+**When the floor and the budget disagree, the budget wins and the hub says
+so on the day.** It is the only honest answer: the floor is a promise about
+time and the budget is a fact about a disk, and a hub that honoured the
+promise would hand the operator a full volume instead of a sentence. So
+eviction continues into the floor, the per-record reason says how far
+inside it the collection was, and one line on stderr names both figures and
+what just happened. D148 asked for *"seven days, unless the fleet produces
+more than the budget in less than seven days, in which case we tell you on
+the day"*, and that is the sentence. A quiet trim here would be the trap:
+the next thing after evidence disappears with no reason is somebody
+concluding Herd lost it.
+
+**One line per sweep, not one per collection** — D151 was yesterday and its
+lesson is a day old: a path reached in bulk must not emit a line per item.
+A sweep that frees fifty collections is one journal line. What is
+per-collection is the **record**: each evicted job's `job.json` carries the
+sentence and its `events.jsonl` carries an `outputs_removed` line, which is
+where "what happened to this job's screenshots" is answered a week later,
+beside the manifest that still names them. The over-budget-and-nothing-to-
+free complaint is said once per episode and cleared when a sweep comes back
+inside the budget, because that path is reached by every file that lands.
+
+**The manifest outliving the bytes was already true, and the eviction path
+would have broken it in three places.** D150 built it and a file that never
+arrived already reached the state an evicted one does, so the carriage
+needed nothing new — but an *evicted* collection is not an unfinished one,
+and three pieces of code could not tell them apart:
+
+* `collections_owed` judges "still owed" by the collection not being whole,
+  which is exactly true of one the sweeper took. The hub would have asked
+  its runner to resend the bytes, swept them again at the next verdict, and
+  looped — two correct mechanisms fighting.
+* `files_may_land` would have accepted those resent chunks, refilling the
+  disk the sweep had just freed.
+* `AbsentFile::still_coming` would have said `true`, so a requester would
+  have waited out D150's thirty-second stall bound and then been told
+  something worse than the truth.
+
+All three now read `outputs.removed`, and the requester gets the sentence
+the record carries: *12 files, 338 MiB, removed 2026-10-30 under the
+200 GB output budget*, with the names under it. The count-and-size line is
+`herdctl`'s and fires only when every absence shares one reason — two
+reasons are two facts, and a tidy sentence over them would hide one.
+
+**Three things in the brief or in D148 that turned out to be wrong, said
+plainly.**
+
+1. **D148 spells the figure both ways.** Alexa's ruling says *"200 GB"*;
+   the example sentence four paragraphs earlier says *"the 200 GiB
+   budget"*. They differ by 7.4 %. The ruling is the ruling, so the default
+   is 200 GB decimal — and `show_bytes` grew the decimal family so that a
+   figure typed as `200GB` reads back as `200 GB` and not as
+   `200000000000 bytes`, which is how somebody concludes the hub took a
+   number they did not mean.
+2. **"Shown as use against budget in M13's status document" cannot be
+   satisfied yet** and is not: M13 does not exist. What exists is the
+   startup line and the per-sweep line. The figure is on the store and
+   ready for M13 to read.
+3. **The byte-size parser had to move.** `parse_bytes`/`show_bytes` lived
+   in `herd-runner`, and the hub cannot depend on it. D151 was right that a
+   logging helper has no business in `herd-proto` — but a **unit table** is
+   not a logging helper: a figure an operator sets on one side of the link
+   and reads back from the other is precisely a thing the two sides must
+   agree about, and two copies is how `500MB` comes to mean two numbers. It
+   is `herd_proto::size` now, re-exported from `herd_runner::size` so no
+   runner command line changed.
+
+**What is unproven.** The 1.1 s walk is one host, one filesystem, warm
+cache, and 100 000 directories is a guess at what a year looks like rather
+than a measurement of one. No sweep has ever run against a few hundred MB
+of real collection — the end-to-end case evicts 4 KiB — so the unlink cost
+of ~560 files is still arithmetic. A hub whose budget is smaller than one
+collection walks on every completing file and frees nothing; it is bounded
+to one journal line and is pathological at 200 GB, but it is a real shape
+and nothing measures it. Part-written bytes of a collection whose runner
+never comes back are counted and can never be evicted, so a fleet that lost
+runners mid-transfer would drift above the budget by that much with no way
+down but an operator; the figure is reported and the gap is not closed.
+And the floor has only ever been crossed in a test that set it to seven
+days and wrote three kilobytes — no real seven days has passed anywhere.

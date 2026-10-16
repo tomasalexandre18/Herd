@@ -262,11 +262,14 @@ is refused. And for the record's half: a job leaving a few hundred MB under
 writes it byte for byte; a requester cannot tell from its own output which
 carriage was used; a link killed mid-collection resumes and the files are
 whole, with no file ever readable half-written; a hash that does not match is
-named on the record rather than kept; and — the assertion D138's objection
-makes the important one — **a runner streaming a few hundred MB never looks
-lost**, its health reports staying inside the 15 s cadence throughout, which
-is the measurement M11 owes and currently only has an argument for. chatOnS's
-`0 crates compiled` acceptance closes in M18.
+named on the record rather than kept; **a collection past the output budget
+is gone while its record and its manifest read fine, and a requester asking
+for it is told so with the figures and the date** (D152); and — the
+assertion D138's objection makes the important one — **a runner streaming a
+few hundred MB never looks lost**, its health reports staying inside the
+15 s cadence throughout, which is the measurement M11 owes and currently
+only has an argument for. chatOnS's `0 crates compiled` acceptance closes in
+M18.
 Certain to overflow one session. The split is **at the record/pack line**,
 record first: it is what the consumer is blocked on today, and it is where
 the protocol break lands. Both halves' frames are nevertheless designed and
@@ -303,15 +306,19 @@ gone.
 long do I have to fetch yesterday's failing screenshots?* Two numbers,
 because there are two kinds of thing (D148). The record proper — `job.json`,
 `events.jsonl`, the log, the inline files — keeps retention by priority
-class, 14/90 days, configurable (closes E-15). A job's **large files** get
-their own budget on the hub's volume, with a floor in days: **200 GB or
-seven days, whichever runs out first**, oldest job first, both figures
-printed at startup and shown as use against budget in M13's status document.
-The 200 GB is Alexa's, chosen on 2026-10-16 without a measurement and
-written down as such (D148): the one figure that would change it is the
-consumer's own output size per job per day, and it is to be adjusted when
-they send it. Evicting inside the floor is a named line and an event, never
-a silent trim.
+class, 14/90 days, configurable (closes E-15), **and that half is still
+here**. The other half, a job's **large files** against their own budget on
+the hub's volume, **shipped in M11** rather than waiting: a sweeper with no
+budget is a disk-full outage with a delay fuse, so streaming could not be
+released without it (D152). `--output-budget` is 200 GB with a seven-day
+`--output-floor`, both printed at startup; the 200 GB is Alexa's, chosen on
+2026-10-16 without a measurement and written down as such (D148). What M12
+still owes on that side is the use-against-budget figure in M13's status
+document, which needs M13. The eviction order is not oldest-first: outside
+the floor before inside it, then a job that passed before one that did not,
+then a collection already fetched before one nobody has opened, with age
+only as the tie-break (D152). Evicting inside the floor is a named line and
+an event, never a silent trim.
 And the **manifest outlives the bytes**: each file's path, length and sha256
 stay on the record for as long as the record does, so a requester asking for
 something already gone is told how many files there were, how big, and when
@@ -325,9 +332,7 @@ and moving its pack (M11), stay here.
 fetchable from its keeper; a pack with no holder at all reports that state by
 name; gc on a runner with a budget 10 GiB below use comes in under it keeping
 every pinned and referenced item; a step result past retention is gone while
-a 60-day merger result reads fine; a job's large files past the output budget
-are gone while the record and its manifest read fine, and a requester asking
-for them is told so with the figures and the date; a `produce` job is
+a 60-day merger result reads fine; a `produce` job is
 scheduled and run on a `build` runner and its pack moves like any other; and
 placement prefers the runner already holding the key, picking reference last.
 

@@ -96,6 +96,23 @@ impl Timestamp {
         self.0.unix_timestamp()
     }
 
+    /// The day this moment falls on, `YYYY-MM-DD`, for the one sentence a
+    /// requester reads about something that is gone (D148, D152).
+    ///
+    /// A date and not the whole instant: *"removed 2026-10-30 under the
+    /// 200 GB output budget"* is a sentence somebody can act on, and the
+    /// nanoseconds would be noise in it. The instant is still on the record
+    /// in full — this is only how it is said.
+    pub fn date(self) -> String {
+        let day = self.0.date();
+        format!(
+            "{:04}-{:02}-{:02}",
+            day.year(),
+            day.month() as u8,
+            day.day()
+        )
+    }
+
     /// This moment, `how_long` later. For a caller that needs a moment it
     /// chooses rather than the one the clock has — a test of aging, above
     /// all, which must be able to make an hour pass without waiting one.
@@ -741,6 +758,45 @@ pub struct OutputSummary {
     /// gets is the same collection either way.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub streamed: bool,
+    /// When a requester first fetched these bytes, if one ever did (D152).
+    ///
+    /// **The first fetch and not the last**, because the only question the
+    /// sweeper asks of it is whether anybody has ever looked — and a figure
+    /// written once per collection costs one record write for ever, where a
+    /// last-read stamp would cost one per fetch on a path that already
+    /// polls. A collection nobody has opened is evidence nobody has seen,
+    /// and that is why it is kept longer than one that has been read.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub first_fetched_at: Option<Timestamp>,
+    /// When the hub's sweeper removed these bytes, and under which figures
+    /// (D152).
+    ///
+    /// **Set on the record that keeps the manifest**, which is what gives
+    /// "the manifest outlives the bytes" an answer rather than a shrug:
+    /// [`OutputSummary::files`] still names every path, length and digest,
+    /// and this says why none of them is on the disk. A requester asking for
+    /// an evicted collection is handed this sentence, with its date and its
+    /// budget in it, instead of "not on this hub's disk".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub removed: Option<OutputsRemoved>,
+}
+
+/// Why a job's output bytes are gone, kept on its record for ever (D152).
+///
+/// Kilobytes beside the manifest it explains, so there is never a reason to
+/// delete it: a record that had files says so, and says what became of them,
+/// for as long as the record exists.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OutputsRemoved {
+    pub at: Timestamp,
+    /// One sentence naming the figures: the date, the budget, and the floor
+    /// when the floor had to be broken. A reason with no figures in it is
+    /// the one report nobody can act on (E-04's style).
+    pub why: String,
+    /// How many bytes went. The manifest's own lengths add up to this, and
+    /// it is written down anyway: an operator reading one record should not
+    /// have to sum twelve numbers to learn what the sweep freed.
+    pub bytes: u64,
 }
 
 impl OutputSummary {
@@ -750,6 +806,105 @@ impl OutputSummary {
     /// existed.
     pub fn is_silent(&self) -> bool {
         self.files.is_empty() && self.refused.is_none() && self.skipped.is_empty()
+    }
+}
+
+/// How much of the hub's volume a job's output files may hold, and for how
+/// long they are safe from the sweeper (D148, D152).
+///
+/// **Two figures and no third.** Invariant 1 says a retention policy is not
+/// a storage product: there is no tier, no class, no per-job override and no
+/// expression — an operator says how much room there is and how long a fresh
+/// collection is promised, and the order in which things go when those two
+/// disagree is Herd's and not configurable. A knob that let one job's
+/// evidence outrank another's would be the first line of a policy language.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Budget {
+    /// Bytes of **whole, verified** collections the hub may hold across
+    /// every job's `files/` directory.
+    ///
+    /// Not the state root: a record is kilobytes and a log has a cap of its
+    /// own (D137), and counting them here would make one number answer for
+    /// three different things that fail in three different ways.
+    ///
+    /// Part-written bytes are deliberately outside it. They belong to a
+    /// transfer in flight, they cannot be evicted without destroying the
+    /// thing that is arriving, and they are bounded by the per-job output
+    /// cap times the number of runners — so the disk may sit that much above
+    /// the budget while collections cross, and nothing pretends otherwise.
+    pub bytes: u64,
+    /// How long a collection is promised before the sweeper may take it.
+    ///
+    /// Seven days (D148). **It is a floor and not a lifetime**: nothing is
+    /// removed merely for being older, and a collection outlives the floor
+    /// by as long as the budget allows. Zero turns the promise off, which is
+    /// what a test uses to make an ordinary eviction happen in a second.
+    pub floor: std::time::Duration,
+}
+
+/// The hub's output budget: 200 GB (D148, chosen by Alexa on 2026-10-16).
+///
+/// **A chosen figure, never a derived one.** No measurement produced it, and
+/// the arithmetic that would — a few hundred megabytes times the number of
+/// jobs a day that really leave that much — needs a distribution only the
+/// first consumer has. Every other byte figure in Herd is computed from what
+/// a mechanism can carry; this one is a decision, and D148 says at length
+/// why it must not be read as anything else.
+pub const OUTPUT_BUDGET: u64 = 200_000_000_000;
+
+/// How long a collection is promised before the sweeper may take it: seven
+/// days (D148).
+pub const OUTPUT_FLOOR: std::time::Duration = std::time::Duration::from_secs(7 * 24 * 60 * 60);
+
+impl Default for Budget {
+    fn default() -> Self {
+        Self {
+            bytes: OUTPUT_BUDGET,
+            floor: OUTPUT_FLOOR,
+        }
+    }
+}
+
+/// A span as a sentence about retention: days, or hours under a day.
+///
+/// The floor is spoken of in days, so both it and an age compared against
+/// it are said in days. `{:?}` on a `Duration` of seven days prints
+/// `604800s`, which is the one figure in the sentence a reader cannot check
+/// against the promise they were given — every other setting the hub prints
+/// is seconds or minutes, where the debug form reads fine.
+pub fn in_days(how_long: std::time::Duration) -> String {
+    let hours = how_long.as_secs() / 3600;
+    if hours >= 24 {
+        return format!("{} day(s)", hours / 24);
+    }
+    format!("{hours} hour(s)")
+}
+
+/// What one run of the sweeper did (D152).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Sweep {
+    /// The jobs whose bytes were removed, in the order they went.
+    pub removed: Vec<JobId>,
+    /// How many bytes that freed.
+    pub freed: u64,
+    /// What the hub holds after it, as the sweep's own walk measured.
+    pub held: u64,
+    /// How many of the removed collections were still inside the floor.
+    ///
+    /// Non-zero is the case D148 insists is never silent: the fleet produced
+    /// more than the budget in less than the floor, and the operator is told
+    /// on the day, in a sentence naming both figures.
+    pub inside_the_floor: usize,
+    /// Bytes the sweeper could not free although it is still over budget:
+    /// collections still arriving, which it must never take.
+    pub could_not_free: u64,
+}
+
+impl Sweep {
+    /// Whether this sweep did nothing at all, which is every sweep on a hub
+    /// that is inside its budget.
+    pub fn is_quiet(&self) -> bool {
+        self.removed.is_empty()
     }
 }
 
@@ -1114,6 +1269,18 @@ impl JobEvent {
         }
     }
 
+    /// The sweeper took this job's output bytes, and why (D152).
+    pub fn outputs_removed(at: Timestamp, files: usize, bytes: u64, why: &str) -> Self {
+        Self {
+            at,
+            what: JobEventKind::OutputsRemoved {
+                files: files as u64,
+                bytes,
+                why: why.to_owned(),
+            },
+        }
+    }
+
     /// A second identical submission joined this job rather than minting a
     /// new one (E-05).
     pub fn joined(at: Timestamp, submissions: u32, asked_for: Priority) -> Self {
@@ -1144,7 +1311,8 @@ impl JobEvent {
             | JobEventKind::AttemptEnded { .. }
             | JobEventKind::Joined { .. }
             | JobEventKind::PriorityRaised { .. }
-            | JobEventKind::Waiting { .. } => None,
+            | JobEventKind::Waiting { .. }
+            | JobEventKind::OutputsRemoved { .. } => None,
         }
     }
 }
@@ -1228,6 +1396,23 @@ pub enum JobEventKind {
     /// Written only when the reason *changes*, so a job that waits an hour
     /// for one lock file leaves one line rather than a thousand.
     Waiting { reason: String },
+    /// The hub's sweeper removed this job's output bytes to stay inside the
+    /// output budget (D152).
+    ///
+    /// **On the job's own history, which is where an irreversible deletion
+    /// belongs.** The hub's journal gets one line per *sweep* and not one
+    /// per collection — D151's lesson about a path reached in bulk — so the
+    /// only place that answers "what happened to this job's screenshots" a
+    /// week later is here, beside the manifest that still names them.
+    OutputsRemoved {
+        /// How many files the manifest named. They are all still on the
+        /// record; none of them is on the disk.
+        files: u64,
+        bytes: u64,
+        /// The same sentence [`OutputsRemoved`](crate::job::OutputsRemoved)
+        /// carries, with the date and the budget in it.
+        why: String,
+    },
 }
 
 /// A job store failed, with the path or the id that failed in the message: the
@@ -1535,6 +1720,35 @@ pub trait JobStore: Send + Sync + 'static {
     /// the point — a job is readable and complete about what it produced long
     /// before its evidence has all crossed.
     fn collections_owed(&self) -> Result<Vec<CollectionOwed>>;
+
+    /// What this store was told its output budget is, for the line the hub
+    /// prints at startup and for a test that wants to read it back.
+    fn output_budget(&self) -> Budget;
+
+    /// Write down that a requester has fetched this job's collection, if
+    /// none ever had (D152).
+    ///
+    /// **A no-op after the first time**, which is what keeps it off the hot
+    /// path: a `--outputs-to` polls while a collection crosses, and a
+    /// last-read stamp would be a record write per poll. What the sweeper
+    /// needs is the boolean, and the boolean only ever changes once.
+    fn note_outputs_fetched(&self, id: &JobId) -> Result<()>;
+
+    /// Bring the hub inside its output budget, and say what that cost
+    /// (D152).
+    ///
+    /// Run where bytes land and once at startup, never on a timer: the only
+    /// thing that can put a hub over its budget is a collection arriving, so
+    /// a clock would be a second writer waking up to find nothing to do. It
+    /// walks `jobs/*/files` when it runs and believes the walk, so the
+    /// running total it is triggered by can drift without ever producing a
+    /// wrong eviction — see [`Budget`] and the order in D152.
+    ///
+    /// A sweep that finds another one already walking answers with
+    /// [`Sweep::default`] and does nothing, so a caller reading `held` off
+    /// it is reading "no figure" and not "nothing held". Nothing but a
+    /// test ever reads it.
+    fn sweep_outputs(&self) -> Result<Sweep>;
 
     /// Read `take` bytes of one of a job's kept files, starting at `offset`.
     ///

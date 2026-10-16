@@ -11,8 +11,9 @@ pub mod store;
 
 pub use capability::RunnerCapacity;
 pub use job::{
-    reading_key, Attempt, JobEvent, JobMetrics, JobRecord, JobState, JobStore, LogWrite, Mint,
-    NewJob, Raise, Reading, StoreError, Submission, Timestamp, RECORD_VERSION,
+    in_days, reading_key, Attempt, Budget, JobEvent, JobMetrics, JobRecord, JobState, JobStore,
+    LogWrite, Mint, NewJob, OutputsRemoved, Raise, Reading, StoreError, Submission, Sweep,
+    Timestamp, OUTPUT_BUDGET, OUTPUT_FLOOR, RECORD_VERSION,
 };
 pub use matcher::{
     Parent, Placement, Placing, Seat, Stickiness, DRAIN_FIRST_LIMIT, STICKINESS_LIMIT,
