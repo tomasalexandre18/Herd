@@ -4,8 +4,10 @@
 //! `Hello` whose protocol version must match. A requester's `SubmitJob` is
 //! minted into a job, handed to the connected runner, and everything the
 //! runner says about that job is relayed back to the requester that submitted
-//! it. There is no scheduling yet: with no runner connected, a submission is
-//! refused by name (M6 gives the hub a queue to put it in instead).
+//! it. With no runner connected a submission is **queued and explained**, not
+//! refused: the one fleet state a submission is refused in is a state root on
+//! which no runner was ever approved, which is a configuration mistake and
+//! not a fleet that is away (D88, D140, [`State::why_no_runner_is_approved`]).
 //!
 //! Everything the hub knows is on its disk before it is acted on, through the
 //! [`JobStore`] it was given. Two consequences run through this file. A result
@@ -1244,44 +1246,48 @@ impl State {
         })
     }
 
-    /// Why a submission cannot be placed anywhere at all, if it cannot.
+    /// Why a submission cannot be placed anywhere **ever**, if it cannot
+    /// (D140).
     ///
-    /// About the *fleet*, not about one job: a job that no connected runner
-    /// can take is queued with its own sentence and is not refused (D38).
-    /// This is the one case a submission is answered with a refusal — there
-    /// is no machine here to run anything.
-    fn why_no_runner(&self) -> Option<String> {
-        self.with_peers(|peers| {
-            if peers.runners.is_empty() {
-                return Some("no runner is connected".to_owned());
-            }
-            if peers
-                .runners
-                .values()
-                .all(|runner| runner.draining || !runner.switch.claims())
-            {
-                return Some(format!(
-                    "every runner connected to this hub takes no new job: {}",
-                    peers
-                        .runners
-                        .values()
-                        .map(|runner| {
-                            if runner.draining {
-                                format!("{} is draining", runner.name)
-                            } else {
-                                // The owner's own words, which is the whole
-                                // point of E-33's reason: a submission refused
-                                // because somebody is gaming on the PC should
-                                // say so.
-                                format!("{} is switched {}", runner.name, runner.switch.sentence())
-                            }
-                        })
-                        .collect::<Vec<_>>()
-                        .join(", ")
-                ));
-            }
-            None
-        })
+    /// About the *fleet*, not about one job, and it is the one state a
+    /// submission is answered with a refusal: **no runner is approved on this
+    /// state root** — never was, or was and was removed. That is a
+    /// configuration mistake, the hub counts it out loud at startup in these
+    /// same words, and the roster is on its disk — so this is a fact the hub
+    /// holds, not a guess about the moment. A job queued against an empty
+    /// roster would wait for nobody coming.
+    ///
+    /// **A fleet that is merely away is not this, and is not refused.**
+    /// Nobody connected this second, or every runner draining or switched
+    /// off, is a job that **waits**, with the sentence the one queue already
+    /// gives it (D38, D88, D140). D88's reason is that a fleet is not a closed
+    /// world — the owner's PC is asleep at night and its 17 GiB come back in
+    /// the morning — and a transient gap is that same situation with *weaker*
+    /// evidence; E-33's switch is explicitly a temporary owner action. Both
+    /// used to be refused here, which made the wait sentence
+    /// [`crate::matcher`] already carried unreachable for a newly submitted
+    /// job: which answer a job got depended only on whether it arrived a
+    /// moment before or after the last link dropped, and every hook
+    /// submitting during a hub restart, a runner restart or a brief
+    /// disconnection got exit 125.
+    ///
+    /// What bounds a job that waits for an away fleet is **E-09's deadline**,
+    /// which is where D88 leaves it: judged in [`crate::matcher::place`]
+    /// before anything about the fleet, including an empty one. A cancel
+    /// reaches it like any other queued job, and E-04's restatement keeps its
+    /// stream saying where it stands.
+    fn why_no_runner_is_approved(&self) -> Option<String> {
+        if self.store.approved_runner_count() > 0 {
+            return None;
+        }
+        Some(
+            "0 runner(s) are approved on this state root, so nothing submitted here could \
+             ever start. That is a configuration mistake rather than a fleet that is away, \
+             and a job queued against an empty roster would wait for nobody coming — so it \
+             is refused here instead of queued. `herdctl runner approve <name>` mints an \
+             approval and `herdctl runner list` says who is approved"
+                .to_owned(),
+        )
     }
 
     fn record_health(
@@ -4471,7 +4477,10 @@ async fn accept_submissions(state: &State, outbox: &Outbox, source: &mut Source)
                     let _ = outbox.send(FromHub::Refused { reason });
                     return Ok(());
                 }
-                if let Some(reason) = state.why_no_runner() {
+                // The one fleet state a submission is refused in: a roster
+                // with nothing on it at all (D140). A fleet that is merely
+                // away queues the job, and the pass below explains it.
+                if let Some(reason) = state.why_no_runner_is_approved() {
                     let _ = outbox.send(FromHub::Refused { reason });
                     return Ok(());
                 }
@@ -4563,23 +4572,17 @@ async fn accept_submissions(state: &State, outbox: &Outbox, source: &mut Source)
                 // dispatch this job between the two.
                 dispatch_a_pass(state)?;
                 drop(_one_pass);
-                // A runner that went away between the check above and the
-                // pass leaves the job queued with nowhere to go, and the
-                // requester is told rather than left watching a job nothing
-                // will pick up. Read from the record, because the pass may
-                // well have started it.
-                let still_queued = state
-                    .store
-                    .job(&job_id)
-                    .with_context(|| format!("reading the record of {job_id}"))?
-                    .is_some_and(|record| record.state == JobState::Queued);
-                if still_queued {
-                    if let Some(reason) = state.why_no_runner() {
-                        state.stop_following(&job_id);
-                        let _ = outbox.send(FromHub::Refused { reason });
-                        return Ok(());
-                    }
-                }
+                // And there is nothing after the pass. A runner that went
+                // away between the roster check and the pass leaves the job
+                // **queued**, with the pass's own sentence on its record and
+                // on this connection — not refused (D140). This is where the
+                // second answer to one fleet state used to live: a submission
+                // that landed a moment after the last link dropped was
+                // refused while the job in front of it, queued a moment
+                // earlier, waited. The requester keeps its place in the
+                // followers, E-04's restatement says where the job stands at
+                // least every 60 s, E-09's deadline bounds it, and a cancel
+                // reaches it.
             }
             // E-07, and the whole of what it must not do: judge, say, and
             // change nothing.
@@ -4599,7 +4602,16 @@ async fn accept_submissions(state: &State, outbox: &Outbox, source: &mut Source)
                     });
                     return Ok(());
                 }
-                let lines = match why_that_parent_will_not_do(state, asked.after.as_ref())? {
+                // The roster, judged exactly as a submission judges it
+                // (D140), through the sentence E-07 already has for a
+                // declaration a submission would refuse. Without this the
+                // dry run would answer "it would wait" about the one fleet
+                // state a submission refuses — two answers to one fleet
+                // state, which is the defect D140 is about, in a new place.
+                let lines = match state
+                    .why_no_runner_is_approved()
+                    .or(why_that_parent_will_not_do(state, asked.after.as_ref())?)
+                {
                     Some(reason) => vec![format!("it would be refused at submission: {reason}")],
                     None => dry_run(state, asked)?,
                 };

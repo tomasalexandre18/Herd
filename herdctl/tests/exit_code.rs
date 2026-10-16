@@ -78,8 +78,29 @@ impl Harness {
 
     /// A hub with nothing to run jobs on, for the refusals that are Herd's own
     /// failure rather than a job's verdict (D20).
+    ///
+    /// **An empty roster**, which since D140 is the one fleet state a
+    /// submission is refused in: a hub whose runners are merely away queues
+    /// the job and explains it, so it produces no 125 to assert.
     async fn with_no_runner() -> Self {
-        Self::start(None::<fn(&mut herd_runner::Confinement)>).await
+        let state = tempfile::tempdir().expect("a temporary state directory");
+        let store = open_when_free(state.path());
+        let hub = Hub::bind(
+            "127.0.0.1:0".parse().expect("a literal loopback address"),
+            Arc::new(store) as Arc<dyn JobStore>,
+        )
+        .await
+        .expect("the hub binds a free port");
+        let hub_url = format!("ws://{}", hub.local_addr());
+        let serving = tokio::spawn(async move {
+            let _ = hub.serve().await;
+        });
+        Self {
+            hub_url,
+            _state: state,
+            tasks: vec![serving],
+            _data_root: None,
+        }
     }
 
     /// A hub whose state root already holds a job today's rules reject (D52),
@@ -634,7 +655,10 @@ async fn herd_s_own_failures_exit_125_and_never_1() {
         stderr(&nowhere)
     );
 
-    // A hub with nothing to run the job on.
+    // A hub that could never run the job: nobody is approved on its state
+    // root. Since D140 that is the one fleet state a submission is refused in
+    // — a fleet that is merely *away* queues the job and explains it, because
+    // a fleet is not a closed world (D88).
     let harness = Harness::with_no_runner().await;
     for arguments in [
         vec!["run", "--", "/bin/true"],
@@ -644,14 +668,41 @@ async fn herd_s_own_failures_exit_125_and_never_1() {
         assert_eq!(
             status_code(&output),
             125,
-            "`{}` with no runner must not look like a failing job: {}",
+            "`{}` against an empty roster must not look like a failing job: {}",
             arguments.join(" "),
             stderr(&output)
         );
         assert_eq!(stdout(&output), "", "stdout belongs to the job");
         assert!(
-            stderr(&output).contains("no runner is connected"),
+            stderr(&output).contains("0 runner(s) are approved on this state root"),
             "the reason must say what Herd could not do: {}",
+            stderr(&output)
+        );
+        // **And which of D139's three states this is.** A refusal in a frame
+        // is the hub saying it minted nothing, so re-running the work is
+        // safe and that is the line a falling-back requester reads. It used
+        // to say `job-unknown` here — "a job may exist whose id you never
+        // learned" — which sends a wrapper looking for a job that does not
+        // exist, and is the opposite action to the right one (D142).
+        //
+        // Both directions, because one line being present is only half of
+        // it: the wrong line being absent is what a wrapper keys on.
+        assert!(
+            stderr(&output).contains(herdctl::NO_JOB_LINE),
+            "`{}`: the one case where re-running is safe has to say so: {}",
+            arguments.join(" "),
+            stderr(&output)
+        );
+        assert!(
+            !stderr(&output).contains(herdctl::JOB_UNKNOWN_LINE),
+            "`{}`: the hub refused in a frame, so a job may NOT exist: {}",
+            arguments.join(" "),
+            stderr(&output)
+        );
+        assert!(
+            !stderr(&output).contains(herdctl::JOB_ID_PREFIX),
+            "`{}`: a refused submission names no job: {}",
+            arguments.join(" "),
             stderr(&output)
         );
     }

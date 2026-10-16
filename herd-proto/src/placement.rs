@@ -291,19 +291,45 @@ pub fn size_mib(figure: u64) -> String {
 /// process.
 pub const PARALLELISM_TOKEN: &str = "{j}";
 
-/// How many times the token appears in a command line.
-pub fn parallelism_tokens(command: &[String]) -> usize {
+/// How many times the token appears in the **declared** text of a command
+/// line.
+///
+/// `args` are the requester's own words, as they travel on the record
+/// ([`crate::Declaration::args`]); empty for a command nobody declared, which
+/// is then declared text throughout. A `{j}` a requester typed in an argument
+/// is not counted, for [`with_parallelism`]'s reason — and counting it would
+/// be worse than filling it, because two of them end the job by name
+/// ("one figure goes in one place").
+pub fn parallelism_tokens(command: &[String], args: &[String]) -> usize {
     command
         .iter()
-        .map(|word| word.matches(PARALLELISM_TOKEN).count())
+        .map(|word| {
+            crate::declared_spans(word, args)
+                .0
+                .iter()
+                .map(|span| span.matches(PARALLELISM_TOKEN).count())
+                .sum::<usize>()
+        })
         .sum()
 }
 
-/// The command with its `{j}` replaced by `threads`.
-pub fn with_parallelism(command: &[String], threads: u32) -> Vec<String> {
+/// The command with the `{j}` its **declaration** wrote replaced by
+/// `threads` (E-22, D107).
+///
+/// `{j}` is the one token the hub fills, and it fills it *after* `herdctl`
+/// has already quoted the requester's arguments into the line (D107). So the
+/// pass is made over the declared text and the argument spans are held out of
+/// it ([`crate::declared_spans`]): a requester whose argument says `{j}` typed
+/// three characters and gets three characters back, never a thread count.
+pub fn with_parallelism(command: &[String], args: &[String], threads: u32) -> Vec<String> {
+    let threads = threads.to_string();
     command
         .iter()
-        .map(|word| word.replace(PARALLELISM_TOKEN, &threads.to_string()))
+        .map(|word| {
+            crate::filled_outside_the_arguments(word, args, |span| {
+                span.replace(PARALLELISM_TOKEN, &threads)
+            })
+        })
         .collect()
 }
 
@@ -456,18 +482,68 @@ mod tests {
             "-j".to_owned(),
             "{j}".to_owned(),
         ];
-        assert_eq!(parallelism_tokens(&command), 1);
-        assert_eq!(with_parallelism(&command, 7)[4], "7");
+        assert_eq!(parallelism_tokens(&command, &[]), 1);
+        assert_eq!(with_parallelism(&command, &[], 7)[4], "7");
         // Inside a word, as a shell line carries it.
         let line = vec![
             "/bin/sh".to_owned(),
             "-c".to_owned(),
             "make -j{j}".to_owned(),
         ];
-        assert_eq!(parallelism_tokens(&line), 1);
-        assert_eq!(with_parallelism(&line, 6)[2], "make -j6");
+        assert_eq!(parallelism_tokens(&line, &[]), 1);
+        assert_eq!(with_parallelism(&line, &[], 6)[2], "make -j6");
         // And a command that carries none, or two.
-        assert_eq!(parallelism_tokens(&["true".to_owned()]), 0);
-        assert_eq!(parallelism_tokens(&["{j} {j}".to_owned()]), 2);
+        assert_eq!(parallelism_tokens(&["true".to_owned()], &[]), 0);
+        assert_eq!(parallelism_tokens(&["{j} {j}".to_owned()], &[]), 2);
+    }
+
+    /// The adversarial half, and the one that matters: a `{j}` the
+    /// **requester** typed in an argument is three characters, and a value a
+    /// substitution pasted in is never itself scanned for tokens (D107).
+    #[test]
+    fn a_token_a_requester_typed_in_an_argument_is_text_and_stays_text() {
+        let args = vec!["--only".to_owned(), PARALLELISM_TOKEN.to_owned()];
+        // The line as `herdctl` resolved it: the declared template with the
+        // requester's arguments quoted into its `{args}`, before the job was
+        // minted (D107).
+        let line = vec![format!(
+            "make -j{PARALLELISM_TOKEN} {}",
+            crate::args_as_line(&args)
+        )];
+        assert_eq!(
+            parallelism_tokens(&line, &args),
+            1,
+            "the declared text holds one {PARALLELISM_TOKEN}; the argument holds none the hub \
+             may count — two would end the job by name"
+        );
+        assert_eq!(
+            with_parallelism(&line, &args, 6)[0],
+            format!("make -j6 '--only' '{PARALLELISM_TOKEN}'")
+        );
+    }
+
+    /// An argument that is the whole of the requester's text leaves the
+    /// declared tokens either side of it filled.
+    #[test]
+    fn the_declared_text_on_both_sides_of_the_arguments_is_filled() {
+        let args = vec!["a b".to_owned()];
+        let line = vec![format!(
+            "make -j{PARALLELISM_TOKEN} {} --jobs {PARALLELISM_TOKEN}",
+            crate::args_as_line(&args)
+        )];
+        assert_eq!(parallelism_tokens(&line, &args), 2);
+        assert_eq!(
+            with_parallelism(&line, &args, 3)[0],
+            "make -j3 'a b' --jobs 3"
+        );
+    }
+
+    /// A command no requester's arguments were spliced into — every ad-hoc
+    /// job — is declared text throughout, and nothing about it changes.
+    #[test]
+    fn a_command_with_no_arguments_beside_it_is_filled_whole() {
+        let line = vec![format!("make -j{PARALLELISM_TOKEN}")];
+        assert_eq!(parallelism_tokens(&line, &[]), 1);
+        assert_eq!(with_parallelism(&line, &[], 8)[0], "make -j8");
     }
 }
