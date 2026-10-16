@@ -52,36 +52,35 @@ nix --version                    # any recent version with flakes
 
 ### 1. Install `herd-runner`
 
-The toolchain is in the flake and nowhere else (D12), so both ways start
-there. Clone the repository first.
-
-Once M16's packaging is merged, the flake offers the runner as a package
-and the whole of this step is one line. Ask `nix flake show` for the
-name it goes by rather than guessing:
+**A release is one download, and that is the ordinary way in.** The
+assets are static musl binaries: nothing on the machine, no toolchain,
+no clone. Take the version you want from the releases page.
 
 ```sh
-nix flake show .            # read the package name for the runner
-nix profile install .#<that name>
+v=v0.2.0
+base=https://github.com/tomasalexandre18/Herd/releases/download/$v
+curl -fLO $base/herd-runner-${v#v}-x86_64-unknown-linux-musl
+curl -fLO $base/SHA256SUMS
+sha256sum --ignore-missing -c SHA256SUMS      # verify before you trust it
+sudo install -m 0755 herd-runner-${v#v}-x86_64-unknown-linux-musl \
+  /usr/local/bin/herd-runner
 herd-runner --version
 ```
 
-Until then, build it in the dev shell and keep the binary:
+`SHA256SUMS` is there so a machine is not trusting a URL. Verify it; the
+whole point of shipping it is that somebody checks.
 
-```sh
-nix develop --command cargo build --release -p herd-runner
-sudo install -m 0755 target/release/herd-runner /usr/local/bin/
-herd-runner --version
-```
+On **NixOS** the binary does not belong in `/usr/local/bin`: the unit in
+`deploy/herd-runner.service` expects `/run/current-system/sw/bin`, so
+put the package in `environment.systemPackages`, or import
+`deploy/nixos-herd-runner.nix`, which does the whole of steps 2, 5 and 6
+declaratively. That is an `/etc/nixos` change and belongs to whoever owns
+that file.
 
-On NixOS, put the package in `environment.systemPackages` instead, so it
-lands in `/run/current-system/sw/bin` — which is the path the service
-unit in `deploy/herd-runner.service` expects. That is an `/etc/nixos`
-change and belongs to whoever owns that file.
-
-Or import `deploy/nixos-herd-runner.nix`, which declares the same unit
-and names the package's own store path, so there is no
-`systemPackages` step to forget. Step 6 says which of the two paths you
-are on; the project's server is on the file, not the module.
+Building from source is still there if you want it — the toolchain is in
+the flake and nowhere else (D12), so clone first and
+`nix develop --command cargo build --release -p herd-runner`. You do not
+need it to join.
 
 ### 2. Give it a data root and the hub's address
 
