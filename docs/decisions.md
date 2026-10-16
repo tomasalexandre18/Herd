@@ -4876,3 +4876,9 @@ actually needs it, because WSL already gives a Windows user a working
 **What would reopen the runner half.** A Windows machine that cannot run WSL2
 and whose capacity we need anyway. Until one exists, the answer to "a Windows
 version?" is "yes, through WSL2" for a runner and "on request" for the CLI.
+
+**On the number.** There is no D143. Three branches appended an entry on the
+same day and each took the next free number against a `main` that then moved
+under it; this one was renumbered twice to keep the file monotonic, which
+matters here — the file is read in order — where a contiguous sequence does
+not. Nothing references 143.
