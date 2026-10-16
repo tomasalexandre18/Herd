@@ -15,7 +15,7 @@
 
 use std::collections::BTreeSet;
 use std::fs::File;
-use std::net::{SocketAddr, TcpListener, TcpStream};
+use std::net::{SocketAddr, TcpListener};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::Mutex;
@@ -228,14 +228,24 @@ impl Herd {
         );
     }
 
-    /// Whether the hub came up, waiting on the port rather than on a sleep.
+    /// Whether the hub came up, waiting on what the hub *says* rather than on
+    /// a sleep — and rather than on a connect.
     ///
     /// `false` means the process ended instead — which is what a port taken
     /// in the meantime looks like from here.
+    ///
+    /// The line, not a connect to the port, for the reason `real_herd`'s
+    /// `start_hub_with` gives at length and D147 records: a connect to a
+    /// loopback port this process was handed a moment ago can be answered by
+    /// something that is not this hub — `free_port` itself, momentarily, on
+    /// its way to passing a repeat over — and it is answered *before* the hub
+    /// has finished printing what it read. The line is the stronger
+    /// condition on both counts: it is printed after the bind and after the
+    /// state root, and only this hub prints it.
     async fn hub_accepts(&mut self) -> bool {
         let deadline = Instant::now() + PATIENCE;
         loop {
-            if TcpStream::connect(self.addr()).is_ok() {
+            if self.said("hub").contains("listening on ws://") {
                 return true;
             }
             if let Some(process) = &mut self.hub {
