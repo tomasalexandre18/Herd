@@ -16,7 +16,7 @@
 
 use std::collections::BTreeSet;
 use std::fs::File;
-use std::net::{SocketAddr, TcpListener, TcpStream};
+use std::net::{SocketAddr, TcpListener};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::Mutex;
@@ -39,18 +39,69 @@ pub const PATIENCE: Duration = Duration::from_secs(30);
 /// configuration nobody can run.
 pub const HEALTH_EVERY_IN_THESE_TESTS: &str = "0.2";
 
+/// How many hubs of one herd are running, as the herd itself counts them.
+///
+/// The herd starts the hubs and the herd is handed them back when they die,
+/// so it can simply *know* this. [`Herd::approve`] needs the answer: a hub
+/// that is up means approving over the wire, and no hub means approving on
+/// the state root, because the two paths want opposite things of that root's
+/// lock (D21). It used to get the answer by connecting to its own port
+/// instead. See [`Herd::approve`] for what that cost.
+#[derive(Clone, Default)]
+pub struct HubCensus(std::sync::Arc<std::sync::atomic::AtomicUsize>);
+
+impl HubCensus {
+    fn one_started(&self) {
+        self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    fn one_is_gone(&self) {
+        self.0.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    fn how_many(&self) -> usize {
+        self.0.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    fn any_running(&self) -> bool {
+        self.how_many() > 0
+    }
+}
+
 /// A process the test started, killed when the test ends however it ends —
 /// so a failure never leaves a hub or a runner behind.
 pub struct Process {
     pub what: &'static str,
     pub child: Child,
+    /// The census of the herd that started it, for a hub and nothing else.
+    ///
+    /// `Option` so that it can be *taken*, which is what makes the herd's
+    /// count fall by exactly one however this process turns out to end:
+    /// signalled, waited for, or merely dropped.
+    hub_census: Option<HubCensus>,
 }
 
 impl Process {
     /// Whether it is still running. The whole point of D17: a runner whose hub
     /// was killed must answer `true` here.
     pub fn alive(&mut self) -> bool {
-        matches!(self.child.try_wait(), Ok(None))
+        match self.child.try_wait() {
+            Ok(None) => true,
+            // Including the hub that died without being asked to — a refusal
+            // at startup, a crash. The herd's count has to follow that too,
+            // or the next approval goes looking for a hub that is not there.
+            _ => {
+                self.off_the_census();
+                false
+            }
+        }
+    }
+
+    /// Note, once, that this process is no longer one of its herd's hubs.
+    fn off_the_census(&mut self) {
+        if let Some(census) = self.hub_census.take() {
+            census.one_is_gone();
+        }
     }
 
     pub async fn signal(&mut self, signal: rustix::process::Signal) {
@@ -63,6 +114,7 @@ impl Process {
         // Reaped here, so that the port and the state root's lock are free
         // before anything tries to take them again.
         let _ = self.child.wait().await;
+        self.off_the_census();
     }
 
     /// Signal it and come straight back, without reaping it.
@@ -93,16 +145,22 @@ impl Process {
 
     /// How long it took to be gone, and how it went.
     pub async fn gone(&mut self) -> std::process::ExitStatus {
-        self.child
+        let status = self
+            .child
             .wait()
             .await
-            .unwrap_or_else(|e| panic!("waiting for the {}: {e}", self.what))
+            .unwrap_or_else(|e| panic!("waiting for the {}: {e}", self.what));
+        self.off_the_census();
+        status
     }
 }
 
 impl Drop for Process {
     fn drop(&mut self) {
         let _ = self.child.start_kill();
+        // A hub the test has let go of is a hub this herd no longer counts:
+        // `kill_on_drop` is set, so it is on its way out.
+        self.off_the_census();
     }
 }
 
@@ -189,16 +247,36 @@ pub fn cadence_unless_given(options: &[&str]) -> Vec<String> {
 /// over. One `HashSet` in one process closes the whole class; across processes
 /// there is nothing to close, because `cargo test` runs one test binary at a
 /// time.
+///
+/// The listener is **closed before the set is touched**, which is not a tidy
+/// up: it is the window in which this function is itself listening on a port
+/// some other herd of this process already owns. `bind(0)` hands back a port
+/// it released a moment ago far sooner than the range's width suggests —
+/// measured on this host, within some 120 allocations of 28 232 ports — so a
+/// repeat is the ordinary case this loop exists for, and on the way to
+/// passing it over this function used to hold a listening socket on another
+/// herd's port across a contended `Mutex`. Two cores make that window a
+/// scheduler timeslice wide. Nothing in this harness asks the network whether
+/// a hub is up any more (see [`Herd::approve`]), so a stray listener no
+/// longer decides anything; closing it first is what keeps it from being
+/// visible at all. Releasing early is safe because the set, not the socket,
+/// is what stops two herds being given one port: whichever caller inserts
+/// first keeps the port and the other goes round again.
+///
+/// Holding the listener until the hub binds — the other way to close the
+/// window — is not open to us. The hub binds the port itself, through its own
+/// `--listen`, which is the thing these tests exist to drive; a harness still
+/// holding it would hand the hub `Address already in use`. Passing the socket
+/// down to the child instead would mean the hub no longer binds its own port,
+/// and that is the code under test.
 pub fn free_port() -> u16 {
     static HANDED_OUT: Mutex<BTreeSet<u16>> = Mutex::new(BTreeSet::new());
     for _ in 0..1_000 {
-        let listener = TcpListener::bind("127.0.0.1:0").expect("a free loopback port");
-        let port = listener
+        let port = TcpListener::bind("127.0.0.1:0")
+            .expect("a free loopback port")
             .local_addr()
             .expect("a bound listener has an address")
             .port();
-        // Released before it is handed out, and remembered before it is
-        // released, so that a second caller cannot be given it in between.
         let mut handed_out = HANDED_OUT
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
@@ -221,6 +299,10 @@ pub struct Herd {
     /// The token each runner of this herd carries, so one name is approved
     /// once however many times it is started (E-48).
     approved: std::sync::Mutex<std::collections::HashMap<String, String>>,
+    /// How many hubs of this herd are running, which is what decides how a
+    /// runner is approved. The herd's own state, never a question for the
+    /// network: see [`Herd::approve`].
+    hubs: HubCensus,
 }
 
 impl Herd {
@@ -231,6 +313,7 @@ impl Herd {
             data_root: tempfile::tempdir().expect("a temporary data root"),
             port: free_port(),
             approved: std::sync::Mutex::new(std::collections::HashMap::new()),
+            hubs: HubCensus::default(),
         }
     }
 
@@ -246,6 +329,23 @@ impl Herd {
     /// synchronous line it has always been at forty-odd call sites. The hub is
     /// a separate process, so there is nothing here for a runtime to deadlock
     /// on.
+    ///
+    /// **Which way round is read off this herd's own census, never off the
+    /// network.** The two paths want opposite things of the state root's lock
+    /// (D21): over the wire needs a hub holding it, on the root needs the
+    /// root free. So the question is only ever "is a hub of mine running",
+    /// and a herd that started every one of them knows the answer without
+    /// asking anybody.
+    ///
+    /// This used to answer it with `TcpStream::connect` on its own port, and
+    /// that is what turned `main` red (D147). A connect to a loopback port is
+    /// not a reliable way to learn that a hub is up: the port is an ephemeral
+    /// one this process was handed a moment earlier, and anything that
+    /// momentarily listens on it — `free_port` itself, on its way to passing
+    /// a repeat over — makes the probe say yes with no hub anywhere. The
+    /// probe then chose the wire, `herdctl` got the honest `Connection
+    /// refused`, and the harness reported it as *the product refusing an
+    /// approval*. Hence the assertion below, which names the harness.
     pub fn approve(&self, name: &str) -> String {
         let mut approved = self
             .approved
@@ -253,39 +353,68 @@ impl Herd {
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         approved
             .entry(name.to_owned())
-            .or_insert_with(|| match TcpStream::connect(self.addr()) {
-                // The hub is up: the operator's own command, over the wire.
-                Ok(_) => {
-                    let output = std::process::Command::new(binary("herdctl"))
-                        .arg("--hub")
-                        .arg(self.url())
-                        .args(["runner", "approve", name])
-                        .output()
-                        .expect("herdctl runs");
-                    assert!(
-                        output.status.success(),
-                        "approving {name} failed: {}",
-                        String::from_utf8_lossy(&output.stderr)
-                    );
-                    let token = String::from_utf8_lossy(&output.stdout).trim().to_owned();
-                    assert!(!token.is_empty(), "an approval prints the token it minted");
-                    token
-                }
-                // No hub yet, which some of these tests want on purpose: a
-                // runner started against a port nothing is listening on.
-                // Approving is then done on the state root itself, which is
-                // also what a deployment does before it starts the hub for
-                // the first time — the approval is a file in the root, so the
-                // hub reads it when it comes up.
-                Err(_) => {
-                    use herd_hub::JobStore;
-                    herd_hub::JobDirStore::open(self.state.path())
-                        .expect("the state root opens")
-                        .approve_runner(name)
-                        .expect("the state root mints a token")
+            .or_insert_with(|| {
+                if self.hubs.any_running() {
+                    self.approve_over_the_wire(name)
+                } else {
+                    self.approve_on_the_state_root(name)
                 }
             })
             .clone()
+    }
+
+    /// A hub of this herd is up: the operator's own command, over the wire.
+    fn approve_over_the_wire(&self, name: &str) -> String {
+        let output = std::process::Command::new(binary("herdctl"))
+            .arg("--hub")
+            .arg(self.url())
+            .args(["runner", "approve", name])
+            .output()
+            .expect("herdctl runs");
+        let complaint = String::from_utf8_lossy(&output.stderr);
+        // Said before the general failure below, because it is a different
+        // accusation: this one is about the harness. A `Connection refused`
+        // here means this herd counted a hub that is not there, and reading
+        // it as the product refusing the approval cost an afternoon once.
+        assert!(
+            output.status.success() || !complaint.contains("Connection refused"),
+            "THE HARNESS IS WRONG, NOT THE PRODUCT: this herd counts {} hub(s) \
+             of its own running, so {name} was approved over the wire — and \
+             nothing is listening on {}. No hub of this herd is up, or one \
+             died without this census noticing. Do not go looking in \
+             herd-hub for this. herdctl said: {complaint}",
+            self.hubs.how_many(),
+            self.addr(),
+        );
+        assert!(
+            output.status.success(),
+            "approving {name} failed: {complaint}"
+        );
+        let token = String::from_utf8_lossy(&output.stdout).trim().to_owned();
+        assert!(!token.is_empty(), "an approval prints the token it minted");
+        token
+    }
+
+    /// No hub of this herd is running, which some of these tests want on
+    /// purpose: a runner started against a port nothing is listening on.
+    ///
+    /// Approving is then done on the state root itself, which is also what a
+    /// deployment does before it starts the hub for the first time — the
+    /// approval is a file in the root, so the hub reads it when it comes up.
+    fn approve_on_the_state_root(&self, name: &str) -> String {
+        use herd_hub::JobStore;
+        herd_hub::JobDirStore::open(self.state.path())
+            .unwrap_or_else(|error| {
+                panic!(
+                    "THE HARNESS IS WRONG, NOT THE PRODUCT: this herd counts \
+                     no hub of its own running, so {name} was approved on the \
+                     state root directly — and the root would not open: \
+                     {error}. A root that is locked is a root some hub is \
+                     holding that this census has lost count of."
+                )
+            })
+            .approve_runner(name)
+            .expect("the state root mints a token")
     }
 
     /// Forget which runners this herd approved (E-48).
@@ -359,7 +488,16 @@ impl Herd {
             .kill_on_drop(true)
             .spawn()
             .expect("herd-hub starts");
-        let hub = Process { what: "hub", child };
+        // Counted the moment it exists, before the wait below: from here on a
+        // hub of this herd may be holding the state root's lock, so the root
+        // is no longer this harness's to mint an approval on. If the wait
+        // fails, `hub` drops and the count falls back with it.
+        self.hubs.one_started();
+        let hub = Process {
+            what: "hub",
+            child,
+            hub_census: Some(self.hubs.clone()),
+        };
         // Waiting for the hub to **say** it is listening, not for a connect to
         // succeed.
         //
@@ -482,6 +620,7 @@ impl Herd {
         Process {
             what: "runner",
             child,
+            hub_census: None,
         }
     }
 
@@ -562,6 +701,7 @@ impl Herd {
         Process {
             what: "wait",
             child,
+            hub_census: None,
         }
     }
 

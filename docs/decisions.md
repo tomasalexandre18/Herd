@@ -4885,7 +4885,117 @@ not. Nothing references 143.
 
 ---
 
-## 2026-10-16 — D146 The first files home, and the first figures under qos
+## 2026-10-16 — D146 A harness must not ask the network what it knows
+
+**`main` went red on the test harness, not on the product.** CI's `check`
+job failed in the `herd-hub` integration binary `killed_hub`, on
+`a_connection_that_served_starts_the_redial_counters_over`, 130 ms after
+that test started:
+
+```
+thread '…' panicked at herd-hub/tests/real_herd/mod.rs:265:21:
+approving the-real-runner failed: herdctl: herd cannot give you a verdict
+for this job: dialling ws://127.0.0.1:34889: IO error: Connection refused
+(os error 111): Connection refused (os error 111)
+```
+
+It reproduced on a docs-only pull request, which is what proved it was
+`main` and not the change. Nothing in the hub, the runner or `herdctl` was
+wrong.
+
+**The defect: `Herd::approve` decided how to approve by probing its own
+port.** A runner is approved before it starts (E-48), and there are two
+ways: `herdctl runner approve` over the wire, which needs a hub up, or
+minting the token on the state root directly, which is what a deployment
+does before its first hub start and which needs the root's lock free (D21).
+The two want opposite things of that lock, so the only question is "is a hub
+of mine running" — and `approve` answered it with `TcpStream::connect` on
+the herd's own address. In the failing test there is no hub at that point on
+purpose: the runner is started against a port nothing is listening on, and
+the hub appears twenty lines later. The probe said the hub was up, the wire
+path was taken, and `herdctl` was refused.
+
+**Proved: a stray listener on the port is sufficient, and is what the CI
+output looks like.** A listener put on the herd's port on purpose, which
+accepts the probe's one connection and then closes, reproduces the CI panic
+at the same line and word for word — same message, same
+`Connection refused (os error 111)`. That is now a test,
+`a_stray_listener_does_not_decide_how_a_runner_is_approved`, so what struck
+once in CI is one run here.
+
+**Hypothesis, not proved: the stray listener in CI was `free_port`'s own.**
+`free_port` hands out a port by binding `127.0.0.1:0`, reading the number
+and letting the listener go; a port it has handed out before is passed over.
+Two measurements on the development host, Linux 6.18, make it the candidate:
+`bind(0)` returns a port it released within some 120 allocations of a
+28 232-port range, so a repeat is the ordinary case that loop exists for —
+and on the way to passing a repeat over, `free_port` held a *listening
+socket on another herd's port* across a contended `Mutex`. Two cores make
+that window a scheduler timeslice wide, which fits a failure seen only
+there. What was not done is catching it happening: the natural failure did
+not reproduce here in 60 runs of the test alone and 25 of the whole binary
+under a low-weight scope, nor in the runs before the fix. The mechanism is
+sufficient and the window is real; that this particular window is the one
+CI fell into remains inference.
+
+**Refuted: the kernel's own source-port choice.** The first hypothesis was
+a loopback self-connect — `free_port`'s number goes back into the ephemeral
+range, the kernel hands it to an outgoing connection as its *source* port,
+and a TCP connection whose source port equals its destination port
+completes by simultaneous open. The second half is true: forcing the source
+port with `bind` and then connecting to that same port succeeds on this
+kernel. The first half is not. 200 000 `TcpStream::connect` calls to a dead
+loopback port in the ephemeral range produced zero self-connections, so
+Linux's automatic source-port choice does not pick the destination port, and
+that mechanism cannot fire through `connect`. The CI runner's kernel is a
+different one and was not measured.
+
+**Choice: the approval path is read off the herd's own state.** A `Herd`
+starts every hub it has and is handed each one back when it dies, so it can
+simply count them. `HubCensus` is incremented when a hub is spawned and
+decremented exactly once however that process ends — signalled, waited for,
+or merely dropped — and `approve` reads the count. It keeps its blocking
+signature, which forty-odd call sites depend on. A hub killed and restarted,
+and `forget_approvals` on a recreated state root, both follow from the count
+with no special case.
+
+**And the failure mode is named rather than made unlikely.** If the wire
+path is ever taken while nothing answers, the assertion now opens with "THE
+HARNESS IS WRONG, NOT THE PRODUCT", gives the count the herd believed, and
+says not to go looking in `herd-hub`. The other side says the matching
+thing: a state root that will not open because something holds its lock
+accuses the census of having lost count. The old sentence — "approving
+failed: connection refused" — reads as the product refusing an approval, and
+that is what it cost: the hunt began in the hub and the runner and reached
+the harness last. A harness that lies about which side is broken is worse
+than one that merely fails.
+
+**Alternative rejected: `free_port` holding its listener until the hub
+binds.** It cannot. The hub binds the port itself through its own
+`--listen`, which is the code these tests exist to drive, so a harness still
+holding it would hand the hub `Address already in use`; passing the socket
+down to the child would mean the hub no longer binds its own port. What is
+done instead is to close the listener before the handed-out set is touched,
+which shrinks the window to almost nothing — and, with nothing probing any
+more, to nothing that decides anything.
+
+**Carried through the suite.** `capabilities.rs` waited for its hub with the
+same connect probe; it now waits for the hub to *say* it is listening, as
+`real_herd::start_hub_with` already did for the same reason. Two assertions
+in `killed_hub.rs` still use `TcpStream::connect(..).is_err()` to check that
+a refused hub did not bind: those are assertions about the product rather
+than decisions taken by the harness, and with `free_port`'s window closed
+their only remaining exposure is the self-connect refuted above. They are
+left alone.
+
+**On the number.** Written as D147, renumbered to 146 on merge: the entry
+that had claimed 146 was on a branch this one overtook, and it is now 147.
+The file is read in order, so order is what is kept — the same collision
+D145 describes, resolved the same way.
+
+---
+
+## 2026-10-16 — D147 The first files home, and the first figures under qos
 
 **A job's files come home on the real deployment, and this is the entry
 that stops that being a claim about a test suite.** The first consumer's
