@@ -733,6 +733,14 @@ pub struct OutputSummary {
     /// join onto its own state root.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub skipped: Vec<String>,
+    /// Whether the bytes came after the verdict rather than on it (D148).
+    ///
+    /// On the record so an operator can tell which carriage a job used, and
+    /// so a hub that restarts knows a collection it is still owed bytes for
+    /// is one it should ask about. **Not for a requester**: what a requester
+    /// gets is the same collection either way.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub streamed: bool,
 }
 
 impl OutputSummary {
@@ -745,6 +753,46 @@ impl OutputSummary {
     }
 }
 
+/// One collection a runner still owes this hub, as the records describe it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CollectionOwed {
+    pub job_id: JobId,
+    /// Which attempt produced it: a second attempt's files are not the
+    /// first's, which is why every file frame carries this.
+    pub attempt: u32,
+    /// Which runner ran that attempt, so one runner is never told about
+    /// another's collection.
+    pub runner: String,
+    /// What this hub holds of it, ready to go on
+    /// [`herd_proto::FromHub::JobFilesHeld`].
+    pub held: Vec<herd_proto::FileHeld>,
+}
+
+/// What one streamed chunk completed, as the store saw it.
+///
+/// Three outcomes rather than a `bool`, because the hub does three different
+/// things with them and a caller that could not tell them apart would have to
+/// guess: say nothing, acknowledge the collection, or name a file that will
+/// not do.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ChunkLanded {
+    /// Written, and this file is not finished yet.
+    More,
+    /// This file is complete, verified and in `files/`, and so is every other
+    /// file the manifest named: the collection is done and the runner may
+    /// drop its spool.
+    Complete,
+    /// This chunk is not what the manifest promised and was not written.
+    ///
+    /// An offset that does not continue what the hub holds, a path no verdict
+    /// announced, or a digest that did not match when the last byte landed.
+    /// Each is named rather than retried silently: a transfer that cannot
+    /// make progress has to be visible, because the alternative is a
+    /// collection that never completes and a job whose record nobody can
+    /// explain.
+    Refused(String),
+}
+
 /// One file of a job's record, as the record names it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct KeptFile {
@@ -752,6 +800,21 @@ pub struct KeptFile {
     /// `files/results.json` under `{out}` is `files/results.json` here.
     pub path: String,
     pub bytes: u64,
+    /// The file's sha256, lowercase hex, as the runner announced it.
+    ///
+    /// **This is what makes the manifest outlive the bytes** (D148). The
+    /// record keeps a path, a size and a digest for every file a job
+    /// produced, and those three are kilobytes however many hundreds of
+    /// megabytes they describe — so there is never a reason to delete them,
+    /// and only the bytes are ever removed. A requester asking for something
+    /// already gone is then told which files, how big, and why, instead of
+    /// being handed a short directory it would read as a whole one; and a
+    /// judge re-reading an old result knows what it was looking for (E-54).
+    ///
+    /// Empty on a record written before this existed, which is the honest
+    /// answer for one: nobody computed a digest for those bytes.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub sha256: String,
 }
 
 /// What `submissions` is on a record that predates the field. One, because
@@ -1404,7 +1467,6 @@ pub trait JobStore: Send + Sync + 'static {
     /// over a malformed path, and a path that cannot be written down is a
     /// fact about one file rather than about the job.
     fn record_outputs(&self, id: &JobId, outputs: &herd_proto::JobOutputs) -> Result<()>;
-
     /// The files this job's record holds, read back off the disk.
     ///
     /// What a `herdctl wait` that attached long after the job ran is given,
@@ -1413,7 +1475,91 @@ pub trait JobStore: Send + Sync + 'static {
     /// still knows. `Default` for a job that kept nothing, and for a job this
     /// store has never heard of — the caller has already dealt with that case
     /// through [`JobStore::job`].
-    fn job_outputs(&self, id: &JobId) -> Result<herd_proto::JobOutputs>;
+    ///
+    /// `with_bytes` decides whether the data comes with the manifest.
+    /// **`false` is not a cheaper version of `true`**: it is the answer to a
+    /// different question. A verdict frame carries the manifest of a streamed
+    /// collection and must not carry hundreds of megabytes; a requester that
+    /// then asks for the files gets them a chunk at a time. Reading the bytes
+    /// to throw them away would be the one place this design reintroduced the
+    /// cost it exists to remove.
+    fn job_outputs(&self, id: &JobId, with_bytes: bool) -> Result<herd_proto::JobOutputs>;
+
+    /// Write one chunk of a streamed output file, and say what that completed.
+    ///
+    /// The hub's half of [`herd_proto::ToHub::JobFileChunk`]. Appends to a
+    /// part-file beside the job's `files/` directory and, when the manifest's
+    /// length is reached, verifies the digest the verdict announced before
+    /// renaming the file into place under D8's discipline.
+    ///
+    /// **`files/` therefore only ever holds whole, verified files**, which is
+    /// what keeps E-53's promise intact while a collection is still arriving:
+    /// a consumer reading the directory sees finished files or nothing, never
+    /// a half-written one it could parse.
+    fn write_output_chunk(
+        &self,
+        id: &JobId,
+        path: &str,
+        offset: u64,
+        data: &[u8],
+    ) -> Result<ChunkLanded>;
+
+    /// How much of each file of a job's manifest this hub holds.
+    ///
+    /// What [`herd_proto::FromHub::JobFilesHeld`] carries, and the whole of
+    /// the resumption design on the runner's side: the hub is the side that
+    /// knows what it has, so a runner redialling with 300 MiB spooled is told
+    /// where to pick up rather than having to ask, and a part-written file
+    /// resumes at the hub's own length instead of the runner's idea of how
+    /// far it had got — which is exactly the figure a dropped link
+    /// invalidated.
+    ///
+    /// Derived from the disk every time, never stored: a count kept beside
+    /// the files could disagree with them, and the disagreement would be a
+    /// collection that never completes (D79's reasoning, applied to bytes).
+    fn output_holdings(&self, id: &JobId) -> Result<Vec<herd_proto::FileHeld>>;
+
+    /// Every collection this hub was promised and has not finished
+    /// receiving.
+    ///
+    /// **Derived from the records, never kept in memory** (D79's rule,
+    /// applied to bytes): a list of outstanding transfers held beside the
+    /// files could disagree with them, and the disagreement would be either a
+    /// runner holding a spool nobody ever asks for again or a hub waiting for
+    /// bytes that are already on its disk. Rebuilt by looking, so a hub that
+    /// restarted twice mid-transfer picks up exactly where its disk says it
+    /// is.
+    ///
+    /// A **finished** job, note: the verdict goes first and the files follow
+    /// (D148), so these are never in [`JobStore::unfinished_jobs`]. That is
+    /// the point — a job is readable and complete about what it produced long
+    /// before its evidence has all crossed.
+    fn collections_owed(&self) -> Result<Vec<CollectionOwed>>;
+
+    /// Read `take` bytes of one of a job's kept files, starting at `offset`.
+    ///
+    /// `None` when the record names the file and the disk does not have it,
+    /// which is a fact a requester is **told** rather than one the hub
+    /// smooths over: the manifest outlives the bytes, so a path with nothing
+    /// behind it is an answer and not a gap (D148).
+    ///
+    /// A chunk at a time, and through the store rather than off a path the
+    /// server built itself: where a job's files live is the store's to know,
+    /// and a server that joined its own paths onto the state root would be a
+    /// second opinion about the layout (D8).
+    fn read_output_chunk(
+        &self,
+        id: &JobId,
+        path: &str,
+        offset: u64,
+        take: usize,
+    ) -> Result<Option<Vec<u8>>>;
+
+    /// Forget whatever is left of a part-written collection.
+    ///
+    /// Called when every file is in place, so the part directory does not
+    /// outlive the transfer it belonged to.
+    fn clear_output_parts(&self, id: &JobId) -> Result<()>;
 
     /// Record the start of an attempt on a job, and give it its number.
     ///

@@ -364,9 +364,13 @@ async fn an_output_over_the_cap_is_refused_with_figures_and_never_truncated() {
         said.contains("Nothing was truncated"),
         "and say that nothing was cut down: {said}"
     );
+    // It used to have to name M11 as somewhere else to go. M11 **is** this
+    // now — the streamed carriage above the inline threshold (D148) — so what
+    // the sentence names instead is the flag that would let the job hand its
+    // output back and the figure that bounds that flag.
     assert!(
-        said.contains("M11"),
-        "and where a large artefact belongs instead: {said}"
+        said.contains("--job-output-cap") && said.contains("disk budget"),
+        "and what to do about it, now that there is no other milestone to point at: {said}"
     );
     // And the record says it, for whoever reads the job afterwards.
     let job_id = the_job_id(&harness);

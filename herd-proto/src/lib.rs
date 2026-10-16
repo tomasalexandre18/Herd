@@ -34,7 +34,8 @@ pub use declaration::{
     LABELS_KEY, LINE_TOKEN, MEMORY_KEY, OUT_TOKEN, READING_KEYS, SCENARIOS_KEY, TMPFS_KEY,
 };
 pub use outputs::{
-    check_relative, JobOutputs, OutputFile, FRAME_CEILING, MAX_OUTPUT_CAP, PER_FILE_OVERHEAD,
+    check_relative, JobOutputs, OutputFile, FRAME_CEILING, INLINE_OUTPUT_MAX, OUTPUT_CHUNK_BYTES,
+    PER_FILE_OVERHEAD,
 };
 pub use placement::{
     default_memory_floor_mib, parallelism_tokens, size_mib, with_parallelism, HostSize,
@@ -46,12 +47,40 @@ pub use placement::{
 /// not announce exactly this number is refused by name
 /// ([`version_mismatch_reason`]), whatever else it got right.
 ///
-/// **1 is the first deployed protocol, and it is frozen here** (D73). The
-/// numbers 2 to 8 each existed for a real format break, but every one of those
-/// breaks was made on a protocol nothing spoke outside this repository;
-/// carrying eight compatibility eras into a deployment would have described a
-/// history no peer ever lived. M16 sets the number back to 1, and from M16 on
-/// it is not a development counter.
+/// **1 was the first deployed protocol and 2 is the first bump since the
+/// freeze** (D73, D148). The development numbers 2 to 8 each existed for a
+/// real format break, but every one of those breaks was made on a protocol
+/// nothing spoke outside this repository; carrying eight compatibility eras
+/// into a deployment would have described a history no peer ever lived. M16
+/// set the number back to 1, and from M16 on it is not a development counter —
+/// so **this 2 is a compatibility statement, approved by Alexa on
+/// 2026-10-16**: M11 needs frames for a job's streamed outputs and for the
+/// content registry, both of them new variants, and D124 and D128 between
+/// them make a new variant on either enum breaking whatever serde would
+/// tolerate.
+///
+/// **And this is the bump that makes the next one cheaper, by exactly one
+/// enum arm.** Both frame enums now carry a `#[serde(other)]` catch-all, so a
+/// frame whose `type` a build has never heard of **decodes** instead of
+/// failing to. What each peer then does with it is deliberately different,
+/// and the difference is the whole value:
+///
+/// * a **runner** logs it and ignores it, because a frame it does not know is
+///   work it is not needed for. Before this, the decode error killed the link
+///   and the runner redialled **into the same undecodable frame** — it looped
+///   rather than shrugged, which D128 recorded as a defect and did not fix.
+///   So a runner-only variant added after this is a log line, not an outage;
+/// * a **requester** still ends the run, because one that cannot read what
+///   the hub is telling it must not report a verdict (D124). The `bail!` is
+///   right and it stays; what the catch-all buys here is a named frame type
+///   in the sentence instead of a serde error about an unknown variant;
+/// * the **hub** refuses the peer by name rather than ignoring it, because a
+///   request it cannot read is work that will never be done, and silence
+///   would leave the peer waiting for it.
+///
+/// None of that makes a `FromHub` variant that can reach a requester free.
+/// The rule from D124 and D128 still stands for anything a requester sees;
+/// what has changed is that it no longer stands for the runner.
 ///
 /// **What moving it now costs.** The handshake tests equality, not a floor:
 /// the day this becomes 2, every runner and every `herdctl` still built
@@ -62,27 +91,24 @@ pub use placement::{
 /// moved is decided before it lands.
 ///
 /// **What still has to move it.** "Additive" is not the same as "an older peer
-/// survives it", and serde does not close the gap. [`FromHub`] and [`ToHub`]
-/// are tagged enums with no catch-all variant, so a frame whose `type` an
-/// older build has never heard of does not decode at all — a read error, not
-/// an ignored message. **Adding a variant to either enum is a breaking change
-/// and moves this number**, whatever serde would tolerate on the wire. The two
-/// clients fail differently and neither failure is acceptable: `herdctl` ends
-/// the run it was following with "undecodable frame" and exits 125, reporting
-/// no verdict for a job that may well have passed — the shape of D117, closed
-/// by D118 — while `herd-runner` drops the link and redials into the same
-/// undecodable frame, so it loops rather than shrugs. The runner's `other =>`
-/// arm, which ignores "what is not a runner's business", only covers variants
-/// that build already knows about; it is not forward compatibility. A new
-/// *field* on an existing variant is the one change that may leave the number
-/// alone, and only when it is `#[serde(default)]` *and* means, when absent,
-/// exactly what its default says.
+/// survives it", and serde only half closes the gap. A frame whose `type` an
+/// older build has never heard of now decodes — into the catch-all described
+/// below — so it is an *ignorable* message rather than a read error. That is
+/// enough for a runner and **not** enough for a requester: `herdctl` refuses
+/// the frame on purpose, ending the run it was following with no verdict for
+/// a job that may well have passed, which is the shape of D117 and is the
+/// right behaviour (D124). So **adding a [`FromHub`] variant that can reach a
+/// requester is still a breaking change and still moves this number**,
+/// whatever serde would tolerate on the wire. A variant only a runner ever
+/// sees no longer is. A new *field* on an existing variant may leave the
+/// number alone, and only when it is `#[serde(default)]` *and* means, when
+/// absent, exactly what its default says.
 ///
 /// The gap between two *builds* speaking the same protocol is a separate
 /// question with a separate answer ([`version_gap`], E-51): a minor gap is
 /// served with a note, a major one refused. This number only says whether two
 /// peers can read each other's frames at all.
-pub const PROTOCOL_VERSION: u32 = 1;
+pub const PROTOCOL_VERSION: u32 = 2;
 
 /// How often a runner says it is alive and what it is doing (E-40).
 ///
@@ -406,6 +432,96 @@ pub mod bytes_as_base64 {
         BASE64
             .decode(text.as_bytes())
             .map_err(serde::de::Error::custom)
+    }
+}
+
+/// The same encoding for bytes that may not be on the frame at all
+/// ([`OutputFile::data`]).
+///
+/// Separate from [`bytes_as_base64`] rather than generic over the option,
+/// because the distinction it keeps is load-bearing: absent means the bytes
+/// are elsewhere, and an empty string means a file of zero bytes. A single
+/// codec that read one as the other would turn "the bytes are streaming" into
+/// "the file is empty", which is the kind of quiet wrong answer a results
+/// file should never be able to give.
+pub mod opt_bytes_as_base64 {
+    use data_encoding::BASE64;
+    use serde::{Deserialize, Deserializer, Serializer};
+
+    pub fn serialize<S: Serializer>(
+        bytes: &Option<Vec<u8>>,
+        serializer: S,
+    ) -> Result<S::Ok, S::Error> {
+        match bytes {
+            Some(bytes) => serializer.serialize_str(&BASE64.encode(bytes)),
+            None => serializer.serialize_none(),
+        }
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(
+        deserializer: D,
+    ) -> Result<Option<Vec<u8>>, D::Error> {
+        let Some(text) = Option::<String>::deserialize(deserializer)? else {
+            return Ok(None);
+        };
+        BASE64
+            .decode(text.as_bytes())
+            .map(Some)
+            .map_err(serde::de::Error::custom)
+    }
+}
+
+/// The sha256 of some bytes, lowercase hex.
+///
+/// One function, here, for the reason the protocol holds every other shared
+/// figure: a runner computes the digest a manifest announces and the hub
+/// verifies a streamed file against it, and two implementations of "the
+/// sha256 of this file" would be two truths about one contract
+/// (invariant 4). The hex is lowercase and that is part of the contract, not
+/// a formatting preference — a comparison is a string comparison.
+pub fn sha256_hex(bytes: &[u8]) -> String {
+    let mut rolling = Sha256Rolling::new();
+    rolling.update(bytes);
+    rolling.finish()
+}
+
+/// The same digest over bytes that arrive a piece at a time.
+///
+/// Both sides of a streamed file need this and neither can hold the file: a
+/// runner hashes 400 MiB off its disk to announce it, and the hub hashes the
+/// chunks as they land to verify it. A `sha256_hex` of the whole thing would
+/// mean reading it into memory, which is the cost the streamed carriage
+/// exists to avoid.
+///
+/// It is here beside [`sha256_hex`] so the two cannot disagree about the
+/// hex — one of them formatting uppercase would make every verification fail
+/// for a reason nobody would look for (invariant 4).
+pub struct Sha256Rolling(sha2::Sha256);
+
+impl Sha256Rolling {
+    #[allow(clippy::new_without_default)]
+    pub fn new() -> Self {
+        use sha2::Digest;
+
+        Self(sha2::Sha256::new())
+    }
+
+    pub fn update(&mut self, bytes: &[u8]) {
+        use sha2::Digest;
+
+        self.0.update(bytes);
+    }
+
+    pub fn finish(self) -> String {
+        use sha2::Digest;
+        use std::fmt::Write;
+
+        let digest = self.0.finalize();
+        let mut hex = String::with_capacity(digest.len() * 2);
+        for byte in digest {
+            let _ = write!(hex, "{byte:02x}");
+        }
+        hex
     }
 }
 
@@ -1193,6 +1309,66 @@ pub enum ToHub {
     /// The hub propagates it to whichever runner holds the attempt; a
     /// requester never names a machine (invariant 6).
     CancelJob { job_id: JobId },
+    /// One piece of one file of a job's streamed collection (D148).
+    ///
+    /// **The file is not announced here, because it was announced on the
+    /// verdict.** `JobFinished` carried the whole manifest — every path, its
+    /// length and its sha256 — before a byte of any file moved, so by the
+    /// time a chunk arrives the hub already knows how long this file is and
+    /// what it must hash to. That is why there is no `job_file_begin` frame:
+    /// the manifest *is* the announcement, it is made once for the collection
+    /// rather than once per file, and it is made on a frame that was going to
+    /// be sent anyway.
+    ///
+    /// `offset` is where these bytes start, and it is checked rather than
+    /// trusted. A resumed transfer is the whole reason it is on the wire: the
+    /// hub holds a part-written file of a known length, tells the runner so
+    /// ([`FromHub::JobFilesHeld`]), and a chunk that does not begin exactly
+    /// where the hub's own bytes end is refused by name instead of splicing
+    /// two different reads of the same path into one file that then fails its
+    /// hash for a reason nobody can see.
+    JobFileChunk {
+        job_id: JobId,
+        /// Which attempt produced it, for the reason [`ToHub::LogChunk`]
+        /// carries one: a second attempt's files are not the first's.
+        attempt: u32,
+        /// Relative to `{out}`, directories preserved, and named on the
+        /// manifest. A path that is not on it is refused — the hub never
+        /// writes a file a verdict did not promise.
+        path: String,
+        offset: u64,
+        #[serde(with = "bytes_as_base64")]
+        data: Vec<u8>,
+    },
+    /// Requester asks for the files of a job it holds the manifest of (D148).
+    ///
+    /// **Only the streamed carriage ever sends this**, and that is the point
+    /// of its existing. Under the inline threshold a collection's bytes are
+    /// already on the verdict frame, so nothing is missing and nothing is
+    /// asked for — D137's single round trip is untouched. Above it the bytes
+    /// are on the hub's disk and this is how they are called for, which costs
+    /// one frame against a payload of hundreds of megabytes and means the hub
+    /// never pushes bytes at a requester that did not want them.
+    ///
+    /// A requester that asks for files it already has asks for nothing: it
+    /// names only what it is missing.
+    AskJobFiles {
+        job_id: JobId,
+        /// The paths wanted. Empty means every path on the manifest.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        paths: Vec<String>,
+    },
+    /// A frame of a type this build has never heard of.
+    ///
+    /// **The hub answers this with a refusal naming the type, never with
+    /// silence.** A request it cannot read is work that will never be done,
+    /// and a peer told nothing would wait for it — which is the failure a
+    /// catch-all is supposed to prevent and not a cheaper version of it. The
+    /// other direction is the opposite ([`FromHub::Unknown`]): a *runner*
+    /// ignores what it does not know, because a frame it has never heard of
+    /// is work it is not needed for.
+    #[serde(other)]
+    Unknown,
 }
 
 /// Everything a requester asks for about one job (E-07).
@@ -1645,6 +1821,130 @@ pub enum FromHub {
     /// acknowledgement of something still in memory would be a lie the next
     /// power cut collects on.
     JobResultAck { job_id: JobId },
+    /// What the hub holds of a job's streamed collection, so a runner resumes
+    /// rather than starts again (D148).
+    ///
+    /// **Sent unprompted**, for every job of a reconnecting runner whose
+    /// collection the hub has not finished receiving — the same shape as
+    /// [`FromHub::ResendLog`], and for the same reason: the hub is the side
+    /// that knows what it is missing, so asking it would be a round trip
+    /// spent learning what it could simply say. A runner that has just
+    /// redialled with 300 MiB spooled needs one frame to know where to pick
+    /// up, not a conversation.
+    ///
+    /// Each entry says how many bytes of that path the hub holds. Equal to
+    /// the manifest's length means complete and verified; less means a
+    /// part-written file to continue; a path absent from the list means not a
+    /// byte of it has arrived.
+    JobFilesHeld {
+        job_id: JobId,
+        attempt: u32,
+        held: Vec<FileHeld>,
+    },
+    /// The hub holds every file the manifest named, verified, and the runner
+    /// may drop its spool.
+    ///
+    /// [`FromHub::JobResultAck`] for the files, and separate from it on
+    /// purpose: the verdict is acknowledged when the verdict is written, and
+    /// a runner must be free to forget a result it has delivered without
+    /// waiting on hundreds of megabytes it has not. The two acknowledgements
+    /// are the two halves of a record and they arrive when each half is
+    /// durable.
+    JobFilesAck { job_id: JobId, attempt: u32 },
+    /// One piece of one file of a job's collection, on its way to a requester
+    /// that asked for it ([`ToHub::AskJobFiles`]).
+    ///
+    /// The requester's side of [`ToHub::JobFileChunk`], and bounded the same
+    /// way. Read off the hub's disk, so this frame flows for a job that
+    /// finished an hour ago and for one finishing now without the two being
+    /// different code: there is one answer to "what did this job leave" and
+    /// it is the disk (D137).
+    JobFile {
+        job_id: JobId,
+        path: String,
+        offset: u64,
+        #[serde(with = "bytes_as_base64")]
+        data: Vec<u8>,
+    },
+    /// Every file the requester asked for has been sent, and here is what
+    /// could not be.
+    ///
+    /// **The frame that makes an absent output answerable instead of empty**
+    /// (D148). The manifest outlives the bytes: a job's record keeps every
+    /// path, length and sha256 for as long as the record exists, and only the
+    /// bytes are ever removed. So a requester asking for something that is
+    /// not there is told which paths, how big they were, and why they are
+    /// gone — never handed a short directory it would read as a whole one.
+    ///
+    /// Two reasons reach it today — a file whose runner never came back, and
+    /// a path the hub refuses to read back off its own disk — and a third
+    /// when M12's sweeper lands, which is eviction. All three say the same
+    /// kind of sentence, which is why there is one frame for them.
+    JobFilesSent {
+        job_id: JobId,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        absent: Vec<AbsentFile>,
+    },
+    /// A frame of a type this build has never heard of.
+    ///
+    /// **A runner logs it and ignores it; a requester ends its run.** The
+    /// asymmetry is deliberate and it is the reason a protocol break was
+    /// worth spending on an enum arm (D148). Before this variant existed the
+    /// decode failed outright, and the two clients failed in two unacceptable
+    /// ways: `herdctl` reported no verdict for a job that may have passed,
+    /// and `herd-runner` dropped the link and **redialled into the same
+    /// undecodable frame** for ever (D128). Ignoring is right for a runner,
+    /// because a frame it does not know is work it is not needed for; it is
+    /// wrong for a requester, because a requester that cannot read what the
+    /// hub is telling it must not pretend to have a verdict (D124).
+    #[serde(other)]
+    Unknown,
+}
+
+/// How much of one streamed output file the hub holds
+/// ([`FromHub::JobFilesHeld`]).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FileHeld {
+    pub path: String,
+    /// Bytes on the hub's disk for this path, complete or part-written.
+    pub bytes: u64,
+}
+
+/// One file a job's record names and the hub cannot hand over **yet**
+/// ([`FromHub::JobFilesSent`]).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AbsentFile {
+    pub path: String,
+    /// How big it was, off the manifest, because "338 MiB of screenshots are
+    /// gone" and "something is gone" are different sentences.
+    pub len: u64,
+    /// Why, in one sentence a requester can act on.
+    pub why: String,
+    /// How many bytes of it the hub holds: 0, or a part-written file's
+    /// length.
+    ///
+    /// **This is what tells a waiting requester that waiting is working.** A
+    /// collection still crossing and a collection that will never arrive look
+    /// identical in a list of names, and the difference between them is
+    /// whether this figure moves.
+    #[serde(default)]
+    pub held: u64,
+    /// Whether the hub is still expecting these bytes.
+    ///
+    /// **The field that makes "not yet" different from "gone", and they must
+    /// never be confused.** The verdict goes first and the bytes follow
+    /// (D148), so a requester asking for a collection the instant its job
+    /// ended is asking for something genuinely in flight — and told "gone"
+    /// it would report a lost result for a job whose evidence was seconds
+    /// away. Told "still coming" it waits, which is what `--outputs-to`
+    /// promises.
+    ///
+    /// `false` is the answer that is final: no runner is going to send these
+    /// bytes, because none holds them — a machine that never came back
+    /// today, M12's retention later. Both deserve the same sentence and both
+    /// get it.
+    #[serde(default)]
+    pub still_coming: bool,
 }
 
 /// The version of the output Herd frames a job's own output with (Q7).
@@ -2005,4 +2305,25 @@ pub fn to_frame<M: Serialize>(message: &M) -> Result<String, serde_json::Error> 
 /// Decode the text of one WebSocket frame into one message.
 pub fn from_frame<M: DeserializeOwned>(frame: &str) -> Result<M, serde_json::Error> {
     serde_json::from_str(frame)
+}
+
+/// The `type` a frame announces itself as, whatever this build knows about it.
+///
+/// The catch-all variants are unit variants, so serde discards the tag on its
+/// way to them: a peer that only matched on the enum would know it had met
+/// something unknown and not **what**. That is the difference between a log
+/// line somebody can act on — `ignoring a frame of type "pack_capability"` —
+/// and one nobody can, so the tag is read back off the text here.
+///
+/// Peeks one field and allocates one string; it is called only on the
+/// unknown path, which is by construction rare.
+pub fn frame_type(frame: &str) -> Option<String> {
+    #[derive(Deserialize)]
+    struct Tagged {
+        #[serde(rename = "type")]
+        kind: String,
+    }
+    serde_json::from_str::<Tagged>(frame)
+        .ok()
+        .map(|tagged| tagged.kind)
 }

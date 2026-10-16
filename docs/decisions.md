@@ -5359,3 +5359,113 @@ protocol move**, which is why it went to `main` on its own (PR #37) instead
 of waiting here: the first consumer has removed their fallback, so a fix
 they get without redeploying anything is worth more than a tidy one they do
 not. Everything else above needs version 2 and lands together.
+
+---
+
+## 2026-10-16 — D149 Building D148's carriage, and the four things it found
+
+**D148 was approved and then built, and three of its sentences turned out to
+be incompatible with code that was already there.** D128 is an entry about
+exactly this — *"a prescription I write into a decision is a hypothesis until
+it is built"* — so this is the follow-up it asks for. `PROTOCOL_VERSION` is
+now **2**, the two carriages work end to end on real binaries, and none of
+what follows was visible from reading.
+
+**One: "the verdict goes first and the files follow" is incompatible with
+`is_current`, and every chunk was silently dropped.** The hub guards every
+frame about a job with one check — is this the attempt I am waiting for? — and
+that check answers `JobIsOver` for a finished job, logs it, replies
+`StaleAttempt` and skips the frame. Right for a log chunk, which can only
+arrive while a job runs. Exactly wrong for a file chunk, which by design
+**always** arrives after the verdict. So the runner streamed 32 chunks, the
+hub read all 32, wrote none, and a requester was told its collection was not
+there — with no error anywhere, because dropping a stale frame is a normal
+thing for the hub to do.
+
+The fix is a separate check (`files_may_land`) asserting what actually has to
+be true: the record says this collection streamed, the attempt is the one on
+the record, and the runner is the machine that ran it. **The general shape,
+worth keeping:** a new frame that breaks an existing invariant about *when*
+frames arrive will be refused by whatever enforces that invariant, silently,
+because refusing is that code's job. "The verdict goes first" was one
+sentence in a design and a load-bearing change to the hub's frame discipline.
+
+**Two: a part-written file at full length is not a finished file, and two
+definitions of "complete" disagreed for a hundred milliseconds.** The hub
+writes chunks into `files.part/`, verifies the digest, and renames into
+`files/` — so between the last byte landing and the rename there is a window
+as long as it takes to hash the file, which for 32 MiB is about a tenth of a
+second. `collections_owed` judged completeness off the **holdings**, which
+report a part file's length, so in that window it said the collection was
+complete; `send_the_files` then told the requester the bytes were no longer
+coming, and the requester went looking in `files/` for something not yet
+there. What it reported was *"the hub does not have it"* for a collection that
+was a tenth of a second from arriving.
+
+Now there is one definition, `collection_is_whole`, and every caller uses it:
+in `files/`, at the manifest's length, verified. D79's rule about slots —
+derive it once, so two answers cannot disagree — applies to bytes, and the
+cost of two answers here was a wrong one at the worst possible moment.
+
+**Three: `--outputs-to` has to wait, and the hub has to say whether waiting
+is worth anything.** D148 said it waits, in one clause, and the first
+implementation asked once. "Not there yet" and "gone for good" are opposite
+instructions and look identical in a list of names, so `AbsentFile` now
+carries `still_coming` and `held`: the requester waits while the figure moves
+and stops when it stops. **The bound is on silence, not on duration** —
+thirty seconds without progress — because a few hundred megabytes on a slow
+link is slow and not broken, and a deadline on the transfer itself would make
+the consumer's biggest runs the ones that fail.
+
+**Four: the output cap's startup check became a clamp, not a refusal.** The
+old check refused a cap bigger than one frame, and refusing was right: a cap
+past the frame produced a verdict nothing could decode, which is D128's
+redial loop. With the streamed carriage there is no frame ceiling, and what
+bounds the flag instead is the disk — a job writes `{out}` inside its
+workspace, which stops at `--job-disk-budget`. That is a figure that *cannot
+bind* rather than one that breaks something, which is D89's case exactly, so
+it is clamped loudly where it is written. Found by the confinement suite: its
+harness lends a 64 MiB disk budget, the refusal fired, and **fifteen tests
+lost their runner at startup** — a legitimate configuration refused. A test
+suite rejecting a new refusal en masse is evidence about the refusal.
+
+**And D128's loop, measured at last.** The catch-all arm was the cheap half
+of this break, and it is now asserted against the real runner's redial loop
+with a hand-written hub that says something from the future. With the arm:
+**one dial** in 1.2 s, and health reports still flowing. With the arm removed:
+**178 dials** in the same 1.2 s. D128 described that loop from reading the
+code; this is the figure.
+
+```
+assertion `left == right` failed: a frame it cannot read must not make a
+runner redial: 178 dials in 1.2 s is D128's loop, not a shrug
+```
+
+The three answers are all tested where the behaviour lives: a runner ignores
+and stays, a requester ends its run naming the frame type (D124's `bail!`,
+kept), and the hub refuses by name rather than leaving a peer waiting for
+work it cannot read.
+
+**What is built, and what is deliberately not.** Built: the protocol move,
+the catch-all, the manifest on the verdict, the inline and streamed carriages
+with the choice made by the runner off a walk that has only measured, the
+spool as a **rename** out of the workspace rather than a copy, per-file
+sha256 verified before a rename on the hub and again by the requester,
+resumption from the hub's own holdings, the window that bounds bytes in
+flight, and the manifest outliving the bytes. Not built, as the orchestrator
+scoped it: the 200 GB budget, the sweeper, the eviction order and the line
+when eviction breaks the seven-day floor. The manifest-outlives-the-bytes
+path is nevertheless already exercised, because a file that never arrived
+reaches exactly the state an evicted one will.
+
+**What is still unproven.** The suite streams 32 MiB, not a few hundred, so
+the consumer's real size has still never crossed a link. The event-loop claim
+— that 1 MiB chunks keep a large transfer inside the 15 s cadence — is now
+plausible rather than measured: nothing went quiet in these tests, and no
+test asserts a health report's timing during a transfer. The window that
+bounds bytes in flight is eight chunks and that figure is chosen, not
+measured against a slow link. And a requester still assembles a collection in
+memory before writing it: streaming removed the base64 blow-up and the
+140 MiB-per-party frame cost, and it did not remove holding the payload once.
+Writing each file to disk as it completes is the next slice, beside the
+sweeper.

@@ -713,6 +713,16 @@ pub async fn wait_for_job(
 /// * **It writes nothing when the collection was refused.** Over the cap
 ///   there are no files, and a directory the caller can find empty is the
 ///   honest shape of that: the sentence is what says why.
+/// * **It says nothing about which carriage the collection came by.** By the
+///   time it is called every entry either holds its bytes or is known to be
+///   absent, whichever way they travelled — see [`fetch_missing_outputs`] —
+///   so one function writes both and there is nothing here to branch on
+///   (D148).
+///
+/// An entry with no bytes is **named and not written**. That is the manifest
+/// outliving the bytes reaching a requester's terminal: twelve files on the
+/// record and eight on the disk have to read as twelve, or the caller reads
+/// eight as all of them.
 pub fn write_outputs(
     directory: &std::path::Path,
     outputs: &herd_proto::JobOutputs,
@@ -722,17 +732,21 @@ pub fn write_outputs(
         herd_proto::check_relative(&file.path).map_err(|why| {
             anyhow!("the hub named an output file this requester will not write: {why}")
         })?;
+        let Some(data) = &file.data else {
+            written.push(format!(
+                "did NOT get {} ({} bytes on this job's record): the hub does not have it",
+                directory.join(&file.path).display(),
+                file.len
+            ));
+            continue;
+        };
         let path = directory.join(&file.path);
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)
                 .with_context(|| format!("making {}", parent.display()))?;
         }
-        std::fs::write(&path, &file.data).with_context(|| format!("writing {}", path.display()))?;
-        written.push(format!(
-            "wrote {} ({} bytes)",
-            path.display(),
-            file.data.len()
-        ));
+        std::fs::write(&path, data).with_context(|| format!("writing {}", path.display()))?;
+        written.push(format!("wrote {} ({} bytes)", path.display(), data.len()));
     }
     Ok(written)
 }
@@ -921,6 +935,186 @@ pub async fn raise_job(config: &Config, job_id: JobId, priority: Priority) -> Re
     }
 }
 
+/// Fill in the bytes of any manifest entry that arrived without them.
+///
+/// **This is the function that makes the two carriages indistinguishable**
+/// (D148), and it does it by not knowing about them. A collection's manifest
+/// is complete whichever way it travelled; what differs is only whether the
+/// bytes came with it. So: anything already holding its bytes is left alone,
+/// anything missing them is asked for, and what comes back fills the same
+/// `files` list. The caller is then holding one collection and cannot tell
+/// which way it came.
+///
+/// Two consequences worth naming, because they are the design and not
+/// side-effects:
+///
+/// * **The inline carriage sends nothing.** Nothing is missing, so there is
+///   no frame and no second round trip — D137's single round trip, kept
+///   exactly.
+/// * **Re-running a fetch that died is free.** The caller passes whatever it
+///   already has; only what is still missing is asked for. That is the whole
+///   of resumption on this leg: the bytes are on the hub's disk, so there is
+///   no transfer state to recover, just a shorter list to ask for.
+///
+/// A file the hub cannot hand over is **left without bytes and named** in the
+/// returned sentences rather than invented or dropped. That is the manifest
+/// outliving the bytes: a requester asking for yesterday's screenshots after
+/// retention took them is told which files, how big they were and why they
+/// are gone, and never handed a short collection it would read as whole.
+/// How long a fetch goes on waiting for a collection that is **not getting
+/// any further**.
+///
+/// There is deliberately no bound on a transfer that is making progress: a
+/// few hundred megabytes on a slow link is slow and not broken, and a
+/// deadline on it would turn the consumer's biggest runs into the ones that
+/// fail. What is bounded is a transfer that has stopped — a runner that went
+/// away mid-collection — and the bound is on *silence*, the same shape as
+/// every other liveness figure in Herd (D148).
+pub const OUTPUTS_STALL_LIMIT: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// How often a waiting fetch asks again.
+const OUTPUTS_POLL: std::time::Duration = std::time::Duration::from_millis(200);
+
+pub async fn fetch_missing_outputs(
+    config: &Config,
+    job_id: &JobId,
+    outputs: &mut herd_proto::JobOutputs,
+) -> Result<Vec<String>> {
+    let mut said = Vec::new();
+    // **Waiting is part of the promise.** The verdict goes first and the
+    // bytes follow (D148), so a requester asking the instant its job ended is
+    // asking for a collection that is genuinely still crossing. The hub says
+    // which absences are still coming and how far they have got, so this
+    // waits while they move and stops when they stop.
+    let mut best = 0u64;
+    let mut since = std::time::Instant::now();
+    loop {
+        let (progress, coming) = fetch_once(config, job_id, outputs, &mut said).await?;
+        if !coming {
+            return Ok(said);
+        }
+        if progress > best {
+            best = progress;
+            since = std::time::Instant::now();
+        } else if since.elapsed() >= OUTPUTS_STALL_LIMIT {
+            said.push(format!(
+                "{job_id}: its runner stopped sending this collection {:?} ago, with \
+                 {progress} byte(s) of it here. Whatever is missing above is named; nothing \
+                 was truncated.",
+                OUTPUTS_STALL_LIMIT
+            ));
+            return Ok(said);
+        }
+        tokio::time::sleep(OUTPUTS_POLL).await;
+    }
+}
+
+/// One round of asking. Returns how many bytes of the collection the hub
+/// holds and whether any of it is still on its way.
+async fn fetch_once(
+    config: &Config,
+    job_id: &JobId,
+    outputs: &mut herd_proto::JobOutputs,
+    said: &mut Vec<String>,
+) -> Result<(u64, bool)> {
+    let wanted: Vec<String> = outputs
+        .files
+        .iter()
+        .filter(|file| !file.is_held())
+        .map(|file| file.path.clone())
+        .collect();
+    if wanted.is_empty() {
+        return Ok((0, false));
+    }
+    let mut socket = join(config).await?;
+    send(
+        &mut socket,
+        &ToHub::AskJobFiles {
+            job_id: job_id.clone(),
+            paths: wanted,
+        },
+    )
+    .await
+    .context("asking the hub for this job's files")?;
+    let mut arriving: std::collections::HashMap<String, Vec<u8>> = std::collections::HashMap::new();
+    // How far the whole collection has got, for the caller's stall bound, and
+    // whether any of it is still on its way.
+    let mut progress = 0u64;
+    let mut coming = false;
+    loop {
+        match next_message(&mut socket).await? {
+            Some(FromHub::JobFile {
+                path, offset, data, ..
+            }) => {
+                let holding = arriving.entry(path.clone()).or_default();
+                // The offset is checked here too, for the reason the hub
+                // checks it: bytes appended at the wrong place make a file
+                // that is a plausible mixture of two reads, and the digest
+                // check below would then fail for a reason nobody could see.
+                if offset != holding.len() as u64 {
+                    bail!(
+                        "the hub sent {path} from byte {offset} and this requester holds {} \
+                         of it: a collection cannot be assembled out of order",
+                        holding.len()
+                    );
+                }
+                holding.extend_from_slice(&data);
+            }
+            Some(FromHub::JobFilesSent { absent, .. }) => {
+                let _ = socket.close(None).await;
+                for gone in absent {
+                    progress += gone.held;
+                    if gone.still_coming {
+                        // **Not said yet**, because it is not a conclusion:
+                        // the bytes are crossing and the caller is about to
+                        // ask again. A line here would print a sentence per
+                        // poll about a transfer that is working fine.
+                        coming = true;
+                        continue;
+                    }
+                    said.push(format!(
+                        "{} ({} bytes on this job's record) is not on the hub: {}",
+                        gone.path, gone.len, gone.why
+                    ));
+                }
+                break;
+            }
+            Some(FromHub::Refused { reason }) => {
+                bail!("the hub refused to hand over this job's files: {reason}")
+            }
+            Some(other) => bail!(
+                "the hub answered a request for a job's files with {}",
+                message_kind(&other)
+            ),
+            None => bail!("the hub closed the connection while sending this job's files"),
+        }
+    }
+    for file in &mut outputs.files {
+        let Some(data) = arriving.remove(&file.path) else {
+            continue;
+        };
+        // **Verified against the manifest before it is believed.** The
+        // digest is the whole reason a streamed transfer is safe to resume,
+        // and a requester that took the bytes on trust would be the one party
+        // that never checked.
+        let candidate = herd_proto::OutputFile {
+            data: Some(data),
+            ..file.clone()
+        };
+        match candidate.disagreement() {
+            None => {
+                progress += file.len;
+                *file = candidate;
+            }
+            Some(why) => said.push(format!(
+                "{} did not arrive intact and was not kept: {why}",
+                file.path
+            )),
+        }
+    }
+    Ok((progress, coming))
+}
+
 /// What this requester will read off the wire: Herd's own ceiling, not the
 /// library's default.
 ///
@@ -1098,8 +1292,31 @@ async fn next_message(socket: &mut Socket) -> Result<Option<FromHub>> {
     while let Some(frame) = socket.next().await {
         match frame.context("reading a frame")? {
             Message::Text(text) => {
-                let message = from_frame(text.as_str())
+                let message: FromHub = from_frame(text.as_str())
                     .map_err(|error| anyhow!("undecodable frame {text}: {error}"))?;
+                // **A requester still refuses what it cannot read, and that
+                // is right** (D124). The catch-all changed what a runner does
+                // with an unknown frame, not what a requester does: one that
+                // cannot understand what the hub is telling it must not go on
+                // to report a verdict, so the run ends with no verdict and
+                // exit 125 — which is a true statement about what this build
+                // knows, where a guess would be a false one about the job.
+                //
+                // What the catch-all buys here is the **name**. This used to
+                // be a serde error about an unknown variant; it is now a
+                // sentence saying which frame and what to do about it, which
+                // is the difference between an operator who can act and one
+                // who files a bug.
+                if message == FromHub::Unknown {
+                    bail!(
+                        "the hub sent a frame of type {:?}, which this requester does not \
+                         know. It speaks protocol {PROTOCOL_VERSION}; the hub is newer, so \
+                         rebuild herdctl rather than trusting a verdict this one cannot \
+                         read.",
+                        herd_proto::frame_type(text.as_str())
+                            .unwrap_or_else(|| "(none)".to_owned())
+                    );
+                }
                 return Ok(Some(message));
             }
             Message::Close(_) => return Ok(None),
@@ -1124,6 +1341,11 @@ fn message_kind(message: &FromHub) -> &'static str {
         FromHub::LogAck { .. } => "log_ack",
         FromHub::ResendLog { .. } => "resend_log",
         FromHub::JobLog { .. } => "job_log",
+        FromHub::JobFile { .. } => "job_file",
+        FromHub::JobFilesSent { .. } => "job_files_sent",
+        FromHub::JobFilesHeld { .. } => "job_files_held",
+        FromHub::JobFilesAck { .. } => "job_files_ack",
+        FromHub::Unknown => "a frame of a type this build does not know",
         FromHub::JobNote { .. } => "job_note",
         FromHub::StillThere { .. } => "still_there",
         FromHub::RanOn { .. } => "ran_on",

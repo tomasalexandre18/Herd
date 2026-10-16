@@ -1937,6 +1937,17 @@ async fn serve_runner(
         }
     }
     println!("herd-hub: runner {name} has joined");
+    // Before anything else is asked of this connection: the collections this
+    // hub is still owed bytes for (D148).
+    //
+    // **Sent unprompted, the way `ResendLog` is**, and for the same reason:
+    // the hub is the side that knows what it is missing, so asking would be a
+    // round trip spent learning what it could simply say. A runner that has
+    // just redialled with 300 MiB spooled needs one frame to know where to
+    // pick up, and a part-written file resumes at the hub's own length rather
+    // than at the runner's idea of how far it had got — which is exactly the
+    // figure a dropped link invalidated.
+    ask_for_the_files_still_owed(state, name, outbox);
     // Whatever happens from here, the runner slot is given back before this
     // returns: a failure that kept the slot would mean no runner could ever
     // join this hub again.
@@ -3071,6 +3082,83 @@ async fn relay_from_runner(
                     }
                 }
             }
+            // One piece of one file of a streamed collection (D148).
+            //
+            // The verdict announced the manifest, so everything needed to
+            // judge this chunk is already on the record: which paths exist,
+            // how long each is, what each must hash to. The store does the
+            // judging and the writing; what happens here is the one decision
+            // that belongs to the link — acknowledging the collection when
+            // the last file lands, which is what lets the runner drop its
+            // spool.
+            ToHub::JobFileChunk {
+                job_id,
+                attempt,
+                path,
+                offset,
+                data,
+            } => {
+                // **Not `is_current`, and the difference is the design.**
+                // Every other frame about a job is about an attempt that is
+                // *running*, so `is_current` refuses one about a job that is
+                // over — which is right for a log chunk and exactly wrong
+                // here: the verdict goes first and the bytes follow (D148),
+                // so a file chunk is *always* about a job that has ended.
+                // Checked by `is_current`, every chunk of every collection
+                // was silently dropped and answered with a `StaleAttempt`.
+                //
+                // What has to be true instead is that this runner produced
+                // the collection this hub is waiting for: the attempt on the
+                // record, from the machine that ran it.
+                if let Err(why) = files_may_land(state, name, &job_id, attempt) {
+                    eprintln!("herd-hub: a file chunk of {job_id} is refused: {why}");
+                    continue;
+                }
+                match state
+                    .store
+                    .write_output_chunk(&job_id, &path, offset, &data)
+                {
+                    Ok(crate::job::ChunkLanded::More) => {}
+                    Ok(crate::job::ChunkLanded::Complete) => {
+                        if let Err(error) = state.store.clear_output_parts(&job_id) {
+                            eprintln!(
+                                "herd-hub: {job_id} has every file and its part directory \
+                                 will not go away: {error}"
+                            );
+                        }
+                        let _ = outbox.send(FromHub::JobFilesAck {
+                            job_id: job_id.clone(),
+                            attempt,
+                        });
+                        println!("herd-hub: {job_id} has every file of its collection");
+                    }
+                    // A chunk that cannot be written is said out loud and the
+                    // collection is **not** acknowledged, so the runner goes
+                    // on holding it: the hub has not got the bytes, and
+                    // pretending otherwise is the one way a result gets
+                    // destroyed (D19).
+                    //
+                    // The hub also tells the runner what it really holds, so
+                    // a disagreement about an offset resolves itself instead
+                    // of becoming a loop of refusals.
+                    Ok(crate::job::ChunkLanded::Refused(why)) => {
+                        eprintln!("herd-hub: a file chunk of {job_id} was not written: {why}");
+                        if let Ok(held) = state.store.output_holdings(&job_id) {
+                            let _ = outbox.send(FromHub::JobFilesHeld {
+                                job_id: job_id.clone(),
+                                attempt,
+                                held,
+                            });
+                        }
+                    }
+                    Err(error) => {
+                        eprintln!(
+                            "herd-hub: writing a file chunk of {job_id} failed: {error}. Its \
+                             runner still holds the collection."
+                        );
+                    }
+                }
+            }
             ToHub::StepFinished {
                 job_id,
                 attempt,
@@ -3398,6 +3486,224 @@ fn the_log_is_whole(
 /// [`keep_trying_to_write_results`], which goes on trying on a growing delay
 /// and never stops. There is no give-up, because the only alternative to
 /// writing a result eventually is losing it.
+/// Tell a runner that has just joined where to resume every collection this
+/// hub is still owed (D148).
+///
+/// Only its own: a collection belongs to the attempt that produced it, and
+/// telling one runner about another's would have it look for a spool it never
+/// had. One that *is* missing its spool — a runner restarted from a cleaned
+/// data root — says so by name, which is the visible no-holder state D148
+/// insists on instead of a job whose evidence never arrives and nobody
+/// notices.
+fn ask_for_the_files_still_owed(state: &State, name: &str, outbox: &Outbox) {
+    let owed = match state.store.collections_owed() {
+        Ok(owed) => owed,
+        Err(error) => {
+            eprintln!("herd-hub: cannot tell which collections are outstanding: {error}");
+            return;
+        }
+    };
+    for collection in owed {
+        if collection.runner != name {
+            continue;
+        }
+        println!(
+            "herd-hub: {} still owes this hub files of {}; asking it to resume",
+            name, collection.job_id
+        );
+        let _ = outbox.send(FromHub::JobFilesHeld {
+            job_id: collection.job_id,
+            attempt: collection.attempt,
+            held: collection.held,
+        });
+    }
+}
+
+/// Hand a requester the files it asked for, and name the ones that are gone.
+///
+/// **This is the function that makes an absent output answerable rather than
+/// empty** (D148). The manifest outlives the bytes: a record keeps every
+/// path, length and digest for as long as it exists, and only the bytes are
+/// ever removed — by a runner that never came back today, by M12's sweeper
+/// later. So a path on the manifest with no file behind it is reported as
+/// what it is, with its size and a reason, and a requester never receives a
+/// short collection it would read as a whole one.
+///
+/// Read off the disk a chunk at a time. Nothing here holds a file, which is
+/// the whole reason this frame exists instead of the verdict carrying it.
+/// Whether a file chunk is one this hub will write, or why it is not.
+///
+/// The counterpart to [`is_current`] for the one kind of frame that is
+/// legitimately about a job that has ended (D148). Three things have to hold,
+/// and each of them is a different mistake being prevented:
+///
+/// * the record says this collection **streamed** — otherwise a peer could
+///   write files into the record of a job whose output came inline, or of one
+///   that left none at all;
+/// * the attempt is the one on the record — a second attempt's files are not
+///   the first's, which is why every file frame carries the number;
+/// * the runner is the one that ran that attempt. There is no authentication
+///   before M15, so this is not a credential; it is the same honesty the
+///   attempt check is, and it keeps one machine's collection out of another
+///   machine's hands by name rather than by trust.
+fn files_may_land(
+    state: &State,
+    from: &str,
+    job_id: &JobId,
+    attempt: u32,
+) -> std::result::Result<(), String> {
+    let record = match state.store.job(job_id) {
+        Ok(Some(record)) => record,
+        Ok(None) => return Err(format!("no such job: {job_id}")),
+        Err(error) => return Err(format!("{job_id}'s record will not read: {error}")),
+    };
+    if !record.outputs.streamed {
+        return Err(format!(
+            "{job_id}'s record names no streamed collection, so this hub is expecting no \
+             file of it"
+        ));
+    }
+    let Some(ran) = record.attempts.last() else {
+        return Err(format!(
+            "{job_id} has no attempt that could have produced files"
+        ));
+    };
+    if ran.number != attempt {
+        return Err(format!(
+            "attempt {attempt} of {job_id} did not produce its collection; attempt {} did",
+            ran.number
+        ));
+    }
+    if ran.runner != from {
+        return Err(format!(
+            "{from} is offering files of {job_id}, which ran on {}",
+            ran.runner
+        ));
+    }
+    Ok(())
+}
+
+fn send_the_files(state: &State, job_id: &JobId, paths: &[String], outbox: &Outbox) {
+    let manifest = match state.store.job_outputs(job_id, false) {
+        Ok(outputs) => outputs,
+        Err(error) => {
+            eprintln!("herd-hub: the manifest of {job_id} could not be read: {error}");
+            let _ = outbox.send(FromHub::JobFilesSent {
+                job_id: job_id.clone(),
+                absent: Vec::new(),
+            });
+            return;
+        }
+    };
+    // **What the hub is still expecting, read once.** This is what tells an
+    // absence the requester should wait for from one it should give up on,
+    // and the two look identical in a list of names: the verdict goes first
+    // and the bytes follow (D148), so a requester asking the instant its job
+    // ended is asking for something genuinely in flight. Told "gone" it
+    // would report a lost result for a job whose evidence was seconds away.
+    // Read, not guessed: an error here would make a collection still
+    // crossing look like one that is never coming, which is the one
+    // confusion this figure exists to prevent. So it is said out loud rather
+    // than defaulted away.
+    let owed = match state.store.collections_owed() {
+        Ok(owed) => owed.into_iter().find(|owed| &owed.job_id == job_id),
+        Err(error) => {
+            eprintln!("herd-hub: cannot tell whether {job_id}'s files are still coming: {error}");
+            None
+        }
+    };
+    let coming = owed.is_some();
+    let held_of = |path: &str| -> u64 {
+        owed.as_ref()
+            .and_then(|owed| owed.held.iter().find(|file| file.path == path))
+            .map(|file| file.bytes)
+            .unwrap_or(0)
+    };
+    let mut absent = Vec::new();
+    for file in &manifest.files {
+        // An empty `paths` means the whole collection; anything else is a
+        // requester saying what it is missing, which is how a `--outputs-to`
+        // that died is simply run again without fetching what it already has.
+        if !paths.is_empty() && !paths.iter().any(|wanted| wanted == &file.path) {
+            continue;
+        }
+        if herd_proto::check_relative(&file.path).is_err() {
+            absent.push(herd_proto::AbsentFile {
+                path: file.path.clone(),
+                len: file.len,
+                why: "this hub will not read a path that climbs out of the job's directory"
+                    .to_owned(),
+                held: 0,
+                still_coming: false,
+            });
+            continue;
+        }
+        match send_one_file(state, job_id, &file.path, outbox) {
+            Ok(()) => {}
+            Err(why) => absent.push(herd_proto::AbsentFile {
+                path: file.path.clone(),
+                len: file.len,
+                why: if coming {
+                    "its runner has not finished sending it to this hub yet".to_owned()
+                } else {
+                    why
+                },
+                held: held_of(&file.path),
+                still_coming: coming,
+            }),
+        }
+    }
+    let _ = outbox.send(FromHub::JobFilesSent {
+        job_id: job_id.clone(),
+        absent,
+    });
+}
+
+/// One file, in chunks, or why it could not be sent.
+fn send_one_file(
+    state: &State,
+    job_id: &JobId,
+    path: &str,
+    outbox: &Outbox,
+) -> std::result::Result<(), String> {
+    let take = herd_proto::OUTPUT_CHUNK_BYTES as usize;
+    let mut offset = 0u64;
+    loop {
+        let data = match state.store.read_output_chunk(job_id, path, offset, take) {
+            Ok(Some(data)) => data,
+            Ok(None) => {
+                return Err("named on this job's record and not on this hub's disk".to_owned())
+            }
+            Err(error) => return Err(format!("could not be read back: {error}")),
+        };
+        let read = data.len();
+        // A zero-length file still gets one frame, because the requester has
+        // to be told to create it: an empty `results.json` is a real file and
+        // not the absence of one. Past the first frame, nothing read means
+        // the end.
+        if read == 0 && offset > 0 {
+            return Ok(());
+        }
+        if outbox
+            .send(FromHub::JobFile {
+                job_id: job_id.clone(),
+                path: path.to_owned(),
+                offset,
+                data,
+            })
+            .is_err()
+        {
+            // The requester went away mid-collection. Not an error about the
+            // file: there is nobody left to tell.
+            return Ok(());
+        }
+        offset += read as u64;
+        if read < take {
+            return Ok(());
+        }
+    }
+}
+
 /// What a job's record holds under `files/`, for the frame a requester gets.
 ///
 /// A read that fails is **not** a reason to withhold the verdict: the files
@@ -3405,8 +3711,22 @@ fn the_log_is_whole(
 /// for, so a store that will not give them up is said out loud and the job
 /// still ends. Nothing is invented in their place — the requester is given no
 /// file and the sentence is on the hub's stderr, where an operator reads it.
+///
+/// **The manifest always, the bytes only if they fit on the frame.** A
+/// streamed collection's record holds hundreds of megabytes and this frame is
+/// the verdict, so what goes on it is the manifest — which is also exactly
+/// what the runner's own verdict carried. A requester that wants the files
+/// then asks ([`herd_proto::ToHub::AskJobFiles`]) and gets them a chunk at a
+/// time; one that does not never pays for them. The inline carriage keeps its
+/// single round trip, because its bytes are already here and nothing is
+/// missing to ask for (D137, D148).
 fn read_the_outputs(state: &State, job_id: &JobId) -> herd_proto::JobOutputs {
-    match state.store.job_outputs(job_id) {
+    let inline = match state.store.job_outputs(job_id, false) {
+        Ok(outputs) => !outputs.streamed,
+        // Unreadable either way, and the arm below says so with the error.
+        Err(_) => true,
+    };
+    match state.store.job_outputs(job_id, inline) {
         Ok(outputs) => outputs,
         Err(error) => {
             eprintln!(
@@ -4678,6 +4998,24 @@ async fn accept_submissions(state: &State, outbox: &Outbox, source: &mut Source)
                     return Ok(());
                 }
             }
+            // A requester asking for the files of a job whose manifest it
+            // already has (D148).
+            //
+            // **Only the streamed carriage ever gets here**, because only it
+            // leaves a requester with something missing: under the inline
+            // threshold the bytes were on the verdict, so nothing is absent
+            // and nothing is asked for — D137's single round trip, untouched.
+            //
+            // Answered off the disk, so one piece of code serves a job that
+            // ended an hour ago and one ending now: there is one answer to
+            // "what did this job leave" and it is the record.
+            ToHub::AskJobFiles { job_id, paths } => {
+                if let Some(reason) = quarantine_refusal(state, &job_id)? {
+                    let _ = outbox.send(FromHub::Refused { reason });
+                    return Ok(());
+                }
+                send_the_files(state, &job_id, &paths, outbox);
+            }
             other => {
                 let _ = outbox.send(FromHub::Refused {
                     reason: format!("a requester may not send {}", message_kind(&other)),
@@ -5069,8 +5407,25 @@ async fn next_message(source: &mut Source) -> Result<Option<ToHub>> {
     let Some(text) = next_text(source).await? else {
         return Ok(None);
     };
-    let message =
+    let message: ToHub =
         from_frame(&text).map_err(|error| anyhow!("undecodable frame {text}: {error}"))?;
+    // **A frame type this hub does not know is refused by name, not ignored**
+    // (D148). Said here because this is where the text is: `Unknown` is a
+    // unit variant, so the tag is discarded on the way to it, and the one
+    // thing the peer needs told is which of its frames this hub cannot read.
+    //
+    // The opposite of the runner's answer to the same situation, deliberately.
+    // A runner ignoring a frame it does not know loses nothing, because a
+    // frame it has never heard of is work it is not needed for. A *request*
+    // the hub cannot read is work that will never be done, and a peer told
+    // nothing would wait for it.
+    if message == ToHub::Unknown {
+        eprintln!(
+            "herd-hub: a peer sent a frame of type {:?}, which this hub does not know (it \
+             speaks protocol {PROTOCOL_VERSION})",
+            herd_proto::frame_type(&text).unwrap_or_else(|| "(none)".to_owned())
+        );
+    }
     Ok(Some(message))
 }
 
@@ -5224,6 +5579,9 @@ async fn next_text(source: &mut Source) -> Result<Option<String>> {
 /// A message's wire tag, for refusal texts.
 fn message_kind(message: &ToHub) -> &'static str {
     match message {
+        ToHub::JobFileChunk { .. } => "job_file_chunk",
+        ToHub::AskJobFiles { .. } => "ask_job_files",
+        ToHub::Unknown => "a frame of a type this hub does not know",
         ToHub::Hello { .. } => "hello",
         ToHub::CapabilitiesChanged { .. } => "capabilities_changed",
         ToHub::SubmitJob { .. } => "submit_job",
@@ -5365,8 +5723,35 @@ mod tests {
         fn record_outputs(&self, id: &JobId, outputs: &herd_proto::JobOutputs) -> StoreResult<()> {
             self.inner.record_outputs(id, outputs)
         }
-        fn job_outputs(&self, id: &JobId) -> StoreResult<herd_proto::JobOutputs> {
-            self.inner.job_outputs(id)
+        fn job_outputs(&self, id: &JobId, with_bytes: bool) -> StoreResult<herd_proto::JobOutputs> {
+            self.inner.job_outputs(id, with_bytes)
+        }
+        fn write_output_chunk(
+            &self,
+            id: &JobId,
+            path: &str,
+            offset: u64,
+            data: &[u8],
+        ) -> StoreResult<crate::job::ChunkLanded> {
+            self.inner.write_output_chunk(id, path, offset, data)
+        }
+        fn output_holdings(&self, id: &JobId) -> StoreResult<Vec<herd_proto::FileHeld>> {
+            self.inner.output_holdings(id)
+        }
+        fn collections_owed(&self) -> StoreResult<Vec<crate::job::CollectionOwed>> {
+            self.inner.collections_owed()
+        }
+        fn read_output_chunk(
+            &self,
+            id: &JobId,
+            path: &str,
+            offset: u64,
+            take: usize,
+        ) -> StoreResult<Option<Vec<u8>>> {
+            self.inner.read_output_chunk(id, path, offset, take)
+        }
+        fn clear_output_parts(&self, id: &JobId) -> StoreResult<()> {
+            self.inner.clear_output_parts(id)
         }
         fn record_step(
             &self,
