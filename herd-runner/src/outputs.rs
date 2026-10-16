@@ -50,14 +50,34 @@
 //! place if it wants all-or-nothing, which costs Herd nothing to support and
 //! is theirs to decide.
 //!
-//! ## Over the cap is a refusal, never a truncation
+//! ## Measured first, then the carriage, then read
 //!
-//! Measured first, read second. The walk takes every file's size and charges
-//! the cap [`OutputFile::weight`] for each — bytes, path and
-//! [`herd_proto::PER_FILE_OVERHEAD`] — and only if the whole collection fits
-//! is a single byte read. Over it, **no file comes back** and the refusal
-//! names the cap and the real figure, because a truncated `results.json` that
-//! still parses is the worst possible outcome: it reads like the truth.
+//! The walk takes every file's size and charges [`OutputFile::weight`] for
+//! each — bytes, path and [`herd_proto::PER_FILE_OVERHEAD`] — and not one
+//! byte is read until the whole collection has been weighed. That order is
+//! what makes the carriage decision possible (D148): a requester declares
+//! nothing about size, because nobody knows in advance whether a run leaves
+//! 1 MiB or 400 MiB, so the choice is made **here**, off the figures, at the
+//! only moment when everything is measured and nothing is read.
+//!
+//! * at or under [`herd_proto::INLINE_OUTPUT_MAX`] the files are read into
+//!   the verdict frame, exactly as they always were;
+//! * above it each file is read **once, to hash it**, the manifest goes on
+//!   the verdict, and `{out}` is **renamed** out of the workspace so the
+//!   bytes outlive the reclaim and can be streamed afterwards.
+//!
+//! Over the job's whole cap, **no file comes back** and the refusal names the
+//! cap and the real figure, because a truncated `results.json` that still
+//! parses is the worst possible outcome: it reads like the truth.
+//!
+//! ## What the manifest promises
+//!
+//! A length and a sha256 per file, announced on the verdict before a byte
+//! moves. A file whose size changed between the walk and the hash is **left
+//! out and named** rather than announced at a figure the stream would then
+//! contradict: a manifest describes bytes that have stopped changing, and a
+//! file still being written by a background child of a job the runner is
+//! killing has not.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -82,6 +102,45 @@ impl Found {
     }
 }
 
+/// A collection, and where its bytes are if they are not in it.
+pub(crate) struct Collected {
+    /// What the verdict carries: the manifest always, the bytes when they
+    /// fit on the frame.
+    pub outputs: JobOutputs,
+    /// Where the bytes wait, when they are travelling by the streamed
+    /// carriage. `None` for an inline collection, a refusal, or nothing at
+    /// all — in each of those cases the verdict is the whole of the delivery
+    /// and there is nothing for a spool to hold.
+    pub spool: Option<PathBuf>,
+}
+
+impl Collected {
+    fn verdict_only(outputs: JobOutputs) -> Self {
+        Self {
+            outputs,
+            spool: None,
+        }
+    }
+
+    /// Nothing collected and nothing to collect: an abandoned attempt.
+    pub(crate) fn nothing() -> Self {
+        Self::verdict_only(JobOutputs::default())
+    }
+}
+
+/// Where one attempt's streamed bytes wait for the hub.
+///
+/// Under the data root, so the rename out of the workspace stays a rename
+/// (see [`spool_into`]), and keyed by **attempt** as well as by job: a second
+/// attempt's output is not the first's, which is the same reason every file
+/// frame carries an attempt number.
+pub(crate) fn spool_path(root: &Path, job_id: &herd_proto::JobId, attempt: u32) -> PathBuf {
+    root.join(SPOOL_DIR).join(format!("{job_id}-{attempt}"))
+}
+
+/// The directory every attempt's spool sits under, inside the data root.
+pub(crate) const SPOOL_DIR: &str = "outputs";
+
 /// Collect what the job left under `out_dir`, or say why nothing came back.
 ///
 /// `root` is the runner's data root: the boundary passed to the mode-restoring
@@ -91,39 +150,118 @@ impl Found {
 /// `cap` of 0 switches the collection off entirely — an owner who wants her
 /// machine to return nothing but a verdict — and says so rather than
 /// reporting an empty `{out}`.
-pub(crate) fn collect(out_dir: &Path, root: &Path, cap: u64) -> JobOutputs {
+///
+/// `spool_at` is where the bytes are moved to if they are too big to ride the
+/// verdict. It must be on the same filesystem as `out_dir` — both are under
+/// the runner's data root — because the move is a **rename**: see
+/// [`spool_into`].
+pub(crate) fn collect(out_dir: &Path, root: &Path, cap: u64, spool_at: &Path) -> Collected {
     if !out_dir.exists() {
         // An ad-hoc job: no declared command, so no `{out}` was ever made.
         // Nothing to say, and nothing on the wire.
-        return JobOutputs::default();
+        return Collected::verdict_only(JobOutputs::default());
     }
     let (found, mut skipped) = walk(out_dir, root);
     if cap == 0 {
         if found.is_empty() && skipped.is_empty() {
-            return JobOutputs::default();
+            return Collected::verdict_only(JobOutputs::default());
         }
-        return JobOutputs::refusing(
+        return Collected::verdict_only(JobOutputs::refusing(
             format!(
                 "this runner returns no output file: its output cap is 0 bytes, and the job \
                  left {} file(s) under its output directory. Raise --job-output-cap on the \
-                 machine, or move large artefacts to M11's direct transfer.",
+                 machine if you want its results back.",
                 found.len()
             ),
             skipped,
-        );
+        ));
     }
     let weight: u64 = found.iter().map(Found::weight).sum();
     if weight > cap {
-        return JobOutputs::refusing(over_the_cap(cap, weight, found.len()), skipped);
+        return Collected::verdict_only(JobOutputs::refusing(
+            over_the_cap(cap, weight, found.len()),
+            skipped,
+        ));
+    }
+
+    // **Measured, then the carriage, then a single byte is read.** The choice
+    // is made off the walk's figures, which is what lets it be made at all: a
+    // requester declares nothing about size (D148), so somebody has to decide
+    // here, and the only honest moment is after everything is measured and
+    // before anything is read. Inline reads the files into the frame, exactly
+    // as it always did; streamed reads each one once to hash it and leaves
+    // the bytes on the disk.
+    if weight <= herd_proto::INLINE_OUTPUT_MAX {
+        return Collected::verdict_only(inline(found, skipped));
     }
 
     let mut files = Vec::with_capacity(found.len());
+    for file in &found {
+        match hash_file(&file.path) {
+            Ok((len, sha256)) if len == file.bytes => {
+                files.push(OutputFile::announced(file.relative.clone(), len, sha256))
+            }
+            // Measured at one size and read at another: the job's own
+            // background child still writing while the runner killed it. The
+            // manifest has to describe bytes that will not move again, so
+            // this file is named and left out rather than announced at a
+            // length the stream would then disagree with — which would fail
+            // at the far end, for a reason the far end could not explain.
+            Ok((len, _)) => skipped.push(format!(
+                "{} was {} byte(s) when it was measured and {len} when it was read, so it \
+                 is not in this record: a manifest has to describe bytes that have stopped \
+                 changing",
+                file.relative, file.bytes
+            )),
+            Err(error) => skipped.push(format!(
+                "{} was measured and then could not be read: {error}",
+                file.relative
+            )),
+        }
+    }
+    // Nothing left to stream — every file went away between the walk and the
+    // read — so there is nothing for a spool to hold and nothing for the
+    // streamed carriage to do. The skipped lines are the whole report.
+    if files.is_empty() {
+        return Collected::verdict_only(JobOutputs {
+            skipped,
+            ..JobOutputs::default()
+        });
+    }
+    match spool_into(out_dir, spool_at) {
+        Ok(()) => Collected {
+            outputs: JobOutputs {
+                files,
+                refused: None,
+                skipped,
+                streamed: true,
+            },
+            spool: Some(spool_at.to_path_buf()),
+        },
+        // The bytes could not be put somewhere that outlives the workspace,
+        // so they are about to be destroyed by the reclaim and there is no
+        // honest way to announce them. Named with the figures, in the shape
+        // the cap refusal uses, because "nothing came back" needs a reason
+        // beside it either way.
+        Err(error) => Collected::verdict_only(JobOutputs::refusing(
+            format!(
+                "this job's output is not in its record: {} in {} file(s) had to be moved \
+                 out of the workspace before it was reclaimed, and that failed: {error}. \
+                 Nothing was truncated and nothing came back.",
+                show_bytes(weight),
+                found.len()
+            ),
+            skipped,
+        )),
+    }
+}
+
+/// Read every file into the frame: the carriage that has always existed.
+fn inline(found: Vec<Found>, mut skipped: Vec<String>) -> JobOutputs {
+    let mut files = Vec::with_capacity(found.len());
     for file in found {
         match fs::read(&file.path) {
-            Ok(data) => files.push(OutputFile {
-                path: file.relative,
-                data,
-            }),
+            Ok(data) => files.push(OutputFile::collected(file.relative, data)),
             // Measured a moment ago and unreadable now: a background child
             // of the job deleting its own output while the runner was killing
             // it, or a mode no restore could take back. Named, because "it
@@ -138,7 +276,59 @@ pub(crate) fn collect(out_dir: &Path, root: &Path, cap: u64) -> JobOutputs {
         files,
         refused: None,
         skipped,
+        streamed: false,
     }
+}
+
+/// How long a file is and what it hashes to, read once and held nowhere.
+///
+/// Both figures come out of the same pass, which is the point: a length taken
+/// from `stat` and a digest taken from a read are two statements about a file
+/// that may have changed in between, and the manifest has to carry two that
+/// agree.
+fn hash_file(path: &Path) -> std::io::Result<(u64, String)> {
+    use std::io::Read;
+
+    let mut file = fs::File::open(path)?;
+    let mut rolling = herd_proto::Sha256Rolling::new();
+    let mut buffer = vec![0u8; 64 << 10];
+    let mut len = 0u64;
+    loop {
+        let read = file.read(&mut buffer)?;
+        if read == 0 {
+            break;
+        }
+        rolling.update(&buffer[..read]);
+        len += read as u64;
+    }
+    Ok((len, rolling.finish()))
+}
+
+/// Move `{out}` out of the workspace, so the bytes outlive the reclaim.
+///
+/// **A rename, not a copy, and that is why the spool lives under the data
+/// root.** Both directories are inside it, so they are on one filesystem and
+/// this is a directory entry being moved: constant time, no second copy of
+/// 400 MiB, and nothing to half-finish. A copy would have doubled the disk a
+/// large collection needs at exactly the moment the machine is already
+/// holding it once.
+///
+/// What is moved is the whole directory, including the things the walk
+/// skipped — a symlink it would not follow, a fifo it would not open.
+/// Nothing ever opens them: the stream reads the manifest's paths and only
+/// those, and the spool is removed whole once the hub has the collection.
+fn spool_into(out_dir: &Path, spool_at: &Path) -> std::io::Result<()> {
+    if let Some(parent) = spool_at.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    // A spool left by an earlier attempt of the same job is not this
+    // attempt's output, and renaming onto a non-empty directory fails. Take
+    // it away first: a previous attempt's files are never the current one's
+    // (the reason every file frame carries an attempt).
+    if spool_at.exists() {
+        fs::remove_dir_all(spool_at)?;
+    }
+    fs::rename(out_dir, spool_at)
 }
 
 /// The sentence a collection over the cap is refused with.
@@ -152,8 +342,8 @@ pub(crate) fn over_the_cap(cap: u64, weight: u64, count: usize) -> String {
         "this job's output is not in its record: {} in {count} file(s), and this runner's \
          output cap is {}. Nothing was truncated — a cut-down results file that still parses \
          reads like the truth — so no file came back at all. Raise --job-output-cap on the \
-         machine for a little more, or move large artefacts to M11's direct transfer, which \
-         is the path they belong on.",
+         machine, up to its disk budget, if a job of this size is meant to hand its output \
+         back.",
         show_bytes(weight),
         show_bytes(cap)
     )
@@ -288,7 +478,17 @@ mod tests {
         }
 
         fn collect(&self, cap: u64) -> JobOutputs {
-            collect(&self.out(), &self.root(), cap)
+            self.collected(cap).outputs
+        }
+
+        /// The whole result, spool and all, for the tests that are about the
+        /// carriage rather than about what was walked.
+        fn collected(&self, cap: u64) -> Collected {
+            collect(&self.out(), &self.root(), cap, &self.spool())
+        }
+
+        fn spool(&self) -> PathBuf {
+            self.root().join("outputs/j1-1")
         }
     }
 
@@ -316,7 +516,7 @@ mod tests {
             .iter()
             .find(|file| file.path == "files/results.json")
             .expect("the results file is there");
-        assert_eq!(results.data, br#"{"ok":true}"#);
+        assert_eq!(results.bytes(), br#"{"ok":true}"#);
     }
 
     /// Over the cap: no file, and a sentence with both figures in it.
@@ -343,13 +543,17 @@ mod tests {
             refusal.contains("1 file(s)"),
             "and how many files it was: {refusal}"
         );
-        assert!(
-            refusal.contains("M11"),
-            "and where a large artefact belongs instead: {refusal}"
-        );
+        // It used to have to name M11 as somewhere else to go. M11 **is**
+        // this — the streamed carriage above the inline threshold — so what
+        // the sentence has to name now is the flag and what bounds it (D148).
         assert!(
             refusal.contains("--job-output-cap"),
             "and the flag that raises it: {refusal}"
+        );
+        assert!(
+            refusal.contains("disk budget"),
+            "and what bounds that flag, since there is no longer a frame to point at: \
+             {refusal}"
         );
     }
 
@@ -403,7 +607,8 @@ mod tests {
         );
         for file in &collected.files {
             assert_ne!(
-                file.data, b"this must never reach a record",
+                file.bytes(),
+                b"this must never reach a record",
                 "a symlink was followed"
             );
         }
@@ -491,8 +696,14 @@ mod tests {
     #[test]
     fn a_job_with_no_output_directory_is_silent() {
         let temp = TempDir::new("outputs-none");
-        let collected = collect(&temp.path().join("jobs/j1/out"), temp.path(), 1 << 20);
-        assert!(collected.is_silent(), "{collected:?}");
+        let collected = collect(
+            &temp.path().join("jobs/j1/out"),
+            temp.path(),
+            1 << 20,
+            &temp.path().join("outputs/j1-1"),
+        );
+        assert!(collected.outputs.is_silent(), "{:?}", collected.outputs);
+        assert!(collected.spool.is_none(), "nothing to spool");
     }
 
     /// A cap of 0 is an owner saying "a verdict and nothing else", and it

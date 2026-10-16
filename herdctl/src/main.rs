@@ -621,7 +621,7 @@ async fn run(args: Args, known: &Cell<WhatExists>) -> Result<Done> {
                 |said| say_it(known, said),
             )
             .await?;
-            keep_the_outputs(&keeping, &finished);
+            keep_the_outputs(&config, &keeping, &finished).await;
             Ok(Done::Job(finished.outcome))
         }
         Action::Submit {
@@ -779,7 +779,7 @@ async fn run(args: Args, known: &Cell<WhatExists>) -> Result<Done> {
                 |said| say_it(known, said),
             )
             .await?;
-            keep_the_outputs(&keeping, &finished);
+            keep_the_outputs(&config, &keeping, &finished).await;
             Ok(Done::Job(finished.outcome))
         }
         Action::Cancel { job_id } => {
@@ -977,8 +977,37 @@ fn labels_of(labels: Vec<String>) -> Result<LabelSet> {
 ///   a symlink is not followed" is the fact somebody needs and the record
 ///   alone would not reach them.
 /// * one line per file written, only with `--outputs-to`.
-fn keep_the_outputs(keeping: &Keeping, finished: &herdctl::Finished) {
-    let outputs = &finished.outputs;
+///
+/// **And the fetch happens here, only when `--outputs-to` was given.** A
+/// streamed collection's verdict carries the manifest and not the bytes
+/// (D148), so a requester that wants the files asks for them — and one that
+/// does not never pays for hundreds of megabytes it was going to throw away.
+/// That is why `herdctl run` with no flag still exits on the verdict and
+/// waits for nothing, which is exactly what it did before streaming existed.
+async fn keep_the_outputs(
+    config: &herdctl::Config,
+    keeping: &Keeping,
+    finished: &herdctl::Finished,
+) {
+    let mut collection = finished.outputs.clone();
+    if keeping.outputs_to.is_some() {
+        match herdctl::fetch_missing_outputs(config, &finished.job_id, &mut collection).await {
+            Ok(said) => {
+                for line in said {
+                    eprintln!("herdctl: {line}");
+                }
+            }
+            // Said and not fatal, for D20's reason: the verdict is the job's
+            // and a side channel never becomes one. A requester that needs
+            // the files to be there checks that itself — the lines above name
+            // every one that is missing, so there is nothing to guess at.
+            Err(error) => eprintln!(
+                "herdctl: the files {} left could not be fetched: {error:#}",
+                finished.job_id
+            ),
+        }
+    }
+    let outputs = &collection;
     if let Some(refusal) = &outputs.refused {
         eprintln!("herdctl: {refusal}");
     }

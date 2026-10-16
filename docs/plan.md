@@ -183,33 +183,72 @@ record shows a timestamped line per executor step.
 The real chatOnS declaration closes in M18.
 
 ### M11 — Content registry, direct transfer (`m11-content-registry`)
-**And the far side of D131's line.** A job's small declared output now rides
-its record through the hub, capped at 32 MiB. Everything bigger — the first
-consumer's screenshot-heavy runs reach a few hundred MB — is refused there by
-name and is **this** milestone's: at that size the bytes stop travelling like
-a log and become artefact distribution, which costs over a gigabyte per party
-and tens of seconds of blocked event loop on a relayed path, past the cadence
-a quiet link lives by. M11 is what makes those move runner to runner instead.
-The hub is the registry and the authority, never the byte path (D10). It holds
-manifests — a pack is a list of content hashes keyed by (commit, key) — and
-which runners hold which blobs; it issues a short-lived, scoped fetch
-capability for a (blob, peer) pair. The bytes move **runner to runner**: each
-runner keeps a per-file content-addressed store under its data root and
-advertises a fetch endpoint (Q2); a runner needing a pack asks the hub who
-holds it and fetches directly, only the hashes it lacks. Three paths, in
-order: **same host** — hardlink or reflink inside the local store, zero bytes
-on any network; **peer reachable** — direct fetch from a holder; **outbound
-only** (a runner with no mesh) — it pushes to and pulls from a keeper, never
-serves. A fetch endpoint binds to the one configured mesh interface and is
-refused at startup if it would bind a default or public one (D11). A pack is
-complete or absent: the manifest is registered only once every blob is held
-and fsynced (E-17, E-13, E-12). The real shape, now known: `<id>/manifest.tsv`,
-`<id>/pack.meta`, `<id>/objects/<sha256>`, `<id>` the sha256 of the manifest,
-complete-or-absent by write-then-rename. Herd keeps a build job's
-`{out}/packs/<id>` by (commit, id) and hands it to the same commit's
-test-pack jobs as `{in}/pack`; measured by them, ~400 MiB in ~560 files,
-verified in under 2 s. E-13's content-addressed storage is then simply
-storing objects by their sha256 name, which is what their pack already is.
+**Two flows wearing one sentence, and this milestone is both** (D148). The
+first consumer has made Herd their only path, with no fallback, and jobs are
+about to run on a second machine. Their words: *"once a job can run on
+another machine, logs, screenshots and scenario files no longer sit on the
+server's disk; results.json alone is not enough to diagnose a red test — we
+need chunked return, hub-side streaming and a retention policy, sized for a
+few hundred MB per job."* That is two needs, separated by **who reads the
+bytes next** and not by how many bytes there are, and they get opposite
+answers.
+
+**A pack is read by a job, and never touches the hub.** A job's declared
+artefacts move **runner to runner**: the hub is the registry and the
+authority, never the byte path (D10). It holds manifests — a pack is a list
+of content hashes keyed by (commit, key) — and which runners hold which
+blobs; it issues a short-lived, scoped fetch capability for a (blob, peer)
+pair. Each runner keeps a per-file content-addressed store under its data
+root and advertises a fetch endpoint (Q2); a runner needing a pack asks the
+hub who holds it and fetches directly, only the hashes it lacks. Three
+paths, in order: **same host** — hardlink or reflink inside the local store,
+zero bytes on any network; **peer reachable** — direct fetch from a holder;
+**outbound only** (a runner with no mesh) — it pushes to and pulls from a
+keeper, never serves. A fetch endpoint binds to the one configured mesh
+interface and is refused at startup if it would bind a default or public one
+(D11). A pack is complete or absent: the manifest is registered only once
+every blob is held and fsynced (E-17, E-13, E-12). The real shape, now
+known: `<id>/manifest.tsv`, `<id>/pack.meta`, `<id>/objects/<sha256>`, `<id>`
+the sha256 of the manifest. Herd keeps a build job's `{out}/packs/<id>` by
+(commit, id) and hands it to the same commit's test-pack jobs as `{in}/pack`;
+measured by them, ~400 MiB in ~560 files, verified in under 2 s. E-13's
+content-addressed storage is then simply storing objects by their sha256
+name, which is what their pack already is.
+
+**A record is read by a requester, and travels through the hub.** A job's
+log, its `results.json` and its per-scenario screenshots are evidence about
+one job, wanted by whoever holds its id — a person or an agent diagnosing a
+red test, who never saw the declaration and may be on a machine with no mesh
+at all. D131 and D137 put that category on the hub and D147 ran it on the
+real deployment; what this milestone changes is only the **carriage**, which
+was one base64 frame and therefore capped at 32 MiB. A requester declares
+nothing new: the runner measures the collection when the job ends, rides the
+verdict frame at or under 32 MiB exactly as today, and **streams** over it,
+file by file, each announced with its path, length and sha256 before a byte
+moves, in bounded chunks, into the job's `files/` directory under D8's
+discipline. The verdict goes first and the files follow, so a side channel
+never delays a verdict (D20) and a stop still takes ≤ 5 s (invariant 2). A
+transfer that dies resumes: the runner holds the collection in its own data
+root until the hub acknowledges all of it, and the hub says on redial which
+files it holds complete and how much of a partial one. Hub → requester needs
+no resumption state — the bytes are on the hub's disk, so `herdctl wait <id>
+--outputs-to <dir>` is simply run again and skips what it already has at the
+right hash.
+
+**This is where the protocol break is spent, and it is spent once** (D148).
+Streaming files needs new variants on both enums, which D124 and D128 make
+breaking whatever serde tolerates, so `PROTOCOL_VERSION` moves to **2**,
+approved by Alexa on 2026-10-16. The registry's own frames above ride the
+same break, and so does a catch-all arm so an unknown frame no longer means
+"does not decode at all" (D128's recorded defect). The arm reads three ways,
+one per direction, and the difference is the point: a **runner** logs and
+ignores what it cannot read, because a frame it does not know is work it is
+not needed for; a **requester** still refuses the run, because one that
+cannot read what the hub is telling it must not report a verdict (D124's
+`bail!`, which stays); and the **hub** refuses by name rather than ignoring,
+because a request it cannot read is work that will never be done and the
+peer has to be told. Nothing from M15 is guessed at here.
+
 **Done when** a two-runner e2e produces a fixture pack on runner A and
 consumes it on runner B with the hub seeing no payload byte (asserted by
 counting bytes on the hub's sockets); a same-host fetch moves zero network
@@ -218,42 +257,79 @@ transfers only the new blobs; killing a transfer mid-flight leaves the pack
 unregistered and no partial blob readable; an outbound-only runner completes
 both directions without listening; a configuration that would bind a default
 or public interface is refused at startup; a fetch without a valid capability
-is refused. chatOnS's `0 crates compiled` acceptance closes in M18.
-Most likely milestone to overflow one session; if it does, split at the
-registry boundary — local CAS plus the same-host and keeper paths first,
-peer-to-peer fetch and capabilities second.
+is refused. And for the record's half: a job leaving a few hundred MB under
+`{out}` returns all of it through the hub and `herdctl wait --outputs-to`
+writes it byte for byte; a requester cannot tell from its own output which
+carriage was used; a link killed mid-collection resumes and the files are
+whole, with no file ever readable half-written; a hash that does not match is
+named on the record rather than kept; and — the assertion D138's objection
+makes the important one — **a runner streaming a few hundred MB never looks
+lost**, its health reports staying inside the 15 s cadence throughout, which
+is the measurement M11 owes and currently only has an argument for. chatOnS's
+`0 crates compiled` acceptance closes in M18.
+Certain to overflow one session. The split is **at the record/pack line**,
+record first: it is what the consumer is blocked on today, and it is where
+the protocol break lands. Both halves' frames are nevertheless designed and
+numbered **together**, in one move to version 2, because a break is paid by
+the deployment and must not be paid twice.
 
-### M12 — Custody, budgets, GC, locality (`m12-custody-gc`)
-**This milestone shrinks.** The consumer's own words are "you move packs;
-our executor owns warm caches": their `up` step pulls its nearest cache
-itself and D77 already timestamps that step, so Herd need not carry a
-cache, know its contents, or collect it. Gone: the prepare step tied to
-cache keys, its duration bookkeeping, a runner's health report of cache
-keys held, and cache diffs registered specially as packs — all of it was
-the cache-engine apparatus D9 sketched, and it is replaced by nothing,
-because the generic mechanisms already cover the ground: `needs`/`leaves`
-(M10) for artefacts, D77's step timestamps for preparation time, M11's
-registry for which runner holds which blob. What stays: scheduling and
-running the consumer's `produce` command on a `build` runner, moving packs
-(M11), key-aware placement (E-23) off M11's own registry, and budgets and
-GC for what Herd itself holds.
-Custody (D10): a key family names one or more **keepers** — runners that pin
-what the retention policy keeps, so a pack outlives the machine that built it
-and survives its owner switching that machine off. The server's runner is the
-default keeper; a pack with no reachable holder is a named, visible state, not
-a silent failure. Per-runner budgets shown as use against budget, gc on each
-runner never removing what a queued or running job references nor what its
-keeper role pins (N = 5 most recent per key family, configurable) (E-16).
-Result retention by priority class — 14/90 days, configurable (closes E-15).
+### M12 — Custody, budgets, GC, retention, locality (`m12-custody-gc`)
+**This milestone shrinks twice.** First by the consumer's own words — "you
+move packs; our executor owns warm caches": their `up` step pulls its nearest
+cache itself and D77 already timestamps that step, so Herd need not carry a
+cache, know its contents, or collect it. Gone: the prepare step tied to cache
+keys, its duration bookkeeping, a runner's health report of cache keys held,
+and cache diffs registered specially as packs — all of it the cache-engine
+apparatus D9 sketched, replaced by nothing, because the generic mechanisms
+already cover the ground: `needs`/`leaves` (M10) for artefacts, D77's step
+timestamps for preparation time, M11's registry for which runner holds which
+blob. Second by D148: **custody is about packs and not about records.** A
+job's record leaves the runner when the job ends, so a verdict and its
+evidence are never unreadable because a machine is asleep, and there is
+nothing for a keeper to pin on that side.
+
+Custody of packs (D10): a key family names one or more **keepers** — runners
+that pin what the retention policy keeps, so a pack outlives the machine that
+built it and survives its owner switching that machine off. The server's
+runner is the default keeper; a pack with no reachable holder is a named,
+visible state, not a silent failure. Per-runner budgets shown as use against
+budget, gc on each runner never removing what a queued or running job
+references nor what its keeper role pins (N = 5 most recent per key family,
+configurable) (E-16). A runner's own undelivered collections are swept the
+same way, and only once the hub has acknowledged them or their record is
+gone.
+
+**Retention, answering the question the consumer will actually ask** — *how
+long do I have to fetch yesterday's failing screenshots?* Two numbers,
+because there are two kinds of thing (D148). The record proper — `job.json`,
+`events.jsonl`, the log, the inline files — keeps retention by priority
+class, 14/90 days, configurable (closes E-15). A job's **large files** get
+their own budget on the hub's volume, with a floor in days: **200 GB or
+seven days, whichever runs out first**, oldest job first, both figures
+printed at startup and shown as use against budget in M13's status document.
+The 200 GB is Alexa's, chosen on 2026-10-16 without a measurement and
+written down as such (D148): the one figure that would change it is the
+consumer's own output size per job per day, and it is to be adjusted when
+they send it. Evicting inside the floor is a named line and an event, never
+a silent trim.
+And the **manifest outlives the bytes**: each file's path, length and sha256
+stay on the record for as long as the record does, so a requester asking for
+something already gone is told how many files there were, how big, and when
+and why they went — never an empty directory and never a short one.
+
 Placement preference among available eligible runners: keys already held,
 then most free memory, reference last (E-23); E-19 still governs waiting.
+Scheduling and running the consumer's `produce` command on a `build` runner,
+and moving its pack (M11), stay here.
 **Done when** a pack whose only non-keeper holder goes offline is still
 fetchable from its keeper; a pack with no holder at all reports that state by
 name; gc on a runner with a budget 10 GiB below use comes in under it keeping
-every pinned and referenced item; a step result past retention is gone while a
-60-day merger result reads fine; a `produce` job is scheduled and run on a
-`build` runner and its pack moves like any other; and placement prefers the
-runner already holding the key, picking reference last.
+every pinned and referenced item; a step result past retention is gone while
+a 60-day merger result reads fine; a job's large files past the output budget
+are gone while the record and its manifest read fine, and a requester asking
+for them is told so with the figures and the date; a `produce` job is
+scheduled and run on a `build` runner and its pack moves like any other; and
+placement prefers the runner already holding the key, picking reference last.
 
 ### M13 — Status and events (`m13-status-events`)
 One status document, JSON with a format version (Q7), carrying the queue,
@@ -335,7 +411,11 @@ docker compose re-asserts M2's no-loss test on the real volume; a reboot of
 the server brings the runner back with no hand; the no-Docker-socket test
 passes with the runner's user removed from `docker`. This milestone also
 sets `PROTOCOL_VERSION` and `RECORD_VERSION` back to 1 and freezes them: the
-first deployed protocol is version 1 (D73).
+first deployed protocol is version 1 (D73). Frozen means a bump is a
+compatibility statement needing Alexa's word, not that neither moves again —
+M11 is the first to spend one, `PROTOCOL_VERSION` to 2 (D148), while
+`RECORD_VERSION` stays at 1 because every field it adds is defaulted and a
+record already on the live state root reads unchanged.
 
 ### M17 — The owner's PC joins (`m17-pc-runner`)
 The second machine, and the one with the hard conditions. Runner on WSL2: a

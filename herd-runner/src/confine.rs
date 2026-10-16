@@ -52,33 +52,51 @@ pub const DEFAULT_LOG_CAP: u64 = 64 << 20;
 /// Twenty gibibytes per job of workspace. The content store (M11, M12) has
 /// its own budget; this is one job's scratch space.
 pub const DEFAULT_DISK_BUDGET: u64 = 20 << 30;
+/// How much declared output a job may bring home in all: **1 GiB**.
+///
+/// **This is the whole collection, not the frame.** Up to
+/// [`herd_proto::INLINE_OUTPUT_MAX`] it rides the verdict; above that the
+/// verdict carries the manifest and the bytes follow (D148). So the flag that
+/// sets this is no longer "how much fits on a frame" — that figure is derived
+/// and nobody tunes it — but "how much may this machine hand back for one
+/// job", which is a real question for whoever owns the machine.
+///
+/// **1 GiB is chosen, not derived, and the distinction matters** (D138). The
+/// consumer states a few hundred megabytes for their screenshot-heavy runs;
+/// this is comfortably above that and no arithmetic produced it. The one
+/// measurement that would change it is their real distribution of output size
+/// per job. Every other figure around it *is* derived —
+/// [`herd_proto::INLINE_OUTPUT_MAX`] from base64 against the frame ceiling,
+/// [`herd_proto::OUTPUT_CHUNK_BYTES`] from the 15 s cadence — and this one
+/// sits here rather than beside them so it is not read as one of them.
+///
+/// It was 32 MiB, and it was the ceiling: the default was the ceiling and the
+/// flag could only lower it, because there was nowhere above a frame to go.
+/// There is now, so the flag may raise it, and what bounds it instead is the
+/// hub's own per-job acceptance and its output budget (M12).
+///
+/// **Over it is still a refusal with figures and no file at all** — never a
+/// truncation, because a cut-down `results.json` that still parses reads like
+/// the truth. What the refusal names has changed: it used to point at M11 as
+/// somewhere else to go, and M11 is this, so it names the cap and the flag.
+pub const DEFAULT_OUTPUT_CAP: u64 = 1 << 30;
 
-/// How much declared output a job may have carried into its record: 32 MiB,
-/// which is [`herd_proto::MAX_OUTPUT_CAP`] and therefore the most this
-/// mechanism can carry at all.
+/// Two things about that figure that must stay true, checked by the compiler
+/// rather than by a test, because both are relationships between constants
+/// and a test would only find out at run time what `cargo build` can refuse.
 ///
-/// **Sized for what the first consumer produces**, which is a results file of
-/// a few kilobytes plus the per-scenario logs a command `leaves`. Not sized
-/// from the log cap beside it: a log is what a person reads, where 64 MiB is
-/// already more than anyone does, and a declared output is what a *program*
-/// reads. Reasoning from the log cap was the first mistake made here and it
-/// produced a figure three orders of magnitude off the real case in one
-/// direction and short of it in the other.
+/// **Above the inline threshold**, because the relationship inverted: this
+/// used to *be* the frame figure, so the flag could only lower it. It is now
+/// above it on purpose — that is what having a second carriage means — and a
+/// change that quietly put it back under would take the streamed path out of
+/// reach of every default deployment without failing anything else.
 ///
-/// **The default is the ceiling, so the flag only ever lowers it**, and that
-/// is the honest affordance: the ceiling is not a taste, it is what can cross
-/// a frame and be decoded inside the 15 s cadence a quiet link lives by (see
-/// [`herd_proto::MAX_OUTPUT_CAP`] for the arithmetic and the measurements).
-/// An operator who wants her machine to give back less says so; one who wants
-/// more is asking for M11.
-///
-/// **Where the real line is.** The consumer's screenshot-heavy runs reach a
-/// few hundred megabytes, and that is **over** this and refused with figures,
-/// on purpose: at that size the bytes stop travelling like a log and become
-/// artefact distribution through the hub, which is the one thing D10 took
-/// Herd out of. Those belong on M11's direct runner-to-runner transfer. The
-/// refusal says so by name rather than leaving someone to guess.
-pub const DEFAULT_OUTPUT_CAP: u64 = herd_proto::MAX_OUTPUT_CAP;
+/// **At or under the default disk budget**, because a job writes `{out}`
+/// inside its workspace: a default cap above the default budget would be
+/// clamped on every runner nobody had configured, which is a line printed at
+/// every startup for a figure Herd chose itself.
+const _: () = assert!(DEFAULT_OUTPUT_CAP > herd_proto::INLINE_OUTPUT_MAX);
+const _: () = assert!(DEFAULT_OUTPUT_CAP <= DEFAULT_DISK_BUDGET);
 
 /// A job is background work on somebody's machine, so it is nice by default.
 /// 10 leaves interactive work ahead of it without starving it.
@@ -195,7 +213,7 @@ pub struct Confined {
 
 impl Confined {
     /// Check everything, or refuse naming what is wrong.
-    pub fn prepare(confinement: Confinement) -> Result<Self, String> {
+    pub fn prepare(mut confinement: Confinement) -> Result<Self, String> {
         crate::privilege::refuse_if_privileged()?;
         let root = DataRoot::open(&confinement.data_root)?;
         let helpers = PrivilegedHelpers::new(confinement.privileged_helpers.clone())?;
@@ -221,23 +239,35 @@ impl Confined {
         if confinement.timeout.is_zero() {
             return Err("a time cap of 0 s would stop every job before it ran".to_owned());
         }
-        // An output cap above what a frame can carry, refused here rather
-        // than discovered on the first job that fills it. A collection
-        // travels inside one verdict frame, so a cap past the ceiling would
-        // produce a frame the hub cannot decode at all — and an undecodable
-        // frame is the redial loop D128 names, not a degraded result. The
-        // same shape as `--cgroup-root` above: a precise request this host
-        // cannot honour is a sentence at startup, never a surprise later.
-        if confinement.output_cap > herd_proto::MAX_OUTPUT_CAP {
-            return Err(format!(
-                "--job-output-cap {} is more than a job's output can ever be, which is {}: \
-                 a collection travels inside one control frame, base64-encoded, and a \
-                 larger one would be a verdict frame nothing on the other side can decode. \
-                 Output bigger than that is an artefact and belongs on the direct \
-                 runner-to-runner transfer (M11), not relayed through the hub.",
+        // An output cap a job could never reach is **clamped, loudly**.
+        //
+        // This check used to be "a cap bigger than one frame", and it was a
+        // refusal: a collection travelled inside the verdict, so a larger cap
+        // would have produced a frame nothing could decode — D128's redial
+        // loop, which is worth refusing a startup over. The streamed carriage
+        // removed that ceiling (D148), so the frame no longer bounds the
+        // flag. What does is the disk: a job writes `{out}` inside its
+        // workspace, and the workspace stops at `--job-disk-budget`, so an
+        // output cap above that budget can never bind.
+        //
+        // **Clamped rather than refused**, which is D89's precedent for
+        // exactly this shape — a memory floor larger than the machine's real
+        // memory guards nothing and is clamped where it is written, not made
+        // a reason the runner will not start. The two cases differ in what is
+        // at stake: an undecodable frame destroys a verdict, while an
+        // unreachable cap merely says more than it can do. Lowering a disk
+        // budget must not stop a runner that was working.
+        if confinement.output_cap > confinement.disk_budget {
+            println!(
+                "herd-runner: --job-output-cap {} is more than --job-disk-budget {}, so it \
+                 could never bind — a job writes its output inside its workspace and the \
+                 workspace stops at the disk budget first. Using {} as the output cap. Raise \
+                 the disk budget if a job is meant to hand back more than that.",
                 show_bytes(confinement.output_cap),
-                show_bytes(herd_proto::MAX_OUTPUT_CAP)
-            ));
+                show_bytes(confinement.disk_budget),
+                show_bytes(confinement.disk_budget)
+            );
+            confinement.output_cap = confinement.disk_budget;
         }
         // The weights are the kernel's own range, checked here so that a
         // figure outside it is one refusal at startup rather than a write the
@@ -880,35 +910,44 @@ mod tests {
         assert!(error.contains("time cap of 0"), "{error}");
     }
 
-    /// An output cap past what a frame can carry is refused at startup, with
-    /// both figures, rather than becoming an undecodable verdict later.
+    /// An output cap a job could never reach is clamped to the disk budget,
+    /// and the clamp is said out loud.
     ///
-    /// The failure it prevents is the worst shape there is: a job runs,
-    /// passes, and its verdict frame is too large for the hub to decode — so
-    /// the link dies and the runner redials into the same frame, which is the
-    /// loop D128 names. One sentence before anything runs instead.
+    /// This assertion used to be about the frame, and it used to be a
+    /// *refusal*: a cap past what one verdict frame could carry would have
+    /// produced a frame the hub could not decode, which is D128's redial
+    /// loop and worth refusing a startup over. The streamed carriage removed
+    /// that ceiling (D148), and the bound that is left is the disk — a job
+    /// writes `{out}` inside its workspace and the workspace stops at the
+    /// disk budget.
+    ///
+    /// So it clamps, which is D89's precedent for a figure that cannot bind:
+    /// lowering a disk budget must not stop a runner that was working, and a
+    /// cap that says more than it can do is a line to print rather than a
+    /// machine to take out of the fleet.
     #[test]
-    fn an_output_cap_larger_than_a_frame_is_refused_at_startup_with_both_figures() {
+    fn an_output_cap_larger_than_the_disk_budget_is_clamped_to_it() {
         let _reaping = crate::testing::one_reaper_at_a_time();
         let temp = TempDir::new("confine-output-cap");
         let mut confinement = Confinement::with_data_root(temp.path());
-        confinement.output_cap = herd_proto::MAX_OUTPUT_CAP + 1;
-        let error = Confined::prepare(confinement).expect_err("a cap past the ceiling is refused");
-        assert!(error.contains("--job-output-cap"), "{error}");
-        assert!(
-            error.contains(&show_bytes(herd_proto::MAX_OUTPUT_CAP)),
-            "the refusal must name the ceiling: {error}"
+        confinement.disk_budget = 64 << 20;
+        confinement.output_cap = confinement.disk_budget * 4;
+        let confined = Confined::prepare(confinement).expect("an unreachable cap is not a refusal");
+        assert_eq!(
+            confined.caps().output_cap,
+            64 << 20,
+            "the cap that is used is the one that can bind"
         );
-        assert!(
-            error.contains("M11"),
-            "and where output that big belongs: {error}"
-        );
-        // The ceiling itself is usable, and it is the default: this is a
-        // ceiling, not a second default below it.
-        let mut confinement = Confinement::with_data_root(temp.path());
-        confinement.output_cap = herd_proto::MAX_OUTPUT_CAP;
-        Confined::prepare(confinement).expect("the ceiling is a usable cap");
-        assert_eq!(DEFAULT_OUTPUT_CAP, herd_proto::MAX_OUTPUT_CAP);
+        // Equal to the budget is left alone: this is a clamp on what cannot
+        // bind, not a margin somebody has to guess at. Its own data root,
+        // because the one above is locked for the life of its `Confined`.
+        drop(confined);
+        let other = TempDir::new("confine-output-cap-exact");
+        let mut confinement = Confinement::with_data_root(other.path());
+        confinement.disk_budget = 64 << 20;
+        confinement.output_cap = confinement.disk_budget;
+        let confined = Confined::prepare(confinement).expect("prepares");
+        assert_eq!(confined.caps().output_cap, 64 << 20);
     }
 
     /// Finding 5 of M4's verification: `--job-memory-max 1kB` was accepted,

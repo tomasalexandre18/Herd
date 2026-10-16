@@ -81,6 +81,17 @@ const LOG_SEQ_FILE: &str = "log.seq";
 /// width is what lets the file be written in place with nothing to truncate.
 const LOG_SEQ_DIGITS: usize = 20;
 const KEPT_FILES_DIR: &str = "files";
+
+/// Where a streamed collection's part-written files wait, beside `files/` and
+/// never inside it.
+///
+/// **A sibling, not a suffix.** A `.part` file under `files/` would be visible
+/// to a consumer reading the record's directory while the job's collection is
+/// still arriving (E-53), and the one promise that directory makes is that
+/// what is in it is whole. So a file becomes visible by being **renamed** into
+/// `files/`, after its digest has been checked, and until then it is in here
+/// where nothing looks for it.
+const OUTPUT_PARTS_DIR: &str = "files.part";
 const LOCK_FILE: &str = "hub.lock";
 /// Where the answers of `labels_from` readings are kept, by their (commit,
 /// command, args) key (D74). Derived, like the index: an answer that cannot be
@@ -407,6 +418,45 @@ impl JobDirStore {
 
     fn jobs_dir(&self) -> PathBuf {
         self.root.join(JOBS_DIR)
+    }
+
+    /// Whether every file this job's manifest names is now whole on the disk.
+    ///
+    /// **`files/` only, never the part directory, and that distinction is a
+    /// bug this had.** A part-written file that has reached its full length
+    /// is *not* complete: its digest has not been checked and it has not been
+    /// renamed, so for the hundred milliseconds it takes to hash 32 MiB it
+    /// looks finished and is not. Judged off the part file, a transfer
+    /// reported itself complete in that window, a requester was told its
+    /// files were no longer coming, and it went looking in `files/` for
+    /// something not yet there — which read as "the hub does not have it" for
+    /// a collection that was seconds from arriving.
+    ///
+    /// So there is **one** definition of complete, here, used by every caller
+    /// that needs one: the bytes are in `files/` at the manifest's length. A
+    /// second definition elsewhere is what caused that, and the lesson is
+    /// D79's — derive it once, so two answers cannot disagree.
+    ///
+    /// Read off the directory each time rather than counted as chunks land. A
+    /// tally kept beside the files could disagree with them too, and the
+    /// disagreement would be either a collection acknowledged before it was
+    /// complete — destroying the runner's only copy — or one never
+    /// acknowledged, leaving a runner holding bytes for ever.
+    fn collection_is_whole(&self, id: &JobId, record: &JobRecord) -> bool {
+        let kept = self.job_dir(id).join(KEPT_FILES_DIR);
+        record
+            .outputs
+            .files
+            .iter()
+            .all(|file| file_length(&kept.join(&file.path)) == Some(file.bytes))
+    }
+
+    fn collection_state(&self, id: &JobId, record: &JobRecord) -> crate::job::ChunkLanded {
+        if self.collection_is_whole(id, record) {
+            crate::job::ChunkLanded::Complete
+        } else {
+            crate::job::ChunkLanded::More
+        }
     }
 
     fn readings_path(&self) -> PathBuf {
@@ -1235,6 +1285,7 @@ impl JobStore for JobDirStore {
             files: Vec::new(),
             refused: outputs.refused.clone(),
             skipped: outputs.skipped.clone(),
+            streamed: outputs.streamed,
         };
         for file in &outputs.files {
             // Asked before the string is joined onto anything. A walk on a
@@ -1250,24 +1301,45 @@ impl JobStore for JobDirStore {
                     continue;
                 }
             };
+            // The bytes on this frame have to be the file the manifest beside
+            // them describes. A length and a digest that nobody compares are
+            // worth nothing, and the comparison is cheap next to the write.
+            if let Some(why) = file.disagreement() {
+                summary
+                    .skipped
+                    .push(format!("a frame this hub will not believe: {why}"));
+                continue;
+            }
+            // **The manifest first, the bytes if they are here.** A streamed
+            // collection's verdict carries every path, length and digest and
+            // none of the data: the entry is written down now, so a record is
+            // complete about what the job produced from the moment the
+            // verdict lands, and the bytes fill in behind it (D148). What a
+            // reader of `job.json` must never find is a path that is not
+            // there *and* no way to tell why — which is why the entry and
+            // the file's absence are both readable rather than one being
+            // inferred from the other.
+            summary.files.push(crate::job::KeptFile {
+                path: file.path.clone(),
+                bytes: file.len,
+                sha256: file.sha256.clone(),
+            });
+            let Some(data) = &file.data else {
+                continue;
+            };
             let path = kept.join(&relative);
             if let Some(parent) = path.parent() {
                 durable::create_dir_all(parent)
                     .map_err(|error| failed("creating", parent, &error))?;
             }
-            durable::write_file(&path, &file.data)
-                .map_err(|error| failed("writing", &path, &error))?;
-            summary.files.push(crate::job::KeptFile {
-                path: file.path.clone(),
-                bytes: file.data.len() as u64,
-            });
+            durable::write_file(&path, data).map_err(|error| failed("writing", &path, &error))?;
         }
         summary.skipped.sort();
         record.outputs = summary;
         self.write_record(&record)
     }
 
-    fn job_outputs(&self, id: &JobId) -> Result<herd_proto::JobOutputs> {
+    fn job_outputs(&self, id: &JobId, with_bytes: bool) -> Result<herd_proto::JobOutputs> {
         let Some(record) = JobStore::job(self, id)? else {
             return Ok(herd_proto::JobOutputs::default());
         };
@@ -1276,6 +1348,7 @@ impl JobStore for JobDirStore {
             files: Vec::new(),
             refused: record.outputs.refused.clone(),
             skipped: record.outputs.skipped.clone(),
+            streamed: record.outputs.streamed,
         };
         for file in &record.outputs.files {
             // The same check on the way out as on the way in: the record is a
@@ -1285,23 +1358,210 @@ impl JobStore for JobDirStore {
                 outputs.skipped.push(why);
                 continue;
             }
+            // **The manifest entry goes out whether the bytes exist or not**,
+            // and that is the whole of "the manifest outlives the bytes"
+            // (D148). A record that named twelve files and can hand over
+            // eight has to say twelve, or the caller reads eight as all of
+            // them. Which of them are really there is answered separately,
+            // by path, so an absence can carry a reason.
+            let entry = herd_proto::OutputFile::announced(
+                file.path.clone(),
+                file.bytes,
+                file.sha256.clone(),
+            );
+            if !with_bytes {
+                outputs.files.push(entry);
+                continue;
+            }
             let path = kept.join(&file.path);
             match fs::read(&path) {
                 Ok(data) => outputs.files.push(herd_proto::OutputFile {
-                    path: file.path.clone(),
-                    data,
+                    data: Some(data),
+                    ..entry
                 }),
                 // Named rather than silently absent: a record that says a
                 // file is there and a directory that does not have it is
                 // something an operator has to see, and a requester given a
                 // short list with no word about it would read it as whole.
-                Err(error) => outputs.skipped.push(format!(
-                    "{} is named on this job's record and could not be read back: {error}",
-                    file.path
-                )),
+                // The entry still goes, so the count stays honest.
+                Err(error) => {
+                    outputs.skipped.push(format!(
+                        "{} is named on this job's record and could not be read back: {error}",
+                        file.path
+                    ));
+                    outputs.files.push(entry);
+                }
             }
         }
         Ok(outputs)
+    }
+
+    fn write_output_chunk(
+        &self,
+        id: &JobId,
+        path: &str,
+        offset: u64,
+        data: &[u8],
+    ) -> Result<crate::job::ChunkLanded> {
+        use crate::job::ChunkLanded;
+
+        let Some(record) = JobStore::job(self, id)? else {
+            return Ok(ChunkLanded::Refused(format!("no such job: {id}")));
+        };
+        // A path no verdict announced is never written. The manifest is the
+        // promise and this is the hub keeping to it: without the check, a
+        // peer could put any relative path it liked under a job's record,
+        // and the record would then describe something the job never left.
+        let Some(entry) = record.outputs.files.iter().find(|file| file.path == path) else {
+            return Ok(ChunkLanded::Refused(format!(
+                "{path} is not on {id}'s manifest, so this hub will not write it: a verdict \
+                 announces every file of a collection before a byte of it moves"
+            )));
+        };
+        if let Err(why) = herd_proto::check_relative(path) {
+            return Ok(ChunkLanded::Refused(why));
+        }
+        let kept = self.job_dir(id).join(KEPT_FILES_DIR);
+        let parts = self.job_dir(id).join(OUTPUT_PARTS_DIR);
+        let whole = kept.join(path);
+        let part = parts.join(path);
+        // Already here and whole: a chunk for a file the hub finished is a
+        // runner that was told so after it had already sent more, which is
+        // ordinary on a resumed transfer and not an error.
+        if file_length(&whole) == Some(entry.bytes) {
+            return Ok(self.collection_state(id, &record));
+        }
+        let held = file_length(&part).unwrap_or(0);
+        // **The offset is checked, not trusted.** A chunk that does not begin
+        // where the hub's own bytes end would splice two different reads of
+        // one path into a file that is a plausible mixture of both — and the
+        // digest would then fail for a reason nothing could explain.
+        if offset != held {
+            return Ok(ChunkLanded::Refused(format!(
+                "{path}: this hub holds {held} byte(s) and the chunk starts at {offset}"
+            )));
+        }
+        if held + data.len() as u64 > entry.bytes {
+            return Ok(ChunkLanded::Refused(format!(
+                "{path}: the manifest says {} byte(s) and this chunk would make it {}",
+                entry.bytes,
+                held + data.len() as u64
+            )));
+        }
+        if let Some(parent) = part.parent() {
+            durable::create_dir_all(parent).map_err(|error| failed("creating", parent, &error))?;
+        }
+        durable::append_bytes(&part, data).map_err(|error| failed("writing", &part, &error))?;
+        if held + data.len() as u64 != entry.bytes {
+            return Ok(ChunkLanded::More);
+        }
+        // The last byte landed, so the promise is now checkable. **Verified
+        // before the rename**, which is what makes `files/` a directory of
+        // whole, verified files and nothing else: a reader of it during a
+        // transfer sees finished files or no file, never one it could parse
+        // and be wrong about (E-53).
+        let real = match digest_of(&part) {
+            Ok(digest) => digest,
+            Err(error) => return Err(failed("reading back", &part, &error)),
+        };
+        if !entry.sha256.is_empty() && real != entry.sha256 {
+            // Thrown away rather than kept: the bytes are not the file the
+            // verdict promised, and the runner still has the real ones. The
+            // sentence names both digests, because "it did not match" with no
+            // figures is the one report nobody can act on.
+            let _ = fs::remove_file(&part);
+            return Ok(ChunkLanded::Refused(format!(
+                "{path}: the manifest says sha256 {} and what arrived hashes to {real}; the \
+                 {} byte(s) received have been thrown away rather than written",
+                entry.sha256, entry.bytes
+            )));
+        }
+        if let Some(parent) = whole.parent() {
+            durable::create_dir_all(parent).map_err(|error| failed("creating", parent, &error))?;
+        }
+        durable::sync_file(&part).map_err(|error| failed("syncing", &part, &error))?;
+        fs::rename(&part, &whole).map_err(|error| failed("renaming", &part, &error))?;
+        if let Some(parent) = whole.parent() {
+            durable::sync_dir(parent).map_err(|error| failed("syncing", parent, &error))?;
+        }
+        Ok(self.collection_state(id, &record))
+    }
+
+    fn output_holdings(&self, id: &JobId) -> Result<Vec<herd_proto::FileHeld>> {
+        let Some(record) = JobStore::job(self, id)? else {
+            return Ok(Vec::new());
+        };
+        let kept = self.job_dir(id).join(KEPT_FILES_DIR);
+        let parts = self.job_dir(id).join(OUTPUT_PARTS_DIR);
+        let mut held = Vec::new();
+        for file in &record.outputs.files {
+            if herd_proto::check_relative(&file.path).is_err() {
+                continue;
+            }
+            // Whole first, then part-written, then nothing at all — and a
+            // path that is in neither place is simply absent from this list,
+            // which is how the runner is told to send it from the beginning.
+            let bytes = match file_length(&kept.join(&file.path)) {
+                Some(bytes) => bytes,
+                None => match file_length(&parts.join(&file.path)) {
+                    Some(bytes) => bytes,
+                    None => continue,
+                },
+            };
+            held.push(herd_proto::FileHeld {
+                path: file.path.clone(),
+                bytes,
+            });
+        }
+        Ok(held)
+    }
+
+    fn read_output_chunk(
+        &self,
+        id: &JobId,
+        path: &str,
+        offset: u64,
+        take: usize,
+    ) -> Result<Option<Vec<u8>>> {
+        use std::io::{Read, Seek, SeekFrom};
+
+        if herd_proto::check_relative(path).is_err() {
+            return Ok(None);
+        }
+        let at = self.job_dir(id).join(KEPT_FILES_DIR).join(path);
+        let mut file = match fs::File::open(&at) {
+            Ok(file) => file,
+            // Not there is an answer, not an error: the record may name a
+            // file whose bytes never arrived or are gone, and the caller's
+            // job is to say which.
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(failed("opening", &at, &error)),
+        };
+        if offset > 0 {
+            file.seek(SeekFrom::Start(offset))
+                .map_err(|error| failed("seeking in", &at, &error))?;
+        }
+        let mut data = vec![0u8; take];
+        let mut filled = 0usize;
+        while filled < take {
+            let read = file
+                .read(&mut data[filled..])
+                .map_err(|error| failed("reading", &at, &error))?;
+            if read == 0 {
+                break;
+            }
+            filled += read;
+        }
+        data.truncate(filled);
+        Ok(Some(data))
+    }
+
+    fn clear_output_parts(&self, id: &JobId) -> Result<()> {
+        let parts = self.job_dir(id).join(OUTPUT_PARTS_DIR);
+        if !parts.exists() {
+            return Ok(());
+        }
+        fs::remove_dir_all(&parts).map_err(|error| failed("removing", &parts, &error))
     }
 
     /// Why a queued job is not starting, on its record and in its history.
@@ -1638,6 +1898,52 @@ impl JobStore for JobDirStore {
         }
         Ok(records)
     }
+
+    fn collections_owed(&self) -> Result<Vec<crate::job::CollectionOwed>> {
+        let mut owed = Vec::new();
+        // A scan of the job directories, like the one that rebuilds the queue
+        // at startup. It runs when a runner dials, not per job, so the cost
+        // is paid once per redial — and the alternative is a list of
+        // outstanding transfers kept in memory, which is the thing that can
+        // disagree with the disk.
+        for name in durable::names_in(&self.jobs_dir())
+            .map_err(|error| failed("listing", &self.jobs_dir(), &error))?
+        {
+            let id = JobId::new(name);
+            // A record that will not read is not a collection to chase. It is
+            // a louder problem than this, and recovery says so where it
+            // belongs (D52); here it is simply skipped.
+            let Ok(Some(record)) = JobStore::job(self, &id) else {
+                continue;
+            };
+            if !record.outputs.streamed || record.outputs.files.is_empty() {
+                continue;
+            }
+            // The one definition of complete, shared with every other
+            // caller: in `files/`, at the manifest's length, verified.
+            // **Not** off the holdings below — a part file at full length is
+            // not a finished file, and judging it so told requesters their
+            // collection had stopped coming in the window where its digest
+            // was still being checked.
+            if self.collection_is_whole(&id, &record) {
+                continue;
+            }
+            let held = self.output_holdings(&id)?;
+            // Whoever ran the attempt that produced it. No attempt means a
+            // record nothing can be asked of, which is not a state a streamed
+            // collection can honestly be in — skipped rather than guessed at.
+            let Some(attempt) = record.attempts.last() else {
+                continue;
+            };
+            owed.push(crate::job::CollectionOwed {
+                job_id: id,
+                attempt: attempt.number,
+                runner: attempt.runner.clone(),
+                held,
+            });
+        }
+        Ok(owed)
+    }
 }
 
 /// What the log says at the place where chunks are missing.
@@ -1887,6 +2193,39 @@ fn write_json<T: Serialize>(path: &Path, value: &T) -> Result<()> {
     durable::write_file(path, &text).map_err(|error| failed("writing", path, &error))
 }
 
+/// How long a file is, or nothing at all if it is not there.
+///
+/// Absent and zero are two different answers and this keeps them apart: an
+/// empty file is a real file a collection may contain, and reading its
+/// absence as "0 bytes held" would tell a runner to resume a file it had
+/// never started.
+fn file_length(path: &Path) -> Option<u64> {
+    fs::metadata(path)
+        .ok()
+        .filter(|at| at.is_file())
+        .map(|at| at.len())
+}
+
+/// The sha256 of a file on this hub's disk, read a piece at a time.
+///
+/// Never `fs::read` then hash: the file may be hundreds of megabytes, and
+/// holding it whole to check it would put back the cost the streamed carriage
+/// exists to remove.
+fn digest_of(path: &Path) -> std::io::Result<String> {
+    use std::io::Read;
+
+    let mut file = fs::File::open(path)?;
+    let mut rolling = herd_proto::Sha256Rolling::new();
+    let mut buffer = vec![0u8; 64 << 10];
+    loop {
+        let read = file.read(&mut buffer)?;
+        if read == 0 {
+            return Ok(rolling.finish());
+        }
+        rolling.update(&buffer[..read]);
+    }
+}
+
 fn failed(what: &str, path: &Path, error: &dyn std::fmt::Display) -> StoreError {
     StoreError::new(format!("{what} {} failed: {error}", path.display()))
 }
@@ -1931,6 +2270,12 @@ mod tests {
 
     /// A store in a directory that goes away with the test.
     fn store() -> (TempDir, JobDirStore) {
+        make_a_store()
+    }
+
+    /// The same thing under a name a local `store` binding cannot shadow, for
+    /// the tests that need two stores at once.
+    fn make_a_store() -> (TempDir, JobDirStore) {
         let dir = tempfile::tempdir().expect("a temporary directory");
         let store = JobDirStore::open(dir.path()).expect("the state root opens");
         (dir, store)
@@ -3340,14 +3685,404 @@ mod tests {
         herd_proto::JobOutputs {
             files: files
                 .iter()
-                .map(|(path, data)| herd_proto::OutputFile {
-                    path: (*path).to_owned(),
-                    data: data.to_vec(),
+                .map(|(path, data)| {
+                    herd_proto::OutputFile::collected((*path).to_owned(), data.to_vec())
                 })
                 .collect(),
-            refused: None,
-            skipped: Vec::new(),
+            ..herd_proto::JobOutputs::default()
         }
+    }
+
+    /// The same collection by the other carriage: the manifest alone, with
+    /// every entry announced and none carried.
+    fn announced(files: &[(&str, &[u8])]) -> herd_proto::JobOutputs {
+        herd_proto::JobOutputs {
+            files: files
+                .iter()
+                .map(|(path, data)| {
+                    herd_proto::OutputFile::announced(
+                        (*path).to_owned(),
+                        data.len() as u64,
+                        herd_proto::sha256_hex(data),
+                    )
+                })
+                .collect(),
+            streamed: true,
+            ..herd_proto::JobOutputs::default()
+        }
+    }
+
+    /// A job minted, handed to a runner, and ready to have a collection
+    /// recorded against it.
+    ///
+    /// The attempt is not decoration: a collection belongs to the attempt
+    /// that produced it, and `collections_owed` has to know **which runner**
+    /// to ask for the bytes. A record with a streamed collection and no
+    /// attempt is a record that contradicts itself, which is why the store
+    /// skips one rather than guessing at a runner.
+    fn a_job(store: &JobDirStore) -> JobRecord {
+        let job = store
+            .create_job(NewJob::at(
+                vec!["true".to_owned()],
+                LabelSet::default(),
+                Priority::Step,
+            ))
+            .expect("minted");
+        store
+            .begin_attempt(&job.id, "test-runner", "the only runner", None)
+            .expect("the attempt is recorded");
+        job
+    }
+
+    /// The streamed carriage, end to end through the store: a manifest with no
+    /// bytes, then the bytes, then a complete and verified collection.
+    ///
+    /// **The property that matters is the last assertion**: what a requester
+    /// reads back is byte-identical to what the inline carriage would have
+    /// given it. Everything above it is the mechanism; that line is the
+    /// promise (D148).
+    #[test]
+    fn a_streamed_collection_lands_the_same_bytes_the_inline_one_would() {
+        let (dir, streamed_store) = store();
+        let store = &streamed_store;
+        let job = a_job(store);
+        let big: Vec<u8> = (0..(3 * herd_proto::OUTPUT_CHUNK_BYTES as usize + 7))
+            .map(|n| (n % 251) as u8)
+            .collect();
+        let files: &[(&str, &[u8])] = &[
+            ("files/results.json", br#"{"ok":true}"#),
+            ("files/deep/shot.png", &big),
+            ("files/empty.marker", b""),
+        ];
+        store
+            .record_outputs(&job.id, &announced(files))
+            .expect("the manifest is recorded");
+
+        // The manifest is on the record from the moment the verdict landed,
+        // and **no byte is on the disk yet**. That is the one thing the
+        // inline carriage never does, and it is deliberate: a record is
+        // complete about what a job produced before its evidence has crossed.
+        let kept = dir
+            .path()
+            .join(JOBS_DIR)
+            .join(job.id.as_str())
+            .join(KEPT_FILES_DIR);
+        let record = store.job(&job.id).expect("reads").expect("there");
+        assert!(record.outputs.streamed, "the record says which carriage");
+        assert_eq!(record.outputs.files.len(), 3);
+        assert!(
+            record
+                .outputs
+                .files
+                .iter()
+                .all(|file| !file.sha256.is_empty()),
+            "every entry carries a digest, which is what outlives the bytes"
+        );
+        assert!(
+            !kept.join("files/results.json").exists(),
+            "nothing is written until its bytes arrive"
+        );
+
+        // Nothing held, so the runner is told to send everything from the
+        // beginning: a path absent from the holdings is exactly that
+        // instruction.
+        assert!(store
+            .output_holdings(&job.id)
+            .expect("holdings read")
+            .is_empty());
+
+        // The bytes, a chunk at a time, in the order a runner sends them.
+        let mut landed = crate::job::ChunkLanded::More;
+        for (path, data) in files {
+            if data.is_empty() {
+                landed = store
+                    .write_output_chunk(&job.id, path, 0, b"")
+                    .expect("an empty file is a file");
+                continue;
+            }
+            for (index, piece) in data
+                .chunks(herd_proto::OUTPUT_CHUNK_BYTES as usize)
+                .enumerate()
+            {
+                let offset = index as u64 * herd_proto::OUTPUT_CHUNK_BYTES;
+                landed = store
+                    .write_output_chunk(&job.id, path, offset, piece)
+                    .expect("a chunk lands");
+            }
+        }
+        assert_eq!(
+            landed,
+            crate::job::ChunkLanded::Complete,
+            "the last chunk of the last file completes the collection"
+        );
+
+        // On the disk, under the same paths the inline carriage uses.
+        assert_eq!(
+            fs::read(kept.join("files/deep/shot.png")).expect("the big file is there"),
+            big
+        );
+        assert_eq!(
+            fs::read(kept.join("files/empty.marker")).expect("the empty file is there"),
+            Vec::<u8>::new(),
+            "an empty file is a real file, not the absence of one"
+        );
+
+        // **And the promise.** Recorded by the other carriage into a second
+        // store, read back the same way, compared field by field: the two
+        // collections a requester is handed are equal.
+        let (_other_dir, other) = make_a_store();
+        let twin = a_job(&other);
+        other
+            .record_outputs(&twin.id, &collected(files))
+            .expect("the inline collection is kept");
+        let by_frame = other.job_outputs(&twin.id, true).expect("reads back");
+        let by_stream = store.job_outputs(&job.id, true).expect("reads back");
+        assert_eq!(
+            by_stream.files, by_frame.files,
+            "a requester cannot tell which carriage it got: that is the whole of D148's \
+             'a requester declares nothing'"
+        );
+        assert_eq!(by_stream.refused, by_frame.refused);
+        assert_eq!(by_stream.skipped, by_frame.skipped);
+        // The *record* differs in exactly one field, which is the one an
+        // operator reads and a requester does not.
+        assert!(by_stream.streamed && !by_frame.streamed);
+    }
+
+    /// A part-written file is resumable, and the hub is the side that says
+    /// from where.
+    #[test]
+    fn a_half_sent_file_resumes_at_the_length_the_hub_holds() {
+        let (dir, store) = store();
+        let job = a_job(&store);
+        let big: Vec<u8> = (0..(2 * herd_proto::OUTPUT_CHUNK_BYTES as usize))
+            .map(|n| (n % 97) as u8)
+            .collect();
+        store
+            .record_outputs(&job.id, &announced(&[("files/shot.png", &big)]))
+            .expect("recorded");
+
+        // One chunk of two, as a link that dropped mid-transfer leaves it.
+        store
+            .write_output_chunk(
+                &job.id,
+                "files/shot.png",
+                0,
+                &big[..herd_proto::OUTPUT_CHUNK_BYTES as usize],
+            )
+            .expect("the first chunk lands");
+        assert_eq!(
+            store.output_holdings(&job.id).expect("holdings"),
+            vec![herd_proto::FileHeld {
+                path: "files/shot.png".to_owned(),
+                bytes: herd_proto::OUTPUT_CHUNK_BYTES,
+            }],
+            "the hub says how far it got, which is what the runner resumes from"
+        );
+        // And the file is **not** visible under `files/` while it is partial:
+        // a consumer reading the record's directory during a transfer sees
+        // whole files or none (E-53).
+        let kept = dir
+            .path()
+            .join(JOBS_DIR)
+            .join(job.id.as_str())
+            .join(KEPT_FILES_DIR);
+        assert!(!kept.join("files/shot.png").exists());
+
+        // A chunk that does not continue where the hub is, refused by name
+        // rather than spliced into a file that would then fail its digest for
+        // a reason nobody could see.
+        let crate::job::ChunkLanded::Refused(why) = store
+            .write_output_chunk(&job.id, "files/shot.png", 0, b"again from the top")
+            .expect("the store answers")
+        else {
+            panic!("an offset that does not continue must be refused");
+        };
+        assert!(why.contains("starts at 0"), "{why}");
+
+        // The rest, from where the hub really is.
+        let landed = store
+            .write_output_chunk(
+                &job.id,
+                "files/shot.png",
+                herd_proto::OUTPUT_CHUNK_BYTES,
+                &big[herd_proto::OUTPUT_CHUNK_BYTES as usize..],
+            )
+            .expect("the second chunk lands");
+        assert_eq!(landed, crate::job::ChunkLanded::Complete);
+        assert_eq!(fs::read(kept.join("files/shot.png")).expect("there"), big);
+    }
+
+    /// Bytes that do not hash to what the verdict promised are thrown away,
+    /// named, and never renamed into place.
+    #[test]
+    fn a_file_that_fails_its_digest_is_refused_and_not_kept() {
+        let (dir, store) = store();
+        let job = a_job(&store);
+        store
+            .record_outputs(&job.id, &announced(&[("files/results.json", b"the truth")]))
+            .expect("recorded");
+        let crate::job::ChunkLanded::Refused(why) = store
+            .write_output_chunk(&job.id, "files/results.json", 0, b"not truth")
+            .expect("the store answers")
+        else {
+            panic!("a digest that does not match must be refused");
+        };
+        assert!(why.contains("sha256"), "{why}");
+        assert!(
+            why.contains(&herd_proto::sha256_hex(b"the truth")),
+            "the refusal names what was promised: {why}"
+        );
+        assert!(
+            why.contains(&herd_proto::sha256_hex(b"not truth")),
+            "and what arrived, because 'it did not match' with no figures is unactionable: \
+             {why}"
+        );
+        let kept = dir
+            .path()
+            .join(JOBS_DIR)
+            .join(job.id.as_str())
+            .join(KEPT_FILES_DIR);
+        assert!(
+            !kept.join("files/results.json").exists(),
+            "a file that failed its digest is never in files/"
+        );
+        // And the collection is still outstanding, so the runner goes on
+        // holding it: the hub has not got the bytes and must not pretend it
+        // has (D19).
+        let owed = store.collections_owed().expect("owed reads");
+        assert_eq!(owed.len(), 1, "{owed:?}");
+    }
+
+    /// A path no verdict announced is never written, whatever a peer sends.
+    #[test]
+    fn a_path_the_manifest_does_not_name_is_refused() {
+        let (_dir, store) = store();
+        let job = a_job(&store);
+        store
+            .record_outputs(&job.id, &announced(&[("files/results.json", b"ok")]))
+            .expect("recorded");
+        let crate::job::ChunkLanded::Refused(why) = store
+            .write_output_chunk(&job.id, "files/surprise.sh", 0, b"rm -rf /")
+            .expect("the store answers")
+        else {
+            panic!("a path off the manifest must be refused");
+        };
+        assert!(why.contains("files/surprise.sh"), "{why}");
+        assert!(why.contains("manifest"), "{why}");
+    }
+
+    /// An outstanding collection is found by looking, names its runner, and
+    /// stops being outstanding when the bytes are all there.
+    ///
+    /// **A finished job**, and that is the point: the verdict goes first and
+    /// the files follow (D148), so an outstanding collection is never in
+    /// `unfinished_jobs` and a scan that only looked there would wait for
+    /// bytes nobody was ever going to be asked for.
+    #[test]
+    fn a_collection_still_owed_is_derived_from_the_records_and_names_its_runner() {
+        let (_dir, store) = store();
+        let job = a_job(&store);
+        store
+            .record_outputs(&job.id, &announced(&[("files/results.json", b"ok")]))
+            .expect("recorded");
+        store
+            .record_state(
+                &job.id,
+                JobState::Finished {
+                    outcome: JobOutcome::Exited { code: 0 },
+                },
+            )
+            .expect("the job is over, and its files are not");
+
+        let owed = store.collections_owed().expect("the scan reads");
+        assert_eq!(owed.len(), 1, "{owed:?}");
+        assert_eq!(owed[0].job_id, job.id);
+        assert_eq!(
+            owed[0].runner, "test-runner",
+            "so one runner is never asked for another's collection"
+        );
+        assert_eq!(owed[0].attempt, 1);
+        assert!(
+            owed[0].held.is_empty(),
+            "nothing held means send it from the beginning"
+        );
+
+        // An inline collection is never owed anything: its bytes arrived with
+        // the verdict, so a hub that chased it would be chasing itself.
+        let inline = a_job(&store);
+        store
+            .record_outputs(&inline.id, &collected(&[("files/results.json", b"ok")]))
+            .expect("kept");
+        assert_eq!(
+            store.collections_owed().expect("reads").len(),
+            1,
+            "only the streamed one is outstanding"
+        );
+
+        // And once the bytes are there it stops being outstanding, read off
+        // the disk rather than off a counter that could disagree with it.
+        store
+            .write_output_chunk(&job.id, "files/results.json", 0, b"ok")
+            .expect("the chunk lands");
+        assert!(
+            store.collections_owed().expect("reads").is_empty(),
+            "a complete collection is owed nothing"
+        );
+    }
+
+    /// The manifest outlives the bytes: a record whose files are gone still
+    /// says what they were.
+    ///
+    /// The case reached here is the one that exists today — a runner that
+    /// never came back, so bytes that never arrived. M12's sweeper will reach
+    /// the same state from the other direction, which is why there is one
+    /// answer for both.
+    #[test]
+    fn a_record_whose_bytes_are_gone_still_names_every_file_it_had() {
+        let (dir, store) = store();
+        let job = a_job(&store);
+        let files: &[(&str, &[u8])] = &[
+            ("files/results.json", br#"{"verdict":"ok"}"#),
+            ("files/shot.png", b"pretend this is 300 MiB"),
+        ];
+        store
+            .record_outputs(&job.id, &collected(files))
+            .expect("kept");
+        // Taken away behind the record's back, which is exactly what
+        // retention will do on purpose.
+        let kept = dir
+            .path()
+            .join(JOBS_DIR)
+            .join(job.id.as_str())
+            .join(KEPT_FILES_DIR);
+        fs::remove_file(kept.join("files/shot.png")).expect("removed");
+
+        let back = store.job_outputs(&job.id, true).expect("reads back");
+        assert_eq!(
+            back.files.len(),
+            2,
+            "two files on the record means two entries, or a reader takes one for all of \
+             them: {back:?}"
+        );
+        let gone = back
+            .files
+            .iter()
+            .find(|file| file.path == "files/shot.png")
+            .expect("still named");
+        assert!(!gone.is_held(), "its bytes are not there");
+        assert_eq!(gone.len, 23, "and its size is still known");
+        assert!(
+            !gone.sha256.is_empty(),
+            "and what it hashed to, which is what a judge re-reading it needs (E-54)"
+        );
+        assert!(
+            back.skipped
+                .iter()
+                .any(|said| said.contains("files/shot.png")),
+            "and the absence is said out loud: {:?}",
+            back.skipped
+        );
     }
 
     /// The whole promise, on the disk and back: `files/results.json` is
@@ -3409,13 +4144,13 @@ mod tests {
         );
 
         // And back out, which is what a requester attaching later is given.
-        let back = store.job_outputs(&job.id).expect("they read back");
+        let back = store.job_outputs(&job.id, true).expect("they read back");
         assert_eq!(back.refused, None);
         assert!(back.skipped.is_empty(), "{:?}", back.skipped);
         assert_eq!(
             back.files
                 .iter()
-                .map(|file| (file.path.as_str(), file.data.clone()))
+                .map(|file| (file.path.as_str(), file.bytes().to_vec()))
                 .collect::<Vec<_>>(),
             [
                 ("files/results.json", br#"{"ok":true}"#.to_vec()),
@@ -3450,7 +4185,7 @@ mod tests {
                 ),
             )
             .expect("the refusal is recorded");
-        let back = store.job_outputs(&job.id).expect("it reads back");
+        let back = store.job_outputs(&job.id, true).expect("it reads back");
         assert!(back.files.is_empty(), "{back:?}");
         assert_eq!(back.refused.as_deref(), Some(refusal));
         assert_eq!(back.skipped.len(), 1, "{back:?}");
@@ -3565,7 +4300,7 @@ mod tests {
         );
         assert_eq!(written["record_version"], RECORD_VERSION);
         assert!(store
-            .job_outputs(&job.id)
+            .job_outputs(&job.id, true)
             .expect("it reads back")
             .is_silent());
 
@@ -3582,8 +4317,17 @@ mod tests {
         assert!(record.outputs.is_silent());
     }
 
-    /// A file the record names and the directory does not have is **named**,
-    /// never a short list read as a whole one.
+    /// A file the record names and the directory does not have is **named and
+    /// still listed**, never a short list read as a whole one.
+    ///
+    /// The second half of that sentence is new, and it is the manifest
+    /// outliving the bytes (D148). This test used to assert the entry was
+    /// **dropped** and only a `skipped` line kept — which was the best
+    /// available answer when a collection was one frame, and is the wrong one
+    /// now: a caller that reads `files` to know what a job produced would
+    /// read a dropped entry as a file the job never wrote. So the entry
+    /// stays, with its size and its digest, and `data` being absent is what
+    /// says the bytes are gone.
     #[test]
     fn a_file_named_on_the_record_and_missing_on_the_disk_is_said_rather_than_dropped() {
         let (dir, store) = store();
@@ -3605,8 +4349,13 @@ mod tests {
                 .join("files/results.json"),
         )
         .expect("somebody removed it from under the record");
-        let back = store.job_outputs(&job.id).expect("it still reads");
-        assert!(back.files.is_empty());
+        let back = store.job_outputs(&job.id, true).expect("it still reads");
+        assert_eq!(back.files.len(), 1, "the entry stays: {back:?}");
+        assert!(
+            !back.files[0].is_held(),
+            "and absent bytes are what says the file is gone, not a missing entry"
+        );
+        assert_eq!(back.files[0].len, 4, "its size is still on the record");
         assert_eq!(back.skipped.len(), 1, "{back:?}");
         assert!(
             back.skipped[0].contains("files/results.json")

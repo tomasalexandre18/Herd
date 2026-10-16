@@ -295,10 +295,25 @@ async fn output_arrives_while_the_job_is_still_running() {
     );
 }
 
+/// A peer on the wrong protocol version is refused by name, whichever side of
+/// this hub's number it is on.
+///
+/// **Both directions, and the stale one is the one that happens.** A peer
+/// announcing a *newer* version is a machine somebody upgraded early; a peer
+/// announcing an *older* one is every runner and every `herdctl` in the fleet
+/// on the morning after a bump, which is exactly the cost D148's move to
+/// version 2 is paid in. The refusal has to name both figures so one line
+/// says which side to move — otherwise a fleet goes quiet machine by machine
+/// with nothing saying why (D73, E-51).
 #[tokio::test]
 async fn a_version_mismatch_is_refused_naming_both_versions() {
+    for announced in [PROTOCOL_VERSION + 1, PROTOCOL_VERSION - 1] {
+        a_peer_announcing_is_refused(announced).await;
+    }
+}
+
+async fn a_peer_announcing_is_refused(announced: u32) {
     let harness = Harness::with_hub().await;
-    let announced = PROTOCOL_VERSION + 1;
 
     for role in [Role::Runner, Role::Requester] {
         let (mut socket, _response) = tokio_tungstenite::connect_async(&harness.hub_url)

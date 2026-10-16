@@ -219,27 +219,42 @@ fn every_output_set() -> Vec<herd_proto::JobOutputs> {
             vec!["files/link is a symlink, and a symlink is never followed".to_owned()],
         ),
         herd_proto::JobOutputs {
-            files: Vec::new(),
-            refused: None,
             skipped: vec!["out/pipe is not a regular file".to_owned()],
+            ..herd_proto::JobOutputs::default()
         },
     ];
     for payload in every_payload() {
         sets.push(herd_proto::JobOutputs {
             files: vec![
-                herd_proto::OutputFile {
-                    // The path the first consumer's contract is about, with
-                    // its directory kept.
-                    path: "files/results.json".to_owned(),
-                    data: payload.clone(),
-                },
-                herd_proto::OutputFile {
-                    path: "deep/under/here.bin".to_owned(),
-                    data: payload,
-                },
+                // The path the first consumer's contract is about, with its
+                // directory kept.
+                herd_proto::OutputFile::collected("files/results.json".to_owned(), payload.clone()),
+                herd_proto::OutputFile::collected(
+                    "deep/under/here.bin".to_owned(),
+                    payload.clone(),
+                ),
             ],
-            refused: None,
-            skipped: Vec::new(),
+            ..herd_proto::JobOutputs::default()
+        });
+        // And the same collection by the other carriage: the manifest alone,
+        // every entry announced and none carried. Both shapes have to survive
+        // the wire, because which one a job's verdict holds is the runner's
+        // choice and a decoder never gets to insist on one (D148).
+        sets.push(herd_proto::JobOutputs {
+            files: vec![
+                herd_proto::OutputFile::announced(
+                    "files/results.json".to_owned(),
+                    payload.len() as u64,
+                    herd_proto::sha256_hex(&payload),
+                ),
+                herd_proto::OutputFile::announced(
+                    "deep/under/here.bin".to_owned(),
+                    payload.len() as u64,
+                    herd_proto::sha256_hex(&payload),
+                ),
+            ],
+            streamed: true,
+            ..herd_proto::JobOutputs::default()
         });
     }
     sets
@@ -674,11 +689,74 @@ fn an_unknown_outcome_is_a_decode_error_not_a_panic() {
     assert!(err.to_string().contains("deadline_passed"), "{err}");
 }
 
+/// A frame of an unknown type **decodes**, into the catch-all, on both enums.
+///
+/// This test used to assert the opposite, and the change is the reason
+/// `PROTOCOL_VERSION` moved to 2 (D148). An unknown `type` was a decode
+/// error, and a decode error on a runner's link killed the link, after which
+/// the runner redialled **into the same undecodable frame** — it looped
+/// rather than shrugged (D128's recorded defect). What decides whether that
+/// is safe is not the decoder but each peer, and the three peers answer
+/// differently; those three answers are asserted in `herd-runner`,
+/// `herdctl` and `herd-hub` respectively, where the behaviour lives.
+///
+/// What is asserted here is the one thing that belongs to the wire: it
+/// decodes, and it decodes to a value that says nothing else.
 #[test]
-fn an_unknown_message_type_is_a_decode_error_not_a_panic() {
-    let err = from_frame::<ToHub>(r#"{"type":"deploy_to_production"}"#)
-        .expect_err("unknown types must be rejected");
-    assert!(err.to_string().contains("deploy_to_production"), "{err}");
+fn an_unknown_message_type_decodes_to_the_catch_all_on_both_enums() {
+    assert_eq!(
+        from_frame::<ToHub>(r#"{"type":"deploy_to_production"}"#)
+            .expect("an unknown type decodes rather than killing a link"),
+        ToHub::Unknown
+    );
+    assert_eq!(
+        from_frame::<FromHub>(r#"{"type":"pack_capability","blob":"abc","peer":"pc"}"#)
+            .expect("an unknown type decodes, payload and all, and is discarded"),
+        FromHub::Unknown
+    );
+}
+
+/// And the type is still readable, because a catch-all that loses it leaves
+/// a log line nobody can act on.
+///
+/// `Unknown` is a unit variant, so serde discards the tag on the way to it:
+/// a peer matching on the enum alone would know it had met something it did
+/// not know and not **what**. `frame_type` reads it back off the text, which
+/// is the difference between `ignoring a frame of type "pack_capability"` and
+/// `ignoring a frame`.
+#[test]
+fn an_unknown_frame_can_still_be_named() {
+    assert_eq!(
+        herd_proto::frame_type(r#"{"type":"pack_capability","blob":"abc"}"#).as_deref(),
+        Some("pack_capability")
+    );
+    // A known frame too, because the function is called on whatever arrived
+    // and must not be a special case for the unknown path.
+    assert_eq!(
+        herd_proto::frame_type(r#"{"type":"job_result_ack","job_id":"j1"}"#).as_deref(),
+        Some("job_result_ack")
+    );
+    // And something that is not a tagged frame at all names nothing rather
+    // than inventing a name.
+    assert_eq!(herd_proto::frame_type("[]"), None);
+    assert_eq!(herd_proto::frame_type(r#"{"no_type":1}"#), None);
+}
+
+/// A **known** frame that is malformed is still a decode error.
+///
+/// The catch-all must not become a swallower. `job_finished` with a missing
+/// required field is a broken frame of a type this build knows, and reading
+/// it as "something I do not know, ignore it" would turn a protocol bug into
+/// a job that silently never finishes — strictly worse than the loop the
+/// catch-all was added to stop.
+#[test]
+fn a_malformed_frame_of_a_known_type_is_still_an_error() {
+    let err = from_frame::<ToHub>(r#"{"type":"job_finished","job_id":"j1"}"#)
+        .expect_err("a known type with a field missing is not an unknown type");
+    assert!(
+        !err.to_string().contains("unknown variant"),
+        "it must fail on the missing field, not be read as an unknown type: {err}"
+    );
 }
 
 /// A log payload's wire shape, pinned: base64 in a JSON string, so that bytes

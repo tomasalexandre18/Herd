@@ -5141,3 +5141,430 @@ is a logon task that starts a distribution. The one real sharp edge is
 the `switch` command creating its own data root, which is a product
 question and not a WSL2 one — it is written down in `docs/joining.md` as
 a trap to check for rather than changed here.
+
+---
+
+## 2026-10-16 — D148 A record streams through the hub; a pack never does
+
+**The first consumer has made Herd their only path and asked for three
+things: chunked return, hub-side streaming, and a retention policy, sized
+for a few hundred MB per job.** Their sentence is *"once a job can run on
+another machine, logs, screenshots and scenario files no longer sit on the
+server's disk; results.json alone is not enough to diagnose a red test."*
+Today a job's `{out}` comes home inside its record, on the frame that
+carries the verdict, capped at 32 MiB (D131, D137) — and D147 proved that
+path on the real deployment with a 616-byte `results.json`. Their
+screenshots are refused by name with figures, which is D138 admitting I had
+told them otherwise.
+
+**The finding that decides it: there are two flows, and only one of them is
+the byte path D10 removed.** Both are "files a job produced", which is why
+the consumer's sentence runs them together, and they are not the same thing.
+
+* **Runner → runner.** A build makes a pack; a test job on another machine
+  consumes it. ~400 MiB in ~560 files, measured. What reads it next is a
+  **job**. This is E-12, E-55 and M11, and D10 is exactly right about it:
+  the hub registers, peers transfer, the same host hardlinks, a keeper
+  covers the machine with no mesh. Nothing here changes it.
+* **Runner → requester.** A job's log, its `results.json`, its per-scenario
+  screenshots. What reads it next is a **person or an agent diagnosing a red
+  test**, holding a job id and nothing else. This is the **record** — E-15,
+  D8's `files/`, D131's ruling, and D137's cap.
+
+**Size is not what separates them. Who reads them next is.** A 400 MiB pack
+and a 400 MiB screenshot directory weigh the same and have nothing else in
+common: one is an input to future work, keyed by (commit, key),
+content-addressed, wanted on a particular machine; the other is evidence
+about one job, keyed by that job's id, wanted by whoever asks.
+
+**So the answer is (c), and it is not a compromise between (a) and (b).** It
+is (a) for the record and (b) for packs, with the boundary drawn at the
+consumer instead of at a byte count. Alexa leans to (b) for everything
+because it is the reading that repeals no invariant. Three findings argue
+against it for the record.
+
+**One: the hub has carried bytes since M1, and it is called the log.**
+`ToHub::LogChunk` → a `log` file on the hub's disk → `FromHub::LogChunk` to
+the follower. 64 MiB a job by default, in 8 KiB chunks, sequence-numbered,
+acknowledged by `LogAck { through_seq }`, re-asked for by
+`ResendLog { from_seq }`, surviving a hub restart and a lost tail (D29,
+D36, E-44). Nobody reads that as a breach of D10, because it is not one. By
+D131's own argument a screenshot is in that category and not the pack's. So
+**the mechanism for streaming large record content through the hub already
+exists, is deployed and is tested** — what does not exist is using it for
+files. That is the whole of the work, and it is why this costs less than it
+looks.
+
+**Two: (b) does not actually save the disk, because the default keeper is
+the server's runner.** D10 makes it the default keeper and D126 put its data
+root on `/mnt/ssd_980` — the same NVMe as the hub's volume. Under (b),
+yesterday's screenshots survive the PC being switched off only by being
+pinned on the server, so the bytes land on the consumer's own NVMe either
+way. (b) moves which directory owns them and adds a replication step; the
+disk budget and the retention policy that (a) is accused of needing are
+needed by (b) too, which is what E-16 already says.
+
+**Three: (b) puts a new requirement on the one party we have no leverage
+over.** A requester today needs one address and one token, and D145 is
+contemplating a `herdctl.exe` that needs no more. Under (b) it would need
+mesh membership, a second protocol, and a runner that is awake — so "how do
+I read yesterday's failing screenshots?" would be answered *"from the PC, if
+she has not switched it off"*. That is the brief's own custody worry, and it
+is a standing cost rather than a case to handle. **A verdict and its
+evidence must be readable from the hub alone, because the hub is the one
+thing that is always up.**
+
+**What this costs, said plainly.** The hub's volume stops being the
+kilobytes Q9 promised and becomes a budgeted resource with a sweeper — which
+is new, is work, and is the price of this choice rather than a detail of it.
+And the server's own runner pays a copy of its own output through the
+container boundary, which is D10's own complaint; no same-host shortcut is
+taken, because writing straight into the hub's volume would couple a runner
+to the hub's storage layout across that boundary.
+
+**A large output is declared as nothing at all.** `{out}` keeps meaning
+exactly what it means. A requester declares no size, no class and no flag,
+because the brief's requirement is right: nobody knows in advance whether a
+run leaves 1 MiB or 400 MiB. The **runner** measures the collection when the
+job ends and picks the carriage:
+
+* at or under 32 MiB it rides the verdict frame, exactly as today — one
+  round trip, no new frame on the common path, nothing D137 built touched;
+* over it, up to the job's output budget, it streams.
+
+Both land in `jobs/<id>/files/` with relative paths kept, and
+`--outputs-to <dir>` is the same flag writing the same tree. **A requester
+cannot tell which carriage was used except by a line on the record.**
+
+That is why 32 MiB is **kept as a figure and changed in meaning**: it stops
+being a refusal boundary and becomes the boundary between two carriages. The
+frame arithmetic that derived it (`FRAME_CEILING`, base64, 140 MiB of peak
+memory a party) is untouched and still governs the inline path, so the
+number is still derived from what can arrive. What does change is the flag:
+`--job-output-cap` becomes **how much a job may return in all**, may now be
+set above 32 MiB because a carriage for that exists, and is bounded by what
+the hub will accept per job rather than by what one frame holds. The inline
+threshold becomes a constant nobody tunes, which is what pure frame
+arithmetic should always have been.
+
+**`leaves` is still not this.** `needs`/`leaves` are M11's packs, keyed by
+(commit, key), content-addressed, for a job downstream. The record is keyed
+by job id for a requester who never saw the declaration. D137 settled that
+and this does not reopen it.
+
+**Chunking and resumption: the log's own discipline, applied to files.**
+
+* Each file is announced with its relative path, its length and its
+  **sha256** before a byte of it moves. The hash is not decoration: it is
+  what makes a resumed transfer safe, and it is what a requester verifies.
+* Bytes travel in bounded chunks — 1 MiB, derived the way
+  `JOB_LOG_FRAME_BYTES` below is derived, from the event loop and not from
+  the ceiling. The hub writes into the temp file D8's discipline already
+  uses and renames only **after** the declared hash verifies.
+* **The verdict goes first and the files follow it.** Three reasons, and
+  they all point the same way: D20 says a side channel never delays or
+  alters a verdict; invariant 2 says stopping never waits for bytes; and a
+  runner that dies mid-transfer has then already delivered the verdict, so
+  the job is readable and only its evidence is pending. The record carries
+  the manifest from the moment the verdict lands, each file `pending` or
+  `held`, so "12 files, 3 arrived" is a readable state and not a gap.
+  `herdctl run` with no flag exits on the verdict and waits for nothing,
+  which is today's behaviour; `--outputs-to` waits for what it asked for and
+  says so.
+* **When the link dies halfway**, the runner still holds the collection: it
+  is copied out of `{out}` into the runner's own data root before the
+  workspace is reclaimed, and held until the hub acknowledges the whole of
+  it. That is M2's existing promise about a finished result, extended to its
+  files — D19 had to be widened for exactly this reason once already (D137).
+  On redial the hub says which files it holds complete; the runner resumes
+  the rest, and resumes a partial one from the length of the hub's temp
+  file. A hash that does not match at the end discards that file and retries
+  it once; a second mismatch is a named line on the record, never a quiet
+  half-file.
+* **Hub → requester needs no resumption state at all.** The bytes are on the
+  hub's disk, so a `--outputs-to` that died is simply run again, skipping
+  every file it already has at the right length and hash. The manifest's
+  hashes are the whole of the resumption design on that leg.
+* **What the requester sees**: one line per file on stderr as it lands,
+  never stdout (E-02). On an incomplete fetch the **job's exit code stands**
+  — D20 again, and D138 kept that ruling once already — and the failure is a
+  loud sentence naming what arrived and what did not. `--outputs-required`
+  is the flag for a requester that wants it fatal, because the alternative
+  is making it diff a directory against a manifest the hub already holds.
+* **Invariant 2 is not negotiated with.** A transfer in flight is abandoned
+  mid-chunk when the owner says `off`; the collection stays on the runner's
+  disk and resumes next time. A **drain** is the other case and has to be
+  said out loud: a draining runner finishes the job it has, and "finished"
+  must include delivering that job's record, or a drain would destroy the
+  result of the job it had just allowed to complete.
+
+**Retention, in the consumer's own question.** They will ask *how long do I
+have to fetch yesterday's failing screenshots?* The answer is a number, and
+there are two numbers because there are two kinds of thing.
+
+* The record proper — `job.json`, `events.jsonl`, the log, the inline files
+  — keeps M12's retention by priority class: 14 days and 90 days (E-15).
+* A job's **large files** get their own budget on the hub's volume, in
+  bytes, with a floor in days: **7 days or the budget, whichever runs out
+  first**, oldest job first. Both printed at startup like every other
+  setting the hub has, and shown as use against budget in M13's status
+  document.
+* **The floor is a promise the hub cannot always keep, so it says when it
+  breaks it.** Evicting something still inside the floor is a named line and
+  an event (M13), never a silent trim. *"Seven days, unless the fleet
+  produces more than the budget in less than seven days, in which case we
+  tell you on the day"* is a sentence a consumer can plan against. *"About a
+  week"* is not.
+* **The hub deletes, on its own volume** — one disk, one sweeper, no
+  custody, which is most of the point of choosing (a) for this flow. A
+  runner deletes only its own undelivered collections, and only once the hub
+  has acknowledged them or the record they belong to is gone.
+
+**And what a requester gets for something already gone is the best part of
+this: the manifest outlives the bytes.** `job.json` keeps every file's path,
+length and sha256 — kilobytes, so there is never a reason to delete it — and
+retention removes only the bytes. So `herdctl wait <id> --outputs-to <dir>`
+on an evicted job answers *12 files, 338 MiB, removed 2026-10-30 under the
+200 GB output budget*, with the names. It never returns an empty directory
+and never returns a short one, and the same shape answers the runner that
+never came back: *4 of 12 files never arrived; `pc` has not been seen since
+…*. **A record that had files says so for as long as the record exists.**
+That is also E-54's offline re-judging getting an honest answer instead of a
+missing one.
+
+**Custody (M12) shrinks again, and the switched-off PC stops being a
+problem for the record.** A job's record has left the runner by the time its
+files are acknowledged, and its verdict before that, so **a verdict is never
+unreadable because a machine is asleep** — the brief's worry, and (b)'s
+standing cost. What keepers are still exactly right for is **packs**: an
+input to future work, genuinely runner-to-runner, with D10's keeper, its
+named no-reachable-holder state, and per-runner budgets. So M12 carries
+custody of packs, GC of runner disks, and the hub's own output budget, and
+carries no custody of records at all.
+**The frame cost: yes, this needs version 2, and version 2 is approved.**
+**The frame cost: yes, this needs version 2.** Plainly, with no dodge
+available. It needs new variants on both enums — `ToHub` for a runner
+announcing a file and sending its bytes, `FromHub` for the hub telling a
+reattaching runner what it already holds and for streaming files to a
+requester — and D124 and D128 together say a new variant on either enum is
+breaking whatever serde would tolerate. D137 used the only defaulted-field
+dodge there was.
+
+A break is paid by the deployment, not by the code, so it is spent **once**.
+What should ride along:
+
+1. **All of M11's registry frames**: a runner advertising which blobs it
+   holds, registering a manifest, asking who holds a pack, and the hub's
+   short-lived scoped fetch capability for a (blob, peer) pair. They are the
+   next milestone and they are already specified. One coordinated restart of
+   a hub and two runners instead of two.
+2. **The runner's unknown-frame arm.** D128 recorded that an unknown
+   `FromHub` variant makes a runner **loop** — the decode fails, the link
+   dies, it redials into the same frame — and called it a defect without
+   fixing it. A version boundary is the one moment to: a catch-all variant
+   so a runner logs and ignores what it cannot read. It does **not** make
+   future additions free, because `herdctl`'s `bail!` is correct and stays
+   (D124: a requester that cannot read what the hub is telling it must not
+   report a verdict). It means a runner-only addition after version 2 is a
+   note rather than an outage.
+3. **Nothing from M15.** Approval and the version pin are not designed, and
+   a frame invented for them now would be invented from reading, which is
+   the mistake D128 is an entry about. If M15 needs one it pays for version
+   3.
+
+**What must not ride along**, because a moving number makes everything look
+free: raising `FRAME_CEILING`, raising the 32 MiB inline threshold, or
+moving the log cap upward. Each is derived from what one party can hold in
+memory at once, and a new carriage beside them changes none of those
+derivations.
+
+**Two rulings from Alexa, both taken on 2026-10-16, both decided rather
+than deferred.**
+
+1. **`PROTOCOL_VERSION` moves to 2, approved for M11**, bundled exactly as
+   recommended: this entry's file frames, M11's registry frames, and the
+   catch-all arm. He accepts that the hub and both runners restart together
+   and that `herdctl` is rebuilt. The version refusal already names both
+   numbers (E-51), so a stale peer is told rather than broken, and that
+   property is asserted rather than assumed.
+2. **The hub's output budget is 200 GB, with the seven-day floor above.**
+   He chose the figure rather than wait for the consumer's, and it is to be
+   adjusted when they send jobs per day times typical output size.
+
+**The budget is a chosen number and must never read as a derived one.**
+200 GB is not computed from anything: no measurement produced it, and the
+arithmetic that would — a few hundred MB times the number of jobs a day
+that really leave that much — needs a figure only the consumer has. **The
+one measurement that would change it** is their distribution of output size
+per job per day; at five such jobs a day 200 GB is months of headroom, at
+five hundred it is under two days and the floor breaks every day. Every
+other figure in this design is derived from what a mechanism can carry —
+`FRAME_CEILING` from what one party can hold in memory, the 32 MiB inline
+threshold from base64 against that ceiling — and this one is not, which is
+why it sits in its own paragraph instead of beside them. D138's lesson is
+not "never choose": it is that a chosen number must not wear a derived
+number's clothes, because whoever reasons from it next will reason from the
+clothes.
+
+**What is unproven, so this entry does not overstate.** No byte of a few
+hundred MB has gone through the hub; the log path has now carried 56 MiB end
+to end, which is evidence and not the figure. 400 MiB in ~560 files means
+~560 announce-and-verify round trips on top of the bytes, and the per-file
+cost is not measured. The event-loop claim — that 1 MiB chunks keep a
+400 MiB transfer inside the 15 s cadence a quiet link lives by — is an
+argument, not a measurement, and it is the first thing M11 must measure.
+And the resumption hash retry exists because it is cheap, not because a
+mismatch was ever observed.
+
+**One defect found while designing this, and it is what was built today.**
+`FromHub::JobLog` carried a job's **whole** recorded log in one frame. The
+default log cap is 64 MiB, base64 makes that about 85 MiB, and
+`FRAME_CEILING` is 64 MiB — so a job that printed more than about 48 MiB
+built a frame neither side could put through a socket, and a `herdctl wait`
+on it got a closed link and **exit 125 with no verdict for a job that had
+passed**. D117's exact shape, on the one path nothing had ever exercised,
+and the same class of mistake D137 found at 16 MiB and then fixed only for
+the output frame — having taken its own first cap from this very neighbour
+without ever checking it. Measured, before the fix, on a real hub with a
+real runner and the real requester code:
+
+```
+a late attach to a loud job returns a verdict rather than a closed link
+Caused by: Space limit exceeded: Message too long: 78293727 > 67108864
+```
+
+The fix is that the backlog travels in frames of `JOB_LOG_FRAME_BYTES`,
+8 MiB, and a requester writes each out as it arrives — several frames are
+byte-identical to the one frame this used to be, because `JobLog` has always
+meant "here are bytes of this job's log". **No variant, no field, no
+`PROTOCOL_VERSION` move, and the deployed `herdctl` reads it unchanged**,
+which is the one change D128 leaves the number alone for. 8 MiB and not
+32 MiB because base64 leaves five-sixths of the ceiling unused at that size
+— room kept on purpose, so raising `--job-log-cap` cannot silently reopen
+this — and because D138's real objection to a big frame was never the
+ceiling but the event loop.
+
+It is also the one slice of this design that was separable **without the
+protocol move**, which is why it went to `main` on its own (PR #37) instead
+of waiting here: the first consumer has removed their fallback, so a fix
+they get without redeploying anything is worth more than a tidy one they do
+not. Everything else above needs version 2 and lands together.
+
+**On the number, and on what a number is for.** This entry is 148 and the
+entry above it is 149: two branches took the next free number the same day,
+and this one landed second. It was not renamed, and that is the rule worth
+stating — **a decision number cited in code is an identifier, not a
+position**. Forty-odd comments across `herd-proto`, `herd-hub` and the plan
+name D148; renumbering it to tidy one inversion in this file would rewrite
+all of them and break every reference anybody has already read. D145 kept
+order where order was free. Here it is not, so the identifier wins.
+
+---
+
+## 2026-10-16 — D150 Building D148's carriage, and the four things it found
+
+**D148 was approved and then built, and three of its sentences turned out to
+be incompatible with code that was already there.** D128 is an entry about
+exactly this — *"a prescription I write into a decision is a hypothesis until
+it is built"* — so this is the follow-up it asks for. `PROTOCOL_VERSION` is
+now **2**, the two carriages work end to end on real binaries, and none of
+what follows was visible from reading.
+
+**One: "the verdict goes first and the files follow" is incompatible with
+`is_current`, and every chunk was silently dropped.** The hub guards every
+frame about a job with one check — is this the attempt I am waiting for? — and
+that check answers `JobIsOver` for a finished job, logs it, replies
+`StaleAttempt` and skips the frame. Right for a log chunk, which can only
+arrive while a job runs. Exactly wrong for a file chunk, which by design
+**always** arrives after the verdict. So the runner streamed 32 chunks, the
+hub read all 32, wrote none, and a requester was told its collection was not
+there — with no error anywhere, because dropping a stale frame is a normal
+thing for the hub to do.
+
+The fix is a separate check (`files_may_land`) asserting what actually has to
+be true: the record says this collection streamed, the attempt is the one on
+the record, and the runner is the machine that ran it. **The general shape,
+worth keeping:** a new frame that breaks an existing invariant about *when*
+frames arrive will be refused by whatever enforces that invariant, silently,
+because refusing is that code's job. "The verdict goes first" was one
+sentence in a design and a load-bearing change to the hub's frame discipline.
+
+**Two: a part-written file at full length is not a finished file, and two
+definitions of "complete" disagreed for a hundred milliseconds.** The hub
+writes chunks into `files.part/`, verifies the digest, and renames into
+`files/` — so between the last byte landing and the rename there is a window
+as long as it takes to hash the file, which for 32 MiB is about a tenth of a
+second. `collections_owed` judged completeness off the **holdings**, which
+report a part file's length, so in that window it said the collection was
+complete; `send_the_files` then told the requester the bytes were no longer
+coming, and the requester went looking in `files/` for something not yet
+there. What it reported was *"the hub does not have it"* for a collection that
+was a tenth of a second from arriving.
+
+Now there is one definition, `collection_is_whole`, and every caller uses it:
+in `files/`, at the manifest's length, verified. D79's rule about slots —
+derive it once, so two answers cannot disagree — applies to bytes, and the
+cost of two answers here was a wrong one at the worst possible moment.
+
+**Three: `--outputs-to` has to wait, and the hub has to say whether waiting
+is worth anything.** D148 said it waits, in one clause, and the first
+implementation asked once. "Not there yet" and "gone for good" are opposite
+instructions and look identical in a list of names, so `AbsentFile` now
+carries `still_coming` and `held`: the requester waits while the figure moves
+and stops when it stops. **The bound is on silence, not on duration** —
+thirty seconds without progress — because a few hundred megabytes on a slow
+link is slow and not broken, and a deadline on the transfer itself would make
+the consumer's biggest runs the ones that fail.
+
+**Four: the output cap's startup check became a clamp, not a refusal.** The
+old check refused a cap bigger than one frame, and refusing was right: a cap
+past the frame produced a verdict nothing could decode, which is D128's
+redial loop. With the streamed carriage there is no frame ceiling, and what
+bounds the flag instead is the disk — a job writes `{out}` inside its
+workspace, which stops at `--job-disk-budget`. That is a figure that *cannot
+bind* rather than one that breaks something, which is D89's case exactly, so
+it is clamped loudly where it is written. Found by the confinement suite: its
+harness lends a 64 MiB disk budget, the refusal fired, and **fifteen tests
+lost their runner at startup** — a legitimate configuration refused. A test
+suite rejecting a new refusal en masse is evidence about the refusal.
+
+**And D128's loop, measured at last.** The catch-all arm was the cheap half
+of this break, and it is now asserted against the real runner's redial loop
+with a hand-written hub that says something from the future. With the arm:
+**one dial** in 1.2 s, and health reports still flowing. With the arm removed:
+**178 dials** in the same 1.2 s. D128 described that loop from reading the
+code; this is the figure.
+
+```
+assertion `left == right` failed: a frame it cannot read must not make a
+runner redial: 178 dials in 1.2 s is D128's loop, not a shrug
+```
+
+The three answers are all tested where the behaviour lives: a runner ignores
+and stays, a requester ends its run naming the frame type (D124's `bail!`,
+kept), and the hub refuses by name rather than leaving a peer waiting for
+work it cannot read.
+
+**What is built, and what is deliberately not.** Built: the protocol move,
+the catch-all, the manifest on the verdict, the inline and streamed carriages
+with the choice made by the runner off a walk that has only measured, the
+spool as a **rename** out of the workspace rather than a copy, per-file
+sha256 verified before a rename on the hub and again by the requester,
+resumption from the hub's own holdings, the window that bounds bytes in
+flight, and the manifest outliving the bytes. Not built, as the orchestrator
+scoped it: the 200 GB budget, the sweeper, the eviction order and the line
+when eviction breaks the seven-day floor. The manifest-outlives-the-bytes
+path is nevertheless already exercised, because a file that never arrived
+reaches exactly the state an evicted one will.
+
+**What is still unproven.** The suite streams 32 MiB, not a few hundred, so
+the consumer's real size has still never crossed a link. The event-loop claim
+— that 1 MiB chunks keep a large transfer inside the 15 s cadence — is now
+plausible rather than measured: nothing went quiet in these tests, and no
+test asserts a health report's timing during a transfer. The window that
+bounds bytes in flight is eight chunks and that figure is chosen, not
+measured against a slow link. And a requester still assembles a collection in
+memory before writing it: streaming removed the base64 blow-up and the
+140 MiB-per-party frame cost, and it did not remove holding the payload once.
+Writing each file to disk as it completes is the next slice, beside the
+sweeper.

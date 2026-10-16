@@ -517,10 +517,23 @@ pub async fn execute(
     // frame either, and its workspace is reclaimed by the next start's reaper
     // — that is the lost-attempt case the hub requeues (E-21), not an output
     // Herd dropped on the floor.
-    let outputs = match &ran.ending {
-        Some(Ending::Abandoned(_)) => herd_proto::JobOutputs::default(),
-        _ => crate::outputs::collect(workspace.out_dir(), confined.root().path(), caps.output_cap),
+    //
+    // A collection too big for the verdict frame is **renamed** out of the
+    // workspace into the spool below instead, where it waits for the hub to
+    // take it (D148). The spool is under the data root for one reason that is
+    // not tidiness: it is on the same filesystem as `{out}`, so moving
+    // 400 MiB out of a workspace that is about to be reclaimed is a directory
+    // entry and not a copy.
+    let collected = match &ran.ending {
+        Some(Ending::Abandoned(_)) => crate::outputs::Collected::nothing(),
+        _ => crate::outputs::collect(
+            workspace.out_dir(),
+            confined.root().path(),
+            caps.output_cap,
+            &crate::outputs::spool_path(confined.root().path(), &job_id, attempt),
+        ),
     };
+    let crate::outputs::Collected { outputs, spool } = collected;
     if let Some(refusal) = &outputs.refused {
         eprintln!("herd-runner: job {job_id} {refusal}");
     }
@@ -559,9 +572,9 @@ pub async fn execute(
                 JobOutcome::StoppedByCap { .. } => outcome,
                 _ => JobOutcome::Cancelled { reason },
             };
-            session.finish(&job_id, outcome, metrics, ran.steps, outputs);
+            session.finish(&job_id, outcome, metrics, ran.steps, outputs, spool);
         }
-        None => session.finish(&job_id, outcome, metrics, ran.steps, outputs),
+        None => session.finish(&job_id, outcome, metrics, ran.steps, outputs, spool),
     }
     if let Some(token) = live {
         confined.live().remove(token);
@@ -1152,6 +1165,7 @@ fn report_could_not_start(job_id: &JobId, session: &Session, reason: String) {
         JobMetrics::default(),
         Vec::new(),
         herd_proto::JobOutputs::default(),
+        None,
     );
 }
 

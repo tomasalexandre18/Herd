@@ -11,3 +11,8 @@ publish.workspace = true
 data-encoding = "2.11.1"
 serde.workspace = true
 serde_json.workspace = true
+# A streamed output file is announced by its sha256 and verified against it
+# (D148). The digest is part of the wire contract, so it is computed by one
+# function here rather than once in the runner and once in the hub
+# (invariant 4).
+sha2.workspace = true

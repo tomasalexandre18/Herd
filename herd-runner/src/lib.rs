@@ -59,7 +59,7 @@ pub mod testing;
 
 use std::collections::{HashMap, VecDeque};
 use std::future::Future;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -72,7 +72,7 @@ use herd_proto::{
 };
 use tokio::net::TcpStream;
 use tokio::sync::mpsc::{self, UnboundedReceiver, UnboundedSender};
-use tokio::sync::watch;
+use tokio::sync::{watch, Semaphore};
 use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::{MaybeTlsStream, WebSocketStream};
 
@@ -578,6 +578,113 @@ pub struct Session {
     capacity: capability::Capacity,
 }
 
+/// One attempt's collection waiting on this runner's disk for the hub
+/// (D148).
+///
+/// **Separate from [`JobInHand`], and that is deliberate.** A verdict is
+/// acknowledged when it is written and the job leaves the live list then; the
+/// files are acknowledged when the last of them is fsynced, which may be
+/// minutes later. Keeping the collection in `jobs` would have tied the one to
+/// the other — either a runner holding a finished job open for hundreds of
+/// megabytes, or a release that dropped the bytes it still owed.
+#[derive(Debug)]
+struct FilesOut {
+    attempt: u32,
+    /// Where the bytes are: the renamed `{out}`, under the data root.
+    spool: PathBuf,
+    /// What the verdict announced, in the order it announced it.
+    manifest: Vec<herd_proto::OutputFile>,
+    /// Bytes of each entry handed to the link so far.
+    sent: Vec<u64>,
+    /// Whether any chunk of each entry has been sent, which is how a
+    /// zero-length file is told from one not started: an empty file is a real
+    /// file and the hub has to be told to create it, so it gets exactly one
+    /// empty chunk.
+    touched: Vec<bool>,
+}
+
+impl FilesOut {
+    fn new(attempt: u32, spool: PathBuf, manifest: Vec<herd_proto::OutputFile>) -> Self {
+        let count = manifest.len();
+        Self {
+            attempt,
+            spool,
+            manifest,
+            sent: vec![0; count],
+            touched: vec![false; count],
+        }
+    }
+
+    /// Start again from what the hub says it holds.
+    ///
+    /// Anything the hub holds complete is marked sent, and a part-written
+    /// file resumes at the hub's own length — never at the runner's idea of
+    /// how far it had got, which is exactly the thing a dropped link
+    /// invalidated.
+    fn resume_from(&mut self, held: &[herd_proto::FileHeld]) {
+        for (index, entry) in self.manifest.iter().enumerate() {
+            let bytes = held
+                .iter()
+                .find(|file| file.path == entry.path)
+                .map(|file| file.bytes)
+                .unwrap_or(0);
+            self.sent[index] = bytes.min(entry.len);
+            // An empty entry the hub already holds needs no second empty
+            // chunk; one it does not hold needs its one.
+            self.touched[index] = held.iter().any(|file| file.path == entry.path);
+        }
+    }
+
+    /// What to send next, with the cursor advanced for it.
+    ///
+    /// Returns the *plan* rather than the frame so the file read happens
+    /// outside the session's lock: a 1 MiB read while holding the mutex every
+    /// other part of the runner contends on would make a streaming job
+    /// contend with its own health report.
+    fn next(&mut self) -> Option<ChunkPlan> {
+        for index in 0..self.manifest.len() {
+            let entry = &self.manifest[index];
+            if entry.len == 0 {
+                if self.touched[index] {
+                    continue;
+                }
+                self.touched[index] = true;
+                return Some(ChunkPlan {
+                    attempt: self.attempt,
+                    path: entry.path.clone(),
+                    file: self.spool.join(&entry.path),
+                    offset: 0,
+                    take: 0,
+                });
+            }
+            if self.sent[index] >= entry.len {
+                continue;
+            }
+            let offset = self.sent[index];
+            let take = herd_proto::OUTPUT_CHUNK_BYTES.min(entry.len - offset);
+            self.sent[index] = offset + take;
+            self.touched[index] = true;
+            return Some(ChunkPlan {
+                attempt: self.attempt,
+                path: entry.path.clone(),
+                file: self.spool.join(&entry.path),
+                offset,
+                take: take as usize,
+            });
+        }
+        None
+    }
+}
+
+/// One read to make and one frame to send, decided under the lock and carried
+/// out outside it.
+struct ChunkPlan {
+    attempt: u32,
+    path: String,
+    file: PathBuf,
+    offset: u64,
+    take: usize,
+}
 #[derive(Debug)]
 struct Inner {
     /// Who this runner *process* is, beside the name its owner gave it.
@@ -598,7 +705,30 @@ struct Inner {
     /// lost by that, because everything a job produces is held here until the
     /// hub acknowledges it.
     link: Option<Outbox>,
+    /// How many file chunks may be queued on the link that is up now.
+    ///
+    /// **The only backpressure the runner has, and it needs one.** The link's
+    /// channel is unbounded, so a pump reading a 400 MiB spool as fast as the
+    /// disk allows would put 400 MiB into memory on its way to a socket that
+    /// is slower than the disk. A permit is taken before a chunk is queued and
+    /// given back by [`write_frames`] once that chunk is on the wire, so what
+    /// is in flight is bounded by [`FILES_IN_FLIGHT`] chunks whatever the two
+    /// speeds are.
+    ///
+    /// Per **connection**, like the link beside it: chunks queued on a link
+    /// that broke are dropped with it, so their permits are gone too, and a
+    /// counter carried across would run down to nothing over a few redials.
+    /// A new link starts with a full window and the hub says where to resume
+    /// from ([`herd_proto::FromHub::JobFilesHeld`]).
+    files_credit: Option<Arc<Semaphore>>,
     jobs: HashMap<JobId, JobInHand>,
+    /// Collections whose bytes this runner still owes the hub, by job.
+    ///
+    /// Outlives `jobs`: a verdict is acknowledged and the job released long
+    /// before hundreds of megabytes have crossed, and a runner that held the
+    /// job open for its files would be a runner whose finished work never
+    /// finishes.
+    collections: HashMap<JobId, FilesOut>,
     /// Verdicts a previous life of this runner wrote to the data root and
     /// nobody has acknowledged yet. Not jobs: nothing of them is running, and
     /// nothing of them is counted as work this runner is doing.
@@ -627,7 +757,9 @@ impl Default for Inner {
         Self {
             instance: mint_an_instance_id(),
             link: None,
+            files_credit: None,
             jobs: HashMap::new(),
+            collections: HashMap::new(),
             spooled: Vec::new(),
             draining: false,
             welcomed_at: None,
@@ -919,6 +1051,12 @@ impl Session {
     /// runner's own figure: it is held against the acknowledgement exactly
     /// like the verdict, because a file that only exists in a workspace that
     /// has been reclaimed is a file nothing can produce again (E-44).
+    /// `spool` is where the bytes are when the collection was too big to ride
+    /// the verdict (D148). The verdict goes first and the bytes follow it:
+    /// D20 says a side channel never delays a verdict, invariant 2 says
+    /// stopping never waits for bytes, and a runner that dies mid-stream has
+    /// then already delivered the verdict, so the job is readable and only
+    /// its evidence is pending.
     pub(crate) fn finish(
         &self,
         job_id: &JobId,
@@ -926,10 +1064,11 @@ impl Session {
         metrics: JobMetrics,
         steps: Vec<StepRun>,
         outputs: JobOutputs,
+        spool: Option<PathBuf>,
     ) {
-        self.with(|inner| {
+        let streaming = self.with(|inner| {
             let Some(job) = inner.jobs.get_mut(job_id) else {
-                return;
+                return false;
             };
             let end = Ended {
                 outcome,
@@ -948,7 +1087,139 @@ impl Session {
                      its result is held until a hub acknowledges it"
                 );
             }
+            // The manifest has been announced, so the bytes may follow. Taken
+            // in hand here, under the same lock that wrote the verdict, so
+            // there is no instant in which a collection is promised and not
+            // owed.
+            match spool {
+                Some(spool) if end.outputs.streamed => {
+                    inner.collections.insert(
+                        job_id.clone(),
+                        FilesOut::new(attempt, spool, end.outputs.files.clone()),
+                    );
+                    true
+                }
+                _ => false,
+            }
         });
+        if streaming {
+            self.pump_files(job_id.clone());
+        }
+    }
+
+    /// Send a collection's bytes, a chunk at a time, until they are all on the
+    /// link or the link goes away.
+    ///
+    /// One task per collection per connection. It holds nothing: every
+    /// decision about what to send next is the session's
+    /// ([`FilesOut::next`]), so a task that is replaced on a redial cannot
+    /// disagree with the one that replaced it, and the file read happens
+    /// outside the session's lock.
+    fn pump_files(&self, job_id: JobId) {
+        let session = self.clone();
+        tokio::spawn(async move {
+            loop {
+                let Some(credit) = session.with(|inner| inner.files_credit.clone()) else {
+                    // No link: the collection stays on the disk and the hub
+                    // says where to resume when there is one again.
+                    return;
+                };
+                // The window, and the one thing that stops a fast disk
+                // filling memory on its way to a slower socket. A permit
+                // comes back when `write_frames` has put a chunk on the wire.
+                if credit
+                    .acquire()
+                    .await
+                    .map(|permit| permit.forget())
+                    .is_err()
+                {
+                    return;
+                }
+                let Some(plan) = session
+                    .with(|inner| inner.collections.get_mut(&job_id).and_then(FilesOut::next))
+                else {
+                    return;
+                };
+                match read_at(&plan.file, plan.offset, plan.take) {
+                    Ok(data) => {
+                        if !session.send(ToHub::JobFileChunk {
+                            job_id: job_id.clone(),
+                            attempt: plan.attempt,
+                            path: plan.path,
+                            offset: plan.offset,
+                            data,
+                        }) {
+                            return;
+                        }
+                    }
+                    // The spool is this runner's own directory and nothing
+                    // but a reap should ever take a file out of it, so this
+                    // is a disk fault or an operator. Either way the hub
+                    // cannot be given what is not there: say so once, by
+                    // name, and stop — the record's manifest still names the
+                    // file, so a requester asking for it is told it never
+                    // arrived rather than handed a short collection (D148).
+                    Err(error) => {
+                        eprintln!(
+                            "herd-runner: {job_id} cannot send {}: {error}. Its record names \
+                             the file and this runner no longer has it.",
+                            plan.file.display()
+                        );
+                        return;
+                    }
+                }
+            }
+        });
+    }
+
+    /// The hub has said what it holds of a collection: resume from there.
+    fn files_held(&self, job_id: &JobId, attempt: u32, held: &[herd_proto::FileHeld]) {
+        let resuming = self.with(|inner| match inner.collections.get_mut(job_id) {
+            Some(files) if files.attempt == attempt => {
+                files.resume_from(held);
+                true
+            }
+            // A collection this runner does not hold, or holds for another
+            // attempt. Not an error and not silent: the hub is waiting for
+            // bytes nobody has, which is exactly the state D148 says must be
+            // visible rather than a job that never completes.
+            other => {
+                eprintln!(
+                    "herd-runner: the hub is waiting for the files of {job_id} attempt \
+                     {attempt}, and this runner holds {}",
+                    match other {
+                        Some(files) => format!("attempt {} of it", files.attempt),
+                        None => "no collection for it".to_owned(),
+                    }
+                );
+                false
+            }
+        });
+        if resuming {
+            self.pump_files(job_id.clone());
+        }
+    }
+
+    /// The hub holds the whole collection: the spool may go.
+    fn files_acknowledged(&self, job_id: &JobId, attempt: u32) {
+        let spool = self.with(|inner| match inner.collections.get(job_id) {
+            Some(files) if files.attempt == attempt => {
+                inner.collections.remove(job_id).map(|files| files.spool)
+            }
+            _ => None,
+        });
+        // Only now, after the hub has said every file is on its disk: a spool
+        // removed before the acknowledgement would be the one copy of a
+        // result destroyed by the mechanism that exists to keep it (D19).
+        if let Some(spool) = spool {
+            if let Err(error) = std::fs::remove_dir_all(&spool) {
+                eprintln!(
+                    "herd-runner: the hub has every file of {job_id} and {} will not go \
+                     away: {error}",
+                    spool.display()
+                );
+            }
+        }
     }
 
     /// Give an attempt back without a verdict, and let the job go.
@@ -1156,9 +1427,10 @@ impl Session {
     /// Done while holding the lock a new chunk would need, so that nothing a
     /// running job produces can slip in front of what is being sent again. A
     /// log that keeps its order across a reconnect is the whole point.
-    fn attach(&self, outbox: Outbox) {
+    fn attach(&self, outbox: Outbox, credit: Arc<Semaphore>) {
         self.with(|inner| {
             inner.link = Some(outbox);
+            inner.files_credit = Some(credit);
             let ids: Vec<JobId> = inner.jobs.keys().cloned().collect();
             for job_id in ids {
                 let Some(job) = inner.jobs.get(&job_id) else {
@@ -1202,7 +1474,17 @@ impl Session {
     }
 
     fn detach(&self) {
-        self.with(|inner| inner.link = None);
+        self.with(|inner| {
+            inner.link = None;
+            // The window goes with the link. Closing it is what ends the
+            // pumps: a task waiting on a permit wakes with an error rather
+            // than waiting for a connection that is gone, and the next
+            // connection's `JobFilesHeld` starts them again from wherever
+            // the hub really got to.
+            if let Some(credit) = inner.files_credit.take() {
+                credit.close();
+            }
+        });
     }
 
     /// What this runner is doing, as a health report says it (E-40).
@@ -1437,6 +1719,41 @@ fn running_jobs(inner: &Inner) -> Vec<RunningJob> {
             chunks_sent: job.next_seq,
         })
         .collect()
+}
+
+/// How many file chunks may be queued on a link at once: **8**, so 8 MiB.
+///
+/// Small enough that a 400 MiB collection never puts more than that in
+/// memory on its way to the socket, and large enough that the pump is not
+/// waiting on a round trip for every chunk — the permits come back from
+/// [`write_frames`], which is on the same machine, so the window only has to
+/// cover the disk-to-socket speed difference and not a network latency.
+const FILES_IN_FLIGHT: usize = 8;
+
+/// `take` bytes of `path` starting at `offset`, and no more held than that.
+///
+/// The read a streamed chunk is, kept out of the session's lock and out of
+/// any buffer that grows with the file: a 400 MiB collection is read 1 MiB at
+/// a time, which is the whole reason the streamed carriage is cheaper than
+/// the frame it replaced.
+fn read_at(path: &Path, offset: u64, take: usize) -> std::io::Result<Vec<u8>> {
+    use std::io::{Read, Seek, SeekFrom};
+
+    let mut file = std::fs::File::open(path)?;
+    if offset > 0 {
+        file.seek(SeekFrom::Start(offset))?;
+    }
+    let mut data = vec![0u8; take];
+    let mut filled = 0usize;
+    while filled < take {
+        let read = file.read(&mut data[filled..])?;
+        if read == 0 {
+            break;
+        }
+        filled += read;
+    }
+    data.truncate(filled);
+    Ok(data)
 }
 
 fn send_on(link: &Option<Outbox>, message: ToHub) -> bool {
@@ -2023,11 +2340,16 @@ pub async fn serve_once(config: Config, session: Session, confined: Arc<Confined
     }
 
     let (outbox, inbox) = mpsc::unbounded_channel();
-    let mut writer = tokio::spawn(write_frames(sink, inbox));
+    // A fresh window for a fresh connection (see [`Inner::files_credit`]):
+    // chunks queued on the link that broke went with it, so their permits
+    // would never have come back and a counter carried across redials would
+    // run down to nothing.
+    let credit = Arc::new(Semaphore::new(FILES_IN_FLIGHT));
+    let mut writer = tokio::spawn(write_frames(sink, inbox, Arc::clone(&credit)));
     // Before anything else on this connection: what the last one could not
     // deliver. A job finished while the hub was away is still a job that ran,
     // and output the hub never wrote is still output the job produced.
-    session.attach(outbox);
+    session.attach(outbox, credit);
     // And what every probe says, before this connection can be dispatched on.
     session.announce_capabilities();
     let reporting = tokio::spawn(report_health(session.clone(), config.health_every));
@@ -2104,6 +2426,14 @@ async fn serve_hub(
                 });
             }
             FromHub::JobResultAck { job_id } => session.release(&job_id),
+            FromHub::JobFilesHeld {
+                job_id,
+                attempt,
+                held,
+            } => session.files_held(&job_id, attempt, &held),
+            FromHub::JobFilesAck { job_id, attempt } => {
+                session.files_acknowledged(&job_id, attempt)
+            }
             FromHub::LogAck {
                 job_id,
                 attempt,
@@ -2172,6 +2502,10 @@ async fn serve_hub(
                 }
                 .into())
             }
+            // Already named where the text was, in `next_message`. Nothing
+            // here, and nothing is the behaviour: the link stays up and the
+            // runner goes on serving (D148).
+            FromHub::Unknown => {}
             other => {
                 eprintln!(
                     "herd-runner: ignoring {}, which is not a runner's business",
@@ -2183,8 +2517,16 @@ async fn serve_hub(
     Ok(())
 }
 
-async fn write_frames(mut sink: Sink, mut inbox: UnboundedReceiver<ToHub>) {
+/// Drain the link's queue onto the socket, and give a file chunk's window
+/// permit back once it is really on the wire.
+///
+/// The permit is returned **here** and nowhere earlier, which is what makes
+/// [`Inner::files_credit`] a window on the socket rather than on the channel:
+/// returning it when the chunk was queued would have bounded nothing, because
+/// queueing is the fast half.
+async fn write_frames(mut sink: Sink, mut inbox: UnboundedReceiver<ToHub>, credit: Arc<Semaphore>) {
     while let Some(message) = inbox.recv().await {
+        let was_a_chunk = matches!(message, ToHub::JobFileChunk { .. });
         match to_frame(&message) {
             Ok(frame) => {
                 if sink.send(Message::text(frame)).await.is_err() {
@@ -2192,6 +2534,9 @@ async fn write_frames(mut sink: Sink, mut inbox: UnboundedReceiver<ToHub>) {
                 }
             }
             Err(error) => eprintln!("herd-runner: a message would not encode: {error}"),
+        }
+        if was_a_chunk {
+            credit.add_permits(1);
         }
     }
     let _ = sink.close().await;
@@ -2216,8 +2561,27 @@ async fn next_message(source: &mut Source, silence_limit: Duration) -> Result<Op
         };
         match frame {
             Message::Text(text) => {
-                let message = from_frame(text.as_str())
+                let message: FromHub = from_frame(text.as_str())
                     .map_err(|error| anyhow!("undecodable frame {text}: {error}"))?;
+                // **A frame from a newer hub, ignored by name, on the link
+                // that stays up** (D148). This used to be the `?` above: the
+                // decode failed, the error killed the link, and the runner
+                // redialled straight into the same frame — it looped rather
+                // than shrugged, which is D128's recorded defect and the
+                // reason `PROTOCOL_VERSION` 2 was worth spending.
+                //
+                // Said here rather than in the handler because this is where
+                // the **text** is: `Unknown` is a unit variant, so the tag is
+                // discarded on the way to it, and a line that cannot name the
+                // type is a line nobody can act on.
+                if message == FromHub::Unknown {
+                    eprintln!(
+                        "herd-runner: ignoring a frame of type {:?}, which this build does \
+                         not know (it speaks protocol {PROTOCOL_VERSION})",
+                        herd_proto::frame_type(text.as_str())
+                            .unwrap_or_else(|| "(none)".to_owned())
+                    );
+                }
                 return Ok(Some(message));
             }
             Message::Close(_) => return Ok(None),
@@ -2229,6 +2593,15 @@ async fn next_message(source: &mut Source, silence_limit: Duration) -> Result<Op
 
 fn message_kind(message: &FromHub) -> &'static str {
     match message {
+        FromHub::JobFilesHeld { .. } => "job_files_held",
+        FromHub::JobFilesAck { .. } => "job_files_ack",
+        FromHub::JobFile { .. } => "job_file",
+        FromHub::JobFilesSent { .. } => "job_files_sent",
+        // Named rather than left to a wildcard, because the one thing this
+        // function is for is saying what arrived — and `Unknown` is the case
+        // where that matters most. The real type is read off the frame text
+        // in `next_message`, which is the only place that still has it.
+        FromHub::Unknown => "a frame type this build does not know",
         FromHub::Welcome { .. } => "welcome",
         FromHub::Refused { .. } => "refused",
         FromHub::StandBy { .. } => "stand_by",
