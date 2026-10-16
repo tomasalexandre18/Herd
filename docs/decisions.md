@@ -4893,8 +4893,10 @@ job failed in the `herd-hub` integration binary `killed_hub`, on
 that test started:
 
 ```
-approving the-real-runner failed: herdctl: herd cannot give you a verdict for
-this job: dialling ws://127.0.0.1:34889: Connection refused (os error 111)
+thread '…' panicked at herd-hub/tests/real_herd/mod.rs:265:21:
+approving the-real-runner failed: herdctl: herd cannot give you a verdict
+for this job: dialling ws://127.0.0.1:34889: IO error: Connection refused
+(os error 111): Connection refused (os error 111)
 ```
 
 It reproduced on a docs-only pull request, which is what proved it was
@@ -4913,19 +4915,28 @@ purpose: the runner is started against a port nothing is listening on, and
 the hub appears twenty lines later. The probe said the hub was up, the wire
 path was taken, and `herdctl` was refused.
 
-**Proved: a stray listener on the port, gone a moment later.** `free_port`
-hands out a port by binding `127.0.0.1:0`, reading the number and letting
-the listener go; a port it has handed out before is passed over. Two
-measurements on the development host, Linux 6.18: `bind(0)` returns a port
-it released within some 120 allocations of a 28 232-port range, so a repeat
-is the ordinary case that loop exists for — and on the way to passing a
-repeat over, `free_port` held a *listening socket on another herd's port*
-across a contended `Mutex`. Two cores make that window a scheduler
-timeslice wide. Driving it on purpose — a listener on the herd's port that
-accepts the probe's one connection and then closes — reproduces the CI
-panic at the same line, word for word. That is now a test:
+**Proved: a stray listener on the port is sufficient, and is what the CI
+output looks like.** A listener put on the herd's port on purpose, which
+accepts the probe's one connection and then closes, reproduces the CI panic
+at the same line and word for word — same message, same
+`Connection refused (os error 111)`. That is now a test,
 `a_stray_listener_does_not_decide_how_a_runner_is_approved`, so what struck
 once in CI is one run here.
+
+**Hypothesis, not proved: the stray listener in CI was `free_port`'s own.**
+`free_port` hands out a port by binding `127.0.0.1:0`, reading the number
+and letting the listener go; a port it has handed out before is passed over.
+Two measurements on the development host, Linux 6.18, make it the candidate:
+`bind(0)` returns a port it released within some 120 allocations of a
+28 232-port range, so a repeat is the ordinary case that loop exists for —
+and on the way to passing a repeat over, `free_port` held a *listening
+socket on another herd's port* across a contended `Mutex`. Two cores make
+that window a scheduler timeslice wide, which fits a failure seen only
+there. What was not done is catching it happening: the natural failure did
+not reproduce here in 60 runs of the test alone and 25 of the whole binary
+under a low-weight scope, nor in the runs before the fix. The mechanism is
+sufficient and the window is real; that this particular window is the one
+CI fell into remains inference.
 
 **Refuted: the kernel's own source-port choice.** The first hypothesis was
 a loopback self-connect — `free_port`'s number goes back into the ephemeral
