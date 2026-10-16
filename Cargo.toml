@@ -6,6 +6,9 @@ resolver = "2"
 version = "0.1.0"
 edition = "2021"
 publish = false
+# Q10, decided 2026-10-16: Apache-2.0 (D141). The verbatim text is in
+# LICENSE at the repository root; this field is what tooling reads.
+license = "Apache-2.0"
 
 # One version per dependency for the whole workspace: the hub, a runner and
 # herdctl must never speak slightly different versions of the same library.

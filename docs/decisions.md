@@ -4587,3 +4587,34 @@ thread count today. That is D107's property broken in the hub, the same way
 it was broken in the runner for `{in}` and `{out}` — and the hub holds
 `declaration.args` on the record, so the same fix applies. Left alone for the
 same reason: it changes a deployed hub, and nobody has hit it.
+
+---
+
+## 2026-10-16 — D141 Q10 settled: Herd is Apache-2.0
+
+**Context.** The licence was the last open question from the first session and
+the only one deliberately left to Alexa, because relicensing is expensive to
+undo: it needs every contributor's consent. He chose **Apache-2.0** from the
+three I put to him.
+
+**Why it is the right one here.** It grants patent rights explicitly, which
+MIT does not, and it is the de facto norm for Rust infrastructure tooling — so
+nobody integrating Herd has to stop and think about it. MPL-2.0 was the
+alternative if every reuse had to stay open; the GPL was argued against and
+not chosen, because Herd is a service somebody deploys rather than a library
+somebody links, so strong copyleft would not buy what it costs in friction.
+
+**How it is recorded, and the care that mattered.** `LICENSE` at the root is
+the **verbatim** canonical text from `apache.org`, 11 358 bytes and 202 lines,
+checked byte-identical. Three copies already on this machine — two from
+crates, one shipped with cargo — all differed from each other, which is
+exactly why none of them was used and why the text was not written from
+memory. `license = "Apache-2.0"` is on `[workspace.package]`, which is what
+tooling reads.
+
+**One thing deliberately not invented.** Apache-2.0's `LICENSE` carries no
+copyright line — the appendix in it is a template, not a statement — so no
+holder name was needed and none was guessed. If Herd should assert attribution
+it goes in a `NOTICE` file or in file headers, with a name only Alexa can
+give. That is a one-line addition whenever he wants it, and its absence
+changes nothing about the grant.

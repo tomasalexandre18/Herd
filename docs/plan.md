@@ -447,7 +447,7 @@ spine.
 | Q7 | Public format versioning | `ran on:` line, status JSON and event payloads each carry a format version; v1 freezes at M16. | M10, M13 |
 | Q8 | Authentication | Per-runner token minted at approval, hashed at the hub; no mTLS (the proxy terminates TLS); one shared requester token to start. | M15 |
 | Q9 | Where state and content live, budgets | Hub volume: job records and manifests only — kilobytes, no payloads. Content lives in each runner's store under its data root, with a per-runner budget (the server's keeper share of their 80 GiB offer; the PC's 900 GiB). | M2, M11, M12 |
-| Q10 | Name and licence | Keep "Herd"; the licence is outward-facing — ask Alexa before M16. | M16 |
+| Q10 | Name and licence | Settled: "Herd", Apache-2.0 (D141). `LICENSE` is verbatim; `license` is on the workspace. | M16 |
 | Q11 | Runner packaging | A flake output (binary via nix profile or copied); semver carried in Hello (E-51). | M16, M17 |
 | Q12 | Local foreground mode | Do not build one: local hub plus runner via `cargo run` is the debug path; chatOnS keeps its own local path. | — |
 | Q13 | Schedule predicate | Exactly {local time, ref moved since last run, submission template}; anything richer is refused as workflow. | M14 |
