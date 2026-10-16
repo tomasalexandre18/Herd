@@ -1761,3 +1761,49 @@ async fn a_connection_that_served_starts_the_redial_counters_over() {
     herd.wait_for_runner().await;
     assert!(second.alive() && runner.alive());
 }
+
+/// **A stray listener on a herd's port does not change how a runner is
+/// approved (D147).**
+///
+/// The harness defect that turned `main` red, as a test. `Herd::approve` used
+/// to choose between `herdctl runner approve` and minting on the state root by
+/// *connecting* to the herd's own port. That port is one the kernel handed
+/// this process out of the ephemeral range a moment earlier, and anything that
+/// momentarily listens on it makes the probe say "the hub is up" with no hub
+/// anywhere. The probe then chose the wire, `herdctl` got the honest
+/// `Connection refused`, and the harness reported it as the *product* refusing
+/// an approval — which is what sent a reader into `herd-hub` looking for a bug
+/// that was never there.
+///
+/// The test above, `a_connection_that_served_starts_the_redial_counters_over`,
+/// is where it struck, because it is one of the few that start a runner before
+/// their hub. It struck roughly never: the stray listener has to be there for
+/// the single connect the probe makes. So here it is put there on purpose,
+/// which turns one run in a few hundred into one run.
+///
+/// No hub is started. The approval must still be minted on the state root,
+/// because that is what this herd's own state says to do — and that state is
+/// now the only thing consulted.
+#[tokio::test]
+async fn a_stray_listener_does_not_decide_how_a_runner_is_approved() {
+    let herd = Herd::new();
+    // Exactly what `free_port` used to be, for an instant, when the kernel
+    // handed it a port another herd of this process already held: a listening
+    // socket on somebody else's port, and no hub behind it.
+    let stray = std::net::TcpListener::bind(herd.addr())
+        .expect("a herd's port is free until its own hub takes it");
+
+    let token = herd.approve("the-real-runner");
+    assert!(!token.is_empty(), "an approval mints a token");
+    // Minted on the state root, which is the only place it can have come
+    // from: nothing here is a hub, least of all the socket above. This is the
+    // approval a deployment makes before it starts its hub for the first time
+    // — a file in the root, read when the hub comes up.
+    assert!(
+        herd.state.path().join("runners.json").is_file(),
+        "the approval is a file in the state root, as a deployment's first \
+         approval is"
+    );
+
+    drop(stray);
+}
