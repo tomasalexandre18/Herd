@@ -5568,3 +5568,95 @@ memory before writing it: streaming removed the base64 blow-up and the
 140 MiB-per-party frame cost, and it did not remove holding the payload once.
 Writing each file to disk as it completes is the next slice, beside the
 sweeper.
+
+---
+
+## 2026-10-16 — D151 The two ways a failure lies to the reader
+
+**One real failure on the live deployment, two defects, and they are the same
+defect wearing different clothes.** Job `j0000000057` — the first consumer's
+`test web-firefox,unit -j 1` — ran while the host was at **load 306** with IO
+pressure `full avg10` near **96 %**, none of it Herd's: another agent's GPU
+QEMU and a Minecraft server. The hub lost the runner twice, E-21 spent its
+one requeue, the job ended `lost`. Neither process died. The liveness
+behaviour itself is a separate question for Alexa and nothing here touches
+it: the 60 s threshold, E-21's single requeue and the stale-attempt rule are
+exactly as they were.
+
+What this entry is about is what the record *said* afterwards. **A failure
+can lie to the person reading it in exactly two ways: by naming the wrong
+cause, and by burying the right one under a thousand repetitions.** Both
+happened in this one job, and both are now fixed.
+
+**The first lie: a step that cannot start blamed the shell.** Attempt 2's
+`down` step reported `this step could not be started: /bin/sh: No such file
+or directory (os error 2)`, on a host where `/bin/sh` is a perfectly good
+symlink into the Nix store. The real cause is the working directory:
+`herd-runner/src/job.rs` spawns every step with `current_dir` set to the
+workspace, and attempt 1's `down` template ends in `rm -rf
+…/agents/herd-{job}`, so attempt 2's `down` was spawned into a directory its
+own predecessor had removed.
+
+The mechanism is proved rather than assumed, and the test that proves it is
+`a_missing_working_directory_and_a_missing_program_fail_alike`. A child
+`chdir`s into its working directory and *then* `exec`s, and a failure at
+either point comes back as **the same error object**: `ErrorKind::NotFound`,
+`raw_os_error` 2, and a `Display` string equal byte for byte. The error
+carries neither path. So nothing in it could have told the runner which of
+the two was missing — and the lie was not Rust's: it was Herd's own
+`format!("{}: {error}", stage.program)`, pasting the program's name onto an
+error that never mentioned it.
+
+`why_a_step_could_not_start` now looks before it speaks. On `NotFound` it
+asks whether the working directory is still there; if it is not, that is what
+gets named, with its path, and the program is not mentioned at all. A
+consumer reading their own `down` step can now see that their own `--purge`
+removed the ground under it.
+
+**The second lie: the runner floods the journal exactly when the host is
+stalled.** After the link came back, the runner wrote *attempt 1 of
+j0000000057 is over as far as the hub is concerned …* **1497 times**, mostly
+inside the same millisecond. One line per buffered item, not one per attempt.
+
+The hub is not at fault: a frame it will not record must be refused by name,
+so it answers every chunk of a dead attempt with its own `StaleAttempt`. The
+runner's fault was echoing every answer. 1497 journal writes onto a host
+already IO-stalled at 96 % is **a runner making its host's stall worse at the
+worst possible moment**, which is the exact opposite of what invariant 2
+promises. It is said once per attempt now, gated on a bounded ring of
+attempts already announced (`REFUSALS_REMEMBERED`, 32) that deliberately does
+not live on the job: the first refusal releases the job, and every repeat
+arrives after it, so the memory has to outlive what it is about. No trailing
+count: the frames simply stop, there is no end to report one at, and a second
+line to say the first line was right would be the same mistake smaller.
+
+**The same shape, found twice more while looking.** `JobInHand::remember`
+dropped one journal line per chunk the held-bytes cap evicted — and the cap
+only bites while the link is down, which is the same moment and the same
+host. A chatty job on a broken link therefore wrote a line per chunk for as
+long as it ran, indefinitely, with no 1497 to bound it. It now says what the
+cap is once and reports the total when the job is let go, which is a count
+that is genuinely worth having: it says how much output was lost. And
+`testing::skipped` wrote the skip log with `writeln!`, which puts the text
+and the newline on the wire as two calls; two tests skipping at once
+interleaved between them and landed on one line, so `scripts/test.sh`, which
+counts lines, announced **12** skipped assertions where there were **13**. A
+count of what was *not* checked that is itself wrong is precisely what D27
+exists to prevent. One `write_all` per line fixes it, and the gate run for
+this branch reports 13.
+
+**On testing a count rather than a sentence.** The defect was never what the
+line said; it was that one true line was written 1497 times. A test asserting
+the wording would go green again the day somebody reintroduces the loop
+saying something else, so
+`a_stale_attempt_is_announced_once_however_many_frames_it_buffered` counts
+the **writes**: 1497 refusals of one attempt must leave one line. Measuring
+that needed one concession from the production code. `eprintln!` consults
+libtest's per-thread output capture — which is inherited by every thread a
+test spawns, so there is no thread from which the macro can be made to reach
+file descriptor 2 inside a test binary — and a line that cannot reach fd 2
+cannot be counted. That path therefore writes through `journal()`, straight
+to the descriptor, where `testing::stderr_lines_about` can divert and count
+it. Same bytes, same place, and the invariant is now measurable rather than
+merely asserted. With the gate removed the test reports `1497`, which is the
+field failure reproduced exactly.

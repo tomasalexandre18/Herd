@@ -303,15 +303,17 @@ pub async fn execute(
         let mut child = match builder.spawn() {
             Ok(child) => child,
             Err(error) => {
-                // Names the executable, so the reason reads as Herd failing
-                // to run this command rather than the command failing.
+                // Names whichever of the two missing things is actually
+                // missing, so the reason reads as Herd failing to run this
+                // command rather than the command failing — and so it does
+                // not send the reader after a shell that is there (D151).
                 ran.step_never_started(
                     stage,
                     StepAt {
                         started_unix_ms: step_started_unix_ms,
                         took: step_started.elapsed(),
                     },
-                    format!("{}: {error}", stage.program),
+                    why_a_step_could_not_start(&stage.program, workspace.work_dir(), &error),
                     &session,
                     &job_id,
                     attempt,
@@ -894,6 +896,40 @@ impl Attempt {
     }
 }
 
+/// Why a step's spawn failed, naming whichever missing thing is the real one
+/// (D151).
+///
+/// `ENOENT` out of a spawn is ambiguous in a way that matters here. The child
+/// `chdir`s into its working directory and *then* `exec`s the program, and a
+/// failure at either point arrives as the same `io::Error`: `NotFound`, `os
+/// error 2`, and the same `Display` text down to the byte. The error carries
+/// neither path, so nothing in it says which of the two was missing — the
+/// sentence has to work that out by looking.
+///
+/// Blaming the program unconditionally is wrong exactly where it costs most.
+/// A declared command's `down` step whose own earlier `--purge` removed the
+/// workspace fails because the ground under it is gone, and a reader told
+/// `/bin/sh: No such file or directory` goes hunting for a missing shell on a
+/// host where `/bin/sh` is perfectly fine. So the directory is checked, and
+/// when it is the thing that is gone it is what gets named — the consumer can
+/// then see that their own takedown removed it.
+fn why_a_step_could_not_start(
+    program: &str,
+    work_dir: &std::path::Path,
+    error: &std::io::Error,
+) -> String {
+    // Only `NotFound` is ambiguous: every other errno came from the exec or
+    // from `pre_exec`, and the program is the thing to name.
+    if error.kind() == std::io::ErrorKind::NotFound && !work_dir.exists() {
+        return format!(
+            "the directory it would have run in is gone: {} — a step that removes the \
+             workspace leaves the next one nothing to run in",
+            work_dir.display()
+        );
+    }
+    format!("{program}: {error}")
+}
+
 /// Now, in milliseconds since the Unix epoch, on this runner's clock (D77).
 fn unix_ms_now() -> i64 {
     SystemTime::now()
@@ -1236,6 +1272,69 @@ mod tests {
             whose_timeout: "this runner's own figure".to_owned(),
             announce: None,
         }
+    }
+
+    /// The mechanism behind D151's first defect, demonstrated rather than
+    /// asserted from memory: a spawn whose working directory is gone and a
+    /// spawn whose program is gone fail **identically**.
+    ///
+    /// Same `ErrorKind`, same errno, same `Display` text, and no path in
+    /// either — so nothing in the error says which of the two was missing,
+    /// and a sentence built by pasting the program's name onto it names the
+    /// wrong thing exactly half the time.
+    #[test]
+    fn a_missing_working_directory_and_a_missing_program_fail_alike() {
+        let gone = crate::testing::TempDir::new("spawn-into-nothing");
+        let work_dir = gone.path().join("work");
+        std::fs::create_dir_all(&work_dir).expect("the fixture makes it");
+        std::fs::remove_dir_all(&work_dir).expect("and then takes it away");
+
+        let shell = "/bin/sh";
+        assert!(
+            std::path::Path::new(shell).exists(),
+            "this test is about a shell that is there"
+        );
+        let no_cwd = std::process::Command::new(shell)
+            .arg("-c")
+            .arg("true")
+            .current_dir(&work_dir)
+            .stdout(std::process::Stdio::null())
+            .spawn()
+            .expect_err("a child cannot chdir into a directory that is gone");
+        let no_program = std::process::Command::new(gone.path().join("not-a-program"))
+            .current_dir(gone.path())
+            .stdout(std::process::Stdio::null())
+            .spawn()
+            .expect_err("a child cannot exec a program that is not there");
+
+        assert_eq!(no_cwd.kind(), std::io::ErrorKind::NotFound);
+        assert_eq!(no_cwd.raw_os_error(), no_program.raw_os_error());
+        assert_eq!(
+            no_cwd.to_string(),
+            no_program.to_string(),
+            "the two errors are indistinguishable, which is the whole defect"
+        );
+
+        // So the sentence has to look. The directory is gone: that is what it
+        // must name, and it must not send the reader after a shell that is
+        // sitting right there.
+        let said = why_a_step_could_not_start(shell, &work_dir, &no_cwd);
+        assert!(
+            said.contains(&work_dir.display().to_string()),
+            "the directory that is missing must be named: {said}"
+        );
+        assert!(
+            !said.contains(shell),
+            "a shell that exists must not be blamed for it: {said}"
+        );
+
+        // And the other way round, the program is still the thing to name:
+        // the directory is there, so nothing else can be at fault.
+        let said = why_a_step_could_not_start(shell, gone.path(), &no_program);
+        assert!(
+            said.contains(shell),
+            "with its directory in place, the step's program is what failed: {said}"
+        );
     }
 
     #[test]
