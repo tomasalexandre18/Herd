@@ -4885,7 +4885,7 @@ not. Nothing references 143.
 
 ---
 
-## 2026-10-16 — D147 A harness must not ask the network what it knows
+## 2026-10-16 — D146 A harness must not ask the network what it knows
 
 **`main` went red on the test harness, not on the product.** CI's `check`
 job failed in the `herd-hub` integration binary `killed_hub`, on
@@ -4988,7 +4988,7 @@ than decisions taken by the harness, and with `free_port`'s window closed
 their only remaining exposure is the self-connect refuted above. They are
 left alone.
 
-**On the number.** This entry was asked for as D147. The highest on `main`
-when it was written was D145, so 146 is presumably on a branch not yet
-merged — the same collision D145 describes happening three times already.
-Left at 147 rather than renumbered, so nothing moves under that branch.
+**On the number.** Written as D147, renumbered to 146 on merge: the entry
+that had claimed 146 was on a branch this one overtook, and it is now 147.
+The file is read in order, so order is what is kept — the same collision
+D145 describes, resolved the same way.
