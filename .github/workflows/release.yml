@@ -13,16 +13,6 @@ on:
   push:
     tags:
       - "v*"
-    # TEMPORARY, and deliberately here rather than left for later:
-    # `workflow_dispatch` cannot be triggered on a branch that is not the
-    # default one, so a branch push is the only way to make this workflow run
-    # on GitHub before it is merged — and a release workflow that has never
-    # run is a release workflow that does not work. Delete this `branches:`
-    # key once this file is on `main`; nothing else refers to it, and from
-    # `main` the two triggers above are how a release is cut and how a change
-    # to this file is tested.
-    branches:
-      - cd-release-binaries
   workflow_dispatch:
     inputs:
       tag:
