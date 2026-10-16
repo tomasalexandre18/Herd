@@ -1,0 +1,6 @@
+{
+  "capabilities": [
+    { "name": "build", "kind": { "type": "counted", "slots": 1 } }
+  ],
+  "deny": ["kvm"]
+}

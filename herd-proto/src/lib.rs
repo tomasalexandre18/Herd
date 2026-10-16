@@ -136,6 +136,39 @@ pub const HEALTH_EVERY: Duration = Duration::from_secs(15);
 /// why the frame it paces needed no protocol break to add.
 pub const STILL_THERE_EVERY: Duration = Duration::from_secs(15);
 
+/// How much of a job's recorded log one [`FromHub::JobLog`] frame carries:
+/// **8 MiB**.
+///
+/// A job's log is the one piece of a record that was already large, and until
+/// this figure existed the backlog travelled **whole**: a `herdctl wait <id>`
+/// on a job that was over got one frame holding everything the job had ever
+/// printed. The default log cap is 64 MiB, base64 makes that about 85 MiB,
+/// and [`FRAME_CEILING`] is 64 MiB — so a job that printed more than about
+/// 48 MiB produced a frame neither side could put through a socket. What a
+/// requester saw was the link closing with no verdict and exit 125, which is
+/// D117's exact shape, for a job that may well have passed. D131 and D137
+/// derived the *output* cap from the frame and never came back to the
+/// neighbour the first 64 MiB had been taken from.
+///
+/// So the backlog travels in pieces, and this is the piece. Several frames
+/// concatenate to exactly the bytes one frame carried — `JobLog` has always
+/// meant "here are bytes of this job's log", and a requester writes them out
+/// in the order they arrive — so this needs no variant, no field and no
+/// [`PROTOCOL_VERSION`] bump, which is the one change D128 leaves the number
+/// alone for.
+///
+/// **Why 8 MiB and not the 32 MiB an output may be.** Two bounds, and the
+/// smaller wins. Base64 puts 8 MiB on the wire as about 10.7 MiB, leaving
+/// five-sixths of the ceiling unused — room that is deliberate, because this
+/// figure has to stay right if an operator raises the log cap. And D138's
+/// real objection to a big frame was never the ceiling but the **event
+/// loop**: a frame costs its whole encode and decode before anything else is
+/// served, and this one is sent to a follower whose link lives by a 15 s
+/// cadence ([`STILL_THERE_EVERY`]). Tens of milliseconds a frame is inside
+/// that cadence by three orders of magnitude; the few hundred milliseconds
+/// 32 MiB measured is inside it by one.
+pub const JOB_LOG_FRAME_BYTES: usize = 8 << 20;
+
 /// How many health reports a silence threshold must be able to miss before
 /// it fires.
 ///
@@ -1717,8 +1750,16 @@ pub enum FromHub {
     /// job ran, so the stream it would have followed is over. This frame is
     /// what the hub has on its disk: both streams in the order they arrived,
     /// which is how the `log` file keeps them, so the split between stdout and
-    /// stderr is not in it. Sent once, before anything else about that job
-    /// (D22).
+    /// stderr is not in it. Sent before anything else about that job (D22).
+    ///
+    /// **Bytes of the log, not the whole of it.** The backlog is sent in
+    /// consecutive frames of at most [`JOB_LOG_FRAME_BYTES`] and a requester
+    /// writes each out as it arrives, so several frames are byte-identical to
+    /// the one frame this used to be. It used to be one, and a job that
+    /// printed more than about 48 MiB then built a frame past
+    /// [`FRAME_CEILING`] — no verdict and exit 125 for a job that had
+    /// passed. Nothing about the frame changed to fix that; only how much of
+    /// the log one of them is allowed to hold.
     JobLog {
         job_id: JobId,
         #[serde(with = "bytes_as_base64")]

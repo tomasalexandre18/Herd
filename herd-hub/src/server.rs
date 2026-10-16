@@ -5069,10 +5069,18 @@ fn answer_a_wait(state: &State, outbox: &Outbox, job_id: JobId) -> Result<bool> 
     // The output the job has already produced, before anything
     // else about it. A detached requester has no other way to get
     // a job's log through the CLI (D22).
-    if !log.is_empty() {
+    //
+    // **In frames of a bounded size, and that is not a refinement.** This
+    // sent the whole log in one frame, and a job's log cap is 64 MiB while
+    // the frame ceiling is 64 MiB too — so past about 48 MiB of output,
+    // base64 built a frame that could not go through the socket, and a
+    // `herdctl wait` on a job that had passed got a closed link and exit 125
+    // (D148). Several frames concatenate to exactly what one carried, so the
+    // frame itself did not have to change.
+    for piece in log.chunks(herd_proto::JOB_LOG_FRAME_BYTES) {
         let _ = outbox.send(FromHub::JobLog {
             job_id: job_id.clone(),
-            data: log,
+            data: piece.to_vec(),
         });
     }
     let metrics = record.metrics.clone();

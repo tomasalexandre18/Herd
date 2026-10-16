@@ -1,11 +1,13 @@
 # Deploying Herd
 
-Eight files besides this one, of which you use five — the two
-reverse-proxy fragments are alternatives, the Traefik override is only
-for a containerised proxy, and `release-notice.md` deploys nothing at
-all: it is what ships with a release, for the person on the machine that
-is joining — plus `docs/joining.md` for the person who walks a machine
-in. `/etc/nixos` is the owner's and nothing here
+Ten files besides this one, of which you use five on this server — the
+two reverse-proxy fragments are alternatives, the Traefik override is
+only for a containerised proxy, and `release-notice.md` deploys nothing
+at all: it is what ships with a release, for the person on the machine
+that is joining — plus `docs/joining.md` for the person who walks a
+machine in. The last two belong to M17's second machine, the Windows PC
+joining inside WSL2 (D145, D149), and nothing on this server reads
+either of them. `/etc/nixos` is the owner's and nothing here
 ever writes to it: what needs it is either an instruction marked
 **OWNER** in the unit file, or — since D126 — a module he may import if
 he wants it, which is an offering and not an installation.
@@ -20,6 +22,8 @@ he wants it, which is an offering and not an installation.
 | `herd-runner.service` | the server's runner, native and unprivileged (E-47, E-52) | `/etc/systemd/system/` |
 | `nixos-herd-runner.nix` | the same runner declared: the unit plus the user, the binary's path and the devices the unit marks OWNER | imported from `/etc/nixos`, or not at all |
 | `release-notice.md` | what a release's binaries are and are not: bare binary against unit, the four things a runner needs, the filesystem that decides whether IO is bounded, and the two gaps | quoted into every GitHub release body by `.github/workflows/release.yml`; nothing installs it |
+| `capabilities-wsl-pc.json` | what the owner's PC offers: one counted `build` slot, and `kvm` denied whatever WSL2 exposes (E-24) | copied onto that PC and named by `--capabilities` in its unit; validated by running the real binary against it |
+| `wsl2-check.sh` | the six things about a WSL2 host nobody here can check: systemd as PID 1, cgroup v2, a delegated subtree for a user unit, what `.wslconfig` gave the VM, the hub reachable, `herd-runner --version` | run on that PC, by the person joining it; read-only, and the block it prints comes back in a message |
 
 **Two paths for the runner, and a machine is on exactly one.** Either the
 unit file is copied into `/etc/systemd/system/` and the OWNER notes in it
