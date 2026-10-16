@@ -27,6 +27,16 @@ both of which have no Nix on them, and fails if any of it fails
 (`scripts/release-smoke.sh`). There is no aarch64 build because every machine
 in the herd today is x86_64; ask if yours is not.
 
+**Upgrading from 0.2.x is a fleet-wide step, not a per-machine one.** The
+protocol went from version 1 to version 2 in 0.3.0, and a version-2 hub
+refuses a version-1 `herdctl` or runner **by name** — it tells you rather
+than misbehaving, which is still a hard stop for anything with no fallback.
+So: put the new binaries on every machine first and restart nothing; then
+restart the hub and its runners together; then the rest. Submit nothing in
+between, and keep the window short. Within a major version the two sides may
+differ by patch — a runner says so at startup and serves the connection
+anyway — but 1 and 2 are not that.
+
 ```sh
 sha256sum -c SHA256SUMS
 install -m 0755 herd-runner-<version>-x86_64-unknown-linux-musl \
