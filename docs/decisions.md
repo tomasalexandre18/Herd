@@ -4822,3 +4822,63 @@ alone: declaring it on a permanent fact would have made every `reference` job
 drain the runner to itself. `shared` is the kind for a fact about a machine,
 and the file now says so. `rig-cpu` stays `exclusive` on purpose: it is the
 machine, and a job that wants the machine does want it empty.
+## 2026-10-16 — D145 Windows means WSL2, and what a native runner would cost
+
+**The question.** Alexa asked whether a Windows version is conceivable. The
+answer is in two halves, because "Herd on Windows" means two different
+programs.
+
+**The runner: WSL2, which is already the plan.** The second machine of M17 is
+a Windows PC, and it joins as a runner *inside* WSL2 — a real Linux kernel
+(theirs is 6.18) with cgroup v2 and systemd, which is exactly the host the
+runner is written for. Q6 already rules the memory ceiling that way and M17
+already carries the WSL checklist and the Windows logon task. So a Windows
+machine contributes capacity today with no port: nothing to build, and the
+only Windows-specific surface is a logon task that starts a WSL command.
+
+**A native Windows runner is refused, and the price is the reason.** The
+runner's whole safety story is cgroup v2: `memory.max`, `cpu.weight`,
+`io.max`, `pids.max`, one subtree per job, and `/proc/pressure` recorded
+beside it. Where there is no cgroup the code falls back to `RLIMIT_AS`, which
+is itself Unix. On Windows there is neither, so the fallback is *nothing* —
+invariant 2 would break on the first job, silently, which is the one failure
+mode this project refuses. Making it honest means a third confinement
+backend on Job Objects, and that backend is not a uniform translation:
+
+- **memory** exists (`JobMemoryLimit`) but with different semantics — the
+  allocation *fails* instead of the offender being killed, so a job over its
+  cap surfaces as a compiler error, not as our exit 124;
+- **kill the whole tree** exists, cleanly (`KILL_ON_JOB_CLOSE`);
+- **CPU share** exists (Job Object CPU rate control);
+- **block IO has no per-job equivalent at all.** There is no `io.max`.
+  Storage QoS is for Hyper-V and SMB, not for a process tree. The knob that
+  stops a build from freezing its host — the one thing the first consumer most
+  needs from us — cannot be written on Windows;
+- **pressure has no equivalent**, so admission (D119) loses the figure it
+  reads;
+- **a clean stop loses its graceful step**: there is no `SIGTERM` to a job's
+  children, so "stop in ≤ 5 s" becomes "terminate in ≤ 5 s";
+- **there is no tmpfs**, so the workspace measurement has no meaning there.
+
+That is a milestone's worth of work for a machine that can already join
+through WSL2, and it permanently doubles every confinement test — the tests
+that are the only reason we believe invariant 2. Invariant 1 says to refuse
+that kind of surface, and this is refused.
+
+**`herdctl.exe` is the cheap half, and is not refused — just not built yet.**
+Its sources contain no Unix-specific code and its dependencies are all
+portable; it is a WebSocket client, an exit code and a file write. If someone
+ever wants to submit from PowerShell without WSL, that is a cross-compile
+target in the release workflow, not a port. It stays unbuilt until a requester
+actually needs it, because WSL already gives a Windows user a working
+`herdctl`.
+
+**What would reopen the runner half.** A Windows machine that cannot run WSL2
+and whose capacity we need anyway. Until one exists, the answer to "a Windows
+version?" is "yes, through WSL2" for a runner and "on request" for the CLI.
+
+**On the number.** There is no D143. Three branches appended an entry on the
+same day and each took the next free number against a `main` that then moved
+under it; this one was renumbered twice to keep the file monotonic, which
+matters here — the file is read in order — where a contiguous sequence does
+not. Nothing references 143.
