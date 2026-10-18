@@ -5933,3 +5933,202 @@ runners mid-transfer would drift above the budget by that much with no way
 down but an operator; the figure is reported and the gap is not closed.
 And the floor has only ever been crossed in a test that set it to seven
 days and wrote three kilobytes — no real seven days has passed anywhere.
+
+---
+
+## 2026-10-18 — D153 The hub's image goes to Docker Hub on the tag
+
+**The hand step this removes has blocked a deployment twice, and it was
+the only part of a release that a tag could not reproduce.** Everything
+else about v0.3.0 comes out of `.github/workflows/release.yml`: three
+static musl binaries, proved by running a real hub, a real runner and two
+real jobs inside an `archlinux` and an `alpine` container, a `SHA256SUMS`,
+and `deploy/release-notice.md` quoted into the body. The hub's **image**
+was built by the same flake and went nowhere — somebody built it on the
+server and `docker load`ed it. Now the tag pushes it, and
+`deploy/docker-compose.yml` names what was pushed.
+
+**From the flake's archive and nowhere else.** There is no `Dockerfile`
+and there will not be one. `packages.<system>.hub-image` is the single
+derivation that has ever built this image; a second way to build the hub
+is how the thing deployed stops being the thing tested. The workflow does
+`nix build .#hub-image` and pushes the archive it gets.
+
+**`skopeo copy`, not `docker load` then `docker tag` then `docker push`.**
+Three reasons, in the order they weigh:
+
+1. **The source is a file, not a name.** `docker load` puts the image in
+   the host's shared image store under the tag the archive carries, and
+   the push that follows names a *tag*. On a machine where that tag
+   already means something — which is exactly the server — the step can
+   push something that is not what was just built. `skopeo copy
+   docker-archive:hub-image docker://…` names the archive, and there is
+   nothing else it could send.
+2. **The manifest survives.** `dockerTools.buildLayeredImage` writes its
+   layers already compressed, so the blobs in the archive hash to the
+   digests in its manifest and skopeo pushes them untouched. Measured
+   here: `skopeo inspect docker-archive:` on the archive reports
+   `sha256:9cfbdbd8a22f3d97f50510499b5cb4c334d9a7e450af113df75289cec04fb7d9`,
+   and a copy out of it writes that same digest to `--digestfile`. The
+   digest a release prints is therefore a property of the flake output,
+   not of whatever a daemon did to it on the way.
+3. **The token never lands on an argv or in `~/.docker/config.json`.**
+   `skopeo login --password-stdin --authfile` into a temporary file of
+   the job's own, removed on the way out. `--dest-creds user:token` would
+   have been one line shorter and readable out of `/proc` (invariant 7).
+
+`--insecure-policy` is on both calls, and the word is misleading: it means
+"consult no containers signature policy", which is what `docker push`
+also does, and it says nothing about transport — TLS to Docker Hub is
+untouched. Without it skopeo refuses to start on a host with no
+`/etc/containers/policy.json`, which is how it was found: this project's
+own server has none.
+
+skopeo comes from the flake, as `devShells.<system>.release`, and not from
+`apt` in the workflow. Same argument D12 makes about every other tool: the
+thing that pushes a release should be pinned like the thing that builds
+one. It is not in the default shell; nobody developing Herd needs it.
+
+**No `latest`, and the reason is this release in particular.** Herd has
+exactly one hub and a fleet that speaks to it, and `PROTOCOL_VERSION`
+moved from 1 to 2 in 0.3.0 — a version-2 hub refuses a version-1 runner
+*by name*, which is a hard stop for anything with no fallback. A floating
+tag means the next `docker compose up -d` can carry the hub across that
+line at a moment nobody chose: a reboot, a host upgrade, an unrelated
+`pull`. Naming the version is what keeps a protocol move a decision
+instead of an accident. There is no argument on the other side worth the
+trade here — `latest` buys a shorter command for a deployment that
+happens a few times a year and is read out of a release notice anyway.
+A digest is accepted everywhere the tag is, and is stronger: a tag is a
+name somebody can move, a digest is the bytes.
+
+**What Alexa has to create, exactly.** Three things on Docker Hub, one
+repository **variable** and one repository **secret**, and nothing else.
+The last two are on two different tabs of one settings page, and which
+tab is part of the instruction rather than something to work out:
+
+| Where | What |
+| --- | --- |
+| Docker Hub | an account, if there is not one. Its name becomes part of every image reference a deployer types |
+| Docker Hub | a **public** repository named exactly `herd-hub` under that account. Public, so that `docker compose pull` on the server needs no credentials at all |
+| Docker Hub | an **access token** (Account settings → Personal access tokens), scoped to **that one repository**, permission **Read & Write**. Not the account password, and not an account-wide token |
+| GitHub → Settings → Secrets and variables → Actions → **Variables** | repository variable `DOCKERHUB_USERNAME`, the account name |
+| GitHub → Settings → Secrets and variables → Actions → **Secrets** | repository secret `DOCKERHUB_TOKEN`, the access token |
+
+**The namespace is a variable, and that is not a detail.** It is in every
+image reference a deployer types — the compose file, the release body,
+`env.example`, the `docker pull` somebody runs at two in the morning — so
+it is public the instant anything is pushed under it, and holding it in a
+secret would have GitHub mask it in every log line this workflow writes.
+That is the part that matters: a push that fails prints skopeo's own
+error text, and `docker.io/***/herd-hub: unauthorized` names neither the
+account nor the repository it was refused on. A masked log is a release
+nobody can diagnose, which costs more than the nothing the secrecy buys.
+The token stays a secret; it is the only thing here that is one.
+
+**A missing credential stops the run before anything exists.** The first
+step after the version is read checks both and, if either is empty, says
+which one is missing, **which tab it goes on** — Variables for the name,
+Secrets for the token — what the token's scope must be, why the name is
+not a secret, and the sentence "nothing of this release has been
+published", then exits 1. It runs before `nix build`, before the
+binaries, and a very long way before `gh release create`. Names only, no
+values, and no `set -x` anywhere in the file: GitHub masks a secret it
+recognises, and a workflow should not be relying on that.
+
+**A release stays one thing, and the order is what makes it so.** One
+job, not three: the binaries, the image and the release are one release,
+and steps in one job run in an order a reader can see. The order is
+binaries → prove them on Arch and Alpine → upload them to the run →
+build the image → prove it → push it → pull it back and prove that →
+*then* create the GitHub release. So a tag can never leave binaries
+published and an image missing. The one partial state it can leave is the
+reverse — the image on Docker Hub and no release — and that one is both
+understandable and re-runnable: re-running the tag pushes identical
+content to the same tag, which is a no-op the registry accepts, and then
+creates the release. The pre-existing `gh release view` branch already
+makes a second run idempotent on the release side.
+
+**Verified the way a downloader would, by pulling it back.** After the
+push the workflow deletes the local tag, pulls the image **by digest**
+from Docker Hub, and runs `scripts/image-smoke.sh` against what the
+registry served: a hub in the container shaped the way
+`deploy/docker-compose.yml` shapes it — read-only root, a volume on
+`/var/lib/herd` and nothing under it, `HERD_STATE_DIR` naming that same
+path, the image's own non-root user — with the static runner and
+`herdctl` on the host dialling the published loopback port, and two real
+jobs through it, the second checking the verdict is worn untouched. That
+is the image sibling of `scripts/release-smoke.sh`, and it runs twice:
+once on the locally loaded archive, which needs no credentials and so
+happens on every hand-run too, and once on the pulled digest.
+
+**The deployment uses it, through one variable, and that is the one place
+this deviates from the brief.** `deploy/docker-compose.yml` cannot name a
+Docker Hub account the repository does not know — the account lives in the
+`DOCKERHUB_USERNAME` variable, which a checked-out tree cannot read, and
+inventing a namespace in a compose file is how a deployment comes to
+point at somebody else's image. So the compose file takes
+`${HERD_HUB_IMAGE:?…}`, **required** and not defaulted, because a hub
+starting quietly on the wrong image is worse than a compose file that
+stops; `deploy/env.example` spells out the value, where the namespace
+comes from, that a digest is accepted, and why there is no `latest` to
+point at. The same variable is how the local build still works —
+`HERD_HUB_IMAGE=herd-hub:0.3.0` after `docker load` — which is why the
+registry path and the offline path are now one line apart instead of two
+compose files. `pull_policy: never` is gone, so `docker compose pull &&
+docker compose up -d` is the upgrade.
+
+**What is still masked, now that the namespace is not.** GitHub masks
+the value of secrets and of nothing else, so with the account name moved
+to a variable the only masked strings left in this workflow are
+`DOCKERHUB_TOKEN` and the implicit `GITHUB_TOKEN`. Neither appears in
+anything a reader needs: the pushed digest is printed in full, skopeo's
+own error text carries the registry, the repository and the tag intact,
+and `gh release create` prints the release URL. So a failed push is
+readable end to end.
+
+It is not, however, always *informative*, and that is a different
+problem with no fix here: Docker Hub answers a bad token with `401
+unauthorized: incorrect username or password` even when the name is
+right, and answers a token whose scope is too narrow with `403 …
+requested access to the resource is denied`. Both lines arrive unmasked
+and both now name `docker.io/<account>/herd-hub`, which is the whole
+gain — but the first sentence blames the username, and it is the token
+that will be wrong. Read the code, not the sentence. The login runs as
+its own step before the copy, so at least which of the two failed is
+never in doubt.
+
+**What is unproven, and it is the half that matters.** None of this has
+run. There is no Docker Hub account yet, no variable, no secret and no
+tag, so the push, the login, the digest file, the pull-back and the
+second smoke run exist only as YAML — and D132 is the entry that says a
+release step nobody has run is a release step that does not work. The
+preflight has never run either, which is worth saying twice because it
+is the step whose whole job is to fire on a day nothing else works.
+What *was* proved, locally, on this host:
+
+* the flake's archive carries exactly `herd-hub:0.3.0` in its
+  `manifest.json` `RepoTags`, which is what the new assertion step
+  compares against the workspace version;
+* `skopeo` reads that gzipped `docker-archive:` without being told it is
+  compressed, and a copy out of it preserves the manifest digest, as
+  above;
+* `scripts/image-smoke.sh` passes against the real flake-built image —
+  containerised hub, host runner, two jobs, the second exiting 7 and
+  `herdctl` exiting 7;
+* editing the comment at the top of `nix/hub-image.nix` leaves the
+  derivation at the same store path, so nothing about what the image
+  contains changed in this work.
+
+Two things could not be checked at all without the credentials: that
+Docker Hub accepts a `buildLayeredImage` manifest as skopeo writes it
+(no reason it should not; it is an ordinary Docker v2 schema 2 manifest),
+and that a token scoped to one repository is enough for `skopeo login`
+against `docker.io` — a repository-scoped token authenticates fine and
+is only refused at the point of writing somewhere it does not cover, but
+that sentence is read and not measured. One more is only half checked:
+`skopeo copy` into `docker-daemon:` fails on this host with `writing
+blob: io: read/write on closed pipe`, which is why the local proof above
+went through a re-tagged `docker load` instead. The workflow does not use
+that transport — it loads with `docker load` and pushes with
+`docker://` — so it is a note about this server, not about the release.

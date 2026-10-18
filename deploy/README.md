@@ -15,7 +15,7 @@ he wants it, which is an offering and not an installation.
 | File | What it is | Where it goes |
 | --- | --- | --- |
 | `docker-compose.yml` | the hub, under docker compose (D5, D8) | the operator's compose directory, say `/srv/herd/` |
-| `env.example` | the variables that file needs, holding paths and no secrets | copy to `.env` beside it |
+| `env.example` | the variables that file needs: which hub image to run, and the *path* to the requester token — no secret of any kind | copy to `.env` beside it |
 | `docker-compose.traefik.yml` | an override, only when the proxy is a container: puts the hub on the proxy's network | beside `docker-compose.yml`, passed with a second `-f` |
 | `reverse-proxy/traefik-herd-hub.yml` | **this server:** a Traefik v3 dynamic config for `wss://` | the directory Traefik's file provider watches, `conf.d/` |
 | `reverse-proxy/nginx-herd-hub.conf` | the same job on a host that runs nginx instead | pasted into the config he already runs |
@@ -60,7 +60,8 @@ machine this has ever been applied to:
                                                    |  ws://herd-hub:8787
                                                    v
                                          herd-hub  (docker compose)
-                                          image herd-hub:0.1.0
+                                          image from Docker Hub,
+                                          pinned to a version
                                           state on the herd-state volume
                                             ^                 ^
          ws://127.0.0.1:8787  -------------'                  |
@@ -80,13 +81,18 @@ all (invariant 3, D11). Herd holds no certificate at any point.
 
 ## The order to do it in
 
-1. Build and load the image. That is the packaging half of M16
-   (`flake.nix`, `nix/`); its contract with this directory is the image
-   name and tag, **`herd-hub:0.1.0`**, and nothing else.
+1. Name the image in `.env`, as `HERD_HUB_IMAGE`. Since D153 the hub's
+   image is pushed to Docker Hub by the release workflow on the version
+   tag, so the normal value is
+   `docker.io/NAMESPACE/herd-hub:<version>` and nothing is built here.
+   `env.example` says where NAMESPACE comes from, and why there is no
+   `latest` to point at. Building it locally instead is still supported
+   and is below, under "the image without a registry".
 2. Make the requester token, outside any repository, and point `.env` at
    it. `env.example` says how, including the mode, which is not the one
    you would guess.
-3. `docker compose up -d`, then `docker compose logs hub`. The hub says
+3. `docker compose pull`, then `docker compose up -d`, then
+   `docker compose logs hub`. The hub says
    in its first three lines whether a requester token is set, how many
    runners are approved, and where its state is.
 4. Publish it as `wss://`, if anything will dial from off this host.
@@ -109,20 +115,28 @@ ownership, and both read as the hub refusing to run, which is correct of
 it (invariant 2's cousin: a service that cannot do its job says so and
 stops).
 
-```sh
-# 1. the image, from the flake, and into the local docker
-nix build .#hub-image
-docker load < result                       # Loaded image: herd-hub:0.1.0
+One line of it is newer than that run and has not been done here:
+**step 3 pulls** where the proven sequence built the image locally and
+`docker load`ed it. The image is the same derivation either way (D153),
+and the release workflow pulls what it pushed and runs two real jobs
+through it before the release exists — but nobody has yet run
+`docker compose pull` on this server. If it surprises you, say so; the
+local path below is what was actually walked.
 
-# 2. the requester token, outside every repository (invariant 7).
+```sh
+# 1. the requester token, outside every repository (invariant 7).
 #    0444 inside a 0700 directory: see env.example for why the mode is
 #    not 0400.
 install -d -m 0700 /etc/herd
 head -c 32 /dev/urandom | base64 > /etc/herd/requester-token
 chmod 0444 /etc/herd/requester-token
 
-# 3. the operator's own .env, beside docker-compose.yml, pointing at it
-cp env.example .env                        # then set the path in it
+# 2. the operator's own .env, beside docker-compose.yml: the token's path
+#    and HERD_HUB_IMAGE, the pinned image this hub runs
+cp env.example .env                        # then edit both lines in it
+
+# 3. the image, from Docker Hub, as .env names it
+docker compose pull                        # or "without a registry", below
 
 # 4. up, and read the three lines it prints
 docker compose up -d
@@ -181,6 +195,30 @@ writes a secret, is unreadable by the non-root hub. `env.example` makes
 it 0444 in a 0700 directory instead: the directory is what keeps it off
 the host, the mode is only what the container sees, and the image holds
 no users but `herd` and root.
+
+### The image without a registry
+
+The flake still builds it, and this is still the way to run a hub from a
+commit that was never tagged — a branch under test, an air-gapped host,
+or a day when Docker Hub is down. It is the same derivation the release
+pushes; what differs is only where the bytes came from.
+
+```sh
+nix build .#hub-image
+docker load < result                       # Loaded image: herd-hub:0.3.0
+```
+
+Then name that purely local tag in `.env`, because there is nothing to
+pull:
+
+```sh
+HERD_HUB_IMAGE=herd-hub:0.3.0
+```
+
+`docker compose pull` will fail on that name, which is correct — skip it
+and go straight to `up -d`. The tag `docker load` prints is the
+workspace's own version (`nix/hub-image.nix`), so read it rather than
+assuming the number above is still current.
 
 ## Step 4, exactly: `wss://` through Traefik and Cloudflare
 
