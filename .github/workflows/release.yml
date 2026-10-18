@@ -51,13 +51,14 @@ jobs:
       # One place where "which tag, if any" is decided. A tag push releases
       # under its own name; a hand-run releases only if it was given one.
       TAG: ${{ github.ref_type == 'tag' && github.ref_name || github.event.inputs.tag }}
-      # Where the image goes. The account is held in a secret because the
-      # token's owner is, not because a Docker Hub namespace is private — it
-      # is public the moment anything is pushed to it — so GitHub masks it
-      # and every line below reads `docker.io/***/herd-hub`. That costs a
-      # readable log and buys nothing; D153 says so and says what to change
-      # if Alexa would rather it were a repository *variable*.
-      IMAGE_REPO: docker.io/${{ secrets.DOCKERHUB_USERNAME }}/herd-hub
+      # Where the image goes. A repository **variable** and not a secret,
+      # deliberately: a Docker Hub namespace is public the instant anything
+      # is pushed to it, it is in every image reference a deployer types,
+      # and holding it in a secret would make GitHub mask it — so every
+      # line below, including skopeo's own error text, would read
+      # `docker.io/***/herd-hub` and a failed push could not be diagnosed
+      # from its log. The token is the secret; the name is not (D153).
+      IMAGE_REPO: docker.io/${{ vars.DOCKERHUB_USERNAME }}/herd-hub
     steps:
       - uses: actions/checkout@v7
 
@@ -99,30 +100,48 @@ jobs:
       # file: a token that reaches a log line is a leaked token
       # (invariant 7). GitHub masks a secret it recognises, but a workflow
       # should not be relying on that.
+      #
+      # The two live in two different tabs of the same settings page, which
+      # is exactly the kind of thing nobody should have to work out at the
+      # moment a release has stopped — so each line below names its own tab.
       - name: the Docker Hub credentials this tag needs, by name
         if: env.TAG != ''
         env:
-          DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
+          DOCKERHUB_USERNAME: ${{ vars.DOCKERHUB_USERNAME }}
           DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
         run: |
           set -euo pipefail
-          missing=
-          [ -n "${DOCKERHUB_USERNAME:-}" ] || missing="$missing DOCKERHUB_USERNAME"
-          [ -n "${DOCKERHUB_TOKEN:-}" ] || missing="$missing DOCKERHUB_TOKEN"
-          if [ -n "$missing" ]; then
-            echo "this tag publishes the hub's image, and these repository" >&2
-            echo "secrets are not set:$missing" >&2
+          missing=0
+          if [ -z "${DOCKERHUB_USERNAME:-}" ] || [ -z "${DOCKERHUB_TOKEN:-}" ]; then
+            missing=1
+            echo "this tag publishes the hub's image and cannot:" >&2
+            echo "github.com/${{ github.repository }}/settings -> Secrets" >&2
+            echo "and variables -> Actions, where the two live in two" >&2
+            echo "different tabs." >&2
             echo >&2
-            echo "Settings -> Secrets and variables -> Actions -> Repository" >&2
-            echo "secrets. DOCKERHUB_USERNAME is the Docker Hub account that" >&2
-            echo "owns the public herd-hub repository; DOCKERHUB_TOKEN is an" >&2
-            echo "access token scoped to that one repository with Read &" >&2
-            echo "Write, never the account password. deploy/release-notice.md" >&2
-            echo "says it in full, and nothing of this release has been" >&2
-            echo "published: fix the secret and re-run this tag." >&2
+          fi
+          if [ -z "${DOCKERHUB_USERNAME:-}" ]; then
+            echo "MISSING, on the 'Variables' tab — repository variable" >&2
+            echo "  DOCKERHUB_USERNAME: the Docker Hub account that owns" >&2
+            echo "  the public herd-hub repository. A variable and not a" >&2
+            echo "  secret on purpose: it is in every image reference a" >&2
+            echo "  deployer types, and masking it would make this very" >&2
+            echo "  log unreadable." >&2
+          fi
+          if [ -z "${DOCKERHUB_TOKEN:-}" ]; then
+            echo "MISSING, on the 'Secrets' tab — repository secret" >&2
+            echo "  DOCKERHUB_TOKEN: a Docker Hub access token scoped to" >&2
+            echo "  that one repository, Read & Write. Never the account" >&2
+            echo "  password, and never an account-wide token." >&2
+          fi
+          if [ "$missing" -ne 0 ]; then
+            echo >&2
+            echo "deploy/release-notice.md says it in full. Nothing of this" >&2
+            echo "release has been published: set it and re-run this tag." >&2
             exit 1
           fi
-          echo "both Docker Hub secrets are set"
+          echo "the DOCKERHUB_USERNAME variable and the DOCKERHUB_TOKEN"
+          echo "secret are both set; the image goes to $IMAGE_REPO:$version"
 
       # ~1 minute, and no toolchain is installed to do it: `pkgsStatic` is
       # nixpkgs' own musl cross set, so D12 still holds and the musl rustc,
@@ -302,7 +321,7 @@ jobs:
       - name: push it to Docker Hub
         if: env.TAG != ''
         env:
-          DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
+          DOCKERHUB_USERNAME: ${{ vars.DOCKERHUB_USERNAME }}
           DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
         run: |
           set -euo pipefail

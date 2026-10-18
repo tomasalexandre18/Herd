@@ -73,17 +73,21 @@ different protocol without anybody choosing the moment. Naming the version
 is how that stays a decision. Pull a digest if you want it stronger still.
 
 **What the publishing needs, for whoever maintains this repository.** Two
-GitHub Actions repository secrets, and nothing else; neither is ever in the
-repository, in the image, or in a log line (invariant 7):
+entries under *Settings → Secrets and variables → Actions*, and nothing
+else. They sit on **two different tabs**, which is the whole point: the
+account name is public the instant anything is pushed under it and belongs
+in every log line, while the token is never in the repository, in the image,
+or in any output (invariant 7).
 
-| Secret | What it is |
-| --- | --- |
-| `DOCKERHUB_USERNAME` | the Docker Hub account that owns the **public** `herd-hub` repository |
-| `DOCKERHUB_TOKEN` | a Docker Hub **access token**, scoped to that one repository, with Read & Write — never the account password, and never an account-wide token |
+| Tab | Name | What it is |
+| --- | --- | --- |
+| **Variables** | `DOCKERHUB_USERNAME` | the Docker Hub account that owns the **public** `herd-hub` repository. A variable, not a secret: masked, it would make a failed push impossible to read |
+| **Secrets** | `DOCKERHUB_TOKEN` | a Docker Hub **access token**, scoped to that one repository, with Read & Write — never the account password, and never an account-wide token |
 
-A tag pushed while either is missing **fails on its first step, by name**,
-before anything is built and long before a GitHub release exists. Half a
-release is worse than none, so the workflow refuses to make one.
+A tag pushed while either is missing **fails on its first step**, naming the
+one that is missing *and the tab it goes on*, before anything is built and
+long before a GitHub release exists. Half a release is worse than none, so
+the workflow refuses to make one.
 
 ## A binary and a service are not the same thing
 

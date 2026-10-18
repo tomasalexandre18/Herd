@@ -6002,21 +6002,35 @@ happens a few times a year and is read out of a release notice anyway.
 A digest is accepted everywhere the tag is, and is stronger: a tag is a
 name somebody can move, a digest is the bytes.
 
-**What Alexa has to create, exactly.** Two things on Docker Hub and two
-repository secrets, and nothing else:
+**What Alexa has to create, exactly.** Three things on Docker Hub, one
+repository **variable** and one repository **secret**, and nothing else.
+The last two are on two different tabs of one settings page, and which
+tab is part of the instruction rather than something to work out:
 
 | Where | What |
 | --- | --- |
 | Docker Hub | an account, if there is not one. Its name becomes part of every image reference a deployer types |
 | Docker Hub | a **public** repository named exactly `herd-hub` under that account. Public, so that `docker compose pull` on the server needs no credentials at all |
 | Docker Hub | an **access token** (Account settings → Personal access tokens), scoped to **that one repository**, permission **Read & Write**. Not the account password, and not an account-wide token |
-| GitHub → Settings → Secrets and variables → Actions | repository secret `DOCKERHUB_USERNAME`, the account name |
-| GitHub → same place | repository secret `DOCKERHUB_TOKEN`, the access token |
+| GitHub → Settings → Secrets and variables → Actions → **Variables** | repository variable `DOCKERHUB_USERNAME`, the account name |
+| GitHub → Settings → Secrets and variables → Actions → **Secrets** | repository secret `DOCKERHUB_TOKEN`, the access token |
 
-**A missing secret stops the run before anything exists.** The first step
-after the version is read checks both and, if either is empty, prints the
-names of the ones that are missing, where to set them, what scope the
-token needs, and the sentence "nothing of this release has been
+**The namespace is a variable, and that is not a detail.** It is in every
+image reference a deployer types — the compose file, the release body,
+`env.example`, the `docker pull` somebody runs at two in the morning — so
+it is public the instant anything is pushed under it, and holding it in a
+secret would have GitHub mask it in every log line this workflow writes.
+That is the part that matters: a push that fails prints skopeo's own
+error text, and `docker.io/***/herd-hub: unauthorized` names neither the
+account nor the repository it was refused on. A masked log is a release
+nobody can diagnose, which costs more than the nothing the secrecy buys.
+The token stays a secret; it is the only thing here that is one.
+
+**A missing credential stops the run before anything exists.** The first
+step after the version is read checks both and, if either is empty, says
+which one is missing, **which tab it goes on** — Variables for the name,
+Secrets for the token — what the token's scope must be, why the name is
+not a secret, and the sentence "nothing of this release has been
 published", then exits 1. It runs before `nix build`, before the
 binaries, and a very long way before `gh release create`. Names only, no
 values, and no `set -x` anywhere in the file: GitHub masks a secret it
@@ -6050,9 +6064,10 @@ happens on every hand-run too, and once on the pulled digest.
 
 **The deployment uses it, through one variable, and that is the one place
 this deviates from the brief.** `deploy/docker-compose.yml` cannot name a
-Docker Hub account the repository does not know — the account is behind
-`DOCKERHUB_USERNAME`, and inventing a namespace in a compose file is how
-a deployment points at somebody else's image. So the compose file takes
+Docker Hub account the repository does not know — the account lives in the
+`DOCKERHUB_USERNAME` variable, which a checked-out tree cannot read, and
+inventing a namespace in a compose file is how a deployment comes to
+point at somebody else's image. So the compose file takes
 `${HERD_HUB_IMAGE:?…}`, **required** and not defaulted, because a hub
 starting quietly on the wrong image is worse than a compose file that
 stops; `deploy/env.example` spells out the value, where the namespace
@@ -6063,23 +6078,34 @@ registry path and the offline path are now one line apart instead of two
 compose files. `pull_policy: never` is gone, so `docker compose pull &&
 docker compose up -d` is the upgrade.
 
-**One thing found while writing it, which is a small cost worth naming.**
-Holding the Docker Hub account in a *secret* makes GitHub mask it, so
-every line of the push and the pull-back reads `docker.io/***/herd-hub`
-and the release's own body is the only place the reference is legible. A
-namespace is public the moment anything is pushed to it; the secrecy here
-is incidental to the token's owner, not a property of the name. If Alexa
-would rather read his logs, moving it to a repository **variable** —
-`vars.DOCKERHUB_USERNAME` in two places in `release.yml` — changes
-nothing else. It is left as a secret because that is what was asked for
-and because a masked log is a small price.
+**What is still masked, now that the namespace is not.** GitHub masks
+the value of secrets and of nothing else, so with the account name moved
+to a variable the only masked strings left in this workflow are
+`DOCKERHUB_TOKEN` and the implicit `GITHUB_TOKEN`. Neither appears in
+anything a reader needs: the pushed digest is printed in full, skopeo's
+own error text carries the registry, the repository and the tag intact,
+and `gh release create` prints the release URL. So a failed push is
+readable end to end.
+
+It is not, however, always *informative*, and that is a different
+problem with no fix here: Docker Hub answers a bad token with `401
+unauthorized: incorrect username or password` even when the name is
+right, and answers a token whose scope is too narrow with `403 …
+requested access to the resource is denied`. Both lines arrive unmasked
+and both now name `docker.io/<account>/herd-hub`, which is the whole
+gain — but the first sentence blames the username, and it is the token
+that will be wrong. Read the code, not the sentence. The login runs as
+its own step before the copy, so at least which of the two failed is
+never in doubt.
 
 **What is unproven, and it is the half that matters.** None of this has
-run. There is no Docker Hub account yet, no secrets, and no tag, so the
-push, the login, the digest file, the pull-back and the second smoke run
-exist only as YAML — and D132 is the entry that says a release step
-nobody has run is a release step that does not work. What *was* proved,
-locally, on this host:
+run. There is no Docker Hub account yet, no variable, no secret and no
+tag, so the push, the login, the digest file, the pull-back and the
+second smoke run exist only as YAML — and D132 is the entry that says a
+release step nobody has run is a release step that does not work. The
+preflight has never run either, which is worth saying twice because it
+is the step whose whole job is to fire on a day nothing else works.
+What *was* proved, locally, on this host:
 
 * the flake's archive carries exactly `herd-hub:0.3.0` in its
   `manifest.json` `RepoTags`, which is what the new assertion step
