@@ -6135,7 +6135,246 @@ that transport — it loads with `docker load` and pushes with
 
 ---
 
-## 2026-10-18 — D154 The latency target is not what stalls this host
+## 2026-10-18 — D155 The served floor, and a test that hoped to clear it
+
+**`main` went red on the test again, not on the product.** CI's `check`
+job failed on a documentation-only pull request, in the `herd-hub`
+integration binary `killed_hub`, on
+`a_connection_that_served_starts_the_redial_counters_over`:
+
+```
+panicked at herd-hub/tests/killed_hub.rs:1747:5:
+a runner that had been serving must redial as if this were its first failure,
+not carry on from the four dials that preceded it:
+herd-runner: dialling ws://127.0.0.1:44583 again in 46.669602ms (attempt 5)
+```
+
+Same test as D146, different line and a different cause, so it is written
+down separately rather than filed under the fix that is already in. The
+product is right; the test asserted a property it had not established.
+
+**What the test was missing.** `Backoff::settled` resets the redial
+counters only for a connection that lasted at least the cap, and the cap
+is the whole argument: a hub that accepts and dies in a loop must not be
+answered every `first` for ever, and the give-up bound must still fire on
+a hub that is broken rather than absent (D104). The test passes
+`--redial-cap 0.05`, so **the floor it has to clear is 50 ms** — and
+nothing in the test held the connection open that long. It waited for
+`wait_for_runner`, which is a `printf` over in a millisecond, read the
+log, and killed the hub. The span from the hub's welcome to the runner
+noticing the reset was whatever the host happened to make it.
+
+**Measured, by printing the span the runner itself judges.** With a
+temporary line in `serve_forever` reporting `served_since` and the cap at
+every redial decision, under
+`systemd-run --scope -p IOWeight=20 -p CPUWeight=20 -p AllowedCPUs=0-1`,
+six runs of the whole binary on two cores gave 65.5, 77.2, 78.1, 82.1,
+173.9 and 298.8 ms against the 50 ms floor. Eight runs of the binary at
+`--test-threads 18` on twelve cores gave 71.9 to 436.1 ms. **The smallest
+margin seen was 15 ms**, on exactly the two-core shape CI runs. That is
+not a test with a property, it is a test with a coin.
+
+**The failure reproduces on demand, word for word, by moving the floor
+rather than the host.** Raising the test's cap to `0.5` so that the floor
+sits above the span the host was going to produce gives:
+
+```
+herd-runner: DEBUG served=Some(305.71204ms) cap=500ms settled=false failures=3
+…
+a runner that had been serving must redial as if this were its first failure,
+not carry on from the four dials that preceded it:
+herd-runner: dialling ws://127.0.0.1:37711 again in 319.95527ms (attempt 5)
+```
+
+which is CI's panic in the same shape, including the `(attempt 5)` — the
+counter reaching 4 because the three dials before the hub came up were
+never spent. The arithmetic checks out too: `(attempt 5)` is the *only*
+number a missed reset can print here, since the test waits for
+`(attempt 4)` and the hub comes up straight after it.
+
+**Not reproduced: the natural crossing.** 25 runs of the single test and
+16 of the whole binary under the low-weight scope, most of them on two
+cores, never put the span under 50 ms. So the mechanism is proved and the
+figures are measured, but that CI's run crossed the floor the natural way
+is read off CI's own line rather than seen here. Nothing else explains
+`(attempt 5)`: the slice the test takes cannot produce it, because
+`climbed` is read before the kill and the file only grows — the boundary
+in the brief's second hypothesis is sound, and it is the floor that is
+not.
+
+**What a user would have seen, had it been the product.** Nothing, this
+time: the reset fired at 65 ms where the floor is 50 ms, as specified.
+The thing worth keeping an eye on is the floor itself at its shipped
+value. The cap in production is 30 s, so a link that cannot hold a
+connection for 30 s never resets anything, and a runner on it walks the
+24 h give-up bound and **exits** while it is still carrying jobs between
+drops. D104 chose that on purpose — it is the same sentence that stops an
+accept-and-die hub from being hammered — and it is not changed here. But
+the WSL2 PC, behind a NAT on a laptop-grade link, is the first machine
+where "every connection shorter than thirty seconds" is imaginable, and
+if it ever gives up with jobs behind it, this paragraph is where to
+start. Changing the rule is Alexa's call, not a test fix.
+
+**The repair: the premise is made true, and the assertion is about the
+first redial.** Two changes, both in the test.
+
+1. **A job that sleeps six floors.** After `wait_for_runner`, the test
+   runs `sleep 0.3` through `herdctl run` and requires it to succeed. The
+   job cannot start before the welcome, cannot report before it has
+   slept, and is answered before the kill, so the connection's life is
+   bounded below by a sleeping child's own clock — the one figure a
+   starved host can only make longer. Six times the floor instead of the
+   1.3 that was there.
+2. **The first redial after the kill, not any line in the slice.** The
+   hub is dead, so the storm that follows counts up through 3, 4, 5 and a
+   search of the whole slice would eventually find whatever number it was
+   looking for; only the first announcement carries the counter. It is
+   matched on whole lines beginning `herd-runner: dialling `, so a read
+   that caught the file mid-write cannot leave half of an earlier line
+   looking like the one under test.
+
+**The repaired test still fails on the defect it exists for.** With
+`Backoff::settled` forced back to its pre-D104 answer — never settled —
+the test fails with the same sentence and the same `(attempt 5)`. A test
+that cannot fail would have been the worse outcome of the two, so this
+was checked rather than argued.
+
+**One thing seen and not diagnosed.** In 25 runs of the single test
+pinned to two CPUs on a host at load average 40, one run failed
+differently: the runner printed `joining ws://…` and then nothing at all
+for the full 30 s patience, so the first wait timed out before any dial
+was announced. On loopback a dial at a port nobody holds is refused in
+microseconds, so a 30 s silence is a stall somewhere, not a slow refusal
+— but it was seen once, under starvation harsher than CI's (two shared
+CPUs against CI's two dedicated ones), and it is not this entry's
+failure. Written down so the next reader of a `killed_hub` timeout has
+it.
+
+---
+
+## 2026-10-18 — D156 The dedup key carries the commit a declaration names
+
+**Context.** E-05 joins a second submission of the same work, and D69
+fixed what "the same work" means: the command and the labels, counted.
+That was right for the only kind of submission that existed then, the
+ad-hoc one, whose command line contains whatever revision it names — so
+keying on the line keyed on the commit as a side effect. `dedup_key`'s
+own comment said as much: "the commit will join it when a submission
+names one (E-01, M10): it is part of the command's meaning, and today
+the command is where it is."
+
+M10 made that sentence false and nobody came back to it. A declared
+submission keeps its commit in `Declaration::commit`, a field of its
+own, and its `command` is the resolved line — which need not mention
+the commit at all, and usually does not, because `{commit}` goes into
+the executor's `up` and `fetch` steps. A declared line that
+interpolates nothing commit-shaped is therefore byte-identical at every
+commit in the repository, and every submission of it joined one job.
+
+**The defect, which is the worst class: a wrong answer presented as a
+right one.** A requester asked Herd to check commit A and was handed
+commit B's verdict, silently, with nothing in the output, the record or
+the logs saying anything had been substituted. Confirmed on the live
+hub's own disk:
+
+```
+j0000000098  "submissions":4
+  "command":["cargo fmt --check && CARGO_BUILD_JOBS={j} cargo xtask clippy"]
+  "commit":"7bc3795600b41c148636cc6a5ac8d540c180ce54"
+
+j0000000146  "submissions":2
+  "command":["cargo fmt --check && CARGO_BUILD_JOBS={j} cargo xtask clippy"]
+  "commit":"bc78ebdc277b9ac7380d6ae0bfc9a71ca5d2ee4d"
+```
+
+Four requesters joined j98. They had asked about four different
+commits and all four were given 7bc3795's verdict, from one execution,
+with identical output in every log.
+
+**The exposure is wider than the first consumer believes.** They
+reported it against their argument-less command and think only that one
+is affected. It is not. Their command with arguments escaped only
+because the *arguments* differed between the two runs they happened to
+compare: `{args}` is filled into the line before the job is minted
+(D107), so two different scenarios are two different lines and two
+different keys — but two submissions of **one** scenario at two commits
+produce the same line, the same arguments and the same key, and collide
+exactly as the argument-less one does. Every declared command whose
+resolved line does not happen to carry the revision is exposed, which
+is the normal case and not the exception.
+
+**Choice.** The key is the command, the labels, **and the commit a
+declaration names**. The commit is written as one more counted field,
+`length:bytes`, after the labels — D69's encoding, for D69's reason: a
+commit pasted onto its neighbour could make a shorter line with a
+longer commit equal to a longer line with a shorter one. An **ad-hoc**
+submission has no declaration, so no commit field is written at all —
+not an empty one — and its key means exactly what it has always meant,
+because its line really does carry whatever revision it names. A
+declared key is an ad-hoc key with one field appended, so the two can
+never be equal.
+
+What does not change: the priority stays out of the key, and the higher
+level still wins on a join (E-05); the labels stay in it, canonical
+from `LabelSet`; two submissions of one declared command at one commit
+are still one execution, which is E-05's whole value — a push hook
+firing twice must not run the work twice — and a fix that made every
+key unique would have been no fix at all.
+
+**No migration, and that is a claim, not an omission.** The key is
+*derived*, never stored: D69 put it that way on purpose, and `job.json`
+has no key field, nor has the index file, which carries only the
+version, the job count and the pending ids. The open-key map is rebuilt
+from the records at every start, so this change alters what is computed
+from a record and not what is written in one. Every existing record
+already carries its whole `declaration`, so it keys correctly under the
+new rule with no field added, no default and no bump of
+`RECORD_VERSION`, which stays 1 (D73). `PROTOCOL_VERSION` does not move
+either: the key is hub-internal and no message carries it.
+
+The records that merged wrongly are still wrong, and nothing here
+rewrites them: a joined record says it answered N submissions and
+cannot say which commits those requesters asked about, because that was
+never written down. They are over; the next submission of any of those
+commits mints and runs (D70).
+
+**The general lesson, which is why this entry is long.** *A field that
+moves out of a string takes its meaning out of every key built from
+that string.* Nothing failed to compile when M10 gave the commit a slot
+of its own; no type changed, no test went red, and the key simply
+stopped distinguishing something it had been distinguishing by
+accident. The comment that recorded the accident — "today the command
+is where it is" — was the only warning, and it was written as a
+reassurance rather than as a tripwire. Before giving a submission a new
+field, ask whether it used to be part of a string some key already
+reads; and when a comment says a property holds "today", give it a test
+rather than a sentence.
+
+**Tests.** Unit: the key over a declared submission whose line says
+nothing about the commit, one commit against two, arguments against
+commits, an ad-hoc line against a declared one, and a byte moved from
+the line into the commit. Store: two declared submissions at one commit
+mint and join, at two commits mint twice, and a hub that restarts
+rebuilds the link keyed on the commit. End to end, through the real
+`herdctl` binary, a real hub, a real runner and the four executor steps
+— `herdctl/tests/declared_dedup.rs` — two submissions of one declared
+command at two commits, each caller told about its own commit by the
+fixture's own `fetch` hook; and the same two at one commit, one
+execution answering both. Both end-to-end tests hold the first job
+inside `run` on a gate the test opens, so the overlap the question is
+asked in is arranged and not raced: without the gate they would pass
+against the very defect they exist for.
+
+**Alternative rejected.** Keying on the whole `Declaration`, executor
+hooks and environment included. It would catch the commit, since the
+resolved hooks carry it, but it would also make a job that differs only
+in a hook's wording a second execution — and the declaration is read
+from the requester's working tree, so an uncommitted edit to the TOML
+would silently stop a push hook's two firings from merging.
+
+---
+
+## 2026-10-18 — D157 The latency target is not what stalls this host
 
 **The first consumer proposed loosening `io.cost.qos` from a p95 of 5 ms to
 10-20 ms, and the measurement says it would change nothing.** Their

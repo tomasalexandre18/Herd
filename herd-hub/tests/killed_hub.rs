@@ -1700,6 +1700,17 @@ async fn a_health_cadence_of_zero_is_refused_on_both_sides() {
 /// itself. That is deliberate: if the connection had not counted as having
 /// served, the runner would come back at a *higher* number and this fails
 /// loudly, rather than passing on a premise it never established (D101).
+///
+/// **The premise is the floor, and it is held down by a sleeping job
+/// (D155).** `Backoff::settled` resets nothing for a connection shorter than
+/// the cap, so the connection below has to outlive 50 ms or the runner is
+/// *right* to come back at the fifth attempt and this test is asserting a
+/// race. Nothing about `wait_for_runner` returning says it will: that waits
+/// for a `printf`, which is over in a millisecond, and the whole
+/// welcome-to-kill span measured 65 ms on two cores against the 50 ms floor.
+/// So the span is made long enough rather than hoped to be: the job below
+/// sleeps six floors, cannot report before it has slept, cannot start before
+/// the welcome, and is answered before the kill.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_connection_that_served_starts_the_redial_counters_over() {
     let herd = Herd::new();
@@ -1708,11 +1719,16 @@ async fn a_connection_that_served_starts_the_redial_counters_over() {
     // small because it is twice over the figure under test: it is the floor a
     // connection has to clear to count as having served, and the ceiling on
     // how long these failures take.
+    const FLOOR: &str = "0.05";
+    // Six times that floor, as a shell's `sleep`: the one figure here that a
+    // starved host can only make *longer*, which is what makes the premise
+    // hold where wall-clock luck did not.
+    const HELD_OPEN: &str = "sleep 0.3";
     let mut runner = herd.start_runner_with(
         "the-real-runner",
         "runner",
         "runner",
-        &["--redial-first", "0.05", "--redial-cap", "0.05"],
+        &["--redial-first", FLOOR, "--redial-cap", FLOOR],
     );
     let out = herd.logs.path().join("runner-out");
     let said = || std::fs::read_to_string(&out).unwrap_or_default();
@@ -1725,6 +1741,18 @@ async fn a_connection_that_served_starts_the_redial_counters_over() {
     // and carried work rather than merely opening.
     let mut hub = herd.start_hub("hub").await;
     herd.wait_for_runner().await;
+    // And then the job that holds it open past the floor. Its result is back
+    // before the kill below, so the connection the kill ends has lasted at
+    // least as long as the sleep — six times what `settled` asks for, by the
+    // sleeping child's own clock rather than by this host's luck.
+    let held = herd
+        .herdctl(&["run", "--", "/bin/sh", "-c", HELD_OPEN])
+        .await;
+    assert!(
+        held.status.success(),
+        "the job that holds the connection open past the floor did not run: {}",
+        String::from_utf8_lossy(&held.stderr)
+    );
     let climbed = said();
     assert!(
         climbed.contains("(attempt 4)"),
@@ -1735,8 +1763,20 @@ async fn a_connection_that_served_starts_the_redial_counters_over() {
     hub.signal(rustix::process::Signal::KILL).await;
     assert!(!hub.alive(), "the hub is gone");
     let from_here = climbed.len();
+    // The **first** redial the runner announces after the kill, which is the
+    // only one that carries the counter this test is about: the hub is gone,
+    // so every dial after it fails too and the storm counts up through 3, 4,
+    // 5 — a search of the whole slice would eventually find any number it was
+    // looking for. Whole lines only, so a read that caught the file mid-write
+    // cannot leave half of an earlier line looking like this one.
+    let first_redial = |text: &str| -> Option<String> {
+        text.lines()
+            .find(|line| line.starts_with("herd-runner: dialling ") && line.contains("again in"))
+            .map(str::to_owned)
+    };
     herd.wait_until("the runner has redialled after the kill", || {
-        said()[from_here.min(said().len())..].contains("again in")
+        let after = said();
+        first_redial(&after[from_here.min(after.len())..]).is_some()
     })
     .await;
 
@@ -1744,8 +1784,9 @@ async fn a_connection_that_served_starts_the_redial_counters_over() {
     // it just lost was a connection, so the failures before it are spent.
     let after = said();
     let after = &after[from_here.min(after.len())..];
+    let redialled = first_redial(after).expect("the wait above has just seen one");
     assert!(
-        after.contains("(attempt 2)"),
+        redialled.contains("(attempt 2)"),
         "a runner that had been serving must redial as if this were its first \
          failure, not carry on from the four dials that preceded it: {after}"
     );

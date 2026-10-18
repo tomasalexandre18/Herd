@@ -31,8 +31,9 @@
 //! returns a plausible string.
 //!
 //! One fixture per test, built fresh. Nothing in this module is shared between
-//! tests, and the three mutators ([`Fixture::dirty`],
-//! [`Fixture::commit_unpushed`], [`Fixture::add_third_command`]) each assert
+//! tests, and the four mutators ([`Fixture::dirty`],
+//! [`Fixture::commit_unpushed`], [`Fixture::commit_pushed`],
+//! [`Fixture::add_third_command`]) each assert
 //! that the state they were asked for is the state the repository is now in —
 //! a mutator that quietly did nothing would hand its caller a test that passes
 //! on a premise nobody established.
@@ -235,6 +236,14 @@ timeout_s = 600
 /// `{out}/files/results.json`. `--leave-bytes <n>` makes that file about `n`
 /// bytes instead of a short JSON, so a test can put a real collection over a
 /// real cap.
+///
+/// `--wait-for <absolute path>` holds the run until that path exists, so a
+/// test can decide **when** a job ends instead of racing it. That is what
+/// makes a test about two submissions overlapping deterministic: a job that
+/// is still running is a job a second submission could join, and without a
+/// gate the test would be asserting about whichever of the two the machine
+/// happened to finish first (D156). It is an ordinary argument, so two
+/// submissions that must be byte-identical can both carry it.
 const STEP_SOURCE: &str = r#"#!/bin/sh
 # The fixture consumer's one tool. Appends the step it was asked for to
 # steps.txt in the directory it runs in, prints one line, prints its verdict,
@@ -249,23 +258,43 @@ const STEP_SOURCE: &str = r#"#!/bin/sh
 # `--leave <path>` writes that path under $GROVE_OUT, which is {out}: this is
 # the consumer whose result is a file rather than only an exit code.
 # `--leave-bytes <n>` makes it about n bytes, for a test about the cap.
+#
+# `--wait-for <absolute path>` holds the run until that path exists, so a test
+# can decide when this job ends rather than race it. Bounded, so a test that
+# never opens its gate fails rather than hangs.
 set -u
 step=${1:?a step name}
 shift
 verdict=0
 leave=
 leave_bytes=
+wait_for=
 previous=
 for word in "$@"; do
     case $previous in
     --verdict) verdict=$word ;;
     --leave) leave=$word ;;
     --leave-bytes) leave_bytes=$word ;;
+    --wait-for) wait_for=$word ;;
     esac
     previous=$word
 done
 printf '%s %s\n' "$step" "$*" >> steps.txt
 printf 'grove %s: %s\n' "$step" "$*"
+if [ -n "$wait_for" ]; then
+    waited=0
+    while [ ! -e "$wait_for" ]; do
+        waited=$((waited + 1))
+        if [ "$waited" -gt 300 ]; then
+            printf 'grove %s: gave up waiting for %s\n' "$step" "$wait_for" >&2
+            exit 70
+        fi
+        # A tenth of a second where the host has one, a whole one where it
+        # does not: a gate that is already open is not waited on at all.
+        sleep 0.1 2>/dev/null || sleep 1
+    done
+    printf 'grove %s: gate %s is open\n' "$step" "$wait_for"
+fi
 if [ -n "$leave" ]; then
     # {out} is the directory the runner made and the runner collects; a tool
     # that cannot find it has been given no place to leave anything, and
@@ -563,6 +592,31 @@ impl Fixture {
         assert!(
             dirty.trim().is_empty(),
             "the unpushed commit left the tree dirty, which is a second refusal: {dirty:?}"
+        );
+        hash
+    }
+
+    /// Commit a change to a tracked file and push it, returning its hash.
+    ///
+    /// A **second commit of the same repository**, with the declaration
+    /// untouched: both commits declare the same commands, so a submission at
+    /// either of them resolves to the very same line. That is the state D156
+    /// is about — two submissions whose only difference is the commit — and
+    /// it is the ordinary one, because `{commit}` goes into the executor's
+    /// steps rather than into a command's line.
+    pub fn commit_pushed(&self, rel: &str, content: &str) -> String {
+        self.git(&["ls-files", "--error-unmatch", "--", rel]);
+        let before = self.rev_parse("HEAD");
+        self.write(rel, content);
+        self.git(&["add", "-A"]);
+        self.git(&["commit", "-qm", "a second commit of the same repository"]);
+        self.git(&["push", "-q", REMOTE, BRANCH]);
+        let hash = self.rev_parse("HEAD");
+        assert_ne!(hash, before, "the fixture committed nothing");
+        let holding = self.git(&["branch", "--remotes", "--contains", &hash]);
+        assert!(
+            holding.contains(&format!("{REMOTE}/{BRANCH}")),
+            "the second commit was pushed and no remote-tracking ref holds {hash}: {holding:?}"
         );
         hash
     }
