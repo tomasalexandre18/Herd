@@ -6371,3 +6371,54 @@ resolved hooks carry it, but it would also make a job that differs only
 in a hook's wording a second execution — and the declaration is read
 from the requester's working tree, so an uncommitted edit to the TOML
 would silently stop a push hook's two firings from merging.
+
+---
+
+## 2026-10-18 — D157 The latency target is not what stalls this host
+
+**The first consumer proposed loosening `io.cost.qos` from a p95 of 5 ms to
+10-20 ms, and the measurement says it would change nothing.** Their
+reasoning was sound: iocost cuts everyone's rate when the device's p95
+crosses the target, a DRAM-less 980 crosses 5 ms in bursts, and they see IO
+pressure at 95-99 % for a minute at a time. Every step of that is plausible.
+It is also, on the evidence, not what is happening.
+
+**What was measured.** `cost.vrate` from `/sys/fs/cgroup/io.stat` beside
+`full avg10` from `/proc/pressure/io`, every two seconds, 784 samples across
+26 minutes of ordinary work on the server — builds, QEMU, the usual
+neighbours. `vrate` is the percentage of the cost model the controller is
+currently granting: at 100 it is granting exactly the model, below it is
+throttling, above it has decided the device is faster than modelled.
+
+```
+quiet   (full avg10 < 5 %):  mean vrate 95.4   over 524 samples
+stalled (full avg10 > 50 %): mean vrate 96.5   over  20 samples
+```
+
+**The two are indistinguishable, and the sign is backwards from the
+hypothesis.** During the two worst episodes — pressure climbing to 78.67 %
+and to 86.22 % — vrate sat at 104.80 and 91.60, which is the controller wide
+open. The *lowest* vrate in the whole run, 69.02, happened at 4.21 %
+pressure: it trimmed while nothing was stalled. Across the run vrate ranged
+69 to 148 with no relationship to pressure at all.
+
+**So the stalls are processes waiting on IO the device is already doing, not
+iocost refusing to let them have it.** Loosening the target would tune a
+knob that is not engaged, and the minute-long stalls would come back
+unchanged — while latency grew for everyone the rest of the time, which is
+what a looser target actually buys. D136 asked for the target and D135 built
+the hard ceiling; neither is the thing to move next.
+
+**What this does not establish.** No sample landed inside one of the
+95-99 % minute-long spikes the consumer reports — the worst seen here is
+86 % for about twenty seconds. If vrate collapses toward the `min=1.00`
+floor *there* and only there, the earlier suggestion stands: raise the
+floor, which bounds how deep a cut can go without letting latency grow all
+the time. The sampler is cheap and the next heavy window settles it. Until
+then this entry says what 784 samples say and not more.
+
+**The method is the part to keep.** Both sides of this had a mechanism that
+sounded right, and two messages of argument had already been spent on it. One
+`awk` over a log settled it in favour of neither. When the next host
+question comes with a plausible story attached, measure the thing the story
+is about before agreeing with it.
