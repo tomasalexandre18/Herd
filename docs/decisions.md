@@ -6135,6 +6135,123 @@ that transport — it loads with `docker load` and pushes with
 
 ---
 
+## 2026-10-18 — D155 The served floor, and a test that hoped to clear it
+
+**`main` went red on the test again, not on the product.** CI's `check`
+job failed on a documentation-only pull request, in the `herd-hub`
+integration binary `killed_hub`, on
+`a_connection_that_served_starts_the_redial_counters_over`:
+
+```
+panicked at herd-hub/tests/killed_hub.rs:1747:5:
+a runner that had been serving must redial as if this were its first failure,
+not carry on from the four dials that preceded it:
+herd-runner: dialling ws://127.0.0.1:44583 again in 46.669602ms (attempt 5)
+```
+
+Same test as D146, different line and a different cause, so it is written
+down separately rather than filed under the fix that is already in. The
+product is right; the test asserted a property it had not established.
+
+**What the test was missing.** `Backoff::settled` resets the redial
+counters only for a connection that lasted at least the cap, and the cap
+is the whole argument: a hub that accepts and dies in a loop must not be
+answered every `first` for ever, and the give-up bound must still fire on
+a hub that is broken rather than absent (D104). The test passes
+`--redial-cap 0.05`, so **the floor it has to clear is 50 ms** — and
+nothing in the test held the connection open that long. It waited for
+`wait_for_runner`, which is a `printf` over in a millisecond, read the
+log, and killed the hub. The span from the hub's welcome to the runner
+noticing the reset was whatever the host happened to make it.
+
+**Measured, by printing the span the runner itself judges.** With a
+temporary line in `serve_forever` reporting `served_since` and the cap at
+every redial decision, under
+`systemd-run --scope -p IOWeight=20 -p CPUWeight=20 -p AllowedCPUs=0-1`,
+six runs of the whole binary on two cores gave 65.5, 77.2, 78.1, 82.1,
+173.9 and 298.8 ms against the 50 ms floor. Eight runs of the binary at
+`--test-threads 18` on twelve cores gave 71.9 to 436.1 ms. **The smallest
+margin seen was 15 ms**, on exactly the two-core shape CI runs. That is
+not a test with a property, it is a test with a coin.
+
+**The failure reproduces on demand, word for word, by moving the floor
+rather than the host.** Raising the test's cap to `0.5` so that the floor
+sits above the span the host was going to produce gives:
+
+```
+herd-runner: DEBUG served=Some(305.71204ms) cap=500ms settled=false failures=3
+…
+a runner that had been serving must redial as if this were its first failure,
+not carry on from the four dials that preceded it:
+herd-runner: dialling ws://127.0.0.1:37711 again in 319.95527ms (attempt 5)
+```
+
+which is CI's panic in the same shape, including the `(attempt 5)` — the
+counter reaching 4 because the three dials before the hub came up were
+never spent. The arithmetic checks out too: `(attempt 5)` is the *only*
+number a missed reset can print here, since the test waits for
+`(attempt 4)` and the hub comes up straight after it.
+
+**Not reproduced: the natural crossing.** 25 runs of the single test and
+16 of the whole binary under the low-weight scope, most of them on two
+cores, never put the span under 50 ms. So the mechanism is proved and the
+figures are measured, but that CI's run crossed the floor the natural way
+is read off CI's own line rather than seen here. Nothing else explains
+`(attempt 5)`: the slice the test takes cannot produce it, because
+`climbed` is read before the kill and the file only grows — the boundary
+in the brief's second hypothesis is sound, and it is the floor that is
+not.
+
+**What a user would have seen, had it been the product.** Nothing, this
+time: the reset fired at 65 ms where the floor is 50 ms, as specified.
+The thing worth keeping an eye on is the floor itself at its shipped
+value. The cap in production is 30 s, so a link that cannot hold a
+connection for 30 s never resets anything, and a runner on it walks the
+24 h give-up bound and **exits** while it is still carrying jobs between
+drops. D104 chose that on purpose — it is the same sentence that stops an
+accept-and-die hub from being hammered — and it is not changed here. But
+the WSL2 PC, behind a NAT on a laptop-grade link, is the first machine
+where "every connection shorter than thirty seconds" is imaginable, and
+if it ever gives up with jobs behind it, this paragraph is where to
+start. Changing the rule is Alexa's call, not a test fix.
+
+**The repair: the premise is made true, and the assertion is about the
+first redial.** Two changes, both in the test.
+
+1. **A job that sleeps six floors.** After `wait_for_runner`, the test
+   runs `sleep 0.3` through `herdctl run` and requires it to succeed. The
+   job cannot start before the welcome, cannot report before it has
+   slept, and is answered before the kill, so the connection's life is
+   bounded below by a sleeping child's own clock — the one figure a
+   starved host can only make longer. Six times the floor instead of the
+   1.3 that was there.
+2. **The first redial after the kill, not any line in the slice.** The
+   hub is dead, so the storm that follows counts up through 3, 4, 5 and a
+   search of the whole slice would eventually find whatever number it was
+   looking for; only the first announcement carries the counter. It is
+   matched on whole lines beginning `herd-runner: dialling `, so a read
+   that caught the file mid-write cannot leave half of an earlier line
+   looking like the one under test.
+
+**The repaired test still fails on the defect it exists for.** With
+`Backoff::settled` forced back to its pre-D104 answer — never settled —
+the test fails with the same sentence and the same `(attempt 5)`. A test
+that cannot fail would have been the worse outcome of the two, so this
+was checked rather than argued.
+
+**One thing seen and not diagnosed.** In 25 runs of the single test
+pinned to two CPUs on a host at load average 40, one run failed
+differently: the runner printed `joining ws://…` and then nothing at all
+for the full 30 s patience, so the first wait timed out before any dial
+was announced. On loopback a dial at a port nobody holds is refused in
+microseconds, so a 30 s silence is a stall somewhere, not a slow refusal
+— but it was seen once, under starvation harsher than CI's (two shared
+CPUs against CI's two dedicated ones), and it is not this entry's
+failure. Written down so the next reader of a `killed_hub` timeout has
+it.
+
+---
+
 ## 2026-10-18 — D156 The dedup key carries the commit a declaration names
 
 **Context.** E-05 joins a second submission of the same work, and D69
