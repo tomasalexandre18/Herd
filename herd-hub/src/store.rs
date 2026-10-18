@@ -2796,6 +2796,10 @@ mod tests {
     /// requester's own checkout (D106).
     const A_COMMIT: &str = "cb5a2e8b4f1d9c7a3e05b8d6f2a1c4e79b0d3f68";
 
+    /// A second commit of the same repository, for the submissions that must
+    /// **not** be one piece of work (D156).
+    const ANOTHER_COMMIT: &str = "3f7d1a90c6e84b25df0a7c13e95b6482da10c7fe";
+
     /// A declared command as a submission carries it, shaped like the first
     /// consumer's and named like nothing of theirs (E-11).
     fn a_declaration() -> Declaration {
@@ -3685,6 +3689,128 @@ mod tests {
             .filter(|event| matches!(event.what, JobEventKind::Joined { .. }))
             .collect();
         assert_eq!(joins.len(), 2, "two joins, one line each: {events:?}");
+    }
+
+    /// A declared submission, as the hub receives one: a resolved line that
+    /// says nothing about the commit — which is the ordinary declared
+    /// command, since `{commit}` goes into the executor's `up` and `fetch`
+    /// steps — and the commit in a field of its own (D156).
+    fn declared_work(commit: &str) -> NewJob {
+        let declaration = Declaration {
+            commit: commit.to_owned(),
+            ..a_declaration()
+        };
+        NewJob::at(
+            vec!["tool check --all".to_owned()],
+            LabelSet::new(["build"]).expect("a label"),
+            Priority::Step,
+        )
+        .declared(Some(declaration), None)
+    }
+
+    /// E-05 still holds for a declared command: a push hook firing twice at
+    /// one commit must not run the work twice. D156 put the commit in the
+    /// key and must not have made every key unique.
+    #[test]
+    fn two_declared_submissions_at_one_commit_are_one_job() {
+        let (_dir, store) = store();
+        let first = match store.submit(declared_work(A_COMMIT)).expect("the first") {
+            Submission::Minted(record) => record,
+            other => panic!("the first submission should mint: {other:?}"),
+        };
+        match store.submit(declared_work(A_COMMIT)).expect("the second") {
+            Submission::Joined { record, .. } => {
+                assert_eq!(record.id, first.id, "both callers hold one id");
+                assert_eq!(record.submissions, 2);
+            }
+            other => panic!("the second submission should join: {other:?}"),
+        }
+        assert_eq!(
+            store.unfinished_jobs().expect("the queue reads").len(),
+            1,
+            "one declared command at one commit is one job"
+        );
+    }
+
+    /// The defect D156 fixes, at the level the hub actually decides it: the
+    /// same declared command at two commits joins nothing, and each
+    /// submission gets a job carrying its **own** commit.
+    ///
+    /// Before D156 the key was the command and the labels alone, so these two
+    /// submissions were byte-identical work and the second was handed the
+    /// first's verdict — a wrong answer presented as a right one.
+    #[test]
+    fn two_declared_submissions_at_two_commits_are_two_jobs() {
+        let (_dir, store) = store();
+        let first = match store.submit(declared_work(A_COMMIT)).expect("the first") {
+            Submission::Minted(record) => record,
+            other => panic!("the first submission should mint: {other:?}"),
+        };
+        let second = match store
+            .submit(declared_work(ANOTHER_COMMIT))
+            .expect("the second")
+        {
+            Submission::Minted(record) => record,
+            Submission::Joined { record, .. } => panic!(
+                "a submission for {ANOTHER_COMMIT} joined {}, which is running {A_COMMIT}",
+                record.id
+            ),
+        };
+        assert_ne!(first.id, second.id);
+        assert_eq!(first.submissions, 1);
+        assert_eq!(second.submissions, 1);
+        // The resolved line really is the same on both: it is the commit,
+        // and nothing else, that made them two pieces of work.
+        assert_eq!(first.command, second.command);
+        assert_eq!(first.labels, second.labels);
+        let commit_of = |record: &JobRecord| {
+            record
+                .declaration
+                .as_ref()
+                .expect("a declared submission")
+                .commit
+                .clone()
+        };
+        assert_eq!(commit_of(&first), A_COMMIT);
+        assert_eq!(commit_of(&second), ANOTHER_COMMIT);
+        assert_eq!(
+            store.unfinished_jobs().expect("the queue reads").len(),
+            2,
+            "two commits are two jobs"
+        );
+    }
+
+    /// The key is derived from the record, so the link the hub rebuilds at
+    /// start keys on the commit too — and D156 therefore needed nothing of
+    /// the records on disk (no field, no default, no [`RECORD_VERSION`]).
+    #[test]
+    fn a_recovered_declared_job_is_keyed_on_its_own_commit() {
+        let dir = tempfile::tempdir().expect("a temporary directory");
+        let first = {
+            let store = JobDirStore::open(dir.path()).expect("the state root opens");
+            store
+                .create_job(declared_work(A_COMMIT))
+                .expect("the first job")
+        };
+        // A hub that comes back reads the records and rebuilds the links.
+        let store = JobDirStore::open(dir.path()).expect("the state root reopens");
+        match store
+            .submit(declared_work(A_COMMIT))
+            .expect("the same work")
+        {
+            Submission::Joined { record, .. } => assert_eq!(record.id, first.id),
+            other => panic!("the same commit should join across a restart: {other:?}"),
+        }
+        match store
+            .submit(declared_work(ANOTHER_COMMIT))
+            .expect("other work")
+        {
+            Submission::Minted(record) => assert_ne!(record.id, first.id),
+            Submission::Joined { record, .. } => panic!(
+                "a submission for {ANOTHER_COMMIT} joined the recovered {}",
+                record.id
+            ),
+        }
     }
 
     /// E-05: "the merged job takes the higher priority" — and only ever the

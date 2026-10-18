@@ -398,12 +398,31 @@ impl NewJob {
     /// The key E-05 deduplicates on: what makes two submissions *the same
     /// work*.
     ///
-    /// The command and the labels, and nothing else. Not the priority — two
-    /// agents asking for one build at two levels are still asking for one
-    /// build, and the higher level wins (E-05). Not the time, not the
-    /// requester. The commit will join it when a submission names one
-    /// (E-01, M10): it is part of the command's meaning, and today the
-    /// command is where it is.
+    /// **The command, the labels, and the commit a declaration names**, and
+    /// nothing else. Not the priority — two agents asking for one build at
+    /// two levels are still asking for one build, and the higher level wins
+    /// (E-05). Not the time, not the requester.
+    ///
+    /// The commit is in the key for a **declared** submission and absent for
+    /// an **ad-hoc** one, and that is not an inconsistency. An ad-hoc command
+    /// line carries whatever revision it names inside itself, so its own text
+    /// already tells two commits apart. A declared submission keeps the
+    /// commit in [`Declaration::commit`], a field of its own, and its
+    /// `command` is the resolved line — which need not mention the commit at
+    /// all, and usually does not, because `{commit}` goes into the executor's
+    /// `up` and `fetch` steps rather than into the line (D156).
+    ///
+    /// **The trap, written down so it is not walked into again: a field that
+    /// moves out of a string takes its meaning out of every key built from
+    /// that string.** The sentence this comment used to carry — "the commit
+    /// is part of the command's meaning, and today the command is where it
+    /// is" — was true of the ad-hoc submission it was written for, and M10's
+    /// declarations made it false the moment the commit got a slot of its
+    /// own. Nothing failed to compile and no test went red: the key simply
+    /// stopped distinguishing commits, and four requesters asking about four
+    /// commits were handed one commit's verdict, silently. Before giving a
+    /// submission a new field, ask whether it used to be part of a string a
+    /// key already reads.
     ///
     /// **Length-prefixed, never concatenated.** `["a b", "c"]` and
     /// `["a", "b c"]` are different work, and any key built by joining
@@ -413,9 +432,18 @@ impl NewJob {
     /// parsed back and two different lists can never produce one key. The
     /// labels go through the same encoding and are already sorted and
     /// deduplicated by [`LabelSet`], so naming two labels in the other order
-    /// is the same work.
+    /// is the same work — and so does the commit, which is one more field
+    /// that must not be able to run into its neighbour.
     pub fn dedup_key(&self) -> String {
-        dedup_key(&self.command, &self.labels)
+        dedup_key(&self.command, &self.labels, self.declared_commit())
+    }
+
+    /// The commit this submission's declaration names, or `None` for an
+    /// ad-hoc submission, which declares nothing (E-01, M10).
+    fn declared_commit(&self) -> Option<&str> {
+        self.declaration
+            .as_ref()
+            .map(|declaration| declaration.commit.as_str())
     }
 }
 
@@ -505,9 +533,15 @@ pub fn reading_key(commit: &str, command: &str, args: &[String]) -> String {
     key
 }
 
-/// The key E-05 deduplicates on, for a command and a label set that are
-/// already somewhere — on a record, say. See [`NewJob::dedup_key`].
-pub fn dedup_key(command: &[String], labels: &LabelSet) -> String {
+/// The key E-05 deduplicates on, for a command, a label set and a declared
+/// commit that are already somewhere — on a record, say. See
+/// [`NewJob::dedup_key`], which is where the whole of it is written down.
+///
+/// `commit` is `None` for an ad-hoc submission. The field is then written
+/// nowhere in the key rather than as an empty piece, so an ad-hoc key still
+/// means exactly what it has always meant; and a declared key is that same
+/// key with one more counted field after it, which no ad-hoc key can equal.
+pub fn dedup_key(command: &[String], labels: &LabelSet, commit: Option<&str>) -> String {
     let mut key = String::new();
     key.push_str("command ");
     for piece in command {
@@ -516,6 +550,10 @@ pub fn dedup_key(command: &[String], labels: &LabelSet) -> String {
     key.push_str(" labels ");
     for label in labels.iter() {
         push_counted(&mut key, label);
+    }
+    if let Some(commit) = commit {
+        key.push_str(" commit ");
+        push_counted(&mut key, commit);
     }
     key
 }
@@ -987,8 +1025,21 @@ impl JobRecord {
     /// disagreement would silently join two submissions that are not the
     /// same work. The hub's index of open keys is rebuilt from the records at
     /// every start, through this.
+    ///
+    /// **Derived is also why D156 needed no migration.** Putting the commit
+    /// in the key changed what is computed from a record, not what is
+    /// written in one: every record already carries its whole
+    /// [`JobRecord::declaration`], so an existing `job.json` keys correctly
+    /// under the new rule with no field added, no default, and no bump of
+    /// [`RECORD_VERSION`].
     pub fn dedup_key(&self) -> String {
-        dedup_key(&self.command, &self.labels)
+        dedup_key(
+            &self.command,
+            &self.labels,
+            self.declaration
+                .as_ref()
+                .map(|declaration| declaration.commit.as_str()),
+        )
     }
 
     /// How much memory this job declares it needs, in MiB, given the `-j` it
@@ -1998,7 +2049,14 @@ mod tests {
         assert_eq!(record.labels, labels(&["build"]));
         assert_eq!(
             record.dedup_key(),
-            dedup_key(&record.command, &record.labels)
+            dedup_key(
+                &record.command,
+                &record.labels,
+                record
+                    .declaration
+                    .as_ref()
+                    .map(|declaration| declaration.commit.as_str())
+            )
         );
     }
 
