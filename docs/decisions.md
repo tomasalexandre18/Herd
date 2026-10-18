@@ -6132,3 +6132,125 @@ blob: io: read/write on closed pipe`, which is why the local proof above
 went through a re-tagged `docker load` instead. The workflow does not use
 that transport — it loads with `docker load` and pushes with
 `docker://` — so it is a note about this server, not about the release.
+
+---
+
+## 2026-10-18 — D156 The dedup key carries the commit a declaration names
+
+**Context.** E-05 joins a second submission of the same work, and D69
+fixed what "the same work" means: the command and the labels, counted.
+That was right for the only kind of submission that existed then, the
+ad-hoc one, whose command line contains whatever revision it names — so
+keying on the line keyed on the commit as a side effect. `dedup_key`'s
+own comment said as much: "the commit will join it when a submission
+names one (E-01, M10): it is part of the command's meaning, and today
+the command is where it is."
+
+M10 made that sentence false and nobody came back to it. A declared
+submission keeps its commit in `Declaration::commit`, a field of its
+own, and its `command` is the resolved line — which need not mention
+the commit at all, and usually does not, because `{commit}` goes into
+the executor's `up` and `fetch` steps. A declared line that
+interpolates nothing commit-shaped is therefore byte-identical at every
+commit in the repository, and every submission of it joined one job.
+
+**The defect, which is the worst class: a wrong answer presented as a
+right one.** A requester asked Herd to check commit A and was handed
+commit B's verdict, silently, with nothing in the output, the record or
+the logs saying anything had been substituted. Confirmed on the live
+hub's own disk:
+
+```
+j0000000098  "submissions":4
+  "command":["cargo fmt --check && CARGO_BUILD_JOBS={j} cargo xtask clippy"]
+  "commit":"7bc3795600b41c148636cc6a5ac8d540c180ce54"
+
+j0000000146  "submissions":2
+  "command":["cargo fmt --check && CARGO_BUILD_JOBS={j} cargo xtask clippy"]
+  "commit":"bc78ebdc277b9ac7380d6ae0bfc9a71ca5d2ee4d"
+```
+
+Four requesters joined j98. They had asked about four different
+commits and all four were given 7bc3795's verdict, from one execution,
+with identical output in every log.
+
+**The exposure is wider than the first consumer believes.** They
+reported it against their argument-less command and think only that one
+is affected. It is not. Their command with arguments escaped only
+because the *arguments* differed between the two runs they happened to
+compare: `{args}` is filled into the line before the job is minted
+(D107), so two different scenarios are two different lines and two
+different keys — but two submissions of **one** scenario at two commits
+produce the same line, the same arguments and the same key, and collide
+exactly as the argument-less one does. Every declared command whose
+resolved line does not happen to carry the revision is exposed, which
+is the normal case and not the exception.
+
+**Choice.** The key is the command, the labels, **and the commit a
+declaration names**. The commit is written as one more counted field,
+`length:bytes`, after the labels — D69's encoding, for D69's reason: a
+commit pasted onto its neighbour could make a shorter line with a
+longer commit equal to a longer line with a shorter one. An **ad-hoc**
+submission has no declaration, so no commit field is written at all —
+not an empty one — and its key means exactly what it has always meant,
+because its line really does carry whatever revision it names. A
+declared key is an ad-hoc key with one field appended, so the two can
+never be equal.
+
+What does not change: the priority stays out of the key, and the higher
+level still wins on a join (E-05); the labels stay in it, canonical
+from `LabelSet`; two submissions of one declared command at one commit
+are still one execution, which is E-05's whole value — a push hook
+firing twice must not run the work twice — and a fix that made every
+key unique would have been no fix at all.
+
+**No migration, and that is a claim, not an omission.** The key is
+*derived*, never stored: D69 put it that way on purpose, and `job.json`
+has no key field, nor has the index file, which carries only the
+version, the job count and the pending ids. The open-key map is rebuilt
+from the records at every start, so this change alters what is computed
+from a record and not what is written in one. Every existing record
+already carries its whole `declaration`, so it keys correctly under the
+new rule with no field added, no default and no bump of
+`RECORD_VERSION`, which stays 1 (D73). `PROTOCOL_VERSION` does not move
+either: the key is hub-internal and no message carries it.
+
+The records that merged wrongly are still wrong, and nothing here
+rewrites them: a joined record says it answered N submissions and
+cannot say which commits those requesters asked about, because that was
+never written down. They are over; the next submission of any of those
+commits mints and runs (D70).
+
+**The general lesson, which is why this entry is long.** *A field that
+moves out of a string takes its meaning out of every key built from
+that string.* Nothing failed to compile when M10 gave the commit a slot
+of its own; no type changed, no test went red, and the key simply
+stopped distinguishing something it had been distinguishing by
+accident. The comment that recorded the accident — "today the command
+is where it is" — was the only warning, and it was written as a
+reassurance rather than as a tripwire. Before giving a submission a new
+field, ask whether it used to be part of a string some key already
+reads; and when a comment says a property holds "today", give it a test
+rather than a sentence.
+
+**Tests.** Unit: the key over a declared submission whose line says
+nothing about the commit, one commit against two, arguments against
+commits, an ad-hoc line against a declared one, and a byte moved from
+the line into the commit. Store: two declared submissions at one commit
+mint and join, at two commits mint twice, and a hub that restarts
+rebuilds the link keyed on the commit. End to end, through the real
+`herdctl` binary, a real hub, a real runner and the four executor steps
+— `herdctl/tests/declared_dedup.rs` — two submissions of one declared
+command at two commits, each caller told about its own commit by the
+fixture's own `fetch` hook; and the same two at one commit, one
+execution answering both. Both end-to-end tests hold the first job
+inside `run` on a gate the test opens, so the overlap the question is
+asked in is arranged and not raced: without the gate they would pass
+against the very defect they exist for.
+
+**Alternative rejected.** Keying on the whole `Declaration`, executor
+hooks and environment included. It would catch the commit, since the
+resolved hooks carry it, but it would also make a job that differs only
+in a hook's wording a second execution — and the declaration is read
+from the requester's working tree, so an uncommitted edit to the TOML
+would silently stop a push hook's two firings from merging.

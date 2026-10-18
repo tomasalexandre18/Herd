@@ -577,6 +577,133 @@ mod tests {
         assert_eq!(at(Priority::Merger), at(Priority::Producer));
     }
 
+    // --- the commit in the key (D156) ---
+
+    /// A commit, as a declaration carries it: forty lowercase hex, resolved
+    /// in the requester's own checkout (E-01).
+    const ONE_COMMIT: &str = "7bc3795600b41c148636cc6a5ac8d540c180ce54";
+    const ANOTHER_COMMIT: &str = "bc78ebdc277b9ac7380d6ae0bfc9a71ca5d2ee4d";
+
+    /// A declared submission whose resolved line says **nothing** about the
+    /// commit, which is the ordinary declared command and the whole of the
+    /// defect: `{commit}` goes into the executor's `up` and `fetch` steps,
+    /// so the line is byte-identical at every commit in the repository.
+    fn declared_key(line: &str, args: &[&str], commit: &str) -> String {
+        let declaration = herd_proto::Declaration {
+            command: "a-declared-command".to_owned(),
+            commit: commit.to_owned(),
+            args: args.iter().map(|arg| (*arg).to_owned()).collect(),
+            executor: herd_proto::Executor {
+                up: "tool ws up {job}".to_owned(),
+                fetch: "tool ws fetch {job} {commit}".to_owned(),
+                run: "tool ws run {job} -- {line}".to_owned(),
+                down: "tool ws down {job}".to_owned(),
+                env: std::collections::BTreeMap::new(),
+            },
+        };
+        NewJob::at(
+            vec![line.to_owned()],
+            LabelSet::new(["build"]).expect("valid labels"),
+            Priority::Step,
+        )
+        .declared(Some(declaration), None)
+        .dedup_key()
+    }
+
+    /// E-05's whole value: a push hook firing twice must not run the work
+    /// twice. Same declared command, same arguments, same commit — one key.
+    #[test]
+    fn one_declared_command_at_one_commit_is_one_piece_of_work() {
+        assert_eq!(
+            declared_key("tool check", &[], ONE_COMMIT),
+            declared_key("tool check", &[], ONE_COMMIT)
+        );
+        assert_eq!(
+            declared_key("tool test posix", &["posix"], ONE_COMMIT),
+            declared_key("tool test posix", &["posix"], ONE_COMMIT)
+        );
+    }
+
+    /// The defect D156 fixes: a declared command taking no argument, at two
+    /// commits, is two pieces of work — however little its resolved line
+    /// says about either of them.
+    #[test]
+    fn one_declared_command_at_two_commits_is_two_pieces_of_work() {
+        assert_ne!(
+            declared_key("tool check", &[], ONE_COMMIT),
+            declared_key("tool check", &[], ANOTHER_COMMIT),
+            "a declared command naming no commit in its line must still be \
+             two pieces of work at two commits"
+        );
+    }
+
+    /// The same, with arguments, and it is its own test because the first
+    /// consumer believes their argument-taking command escaped the defect.
+    ///
+    /// It did not. It escaped only the two runs they happened to compare,
+    /// whose *arguments* differed: `{args}` is filled into the line before
+    /// the job is minted (D107), so two scenarios are two lines and two
+    /// keys. Two submissions of **one** scenario at two commits produce the
+    /// same line, the same arguments and — before D156 — the same key.
+    #[test]
+    fn one_declared_command_with_arguments_at_two_commits_is_two_pieces_of_work() {
+        assert_ne!(
+            declared_key("tool test posix", &["posix"], ONE_COMMIT),
+            declared_key("tool test posix", &["posix"], ANOTHER_COMMIT),
+            "arguments are not what saves a declared command: one scenario at \
+             two commits is two pieces of work"
+        );
+    }
+
+    /// The arguments keep their current role, which is the other half of the
+    /// first consumer's belief: one commit, two scenarios, two keys.
+    #[test]
+    fn two_scenarios_at_one_commit_are_still_two_pieces_of_work() {
+        assert_ne!(
+            declared_key("tool test posix", &["posix"], ONE_COMMIT),
+            declared_key("tool test ext4", &["ext4"], ONE_COMMIT)
+        );
+    }
+
+    /// An ad-hoc submission declares nothing and keeps today's meaning: its
+    /// line really does carry whatever revision it names.
+    #[test]
+    fn an_ad_hoc_submission_is_keyed_on_its_line_alone() {
+        assert_eq!(
+            key(&["git", "log", ONE_COMMIT], &["build"]),
+            key(&["git", "log", ONE_COMMIT], &["build"])
+        );
+        assert_ne!(
+            key(&["git", "log", ONE_COMMIT], &["build"]),
+            key(&["git", "log", ANOTHER_COMMIT], &["build"])
+        );
+        // And an ad-hoc line is never the same work as a declared command
+        // that happens to resolve to it: one of them names a commit and the
+        // other does not.
+        assert_ne!(
+            key(&["tool check"], &["build"]),
+            declared_key("tool check", &[], ONE_COMMIT)
+        );
+    }
+
+    /// The commit is one more counted field, so it cannot run into the one
+    /// beside it — the reason the key was length-prefixed in the first place.
+    #[test]
+    fn the_commit_cannot_run_into_its_neighbour() {
+        // The line loses a byte and the commit gains the same byte. A key
+        // that pasted the two together would make these equal.
+        assert_ne!(
+            declared_key("tool chec", &[], &format!("k{ONE_COMMIT}")),
+            declared_key("tool check", &[], ONE_COMMIT)
+        );
+        // And a commit that is the empty string is not the same as no commit
+        // at all, which is what an ad-hoc submission has.
+        assert_ne!(
+            declared_key("tool check", &[], ""),
+            key(&["tool check"], &["build"])
+        );
+    }
+
     // --- the sentence an operator reads ---
 
     #[test]
