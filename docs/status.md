@@ -26,40 +26,38 @@ there rather than reported. At or under 32 MiB an output rides the
 verdict, above it streams; a requester cannot tell which carriage it
 got, and that is a test (D148, D150).
 
-**Protocol version 2**, spent once on the file frames, M11's registry
-frames, and the catch-all arm that ends D128: an unknown frame used not
-to decode at all, so a runner looped redialling into it — 1 dial with the
-arm, **178** without. `RECORD_VERSION` stays 1.
+**Protocol version 2, and the whole fleet is on it.** v0.3.0 is released,
+the hub runs `herd-hub:0.3.0` and the runner 0.3.0, switched together in
+one window and proved with a job through the consumer's own `herdctl`.
+The bump bought the file frames, M11's registry frames, and the catch-all
+arm that ends D128 — an unknown frame used not to decode at all, so a
+runner looped redialling into it: 1 dial with the arm, **178** without.
+`RECORD_VERSION` stays 1, and a job may now return **1 GiB**.
 
 **Proven by the consumer through Herd**: `rig` (1 799 s), `rig firefox`
 (2 660 s), `test d3d` (2 006 s), `test web-firefox` at zero pixels off,
 four `check` runs — so long jobs, KVM behind a busy probe and the
-exclusive `rig-cpu` label all behave as designed. `main` carries M1-M11's
-carriage, M15, M16 and Apache-2.0; `fmt`, `clippy -D warnings` and
-`./scripts/test.sh` are green with 13 loud skips, every one this host's.
+exclusive `rig-cpu` label all behave as designed. The runner offers
+**one** build slot and **two** kvm, Alexa's choice: a VM costs little
+next to a build. `main` carries M1-M11, M15, M16 and Apache-2.0, and the
+gates are green with 13 loud skips, every one this host's.
+
 
 ## What is not done, and why
 
-1. **The hub on the server is still `0.1.0`.** v0.2.0 is released and its
-   image built and staged; applying it is four commands and Alexa's.
-   Until then it refuses a submission when no runner is connected, and a
-   `herdctl wait` on a job that printed over ~48 MiB returns no verdict
-   for a job that passed. Both fixed in v0.2.0, the second reaching them
-   with nothing to redeploy.
-2. **v0.3.0 is not cut, deliberately.** Protocol 2 is a synchronised
-   restart of the whole fleet, and large outputs land on the hub's disk
-   with **nothing yet removing them**: the budget and sweeper are being
-   built, and releasing first would ship a disk-full outage on a fuse.
-3. **The reaper's janitor list is unbuilt** (D134), the last of the
+1. **The reaper's janitor list is unbuilt** (D134), the last of the
    consumer's four blocking items: when a `down` step fails, Herd records
    that and does nothing else, so a failing `up` leaves workspaces behind.
-4. **M17's second machine is prepared, not joined.** Everything possible
+2. **The hub re-reads every job record** on each 200 ms poll of a waiting
+   `--outputs-to` — invisible at today's job count, about 0.9 s of hub
+   time per poll at 100 000 records (D152). Next after the janitor work.
+3. **M17's second machine is prepared, not joined.** Everything possible
    without the PC is done (D149); the load-bearing unknown is whether a
    user scope on WSL2 gets a delegated subtree with `memory` in it.
-5. **`wss://` is configured and never dialled**; the tailnet makes it
+4. **`wss://` is configured and never dialled**; the tailnet makes it
    optional. And one shared token means any requester may ask for the
    merger level: no authentication ceiling per requester yet.
-6. A test that cannot be made honestly **skips loudly** (D27). Thirteen
+5. A test that cannot be made honestly **skips loudly** (D27). Thirteen
    do here, and that counter was itself wrong until today: it said 12.
 
 Open and recorded: D63, D64, D92, D98, D101, D122's two reaper blind
@@ -83,8 +81,10 @@ per-capability probe budgets, a lighter `labels_from`.
 
 ## Next action
 
-The output budget and sweeper, which is what v0.3.0 waits on. Then the
-janitor list (D134), then M17 with Alexa at the PC. Open for him: the
-staged 0.2.0 hub, and the synchronised window for protocol 2 — the
-consumer must not restart piecemeal, because a version-2 hub refuses a
-version-1 `herdctl` by name and their pipeline has no fallback left.
+M17: the runbook is with Alexa and stops after the verification script,
+because whether a user scope on that WSL2 delegates a cgroup with
+`memory` in it decides the shape of everything after it — and the same
+block reports the PC's RAM, the other figure nobody here has. Then the
+janitor list (D134). Waiting on Alexa: a Docker Hub account, a
+repository-scoped token and two repository settings, after which a hub
+deploys by `docker compose pull` instead of a hand-run `docker load`.
