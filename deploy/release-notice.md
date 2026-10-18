@@ -15,7 +15,7 @@ For the full walk — one machine, one person, under thirty minutes — read
 | --- | --- |
 | `herd-runner-<version>-x86_64-unknown-linux-musl` | the client that offers a machine's capacity and runs jobs |
 | `herdctl-<version>-x86_64-unknown-linux-musl` | the CLI: submit a job, follow it, approve a runner |
-| `herd-hub-<version>-x86_64-unknown-linux-musl` | the service. You probably do not need this one: the hub is deployed as a container image (`herd-hub:<version>`), and there is one hub |
+| `herd-hub-<version>-x86_64-unknown-linux-musl` | the service. You probably do not need this one: the hub is deployed as a container image, published by this same tag, and there is one hub. See "the hub is an image" below |
 | `SHA256SUMS` | so you can verify the three rather than trust a URL |
 
 **x86_64 Linux only**, and statically linked against musl: they depend on no
@@ -43,6 +43,47 @@ install -m 0755 herd-runner-<version>-x86_64-unknown-linux-musl \
   /usr/local/bin/herd-runner
 herd-runner --version
 ```
+
+## The hub is an image, and this tag published it
+
+The three files above are the binaries. **The hub is normally not one of
+them**: it is a container image on Docker Hub, pushed by the same workflow
+on the same tag, out of the same Nix derivation that has ever built it
+(`nix/hub-image.nix`, D153). There is no Dockerfile and no second build, so
+the hub a release deploys is the hub a release tested.
+
+The release body above prints the exact reference, by tag and by digest.
+Deploying is then a pull and an up:
+
+```sh
+docker compose pull
+docker compose up -d
+```
+
+`deploy/docker-compose.yml` takes the image from `HERD_HUB_IMAGE` in your
+`.env`; `deploy/env.example` says what to put and `deploy/README.md` walks
+the first start. x86_64 only, for the reason the binaries are.
+
+**There is no `latest` tag and there will not be one.** A hub is a single
+instance that a whole fleet speaks to, and the protocol version is part of
+what it speaks: 0.3.0 moved it from 1 to 2, and a version-2 hub refuses a
+version-1 runner by name. A floating tag means the next `up -d` — a reboot,
+a host upgrade, an unrelated `docker compose pull` — can land the fleet on a
+different protocol without anybody choosing the moment. Naming the version
+is how that stays a decision. Pull a digest if you want it stronger still.
+
+**What the publishing needs, for whoever maintains this repository.** Two
+GitHub Actions repository secrets, and nothing else; neither is ever in the
+repository, in the image, or in a log line (invariant 7):
+
+| Secret | What it is |
+| --- | --- |
+| `DOCKERHUB_USERNAME` | the Docker Hub account that owns the **public** `herd-hub` repository |
+| `DOCKERHUB_TOKEN` | a Docker Hub **access token**, scoped to that one repository, with Read & Write — never the account password, and never an account-wide token |
+
+A tag pushed while either is missing **fails on its first step, by name**,
+before anything is built and long before a GitHub release exists. Half a
+release is worse than none, so the workflow refuses to make one.
 
 ## A binary and a service are not the same thing
 

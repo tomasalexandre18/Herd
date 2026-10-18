@@ -50,6 +50,19 @@
           ];
           env.RUST_BACKTRACE = "1";
         };
+
+        # The one tool a release needs that a GitHub runner does not already
+        # have: `skopeo`, which copies the image `packages.hub-image` builds
+        # straight from its archive to Docker Hub without a docker daemon in
+        # the middle (D153). It is here and not apt-installed in the workflow
+        # for the reason D12 gives about every other tool: it comes from the
+        # flake's own pinned nixpkgs, so the thing that pushes a release is
+        # pinned like the thing that builds one. It is not in the default
+        # shell, because nobody developing Herd needs it.
+        release = pkgs.mkShell {
+          name = "herd-release";
+          packages = [ pkgs.skopeo ];
+        };
       });
 
       packages = forAllSystems (

@@ -5,6 +5,13 @@
 # run — which the flake's default packages are not: they are linked against
 # glibc out of the Nix store and do not exec on a host without Nix.
 #
+# Since D153 it is also **the hub's container image on Docker Hub**, pushed
+# from the very archive `packages.hub-image` builds — one image, built one
+# way, so the thing deployed is the thing that was tested. The image is
+# pushed *before* the GitHub release is created, so that a tag never leaves
+# binaries published and an image missing: see D153 for the ordering and for
+# what a failure in the middle leaves behind.
+#
 # This file is **not** the merge gate. `ci.yml` is, with its `check` and
 # `docs` jobs, and nothing here touches it.
 name: release
@@ -32,14 +39,25 @@ permissions:
   contents: write
 
 jobs:
+  # One job and not three, deliberately. The binaries, the image and the
+  # release are one release, and steps in one job run in an order a reader
+  # can see; jobs would need the artefacts passed between them and would let
+  # GitHub decide what runs when.
   binaries:
-    name: static binaries
+    name: static binaries and the hub image
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 45
     env:
       # One place where "which tag, if any" is decided. A tag push releases
       # under its own name; a hand-run releases only if it was given one.
       TAG: ${{ github.ref_type == 'tag' && github.ref_name || github.event.inputs.tag }}
+      # Where the image goes. The account is held in a secret because the
+      # token's owner is, not because a Docker Hub namespace is private — it
+      # is public the moment anything is pushed to it — so GitHub masks it
+      # and every line below reads `docker.io/***/herd-hub`. That costs a
+      # readable log and buys nothing; D153 says so and says what to change
+      # if Alexa would rather it were a repository *variable*.
+      IMAGE_REPO: docker.io/${{ secrets.DOCKERHUB_USERNAME }}/herd-hub
     steps:
       - uses: actions/checkout@v7
 
@@ -72,6 +90,39 @@ jobs:
                  "bump workspace.package.version, or tag what the workspace says" >&2
             exit 1
           fi
+
+      # Before anything is built, and long before anything is published: a
+      # tag that publishes the binaries and then finds it cannot push the
+      # image is the half-release D153 exists to prevent, and the cheapest
+      # way to never have one is to refuse the run while nothing has been
+      # done. Names only, never a value, and no `set -x` anywhere in this
+      # file: a token that reaches a log line is a leaked token
+      # (invariant 7). GitHub masks a secret it recognises, but a workflow
+      # should not be relying on that.
+      - name: the Docker Hub credentials this tag needs, by name
+        if: env.TAG != ''
+        env:
+          DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
+          DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          missing=
+          [ -n "${DOCKERHUB_USERNAME:-}" ] || missing="$missing DOCKERHUB_USERNAME"
+          [ -n "${DOCKERHUB_TOKEN:-}" ] || missing="$missing DOCKERHUB_TOKEN"
+          if [ -n "$missing" ]; then
+            echo "this tag publishes the hub's image, and these repository" >&2
+            echo "secrets are not set:$missing" >&2
+            echo >&2
+            echo "Settings -> Secrets and variables -> Actions -> Repository" >&2
+            echo "secrets. DOCKERHUB_USERNAME is the Docker Hub account that" >&2
+            echo "owns the public herd-hub repository; DOCKERHUB_TOKEN is an" >&2
+            echo "access token scoped to that one repository with Read &" >&2
+            echo "Write, never the account password. deploy/release-notice.md" >&2
+            echo "says it in full, and nothing of this release has been" >&2
+            echo "published: fix the secret and re-run this tag." >&2
+            exit 1
+          fi
+          echo "both Docker Hub secrets are set"
 
       # ~1 minute, and no toolchain is installed to do it: `pkgsStatic` is
       # nixpkgs' own musl cross set, so D12 still holds and the musl rustc,
@@ -192,6 +243,102 @@ jobs:
           path: dist/
           if-no-files-found: error
 
+      # ---------------------------------------------------------------
+      # The hub's image. From here to the release below, the subject is one
+      # artefact: `packages.hub-image`, the same derivation an operator can
+      # still build by hand (`deploy/README.md`). There is no Dockerfile and
+      # no second way to build it, because two ways to build the hub is how
+      # the thing deployed stops being the thing tested (D153).
+      # ---------------------------------------------------------------
+
+      - name: build the hub's image, from the flake and nowhere else
+        run: nix build .#hub-image --print-build-logs --out-link hub-image
+
+      # The archive names itself, and the name is the deployment's contract.
+      # `nix/hub-image.nix` takes the tag from the workspace version the same
+      # way the binaries above take theirs, so this cannot drift — which is
+      # exactly why it is worth asserting rather than assuming: if it ever
+      # does drift, a release would push an image tagged for a hub it does
+      # not contain. One tag and no second one, which is also where a
+      # `latest` would show up if anybody ever added one (D153 says why there
+      # is none).
+      - name: assert the archive carries herd-hub:$version, and only that
+        run: |
+          set -euo pipefail
+          tags=$(tar -xzOf hub-image manifest.json | jq -r '.[].RepoTags[]')
+          printf 'the archive says: %s\n' "$tags"
+          if [ "$tags" != "herd-hub:$version" ]; then
+            echo "expected exactly herd-hub:$version in the archive" >&2
+            exit 1
+          fi
+
+      # Proven before it is pushed, and proven on every run including a
+      # hand-run with no tag: this step needs no credentials, so the image
+      # half of a release can be exercised without publishing anything.
+      # scripts/image-smoke.sh is a hub in the container — read-only root, a
+      # volume on /var/lib/herd, the image's own non-root user, exactly the
+      # shape `deploy/docker-compose.yml` gives it — with the static runner
+      # and `herdctl` built above dialling it on the host, and two real jobs
+      # through it.
+      - name: run a hub out of the image, before anything is pushed
+        run: |
+          set -euo pipefail
+          docker load < hub-image
+          ./scripts/image-smoke.sh "herd-hub:$version" "$PWD/bin"
+
+      # `skopeo copy` straight from the archive, and not `docker load` then
+      # `docker tag` then `docker push`. Three reasons, in order of weight
+      # (D153): the source is a *file* and not a name in a shared local image
+      # store, so there is nothing else this step could push by accident; the
+      # manifest the flake built is the manifest the registry stores, digest
+      # unchanged, because the archive's layers are already the compressed
+      # blobs; and the token goes in through `--password-stdin` into an
+      # authfile of this job's own rather than onto an argv or into
+      # `~/.docker/config.json`.
+      #
+      # `--insecure-policy` is about *signatures*, not transport: it means
+      # "no containers-policy.json to consult", which is what `docker push`
+      # also does. TLS to Docker Hub is untouched.
+      - name: push it to Docker Hub
+        if: env.TAG != ''
+        env:
+          DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
+          DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          auth=$(mktemp)
+          trap 'rm -f "$auth"' EXIT
+
+          printf '%s' "$DOCKERHUB_TOKEN" |
+            nix develop .#release --command skopeo login \
+              --authfile "$auth" \
+              --username "$DOCKERHUB_USERNAME" \
+              --password-stdin docker.io
+
+          nix develop .#release --command skopeo --insecure-policy copy \
+            --authfile "$auth" \
+            --digestfile image-digest.txt \
+            "docker-archive:hub-image" \
+            "docker://$IMAGE_REPO:$version"
+
+          digest=$(cat image-digest.txt)
+          echo "digest=$digest" >> "$GITHUB_ENV"
+          echo "pushed, and the registry now holds $digest"
+
+      # The downloader's half, and the only step that proves what is on
+      # Docker Hub rather than what was on this runner. By digest, not by
+      # tag: a tag is a name somebody can move, a digest is the bytes. The
+      # local tag goes first so that nothing already here can answer in the
+      # registry's place.
+      - name: pull it back by digest and run a hub out of that
+        if: env.TAG != ''
+        run: |
+          set -euo pipefail
+          docker rmi "herd-hub:$version" >/dev/null 2>&1 || true
+          ref="$IMAGE_REPO@$digest"
+          docker pull "$ref"
+          ./scripts/image-smoke.sh "$ref" "$PWD/bin"
+
       # `gh` rather than a third-party action: it is on the runner already,
       # and a release is the one step here that cannot be undone quietly.
       # The notice is quoted into the body rather than linked, because
@@ -212,6 +359,18 @@ jobs:
             echo '```sh'
             echo "sha256sum -c SHA256SUMS"
             echo "chmod +x herd-runner-$version-$triple"
+            echo '```'
+            echo
+            echo "The hub is not one of these three for most people: it is a"
+            echo "container image, published on Docker Hub by this same tag"
+            echo "and proved by pulling it back down and running two real"
+            echo "jobs through it. Deploying it is a pull and an up:"
+            echo
+            echo '```sh'
+            echo "docker pull $IMAGE_REPO:$version"
+            # The digest as well, because a tag is a name somebody can move
+            # and a digest is the bytes. `deploy/env.example` accepts either.
+            echo "docker pull $IMAGE_REPO@$digest"
             echo '```'
             echo
             # One line: a markdown link destination cannot be broken across

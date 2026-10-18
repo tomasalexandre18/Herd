@@ -1,9 +1,10 @@
 # The hub's container image: `herd-hub:<workspace version>` (M16).
 #
-# The name and the tag are the deployment's contract — the compose file refers
-# to this image by `herd-hub:0.1.0` — and the tag comes from the workspace's
-# own version, read once in `flake.nix`, so it can never drift from the binary
-# inside the image.
+# The name and the tag are the deployment's contract — `herd-hub:<version>`,
+# which is what the deployment names in `HERD_HUB_IMAGE` and what the release
+# workflow pushes to Docker Hub unchanged (D153) — and the tag comes from the
+# workspace's own version, read once in `flake.nix`, so it can never drift
+# from the binary inside the image.
 #
 # What is in it: the hub, a C library, and two text files naming the user it
 # runs as. No shell, no package manager, no CA bundle: the hub execs nothing,

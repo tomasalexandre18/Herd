@@ -4,8 +4,17 @@
 # under docker compose like any other app on the server, with no state
 # outside its own volume (D8).
 #
-# The image `herd-hub:0.1.0` is built and loaded by the packaging half of
-# M16 (`nix/`, `flake.nix`). Nothing here ever pulls from a registry.
+# The image comes from Docker Hub, pushed by
+# `.github/workflows/release.yml` on the version tag out of the one
+# derivation that has ever built it, `nix/hub-image.nix` (D153). So a new
+# hub is `docker compose pull` and `up -d`, and no longer a `nix build` and
+# a `docker load` on the server. The local build still works and is still
+# documented in `README.md`; it is no longer the normal way.
+#
+# `HERD_HUB_IMAGE` in `.env` names it, **with its version**. There is no
+# `latest` to name: a floating tag is how a hub restarts into a different
+# `PROTOCOL_VERSION` by accident, and that is a fleet-wide, synchronised
+# restart (`release-notice.md`), not a container coming back.
 #
 # Where this file goes: anywhere the operator keeps his compose projects —
 # `/srv/herd/` on the server. It is a file, not a NixOS module: `/etc/nixos`
@@ -22,10 +31,13 @@ name: herd
 
 services:
   hub:
-    image: herd-hub:0.1.0
-    # Built locally by Nix and `docker load`ed. Never reach for a registry:
-    # a pull here would either fail or, worse, find something else.
-    pull_policy: never
+    # Set in `.env`, and required there rather than defaulted here: the
+    # Docker Hub account that owns the repository is the operator's, not
+    # this file's, and a default would be a guess that silently ran the
+    # wrong hub. `env.example` says exactly what to put. No `pull_policy`:
+    # the default — pull when the tag is not already local — is what makes
+    # `docker compose pull && docker compose up -d` the upgrade.
+    image: ${HERD_HUB_IMAGE:?set HERD_HUB_IMAGE in .env to the hub image this deployment runs, for example docker.io/NAMESPACE/herd-hub:0.3.0; see env.example}
     restart: unless-stopped
 
     # The hub listens on every interface *inside its network namespace*,
