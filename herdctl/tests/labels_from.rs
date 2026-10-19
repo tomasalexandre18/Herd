@@ -31,7 +31,7 @@ mod fixture;
 
 use fixture::{
     Fixture, Harness, BRANCH, PROBE, PROBE_DECLARES_MEMORY_MIB, READ_LABELS, READ_MEMORY_MIB,
-    READ_SCENARIOS, READ_TMPFS_MIB, REFUSES_CODE, RUNNER,
+    READ_SCENARIOS, READ_TMPFS_MIB, REFUSES_CODE, RUNNER, SKETCH,
 };
 
 /// How long a reading may take in the tests that are about a reading
@@ -575,5 +575,195 @@ async fn a_dry_run_says_the_reading_would_run_first_and_changes_nothing() {
         harness.records().is_empty(),
         "a dry run mints nothing, least of all a reading: {:#?}",
         harness.records()
+    );
+}
+
+/// The offer that reproduces the incident of 2026-10-19: **one** slot of the
+/// label the reading command declares as its baseline (D159).
+///
+/// Everything else about the fixture's offer is unchanged. One slot is the
+/// setting the first consumer wants to go back to, and it is what turned one
+/// reading into a convoy of thirteen jobs: the reading carried the declared
+/// command's labels, so it had to take that single slot, and it queued
+/// forty-six minutes behind a long build.
+const ONE_SLOT_OF_THE_BASELINE: &str = r#"[
+    {"name":"grove-toolchain","kind":{"type":"counted","slots":1},"origins":{"declared":true}},
+    {"name":"linux","kind":{"type":"shared"},"origins":{"declared":true}}
+]"#;
+
+/// How long these tests wait for the hub's own records to say what they are
+/// about before failing with what the records held instead.
+const PATIENCE: Duration = Duration::from_secs(60);
+
+/// The record of the reading, found by the field that says it is one.
+fn the_reading(records: &[serde_json::Value]) -> Option<&serde_json::Value> {
+    records
+        .iter()
+        .find(|record| !record["reading_for"].is_null())
+}
+
+/// Wait until the reading has run to its end **while the job holding the
+/// machine's one slot is still running**, then open the gate that lets the
+/// holder finish.
+///
+/// This is the whole assertion, and it is made from the hub's own records at
+/// one moment rather than from two clocks: while the gate is shut the holder
+/// cannot end, so a reading that has reached a verdict beside a holder whose
+/// attempt has no `ended_at` is a reading that ran on a machine whose only
+/// slot was taken. Before D159 this moment never arrived — the reading sat in
+/// the queue behind the slot — and the test fails with the records that show
+/// it waiting.
+async fn open_the_gate_once_a_reading_has_run_beside_the_holder(
+    harness: &Harness,
+    gate: &std::path::Path,
+    holder: &str,
+) {
+    let deadline = std::time::Instant::now() + PATIENCE;
+    loop {
+        let records = harness.records();
+        let held = records
+            .iter()
+            .find(|record| record["id"] == serde_json::json!(holder));
+        if let (Some(held), Some(reading)) = (held, the_reading(&records)) {
+            let holder_running = held["state"]["type"] == serde_json::json!("running")
+                && held["attempts"][0]["ended_at"].is_null();
+            let reading_is_over =
+                reading["state"]["outcome"]["type"] == serde_json::json!("exited");
+            if reading_is_over {
+                assert!(
+                    holder_running,
+                    "the holder of the one slot must still be running when the reading \
+                     ends, or this test proves nothing about them overlapping: {held:#}"
+                );
+                assert_eq!(
+                    reading["state"]["outcome"],
+                    serde_json::json!({"type": "exited", "code": 0}),
+                    "the reading ran beside the holder and came off: {reading:#}"
+                );
+                break;
+            }
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "no reading ever ran while {holder} held the machine's one slot; the hub's \
+             records are {records:#?}"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    std::fs::write(gate, b"open\n").expect("the gate opens");
+}
+
+/// **The incident of 2026-10-19, end to end, and it cannot happen again**
+/// (D159).
+///
+/// A real hub, a real runner offering **one** slot of the baseline label, a
+/// real job holding that slot for as long as this test says, and a real
+/// `labels_from` reading of a command whose declared labels are that same
+/// label. The reading runs beside the holder instead of queueing behind it,
+/// and the job it was read for is then placed on the figures it answered.
+///
+/// What each half is for:
+///
+/// * the holder is the **third** command, which declares no artefact and
+///   needs none, so the only thing it and the reading have in common is the
+///   machine's one slot — nothing about a carriage can be what let the
+///   reading through;
+/// * the gate is what makes it an assertion rather than a race (D156): the
+///   holder cannot end until this test writes the gate, so "the reading ended
+///   while the holder was running" is a fact about the records and not about
+///   which process the machine happened to finish first.
+#[tokio::test]
+async fn a_reading_runs_beside_a_real_job_on_a_machine_with_one_slot() {
+    let Some(fixture) = Fixture::new("a_reading_runs_beside_a_real_job_on_a_machine_with_one_slot")
+    else {
+        return;
+    };
+    // A command of its own to hold the slot with: it leaves nothing and needs
+    // nothing, so the slot is the only thing contended here.
+    fixture.add_third_command();
+    let harness = Harness::with_all_of(
+        herd_hub::Policy::default(),
+        herd_hub::Budget::default(),
+        |_| {},
+        |config| {
+            config.capabilities = serde_json::from_str(ONE_SLOT_OF_THE_BASELINE)
+                .expect("one counted slot of the baseline label");
+        },
+    )
+    .await;
+    let gate = fixture.home().join("gate-one-slot");
+    let gate_arg = gate.to_string_lossy().into_owned();
+
+    // The job that takes the one slot, submitted without waiting for it: it
+    // stands in for the long build that the reading queued forty-six minutes
+    // behind.
+    let holder = harness
+        .herdctl_in(
+            &fixture,
+            &[
+                "submit",
+                "--command",
+                SKETCH,
+                "--commit",
+                BRANCH,
+                "--",
+                "--wait-for",
+                gate_arg.as_str(),
+            ],
+        )
+        .await;
+    assert_eq!(status_code(&holder), 0, "{}", stderr(&holder));
+    let holder_id = stdout(&holder).trim().to_owned();
+    assert!(
+        holder_id.starts_with('j'),
+        "herdctl submit prints the job id: {holder_id:?}"
+    );
+
+    // Then the reading command, whose declared baseline is the very label
+    // that job is holding.
+    let (asked, ()) = tokio::join!(
+        probe_answering(&harness, &fixture, fixture::ANSWER_GOOD),
+        open_the_gate_once_a_reading_has_run_beside_the_holder(&harness, &gate, &holder_id),
+    );
+    assert_eq!(
+        status_code(&asked),
+        0,
+        "the job the reading was read for must still run: {}",
+        stderr(&asked)
+    );
+
+    // And the job really got its figures, from the reading that ran beside
+    // the holder (E-15).
+    let (waited, reading) = the_job_and_its_reading(&harness);
+    assert_eq!(
+        waited["reading"]["answer"],
+        serde_json::json!({
+            "labels": READ_LABELS,
+            "memory_mib": READ_MEMORY_MIB,
+            "tmpfs_mib": READ_TMPFS_MIB,
+            "scenarios": READ_SCENARIOS,
+        }),
+        "the answer must be on the record of the job it was read for: {waited:#}"
+    );
+    // The reading's own record says whose reading it was, and the line
+    // explaining its placement says it held none of the machine (D159).
+    assert_eq!(
+        reading["reading_for"].as_str(),
+        waited["id"].as_str(),
+        "a reading names the job it was minted for: {reading:#}"
+    );
+    let why = reading["attempts"][0]["why"]
+        .as_str()
+        .unwrap_or_else(|| panic!("the reading was never placed: {reading:#}"));
+    assert!(
+        why.contains("requirement reading") && why.contains("holds none of them"),
+        "the placement must say the reading took nothing: {why:?}"
+    );
+    // And the cap is still the hub's own five minutes, unchanged by any of
+    // this (D74, D108).
+    assert_eq!(
+        reading["timeout_s"].as_u64(),
+        Some(herd_hub::READING_CAP.as_secs()),
+        "the reading is still bounded by the hub's figure: {reading:#}"
     );
 }

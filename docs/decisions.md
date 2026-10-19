@@ -6538,3 +6538,142 @@ holds a per-connection or per-process resource, the test to write is the
 
 No protocol change: `PROTOCOL_VERSION` stays at 2 and the fix is entirely
 inside the runner.
+
+---
+
+## 2026-10-19 — D159 A requirement reading is matched, never counted
+
+**The incident.** The server runner's `build` was set to one slot. A
+`labels_from` reading is minted as a job carrying the declared command's
+labels (D74), so it had to take that single slot — and it queued **46
+minutes** behind a long build, while **thirteen** jobs whose requirements
+that reading answers queued behind the reading. One convoy, thirteen jobs,
+out of one job that builds and boots nothing. The mitigation was to put
+`build` back to two, which is a revert and not a fix; the consumer wants one
+build at a time, and this is what lets them have it.
+
+**Alexa's ruling.** A reading is matched on the declared command's labels and
+**does not consume the counted slot**. One rule about one kind of job, not a
+scheduling option (invariant 1): there is no new knob, no new setting and no
+policy anywhere in this.
+
+**The distinction, which is the whole of the entry: eligibility is not
+availability.**
+
+A reading must still land only on a machine that *could* run the command. It
+reads that machine's capabilities and answers with figures the real job is
+then placed on, so a reading on the wrong machine answers with figures that
+mean nothing — the worst failure available here, because nothing about it
+looks wrong. So a reading is matched on what a runner **offers and denies**,
+exactly as any job is. It is matched on **nothing that is about contention**,
+because a `--labels` line takes none of it.
+
+The two halves were already told apart in the code, which is why this is a
+narrow change rather than a new concept: `HeldUp::clears_with_time` and
+`Contention::clears_with_time()` have said since M5 and M7 which obstacles are
+about the *machine* and which are about the *moment*. A reading is held to the
+first and not the second.
+
+### The three answers, each with its reason
+
+**1. A counted slot: not consumed and not waited for.** The whole point of the
+change. A slot is contention and only contention; a reading holds none and
+`Holdings::holders_of` does not count one. Both directions are tested: a
+reading is claimed on a machine whose only slot is taken, **and** a reading
+already running does not stop a real job taking the slot it would have held.
+That second half is where the forty-six minutes were.
+
+**2. An exclusive capability: a reading never takes the machine and never
+waits for it to be empty — but a machine a host-wide job has already emptied
+stays empty, a reading included.**
+
+The two arguments are both real and they are about different things, so both
+win where they apply:
+
+* `ExclusiveNeedsIdle` — "this label needs an idle runner" — is the reading
+  *consuming* exclusivity. A reading able to hold a whole machine empty for
+  itself is the incident in a worse costume: not one slot but every slot. It
+  does not apply to a reading.
+* `HostIsExclusive` — "a host-wide job is holding this machine" — is the
+  reading *respecting* exclusivity. D46 already decided that host-wide empties
+  the host of *everything*, "including work that asked for nothing", and a
+  reading is such work. `exclusive` is the machine owner's promise that
+  nothing runs beside her job, and the figures an exclusive job exists to
+  measure are exactly what a process beside it would spoil. A promise broken
+  for a cheap process is a promise broken. It does apply.
+
+Same reasoning for the two neighbours of exclusivity. A reading **never asks
+for a quiet host** (E-27's `drain_first`): nothing may hold a machine empty
+for fifteen minutes on account of a `--labels` line, so
+`needs_a_quiet_host` answers `None` for one and `reservations` reserves
+nothing for one. A reading **does respect** a host being emptied for somebody
+else: readings allowed to slip onto a draining machine would starve the drain
+for ever, which is the attack E-27 exists to answer, and the wait is bounded
+by the same fifteen minutes everything else is. And a reading **counts among
+the jobs running** on a machine, so an exclusive job waits for it — at most
+the five minutes of `READING_CAP` — rather than starting beside it.
+
+A pairwise `excludes` is contention between *holders*, and a reading is not
+one: it holds nothing for the exclusion to bite on. Host-wide is about the
+machine; an exclusion is between two capabilities. That is why one reaches a
+reading and the other does not.
+
+**3. A busy probe's verdict: a reading does not wait for it, whichever kind of
+suspension it is.**
+
+A probe says something *outside* Herd holds the capability. What `suspends()`
+protects is the **handing out of that capability** (E-26, D48) — and a reading
+is handed none: it runs a `--labels` line, which does not touch the GPU the
+lock file is about. The judgement itself is not split and not duplicated:
+`Availability::suspends()` stays the one place that decides what suspends,
+made once in `herd-proto` for the runner and the hub alike. What D159 changes
+is only *who is held to it*, and it changes it at the one `if` that already
+separates the two halves.
+
+The failure direction settles it, and the asymmetry is total. A reading that
+runs while a probe says busy costs one `--labels` line on a machine something
+else is using. A reading that waits for a probe nobody can read — a missing
+binary, a broken script, a runner whose first snapshot never arrives — waits
+for **ever**, and every job its answer unblocks waits behind it. That is
+tonight's incident with no bound on it at all. Where one mistake costs a shell
+line and the other costs a convoy, make the cheap one.
+
+### What a reading is still admitted against, and still bounded by
+
+**Slot-free, never admission-free.** A reading runs a real process on a real
+machine, so the room there still has to cover it (D119): admission is in its
+path exactly as it is in any job's, and a reading declaring more than is free
+waits with the figures in its sentence. In practice it declares nothing —
+`reading_job` gives it no memory and no tmpfs figure, because it builds and
+boots nothing — so the arithmetic costs it zero today. The thing that must not
+happen is the *step* being skipped, and it is not: the day a consumer's
+`--labels` needs room, the room is weighed.
+
+`READING_CAP` is untouched: five minutes, the hub's own figure, because a
+reading boots nothing. The runner's own cap still bounds it and is never
+raised by it (D108) — a reading carries the hub's figure where a declared
+command carries its own, and the smaller of that and the owner's still wins.
+
+**No recursion, still structural.** The hub is the only thing that mints a
+reading and mints it with none of its own (D74's third limit). D159 adds a
+second field to that same mint — `reading_for`, the job the reading was minted
+for — and nothing on the wire can ask for either. `PROTOCOL_VERSION` stays at
+2: nothing about this crosses the link. `RECORD_VERSION` does not move either,
+for D73's reason — one more optional field with a `serde` default, read on an
+old record as a job that is not a reading.
+
+### And the sentence, which is half of why this cost forty-five minutes
+
+Every sentence Herd produced about the convoy was **true**. The waiters
+correctly said `build has 1 slot(s) and 1 are taken`, and not one of them said
+the thing holding that slot was a reading rather than a build. A figure a
+human cannot break down is a figure that gets broken down by hand, at night.
+
+So every sentence that counts the jobs on a machine now says how many of them
+are requirement readings: the slot waiter (where a reading is now *beside* the
+count, holding no slot, and the sentence says so), the host-wide waiter, the
+drain-first waiter, and admission's own "N jobs running there hold X of
+memory". One wording, in one function, `of_which`. And the line explaining a
+reading's own placement says in as many words that it holds none of the
+machine — so a record of a reading can never be read as a record of something
+that held a slot.

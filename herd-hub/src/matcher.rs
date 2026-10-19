@@ -53,7 +53,7 @@
 use std::collections::BTreeMap;
 use std::time::Duration;
 
-use herd_proto::{Holdings, HostSize, JobId, LabelSet, Parallelism};
+use herd_proto::{of_which, Holdings, HostSize, JobId, LabelSet, Occupant, Parallelism};
 
 use crate::capability::RunnerCapacity;
 use crate::job::{JobRecord, JobState, Timestamp};
@@ -305,14 +305,30 @@ enum Verdict {
 /// machine, and `exclusive` is host-wide: it empties the host of *everything*,
 /// including work that asked for nothing (D46). [`Holdings`] counts jobs for
 /// that reason, so an empty label set is still an entry.
-pub fn holdings(records: &[JobRecord]) -> BTreeMap<String, Vec<(JobId, LabelSet)>> {
-    let mut held: BTreeMap<String, Vec<(JobId, LabelSet)>> = BTreeMap::new();
+///
+/// Each entry also carries **what** the job is, read off its own record
+/// ([`JobRecord::occupant`]): a requirement reading is running on the machine
+/// and holds none of its capabilities (D159), and no label set can say that.
+pub fn holdings(records: &[JobRecord]) -> BTreeMap<String, Vec<Holding>> {
+    let mut held: BTreeMap<String, Vec<Holding>> = BTreeMap::new();
     for (runner, record) in out_there(records) {
-        held.entry(runner.to_owned())
-            .or_default()
-            .push((record.id.clone(), record.labels_needed().clone()));
+        held.entry(runner.to_owned()).or_default().push(Holding {
+            job: record.id.clone(),
+            labels: record.labels_needed().clone(),
+            occupant: record.occupant(),
+        });
     }
     held
+}
+
+/// One open attempt on one runner, as a dispatch pass reads it off the
+/// records: which job, what it was placed against, and what kind of work it
+/// is (D159).
+#[derive(Debug, Clone)]
+pub struct Holding {
+    pub job: JobId,
+    pub labels: LabelSet,
+    pub occupant: Occupant,
 }
 
 /// Every job the records say has an attempt out on a runner, with that
@@ -364,6 +380,16 @@ pub struct Reserved {
     pub tmpfs_mib: u64,
     /// How many jobs those two sums are over.
     pub jobs: u32,
+    /// How many of those jobs are requirement readings (D74, D159).
+    ///
+    /// A reading declares no memory and no tmpfs — it builds and boots
+    /// nothing, so `reading_job` gives it no figure to declare — and it is
+    /// still weighed by admission like any job, which is what D119 asks and
+    /// what D159 deliberately leaves alone: a reading is slot-free, never
+    /// admission-free. It is counted here so that the sentence a short job
+    /// reads can break the count down: "2 jobs running there hold 4 GiB" says
+    /// nothing about which of the two is a `--labels` line.
+    pub readings: u32,
     /// Jobs out there whose declared memory **cannot be costed** from their
     /// record, with the reason, by job.
     ///
@@ -377,23 +403,27 @@ pub struct Reserved {
 
 impl Reserved {
     /// Take this job's declared need, as the claim does.
-    fn take(&mut self, memory_mib: u64, tmpfs_mib: u64) {
+    fn take(&mut self, memory_mib: u64, tmpfs_mib: u64, occupant: Occupant) {
         self.memory_mib = self.memory_mib.saturating_add(memory_mib);
         self.tmpfs_mib = self.tmpfs_mib.saturating_add(tmpfs_mib);
         self.jobs += 1;
+        if !occupant.holds_capabilities() {
+            self.readings += 1;
+        }
     }
 
     /// The clause naming what is already taken here (E-04).
     fn sentence(&self) -> String {
+        let of_which = of_which(usize::try_from(self.readings).unwrap_or(usize::MAX));
         match self.jobs {
             0 => "nothing is running there".to_owned(),
             1 => format!(
-                "1 job running there holds {} of memory and {} of tmpfs",
+                "1 job running there holds {} of memory and {} of tmpfs{of_which}",
                 herd_proto::size_mib(self.memory_mib),
                 herd_proto::size_mib(self.tmpfs_mib)
             ),
             many => format!(
-                "{many} jobs running there hold {} of memory and {} of tmpfs",
+                "{many} jobs running there hold {} of memory and {} of tmpfs{of_which}",
                 herd_proto::size_mib(self.memory_mib),
                 herd_proto::size_mib(self.tmpfs_mib)
             ),
@@ -407,9 +437,13 @@ pub fn reserved(records: &[JobRecord]) -> BTreeMap<String, Reserved> {
     for (runner, record) in out_there(records) {
         let here = taken.entry(runner.to_owned()).or_default();
         match record.memory_held_mib() {
-            Ok(memory) => here.take(memory.unwrap_or(0), record.tmpfs_need_mib()),
+            Ok(memory) => here.take(
+                memory.unwrap_or(0),
+                record.tmpfs_need_mib(),
+                record.occupant(),
+            ),
             Err(why) => {
-                here.take(0, record.tmpfs_need_mib());
+                here.take(0, record.tmpfs_need_mib(), record.occupant());
                 here.uncostable.push((record.id.clone(), why));
             }
         }
@@ -440,7 +474,19 @@ fn slots_for(job_labels: &LabelSet, capacity: &RunnerCapacity) -> u32 {
 /// One phrase per label that is governed by a count, with the figures: a
 /// claim line that said "labels build" and no more would not say whether the
 /// machine now has a slot left.
-fn what_it_takes(job_labels: &LabelSet, seat: &Seat) -> String {
+///
+/// A requirement reading takes **none** of them and the line says so in as
+/// many words (D159), so that the record of a reading cannot be read as a
+/// record of something that held the machine.
+fn what_it_takes(job_labels: &LabelSet, seat: &Seat, occupant: Occupant) -> String {
+    if !occupant.holds_capabilities() {
+        return format!(
+            "it is a requirement reading and holds none of them — no slot, no host-wide \
+             machine, nothing emptied — because it builds and boots nothing; it is matched on \
+             the labels {} offers and has not denied, and nothing about contention (D159)",
+            seat.name
+        );
+    }
     let mut clauses = Vec::new();
     for label in job_labels.iter() {
         let Some(capability) = seat.capacity.offer().available(label) else {
@@ -621,9 +667,13 @@ fn judge(record: &JobRecord, seat: &Seat, placing: &Placing, now: Timestamp) -> 
             ));
         }
     }
+    // What this job *is*, which three of the gates below turn on (D159).
+    let occupant = record.occupant();
     // What M5's algebra decides: the kinds, under contention with what is
-    // already running here (E-25).
-    let contention = seat.holdings.check(record.labels_needed());
+    // already running here (E-25). A requirement reading is judged on what
+    // this runner offers and denies and on nothing about contention, which
+    // [`Holdings::check`] is where that is written down.
+    let contention = seat.holdings.check(record.labels_needed(), occupant);
     // **The impossible case is judged first, before anything about the
     // moment.** A label set that contradicts itself is a fact about the
     // submission, and a job asking for two labels that exclude each other —
@@ -639,12 +689,34 @@ fn judge(record: &JobRecord, seat: &Seat, placing: &Placing, now: Timestamp) -> 
     // What M5 decided: offered and not suspended. A label this runner does
     // not offer is not about the moment; a probe outside Herd holding one is
     // (D48).
+    //
+    // **And that is exactly where a requirement reading is let through**
+    // (D159). The two halves of this judgement are the two halves of D159's
+    // distinction, already told apart by `clears_with_time` and already named
+    // by `held_up_by`'s own doc comment: `false` is the *machine* — a label
+    // it does not offer, a label its owner denied — which is eligibility, and
+    // a reading is held to it, because a reading placed on a machine that
+    // could not run the command reads the wrong machine's capabilities and
+    // answers with figures that mean nothing. `true` is the *moment* — a
+    // probe outside Herd holding the capability, or a probe that cannot be
+    // read at all — which is availability, and a reading is given none of the
+    // capability it would be about: it runs a `--labels` line, which does not
+    // touch the GPU the lock protects.
+    //
+    // The failure direction decides it. A reading that runs while a probe
+    // says busy costs one `--labels` line on a machine something else is
+    // using. A reading that waits for a probe nobody can read waits for ever,
+    // and every job its answer unblocks waits behind it — which is the
+    // incident D159 was written for, in a different costume. The cheap
+    // mistake is the one to make.
     if let Some(held_up) = seat.capacity.held_up_by(record.labels_needed()) {
-        return if held_up.clears_with_time {
-            Verdict::Later(held_up.reason)
+        if held_up.clears_with_time {
+            if occupant.holds_capabilities() {
+                return Verdict::Later(held_up.reason);
+            }
         } else {
-            Verdict::NotHere(held_up.reason)
-        };
+            return Verdict::NotHere(held_up.reason);
+        }
     }
     if let Err(contention) = contention {
         let reason = format!("on {}, {contention}", seat.name);
@@ -754,7 +826,21 @@ pub fn eligible(
 /// label's spelling, and `metal-pc` only behaves differently from `build`
 /// because the PC's own capability file says `"drain_first": true` about it
 /// (D86). A label the runner does not offer cannot ask for anything.
+///
+/// **And `None` for a requirement reading, always** (D159). Asking for a
+/// quiet host is the strongest thing a job can do to a machine — E-27 lets it
+/// hold one empty for fifteen minutes — and a reading that builds and boots
+/// nothing must not be able to. It is one function rather than two checks
+/// because both callers need it: [`judge`], which would make the reading wait
+/// for the host to empty, and [`reservations`], which would empty the host
+/// *for* it. A reading still **respects** a host being emptied for somebody
+/// else, which is [`Seat::reserved_for`] and is judged before this: a stream
+/// of readings allowed to slip onto a draining machine would starve the drain
+/// for ever, which is the attack E-27 exists to answer.
 fn needs_a_quiet_host(record: &JobRecord, seat: &Seat) -> Option<String> {
+    if record.is_a_reading() {
+        return None;
+    }
     record.labels_needed().iter().find_map(|label| {
         seat.capacity
             .offer()
@@ -783,11 +869,16 @@ fn quiet_host_sentence(
 ) -> String {
     let waited = now.since(record.submitted_at);
     let running = seat.holdings.running();
+    // What those jobs are, when some of them are requirement readings (D159):
+    // a drain that is waiting on a `--labels` line is a drain whose operator
+    // should be told so, and the figure alone never says it.
+    let of_which = of_which(seat.holdings.readings_running());
     if may_still_hold_a_host(record, limit, now) {
         format!(
             "{} is being emptied for it: {label} starts only on a quiet host and {running} \
-             job(s) are still running there, so {} claims nothing new until they end or until \
-             the {} drain-first limit is reached (--drain-first-limit); it has waited {}",
+             job(s) are still running there{of_which}, so {} claims nothing new until they \
+             end or until the {} drain-first limit is reached (--drain-first-limit); it has \
+             waited {}",
             seat.name,
             seat.name,
             roughly(limit),
@@ -796,10 +887,10 @@ fn quiet_host_sentence(
     } else {
         format!(
             "{label} starts only on a quiet host and {running} job(s) are still running on \
-             {}; the {} this job may hold a machine empty for is spent after {}, so {} claims \
-             other work again and this job now waits for its host to go quiet on its own. \
-             The drain did not win: raise this job's priority, or stop submitting work to {} \
-             (--drain-first-limit)",
+             {}{of_which}; the {} this job may hold a machine empty for is spent after {}, so \
+             {} claims other work again and this job now waits for its host to go quiet on \
+             its own. The drain did not win: raise this job's priority, or stop submitting \
+             work to {} (--drain-first-limit)",
             seat.name,
             roughly(limit),
             roughly(waited),
@@ -1063,7 +1154,8 @@ fn claim(
         memory_mib,
         tmpfs_mib,
     } = fitted;
-    let takes = what_it_takes(record.labels_needed(), seat);
+    let occupant = record.occupant();
+    let takes = what_it_takes(record.labels_needed(), seat, occupant);
     let labels = if record.labels_needed().is_empty() {
         "none".to_owned()
     } else {
@@ -1097,9 +1189,12 @@ fn claim(
     // next job offered in this pass contends with this one (D79): an
     // exclusive job and a counted job arriving in one pass must not both be
     // admitted.
-    if let Err(contention) = seat
-        .holdings
-        .admit(&record.id, record.labels_needed().clone())
+    // A requirement reading is written down here too, holding nothing: it is
+    // running on this machine, so a host-wide job waits for it and the next
+    // sentence about this machine can name it (D159).
+    if let Err(contention) =
+        seat.holdings
+            .admit(&record.id, record.labels_needed().clone(), occupant)
     {
         // The judgement above said this was free. Only a bug can get here,
         // and the one thing it must not do is place the job anyway.
@@ -1114,7 +1209,7 @@ fn claim(
     // offered is weighed against this one and not only against what was
     // running when the pass began (E-32's host-wide bound). The slot version
     // of this is M7's; these are the two figures M8 adds.
-    seat.reserved.take(memory_mib, tmpfs_mib);
+    seat.reserved.take(memory_mib, tmpfs_mib, occupant);
     let command = match derived {
         Some(derived) => {
             herd_proto::with_parallelism(&record.command, record.requester_args(), derived.threads)
@@ -1292,6 +1387,7 @@ mod tests {
             declaration: None,
             timeout_s: None,
             reading: None,
+            reading_for: None,
             parallelism: None,
             submissions: 1,
             state: JobState::Queued,
@@ -2101,8 +2197,11 @@ mod tests {
         let mut seat = her_pc();
         // The judgement said free; by the time the claim is written the one
         // slot has gone to somebody else.
-        seat.holdings
-            .already_holding(&JobId::new("j-elsewhere"), labels(&["build"]));
+        seat.holdings.already_holding(
+            &JobId::new("j-elsewhere"),
+            labels(&["build"]),
+            Occupant::Job,
+        );
         let why = waited(claim(
             &queued("j1", &["build"]),
             &mut seat,
@@ -2206,8 +2305,11 @@ mod tests {
     #[test]
     fn a_holding_the_offer_no_longer_explains_still_empties_the_host() {
         let mut seat = their_server();
-        seat.holdings
-            .already_holding(&JobId::new("j-old"), labels(&["a-label-nobody-offers"]));
+        seat.holdings.already_holding(
+            &JobId::new("j-old"),
+            labels(&["a-label-nobody-offers"]),
+            Occupant::Job,
+        );
         let mut fleet = vec![seat];
         let why = waited(place(
             &queued("j1", &["igpu-vfio"]),
@@ -2250,8 +2352,9 @@ mod tests {
     /// A fleet of one seat, with what the records say is already out on it.
     fn fleet_with(mut seat: Seat, running: &[JobRecord]) -> Vec<Seat> {
         let held = holdings(running);
-        for (job, labels) in held.get(&seat.name).into_iter().flatten() {
-            seat.holdings.already_holding(job, labels.clone());
+        for holding in held.get(&seat.name).into_iter().flatten() {
+            seat.holdings
+                .already_holding(&holding.job, holding.labels.clone(), holding.occupant);
         }
         seat.reserved = reserved(running).remove(&seat.name).unwrap_or_default();
         vec![seat]
@@ -3057,7 +3160,7 @@ mod tests {
         let mut pc = her_pc_with_a_metal_lease();
         // A build is already running there.
         pc.holdings
-            .already_holding(&JobId::new("j0"), labels(&["build"]));
+            .already_holding(&JobId::new("j0"), labels(&["build"]), Occupant::Job);
         pc.reserved.jobs = 1;
         let queue = vec![build.clone(), trial.clone()];
         let seats = vec![pc];
@@ -3137,7 +3240,7 @@ mod tests {
         let build = queued("j1", &["build"]);
         let mut pc = her_pc_with_a_metal_lease();
         pc.holdings
-            .already_holding(&JobId::new("j0"), labels(&["build"]));
+            .already_holding(&JobId::new("j0"), labels(&["build"]), Occupant::Job);
         pc.reserved.jobs = 1;
         let mut seats = vec![pc];
         let too_late = trial
@@ -3260,7 +3363,7 @@ mod tests {
             ]),
         );
         pc.holdings
-            .already_holding(&JobId::new("j0"), labels(&["build"]));
+            .already_holding(&JobId::new("j0"), labels(&["build"]), Occupant::Job);
         pc.reserved.jobs = 1;
         let mut seats = vec![pc];
         let reserved = reservations(
@@ -3330,5 +3433,237 @@ mod tests {
         record.attempts.push(running);
         assert_eq!(record.goes_a_runner_took(), 1);
         assert_eq!(record.requeues_spent(), 2);
+    }
+
+    // ------------------------------- a requirement reading (D159) ----
+
+    /// A record of the job the hub mints to read what another job needs
+    /// (D74): an ordinary job in every respect but one — it is marked as the
+    /// reading of a job, and the claim step reads that off it (D159).
+    fn a_reading(id: &str, baseline: &[&str], reads_for: &str) -> JobRecord {
+        let mut record = queued(id, baseline);
+        record.reading_for = Some(JobId::new(reads_for.to_owned()));
+        assert!(record.is_a_reading());
+        assert_eq!(record.occupant(), Occupant::Reading);
+        record
+    }
+
+    /// **The incident, through the claim step.** Her PC has one build slot.
+    /// A build is holding it; a reading whose baseline is `build` is claimed
+    /// anyway, and the line explaining the claim says it holds nothing.
+    #[test]
+    fn a_reading_is_claimed_on_a_machine_whose_only_slot_is_taken() {
+        let build = out_on(a_build("j0", 1792), "wsl-pc");
+        let mut fleet = fleet_with(her_pc(), std::slice::from_ref(&build));
+        // The ordinary job behind it still waits, which is the half of this
+        // that must not change.
+        let why = waited(place(
+            &queued("j1", &["build"]),
+            &mut fleet,
+            now(),
+            Stickiness::default(),
+            &Placing::default(),
+        ));
+        assert!(why.contains("build has 1 slot(s) and 1 are taken"), "{why}");
+        // The reading does not.
+        let (runner, why) = placed(place(
+            &a_reading("j2", &["build"], "j1"),
+            &mut fleet,
+            now(),
+            Stickiness::default(),
+            &Placing::default(),
+        ));
+        assert_eq!(runner, "wsl-pc");
+        assert!(why.contains("requirement reading"), "{why}");
+        assert!(why.contains("holds none of them"), "{why}");
+        assert!(
+            !why.contains("slot 1 of 1"),
+            "a reading must not be reported as taking a slot: {why}"
+        );
+    }
+
+    /// And the other direction, which is what the forty-six minutes were: a
+    /// reading already running does not stop the real job taking the slot.
+    #[test]
+    fn a_reading_running_does_not_hold_the_slot_against_a_real_job() {
+        let reading = out_on(a_reading("j0", &["build"], "j1"), "wsl-pc");
+        let mut fleet = fleet_with(her_pc(), std::slice::from_ref(&reading));
+        let (runner, why) = placed(place(
+            &a_build("j1", 1792),
+            &mut fleet,
+            now(),
+            Stickiness::default(),
+            &Placing::default(),
+        ));
+        assert_eq!(runner, "wsl-pc");
+        assert!(why.contains("build slot 1 of 1"), "{why}");
+    }
+
+    /// Eligibility is not waived: a reading waits for a runner that offers
+    /// its baseline, because a reading placed on a machine which could not
+    /// run the command reads the wrong machine's capabilities.
+    #[test]
+    fn a_reading_still_waits_for_a_runner_that_offers_its_baseline() {
+        let mut fleet = vec![her_pc()];
+        let why = waited(place(
+            &a_reading("j2", &["kvm"], "j1"),
+            &mut fleet,
+            now(),
+            Stickiness::default(),
+            &Placing::default(),
+        ));
+        assert!(why.contains("does not offer kvm"), "{why}");
+    }
+
+    /// A probe outside Herd holding a capability — or a probe nobody can read
+    /// at all — holds off a job and **not** a reading (D159).
+    ///
+    /// The failure direction decides it. A reading that runs while the lock
+    /// is held costs one `--labels` line, which does not touch the thing the
+    /// lock protects. A reading that waits for a probe that cannot be read
+    /// waits for ever, and every job its answer unblocks waits behind it.
+    #[test]
+    fn a_suspended_probe_holds_off_a_job_and_not_a_reading() {
+        for suspension in [
+            Availability::busy("the lock file /run/metal-pc is there"),
+            Availability::unknown("the probe cannot be started"),
+        ] {
+            let mut fleet = vec![her_pc_with_a_metal_lease()];
+            fleet[0]
+                .capacity
+                .update(vec![CapabilityState::new("metal-pc", suspension.clone())]);
+            let why = waited(place(
+                &queued("j1", &["metal-pc"]),
+                &mut fleet,
+                now(),
+                Stickiness::default(),
+                &Placing::default(),
+            ));
+            assert!(why.contains("suspended on wsl-pc"), "{why}");
+            let (runner, _) = placed(place(
+                &a_reading("j2", &["metal-pc"], "j1"),
+                &mut fleet,
+                now(),
+                Stickiness::default(),
+                &Placing::default(),
+            ));
+            assert_eq!(runner, "wsl-pc", "a reading runs anyway: {suspension:?}");
+        }
+    }
+
+    /// A reading never asks for a quiet host, so it neither holds a machine
+    /// empty for itself (E-27's fifteen minutes) nor waits for one to empty.
+    #[test]
+    fn a_reading_never_holds_a_host_empty_and_never_waits_for_a_quiet_one() {
+        let reading = a_reading("j2", &["metal-pc"], "j1");
+        let build = out_on(a_build("j0", 1792), "wsl-pc");
+        let mut fleet = fleet_with(her_pc_with_a_metal_lease(), std::slice::from_ref(&build));
+        // Nothing is held empty for it.
+        let held = reservations(
+            std::slice::from_ref(&reading),
+            &fleet,
+            now(),
+            DRAIN_FIRST_LIMIT,
+        );
+        assert!(
+            held.is_empty(),
+            "a reading must not be able to empty a machine: {held:?}"
+        );
+        // And it is claimed while a build is still running there, which a
+        // real `metal-pc` job would have waited for.
+        let (runner, _) = placed(place(
+            &reading,
+            &mut fleet,
+            now(),
+            Stickiness::default(),
+            &Placing::default(),
+        ));
+        assert_eq!(runner, "wsl-pc");
+        let trial = queued("j3", &["metal-pc"]);
+        let why = waited(place(
+            &trial,
+            &mut fleet,
+            now(),
+            Stickiness::default(),
+            &Placing {
+                parent: Parent::None,
+                drain_first_limit: Some(DRAIN_FIRST_LIMIT),
+            },
+        ));
+        assert!(why.contains("quiet host"), "{why}");
+        // And the drain's own sentence names the reading among the jobs it
+        // is waiting for (D159).
+        assert!(why.contains("requirement reading"), "{why}");
+    }
+
+    /// A reading still respects a host being emptied for somebody else. A
+    /// stream of readings allowed onto a draining machine would starve the
+    /// drain for ever, which is the attack E-27 exists to answer — and the
+    /// wait is bounded by the same fifteen minutes everything else is.
+    #[test]
+    fn a_reading_respects_a_host_being_emptied_for_another_job() {
+        let trial = queued("j1", &["metal-pc"]);
+        let mut fleet = vec![her_pc_with_a_metal_lease()];
+        let held = reservations(
+            std::slice::from_ref(&trial),
+            &fleet,
+            now(),
+            DRAIN_FIRST_LIMIT,
+        );
+        for seat in fleet.iter_mut() {
+            seat.reserved_for = held.get(&seat.name).cloned();
+        }
+        let why = waited(place(
+            &a_reading("j2", &["build"], "j3"),
+            &mut fleet,
+            now(),
+            Stickiness::default(),
+            &Placing::default(),
+        ));
+        assert!(why.contains("is being emptied for j1"), "{why}");
+    }
+
+    /// **Slot-free, never admission-free** (D119, D159). A reading runs a
+    /// process on a machine, so the room there still has to cover it: one
+    /// that declares a figure bigger than what is free waits exactly as a job
+    /// does, and the sentence carries the figures.
+    #[test]
+    fn a_reading_is_still_admitted_against_the_room_it_runs_in() {
+        // 17 GiB lent less a 3 GiB floor is 14 GiB admitted on her PC.
+        let sitting = out_on(a_test("j0", 10 * 1024, 0), "wsl-pc");
+        let mut fleet = fleet_with(her_pc(), std::slice::from_ref(&sitting));
+        let mut reading = a_reading("j2", &["build"], "j1");
+        reading.memory_mib = Some(8 * 1024);
+        let why = waited(place(
+            &reading,
+            &mut fleet,
+            now(),
+            Stickiness::default(),
+            &Placing::default(),
+        ));
+        assert!(why.contains("free of its"), "{why}");
+        assert!(why.contains("8 GiB needed"), "{why}");
+    }
+
+    /// And what a short job is told, when some of the room is held by a
+    /// reading: the count of jobs is broken down (D159).
+    #[test]
+    fn a_short_job_is_told_how_much_of_the_room_a_reading_holds() {
+        let mut reading = a_reading("j0", &["build"], "j1");
+        reading.memory_mib = Some(10 * 1024);
+        let reading = out_on(reading, "wsl-pc");
+        let mut fleet = fleet_with(her_pc(), std::slice::from_ref(&reading));
+        let why = waited(place(
+            &a_test("j2", 8 * 1024, 0),
+            &mut fleet,
+            now(),
+            Stickiness::default(),
+            &Placing::default(),
+        ));
+        assert!(
+            why.contains("1 job running there holds 10 GiB of memory"),
+            "{why}"
+        );
+        assert!(why.contains("of which 1 is a requirement reading"), "{why}");
     }
 }

@@ -62,8 +62,8 @@ carries M1-M11, M15, M16 and Apache-2.0, gates green with 13 skips.
    are all on the hub; only an operator can free the disk.
 
 Open and recorded: D63, D64, D92, D98, D101, D122's two reaper blind
-spots, D134's janitor gap, and the consumer's items 7-9 — a flock probe,
-per-capability probe budgets, a lighter `labels_from`.
+spots, D134's janitor gap, and the consumer's items 7-8. Item 9, a
+lighter `labels_from`, is largely answered by D159: a slot-free reading.
 
 ## The host, as it really is
 
