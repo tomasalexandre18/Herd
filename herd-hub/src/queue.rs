@@ -294,6 +294,7 @@ mod tests {
             declaration: None,
             timeout_s: None,
             reading: None,
+            reading_for: None,
             parallelism: None,
             submissions: 1,
             state: JobState::Queued,

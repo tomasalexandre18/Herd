@@ -841,13 +841,31 @@ pub enum Contention {
         by: JobId,
     },
     /// Every slot of a counted capability is taken.
+    ///
+    /// `readings` is how many requirement readings are **also** running on
+    /// that machine, holding no slot of it (D159). It is in the sentence for
+    /// the reason D159 exists: the night this was written the waiters said
+    /// "build has 1 slot(s) and 1 are taken" and nothing said whether the
+    /// holder was a build or a reading, and the diagnosis cost forty-five
+    /// minutes. Now the sentence says, either way.
     NoSlot {
         label: String,
         slots: u32,
         holders: u32,
+        readings: usize,
     },
     /// The label is host-wide and this runner is not idle.
-    ExclusiveNeedsIdle { label: String, running: usize },
+    ///
+    /// `readings` is how many of those jobs are requirement readings. A
+    /// reading holds no capability and still counts here, because host-wide
+    /// empties the machine of work that holds nothing too (D46) — so the
+    /// sentence has to say when the thing an exclusive job is waiting for is
+    /// a reading (D159).
+    ExclusiveNeedsIdle {
+        label: String,
+        running: usize,
+        readings: usize,
+    },
     /// A host-wide capability is held here, so nothing else runs.
     HostIsExclusive { held: String, by: JobId },
     /// This job is already holding something on this runner.
@@ -861,6 +879,46 @@ pub enum Contention {
     /// relabel would be an over-admission with nothing on any record to show
     /// it. A job releases ([`Holdings::release`]) and is admitted again.
     AlreadyHolding { job: JobId, held: LabelSet },
+}
+
+/// What a count of jobs running on a machine is **made of**, when some of
+/// them are requirement readings (D74, D159).
+///
+/// One wording, in one place, used by every sentence that counts the jobs on
+/// a machine: the algebra's own contentions here, and the hub's admission and
+/// drain-first sentences. Empty when none of them is a reading, so an
+/// ordinary wait reads exactly as it always did.
+///
+/// This exists because of what the incident cost. A machine with one build
+/// slot queued thirteen jobs behind a reading that builds nothing, and every
+/// sentence Herd produced about it was true and none of them said the word
+/// "reading". A figure a human cannot break down is a figure that takes
+/// forty-five minutes to break down by hand.
+pub fn of_which(readings: usize) -> String {
+    match readings {
+        0 => String::new(),
+        1 => ", of which 1 is a requirement reading that holds none of this machine's \
+             capabilities (D159)"
+            .to_owned(),
+        many => format!(
+            ", of which {many} are requirement readings that hold none of this machine's \
+             capabilities (D159)"
+        ),
+    }
+}
+
+/// The same, where the readings are *beside* the count rather than in it:
+/// they take no slot of a counted capability at all (D159).
+fn alongside(readings: usize) -> String {
+    match readings {
+        0 => String::new(),
+        1 => ", and 1 requirement reading is running there besides, holding no slot (D159)"
+            .to_owned(),
+        many => format!(
+            ", and {many} requirement readings are running there besides, holding no slot \
+             (D159)"
+        ),
+    }
 }
 
 impl Contention {
@@ -881,10 +939,19 @@ impl Contention {
                 label,
                 slots,
                 holders,
-            } => format!("{label} has {slots} slot(s) and {holders} are taken"),
-            Contention::ExclusiveNeedsIdle { label, running } => format!(
+                readings,
+            } => format!(
+                "{label} has {slots} slot(s) and {holders} are taken{}",
+                alongside(*readings)
+            ),
+            Contention::ExclusiveNeedsIdle {
+                label,
+                running,
+                readings,
+            } => format!(
                 "{label} is host-wide and this runner is running {running} \
-                 other job(s)"
+                 other job(s){}",
+                of_which(*readings)
             ),
             Contention::HostIsExclusive { held, by } => format!(
                 "{by} holds {held}, which is host-wide, so nothing else runs \
@@ -940,12 +1007,71 @@ impl fmt::Display for Contention {
     }
 }
 
+/// What one open attempt on a runner **is**, for the algebra: ordinary work,
+/// or a requirement reading (D74, D159).
+///
+/// The distinction is the one D159 records, and it is a narrow one:
+/// *eligibility is not availability*. A reading has to land on a machine that
+/// could run the command it is reading for, or it reads the wrong machine's
+/// capabilities and answers with figures that mean nothing — so it is matched
+/// on what a runner **offers and denies**, exactly as any job is. It is not
+/// matched on anything that is about **contention**, because it builds and
+/// boots nothing: a counted slot it would hold for five minutes while the
+/// thirteen jobs its answer unblocks queue behind it is the incident D159 was
+/// written for.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum Occupant {
+    /// An ordinary job. It holds the labels it asked for: a slot of each
+    /// counted one, the whole machine of a host-wide one, and an exclusion
+    /// against whatever those labels exclude.
+    #[default]
+    Job,
+    /// A `labels_from` requirement reading (D74). It holds **none** of them.
+    ///
+    /// It is still a job running on that machine, and everything that follows
+    /// from that still applies: it counts among the jobs running there, so a
+    /// host-wide job waits for it; it respects a host being emptied for
+    /// something else; and it is admitted against the room (D119). What it
+    /// does not do is *take* any of that.
+    Reading,
+}
+
+impl Occupant {
+    /// Whether this occupant holds the labels it was placed against.
+    ///
+    /// The one question the algebra asks of it, so that "a reading holds
+    /// nothing" is written down once rather than matched on in six places.
+    pub fn holds_capabilities(self) -> bool {
+        matches!(self, Occupant::Job)
+    }
+
+    /// How this occupant reads in a sentence a human is given (E-04).
+    pub fn name(self) -> &'static str {
+        match self {
+            Occupant::Job => "job",
+            Occupant::Reading => "requirement reading",
+        }
+    }
+}
+
+/// One open attempt on a runner: what it is, and what it holds.
+#[derive(Debug, Clone)]
+struct Occupation {
+    occupant: Occupant,
+    labels: LabelSet,
+}
+
 /// What one runner is holding right now, and the rules for taking more.
 ///
 /// The algebra's working end. It holds *jobs*, not labels, for two reasons
 /// that both matter: a host-wide capability has to know whether anything at
 /// all is running, which a count of labels cannot say; and releasing is
 /// something a job does, once, whatever it was holding.
+///
+/// Each entry also says **what** that job is — ordinary work or a requirement
+/// reading ([`Occupant`]) — because a reading is running on the machine and
+/// holds none of its capabilities (D159), and those two facts cannot be told
+/// apart from a label set.
 ///
 /// Pure bookkeeping — no clock, no I/O, no probes. Where this gets consulted
 /// is the claim step, and that is M7's: this type exists now because M6's
@@ -954,7 +1080,7 @@ impl fmt::Display for Contention {
 #[derive(Debug, Clone, Default)]
 pub struct Holdings {
     offer: CapabilityOffer,
-    held: BTreeMap<JobId, LabelSet>,
+    held: BTreeMap<JobId, Occupation>,
 }
 
 impl Holdings {
@@ -970,19 +1096,53 @@ impl Holdings {
     }
 
     /// How many jobs are running here.
+    ///
+    /// **A requirement reading is one of them.** It holds no capability
+    /// (D159), but it is a process on that machine, so a host-wide job that
+    /// needs an idle runner waits for it: `exclusive` empties the host of
+    /// everything, including work that holds nothing (D46), and a promise
+    /// broken for a cheap process is a promise broken.
     pub fn running(&self) -> usize {
         self.held.len()
     }
 
     /// How many jobs hold this label.
+    ///
+    /// Readings are **not** among them: one takes no slot of a counted
+    /// capability and never empties a host-wide one (D159).
     pub fn holders_of(&self, label: &str) -> u32 {
         u32::try_from(
-            self.held
-                .values()
-                .filter(|labels| labels.contains(label))
+            self.holders()
+                .filter(|(_, labels)| labels.contains(label))
                 .count(),
         )
         .unwrap_or(u32::MAX)
+    }
+
+    /// How many of the jobs running here are requirement readings (D74,
+    /// D159).
+    ///
+    /// On the type so that every sentence a waiting job is given can say what
+    /// it is waiting behind. Tonight's convoy was legible only to someone who
+    /// could read a record: the waiters said "build has 1 slot(s) and 1 are
+    /// taken" and nothing said the holder was a reading rather than a build,
+    /// which cost forty-five minutes of diagnosis (D159).
+    pub fn readings_running(&self) -> usize {
+        self.held
+            .values()
+            .filter(|occupation| !occupation.occupant.holds_capabilities())
+            .count()
+    }
+
+    /// Every job running here that holds the labels it was placed against —
+    /// which is every job but a reading (D159).
+    fn holders(&self) -> impl Iterator<Item = (&JobId, &LabelSet)> {
+        self.held.iter().filter_map(|(job, occupation)| {
+            occupation
+                .occupant
+                .holds_capabilities()
+                .then_some((job, &occupation.labels))
+        })
     }
 
     /// Whether a job holding `labels` could start here now, and why not if it
@@ -998,7 +1158,17 @@ impl Holdings {
     /// 5. a counted label needs a free slot — `shared` has none to need;
     /// 6. no label may be held alongside a label something else already holds
     ///    and excludes.
-    pub fn check(&self, labels: &LabelSet) -> Result<(), Contention> {
+    ///
+    /// **A requirement reading is judged on the first three and no more**
+    /// (D159). One, two and three are not about contention: one and two are
+    /// facts about the offer and about the asked-for set itself — the
+    /// *eligibility* that keeps a reading on a machine which could run the
+    /// command, without which it reads the wrong machine's capabilities — and
+    /// three is the state of a machine its owner's host-wide job has already
+    /// emptied, which empties it of work holding nothing too (D46). Four,
+    /// five and six are contention and nothing else, and a reading that
+    /// builds and boots nothing takes none of it.
+    pub fn check(&self, labels: &LabelSet, occupant: Occupant) -> Result<(), Contention> {
         for label in labels.iter() {
             if self.offer.available(label).is_none() {
                 return Err(Contention::NotOffered {
@@ -1020,8 +1190,10 @@ impl Holdings {
                 }
             }
         }
-        // Something host-wide is held: nothing else runs, whatever it asks for.
-        for (job, held) in &self.held {
+        // Something host-wide is held: nothing else runs, whatever it asks
+        // for — a reading included (D46, D159). Only a holder can be the one
+        // holding it, which is every job but a reading.
+        for (job, held) in self.holders() {
             for label in held.iter() {
                 if self
                     .offer
@@ -1035,6 +1207,13 @@ impl Holdings {
                 }
             }
         }
+        // And here the reading stops. Everything below is contention: a slot
+        // that is taken, a host that is not empty, an exclusion a running job
+        // holds. A reading is matched on what this runner offers and denies,
+        // and on none of that (D159).
+        if !occupant.holds_capabilities() {
+            return Ok(());
+        }
         for label in labels.iter() {
             let capability = self
                 .offer
@@ -1044,6 +1223,7 @@ impl Holdings {
                 return Err(Contention::ExclusiveNeedsIdle {
                     label: label.to_owned(),
                     running: self.held.len(),
+                    readings: self.readings_running(),
                 });
             }
             if let Some(slots) = capability.kind.holders_allowed() {
@@ -1053,10 +1233,11 @@ impl Holdings {
                         label: label.to_owned(),
                         slots,
                         holders,
+                        readings: self.readings_running(),
                     });
                 }
             }
-            for (job, held) in &self.held {
+            for (job, held) in self.holders() {
                 for other in held.iter() {
                     if capability.excludes.contains(other) {
                         return Err(Contention::Excluded {
@@ -1078,15 +1259,21 @@ impl Holdings {
     ///
     /// A job that is already holding something here is an error, never a
     /// relabel: see [`Contention::AlreadyHolding`].
-    pub fn admit(&mut self, job: &JobId, labels: LabelSet) -> Result<(), Contention> {
-        if let Some(held) = self.held.get(job) {
+    pub fn admit(
+        &mut self,
+        job: &JobId,
+        labels: LabelSet,
+        occupant: Occupant,
+    ) -> Result<(), Contention> {
+        if let Some(occupation) = self.held.get(job) {
             return Err(Contention::AlreadyHolding {
                 job: job.clone(),
-                held: held.clone(),
+                held: occupation.labels.clone(),
             });
         }
-        self.check(&labels)?;
-        self.held.insert(job.clone(), labels);
+        self.check(&labels, occupant)?;
+        self.held
+            .insert(job.clone(), Occupation { occupant, labels });
         Ok(())
     }
 
@@ -1108,8 +1295,14 @@ impl Holdings {
     /// A job already in the holdings keeps the labels it was first written
     /// with: a relabel is what [`Contention::AlreadyHolding`] exists to
     /// refuse, and a rebuild must not be the one path that does it.
-    pub fn already_holding(&mut self, job: &JobId, labels: LabelSet) {
-        self.held.entry(job.clone()).or_insert(labels);
+    /// `occupant` comes off the record too (`JobRecord::occupant`): what a
+    /// job *is* survives a restart because it is written down, and a rebuild
+    /// that guessed would read a reading as a build and hand its slot away
+    /// twice.
+    pub fn already_holding(&mut self, job: &JobId, labels: LabelSet, occupant: Occupant) {
+        self.held
+            .entry(job.clone())
+            .or_insert(Occupation { occupant, labels });
     }
 
     /// Give back whatever a job was holding. Idempotent: a job that ended
@@ -1120,7 +1313,12 @@ impl Holdings {
 
     /// What a job is holding, if it is holding anything.
     pub fn held_by(&self, job: &JobId) -> Option<&LabelSet> {
-        self.held.get(job)
+        self.held.get(job).map(|occupation| &occupation.labels)
+    }
+
+    /// What kind of work this job is, if it is running here at all (D159).
+    pub fn occupant_of(&self, job: &JobId) -> Option<Occupant> {
+        self.held.get(job).map(|occupation| occupation.occupant)
     }
 }
 
@@ -1153,13 +1351,13 @@ mod tests {
 
     /// Take a label set for a job and insist it works.
     fn admit(held: &mut Holdings, n: u32, names: &[&str]) {
-        held.admit(&job(n), labels(names))
+        held.admit(&job(n), labels(names), Occupant::Job)
             .unwrap_or_else(|why| panic!("j{n} should have been admitted: {why}"));
     }
 
     /// Try to take a label set and insist it does not work, returning why.
     fn refuse(held: &Holdings, names: &[&str]) -> Contention {
-        held.check(&labels(names))
+        held.check(&labels(names), Occupant::Job)
             .expect_err("this should have been held up")
     }
 
@@ -1196,6 +1394,7 @@ mod tests {
                     label: "build".to_owned(),
                     slots: n,
                     holders: n,
+                    readings: 0,
                 },
                 "counted({n}) let an {}th holder in",
                 n + 1
@@ -1244,7 +1443,7 @@ mod tests {
         ]);
         admit(&mut held, 0, &["build"]);
         let why = held
-            .admit(&job(0), labels(&["reference"]))
+            .admit(&job(0), labels(&["reference"]), Occupant::Job)
             .expect_err("a job that already holds cannot be admitted again");
         assert_eq!(
             why,
@@ -1290,6 +1489,7 @@ mod tests {
             Contention::ExclusiveNeedsIdle {
                 label: "nightly".to_owned(),
                 running: 1,
+                readings: 0,
             }
         );
         held.release(&job(0));
@@ -1352,10 +1552,245 @@ mod tests {
             .expect("a valid exclusion");
         let mut held = holdings(vec![nightly, Capability::counted("build", 4)]);
         admit(&mut held, 0, &["build"]);
-        assert!(held.check(&labels(&["nightly"])).is_err());
+        assert!(held.check(&labels(&["nightly"]), Occupant::Job).is_err());
         held.release(&job(0));
         admit(&mut held, 1, &["nightly"]);
-        assert!(held.check(&labels(&["build"])).is_err());
+        assert!(held.check(&labels(&["build"]), Occupant::Job).is_err());
+    }
+
+    // ------------------------------- a requirement reading (D159) ----
+
+    /// Take a label set **for a reading** and insist it works.
+    fn admit_a_reading(held: &mut Holdings, n: u32, names: &[&str]) {
+        held.admit(&job(n), labels(names), Occupant::Reading)
+            .unwrap_or_else(|why| panic!("the reading j{n} should have been admitted: {why}"));
+    }
+
+    /// Try to take a label set for a reading and insist it does not work.
+    fn refuse_a_reading(held: &Holdings, names: &[&str]) -> Contention {
+        held.check(&labels(names), Occupant::Reading)
+            .expect_err("this reading should have been held up")
+    }
+
+    /// **The incident, in the algebra.** One build slot, one build holding
+    /// it, and a reading of a command whose baseline is `build`. The reading
+    /// is admitted — it builds and boots nothing, so it takes no slot — and
+    /// the slot count does not move.
+    #[test]
+    fn a_reading_takes_no_slot_and_does_not_wait_for_one() {
+        let mut held = holdings(vec![Capability::counted("build", 1)]);
+        admit(&mut held, 0, &["build"]);
+        // The ordinary job behind it waits, exactly as it did before D159.
+        assert!(matches!(
+            refuse(&held, &["build"]),
+            Contention::NoSlot { .. }
+        ));
+        // The reading does not.
+        admit_a_reading(&mut held, 1, &["build"]);
+        assert_eq!(
+            held.holders_of("build"),
+            1,
+            "a reading must not be counted among the holders of a slot"
+        );
+        assert_eq!(held.readings_running(), 1);
+        assert_eq!(held.running(), 2, "it is still running on that machine");
+    }
+
+    /// And the other direction, which is the half that was costing the
+    /// convoy: a reading already running does not stop a real job taking the
+    /// slot it would have held.
+    #[test]
+    fn a_reading_running_does_not_stop_a_real_job_taking_the_slot() {
+        let mut held = holdings(vec![Capability::counted("build", 1)]);
+        admit_a_reading(&mut held, 0, &["build"]);
+        assert_eq!(held.holders_of("build"), 0);
+        admit(&mut held, 1, &["build"]);
+        assert_eq!(held.holders_of("build"), 1);
+        // And now the slot really is taken, reading or no reading.
+        assert!(matches!(
+            refuse(&held, &["build"]),
+            Contention::NoSlot { .. }
+        ));
+    }
+
+    /// Eligibility is **not** waived. A reading has to land on a machine that
+    /// could run the command, or it reads the wrong machine's capabilities
+    /// and answers with figures that mean nothing — so a label this runner
+    /// does not offer, and a label its owner denied, hold a reading off
+    /// exactly as they hold off any job.
+    #[test]
+    fn a_reading_is_still_matched_on_what_the_runner_offers_and_denies() {
+        let offer = CapabilityOffer::new(vec![
+            OfferedCapability::new(
+                Capability::counted("build", 1),
+                CapabilityOrigins::declared(),
+            ),
+            OfferedCapability::new(
+                Capability::shared("kvm"),
+                CapabilityOrigins {
+                    probed: true,
+                    declared: false,
+                    denied: true,
+                },
+            ),
+        ])
+        .expect("a valid offer");
+        let held = Holdings::new(offer);
+        assert_eq!(
+            refuse_a_reading(&held, &["nothing-offers-this"]),
+            Contention::NotOffered {
+                label: "nothing-offers-this".to_owned()
+            }
+        );
+        assert_eq!(
+            refuse_a_reading(&held, &["kvm"]),
+            Contention::NotOffered {
+                label: "kvm".to_owned()
+            },
+            "a denied capability is not handed to a reading either"
+        );
+        // And a label set that contradicts itself is still impossible: that
+        // is a fact about the declaration, not about contention.
+        let mut both = holdings(vec![
+            Capability::counted("build", 1)
+                .excluding(["rig"])
+                .expect("valid labels"),
+            Capability::shared("rig"),
+        ]);
+        assert!(refuse_a_reading(&both, &["build", "rig"]).is_impossible());
+        // Nothing above admitted anything.
+        assert_eq!(both.running(), 0);
+        admit_a_reading(&mut both, 0, &["build"]);
+    }
+
+    /// A reading of a command that declares a host-wide capability neither
+    /// **takes** the machine nor **waits** for it to be empty: both are
+    /// contention, and a reading that could hold a whole machine empty would
+    /// be a worse version of the incident D159 is about.
+    #[test]
+    fn a_reading_of_an_exclusive_command_neither_takes_nor_empties_the_machine() {
+        let mut held = holdings(vec![
+            Capability::exclusive("rig-cpu"),
+            Capability::counted("build", 2),
+        ]);
+        // Something is running there, which would stop a real `rig-cpu` job.
+        admit(&mut held, 0, &["build"]);
+        assert!(matches!(
+            refuse(&held, &["rig-cpu"]),
+            Contention::ExclusiveNeedsIdle { .. }
+        ));
+        // The reading of the same command runs anyway, and empties nothing.
+        admit_a_reading(&mut held, 1, &["rig-cpu"]);
+        assert_eq!(held.holders_of("rig-cpu"), 0);
+        // A third job is still admitted beside it: the reading did not make
+        // this machine exclusive.
+        admit(&mut held, 2, &["build"]);
+    }
+
+    /// But a machine a host-wide job has **already emptied** stays empty, and
+    /// a reading is one of the things it is emptied of (D46).
+    ///
+    /// This is the one contention rule a reading is still held to, and it is
+    /// held to it because `exclusive` is the owner's promise that nothing
+    /// runs beside her job — a promise broken for a cheap process is a
+    /// promise broken, and the figures the exclusive job exists to measure
+    /// are what a process beside it would spoil.
+    #[test]
+    fn a_reading_waits_for_a_machine_an_exclusive_job_has_emptied() {
+        let mut held = holdings(vec![
+            Capability::exclusive("rig-cpu"),
+            Capability::counted("build", 2),
+        ]);
+        admit(&mut held, 0, &["rig-cpu"]);
+        let why = refuse_a_reading(&held, &["build"]);
+        assert_eq!(
+            why,
+            Contention::HostIsExclusive {
+                held: "rig-cpu".to_owned(),
+                by: job(0),
+            }
+        );
+        assert!(why.clears_with_time(), "it waits and is never refused");
+        held.release(&job(0));
+        admit_a_reading(&mut held, 1, &["build"]);
+    }
+
+    /// An exclusion a running job holds is contention between **holders**,
+    /// and a reading is not one: it holds nothing for the exclusion to bite
+    /// on.
+    #[test]
+    fn a_reading_is_not_held_off_by_an_exclusion_a_running_job_holds() {
+        let mut held = holdings(vec![
+            Capability::counted("gpu-venus", 2)
+                .excluding(["igpu-vfio"])
+                .expect("valid labels"),
+            Capability::counted("igpu-vfio", 1),
+        ]);
+        admit(&mut held, 0, &["gpu-venus"]);
+        assert!(matches!(
+            refuse(&held, &["igpu-vfio"]),
+            Contention::Excluded { .. }
+        ));
+        admit_a_reading(&mut held, 1, &["igpu-vfio"]);
+        // And a reading holding nothing excludes nothing in its turn.
+        admit(&mut held, 2, &["gpu-venus"]);
+    }
+
+    /// **The sentence.** Tonight's convoy was legible only to someone who
+    /// could read a record: the waiters said "build has 1 slot(s) and 1 are
+    /// taken" and nothing said what the holder was. Every sentence that
+    /// counts the jobs on a machine now says how many of them are readings
+    /// (D159).
+    #[test]
+    fn a_waiting_job_is_told_when_it_is_waiting_behind_a_reading() {
+        let mut held = holdings(vec![
+            Capability::exclusive("rig-cpu"),
+            Capability::counted("build", 1),
+        ]);
+        admit(&mut held, 0, &["build"]);
+        admit_a_reading(&mut held, 1, &["build"]);
+        // The slot waiter: the reading is beside the count, not in it, and
+        // the sentence says so rather than leaving the operator to guess.
+        let slot = refuse(&held, &["build"]).reason();
+        assert!(
+            slot.contains("build has 1 slot(s) and 1 are taken"),
+            "{slot}"
+        );
+        assert!(slot.contains("requirement reading"), "{slot}");
+        assert!(slot.contains("holding no slot"), "{slot}");
+        // The host-wide waiter: the reading is one of the jobs it is waiting
+        // for, so it is named inside the count.
+        let quiet = refuse(&held, &["rig-cpu"]).reason();
+        assert!(quiet.contains("running 2 other job(s)"), "{quiet}");
+        assert!(
+            quiet.contains("of which 1 is a requirement reading"),
+            "{quiet}"
+        );
+        // And with no reading running, neither sentence gains a word.
+        held.release(&job(1));
+        assert_eq!(
+            refuse(&held, &["build"]).reason(),
+            "build has 1 slot(s) and 1 are taken"
+        );
+        assert_eq!(
+            refuse(&held, &["rig-cpu"]).reason(),
+            "rig-cpu is host-wide and this runner is running 1 other job(s)"
+        );
+    }
+
+    /// A reading is written down as a reading when the holdings are rebuilt
+    /// from the records, so a hub that restarts does not read one as a build
+    /// and hand its slot away twice (D79, D159).
+    #[test]
+    fn a_rebuilt_reading_is_still_a_reading() {
+        let mut held = holdings(vec![Capability::counted("build", 1)]);
+        held.already_holding(&job(0), labels(&["build"]), Occupant::Reading);
+        held.already_holding(&job(1), labels(&["build"]), Occupant::Job);
+        assert_eq!(held.holders_of("build"), 1);
+        assert_eq!(held.readings_running(), 1);
+        assert_eq!(held.occupant_of(&job(0)), Some(Occupant::Reading));
+        assert_eq!(held.occupant_of(&job(1)), Some(Occupant::Job));
+        assert_eq!(held.occupant_of(&job(2)), None);
     }
 
     // -------------------------------------------- exclusion ----
@@ -1537,7 +1972,7 @@ mod tests {
         assert!(offer.available("kvm").is_none(), "but never offered");
         let held = Holdings::new(offer);
         assert_eq!(
-            held.check(&labels(&["kvm"])),
+            held.check(&labels(&["kvm"]), Occupant::Job),
             Err(Contention::NotOffered {
                 label: "kvm".to_owned()
             })

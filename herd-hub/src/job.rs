@@ -10,8 +10,8 @@ use std::error::Error;
 use std::fmt;
 
 use herd_proto::{
-    Declaration, JobId, JobOutcome, LabelSet, LabelsFrom, LogStream, Priority, Requirements,
-    StepRun,
+    Declaration, JobId, JobOutcome, LabelSet, LabelsFrom, LogStream, Occupant, Priority,
+    Requirements, StepRun,
 };
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
@@ -307,6 +307,9 @@ pub struct NewJob {
     /// The reading that will say what this job needs, when its command
     /// declares one (D74); see [`JobRecord::reading`].
     pub reading: Option<Reading>,
+    /// The job this one is the requirement reading **of**, when it is one
+    /// (D74, D159); see [`JobRecord::reading_for`].
+    pub reading_for: Option<JobId>,
 }
 
 impl NewJob {
@@ -342,6 +345,7 @@ impl NewJob {
             declaration: None,
             timeout_s: None,
             reading: None,
+            reading_for: None,
         }
     }
 
@@ -377,6 +381,19 @@ impl NewJob {
     /// answer is on its record.
     pub fn reading(mut self, labels_from: Option<herd_proto::LabelsFrom>) -> Self {
         self.reading = labels_from.map(Reading::of);
+        self
+    }
+
+    /// The same, as the requirement reading **of** that job (D74, D159).
+    ///
+    /// The one thing on a reading that is not an ordinary job's, and it is
+    /// one field rather than a flag because naming the job it was minted for
+    /// is what lets every sentence about a machine say *whose* reading is
+    /// running there. Only the hub ever calls this: it is the only thing that
+    /// mints a reading (D74's third limit, no recursion), and nothing on the
+    /// wire can ask for one.
+    pub fn reads_for(mut self, job: &JobId) -> Self {
+        self.reading_for = Some(job.clone());
         self
     }
 
@@ -715,6 +732,32 @@ pub struct JobRecord {
     /// before this field existed is a record of such a job.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reading: Option<Reading>,
+    /// The job this one is the requirement reading **of**, when it is one
+    /// (D74, D159).
+    ///
+    /// The mirror of [`JobRecord::reading`], and the two can never both be
+    /// set: a command reached through `labels_from` cannot resolve one of its
+    /// own, because the hub is the only thing that mints such a job and mints
+    /// it with none (D74's third limit).
+    ///
+    /// It exists because the claim step has to be able to tell a reading from
+    /// a build, and nothing else on the record says so: a reading is an
+    /// ordinary job in every other respect, which is D74's whole design. A
+    /// reading **holds no capability** — no counted slot, no host-wide
+    /// machine, no exclusion — and is still admitted against the room it runs
+    /// in (D119) and still bounded by the hub's reading cap and the runner's
+    /// own (D108). That is D159, and this field is how the arithmetic knows.
+    ///
+    /// Written at the mint and never changed, so a hub that restarts rebuilds
+    /// the right holdings from the records: a reading read back as an
+    /// ordinary job would be handed a slot nobody gave it.
+    ///
+    /// `#[serde(default)]`, because a record written before D159 is a record
+    /// of a job that is not a reading — or, for the one in flight across the
+    /// upgrade, of a reading that holds its slot until it ends, which is five
+    /// minutes at most ([`crate::READING_CAP`]).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reading_for: Option<JobId>,
     /// How many submissions this one execution answers (E-05).
     ///
     /// 1 for an ordinary job; 2 after a second identical submission joined
@@ -1106,6 +1149,24 @@ impl JobRecord {
         self.reading.as_ref()?.answer.as_ref()
     }
 
+    /// What this job **is**, for the claim step's arithmetic (D159).
+    ///
+    /// [`herd_proto::Occupant::Reading`] for a `labels_from` requirement
+    /// reading the hub minted, and [`herd_proto::Occupant::Job`] for
+    /// everything else. The one place the distinction is read off a record,
+    /// so that a second reading of it cannot drift from this one.
+    pub fn occupant(&self) -> Occupant {
+        match self.reading_for {
+            Some(_) => Occupant::Reading,
+            None => Occupant::Job,
+        }
+    }
+
+    /// Whether this job is the requirement reading of another (D74, D159).
+    pub fn is_a_reading(&self) -> bool {
+        self.reading_for.is_some()
+    }
+
     /// Whether this job is waiting for a reading to say what it needs (D74).
     ///
     /// A job that is is never placed: not by the claim step, not by a dry
@@ -1170,6 +1231,7 @@ impl JobRecord {
             declaration: new.declaration,
             timeout_s: new.timeout_s,
             reading: new.reading,
+            reading_for: new.reading_for,
             parallelism: None,
             submissions: 1,
             state: JobState::Queued,

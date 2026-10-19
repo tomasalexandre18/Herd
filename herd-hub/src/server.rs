@@ -58,7 +58,7 @@ use herd_proto::{
     a_frame_about_a_job_that_is_over_reason, foreign_state_root_reason, from_frame,
     not_this_runner_s_attempt_reason, runner_twin_reason, to_frame, unreadable_handshake_reason,
     version_mismatch_reason, CapabilityState, FromHub, Holdings, HostSize, JobId, JobMetrics,
-    JobOutcome, LabelSet, Priority, Role, RunningJob, ToHub, HEALTH_EVERY, PROTOCOL_VERSION,
+    JobOutcome, Priority, Role, RunningJob, ToHub, HEALTH_EVERY, PROTOCOL_VERSION,
 };
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::mpsc::{self, UnboundedReceiver, UnboundedSender};
@@ -1059,7 +1059,7 @@ impl State {
     /// is leaving.
     fn seats(
         &self,
-        held: &BTreeMap<String, Vec<(JobId, LabelSet)>>,
+        held: &BTreeMap<String, Vec<matcher::Holding>>,
         reserved: &BTreeMap<String, matcher::Reserved>,
     ) -> Vec<Seat> {
         self.with_peers(|peers| {
@@ -1068,13 +1068,20 @@ impl State {
                 .values()
                 .map(|runner| {
                     let mut holdings = Holdings::new(runner.capacity.offer().clone());
-                    for (job, labels) in held.get(&runner.name).into_iter().flatten() {
+                    for holding in held.get(&runner.name).into_iter().flatten() {
                         // Written down, never checked: a job the records say
                         // is out there is out there, whatever the offer says
                         // about its labels now. Checking would quietly leave
                         // such a job out of the holdings and read the host as
-                        // idle on top of work that is running.
-                        holdings.already_holding(job, labels.clone());
+                        // idle on top of work that is running. What it *is*
+                        // comes off the record with it (D159), so a hub that
+                        // restarts does not read a reading as a build and
+                        // hand its slot away twice.
+                        holdings.already_holding(
+                            &holding.job,
+                            holding.labels.clone(),
+                            holding.occupant,
+                        );
                     }
                     Seat {
                         name: runner.name.clone(),
@@ -2469,6 +2476,13 @@ fn reading_job(
     // Said out loud rather than left to the default: this is D74's third
     // limit, and it is kept here or nowhere.
     .reading(None)
+    // And this is what makes it a reading in the claim step's eyes (D159):
+    // it holds no counted slot, empties no host-wide machine and waits for
+    // no probe, while still being matched on the labels a runner offers and
+    // has not denied, and still admitted against the room (D119). The one
+    // place a reading is ever marked as one — the hub is the only thing that
+    // mints one, which is also how D74's no-recursion limit is kept.
+    .reads_for(&record.id)
 }
 
 /// Why a job whose requirements could not be read is refused, **by name**

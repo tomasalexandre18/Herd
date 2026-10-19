@@ -25,9 +25,9 @@ pub mod placement;
 pub mod size;
 
 pub use capability::{
-    check_label, metal_label, Availability, BusyProbe, Capability, CapabilityError, CapabilityKind,
-    CapabilityOffer, CapabilityOrigins, CapabilityState, Contention, Holdings, LabelSet,
-    OfferedCapability,
+    check_label, metal_label, of_which, Availability, BusyProbe, Capability, CapabilityError,
+    CapabilityKind, CapabilityOffer, CapabilityOrigins, CapabilityState, Contention, Holdings,
+    LabelSet, Occupant, OfferedCapability,
 };
 pub use declaration::{
     args_as_line, declared_spans, filled_outside_the_arguments, shell_quote, Declaration, Executor,
