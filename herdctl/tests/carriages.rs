@@ -450,3 +450,92 @@ async fn a_collection_the_sweeper_took_is_answered_with_its_figures() {
         "an evicted collection is not a transfer that stalled: {said}"
     );
 }
+
+/// **The outage of 2026-10-19: a second collection on one link** (D158).
+///
+/// Every test above runs exactly one streamed collection and then throws its
+/// hub and its runner away, which is why none of them could see this. The
+/// runner's send window is per **connection**, and the pump used to spend a
+/// permit on the acquisition that *finds the collection finished* and never
+/// give it back — so the window shrank by one for every collection that
+/// succeeded, and the one that arrived with the window at zero waited for
+/// room for ever. On the first consumer that was the ninth collection of the
+/// evening: `pack result: ok`, a complete manifest on the record, an empty
+/// `files/` on the hub, and no line anywhere saying why.
+///
+/// So the thing under test is **two in a row on one link**, with the window
+/// set to one so that two is enough (`Harness::with_files_in_flight`). The
+/// second run is the assertion; the first is the one that has to not poison
+/// it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_second_streamed_collection_on_one_link_comes_home_too() {
+    let Some(fixture) = Fixture::new("a_second_streamed_collection_on_one_link_comes_home_too")
+    else {
+        return;
+    };
+    // One hub and one runner for both runs — the whole point. A window of
+    // one makes the second collection the one that finds the window empty,
+    // where the shipped figure of eight would make it the ninth.
+    let harness = Harness::with_files_in_flight(1).await;
+    let size = over_the_threshold().to_string();
+
+    for round in 1..=2 {
+        // A path of its own per round, so the two submissions are two jobs
+        // and not one deduplicated onto the other (D156).
+        let leaves = format!("files/results-{round}.json");
+        let into = herd_runner::testing::TempDir::new(&format!("second-collection-{round}"));
+        let output = harness
+            .herdctl_in(
+                &fixture,
+                &[
+                    "run",
+                    "--command",
+                    ASSEMBLE,
+                    "--commit",
+                    BRANCH,
+                    "--outputs-to",
+                    &into.path().to_string_lossy(),
+                    "--",
+                    "--leave",
+                    &leaves,
+                    "--leave-bytes",
+                    &size,
+                    "--verdict",
+                    "0",
+                ],
+            )
+            .await;
+        let said = stderr(&output);
+        assert_eq!(
+            status_code(&output),
+            0,
+            "collection {round} of 2 on this link: {said}"
+        );
+        let landed = into.path().join(&leaves);
+        let bytes = std::fs::metadata(&landed).map(|about| about.len()).ok();
+        assert_eq!(
+            bytes,
+            Some(over_the_threshold()),
+            "collection {round} of 2 on this link did not come home to {}. A collection \
+             that works once and never again is a window that is not given back, not a \
+             collection that is too big: the first one here succeeded.\n{said}",
+            landed.display()
+        );
+        assert!(
+            !said.contains("stopped sending"),
+            "collection {round} of 2 stalled rather than arriving: {said}"
+        );
+    }
+
+    // Both records really took the streamed carriage, so this test is about
+    // the thing it says it is about and not about two inline collections.
+    let records = harness.records();
+    assert_eq!(records.len(), 2, "two jobs ran: {records:#?}");
+    for record in &records {
+        assert_eq!(
+            record["outputs"]["streamed"].as_bool(),
+            Some(true),
+            "both collections must have streamed, or the window was never used: {record:#?}"
+        );
+    }
+}

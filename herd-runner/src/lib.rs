@@ -361,6 +361,19 @@ pub struct Config {
     /// A second by default. Injectable because a test that is about the ten
     /// seconds must be able to measure them without them being mostly this.
     pub switch_poll: Duration,
+    /// How many file chunks of a streamed collection may be queued on one
+    /// link at a time (D148): [`FILES_IN_FLIGHT`] unless a test says
+    /// otherwise.
+    ///
+    /// Injectable for the reason [`Confinement::output_cap`] is. The failure
+    /// this window has is that it *runs down* across collections, and
+    /// reproducing that at the shipped figure costs nine real transfers of
+    /// over 32 MiB each; at a window of one it costs two, and it is the same
+    /// mechanism either way (D158).
+    pub files_in_flight: usize,
+    /// How long a collection's pump waits for room on that window before it
+    /// says so on stderr (D158).
+    pub files_stall_after: Duration,
 }
 
 impl Default for Config {
@@ -385,6 +398,8 @@ impl Default for Config {
             // where the root really ended up.
             switch_file: None,
             switch_poll: crate::switch::Poll::default().0,
+            files_in_flight: FILES_IN_FLIGHT,
+            files_stall_after: FILES_STALL_AFTER,
         }
     }
 }
@@ -812,6 +827,14 @@ struct Inner {
     /// its build because its owner wanted the machine back in ten seconds
     /// would have lost her exactly the work she was being polite about.
     switch: herd_proto::Switch,
+    /// How long a collection's pump waits for room on the link before it says
+    /// so (D158).
+    ///
+    /// Carried here rather than read from a constant so that a test can see a
+    /// real pump wait out a real bound without waiting out the shipped one.
+    /// Set from [`Config::files_stall_after`] when a connection attaches,
+    /// like the window it is about.
+    files_stall_after: Duration,
 }
 
 impl Default for Inner {
@@ -820,6 +843,7 @@ impl Default for Inner {
             instance: mint_an_instance_id(),
             link: None,
             files_credit: None,
+            files_stall_after: FILES_STALL_AFTER,
             jobs: HashMap::new(),
             collections: HashMap::new(),
             spooled: Vec::new(),
@@ -830,6 +854,97 @@ impl Default for Inner {
         }
     }
 }
+
+/// What a pump says when the link's window has not opened for it (D158).
+///
+/// **The sentence that would have named this outage in ten seconds.** A
+/// collection waiting here is a job whose verdict is already on the hub and
+/// whose bytes are not moving, which from every other vantage point looks
+/// like an absence with no cause: the hub holds a manifest and no files, and
+/// the requester is told what it did not get. Only the runner knows it is
+/// waiting, so only the runner can say it — by job, with the figure, and
+/// saying which of the two it is, because a window that has room for nobody
+/// is a defect in this runner and a window that is merely full is a slow
+/// socket.
+fn waiting_for_room(job_id: &JobId, waited: Duration) -> String {
+    format!(
+        "the files of {job_id} have waited {waited:?} for room on the link to the hub and \
+         none came. Their bytes are on this runner, the hub has a manifest and no file, and \
+         a requester asking for them is being told it did not get them. Nothing is wrong \
+         with the collection: the window this runner sends chunks through is not opening."
+    )
+}
+
+/// Why a spool this runner owns the top of will nonetheless not be removed,
+/// when the reason is one a reader cannot see from the error alone (D158).
+///
+/// `Permission denied` on a tree whose every directory is `drwxr-xr-x` reads
+/// as impossible, and the hour it costs to work out goes on the one fact the
+/// error does not carry: **unlinking is a write to the directory that holds
+/// the name**, so a directory the runner did not create is a directory the
+/// runner cannot empty, whatever its mode says. A job that moves a tree it
+/// did not make into `{out}` — a content-addressed store prepared beforehand,
+/// say — leaves exactly that, and no `chmod` fixes it because `chmod` is also
+/// the owner's to make.
+fn why_it_will_not_go(spool: &Path) -> Option<String> {
+    let mine = crate::privilege::effective_uid()?;
+    let (path, owner) = foreign_directory_under(spool, mine)?;
+    Some(format!(
+        "{} belongs to uid {owner} and this runner is uid {mine}, so it may not unlink what \
+         is inside it however the directory is moded — a job that moved a tree it did not \
+         create into its output directory leaves one of these behind",
+        path.display()
+    ))
+}
+
+/// The shallowest directory under `spool` that `mine` does not own, with its
+/// owner.
+///
+/// Breadth first, because the shallowest is the one an operator acts on: one
+/// foreign directory near the top usually holds all the others, and naming a
+/// leaf six levels down would have her fix one of hundreds. Symlinks are not
+/// followed, for the reason [`crate::outputs`] does not follow them. Bounded
+/// at [`FOREIGN_SEARCH_LIMIT`] entries: this runs on a path that has already
+/// failed, to explain it, and an explanation must not cost more than the
+/// thing it explains.
+#[cfg(unix)]
+fn foreign_directory_under(spool: &Path, mine: u32) -> Option<(PathBuf, u32)> {
+    use std::os::unix::fs::MetadataExt;
+
+    let mut looked = 0usize;
+    let mut todo = VecDeque::from([spool.to_path_buf()]);
+    while let Some(dir) = todo.pop_front() {
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            looked += 1;
+            if looked > FOREIGN_SEARCH_LIMIT {
+                return None;
+            }
+            let path = entry.path();
+            let Ok(about) = std::fs::symlink_metadata(&path) else {
+                continue;
+            };
+            if !about.is_dir() {
+                continue;
+            }
+            if about.uid() != mine {
+                return Some((path, about.uid()));
+            }
+            todo.push_back(path);
+        }
+    }
+    None
+}
+
+#[cfg(not(unix))]
+fn foreign_directory_under(_spool: &Path, _mine: u32) -> Option<(PathBuf, u32)> {
+    None
+}
+
+/// How many entries [`foreign_directory_under`] looks at before it gives up.
+const FOREIGN_SEARCH_LIMIT: usize = 20_000;
 
 /// What a position means for the machine it was just set on (E-33).
 ///
@@ -1179,11 +1294,25 @@ impl Session {
     /// ([`FilesOut::next`]), so a task that is replaced on a redial cannot
     /// disagree with the one that replaced it, and the file read happens
     /// outside the session's lock.
+    ///
+    /// **A permit is spent only by a chunk that reaches the link** (D158).
+    /// The permit is held, not forgotten, until [`Session::send`] has queued
+    /// the frame [`write_frames`] will hand it back for; every other way out
+    /// of the loop — the collection is finished, a file will not read, the
+    /// link went away — drops it, and dropping returns it. Forgetting it on
+    /// acquisition cost the window one permit per **completed** collection,
+    /// so the eighth collection on one connection left
+    /// [`Config::files_in_flight`] at zero and the ninth waited for room
+    /// that could never come: output that worked all evening and then
+    /// stopped, with nothing said by anybody.
     fn pump_files(&self, job_id: JobId) {
         let session = self.clone();
         tokio::spawn(async move {
+            let mut already_said = false;
             loop {
-                let Some(credit) = session.with(|inner| inner.files_credit.clone()) else {
+                let Some((credit, stall_after)) = session
+                    .with(|inner| Some((inner.files_credit.clone()?, inner.files_stall_after)))
+                else {
                     // No link: the collection stays on the disk and the hub
                     // says where to resume when there is one again.
                     return;
@@ -1191,14 +1320,35 @@ impl Session {
                 // The window, and the one thing that stops a fast disk
                 // filling memory on its way to a slower socket. A permit
                 // comes back when `write_frames` has put a chunk on the wire.
-                if credit
-                    .acquire()
-                    .await
-                    .map(|permit| permit.forget())
-                    .is_err()
-                {
-                    return;
-                }
+                //
+                // **A window that will not open is said out loud, once per
+                // collection** (D158). Waiting here is ordinary for a moment
+                // and is a stopped transfer for longer than that, and a
+                // stopped transfer is precisely the state that reached the
+                // first consumer as a job whose verdict said `ok` and whose
+                // files never came. This runner is the only party that knows
+                // *why* nothing is moving — the hub sees an absence and the
+                // requester sees a short collection — so it is the one that
+                // has to speak, and it speaks inside `herdctl`'s own
+                // `OUTPUTS_STALL_LIMIT` so the line is already in the journal
+                // when the requester gives up.
+                let permit = match tokio::time::timeout(stall_after, credit.acquire()).await {
+                    Ok(Ok(permit)) => permit,
+                    Ok(Err(_)) => return,
+                    Err(_) => {
+                        if !already_said {
+                            already_said = true;
+                            journal(&format!(
+                                "herd-runner: {}",
+                                waiting_for_room(&job_id, stall_after)
+                            ));
+                        }
+                        match credit.acquire().await {
+                            Ok(permit) => permit,
+                            Err(_) => return,
+                        }
+                    }
+                };
                 let Some(plan) = session
                     .with(|inner| inner.collections.get_mut(&job_id).and_then(FilesOut::next))
                 else {
@@ -1215,6 +1365,9 @@ impl Session {
                         }) {
                             return;
                         }
+                        // On the link's queue, so `write_frames` owes this
+                        // permit back and this task must not return it too.
+                        permit.forget();
                     }
                     // The spool is this runner's own directory and nothing
                     // but a reap should ever take a file out of it, so this
@@ -1279,8 +1432,14 @@ impl Session {
             if let Err(error) = std::fs::remove_dir_all(&spool) {
                 eprintln!(
                     "herd-runner: the hub has every file of {job_id} and {} will not go \
-                     away: {error}",
-                    spool.display()
+                     away: {error}.{} The bytes are safe on the hub; what is left here is \
+                     this runner's own copy, and it will not shrink until somebody who can \
+                     write there removes it.",
+                    spool.display(),
+                    match why_it_will_not_go(&spool) {
+                        Some(why) => format!(" {why}."),
+                        None => String::new(),
+                    }
                 );
             }
         }
@@ -1529,10 +1688,11 @@ impl Session {
     /// Done while holding the lock a new chunk would need, so that nothing a
     /// running job produces can slip in front of what is being sent again. A
     /// log that keeps its order across a reconnect is the whole point.
-    fn attach(&self, outbox: Outbox, credit: Arc<Semaphore>) {
+    fn attach(&self, outbox: Outbox, credit: Arc<Semaphore>, stall_after: Duration) {
         self.with(|inner| {
             inner.link = Some(outbox);
             inner.files_credit = Some(credit);
+            inner.files_stall_after = stall_after;
             let ids: Vec<JobId> = inner.jobs.keys().cloned().collect();
             for job_id in ids {
                 let Some(job) = inner.jobs.get(&job_id) else {
@@ -1830,7 +1990,23 @@ fn running_jobs(inner: &Inner) -> Vec<RunningJob> {
 /// waiting on a round trip for every chunk — the permits come back from
 /// [`write_frames`], which is on the same machine, so the window only has to
 /// cover the disk-to-socket speed difference and not a network latency.
-const FILES_IN_FLIGHT: usize = 8;
+///
+/// Public because it is a figure a test has to be able to exceed: the way a
+/// window is got wrong is that it runs down over several collections, and a
+/// test that does not know how many collections "several" is cannot write
+/// that down (D158).
+pub const FILES_IN_FLIGHT: usize = 8;
+
+/// How long a collection's pump waits for room on the link before it says so:
+/// **fifteen seconds** (D158).
+///
+/// Under `herdctl`'s own thirty-second stall bound, deliberately: the
+/// requester gives up at thirty and the only party that knows *why* the bytes
+/// stopped is this one, so its line has to already be in the journal when the
+/// requester's appears. Long enough that an ordinary full window — a slow
+/// socket behind a fast disk — never reaches it, because a line printed every
+/// time a transfer is merely busy is a line nobody reads (D151).
+const FILES_STALL_AFTER: Duration = Duration::from_secs(15);
 
 /// `take` bytes of `path` starting at `offset`, and no more held than that.
 ///
@@ -2446,12 +2622,12 @@ pub async fn serve_once(config: Config, session: Session, confined: Arc<Confined
     // chunks queued on the link that broke went with it, so their permits
     // would never have come back and a counter carried across redials would
     // run down to nothing.
-    let credit = Arc::new(Semaphore::new(FILES_IN_FLIGHT));
+    let credit = Arc::new(Semaphore::new(config.files_in_flight));
     let mut writer = tokio::spawn(write_frames(sink, inbox, Arc::clone(&credit)));
     // Before anything else on this connection: what the last one could not
     // deliver. A job finished while the hub was away is still a job that ran,
     // and output the hub never wrote is still output the job produced.
-    session.attach(outbox, credit);
+    session.attach(outbox, credit, config.files_stall_after);
     // And what every probe says, before this connection can be dispatched on.
     session.announce_capabilities();
     let reporting = tokio::spawn(report_health(session.clone(), config.health_every));
@@ -3142,6 +3318,177 @@ mod tests {
             root.hub_state_root(),
             None,
             "so the next dial announces no root at all, and is admitted"
+        );
+    }
+
+    /// A collection, on the disk and in the session, ready to be pumped.
+    ///
+    /// Small on purpose: these tests are about the **window**, not about
+    /// moving bytes, and a one-chunk collection exercises every edge of the
+    /// window that a four-hundred-megabyte one does.
+    fn a_collection_to_send(
+        session: &Session,
+        job_id: &JobId,
+        spool: &Path,
+    ) -> herd_proto::JobOutputs {
+        let bytes = b"the one file of a streamed collection".to_vec();
+        std::fs::create_dir_all(spool).expect("a spool directory");
+        std::fs::write(spool.join("results.json"), &bytes).expect("the spooled file");
+        let _cancel = session
+            .take_job(job_id, 1)
+            .expect("a fresh session is not draining");
+        herd_proto::JobOutputs {
+            files: vec![herd_proto::OutputFile {
+                path: "results.json".to_owned(),
+                len: bytes.len() as u64,
+                sha256: herd_proto::sha256_hex(&bytes),
+                data: None,
+            }],
+            streamed: true,
+            ..Default::default()
+        }
+    }
+
+    /// **The outage of 2026-10-19, in one assertion** (D158).
+    ///
+    /// Every chunk of a collection takes a permit out of the link's window
+    /// and [`write_frames`] puts it back when the chunk is on the wire. The
+    /// pump also took one for the acquisition that *finds the collection
+    /// finished*, and nothing ever gave that one back — so each completed
+    /// collection shrank the window by one, the eighth left it at zero, and
+    /// the ninth waited for room for ever while the hub held a manifest with
+    /// no files behind it.
+    ///
+    /// Asserted on the window itself rather than on a ninth transfer,
+    /// because the window is the invariant: **a collection that has gone
+    /// through gives back everything it borrowed.** A test written as "nine
+    /// collections still work" would pass again the day the window is
+    /// widened to nine.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_finished_collection_gives_the_whole_window_back() {
+        let temp = crate::testing::TempDir::new("window-returned");
+        let session = Session::new();
+        let credit = Arc::new(Semaphore::new(FILES_IN_FLIGHT));
+        let (outbox, mut inbox) = mpsc::unbounded_channel();
+        session.attach(outbox, Arc::clone(&credit), Duration::from_millis(50));
+
+        for number in 1..=3 {
+            let job_id = JobId::new(format!("j000000021{number}"));
+            let spool = temp.path().join(format!("spool-{number}"));
+            let outputs = a_collection_to_send(&session, &job_id, &spool);
+            session.finish(
+                &job_id,
+                JobOutcome::Exited { code: 0 },
+                JobMetrics::default(),
+                Vec::new(),
+                outputs,
+                Some(spool),
+            );
+            // Stand in for `write_frames`: drain the link and give a permit
+            // back for every chunk that really reached it, which is the
+            // contract the pump is written against.
+            let mut chunks = 0;
+            while chunks == 0 {
+                while let Ok(message) = inbox.try_recv() {
+                    if matches!(message, ToHub::JobFileChunk { .. }) {
+                        chunks += 1;
+                        credit.add_permits(1);
+                    }
+                }
+                tokio::task::yield_now().await;
+            }
+            // The hub has it all, so the pump finds nothing more to send and
+            // ends — which is the moment the permit used to disappear.
+            session.files_acknowledged(&job_id, 1);
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while credit.available_permits() < FILES_IN_FLIGHT {
+                assert!(
+                    Instant::now() < deadline,
+                    "collection {number} left the window at {} of {FILES_IN_FLIGHT} permits: \
+                     a window that shrinks per collection runs out, and the collection it \
+                     runs out on waits for ever",
+                    credit.available_permits()
+                );
+                tokio::task::yield_now().await;
+            }
+        }
+    }
+
+    /// A collection that cannot get room on the link says so, by name, once
+    /// (D158).
+    ///
+    /// The silence was half the defect: the runner waited, the hub had
+    /// nothing to report because nothing arrived, and the requester was told
+    /// only that it did not get its files. One line, from the one party that
+    /// knows why.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_collection_with_no_room_on_the_link_is_not_silent_about_it() {
+        let temp = crate::testing::TempDir::new("window-stalled");
+        let session = Session::new();
+        let job_id = JobId::new("j0000000214");
+        let spool = temp.path().join("spool");
+        let outputs = a_collection_to_send(&session, &job_id, &spool);
+        // A link whose window has no room in it at all, which is what eight
+        // leaked permits left behind.
+        let (outbox, _inbox) = mpsc::unbounded_channel();
+        session.attach(
+            outbox,
+            Arc::new(Semaphore::new(0)),
+            Duration::from_millis(50),
+        );
+
+        let (_, said) = crate::testing::stderr_lines_about("j0000000214", || {
+            session.finish(
+                &job_id,
+                JobOutcome::Exited { code: 0 },
+                JobMetrics::default(),
+                Vec::new(),
+                outputs,
+                Some(spool.clone()),
+            );
+            // The pump is on another worker; this thread waits out several
+            // times the bound so that a line which is never written is a
+            // failure and not a race.
+            std::thread::sleep(Duration::from_millis(600));
+        });
+        assert_eq!(
+            said.len(),
+            1,
+            "a stalled collection says so exactly once, not never and not per chunk: {said:#?}"
+        );
+        assert!(
+            said[0].contains("room on the link"),
+            "and the line says what it is waiting for: {}",
+            said[0]
+        );
+    }
+
+    /// The sentence a reader gets when a spool will not go away, and the one
+    /// fact the `errno` does not carry (D158).
+    #[test]
+    fn a_directory_the_runner_does_not_own_is_named_as_why_a_spool_stays() {
+        let temp = crate::testing::TempDir::new("foreign-spool");
+        let spool = temp.path().join("j0000000211-1");
+        std::fs::create_dir_all(spool.join("packs/abc/objects")).expect("a spool tree");
+        std::fs::write(spool.join("packs/abc/objects/one"), b"an object").expect("an object");
+
+        let mine = crate::privilege::effective_uid().expect("a unix uid");
+        assert_eq!(
+            foreign_directory_under(&spool, mine),
+            None,
+            "a tree this runner made itself is one it can empty, so there is nothing to say"
+        );
+        // The real shape, which cannot be built in a test without root: a
+        // directory somebody else owns. Asked from the point of view of
+        // another uid, every one of these is foreign, and the walk has to
+        // find the shallowest.
+        let (named, owner) = foreign_directory_under(&spool, mine.wrapping_add(1))
+            .expect("a directory this uid does not own");
+        assert_eq!(owner, mine);
+        assert_eq!(
+            named,
+            spool.join("packs"),
+            "the shallowest one, because that is the one an operator fixes"
         );
     }
 }

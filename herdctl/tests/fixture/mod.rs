@@ -816,6 +816,25 @@ impl Harness {
         .await
     }
 
+    /// The same, with the runner's file window set by the test (D158).
+    ///
+    /// A window a test chose rather than the shipped
+    /// [`herd_runner::FILES_IN_FLIGHT`], for the reason
+    /// [`Harness::with_output_cap`] exists: the way a window goes wrong is
+    /// that it *runs down over collections*, and seeing that at eight costs
+    /// nine real transfers of over 32 MiB each. At one it costs two, and the
+    /// mechanism is the same — a collection that gives back less than it
+    /// took leaves the next one with less room, until there is none.
+    pub async fn with_files_in_flight(window: usize) -> Harness {
+        Harness::with_all_of(
+            herd_hub::Policy::default(),
+            herd_hub::Budget::default(),
+            |_| {},
+            move |config| config.files_in_flight = window,
+        )
+        .await
+    }
+
     /// A hub and a runner, with the hub's timing and the runner's confinement
     /// both open to the test.
     pub async fn with(
@@ -830,6 +849,17 @@ impl Harness {
         policy: herd_hub::Policy,
         budget: herd_hub::Budget,
         confine: impl FnOnce(&mut herd_runner::Confinement),
+    ) -> Harness {
+        Harness::with_all_of(policy, budget, confine, |_| {}).await
+    }
+
+    /// The same again, with the runner's whole [`herd_runner::Config`] open
+    /// to the test after everything else has been filled in.
+    pub async fn with_all_of(
+        policy: herd_hub::Policy,
+        budget: herd_hub::Budget,
+        confine: impl FnOnce(&mut herd_runner::Confinement),
+        tune: impl FnOnce(&mut herd_runner::Config),
     ) -> Harness {
         use herd_hub::{Hub, JobDirStore, JobStore};
         use std::sync::Arc;
@@ -863,7 +893,7 @@ impl Harness {
         let root = herd_runner::testing::TempDir::new("declared-e2e");
         let offer: herd_proto::CapabilityOffer = serde_json::from_str(WHAT_THE_FIXTURE_ASKS_FOR)
             .expect("the capabilities this fixture's commands ask for");
-        let config = herd_runner::Config {
+        let mut config = herd_runner::Config {
             hub_url: hub_url.clone(),
             name: Some(RUNNER.to_owned()),
             token: Some(token),
@@ -889,6 +919,7 @@ impl Harness {
             },
             ..herd_runner::Config::default()
         };
+        tune(&mut config);
         tasks.push(tokio::spawn(async move {
             let _ = herd_runner::run(config).await;
         }));
