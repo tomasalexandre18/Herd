@@ -28,14 +28,17 @@
 //! unprivileged when it is not.
 
 /// The effective user id, or `None` where there is no such notion.
+///
+/// Shared with the spool reaper, which has to say whose a directory it
+/// cannot empty is (D158).
 #[cfg(unix)]
-fn effective_uid() -> Option<u32> {
+pub(crate) fn effective_uid() -> Option<u32> {
     // Safe: geteuid reads one integer out of the kernel and cannot fail.
     Some(unsafe { libc::geteuid() })
 }
 
 #[cfg(not(unix))]
-fn effective_uid() -> Option<u32> {
+pub(crate) fn effective_uid() -> Option<u32> {
     None
 }
 

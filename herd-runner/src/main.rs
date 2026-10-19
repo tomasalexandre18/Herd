@@ -602,6 +602,11 @@ async fn main() -> Result<()> {
         preference: args.preference.unwrap_or(0),
         switch_file: Some(switch_file),
         switch_poll: Duration::from_millis(args.switch_poll.unwrap_or(DEFAULT_POLL_MS)),
+        // Not options: the window and the bound on waiting for it are Herd's
+        // own figures, and an owner has no way to know what to set them to
+        // (D158). They exist on `Config` for the tests that have to exceed
+        // them.
+        ..Config::default()
     })
     .await
 }

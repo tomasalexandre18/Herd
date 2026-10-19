@@ -6422,3 +6422,119 @@ sounded right, and two messages of argument had already been spent on it. One
 `awk` over a log settled it in favour of neither. When the next host
 question comes with a plausible story attached, measure the thing the story
 is about before agreeing with it.
+
+---
+
+## 2026-10-19 — D158 A send window that ran down, and a spool that stays
+
+**The first consumer's chained jobs stopped bringing their outputs home on
+the night of 2026-10-19.** The build ended `pack result: ok`, the record
+carried the full manifest — path, length and sha256 for every one of
+hundreds of files — and `jobs/<id>/files/` on the hub was empty. `herdctl
+wait --outputs-to` reported *"did NOT get … the hub does not have it"* for
+every path, and the consumer's wrapper failed with `no pack came home`.
+Jobs `j214`, `j217`, `j218`, `j219`, `j220`, `j222`, and in fact `j209`
+before any of them.
+
+**Two defects, and the obvious link between them is not real.** The
+chronology said the outage began right after the one job that logged a
+failed spool removal, and that reading was wrong: the removal failure had
+been happening all evening, nine times, including under every collection
+that worked. It is a real defect and it is not this one.
+
+### The outage: one permit per finished collection, never given back
+
+A streamed collection (D148) is sent chunk by chunk through a window of
+`FILES_IN_FLIGHT` = 8 permits held on the link. A permit is taken before a
+chunk is read and given back by `write_frames` once the chunk is on the
+wire. The pump's loop took a permit, then asked the session what to send
+next, and **when the answer was "nothing, it is all sent" it returned
+without the permit** — `acquire().map(|permit| permit.forget())` forgot it
+at the moment of acquisition, so there was nothing left to drop.
+
+So every collection that completed cost the window one permit for ever. The
+window is per connection, which is what made this look like a time bomb
+rather than a leak: the runner joined the hub at 22:21 UTC, eight
+collections were acknowledged — `j190`, `j193`, `j188`, `j198`, `j196`,
+`j204`, `j207`, `j211` — and the ninth, `j209`, arrived at a window of
+zero and waited on `acquire()` for ever. Everything after it queued behind
+the same closed window. Not one chunk of `j214` ever reached the hub: its
+`files/` was empty and it had no `parts/` directory at all.
+
+**Fixed by holding the permit and forgetting it only once
+`Session::send` has queued the frame `write_frames` will hand it back
+for.** Every other way out of the loop now drops it, and dropping returns
+it.
+
+### Why the suite did not catch it
+
+**Every streamed-collection test ran exactly one collection and then threw
+its hub and its runner away.** `carriages.rs` built a fresh `Harness` per
+journey; a window that is whole at the start of every connection is whole
+for the only collection any test ever ran on it. A leak that costs one
+permit per *success* is invisible to a suite whose longest link carries one
+success.
+
+The regression test is two collections in a row on one hub, one runner and
+one link, with the window set to 1 through the new
+`Config::files_in_flight` — the same injection `Confinement::output_cap`
+already uses, for the same reason: at the shipped figure of eight the test
+would cost nine real transfers of over 32 MiB. It fails on the code that
+shipped. Beside it, a unit test asserts the property directly at the real
+figure: **a collection that has gone through gives back everything it
+borrowed.**
+
+### The silence, which is its own defect
+
+Nobody said anything. The runner waited on a semaphore; the hub had no
+error to report because nothing arrived and no redial happened to make it
+notice; the requester was told only what it did not get. An hour of an
+operator's time went on establishing a fact the runner knew the whole time.
+
+The runner now says it, because the runner is the only party that can: the
+hub sees an absence and the requester sees a short collection, and only the
+sender knows it is waiting for room. A pump that cannot get a permit within
+`FILES_STALL_AFTER` — fifteen seconds, under `herdctl`'s own thirty-second
+stall bound, so the line is already in the journal when the requester gives
+up — writes one line per collection naming the job and saying that the
+collection is fine and the window is not opening.
+
+### The second defect: a spool the runner may not remove
+
+`herd-runner: the hub has every file of j0000000211 and
+/mnt/ssd_980/herd-runner/outputs/j0000000211-1 will not go away: Permission
+denied (os error 13)` — on a tree whose every directory is `drwxr-xr-x` and
+whose top the runner owns. `find … -type d ! -perm -u=w` over the whole
+spool returns zero, which is what sent the first reading of this down the
+wrong path: `-perm -u=w` tests the *owner's* write bit, and the owner is
+not the runner.
+
+Under `j0000000211-1/packs/` the directories are `drwxrwsr-x server users`,
+written by uid 1002; the runner is uid 986 and is in no group but its own.
+**Unlinking a name is a write to the directory that holds it**, so a
+directory the runner did not create is a directory the runner cannot empty,
+whatever its mode says — and it cannot `chmod` or `chown` its way out,
+because both are the owner's to do. The consumer's job moves a
+content-addressed pack tree, prepared beforehand by their own tooling, into
+`{out}`; `{out}` is renamed into the spool by D148's carriage, ownership
+and all. 7.4 GB of spool had accumulated across sixteen jobs.
+
+Herd cannot remove those bytes and will not pretend to. What it can do is
+stop costing an hour to diagnose: the message now walks the spool, names
+the shallowest directory the runner does not own and its uid beside the
+runner's own, and says that the bytes are safe on the hub and that what is
+left is this runner's copy. No behaviour changes — the spool is still not
+removed, and the collection it belonged to was delivered.
+
+### What to keep
+
+**A resource that is returned on the happy path must be tested over more
+than one happy path.** Both halves of this entry are things that worked
+perfectly the first time: the window carried eight collections before it
+closed, and the spool removal failed on a tree that had already been
+delivered. A test that runs one of anything cannot see either. Where Herd
+holds a per-connection or per-process resource, the test to write is the
+*second* use of it, and the suite now has one for the file window.
+
+No protocol change: `PROTOCOL_VERSION` stays at 2 and the fix is entirely
+inside the runner.
