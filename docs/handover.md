@@ -660,8 +660,8 @@ what actually happened under each. The rest stands.
    and **in no release**. The next tag is what finishes this step.
    **Not built at all: 3.7 and `PR_SET_DUMPABLE`** — a reading is still
    costed at zero and unbounded, and `PR_SET_DUMPABLE` is still nowhere
-   in the workspace. Still
-   unwritten with them: `docs/operating.md` — what the hub prints, what
+   in the workspace. Still unwritten with them:
+   `docs/operating.md` — what the hub prints, what
    the runner prints, the ten lines of `docs/joining.md` "When it does
    not work" extended, O-6's report recipe, the figures and what each
    guards, the example deployment read on 2026-10-23 and marked as such.
