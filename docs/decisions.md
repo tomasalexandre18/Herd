@@ -6677,3 +6677,151 @@ memory". One wording, in one function, `of_which`. And the line explaining a
 reading's own placement says in as many words that it holds none of the
 machine — so a record of a reading can never be read as a record of something
 that held a slot.
+
+---
+
+## 2026-10-23 — D162 The image ships on the release, binaries ship first
+
+**Three tags in a row produced nothing, and the durations say why.**
+`gh run list --workflow=release.yml`: v0.3.1 failed in 22 s, v0.3.2 in 24 s,
+v0.3.3 in 26 s. Twenty-two seconds is not a build — it is a checkout, a Nix
+install, one `nix eval`, and then the credential preflight D153 put in front
+of everything, refusing the run because `vars.DOCKERHUB_USERNAME` and
+`secrets.DOCKERHUB_TOKEN` do not exist. `gh release list` shows the
+consequence: the newest release is **v0.3.0, of 2026-10-16**. Three versions
+of Herd have been tagged and none of them has a binary anybody can download.
+The step whose whole purpose was to prevent half a release has instead
+prevented three whole ones, and it did it on the day the first consumer
+became the sole operator of the running hub and was promised deployment
+artefacts.
+
+Alexa's decision, which this entry records: **take the registry off the
+release path.** He is not creating the Docker Hub account or the token, and
+that is settled, not pending.
+
+**What survives of D153, and what does not.** What survives is its intent
+and its main structural rule. The intent — an operator gets a runnable hub
+image out of a tag without building it — is kept in full, and is in fact
+better served than before, because it no longer depends on an account
+nobody has. The rule — `nix/hub-image.nix` is the single derivation that
+has ever built this image, there is no Dockerfile and no second build — is
+untouched and is the reason the archive can be trusted at all. So is the
+"no `latest`" argument, which the new delivery strengthens rather than
+weakens: a tag that arrived by `docker load` cannot be moved by anything
+but another `docker load`, so a fleet cannot cross a `PROTOCOL_VERSION`
+line because of a reboot.
+
+What does not survive: the registry as the only way to get the image, the
+`skopeo` push and the pull-back-by-digest inside the workflow, the
+preflight, and — this is the one that matters most — D153's ordering
+argument. D153 reasoned that a tag must never leave binaries published and
+an image missing, and put every image step *before* the GitHub release to
+guarantee it. That is a defensible trade when the two halves are equally
+reliable. It is the wrong trade when one half depends on a third party and
+the other does not, and the cost of being wrong is what the first paragraph
+measures. So the order is now the reverse of D153's and the reversal is the
+point: binaries built, proved on Arch and on Alpine, summed, **published**
+— and only then the image built, asserted, smoke-tested and attached. From
+the release step onward a failure costs the archive and never the binaries.
+
+**The body is written in two halves for the same reason.** A release that
+describes an asset it does not have is worse than a release with three
+files and no fourth, so the half of the body that says "`docker load` this
+archive" is added by `gh release edit` after the archive is really
+uploaded. `SHA256SUMS` goes up twice for the same reason: three lines with
+the release, a fourth appended and re-uploaded with the archive, with the
+count asserted at both points. A reader who took only the binaries uses
+`sha256sum --ignore-missing -c`, which is now what every document here
+prints.
+
+**Keeping a registry path, and why it is not in the workflow.** The brief
+asked whether an optional, skipped-when-unconfigured push belongs in this
+file. It does not, and "remove it" is the recommendation. Three reasons.
+First, it was never working machinery: D153's own closing paragraph says
+"none of this has run" — not the login, not the copy, not the digest file,
+not the pull-back. Deleting unexercised YAML costs nothing, because there
+is nothing proven to lose. Second, an `if: vars.… != ''` step forks
+everything downstream of it — the body would need a digest line in one
+branch and not the other, the pull-back smoke would run or not — and
+conditional branches nobody exercises are precisely where the next broken
+release comes from. Third, a skipped step is a quiet step: a release that
+silently did not publish where somebody expected it to is a worse failure
+mode than one that never claimed to.
+
+The path to a registry is therefore kept where it cannot touch a release:
+`devShells.release` still carries `skopeo`, and `flake.nix`,
+`deploy/README.md` and `deploy/release-notice.md` each give the one command
+that copies the downloaded archive into any registry. It is a thing a
+person runs, by hand, after a release exists. If somebody later wants it
+automated, the two commits D153 shipped (`0a4e2fd`, `7a7e4bd`) are in
+history and can be read back — but it would want to be a separate workflow
+on a separate trigger, never a step the tag has to get past.
+
+**`scripts/image-smoke.sh` earns its place more than it did, not less.**
+D153 ran it twice: once on the locally loaded archive, once on an image
+pulled back from the registry by digest, and called the second the one that
+mattered. The second run is gone with the registry. What is left is the
+run that was previously the warm-up, and it is now the only proof the image
+has — and it happens to be the *right* proof, because it is exactly what an
+operator now does: `docker load`, then run the container shaped the way
+`deploy/docker-compose.yml` shapes it. The script and the deployment walk
+one path. It also needs no credentials, which is the other half of why it
+survived: nothing in it can stop a release for want of a secret. Keep it,
+unchanged except for a header that no longer describes a registry.
+
+**The archive, measured rather than assumed.** 18 958 841 bytes — 18.1 MiB
+— built from this tree at 0.3.3, well inside GitHub's per-asset limit, and
+`herd-hub-image-<version>.tar.gz` on the release page. One more figure is
+worth recording because it was not expected: the image id in that archive,
+`sha256:6e92753d0c66…`, is **the id of the container running on this server
+right now**. The operator's hub was loaded from this same derivation by
+hand, so the archive the release will attach is byte-for-byte what is
+already in production. `docker load` of it was a no-op.
+
+**How this was proved without burning v0.3.4.** The next real tag
+finalises a handover and must not be the experiment, so none was created.
+What was *executed*, locally, on this host: `nix build .#hub-image`; the
+archive's `manifest.json` carrying exactly `herd-hub:0.3.3`; `docker load`;
+`scripts/image-smoke.sh herd-hub:0.3.3` green against the loaded tag — a
+containerised hub, a host runner, two real jobs, the second exiting 7; and
+then the operator's own path end to end, `deploy/docker-compose.yml` with
+`HERD_HUB_IMAGE=herd-hub:0.3.3` in a `.env`, `up -d`, the hub's three
+startup lines, a runner approved and a real job through it — run under a
+project name and a port of its own so the live `herd` project at `/srv/herd`
+was never touched, and torn down with `down -v`.
+
+What is **unexercised** and must be said plainly: no step of the new
+workflow has run on GitHub. The reordering, the two-half body, the second
+`SHA256SUMS` upload and the `gh release edit` exist only as YAML, and D132
+is the entry that says a release step nobody has run is a release step that
+does not work. Two things close that, in order, and neither needs a tag:
+
+1. `workflow_dispatch` on this branch with `tag` left empty. It runs
+   everything above the release — both distribution smokes, the static
+   assertions, the sums, the image build, the archive assertion,
+   `image-smoke.sh` — and creates nothing. This is possible only because
+   `release.yml` already carries `workflow_dispatch` **on `main`**: GitHub
+   offers the trigger from the default branch and then runs the file from
+   the ref you pick. The note in `d2d37b7` saying a hand-run cannot reach a
+   non-default branch was true when this workflow was not yet on `main`,
+   and is no longer; so the temporary `branches:` trigger that commit
+   deleted does not need to come back. This is also why the `tag` input
+   keeps its name and shape here and only its description changed: the
+   form GitHub offers is read from the default branch's copy of the
+   file, so an input renamed on a branch is an input a hand-run on that
+   branch cannot be given.
+2. `workflow_dispatch` with `tag: v0.3.3` — a tag that already exists and
+   whose run failed. It publishes the release v0.3.3 never got, which is
+   the handover artefact, and in doing so exercises the two `gh release`
+   steps and the body halves for real. The workspace is at 0.3.3, so the
+   version check passes. v0.3.1 and v0.3.2 cannot be recovered this way
+   and will not be: the workspace no longer says those numbers, and the
+   check that refuses them is right to.
+
+Both are Alexa's to run, like anything outward-facing.
+
+**On the number.** This entry is 162 and the last on `main` is 159: D160
+and D161 are held by two unmerged branches, and the gap is left rather than
+filled, for the reason D148's closing paragraph gives — a decision number
+cited in code is an identifier, not a position. D143 and D154 do not exist
+either.
