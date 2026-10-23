@@ -51,14 +51,28 @@
           env.RUST_BACKTRACE = "1";
         };
 
-        # The one tool a release needs that a GitHub runner does not already
-        # have: `skopeo`, which copies the image `packages.hub-image` builds
-        # straight from its archive to Docker Hub without a docker daemon in
-        # the middle (D153). It is here and not apt-installed in the workflow
-        # for the reason D12 gives about every other tool: it comes from the
-        # flake's own pinned nixpkgs, so the thing that pushes a release is
-        # pinned like the thing that builds one. It is not in the default
-        # shell, because nobody developing Herd needs it.
+        # `skopeo`, which copies the archive `packages.hub-image` builds
+        # straight into a registry without a docker daemon in the middle.
+        # The release workflow no longer uses it: since D162 the image ships
+        # as an archive attached to the GitHub release and nothing is pushed
+        # anywhere. This shell is what is left of that path, and it is the
+        # whole of it — whoever wants the image in a registry of their own
+        # runs one command against the archive they downloaded:
+        #
+        #   nix develop .#release --command skopeo --insecure-policy copy \
+        #     docker-archive:herd-hub-image-<version>.tar.gz \
+        #     docker://<registry>/herd-hub:<version>
+        #
+        # Deliberately a command a person runs and not a step in the
+        # workflow: a publication that is not in the release path cannot
+        # fail a release, which is the one lesson the three tags D162 names
+        # paid for. `--insecure-policy` means "consult no containers
+        # signature policy", which is what `docker push` also does; it says
+        # nothing about transport, and TLS is untouched.
+        #
+        # It comes from the flake and not from `apt` for the reason D12
+        # gives about every other tool: pinned nixpkgs. It is not in the
+        # default shell, because nobody developing Herd needs it.
         release = pkgs.mkShell {
           name = "herd-release";
           packages = [ pkgs.skopeo ];
