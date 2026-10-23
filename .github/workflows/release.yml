@@ -258,9 +258,14 @@ jobs:
           } > body-head.md
 
           {
-            # One line: a markdown link destination cannot be broken across
-            # two.
-            echo "The notice in full, as of this tag: <https://github.com/${{ github.repository }}/blob/$TAG/deploy/release-notice.md>"
+            # The commit this run checked out, and not `$TAG`: the notice
+            # quoted below was `cat` out of *this* tree, and a hand-run can
+            # publish an existing tag from a later commit — `actions/checkout`
+            # takes the ref the run was started on, not the ref named in the
+            # input. Linking the tag would then point a reader at a different
+            # notice from the one printed underneath it. One line: a markdown
+            # link destination cannot be broken across two.
+            echo "The notice in full, as of the commit that built this: <https://github.com/${{ github.repository }}/blob/${{ github.sha }}/deploy/release-notice.md>"
             echo
             echo "---"
             echo
