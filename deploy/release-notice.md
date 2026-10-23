@@ -201,7 +201,7 @@ the reason.
 
 ```
 $ herdctl runner list
-server: approved 2026-10-01T09:11:12Z, connected now, herd 0.3.3
+server: approved 2026-10-01T09:11:12Z, connected now, herd 0.3.4
   kvm is suspended: the probe `/etc/herd/kvm.sh` exited 0, which means busy
   gpu-venus is suspended: gpu-venus has a busy probe (command /etc/herd/gpu.sh) and server has not reported a reading of it yet
 wsl-pc: approved 2026-10-02T18:40:03Z, not connected

@@ -282,7 +282,7 @@ yours. The second is the only proof that counts.
 
 ```sh
 herdctl runner list
-# server: approved 2026-10-15T17:38:28Z, connected now, herd 0.3.3
+# server: approved 2026-10-15T17:38:28Z, connected now, herd 0.3.4
 
 herdctl run -- sh -c 'echo it works; nproc'
 ```

@@ -7396,8 +7396,9 @@ busy, and asserts the build on the connected runner's line, the suspension
 under it, and that the machine which is *not* connected claims neither.
 The protocol's round trip carries both new fields, set and unset.
 
-**On the number.** This entry is D166 and the last on `main` is D165; D161
-is held by an unmerged branch, so that gap stays, as D143's and D154's do,
-under D148's rule. One entry rather than three, because the three are one
-decision about who the reader is — and because doing them apart would have
-meant three branches touching the same four files in the same week.
+**On the number.** This entry is D166 and the last on `main` is D165. The
+branch that held D161 while this was being written has landed since, so the
+only gaps left are D143's and D154's, and they stay, under D148's rule. One
+entry rather than three, because the three are one decision about who the
+reader is — and because doing them apart would have meant three branches
+touching the same four files in the same week.
