@@ -2139,16 +2139,49 @@ pub async fn run_until(config: Config, stop: impl Future<Output = String>) -> Re
     // Read **once, here, before the first dial**, so that a runner restarted
     // on a machine its owner switched off never claims anything at all. The
     // watcher then takes over.
+    //
+    // A persisted `drain` is read as `off` here and nowhere else (D164): the
+    // word was said to a process that is gone, and a process holding nothing
+    // has already finished and left. See `switch::at_startup` for the whole
+    // of why.
+    let mut a_stale_drain: Option<herd_proto::Switch> = None;
     if let Some(path) = &config.switch_file {
         match crate::switch::read(path) {
-            Ok(Some(switch)) => {
+            Ok(Some(written)) => {
+                let read = crate::switch::at_startup(written.clone());
+                if let Some(said) = &read.converted {
+                    eprintln!("herd-runner: {said}");
+                    // Written back, so that there is one state and not two:
+                    // the hub is about to be told `off`, and a file still
+                    // saying `drain` would be a second truth the watcher
+                    // reads a second later. If it cannot be written the
+                    // position is still taken — and then the watcher has to
+                    // be told to keep ignoring that same reading, or the
+                    // restart loop comes back through the back door.
+                    match crate::switch::write(path, &read.position) {
+                        Ok(()) => eprintln!(
+                            "herd-runner: {} now says {}, so this is read once and not every \
+                             restart",
+                            path.display(),
+                            read.position.sentence()
+                        ),
+                        Err(error) => {
+                            a_stale_drain = Some(written);
+                            eprintln!(
+                                "herd-runner: that position is in force but could not be \
+                                 written down, so the file still says drain and this runner \
+                                 will go on reading it as off until the file changes: {error}"
+                            );
+                        }
+                    }
+                }
                 eprintln!(
                     "herd-runner: the owner's switch says {} ({}); {}",
-                    switch.sentence(),
+                    read.position.sentence(),
                     path.display(),
-                    what_that_position_does(&switch, 0)
+                    what_that_position_does(&read.position, 0)
                 );
-                session.set_switch(switch);
+                session.set_switch(read.position);
             }
             Ok(None) => {}
             Err(why) => eprintln!(
@@ -2158,7 +2191,11 @@ pub async fn run_until(config: Config, stop: impl Future<Output = String>) -> Re
             ),
         }
     }
-    let watching_the_switch = tokio::spawn(watch_the_switch(config.clone(), session.clone()));
+    let watching_the_switch = tokio::spawn(watch_the_switch(
+        config.clone(),
+        session.clone(),
+        a_stale_drain,
+    ));
     let stop_watching_the_switch = watching_the_switch.abort_handle();
     let stop_probing = probing.abort_handle();
     let serving = serve_forever(config.clone(), session.clone(), Arc::clone(&confined));
@@ -2476,7 +2513,17 @@ fn apply_a_switch(
 /// Beside the redial loop, like the probes, and for the same reason: an owner
 /// switching her machine off while the hub is down must still be obeyed, and
 /// the next connection announces the position in its handshake.
-async fn watch_the_switch(config: Config, session: Session) {
+///
+/// `a_stale_drain` is the reading startup converted to `off` and could not
+/// write back (D164). A reading equal to it is the same stale word and is
+/// skipped; anything else is the owner speaking now, is honoured, and clears
+/// the staleness — including a fresh `drain`, which is still "finish and
+/// leave" and still obeyed.
+async fn watch_the_switch(
+    config: Config,
+    session: Session,
+    mut a_stale_drain: Option<herd_proto::Switch>,
+) {
     let Some(path) = config.switch_file.clone() else {
         return;
     };
@@ -2488,6 +2535,11 @@ async fn watch_the_switch(config: Config, session: Session) {
                 // An absent file is a machine nobody has withdrawn, and that
                 // is how a switch is turned back on with `rm`.
                 let switch = read.unwrap_or_default();
+                if a_stale_drain.as_ref() == Some(&switch) {
+                    tokio::time::sleep(config.switch_poll).await;
+                    continue;
+                }
+                a_stale_drain = None;
                 if let Some(said) = session.set_switch(switch) {
                     eprintln!("herd-runner: {said} (from {})", path.display());
                 }
