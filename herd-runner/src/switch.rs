@@ -238,7 +238,6 @@ mod tests {
             "not json at all",
             r#"{"position":"of course"}"#,
             r#"{"position":"off"}"#,
-            r#"{"position":"on","reason":"a reason on means nothing by"}"#,
             r#"{}"#,
         ] {
             let (_keep, path) = in_a_temporary_place(Some(contents));
@@ -253,6 +252,18 @@ mod tests {
                 "{contents:?} must never read as a runner that claims"
             );
         }
+
+        // And the one case that moved out of that list under D166. This file
+        // is not mangled: it says `on` in so many words and carries one
+        // surplus field, so reading it as `on` is reading what it says rather
+        // than guessing at it. The hazard above is untouched — a truncated
+        // file, an unknown position and a missing one are all still errors —
+        // and the hazard here was never the same thing: nothing in Herd
+        // writes a reason on `on`, so such a file was typed by a person, and
+        // refusing it would withdraw a machine nobody meant to withdraw.
+        let (_keep, path) =
+            in_a_temporary_place(Some(r#"{"position":"on","reason":"the window is over"}"#));
+        assert_eq!(read(&path), Ok(Some(Switch::On)));
     }
 
     /// **The restart loop, closed.** A `drain` on the disk is read as `off`
@@ -325,7 +336,7 @@ mod tests {
         }
     }
 
-    /// `off` needs a reason and `on` refuses one, in the one place both the
+    /// `off` needs a reason and `on` keeps none, in the one place both the
     /// file and the two command lines go through.
     #[test]
     fn a_position_carries_exactly_the_reason_it_should() {

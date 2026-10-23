@@ -335,10 +335,10 @@ impl Switch {
 
     /// Read a position from the word an owner typed, with the reason she gave.
     ///
-    /// A reason is **required** for `off` and for `drain`, and refused for
-    /// `on`: E-33 asks for `off <reason>` in so many words, and a machine
-    /// withdrawn for no stated reason is a machine nobody can decide to switch
-    /// back on.
+    /// A reason is **required** for `off` and for `drain`: E-33 asks for `off
+    /// <reason>` in so many words, and a machine withdrawn for no stated
+    /// reason is a machine nobody can decide to switch back on. For `on` it is
+    /// accepted and dropped rather than refused (D166).
     pub fn parse(position: &str, reason: Option<&str>) -> Result<Self, String> {
         let said = reason.map(str::trim).filter(|reason| !reason.is_empty());
         match (position, said) {
@@ -830,6 +830,10 @@ pub enum JobOutcome {
     /// kilobytes: "stopped at its disk cap of 21474836480 bytes" is then a
     /// lie, and the real reason belongs in the record rather than only on the
     /// runner's stderr. Absent whenever the cap's own figure says it all.
+    ///
+    /// One kind of unmeasurable workspace is **not** reported here at all:
+    /// one the runner was *refused* access to, which is
+    /// [`JobOutcome::SetupFailed`] and not a cap (D166).
     StoppedByCap {
         cap: Cap,
         limit: u64,

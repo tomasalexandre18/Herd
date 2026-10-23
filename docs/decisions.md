@@ -7358,8 +7358,16 @@ carries one extra piece of information is a bad trade: an operator switching
 a fleet back on after a maintenance window types the same `--reason` on
 every line, and the one that was `on` was the one that failed. The reason is
 now accepted, dropped, and said where it was typed, on both halves of E-33
-— `herdctl switch` and `herd-runner switch`. A switch *file* that says `on`
-with a reason is likewise read rather than refused.
+— `herdctl switch` and `herd-runner switch`.
+
+A switch *file* that says `on` with a reason is likewise read rather than
+refused, and that case moved out of the list in
+`nothing_unreadable_reads_as_a_runner_that_claims`. The hazard that test
+exists for is untouched: a truncated file, an unknown position and a missing
+one are all still errors, because none of them says what it wants. This one
+says `on` in so many words and carries one surplus field — and nothing in
+Herd writes a reason on `on`, so such a file was typed by a person, and
+refusing it would withdraw a machine nobody meant to withdraw.
 
 ### Done means a passing test
 
@@ -7372,6 +7380,11 @@ the failure worth building the test around.
 `a_workspace_the_runner_was_refused_is_a_setup_failure_and_not_a_cap` is the
 split of part 3 at the `Attempt` level, both branches, asserting that the
 reason names the path and the budget and that no cap is recorded;
+`a_refusal_during_the_takedown_leaves_an_established_verdict_alone` holds the
+one line D108 draws through it — the `down` step runs however the others
+ended, so a refusal seen there is said in the job's log and the verdict is
+left exactly as it was, which is a defect this change had on its first
+writing;
 `a_path_the_runner_cannot_take_its_access_back_on_is_refused_and_not_capped`
 reaches a **real** refusal with no second user by putting a directory the
 walk must search above the data root, which is the one place the

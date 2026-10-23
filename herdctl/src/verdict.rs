@@ -23,10 +23,14 @@
 //! at all ([`Verdict::job_exists`]), which is D109's stderr contract made
 //! machine-readable.
 //!
-//! **Every key is always there.** A field with nothing in it is `null`, never
-//! absent, so a reader can index the document rather than probe it. Adding a
-//! field therefore does not move [`herd_proto::VERDICT_FORMAT_VERSION`];
-//! removing one, or changing what one means, does.
+//! **Every one of this document's own fields is always there.** A field with
+//! nothing in it is `null`, never absent, so a reader can index the document
+//! rather than probe it. (What is nested inside `outcome` and `metrics` is
+//! the protocol's own shape and keeps the protocol's own habits, where a
+//! figure nobody measured is absent rather than a zero that reads as one.)
+//! Adding a field therefore does not move
+//! [`herd_proto::VERDICT_FORMAT_VERSION`]; removing one, or changing what one
+//! means, does.
 
 use std::path::Path;
 

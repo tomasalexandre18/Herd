@@ -881,7 +881,11 @@ pub async fn fleet_switches(config: &Config) -> Result<Vec<RunnerSwitch>> {
 ///
 /// The position, the owner's reason, and whether work is still running there —
 /// because "off with a job on it" is the ordinary case and a line that did not
-/// say so would read like a contradiction.
+/// say so would read like a contradiction. Then, since D166, the build the
+/// machine runs, and an indented line for each capability it is not handing
+/// out: this is the same fleet `herdctl runner list` shows from the other
+/// side, and an operator must not have to learn which of the two tells her
+/// the truth about a machine.
 pub fn switch_lines(runner: &RunnerSwitch) -> Vec<String> {
     let mut line = format!("{}: {}", runner.name, runner.switch.sentence());
     line.push_str(&match runner.jobs {
@@ -911,7 +915,8 @@ pub fn switch_lines(runner: &RunnerSwitch) -> Vec<String> {
 ///
 /// Nothing is printed when nothing is suspended, and nothing is printed when
 /// the hub did not say: a line claiming a clean bill of health is exactly
-/// what a hub that cannot answer must not produce ([`RunnerFacts`]).
+/// what a hub that cannot answer must not produce
+/// ([`herd_proto::RunnerFacts`]).
 fn suspension_lines(facts: &herd_proto::RunnerFacts) -> Vec<String> {
     facts
         .suspensions()
@@ -1379,8 +1384,8 @@ pub async fn approved_runners(config: &Config) -> Result<Vec<ApprovedRunner>> {
 /// working**, and until D166 it could not say so: a machine whose `kvm` and
 /// `gpu-venus` probes had been failing for hours, with every job that needed
 /// them waiting, printed the same line as a healthy one. So the runner's
-/// build goes on its own line and each suspended capability goes under it,
-/// with the reason.
+/// build is on its line, and each capability it is not handing out gets an
+/// indented line under it, with the reason.
 pub fn approved_runner_lines(runner: &ApprovedRunner) -> Vec<String> {
     let mut line = format!(
         "{}: approved {}, {}",

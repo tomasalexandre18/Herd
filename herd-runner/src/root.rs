@@ -392,9 +392,10 @@ impl Workspace {
     ///
     /// An error here is not a detail. The disk budget is enforced against
     /// this number, so a workspace that cannot be measured is a budget that
-    /// cannot be enforced, and the job ends at the cap instead of being
-    /// called a success (D23's "absent rather than zero", applied to the one
-    /// figure a job can interfere with).
+    /// cannot be enforced, and the job ends rather than being called a
+    /// success (D23's "absent rather than zero", applied to the one figure a
+    /// job can interfere with). Whether it ends at the *cap* or as a setup
+    /// failure is [`Unmeasurable::refused`]'s answer (D166).
     pub fn measure(&self) -> Result<u64, Unmeasurable> {
         measure_tree(&self.base, &self.root)
     }

@@ -471,10 +471,20 @@ pub async fn execute(
             });
         }
     }
-    if let Some(reason) = &ran.unmeasurable {
+    if let Some(unmeasurable) = &ran.unmeasurable {
         eprintln!(
             "herd-runner: job {job_id} could not be held to its disk budget, because \
-             its workspace could not be measured: {reason}"
+             its workspace could not be measured: {}{}",
+            unmeasurable.why,
+            if unmeasurable.refused {
+                // Said here too, on the machine's own stderr, because the
+                // person who can fix this is the one reading this journal
+                // (D166).
+                ". This runner was refused that path rather than reaching a budget, so the \
+                 job is reported as a setup failure and not as a disk cap"
+            } else {
+                ""
+            }
         );
     }
 
@@ -683,6 +693,29 @@ impl Attempt {
         })
     }
 
+    /// Record a workspace the runner was **refused** during one step, and
+    /// answer whether that step was the takedown (D166).
+    ///
+    /// The distinction is D108's and it is not a detail. A refusal seen while
+    /// the job's own steps are running ends the attempt: the disk budget
+    /// could not be enforced, so there is no verdict to stand behind. One
+    /// seen while the workspace is being *taken down* is a different fact
+    /// entirely — the verdict already exists, and a tree that will not go
+    /// away is an operator's problem and never a test result — so it is said
+    /// in the job's log, where `down` failures are said, and the verdict is
+    /// left exactly as it was.
+    ///
+    /// The first refusal is kept rather than the last: the earliest one is
+    /// the one that stopped the job, and the steps after it only see the same
+    /// path still unreadable.
+    fn refused_workspace(&mut self, step: Option<Step>, reason: String) -> bool {
+        if step == Some(Step::Down) {
+            return true;
+        }
+        let _ = self.setup_failed.get_or_insert(reason);
+        false
+    }
+
     /// End an attempt whose workspace could not be measured, as the one thing
     /// it is (D30, D166).
     ///
@@ -857,14 +890,15 @@ impl Attempt {
         let how = Self::how_it_went(exit_code, &ended);
         self.record(stage, at, exit_code, ended, session, job_id, attempt);
 
-        // Whichever step it fired on, and ahead of everything else read off
-        // this step: a workspace the runner was refused is the machine's
-        // problem at `up` exactly as it is at `run`, and letting a
-        // preparation step turn it into `could_not_start` would hide both the
-        // machine's part in it and the path somebody has to go and fix
-        // (D166).
+        // Ahead of everything else read off this step: a workspace the runner
+        // was refused is the machine's problem at `up` exactly as it is at
+        // `run`, and letting a preparation step turn it into
+        // `could_not_start` would hide both the machine's part in it and the
+        // path somebody has to go and fix (D166).
         if let Some(reason) = refused_workspace {
-            self.setup_failed = Some(reason);
+            if self.refused_workspace(stage.step, reason) {
+                self.say_the_takedown_did_not_come_off(session, job_id, &how);
+            }
             return;
         }
 
@@ -1549,6 +1583,36 @@ mod tests {
             detail.is_some_and(|detail| detail.contains("could not measure")),
             "the figure alone would be a true number in a false sentence (D30)"
         );
+    }
+
+    /// A refusal seen while the workspace is being **taken down** leaves the
+    /// verdict alone (D108, D166).
+    ///
+    /// The `down` step is the one that runs however the others ended, so it
+    /// is the one place where an ending read off a step would arrive after a
+    /// verdict had already been established — and throwing a verdict away
+    /// because a workspace would not go quietly is exactly what D108 forbids.
+    #[test]
+    fn a_refusal_during_the_takedown_leaves_an_established_verdict_alone() {
+        let mut ran = Attempt {
+            verdict: Some(JobOutcome::Exited { code: 0 }),
+            ..Attempt::default()
+        };
+        assert!(
+            ran.refused_workspace(Some(Step::Down), "/out/packs cannot be read".to_owned()),
+            "a takedown's refusal is said in the log, not made the job's ending"
+        );
+        assert!(ran.setup_failed.is_none());
+        assert_eq!(ran.outcome(), JobOutcome::Exited { code: 0 });
+
+        // On the job's own steps it *is* the ending, and the first one is the
+        // one kept: the steps after it see the same path still unreadable.
+        assert!(!ran.refused_workspace(Some(Step::Run), "the first path".to_owned()));
+        ran.refused_workspace(None, "a later one".to_owned());
+        let JobOutcome::SetupFailed { reason } = ran.outcome() else {
+            panic!("{:?}", ran.outcome())
+        };
+        assert_eq!(reason, "the first path");
     }
 
     /// An attempt whose steps all ran to their end is one nothing stopped, so

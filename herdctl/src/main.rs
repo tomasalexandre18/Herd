@@ -223,7 +223,8 @@ Exit codes:
   the job's own  worn untouched — 0, 1, 75, whatever the process exited with
   124            a runner stopped the job at a cap: time, memory, log or disk
   125            Herd has no verdict: it could not run the job, lost it,
-                 refused it, or could not be reached. Never a failing build
+                 refused it, could not be reached, or the machine it ran on
+                 could not do its own part. Never a failing build
   128 + n        the job was killed by signal n, as a shell reports one
   2              a command did part of what it says and named the rest
 

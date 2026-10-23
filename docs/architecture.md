@@ -196,6 +196,7 @@ The dependencies that shape something, and why:
 | herd-runner | `libc` | `setsid`, `nice`, `ioprio_set`, `setrlimit`, and the write of `0` into `cgroup.procs` between fork and exec |
 | herd-runner, herdctl | `tokio-tungstenite` with `rustls-tls-webpki-roots`, `rustls` with `ring` | `wss://` on the side that dials, verified against roots bundled in the binary. No trust-this-CA option, on purpose (D115) |
 | herdctl | `toml` | only `herdctl` parses the consumer's declaration; the hub and a runner never see TOML (D106) |
+| herdctl | `serde_json` | the machine-readable verdict `--verdict-to` writes (D166) |
 
 The hub keeps `tokio-tungstenite` at default features and never wraps its
 listener: the reverse proxy terminates TLS (D14).
@@ -291,7 +292,7 @@ twice. The payload types that ride inside these frames are
 `JobOutcome`, `JobMetrics` and `Pressure`, `JobOutputs` and `OutputFile`,
 `CapabilityOffer` / `CapabilityState` / `Availability`, `HostSize`,
 `RunningJob`, `RunnerSwitch`, `SwitchPersistence`, `ApprovedRunner`,
-`FileHeld` and `AbsentFile`.
+`RunnerFacts` and `SuspendedCapability`, `FileHeld` and `AbsentFile`.
 
 `JOB_LOG_FRAME_BYTES` is **8 MiB**: a `FromHub::JobLog` backlog travels in
 pieces that concatenate to exactly what one frame used to carry, which

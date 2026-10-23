@@ -292,8 +292,7 @@ under it for every capability it is offering and **not** handing out, with
 the reason (D166). Lines like
 
 ```
-  kvm is suspended: its busy probe exited 0, which this capability
-    declares as busy
+  kvm is suspended: the probe `/etc/herd/kvm.sh` exited 0, which means busy
 ```
 
 are not a failure of this step — a job that needs `kvm` waits rather than
@@ -866,6 +865,7 @@ root and delivered on the next start (D34). Stopping loses nothing.
 | a data root that is refused, naming itself | the directory is not writable by the runner's user, or another runner already holds it (D32) |
 | the unit will not start, and systemd names a mount rather than the runner | the data root's filesystem is not mounted. `RequiresMountsFor=` holds the service back on purpose, so it cannot build a root on a bare mount point |
 | `herdctl runner list` shows it approved but not connected | the service is not running: `journalctl -u herd-runner` |
+| jobs needing a label wait for ever on a connected machine | `herdctl runner list` prints an indented line for every capability that machine is not handing out, with the reason (D166). A probe that cannot be read suspends its capability, and the wait is then endless |
 
 ## Picking `ws://` or `wss://`, and the certificate that decides it
 

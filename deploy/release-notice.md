@@ -194,7 +194,7 @@ sudo chmod 0400 /etc/herd/runner-token.env
 
 ## Is the fleet working? `herdctl runner list`
 
-One command, and it answers three questions: which machines are approved,
+One command, and it answers four questions: which machines are approved,
 which of them are here, which build each one runs, and — the one that
 matters most — which of its capabilities it is **not** handing out, with
 the reason.
@@ -202,11 +202,8 @@ the reason.
 ```
 $ herdctl runner list
 server: approved 2026-10-01T09:11:12Z, connected now, herd 0.3.3
-  kvm is suspended: its busy probe exited 0, which this capability
-    declares as busy
-  gpu-venus is suspended: gpu-venus has a busy probe (command
-    /etc/herd/probes/gpu-venus.sh) and server has not reported a reading
-    of it yet
+  kvm is suspended: the probe `/etc/herd/kvm.sh` exited 0, which means busy
+  gpu-venus is suspended: gpu-venus has a busy probe (command /etc/herd/gpu.sh) and server has not reported a reading of it yet
 wsl-pc: approved 2026-10-02T18:40:03Z, not connected
 ```
 
@@ -375,9 +372,11 @@ cannot:
 
 Three things about the file:
 
-* **Every key is always present.** A field with nothing in it is `null`, so
-  a reader indexes the document instead of probing it. The first field is
-  `verdict_format_version`; check it before anything else.
+* **Every field in the table above is always present.** One with nothing in
+  it is `null`, so a reader indexes the document instead of probing it.
+  (Inside `outcome` and `metrics` the wire's own habits apply: a figure
+  nobody could measure is absent rather than a zero that reads as one.) The
+  first field is `verdict_format_version`; check it before anything else.
 * **It is written however the run ends**, no verdict included, so a stale
   file from an earlier run is never read as this run's answer.
 * **It is a file, not a stream.** `stdout` belongs to the job and `stderr`
