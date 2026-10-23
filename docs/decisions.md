@@ -6677,3 +6677,45 @@ memory". One wording, in one function, `of_which`. And the line explaining a
 reading's own placement says in as many words that it holds none of the
 machine — so a record of a reading can never be read as a record of something
 that held a slot.
+
+## 2026-10-23 — D160 The architecture is drawn, in one document
+
+**`docs/architecture.md` holds the whole architecture as Mermaid, and it is
+reference rather than a journal** — it changes when the behaviour changes,
+like `docs/runner-confinement.md`, which it points at instead of copying.
+Alexa asked for a complete picture because he is going to review one, and
+"complete" was the acceptance test, not brevity.
+
+**The cut: one top-level diagram that really is the whole system, then one
+detail diagram per box of it, each complete in itself.** A single graph
+holding everything would be a hairball nobody can review, which fails the
+requirement it was meant to meet; a set of fragments with no whole is the
+same failure wearing the other costume. So there is exactly one picture of
+the system and twenty-four expansions of its boxes, and the document says so
+in its first two sentences, because a reader must be able to tell a
+deliberate structure from a dodge.
+
+**Everything is read out of the code, never out of the plan.** Where the code
+and `docs/plan.md` or `docs/coverage.md` disagree, the code is drawn and the
+disagreement is reported as a finding — a diagram that quietly sided with a
+document would make the document true by drawing it.
+
+**One styling convention, in every diagram, with a legend as the first
+figure.** Four classes — `built`, `unbuilt`, `store`, `outside` — and two
+arrows, solid for a path that exists and dashed for one that does not.
+**Anything unbuilt also carries the word in its own label**, so the
+distinction survives a renderer that drops CSS, and §12 collects every
+unbuilt thing in one table with where each gap is recorded. A reviewer who
+cannot tell a drawn line that exists from one that is planned is reading a
+sales brochure.
+
+Decision numbers and expectation numbers sit beside the structures they
+justify, so a review can jump from a box to the reasoning.
+
+**Every block was rendered before this was committed**, with
+`mermaid-cli` 11.12.0: twenty-five of twenty-five. Two defects it caught are
+worth writing down, because they are silent and both were in the first
+draft — a `;` inside a `sequenceDiagram` message is a **statement
+separator** and swallows the next line, and a transition label in a
+`stateDiagram-v2` must not be quoted. The renderer is not in the flake and
+should not be: this is a once-per-document check, not a gate.
