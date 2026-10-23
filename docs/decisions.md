@@ -7603,3 +7603,82 @@ work D152 refused to do per verdict.
 written and whose `exit_code_from` this entry leans on. D161 is still held by
 an unmerged branch, so the gaps are D143's, D154's and D161's, all three
 under D148's rule.
+
+## 2026-10-23 — D168 A tag states the two numbers an operator asks us for
+
+**The first consumer, now the sole operator of the running hub, had to ask us
+whether rolling an image back was safe.** Their update script answers that
+from `RECORD_VERSION`: a hub reads only a state root whose number is exactly
+its own and refuses to start on any other, so a rollback across a move in
+that number cannot read the state it is rolling back onto. The number is in
+`herd-hub/src/job.rs` and nowhere a deployer can reach it — `herd-hub
+--version` does not print it, and no release body carried it — so the script
+did the correct thing with an unknown and marked the rollback unsafe, and a
+person asked. The answer was read out of the source for them: it is **1**, and
+`git log -S'pub const RECORD_VERSION'` shows it has not moved since the
+v0.3.0 freeze (D73). That answer should not have come from us. The handover's
+whole premise is that a question only this repository can answer is
+answerable from what a tag produces, so the number goes in the artefact.
+
+**`PROTOCOL_VERSION` goes beside it, unasked.** It is the same kind of
+question with the same kind of consequence — whether a runner and a hub of
+two different builds talk at all — and an operator holding two releases wants
+both answers in one place. Two lines cost nothing; being asked a second time
+costs a message each way.
+
+**They go in the generated half of the body, not in the notice.** Both were
+plausible: `deploy/release-notice.md` is quoted into every release and is
+where the *meaning* of these numbers belongs, and does now carry it. But the
+figures belong in the half the workflow writes, for two reasons. The first is
+drift: a number read out of the checked-out tree at build time is the number
+the binaries in that same release were compiled from, and a number typed into
+a prose file is a number somebody has to remember to change — this project has
+already shipped a `SHA256SUMS` covering two binaries out of three because a
+glob was written once and not re-read. The second is the ordering D162 bought:
+the head half is written and published **with the binaries**, before the image
+is so much as built, so a release that loses the archive half still states its
+two numbers. Putting them in the image half would make the rollback answer
+depend on the step most likely to fail.
+
+**Read with `sed`, not with `nix eval`, and the choice is narrower than it
+looks.** The version and the triple come out of `nix eval .#static…` because
+the flake genuinely holds them: `flake.nix` reads
+`workspace.package.version` once and every package takes it from there. No
+flake attribute holds either of these two numbers, and giving it one means a
+`builtins.match` over a 2 000-line Rust file inside the file that is the
+build's contract. It is a regex over the source either way; the question is
+only where it lives. It lives beside the release note it serves, in the step
+that already derives the rest, and not in the thing that builds the binaries.
+Both constants are declared exactly once as `pub const …: u32 = N;`, which is
+what makes a one-line read honest rather than lucky.
+
+**A number that came out empty would be worse than no line at all**, which is
+why the step asserts rather than interpolates. The release body promises a
+shape — `^RECORD_VERSION: [0-9]+$`, said in the body itself so a script may
+rely on it — and a body carrying `RECORD_VERSION:` with nothing after it would
+let that script match nothing and conclude nothing while looking like it had
+checked. So the step refuses an empty value, a non-numeric one, and two
+declarations at once, naming the constant and the file it looked in, before
+anything is built. It deliberately tolerates anything after the semicolon, a
+trailing comment included: that still declares the same number, and a tag is
+the wrong moment to discover somebody added one. Proven the way D162's own
+work was proven — the shell blocks extracted from the workflow and run
+verbatim, offline, against this tree, with `gh` stubbed: the body comes out
+carrying `RECORD_VERSION: 1` and `PROTOCOL_VERSION: 2`, `grep -E` matches both
+lines, a declaration deleted, renamed or duplicated fails the step with its
+own sentence, and a hand-bumped `7` is read as 7, which is the proof the line
+is read and not typed.
+
+**What is deliberately not done.** `herd-hub --version` is untouched: this is
+a CI and documentation change, and in any case a binary cannot answer a
+question an operator has *before* downloading it, which is when rollback is
+decided. Nothing compares this release's numbers with the previous release's —
+the workflow does not have the previous release in hand, and the comparison is
+the operator's to make, now that both releases state their own. And v0.3.5's
+published body is left alone: it is already out and already read, and editing
+a release underneath the person deploying it is its own small betrayal. The
+next tag carries the lines.
+
+**On the number.** This entry is D168 and the last on `main` is D167. D161 is
+still held by an unmerged branch, so the gaps are D143's, D154's and D161's,
+all three under D148's rule.
