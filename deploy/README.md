@@ -21,7 +21,7 @@ he wants it, which is an offering and not an installation.
 | `reverse-proxy/nginx-herd-hub.conf` | the same job on a host that runs nginx instead | pasted into the config he already runs |
 | `herd-runner.service` | the server's runner, native and unprivileged (E-47, E-52) | `/etc/systemd/system/` |
 | `nixos-herd-runner.nix` | the same runner declared: the unit plus the user, the binary's path and the devices the unit marks OWNER | imported from `/etc/nixos`, or not at all |
-| `release-notice.md` | what a release's binaries are and are not: bare binary against unit, the four things a runner needs, the filesystem that decides whether IO is bounded, and the two gaps | quoted into every GitHub release body by `.github/workflows/release.yml`; nothing installs it |
+| `release-notice.md` | what a release's binaries are and are not: bare binary against unit, the four things a runner needs, the two numbers an operator compares before a rollback, the filesystem that decides whether IO is bounded, and the two gaps | quoted into every GitHub release body by `.github/workflows/release.yml`; nothing installs it |
 | `capabilities-wsl-pc.json` | what the owner's PC offers: one counted `build` slot, and `kvm` denied whatever WSL2 exposes (E-24) | copied onto that PC and named by `--capabilities` in its unit; validated by running the real binary against it |
 | `wsl2-check.sh` | the six things about a WSL2 host nobody here can check: systemd as PID 1, cgroup v2, a delegated subtree for a user unit, what `.wslconfig` gave the VM, the hub reachable, `herd-runner --version` | run on that PC, by the person joining it; read-only, and the block it prints comes back in a message |
 
