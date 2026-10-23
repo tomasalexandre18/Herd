@@ -6809,3 +6809,183 @@ make for itself, and the rule is the same one read from the other end: a
 decision number is an identifier and not a position, so it is free to move
 before anything cites it and fixed afterwards. The gaps stay, here and at
 D143 and D154.
+
+---
+
+## 2026-10-23 — D164 A persisted drain is read as off
+
+**The outage.** 15:06 today, on the machine's own operator's account, not
+inferred from the code: `herdctl switch server drain`, then a
+`systemctl restart`. Every start read the persisted position, held nothing,
+and left at once — systemd started the runner **eight times in two minutes**.
+`herdctl switch server on` then failed with *"no runner called server is
+connected to this hub"*, because the runner was never connected long enough
+for the instruction to land. The only way out was a shell on the machine and
+`herd-runner switch on`.
+
+Three mechanisms, each defensible alone and lethal together: the position is
+persisted in the data root so that an owner's withdrawal outlives a reboot
+(D99); `drain` means "finish and leave" by its own specification; and the
+NixOS module sets `Restart = "always"` with `RestartSec = "5s"`, which is what
+a runner that never crashes should have. Nothing here was a bug. The composite
+was.
+
+**Choice.** A `drain` found in the switch file **at startup** is read as
+`off`, with the reason its owner gave, and the file is rewritten to say so.
+
+The reasoning is about what the word *is*. A drain is an instruction to one
+process — finish what you hold, then go — and a process that holds nothing
+because it has only just started has already carried both halves out. Obeying
+it literally is not obedience, it is a loop. `off` is the position a restart
+can carry meaningfully: nothing new is claimed, nothing is served to a peer,
+the reason stays visible in every sentence that mentions the machine, and the
+runner **stays connected**. That last clause is the whole value of the choice
+and not a side effect of it — it is what puts the recovery back within reach
+of the hub, so an operator who wants the machine back on types
+`herdctl switch server on` from wherever she is instead of finding a shell on
+the host.
+
+**Alternatives rejected.** An `--exit-when-drained` flag, which the first
+consumer also proposed: it makes the loop opt-in rather than impossible, and
+the operator who sets it is the same operator who would not have predicted
+this. Keeping the runner connected and idle *in* `drain`: it would mean a
+position that says "leave when empty" and does not, which is worse than
+converting it, because nothing in the sentence an operator reads would have
+changed. Doing nothing at the runner and having the hub hold a pending switch
+for a disconnected runner — the consumer's third suggestion — is sound hub
+state and a separate decision, and this change makes it unnecessary *for this
+failure*: the runner is now reachable, so there is nothing to queue for it.
+It would still earn its keep for a runner that is genuinely down while an
+operator switches it, and it stays open.
+
+**The file is rewritten, which is the part worth arguing about.** The
+alternative is to convert in memory each time and leave the owner's file
+saying `drain` for ever. That would be two truths about one switch: the hub
+told `off`, the disk saying `drain`, and the watcher — which re-reads that
+file every second — finding `drain` again and leaving. So the conversion is
+written back, fsynced, exactly as any other position is (D99), and the next
+restart has nothing to convert. When the write fails, which is a read-only or
+full data root, the position is still taken and the watcher is handed that one
+stale reading to ignore until the file changes — because a position that is in
+force but not durable is already D99's case, and the loop must not come back
+through it. A `drain` written **later**, by anybody, differs from that reading
+and is obeyed in full: it is the owner speaking to this process, which is what
+a drain is for.
+
+**Done means a passing test.** On the pure reading,
+`a_persisted_drain_starts_a_runner_off_and_not_leaving`; and
+`herd-runner/tests/persisted_switch.rs`, which starts
+a real runner on a persisted `drain` with nowhere to dial and asserts it is
+still there two seconds later and that its file now says `off`. Verified to
+fail — in 1.1 s, the way the server failed — with the conversion stubbed out,
+which is the only way to know it tests anything. Its sibling asserts the
+control: a persisted `off` still starts `off` and nobody rewrites her file.
+
+---
+
+## 2026-10-23 — D165 A probe that cannot be started refuses the file
+
+**The outage, and it cost hours.** The first consumer's capability file
+carried the literal, unsubstituted placeholders `@probe@` and
+`@agents_user@`. Every probe sweep therefore failed with ENOENT, `kvm` and
+`gpu-venus` were suspended for as long as that file was live, and jobs queued
+behind capabilities that could never clear. The runner was up, healthy, and
+reporting faithfully: the hub's waiting sentence said *"the probe
+`@probe@ qemu @agents_user@` cannot be started: No such file or
+directory"*, in as many words, on every job. Nobody reads a waiting sentence
+until something is already late.
+
+**Choice.** A probe whose program cannot be spawned **at all** refuses the
+capability file when it is loaded, naming the file, the capability and the
+program; and `herd-runner check --capabilities FILE` validates a file and runs
+each of its probes once, exiting non-zero on anything that would refuse a
+startup.
+
+**This is not D49, and the next reader will want to conflate them.** D49 is
+the runtime rule and it does not move: a probe that *runs* and whose answer
+cannot be read — a timeout, a signal, an exit code the configuration gave no
+meaning to, a lock nobody can look at — suspends its capability, because
+something outside Herd owns the thing and an unreadable probe is never
+permission to assume it is free. That rule is why today was survivable rather
+than destructive. What it is not is a way to notice a *typo*, and it cannot be
+made into one without becoming the other judgement: "suspend" and "refuse" are
+answers to different questions.
+
+So the two are told apart by what they are asked. A program that cannot be
+spawned can never answer, so there is nothing to learn by asking it every two
+seconds for the rest of the deployment; it is settled once, before the process
+is a runner, the way a health cadence is settled at the handshake (D53). A
+program that answers something unreadable is answering, and that is a state of
+the world, not a state of the file.
+
+**The seam is the file, not the startup.** `CapabilityFile::read` is where it
+lands, rather than a check somewhere in `run_until`, because the thing an
+operator got wrong is a file she wrote and the refusal has to name it. The
+judgement itself is `unstartable`: a program with a `/` in it is that path, a
+bare word is looked for on `PATH` — which is what `execvp` does — and nothing
+is run. It is **conservative in one direction on purpose**: it answers "no
+spawn could succeed" only when it is sure, so a program executable by a user
+this process is not passes the check and is caught at runtime by D49 as
+before. A false refusal would be a runner that will not start on a file that
+works, which is a worse trap than the one being closed.
+
+`herd-runner check` is the other half and the one that matches the lesson: the
+file was wrong before it was deployed. It reads the file strictly, says of
+every command probe whether its program can be started, runs each probe once
+and prints the verdict, and exits non-zero on a refusal only — an unreadable
+*answer* is printed as D49's suspension and does not fail the command, because
+a held lock is often the honest answer of the moment. It reads the file *as
+written* rather than through `read`, so it reports every probe instead of
+stopping at the first. One caveat it prints rather than hides: the `PATH` it
+searches is its own, and a runner under a unit file may have another.
+
+**Done means a passing test.**
+`a_probe_whose_program_cannot_be_started_refuses_the_file` writes the
+consumer's own file, placeholders and all, and asserts the refusal names the
+path, the capability and `@probe@`;
+`a_probe_that_names_a_real_program_or_a_lock_file_starts_a_runner` and
+`a_program_is_unstartable_only_when_no_spawn_could_work` are the other side of
+the line, the second on all six shapes the judgement has to tell apart;
+`check_reads_a_capability_file_and_its_probes_once` runs the subcommand's own
+function on both a broken file and a good one, in the test binary that is
+allowed to fork.
+
+### Two tests that had to change, and one that was not testing what it said
+
+`a_broken_probe_suspends_its_own_capability_and_hangs_nothing` — D49's own
+end-to-end test — declared `/nonexistent/herd-probe` as one of its three
+broken probes, which this change refuses at startup, so the runner would never
+have reached the behaviour under test. Its fixture is now a real file,
+executable, whose shebang names an interpreter that is not there: the spawn
+still fails with ENOENT, at runtime, and the test's own assertion ("cannot be
+started") is untouched. That is a better fixture than the old one as well as a
+necessary one, because it is the case that genuinely survives this change — a
+probe whose interpreter is uninstalled under a running runner — and it is
+exactly where the startup check stops: it asks whether there is anything to
+run, never whether running it will work.
+
+`ten_hanging_probes_do_not_delay_the_runner_joining` declared ten probes of
+`/bin/sleep 8`. **There is no `/bin/sleep` on this project's own host** —
+`/bin` on NixOS holds `sh` and nothing else — so the ten probes this test says
+it measures were ten instant ENOENTs, and the claim it prints a number for was
+not being made. The probes are `/bin/sh -c "sleep 8"` now and really hang; the
+join is still inside one timeout. The test was green before and green after,
+which is why nobody noticed, and only the new refusal made it say anything at
+all.
+
+### One stale comment, corrected
+
+`Capacity::new` said *"the first sweep happens before the runner joins a
+hub"*. It does not, and has not since the sweep moved: `run_until` says in as
+many words that the probes are read *beside* the join and not in front of it,
+because a first sweep awaited there made joining cost as long as the slowest
+probe — twenty seconds, measured. The design is still safe for the reason the
+comment then half-stated: a probed capability with no reading yet is suspended
+at both ends under D49. So this is a comment that contradicted the code, not a
+hole; it now says what the code does and why that is safe.
+
+**On the numbers.** Two entries rather than one, because these are two
+unrelated mechanisms observed on one day and invariant 8 asks for one dated
+entry per decision. D160 to D163 are held by branches in flight, so these take
+the next two free numbers; the gaps stay, here and at D143 and D154, under
+D148's rule.
