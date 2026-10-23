@@ -2,20 +2,24 @@
 #
 # WHAT THIS IS. An offering, not an installation. Nothing in Herd ever writes
 # to /etc/nixos — that file is the owner's, and this one only becomes real if
-# he imports it. Until he does, the server stays on the imperative path: a
-# `useradd --system herd` and a unit copied into /etc/systemd/system/, which
-# works and survives a reboot but is unmanaged state outside the NixOS
-# generation. A machine is on exactly one of the two paths; `deploy/README.md`
-# and `docs/joining.md` say which one, and so does the header of
-# deploy/herd-runner.service.
+# he imports it. The other path is imperative: a `useradd --system herd` and
+# a unit copied into /etc/systemd/system/, which works and survives a reboot
+# but is unmanaged state outside the NixOS generation. A machine is on
+# exactly one of the two paths; `deploy/README.md` and `docs/joining.md` say
+# which one, and so does the header of deploy/herd-runner.service. The
+# project's own server imported this module and is on this path, which is
+# why every figure the unit carries is an option here rather than a literal.
 #
 # WHAT IT IS EQUIVALENT TO. Every directive of deploy/herd-runner.service,
 # with what that unit marks OWNER declared alongside it instead of done by
 # hand: the system user, the data root, the binary's path and the /dev/vfio
 # group. One OWNER note stays a note on both paths — the token file, which is
 # a secret and so must never be a value in a Nix expression (invariant 7).
-# The reasoning for each figure is *not* repeated here — it is in the comments
-# of that unit, which stay the one place a figure is explained.
+# The derivation of each figure is *not* repeated here — it is in the comments
+# of that unit, which stay the one place a figure is worked out. What an
+# option's description carries is what the figure means and what moving it
+# costs, because that description is what `nixos-rebuild` and
+# `man configuration.nix` show a reader who will never open this file.
 #
 # THE TWO MUST BE CHANGED TOGETHER. If they drift, nothing fails: both still
 # produce a running runner. What breaks is that the machine's real limits stop
@@ -41,8 +45,9 @@
 #   ];
 #
 # WHAT THE PROJECT'S OWN SERVER SAYS, as the worked example. These are the
-# figures the live transient unit on that host already carries (D144), so the
-# rebuild that makes it permanent is a no-op and not a change:
+# figures the live unit on that host carries today — it is this module's
+# output, read back with `systemctl cat herd-runner` — so the example is a
+# description of a running machine and not an illustration (D144):
 #
 #     {
 #       services.herd-runner.enable = true;
@@ -98,9 +103,12 @@
 let
   cfg = config.services.herd-runner;
 
-  # The arguments of the unit's ExecStart line, in the same order. The five
-  # that joining.md tells you to change on a different machine are options
-  # above; the rest are literal here exactly as they are literal there.
+  # The arguments of the unit's ExecStart line, in the same order. Every
+  # figure on it is an option below, defaulted to the value the copied unit
+  # states, so that importing this module changes no machine's behaviour and
+  # a machine that needs another figure says so declaratively. The one
+  # literal left is --cgroup-root, which is this unit's own cgroup path and
+  # not a figure anybody chooses.
   arguments = [
     "--hub ${cfg.hub}"
     "--name ${cfg.name}"
@@ -113,9 +121,9 @@ let
     "--cgroup-root /sys/fs/cgroup/system.slice/herd-runner.service"
     "--job-memory-max ${cfg.jobMemoryMax}"
     "--job-timeout ${toString cfg.jobTimeout}"
-    "--job-log-cap 64MiB"
-    "--job-disk-budget 20GiB"
-    "--job-nice 10"
+    "--job-log-cap ${cfg.jobLogCap}"
+    "--job-disk-budget ${cfg.jobDiskBudget}"
+    "--job-nice ${toString cfg.jobNice}"
   ]
   # The two that are absent unless a machine names them, and absent means the
   # flag itself is not on the line: the runner's own default then stands
@@ -129,10 +137,10 @@ let
     "--host-memory ${cfg.hostMemory}"
     "--host-memory-floor ${cfg.hostMemoryFloor}"
     "--host-threads ${toString cfg.hostThreads}"
-    "--host-tmpfs 4GiB"
-    "--host-tmpfs-path /dev/shm"
-    "--health-every 15"
-    "--drain-grace 3"
+    "--host-tmpfs ${cfg.hostTmpfs}"
+    "--host-tmpfs-path ${cfg.hostTmpfsPath}"
+    "--health-every ${toString cfg.healthEvery}"
+    "--drain-grace ${toString cfg.drainGrace}"
   ]
   ++ cfg.extraArgs;
 in
@@ -268,6 +276,53 @@ in
       '';
     };
 
+    jobLogCap = lib.mkOption {
+      type = lib.types.str;
+      default = "64MiB";
+      example = "256MiB";
+      description = ''
+        How much log one job may produce before it is stopped and told why
+        (--job-log-cap). It is a cap on the job and not on the link: a job
+        that would have said more is ended at this figure, so raising it
+        buys a noisier build its output and costs the hub the bytes to keep
+        it. 64MiB is the runner's own default, written down here so that the
+        figure is a decision rather than whatever the binary last shipped.
+      '';
+    };
+
+    jobDiskBudget = lib.mkOption {
+      type = lib.types.str;
+      default = "20GiB";
+      example = "40GiB";
+      description = ''
+        How much one job may write under `dataRoot` before it is stopped
+        naming the budget (--job-disk-budget). It caps one job; it reserves
+        nothing, so the right figure is read off the free space on that
+        filesystem divided by the build slots this machine offers — and that
+        space is usually shared with everything else on the disk. 20GiB is
+        the figure deploy/herd-runner.service works out for the project's
+        server, where the data root has a few hundred GiB free.
+      '';
+    };
+
+    jobNice = lib.mkOption {
+      type = lib.types.int;
+      default = 10;
+      description = ''
+        The `nice` value every job's processes run at (--job-nice). Ten
+        keeps a build behind anything interactive on the machine, which is
+        what lets a runner share a host somebody is using (invariant 2).
+
+        It is a floor and not a ceiling: the runner raises a job's niceness
+        towards this figure and never lowers it, so a runner its owner
+        started niced further stays that nice, and a figure under that
+        changes nothing. Zero is the one value that is a different
+        statement — it turns the whole courtesy off, including the idle IO
+        class a job's processes are put in alongside the niceness, which is
+        the half of this that keeps a build off a contended disk.
+      '';
+    };
+
     jobPidsMax = lib.mkOption {
       type = lib.types.nullOr lib.types.int;
       default = null;
@@ -318,6 +373,79 @@ in
       description = "Threads Herd may use, of the machine's total.";
     };
 
+    hostTmpfs = lib.mkOption {
+      type = lib.types.str;
+      default = "4GiB";
+      example = "10GiB";
+      description = ''
+        How much room on this host's tmpfs a job may reserve (--host-tmpfs).
+        This is what admission weighs a job's tmpfs requirement against, and
+        the figure a job cannot talk its way past: a job asking for more
+        tmpfs than this machine lends is not queued here, it is **refused**,
+        because no reservation on this runner could ever cover it. So this
+        option is the difference between a job waiting for room and a job
+        the fleet cannot run at all.
+
+        4GiB is what deploy/herd-runner.service lends on the project's
+        server, and the reasoning there is a ceiling and not a measurement:
+        /dev/shm defaults to half of RAM — about 15 GiB on that 31 GiB host
+        — and tmpfs pages are RAM, so a job allowed to reserve all of it on
+        top of its memory ceiling, with no swap, is the host falling over.
+        A machine with more RAM, or one whose consumer's jobs ask for more
+        than this, says its own figure here.
+
+        The runner clamps what is asked to what the mount at `hostTmpfsPath`
+        really holds and says so at startup, so a figure larger than the
+        tmpfs is corrected rather than believed — a reservation nothing
+        backs is worse than a smaller honest one.
+      '';
+    };
+
+    hostTmpfsPath = lib.mkOption {
+      type = lib.types.str;
+      default = "/dev/shm";
+      description = ''
+        Which tmpfs `hostTmpfs` is measured and clamped against
+        (--host-tmpfs-path). /dev/shm is a tmpfs on every Linux and is where
+        a tool asking for shared memory lands, so it is the right mount
+        unless this machine's jobs use another one. Naming a path that is
+        not a tmpfs does not fail the startup: the runner says the path's
+        filesystem type and lends the figure above unchecked.
+      '';
+    };
+
+    healthEvery = lib.mkOption {
+      type = lib.types.int;
+      default = 15;
+      description = ''
+        Seconds between this runner's health reports (--health-every, E-40).
+        It is how quickly the hub's view of this machine goes stale, and it
+        is not this machine's figure alone: the hub declares a runner lost
+        after its own --lost-after, and it **refuses a runner by name** at
+        the handshake when --lost-after cannot outlast three of that
+        runner's reports. So raising this far enough keeps this runner off
+        the fleet until the hub's figure moves with it. Whole seconds; the
+        runner accepts a fraction and no machine has wanted one.
+      '';
+    };
+
+    drainGrace = lib.mkOption {
+      type = lib.types.int;
+      default = 3;
+      description = ''
+        Seconds a drain may take before the runner exits regardless
+        (--drain-grace): asked to stop, it takes no new job, ends what is
+        running, tells the hub, and goes. Invariant 2 promises the owner
+        that this is over inside five seconds, so the figure stays under
+        that bound — three leaves room for the verdicts to reach the hub and
+        still answers a `systemctl stop` at once. Raise it and every stop,
+        including the restart a `nixos-rebuild switch` causes, takes that
+        much longer; raise it past the TimeoutStopSec below and systemd ends
+        the jobs behind the runner's back, which is the one thing KillMode
+        is set to prevent.
+      '';
+    };
+
     vfio = lib.mkOption {
       type = lib.types.bool;
       default = false;
@@ -360,6 +488,16 @@ in
         Appended to ExecStart. --capabilities is the one that is deliberately
         absent by default: a file that does not exist refuses the startup, so
         it is added in the same move as writing the file.
+
+        A flag already on the line may be repeated here and the last value
+        wins (D163) — the runner replaces a prior occurrence rather than
+        refusing the command line, so this list is an escape hatch for a
+        figure that has no option yet. It is not the place for one that has:
+        an option above is read in `nixos-rebuild`, carries its own type and
+        is what the next reader of the configuration finds. Options that
+        take a list — --privileged-helper, --declare-capability,
+        --deny-capability — still collect every occurrence, here as
+        anywhere.
       '';
     };
   };

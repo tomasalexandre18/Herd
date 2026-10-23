@@ -6680,6 +6680,932 @@ that held a slot.
 
 ---
 
+## 2026-10-23 — D160 The architecture is drawn, in one document
+
+**`docs/architecture.md` holds the whole architecture as Mermaid, and it is
+reference rather than a journal** — it changes when the behaviour changes,
+like `docs/runner-confinement.md`, which it points at instead of copying.
+Alexa asked for a complete picture because he is going to review one, and
+"complete" was the acceptance test, not brevity.
+
+**The cut: one top-level diagram that really is the whole system, then one
+detail diagram per box of it, each complete in itself.** A single graph
+holding everything would be a hairball nobody can review, which fails the
+requirement it was meant to meet; a set of fragments with no whole is the
+same failure wearing the other costume. So there is exactly one picture of
+the system and twenty-four expansions of its boxes, and the document says so
+in its first two sentences, because a reader must be able to tell a
+deliberate structure from a dodge.
+
+**Everything is read out of the code, never out of the plan.** Where the code
+and `docs/plan.md` or `docs/coverage.md` disagree, the code is drawn and the
+disagreement is reported as a finding — a diagram that quietly sided with a
+document would make the document true by drawing it.
+
+**One styling convention, in every diagram, with a legend as the first
+figure.** Four classes — `built`, `unbuilt`, `store`, `outside` — and two
+arrows, solid for a path that exists and dashed for one that does not.
+**Anything unbuilt also carries the word in its own label**, so the
+distinction survives a renderer that drops CSS, and §12 collects every
+unbuilt thing in one table with where each gap is recorded. A reviewer who
+cannot tell a drawn line that exists from one that is planned is reading a
+sales brochure.
+
+Decision numbers and expectation numbers sit beside the structures they
+justify, so a review can jump from a box to the reasoning.
+
+**Every block was rendered before this was committed**, with
+`mermaid-cli` 11.12.0: twenty-five of twenty-five. Two defects it caught are
+worth writing down, because they are silent and both were in the first
+draft — a `;` inside a `sequenceDiagram` message is a **statement
+separator** and swallows the next line, and a transition label in a
+`stateDiagram-v2` must not be quoted. The renderer is not in the flake and
+should not be: this is a once-per-document check, not a gate.
+
+---
+
+## 2026-10-23 — D162 The image ships on the release, binaries ship first
+
+**Three tags in a row produced nothing, and the durations say why.**
+`gh run list --workflow=release.yml`: v0.3.1 failed in 22 s, v0.3.2 in 24 s,
+v0.3.3 in 26 s. Twenty-two seconds is not a build — it is a checkout, a Nix
+install, one `nix eval`, and then the credential preflight D153 put in front
+of everything, refusing the run because `vars.DOCKERHUB_USERNAME` and
+`secrets.DOCKERHUB_TOKEN` do not exist. `gh release list` shows the
+consequence: the newest release is **v0.3.0, of 2026-10-16**. Three versions
+of Herd have been tagged and none of them has a binary anybody can download.
+The step whose whole purpose was to prevent half a release has instead
+prevented three whole ones, and it did it on the day the first consumer
+became the sole operator of the running hub and was promised deployment
+artefacts.
+
+Alexa's decision, which this entry records: **take the registry off the
+release path.** He is not creating the Docker Hub account or the token, and
+that is settled, not pending.
+
+**What survives of D153, and what does not.** What survives is its intent
+and its main structural rule. The intent — an operator gets a runnable hub
+image out of a tag without building it — is kept in full, and is in fact
+better served than before, because it no longer depends on an account
+nobody has. The rule — `nix/hub-image.nix` is the single derivation that
+has ever built this image, there is no Dockerfile and no second build — is
+untouched and is the reason the archive can be trusted at all. So is the
+"no `latest`" argument, which the new delivery strengthens rather than
+weakens: a tag that arrived by `docker load` cannot be moved by anything
+but another `docker load`, so a fleet cannot cross a `PROTOCOL_VERSION`
+line because of a reboot.
+
+What does not survive: the registry as the only way to get the image, the
+`skopeo` push and the pull-back-by-digest inside the workflow, the
+preflight, and — this is the one that matters most — D153's ordering
+argument. D153 reasoned that a tag must never leave binaries published and
+an image missing, and put every image step *before* the GitHub release to
+guarantee it. That is a defensible trade when the two halves are equally
+reliable. It is the wrong trade when one half depends on a third party and
+the other does not, and the cost of being wrong is what the first paragraph
+measures. So the order is now the reverse of D153's and the reversal is the
+point: binaries built, proved on Arch and on Alpine, summed, **published**
+— and only then the image built, asserted, smoke-tested and attached. From
+the release step onward a failure costs the archive and never the binaries.
+
+**The body is written in two halves for the same reason.** A release that
+describes an asset it does not have is worse than a release with three
+files and no fourth, so the half of the body that says "`docker load` this
+archive" is added by `gh release edit` after the archive is really
+uploaded. `SHA256SUMS` goes up twice for the same reason: three lines with
+the release, a fourth appended and re-uploaded with the archive, with the
+count asserted at both points. A reader who took only the binaries uses
+`sha256sum --ignore-missing -c`, which is now what every document here
+prints.
+
+**Keeping a registry path, and why it is not in the workflow.** The brief
+asked whether an optional, skipped-when-unconfigured push belongs in this
+file. It does not, and "remove it" is the recommendation. Three reasons.
+First, it was never working machinery: D153's own closing paragraph says
+"none of this has run" — not the login, not the copy, not the digest file,
+not the pull-back. Deleting unexercised YAML costs nothing, because there
+is nothing proven to lose. Second, an `if: vars.… != ''` step forks
+everything downstream of it — the body would need a digest line in one
+branch and not the other, the pull-back smoke would run or not — and
+conditional branches nobody exercises are precisely where the next broken
+release comes from. Third, a skipped step is a quiet step: a release that
+silently did not publish where somebody expected it to is a worse failure
+mode than one that never claimed to.
+
+The path to a registry is therefore kept where it cannot touch a release:
+`devShells.release` still carries `skopeo`, and `flake.nix`,
+`deploy/README.md` and `deploy/release-notice.md` each give the one command
+that copies the downloaded archive into any registry. It is a thing a
+person runs, by hand, after a release exists. If somebody later wants it
+automated, the two commits D153 shipped (`0a4e2fd`, `7a7e4bd`) are in
+history and can be read back — but it would want to be a separate workflow
+on a separate trigger, never a step the tag has to get past.
+
+**`scripts/image-smoke.sh` earns its place more than it did, not less.**
+D153 ran it twice: once on the locally loaded archive, once on an image
+pulled back from the registry by digest, and called the second the one that
+mattered. The second run is gone with the registry. What is left is the
+run that was previously the warm-up, and it is now the only proof the image
+has — and it happens to be the *right* proof, because it is exactly what an
+operator now does: `docker load`, then run the container shaped the way
+`deploy/docker-compose.yml` shapes it. The script and the deployment walk
+one path. It also needs no credentials, which is the other half of why it
+survived: nothing in it can stop a release for want of a secret. Keep it,
+unchanged except for a header that no longer describes a registry.
+
+**The archive, measured rather than assumed.** 18 958 841 bytes — 18.1 MiB
+— built from this tree at 0.3.3, well inside GitHub's per-asset limit, and
+`herd-hub-image-<version>.tar.gz` on the release page. One more figure is
+worth recording because it was not expected: the image id in that archive,
+`sha256:6e92753d0c66…`, is **the id of the container running on this server
+right now**. The operator's hub was loaded from this same derivation by
+hand, so the archive the release will attach is byte-for-byte what is
+already in production. `docker load` of it was a no-op.
+
+**How this was proved without burning v0.3.4.** The next real tag
+finalises a handover and must not be the experiment, so none was created.
+What was *executed*, locally, on this host: `nix build .#hub-image`; the
+archive's `manifest.json` carrying exactly `herd-hub:0.3.3`; `docker load`;
+`scripts/image-smoke.sh herd-hub:0.3.3` green against the loaded tag — a
+containerised hub, a host runner, two real jobs, the second exiting 7; and
+then the operator's own path end to end, `deploy/docker-compose.yml` with
+`HERD_HUB_IMAGE=herd-hub:0.3.3` in a `.env`, `up -d`, the hub's three
+startup lines, a runner approved and a real job through it — run under a
+project name and a port of its own so the live `herd` project at `/srv/herd`
+was never touched, and torn down with `down -v`.
+
+What is **unexercised** and must be said plainly: no step of the new
+workflow has run on GitHub. The reordering, the two-half body, the second
+`SHA256SUMS` upload and the `gh release edit` exist only as YAML, and D132
+is the entry that says a release step nobody has run is a release step that
+does not work. Two things close that, in order, and neither needs a tag:
+
+1. `workflow_dispatch` on this branch with `tag` left empty. It runs
+   everything above the release — both distribution smokes, the static
+   assertions, the sums, the image build, the archive assertion,
+   `image-smoke.sh` — and creates nothing. This is possible only because
+   `release.yml` already carries `workflow_dispatch` **on `main`**: GitHub
+   offers the trigger from the default branch and then runs the file from
+   the ref you pick. The note in `d2d37b7` saying a hand-run cannot reach a
+   non-default branch was true when this workflow was not yet on `main`,
+   and is no longer; so the temporary `branches:` trigger that commit
+   deleted does not need to come back. This is also why the `tag` input
+   keeps its name and shape here and only its description changed: the
+   form GitHub offers is read from the default branch's copy of the
+   file, so an input renamed on a branch is an input a hand-run on that
+   branch cannot be given.
+2. `workflow_dispatch` with `tag: v0.3.3` — a tag that already exists and
+   whose run failed. It publishes the release v0.3.3 never got, which is
+   the handover artefact, and in doing so exercises the two `gh release`
+   steps and the body halves for real. The workspace is at 0.3.3, so the
+   version check passes. v0.3.1 and v0.3.2 cannot be recovered this way
+   and will not be: the workspace no longer says those numbers, and the
+   check that refuses them is right to.
+
+Both are Alexa's to run, like anything outward-facing.
+
+**On the number.** This entry is 162 and the last on `main` is 159: D160
+and D161 are held by two unmerged branches, and the gap is left rather than
+filled, for the reason D148's closing paragraph gives — a decision number
+cited in code is an identifier, not a position. D143 and D154 do not exist
+either.
+
+---
+
+## 2026-10-23 — D163 A runner's figures belong to the machine's owner
+
+**The refusal.** The first consumer's jobs ask for 10 GiB of tmpfs. The
+server's runner lends 4 GiB, so the hub's record of `j0000001566` says, in
+its own words, that *"server has 4 GiB of tmpfs in all and this job needs
+10 GiB, so no reservation there can ever cover it"*. That is not a wait: it
+is a permanent refusal, and three jobs are held by it. `/dev/shm` on that
+host is 16 GiB — the capacity is there and has been all along. What stood in
+the way was `"--host-tmpfs 4GiB"`, a string literal in
+`deploy/nixos-herd-runner.nix`.
+
+**And the operator could not work around it.** The honest attempt is to
+append `--host-tmpfs 8GiB` through `services.herd-runner.extraArgs`, which
+is what that option is for. It failed:
+`the argument '--host-tmpfs <SIZE>' cannot be used multiple times`. So the
+figure was ours and nobody else's, on a machine we do not own, with no way
+for its owner to say otherwise short of editing this repository. That is the
+thing being fixed, and it is worth more than the one number: a deployment
+that states a cap its operator cannot restate is a deployment that decides
+for someone else's hardware.
+
+### The two halves
+
+**Seven figures become options of `services.herd-runner`.** `hostTmpfs`,
+`hostTmpfsPath`, `jobLogCap`, `jobDiskBudget`, `jobNice`, `healthEvery` and
+`drainGrace`, each defaulted to the value that was literal in the module a
+minute ago: `4GiB`, `/dev/shm`, `64MiB`, `20GiB`, `10`, `15`, `3`. The
+module already had `jobTimeout`, `jobMemoryMax`, `hostMemory`,
+`hostMemoryFloor` and `hostThreads`; there was no reason beyond history for
+the line to be half declared, and the half left out included the one figure
+that refuses work outright.
+
+**No default moves.** The point is that an operator can choose, not that we
+choose differently for her. This is checkable rather than asserted: the
+module's `ExecStart` was evaluated before and after the change with
+`nixosSystem` and the two strings are byte-identical, so a `nixos-rebuild`
+that only picks up these options is a no-op and not a restart anybody has to
+plan. The server will raise `hostTmpfs` next, in `/etc/nixos`, which is the
+owner's file and the owner's move.
+
+**A repeated flag on the runner takes the last value.** `args_override_self`
+on `herd-runner`'s clap command, which is clap's own word for "replace prior
+occurrences of arguments rather than error". It is what makes `extraArgs` an
+escape hatch again: this command line has two authors — a deployment that
+writes the figures it chose, and the operator of the machine, who appends to
+it — and before this the second author could not correct the first. Options
+whose action is to append are untouched by it, which matters here:
+`--privileged-helper`, `--declare-capability` and `--deny-capability` each
+declare a *list* by repetition, and a last-wins reading of those would
+quietly narrow a machine's declaration to its final line and refuse the rest
+later, on a job. That is asserted, not assumed.
+
+### Why plain types and not `nullOr`, with the one exception recorded
+
+`jobPidsMax` and `jobIoMax` are `nullOr` because absence is a *statement*
+there: the flag leaves the line entirely and the runner's own default stands
+(`pids.max` 1024, and no `io.max` written at all). None of these seven is in
+that position. All seven are on the ExecStart line today, every one of them
+with a figure somebody chose, and keeping them on it is what makes the
+defaults a no-op.
+
+One of them does have a real third state, and it is recorded here rather
+than built: with `--host-tmpfs` absent the runner *measures* the mount and
+lends what it finds. On the project's server that would be 16 GiB rather
+than 4, which is a different decision about what the host lends and not a
+spelling of the same one — so `hostTmpfs = null` meaning "lend whatever
+`/dev/shm` has" is a coherent option and a separate ruling. It is Alexa's,
+not this entry's. A figure is also the safer default of the two: a machine
+that lends what it happens to measure lends more the day somebody remounts
+`/dev/shm`, and invariant 2 is about the host never falling over.
+
+### Only the runner, and why that is not an inconsistency
+
+`herd-hub` and `herdctl` keep clap's refusal, deliberately.
+
+The hub has no command line to override. `deploy/docker-compose.yml`
+configures it entirely through the environment — `HERD_LISTEN`,
+`HERD_STATE_DIR`, `HERD_REQUESTER_TOKEN_FILE` — and an environment variable
+holds one value by construction, so there is no second author to make room
+for. The day the hub's deployment grows an argument list this argument comes
+back, and nothing about the change would be harder then.
+
+`herdctl` is the opposite case: its command line has one author, a requester
+typing or generating it in one place, and a flag given twice there is a
+mistake rather than an override. A requester who writes `--priority` twice
+wants to be told, not quietly given the second one — the hub's queue is the
+wrong place to discover a generated command line was wrong. So consistency
+across three binaries would buy nothing and would cost `herdctl`'s loudest
+check on its own callers.
+
+### Done means a passing test
+
+`a_repeated_option_takes_the_value_stated_last` reads the parse directly, on
+`Args`, in `herd-runner/src/main.rs` beside the struct it is about — the
+runner had no argument tests at all, and `herdctl`'s own `mod tests` in its
+`main.rs` is the precedent for where one goes. It asserts the operator's
+case (`--host-tmpfs 4GiB … --host-tmpfs 10GiB` yields 10 GiB) and then all
+seven of the module's figures stated twice over. Verified to fail without
+`args_override_self`, which is the only way to know it is testing anything.
+Two more beside it: the list options keep every occurrence, and
+`Args::command().debug_assert()`, because nothing in the suite built this
+binary's parser before and clap's own conflict assertions ran nowhere.
+
+### Two things that were no longer true, and the number
+
+`deploy/herd-runner.service` said the copied-unit path *"is what the
+project's server runs today"* and the module said the server *"stays on the
+imperative path"* until the owner imports it. Neither is true:
+`systemctl cat herd-runner` on that host prints a `/nix/store` unit with
+`Documentation=file:///etc/herd/joining.md`, which only this module
+produces, and `docs/status.md` has said the runner is declarative since
+D144. The module's worked example also described the live unit as
+*"transient"* and the rebuild as *"the rebuild that makes it permanent"* —
+that rebuild has happened. All three corrected, because the one thing both
+files promise is that they describe the host as it is.
+
+**On the number.** This is D163, and the three numbers under it are spoken
+for by work that is still in flight: D160 by an unmerged pull request the
+owner is reviewing, D161 by `docs-handover`, which appended its own entry
+while this branch was being written, and D162 by a branch on the release
+path. This entry was D161 for an afternoon and was renumbered rather than
+contested, which is the cheap direction: the citations that move with it are
+three — two comments in `herd-runner/src/main.rs` and one option description
+in `deploy/nixos-herd-runner.nix` — and all three are on this branch, where
+nobody has read them yet. That is exactly the calculation D148 refused to
+make for itself, and the rule is the same one read from the other end: a
+decision number is an identifier and not a position, so it is free to move
+before anything cites it and fixed afterwards. The gaps stay, here and at
+D143 and D154.
+
+---
+
+## 2026-10-23 — D164 A persisted drain is read as off
+
+**The outage.** 15:06 today, on the machine's own operator's account, not
+inferred from the code: `herdctl switch server drain`, then a
+`systemctl restart`. Every start read the persisted position, held nothing,
+and left at once — systemd started the runner **eight times in two minutes**.
+`herdctl switch server on` then failed with *"no runner called server is
+connected to this hub"*, because the runner was never connected long enough
+for the instruction to land. The only way out was a shell on the machine and
+`herd-runner switch on`.
+
+Three mechanisms, each defensible alone and lethal together: the position is
+persisted in the data root so that an owner's withdrawal outlives a reboot
+(D99); `drain` means "finish and leave" by its own specification; and the
+NixOS module sets `Restart = "always"` with `RestartSec = "5s"`, which is what
+a runner that never crashes should have. Nothing here was a bug. The composite
+was.
+
+**Choice.** A `drain` found in the switch file **at startup** is read as
+`off`, with the reason its owner gave, and the file is rewritten to say so.
+
+The reasoning is about what the word *is*. A drain is an instruction to one
+process — finish what you hold, then go — and a process that holds nothing
+because it has only just started has already carried both halves out. Obeying
+it literally is not obedience, it is a loop. `off` is the position a restart
+can carry meaningfully: nothing new is claimed, nothing is served to a peer,
+the reason stays visible in every sentence that mentions the machine, and the
+runner **stays connected**. That last clause is the whole value of the choice
+and not a side effect of it — it is what puts the recovery back within reach
+of the hub, so an operator who wants the machine back on types
+`herdctl switch server on` from wherever she is instead of finding a shell on
+the host.
+
+**Alternatives rejected.** An `--exit-when-drained` flag, which the first
+consumer also proposed: it makes the loop opt-in rather than impossible, and
+the operator who sets it is the same operator who would not have predicted
+this. Keeping the runner connected and idle *in* `drain`: it would mean a
+position that says "leave when empty" and does not, which is worse than
+converting it, because nothing in the sentence an operator reads would have
+changed. Doing nothing at the runner and having the hub hold a pending switch
+for a disconnected runner — the consumer's third suggestion — is sound hub
+state and a separate decision, and this change makes it unnecessary *for this
+failure*: the runner is now reachable, so there is nothing to queue for it.
+It would still earn its keep for a runner that is genuinely down while an
+operator switches it, and it stays open.
+
+**The file is rewritten, which is the part worth arguing about.** The
+alternative is to convert in memory each time and leave the owner's file
+saying `drain` for ever. That would be two truths about one switch: the hub
+told `off`, the disk saying `drain`, and the watcher — which re-reads that
+file every second — finding `drain` again and leaving. So the conversion is
+written back, fsynced, exactly as any other position is (D99), and the next
+restart has nothing to convert. When the write fails, which is a read-only or
+full data root, the position is still taken and the watcher is handed that one
+stale reading to ignore until the file changes — because a position that is in
+force but not durable is already D99's case, and the loop must not come back
+through it. A `drain` written **later**, by anybody, differs from that reading
+and is obeyed in full: it is the owner speaking to this process, which is what
+a drain is for.
+
+**Done means a passing test.** On the pure reading,
+`a_persisted_drain_starts_a_runner_off_and_not_leaving`; and
+`herd-runner/tests/persisted_switch.rs`, which starts
+a real runner on a persisted `drain` with nowhere to dial and asserts it is
+still there two seconds later and that its file now says `off`. Verified to
+fail — in 1.1 s, the way the server failed — with the conversion stubbed out,
+which is the only way to know it tests anything. Its sibling asserts the
+control: a persisted `off` still starts `off` and nobody rewrites her file.
+
+---
+
+## 2026-10-23 — D165 A probe that cannot be started refuses the file
+
+**The outage, and it cost hours.** The first consumer's capability file
+carried the literal, unsubstituted placeholders `@probe@` and
+`@agents_user@`. Every probe sweep therefore failed with ENOENT, `kvm` and
+`gpu-venus` were suspended for as long as that file was live, and jobs queued
+behind capabilities that could never clear. The runner was up, healthy, and
+reporting faithfully: the hub's waiting sentence said *"the probe
+`@probe@ qemu @agents_user@` cannot be started: No such file or
+directory"*, in as many words, on every job. Nobody reads a waiting sentence
+until something is already late.
+
+**Choice.** A probe whose program cannot be spawned **at all** refuses the
+capability file when it is loaded, naming the file, the capability and the
+program; and `herd-runner check --capabilities FILE` validates a file and runs
+each of its probes once, exiting non-zero on anything that would refuse a
+startup.
+
+**This is not D49, and the next reader will want to conflate them.** D49 is
+the runtime rule and it does not move: a probe that *runs* and whose answer
+cannot be read — a timeout, a signal, an exit code the configuration gave no
+meaning to, a lock nobody can look at — suspends its capability, because
+something outside Herd owns the thing and an unreadable probe is never
+permission to assume it is free. That rule is why today was survivable rather
+than destructive. What it is not is a way to notice a *typo*, and it cannot be
+made into one without becoming the other judgement: "suspend" and "refuse" are
+answers to different questions.
+
+So the two are told apart by what they are asked. A program that cannot be
+spawned can never answer, so there is nothing to learn by asking it every two
+seconds for the rest of the deployment; it is settled once, before the process
+is a runner, the way a health cadence is settled at the handshake (D53). A
+program that answers something unreadable is answering, and that is a state of
+the world, not a state of the file.
+
+**The seam is the file, not the startup.** `CapabilityFile::read` is where it
+lands, rather than a check somewhere in `run_until`, because the thing an
+operator got wrong is a file she wrote and the refusal has to name it. The
+judgement itself is `unstartable`: a program with a `/` in it is that path, a
+bare word is looked for on `PATH` — which is what `execvp` does — and nothing
+is run. It is **conservative in one direction on purpose**: it answers "no
+spawn could succeed" only when it is sure, so a program executable by a user
+this process is not passes the check and is caught at runtime by D49 as
+before. A false refusal would be a runner that will not start on a file that
+works, which is a worse trap than the one being closed.
+
+`herd-runner check` is the other half and the one that matches the lesson: the
+file was wrong before it was deployed. It reads the file strictly, says of
+every command probe whether its program can be started, runs each probe once
+and prints the verdict, and exits non-zero on a refusal only — an unreadable
+*answer* is printed as D49's suspension and does not fail the command, because
+a held lock is often the honest answer of the moment. It reads the file *as
+written* rather than through `read`, so it reports every probe instead of
+stopping at the first. One caveat it prints rather than hides: the `PATH` it
+searches is its own, and a runner under a unit file may have another.
+
+**Done means a passing test.**
+`a_probe_whose_program_cannot_be_started_refuses_the_file` writes the
+consumer's own file, placeholders and all, and asserts the refusal names the
+path, the capability and `@probe@`;
+`a_probe_that_names_a_real_program_or_a_lock_file_starts_a_runner` and
+`a_program_is_unstartable_only_when_no_spawn_could_work` are the other side of
+the line, the second on all six shapes the judgement has to tell apart;
+`check_reads_a_capability_file_and_its_probes_once` runs the subcommand's own
+function on both a broken file and a good one, in the test binary that is
+allowed to fork.
+
+### Two tests that had to change, and one that was not testing what it said
+
+`a_broken_probe_suspends_its_own_capability_and_hangs_nothing` — D49's own
+end-to-end test — declared `/nonexistent/herd-probe` as one of its three
+broken probes, which this change refuses at startup, so the runner would never
+have reached the behaviour under test. Its fixture is now a real file,
+executable, whose shebang names an interpreter that is not there: the spawn
+still fails with ENOENT, at runtime, and the test's own assertion ("cannot be
+started") is untouched. That is a better fixture than the old one as well as a
+necessary one, because it is the case that genuinely survives this change — a
+probe whose interpreter is uninstalled under a running runner — and it is
+exactly where the startup check stops: it asks whether there is anything to
+run, never whether running it will work.
+
+`ten_hanging_probes_do_not_delay_the_runner_joining` declared ten probes of
+`/bin/sleep 8`. **There is no `/bin/sleep` on this project's own host** —
+`/bin` on NixOS holds `sh` and nothing else — so the ten probes this test says
+it measures were ten instant ENOENTs, and the claim it prints a number for was
+not being made. The probes are `/bin/sh -c "sleep 8"` now and really hang; the
+join is still inside one timeout. The test was green before and green after,
+which is why nobody noticed, and only the new refusal made it say anything at
+all.
+
+### One stale comment, corrected
+
+`Capacity::new` said *"the first sweep happens before the runner joins a
+hub"*. It does not, and has not since the sweep moved: `run_until` says in as
+many words that the probes are read *beside* the join and not in front of it,
+because a first sweep awaited there made joining cost as long as the slowest
+probe — twenty seconds, measured. The design is still safe for the reason the
+comment then half-stated: a probed capability with no reading yet is suspended
+at both ends under D49. So this is a comment that contradicted the code, not a
+hole; it now says what the code does and why that is safe.
+
+**On the numbers.** Two entries rather than one, because these are two
+unrelated mechanisms observed on one day and invariant 8 asks for one dated
+entry per decision. D160 to D163 are held by branches in flight, so these take
+the next two free numbers; the gaps stay, here and at D143 and D154, under
+D148's rule.
+
+---
+
+## 2026-10-23 — D166 The product says what only a shell could say
+
+**What changed under us, and it changes what this work is for.** As of today
+the first consumer is the **sole operator** of the running system: they own
+the hub container, the runner units, the capability files, the disk, the
+restarts. We ship software; they run it. Until today a person with a shell
+could answer *why did this job fail* and *is the fleet healthy* by reading
+our source and their disk. Now the answer has to arrive in the product,
+because whoever is asking has neither.
+
+Today's proof of what that costs: their capability file carried
+unsubstituted placeholders, every probe failed with ENOENT, `kvm` and
+`gpu-venus` were suspended for hours with every job that needed them
+waiting, and the only reason anybody found out is that we read their disk —
+an access we have both now given up. `herdctl runner list`, which is where
+an operator looks first, said nothing about any of it.
+
+**Choice.** Three things, in one entry because they are one complaint with
+three faces: a machine-readable verdict, a fleet listing that names a
+runner's build and what it is not handing out, and a permission failure
+reported as a setup failure instead of a disk cap.
+
+They close chatOnS's grievances 9 (every verdict names its cause), 10a and
+10c (the runner's name in a machine-readable result), and point 3.2 of the
+scope review (the exit codes are ambiguous and a requester parses prose).
+Grievance 10a's second half is folded in at the end.
+
+### 1. `--verdict-to <FILE>`, and the two fields that earn it
+
+`herdctl run` and `herdctl wait` take `--verdict-to <FILE>` and write the
+job's end as JSON. `JobOutcome` was already `Serialize`; what was missing
+was any way to ask for it.
+
+The document carries the cause in one word, the runner's name and why
+there, a cap's figures when a cap ended the job, the sentences `herdctl`
+printed, the outcome as the wire carries it, and what the runner measured.
+Two of its fields are the reason it exists rather than a convenience:
+
+* `exit_code_from` — `job`, `signal` or `herd`. `herdctl --help`'s own
+  exit-code table admits that a job's **own** exit of 124 or 125 is worn
+  untouched and is therefore indistinguishable from a cap and from Herd
+  having no verdict. One field apart, the three are three:
+  `{"exit_code": 124, "exit_code_from": "job"}` is a build that chose 124,
+  and `{"exit_code": 124, "exit_code_from": "herd"}` is a cap, with `cause`
+  saying which.
+* `job_exists` — `a_job`, `nothing` or `unknown`. This is D109's three
+  stderr lines, which a falling-back requester has had to `sed` for, as a
+  field. The prose stays exactly as it was; nothing about it is withdrawn.
+
+`cause` is the outcome variant's **own serde tag**, through a new
+`JobOutcome::cause()`, so the word in the document and the word on the wire
+cannot drift apart. A second table of those names would have been a second
+answer to "why did this job end", which is what invariant 4 exists to keep
+single.
+
+**A file and never a stream.** stdout is the job's own output, framed and
+nothing else (E-02), and stderr carries Herd's prose that the same wrapper
+is already reading a line at a time; a JSON document spliced into either is
+one nobody can parse reliably. A caller that wants it on a pipe names one:
+`--verdict-to /dev/fd/3`.
+
+**Written however the run ends**, no verdict included — `cause` is then
+`no_verdict`. The alternative was to leave no file, and that is the worse
+failure: a wrapper reading the document would find the *previous* run's and
+act on the previous run's answer. Failing to write it is said loudly on
+stderr and never changes the exit code, for the reason `--outputs-to`
+already has: the verdict is the answer the caller is waiting for and a path
+the requester named and cannot write is a problem with that path.
+
+**The version follows the precedent rather than inventing one.**
+`OUTPUT_FORMAT_VERSION` is a `u32` in `herd-proto`, carried inside the
+thing it versions, documented with what moves it, and listed in the version
+table in `docs/architecture.md`. So `VERDICT_FORMAT_VERSION` is a `u32` in
+`herd-proto` beside it, carried as the document's **first** field so a
+reader can refuse a version before it reads anything else, and in the same
+table. A second number rather than a reuse of the first, because the two
+framings are parsed by different readers and will not move together.
+Adding a field does not move it — every key is always present, `null`
+included, so a document that gains one still answers everything it
+answered — while removing a field, or changing what one means, does.
+
+### 2. The build and the suspensions, in the listing
+
+`ApprovedRunner` and `RunnerSwitch` gain one defaulted field each, a
+`RunnerFacts` carrying the runner's announced build and every capability it
+is not handing out with the reason. The hub already knew both: it computes
+`version_gap` at the handshake and it receives `CapabilitiesChanged`. What
+it did with the first was print a line on its **own stderr**, which is a
+place nobody operating the fleet through `herdctl` ever looks.
+
+`herdctl runner list` now prints the build on the runner's line and one
+indented line per suspension underneath. Indented and one each, rather than
+appended: a probe's reason is a sentence with a path in it — the
+consumer's were sixty characters apiece — and two of them on one line is a
+line nobody reads to the end. `herdctl switch`, which is the same fleet
+seen from the owner's side, says the same two things.
+
+**`suspended` is an `Option<Vec<_>>` and the `Option` is load-bearing.** An
+empty list means "this hub is connected to the machine and nothing is
+suspended"; absent means "this hub did not say". Had it been a plain `Vec`
+with a `serde` default, a frame from a hub that has never heard of the
+field would have decoded as a clean bill of health — which is the exact
+defect this entry is about, rebuilt one layer down. A runner that is not
+connected carries neither field, because a machine that is not here offers
+nothing and a figure for it would be a report about a runner that left.
+
+Neither field moves `PROTOCOL_VERSION`: a new field on an existing variant
+may leave it alone when it is `#[serde(default)]` and means, absent,
+exactly what its default says, and both do.
+
+### 3. A permission failure is a setup failure
+
+Three of the consumer's jobs — j984, j989, j1197 — ended `stopped_by_cap`
+with `cap: disk` and exit **124**, carrying a detail that said plainly that
+the runner could not *measure* the job's workspace, so it could not hold
+the job to its disk budget at all, naming a path under `{out}` that cannot
+be read. The text was honest; the outcome type was a lie, and 124 told
+their requester that a budget killed their build.
+
+The mechanism is known and is not ours to fix: the runner walks `{out}` as
+uid `herd`, the consumer's jobs deposit trees owned by `server:users`, and
+`chmod` on an inode somebody else owns is refused however often it is
+retried. That half is theirs and they are already moving to runner-owned
+trees. **Nothing about the walk's behaviour changes here**, including that
+the job is still ended — a budget that cannot be enforced must never read
+as a job that passed, which is D30 and invariant 2 and is right. What
+changes is what the ending is *called*.
+
+`root::measure` now answers with an `Unmeasurable { why, refused }` instead
+of a bare sentence, where `refused` is `ErrorKind::PermissionDenied`. The
+kind rides with the sentence rather than being re-derived by matching on its
+words, which is the one way this could have been done wrong. A refused
+measurement ends the job `SetupFailed`, which exits **125** and names the
+path. Every other failure to measure — a path that is not a directory, a
+measuring task that died — is the runner failing at its own work, and D30's
+cap stays right for it.
+
+**Why a new variant and not `CouldNotStart`.** Two reasons, and the second
+is the one that settles it. `CouldNotStart` means Herd never got a process
+out of the job, which is false here — the job ran, and produced output. And
+it is the one ending the `ran on:` line is deliberately **withheld** for
+(D16), because a job that never started has no output to frame. This job
+ran on a named machine, and that machine's name is the only actionable
+thing in the whole report: the setup that is broken is its own. Reporting it
+as `CouldNotStart` would have hidden exactly the fact grievances 10a and
+10c asked for.
+
+**What the variant costs, said out loud.** `JobOutcome`'s own doc blesses a
+new variant as the additive way to add an ending, and it does not move
+`PROTOCOL_VERSION` under the rule that covers frames. But "additive" is not
+"an older peer survives it": `JobOutcome` has no `#[serde(other)]`
+catch-all, so an older `herdctl` decoding `setup_failed` fails to read the
+frame. What it then does is exit **125** with a sentence naming what it
+could not read — which is the same exit code this variant produces, with a
+worse sentence. That is materially unlike D117's shape, where the hazard was
+a job that *passed* being read as no verdict: here there is no verdict
+either way, so an older requester is degraded and never misled. The same
+reasoning covers a record: a hub rolled back below this change and reading a
+`setup_failed` record refuses to start naming the file, loudly, rather than
+guessing — which is what `RECORD_VERSION`'s contract already promises for
+anything it cannot read. A catch-all variant on `JobOutcome` would make the
+*next* ending cheaper and was deliberately left out of this change: it
+would have to be a unit variant, so a record round-tripping through it
+would lose its reason, and that is a decision of its own.
+
+### Grievance 10a's second half: `switch on --reason` no longer fails
+
+`herdctl switch <runner> on --reason …` was refused with *"switching a
+runner on takes no reason"*. The position still carries none — a machine
+nobody has withdrawn needs no explaining — but refusing a command because it
+carries one extra piece of information is a bad trade: an operator switching
+a fleet back on after a maintenance window types the same `--reason` on
+every line, and the one that was `on` was the one that failed. The reason is
+now accepted, dropped, and said where it was typed, on both halves of E-33
+— `herdctl switch` and `herd-runner switch`.
+
+A switch *file* that says `on` with a reason is likewise read rather than
+refused, and that case moved out of the list in
+`nothing_unreadable_reads_as_a_runner_that_claims`. The hazard that test
+exists for is untouched: a truncated file, an unknown position and a missing
+one are all still errors, because none of them says what it wants. This one
+says `on` in so many words and carries one surplus field — and nothing in
+Herd writes a reason on `on`, so such a file was typed by a person, and
+refusing it would withdraw a machine nobody meant to withdraw.
+
+### Done means a passing test
+
+`the_verdict_document_tells_a_job_s_own_code_from_herd_s`, against the real
+binary, a real hub and a real runner: a job that chooses to exit 124 and a
+job a cap stopped at the same code, told apart by `exit_code_from`, with the
+runner's name read out of `ran_on.runner`; and the run that got no verdict
+at all, which overwrites a stale document planted first, because that was
+the failure worth building the test around.
+`a_workspace_the_runner_was_refused_is_a_setup_failure_and_not_a_cap` is the
+split of part 3 at the `Attempt` level, both branches, asserting that the
+reason names the path and the budget and that no cap is recorded;
+`a_refusal_during_the_takedown_leaves_an_established_verdict_alone` holds the
+one line D108 draws through it — the `down` step runs however the others
+ended, so a refusal seen there is said in the job's log and the verdict is
+left exactly as it was, which is a defect this change had on its first
+writing;
+`a_path_the_runner_cannot_take_its_access_back_on_is_refused_and_not_capped`
+reaches a **real** refusal with no second user by putting a directory the
+walk must search above the data root, which is the one place the
+restoration deliberately does not reach — and skips itself loudly, under
+D27, on a host where mode 000 does not bind the user running it.
+`the_fleet_listing_names_a_runner_s_build_and_what_it_is_not_handing_out`
+drives the real binaries with a probe that really starts and really says
+busy, and asserts the build on the connected runner's line, the suspension
+under it, and that the machine which is *not* connected claims neither.
+The protocol's round trip carries both new fields, set and unset.
+
+**On the number.** This entry is D166 and the last on `main` is D165. D161
+is still held by an unmerged branch, so the gaps are D143's, D154's and
+D161's, and all three stand under D148's rule. One entry rather than three,
+because the three are one decision about who the reader is — and because
+doing them apart would have meant three branches touching the same four
+files in the same week.
+
+---
+
+## 2026-10-23 — D167 A job is finished when its evidence is here
+
+**The first consumer, now the only operator of this fleet, reported the worst
+defect Herd has had and reported it properly: with job ids, versions, and the
+transfer itself already ruled out.** Runner 0.3.2, hub 0.3.3, herdctl 0.3.3.
+Job `j1586` was recorded finished at **14:11:43**; its files went on arriving
+until **14:12:40**; a `herdctl wait --outputs-to` that fetched at 14:12:20 was
+told **195 of 657** files were not there — *"did NOT get … the hub does not
+have it"* — and a second `herdctl wait` minutes later got all of them.
+`j1578` and `j1580` were 268 and 273 files short the same way. The gap
+between "finished" and the last output was **55 to 130 seconds**, and they
+were working around it per build.
+
+**Nothing was lost and nothing was broken. The word *finished* was wrong.**
+Their own first move was to check that every object of every pack was on the
+record, and it was. What the hub did was relay `FromHub::JobFinished` the
+moment it had written the end, carrying whatever `read_the_outputs` found on
+the disk *at that instant* — and a streamed collection arrives **after** the
+verdict by design (D148). D150 then fixed `is_current` precisely so that a
+file chunk arriving after the verdict is not dropped. So this is not a slip
+in one function: the system was built to expect late arrivals and built to
+report the job over before them. **"This job finished successfully" and "this
+job's evidence is on the hub" were two different facts reported as one.**
+
+**The choice: the verdict waits, and the record does not.** The consumer
+offered two shapes — report finished only when the outputs are here, or make
+`wait` block while they are in flight — and the answer is the first, with one
+line of the second's reasoning kept. `ToHub::JobFinished` still records the
+end exactly when it did; what is held back is only the sentence a requester
+reads, in memory, per job. Three reasons, and the first is the one that
+decides it:
+
+1. **Recording the end is what frees the slot.** Confirmed in
+   `matcher::out_there` rather than assumed: a dispatch pass counts a job as
+   occupying its runner for exactly as long as the record says an attempt is
+   open there — `Assigned | Running | Interrupted` with no `ended_at` — and
+   from nothing else (D79). `holdings`, `reserved` and the admission algebra
+   all read that one filter. So delaying the write would have held a build
+   slot for up to two minutes after the work was done, on machines with one
+   or two of them, once per job. Holding the *frame* touches nothing the
+   matcher reads.
+2. **A requester is not only `herdctl`.** Their tooling keys off the verdict;
+   so would anything else. Fixing the requester would leave the hub still
+   saying something untrue, and the next consumer would find it again.
+3. **It is what D148 already promised** — *"`--outputs-to` waits for what it
+   asked for and says so"* — delivered at the end that can keep it.
+
+**It cannot wait for ever, and the bound has two legs because the failures
+are two.** `COLLECTION_SILENCE`, 30 s, on *silence* and never on duration: a
+few hundred megabytes on a slow link is slow and not broken, and a deadline
+on the transfer itself would make the fleet's biggest jobs the ones that
+fail. The figure is twice the runner's own stall sentence, so the machine
+sending the bytes speaks before the hub speaks for it, and it is the same
+figure as the requester's own fetch bound (D150) so that the two cannot
+disagree about when a transfer stopped. A constant and not a flag: nothing an
+operator can tune makes it better. The other leg needs no clock at all — **a
+runner that is not connected is sending nothing**, so a held verdict whose
+owing machine has gone is released at once, naming it. That is also what
+answers a `herdctl wait` an hour later on a collection that never completed:
+immediately, rather than after half a minute of nothing.
+
+**And a wait that cannot be rewarded must not be silent.** A held verdict
+says why it is held, on the clock that already keeps a followed job's stream
+alive (E-04's precedent, and `still_there_every`'s cadence) — *"this job has
+ended and its files are still arriving: 462 of 661 output file(s) and 338 MiB
+of 400 MiB have reached this hub from wsl-pc"*. Sixty seconds of waiting is
+four such lines instead of a minute of silence after a job the requester
+watched finish. It is one mechanism and not two on purpose: the note **is**
+the traffic that keeps the link warm, and `say_again_why_jobs_wait` gives a
+job whose record is terminal neither a restatement nor a breath — right when
+a follower was always dropped at the verdict, and a hole the moment one is
+not.
+
+**Who waits: the requester says, and that is the second half of this
+entry.** The first shape held every verdict, whoever was following, because
+the hub cannot guess which requester is going to fetch — so a `herdctl run`
+with no `--outputs-to`, which receives no byte of the collection and never
+asks about it, paid the minute or two the bytes take. D148 had promised that
+such a run *"exits on the verdict and waits for nothing"*, and that promise
+was going to be broken as an accepted cost, on the argument that a field on
+the wait frame was protocol surface while a branch was in `herd-proto`.
+That argument expired when the branch merged, and Alexa pulled the line the
+same hour. It was the right call: an accepted cost that nobody has to accept
+is just a defect with a paragraph in front of it.
+
+So `wants_files` rides `SubmitJob` and `WaitForJob`, the hub keeps it **per
+follower** rather than per job, and one verdict goes to some followers at
+once while the rest of them wait. Two requesters on one job answering
+differently are both right, which is the whole shape: `herdctl run --command
+build` is told the moment the end is recorded, and the `herdctl wait
+<id> --outputs-to` beside it is told when its collection is whole.
+
+**The field's default is the load-bearing part, and it defaults the way
+silence has to fail.** Absent means *wants them*. The frames that leave it
+out are the ones from every `herdctl` already deployed, so defaulted the
+other way the upgrade that fixed this defect would have handed every
+existing requester the early verdict and put it straight back in — the fix
+arriving as a regression, for exactly the people it was for. `bool`'s own
+`Default` is `false`, so the safe answer is the one a reader would least
+expect, which is why it is a named function with the reasoning on it and why
+`a_wait_that_predates_wants_files_is_read_as_wanting_them` asserts it off
+literal bytes rather than off today's types. Same shape as D166's `facts`,
+whose absence means "this hub did not say": an absent field reports what the
+peer did not tell you, and the safe reading of that silence is the one that
+costs a little waiting rather than the one that costs a wrong answer. A
+defaulted field moves no version number (D124, D128), so this still ships
+without a coordinated restart.
+
+**Beside `asked`, not inside it.** `Asked` is shared with `DryRun` by E-07's
+own safety property — a dry run must describe the same job a submission
+makes — and a dry run has no files to want. It is also not a fact about the
+job at all: it is a fact about one follower, and two followers of one job
+disagree about it by design.
+
+**The exit code, which is where this entry contradicts an earlier one.**
+D148 ruled that on an incomplete fetch *"the job's exit code stands"*, with
+`--outputs-required` as the flag for anyone who wanted it fatal — and that
+flag was never built, so for a year the honest answer to a short collection
+was a loud sentence and a **zero**. That is what the consumer was working
+around: a wrapper cannot act on a sentence. So `herdctl` now exits **2** —
+*"a command did part of what it says and named the rest"*, D99's code, with
+its existing meaning rather than a second one — and exits it in exactly one
+case: `--outputs-to` was given, the collection came back short, and the job's
+own code was **0**. A failing build whose screenshots are short still exits
+1, a job stopped by a cap still exits 124, a job with no verdict still exits
+125. **The only code replaced is the one that says "everything you asked for
+happened".**
+
+That is not a repeal of D20. D20 forbids a side channel becoming *a verdict
+about the job*: the verdict is printed, is on the record, is unaltered, and
+2 is `herdctl` speaking about itself. 125 keeps its single meaning, which is
+the property the project has defended twice. `a_collection_the_sweeper_took_…`
+asserted the 0 and now asserts the 2, with its D20 paragraph rewritten rather
+than deleted — a collection retention took is also a `--outputs-to` that
+wrote a short directory, and one rule with no special cases is worth more
+than a kind answer for the evicted case.
+
+**And D166's document is where that distinction gets made in a field rather
+than in a sentence**, which is the field doing the work it was added for.
+A 2 is not the job's code, so the document says `"exit_code_from": "herd"`
+beside it; without that a reader would go looking for a build that exited 2
+and there was none. `passed` is deliberately left **true** for a green build
+whose files are short, because `passed` is the *job's* verdict and turning it
+false would be the D20 violation this entry just argued against. What tells a
+wrapper the run was incomplete is the code, that field beside it, and the
+sentence in `said` naming how many files of how many are missing — which is
+why the sentence is returned out of `keep_the_outputs` and pushed onto `said`
+rather than printed where it is discovered. A wrapper reading the document
+and keying on `passed` alone would still act on an incomplete set; the code
+is the signal, and it is the one the consumer's `run.sh` already reads.
+
+**One finding that contradicts the brief, and it is why the suite was
+green.** `herdctl::fetch_missing_outputs` *does* wait, and has since D150. It
+gave up anyway, and the reason is arithmetic: each round asks only for what
+is still missing, and reported the bytes of **that round**. The first round
+of a 657-file collection is by far the biggest, so every round after it
+reported less than the best figure seen, however many files it had just
+collected — `since` never reset, and the stall bound fired 30 s later on a
+transfer that was arriving normally. 14:11:43 plus the first round plus
+thirty seconds is 14:12:20, which is the minute the consumer measured. **With
+a one-file collection the figure is monotonic by accident**, and one file is
+what the suite streamed, which is exactly how this stayed invisible. The
+progress figure is now seeded with what earlier rounds already hold. The hub
+side above would have masked this defect without fixing it; both are fixed,
+and only one of them was in the brief.
+
+**What is proven, and how.** `herd-hub/tests/outputs_whole.rs` runs a real
+hub, a real runner and a real declared job leaving **33 files of a megabyte**
+— over the inline threshold in total, and *many*, which is the shape that
+hid this — with a hand-written requester that fetches the **instant** it is
+told the job finished, once, with no retry. With the hold stubbed out it
+reports `did NOT get 33 of 33 file(s)`, which is the field failure
+reproduced at smaller figures; with the fix, nothing is absent. The same file
+asserts the honest end: a runner that announces a collection and goes away
+without sending a byte of it leaves a wait that **ends**, naming the machine
+that owed the bytes, with the file named off the manifest that outlives them.
+And a third test is the one the field made possible: two followers on one
+job, one wanting files and one not, with the second holding its verdict while
+the first still has none — judged off `collection_owed` rather than off a
+sleep, so a run that reaches it with the collection already complete **fails
+saying nothing was measured** instead of passing quietly. `herdctl` asserts
+the exit code either way, including that a failing build keeps its 1 and that
+D166's `SetupFailed` passes through untouched.
+
+**What is deliberately not done.** `read_the_outputs` and its neighbours are
+untouched beyond the one call site. No **frame** was added: the sentence
+rides `FromHub::JobNote`, which every deployed `herdctl` already reads, and
+the one new field is defaulted, so this ships without a version move and
+without a coordinated restart — which for a defect being worked around per
+build is most of its value. `JobStore::collection_owed` is new and
+`collections_owed` is now written in terms of it: one definition of complete,
+asked two ways, because walking every record to answer about one job is the
+work D152 refused to do per verdict.
+
+**On the number.** D167, after D166, which merged while this was being
+written and whose `exit_code_from` this entry leans on. D161 is still held by
+an unmerged branch, so the gaps are D143's, D154's and D161's, all three
+under D148's rule.
+
+---
+
 ## 2026-10-23 — D161 Herd is shipped, not operated
 
 **Context.** The owner decided on 2026-10-23 that Herd no longer operates

@@ -46,7 +46,7 @@
 //!   is retried for as long as it takes and never dropped (D19); output the
 //!   hub is missing is asked for again before the log is declared short (D29).
 
-use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -77,6 +77,28 @@ pub const DEFAULT_LISTEN_ADDR: &str = "127.0.0.1:8787";
 
 /// How long a runner may be unheard from before it is lost (E-21).
 pub const LOST_AFTER: Duration = Duration::from_secs(60);
+
+/// How long a held verdict waits on a collection that has gone **silent**
+/// before it is handed over anyway: **30 s** (D167).
+///
+/// A verdict whose streamed collection is still crossing is not given to a
+/// requester yet, because a requester that fetches on it gets a short
+/// directory. That wait has to be bounded, and the bound is on *silence* and
+/// not on duration — a few hundred megabytes on a slow link is slow and not
+/// broken, so a deadline on the transfer itself would make the fleet's
+/// biggest jobs the ones that fail. This is the same shape as every other
+/// liveness figure in Herd, and the same figure the requester's own fetch
+/// uses (`herdctl::OUTPUTS_STALL_LIMIT`, D150), on purpose: two different
+/// silences would mean a requester and a hub disagreeing about when a
+/// transfer had stopped.
+///
+/// Twice the runner's own stall sentence (15 s) so that the machine sending
+/// the bytes gets to say what went wrong before the hub speaks for it; half
+/// [`LOST_AFTER`] so that a runner that has genuinely died is noticed by the
+/// watchdog at about the same time rather than long after. A constant and not
+/// a flag: nothing an operator can tune makes this better, and a figure
+/// derived from two others must not drift away from them.
+pub const COLLECTION_SILENCE: Duration = Duration::from_secs(30);
 
 /// The largest first frame this hub accepts, in bytes: **1 MiB**.
 ///
@@ -320,6 +342,15 @@ pub struct Policy {
     /// has to be able to make a reading overrun its cap without waiting five
     /// minutes, and through the hub's own code rather than a copy of it.
     pub reading_cap: Duration,
+    /// How long a verdict held for a still-crossing collection waits on
+    /// **silence** before it is handed over anyway (D167).
+    ///
+    /// See [`COLLECTION_SILENCE`]. A setting for the reason every other
+    /// figure here is one: a test has to be able to prove that a runner which
+    /// dies mid-collection never leaves a `wait` hanging, without waiting
+    /// half a minute to find out, and through the hub's own clock rather than
+    /// a copy of it.
+    pub collection_silence: Duration,
 }
 
 impl Default for Policy {
@@ -337,6 +368,7 @@ impl Default for Policy {
             drain_first_limit: crate::matcher::DRAIN_FIRST_LIMIT,
             requeue_budget: REQUEUE_BUDGET,
             reading_cap: READING_CAP,
+            collection_silence: COLLECTION_SILENCE,
         }
     }
 }
@@ -674,6 +706,13 @@ struct State {
 /// functions.
 #[derive(Debug, Clone)]
 struct Announced {
+    /// Which **build** it is, as its handshake said (E-51, D166).
+    ///
+    /// Kept because a fleet listing has to be able to say it. The hub already
+    /// judges this string at the handshake — refusing a major gap, noting a
+    /// minor one on its own stderr — and that note goes nowhere an operator
+    /// working through `herdctl` will ever see it.
+    version: String,
     /// What it offers, and what its probes say (M5, E-24).
     capacity: RunnerCapacity,
     /// How big its host is (E-22).
@@ -699,11 +738,23 @@ struct Attached {
     log: Vec<u8>,
     /// Why the job is not moving, if this hub knows that it is not (D19).
     stalled: Option<String>,
+    /// Whether this connection was left in the job's list of followers.
+    ///
+    /// False for a job that is already over, which is the ordinary case: the
+    /// caller answers such a wait itself and there is nothing more to come.
+    /// The caller needs to know, because a verdict held for a collection
+    /// still crossing (D167) *is* something more to come, and it must be
+    /// registered exactly once.
+    following: bool,
 }
 
 /// One runner's connection, and what the hub knows about it.
 struct ConnectedRunner {
     name: String,
+    /// Which **build** this is, as its handshake announced it (E-51, D166).
+    /// On the connection because a build is a fact about the process, and a
+    /// redial brings its own — which is the whole point after an upgrade.
+    version: String,
     /// Which *process* this is, as its handshake announced it. What tells a
     /// redial from a twin, which a name cannot.
     instance: Option<String>,
@@ -767,6 +818,32 @@ struct ConnectedRunner {
     jobs: Vec<RunningJob>,
 }
 
+impl ConnectedRunner {
+    /// What a fleet listing says about this machine besides its name (D166).
+    ///
+    /// Built in one place for both listings — `herdctl runner list` and
+    /// `herdctl switch` — because an operator must not have to learn which of
+    /// the two commands tells the truth about a runner.
+    ///
+    /// The suspensions are `Some` even when the list is empty, and that is
+    /// the point of the `Option`: this hub is connected to the machine and is
+    /// answering the question. An *absent* list means a hub that cannot
+    /// answer it, which is a different thing and must not read as a clean
+    /// bill of health.
+    fn facts(&self) -> herd_proto::RunnerFacts {
+        herd_proto::RunnerFacts {
+            version: Some(self.version.clone()),
+            suspended: Some(
+                self.capacity
+                    .suspended()
+                    .into_iter()
+                    .map(|(label, why)| herd_proto::SuspendedCapability { label, why })
+                    .collect(),
+            ),
+        }
+    }
+}
+
 /// What a runner said it did with a position the hub asked it for (E-33, D99).
 #[derive(Debug, Clone)]
 struct Acknowledged {
@@ -812,7 +889,7 @@ struct Peers {
     /// from M2: a `herdctl run` follows the job it submitted, and a
     /// `herdctl wait` on the same id attaches beside it rather than taking
     /// its place.
-    followers: HashMap<JobId, Vec<Outbox>>,
+    followers: HashMap<JobId, Vec<Follower>>,
     /// Per job, why the hub could not write down what it was told about it.
     ///
     /// A job whose end the hub cannot store keeps a record that reads
@@ -879,6 +956,48 @@ struct Peers {
     /// Kept beside [`Peers::wait_told`] and pruned by the same loop, for the
     /// same reason: it is a fact about a stream, not about a job.
     spoke_to_followers: HashMap<JobId, Instant>,
+    /// Verdicts this hub has **recorded** and not yet handed to a requester,
+    /// because the collection they announce is still crossing (D167).
+    ///
+    /// The end is on the disk before an entry appears here, which is the
+    /// whole point: recording the end is what frees the job's slot on its
+    /// runner — the dispatch pass reads occupancy off the records and from
+    /// nothing else (D79, `matcher::out_there`) — so a machine with one build
+    /// slot is never held for the minute or two a few hundred megabytes take
+    /// to arrive. What is held is only the sentence a requester reads, and it
+    /// is held because a requester that fetches the moment it is told
+    /// `finished` otherwise gets a short collection and no word about it.
+    ///
+    /// In memory and never on the disk, deliberately: a record says what
+    /// happened, and "whose requester has not been told yet" is a fact about
+    /// a stream. An entry lost to a hub restart costs nothing — the record is
+    /// terminal and complete, and the next `herdctl wait` re-derives the
+    /// whole question off the disk in [`answer_a_wait`].
+    held_verdicts: HashMap<JobId, HeldVerdict>,
+}
+
+/// One requester following one job, and what it will do about that job's
+/// output files (D167).
+///
+/// The flag is per **follower** and not per job, because two requesters can
+/// follow one job and answer differently: a `herdctl run` that asked for no
+/// files is told the verdict the moment it is recorded, exactly as it always
+/// was, while a `herdctl wait --outputs-to` beside it waits for the
+/// collection it is about to fetch. Absent on the wire means *wants them*,
+/// so a requester built before the field keeps the safe behaviour
+/// ([`herd_proto::ToHub::WaitForJob`]).
+struct Follower {
+    outbox: Outbox,
+    wants_files: bool,
+}
+
+/// A verdict waiting for its collection (D167).
+struct HeldVerdict {
+    outcome: JobOutcome,
+    metrics: JobMetrics,
+    /// When a byte of this collection last landed on this hub. The bound is
+    /// on silence, not on duration ([`COLLECTION_SILENCE`]).
+    moved: Instant,
 }
 
 impl Peers {
@@ -891,7 +1010,11 @@ impl Peers {
     /// timestamp would be a frame the clock never saw, and the hub would then
     /// tell a busy connection it was quiet.
     fn followers_to_write_to(&mut self, id: &JobId) -> Vec<Outbox> {
-        let followers = self.followers.get(id).cloned().unwrap_or_default();
+        let followers: Vec<Outbox> = self
+            .followers
+            .get(id)
+            .map(|following| following.iter().map(|f| f.outbox.clone()).collect())
+            .unwrap_or_default();
         if !followers.is_empty() {
             self.spoke_to_followers.insert(id.clone(), Instant::now());
         }
@@ -1000,6 +1123,7 @@ impl State {
                 name.to_owned(),
                 ConnectedRunner {
                     name: name.to_owned(),
+                    version: announced.version,
                     instance: instance.map(str::to_owned),
                     outbox: outbox.clone(),
                     capacity: announced.capacity,
@@ -1207,6 +1331,7 @@ impl State {
                     switch: runner.switch.clone(),
                     jobs: runner.jobs.len() as u32,
                     stopping: runner.draining,
+                    facts: runner.facts(),
                 })
                 .collect()
         })
@@ -1325,10 +1450,13 @@ impl State {
         });
     }
 
-    fn follow(&self, id: JobId, outbox: &Outbox) {
+    fn follow(&self, id: JobId, outbox: &Outbox, wants_files: bool) {
         self.with_peers(|peers| {
             peers.joined(&id);
-            peers.followers.entry(id).or_default().push(outbox.clone());
+            peers.followers.entry(id).or_default().push(Follower {
+                outbox: outbox.clone(),
+                wants_files,
+            });
         });
     }
 
@@ -1399,38 +1527,162 @@ impl State {
     /// Reading the record and registering have to be one step too: between
     /// them the job could reach its end, and a requester that registered
     /// afterwards would wait for a frame that has already been sent.
-    fn attach(&self, id: &JobId, outbox: &Outbox) -> crate::job::Result<Option<Attached>> {
+    fn attach(
+        &self,
+        id: &JobId,
+        outbox: &Outbox,
+        wants_files: bool,
+    ) -> crate::job::Result<Option<Attached>> {
         self.with_peers(|peers| {
             let Some(record) = self.store.job(id)? else {
                 return Ok(None);
             };
             let log = self.store.job_log(id)?.unwrap_or_default();
             let stalled = peers.stalled.get(id).cloned();
-            if !record.state.is_terminal() {
+            // **A job whose verdict this hub is holding is still followed**
+            // (D167). Its record is terminal, so without this clause a
+            // `herdctl wait` arriving while the collection crosses would be
+            // registered nowhere and would never be sent the verdict it is
+            // held back from. It is not enough for the caller to answer this
+            // connection directly: the collection completes on another task
+            // entirely, and the list of followers is where that task looks.
+            //
+            // Only for a requester that wants the files: one that does not
+            // is answered now and has nothing more to come.
+            let held_back = wants_files && peers.held_verdicts.contains_key(id);
+            let following = !record.state.is_terminal() || held_back;
+            if following {
                 peers.joined(id);
                 peers
                     .followers
                     .entry(id.clone())
                     .or_default()
-                    .push(outbox.clone());
+                    .push(Follower {
+                        outbox: outbox.clone(),
+                        wants_files,
+                    });
             }
             Ok(Some(Attached {
                 record,
                 log,
                 stalled,
+                following,
             }))
         })
     }
 
     fn stop_following(&self, id: &JobId) -> Vec<Outbox> {
-        self.with_peers(|peers| peers.followers.remove(id).unwrap_or_default())
+        self.with_peers(|peers| {
+            peers
+                .followers
+                .remove(id)
+                .unwrap_or_default()
+                .into_iter()
+                .map(|follower| follower.outbox)
+                .collect()
+        })
+    }
+
+    /// Take the followers of this job whose answer about its files is
+    /// `wants_files`, leaving the others where they are (D167).
+    ///
+    /// What lets one verdict go to some followers now and wait for the rest:
+    /// a `herdctl run` that asked for no files is told the moment the end is
+    /// recorded, and the `herdctl wait --outputs-to` beside it keeps waiting
+    /// for the collection it is about to fetch.
+    fn take_the_followers_that(&self, id: &JobId, wants_files: bool) -> Vec<Outbox> {
+        self.with_peers(|peers| {
+            let Some(following) = peers.followers.get_mut(id) else {
+                return Vec::new();
+            };
+            let mut taken = Vec::new();
+            following.retain(|follower| {
+                if follower.wants_files == wants_files {
+                    taken.push(follower.outbox.clone());
+                    false
+                } else {
+                    true
+                }
+            });
+            if following.is_empty() {
+                peers.followers.remove(id);
+            }
+            if !taken.is_empty() {
+                peers.spoke_to_followers.insert(id.clone(), Instant::now());
+            }
+            taken
+        })
+    }
+
+    /// Whether anybody following this job is going to fetch its files, and
+    /// is therefore worth holding its verdict for.
+    fn anybody_wants_the_files(&self, id: &JobId) -> bool {
+        self.with_peers(|peers| {
+            peers
+                .followers
+                .get(id)
+                .is_some_and(|following| following.iter().any(|f| f.wants_files))
+        })
+    }
+
+    /// Keep this job's verdict back: it is recorded, and the collection it
+    /// announced is still crossing (D167).
+    ///
+    /// Idempotent on the clock it carries. A verdict already held keeps the
+    /// instant it was last making progress, so a second look at the same job
+    /// does not reset the silence bound — which is exactly how a wedged
+    /// transfer would wait for ever.
+    fn hold_the_verdict(&self, id: &JobId, outcome: &JobOutcome, metrics: &JobMetrics) {
+        self.with_peers(|peers| {
+            peers
+                .held_verdicts
+                .entry(id.clone())
+                .or_insert(HeldVerdict {
+                    outcome: outcome.clone(),
+                    metrics: metrics.clone(),
+                    moved: Instant::now(),
+                });
+        });
+    }
+
+    /// A byte of this job's collection landed, so its held verdict is
+    /// waiting on something that is working (D167).
+    fn the_collection_moved(&self, id: &JobId) {
+        self.with_peers(|peers| {
+            if let Some(held) = peers.held_verdicts.get_mut(id) {
+                held.moved = Instant::now();
+            }
+        });
+    }
+
+    /// Take this job's held verdict, if one is held.
+    fn take_the_held_verdict(&self, id: &JobId) -> Option<(JobOutcome, JobMetrics)> {
+        self.with_peers(|peers| {
+            peers
+                .held_verdicts
+                .remove(id)
+                .map(|held| (held.outcome, held.metrics))
+        })
+    }
+
+    /// Every job whose verdict is held, and how long its collection has been
+    /// silent, for the clock that decides whether holding it is still worth
+    /// anything.
+    fn verdicts_held(&self) -> Vec<(JobId, Duration)> {
+        self.with_peers(|peers| {
+            peers
+                .held_verdicts
+                .iter()
+                .map(|(id, held)| (id.clone(), held.moved.elapsed()))
+                .collect()
+        })
     }
 
     /// A requester went away: nobody is waiting for its jobs any more.
     fn forget_follower(&self, outbox: &Outbox) {
         self.with_peers(|peers| {
             for following in peers.followers.values_mut() {
-                following.retain(|f| !f.same_channel(outbox));
+                following.retain(|f| !f.outbox.same_channel(outbox));
             }
             peers.followers.retain(|_, following| !following.is_empty());
         });
@@ -1728,6 +1980,7 @@ async fn serve_peer(state: Arc<State>, stream: TcpStream) -> Result<()> {
                 said(state_root),
                 health_every_ms.map(Duration::from_millis),
                 Announced {
+                    version: peer_version,
                     capacity: RunnerCapacity::new(name, capabilities),
                     host,
                     preference,
@@ -2573,6 +2826,9 @@ fn how_it_ended(outcome: &JobOutcome) -> String {
         JobOutcome::Cancelled { reason } => format!("was cancelled: {reason}"),
         JobOutcome::Lost { reason } => format!("was lost: {reason}"),
         JobOutcome::Impossible { reason } => format!("could never have run: {reason}"),
+        JobOutcome::SetupFailed { reason } => {
+            format!("ran on a machine that could not do its part: {reason}")
+        }
     }
 }
 
@@ -2708,6 +2964,17 @@ async fn say_again_why_jobs_wait(state: Arc<State>) {
     let tick = restating.tick.min(breathing.tick);
     loop {
         tokio::time::sleep(tick).await;
+        // **The verdicts this hub is holding, first** (D167). They belong on
+        // this clock and not on one of their own for the reason the two
+        // deadlines above share it: a held verdict's note *is* the traffic
+        // that keeps its follower's link warm, and the loop below gives a job
+        // whose record is terminal neither a restatement nor a breath — which
+        // was right when a follower was always dropped at the verdict and
+        // would now leave a requester waiting for files behind a proxy with
+        // an idle timeout.
+        for (job_id, silent_for) in state.verdicts_held() {
+            look_at_a_held_verdict(&state, &job_id, silent_for, &breathing);
+        }
         let followed = state.with_peers(|peers| {
             let followed: Vec<JobId> = peers
                 .followers
@@ -3136,7 +3403,12 @@ async fn relay_from_runner(
                     .store
                     .write_output_chunk(&job_id, &path, offset, &data)
                 {
-                    Ok(crate::job::ChunkLanded::More) => {}
+                    // A byte landed, so a verdict held for this collection is
+                    // waiting on something that is working: the bound is on
+                    // silence, not on how long a transfer takes (D167).
+                    Ok(crate::job::ChunkLanded::More) => {
+                        state.the_collection_moved(&job_id);
+                    }
                     Ok(crate::job::ChunkLanded::Complete) => {
                         if let Err(error) = state.store.clear_output_parts(&job_id) {
                             eprintln!(
@@ -3149,6 +3421,11 @@ async fn relay_from_runner(
                             attempt,
                         });
                         println!("herd-hub: {job_id} has every file of its collection");
+                        // And the verdict this hub was holding for exactly
+                        // this moment (D167). Here rather than on a clock,
+                        // because the only thing that can complete a
+                        // collection is a chunk arriving.
+                        the_collection_is_whole(state, &job_id);
                     }
                     // A chunk that cannot be written is said out loud and the
                     // collection is **not** acknowledged, so the runner goes
@@ -3279,15 +3556,14 @@ async fn relay_from_runner(
                 // a requester following live and a `herdctl wait` an hour
                 // later are given the same bytes by the same code: one answer
                 // to "what did this job leave?", which is the disk (D131).
-                let kept = read_the_outputs(state, &job_id);
-                for follower in state.stop_following(&job_id) {
-                    let _ = follower.send(FromHub::JobFinished {
-                        job_id: job_id.clone(),
-                        outcome: outcome.clone(),
-                        metrics: metrics.clone(),
-                        outputs: kept.clone(),
-                    });
-                }
+                //
+                // **And not yet, if the bytes are still coming** (D167). A
+                // streamed collection follows the verdict by design, so this
+                // used to report a job finished while its files were still
+                // arriving — and a requester fetching on that signal got a
+                // short collection. The record is already written, which is
+                // what frees the slot; what waits is the sentence.
+                tell_or_hold_the_verdict(state, &job_id, &outcome, &metrics);
                 // A job that ends gives back whatever it was holding, and
                 // something queued may have been waiting for exactly that
                 // (E-22, E-25). Before M7 this trigger was not needed —
@@ -3872,6 +4148,314 @@ fn send_one_file(
     }
 }
 
+/// Where a job's streamed collection stands, for the one decision that
+/// depends on it: may this job's verdict go to its requester yet? (D167)
+enum TheCollection {
+    /// Nothing is outstanding. Either the job left no files, or they rode the
+    /// verdict, or every one of them is on this hub at its declared length —
+    /// so a requester that fetches on the verdict gets the whole set.
+    Whole,
+    /// Bytes are genuinely crossing and the machine sending them is here.
+    /// Carries how far it has got, for the requester to read while it waits.
+    Crossing(String),
+    /// Bytes are outstanding and waiting longer buys nothing: the runner has
+    /// gone, or nothing has landed for [`COLLECTION_SILENCE`]. Carries what
+    /// is missing and why, because the requester is about to be told the job
+    /// is over with a collection that is short.
+    StoppedShort(String),
+}
+
+/// How far a collection that is still crossing has got, in the figures a
+/// requester needs: files here of files promised, bytes here of bytes
+/// promised, and which machine is sending them.
+fn how_far_the_collection_got(record: &JobRecord, owed: &crate::job::CollectionOwed) -> String {
+    let promised: u64 = record.outputs.files.iter().map(|file| file.bytes).sum();
+    let here: u64 = owed.held.iter().map(|file| file.bytes).sum();
+    format!(
+        "{} of {} output file(s) and {} of {} have reached this hub from {}",
+        owed.held.len(),
+        record.outputs.files.len(),
+        herd_proto::show_bytes(here),
+        herd_proto::show_bytes(promised),
+        owed.runner,
+    )
+}
+
+/// Ask the disk where a job's collection stands.
+///
+/// `silent_for` is how long the verdict has already been held with nothing
+/// landing, or `None` the first time the question is asked — nothing can have
+/// gone silent before the hub started listening for it.
+///
+/// **A store that will not answer is never a reason to hold a verdict**, and
+/// that is the same ruling [`read_the_outputs`] takes: the end is recorded,
+/// somebody is waiting for it, and an unreadable disk is said out loud rather
+/// than turned into a wait with no end. The absences then answer for
+/// themselves on the fetch, which is where a requester can act on them.
+fn where_the_collection_stands(
+    state: &State,
+    job_id: &JobId,
+    silent_for: Option<Duration>,
+) -> TheCollection {
+    let owed = match state.store.collection_owed(job_id) {
+        Ok(None) => return TheCollection::Whole,
+        Ok(Some(owed)) => owed,
+        Err(error) => {
+            eprintln!(
+                "herd-hub: whether {job_id}'s files have all arrived cannot be read, so its \
+                 verdict is not held back for them: {error}"
+            );
+            return TheCollection::Whole;
+        }
+    };
+    let Ok(Some(record)) = state.store.job(job_id) else {
+        return TheCollection::Whole;
+    };
+    let got = how_far_the_collection_got(&record, &owed);
+    // **The runner is the first bound, and it needs no clock.** A machine
+    // that is not connected is sending nothing, so there is no silence to
+    // time: a verdict held for it would wait out the whole bound to learn
+    // what is already known. This is also what answers a `herdctl wait` an
+    // hour later on a collection whose runner never came back — at once,
+    // rather than after half a minute of nothing.
+    if state.outbox_of(&owed.runner).is_none() {
+        return TheCollection::StoppedShort(format!(
+            "{got}, and {} is not connected to this hub",
+            owed.runner
+        ));
+    }
+    // And the second: a runner that is here and sending nothing.
+    if silent_for.is_some_and(|silent| silent >= state.policy.collection_silence) {
+        return TheCollection::StoppedShort(format!(
+            "{got}, and no byte of it has landed for {:?}",
+            state.policy.collection_silence
+        ));
+    }
+    TheCollection::Crossing(got)
+}
+
+/// Hand a job's verdict to everybody waiting for it, and stop following it.
+///
+/// The one place a requester-facing [`FromHub::JobFinished`] is built for a
+/// job a runner reported on, so that the files on it are read off the disk
+/// once and by one piece of code (D131).
+fn tell_them_how_it_ended(
+    state: &State,
+    job_id: &JobId,
+    outcome: &JobOutcome,
+    metrics: &JobMetrics,
+) {
+    hand_them_the_verdict(
+        state,
+        job_id,
+        outcome,
+        metrics,
+        state.stop_following(job_id),
+    );
+}
+
+/// The same verdict to a chosen list of followers (D167).
+///
+/// Nothing is read off the disk for an empty list, which is the common case
+/// on the path that hands the verdict to the followers wanting no files:
+/// usually there are none, and a manifest read per verdict for nobody would
+/// be a cost paid by every job in the fleet.
+fn hand_them_the_verdict(
+    state: &State,
+    job_id: &JobId,
+    outcome: &JobOutcome,
+    metrics: &JobMetrics,
+    to: Vec<Outbox>,
+) {
+    if to.is_empty() {
+        return;
+    }
+    let kept = read_the_outputs(state, job_id);
+    for follower in to {
+        let _ = follower.send(FromHub::JobFinished {
+            job_id: job_id.clone(),
+            outcome: outcome.clone(),
+            metrics: metrics.clone(),
+            outputs: kept.clone(),
+        });
+    }
+}
+
+/// Tell a job's requesters how it ended, **or hold that sentence back until
+/// its collection is whole** (D167).
+///
+/// This is the whole of the defect it fixes. A streamed collection follows
+/// the verdict by design (D148), so for the minute or two a few hundred
+/// megabytes take to cross, "this job finished successfully" and "this job's
+/// evidence is on the hub" were two different facts reported as one — and a
+/// requester that fetched on the first got a short directory with 195 of 657
+/// files named as absent, while a second fetch minutes later got all of
+/// them. The fix is not to make the transfer faster or the fetch cleverer: it
+/// is that **a requester is told a job finished once there is something whole
+/// to fetch**.
+///
+/// What is deliberately *not* delayed is the record. The end is on the disk
+/// before this is called, and that is what frees the job's slot on its runner
+/// — a dispatch pass reads occupancy off the records and from nothing else
+/// (D79, [`crate::matcher`]). Holding the record back instead would be the
+/// same sentence arriving correctly and a one-slot machine standing idle for
+/// two minutes after its work was done, once per job.
+///
+/// **Only the followers that said they want the files wait**, which is what
+/// [`Follower::wants_files`] is for. A `herdctl run` with no `--outputs-to`
+/// receives no byte of the collection and never asks about it, so it is told
+/// the moment the end is recorded — D148's promise, kept — while a `herdctl
+/// wait --outputs-to` beside it waits for the collection it is about to
+/// fetch. A requester that does not mention the field is read as wanting
+/// them, so an older `herdctl` keeps the safe behaviour rather than being
+/// handed the early verdict by the upgrade that fixed this.
+fn tell_or_hold_the_verdict(
+    state: &State,
+    job_id: &JobId,
+    outcome: &JobOutcome,
+    metrics: &JobMetrics,
+) {
+    // **A follower that said it wants no files is never held** (D167). The
+    // verdict is the only thing it is waiting for, so it is told the moment
+    // the end is recorded — which is what `herdctl run` with no
+    // `--outputs-to` has always done and what D148 promised it would keep
+    // doing. Taken first, so what is left to hold is exactly the followers
+    // the hold is for.
+    hand_them_the_verdict(
+        state,
+        job_id,
+        outcome,
+        metrics,
+        state.take_the_followers_that(job_id, false),
+    );
+    if !state.anybody_wants_the_files(job_id) {
+        return;
+    }
+    match where_the_collection_stands(state, job_id, None) {
+        TheCollection::Whole => tell_them_how_it_ended(state, job_id, outcome, metrics),
+        TheCollection::StoppedShort(why) => {
+            say_the_collection_is_short(state, job_id, &why);
+            tell_them_how_it_ended(state, job_id, outcome, metrics);
+        }
+        TheCollection::Crossing(got) => {
+            state.hold_the_verdict(job_id, outcome, metrics);
+            println!("herd-hub: {job_id} is recorded and its verdict waits for its files: {got}");
+            say_the_collection_is_crossing(state, job_id, &got);
+        }
+    }
+}
+
+/// The sentence a requester reads while its verdict is held.
+///
+/// Said the way a queued job's `waiting_for` says itself (E-04): a wait with
+/// no explanation is the thing being fixed here as much as the short
+/// directory was. It goes out when the verdict is first held and again on the
+/// clock, so a requester that waits sixty seconds for files has four lines
+/// saying which files and from where, rather than a minute of silence after a
+/// job it watched finish.
+fn say_the_collection_is_crossing(state: &State, job_id: &JobId, got: &str) {
+    let note = format!(
+        "this job has ended and its files are still arriving: {got}. Its verdict follows \
+         when the collection is whole, so that a fetch on it gets every file."
+    );
+    for follower in state.followers_to_tell(job_id) {
+        let _ = follower.send(FromHub::JobNote {
+            job_id: job_id.clone(),
+            note: note.clone(),
+        });
+    }
+}
+
+/// The sentence a requester reads when a collection is **not** going to
+/// complete, said before the verdict rather than instead of it.
+///
+/// A wait that cannot be rewarded has to end, and it has to end saying why:
+/// the verdict goes out next, the fetch that follows names every missing path
+/// off the manifest, and `herdctl` exits non-zero rather than 0 on a
+/// collection it was asked for and did not get. What must never happen is the
+/// third thing — a `wait` that hangs with nothing said (D167).
+fn say_the_collection_is_short(state: &State, job_id: &JobId, why: &str) {
+    eprintln!("herd-hub: {job_id}'s collection did not finish arriving: {why}");
+    let note = format!(
+        "this job's files did not all arrive: {why}. Its verdict follows now, and every \
+         file this hub does not have is named on the record."
+    );
+    for follower in state.followers_to_tell(job_id) {
+        let _ = follower.send(FromHub::JobNote {
+            job_id: job_id.clone(),
+            note: note.clone(),
+        });
+    }
+}
+
+/// The collection is whole: let the verdict go (D167).
+///
+/// Called where the last byte lands, which is the event rather than a clock —
+/// the only thing that can complete a collection is a chunk arriving, so a
+/// timer would be a second mechanism waking up to find nothing to do (D152's
+/// own reasoning about the sweeper).
+fn the_collection_is_whole(state: &State, job_id: &JobId) {
+    let Some((outcome, metrics)) = state.take_the_held_verdict(job_id) else {
+        return;
+    };
+    println!("herd-hub: {job_id}'s collection is whole, so its verdict goes to its requesters");
+    tell_them_how_it_ended(state, job_id, &outcome, &metrics);
+}
+
+/// One look at one held verdict, on the clock that keeps a followed job's
+/// stream alive (D167).
+///
+/// Four answers, and each of them ends the hold or restates it:
+///
+/// * nobody is following any more, so there is nobody to hold it for — the
+///   entry goes, and a later `herdctl wait` derives the whole question off
+///   the disk again in [`answer_a_wait`];
+/// * the collection is whole, which the chunk path normally catches first;
+///   this is the belt for a chunk that landed before the verdict did, or for
+///   a hub that restarted mid-transfer;
+/// * it cannot complete — the runner is gone, or nothing has landed for
+///   [`COLLECTION_SILENCE`] — so the verdict goes out with the absence named;
+/// * it is still crossing, and the requester is told so again.
+fn look_at_a_held_verdict(
+    state: &State,
+    job_id: &JobId,
+    silent_for: Duration,
+    breathing: &Restating,
+) {
+    if !state.anybody_wants_the_files(job_id) {
+        let _ = state.take_the_held_verdict(job_id);
+        return;
+    }
+    match where_the_collection_stands(state, job_id, Some(silent_for)) {
+        TheCollection::Whole => the_collection_is_whole(state, job_id),
+        TheCollection::StoppedShort(why) => {
+            let Some((outcome, metrics)) = state.take_the_held_verdict(job_id) else {
+                return;
+            };
+            say_the_collection_is_short(state, job_id, &why);
+            tell_them_how_it_ended(state, job_id, &outcome, &metrics);
+        }
+        // Restated on the liveness cadence and not on every tick, for the
+        // reason that cadence exists: the note *is* traffic, so it keeps the
+        // link warm through a proxy with an idle timeout at the same time as
+        // it explains the wait. One mechanism, one figure, and a bound a
+        // reader can compute — a sixty-second wait is four lines.
+        TheCollection::Crossing(got) => {
+            let due = state.with_peers(|peers| {
+                breathing.is_due(
+                    peers
+                        .spoke_to_followers
+                        .get(job_id)
+                        .map(|spoke| spoke.elapsed()),
+                )
+            });
+            if due {
+                say_the_collection_is_crossing(state, job_id, &got);
+            }
+        }
+    }
+}
+
 /// What a job's record holds under `files/`, for the frame a requester gets.
 ///
 /// A read that fails is **not** a reason to withhold the verdict: the files
@@ -4033,15 +4617,10 @@ async fn keep_trying_to_write_results(state: Arc<State>) {
                             job_id: job_id.clone(),
                         });
                     }
-                    let kept = read_the_outputs(&state, &job_id);
-                    for follower in state.stop_following(&job_id) {
-                        let _ = follower.send(FromHub::JobFinished {
-                            job_id: job_id.clone(),
-                            outcome: outcome.clone(),
-                            metrics: metrics.clone(),
-                            outputs: kept.clone(),
-                        });
-                    }
+                    // Held back if its collection is still crossing, exactly
+                    // as on the first try: a verdict written late is still a
+                    // verdict a requester may fetch on (D167).
+                    tell_or_hold_the_verdict(&state, &job_id, &outcome, &metrics);
                     // Written at last, so what it was holding is given back
                     // at last: whatever was waiting for that slot can go.
                     if let Err(error) = dispatch_queued_jobs(&state) {
@@ -4954,7 +5533,7 @@ async fn accept_submissions(state: &State, outbox: &Outbox, source: &mut Source)
             }
         };
         match message {
-            ToHub::SubmitJob { asked } => {
+            ToHub::SubmitJob { asked, wants_files } => {
                 if asked.command.is_empty() {
                     let _ = outbox.send(FromHub::Refused {
                         reason: "a job needs a command to run".to_owned(),
@@ -5015,7 +5594,7 @@ async fn accept_submissions(state: &State, outbox: &Outbox, source: &mut Source)
                     job_id: job_id.clone(),
                 });
                 match &submission {
-                    Submission::Minted(_) => state.follow(job_id.clone(), outbox),
+                    Submission::Minted(_) => state.follow(job_id.clone(), outbox, wants_files),
                     Submission::Joined { record, raised } => {
                         println!(
                             "herd-hub: a submission joined {job_id}, which is {} and \
@@ -5046,7 +5625,7 @@ async fn accept_submissions(state: &State, outbox: &Outbox, source: &mut Source)
                         // joiner that was told nothing until the next chunk
                         // arrived would be a joiner whose log is short of
                         // everything that happened before it joined.
-                        answer_a_wait(state, outbox, job_id.clone())?;
+                        answer_a_wait(state, outbox, job_id.clone(), wants_files)?;
                     }
                 }
                 // And then the job goes through exactly the same gate every
@@ -5129,14 +5708,27 @@ async fn accept_submissions(state: &State, outbox: &Outbox, source: &mut Source)
                         return Ok(());
                     }
                 };
+                // Keyed by name, carrying what the listing says about each
+                // connected machine: its build and what it is not handing out
+                // (D166). A name that is not in here is a runner that is not
+                // connected, and that is still the only question `connected`
+                // answers.
                 let connected = state.with_peers(|peers| {
-                    peers.runners.keys().cloned().collect::<BTreeSet<String>>()
+                    peers
+                        .runners
+                        .iter()
+                        .map(|(name, runner)| (name.clone(), runner.facts()))
+                        .collect::<BTreeMap<String, herd_proto::RunnerFacts>>()
                 });
                 let _ = outbox.send(FromHub::ApprovedRunners {
                     runners: approvals
                         .into_iter()
                         .map(|approval| herd_proto::ApprovedRunner {
-                            connected: connected.contains(&approval.name),
+                            connected: connected.contains_key(&approval.name),
+                            // Empty for a machine that is not here: it offers
+                            // nothing, so it suspends nothing, and a stale
+                            // list would be a report about a runner that left.
+                            facts: connected.get(&approval.name).cloned().unwrap_or_default(),
                             name: approval.name,
                             approved_unix_s: approval.approved_unix_s,
                         })
@@ -5157,12 +5749,15 @@ async fn accept_submissions(state: &State, outbox: &Outbox, source: &mut Source)
                 }
                 cancel_job(state, outbox, &job_id)?;
             }
-            ToHub::WaitForJob { job_id } => {
+            ToHub::WaitForJob {
+                job_id,
+                wants_files,
+            } => {
                 if let Some(reason) = quarantine_refusal(state, &job_id)? {
                     let _ = outbox.send(FromHub::Refused { reason });
                     return Ok(());
                 }
-                if !answer_a_wait(state, outbox, job_id)? {
+                if !answer_a_wait(state, outbox, job_id, wants_files)? {
                     return Ok(());
                 }
             }
@@ -5204,15 +5799,20 @@ async fn accept_submissions(state: &State, outbox: &Outbox, source: &mut Source)
 /// guarantees a joiner is given the log the job produced before it joined,
 /// and is answered at once if the job ended in the meantime.
 ///
+/// `wants_files` is this requester's own answer about the job's output files
+/// (D167): one that is going to fetch them has its verdict held until they
+/// have all arrived, and one that is not is answered at once.
+///
 /// `false` means the job does not exist and the connection has been refused.
-fn answer_a_wait(state: &State, outbox: &Outbox, job_id: JobId) -> Result<bool> {
+fn answer_a_wait(state: &State, outbox: &Outbox, job_id: JobId, wants_files: bool) -> Result<bool> {
     let attached = state
-        .attach(&job_id, outbox)
+        .attach(&job_id, outbox, wants_files)
         .with_context(|| format!("reading the record of {job_id}"))?;
     let Some(Attached {
         record,
         log,
         stalled,
+        following,
     }) = attached
     else {
         // A terminal no, as D13 means it: this id will not come
@@ -5260,18 +5860,69 @@ fn answer_a_wait(state: &State, outbox: &Outbox, job_id: JobId) -> Result<bool> 
         // the record too, so a wait an hour later reads the same
         // figures the requester that followed the job read (E-15).
         JobState::Finished { outcome } => {
-            // And the files it left, off the same record. This is what makes
-            // the whole mechanism work for a requester that was never
-            // connected while the job ran: `herdctl wait <id>` an hour later
-            // gets the verdict and the bytes in one frame, so there is no
-            // fetch command to add and no second round trip (D131).
-            let kept = read_the_outputs(state, &job_id);
-            let _ = outbox.send(FromHub::JobFinished {
-                job_id,
-                outcome,
-                metrics,
-                outputs: kept,
-            });
+            // **A verdict whose collection is still crossing waits here
+            // too** (D167). The record is terminal and says the job passed,
+            // and a `herdctl wait --outputs-to` answered from it while the
+            // bytes were still arriving is the very case the first consumer
+            // measured: a fetch on that answer gets a short directory. So
+            // this wait is registered, told why it is waiting, and answered
+            // when the collection is whole — or when waiting has stopped
+            // being worth anything.
+            //
+            // Derived off the disk rather than from the entry in memory,
+            // because this path is the one that has to work after a hub
+            // restart and for a requester that was never connected while the
+            // job ran.
+            //
+            // **And only for a requester that said it wants the files.** One
+            // that did not is asking a different question — "how did it
+            // end?" — and the answer to that has been on the disk since the
+            // verdict was recorded.
+            let stands = if wants_files {
+                where_the_collection_stands(state, &job_id, None)
+            } else {
+                TheCollection::Whole
+            };
+            match stands {
+                TheCollection::Crossing(got) => {
+                    // Exactly once: `State::attach` registers this
+                    // connection when a verdict is already held, and this is
+                    // the first hold when it is not.
+                    state.hold_the_verdict(&job_id, &outcome, &metrics);
+                    if !following {
+                        state.follow(job_id.clone(), outbox, wants_files);
+                    }
+                    say_the_collection_is_crossing(state, &job_id, &got);
+                }
+                stands => {
+                    if let TheCollection::StoppedShort(why) = &stands {
+                        say_the_collection_is_short(state, &job_id, why);
+                    }
+                    // And the files it left, off the same record. This is
+                    // what makes the whole mechanism work for a requester
+                    // that was never connected while the job ran: `herdctl
+                    // wait <id>` an hour later gets the verdict and the bytes
+                    // in one frame, so there is no fetch command to add and
+                    // no second round trip (D131).
+                    let kept = read_the_outputs(state, &job_id);
+                    let verdict = FromHub::JobFinished {
+                        job_id: job_id.clone(),
+                        outcome,
+                        metrics,
+                        outputs: kept,
+                    };
+                    // Whoever `attach` left following — this connection, if a
+                    // verdict was held a moment ago and has since been let go
+                    // — and then this connection, which is the ordinary case
+                    // and leaves no follower behind on a job that is over.
+                    for follower in state.stop_following(&job_id) {
+                        if !follower.same_channel(outbox) {
+                            let _ = follower.send(verdict.clone());
+                        }
+                    }
+                    let _ = outbox.send(verdict);
+                }
+            }
         }
         // Waiting for a job whose attempt was interrupted is
         // waiting for a runner that may never come back, so the
@@ -5917,6 +6568,9 @@ mod tests {
         fn collections_owed(&self) -> StoreResult<Vec<crate::job::CollectionOwed>> {
             self.inner.collections_owed()
         }
+        fn collection_owed(&self, id: &JobId) -> StoreResult<Option<crate::job::CollectionOwed>> {
+            self.inner.collection_owed(id)
+        }
         fn output_budget(&self) -> crate::job::Budget {
             self.inner.output_budget()
         }
@@ -6069,6 +6723,7 @@ mod tests {
                 &outbox,
                 kick,
                 Announced {
+                    version: hub_version().to_owned(),
                     capacity: offering_kvm_free(),
                     host: HostSize::default(),
                     preference: 0,

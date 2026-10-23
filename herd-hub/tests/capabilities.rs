@@ -626,31 +626,56 @@ async fn a_busy_command_probe_keeps_a_job_queued_until_it_says_free() {
     assert!(String::from_utf8_lossy(&waited.stdout).contains("the lease is free"));
 }
 
-/// A probe that cannot be read suspends its capability and nothing else.
+/// A probe that cannot be read suspends its capability and nothing else
+/// (D49).
 ///
-/// Three ways of being broken, in one runner: a command that is not there, a
-/// command that exits with a code the configuration gives no meaning to, and a
-/// command that hangs. Each suspends its own capability, by name; the runner
-/// goes on serving; a job that needs nothing runs to completion while all
-/// three are broken; and the hub is never held up by any of them.
+/// Three ways of being broken, in one runner: a command that cannot be spawned
+/// though its program is there to spawn, a command that exits with a code the
+/// configuration gives no meaning to, and a command that hangs. Each suspends
+/// its own capability, by name; the runner goes on serving; a job that needs
+/// nothing runs to completion while all three are broken; and the hub is never
+/// held up by any of them.
+///
+/// **The first probe used to be `/nonexistent/herd-probe` and cannot be any
+/// more** (D165). A probe whose *program* is not there at all is now a
+/// configuration error that refuses the runner's startup, so a runner carrying
+/// this file would not reach the behaviour under test. That changes nothing
+/// about D49, which is what this test is for, and the fixture says so: the
+/// program is a real file, executable, and its shebang names an interpreter
+/// that is not there — so the spawn still fails with ENOENT, at runtime, as it
+/// would the day a probe's interpreter is uninstalled under a running runner.
+/// The startup check cannot see that case and deliberately does not try: it
+/// asks whether there is anything to run, not whether running it will work.
 #[tokio::test]
 async fn a_broken_probe_suspends_its_own_capability_and_hangs_nothing() {
     let mut herd = Herd::new();
-    let file = r#"{"capabilities":[
-        {"name":"missing-probe","kind":{"type":"shared"},
-         "busy_probe":{"type":"command","command":["/nonexistent/herd-probe"]}},
-        {"name":"confused-probe","kind":{"type":"shared"},
-         "busy_probe":{"type":"command","command":["/bin/sh","-c","exit 7"]}},
-        {"name":"hanging-probe","kind":{"type":"shared"},
-         "busy_probe":{"type":"command","command":["/bin/sh","-c","sleep 60"]}},
-        {"name":"fine","kind":{"type":"shared"}}
-    ]}"#;
+    let unspawnable = herd.run.path().join("probe-with-no-interpreter");
+    std::fs::write(&unspawnable, b"#!/nonexistent/herd-interpreter\nexit 1\n")
+        .expect("the fixture writes a program");
+    #[cfg(unix)]
+    std::fs::set_permissions(
+        &unspawnable,
+        std::os::unix::fs::PermissionsExt::from_mode(0o755),
+    )
+    .expect("and makes it executable, so it is a program a runner will start on");
+    let file = format!(
+        r#"{{"capabilities":[
+        {{"name":"unspawnable-probe","kind":{{"type":"shared"}},
+         "busy_probe":{{"type":"command","command":[{}]}}}},
+        {{"name":"confused-probe","kind":{{"type":"shared"}},
+         "busy_probe":{{"type":"command","command":["/bin/sh","-c","exit 7"]}}}},
+        {{"name":"hanging-probe","kind":{{"type":"shared"}},
+         "busy_probe":{{"type":"command","command":["/bin/sh","-c","sleep 60"]}}}},
+        {{"name":"fine","kind":{{"type":"shared"}}}}
+    ]}}"#,
+        serde_json::to_string(&unspawnable.display().to_string()).expect("a path encodes")
+    );
     herd.start_hub().await;
-    herd.start_runner(Some(file), &["--no-detect", "--probe-timeout", "200"])
+    herd.start_runner(Some(&file), &["--no-detect", "--probe-timeout", "200"])
         .await;
 
     for (label, words) in [
-        ("missing-probe", "cannot be started"),
+        ("unspawnable-probe", "cannot be started"),
         ("confused-probe", "exited 7"),
         ("hanging-probe", "did not answer within 200 ms"),
     ] {
@@ -1274,13 +1299,19 @@ async fn ten_hanging_probes_do_not_delay_the_runner_joining() {
     /// concerned, and short enough that one left behind by a hard kill of
     /// this test's own processes reaps itself rather than outliving the suite.
     const HANGS_FOR_SECONDS: u64 = 8;
+    // `/bin/sh -c "sleep N"` and not `/bin/sleep`, which was the probe here
+    // until D165 and does not exist on this project's own host: `/bin` on
+    // NixOS holds `sh` and nothing else, so these ten probes were ten
+    // instant ENOENTs and the thing this test says it measures — ten probes
+    // that *hang* — was not being measured at all. They hang now, which is
+    // the harder case and the one the comment above describes.
 
     let declared: Vec<String> = (0..PROBES)
         .map(|n| {
             format!(
                 r#"{{"name":"hangs-{n}","kind":{{"type":"shared"}},
                      "busy_probe":{{"type":"command",
-                                    "command":["/bin/sleep","{HANGS_FOR_SECONDS}"]}}}}"#
+                                    "command":["/bin/sh","-c","sleep {HANGS_FOR_SECONDS}"]}}}}"#
             )
         })
         .collect();

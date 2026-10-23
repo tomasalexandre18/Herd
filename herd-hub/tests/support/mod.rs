@@ -161,12 +161,26 @@ impl Harness {
         harness
     }
 
+    /// A hub whose timing a test chooses, with nothing connected to it yet.
+    ///
+    /// The point of [`herd_hub::Policy`] being one struct: a test can make a
+    /// deadline pass in a second *through the code the hub runs*, instead of
+    /// waiting out a figure chosen for a deployment.
+    pub async fn with_hub_timed(policy: herd_hub::Policy) -> Self {
+        Self::start_under(policy).await
+    }
+
     async fn start() -> Self {
+        Self::start_under(herd_hub::Policy::default()).await
+    }
+
+    async fn start_under(policy: herd_hub::Policy) -> Self {
         let state = tempfile::tempdir().expect("a temporary state directory");
         let store = Arc::new(JobDirStore::open(state.path()).expect("the state root opens"));
-        let hub = Hub::bind(
+        let hub = Hub::bind_with_policy(
             "127.0.0.1:0".parse().expect("a literal loopback address"),
             Arc::clone(&store) as Arc<dyn JobStore>,
+            policy,
         )
         .await
         .expect("the hub binds a free port");

@@ -15,8 +15,9 @@ For the full walk — one machine, one person, under thirty minutes — read
 | --- | --- |
 | `herd-runner-<version>-x86_64-unknown-linux-musl` | the client that offers a machine's capacity and runs jobs |
 | `herdctl-<version>-x86_64-unknown-linux-musl` | the CLI: submit a job, follow it, approve a runner |
-| `herd-hub-<version>-x86_64-unknown-linux-musl` | the service. You probably do not need this one: the hub is deployed as a container image, published by this same tag, and there is one hub. See "the hub is an image" below |
-| `SHA256SUMS` | so you can verify the three rather than trust a URL |
+| `herd-hub-<version>-x86_64-unknown-linux-musl` | the service. You probably do not need this one: the hub is deployed as a container image, attached to this same release, and there is one hub. See "the hub is an image" below |
+| `herd-hub-image-<version>.tar.gz` | that container image, as an archive to `docker load`. About 19 MB. See "the hub is an image" below |
+| `SHA256SUMS` | so you can verify the four rather than trust a URL. Add `--ignore-missing` if you did not download them all |
 
 **x86_64 Linux only**, and statically linked against musl: they depend on no
 libc, no dynamic loader and no Nix store, and they run on any distribution —
@@ -38,56 +39,63 @@ differ by patch — a runner says so at startup and serves the connection
 anyway — but 1 and 2 are not that.
 
 ```sh
-sha256sum -c SHA256SUMS
+sha256sum --ignore-missing -c SHA256SUMS
 install -m 0755 herd-runner-<version>-x86_64-unknown-linux-musl \
   /usr/local/bin/herd-runner
 herd-runner --version
 ```
 
-## The hub is an image, and this tag published it
+## The hub is an image, and it is attached to this release
 
-The three files above are the binaries. **The hub is normally not one of
-them**: it is a container image on Docker Hub, pushed by the same workflow
-on the same tag, out of the same Nix derivation that has ever built it
+The three binaries above are not the whole release. **The hub is normally
+not one of them**: it is a container image, attached here as
+`herd-hub-image-<version>.tar.gz` and built by the same workflow on the same
+tag, out of the same Nix derivation that has ever built it
 (`nix/hub-image.nix`, D153). There is no Dockerfile and no second build, so
-the hub a release deploys is the hub a release tested.
+the hub a release deploys is the hub a release tested — the workflow loads
+this very archive and runs a hub, a runner and two real jobs through it
+before the release exists.
 
-The release body above prints the exact reference, by tag and by digest.
-Deploying is then a pull and an up:
+It is about 19 MB, and `SHA256SUMS` above covers it along with the binaries.
+Deploying it is a load and an up:
 
 ```sh
-docker compose pull
+sha256sum --ignore-missing -c SHA256SUMS
+docker load < herd-hub-image-<version>.tar.gz
+#   Loaded image: herd-hub:<version>
 docker compose up -d
 ```
 
 `deploy/docker-compose.yml` takes the image from `HERD_HUB_IMAGE` in your
-`.env`; `deploy/env.example` says what to put and `deploy/README.md` walks
-the first start. x86_64 only, for the reason the binaries are.
+`.env`, and that is the tag `docker load` just printed;
+`deploy/env.example` says what to put and `deploy/README.md` walks the first
+start, including the two ownership failures it actually hits. x86_64 only,
+for the reason the binaries are.
+
+**There is no registry behind that tag, and so no `docker compose pull`.**
+The tag is local to the machine that loaded it, and a pull fails on it,
+which is correct. Upgrading is the four lines above again with the next
+release's archive. Putting the image in a registry of your own is one
+`skopeo copy` out of this archive — `flake.nix`'s `release` shell has the
+tool and the command — and is deliberately not part of cutting a release:
+Herd published a registry step inside the release path once, and the three
+tags v0.3.1, v0.3.2 and v0.3.3 produced no release at all because of it
+(D162). An optional publication never gets a veto over the artefacts again.
 
 **There is no `latest` tag and there will not be one.** A hub is a single
 instance that a whole fleet speaks to, and the protocol version is part of
 what it speaks: 0.3.0 moved it from 1 to 2, and a version-2 hub refuses a
 version-1 runner by name. A floating tag means the next `up -d` — a reboot,
-a host upgrade, an unrelated `docker compose pull` — can land the fleet on a
-different protocol without anybody choosing the moment. Naming the version
-is how that stays a decision. Pull a digest if you want it stronger still.
+a host upgrade — can land the fleet on a different protocol without anybody
+choosing the moment. Naming the version is how that stays a decision, and a
+loaded tag is pinned by construction: nothing can move it but another
+`docker load`.
 
-**What the publishing needs, for whoever maintains this repository.** Two
-entries under *Settings → Secrets and variables → Actions*, and nothing
-else. They sit on **two different tabs**, which is the whole point: the
-account name is public the instant anything is pushed under it and belongs
-in every log line, while the token is never in the repository, in the image,
-or in any output (invariant 7).
-
-| Tab | Name | What it is |
-| --- | --- | --- |
-| **Variables** | `DOCKERHUB_USERNAME` | the Docker Hub account that owns the **public** `herd-hub` repository. A variable, not a secret: masked, it would make a failed push impossible to read |
-| **Secrets** | `DOCKERHUB_TOKEN` | a Docker Hub **access token**, scoped to that one repository, with Read & Write — never the account password, and never an account-wide token |
-
-A tag pushed while either is missing **fails on its first step**, naming the
-one that is missing *and the tab it goes on*, before anything is built and
-long before a GitHub release exists. Half a release is worse than none, so
-the workflow refuses to make one.
+**Nothing about this release needs a credential.** Not a registry account,
+not a token, not a repository secret or variable. Everything a tag publishes
+is built from the flake and attached by GitHub's own token, which is why a
+tag now either produces all four files or fails visibly while producing
+none of them.
 
 ## A binary and a service are not the same thing
 
@@ -183,6 +191,32 @@ printf 'HERD_TOKEN=%s\n' "$token" | sudo tee /etc/herd/runner-token.env >/dev/nu
 sudo chown herd:herd /etc/herd/runner-token.env
 sudo chmod 0400 /etc/herd/runner-token.env
 ```
+
+## Is the fleet working? `herdctl runner list`
+
+One command, and it answers four questions: which machines are approved,
+which of them are here, which build each one runs, and — the one that
+matters most — which of its capabilities it is **not** handing out, with
+the reason.
+
+```
+$ herdctl runner list
+server: approved 2026-10-01T09:11:12Z, connected now, herd 0.3.4
+  kvm is suspended: the probe `/etc/herd/kvm.sh` exited 0, which means busy
+  gpu-venus is suspended: gpu-venus has a busy probe (command /etc/herd/gpu.sh) and server has not reported a reading of it yet
+wsl-pc: approved 2026-10-02T18:40:03Z, not connected
+```
+
+A suspended capability is not a refusal: jobs that need it **wait**, with
+the same reason on their own record (`herdctl wait <id>` prints it). But a
+capability suspended because its probe is broken waits for ever, and the
+fleet looks healthy from every other angle — so this is the line to read
+first when a job is not starting. A machine that is not connected has told
+this hub nothing, so it carries neither a build nor a list: that is the
+absence of an answer and not a clean bill of health.
+
+`herdctl switch` says the same two things under each runner's switch
+position, for whoever is already looking there.
 
 ## The data root's filesystem decides whether IO is bounded at all
 
@@ -314,12 +348,44 @@ finds out, and say so when it breaks.
 | --- | --- |
 | the job's own | worn untouched — `0`, `1`, `75`, anything the process really exited with. This is the whole point: a test suite's own code reaches the caller |
 | `124` | a runner stopped the job at one of its caps: time, memory, log size or disk budget. `timeout(1)`'s code, generalised. Which cap it was is printed on stderr and carried in the record |
-| `125` | **Herd has no verdict.** It could not run the job, lost the runner, refused it, or could not be reached at all. Never a failing build — a script that reads 125 as "the tests failed" is the one mistake that cannot be survived (D20). The reason is printed on stderr |
+| `125` | **Herd has no verdict.** It could not run the job, lost the runner, refused it, could not be reached at all, or the machine it ran on could not do its own part (`setup_failed` — a workspace the runner was refused access to, say, which is a host to fix and never a build that failed). Never a failing build — a script that reads 125 as "the tests failed" is the one mistake that cannot be survived (D20). The reason is printed on stderr |
 | `128 + n` | the job was killed by signal `n`, exactly as a shell reports one |
 
 A job *can* exit 124 or 125 by itself, which is why the reason is always on
 stderr as well, and why the wire carries a typed outcome rather than a
 number. Read the sentence, not just the code.
+
+### For an agent: `--verdict-to`, and no sentence to parse
+
+`herdctl run --verdict-to <FILE>` and `herdctl wait --verdict-to <FILE>`
+write the job's end as JSON. The fields that answer what an exit code
+cannot:
+
+| Field | What it says |
+| --- | --- |
+| `cause` | one word: `exited`, `signalled`, `stopped_by_cap`, `could_not_start`, `setup_failed`, `cancelled`, `lost`, `impossible` — or `no_verdict` when Herd never got one |
+| `exit_code_from` | `job`, `signal` or `herd`. **This is what tells a job's own 124 or 125 from Herd's.** A build that chose to exit 124 is `{"exit_code": 124, "exit_code_from": "job"}`; a cap is `{"exit_code": 124, "exit_code_from": "herd"}`, with `cause` saying which |
+| `job_exists` | `a_job`, `nothing` or `unknown` — the three stderr lines below, as a field |
+| `ran_on` | `{"runner": …, "why": …}`: which machine ran it and why there |
+| `cap` | which cap and its figures, when a cap ended the job. A non-null `detail` means the job did **not** reach `limit` |
+| `passed`, `job_id`, `said`, `outcome`, `metrics` | the verdict in one boolean, the id, the sentences a person would have read, the outcome as the wire carries it, and what the runner measured |
+
+Three things about the file:
+
+* **Every field in the table above is always present.** One with nothing in
+  it is `null`, so a reader indexes the document instead of probing it.
+  (Inside `outcome` and `metrics` the wire's own habits apply: a figure
+  nobody could measure is absent rather than a zero that reads as one.) The
+  first field is `verdict_format_version`; check it before anything else.
+* **It is written however the run ends**, no verdict included, so a stale
+  file from an earlier run is never read as this run's answer.
+* **It is a file, not a stream.** `stdout` belongs to the job and `stderr`
+  carries the prose above. For a pipe, name one: `--verdict-to /dev/fd/3`.
+
+```sh
+herdctl run --verdict-to v.json --command build --commit "$sha"
+jq -r 'if .passed then "ok" else "\(.cause) on \(.ran_on.runner // "nowhere")" end' v.json
+```
 
 ### Falling back after 125: the id is the answer, not the code
 

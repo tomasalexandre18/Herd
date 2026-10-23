@@ -371,6 +371,105 @@ async fn a_requester_without_the_hub_s_token_is_refused_and_told_where_to_get_it
     );
 }
 
+/// What the listing an operator looks at first has to be able to say (D166).
+///
+/// **The outage this exists for.** A runner's capability file carried
+/// unsubstituted placeholders, so every probe failed, so `kvm` and
+/// `gpu-venus` were suspended for hours with every job that needed them
+/// waiting — and `herdctl runner list` printed, for that machine, exactly
+/// what it prints for a healthy one. The only way anybody found out was by
+/// reading the runner's own disk, which is an access nobody on our side has
+/// now that the consumer operates the machines. So one command has to answer
+/// three questions: is it here, which build is it, and what is it not handing
+/// out.
+///
+/// The real binaries, because the shape under test is a frame crossing from a
+/// runner's probes to an operator's terminal through the hub, and a
+/// single-process test would have skipped the two hops that mattered.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_fleet_listing_names_a_runner_s_build_and_what_it_is_not_handing_out() {
+    let herd = Herd::new();
+    let _hub = herd.start_hub("hub").await;
+
+    let root = herd.runner_root("probed");
+    std::fs::create_dir_all(&root).expect("the runner's data root");
+    let capabilities = root.join("capabilities.json");
+    // A probe that really starts — D165 refuses a file whose probe cannot be
+    // — and really says busy: exit 0 is the configured busy code (D51). The
+    // program is `/bin/sh`, which is the one thing `/bin` holds on this host.
+    std::fs::write(
+        &capabilities,
+        br#"{"capabilities":[
+            {"name":"kvm","kind":{"type":"counted","slots":1},
+             "busy_probe":{"type":"command","command":["/bin/sh","-c","exit 0"]}}
+        ]}"#,
+    )
+    .expect("the capability file is written");
+    let _runner = herd.start_runner_with(
+        "server",
+        "probed",
+        "probed",
+        &[
+            "--capabilities",
+            &capabilities.display().to_string(),
+            "--no-detect",
+            "--probe-interval",
+            "50",
+        ],
+    );
+    // A second machine, approved and never started: what the listing must
+    // *not* say about a runner that is not here.
+    let _ = herd.approve("the-pc-that-is-off");
+
+    let listing = {
+        let deadline = std::time::Instant::now() + PATIENCE;
+        loop {
+            let output = herd.herdctl(&["runner", "list"]).await;
+            let text = String::from_utf8_lossy(&output.stdout).into_owned();
+            if text.contains("is suspended") {
+                break text;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the listing never said what the runner is not handing out: {text}"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+    };
+
+    let line = listing
+        .lines()
+        .find(|line| line.starts_with("server:"))
+        .unwrap_or_else(|| panic!("the connected runner has no line: {listing}"));
+    assert!(
+        line.contains("connected now"),
+        "the machine is here and the line says so: {line}"
+    );
+    // E-51's figure, which the hub already judges at the handshake and until
+    // now reported only on its own stderr.
+    assert!(
+        line.contains(&format!("herd {}", herd_runner::runner_version())),
+        "the build an operator would otherwise need a shell to read: {line}"
+    );
+    assert!(
+        listing.contains("  kvm is suspended:"),
+        "the capability nothing may be given, under its own machine: {listing}"
+    );
+
+    let off = listing
+        .lines()
+        .find(|line| line.starts_with("the-pc-that-is-off:"))
+        .unwrap_or_else(|| panic!("the approved machine has no line: {listing}"));
+    assert!(off.contains("not connected"), "{off}");
+    // A machine that is not here offers nothing, so it suspends nothing and
+    // has no build to report: a figure for it would be a report about a
+    // runner that left.
+    assert!(
+        !off.contains("herd "),
+        "a runner that is not connected has not told this hub anything: {off}"
+    );
+}
+
 /// Every file under a directory, recursively.
 fn files_under(root: &std::path::Path) -> Vec<std::path::PathBuf> {
     let mut found = Vec::new();

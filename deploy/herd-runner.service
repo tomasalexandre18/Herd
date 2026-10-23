@@ -19,11 +19,15 @@
 #   1. this file, copied into /etc/systemd/system/, with every OWNER note
 #      below satisfied by hand. It works and it survives a reboot, but the
 #      user and the unit are then unmanaged state outside the NixOS
-#      generation. This is what the project's server runs today.
+#      generation.
 #   2. deploy/nixos-herd-runner.nix, imported from /etc/nixos: the same unit
 #      declared, with the user, the groups and the binary's path along with
 #      it, and no OWNER steps left over. Importing it is an /etc/nixos
-#      change, which is the owner's; Herd never writes there.
+#      change, which is the owner's; Herd never writes there. This is what
+#      the project's server runs today, and on it every figure on the
+#      ExecStart line below is an option of `services.herd-runner` with the
+#      value below as its default — so a machine on that path changes a
+#      figure by naming it there, and not by editing a copy of this file.
 #
 # The two must be changed together. The module is written to produce exactly
 # this unit, and a figure edited in one and not the other gives a machine
@@ -287,6 +291,12 @@ ExecStart=/run/current-system/sw/bin/herd-runner \
 #                            to reserve 15 GiB of it on top of an 8 GiB
 #                            ceiling, with no swap, is the host falling over.
 #                            4 GiB is a reservation the machine can honour.
+#                            It is also a hard gate and not a queue: a job
+#                            asking for more tmpfs than this is refused
+#                            here, by a hub sentence saying no reservation
+#                            on this runner could ever cover it — so this
+#                            figure decides what the machine can run at all
+#                            and not only when. `hostTmpfs` on the Nix path.
 #
 #   --data-root              The ext4 NVMe, not /var/lib, because an
 #     /mnt/ssd_980/          io.weight reaches a block device and never the

@@ -7,6 +7,7 @@
 
 pub mod checkout;
 pub mod declaration;
+pub mod verdict;
 
 use anyhow::{anyhow, bail, Context, Result};
 use futures_util::{SinkExt, StreamExt};
@@ -59,6 +60,30 @@ pub struct Finished {
     /// output. `herdctl run --outputs-to <dir>` is what puts them on a disk,
     /// and it says on **stderr** which files it wrote.
     pub outputs: herd_proto::JobOutputs,
+    /// Where it ran and why there, as the hub said (E-02, D109, D166).
+    ///
+    /// Kept beside the outcome because the machine-readable verdict carries
+    /// it, and because a `ran on:` line that has been printed on stdout is a
+    /// line nothing can read back: it is the job's own output from the moment
+    /// it is written.
+    ///
+    /// **Recorded even for an ending the printed line is withheld for.** The
+    /// stdout line frames a job's *output*, so a job that never started gets
+    /// none (D16); this field is a record, and a machine that failed to start
+    /// a job is exactly the machine somebody needs named. `None` means the
+    /// hub never placed the job at all — it was refused, or it was impossible.
+    pub ran_on: Option<RanOn>,
+}
+
+/// The two parts of E-02's framing line, kept rather than only printed.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct RanOn {
+    /// The runner's own name — grievances 10a and 10c, which asked for this
+    /// and nothing more.
+    pub runner: String,
+    /// Why there, in the hub's own words: the sentence the placement line
+    /// carries inside its parentheses.
+    pub why: String,
 }
 
 /// `herdctl`'s exit code when there is no verdict to report: Herd could not
@@ -163,7 +188,12 @@ pub fn exit_code_for(outcome: &JobOutcome) -> u8 {
         JobOutcome::CouldNotStart { .. }
         | JobOutcome::Cancelled { .. }
         | JobOutcome::Impossible { .. }
-        | JobOutcome::Lost { .. } => NO_VERDICT_CODE,
+        | JobOutcome::Lost { .. }
+        // 125 and **not** 124, which is the whole of D166's third part: the
+        // machine the job ran on could not do its own part, so nobody
+        // established anything about this job. 124 would say a budget killed
+        // it, which is a verdict about the submission and was never true.
+        | JobOutcome::SetupFailed { .. } => NO_VERDICT_CODE,
         JobOutcome::StoppedByCap { .. } => STOPPED_BY_CAP_CODE,
     }
 }
@@ -208,6 +238,21 @@ pub fn stopped_by_cap_message(cap: Cap, limit: u64, detail: Option<&str>) -> Str
 /// A function, so the wording lives in one place and a test can rely on it.
 pub fn could_not_start_message(reason: &str) -> String {
     format!("herd could not run this job, so it never started: {reason}")
+}
+
+/// The one sentence `herdctl` prints on stderr for a job that ran on a machine
+/// which could not do its own part (D166).
+///
+/// The **machine** is the subject, as Herd is in [`could_not_start_message`]
+/// and the runner is in [`stopped_by_cap_message`], because that is the one
+/// thing this sentence has to get across: nothing about the submission is at
+/// fault and re-submitting it unchanged will fail again in the same way until
+/// somebody fixes the host. `reason` names the path.
+pub fn setup_failed_message(reason: &str) -> String {
+    format!(
+        "this job has no verdict of its own: the machine it ran on could not do its part, \
+         which is nothing the job or its requester did: {reason}"
+    )
 }
 
 /// The one sentence `herdctl` prints on stderr when it has no verdict to give:
@@ -384,12 +429,20 @@ pub enum Said<'a> {
 #[derive(Default)]
 struct Framing {
     held: Option<String>,
+    /// The last placement, kept whether or not the line is ever printed: it
+    /// is what [`Finished::ran_on`] carries (D166). A requeued attempt
+    /// replaces it, which is the truth about where the job really ran.
+    placed: Option<RanOn>,
 }
 
 impl Framing {
     /// The hub handed the job to a runner and said why there.
     fn placed(&mut self, runner: &str, why: &str) {
         self.held = Some(herd_proto::ran_on_line(runner, why));
+        self.placed = Some(RanOn {
+            runner: runner.to_owned(),
+            why: why.to_owned(),
+        });
     }
 
     /// Let it out, if it is still held. Called ahead of every byte of the
@@ -407,7 +460,67 @@ impl Framing {
     }
 }
 
+/// What a requester following a job is going to do about its output files
+/// (D167).
+///
+/// The hub holds a job's verdict until its streamed collection has all
+/// reached it, because a requester that fetches on the verdict otherwise
+/// gets a short directory. That costs a wait, and a requester that is never
+/// going to ask for the files should not pay it — so it says which it is,
+/// and this is that answer in one word at every call site that has to give
+/// it.
+///
+/// [`Wanting::Files`] is the default, in Rust as on the wire: silence has to
+/// fail towards waiting, because the requester that says nothing is the one
+/// built before the question existed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Wanting {
+    /// It will fetch them, so the verdict waits until they are all on the
+    /// hub.
+    #[default]
+    Files,
+    /// It will not, so the verdict comes as soon as it is recorded — which
+    /// is what `herdctl run` with no `--outputs-to` has always done.
+    OnlyTheVerdict,
+}
+
+impl Wanting {
+    fn wants_files(self) -> bool {
+        self == Wanting::Files
+    }
+}
+
+/// Submit a job and follow it to its end, wanting its files.
+///
+/// [`run_job_wanting`] is the same call for a requester that will not fetch
+/// them. This one is the safe default and the one every test uses: it waits
+/// for a collection it is not going to ask for, which costs latency and
+/// cannot give a wrong answer.
 pub async fn run_job(
+    config: &Config,
+    command: Vec<String>,
+    labels: LabelSet,
+    priority: Priority,
+    declared: Declared,
+    on_log: impl FnMut(LogStream, &[u8]),
+    said: impl FnMut(Said),
+) -> Result<Finished> {
+    run_job_wanting(
+        Wanting::default(),
+        config,
+        command,
+        labels,
+        priority,
+        declared,
+        on_log,
+        said,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+pub async fn run_job_wanting(
+    wanting: Wanting,
     config: &Config,
     command: Vec<String>,
     labels: LabelSet,
@@ -424,6 +537,7 @@ pub async fn run_job(
         &mut socket,
         &ToHub::SubmitJob {
             asked: declared.asked(command, labels, priority),
+            wants_files: wanting.wants_files(),
         },
     )
     .await
@@ -493,6 +607,7 @@ pub async fn run_job(
                     outcome,
                     metrics,
                     outputs,
+                    ran_on: framing.placed.clone(),
                 });
             }
             FromHub::Refused { reason } => {
@@ -563,6 +678,11 @@ pub async fn submit_job_saying(
         &mut socket,
         &ToHub::SubmitJob {
             asked: declared.asked(command, labels, priority),
+            // A `submit` leaves with the id and closes, so it follows
+            // nothing and nothing is ever held for it: the hub drops a
+            // follower when its connection goes. It sends the default rather
+            // than an answer it has no business giving (D167).
+            wants_files: Wanting::default().wants_files(),
         },
     )
     .await
@@ -613,6 +733,18 @@ pub async fn submit_job_saying(
 pub async fn wait_for_job(
     config: &Config,
     job_id: JobId,
+    on_log: impl FnMut(LogStream, &[u8]),
+    said: impl FnMut(Said),
+) -> Result<Finished> {
+    wait_for_job_wanting(Wanting::default(), config, job_id, on_log, said).await
+}
+
+/// The same wait, saying whether this requester will fetch the job's output
+/// files (D167).
+pub async fn wait_for_job_wanting(
+    wanting: Wanting,
+    config: &Config,
+    job_id: JobId,
     mut on_log: impl FnMut(LogStream, &[u8]),
     mut said: impl FnMut(Said),
 ) -> Result<Finished> {
@@ -621,6 +753,7 @@ pub async fn wait_for_job(
         &mut socket,
         &ToHub::WaitForJob {
             job_id: job_id.clone(),
+            wants_files: wanting.wants_files(),
         },
     )
     .await
@@ -654,6 +787,7 @@ pub async fn wait_for_job(
                     outcome,
                     metrics,
                     outputs,
+                    ran_on: framing.placed.clone(),
                 });
             }
             FromHub::JobLog { data, .. } => {
@@ -826,8 +960,12 @@ pub async fn fleet_switches(config: &Config) -> Result<Vec<RunnerSwitch>> {
 ///
 /// The position, the owner's reason, and whether work is still running there —
 /// because "off with a job on it" is the ordinary case and a line that did not
-/// say so would read like a contradiction.
-pub fn switch_line(runner: &RunnerSwitch) -> String {
+/// say so would read like a contradiction. Then, since D166, the build the
+/// machine runs, and an indented line for each capability it is not handing
+/// out: this is the same fleet `herdctl runner list` shows from the other
+/// side, and an operator must not have to learn which of the two tells her
+/// the truth about a machine.
+pub fn switch_lines(runner: &RunnerSwitch) -> Vec<String> {
     let mut line = format!("{}: {}", runner.name, runner.switch.sentence());
     line.push_str(&match runner.jobs {
         0 => ", nothing running".to_owned(),
@@ -837,7 +975,33 @@ pub fn switch_line(runner: &RunnerSwitch) -> String {
     if runner.stopping {
         line.push_str("; it is also stopping (SIGTERM)");
     }
-    line
+    if let Some(version) = &runner.facts.version {
+        line.push_str(&format!("; herd {version}"));
+    }
+    let mut lines = vec![line];
+    lines.extend(suspension_lines(&runner.facts));
+    lines
+}
+
+/// What a fleet listing says, under a runner's own line, about the
+/// capabilities it is offering and not handing out (D49, D166).
+///
+/// **Indented and one per capability**, rather than appended to the line
+/// above. A probe's reason is a sentence with a path in it — the first
+/// consumer's were sixty characters each — and two of them on one line is a
+/// line nobody reads to the end. The listing is where an operator looks first
+/// and these are the lines she has to see.
+///
+/// Nothing is printed when nothing is suspended, and nothing is printed when
+/// the hub did not say: a line claiming a clean bill of health is exactly
+/// what a hub that cannot answer must not produce
+/// ([`herd_proto::RunnerFacts`]).
+fn suspension_lines(facts: &herd_proto::RunnerFacts) -> Vec<String> {
+    facts
+        .suspensions()
+        .iter()
+        .map(|suspended| format!("  {}", suspended.sentence()))
+        .collect()
 }
 
 /// A deadline as a requester types it, in seconds since the Unix epoch
@@ -1049,6 +1213,22 @@ async fn fetch_once(
     if wanted.is_empty() {
         return Ok((0, false));
     }
+    // **What this requester already holds counts towards the progress it
+    // reports**, and leaving it out was a defect this round could not see
+    // (D167). A round asks only for what is still missing, so the figure it
+    // came back with was the bytes of *that* round — and the first round of a
+    // 657-file collection is by far the biggest. Every round after it
+    // reported less than the first, however many files it had just collected,
+    // so the caller's stall bound saw a transfer that never beat its best and
+    // gave up thirty seconds later on a collection that was arriving
+    // normally. With a one-file collection — which is what the suite streamed
+    // — the figure is monotonic by accident and nothing showed.
+    let mut progress: u64 = outputs
+        .files
+        .iter()
+        .filter(|file| file.is_held())
+        .map(|file| file.len)
+        .sum();
     let mut socket = join(config).await?;
     send(
         &mut socket,
@@ -1060,9 +1240,8 @@ async fn fetch_once(
     .await
     .context("asking the hub for this job's files")?;
     let mut arriving: std::collections::HashMap<String, Vec<u8>> = std::collections::HashMap::new();
-    // How far the whole collection has got, for the caller's stall bound, and
-    // whether any of it is still on its way.
-    let mut progress = 0u64;
+    // Whether any of it is still on its way. The progress figure is above,
+    // seeded with what earlier rounds already collected.
     let mut coming = false;
     loop {
         match next_message(&mut socket).await? {
@@ -1290,12 +1469,19 @@ pub async fn approved_runners(config: &Config) -> Result<Vec<ApprovedRunner>> {
     }
 }
 
-/// One approved runner, as `herdctl runner list` prints it (E-48).
+/// One approved runner, as `herdctl runner list` prints it (E-48, D166).
 ///
 /// No token and no hash: there is nothing to print, which is the property
 /// E-48 is built on.
-pub fn approved_runner_line(runner: &ApprovedRunner) -> String {
-    format!(
+///
+/// **This is the one command an operator runs to see whether the fleet is
+/// working**, and until D166 it could not say so: a machine whose `kvm` and
+/// `gpu-venus` probes had been failing for hours, with every job that needed
+/// them waiting, printed the same line as a healthy one. So the runner's
+/// build is on its line, and each capability it is not handing out gets an
+/// indented line under it, with the reason.
+pub fn approved_runner_lines(runner: &ApprovedRunner) -> Vec<String> {
+    let mut line = format!(
         "{}: approved {}, {}",
         runner.name,
         approved_at(runner.approved_unix_s),
@@ -1304,7 +1490,13 @@ pub fn approved_runner_line(runner: &ApprovedRunner) -> String {
         } else {
             "not connected"
         }
-    )
+    );
+    if let Some(version) = &runner.facts.version {
+        line.push_str(&format!(", herd {version}"));
+    }
+    let mut lines = vec![line];
+    lines.extend(suspension_lines(&runner.facts));
+    lines
 }
 
 /// When an approval was made, as a human reads it, falling back to the raw

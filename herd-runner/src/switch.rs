@@ -14,7 +14,9 @@
 //!   to want her machine back;
 //! * it survives the runner process — an owner who switched her PC off before
 //!   rebooting it has not changed her mind, and a runner that rejoined `on`
-//!   would be a machine that gave itself back;
+//!   would be a machine that gave itself back. Two of the three positions
+//!   survive as themselves; a persisted `drain` is read as `off`, because it
+//!   was an instruction to a process that is gone ([`at_startup`], D164);
 //! * a switch set through the hub is written here too, so there is one state
 //!   and not two.
 //!
@@ -83,6 +85,56 @@ pub fn read(path: &Path) -> Result<Option<Switch>, String> {
     Switch::parse(&read.position, read.reason.as_deref())
         .map(Some)
         .map_err(|why| format!("{}: {why}", path.display()))
+}
+
+/// What a position written in the file means to a runner that is only now
+/// starting (D164).
+///
+/// Two of the three positions mean the same thing at startup as they mean to a
+/// running runner, and `drain` does not. It is an instruction to *one process*
+/// — finish what you hold, then go — and a process that has just started holds
+/// nothing, so it has already carried it out. Read literally it is a runner
+/// that joins and leaves again, which under a unit with `Restart = "always"`
+/// is a restart loop, and a runner nobody can reach to switch back `on`
+/// because it is never connected long enough for the instruction to land.
+///
+/// `off` is what a restart can mean: nothing new is claimed, the reason the
+/// owner gave stays visible, the runner stays connected, and that last clause
+/// is the point — `herdctl switch <runner> on` reaches it from anywhere,
+/// instead of only from a shell on the machine.
+pub struct AtStartup {
+    /// The position this process takes.
+    pub position: Switch,
+    /// Why that is not the position written down, when it is not. One
+    /// sentence, said once on the runner's own stderr: an owner who wrote
+    /// `drain` and gets `off` has to be able to read why.
+    pub converted: Option<String>,
+}
+
+/// Read a persisted position as a starting runner reads it (D164).
+pub fn at_startup(written: Switch) -> AtStartup {
+    let Switch::Drain { reason } = written else {
+        return AtStartup {
+            position: written,
+            converted: None,
+        };
+    };
+    let off = Switch::Off {
+        reason: reason.clone(),
+    };
+    AtStartup {
+        converted: Some(format!(
+            "the switch file says drain ({reason}), and a drain is an instruction to one \
+             process: finish what you hold, then go. This process has just started and holds \
+             nothing, so it has already done both — so it starts {}, which is the position a \
+             restart can keep: nothing new is claimed, the reason stays visible, this runner \
+             stays connected, and `herdctl switch <runner> on` can reach it from anywhere. A \
+             runner that read drain here would leave the moment it joined, and a unit that \
+             restarts it would do that for ever",
+            off.sentence()
+        )),
+        position: off,
+    }
 }
 
 /// Write a position down, so that it outlives the process that applied it.
@@ -186,7 +238,6 @@ mod tests {
             "not json at all",
             r#"{"position":"of course"}"#,
             r#"{"position":"off"}"#,
-            r#"{"position":"on","reason":"a reason on means nothing by"}"#,
             r#"{}"#,
         ] {
             let (_keep, path) = in_a_temporary_place(Some(contents));
@@ -201,14 +252,102 @@ mod tests {
                 "{contents:?} must never read as a runner that claims"
             );
         }
+
+        // And the one case that moved out of that list under D166. This file
+        // is not mangled: it says `on` in so many words and carries one
+        // surplus field, so reading it as `on` is reading what it says rather
+        // than guessing at it. The hazard above is untouched — a truncated
+        // file, an unknown position and a missing one are all still errors —
+        // and the hazard here was never the same thing: nothing in Herd
+        // writes a reason on `on`, so such a file was typed by a person, and
+        // refusing it would withdraw a machine nobody meant to withdraw.
+        let (_keep, path) =
+            in_a_temporary_place(Some(r#"{"position":"on","reason":"the window is over"}"#));
+        assert_eq!(read(&path), Ok(Some(Switch::On)));
     }
 
-    /// `off` needs a reason and `on` refuses one, in the one place both the
+    /// **The restart loop, closed.** A `drain` on the disk is read as `off`
+    /// by the process that finds it there (D164).
+    ///
+    /// The outage: `herdctl switch server drain`, then `systemctl restart`.
+    /// Each start read `drain`, held nothing, and left at once; the unit's
+    /// `Restart = "always"` started it again, eight times in two minutes, and
+    /// `herdctl switch server on` could not land because the runner was never
+    /// connected long enough to be told. Read as `off` the same machine stays
+    /// connected with its owner's reason visible, and the instruction lands.
+    #[test]
+    fn a_persisted_drain_starts_a_runner_off_and_not_leaving() {
+        let (_keep, path) = in_a_temporary_place(None);
+        let drain = Switch::Drain {
+            reason: "the rig is mine tonight".to_owned(),
+        };
+        write(&path, &drain).expect("the switch is written");
+        let written = read(&path)
+            .expect("the file reads")
+            .expect("the file holds a position");
+        assert_eq!(written, drain, "the file keeps what was written to it");
+
+        let starting = at_startup(written);
+        assert_eq!(
+            starting.position,
+            Switch::Off {
+                reason: "the rig is mine tonight".to_owned()
+            },
+            "a persisted drain starts off, with the reason its owner gave"
+        );
+        assert!(
+            !starting.position.leaves_when_empty(),
+            "a runner that starts on this position must not leave the moment it joins"
+        );
+        assert!(!starting.position.claims(), "and it claims nothing either");
+        let said = starting
+            .converted
+            .expect("an owner who wrote drain and gets off must be told why");
+        for word in ["drain", "off", "connected", "restart"] {
+            assert!(
+                said.contains(word),
+                "the sentence has to say {word:?} to explain itself: {said}"
+            );
+        }
+        assert!(
+            said.contains("the rig is mine tonight"),
+            "and it carries her reason: {said}"
+        );
+    }
+
+    /// The other two positions mean at startup what they mean at any other
+    /// time, and say nothing: `off` is the position that survives a restart,
+    /// and `on` is a machine nobody has withdrawn.
+    #[test]
+    fn the_other_two_positions_survive_a_restart_as_themselves() {
+        for position in [
+            Switch::On,
+            Switch::Off {
+                reason: "she is gaming".to_owned(),
+            },
+        ] {
+            let starting = at_startup(position.clone());
+            assert_eq!(starting.position, position);
+            assert!(
+                starting.converted.is_none(),
+                "nothing was converted, so nothing is explained: {:?}",
+                starting.converted
+            );
+        }
+    }
+
+    /// `off` needs a reason and `on` keeps none, in the one place both the
     /// file and the two command lines go through.
     #[test]
     fn a_position_carries_exactly_the_reason_it_should() {
         assert_eq!(Switch::parse("on", None), Ok(Switch::On));
-        assert!(Switch::parse("on", Some("why")).is_err());
+        // A reason on `on` is accepted and dropped, never a refusal (D166):
+        // the position carries none, and failing a command because it was
+        // given one extra piece of information was a bad trade.
+        assert_eq!(
+            Switch::parse("on", Some("the window is over")),
+            Ok(Switch::On)
+        );
         assert!(Switch::parse("off", None).is_err());
         assert!(Switch::parse("drain", None).is_err());
         assert!(Switch::parse("off", Some("  ")).is_err());

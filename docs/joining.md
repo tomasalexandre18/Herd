@@ -61,7 +61,7 @@ assets are static musl binaries: nothing on the machine, no toolchain,
 no clone. Take the version you want from the releases page.
 
 ```sh
-v=v0.3.3
+v=v0.3.4
 base=https://github.com/tomasalexandre18/Herd/releases/download/$v
 curl -fLO $base/herd-runner-${v#v}-x86_64-unknown-linux-musl
 curl -fLO $base/SHA256SUMS
@@ -282,10 +282,23 @@ yours. The second is the only proof that counts.
 
 ```sh
 herdctl runner list
-# server: approved 2026-10-15T17:38:28Z, connected now
+# server: approved 2026-10-15T17:38:28Z, connected now, herd 0.3.4
 
 herdctl run -- sh -c 'echo it works; nproc'
 ```
+
+The listing names the build this machine is running, and one indented line
+under it for every capability it is offering and **not** handing out, with
+the reason (D166). Lines like
+
+```
+  kvm is suspended: the probe `/etc/herd/kvm.sh` exited 0, which means busy
+```
+
+are not a failure of this step — a job that needs `kvm` waits rather than
+being refused — but a capability suspended because its probe is broken
+waits for ever, and nothing else in the listing would say so. Read them
+before you read anything else.
 
 The job's output is preceded by one line naming where it ran and why:
 
@@ -852,6 +865,7 @@ root and delivered on the next start (D34). Stopping loses nothing.
 | a data root that is refused, naming itself | the directory is not writable by the runner's user, or another runner already holds it (D32) |
 | the unit will not start, and systemd names a mount rather than the runner | the data root's filesystem is not mounted. `RequiresMountsFor=` holds the service back on purpose, so it cannot build a root on a bare mount point |
 | `herdctl runner list` shows it approved but not connected | the service is not running: `journalctl -u herd-runner` |
+| jobs needing a label wait for ever on a connected machine | `herdctl runner list` prints an indented line for every capability that machine is not handing out, with the reason (D166). A probe that cannot be read suspends its capability, and the wait is then endless |
 
 ## Picking `ws://` or `wss://`, and the certificate that decides it
 
