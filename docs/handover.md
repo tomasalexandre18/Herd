@@ -12,8 +12,12 @@ reasoning behind the boundary itself is D161 in `docs/decisions.md`.
 
 How it was written, so a reader knows what to trust:
 
-- everything about the code is read at `36ef9ab` (v0.3.3, `main`) and
-  cited by file and line;
+- the plan was written against `36ef9ab` (v0.3.3, `main`) and cites the
+  code by file and line. Everything it asserts about **what is built**
+  was re-read at `5b1021e` on the evening of 2026-10-23, after the gate
+  release; §3.0 and the opening line of each subsection of §3 carry
+  that reading, and a line number below belongs to the first one and
+  may have moved since;
 - everything about the server outside the repository was read on
   2026-10-23 from the host and is marked **server**: the owner's
   `/etc/nixos/flake.nix`, the live unit, the consumer's capability file,
@@ -45,8 +49,10 @@ not reach us.
 
 The one sentence that makes the boundary honest rather than a
 withdrawal: **we may not hand over an instance that only its author can
-tell is healthy.** Today's fleet is exactly that, and section 3 is what
-closes the gap.
+tell is healthy.** The fleet this was written about was exactly that,
+and section 3 is what closed the gap. It did not close it first: the
+handover was announced before any of it was built, and §3.0 says where
+the gate stands and what is still open.
 
 ## 2. Where the line falls, subsystem by subsystem
 
@@ -57,17 +63,17 @@ the two, named so it can be pointed at in a dispute.
 | Subsystem | We ship | They operate | What crosses the line |
 |---|---|---|---|
 | Protocol | `herd-proto`, `PROTOCOL_VERSION` 2, `version_gap` (E-51, invariant 4) | nothing — but every peer of theirs must speak it | the refusal sentence naming both versions (`herd-proto/src/lib.rs:2144`); a protocol move is announced in `deploy/release-notice.md` as a fleet-wide restart |
-| Hub, the binary | `herd-hub` and the image `packages.hub-image` (D5, D153), both at the workspace version | the container, its restarts, `docker compose pull`/`load`, `.env` | `deploy/docker-compose.yml`, `deploy/env.example`, the image tag `herd-hub:<version>`, the three lines the hub prints at startup (`herd-hub/src/main.rs:252-288`) |
+| Hub, the binary | `herd-hub` and the image `packages.hub-image` (D5, D153), both at the workspace version | the container, its restarts, `docker compose pull`/`load`, `.env` | `deploy/docker-compose.yml`, `deploy/env.example`, the image tag `herd-hub:<version>`, the archive attached to the release and `docker load`ed (D162), the three lines the hub prints at startup (`herd-hub/src/main.rs:252-288`) |
 | Hub, the state root | the layout and its five version numbers (`RECORD_VERSION`, `LAYOUT_VERSION`, …, D8, D73) and the rule that an unreadable version refuses to start | the volume `herd_herd-state`, its filesystem, its backups, its size | `job.json`, `events.jsonl`, `log`, `files/` as plain files (E-15, E-53); a `herd-hub migrate` is UNBUILT and is the only way a `RECORD_VERSION` move will ever be theirs to run |
 | Hub, the output budget and sweeper | `--output-budget`, `--output-floor`, the four-rank eviction, the manifest that outlives the bytes (D152) | choosing the two figures, watching the disk, the first real eviction | the two flags, the `OutputsRemoved` event and the sentence a requester gets for an evicted collection |
 | Hub, the roster and tokens | `runners.json` with salted hashes, `herdctl runner approve/remove/list` (E-48, Q8) | `/etc/herd/requester-token`, each runner's token file, who holds the requester token | the token's path in `.env`; the approve command's one-time print; the roster version |
 | Runner, the binary | `herd-runner` static musl, and the flake package | the process, its user, its groups, its restarts | every `--flag`/`HERD_*` pair in `herd-runner/src/main.rs:36-327`; the startup report (`confine.rs`); the exit sentence |
-| Runner, the unit and module | `deploy/herd-runner.service` and `deploy/nixos-herd-runner.nix` as **reference texts**, with their OWNER notes | the copy or the import in `/etc/nixos`, the pin, `nixos-rebuild`, every OWNER item | the module's options (today **22**, missing **7**, section 3.3); the unit's OWNER notes (`deploy/herd-runner.service:64,76,87,153`) |
+| Runner, the unit and module | `deploy/herd-runner.service` and `deploy/nixos-herd-runner.nix` as **reference texts**, with their OWNER notes | the copy or the import in `/etc/nixos`, the pin, `nixos-rebuild`, every OWNER item | the module's options (the seven figures that were literals are options since D163, section 3.3); the unit's OWNER notes (`deploy/herd-runner.service:64,76,87,153`) |
 | Runner, the data root | the layout (`jobs/`, `held-results/`, `outputs/`, the lock, the switch) and E-45's cooperative confinement (D28) | `/mnt/ssd_980/herd-runner`, its filesystem, its free space, **the spool it cannot free** (D158) | the D158 message naming the shallowest directory the runner does not own; the `switch` file's JSON |
-| Runner, capabilities and probes | the file's strict schema (D60, D61), the three kinds, `busy_probe`, the suspension rule (D48, D49) | the file, the probe scripts, their substitution, their permissions | `--capabilities FILE`; the `herd-runner: <cap> is suspended: <reason>` stderr line (`capability.rs:860`); UNBUILT: a validator and a startup refusal (section 3.1) |
-| Runner, the owner's switch | `herd-runner switch`, `herdctl switch`, `SwitchApplied` (E-33, D99) | the owner's shortcut, the reason she types | the switch file; the fleet listing `herdctl switch`; **the drain-restart trap** (section 3.4) |
-| `herdctl` | the binary, the declaration reader (D106), the exit codes (D20, D40) | their wrappers, their `commands.toml`, their agents' `HERD_TOKEN` | the exit-code table (`herdctl/src/main.rs:200-236`), the `ran on:` line with `OUTPUT_FORMAT_VERSION` (Q7, D110), the stderr `job-id:` line; UNBUILT: a machine-readable verdict (section 3.2) |
-| Releases | the tag, three binaries, `SHA256SUMS`, the notice, the image (D132, D153) | pinning a version in `/etc/nixos` and `.env`, moving the fleet | the GitHub release page and `deploy/release-notice.md`; **broken since v0.3.1** (section 3.5) |
+| Runner, capabilities and probes | the file's strict schema (D60, D61), the three kinds, `busy_probe`, the suspension rule (D48, D49) | the file, the probe scripts, their substitution, their permissions | `--capabilities FILE`; the `herd-runner: <cap> is suspended: <reason>` stderr line (`capability.rs:860`); `herd-runner check --capabilities FILE`, and a probe that cannot be spawned refusing the file when it is loaded (D165, section 3.1) |
+| Runner, the owner's switch | `herd-runner switch`, `herdctl switch`, `SwitchApplied` (E-33, D99) | the owner's shortcut, the reason she types | the switch file; the fleet listing `herdctl switch`, now carrying each runner's build and its suspended capabilities (D166); the drain-restart trap, closed by D164 (section 3.4) |
+| `herdctl` | the binary, the declaration reader (D106), the exit codes (D20, D40) | their wrappers, their `commands.toml`, their agents' `HERD_TOKEN` | the exit-code table (`herdctl/src/main.rs:200-236`), the `ran on:` line with `OUTPUT_FORMAT_VERSION` (Q7, D110), the stderr `job-id:` line; the verdict document of `run|wait --verdict-to FILE`, carrying `VERDICT_FORMAT_VERSION` (D166, section 3.2) |
+| Releases | the tag, three binaries, `SHA256SUMS`, the notice, the image (D132, D153) | pinning a version in `/etc/nixos` and `.env`, moving the fleet | the GitHub release page and `deploy/release-notice.md`; **shipping again since v0.3.4** — three binaries, `SHA256SUMS` and the image archive, no credentials (D162, section 3.5) |
 | Status and events | UNBUILT: M13's JSON status document and events (E-35, E-37) | the renderer, the ntfy topic, the dashboard | the versioned schema, once it exists (section 4) |
 | Documentation | `deploy/README.md`, `docs/joining.md`, `docs/runner-confinement.md`, `docs/architecture.md`, UNBUILT `docs/operating.md` | reading them before changing a figure; their own runbooks on top | the OWNER vocabulary: every step marked OWNER is theirs by definition |
 | Diagnosis | the sentences on the record (E-04, E-36), the hub's log lines, the runner's journal lines | reading them, on their machines | a bug report: hub version, runner version, job id, the verdict, the record directory (section 6, O-6) |
@@ -86,8 +92,12 @@ spawns `@probe@`, gets `ENOENT`, and reads the capability as
 (`herd-runner/src/capability.rs:639`), which **suspends** it (D49). So
 `kvm` and `gpu-venus` are suspended for as long as that file stands, and
 every job needing them waits with a true sentence that nobody reads.
-That is their fix to make — and section 3.1 is ours, because a runner
-that lets this happen silently is not one we may hand over.
+That is their fix to make — and section 3.1 was ours, because a runner
+that lets this happen silently is not one we may hand over. Ours is
+done: since D165 a runner handed that file refuses to start, naming the
+file, the capability and the program, and `herd-runner check
+--capabilities FILE` says the same before a restart. Theirs stands
+until the templates are substituted.
 
 **The data roots are theirs, including the part Herd cannot clean.** The
 spool under the runner's `outputs/` holds trees the consumer's jobs
@@ -97,20 +107,78 @@ own log shows the same family turning into verdicts: three jobs ended
 `stopped_by_cap` on disk because the runner *could not measure* a
 directory it may not read (**server**, `docker logs herd-hub-1`,
 j0000000984, j0000000989, j0000001197). The bytes are theirs to free;
-the misreporting is ours to fix (section 3.2).
+the misreporting was ours and is fixed: since D166 a workspace the
+runner is refused ends the job `SetupFailed`, exit 125, naming the
+path, and never a disk cap at 124 (section 3.2).
 
 **The pin is theirs.** `/etc/nixos/flake.nix:15` (**server**) reads
 `herd.url = "github:tomasalexandre18/Herd/v0.3.2"`, the live unit runs
 `herd-runner-0.3.2`, the hub container is `herd-hub:0.3.3`. Moving a pin
 is "the deliberate act of upgrading the runner", in the owner's own
 comment on that line. Under the boundary it stays deliberate and becomes
-theirs, with one obligation attached (O-1).
+theirs, with one obligation attached (O-1). Those three figures were read
+before the gate release; a supported pin today is **v0.3.4** or the tag
+before it, v0.3.3 (O-1), and v0.3.2 is under both. Nothing in section 3
+reaches a machine until the pin moves.
 
-## 3. What must be built before the handover is honest
+## 3. The gate: what had to be built, and where it stands
+
+### 3.0 Where the gate stands
+
+Re-read at `5b1021e` on the evening of 2026-10-23. Six of the seven
+items below are built; the seventh is not. Four of the six are in
+**v0.3.4**, the gate's own release, cut at 17:43; the other two landed
+on `main` after the tag and are **in no release**, so the gate as
+shipped software is smaller than the gate as merged work. Nothing in
+either reaches the fleet until the pin moves off v0.3.2 (O-1).
+
+| Item | State | What landed, and where it differs from the plan |
+|---|---|---|
+| 3.1 an unstartable probe refuses the file; `herd-runner check` | **met, in v0.3.4** | D165. The refusal is at *file load*, before the process is a runner, and D49's runtime rule is untouched — the distinction 3.1 asked to be written in the code is written in D165 |
+| 3.2 a verdict a machine can read | **met, on `main`, in no release** | D166, merged at 18:02, after v0.3.4 was cut. As `run\|wait --verdict-to FILE` and not `--json`: a document carrying `VERDICT_FORMAT_VERSION`, `cause`, `exit_code_from`, `job_exists`, `ran_on`, the cap's figures and the prose `herdctl` printed. With it the permission lie: a workspace the runner is refused is `SetupFailed` at exit 125, never a disk cap at 124 |
+| 3.3 the seven module options | **met, in v0.3.4** | D163, plus one thing this plan ruled out and the code made free: `args_override_self` on the runner, so a repeated flag takes the value stated last and `extraArgs` can override after all |
+| 3.4 a persisted `drain` is read as `off` | **met, in v0.3.4** | D164, as planned, reason rewritten to say the drain happened and that the switch is now `off` |
+| 3.5 a release that ships | **met, in v0.3.4** | D162, the recommendation taken: no credential preflight, the three binaries published first, the hub image attached as a `docker load` archive. v0.3.4 carries the three binaries, the archive and `SHA256SUMS`, and is the first release since v0.3.0 |
+| 3.6 versions you can see | **met for the runner, not for the hub; on `main`, in no release** | D166 puts a runner's build and every suspended capability with its reason on `herdctl runner list` and on `herdctl switch`. The hub's own version is **not** on that listing: it travels on `Welcome` and `herdctl` drops it (`herdctl/src/lib.rs:1395`), so O-6's report is where a hub version still comes from |
+| 3.7 a reading costed and bounded | **not met** | nothing landed. A reading is still minted with no figures (`herd-hub/src/server.rs:2724`), `memory_need_mib` still answers `Ok(None)` for a job that declares none (`herd-hub/src/job.rs:1100-1123`), the matcher still reserves `unwrap_or(0)` (`herd-hub/src/matcher.rs:441`), and no `--readings-per-runner` exists. Four processes on a two-slot runner, accounted as two |
+
+Also landed on `main` and in no release, and nowhere in this plan:
+**D167**, a job is reported finished only once its declared outputs
+have reached the hub. The
+consumer found it after the handover — `herdctl wait --outputs-to`
+returned *successfully* while files were still arriving, one job short
+195 of 657 — and it is the worst defect Herd has had. A gate about an
+instance that cannot be judged from outside did not foresee a verdict
+that was itself untrue; nothing in section 3 would have caught it.
+
+**So the gate is substantially met and not cleared.** Two of its three
+headings are done as code: a release that ships (released), and a
+verdict a machine can read (merged, untagged). The third — an instance
+that does not lie to its operator — is done but for 3.7, which is the
+one part of it an operator cannot see at all and cannot bound: the hub
+puts processes on their machine and weighs them at zero. One item,
+costed at a day, plus a tag that carries D166 and D167.
+
+**And the handover did not wait for the gate.** It was announced on
+2026-10-23 before any of these seven landed, and the consumer accepted
+it with a full inventory of the defects they were taking on
+(orchestrator's report; no GitHub issue records the exchange). D161's
+third rejected alternative — *hand over now and fix the gate
+afterwards* — was rejected as a plan and is what happened anyway, with
+that inventory standing where the gate was meant to stand. So nothing
+below is a precondition that was waited for. It is the obligation the
+handover created, and six of its seven items were discharged inside the
+day.
+
+What follows is the analysis that produced those seven items, kept as it
+was written: the reasoning is the record of why each one exists, and the
+state of each is in the table above and in the line that opens its
+subsection.
 
 The test case is the placeholder bug: an operator must be able to tell a
 healthy runner from a half-dead one **without reading our source**.
-Today they cannot, and here is exactly why, in the code:
+When this was written they could not, and here is exactly why, in the
+code:
 
 1. the probe is read *beside* the join, not before it
    (`herd-runner/src/lib.rs:2111-2118`), so a runner with an unstartable
@@ -132,6 +200,8 @@ nowhere an operator does. Five candidates were weighed; the verdict on
 each follows, then the three that gate the handover.
 
 ### 3.1 A runner that refuses what it cannot do, and a check to run first
+
+**Built, D165, in v0.3.4.**
 
 **Build: a startup refusal and a `check` subcommand.** Two changes in
 `herd-runner`, no protocol move.
@@ -164,6 +234,11 @@ jobs queued behind them, found by us reading their disk.
 
 ### 3.2 A verdict a machine can read
 
+**Built, D166, on `main` and in no release yet**, as `run|wait
+--verdict-to FILE` rather than `--json`: a file and not stdout, so the
+prose a person reads stays exactly where it was. The `SetupFailed` half
+below landed with it.
+
 **Build: `herdctl wait|run --json`, printing the serialised `JobOutcome`
 plus the runner's name, the attempt list and the outputs manifest.**
 `JobOutcome` is already `Serialize` (`herd-proto/src/lib.rs:720`);
@@ -184,9 +259,18 @@ measure the job's workspace" (**server**, the three jobs above). That is
 a lie wearing a cap's clothes: the job did not exceed anything. It
 becomes `CouldNotStart`-class, exit 125, naming the path and the uid
 that owns it — the D158 message already computes the path. This is the
-Herd half of grievance 7; the other half is O-4.
+Herd half of grievance 7; the other half is O-4. As built it is a new
+`SetupFailed` and not `CouldNotStart`: D166's reason is that
+`CouldNotStart` means Herd never got a process at all, so reporting a
+workspace it was refused that way would hide the one fact the report
+exists for. Exit 125 either way.
 
 ### 3.3 The seven module options
+
+**Built, D163, in v0.3.4** — and one line more than "nothing else":
+`args_override_self` on the runner's parser, which makes the repeated
+flag below take its last value, so `extraArgs` overrides too. The
+objection in "Not done" was to *silence*; clap's own rule is not silent.
 
 **Build: seven `mkOption`s, and nothing else in the module.**
 `deploy/nixos-herd-runner.nix:116-118,132-135` renders `--job-log-cap
@@ -206,6 +290,8 @@ into two values on one line, and a module option is what a NixOS
 operator expects.
 
 ### 3.4 Drain does not loop
+
+**Built, D164, in v0.3.4.**
 
 The trap, verified end to end: a switch is persisted under the data root
 (`herd-runner/src/switch.rs:95`); `Drain` means "this runner leaves once
@@ -236,6 +322,13 @@ re-enabled. Cost of this fix: an hour. Cost of leaving it: an operator
 we have just made responsible for restarts, shipped a restart loop.
 
 ### 3.5 A release that ships
+
+**Fixed, D162, in v0.3.4**, the recommendation below taken whole: no
+Docker Hub, no credentials, the image archive attached to the release,
+the binaries published before it. One thing went differently from step 1
+of section 9: the v0.3.3 tag was not re-run, v0.3.4 was cut instead, so
+**v0.3.1, v0.3.2 and v0.3.3 still have no release** and the page shows
+v0.3.0 then v0.3.4.
 
 **Finding, not in either analysis:** `.github/workflows/release.yml` has
 **failed on every tag since D153 landed** — v0.3.1, v0.3.2 and v0.3.3
@@ -273,6 +366,14 @@ veto the binaries: the image step fails its own step, not the release.
 
 ### 3.6 Versions you can see
 
+**Half built, D166, on `main` and in no release yet.** `ApprovedRunner`
+gained `facts`, a
+`#[serde(default)]` field carrying the runner's build and its suspended
+capabilities with their reasons, printed by `herdctl runner list` and by
+`herdctl switch`. The hub's own version did not join the listing: it is
+on `Welcome` and `herdctl` discards it, so a hub version reaches us only
+through O-6's report. That residue is small and named, not forgotten.
+
 **Build: the build version on `ApprovedRunner` and in `herdctl runner
 list`, and the hub's version on the same listing.** `Hello` already
 carries `peer_version` and the hub already judges it with `version_gap`
@@ -285,6 +386,9 @@ with us asking which version they run, and `docs/status.md:13` saying
 side.
 
 ### 3.7 A reading weighs what it puts on the machine
+
+**Not built. This is the one gate item still open**, and every line of
+it below was re-read at `5b1021e` and still holds.
 
 A requirement reading is admitted against memory while declaring none,
 and nothing bounds how many run on one runner. The chain, re-read:
@@ -354,6 +458,11 @@ Of the seven above, three are the gate; the other four ride with them.
 3. **A verdict and a report a machine can read** (3.2) — the one
    artefact that lets a bug cross the boundary with its evidence.
 
+Where the three stand on the evening of 2026-10-23: 1 is done and
+released; 3 is done and merged, in no tag yet; 2 is done but for 3.7.
+So two of three are cleared as code, one of three has reached a release,
+and the gate is not cleared. 3.0 has it item by item.
+
 Not in the gate, and said so: M13's status document (section 4) — it is
 what *replaces* our reading of their disk and is the first thing after
 the gate, but a handover does not wait for it; the owner's switch works,
@@ -372,10 +481,10 @@ it is a real loss. Four things replace it, in order of arrival:
 
 | Access lost | What replaces it | When |
 |---|---|---|
-| reading `job.json` and `waiting_for` on their volume | `herdctl wait --json` (3.2) in the bug report, and the record directory tarred (O-6) | gate |
-| `journalctl -u herd-runner` on their host | `herd-runner check` output (3.1) in the report; the startup refusal making the common case impossible | gate |
+| reading `job.json` and `waiting_for` on their volume | `herdctl wait --verdict-to FILE` (3.2) in the bug report, and the record directory tarred (O-6) | merged, **needs a tag** |
+| `journalctl -u herd-runner` on their host | `herd-runner check` output (3.1) in the report; the startup refusal making the common case impossible | **in v0.3.4** |
 | `du` on `files/` and the sweeper's log line | the hub's startup line already prints the budget; M13's status document carries use-against-budget, evictions so far, and the floor (D152 "what M12 still owes") | M13 |
-| counting suspended capabilities across the fleet | `herdctl runner list` showing version and suspended capabilities with reasons; M13's document carrying the same | gate (listing), M13 (document) |
+| counting suspended capabilities across the fleet | `herdctl runner list` showing version and suspended capabilities with reasons; M13's document carrying the same | listing merged, **needs a tag**; M13 (document) |
 | our own end-to-end runs against the deployed pair | **nothing replaces this fully.** The suite's real-binary tests and `scripts/release-smoke.sh` stay; the deployed pair stops being our test bed. Section 8, R6 | — |
 
 **M13 moves to first after the gate**, and its shape changes slightly
@@ -404,7 +513,7 @@ do instead; "theirs" is what they do instead.
 | freeing their disk (the spool, the first eviction) | O-3 and O-4; the hub says when it evicts and the runner names the directory it cannot remove |
 | keeping `docs/status.md` as a picture of *their* deployment | `docs/status.md` describes the **software**: what is merged, what is released, what is unbuilt. Its "The host, as it really is" section goes; the facts in it move to `docs/operating.md` as *an example deployment, read on 2026-10-23* |
 | counting their fleet in our plan (the server, the PC, "more machines later") | the plan names capabilities we support, not machines we run. M17 becomes a supported-platform milestone, not a joining (section 7) |
-| being "waiting on Alexa for a Docker Hub account" | the decision in 3.5 |
+| being "waiting on Alexa for a Docker Hub account" | the decision in 3.5, taken the same day: no registry, the archive on the release (D162) |
 
 What we do **not** stop: owning every defect in the four crates, the
 unit, the module and the compose file, however it was found; answering a
@@ -420,8 +529,13 @@ building.
 - **O-1 — Run a supported version.** A supported version is the newest
   tag or the one before it. A report against anything older gets one
   answer: upgrade and retry. We in turn promise that a tag always ships
-  (3.5) and that a protocol move is announced in the release notice as a
-  fleet-wide restart (`deploy/env.example:21-26`).
+  (3.5, kept since D162 — v0.3.4 is the first release since v0.3.0) and
+  that a protocol move is announced in the release notice as a
+  fleet-wide restart (`deploy/env.example:21-26`). The newest tag is
+  **v0.3.4** and the server's pin is v0.3.2, two tags under it, so the
+  fleet is already below what this obligation asks — and the next tag
+  will put it three under, because D166 and D167 are merged and
+  untagged.
 - **O-2 — Own the pin and the restarts.** `/etc/nixos`, `.env`, the
   units, `Restart=`, the reboot. We never touch them; `deploy/` is a
   reference they copy or import (D130, the module's header).
@@ -442,8 +556,8 @@ building.
   tokens. `herd-runner check` (3.1) runs in their generator before the
   restart, and a runner that refuses to start is theirs to read.
 - **O-6 — Report with evidence.** A report carries: the hub version and
-  the runner version (3.6), the job id, `herdctl wait <id> --json`
-  (3.2), and the job directory `jobs/<id>/` tarred — `job.json`,
+  the runner version (3.6), the job id, `herdctl wait <id> --verdict-to
+  FILE` (3.2), and the job directory `jobs/<id>/` tarred — `job.json`,
   `events.jsonl`, `log`, never `files/`. For a capability: `herd-runner
   check` output. For a runner: `journalctl -u herd-runner --since` the
   incident. Anything less is answered with this list.
@@ -485,8 +599,8 @@ it reconciles with the scope review's four waves.
 | M16 | merged | survives as **the deployment reference** | compose, unit, module, notice — the artefacts of section 2; the server stops being "the" deployment and becomes the one that was walked |
 | M17 | planned | **becomes "WSL2 is a supported platform"**: `wsl2-check.sh` with its automount and interop checks made failing (review 2.2), the user-unit recipe, E-30's ceiling measured once on real hardware. **The joining itself is theirs** (E-49's thirty minutes become a claim they time, not one we walk) | the PC is the owner's, and the owner is now on the operating side of this line |
 | M18 | planned | survives, **inverted**: the gated acceptances are closed by *them* walking `docs/coverage.md` against the release, with us answering | acceptance was always paced by their side (plan.md M18) |
-| Requirement readings (D74, D159) | merged, in service | survive, **costed and bounded** in the gate (3.7); moving them into the requester's checkout is **proposed to the consumer**, never removed alone | `labels_from` is their mechanism in service; what the hub can promise about it today is nothing |
-| **M19** (new) | — | **the handover itself**: the gate of section 3, `docs/operating.md`, O-1..O-9 agreed or refused, `docs/status.md` rewritten as software state | this document's own completion criterion |
+| Requirement readings (D74, D159) | merged, in service | survive, **costed and bounded** in the gate (3.7) — **the one gate item still open**; moving them into the requester's checkout is **proposed to the consumer**, never removed alone | `labels_from` is their mechanism in service; what the hub can promise about it today is nothing |
+| **M19** (new) | — | **the handover itself**: the gate of section 3 (built but for 3.7 — D162-D165 in v0.3.4, D166 and D167 merged and untagged), `docs/operating.md` (unwritten), O-1..O-9 agreed or refused (unanswered), `docs/status.md` rewritten as software state (done, 2026-10-23) | this document's own completion criterion; the handover was announced before any of it, so M19 is now what it owes rather than what it waits for |
 
 **Reconciling with the scope review's four waves.** The review ordered:
 wave 0 cut the unbuilt (M15d, M14's scheduler, M11/M12 peer-to-peer);
@@ -515,33 +629,44 @@ tool by which a `RECORD_VERSION` move can ever be *theirs* to run.
 
 | # | Risk | What answers it |
 |---|---|---|
-| R1 | **A fleet nobody watches.** Today two capabilities have been dead for a day and the only alarm was us reading their disk. After the handover there is no us | 3.1 makes the common case a refused startup; `herdctl runner list` (3.6) and M13 make the rest visible; O-5 puts the check in their generator. Honest residue: a probe that *becomes* unstartable after start is still only a line on a record |
+| R1 | **A fleet nobody watches.** Two capabilities had been dead for a day and the only alarm was us reading their disk. After the handover there is no us | answered: 3.1 makes the common case a refused startup (D165, in v0.3.4), and `herdctl runner list` names the build and every suspension (D166, merged, untagged); M13 makes the rest visible; O-5 puts the check in their generator. Two honest residues: a probe that *becomes* unstartable after start is still only a line on a record, and none of it watches anything until the pin moves off v0.3.2 |
 | R2 | **A bug report with no reproduction.** "Herd lost my pack" with no job id, against a hub we cannot see | O-6 and 3.2: a report is a verdict JSON and a record directory, or it is returned with the list. The record is plain files (E-53) precisely so this works |
-| R3 | **Version skew that makes every grievance unanswerable.** Already real: the server runs 0.3.2, `status.md` says 0.2.0, the grievances were filed against 0.3.0 and one of them (dedup by commit) was fixed in 0.3.1 | O-1 (newest two tags), 3.5 (a tag that ships), 3.6 (the version on the listing and in the report) |
+| R3 | **Version skew that makes every grievance unanswerable.** Already real: the server runs 0.3.2, the grievances were filed against 0.3.0 and one of them (dedup by commit) was fixed in 0.3.1; D167 was reported against runner 0.3.2 with hub 0.3.3 | O-1 (newest two tags), 3.5 (a tag that ships, kept: v0.3.4), 3.6 (the runner's version on the listing, the hub's only in the report). The skew is wider after the gate, not narrower: v0.3.4 holds four fixes the running fleet does not have, and `main` holds two more that no tag carries |
 | R4 | **Loss of measurement access.** Every decisive number came from their disk; this agent could already not re-read two of them | section 4: the report, the listing, M13. Residue: we will no longer *discover* a problem; we will be told. That is the decision |
 | R5 | **Drift between our reference texts and their copies.** They fork the unit, lower a figure in one place and not the other, and the module header's warning (`nixos-herd-runner.nix:21-28`) comes true | the seven options (3.3) remove the main reason to fork; `docs/operating.md` names the unit as the reference; O-6's report includes `systemctl cat herd-runner` |
 | R6 | **Losing the real test bed.** Every milestone's e2e ran against the real binaries and, since M16, against the deployed pair; the consumer's jobs found D158, D139, D128 | the suite's real-binary tests, `release-smoke.sh` and `image-smoke.sh` stay in CI. What is lost is *their* jobs on *our* watch — replaced by M18 inverted: they walk coverage against a release and report. Accept the loss; name it |
 | R7 | **The two-sided bug.** The spool (D158) is a permission on their side and a misreport on ours; the readings cap (grievance 6) is a flag on their side and a refuse-not-queue on ours. Each side can wait for the other | every two-sided item in this document names both halves and which section or obligation owns each. The rule: we ship our half without waiting for theirs |
 | R8 | **The boundary is organisational, not personal.** The owner of Herd also owns the consumer and the server; the ssh session is one keystroke away and will stay so | the rule in section 5 is for *this project's* work: a fact about a running instance enters this repository only through a report or a release. When the owner reads his own server as the consumer's operator, he writes down what he read as the consumer would |
-| R9 | **The gate becomes a wall.** Seven items before "honest" can grow into six months | the gate is scoped at five to six days of work total (3.1 one day, 3.2 one day, 3.3 half, 3.4 an hour, 3.5 half, 3.6 half, 3.7 one day) and ships as **one release, v0.3.4**. Anything not in it is after it |
+| R9 | **The gate becomes a wall.** Seven items before "honest" can grow into six months | it did not: six of the seven were built on 2026-10-23, against a budget of five to six days, and four of them shipped as **v0.3.4** the same afternoon. The residue is 3.7 (one day) and a tag for D166 and D167 — a wall only if it waits, which is why 3.0 says the gate is not cleared rather than calling it done |
 
-## 9. The order, and the first step this week
+## 9. The order, and what is already behind it
 
-1. **This week — the owner decides D161** (the boundary as written here)
-   and the one question inside it that changes an artefact: Docker Hub
-   or the archive on the release (3.5, recommendation: the archive).
-   Then **the first step**: one pull request that makes `release.yml`
-   publish binaries and the image archive without credentials, and a
-   re-run of the v0.3.3 tag so that **v0.3.3 exists as a release**. Half
-   a day; it unblocks everything after it and gives the consumer the fix
-   they are missing (D159, the slot-free reading) on a page they can
-   download from.
-2. **The gate, as v0.3.4** — 3.1, 3.2, 3.3, 3.4, 3.6, 3.7 and
-   `PR_SET_DUMPABLE`, one branch each, small commits, five to six
-   days. With it `docs/operating.md`: what the hub prints, what the
-   runner prints, the ten lines of `docs/joining.md` "When it does not
-   work" extended, O-6's report recipe, the figures and what each
+Steps 1 and 2 are done, on 2026-10-23, and are left here as written with
+what actually happened under each. The rest stands.
+
+1. **Done — the owner decided D161**, and took the one question inside
+   it the recommended way: no Docker Hub, the image archive on the
+   release (D162). `release.yml` publishes the three binaries first and
+   attaches the archive, with no credential preflight. It went
+   differently in one respect: the v0.3.3 tag was not re-run. **v0.3.4**
+   was cut instead and is the first release since v0.3.0, so v0.3.1,
+   v0.3.2 and v0.3.3 remain tags with no release, and the fix the
+   consumer was missing (D159, the slot-free reading) reaches them in
+   v0.3.4.
+2. **Done but for one item, and only half of it released** — the gate
+   was built in a day rather than five: 3.5 (D162), 3.3 (D163), 3.4
+   (D164) and 3.1 (D165) went out in **v0.3.4** at 17:43; 3.2 and 3.6's
+   runner half (D166) and D167 merged after it, so they are on `main`
+   and **in no release**. The next tag is what finishes this step.
+   **Not built at all: 3.7 and `PR_SET_DUMPABLE`** — a reading is still
+   costed at zero and unbounded, and `PR_SET_DUMPABLE` is still nowhere
+   in the workspace. Still
+   unwritten with them: `docs/operating.md` — what the hub prints, what
+   the runner prints, the ten lines of `docs/joining.md` "When it does
+   not work" extended, O-6's report recipe, the figures and what each
    guards, the example deployment read on 2026-10-23 and marked as such.
+   That document is now the next thing after 3.7, because O-5 and O-6
+   both point at it.
 3. **The message to the consumer** — the owner's to send, drafted by us
    from the grievance response: the probe is not substituted and `kvm`
    and `gpu-venus` are dead until it is; the dedup-by-commit fix is in
@@ -563,42 +688,71 @@ Alexa").
 ## 10. Where the code and the two analyses disagree
 
 Checked on purpose, reported as findings. The two analyses are the scope
-review and the grievance response of 2026-10-23.
+review and the grievance response of 2026-10-23. Each finding is left as
+it was written and closed, or not, at `5b1021e` on the evening of the
+same day.
 
 1. **The release has not shipped since v0.3.0.** Neither document says
    so; both treat the Docker Hub step as "written and never run". It is
    worse: the credential check *refuses the whole run*, so v0.3.1,
    v0.3.2 and v0.3.3 have no binaries on GitHub. Section 3.5.
+   **Closed:** D162 took the preflight out and v0.3.4 shipped three
+   binaries, `SHA256SUMS` and the image archive. Those three tags are
+   still releases nobody ever got.
 2. **`extraArgs` exists** (`nixos-herd-runner.nix:355`). The grievance
    response says the seven flags have "no module option", which is
    true, but a reader could think `extraArgs` is the way out. It is
    not: clap refuses the repeated flag. Section 3.3.
+   **Overtaken:** D163 added the seven options *and* set
+   `args_override_self`, so a repeated flag now takes the value stated
+   last and `extraArgs` is a way out after all. The finding is why the
+   options exist, not an argument against them.
 3. **The first probe sweep is beside the join, not before it.** The
    runner's own comment at `capability.rs:757-759` ("the first sweep
    happens before the runner joins a hub") is stale; `lib.rs:2111-2118`
    explains the change. Consequence for the placeholder bug: the runner
    joins looking healthy and announces the suspension on the same link
-   a moment later. Neither analysis draws this.
-4. **`herdctl` has nine top-level commands, not ten**: `run`, `submit`,
+   a moment later. Neither analysis draws this. **Half closed:** the
+   stale comment is gone — `capability.rs:883` now says the sweep
+   happens beside the join and not in front of it — and D165 makes the
+   unstartable-probe case a refusal before there is a runner at all. The
+   ordering itself is unchanged, so a probe that *becomes* unstartable
+   still announces itself a moment after the join.
+4. **`herdctl` has eight top-level commands, not ten**: `run`, `submit`,
    `would-run`, `switch`, `runner`, `wait`, `cancel`, `raise`, and
    `runner` holds `approve`, `remove`, `list` (`herdctl/src/main.rs:254-
    470`). The response lists `approve` and `remove` as top-level. No
-   consequence.
+   consequence. (This plan first wrote nine over the same eight names;
+   re-counted at `5b1021e`, where the list is unchanged — D166 added
+   flags, not commands. `herd-runner` is the binary that gained one,
+   `check`.)
 5. **The fleet listing carries no version and no suspension**
    (`herd-proto/src/lib.rs:427-449`). The response proposes the
    serialised verdict as the one fix for grievances 9, 10a and 10c; it
    is, but it does not fix *this*, which is where an operator would
-   first look. Section 3.6.
+   first look. Section 3.6. **Closed for the runner, on `main`:** D166
+   put `ApprovedRunner::facts` on the listing — the build, and each
+   suspended capability with its reason. The hub's own version is still
+   not there, and no release carries any of it yet.
 6. **The hub's log already shows D158 producing false caps**: three
    jobs ended `stopped_by_cap` on disk because a directory could not be
    measured (**server**, `docker logs herd-hub-1`). The response
    suspects grievance 7's 124 "very probably" comes from this; the log
-   makes it certain for those three.
-7. **D160 is taken.** `docs/decisions.md` on `main` ends at D159;
-   PR #54 appends D160. The entry for this document is **D161**, and
-   the file will show a gap at D160 until #54 merges — the file's own
-   note on D143 (`decisions.md:4880-4884`) says a gap is acceptable and
-   monotonic order is what matters. There is also no D154.
+   makes it certain for those three. **Closed on our half, on `main`:**
+   D166 ends such a job `SetupFailed` at exit 125, naming the path. No
+   release carries it yet, and D158's deposit is still theirs to free
+   (O-4).
+7. **D160 is taken, and so are 162 to 167.** `docs/decisions.md` ended
+   at D159 when this was written; PR #54 appended D160 the same morning
+   and six more entries landed the same day. So D161's number is in
+   place and its *position* is not: this entry is appended after D167
+   rather than slid into the 161 slot, because the file is append-only
+   and an insertion into the middle of it is not something a reader of
+   the diff can check. That is D148's rule — a decision number cited in
+   code is an identifier, not a position — and D167 ruled the same way
+   from the other side while this branch was open, counting 161 with 143
+   and 154 as a gap "all three under D148's rule". After this merge the
+   gaps left are D143's and D154's.
 8. **The review's "no non-Nix host exists"** for M15d is true today and
    would stop being true the day the PC joined by release binary. Under
    the boundary it does not matter: the PC's operator updates it.
@@ -607,18 +761,29 @@ review and the grievance response of 2026-10-23.
    server: `v0.2.0` (line 13) against a pin of v0.3.2; `herd-hub:0.3.1`
    and runner 0.3.0 (line 32) against 0.3.3 and 0.3.2; and "M11's
    registry frames" (PR #54's finding 1). It is the orchestrator's to
-   replace, in step 5 above.
+   replace, in step 5 above. **Done**, on 2026-10-23: it opens on who
+   operates what and carries the three figures. One line of it was
+   overtaken by the evening — it says the newest release is v0.3.0 and
+   that what is missing is a tag, which v0.3.4 answered a few hours
+   later. That is the file's own to carry, not this document's.
 10. **A reading weighs zero and is unbounded** (section 3.7). The scope
     review filed the D119/D159 asymmetry under "a sentence, not code",
     and the grievance response repeated it. The source — `server.rs:2459`
     against `:2449`, `job.rs:1114`, `matcher.rs:441` — says it is a
     defect in the accounting. Raised by the orchestrator after the
     review, verified here, and the one place where this plan reverses
-    one of the two documents rather than refining it.
+    one of the two documents rather than refining it. **Stands**, and is
+    the one gate item still open: re-read at `5b1021e`, where the
+    mint is at `server.rs:2724`, `memory_need_mib` at `job.rs:1100-1123`
+    and the reservation at `matcher.rs:441`, all unchanged in substance.
 
 Everything else both documents assert about the code was re-read and
 holds: `@probe@` verbatim in the live file, the seven literal flags on
 the live unit, the drain semantics, the sweeper measuring only `files/`,
 `version_gap` at the handshake, `JobOutcome` serialisable, no pack frame
 on either enum, no `PR_SET_DUMPABLE` anywhere, `SetSwitch` dispatched on
-the requester role.
+the requester role. Of those, two have moved since: the seven literal
+flags are options (D163) and `JobOutcome` is now serialised for a
+requester by name (D166). `PR_SET_DUMPABLE` is still absent, the pack
+frame is still on neither enum, and `SetSwitch` still rides the
+requester token.
