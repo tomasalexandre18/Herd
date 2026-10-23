@@ -61,7 +61,7 @@ assets are static musl binaries: nothing on the machine, no toolchain,
 no clone. Take the version you want from the releases page.
 
 ```sh
-v=v0.3.3
+v=v0.3.4
 base=https://github.com/tomasalexandre18/Herd/releases/download/$v
 curl -fLO $base/herd-runner-${v#v}-x86_64-unknown-linux-musl
 curl -fLO $base/SHA256SUMS
