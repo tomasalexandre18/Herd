@@ -1834,6 +1834,23 @@ pub trait JobStore: Send + Sync + 'static {
     /// before its evidence has all crossed.
     fn collections_owed(&self) -> Result<Vec<CollectionOwed>>;
 
+    /// The same question about **one** job: is this hub still owed any of
+    /// this collection?
+    ///
+    /// `None` means there is nothing left to wait for, and it says so for
+    /// every reason there is — the job left no files, they rode the verdict,
+    /// they are all here at their declared length, or the sweeper took them.
+    /// `Some` means bytes are genuinely outstanding, and names the runner
+    /// that owes them.
+    ///
+    /// **One definition, asked two ways** (D79). [`JobStore::collections_owed`]
+    /// is this answer over every record, which is what a runner's redial
+    /// needs; this is what a *verdict* needs, because a verdict is about one
+    /// job and walking the whole store to answer for one of them is the work
+    /// D152 refused to do once per verdict. Both read the same completeness
+    /// test off the same disk, so the two cannot disagree (D167).
+    fn collection_owed(&self, id: &JobId) -> Result<Option<CollectionOwed>>;
+
     /// What this store was told its output budget is, for the line the hub
     /// prints at startup and for a test that wants to read it back.
     fn output_budget(&self) -> Budget;

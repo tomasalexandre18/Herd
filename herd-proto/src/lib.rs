@@ -492,6 +492,30 @@ impl RunnerFacts {
     }
 }
 
+/// What a frame that does not mention it means by `wants_files`: **yes**
+/// (D167).
+///
+/// A requester asks the hub to hold a job's verdict until the job's output
+/// files have all reached it, because one that fetches on the verdict while
+/// they are still crossing gets a short collection and no word about it. The
+/// field is how a requester that wants no files declines the wait — and its
+/// **absence has to fail towards waiting**, because the frames that leave it
+/// out are the ones from a `herdctl` built before it existed. Defaulted the
+/// other way, every deployed requester would be handed the early verdict and
+/// put straight back into the defect by the upgrade that fixed it.
+///
+/// The same reasoning as [`RunnerSwitch::facts`]' default, in the direction
+/// this field's silence has to mean: an absent field says what the peer did
+/// not say, and the safe reading of that silence is the one that costs a
+/// little waiting rather than the one that costs a wrong answer.
+///
+/// A defaulted field does not move [`PROTOCOL_VERSION`] (D124, D128): an
+/// older peer's frame still decodes, and this one's reading of it is the
+/// behaviour that peer already had.
+fn wants_files_unless_told() -> bool {
+    true
+}
+
 /// What one runner's switch is, as the hub reports the fleet's (E-33).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RunnerSwitch {
@@ -1290,7 +1314,18 @@ pub enum ToHub {
     /// job in a second shape would be a dry run whose answer is about a
     /// slightly different job than the one a submission makes, and that is
     /// exactly the lie E-07 must not tell.
-    SubmitJob { asked: Asked },
+    SubmitJob {
+        asked: Asked,
+        /// Whether this requester is going to fetch the job's output files,
+        /// so the hub holds the verdict until they are all there (D167).
+        ///
+        /// **Beside `asked` and not inside it**, because it is a fact about
+        /// *this follower* and not about the job: two requesters following
+        /// one job may answer differently, and [`ToHub::DryRun`] carries the
+        /// same [`Asked`] and has no files to want.
+        #[serde(default = "wants_files_unless_told")]
+        wants_files: bool,
+    },
     /// Requester asks where a job **would** run, and for nothing to happen
     /// (E-07).
     ///
@@ -1360,7 +1395,13 @@ pub enum ToHub {
     /// job by its id alone. A job that is already over is answered at once
     /// from the hub's record, which is why the hub's state has to be durable
     /// for this message to mean anything.
-    WaitForJob { job_id: JobId },
+    WaitForJob {
+        job_id: JobId,
+        /// Whether this requester is going to fetch the job's output files
+        /// (D167). See [`ToHub::SubmitJob`]'s field of the same name.
+        #[serde(default = "wants_files_unless_told")]
+        wants_files: bool,
+    },
     /// Runner reports that it has spawned the job's process.
     JobStarted { job_id: JobId, attempt: u32 },
     /// Runner reports output. `seq` counts chunks per job, across both

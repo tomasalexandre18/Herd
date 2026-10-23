@@ -7402,3 +7402,204 @@ D161's, and all three stand under D148's rule. One entry rather than three,
 because the three are one decision about who the reader is — and because
 doing them apart would have meant three branches touching the same four
 files in the same week.
+
+---
+
+## 2026-10-23 — D167 A job is finished when its evidence is here
+
+**The first consumer, now the only operator of this fleet, reported the worst
+defect Herd has had and reported it properly: with job ids, versions, and the
+transfer itself already ruled out.** Runner 0.3.2, hub 0.3.3, herdctl 0.3.3.
+Job `j1586` was recorded finished at **14:11:43**; its files went on arriving
+until **14:12:40**; a `herdctl wait --outputs-to` that fetched at 14:12:20 was
+told **195 of 657** files were not there — *"did NOT get … the hub does not
+have it"* — and a second `herdctl wait` minutes later got all of them.
+`j1578` and `j1580` were 268 and 273 files short the same way. The gap
+between "finished" and the last output was **55 to 130 seconds**, and they
+were working around it per build.
+
+**Nothing was lost and nothing was broken. The word *finished* was wrong.**
+Their own first move was to check that every object of every pack was on the
+record, and it was. What the hub did was relay `FromHub::JobFinished` the
+moment it had written the end, carrying whatever `read_the_outputs` found on
+the disk *at that instant* — and a streamed collection arrives **after** the
+verdict by design (D148). D150 then fixed `is_current` precisely so that a
+file chunk arriving after the verdict is not dropped. So this is not a slip
+in one function: the system was built to expect late arrivals and built to
+report the job over before them. **"This job finished successfully" and "this
+job's evidence is on the hub" were two different facts reported as one.**
+
+**The choice: the verdict waits, and the record does not.** The consumer
+offered two shapes — report finished only when the outputs are here, or make
+`wait` block while they are in flight — and the answer is the first, with one
+line of the second's reasoning kept. `ToHub::JobFinished` still records the
+end exactly when it did; what is held back is only the sentence a requester
+reads, in memory, per job. Three reasons, and the first is the one that
+decides it:
+
+1. **Recording the end is what frees the slot.** Confirmed in
+   `matcher::out_there` rather than assumed: a dispatch pass counts a job as
+   occupying its runner for exactly as long as the record says an attempt is
+   open there — `Assigned | Running | Interrupted` with no `ended_at` — and
+   from nothing else (D79). `holdings`, `reserved` and the admission algebra
+   all read that one filter. So delaying the write would have held a build
+   slot for up to two minutes after the work was done, on machines with one
+   or two of them, once per job. Holding the *frame* touches nothing the
+   matcher reads.
+2. **A requester is not only `herdctl`.** Their tooling keys off the verdict;
+   so would anything else. Fixing the requester would leave the hub still
+   saying something untrue, and the next consumer would find it again.
+3. **It is what D148 already promised** — *"`--outputs-to` waits for what it
+   asked for and says so"* — delivered at the end that can keep it.
+
+**It cannot wait for ever, and the bound has two legs because the failures
+are two.** `COLLECTION_SILENCE`, 30 s, on *silence* and never on duration: a
+few hundred megabytes on a slow link is slow and not broken, and a deadline
+on the transfer itself would make the fleet's biggest jobs the ones that
+fail. The figure is twice the runner's own stall sentence, so the machine
+sending the bytes speaks before the hub speaks for it, and it is the same
+figure as the requester's own fetch bound (D150) so that the two cannot
+disagree about when a transfer stopped. A constant and not a flag: nothing an
+operator can tune makes it better. The other leg needs no clock at all — **a
+runner that is not connected is sending nothing**, so a held verdict whose
+owing machine has gone is released at once, naming it. That is also what
+answers a `herdctl wait` an hour later on a collection that never completed:
+immediately, rather than after half a minute of nothing.
+
+**And a wait that cannot be rewarded must not be silent.** A held verdict
+says why it is held, on the clock that already keeps a followed job's stream
+alive (E-04's precedent, and `still_there_every`'s cadence) — *"this job has
+ended and its files are still arriving: 462 of 661 output file(s) and 338 MiB
+of 400 MiB have reached this hub from wsl-pc"*. Sixty seconds of waiting is
+four such lines instead of a minute of silence after a job the requester
+watched finish. It is one mechanism and not two on purpose: the note **is**
+the traffic that keeps the link warm, and `say_again_why_jobs_wait` gives a
+job whose record is terminal neither a restatement nor a breath — right when
+a follower was always dropped at the verdict, and a hole the moment one is
+not.
+
+**Who waits: the requester says, and that is the second half of this
+entry.** The first shape held every verdict, whoever was following, because
+the hub cannot guess which requester is going to fetch — so a `herdctl run`
+with no `--outputs-to`, which receives no byte of the collection and never
+asks about it, paid the minute or two the bytes take. D148 had promised that
+such a run *"exits on the verdict and waits for nothing"*, and that promise
+was going to be broken as an accepted cost, on the argument that a field on
+the wait frame was protocol surface while a branch was in `herd-proto`.
+That argument expired when the branch merged, and Alexa pulled the line the
+same hour. It was the right call: an accepted cost that nobody has to accept
+is just a defect with a paragraph in front of it.
+
+So `wants_files` rides `SubmitJob` and `WaitForJob`, the hub keeps it **per
+follower** rather than per job, and one verdict goes to some followers at
+once while the rest of them wait. Two requesters on one job answering
+differently are both right, which is the whole shape: `herdctl run --command
+build` is told the moment the end is recorded, and the `herdctl wait
+<id> --outputs-to` beside it is told when its collection is whole.
+
+**The field's default is the load-bearing part, and it defaults the way
+silence has to fail.** Absent means *wants them*. The frames that leave it
+out are the ones from every `herdctl` already deployed, so defaulted the
+other way the upgrade that fixed this defect would have handed every
+existing requester the early verdict and put it straight back in — the fix
+arriving as a regression, for exactly the people it was for. `bool`'s own
+`Default` is `false`, so the safe answer is the one a reader would least
+expect, which is why it is a named function with the reasoning on it and why
+`a_wait_that_predates_wants_files_is_read_as_wanting_them` asserts it off
+literal bytes rather than off today's types. Same shape as D166's `facts`,
+whose absence means "this hub did not say": an absent field reports what the
+peer did not tell you, and the safe reading of that silence is the one that
+costs a little waiting rather than the one that costs a wrong answer. A
+defaulted field moves no version number (D124, D128), so this still ships
+without a coordinated restart.
+
+**Beside `asked`, not inside it.** `Asked` is shared with `DryRun` by E-07's
+own safety property — a dry run must describe the same job a submission
+makes — and a dry run has no files to want. It is also not a fact about the
+job at all: it is a fact about one follower, and two followers of one job
+disagree about it by design.
+
+**The exit code, which is where this entry contradicts an earlier one.**
+D148 ruled that on an incomplete fetch *"the job's exit code stands"*, with
+`--outputs-required` as the flag for anyone who wanted it fatal — and that
+flag was never built, so for a year the honest answer to a short collection
+was a loud sentence and a **zero**. That is what the consumer was working
+around: a wrapper cannot act on a sentence. So `herdctl` now exits **2** —
+*"a command did part of what it says and named the rest"*, D99's code, with
+its existing meaning rather than a second one — and exits it in exactly one
+case: `--outputs-to` was given, the collection came back short, and the job's
+own code was **0**. A failing build whose screenshots are short still exits
+1, a job stopped by a cap still exits 124, a job with no verdict still exits
+125. **The only code replaced is the one that says "everything you asked for
+happened".**
+
+That is not a repeal of D20. D20 forbids a side channel becoming *a verdict
+about the job*: the verdict is printed, is on the record, is unaltered, and
+2 is `herdctl` speaking about itself. 125 keeps its single meaning, which is
+the property the project has defended twice. `a_collection_the_sweeper_took_…`
+asserted the 0 and now asserts the 2, with its D20 paragraph rewritten rather
+than deleted — a collection retention took is also a `--outputs-to` that
+wrote a short directory, and one rule with no special cases is worth more
+than a kind answer for the evicted case.
+
+**And D166's document is where that distinction gets made in a field rather
+than in a sentence**, which is the field doing the work it was added for.
+A 2 is not the job's code, so the document says `"exit_code_from": "herd"`
+beside it; without that a reader would go looking for a build that exited 2
+and there was none. `passed` is deliberately left **true** for a green build
+whose files are short, because `passed` is the *job's* verdict and turning it
+false would be the D20 violation this entry just argued against. What tells a
+wrapper the run was incomplete is the code, that field beside it, and the
+sentence in `said` naming how many files of how many are missing — which is
+why the sentence is returned out of `keep_the_outputs` and pushed onto `said`
+rather than printed where it is discovered. A wrapper reading the document
+and keying on `passed` alone would still act on an incomplete set; the code
+is the signal, and it is the one the consumer's `run.sh` already reads.
+
+**One finding that contradicts the brief, and it is why the suite was
+green.** `herdctl::fetch_missing_outputs` *does* wait, and has since D150. It
+gave up anyway, and the reason is arithmetic: each round asks only for what
+is still missing, and reported the bytes of **that round**. The first round
+of a 657-file collection is by far the biggest, so every round after it
+reported less than the best figure seen, however many files it had just
+collected — `since` never reset, and the stall bound fired 30 s later on a
+transfer that was arriving normally. 14:11:43 plus the first round plus
+thirty seconds is 14:12:20, which is the minute the consumer measured. **With
+a one-file collection the figure is monotonic by accident**, and one file is
+what the suite streamed, which is exactly how this stayed invisible. The
+progress figure is now seeded with what earlier rounds already hold. The hub
+side above would have masked this defect without fixing it; both are fixed,
+and only one of them was in the brief.
+
+**What is proven, and how.** `herd-hub/tests/outputs_whole.rs` runs a real
+hub, a real runner and a real declared job leaving **33 files of a megabyte**
+— over the inline threshold in total, and *many*, which is the shape that
+hid this — with a hand-written requester that fetches the **instant** it is
+told the job finished, once, with no retry. With the hold stubbed out it
+reports `did NOT get 33 of 33 file(s)`, which is the field failure
+reproduced at smaller figures; with the fix, nothing is absent. The same file
+asserts the honest end: a runner that announces a collection and goes away
+without sending a byte of it leaves a wait that **ends**, naming the machine
+that owed the bytes, with the file named off the manifest that outlives them.
+And a third test is the one the field made possible: two followers on one
+job, one wanting files and one not, with the second holding its verdict while
+the first still has none — judged off `collection_owed` rather than off a
+sleep, so a run that reaches it with the collection already complete **fails
+saying nothing was measured** instead of passing quietly. `herdctl` asserts
+the exit code either way, including that a failing build keeps its 1 and that
+D166's `SetupFailed` passes through untouched.
+
+**What is deliberately not done.** `read_the_outputs` and its neighbours are
+untouched beyond the one call site. No **frame** was added: the sentence
+rides `FromHub::JobNote`, which every deployed `herdctl` already reads, and
+the one new field is defaulted, so this ships without a version move and
+without a coordinated restart — which for a defect being worked around per
+build is most of its value. `JobStore::collection_owed` is new and
+`collections_owed` is now written in terms of it: one definition of complete,
+asked two ways, because walking every record to answer about one job is the
+work D152 refused to do per verdict.
+
+**On the number.** D167, after D166, which merged while this was being
+written and whose `exit_code_from` this entry leans on. D161 is still held by
+an unmerged branch, so the gaps are D143's, D154's and D161's, all three
+under D148's rule.

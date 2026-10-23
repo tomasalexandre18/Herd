@@ -356,10 +356,12 @@ fn every_message_to_the_hub_round_trips() {
         // A dry run carries exactly what a submission carries (E-07).
         round_trip_to_hub(ToHub::SubmitJob {
             asked: full.clone(),
+            wants_files: true,
         });
         round_trip_to_hub(ToHub::DryRun { asked: full });
         round_trip_to_hub(ToHub::SubmitJob {
             asked: bare.clone(),
+            wants_files: false,
         });
         round_trip_to_hub(ToHub::DryRun { asked: bare });
         round_trip_to_hub(ToHub::RaiseJob {
@@ -369,6 +371,7 @@ fn every_message_to_the_hub_round_trips() {
     }
     round_trip_to_hub(ToHub::WaitForJob {
         job_id: JobId::new("j0000000001"),
+        wants_files: true,
     });
     round_trip_to_hub(ToHub::JobStarted {
         job_id: JobId::new("j1"),
@@ -799,10 +802,11 @@ fn a_log_payload_is_base64_in_the_frame_and_comes_back_byte_for_byte() {
 fn the_durability_frames_are_tagged_json_objects() {
     assert_eq!(
         to_frame(&ToHub::WaitForJob {
-            job_id: JobId::new("j0000000042")
+            job_id: JobId::new("j0000000042"),
+            wants_files: true,
         })
         .expect("encodes"),
-        r#"{"type":"wait_for_job","job_id":"j0000000042"}"#
+        r#"{"type":"wait_for_job","job_id":"j0000000042","wants_files":true}"#
     );
     assert_eq!(
         to_frame(&FromHub::JobResultAck {
@@ -1359,5 +1363,54 @@ fn a_verdict_from_a_build_that_predates_a_job_s_outputs_still_decodes() {
     assert!(
         !today.contains("outputs"),
         "a job that kept nothing must put nothing on the wire: {today}"
+    );
+}
+
+/// **The direction an absent `wants_files` has to default in** (D167).
+///
+/// A requester asks the hub to hold a job's verdict until the job's output
+/// files have all reached it, because one that fetches on the verdict while
+/// they are still crossing gets a short collection. The field is how a
+/// requester that wants no files declines that wait — and the frames that
+/// leave it out are the ones from every `herdctl` built before it existed.
+///
+/// So the default has to be **true**, and this is the test that says so.
+/// Defaulted the other way, the upgrade that fixed the defect would have
+/// handed every deployed requester the early verdict and put it straight
+/// back into the defect; and `bool`'s own `Default` is `false`, so the safe
+/// answer here is the one a reader would least expect. The frames are
+/// written out literally rather than built from today's types, for the
+/// reason the test above gives: a frame built from today's types would pass
+/// even if the default had been inverted.
+#[test]
+fn a_wait_that_predates_wants_files_is_read_as_wanting_them() {
+    let wait = r#"{"type":"wait_for_job","job_id":"j0000000042"}"#;
+    match from_frame::<ToHub>(wait).expect("an older requester's wait decodes") {
+        ToHub::WaitForJob { wants_files, .. } => assert!(
+            wants_files,
+            "a wait that does not say must be read as wanting this job's files: \
+             silence fails towards waiting, never towards a short collection"
+        ),
+        other => panic!("that is not a wait: {other:?}"),
+    }
+
+    let submission = r#"{"type":"submit_job","asked":{"command":["true"],
+        "priority":"step"}}"#;
+    match from_frame::<ToHub>(submission).expect("an older requester's submission decodes") {
+        ToHub::SubmitJob { wants_files, .. } => assert!(wants_files),
+        other => panic!("that is not a submission: {other:?}"),
+    }
+
+    // And said out loud when it is given, in both directions: an operator
+    // reading a frame off a link sees which answer this requester gave,
+    // rather than having to know what an absent field means.
+    let says_no = to_frame(&ToHub::WaitForJob {
+        job_id: JobId::new("j0000000042"),
+        wants_files: false,
+    })
+    .expect("encodes");
+    assert!(
+        says_no.contains(r#""wants_files":false"#),
+        "a requester that declines the wait says so on the wire: {says_no}"
     );
 }
