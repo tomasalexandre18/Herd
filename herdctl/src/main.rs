@@ -7,9 +7,9 @@ use clap::{Parser, Subcommand};
 use herd_proto::{JobId, JobOutcome, LabelSet, LogStream, Priority};
 use herdctl::verdict::{JobExists, Verdict};
 use herdctl::{
-    could_not_start_message, exit_code_for, impossible_exit_code_reason, job_id_line,
-    no_verdict_message, no_verdict_reason, setup_failed_message, stopped_by_cap_message, Config,
-    DEFAULT_HUB_URL, JOB_UNKNOWN_LINE, NO_JOB_LINE, NO_VERDICT_CODE,
+    could_not_start_message, impossible_exit_code_reason, job_id_line, no_verdict_message,
+    no_verdict_reason, setup_failed_message, stopped_by_cap_message, Config, DEFAULT_HUB_URL,
+    JOB_UNKNOWN_LINE, NO_JOB_LINE, NO_VERDICT_CODE,
 };
 
 /// What this invocation knows about whether a job of its own exists.
@@ -226,7 +226,10 @@ Exit codes:
                  refused it, could not be reached, or the machine it ran on
                  could not do its own part. Never a failing build
   128 + n        the job was killed by signal n, as a shell reports one
-  2              a command did part of what it says and named the rest
+  2              a command did part of what it says and named the rest —
+                 including `--outputs-to` on a job that passed whose output
+                 files did not all arrive. The verdict still stands and is
+                 printed; every missing path is named on stderr
 
 For a requester that is a program: --verdict-to
   `herdctl run --verdict-to <FILE>` and `herdctl wait --verdict-to <FILE>`
@@ -526,7 +529,18 @@ enum Done {
     ///
     /// Boxed because it is much the largest of the three and every other
     /// arm would otherwise carry its weight.
-    Job(Box<herdctl::Finished>),
+    Job {
+        finished: Box<herdctl::Finished>,
+        /// The sentence naming the output files `--outputs-to` was promised
+        /// and did not get, or `None` when it got all of them or was never
+        /// given (D167).
+        ///
+        /// Carried out of [`keep_the_outputs`] rather than printed there,
+        /// because it belongs in the verdict document beside the others: a
+        /// wrapper reading that file is the reader this fact is for, and it
+        /// is also what makes this invocation exit non-zero.
+        short_of_its_files: Option<String>,
+    },
     /// The command did its own job; nothing ran.
     Said,
     /// The command did **part** of what it says, and said which part on
@@ -552,6 +566,34 @@ enum Done {
 /// that is a job with no verdict. 2 is free, and the sentence on stderr is
 /// what a person reads either way.
 const NOT_SETTLED_CODE: u8 = 2;
+
+/// What a run exits with, given how the job ended and whether the files its
+/// requester asked for all arrived (D167).
+///
+/// **The job's verdict always wins when it has one to give.** A failing build
+/// whose screenshots are short exits 1, because the build failing is the more
+/// important fact and the missing files are named on stderr beside it; a job
+/// stopped by a cap still exits 124, a setup failure still exits what D166
+/// gave it, and one with no verdict still exits 125. The one code this
+/// replaces is **0** — and that is the whole of the change, because 0 is the
+/// only code that says "everything you asked for happened". A requester that
+/// passed `--outputs-to`, got a short directory and read a zero would act on
+/// an incomplete set, which is what the first consumer was working around at
+/// a cost per build.
+///
+/// It does not reopen D20. D20 is about a side channel never becoming a
+/// *verdict about the job*: the verdict is printed, is in the document, and
+/// is not altered here. 2 is `herdctl` speaking about itself — "a command did
+/// part of what it says and named the rest" — which is exactly what a fetch
+/// that wrote eight files of twelve did. The document says so in as many
+/// words, because `exit_code_from` then reads `herd` rather than `job`
+/// (D166's own field, doing the work it was added for).
+fn code_for(outcome: &JobOutcome, files_short: bool) -> u8 {
+    match herdctl::exit_code_for(outcome) {
+        0 if files_short => NOT_SETTLED_CODE,
+        code => code,
+    }
+}
 
 /// Where a verdict document goes, and what this invocation already knew
 /// about the job it is about (D166).
@@ -630,7 +672,10 @@ async fn main() -> ExitCode {
     let reporting = Reporting::of(&args.command);
     let known = Cell::new(WhatExists::default());
     match run(args, &known).await {
-        Ok(Done::Job(finished)) => {
+        Ok(Done::Job {
+            finished,
+            short_of_its_files,
+        }) => {
             // Each sentence goes to stderr, never to stdout: stdout carried
             // the job's own output and must stay the job's alone. They are
             // **kept** as well as printed, so that a wrapper reading the
@@ -665,11 +710,26 @@ async fn main() -> ExitCode {
             if let Some(reason) = no_verdict_reason(&finished.outcome) {
                 said.push(no_verdict_message(&reason));
             }
+            // The shortfall last, after the per-file lines `keep_the_outputs`
+            // has already written, and in `said` rather than straight to
+            // stderr so that the document carries it too (D167).
+            let files_short = short_of_its_files.is_some();
+            if let Some(sentence) = short_of_its_files {
+                said.push(sentence);
+            }
             for sentence in &said {
                 eprintln!("herdctl: {sentence}");
             }
-            let code = exit_code_for(&finished.outcome);
-            reporting.write(&Verdict::of(&finished, said, code));
+            let code = code_for(&finished.outcome, files_short);
+            let verdict = Verdict::of(&finished, said, code);
+            // And whose number it is. A 2 is this command's own, never the
+            // job's, so the document must not label it `job` — which is the
+            // distinction D166 added the field to be able to draw.
+            reporting.write(&if files_short {
+                verdict.with_herd_s_own_code()
+            } else {
+                verdict
+            });
             ExitCode::from(code)
         }
         Ok(Done::Said) => ExitCode::SUCCESS,
@@ -744,7 +804,13 @@ async fn run(args: Args, known: &Cell<WhatExists>) -> Result<Done> {
             eprintln!("herdctl: {}", submitting_at(job.priority));
             // Each stream is written to its own, so a caller's pipes and
             // redirections behave as if the command had run here.
-            let finished = herdctl::run_job(
+            let finished = herdctl::run_job_wanting(
+                // Whether the hub holds this job's verdict until its output
+                // files have all reached it (D167). Said here, where the flag
+                // that decides it lives, so that a `herdctl run` which asked
+                // for no files still exits on the verdict and waits for
+                // nothing — D148's promise, kept.
+                wanting(&keeping),
                 &config,
                 job.command,
                 job.labels,
@@ -761,8 +827,11 @@ async fn run(args: Args, known: &Cell<WhatExists>) -> Result<Done> {
                 |said| say_it(known, said),
             )
             .await?;
-            keep_the_outputs(&config, &keeping, &finished).await;
-            Ok(Done::Job(Box::new(finished)))
+            let short_of_its_files = keep_the_outputs(&config, &keeping, &finished).await;
+            Ok(Done::Job {
+                finished: Box::new(finished),
+                short_of_its_files,
+            })
         }
         Action::Submit {
             labels,
@@ -929,7 +998,8 @@ async fn run(args: Args, known: &Cell<WhatExists>) -> Result<Done> {
             // arrives afterwards. Without it a detached requester could only
             // read a job's output by reading the hub's state directory, which
             // a requester on another machine cannot do (D22).
-            let finished = herdctl::wait_for_job(
+            let finished = herdctl::wait_for_job_wanting(
+                wanting(&keeping),
                 &config,
                 JobId::new(job_id),
                 |stream, data| match stream {
@@ -939,8 +1009,11 @@ async fn run(args: Args, known: &Cell<WhatExists>) -> Result<Done> {
                 |said| say_it(known, said),
             )
             .await?;
-            keep_the_outputs(&config, &keeping, &finished).await;
-            Ok(Done::Job(Box::new(finished)))
+            let short_of_its_files = keep_the_outputs(&config, &keeping, &finished).await;
+            Ok(Done::Job {
+                finished: Box::new(finished),
+                short_of_its_files,
+            })
         }
         Action::Cancel { job_id } => {
             let note = herdctl::cancel_job(&config, JobId::new(job_id)).await?;
@@ -1144,12 +1217,24 @@ fn labels_of(labels: Vec<String>) -> Result<LabelSet> {
 /// does not never pays for hundreds of megabytes it was going to throw away.
 /// That is why `herdctl run` with no flag still exits on the verdict and
 /// waits for nothing, which is exactly what it did before streaming existed.
+///
+/// **It comes back with the sentence naming what is short, if anything is**
+/// (D167). A requester that asked for files and did not get all of them must
+/// not read a zero, so the answer reaches the exit code through [`code_for`]
+/// — and the sentence goes with it, because the verdict document is where a
+/// wrapper reads this and `said` is the field it reads it from. A short set is
+/// a fact about this fetch and not about the job, so it never touches the
+/// verdict itself.
 async fn keep_the_outputs(
     config: &herdctl::Config,
     keeping: &Keeping,
     finished: &herdctl::Finished,
-) {
+) -> Option<String> {
     let mut collection = finished.outputs.clone();
+    // A fetch that failed outright leaves nothing in hand, and a requester
+    // that asked for files has then certainly not got them: short, whatever
+    // the manifest says.
+    let mut could_not_fetch = None;
     if keeping.outputs_to.is_some() {
         match herdctl::fetch_missing_outputs(config, &finished.job_id, &mut collection).await {
             Ok(said) => {
@@ -1157,14 +1242,16 @@ async fn keep_the_outputs(
                     eprintln!("herdctl: {line}");
                 }
             }
-            // Said and not fatal, for D20's reason: the verdict is the job's
-            // and a side channel never becomes one. A requester that needs
-            // the files to be there checks that itself — the lines above name
-            // every one that is missing, so there is nothing to guess at.
-            Err(error) => eprintln!(
-                "herdctl: the files {} left could not be fetched: {error:#}",
-                finished.job_id
-            ),
+            // Never the verdict, for D20's reason: the verdict is the job's
+            // and a side channel never becomes one. It is the exit code of
+            // *this command* that changes, because this command was asked for
+            // files and did not come back with them (D167).
+            Err(error) => {
+                could_not_fetch = Some(format!(
+                    "the files {} left could not be fetched: {error:#}",
+                    finished.job_id
+                ));
+            }
         }
     }
     let outputs = &collection;
@@ -1185,23 +1272,64 @@ async fn keep_the_outputs(
                 outputs.count()
             );
         }
-        return;
+        return None;
     };
+    // **What is short, counted off the manifest and not off the directory.**
+    // An entry with no bytes is one this requester was promised and does not
+    // have, whichever way it travelled and whatever became of it — still
+    // crossing when the wait gave up, taken by the hub's sweeper, or never
+    // sent at all. The manifest outlives the bytes (D148), so the count is
+    // honest for all three.
+    let missing = outputs.files.iter().filter(|file| !file.is_held()).count();
+    let mut could_not_write = None;
     match herdctl::write_outputs(directory, outputs) {
         Ok(written) => {
             for line in written {
                 eprintln!("herdctl: {line}");
             }
         }
-        // Said and not fatal: the verdict is the answer the caller is waiting
-        // for and it has already been established. A requester that cannot
-        // write to the directory it named has a problem with that directory,
-        // not with the job.
-        Err(error) => eprintln!(
-            "herdctl: the files {} left could not be written under {}: {error:#}",
+        // The sentence is said and the verdict stands; what this costs is
+        // this command's own exit code (D167). A requester that cannot write
+        // to the directory it named has a problem with that directory, not
+        // with the job — and has not got the files either.
+        Err(error) => {
+            could_not_write = Some(format!(
+                "the files {} left could not be written under {}: {error:#}",
+                finished.job_id,
+                directory.display()
+            ));
+        }
+    }
+    // **One sentence naming the shortfall, after the per-file lines.** A
+    // reader who has just seen 195 lines needs the count and the
+    // consequence, and a wrapper needs to find the reason without parsing
+    // 195 lines — which is what the verdict document's `said` is for, so
+    // this is returned rather than printed here (D167).
+    if let Some(sentence) = could_not_fetch.or(could_not_write) {
+        return Some(sentence);
+    }
+    if missing > 0 {
+        return Some(format!(
+            "{}: {missing} of {} output file(s) are not here. Every missing path is named \
+             above and every one is still on this job's record. This run did part of what it \
+             says, so it does not exit 0.",
             finished.job_id,
-            directory.display()
-        ),
+            outputs.files.len(),
+        ));
+    }
+    None
+}
+
+/// Whether this invocation is going to fetch the job's output files (D167).
+///
+/// One question, one answer, off the one flag that decides it: `--outputs-to`
+/// is the whole of "this requester will fetch them", and a `herdctl run`
+/// without it still exits on the verdict and waits for nothing.
+fn wanting(keeping: &Keeping) -> herdctl::Wanting {
+    if keeping.outputs_to.is_some() {
+        herdctl::Wanting::Files
+    } else {
+        herdctl::Wanting::OnlyTheVerdict
     }
 }
 
@@ -1238,6 +1366,59 @@ fn write_now(out: &mut impl Write, data: &[u8]) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// **A short collection never exits 0, and never overwrites a verdict**
+    /// (D167).
+    ///
+    /// The two halves are one rule and have to be asserted together, because
+    /// each on its own is a plausible mistake. Reporting the job's code
+    /// whatever happened is the behaviour the first consumer was working
+    /// around: a green build with 195 of 657 files missing exited 0, and a
+    /// wrapper acting on that acted on an incomplete set. Reporting 2
+    /// whenever anything was missing would be the opposite mistake — a
+    /// failing build whose screenshots are short would stop reading as a
+    /// failing build, which is what D20 forbids.
+    #[test]
+    fn a_short_collection_costs_the_zero_and_nothing_else() {
+        let passed = JobOutcome::Exited { code: 0 };
+        assert_eq!(code_for(&passed, false), 0, "nothing missing, nothing said");
+        assert_eq!(
+            code_for(&passed, true),
+            NOT_SETTLED_CODE,
+            "a job that passed and files that did not arrive is a run that did part of \
+             what it says"
+        );
+
+        // Every code that *is* a verdict, or a named end, outranks the
+        // shortfall: it is the more important fact and the missing files are
+        // named on stderr beside it.
+        for (outcome, code) in [
+            (JobOutcome::Exited { code: 1 }, 1u8),
+            (JobOutcome::Exited { code: 75 }, 75),
+            (JobOutcome::Signalled { signal: 9 }, 128u8.saturating_add(9)),
+            (
+                JobOutcome::Lost {
+                    reason: "its runner went away".to_owned(),
+                },
+                herdctl::NO_VERDICT_CODE,
+            ),
+            // D166's ending, passed through untouched: a setup failure is
+            // not a short collection and must not start reading as one.
+            (
+                JobOutcome::SetupFailed {
+                    reason: "its runner may not read the capability file".to_owned(),
+                },
+                herdctl::NO_VERDICT_CODE,
+            ),
+        ] {
+            assert_eq!(
+                code_for(&outcome, true),
+                code,
+                "{outcome:?} keeps its own code whether or not the files arrived"
+            );
+            assert_eq!(code_for(&outcome, false), code);
+        }
+    }
 
     /// The step back a refusal authorises is **one** transition, and the
     /// ratchet keeps its meaning everywhere else (D139, D142).

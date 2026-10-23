@@ -2367,49 +2367,55 @@ impl JobStore for JobDirStore {
             .map_err(|error| failed("listing", &self.jobs_dir(), &error))?
         {
             let id = JobId::new(name);
-            // A record that will not read is not a collection to chase. It is
-            // a louder problem than this, and recovery says so where it
-            // belongs (D52); here it is simply skipped.
-            let Ok(Some(record)) = JobStore::job(self, &id) else {
-                continue;
-            };
-            if !record.outputs.streamed || record.outputs.files.is_empty() {
-                continue;
+            // One job's answer, from the one place that knows it. A record
+            // that will not read is not a collection to chase: it is a louder
+            // problem than this, and recovery says so where it belongs (D52);
+            // here it is simply skipped.
+            if let Some(collection) = JobStore::collection_owed(self, &id)? {
+                owed.push(collection);
             }
-            // **A collection the sweeper took is not one anybody still owes**
-            // (D152). Without this the two mechanisms would fight: an
-            // evicted collection fails `collection_is_whole` for exactly the
-            // same reason an unfinished one does, so the hub would ask its
-            // runner to send the bytes again and sweep them again, for ever
-            // — and a requester asking for it would be told to keep waiting
-            // for something that is never coming back.
-            if record.outputs.removed.is_some() {
-                continue;
-            }
-            // The one definition of complete, shared with every other
-            // caller: in `files/`, at the manifest's length, verified.
-            // **Not** off the holdings below — a part file at full length is
-            // not a finished file, and judging it so told requesters their
-            // collection had stopped coming in the window where its digest
-            // was still being checked.
-            if self.collection_is_whole(&id, &record) {
-                continue;
-            }
-            let held = self.output_holdings(&id)?;
-            // Whoever ran the attempt that produced it. No attempt means a
-            // record nothing can be asked of, which is not a state a streamed
-            // collection can honestly be in — skipped rather than guessed at.
-            let Some(attempt) = record.attempts.last() else {
-                continue;
-            };
-            owed.push(crate::job::CollectionOwed {
-                job_id: id,
-                attempt: attempt.number,
-                runner: attempt.runner.clone(),
-                held,
-            });
         }
         Ok(owed)
+    }
+
+    fn collection_owed(&self, id: &JobId) -> Result<Option<crate::job::CollectionOwed>> {
+        let Ok(Some(record)) = JobStore::job(self, id) else {
+            return Ok(None);
+        };
+        if !record.outputs.streamed || record.outputs.files.is_empty() {
+            return Ok(None);
+        }
+        // **A collection the sweeper took is not one anybody still owes**
+        // (D152). Without this the two mechanisms would fight: an evicted
+        // collection fails `collection_is_whole` for exactly the same reason
+        // an unfinished one does, so the hub would ask its runner to send the
+        // bytes again and sweep them again, for ever — and a requester asking
+        // for it would be told to keep waiting for something that is never
+        // coming back.
+        if record.outputs.removed.is_some() {
+            return Ok(None);
+        }
+        // The one definition of complete, shared with every other caller: in
+        // `files/`, at the manifest's length, verified. **Not** off the
+        // holdings below — a part file at full length is not a finished file,
+        // and judging it so told requesters their collection had stopped
+        // coming in the window where its digest was still being checked.
+        if self.collection_is_whole(id, &record) {
+            return Ok(None);
+        }
+        let held = self.output_holdings(id)?;
+        // Whoever ran the attempt that produced it. No attempt means a record
+        // nothing can be asked of, which is not a state a streamed collection
+        // can honestly be in — skipped rather than guessed at.
+        let Some(attempt) = record.attempts.last() else {
+            return Ok(None);
+        };
+        Ok(Some(crate::job::CollectionOwed {
+            job_id: id.clone(),
+            attempt: attempt.number,
+            runner: attempt.runner.clone(),
+            held,
+        }))
     }
 }
 

@@ -108,6 +108,10 @@ async fn a_quiet_running_job_keeps_its_follower_hearing_from_the_hub() {
                 LabelSet::default(),
                 Priority::Step,
             ),
+            // The safe default, which is also what a requester built
+            // before the field sends (D167): these jobs leave no output, so
+            // holding nothing is what it asks for here.
+            wants_files: true,
         },
     )
     .await;
@@ -310,6 +314,10 @@ async fn a_queued_job_whose_reason_is_not_restated_is_kept_warm_anyway() {
                 LabelSet::of("gated").expect("a label"),
                 Priority::Step,
             ),
+            // The safe default, which is also what a requester built
+            // before the field sends (D167): these jobs leave no output, so
+            // holding nothing is what it asks for here.
+            wants_files: true,
         },
     )
     .await;
@@ -367,6 +375,7 @@ async fn a_follower_of_a_job_that_has_ended_gets_no_liveness_frame() {
         &mut socket,
         &ToHub::WaitForJob {
             job_id: herd_proto::JobId::new(&job),
+            wants_files: true,
         },
     )
     .await;

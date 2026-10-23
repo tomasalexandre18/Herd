@@ -460,7 +460,67 @@ impl Framing {
     }
 }
 
+/// What a requester following a job is going to do about its output files
+/// (D167).
+///
+/// The hub holds a job's verdict until its streamed collection has all
+/// reached it, because a requester that fetches on the verdict otherwise
+/// gets a short directory. That costs a wait, and a requester that is never
+/// going to ask for the files should not pay it — so it says which it is,
+/// and this is that answer in one word at every call site that has to give
+/// it.
+///
+/// [`Wanting::Files`] is the default, in Rust as on the wire: silence has to
+/// fail towards waiting, because the requester that says nothing is the one
+/// built before the question existed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Wanting {
+    /// It will fetch them, so the verdict waits until they are all on the
+    /// hub.
+    #[default]
+    Files,
+    /// It will not, so the verdict comes as soon as it is recorded — which
+    /// is what `herdctl run` with no `--outputs-to` has always done.
+    OnlyTheVerdict,
+}
+
+impl Wanting {
+    fn wants_files(self) -> bool {
+        self == Wanting::Files
+    }
+}
+
+/// Submit a job and follow it to its end, wanting its files.
+///
+/// [`run_job_wanting`] is the same call for a requester that will not fetch
+/// them. This one is the safe default and the one every test uses: it waits
+/// for a collection it is not going to ask for, which costs latency and
+/// cannot give a wrong answer.
 pub async fn run_job(
+    config: &Config,
+    command: Vec<String>,
+    labels: LabelSet,
+    priority: Priority,
+    declared: Declared,
+    on_log: impl FnMut(LogStream, &[u8]),
+    said: impl FnMut(Said),
+) -> Result<Finished> {
+    run_job_wanting(
+        Wanting::default(),
+        config,
+        command,
+        labels,
+        priority,
+        declared,
+        on_log,
+        said,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+pub async fn run_job_wanting(
+    wanting: Wanting,
     config: &Config,
     command: Vec<String>,
     labels: LabelSet,
@@ -477,6 +537,7 @@ pub async fn run_job(
         &mut socket,
         &ToHub::SubmitJob {
             asked: declared.asked(command, labels, priority),
+            wants_files: wanting.wants_files(),
         },
     )
     .await
@@ -617,6 +678,11 @@ pub async fn submit_job_saying(
         &mut socket,
         &ToHub::SubmitJob {
             asked: declared.asked(command, labels, priority),
+            // A `submit` leaves with the id and closes, so it follows
+            // nothing and nothing is ever held for it: the hub drops a
+            // follower when its connection goes. It sends the default rather
+            // than an answer it has no business giving (D167).
+            wants_files: Wanting::default().wants_files(),
         },
     )
     .await
@@ -667,6 +733,18 @@ pub async fn submit_job_saying(
 pub async fn wait_for_job(
     config: &Config,
     job_id: JobId,
+    on_log: impl FnMut(LogStream, &[u8]),
+    said: impl FnMut(Said),
+) -> Result<Finished> {
+    wait_for_job_wanting(Wanting::default(), config, job_id, on_log, said).await
+}
+
+/// The same wait, saying whether this requester will fetch the job's output
+/// files (D167).
+pub async fn wait_for_job_wanting(
+    wanting: Wanting,
+    config: &Config,
+    job_id: JobId,
     mut on_log: impl FnMut(LogStream, &[u8]),
     mut said: impl FnMut(Said),
 ) -> Result<Finished> {
@@ -675,6 +753,7 @@ pub async fn wait_for_job(
         &mut socket,
         &ToHub::WaitForJob {
             job_id: job_id.clone(),
+            wants_files: wanting.wants_files(),
         },
     )
     .await
@@ -1134,6 +1213,22 @@ async fn fetch_once(
     if wanted.is_empty() {
         return Ok((0, false));
     }
+    // **What this requester already holds counts towards the progress it
+    // reports**, and leaving it out was a defect this round could not see
+    // (D167). A round asks only for what is still missing, so the figure it
+    // came back with was the bytes of *that* round — and the first round of a
+    // 657-file collection is by far the biggest. Every round after it
+    // reported less than the first, however many files it had just collected,
+    // so the caller's stall bound saw a transfer that never beat its best and
+    // gave up thirty seconds later on a collection that was arriving
+    // normally. With a one-file collection — which is what the suite streamed
+    // — the figure is monotonic by accident and nothing showed.
+    let mut progress: u64 = outputs
+        .files
+        .iter()
+        .filter(|file| file.is_held())
+        .map(|file| file.len)
+        .sum();
     let mut socket = join(config).await?;
     send(
         &mut socket,
@@ -1145,9 +1240,8 @@ async fn fetch_once(
     .await
     .context("asking the hub for this job's files")?;
     let mut arriving: std::collections::HashMap<String, Vec<u8>> = std::collections::HashMap::new();
-    // How far the whole collection has got, for the caller's stall bound, and
-    // whether any of it is still on its way.
-    let mut progress = 0u64;
+    // Whether any of it is still on its way. The progress figure is above,
+    // seeded with what earlier rounds already collected.
     let mut coming = false;
     loop {
         match next_message(&mut socket).await? {

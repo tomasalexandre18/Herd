@@ -184,6 +184,27 @@ impl Verdict {
         }
     }
 
+    /// The same document, saying that [`Verdict::exit_code`] is **Herd's own
+    /// number and not the job's** (D167).
+    ///
+    /// For the one case where a job that ended perfectly well does not leave
+    /// this invocation exiting 0: `--outputs-to` was given and the collection
+    /// came back short, so `herdctl` exits 2 — *a command did part of what it
+    /// says*. [`ExitCodeFrom::of`] reads the code's origin off the outcome,
+    /// and the outcome says `exited 0`, so without this the document would
+    /// label a 2 as the job's own and a reader would go looking for a build
+    /// that exited 2. There was none.
+    ///
+    /// [`Verdict::passed`] is deliberately **not** touched. The job passed:
+    /// that is the verdict, it is the record's, and a side channel does not
+    /// become one (D20). What says the run was incomplete is the code, this
+    /// field beside it, and the sentence in [`Verdict::said`] naming every
+    /// file that is missing.
+    pub fn with_herd_s_own_code(mut self) -> Self {
+        self.exit_code_from = ExitCodeFrom::Herd;
+        self
+    }
+
     /// The document for a run that got no outcome at all: the hub could not be
     /// reached, it refused the submission, the link went mid-job.
     ///

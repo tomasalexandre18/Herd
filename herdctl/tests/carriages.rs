@@ -332,8 +332,9 @@ async fn a_streamed_collection_reaches_a_requester_that_attaches_afterwards() {
 ///   question is not "did Herd lose it";
 /// * the fetch writes **no file**, and the directory it was pointed at is
 ///   empty rather than short;
-/// * and the job's exit code is still its own (D20): a side channel never
-///   becomes a verdict, not even when the bytes are gone.
+/// * and the **verdict** is still the job's own (D20): a side channel never
+///   becomes a verdict, not even when the bytes are gone — while the exit
+///   code of this *command* says that it did part of what it says (D167).
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_collection_the_sweeper_took_is_answered_with_its_figures() {
     let Some(fixture) = Fixture::new("a_collection_the_sweeper_took_is_answered_with_its_figures")
@@ -428,11 +429,21 @@ async fn a_collection_the_sweeper_took_is_answered_with_its_figures() {
         )
         .await;
     let said = stderr(&waited);
+    // **2 and not 0, and that is D167 rather than a change of mind about
+    // D20.** The job passed and still passed: its verdict is on the record,
+    // is printed, and nothing here alters it. What the code says is that
+    // *this command* was asked for a directory of files and wrote a short
+    // one — "a command did part of what it says and named the rest". A
+    // requester that read a 0 here would act on an incomplete set, which is
+    // the cost the first consumer was paying per build.
     assert_eq!(
         status_code(&waited),
-        0,
-        "the job passed and still passed: a side channel never becomes a verdict (D20). \
-         {said}"
+        2,
+        "a `--outputs-to` that came back short does not exit 0 (D167): {said}"
+    );
+    assert!(
+        said.contains("did part of what it says"),
+        "and the sentence beside the code says what was short: {said}"
     );
     assert!(
         said.contains(RESULTS) && said.contains("removed") && said.contains("output budget"),
