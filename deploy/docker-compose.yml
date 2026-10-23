@@ -4,12 +4,15 @@
 # under docker compose like any other app on the server, with no state
 # outside its own volume (D8).
 #
-# The image comes from Docker Hub, pushed by
-# `.github/workflows/release.yml` on the version tag out of the one
-# derivation that has ever built it, `nix/hub-image.nix` (D153). So a new
-# hub is `docker compose pull` and `up -d`, and no longer a `nix build` and
-# a `docker load` on the server. The local build still works and is still
-# documented in `README.md`; it is no longer the normal way.
+# The image comes as an archive attached to the GitHub release, built on the
+# version tag by `.github/workflows/release.yml` out of the one derivation
+# that has ever built it, `nix/hub-image.nix` (D153 for that rule, D162 for
+# this delivery). So a new hub is: download the archive, `docker load`, name
+# the tag it prints, `up -d`. There is no registry to pull from — `docker
+# compose pull` will fail on a loaded tag, correctly, and is skipped.
+# Building the archive locally with `nix build .#hub-image` instead of
+# downloading it is the same derivation and is still documented in
+# `README.md`.
 #
 # `HERD_HUB_IMAGE` in `.env` names it, **with its version**. There is no
 # `latest` to name: a floating tag is how a hub restarts into a different
@@ -31,13 +34,14 @@ name: herd
 
 services:
   hub:
-    # Set in `.env`, and required there rather than defaulted here: the
-    # Docker Hub account that owns the repository is the operator's, not
-    # this file's, and a default would be a guess that silently ran the
-    # wrong hub. `env.example` says exactly what to put. No `pull_policy`:
-    # the default — pull when the tag is not already local — is what makes
-    # `docker compose pull && docker compose up -d` the upgrade.
-    image: ${HERD_HUB_IMAGE:?set HERD_HUB_IMAGE in .env to the hub image this deployment runs, for example docker.io/NAMESPACE/herd-hub:0.3.0; see env.example}
+    # Set in `.env`, and required there rather than defaulted here: which
+    # version this hub runs is the operator's decision, not this file's, and
+    # a default would be a guess that silently ran the wrong hub — a
+    # floating default is also how a fleet crosses a `PROTOCOL_VERSION`
+    # line nobody chose (D153). `env.example` says exactly what to put: the
+    # tag `docker load` printed. No `pull_policy`: the default is "use what
+    # is already local", which is what a loaded tag is.
+    image: ${HERD_HUB_IMAGE:?set HERD_HUB_IMAGE in .env to the hub image this deployment runs, for example herd-hub:0.3.3 after loading the archive attached to the release; see env.example}
     restart: unless-stopped
 
     # The hub listens on every interface *inside its network namespace*,
