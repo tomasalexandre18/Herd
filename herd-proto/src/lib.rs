@@ -342,12 +342,17 @@ impl Switch {
     pub fn parse(position: &str, reason: Option<&str>) -> Result<Self, String> {
         let said = reason.map(str::trim).filter(|reason| !reason.is_empty());
         match (position, said) {
-            ("on", None) => Ok(Switch::On),
-            ("on", Some(_)) => Err(
-                "switching a runner on takes no reason: a reason is what explains a machine \
-                 being withdrawn"
-                    .to_owned(),
-            ),
+            // A reason on `on` is **accepted and dropped**, never a refusal
+            // (D166). The position carries none because a machine nobody has
+            // withdrawn needs no explaining, and that is still true — but
+            // refusing a command for carrying one extra piece of information
+            // is a bad trade. An operator switching a fleet back on after a
+            // maintenance window types the same `--reason` on every line, and
+            // the one that was `on` was the one that failed. Whoever typed it
+            // is told, where they typed it, that it is not kept; the reason
+            // that stays visible is the **withdrawal's**, which is the one
+            // anybody needs in order to decide to switch back on at all.
+            ("on", _) => Ok(Switch::On),
             ("off", Some(reason)) => Ok(Switch::Off {
                 reason: reason.to_owned(),
             }),
@@ -422,6 +427,71 @@ impl SwitchPersistence {
     }
 }
 
+/// One capability a runner offers and is not handing out, as a fleet listing
+/// shows it (D49, D166).
+///
+/// Its own type rather than a pair of strings, because it travels on two
+/// frames and lands in two commands' output — and because the next thing a
+/// listing will want to say about a suspension, how long it has been one, is
+/// a field here and nothing else.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SuspendedCapability {
+    /// The label nothing may be given right now.
+    pub label: String,
+    /// What said so: the probe's own answer, or that it has not answered yet.
+    pub why: String,
+}
+
+impl SuspendedCapability {
+    /// The clause a fleet listing prints for one suspension.
+    ///
+    /// The runner's name is **not** in it, because the line above it already
+    /// names the machine. The hub's own log says `"<label> is suspended on
+    /// <runner>: <why>"` for the opposite reason — there it is one line among
+    /// a fleet's — and the two share the words an operator greps for.
+    pub fn sentence(&self) -> String {
+        format!("{} is suspended: {}", self.label, self.why)
+    }
+}
+
+/// What a fleet listing says about a connected runner besides its name
+/// (E-51, D49, D166).
+///
+/// One struct on two frames, because `herdctl runner list` and `herdctl
+/// switch` are one question asked from two sides, and an operator must not
+/// have to learn which of them tells the truth about a machine.
+///
+/// **Both fields are optional, and absent means "this hub did not say".** An
+/// empty list of suspensions and a hub that reported none at all are
+/// different facts, and reading the second as the first is how a listing
+/// tells an operator her fleet is healthy when nobody ever asked.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RunnerFacts {
+    /// The build this runner announced in its handshake
+    /// ([`ToHub::Hello`]'s `peer_version`).
+    ///
+    /// The hub already judges it there and serves a minor gap with a note on
+    /// its own stderr (E-51) — a line nobody operating the fleet through
+    /// `herdctl` ever sees. So the figure itself comes to the listing, and
+    /// whoever reads it can compare three machines without a shell on any of
+    /// them.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub version: Option<String>,
+    /// Every capability this runner offers and is not handing out, with the
+    /// reason, as the hub last heard it ([`ToHub::CapabilitiesChanged`]).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub suspended: Option<Vec<SuspendedCapability>>,
+}
+
+impl RunnerFacts {
+    /// The suspensions, when the hub reported any at all. Empty both for a
+    /// fleet with nothing suspended and for a hub that does not say, which is
+    /// why a *line* about them is printed only when there is one to print.
+    pub fn suspensions(&self) -> &[SuspendedCapability] {
+        self.suspended.as_deref().unwrap_or_default()
+    }
+}
+
 /// What one runner's switch is, as the hub reports the fleet's (E-33).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RunnerSwitch {
@@ -432,6 +502,11 @@ pub struct RunnerSwitch {
     pub jobs: u32,
     /// Whether it is also stopping for good (`SIGTERM`, invariant 2).
     pub stopping: bool,
+    /// Its build and its suspended capabilities (D166). Defaulted, so a frame
+    /// from a hub that has never heard of either still decodes — as "this hub
+    /// did not say", which is exactly what it did not.
+    #[serde(default)]
+    pub facts: RunnerFacts,
 }
 
 /// One approved runner, as `herdctl runner list` prints it (E-48).
@@ -446,6 +521,20 @@ pub struct ApprovedRunner {
     pub approved_unix_s: u64,
     /// Whether a runner of that name is connected to this hub right now.
     pub connected: bool,
+    /// Its build and its suspended capabilities, for a runner that is
+    /// connected (D166).
+    ///
+    /// **This is the field that makes the listing an operator's first stop
+    /// rather than a roll call.** A fleet with two capabilities suspended for
+    /// hours, and every job that needed them waiting, read here exactly like
+    /// a healthy one; the only way anybody found out was by reading the
+    /// runner's own disk, which — now that the consumer operates the machines
+    /// and we only ship the software — nobody on this side can do.
+    ///
+    /// Empty for a runner that is not connected: a machine that is not here
+    /// offers nothing, so it suspends nothing.
+    #[serde(default)]
+    pub facts: RunnerFacts,
 }
 
 /// How a log payload travels inside the JSON frame: standard base64, padded.
@@ -779,6 +868,29 @@ pub enum JobOutcome {
     /// Distinct from [`JobOutcome::CouldNotStart`], which is a job Herd tried
     /// to run: this one never reached a machine at all.
     Impossible { reason: String },
+    /// The job reached a machine, ran there, and that machine could not do
+    /// its own part — so there is no verdict to stand behind (D166).
+    ///
+    /// **Not a cap, and not the job failing.** The case this exists for is
+    /// the one the first consumer hit three times: the runner walks the job's
+    /// workspace to hold it to its disk budget and is refused access to a
+    /// path inside it, because the tree was deposited by a process of another
+    /// ownership. The budget cannot be enforced, so the job is ended — that
+    /// much is invariant 2 and is right — but it was being reported as
+    /// `stopped_by_cap` with `cap: disk`, which wears 124 and tells a
+    /// requester a budget killed their build. Nothing of the sort happened.
+    /// A person has to change a file's ownership, and `reason` names the path
+    /// they have to change it on.
+    ///
+    /// Distinct from [`JobOutcome::CouldNotStart`] on two counts, and the
+    /// second is why this is a variant rather than a reuse of it: that one is
+    /// a job Herd never got a process out of, which is false here; and it is
+    /// the one ending the `ran on:` line is deliberately *withheld* for
+    /// (D16), because a job that never started has no output to frame. This
+    /// job ran on a named machine, and that machine's name is the only
+    /// actionable thing in the whole report — the setup that is broken is
+    /// its own.
+    SetupFailed { reason: String },
 }
 
 impl JobOutcome {
@@ -794,6 +906,28 @@ impl JobOutcome {
     /// (D152), and a passing job's evidence is the evidence nobody ever opens.
     pub fn is_success(&self) -> bool {
         matches!(self, JobOutcome::Exited { code: 0 })
+    }
+
+    /// The one word that names what ended the job, for a reader that is a
+    /// program (D166).
+    ///
+    /// **It is the variant's own serde tag, by construction**, so the word in
+    /// a machine-readable verdict and the word on the wire are the same word
+    /// and cannot drift apart. That is the whole reason this is a method here
+    /// and not a `match` in whoever writes the document: a second table of
+    /// these names would be a second answer to "why did this job end", which
+    /// is the question invariant 4 exists to keep single.
+    pub fn cause(&self) -> &'static str {
+        match self {
+            JobOutcome::Exited { .. } => "exited",
+            JobOutcome::Signalled { .. } => "signalled",
+            JobOutcome::CouldNotStart { .. } => "could_not_start",
+            JobOutcome::StoppedByCap { .. } => "stopped_by_cap",
+            JobOutcome::Cancelled { .. } => "cancelled",
+            JobOutcome::Lost { .. } => "lost",
+            JobOutcome::Impossible { .. } => "impossible",
+            JobOutcome::SetupFailed { .. } => "setup_failed",
+        }
     }
 }
 
@@ -2017,6 +2151,28 @@ pub struct AbsentFile {
 /// `^ran on: (\S+) \((.*)\)$` is satisfied exactly (D109).
 pub const OUTPUT_FORMAT_VERSION: u32 = 1;
 
+/// The version of the machine-readable verdict `herdctl --verdict-to` writes
+/// (D166).
+///
+/// A second number rather than a reuse of [`OUTPUT_FORMAT_VERSION`], because
+/// the two framings are parsed by different readers and will not move
+/// together: one is the single line that frames a job's own output on stdout,
+/// the other is a JSON document written to a file. A consumer whose parser
+/// broke because the *other* one moved would have been told nothing useful.
+///
+/// It lives here, beside its sibling, for the reason the version table in
+/// `docs/architecture.md` gives: the numbers a consumer's parser keys on are
+/// the protocol's outward promises and belong in the protocol crate, whoever
+/// happens to print them. It is carried in the document as
+/// `verdict_format_version`, the first field, so a reader can refuse a
+/// version it has never heard of before it reads anything else.
+///
+/// **What moves it.** Removing a field, or changing what one means. Adding a
+/// field does not: every reader of JSON already ignores what it was not
+/// looking for, and a document that gains a field still answers every
+/// question it answered before.
+pub const VERDICT_FORMAT_VERSION: u32 = 1;
+
 /// E-02's first line: where this job ran, and why there.
 ///
 /// Built here rather than in the requester's CLI because the hub's tests
@@ -2092,6 +2248,26 @@ pub fn cap_stop_reason(cap: Cap, limit: u64, detail: Option<&str>) -> String {
             cap.unit()
         ),
     }
+}
+
+/// The one sentence a disk budget nobody was allowed to measure reads as
+/// (D166).
+///
+/// Here, beside [`cap_stop_reason`], because it is the sentence that replaces
+/// one of its cases: a workspace the runner was *refused* is not a cap that
+/// could not be held to, it is a machine that was not set up for the runner
+/// to do its part, and the two must not read alike. It names the figure the
+/// budget was, so nobody has to go looking for it, and then says in so many
+/// words whose problem this is — because the person reading it is a requester
+/// whose build did not fail, and the thing that has to happen next happens on
+/// somebody else's disk.
+pub fn workspace_refused_reason(limit: u64, detail: &str) -> String {
+    format!(
+        "this runner was refused access to the job's own workspace, so it could not hold the \
+         job to its disk budget of {limit} bytes at all: {detail}. The job was ended and has \
+         no verdict; whoever runs this machine has to make that path readable to the user the \
+         runner runs as"
+    )
 }
 
 /// The wording of a version refusal, so that every peer reads one sentence and

@@ -7181,3 +7181,210 @@ unrelated mechanisms observed on one day and invariant 8 asks for one dated
 entry per decision. D160 to D163 are held by branches in flight, so these take
 the next two free numbers; the gaps stay, here and at D143 and D154, under
 D148's rule.
+
+---
+
+## 2026-10-23 — D166 The product says what only a shell could say
+
+**What changed under us, and it changes what this work is for.** As of today
+the first consumer is the **sole operator** of the running system: they own
+the hub container, the runner units, the capability files, the disk, the
+restarts. We ship software; they run it. Until today a person with a shell
+could answer *why did this job fail* and *is the fleet healthy* by reading
+our source and their disk. Now the answer has to arrive in the product,
+because whoever is asking has neither.
+
+Today's proof of what that costs: their capability file carried
+unsubstituted placeholders, every probe failed with ENOENT, `kvm` and
+`gpu-venus` were suspended for hours with every job that needed them
+waiting, and the only reason anybody found out is that we read their disk —
+an access we have both now given up. `herdctl runner list`, which is where
+an operator looks first, said nothing about any of it.
+
+**Choice.** Three things, in one entry because they are one complaint with
+three faces: a machine-readable verdict, a fleet listing that names a
+runner's build and what it is not handing out, and a permission failure
+reported as a setup failure instead of a disk cap.
+
+They close chatOnS's grievances 9 (every verdict names its cause), 10a and
+10c (the runner's name in a machine-readable result), and point 3.2 of the
+scope review (the exit codes are ambiguous and a requester parses prose).
+Grievance 10a's second half is folded in at the end.
+
+### 1. `--verdict-to <FILE>`, and the two fields that earn it
+
+`herdctl run` and `herdctl wait` take `--verdict-to <FILE>` and write the
+job's end as JSON. `JobOutcome` was already `Serialize`; what was missing
+was any way to ask for it.
+
+The document carries the cause in one word, the runner's name and why
+there, a cap's figures when a cap ended the job, the sentences `herdctl`
+printed, the outcome as the wire carries it, and what the runner measured.
+Two of its fields are the reason it exists rather than a convenience:
+
+* `exit_code_from` — `job`, `signal` or `herd`. `herdctl --help`'s own
+  exit-code table admits that a job's **own** exit of 124 or 125 is worn
+  untouched and is therefore indistinguishable from a cap and from Herd
+  having no verdict. One field apart, the three are three:
+  `{"exit_code": 124, "exit_code_from": "job"}` is a build that chose 124,
+  and `{"exit_code": 124, "exit_code_from": "herd"}` is a cap, with `cause`
+  saying which.
+* `job_exists` — `a_job`, `nothing` or `unknown`. This is D109's three
+  stderr lines, which a falling-back requester has had to `sed` for, as a
+  field. The prose stays exactly as it was; nothing about it is withdrawn.
+
+`cause` is the outcome variant's **own serde tag**, through a new
+`JobOutcome::cause()`, so the word in the document and the word on the wire
+cannot drift apart. A second table of those names would have been a second
+answer to "why did this job end", which is what invariant 4 exists to keep
+single.
+
+**A file and never a stream.** stdout is the job's own output, framed and
+nothing else (E-02), and stderr carries Herd's prose that the same wrapper
+is already reading a line at a time; a JSON document spliced into either is
+one nobody can parse reliably. A caller that wants it on a pipe names one:
+`--verdict-to /dev/fd/3`.
+
+**Written however the run ends**, no verdict included — `cause` is then
+`no_verdict`. The alternative was to leave no file, and that is the worse
+failure: a wrapper reading the document would find the *previous* run's and
+act on the previous run's answer. Failing to write it is said loudly on
+stderr and never changes the exit code, for the reason `--outputs-to`
+already has: the verdict is the answer the caller is waiting for and a path
+the requester named and cannot write is a problem with that path.
+
+**The version follows the precedent rather than inventing one.**
+`OUTPUT_FORMAT_VERSION` is a `u32` in `herd-proto`, carried inside the
+thing it versions, documented with what moves it, and listed in the version
+table in `docs/architecture.md`. So `VERDICT_FORMAT_VERSION` is a `u32` in
+`herd-proto` beside it, carried as the document's **first** field so a
+reader can refuse a version before it reads anything else, and in the same
+table. A second number rather than a reuse of the first, because the two
+framings are parsed by different readers and will not move together.
+Adding a field does not move it — every key is always present, `null`
+included, so a document that gains one still answers everything it
+answered — while removing a field, or changing what one means, does.
+
+### 2. The build and the suspensions, in the listing
+
+`ApprovedRunner` and `RunnerSwitch` gain one defaulted field each, a
+`RunnerFacts` carrying the runner's announced build and every capability it
+is not handing out with the reason. The hub already knew both: it computes
+`version_gap` at the handshake and it receives `CapabilitiesChanged`. What
+it did with the first was print a line on its **own stderr**, which is a
+place nobody operating the fleet through `herdctl` ever looks.
+
+`herdctl runner list` now prints the build on the runner's line and one
+indented line per suspension underneath. Indented and one each, rather than
+appended: a probe's reason is a sentence with a path in it — the
+consumer's were sixty characters apiece — and two of them on one line is a
+line nobody reads to the end. `herdctl switch`, which is the same fleet
+seen from the owner's side, says the same two things.
+
+**`suspended` is an `Option<Vec<_>>` and the `Option` is load-bearing.** An
+empty list means "this hub is connected to the machine and nothing is
+suspended"; absent means "this hub did not say". Had it been a plain `Vec`
+with a `serde` default, a frame from a hub that has never heard of the
+field would have decoded as a clean bill of health — which is the exact
+defect this entry is about, rebuilt one layer down. A runner that is not
+connected carries neither field, because a machine that is not here offers
+nothing and a figure for it would be a report about a runner that left.
+
+Neither field moves `PROTOCOL_VERSION`: a new field on an existing variant
+may leave it alone when it is `#[serde(default)]` and means, absent,
+exactly what its default says, and both do.
+
+### 3. A permission failure is a setup failure
+
+Three of the consumer's jobs — j984, j989, j1197 — ended `stopped_by_cap`
+with `cap: disk` and exit **124**, carrying a detail that said plainly that
+the runner could not *measure* the job's workspace, so it could not hold
+the job to its disk budget at all, naming a path under `{out}` that cannot
+be read. The text was honest; the outcome type was a lie, and 124 told
+their requester that a budget killed their build.
+
+The mechanism is known and is not ours to fix: the runner walks `{out}` as
+uid `herd`, the consumer's jobs deposit trees owned by `server:users`, and
+`chmod` on an inode somebody else owns is refused however often it is
+retried. That half is theirs and they are already moving to runner-owned
+trees. **Nothing about the walk's behaviour changes here**, including that
+the job is still ended — a budget that cannot be enforced must never read
+as a job that passed, which is D30 and invariant 2 and is right. What
+changes is what the ending is *called*.
+
+`root::measure` now answers with an `Unmeasurable { why, refused }` instead
+of a bare sentence, where `refused` is `ErrorKind::PermissionDenied`. The
+kind rides with the sentence rather than being re-derived by matching on its
+words, which is the one way this could have been done wrong. A refused
+measurement ends the job `SetupFailed`, which exits **125** and names the
+path. Every other failure to measure — a path that is not a directory, a
+measuring task that died — is the runner failing at its own work, and D30's
+cap stays right for it.
+
+**Why a new variant and not `CouldNotStart`.** Two reasons, and the second
+is the one that settles it. `CouldNotStart` means Herd never got a process
+out of the job, which is false here — the job ran, and produced output. And
+it is the one ending the `ran on:` line is deliberately **withheld** for
+(D16), because a job that never started has no output to frame. This job
+ran on a named machine, and that machine's name is the only actionable
+thing in the whole report: the setup that is broken is its own. Reporting it
+as `CouldNotStart` would have hidden exactly the fact grievances 10a and
+10c asked for.
+
+**What the variant costs, said out loud.** `JobOutcome`'s own doc blesses a
+new variant as the additive way to add an ending, and it does not move
+`PROTOCOL_VERSION` under the rule that covers frames. But "additive" is not
+"an older peer survives it": `JobOutcome` has no `#[serde(other)]`
+catch-all, so an older `herdctl` decoding `setup_failed` fails to read the
+frame. What it then does is exit **125** with a sentence naming what it
+could not read — which is the same exit code this variant produces, with a
+worse sentence. That is materially unlike D117's shape, where the hazard was
+a job that *passed* being read as no verdict: here there is no verdict
+either way, so an older requester is degraded and never misled. The same
+reasoning covers a record: a hub rolled back below this change and reading a
+`setup_failed` record refuses to start naming the file, loudly, rather than
+guessing — which is what `RECORD_VERSION`'s contract already promises for
+anything it cannot read. A catch-all variant on `JobOutcome` would make the
+*next* ending cheaper and was deliberately left out of this change: it
+would have to be a unit variant, so a record round-tripping through it
+would lose its reason, and that is a decision of its own.
+
+### Grievance 10a's second half: `switch on --reason` no longer fails
+
+`herdctl switch <runner> on --reason …` was refused with *"switching a
+runner on takes no reason"*. The position still carries none — a machine
+nobody has withdrawn needs no explaining — but refusing a command because it
+carries one extra piece of information is a bad trade: an operator switching
+a fleet back on after a maintenance window types the same `--reason` on
+every line, and the one that was `on` was the one that failed. The reason is
+now accepted, dropped, and said where it was typed, on both halves of E-33
+— `herdctl switch` and `herd-runner switch`. A switch *file* that says `on`
+with a reason is likewise read rather than refused.
+
+### Done means a passing test
+
+`the_verdict_document_tells_a_job_s_own_code_from_herd_s`, against the real
+binary, a real hub and a real runner: a job that chooses to exit 124 and a
+job a cap stopped at the same code, told apart by `exit_code_from`, with the
+runner's name read out of `ran_on.runner`; and the run that got no verdict
+at all, which overwrites a stale document planted first, because that was
+the failure worth building the test around.
+`a_workspace_the_runner_was_refused_is_a_setup_failure_and_not_a_cap` is the
+split of part 3 at the `Attempt` level, both branches, asserting that the
+reason names the path and the budget and that no cap is recorded;
+`a_path_the_runner_cannot_take_its_access_back_on_is_refused_and_not_capped`
+reaches a **real** refusal with no second user by putting a directory the
+walk must search above the data root, which is the one place the
+restoration deliberately does not reach — and skips itself loudly, under
+D27, on a host where mode 000 does not bind the user running it.
+`the_fleet_listing_names_a_runner_s_build_and_what_it_is_not_handing_out`
+drives the real binaries with a probe that really starts and really says
+busy, and asserts the build on the connected runner's line, the suspension
+under it, and that the machine which is *not* connected claims neither.
+The protocol's round trip carries both new fields, set and unset.
+
+**On the number.** This entry is D166 and the last on `main` is D165; D161
+is held by an unmerged branch, so that gap stays, as D143's and D154's do,
+under D148's rule. One entry rather than three, because the three are one
+decision about who the reader is — and because doing them apart would have
+meant three branches touching the same four files in the same week.

@@ -24,6 +24,10 @@ time.workspace = true
 # an unknown key is refused by name (`deny_unknown_fields`) rather than read
 # past. The protocol's resolved types are not the file's parser.
 serde.workspace = true
+# The machine-readable verdict is JSON, and a requester that has to `sed` a
+# sentence to learn which machine ran its build is one rewording away from
+# reading its fleet wrong (D166).
+serde_json.workspace = true
 toml.workspace = true
 
 # The exit code is outward-facing, so the test that pins it runs the real
@@ -31,6 +35,5 @@ toml.workspace = true
 [dev-dependencies]
 herd-hub.workspace = true
 herd-runner.workspace = true
-serde_json.workspace = true
 tempfile.workspace = true
 tokio = { workspace = true, features = ["process", "time"] }

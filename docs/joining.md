@@ -282,10 +282,24 @@ yours. The second is the only proof that counts.
 
 ```sh
 herdctl runner list
-# server: approved 2026-10-15T17:38:28Z, connected now
+# server: approved 2026-10-15T17:38:28Z, connected now, herd 0.3.3
 
 herdctl run -- sh -c 'echo it works; nproc'
 ```
+
+The listing names the build this machine is running, and one indented line
+under it for every capability it is offering and **not** handing out, with
+the reason (D166). Lines like
+
+```
+  kvm is suspended: its busy probe exited 0, which this capability
+    declares as busy
+```
+
+are not a failure of this step — a job that needs `kvm` waits rather than
+being refused — but a capability suspended because its probe is broken
+waits for ever, and nothing else in the listing would say so. Read them
+before you read anything else.
 
 The job's output is preceded by one line naming where it ran and why:
 

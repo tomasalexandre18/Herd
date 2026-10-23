@@ -330,7 +330,13 @@ mod tests {
     #[test]
     fn a_position_carries_exactly_the_reason_it_should() {
         assert_eq!(Switch::parse("on", None), Ok(Switch::On));
-        assert!(Switch::parse("on", Some("why")).is_err());
+        // A reason on `on` is accepted and dropped, never a refusal (D166):
+        // the position carries none, and failing a command because it was
+        // given one extra piece of information was a bad trade.
+        assert_eq!(
+            Switch::parse("on", Some("the window is over")),
+            Ok(Switch::On)
+        );
         assert!(Switch::parse("off", None).is_err());
         assert!(Switch::parse("drain", None).is_err());
         assert!(Switch::parse("off", Some("  ")).is_err());

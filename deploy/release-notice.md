@@ -192,6 +192,35 @@ sudo chown herd:herd /etc/herd/runner-token.env
 sudo chmod 0400 /etc/herd/runner-token.env
 ```
 
+## Is the fleet working? `herdctl runner list`
+
+One command, and it answers three questions: which machines are approved,
+which of them are here, which build each one runs, and — the one that
+matters most — which of its capabilities it is **not** handing out, with
+the reason.
+
+```
+$ herdctl runner list
+server: approved 2026-10-01T09:11:12Z, connected now, herd 0.3.3
+  kvm is suspended: its busy probe exited 0, which this capability
+    declares as busy
+  gpu-venus is suspended: gpu-venus has a busy probe (command
+    /etc/herd/probes/gpu-venus.sh) and server has not reported a reading
+    of it yet
+wsl-pc: approved 2026-10-02T18:40:03Z, not connected
+```
+
+A suspended capability is not a refusal: jobs that need it **wait**, with
+the same reason on their own record (`herdctl wait <id>` prints it). But a
+capability suspended because its probe is broken waits for ever, and the
+fleet looks healthy from every other angle — so this is the line to read
+first when a job is not starting. A machine that is not connected has told
+this hub nothing, so it carries neither a build nor a list: that is the
+absence of an answer and not a clean bill of health.
+
+`herdctl switch` says the same two things under each runner's switch
+position, for whoever is already looking there.
+
 ## The data root's filesystem decides whether IO is bounded at all
 
 This is not a detail and it cannot be fixed later by a flag. A job's IO is
@@ -322,12 +351,42 @@ finds out, and say so when it breaks.
 | --- | --- |
 | the job's own | worn untouched — `0`, `1`, `75`, anything the process really exited with. This is the whole point: a test suite's own code reaches the caller |
 | `124` | a runner stopped the job at one of its caps: time, memory, log size or disk budget. `timeout(1)`'s code, generalised. Which cap it was is printed on stderr and carried in the record |
-| `125` | **Herd has no verdict.** It could not run the job, lost the runner, refused it, or could not be reached at all. Never a failing build — a script that reads 125 as "the tests failed" is the one mistake that cannot be survived (D20). The reason is printed on stderr |
+| `125` | **Herd has no verdict.** It could not run the job, lost the runner, refused it, could not be reached at all, or the machine it ran on could not do its own part (`setup_failed` — a workspace the runner was refused access to, say, which is a host to fix and never a build that failed). Never a failing build — a script that reads 125 as "the tests failed" is the one mistake that cannot be survived (D20). The reason is printed on stderr |
 | `128 + n` | the job was killed by signal `n`, exactly as a shell reports one |
 
 A job *can* exit 124 or 125 by itself, which is why the reason is always on
 stderr as well, and why the wire carries a typed outcome rather than a
 number. Read the sentence, not just the code.
+
+### For an agent: `--verdict-to`, and no sentence to parse
+
+`herdctl run --verdict-to <FILE>` and `herdctl wait --verdict-to <FILE>`
+write the job's end as JSON. The fields that answer what an exit code
+cannot:
+
+| Field | What it says |
+| --- | --- |
+| `cause` | one word: `exited`, `signalled`, `stopped_by_cap`, `could_not_start`, `setup_failed`, `cancelled`, `lost`, `impossible` — or `no_verdict` when Herd never got one |
+| `exit_code_from` | `job`, `signal` or `herd`. **This is what tells a job's own 124 or 125 from Herd's.** A build that chose to exit 124 is `{"exit_code": 124, "exit_code_from": "job"}`; a cap is `{"exit_code": 124, "exit_code_from": "herd"}`, with `cause` saying which |
+| `job_exists` | `a_job`, `nothing` or `unknown` — the three stderr lines below, as a field |
+| `ran_on` | `{"runner": …, "why": …}`: which machine ran it and why there |
+| `cap` | which cap and its figures, when a cap ended the job. A non-null `detail` means the job did **not** reach `limit` |
+| `passed`, `job_id`, `said`, `outcome`, `metrics` | the verdict in one boolean, the id, the sentences a person would have read, the outcome as the wire carries it, and what the runner measured |
+
+Three things about the file:
+
+* **Every key is always present.** A field with nothing in it is `null`, so
+  a reader indexes the document instead of probing it. The first field is
+  `verdict_format_version`; check it before anything else.
+* **It is written however the run ends**, no verdict included, so a stale
+  file from an earlier run is never read as this run's answer.
+* **It is a file, not a stream.** `stdout` belongs to the job and `stderr`
+  carries the prose above. For a pipe, name one: `--verdict-to /dev/fd/3`.
+
+```sh
+herdctl run --verdict-to v.json --command build --commit "$sha"
+jq -r 'if .passed then "ok" else "\(.cause) on \(.ran_on.runner // "nowhere")" end' v.json
+```
 
 ### Falling back after 125: the id is the answer, not the code
 

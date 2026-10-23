@@ -5,10 +5,11 @@ use std::process::ExitCode;
 use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand};
 use herd_proto::{JobId, JobOutcome, LabelSet, LogStream, Priority};
+use herdctl::verdict::{JobExists, Verdict};
 use herdctl::{
     could_not_start_message, exit_code_for, impossible_exit_code_reason, job_id_line,
-    no_verdict_message, no_verdict_reason, stopped_by_cap_message, Config, DEFAULT_HUB_URL,
-    JOB_UNKNOWN_LINE, NO_JOB_LINE, NO_VERDICT_CODE,
+    no_verdict_message, no_verdict_reason, setup_failed_message, stopped_by_cap_message, Config,
+    DEFAULT_HUB_URL, JOB_UNKNOWN_LINE, NO_JOB_LINE, NO_VERDICT_CODE,
 };
 
 /// What this invocation knows about whether a job of its own exists.
@@ -164,7 +165,8 @@ struct Declaring {
     checkout: Option<std::path::PathBuf>,
 }
 
-/// Where a requester wants the job's own output **files** put (D131).
+/// What a requester wants written to a disk about a job it followed: the
+/// job's own output **files** (D131), and the job's end as JSON (D166).
 ///
 /// A flattened group shared by `run` and `wait`, because the two are the same
 /// question asked at two moments: `run` follows a job to its end, `wait`
@@ -188,6 +190,26 @@ struct Keeping {
     /// would read like a whole one.
     #[arg(long = "outputs-to", value_name = "DIR")]
     outputs_to: Option<std::path::PathBuf>,
+    /// Where to write this job's verdict as JSON, for a requester that is a
+    /// program (D166).
+    ///
+    /// The document names the cause in one word, says whether the exit code
+    /// is the job's own or Herd's, names the runner the job ran on, carries a
+    /// cap's figures when a cap ended the job, and says whether a job of
+    /// yours exists at all — which is the question 125 cannot answer. It
+    /// carries its own format version as its first field.
+    ///
+    /// **A file and never a stream.** Stdout is the job's own output, framed
+    /// and nothing else (E-02), and stderr carries Herd's prose, which the
+    /// same wrapper is already reading a line at a time; a JSON document
+    /// spliced into either is one nobody can parse. A caller that wants it on
+    /// a pipe names one: `--verdict-to /dev/fd/3`.
+    ///
+    /// It is written however the run ends, including when there is no verdict
+    /// at all — a wrapper that found yesterday's file would act on
+    /// yesterday's answer.
+    #[arg(long = "verdict-to", value_name = "FILE")]
+    verdict_to: Option<std::path::PathBuf>,
 }
 /// What `herdctl --help` says about exit codes, and about the one thing a
 /// code cannot say.
@@ -204,6 +226,30 @@ Exit codes:
                  refused it, or could not be reached. Never a failing build
   128 + n        the job was killed by signal n, as a shell reports one
   2              a command did part of what it says and named the rest
+
+For a requester that is a program: --verdict-to
+  `herdctl run --verdict-to <FILE>` and `herdctl wait --verdict-to <FILE>`
+  write the job's end as JSON, so nothing below has to be parsed out of a
+  sentence. The fields that answer what a code cannot:
+
+    cause            one word: exited, signalled, stopped_by_cap,
+                     could_not_start, setup_failed, cancelled, lost,
+                     impossible — or no_verdict when Herd never got one
+    exit_code_from   job, signal or herd. **This is what tells a job's own
+                     exit of 124 or 125 from Herd's**, which the code alone
+                     cannot: a build that exits 124 reads
+                     {\"exit_code\": 124, \"exit_code_from\": \"job\"}, and a
+                     cap reads {\"exit_code\": 124, \"exit_code_from\": \"herd\"}
+    job_exists       a_job, nothing or unknown — the three stderr lines below,
+                     as a field
+    ran_on           the runner the job ran on, and why there
+    cap              which cap and its figures, when a cap ended the job
+
+  Every key is always present; a field with nothing in it is null. The
+  document carries its own `verdict_format_version` as its first field. The
+  file is written however the run ends, no verdict included, so a stale one
+  is never read as this run's answer. It is a file and not a stream because
+  stdout belongs to the job (E-02) and stderr carries the prose below.
 
 Falling back after 125:
   125 is one code for two opposite situations — a job that exists and may
@@ -387,7 +433,8 @@ enum Action {
         runner: Option<String>,
         /// One of `on`, `off`, `drain`.
         position: Option<String>,
-        /// Why. Required for `off` and `drain`, refused for `on`.
+        /// Why. Required for `off` and `drain`; for `on`, accepted and not
+        /// kept, because that position needs none (D166).
         #[arg(long)]
         reason: Option<String>,
     },
@@ -472,8 +519,13 @@ enum RunnerAction {
 
 /// What a subcommand leaves the process to exit with.
 enum Done {
-    /// A job ended, and its end decides the exit code (D16).
-    Job(JobOutcome),
+    /// A job ended, and its end decides the exit code (D16). The whole of
+    /// what came back, not only the ending, because the machine-readable
+    /// verdict names the runner and carries what it measured (D166).
+    ///
+    /// Boxed because it is much the largest of the three and every other
+    /// arm would otherwise carry its weight.
+    Job(Box<herdctl::Finished>),
     /// The command did its own job; nothing ran.
     Said,
     /// The command did **part** of what it says, and said which part on
@@ -500,23 +552,97 @@ enum Done {
 /// what a person reads either way.
 const NOT_SETTLED_CODE: u8 = 2;
 
+/// Where a verdict document goes, and what this invocation already knew
+/// about the job it is about (D166).
+///
+/// Taken off the command **before** it is consumed, because the document has
+/// to be written on the paths that have no job to carry it: a hub that could
+/// not be reached, a submission the hub refused, a link that went while the
+/// job was still running. A wrapper that read this file and found the
+/// previous run's would act on the previous run's answer, which is worse than
+/// anything it could be reporting.
+struct Reporting {
+    to: Option<std::path::PathBuf>,
+    /// The id a `wait` was handed. `run` learns its own from the hub.
+    job_id: Option<String>,
+}
+
+impl Reporting {
+    fn of(action: &Action) -> Self {
+        match action {
+            Action::Run { keeping, .. } => Self {
+                to: keeping.verdict_to.clone(),
+                job_id: None,
+            },
+            Action::Wait { job_id, keeping } => Self {
+                to: keeping.verdict_to.clone(),
+                job_id: Some(job_id.clone()),
+            },
+            // Nothing else takes the option: a command that runs no job has
+            // no verdict to report, and `submit` is not waiting for one.
+            _ => Self {
+                to: None,
+                job_id: None,
+            },
+        }
+    }
+
+    /// Whether a job of this requester's exists, as the document says it.
+    fn job_exists(&self, known: WhatExists) -> JobExists {
+        match (&self.job_id, known) {
+            // A `wait` was handed an id, so a job exists whatever this
+            // invocation then managed to do about it.
+            (Some(_), _) => JobExists::AJob,
+            (None, WhatExists::AJob) => JobExists::AJob,
+            (None, WhatExists::Unknown) => JobExists::Unknown,
+            // `NotASubmission` cannot arrive here — only `run` and `wait`
+            // take the option, and `run` learns `Nothing` before it submits
+            // anything — and it would mean the same thing if it did: this
+            // invocation left no job behind.
+            (None, WhatExists::Nothing | WhatExists::NotASubmission) => JobExists::Nothing,
+        }
+    }
+
+    /// Write it, and when it cannot be written say so and nothing more.
+    ///
+    /// **It never touches the exit code.** The verdict is the answer the
+    /// caller is waiting for and it has already been established; a file the
+    /// requester named and cannot write is a problem with that path, exactly
+    /// as it is for `--outputs-to`. So the sentence is loud, and the file's
+    /// absence is the other half of it.
+    fn write(&self, verdict: &Verdict) {
+        let Some(path) = &self.to else {
+            return;
+        };
+        if let Err(error) = verdict.write_to(path) {
+            eprintln!(
+                "herdctl: this job's verdict could not be written to {}: {error:#}",
+                path.display()
+            );
+        }
+    }
+}
+
 #[tokio::main]
 async fn main() -> ExitCode {
     let args = Args::parse();
+    let reporting = Reporting::of(&args.command);
     let known = Cell::new(WhatExists::default());
     match run(args, &known).await {
-        Ok(Done::Job(outcome)) => {
-            // The reason goes to stderr, never to stdout: stdout carried the
-            // job's own output and must stay the job's alone.
-            match &outcome {
+        Ok(Done::Job(finished)) => {
+            // Each sentence goes to stderr, never to stdout: stdout carried
+            // the job's own output and must stay the job's alone. They are
+            // **kept** as well as printed, so that a wrapper reading the
+            // verdict document logs the same words a person would have read
+            // (D166).
+            let mut said = Vec::new();
+            match &finished.outcome {
                 JobOutcome::CouldNotStart { reason } => {
-                    eprintln!("herdctl: {}", could_not_start_message(reason));
+                    said.push(could_not_start_message(reason));
                 }
+                JobOutcome::SetupFailed { reason } => said.push(setup_failed_message(reason)),
                 JobOutcome::StoppedByCap { cap, limit, detail } => {
-                    eprintln!(
-                        "herdctl: {}",
-                        stopped_by_cap_message(*cap, *limit, detail.as_deref())
-                    );
+                    said.push(stopped_by_cap_message(*cap, *limit, detail.as_deref()));
                 }
                 JobOutcome::Exited { .. }
                 | JobOutcome::Signalled { .. }
@@ -529,16 +655,21 @@ async fn main() -> ExitCode {
             // An exit code outside 0..=255 is one no process can have worn,
             // so there is no verdict to report and the reason is said as
             // Herd's own failure, never as the job's (D20).
-            if let Some(reason) = impossible_exit_code_reason(&outcome) {
-                eprintln!("herdctl: {}", no_verdict_message(&reason));
+            if let Some(reason) = impossible_exit_code_reason(&finished.outcome) {
+                said.push(no_verdict_message(&reason));
             }
             // Cancelled, or lost with its runner: a real end, and not one that
             // carries a verdict. Said in words, because 125 cannot say which
             // of them it was (D20).
-            if let Some(reason) = no_verdict_reason(&outcome) {
-                eprintln!("herdctl: {}", no_verdict_message(&reason));
+            if let Some(reason) = no_verdict_reason(&finished.outcome) {
+                said.push(no_verdict_message(&reason));
             }
-            ExitCode::from(exit_code_for(&outcome))
+            for sentence in &said {
+                eprintln!("herdctl: {sentence}");
+            }
+            let code = exit_code_for(&finished.outcome);
+            reporting.write(&Verdict::of(&finished, said, code));
+            ExitCode::from(code)
         }
         Ok(Done::Said) => ExitCode::SUCCESS,
         // The sentence was printed where the command prints: what this arm
@@ -548,7 +679,8 @@ async fn main() -> ExitCode {
         // saying so with 1 would be indistinguishable from a job whose tests
         // failed (D20). One code, one meaning, and the reason on stderr.
         Err(error) => {
-            eprintln!("herdctl: {}", no_verdict_message(&format!("{error:#}")));
+            let said = no_verdict_message(&format!("{error:#}"));
+            eprintln!("herdctl: {said}");
             // And then the one thing a falling-back requester has to know,
             // which the code cannot say. A job that exists has already named
             // itself on stderr, the moment the hub said its id; the other
@@ -558,6 +690,13 @@ async fn main() -> ExitCode {
                 WhatExists::Unknown => eprintln!("{JOB_UNKNOWN_LINE}"),
                 WhatExists::Nothing => eprintln!("{NO_JOB_LINE}"),
             }
+            // The same three states, in a field rather than in a sentence:
+            // this is the half of D109 a program was being asked to `sed`.
+            reporting.write(&Verdict::none(
+                reporting.job_id.clone(),
+                reporting.job_exists(known.get()),
+                said,
+            ));
             ExitCode::from(NO_VERDICT_CODE)
         }
     }
@@ -622,7 +761,7 @@ async fn run(args: Args, known: &Cell<WhatExists>) -> Result<Done> {
             )
             .await?;
             keep_the_outputs(&config, &keeping, &finished).await;
-            Ok(Done::Job(finished.outcome))
+            Ok(Done::Job(Box::new(finished)))
         }
         Action::Submit {
             labels,
@@ -705,7 +844,9 @@ async fn run(args: Args, known: &Cell<WhatExists>) -> Result<Done> {
                         println!("no runner is connected to this hub");
                     }
                     for runner in &runners {
-                        println!("{}", herdctl::switch_line(runner));
+                        for line in herdctl::switch_lines(runner) {
+                            println!("{line}");
+                        }
                     }
                 }
                 (Some(runner), None) => {
@@ -718,6 +859,22 @@ async fn run(args: Args, known: &Cell<WhatExists>) -> Result<Done> {
                 (Some(runner), Some(position)) => {
                     let switch = herd_proto::Switch::parse(&position, reason.as_deref())
                         .map_err(anyhow::Error::msg)?;
+                    // `on` takes no reason and no longer refuses one (D166).
+                    // Said here, where the person typed it, rather than
+                    // dropped in silence: a reason that goes nowhere is at
+                    // least a reason somebody read.
+                    if let (herd_proto::Switch::On, Some(given)) = (
+                        &switch,
+                        reason
+                            .as_deref()
+                            .map(str::trim)
+                            .filter(|given| !given.is_empty()),
+                    ) {
+                        eprintln!(
+                            "herdctl: switching {runner} on; the reason given is not kept, \
+                             because the position that carries one is the withdrawal: {given}"
+                        );
+                    }
                     // This waits for the runner to have the position on its
                     // own disk, bounded by E-33's ten seconds (D99). Anything
                     // short of that is said on stderr and is not success: the
@@ -757,7 +914,9 @@ async fn run(args: Args, known: &Cell<WhatExists>) -> Result<Done> {
                         );
                     }
                     for runner in &runners {
-                        println!("{}", herdctl::approved_runner_line(runner));
+                        for line in herdctl::approved_runner_lines(runner) {
+                            println!("{line}");
+                        }
                     }
                 }
             }
@@ -780,7 +939,7 @@ async fn run(args: Args, known: &Cell<WhatExists>) -> Result<Done> {
             )
             .await?;
             keep_the_outputs(&config, &keeping, &finished).await;
-            Ok(Done::Job(finished.outcome))
+            Ok(Done::Job(Box::new(finished)))
         }
         Action::Cancel { job_id } => {
             let note = herdctl::cancel_job(&config, JobId::new(job_id)).await?;

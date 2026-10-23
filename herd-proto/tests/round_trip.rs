@@ -953,6 +953,21 @@ fn every_link_frame_round_trips() {
             },
             jobs: 1,
             stopping: false,
+            facts: herd_proto::RunnerFacts::default(),
+        }],
+        // The facts D166 carries to a fleet listing, both of them said.
+        vec![RunnerSwitch {
+            name: "server".to_owned(),
+            switch: Switch::On,
+            jobs: 0,
+            stopping: false,
+            facts: herd_proto::RunnerFacts {
+                version: Some("0.3.3".to_owned()),
+                suspended: Some(vec![herd_proto::SuspendedCapability {
+                    label: "kvm".to_owned(),
+                    why: "its probe cannot be started".to_owned(),
+                }]),
+            },
         }],
     ] {
         round_trip_from_hub(FromHub::FleetSwitches { runners });
@@ -987,6 +1002,27 @@ fn every_link_frame_round_trips() {
             name: "wsl-pc".to_owned(),
             approved_unix_s: 1_760_000_000,
             connected: true,
+            facts: herd_proto::RunnerFacts::default(),
+        }],
+        // What the listing an operator looks at first really carries (D166):
+        // the build, and every capability the machine is not handing out.
+        vec![herd_proto::ApprovedRunner {
+            name: "server".to_owned(),
+            approved_unix_s: 1_760_000_000,
+            connected: true,
+            facts: herd_proto::RunnerFacts {
+                version: Some("0.3.3".to_owned()),
+                suspended: Some(vec![
+                    herd_proto::SuspendedCapability {
+                        label: "gpu-venus".to_owned(),
+                        why: "its probe has not answered yet".to_owned(),
+                    },
+                    herd_proto::SuspendedCapability {
+                        label: "kvm".to_owned(),
+                        why: "its probe cannot be started".to_owned(),
+                    },
+                ]),
+            },
         }],
     ] {
         round_trip_from_hub(FromHub::ApprovedRunners { runners });
