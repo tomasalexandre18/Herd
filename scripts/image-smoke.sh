@@ -1,15 +1,19 @@
 #!/bin/sh
 # Does the hub's *published container image* actually run a job? This script
-# answers that, against an image reference docker can already get — a local
-# tag, or a digest on Docker Hub that was just pulled back down.
+# answers that, against an image reference docker can already get — which
+# since D162 means a tag `docker load` just put there, out of the archive the
+# release attaches.
 #
 #   image-smoke.sh <image reference> <directory holding herd-runner, herdctl>
 #
-# `.github/workflows/release.yml` runs it twice on a tag: once on the archive
-# the flake built and loaded locally, and once on what the registry served
-# back after the push. The second run is the one that matters, because it is
-# the only one that proves the bytes a deployer pulls are the bytes that were
-# tested — `docker compose pull` on the server does exactly what it does.
+# `.github/workflows/release.yml` runs it once per run, tag or no tag, on the
+# archive the flake built and loaded locally. It is now the *only* proof the
+# image has — D153's second run, against an image pulled back from Docker Hub
+# by digest, went with the registry — and that makes it worth more than it
+# was, not less: `docker load` and run is exactly what an operator does with
+# the attached archive, so this script and the deployment now walk the same
+# path. It needs no credentials, which is the other half of why it survived:
+# it cannot be the step that stops a release for want of a secret.
 #
 # It is the image's sibling of `scripts/release-smoke.sh`: a real hub, a real
 # runner and two real jobs, not `--version` once. The hub runs **in the

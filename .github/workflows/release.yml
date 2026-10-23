@@ -1,16 +1,37 @@
-# What a release is: three statically linked binaries and a SHA256SUMS, built
-# on a pushed tag, plus `deploy/release-notice.md` quoted into the release
-# body. The first consumer's team deploys on their own machines, so a release
-# has to be something a person can download onto an Arch box or a WSL2 PC and
-# run — which the flake's default packages are not: they are linked against
-# glibc out of the Nix store and do not exec on a host without Nix.
+# What a release is: three statically linked binaries, the hub's container
+# image as an archive, and a SHA256SUMS covering all four, built on a pushed
+# tag, plus `deploy/release-notice.md` quoted into the release body. The
+# first consumer's team deploys on their own machines, so a release has to be
+# something a person can download onto an Arch box or a WSL2 PC and run —
+# which the flake's default packages are not: they are linked against glibc
+# out of the Nix store and do not exec on a host without Nix.
 #
-# Since D153 it is also **the hub's container image on Docker Hub**, pushed
-# from the very archive `packages.hub-image` builds — one image, built one
-# way, so the thing deployed is the thing that was tested. The image is
-# pushed *before* the GitHub release is created, so that a tag never leaves
-# binaries published and an image missing: see D153 for the ordering and for
-# what a failure in the middle leaves behind.
+# Since D162 the hub's image ships **as a release asset**, `docker load`ed by
+# the operator, and not pushed to a registry. D153 put it on Docker Hub and
+# guarded the tag with a credential preflight; that preflight then failed
+# every tag from v0.3.1 to v0.3.3 — in 22, 24 and 26 seconds, before a single
+# binary was built — because the credentials it demanded were never created.
+# Three tags produced no release at all. What survives of D153 is its intent,
+# which this file still keeps: an operator gets a runnable hub image out of a
+# tag without building it, from the one derivation that has ever built it.
+# What does not survive is a registry as the only way to get one, and an
+# optional publication holding a veto over the binaries.
+#
+# **The order below is the guarantee.** The binaries are the floor: they are
+# built, proved, summed and *published* before the image is so much as built,
+# so nothing about the image can cost a tag its release again. The body is
+# written in two halves for the same reason — the half that promises the
+# archive is added only once the archive is attached, so a release never
+# describes an asset that is not there.
+#
+# **Rehearsing it without a tag.** `workflow_dispatch` with the `tag` input
+# left empty runs every step above the release: the build, both distribution
+# smokes, the static assertions, the sums, the image build, the archive
+# assertion and `image-smoke.sh` against the loaded archive. It creates no
+# tag and no release, and leaves the binaries and the archive on the run as
+# artifacts. Given a `tag` that already exists, it publishes the release for
+# it — which is how a tag whose run failed is recovered without cutting a new
+# version.
 #
 # This file is **not** the merge gate. `ci.yml` is, with its `check` and
 # `docs` jobs, and nothing here touches it.
@@ -24,9 +45,9 @@ on:
     inputs:
       tag:
         description: >-
-          Tag to publish the release on, e.g. v0.1.0. Left empty, the
-          binaries are built and verified and attached to this run, and no
-          release is created.
+          Tag to publish the release on, e.g. v0.1.0. It must already exist.
+          Left empty, the binaries and the hub image are built and verified
+          and attached to this run, and no release is created.
         required: false
         default: ""
 
@@ -39,10 +60,12 @@ permissions:
   contents: write
 
 jobs:
-  # One job and not three, deliberately. The binaries, the image and the
+  # One job and not two, deliberately. The binaries, the image and the
   # release are one release, and steps in one job run in an order a reader
-  # can see; jobs would need the artefacts passed between them and would let
-  # GitHub decide what runs when.
+  # can see; splitting the image into a job of its own would make the floor
+  # structural but would also have to pass the binaries between jobs to run
+  # `image-smoke.sh`, and would let GitHub decide what runs when. The step
+  # order below buys the same guarantee and can be read top to bottom.
   binaries:
     name: static binaries and the hub image
     runs-on: ubuntu-latest
@@ -51,14 +74,6 @@ jobs:
       # One place where "which tag, if any" is decided. A tag push releases
       # under its own name; a hand-run releases only if it was given one.
       TAG: ${{ github.ref_type == 'tag' && github.ref_name || github.event.inputs.tag }}
-      # Where the image goes. A repository **variable** and not a secret,
-      # deliberately: a Docker Hub namespace is public the instant anything
-      # is pushed to it, it is in every image reference a deployer types,
-      # and holding it in a secret would make GitHub mask it — so every
-      # line below, including skopeo's own error text, would read
-      # `docker.io/***/herd-hub` and a failed push could not be diagnosed
-      # from its log. The token is the secret; the name is not (D153).
-      IMAGE_REPO: docker.io/${{ vars.DOCKERHUB_USERNAME }}/herd-hub
     steps:
       - uses: actions/checkout@v7
 
@@ -86,62 +101,11 @@ jobs:
           # names would lie about what is inside them. A pre-release suffix
           # is allowed — `v0.1.0-rc1` for 0.1.0 — because that is how a
           # release gets rehearsed; a different version is not.
-          if [ -n "${TAG:-}" ] && [ "${TAG#v$version}" = "$TAG" ]; then
+          if [ -n "${TAG:-}" ] && [ "${TAG#"v$version"}" = "$TAG" ]; then
             echo "tag $TAG is not v$version or a pre-release of it:" \
                  "bump workspace.package.version, or tag what the workspace says" >&2
             exit 1
           fi
-
-      # Before anything is built, and long before anything is published: a
-      # tag that publishes the binaries and then finds it cannot push the
-      # image is the half-release D153 exists to prevent, and the cheapest
-      # way to never have one is to refuse the run while nothing has been
-      # done. Names only, never a value, and no `set -x` anywhere in this
-      # file: a token that reaches a log line is a leaked token
-      # (invariant 7). GitHub masks a secret it recognises, but a workflow
-      # should not be relying on that.
-      #
-      # The two live in two different tabs of the same settings page, which
-      # is exactly the kind of thing nobody should have to work out at the
-      # moment a release has stopped — so each line below names its own tab.
-      - name: the Docker Hub credentials this tag needs, by name
-        if: env.TAG != ''
-        env:
-          DOCKERHUB_USERNAME: ${{ vars.DOCKERHUB_USERNAME }}
-          DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
-        run: |
-          set -euo pipefail
-          missing=0
-          if [ -z "${DOCKERHUB_USERNAME:-}" ] || [ -z "${DOCKERHUB_TOKEN:-}" ]; then
-            missing=1
-            echo "this tag publishes the hub's image and cannot:" >&2
-            echo "github.com/${{ github.repository }}/settings -> Secrets" >&2
-            echo "and variables -> Actions, where the two live in two" >&2
-            echo "different tabs." >&2
-            echo >&2
-          fi
-          if [ -z "${DOCKERHUB_USERNAME:-}" ]; then
-            echo "MISSING, on the 'Variables' tab — repository variable" >&2
-            echo "  DOCKERHUB_USERNAME: the Docker Hub account that owns" >&2
-            echo "  the public herd-hub repository. A variable and not a" >&2
-            echo "  secret on purpose: it is in every image reference a" >&2
-            echo "  deployer types, and masking it would make this very" >&2
-            echo "  log unreadable." >&2
-          fi
-          if [ -z "${DOCKERHUB_TOKEN:-}" ]; then
-            echo "MISSING, on the 'Secrets' tab — repository secret" >&2
-            echo "  DOCKERHUB_TOKEN: a Docker Hub access token scoped to" >&2
-            echo "  that one repository, Read & Write. Never the account" >&2
-            echo "  password, and never an account-wide token." >&2
-          fi
-          if [ "$missing" -ne 0 ]; then
-            echo >&2
-            echo "deploy/release-notice.md says it in full. Nothing of this" >&2
-            echo "release has been published: set it and re-run this tag." >&2
-            exit 1
-          fi
-          echo "the DOCKERHUB_USERNAME variable and the DOCKERHUB_TOKEN"
-          echo "secret are both set; the image goes to $IMAGE_REPO:$version"
 
       # ~1 minute, and no toolchain is installed to do it: `pkgsStatic` is
       # nixpkgs' own musl cross set, so D12 still holds and the musl rustc,
@@ -231,7 +195,9 @@ jobs:
       # somebody's disk six months from now still says what it is. SHA256SUMS
       # is what lets a reader verify what they downloaded instead of trusting
       # a URL: `sha256sum -c SHA256SUMS` in the directory they downloaded
-      # into.
+      # into. The hub image's archive is added to this same file further
+      # down, once it has been built and proved; a reader who downloaded only
+      # the binaries checks them with `sha256sum --ignore-missing -c`.
       - name: name them and sum them
         run: |
           set -euo pipefail
@@ -263,110 +229,19 @@ jobs:
           if-no-files-found: error
 
       # ---------------------------------------------------------------
-      # The hub's image. From here to the release below, the subject is one
-      # artefact: `packages.hub-image`, the same derivation an operator can
-      # still build by hand (`deploy/README.md`). There is no Dockerfile and
-      # no second way to build it, because two ways to build the hub is how
-      # the thing deployed stops being the thing tested (D153).
+      # The floor. Everything above is the binaries; everything below is the
+      # hub's image, and it comes *after* the release exists on purpose
+      # (D162). Three tags in a row published nothing because a step about
+      # the image failed before this point; that cannot happen again, because
+      # from here on a failure costs the archive and never the binaries.
       # ---------------------------------------------------------------
 
-      - name: build the hub's image, from the flake and nowhere else
-        run: nix build .#hub-image --print-build-logs --out-link hub-image
-
-      # The archive names itself, and the name is the deployment's contract.
-      # `nix/hub-image.nix` takes the tag from the workspace version the same
-      # way the binaries above take theirs, so this cannot drift — which is
-      # exactly why it is worth asserting rather than assuming: if it ever
-      # does drift, a release would push an image tagged for a hub it does
-      # not contain. One tag and no second one, which is also where a
-      # `latest` would show up if anybody ever added one (D153 says why there
-      # is none).
-      - name: assert the archive carries herd-hub:$version, and only that
-        run: |
-          set -euo pipefail
-          tags=$(tar -xzOf hub-image manifest.json | jq -r '.[].RepoTags[]')
-          printf 'the archive says: %s\n' "$tags"
-          if [ "$tags" != "herd-hub:$version" ]; then
-            echo "expected exactly herd-hub:$version in the archive" >&2
-            exit 1
-          fi
-
-      # Proven before it is pushed, and proven on every run including a
-      # hand-run with no tag: this step needs no credentials, so the image
-      # half of a release can be exercised without publishing anything.
-      # scripts/image-smoke.sh is a hub in the container — read-only root, a
-      # volume on /var/lib/herd, the image's own non-root user, exactly the
-      # shape `deploy/docker-compose.yml` gives it — with the static runner
-      # and `herdctl` built above dialling it on the host, and two real jobs
-      # through it.
-      - name: run a hub out of the image, before anything is pushed
-        run: |
-          set -euo pipefail
-          docker load < hub-image
-          ./scripts/image-smoke.sh "herd-hub:$version" "$PWD/bin"
-
-      # `skopeo copy` straight from the archive, and not `docker load` then
-      # `docker tag` then `docker push`. Three reasons, in order of weight
-      # (D153): the source is a *file* and not a name in a shared local image
-      # store, so there is nothing else this step could push by accident; the
-      # manifest the flake built is the manifest the registry stores, digest
-      # unchanged, because the archive's layers are already the compressed
-      # blobs; and the token goes in through `--password-stdin` into an
-      # authfile of this job's own rather than onto an argv or into
-      # `~/.docker/config.json`.
-      #
-      # `--insecure-policy` is about *signatures*, not transport: it means
-      # "no containers-policy.json to consult", which is what `docker push`
-      # also does. TLS to Docker Hub is untouched.
-      - name: push it to Docker Hub
+      # The body in pieces, so that the half promising the archive can be
+      # added later, once the archive is really attached. A release that
+      # describes an asset it does not have is worse than a release with
+      # three files and no fourth.
+      - name: write the release body, the half about the binaries
         if: env.TAG != ''
-        env:
-          DOCKERHUB_USERNAME: ${{ vars.DOCKERHUB_USERNAME }}
-          DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
-        run: |
-          set -euo pipefail
-          auth=$(mktemp)
-          trap 'rm -f "$auth"' EXIT
-
-          printf '%s' "$DOCKERHUB_TOKEN" |
-            nix develop .#release --command skopeo login \
-              --authfile "$auth" \
-              --username "$DOCKERHUB_USERNAME" \
-              --password-stdin docker.io
-
-          nix develop .#release --command skopeo --insecure-policy copy \
-            --authfile "$auth" \
-            --digestfile image-digest.txt \
-            "docker-archive:hub-image" \
-            "docker://$IMAGE_REPO:$version"
-
-          digest=$(cat image-digest.txt)
-          echo "digest=$digest" >> "$GITHUB_ENV"
-          echo "pushed, and the registry now holds $digest"
-
-      # The downloader's half, and the only step that proves what is on
-      # Docker Hub rather than what was on this runner. By digest, not by
-      # tag: a tag is a name somebody can move, a digest is the bytes. The
-      # local tag goes first so that nothing already here can answer in the
-      # registry's place.
-      - name: pull it back by digest and run a hub out of that
-        if: env.TAG != ''
-        run: |
-          set -euo pipefail
-          docker rmi "herd-hub:$version" >/dev/null 2>&1 || true
-          ref="$IMAGE_REPO@$digest"
-          docker pull "$ref"
-          ./scripts/image-smoke.sh "$ref" "$PWD/bin"
-
-      # `gh` rather than a third-party action: it is on the runner already,
-      # and a release is the one step here that cannot be undone quietly.
-      # The notice is quoted into the body rather than linked, because
-      # whoever downloads a tarball six months from now may not have the
-      # repository — and linked, as well, so they can read the current one.
-      - name: publish the release
-        if: env.TAG != ''
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -euo pipefail
           {
@@ -376,31 +251,40 @@ jobs:
             echo "Verify what you downloaded, then read the notice below:"
             echo
             echo '```sh'
-            echo "sha256sum -c SHA256SUMS"
+            echo "sha256sum --ignore-missing -c SHA256SUMS"
             echo "chmod +x herd-runner-$version-$triple"
             echo '```'
             echo
-            echo "The hub is not one of these three for most people: it is a"
-            echo "container image, published on Docker Hub by this same tag"
-            echo "and proved by pulling it back down and running two real"
-            echo "jobs through it. Deploying it is a pull and an up:"
-            echo
-            echo '```sh'
-            echo "docker pull $IMAGE_REPO:$version"
-            # The digest as well, because a tag is a name somebody can move
-            # and a digest is the bytes. `deploy/env.example` accepts either.
-            echo "docker pull $IMAGE_REPO@$digest"
-            echo '```'
-            echo
-            # One line: a markdown link destination cannot be broken across
-            # two.
-            echo "The notice in full, as of this tag: <https://github.com/${{ github.repository }}/blob/$TAG/deploy/release-notice.md>"
+          } > body-head.md
+
+          {
+            # The commit this run checked out, and not `$TAG`: the notice
+            # quoted below was `cat` out of *this* tree, and a hand-run can
+            # publish an existing tag from a later commit — `actions/checkout`
+            # takes the ref the run was started on, not the ref named in the
+            # input. Linking the tag would then point a reader at a different
+            # notice from the one printed underneath it. One line: a markdown
+            # link destination cannot be broken across two.
+            echo "The notice in full, as of the commit that built this: <https://github.com/${{ github.repository }}/blob/${{ github.sha }}/deploy/release-notice.md>"
             echo
             echo "---"
             echo
             cat deploy/release-notice.md
-          } > release-body.md
+          } > body-tail.md
 
+          cat body-head.md body-tail.md > release-body.md
+
+      # `gh` rather than a third-party action: it is on the runner already,
+      # and a release is the one step here that cannot be undone quietly.
+      # The notice is quoted into the body rather than linked, because
+      # whoever downloads a tarball six months from now may not have the
+      # repository — and linked, as well, so they can read the current one.
+      - name: publish the release, with the binaries
+        if: env.TAG != ''
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
           # A tag carrying a suffix — `v0.1.0-rc1`, and the throwaway tag this
           # workflow was first proven with — is published as a pre-release,
           # so a rehearsal never sits in the place a reader looks for the
@@ -421,4 +305,123 @@ jobs:
               --notes-file release-body.md \
               --verify-tag $prerelease
           fi
+          gh release view "$TAG"
+
+      # ---------------------------------------------------------------
+      # The hub's image. The subject from here down is one artefact:
+      # `packages.hub-image`, the same derivation an operator can still build
+      # by hand (`deploy/README.md`). There is no Dockerfile and no second
+      # way to build the hub, because two ways to build it is how the thing
+      # deployed stops being the thing tested — that part of D153 stands
+      # unchanged. What changed is only where the bytes go: onto the release
+      # as an archive, not into a registry (D162).
+      # ---------------------------------------------------------------
+
+      - name: build the hub's image, from the flake and nowhere else
+        run: nix build .#hub-image --print-build-logs --out-link hub-image
+
+      # The archive names itself, and the name is the deployment's contract:
+      # `docker load` prints the tag it carries, and that tag is what the
+      # operator puts in `HERD_HUB_IMAGE`. `nix/hub-image.nix` takes it from
+      # the workspace version the same way the binaries above take theirs, so
+      # it cannot drift — which is exactly why it is worth asserting rather
+      # than assuming: a drift would ship an archive tagged for a hub it does
+      # not contain. One tag and no second one, which is also where a
+      # `latest` would show up if anybody ever added one (D153 says why there
+      # is none, and that reason has not moved).
+      - name: assert the archive carries herd-hub:$version, and only that
+        run: |
+          set -euo pipefail
+          tags=$(tar -xzOf hub-image manifest.json | jq -r '.[].RepoTags[]')
+          printf 'the archive says: %s\n' "$tags"
+          if [ "$tags" != "herd-hub:$version" ]; then
+            echo "expected exactly herd-hub:$version in the archive" >&2
+            exit 1
+          fi
+
+      # The one proof the image has, now that nothing is pushed and nothing
+      # is pulled back — and it is the right one, because it is exactly what
+      # an operator does with the attached archive: `docker load`, then run
+      # it. scripts/image-smoke.sh is a hub in the container — read-only
+      # root, a volume on /var/lib/herd, the image's own non-root user,
+      # exactly the shape `deploy/docker-compose.yml` gives it — with the
+      # static runner and `herdctl` built above dialling it on the host, and
+      # two real jobs through it. It needs no credentials, so it runs on
+      # every run including a hand-run with no tag.
+      - name: load the archive and run a hub out of it
+        run: |
+          set -euo pipefail
+          docker load < hub-image
+          ./scripts/image-smoke.sh "herd-hub:$version" "$PWD/bin"
+
+      # Named for a person's download directory, and summed in the same
+      # SHA256SUMS as the binaries, because it is a download like any other.
+      # `install` and not a symlink: `hub-image` points into the Nix store
+      # and `gh release upload` would follow it to a name nobody chose.
+      - name: name the archive and add it to SHA256SUMS
+        run: |
+          set -euo pipefail
+          archive="herd-hub-image-$version.tar.gz"
+          install -m 0644 hub-image "dist/$archive"
+          ls -l "dist/$archive"
+          cd dist
+          sha256sum "$archive" >> SHA256SUMS
+          cat SHA256SUMS
+          summed=$(wc -l < SHA256SUMS)
+          if [ "$summed" -ne 4 ]; then
+            echo "SHA256SUMS covers $summed files, not 4" >&2
+            exit 1
+          fi
+
+      # So that a hand-run with no tag still hands back an archive somebody
+      # can `docker load`: the rehearsal is only worth running if what it
+      # produces can be inspected. This artifact's `SHA256SUMS` is the
+      # complete four-line one; the binaries' artifact above was uploaded
+      # before the archive existed and its copy covers three.
+      - uses: actions/upload-artifact@v4
+        with:
+          name: herd-hub-image-${{ env.version }}
+          path: |
+            dist/herd-hub-image-*.tar.gz
+            dist/SHA256SUMS
+          if-no-files-found: error
+
+      - name: attach the archive to the release, and say so in the body
+        if: env.TAG != ''
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          archive="herd-hub-image-$version.tar.gz"
+          # SHA256SUMS goes up again: it has a fourth line now.
+          gh release upload "$TAG" "dist/$archive" dist/SHA256SUMS --clobber
+
+          {
+            echo "The hub is not one of the three binaries for most people:"
+            echo "it is a container image, attached to this release as"
+            echo "\`$archive\` and loaded with \`docker load\`. There is no"
+            echo "registry to pull from and no credentials to hold (D162)."
+            echo
+            echo '```sh'
+            echo "docker load < $archive        # Loaded image: herd-hub:$version"
+            echo '```'
+            echo
+            echo "Then name that tag in the \`.env\` beside"
+            echo "\`deploy/docker-compose.yml\`, which requires it and"
+            echo "defaults to nothing:"
+            echo
+            echo '```sh'
+            echo "HERD_HUB_IMAGE=herd-hub:$version"
+            echo '```'
+            echo
+            echo "and \`docker compose up -d\`. Skip \`docker compose pull\`:"
+            echo "that tag is local to the machine that loaded it, and"
+            echo "pulling it would fail. \`deploy/README.md\` walks the first"
+            echo "start, including the two ownership failures it actually"
+            echo "hits."
+            echo
+          } > body-image.md
+
+          cat body-head.md body-image.md body-tail.md > release-body.md
+          gh release edit "$TAG" --notes-file release-body.md
           gh release view "$TAG"

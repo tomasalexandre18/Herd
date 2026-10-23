@@ -60,8 +60,9 @@ machine this has ever been applied to:
                                                    |  ws://herd-hub:8787
                                                    v
                                          herd-hub  (docker compose)
-                                          image from Docker Hub,
-                                          pinned to a version
+                                          image loaded from the
+                                          release's archive, pinned
+                                          to a version
                                           state on the herd-state volume
                                             ^                 ^
          ws://127.0.0.1:8787  -------------'                  |
@@ -81,18 +82,20 @@ all (invariant 3, D11). Herd holds no certificate at any point.
 
 ## The order to do it in
 
-1. Name the image in `.env`, as `HERD_HUB_IMAGE`. Since D153 the hub's
-   image is pushed to Docker Hub by the release workflow on the version
-   tag, so the normal value is
-   `docker.io/NAMESPACE/herd-hub:<version>` and nothing is built here.
-   `env.example` says where NAMESPACE comes from, and why there is no
-   `latest` to point at. Building it locally instead is still supported
-   and is below, under "the image without a registry".
+1. Get the image and name it in `.env`, as `HERD_HUB_IMAGE`. Since D162
+   the hub's image is **an archive attached to the GitHub release** —
+   `herd-hub-image-<version>.tar.gz`, built on the version tag out of the
+   flake — so this is a download and a `docker load`, and nothing is
+   compiled here. "The image, from a release" is just below.
+   `env.example` says what to put and why there is no `latest` to point
+   at. Building the archive locally instead of downloading it is the same
+   derivation and is under "the image without a release".
 2. Make the requester token, outside any repository, and point `.env` at
    it. `env.example` says how, including the mode, which is not the one
    you would guess.
-3. `docker compose pull`, then `docker compose up -d`, then
-   `docker compose logs hub`. The hub says
+3. `docker compose up -d`, then
+   `docker compose logs hub`. There is no `docker compose pull`: the tag
+   is local to this machine and pulling it would fail. The hub says
    in its first three lines whether a requester token is set, how many
    runners are approved, and where its state is.
 4. Publish it as `wss://`, if anything will dial from off this host.
@@ -115,13 +118,13 @@ ownership, and both read as the hub refusing to run, which is correct of
 it (invariant 2's cousin: a service that cannot do its job says so and
 stops).
 
-One line of it is newer than that run and has not been done here:
-**step 3 pulls** where the proven sequence built the image locally and
-`docker load`ed it. The image is the same derivation either way (D153),
-and the release workflow pulls what it pushed and runs two real jobs
-through it before the release exists — but nobody has yet run
-`docker compose pull` on this server. If it surprises you, say so; the
-local path below is what was actually walked.
+Since D162 the sequence below is also the one the release delivers:
+step 3 is a `docker load` of an archive, which is exactly what the
+proven run did — it built that archive locally rather than downloading
+it, and the archive is the same derivation either way. The release
+workflow loads its own archive and runs two real jobs through the
+resulting container before the release exists, so a tag whose
+`image-smoke.sh` is green is a tag whose archive starts.
 
 ```sh
 # 1. the requester token, outside every repository (invariant 7).
@@ -135,8 +138,9 @@ chmod 0444 /etc/herd/requester-token
 #    and HERD_HUB_IMAGE, the pinned image this hub runs
 cp env.example .env                        # then edit both lines in it
 
-# 3. the image, from Docker Hub, as .env names it
-docker compose pull                        # or "without a registry", below
+# 3. the image, from the archive attached to the release. No pull: the
+#    tag this prints is local to this machine, which is what .env names
+docker load < herd-hub-image-0.3.3.tar.gz  # Loaded image: herd-hub:0.3.3
 
 # 4. up, and read the three lines it prints
 docker compose up -d
@@ -196,29 +200,60 @@ it 0444 in a 0700 directory instead: the directory is what keeps it off
 the host, the mode is only what the container sees, and the image holds
 no users but `herd` and root.
 
-### The image without a registry
+### The image, from a release
 
-The flake still builds it, and this is still the way to run a hub from a
-commit that was never tagged — a branch under test, an air-gapped host,
-or a day when Docker Hub is down. It is the same derivation the release
-pushes; what differs is only where the bytes came from.
+The normal path, and the whole of it. A release page carries
+`herd-hub-image-<version>.tar.gz` beside the three binaries, and its
+`SHA256SUMS` covers all four files.
+
+```sh
+# in the directory you downloaded into
+sha256sum --ignore-missing -c SHA256SUMS
+#   herd-hub-image-0.3.3.tar.gz: OK
+
+docker load < herd-hub-image-0.3.3.tar.gz  # Loaded image: herd-hub:0.3.3
+docker image inspect herd-hub:0.3.3 --format '{{.Config.User}}'
+#   herd          <- it runs as uid 1000 and never as root
+```
+
+Then name the tag `docker load` printed in `.env`:
+
+```sh
+HERD_HUB_IMAGE=herd-hub:0.3.3
+```
+
+Read that tag rather than assuming the number above is still current: it
+is the workspace's own version (`nix/hub-image.nix`), and this file is
+not re-dated every release.
+
+**There is no registry and no `docker compose pull`.** The tag is local
+to the machine that loaded it, and `pull` fails on it, which is correct.
+So upgrading is: download the next release's archive, `docker load` it,
+change the one line in `.env`, `docker compose up -d`. Nothing can move
+this hub to another version on its own, which is the property
+`release-notice.md` cares about — a protocol move is a fleet-wide
+synchronised restart, not a container coming back.
+
+If you want the image in a registry of your own, one command does it
+from the archive you already have; the `release` shell in `flake.nix`
+holds the tool and spells the command out. It is deliberately something
+a person runs and not a step in the release: a publication inside the
+release path is what cost v0.3.1, v0.3.2 and v0.3.3 their releases
+altogether (D162).
+
+### The image without a release
+
+The flake builds the same archive, and this is the way to run a hub from
+a commit that was never tagged — a branch under test, or an air-gapped
+host.
 
 ```sh
 nix build .#hub-image
-docker load < result                       # Loaded image: herd-hub:0.3.0
+docker load < result                       # Loaded image: herd-hub:0.3.3
 ```
 
-Then name that purely local tag in `.env`, because there is nothing to
-pull:
-
-```sh
-HERD_HUB_IMAGE=herd-hub:0.3.0
-```
-
-`docker compose pull` will fail on that name, which is correct — skip it
-and go straight to `up -d`. The tag `docker load` prints is the
-workspace's own version (`nix/hub-image.nix`), so read it rather than
-assuming the number above is still current.
+Same derivation, same tag, same line in `.env` as above; what differs is
+only where the bytes came from.
 
 ## Step 4, exactly: `wss://` through Traefik and Cloudflare
 

@@ -87,4 +87,4 @@ outputs after eight collections on one connection. Then M17 — the
 runbook is with Alexa and stops after the verification script, because
 whether a user scope on that WSL2 delegates a cgroup with `memory` in
 it decides everything after it — then the janitor list (D134). Waiting
-on Alexa: a Docker Hub account and a repository-scoped token.
+on Alexa: `release.yml` by hand with no tag, then with `v0.3.3` (D162).
