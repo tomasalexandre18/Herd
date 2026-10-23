@@ -29,7 +29,7 @@ use herd_runner::{
 /// ends what it is running, says so to the hub, and exits inside five seconds
 /// (invariant 2). A verdict the hub has not acknowledged by then is written
 /// under the data root and delivered on the next start (D34).
-/// A repeated option is not an error here: the last one wins (D161).
+/// A repeated option is not an error here: the last one wins (D163).
 ///
 /// This runner's command line has two authors. A deployment writes the
 /// figures it chose — `deploy/nixos-herd-runner.nix` and
@@ -631,7 +631,7 @@ mod tests {
     use clap::CommandFactory;
 
     /// The behaviour a deployment depends on: the figure stated last is the
-    /// figure this runner uses (D161).
+    /// figure this runner uses (D163).
     ///
     /// The case this exists for is real and was a refusal on the live fleet.
     /// `deploy/nixos-herd-runner.nix` writes `--host-tmpfs 4GiB` on the

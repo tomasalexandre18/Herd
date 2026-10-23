@@ -490,7 +490,7 @@ in
         it is added in the same move as writing the file.
 
         A flag already on the line may be repeated here and the last value
-        wins (D161) — the runner replaces a prior occurrence rather than
+        wins (D163) — the runner replaces a prior occurrence rather than
         refusing the command line, so this list is an escape hatch for a
         figure that has no option yet. It is not the place for one that has:
         an option above is read in `nixos-rebuild`, carries its own type and

@@ -6680,7 +6680,7 @@ that held a slot.
 
 ---
 
-## 2026-10-23 — D161 A runner's figures belong to the machine's owner
+## 2026-10-23 — D163 A runner's figures belong to the machine's owner
 
 **The refusal.** The first consumer's jobs ask for 10 GiB of tmpfs. The
 server's runner lends 4 GiB, so the hub's record of `j0000001566` says, in
@@ -6796,7 +6796,16 @@ D144. The module's worked example also described the live unit as
 that rebuild has happened. All three corrected, because the one thing both
 files promise is that they describe the host as it is.
 
-**On the number.** This is D161 and D160 does not exist yet: it is taken by
-an unmerged pull request the owner is reviewing. The gap stays, by D148's
-rule — a decision number is an identifier, not a position — and D143 and
-D154 are already missing for the same kind of reason.
+**On the number.** This is D163, and the three numbers under it are spoken
+for by work that is still in flight: D160 by an unmerged pull request the
+owner is reviewing, D161 by `docs-handover`, which appended its own entry
+while this branch was being written, and D162 by a branch on the release
+path. This entry was D161 for an afternoon and was renumbered rather than
+contested, which is the cheap direction: the citations that move with it are
+three — two comments in `herd-runner/src/main.rs` and one option description
+in `deploy/nixos-herd-runner.nix` — and all three are on this branch, where
+nobody has read them yet. That is exactly the calculation D148 refused to
+make for itself, and the rule is the same one read from the other end: a
+decision number is an identifier and not a position, so it is free to move
+before anything cites it and fixed afterwards. The gaps stay, here and at
+D143 and D154.
