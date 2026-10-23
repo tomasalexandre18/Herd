@@ -6677,3 +6677,77 @@ memory". One wording, in one function, `of_which`. And the line explaining a
 reading's own placement says in as many words that it holds none of the
 machine — so a record of a reading can never be read as a record of something
 that held a slot.
+
+---
+
+## 2026-10-23 — D161 Herd is shipped, not operated
+
+**Context.** The owner decided on 2026-10-23 that Herd no longer operates
+the hub or the runner: *"tu ne dois plus gérer le hub et le runner, cette
+responsabilité tombe au client, soit chatOnS OS."* Until now the project
+ran its own fleet — one hub in docker compose and one native runner on
+the NixOS server — and every milestone from M16 on was proved against
+that deployment. The two analyses written the same day found the fleet
+half-dead in ways only its author could see: two capabilities suspended
+behind an unsubstituted `@probe@` in the consumer's capability file,
+seven runner figures the operator cannot set, a `drain` that restarts
+into a loop, 90 GB of outputs with no eviction ever, a spool the runner
+cannot free, and a release workflow that has published nothing since
+v0.3.0. Every one of those was found by reading the server's disk.
+
+**Choice.** Herd becomes software we build and ship, not a service we
+run. We own the protocol, the four crates, the deployment files as
+reference texts, the releases and the documentation. The consumer owns
+every running instance: the hub container and its volume, the runner
+units and their data roots, the capability files and the probes, the
+tokens, the disk, the restarts and the upgrades. What crosses the line
+is always a named artefact — a file format, a flag, a document, an exit
+code, a schema — and never a person logging in. A fact about their
+machines reaches us as a bug report carrying a job id and two version
+numbers, or it does not reach us. `docs/handover.md` holds the plan: the
+line subsystem by subsystem, what must be built before the handover is
+honest, what we stop doing, what they must accept, the milestones
+revised, the order, and the risks.
+
+**The one rule that keeps this from being a withdrawal.** We may not
+hand over an instance that only its author can tell is healthy. So the
+handover is gated on one release, v0.3.4, that makes the instance
+judgeable from outside: a runner that refuses a probe it cannot start
+and a `herd-runner check` to run before starting it; a verdict a machine
+can read; the seven module options; a persisted `drain` read as `off`
+at startup; the version on the fleet listing; a reading costed at a
+figure and bounded per runner; and a release workflow that publishes
+without credentials we do not hold. Until that release exists the
+decision is taken and the handover is not done.
+
+**What is cut with it.** M15d's self-update (a third deployment path
+into machines we no longer deploy; D66 was the owner's requirement for
+a fleet he operated), M14's scheduler half (a timer and a `herdctl
+submit` on their side), M11's pack half and M12's peer-to-peer (a
+distributed cache for a fleet we do not run, with no measurement
+defending it). Each cut costs nothing today; `docs/handover.md` §7 names
+what each would cost to keep.
+
+**Alternatives rejected.**
+
+1. *Keep operating the server's pair as the reference deployment while
+   the consumer operates the rest.* Rejected: it is the arrangement that
+   produced today's fleet — one party with the keys and no obligation,
+   the other with the obligation and no keys. Two operators of one
+   instance is nobody operating it.
+2. *Shrink Herd to a library and let the consumer build the service.*
+   Rejected: the four crates, the unit and the compose file are the
+   product; invariant 1 is kept by refusing features, not by refusing
+   to ship.
+3. *Hand over now and fix the gate afterwards.* Rejected: a trap we
+   operated around becomes a trap we shipped the moment the handover is
+   announced, and the first grievance against a restart loop or a
+   half-dead runner would be answered by us logging in again.
+
+**Consequences.** `docs/status.md` describes the software, never a
+deployment; `docs/plan.md`'s M17 becomes a supported-platform milestone
+and M18 is walked by the consumer against a release; a new M19 is the
+handover itself; measurement access is replaced by the report format,
+the fleet listing and M13's status document, in that order. The
+remaining loss — we are told about problems instead of discovering them
+— is the decision, and is written down as such (`docs/handover.md` §8).
