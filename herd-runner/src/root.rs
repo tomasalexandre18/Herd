@@ -24,6 +24,7 @@
 //! directories are the runner's own — and a figure that still cannot be taken
 //! is returned as an error, never as a zero (D23).
 
+use std::fmt;
 use std::fs;
 use std::io;
 use std::path::{Component, Path, PathBuf};
@@ -391,10 +392,11 @@ impl Workspace {
     ///
     /// An error here is not a detail. The disk budget is enforced against
     /// this number, so a workspace that cannot be measured is a budget that
-    /// cannot be enforced, and the job ends at the cap instead of being
-    /// called a success (D23's "absent rather than zero", applied to the one
-    /// figure a job can interfere with).
-    pub fn measure(&self) -> Result<u64, String> {
+    /// cannot be enforced, and the job ends rather than being called a
+    /// success (D23's "absent rather than zero", applied to the one figure a
+    /// job can interfere with). Whether it ends at the *cap* or as a setup
+    /// failure is [`Unmeasurable::refused`]'s answer (D166).
+    pub fn measure(&self) -> Result<u64, Unmeasurable> {
         measure_tree(&self.base, &self.root)
     }
 
@@ -410,9 +412,46 @@ impl Workspace {
     }
 }
 
+/// Why a tree could not be measured, and whose problem that is (D166).
+///
+/// The sentence was always there; what was missing was the one bit beside it.
+/// A workspace that cannot be measured is a disk budget that cannot be
+/// enforced either way, so the job ends either way — but *why* it could not be
+/// measured decides what the job's end is called. A path the runner is
+/// **refused** is a fact about how the machine is set up, which is a person's
+/// job to fix and never the requester's; anything else is the runner failing
+/// at its own work, and D30's reading — the cap it could not be held to —
+/// stays right for it.
+///
+/// So the kind rides with the sentence rather than being re-derived by
+/// matching on its words, which is the one way this could have been done
+/// wrong.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Unmeasurable {
+    /// The sentence a human reads, naming the path.
+    pub why: String,
+    /// The runner was not allowed to read a path inside the tree.
+    pub refused: bool,
+}
+
+impl Unmeasurable {
+    pub(crate) fn of(why: String, error: &io::Error) -> Self {
+        Self {
+            why,
+            refused: error.kind() == io::ErrorKind::PermissionDenied,
+        }
+    }
+}
+
+impl fmt::Display for Unmeasurable {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.why)
+    }
+}
+
 /// Sum the apparent size of every regular file under a directory, restoring
 /// the access the walk needs, and refusing to call an unreadable tree empty.
-fn measure_tree(path: &Path, up_to: &Path) -> Result<u64, String> {
+fn measure_tree(path: &Path, up_to: &Path) -> Result<u64, Unmeasurable> {
     let mut total = 0u64;
     let mut pending = vec![path.to_path_buf()];
     while let Some(directory) = pending.pop() {
@@ -431,9 +470,9 @@ fn measure_tree(path: &Path, up_to: &Path) -> Result<u64, String> {
                 Ok(metadata) => metadata,
                 Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
                 Err(error) => {
-                    return Err(format!(
-                        "{} cannot be measured: {error}",
-                        entry.path().display()
+                    return Err(Unmeasurable::of(
+                        format!("{} cannot be measured: {error}", entry.path().display()),
+                        &error,
                     ))
                 }
             };
@@ -458,7 +497,7 @@ fn measure_tree(path: &Path, up_to: &Path) -> Result<u64, String> {
 pub(crate) fn read_dir_restoring(
     directory: &Path,
     up_to: &Path,
-) -> Result<Option<Vec<fs::DirEntry>>, String> {
+) -> Result<Option<Vec<fs::DirEntry>>, Unmeasurable> {
     match collect_dir(directory) {
         Ok(entries) => return Ok(Some(entries)),
         Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
@@ -473,9 +512,19 @@ pub(crate) fn read_dir_restoring(
     match collect_dir(directory) {
         Ok(entries) => Ok(Some(entries)),
         Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
-        Err(error) => Err(format!(
-            "{} cannot be read even after its mode was restored: {error}",
-            directory.display()
+        // The restoration is the runner taking back access to a tree it
+        // created. What survives it is a tree whose ownership is not the
+        // runner's at all — the first consumer's jobs deposit theirs under
+        // another user — and `chmod` on an inode somebody else owns is
+        // refused however many times it is tried. That is the case D166 is
+        // about, and `Unmeasurable::refused` is how it is told apart here
+        // rather than by reading this sentence's words later.
+        Err(error) => Err(Unmeasurable::of(
+            format!(
+                "{} cannot be read even after its mode was restored: {error}",
+                directory.display()
+            ),
+            &error,
         )),
     }
 }
@@ -956,6 +1005,90 @@ mod tests {
         );
     }
 
+    /// Which of the two endings a failed measurement is turns on the error's
+    /// **kind** and never on the words of its sentence (D166).
+    #[test]
+    fn a_refused_measurement_is_told_from_any_other_by_the_kind_of_its_error() {
+        let refused = Unmeasurable::of(
+            "/srv/herd/out/packs cannot be read".to_owned(),
+            &io::Error::from(io::ErrorKind::PermissionDenied),
+        );
+        assert!(refused.refused, "{refused}");
+        for kind in [
+            io::ErrorKind::NotFound,
+            io::ErrorKind::InvalidData,
+            io::ErrorKind::Other,
+        ] {
+            let other = Unmeasurable::of("whatever".to_owned(), &io::Error::from(kind));
+            assert!(
+                !other.refused,
+                "{kind:?} is the runner failing at its own work, which is still D30's cap"
+            );
+        }
+    }
+
+    /// And the same judgement on a **real** refusal, reached the way the
+    /// consumer's jobs reach it: a path the runner cannot take its access
+    /// back on, because what is in the way is not a mode it owns.
+    ///
+    /// No second user is needed to make one. The runner restores modes
+    /// between the workspace and its data root and **nothing above the data
+    /// root**, which is the right line to draw — a runner owns its data root
+    /// and nothing else on the host — so a directory above it that the walk
+    /// cannot search is an access that stays refused however many times the
+    /// restoration runs. That is the same answer the consumer's `server:users`
+    /// trees give for a different reason, and it is the answer this is about.
+    #[test]
+    #[cfg(unix)]
+    fn a_path_the_runner_cannot_take_its_access_back_on_is_refused_and_not_capped() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = TempDir::new("refused");
+        let outside = temp.path().join("not-ours");
+        let inside = outside.join("data-root");
+        fs::create_dir_all(&inside).expect("the fixture makes both");
+        let root = DataRoot::open(&inside).expect("usable");
+        let workspace = root.open_workspace(&JobId::new("j1197")).expect("made");
+        fs::write(workspace.work_dir().join("pack"), vec![3u8; 4_096]).expect("the job writes");
+
+        // Above the data root, so nothing in the walk's restoration reaches
+        // it. Put back at once, whatever the assertions below do.
+        fs::set_permissions(&outside, fs::Permissions::from_mode(0o000)).expect("chmod 000");
+        let measured = workspace.measure();
+        fs::set_permissions(&outside, fs::Permissions::from_mode(0o700)).expect("chmod back");
+
+        match measured {
+            Err(refused) => {
+                assert!(
+                    refused.refused,
+                    "an access the runner cannot take back is a setup failure, not a budget: \
+                     {refused}"
+                );
+                assert!(
+                    refused
+                        .why
+                        .contains(&workspace.work_dir().display().to_string())
+                        || refused
+                            .why
+                            .contains(&workspace.base_dir().display().to_string()),
+                    "the sentence names the path: {refused}"
+                );
+            }
+            // Running as a user the mode does not bind — root — which is a
+            // host this assertion cannot be made on rather than one it
+            // passes on (D27).
+            Ok(measured) => crate::testing::skipped(
+                "a_path_the_runner_cannot_take_its_access_back_on_is_refused_and_not_capped",
+                &format!(
+                    "a directory at mode 000 did not stop this user from walking it \
+                     ({measured} bytes were measured through it), which is what running as \
+                     root looks like — a non-root user would prove that a refused path is \
+                     reported as a setup failure and never as a disk cap"
+                ),
+            ),
+        }
+    }
+
     /// A measurement is taken, or it is an error. It is never a zero that
     /// means "could not look" (D23).
     #[test]
@@ -966,7 +1099,14 @@ mod tests {
         // A file where a directory is expected: read_dir fails with ENOTDIR,
         // which no chmod can fix, so the figure must be absent.
         let error = measure_tree(&file, temp.path()).expect_err("a file is not a tree to walk");
-        assert!(error.contains(&file.display().to_string()), "{error}");
+        assert!(error.why.contains(&file.display().to_string()), "{error}");
+        // ENOTDIR is the runner failing at its own work, not a path somebody
+        // else owns: D30's reading — the cap that could not be held to —
+        // stays right for it, and D166's does not apply.
+        assert!(
+            !error.refused,
+            "a directory that is not a directory is not an access that was refused: {error}"
+        );
         // A path that is simply not there holds nothing, which is a real zero.
         assert_eq!(
             measure_tree(&temp.path().join("never-made"), temp.path()),

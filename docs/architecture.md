@@ -148,7 +148,7 @@ Every module, and what lives in it:
 
 | Crate | Module | What is in it |
 |---|---|---|
-| herd-proto | `lib.rs` | `ToHub`, `FromHub`, `Asked`, `Role`, `Switch`, `Priority`, `JobOutcome`, `Cap`, `JobMetrics`, `Pressure`, `JobId`, `RunningJob`, `PROTOCOL_VERSION`, `HEALTH_EVERY`, `STILL_THERE_EVERY`, `JOB_LOG_FRAME_BYTES`, `SILENCE_MARGIN`, `version_gap`, every named refusal sentence |
+| herd-proto | `lib.rs` | `ToHub`, `FromHub`, `Asked`, `Role`, `Switch`, `Priority`, `JobOutcome`, `Cap`, `JobMetrics`, `Pressure`, `JobId`, `RunningJob`, `RunnerSwitch`, `ApprovedRunner`, `RunnerFacts`, `SuspendedCapability`, `PROTOCOL_VERSION`, `HEALTH_EVERY`, `STILL_THERE_EVERY`, `JOB_LOG_FRAME_BYTES`, `SILENCE_MARGIN`, `OUTPUT_FORMAT_VERSION`, `VERDICT_FORMAT_VERSION`, `version_gap`, every named refusal sentence |
 | herd-proto | `capability.rs` | `LabelSet`, `Capability`, `CapabilityKind`, `CapabilityOffer`, `CapabilityOrigins`, `BusyProbe`, `Availability`, `CapabilityState`, `Holdings`, `Contention`, `Occupant` |
 | herd-proto | `declaration.rs` | `Declaration`, `Executor`, `Step`, `StepRun`, `LabelsFrom`, `Requirements`, the seven tokens, `shell_quote` |
 | herd-proto | `outputs.rs` | `JobOutputs`, `OutputFile`, `FRAME_CEILING`, `INLINE_OUTPUT_MAX`, `OUTPUT_CHUNK_BYTES`, `PER_FILE_OVERHEAD` |
@@ -181,6 +181,7 @@ Every module, and what lives in it:
 | herdctl | `main.rs` | the CLI and the exit codes |
 | herdctl | `declaration.rs` | read the consumer's TOML, strictly |
 | herdctl | `checkout.rs` | resolve the commit in the requester's own git |
+| herdctl | `verdict.rs` | `Verdict`, `ExitCodeFrom`, `JobExists`, `CapReport` — the document `--verdict-to` writes |
 
 One version per dependency for the whole workspace, so the hub, a runner
 and `herdctl` can never speak slightly different versions of one library.
@@ -195,6 +196,7 @@ The dependencies that shape something, and why:
 | herd-runner | `libc` | `setsid`, `nice`, `ioprio_set`, `setrlimit`, and the write of `0` into `cgroup.procs` between fork and exec |
 | herd-runner, herdctl | `tokio-tungstenite` with `rustls-tls-webpki-roots`, `rustls` with `ring` | `wss://` on the side that dials, verified against roots bundled in the binary. No trust-this-CA option, on purpose (D115) |
 | herdctl | `toml` | only `herdctl` parses the consumer's declaration; the hub and a runner never see TOML (D106) |
+| herdctl | `serde_json` | the machine-readable verdict `--verdict-to` writes (D166) |
 
 The hub keeps `tokio-tungstenite` at default features and never wraps its
 listener: the reverse proxy terminates TLS (D14).
@@ -290,7 +292,7 @@ twice. The payload types that ride inside these frames are
 `JobOutcome`, `JobMetrics` and `Pressure`, `JobOutputs` and `OutputFile`,
 `CapabilityOffer` / `CapabilityState` / `Availability`, `HostSize`,
 `RunningJob`, `RunnerSwitch`, `SwitchPersistence`, `ApprovedRunner`,
-`FileHeld` and `AbsentFile`.
+`RunnerFacts` and `SuspendedCapability`, `FileHeld` and `AbsentFile`.
 
 `JOB_LOG_FRAME_BYTES` is **8 MiB**: a `FromHub::JobLog` backlog travels in
 pieces that concatenate to exactly what one frame used to carry, which
@@ -331,8 +333,10 @@ what its default says.
 
 ### 3.4 The versions, and what each one refuses
 
-Five version numbers, each refusing a different kind of mismatch. The
-handshake tests **equality**, not a floor.
+Six version numbers, each refusing a different kind of mismatch — except
+the last two, which refuse nothing and exist so that a consumer's parser
+can tell which shape it was handed. The handshake tests **equality**, not a
+floor.
 
 | Number | Value | Where it lives | What a mismatch does |
 |---|---|---|---|
@@ -341,6 +345,7 @@ handshake tests **equality**, not a floor.
 | `RECORD_VERSION` | **1** | `herd-hub/src/job.rs`; sits in front of `job.json` **and every line of `events.jsonl`** | the file is not read at all: the store errors naming the path and both numbers, and because that comes out of recovery the hub **refuses to start** on that state root |
 | `LAYOUT_VERSION`, `INDEX_VERSION`, `READINGS_VERSION`, `ROSTER_VERSION` | **1** each | `store.json`, `index/state.json`, `readings/answers.json`, `runners.json` | the file is refused rather than read as if it were this version; the roster's one decides who may connect |
 | `OUTPUT_FORMAT_VERSION` | **1** | the `ran on: …` line a requester's stdout is framed with | nothing refuses; it is how a consumer's parser knows which framing it got (Q7) |
+| `VERDICT_FORMAT_VERSION` | **1** | the first field of the JSON document `herdctl --verdict-to` writes | nothing refuses; a reader checks it before it reads anything else. Adding a field does not move it — every key is always present, so a document that gains one still answers what it answered before — while removing a field, or changing what one means, does (D166) |
 
 `RECORD_VERSION` is frozen at 1 since M16. It reached 6 while nothing was
 deployed; a bump now costs the operator's whole state root — every queued
@@ -400,7 +405,7 @@ stateDiagram-v2
   end note
 ```
 
-The seven outcomes, with the exit code `herdctl` wears for each:
+The eight outcomes, with the exit code `herdctl` wears for each:
 
 | `JobOutcome` | `herdctl` exits | What it means |
 |---|---|---|
@@ -411,11 +416,15 @@ The seven outcomes, with the exit code `herdctl` wears for each:
 | `Cancelled { reason }` | **125** | a requester asked, a deadline passed unstarted, or the parent did not succeed |
 | `Lost { reason }` | **125** | a second runner loss, or the requeue budget spent |
 | `Impossible { reason }` | **125** | nothing in this fleet could ever run it (E-36) |
+| `SetupFailed { reason }` | **125** | it ran on a machine that could not do its own part, so nobody established anything about it. Today's one case: the runner was refused access to a path inside the job's own workspace, so the disk budget could not be enforced at all. Not a cap — 124 would tell a requester a budget killed their build — and not `CouldNotStart`, which would withhold the `ran on:` line and hide the machine whose setup is broken (D166) |
 
 125 is one code for two opposite situations — a job that exists and may
 still be running, and a submission that never left — so `herdctl` says
 which on **stderr**, in one documented line, and a wrapper falls back on
-that rather than on the code.
+that rather than on the code. A requester that would rather not parse a
+sentence passes `--verdict-to <FILE>` and reads the document described in
+§3.4 instead: `cause`, `exit_code_from` and `job_exists` are the three
+questions the code cannot answer, in fields (D166).
 
 Two transitions the store answers `AlreadyThere` to rather than refusing:
 `finished` to `finished` with the same outcome, and `interrupted` to

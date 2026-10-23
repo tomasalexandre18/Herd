@@ -357,9 +357,10 @@ enum Command {
     Switch {
         /// One of `on`, `off`, `drain`.
         position: String,
-        /// Why. Required for `off` and `drain`, refused for `on`: a machine
-        /// withdrawn for no stated reason is one nobody can decide to switch
-        /// back on.
+        /// Why. Required for `off` and `drain`: a machine withdrawn for no
+        /// stated reason is one nobody can decide to switch back on. For
+        /// `on`, accepted and not kept — the position needs none, and
+        /// refusing the command for carrying one was a bad trade (D166).
         #[arg(long)]
         reason: Option<String>,
     },
@@ -426,6 +427,21 @@ async fn main() -> Result<()> {
         herd_runner::switch::write(&switch_file, &switch)
             .map_err(anyhow::Error::msg)
             .context("writing the switch")?;
+        // `on` carries no reason and no longer refuses one (D166). Said where
+        // the owner typed it, so a reason that goes nowhere is at least one
+        // somebody read.
+        if let (herd_proto::Switch::On, Some(given)) = (
+            &switch,
+            reason
+                .as_deref()
+                .map(str::trim)
+                .filter(|given| !given.is_empty()),
+        ) {
+            println!(
+                "herd-runner: the reason given is not kept, because the position that carries \
+                 one is the withdrawal: {given}"
+            );
+        }
         println!(
             "herd-runner: the switch in {} is now {}. A runner of this data root honours it \
              within ten seconds, whether or not a hub is up (E-33)",

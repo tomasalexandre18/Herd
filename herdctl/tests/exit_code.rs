@@ -760,6 +760,141 @@ async fn herdctl_exits_124_for_every_cap_a_test_can_trip() {
     assert!(stderr(&output).contains("disk cap"), "{}", stderr(&output));
 }
 
+/// Read the document `--verdict-to` wrote, as the agent that submitted the
+/// job would read it.
+fn verdict_at(path: &std::path::Path) -> serde_json::Value {
+    let text = std::fs::read_to_string(path)
+        .unwrap_or_else(|error| panic!("{} was not written: {error}", path.display()));
+    serde_json::from_str(&text).unwrap_or_else(|error| panic!("{text} is not json: {error}"))
+}
+
+/// The machine-readable verdict, against the real binary (D166).
+///
+/// **What it has to settle.** `herdctl --help`'s own exit-code table admits
+/// that 124 and 125 are "one code for two opposite situations", resolved by a
+/// documented stderr line — so a requester that is a program has been reading
+/// prose. The hardest case is the one this test leads with: a job that exits
+/// 124 *by itself* wears that code untouched (E-02), and by the code alone it
+/// is indistinguishable from a cap. One field apart, they are two things.
+#[tokio::test]
+async fn the_verdict_document_tells_a_job_s_own_code_from_herd_s() {
+    let into = TempDir::new().expect("a temporary directory for the verdicts");
+
+    // ---- A job that chose 124 for itself.
+    let harness = Harness::new().await;
+    let own = into.path().join("own.json");
+    let output = harness
+        .herdctl_args(&[
+            "run",
+            "--verdict-to",
+            &own.display().to_string(),
+            "--",
+            "/bin/sh",
+            "-c",
+            "printf 'done\\n'; exit 124",
+        ])
+        .await;
+    assert_eq!(status_code(&output), 124, "{}", stderr(&output));
+    let verdict = verdict_at(&own);
+    assert_eq!(
+        verdict["verdict_format_version"],
+        serde_json::json!(herd_proto::VERDICT_FORMAT_VERSION)
+    );
+    assert_eq!(verdict["cause"], "exited");
+    assert_eq!(verdict["exit_code"], 124);
+    assert_eq!(
+        verdict["exit_code_from"], "job",
+        "the job itself exited 124, and that is the fact no exit code can carry"
+    );
+    assert_eq!(verdict["passed"], false);
+    assert_eq!(verdict["cap"], serde_json::Value::Null);
+    // Grievances 10a and 10c: the runner's name, in a field.
+    assert_eq!(verdict["ran_on"]["runner"], "exit-code-runner");
+    assert!(
+        verdict["ran_on"]["why"]
+            .as_str()
+            .is_some_and(|why| !why.is_empty()),
+        "and why there: {verdict}"
+    );
+    assert_eq!(verdict["job_exists"], "a_job");
+    assert!(verdict["job_id"].as_str().is_some_and(|id| !id.is_empty()));
+    // The outcome as the protocol carries it, for a reader that wants all of
+    // it rather than the summary.
+    assert_eq!(verdict["outcome"]["type"], "exited");
+    assert_eq!(verdict["outcome"]["code"], 124);
+    drop(harness);
+
+    // ---- The same code, from a cap. One field apart.
+    let harness = Harness::with_caps(|caps| caps.timeout = Duration::from_secs(1)).await;
+    let capped = into.path().join("capped.json");
+    let output = harness
+        .herdctl_args(&[
+            "run",
+            "--verdict-to",
+            &capped.display().to_string(),
+            "--",
+            "/bin/sh",
+            "-c",
+            "sleep 120",
+        ])
+        .await;
+    assert_eq!(status_code(&output), 124, "{}", stderr(&output));
+    let verdict = verdict_at(&capped);
+    assert_eq!(verdict["cause"], "stopped_by_cap");
+    assert_eq!(verdict["exit_code"], 124);
+    assert_eq!(
+        verdict["exit_code_from"], "herd",
+        "nothing the job did produced this number: {verdict}"
+    );
+    assert_eq!(verdict["cap"]["cap"], "time");
+    assert_eq!(verdict["cap"]["limit"], 1);
+    assert_eq!(verdict["cap"]["unit"], "s");
+    // The sentence a person would have read, kept beside the fields so that
+    // one log line says the same thing in both places.
+    assert!(
+        verdict["said"].as_array().is_some_and(|said| said
+            .iter()
+            .any(|line| line.as_str().is_some_and(|line| line.contains("time cap")))),
+        "{verdict}"
+    );
+    drop(harness);
+
+    // ---- And the run that never got a verdict at all, which is the case a
+    // document had better still exist for: a wrapper that found the previous
+    // run's file would act on the previous run's answer.
+    let nothing = into.path().join("nothing.json");
+    std::fs::write(&nothing, b"{\"cause\":\"exited\",\"passed\":true}\n")
+        .expect("a stale document from an earlier run");
+    let output = Command::new(env!("CARGO_BIN_EXE_herdctl"))
+        .args([
+            "--hub",
+            // A port nothing of ours is on, so the dial fails outright.
+            "ws://127.0.0.1:1",
+            "run",
+            "--verdict-to",
+            &nothing.display().to_string(),
+            "--",
+            "/bin/sh",
+            "-c",
+            "exit 0",
+        ])
+        .output()
+        .await
+        .expect("herdctl runs");
+    assert_eq!(status_code(&output), 125, "{}", stderr(&output));
+    let verdict = verdict_at(&nothing);
+    assert_eq!(verdict["cause"], "no_verdict");
+    assert_eq!(verdict["exit_code"], 125);
+    assert_eq!(verdict["exit_code_from"], "herd");
+    assert_eq!(verdict["passed"], false);
+    assert_eq!(
+        verdict["job_exists"], "nothing",
+        "the dial failed, so nothing was submitted and running the work again is safe"
+    );
+    assert_eq!(verdict["job_id"], serde_json::Value::Null);
+    assert_eq!(verdict["outcome"], serde_json::Value::Null);
+}
+
 /// The strict half of D52: a label a requester *submits* is refused, by name,
 /// before anything is minted.
 ///

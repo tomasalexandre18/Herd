@@ -46,7 +46,7 @@
 //!   is retried for as long as it takes and never dropped (D19); output the
 //!   hub is missing is asked for again before the log is declared short (D29).
 
-use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -674,6 +674,13 @@ struct State {
 /// functions.
 #[derive(Debug, Clone)]
 struct Announced {
+    /// Which **build** it is, as its handshake said (E-51, D166).
+    ///
+    /// Kept because a fleet listing has to be able to say it. The hub already
+    /// judges this string at the handshake — refusing a major gap, noting a
+    /// minor one on its own stderr — and that note goes nowhere an operator
+    /// working through `herdctl` will ever see it.
+    version: String,
     /// What it offers, and what its probes say (M5, E-24).
     capacity: RunnerCapacity,
     /// How big its host is (E-22).
@@ -704,6 +711,10 @@ struct Attached {
 /// One runner's connection, and what the hub knows about it.
 struct ConnectedRunner {
     name: String,
+    /// Which **build** this is, as its handshake announced it (E-51, D166).
+    /// On the connection because a build is a fact about the process, and a
+    /// redial brings its own — which is the whole point after an upgrade.
+    version: String,
     /// Which *process* this is, as its handshake announced it. What tells a
     /// redial from a twin, which a name cannot.
     instance: Option<String>,
@@ -765,6 +776,32 @@ struct ConnectedRunner {
     /// same position can never answer a new question.
     applied: watch::Sender<Option<Acknowledged>>,
     jobs: Vec<RunningJob>,
+}
+
+impl ConnectedRunner {
+    /// What a fleet listing says about this machine besides its name (D166).
+    ///
+    /// Built in one place for both listings — `herdctl runner list` and
+    /// `herdctl switch` — because an operator must not have to learn which of
+    /// the two commands tells the truth about a runner.
+    ///
+    /// The suspensions are `Some` even when the list is empty, and that is
+    /// the point of the `Option`: this hub is connected to the machine and is
+    /// answering the question. An *absent* list means a hub that cannot
+    /// answer it, which is a different thing and must not read as a clean
+    /// bill of health.
+    fn facts(&self) -> herd_proto::RunnerFacts {
+        herd_proto::RunnerFacts {
+            version: Some(self.version.clone()),
+            suspended: Some(
+                self.capacity
+                    .suspended()
+                    .into_iter()
+                    .map(|(label, why)| herd_proto::SuspendedCapability { label, why })
+                    .collect(),
+            ),
+        }
+    }
 }
 
 /// What a runner said it did with a position the hub asked it for (E-33, D99).
@@ -1000,6 +1037,7 @@ impl State {
                 name.to_owned(),
                 ConnectedRunner {
                     name: name.to_owned(),
+                    version: announced.version,
                     instance: instance.map(str::to_owned),
                     outbox: outbox.clone(),
                     capacity: announced.capacity,
@@ -1207,6 +1245,7 @@ impl State {
                     switch: runner.switch.clone(),
                     jobs: runner.jobs.len() as u32,
                     stopping: runner.draining,
+                    facts: runner.facts(),
                 })
                 .collect()
         })
@@ -1728,6 +1767,7 @@ async fn serve_peer(state: Arc<State>, stream: TcpStream) -> Result<()> {
                 said(state_root),
                 health_every_ms.map(Duration::from_millis),
                 Announced {
+                    version: peer_version,
                     capacity: RunnerCapacity::new(name, capabilities),
                     host,
                     preference,
@@ -2573,6 +2613,9 @@ fn how_it_ended(outcome: &JobOutcome) -> String {
         JobOutcome::Cancelled { reason } => format!("was cancelled: {reason}"),
         JobOutcome::Lost { reason } => format!("was lost: {reason}"),
         JobOutcome::Impossible { reason } => format!("could never have run: {reason}"),
+        JobOutcome::SetupFailed { reason } => {
+            format!("ran on a machine that could not do its part: {reason}")
+        }
     }
 }
 
@@ -5129,14 +5172,27 @@ async fn accept_submissions(state: &State, outbox: &Outbox, source: &mut Source)
                         return Ok(());
                     }
                 };
+                // Keyed by name, carrying what the listing says about each
+                // connected machine: its build and what it is not handing out
+                // (D166). A name that is not in here is a runner that is not
+                // connected, and that is still the only question `connected`
+                // answers.
                 let connected = state.with_peers(|peers| {
-                    peers.runners.keys().cloned().collect::<BTreeSet<String>>()
+                    peers
+                        .runners
+                        .iter()
+                        .map(|(name, runner)| (name.clone(), runner.facts()))
+                        .collect::<BTreeMap<String, herd_proto::RunnerFacts>>()
                 });
                 let _ = outbox.send(FromHub::ApprovedRunners {
                     runners: approvals
                         .into_iter()
                         .map(|approval| herd_proto::ApprovedRunner {
-                            connected: connected.contains(&approval.name),
+                            connected: connected.contains_key(&approval.name),
+                            // Empty for a machine that is not here: it offers
+                            // nothing, so it suspends nothing, and a stale
+                            // list would be a report about a runner that left.
+                            facts: connected.get(&approval.name).cloned().unwrap_or_default(),
                             name: approval.name,
                             approved_unix_s: approval.approved_unix_s,
                         })
@@ -6069,6 +6125,7 @@ mod tests {
                 &outbox,
                 kick,
                 Announced {
+                    version: hub_version().to_owned(),
                     capacity: offering_kvm_free(),
                     host: HostSize::default(),
                     preference: 0,

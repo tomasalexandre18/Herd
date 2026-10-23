@@ -74,7 +74,7 @@ use crate::cgroup::JobCgroup;
 use crate::confine::{job_environment, kill_process_group, ChildSetup, Confined, POLL_INTERVAL};
 use crate::metrics::{host_load_milli, process_rss_bytes};
 use crate::reclaim::{kill_by_marker, JobTag};
-use crate::root::Workspace;
+use crate::root::{Unmeasurable, Workspace};
 use crate::step::{self, Stage};
 use crate::{CancelToken, Ending, Session};
 
@@ -453,20 +453,13 @@ pub async fn execute(
     // their reason, and "stopped at its disk cap" would replace a true reason
     // with a cap that is not why the job is over.
     if ran.nothing_ended_it() {
-        if ran.unmeasurable.is_some() {
+        if let Some(unmeasurable) = ran.unmeasurable.clone() {
             // A workspace the runner cannot measure is a disk budget it
             // cannot enforce, and an unenforced budget must never read as a
-            // job that passed. The figure is absent and the job is stopped by
-            // the cap it could not be held to.
-            ran.cap = Some(Capped {
-                cap: Cap::Disk,
-                limit: caps.disk_budget,
-                detail: Some(format!(
-                    "this runner could not measure the job's workspace, so it could not \
-                     hold the job to its disk budget at all: {}",
-                    ran.unmeasurable.clone().unwrap_or_default()
-                )),
-            });
+            // job that passed. The figure is absent and the job ends either
+            // way; what the ending is *called* turns on why the measurement
+            // failed (D166).
+            ran.ended_unmeasurable(&unmeasurable, caps.disk_budget);
         } else if final_disk
             .as_ref()
             .is_ok_and(|used| *used > caps.disk_budget)
@@ -478,10 +471,20 @@ pub async fn execute(
             });
         }
     }
-    if let Some(reason) = &ran.unmeasurable {
+    if let Some(unmeasurable) = &ran.unmeasurable {
         eprintln!(
             "herd-runner: job {job_id} could not be held to its disk budget, because \
-             its workspace could not be measured: {reason}"
+             its workspace could not be measured: {}{}",
+            unmeasurable.why,
+            if unmeasurable.refused {
+                // Said here too, on the machine's own stderr, because the
+                // person who can fix this is the one reading this journal
+                // (D166).
+                ". This runner was refused that path rather than reaching a budget, so the \
+                 job is reported as a setup failure and not as a disk cap"
+            } else {
+                ""
+            }
         );
     }
 
@@ -610,20 +613,34 @@ struct Attempt {
     could_not_start: Option<String>,
     /// A cap that ended the attempt.
     cap: Option<Capped>,
+    /// Why the machine this attempt ran on could not do its own part, when
+    /// that is what ended it (D166).
+    ///
+    /// One case today, and it is the one the first consumer hit three times:
+    /// the walk that holds a job to its disk budget was **refused** a path
+    /// inside the job's own workspace. The budget cannot be enforced, so the
+    /// job still ends — that half is invariant 2 and was always right — but
+    /// it is not a cap and must not wear one's exit code.
+    setup_failed: Option<String>,
     /// How somebody outside the job asked for it to end, if somebody did.
     ending: Option<Ending>,
     /// The high-water mark of the workspace across every step, or `None` if
     /// no measurement could be taken at all.
     peak_disk: Option<u64>,
-    /// Why a measurement could not be taken, if one could not.
-    unmeasurable: Option<String>,
+    /// Why a measurement could not be taken, if one could not — and whether
+    /// it was an access the runner was refused, which is what decides between
+    /// D30's cap and D166's setup failure.
+    unmeasurable: Option<Unmeasurable>,
     peak_rss: Option<u64>,
 }
 
 impl Attempt {
     /// Whether the steps before `down` can still run.
     fn over(&self) -> bool {
-        self.could_not_start.is_some() || self.cap.is_some() || self.ending.is_some()
+        self.could_not_start.is_some()
+            || self.cap.is_some()
+            || self.setup_failed.is_some()
+            || self.ending.is_some()
     }
 
     /// Whether anything has ended this attempt other than its own steps
@@ -649,6 +666,16 @@ impl Attempt {
                 detail: capped.detail.clone(),
             };
         }
+        // After the cap rather than before it, and the two can never both be
+        // set anyway: a setup failure is recorded exactly where a cap would
+        // have been and in its place (D166). The order here is for whoever
+        // reads this function — a cap is still the first thing that ends a
+        // job — and not a precedence anything depends on.
+        if let Some(reason) = &self.setup_failed {
+            return JobOutcome::SetupFailed {
+                reason: reason.clone(),
+            };
+        }
         if let Some(reason) = &self.could_not_start {
             return JobOutcome::CouldNotStart {
                 reason: reason.clone(),
@@ -664,6 +691,60 @@ impl Attempt {
                     .to_owned(),
             }
         })
+    }
+
+    /// Record a workspace the runner was **refused** during one step, and
+    /// answer whether that step was the takedown (D166).
+    ///
+    /// The distinction is D108's and it is not a detail. A refusal seen while
+    /// the job's own steps are running ends the attempt: the disk budget
+    /// could not be enforced, so there is no verdict to stand behind. One
+    /// seen while the workspace is being *taken down* is a different fact
+    /// entirely — the verdict already exists, and a tree that will not go
+    /// away is an operator's problem and never a test result — so it is said
+    /// in the job's log, where `down` failures are said, and the verdict is
+    /// left exactly as it was.
+    ///
+    /// The first refusal is kept rather than the last: the earliest one is
+    /// the one that stopped the job, and the steps after it only see the same
+    /// path still unreadable.
+    fn refused_workspace(&mut self, step: Option<Step>, reason: String) -> bool {
+        if step == Some(Step::Down) {
+            return true;
+        }
+        let _ = self.setup_failed.get_or_insert(reason);
+        false
+    }
+
+    /// End an attempt whose workspace could not be measured, as the one thing
+    /// it is (D30, D166).
+    ///
+    /// Two endings out of one mechanism, because the mechanism has two
+    /// causes. A walk that was **refused** a path is a fact about how the
+    /// machine is set up: no submission could have caused it, nothing a
+    /// requester changes will fix it, and 124 would tell them a budget killed
+    /// their build. Anything else — a path that is not a directory, a
+    /// measuring task that died — is the runner failing at its own work, and
+    /// D30's reading still holds: the job is stopped by the cap it could not
+    /// be held to, with the real reason beside the figure so that four
+    /// kilobytes never read as a filled disk.
+    fn ended_unmeasurable(&mut self, unmeasurable: &Unmeasurable, budget: u64) {
+        if unmeasurable.refused {
+            self.setup_failed = Some(herd_proto::workspace_refused_reason(
+                budget,
+                &unmeasurable.why,
+            ));
+        } else {
+            self.cap = Some(Capped {
+                cap: Cap::Disk,
+                limit: budget,
+                detail: Some(format!(
+                    "this runner could not measure the job's workspace, so it could not hold \
+                     the job to its disk budget at all: {}",
+                    unmeasurable.why
+                )),
+            });
+        }
     }
 
     /// How a step went, in the words its own line uses.
@@ -734,7 +815,20 @@ impl Attempt {
         // read where the watchdog saw nothing: an out-of-memory kill reaches
         // us as a signal, and a bare "signalled by 9" would tell nobody why
         // (E-30).
+        // A disk cap the runner was *refused* its way into is not a cap at
+        // all (D166). Judged before `capped` is built, so that neither this
+        // step's line nor the attempt's ending can go on calling it one.
+        let refused_workspace = match (watched.cap, &self.unmeasurable) {
+            (Some(Cap::Disk), Some(unmeasurable)) if unmeasurable.refused => Some(
+                herd_proto::workspace_refused_reason(caps.disk_budget, &unmeasurable.why),
+            ),
+            _ => None,
+        };
+
         let capped = match (watched.cap, oomed) {
+            // Said as the setup failure it is, below. Nothing is recorded as
+            // a cap here, which is the whole of D166's change.
+            _ if refused_workspace.is_some() => None,
             (Some(cap), _) => Some(Capped {
                 cap,
                 limit: limit_of(cap, stage, caps),
@@ -744,9 +838,10 @@ impl Attempt {
                 // 21474836480 bytes", which is a true number in a false
                 // sentence (D30).
                 detail: match (cap, &self.unmeasurable) {
-                    (Cap::Disk, Some(reason)) => Some(format!(
+                    (Cap::Disk, Some(unmeasurable)) => Some(format!(
                         "this runner could not measure the job's workspace, so it could not \
-                         hold the job to its disk budget at all: {reason}"
+                         hold the job to its disk budget at all: {}",
+                        unmeasurable.why
                     )),
                     _ => None,
                 },
@@ -762,34 +857,50 @@ impl Attempt {
         // What the step's own line says: a code when a shell exited, and why
         // there is none when nothing did. Never a zero for a code that was
         // not read (D23's rule, as `StepRun` states it).
-        let (exit_code, ended) = match (&capped, &watched.ending, &watched.outcome) {
-            // The time cap is the one of the four whose figure is the step's
-            // own rather than the runner's, so its sentence says whose it is
-            // (D108).
-            (Some(capped), _, _) if capped.cap == Cap::Time => {
-                (None, Some(step::stopped_at_the_time_cap(stage)))
+        let (exit_code, ended) = if let Some(said) = &refused_workspace {
+            (None, Some(said.clone()))
+        } else {
+            match (&capped, &watched.ending, &watched.outcome) {
+                // The time cap is the one of the four whose figure is the step's
+                // own rather than the runner's, so its sentence says whose it is
+                // (D108).
+                (Some(capped), _, _) if capped.cap == Cap::Time => {
+                    (None, Some(step::stopped_at_the_time_cap(stage)))
+                }
+                (Some(capped), _, _) => (
+                    None,
+                    Some(herd_proto::cap_stop_reason(
+                        capped.cap,
+                        capped.limit,
+                        capped.detail.as_deref(),
+                    )),
+                ),
+                (None, Some(asked), _) => (
+                    None,
+                    Some(format!("was ended before it finished: {}", asked.reason())),
+                ),
+                (None, None, JobOutcome::Exited { code }) => (Some(*code), None),
+                (None, None, JobOutcome::Signalled { signal }) => {
+                    (None, Some(format!("was killed by signal {signal}")))
+                }
+                (None, None, JobOutcome::CouldNotStart { reason }) => (None, Some(reason.clone())),
+                (None, None, other) => (None, Some(format!("ended as {other:?}"))),
             }
-            (Some(capped), _, _) => (
-                None,
-                Some(herd_proto::cap_stop_reason(
-                    capped.cap,
-                    capped.limit,
-                    capped.detail.as_deref(),
-                )),
-            ),
-            (None, Some(asked), _) => (
-                None,
-                Some(format!("was ended before it finished: {}", asked.reason())),
-            ),
-            (None, None, JobOutcome::Exited { code }) => (Some(*code), None),
-            (None, None, JobOutcome::Signalled { signal }) => {
-                (None, Some(format!("was killed by signal {signal}")))
-            }
-            (None, None, JobOutcome::CouldNotStart { reason }) => (None, Some(reason.clone())),
-            (None, None, other) => (None, Some(format!("ended as {other:?}"))),
         };
         let how = Self::how_it_went(exit_code, &ended);
         self.record(stage, at, exit_code, ended, session, job_id, attempt);
+
+        // Ahead of everything else read off this step: a workspace the runner
+        // was refused is the machine's problem at `up` exactly as it is at
+        // `run`, and letting a preparation step turn it into
+        // `could_not_start` would hide both the machine's part in it and the
+        // path somebody has to go and fix (D166).
+        if let Some(reason) = refused_workspace {
+            if self.refused_workspace(stage.step, reason) {
+                self.say_the_takedown_did_not_come_off(session, job_id, &how);
+            }
+            return;
+        }
 
         let came_off = exit_code == Some(0);
         match stage.step {
@@ -1037,8 +1148,9 @@ struct Watched {
     /// The high-water mark of the workspace, or `None` if no measurement
     /// could be taken at all.
     peak_disk: Option<u64>,
-    /// Why a measurement could not be taken, if one could not.
-    unmeasurable: Option<String>,
+    /// Why a measurement could not be taken, if one could not, and whether it
+    /// was an access the runner was refused (D166).
+    unmeasurable: Option<Unmeasurable>,
     peak_rss: Option<u64>,
 }
 
@@ -1056,7 +1168,7 @@ async fn watch(child: &mut Child, watch: Watch<'_>) -> Watched {
     let mut cap: Option<Cap> = None;
     let mut ending: Option<Ending> = None;
     let mut peak_disk: Option<u64> = None;
-    let mut unmeasurable: Option<String> = None;
+    let mut unmeasurable: Option<Unmeasurable> = None;
     let mut peak_rss: Option<u64> = None;
 
     let outcome = loop {
@@ -1109,10 +1221,17 @@ async fn watch(child: &mut Child, watch: Watch<'_>) -> Watched {
             let workspace = watch.workspace.clone();
             let measured = tokio::task::spawn_blocking(move || workspace.measure())
                 .await
-                .unwrap_or_else(|error| Err(format!("the measuring task failed: {error}")));
+                .unwrap_or_else(|error| {
+                    // The runner failing at its own work, not a path it was
+                    // refused: D30's cap, not D166's setup failure.
+                    Err(crate::root::Unmeasurable {
+                        why: format!("the measuring task failed: {error}"),
+                        refused: false,
+                    })
+                });
             match &measured {
                 Ok(used) => peak_disk = Some(peak_disk.unwrap_or(0).max(*used)),
-                Err(reason) => unmeasurable = Some(reason.clone()),
+                Err(unreadable) => unmeasurable = Some(unreadable.clone()),
             }
             if watch.cgroup.is_none() {
                 if let Some(rss) = process_rss_bytes(watch.pid) {
@@ -1387,6 +1506,113 @@ mod tests {
                 detail: None
             }
         );
+    }
+
+    /// The split D166 is about: a workspace the runner was **refused** is a
+    /// setup failure naming the path, and anything else that stops a
+    /// measurement is still D30's cap.
+    ///
+    /// One mechanism, two endings, and the difference is the whole of why the
+    /// first consumer's j984, j989 and j1197 were wrong. All three ended
+    /// `stopped_by_cap` with `cap: disk` and exit 124, with a detail saying
+    /// plainly that the runner could not *measure* the workspace at all — a
+    /// true sentence under a false outcome, and 124 told their requester a
+    /// budget had killed the build. Nothing of the sort happened: the trees
+    /// were deposited under another ownership and `chmod` on somebody else's
+    /// inode is refused however often it is tried.
+    #[test]
+    fn a_workspace_the_runner_was_refused_is_a_setup_failure_and_not_a_cap() {
+        let budget = 21_474_836_480;
+        let path = "/srv/herd/jobs/j1197/work/out/packs/pack-f0.pack";
+
+        let mut ran = Attempt {
+            verdict: Some(JobOutcome::Exited { code: 0 }),
+            ..Attempt::default()
+        };
+        ran.ended_unmeasurable(
+            &Unmeasurable {
+                why: format!(
+                    "{path} cannot be read even after its mode was restored: \
+                              Permission denied (os error 13)"
+                ),
+                refused: true,
+            },
+            budget,
+        );
+        assert!(
+            ran.cap.is_none(),
+            "no cap ended this job, and 124 would say one had"
+        );
+        assert!(!ran.nothing_ended_it(), "the job is over all the same");
+        let JobOutcome::SetupFailed { reason } = ran.outcome() else {
+            panic!(
+                "a refused workspace is a setup failure: {:?}",
+                ran.outcome()
+            )
+        };
+        assert!(
+            reason.contains(path),
+            "the path somebody has to go and fix has to be in it: {reason}"
+        );
+        assert!(
+            reason.contains(&budget.to_string()),
+            "and the budget it could not be held to: {reason}"
+        );
+
+        // The other half of the mechanism is untouched. A measurement that
+        // failed for any reason but access is the runner failing at its own
+        // work, and an unenforceable budget must still never read as a job
+        // that passed (D30).
+        let mut ran = Attempt {
+            verdict: Some(JobOutcome::Exited { code: 0 }),
+            ..Attempt::default()
+        };
+        ran.ended_unmeasurable(
+            &Unmeasurable {
+                why: "/srv/herd/jobs/j7/work cannot be measured: Not a directory".to_owned(),
+                refused: false,
+            },
+            budget,
+        );
+        assert!(ran.setup_failed.is_none());
+        let JobOutcome::StoppedByCap { cap, limit, detail } = ran.outcome() else {
+            panic!("{:?}", ran.outcome())
+        };
+        assert_eq!((cap, limit), (Cap::Disk, budget));
+        assert!(
+            detail.is_some_and(|detail| detail.contains("could not measure")),
+            "the figure alone would be a true number in a false sentence (D30)"
+        );
+    }
+
+    /// A refusal seen while the workspace is being **taken down** leaves the
+    /// verdict alone (D108, D166).
+    ///
+    /// The `down` step is the one that runs however the others ended, so it
+    /// is the one place where an ending read off a step would arrive after a
+    /// verdict had already been established — and throwing a verdict away
+    /// because a workspace would not go quietly is exactly what D108 forbids.
+    #[test]
+    fn a_refusal_during_the_takedown_leaves_an_established_verdict_alone() {
+        let mut ran = Attempt {
+            verdict: Some(JobOutcome::Exited { code: 0 }),
+            ..Attempt::default()
+        };
+        assert!(
+            ran.refused_workspace(Some(Step::Down), "/out/packs cannot be read".to_owned()),
+            "a takedown's refusal is said in the log, not made the job's ending"
+        );
+        assert!(ran.setup_failed.is_none());
+        assert_eq!(ran.outcome(), JobOutcome::Exited { code: 0 });
+
+        // On the job's own steps it *is* the ending, and the first one is the
+        // one kept: the steps after it see the same path still unreadable.
+        assert!(!ran.refused_workspace(Some(Step::Run), "the first path".to_owned()));
+        ran.refused_workspace(None, "a later one".to_owned());
+        let JobOutcome::SetupFailed { reason } = ran.outcome() else {
+            panic!("{:?}", ran.outcome())
+        };
+        assert_eq!(reason, "the first path");
     }
 
     /// An attempt whose steps all ran to their end is one nothing stopped, so

@@ -172,17 +172,25 @@ fn the_line_about(said: &str, runner: &str) -> String {
         .unwrap_or_else(|| panic!("`herdctl switch` says nothing about {runner}: {said}"))
 }
 
-/// Wait until `herdctl switch` says exactly this about one machine.
+/// Wait until `herdctl switch` opens its line about one machine with this.
 ///
 /// The figures on that line are the runner's own, carried on its health
 /// report, so they lag what they describe by up to one cadence. A test that
 /// read them without waiting would be asserting a state it had not
 /// established (D100).
+///
+/// The **opening** of the line and not the whole of it, since D166: the
+/// clause the fleet listing appends — which build the machine runs — is a
+/// fact about the machine and not about its switch, and a test about E-33
+/// has no business going red because the listing learned to say something
+/// else about the fleet. Everything these tests are about is in the part
+/// that is still matched exactly: the position, its reason, and what is
+/// running there.
 async fn until_the_fleet_says(herd: &Herd, runner: &str, line: &str) {
     let deadline = Instant::now() + PATIENCE;
     loop {
         let said = herd.switches().await;
-        if line_about(&said, runner).as_deref() == Some(line) {
+        if line_about(&said, runner).is_some_and(|said| said.starts_with(line)) {
             return;
         }
         assert!(
@@ -334,13 +342,18 @@ async fn a_switch_off_on_the_machine_stops_claims_in_ten_seconds_and_spares_the_
         "the refusal must carry her own reason (E-33): {refusal}"
     );
     // And the state is visible, with the reason, through herdctl — the whole
-    // line and not a fragment of it: the machine's name, the owner's own
-    // words, and the **one** job this test put there, which *finishes*. That
-    // last word is the whole difference between her switch and a shutdown.
+    // of what E-33 asks for and not a fragment of it: the machine's name, the
+    // owner's own words, and the **one** job this test put there, which
+    // *finishes*. That last word is the whole difference between her switch
+    // and a shutdown.
+    //
+    // Matched from the start of the line rather than against all of it, since
+    // D166 appends which build the machine runs — a fact about the machine
+    // and not about its switch.
     let said = herd.switches().await;
-    assert_eq!(
-        the_line_about(&said, "wsl-pc"),
-        "wsl-pc: off (she is gaming), 1 job running there finishes",
+    let line = the_line_about(&said, "wsl-pc");
+    assert!(
+        line.starts_with("wsl-pc: off (she is gaming), 1 job running there finishes"),
         "E-33 asks for the position, its reason and what becomes of the work in flight: {said}"
     );
 
