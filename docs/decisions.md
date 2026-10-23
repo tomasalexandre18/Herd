@@ -6677,3 +6677,126 @@ memory". One wording, in one function, `of_which`. And the line explaining a
 reading's own placement says in as many words that it holds none of the
 machine — so a record of a reading can never be read as a record of something
 that held a slot.
+
+---
+
+## 2026-10-23 — D161 A runner's figures belong to the machine's owner
+
+**The refusal.** The first consumer's jobs ask for 10 GiB of tmpfs. The
+server's runner lends 4 GiB, so the hub's record of `j0000001566` says, in
+its own words, that *"server has 4 GiB of tmpfs in all and this job needs
+10 GiB, so no reservation there can ever cover it"*. That is not a wait: it
+is a permanent refusal, and three jobs are held by it. `/dev/shm` on that
+host is 16 GiB — the capacity is there and has been all along. What stood in
+the way was `"--host-tmpfs 4GiB"`, a string literal in
+`deploy/nixos-herd-runner.nix`.
+
+**And the operator could not work around it.** The honest attempt is to
+append `--host-tmpfs 8GiB` through `services.herd-runner.extraArgs`, which
+is what that option is for. It failed:
+`the argument '--host-tmpfs <SIZE>' cannot be used multiple times`. So the
+figure was ours and nobody else's, on a machine we do not own, with no way
+for its owner to say otherwise short of editing this repository. That is the
+thing being fixed, and it is worth more than the one number: a deployment
+that states a cap its operator cannot restate is a deployment that decides
+for someone else's hardware.
+
+### The two halves
+
+**Seven figures become options of `services.herd-runner`.** `hostTmpfs`,
+`hostTmpfsPath`, `jobLogCap`, `jobDiskBudget`, `jobNice`, `healthEvery` and
+`drainGrace`, each defaulted to the value that was literal in the module a
+minute ago: `4GiB`, `/dev/shm`, `64MiB`, `20GiB`, `10`, `15`, `3`. The
+module already had `jobTimeout`, `jobMemoryMax`, `hostMemory`,
+`hostMemoryFloor` and `hostThreads`; there was no reason beyond history for
+the line to be half declared, and the half left out included the one figure
+that refuses work outright.
+
+**No default moves.** The point is that an operator can choose, not that we
+choose differently for her. This is checkable rather than asserted: the
+module's `ExecStart` was evaluated before and after the change with
+`nixosSystem` and the two strings are byte-identical, so a `nixos-rebuild`
+that only picks up these options is a no-op and not a restart anybody has to
+plan. The server will raise `hostTmpfs` next, in `/etc/nixos`, which is the
+owner's file and the owner's move.
+
+**A repeated flag on the runner takes the last value.** `args_override_self`
+on `herd-runner`'s clap command, which is clap's own word for "replace prior
+occurrences of arguments rather than error". It is what makes `extraArgs` an
+escape hatch again: this command line has two authors — a deployment that
+writes the figures it chose, and the operator of the machine, who appends to
+it — and before this the second author could not correct the first. Options
+whose action is to append are untouched by it, which matters here:
+`--privileged-helper`, `--declare-capability` and `--deny-capability` each
+declare a *list* by repetition, and a last-wins reading of those would
+quietly narrow a machine's declaration to its final line and refuse the rest
+later, on a job. That is asserted, not assumed.
+
+### Why plain types and not `nullOr`, with the one exception recorded
+
+`jobPidsMax` and `jobIoMax` are `nullOr` because absence is a *statement*
+there: the flag leaves the line entirely and the runner's own default stands
+(`pids.max` 1024, and no `io.max` written at all). None of these seven is in
+that position. All seven are on the ExecStart line today, every one of them
+with a figure somebody chose, and keeping them on it is what makes the
+defaults a no-op.
+
+One of them does have a real third state, and it is recorded here rather
+than built: with `--host-tmpfs` absent the runner *measures* the mount and
+lends what it finds. On the project's server that would be 16 GiB rather
+than 4, which is a different decision about what the host lends and not a
+spelling of the same one — so `hostTmpfs = null` meaning "lend whatever
+`/dev/shm` has" is a coherent option and a separate ruling. It is Alexa's,
+not this entry's. A figure is also the safer default of the two: a machine
+that lends what it happens to measure lends more the day somebody remounts
+`/dev/shm`, and invariant 2 is about the host never falling over.
+
+### Only the runner, and why that is not an inconsistency
+
+`herd-hub` and `herdctl` keep clap's refusal, deliberately.
+
+The hub has no command line to override. `deploy/docker-compose.yml`
+configures it entirely through the environment — `HERD_LISTEN`,
+`HERD_STATE_DIR`, `HERD_REQUESTER_TOKEN_FILE` — and an environment variable
+holds one value by construction, so there is no second author to make room
+for. The day the hub's deployment grows an argument list this argument comes
+back, and nothing about the change would be harder then.
+
+`herdctl` is the opposite case: its command line has one author, a requester
+typing or generating it in one place, and a flag given twice there is a
+mistake rather than an override. A requester who writes `--priority` twice
+wants to be told, not quietly given the second one — the hub's queue is the
+wrong place to discover a generated command line was wrong. So consistency
+across three binaries would buy nothing and would cost `herdctl`'s loudest
+check on its own callers.
+
+### Done means a passing test
+
+`a_repeated_option_takes_the_value_stated_last` reads the parse directly, on
+`Args`, in `herd-runner/src/main.rs` beside the struct it is about — the
+runner had no argument tests at all, and `herdctl`'s own `mod tests` in its
+`main.rs` is the precedent for where one goes. It asserts the operator's
+case (`--host-tmpfs 4GiB … --host-tmpfs 10GiB` yields 10 GiB) and then all
+seven of the module's figures stated twice over. Verified to fail without
+`args_override_self`, which is the only way to know it is testing anything.
+Two more beside it: the list options keep every occurrence, and
+`Args::command().debug_assert()`, because nothing in the suite built this
+binary's parser before and clap's own conflict assertions ran nowhere.
+
+### Two things that were no longer true, and the number
+
+`deploy/herd-runner.service` said the copied-unit path *"is what the
+project's server runs today"* and the module said the server *"stays on the
+imperative path"* until the owner imports it. Neither is true:
+`systemctl cat herd-runner` on that host prints a `/nix/store` unit with
+`Documentation=file:///etc/herd/joining.md`, which only this module
+produces, and `docs/status.md` has said the runner is declarative since
+D144. The module's worked example also described the live unit as
+*"transient"* and the rebuild as *"the rebuild that makes it permanent"* —
+that rebuild has happened. All three corrected, because the one thing both
+files promise is that they describe the host as it is.
+
+**On the number.** This is D161 and D160 does not exist yet: it is taken by
+an unmerged pull request the owner is reviewing. The gap stays, by D148's
+rule — a decision number is an identifier, not a position — and D143 and
+D154 are already missing for the same kind of reason.

@@ -29,8 +29,22 @@ use herd_runner::{
 /// ends what it is running, says so to the hub, and exits inside five seconds
 /// (invariant 2). A verdict the hub has not acknowledged by then is written
 /// under the data root and delivered on the next start (D34).
+/// A repeated option is not an error here: the last one wins (D161).
+///
+/// This runner's command line has two authors. A deployment writes the
+/// figures it chose — `deploy/nixos-herd-runner.nix` and
+/// `deploy/herd-runner.service` both put every cap on the `ExecStart` line —
+/// and the operator of the machine appends to it, through
+/// `services.herd-runner.extraArgs` or by hand. Without this, the second
+/// author cannot correct the first: clap's default is to refuse the whole
+/// command line with *"cannot be used multiple times"*, so a figure a
+/// deployment stated could only be changed by editing the deployment.
+///
+/// Options that collect a list — `--privileged-helper`,
+/// `--declare-capability`, `--deny-capability` — are unaffected: their action
+/// is to append, and every occurrence is still kept.
 #[derive(Debug, Parser)]
-#[command(name = "herd-runner", version, about)]
+#[command(name = "herd-runner", version, about, args_override_self = true)]
 struct Args {
     /// The hub to dial. The runner opens this connection; nothing listens here.
     #[arg(long, env = "HERD_HUB_URL", default_value = DEFAULT_HUB_URL)]
@@ -609,4 +623,138 @@ async fn main() -> Result<()> {
         ..Config::default()
     })
     .await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use clap::CommandFactory;
+
+    /// The behaviour a deployment depends on: the figure stated last is the
+    /// figure this runner uses (D161).
+    ///
+    /// The case this exists for is real and was a refusal on the live fleet.
+    /// `deploy/nixos-herd-runner.nix` writes `--host-tmpfs 4GiB` on the
+    /// ExecStart line, and the operator of that machine — who may not own
+    /// this repository — appends `--host-tmpfs 10GiB` through
+    /// `services.herd-runner.extraArgs`. Clap's default would refuse that
+    /// whole command line with *"cannot be used multiple times"*, which
+    /// leaves the figure ours and nobody else's; `args_override_self` makes
+    /// the appended one win.
+    ///
+    /// Read as a unit test on `Args` rather than on a spawned binary,
+    /// because what is asserted is the parse and nothing downstream of it:
+    /// a repeated flag has to resolve the same way on a host with no tmpfs,
+    /// no cgroup delegation and no hub to dial.
+    #[test]
+    fn a_repeated_option_takes_the_value_stated_last() {
+        let args = Args::try_parse_from([
+            "herd-runner",
+            "--host-tmpfs",
+            "4GiB",
+            "--host-tmpfs-path",
+            "/dev/shm",
+            "--host-tmpfs",
+            "10GiB",
+        ])
+        .expect("a repeated option parses rather than refusing the command line");
+        assert_eq!(
+            args.host_tmpfs.as_deref(),
+            Some("10GiB"),
+            "the operator's figure is the one appended last"
+        );
+        assert_eq!(
+            args.host_tmpfs_path.as_deref(),
+            Some("/dev/shm"),
+            "a flag given once keeps its value"
+        );
+
+        // Every figure the NixOS module puts on the line, each one stated
+        // twice: all seven are options of that module today, and an
+        // operator must be able to correct any of them from outside it.
+        let args = Args::try_parse_from([
+            "herd-runner",
+            "--host-tmpfs",
+            "4GiB",
+            "--host-tmpfs-path",
+            "/dev/shm",
+            "--job-log-cap",
+            "64MiB",
+            "--job-disk-budget",
+            "20GiB",
+            "--job-nice",
+            "10",
+            "--health-every",
+            "15",
+            "--drain-grace",
+            "3",
+            "--host-tmpfs",
+            "16GiB",
+            "--host-tmpfs-path",
+            "/run/shm",
+            "--job-log-cap",
+            "128MiB",
+            "--job-disk-budget",
+            "40GiB",
+            "--job-nice",
+            "5",
+            "--health-every",
+            "30",
+            "--drain-grace",
+            "4",
+        ])
+        .expect("seven repeated options parse");
+        assert_eq!(args.host_tmpfs.as_deref(), Some("16GiB"));
+        assert_eq!(args.host_tmpfs_path.as_deref(), Some("/run/shm"));
+        assert_eq!(args.job_log_cap.as_deref(), Some("128MiB"));
+        assert_eq!(args.job_disk_budget.as_deref(), Some("40GiB"));
+        assert_eq!(args.job_nice, Some(5));
+        assert_eq!(args.health_every, 30.0);
+        assert_eq!(args.drain_grace, 4.0);
+    }
+
+    /// The other half of the same change, and the one that would be a silent
+    /// loss: an option that collects a list still collects every occurrence.
+    ///
+    /// `args_override_self` replaces a prior occurrence of an argument, and
+    /// it is exactly the arguments whose action is to *append* that it does
+    /// not touch. A runner is told which privileged helpers it may call and
+    /// which capabilities it offers or refuses by repeating one flag, so a
+    /// last-wins reading of those would narrow a machine's declaration to
+    /// its final line and refuse the rest by name later, on a job.
+    #[test]
+    fn an_option_that_collects_a_list_keeps_every_occurrence() {
+        let args = Args::try_parse_from([
+            "herd-runner",
+            "--privileged-helper",
+            "/sbin/modprobe",
+            "--privileged-helper",
+            "/run/wrappers/bin/mount",
+            "--declare-capability",
+            "kvm",
+            "--declare-capability",
+            "rig-cpu",
+            "--deny-capability",
+            "docker",
+            "--deny-capability",
+            "nvidia",
+        ])
+        .expect("a list option parses repeated");
+        assert_eq!(
+            args.privileged_helpers,
+            ["/sbin/modprobe", "/run/wrappers/bin/mount"],
+            "a helper list is a list, not the last path given"
+        );
+        assert_eq!(args.declare_capability, ["kvm", "rig-cpu"]);
+        assert_eq!(args.deny_capability, ["docker", "nvidia"]);
+    }
+
+    /// The command itself is still well-formed, including the `switch`
+    /// subcommand `args_override_self` propagates to. Clap's own assertions
+    /// catch a conflict this change could introduce and they run nowhere
+    /// else: nothing in the suite builds this binary's parser.
+    #[test]
+    fn the_runner_s_command_line_is_well_formed() {
+        Args::command().debug_assert();
+    }
 }
