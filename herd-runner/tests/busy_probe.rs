@@ -578,3 +578,84 @@ async fn the_lease_probe_is_read_on_exactly_its_two_declared_codes() {
     };
     assert_eq!(evaluate(&lying, timeout).await, Availability::Free);
 }
+
+/// `herd-runner check --capabilities FILE`, which is the whole lesson of the
+/// outage of 2026-10-23: the file was wrong before it was deployed, and
+/// nothing said so until jobs were late (D165).
+///
+/// It lives in this binary and not beside the module because it *runs* the
+/// probes, and running one is a `fork` — the hazard this file's own header
+/// explains.
+#[tokio::test]
+async fn check_reads_a_capability_file_and_its_probes_once() {
+    let settings = herd_runner::capability::ProbeSettings {
+        interval: Duration::from_secs(2),
+        timeout: Duration::from_secs(5),
+    };
+    let dir = herd_runner::testing::TempDir::new("check-capabilities");
+
+    // The file the consumer deployed, with its placeholders unsubstituted.
+    // One probe, unstartable: `check` exits non-zero and says which.
+    let broken = dir.path().join("broken.json");
+    std::fs::write(
+        &broken,
+        br#"{"capabilities":[
+            {"name":"kvm","kind":{"type":"shared"},
+             "busy_probe":{"type":"command",
+                           "command":["@probe@","qemu","@agents_user@"]}}
+        ]}"#,
+    )
+    .expect("written");
+    let (lines, ok) = herd_runner::capability::check(&broken, settings).await;
+    assert!(
+        !ok,
+        "a file a runner refuses must fail this command: {lines:#?}"
+    );
+    let said = lines.join("\n");
+    assert!(said.contains("@probe@"), "{said}");
+    assert!(said.contains("kvm"), "{said}");
+    assert!(said.contains("REFUSED"), "{said}");
+
+    // And a file whose probes can be started: each is run once and its
+    // verdict printed, and an unreadable *answer* is reported without
+    // failing the command — that suspends the capability at runtime (D49)
+    // and is often the honest answer of the moment.
+    let fine = dir.path().join("fine.json");
+    let held = dir.path().join("held.lock");
+    std::fs::write(&held, b"").expect("the lock is held");
+    std::fs::write(
+        &fine,
+        format!(
+            r#"{{"capabilities":[
+                {{"name":"free-one","kind":{{"type":"shared"}},
+                 "busy_probe":{{"type":"command","command":["/bin/sh","-c","exit 1"]}}}},
+                {{"name":"busy-one","kind":{{"type":"shared"}},
+                 "busy_probe":{{"type":"command","command":["/bin/sh","-c","exit 0"]}}}},
+                {{"name":"unreadable-one","kind":{{"type":"shared"}},
+                 "busy_probe":{{"type":"command","command":["/bin/sh","-c","exit 42"]}}}},
+                {{"name":"metal-pc","kind":{{"type":"counted","slots":1}},
+                 "busy_probe":{{"type":"lock_file","path":{}}}}}
+            ],"deny":["nvidia"]}}"#,
+            serde_json::to_string(&held.display().to_string()).expect("a path encodes")
+        )
+        .as_bytes(),
+    )
+    .expect("written");
+    let (lines, ok) = herd_runner::capability::check(&fine, settings).await;
+    assert!(
+        ok,
+        "every probe here names a program that starts, so the file is deployable: {lines:#?}"
+    );
+    let said = lines.join("\n");
+    assert!(said.contains("free-one: shared"), "{said}");
+    assert!(said.contains("free"), "{said}");
+    assert!(said.contains("busy"), "{said}");
+    assert!(
+        said.contains("unreadable") && said.contains("D49"),
+        "an unreadable answer is reported as D49's suspension, not as a refusal: {said}"
+    );
+    assert!(
+        said.contains("nvidia: denied"),
+        "the denials are part of what the file says: {said}"
+    );
+}

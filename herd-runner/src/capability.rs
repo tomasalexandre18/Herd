@@ -114,11 +114,75 @@ pub struct CapabilityFile {
 
 impl CapabilityFile {
     /// Read one, naming the path when it will not read.
+    ///
+    /// Including a probe whose program this host could never start (D165):
+    /// that is a configuration error and it refuses the runner's startup
+    /// here, where the refusal can name the file its owner wrote.
     pub fn read(path: &Path) -> Result<Self, String> {
+        let file = Self::read_as_written(path)?;
+        let unstartable = file.unstartable_probes();
+        if !unstartable.is_empty() {
+            return Err(format!(
+                "{} declares a probe this host cannot start: {}. A probe that cannot be \
+                 started is not a busy capability, it is a capability suspended for as long \
+                 as this file is live, and every job that asks for it waits behind a reading \
+                 that will never arrive — so it is refused here rather than discovered in a \
+                 queue (D165)",
+                path.display(),
+                unstartable.join("; ")
+            ));
+        }
+        Ok(file)
+    }
+
+    /// The same reading **without** the startability check, which is what
+    /// `herd-runner check` needs: it reports every probe in the file, and a
+    /// refusal on the first one would hide the rest.
+    pub fn read_as_written(path: &Path) -> Result<Self, String> {
         let text = std::fs::read_to_string(path)
             .map_err(|error| format!("{} cannot be read: {error}", path.display()))?;
         Self::parse(&text)
             .map_err(|why| format!("{} is not a capability file: {why}", path.display()))
+    }
+
+    /// Every probe in this file whose program could not be spawned at all, one
+    /// sentence each, naming the capability and the program (D165).
+    ///
+    /// **This is not D49.** D49 is the runtime rule and it does not move: a
+    /// probe that *runs* and whose answer cannot be read — a timeout, a signal,
+    /// an exit code the configuration gave no meaning to — suspends its
+    /// capability, because something outside Herd owns the thing and an
+    /// unreadable probe is not permission to assume it is free. That rule is
+    /// right and it is why the real outage was survivable at all. What it is
+    /// not is a way to notice a *typo*: a file carrying the unsubstituted
+    /// placeholder `@probe@` suspended two capabilities for hours while the
+    /// runner looked healthy, because every sweep failed with ENOENT and every
+    /// ENOENT was faithfully reported as "suspended" in a waiting sentence
+    /// nobody reads until something is late.
+    ///
+    /// So the two are told apart by *when* and by *what*: a program that
+    /// cannot be spawned can never answer, so nothing is learned by asking it
+    /// every two seconds for ever. It is settled once, before the runner
+    /// starts, like a cadence the handshake refuses (D53).
+    pub fn unstartable_probes(&self) -> Vec<String> {
+        self.capabilities
+            .iter()
+            .filter_map(|capability| {
+                let BusyProbe::Command { command, .. } = capability.busy_probe.as_ref()? else {
+                    // A lock-file probe runs no program. A path it cannot
+                    // look at is D49's business and stays there: a lock
+                    // nobody can see is a lock that may be held.
+                    return None;
+                };
+                let program = command.first()?;
+                let why = unstartable(program)?;
+                Some(format!(
+                    "the capability {:?} is probed by {} and {why}",
+                    capability.name,
+                    command.join(" ")
+                ))
+            })
+            .collect()
     }
 
     /// The same reading, over the text itself, so that what a key refuses can
@@ -431,6 +495,67 @@ impl From<FileProbe> for BusyProbe {
             },
         }
     }
+}
+
+/// Why a probe's program could never be spawned on this host, if it could not
+/// (D165).
+///
+/// Asked before the runner starts, and answered the way the kernel will answer
+/// it: a program with a `/` in it is that path, and a bare word is looked for
+/// on `PATH`, which is what `execvp` does. Nothing is run — this is the
+/// question "is there anything here to run at all", not "what does it say",
+/// and running the operator's command is `herd-runner check`'s job.
+///
+/// **Conservative in one direction on purpose.** It answers `Some` only when
+/// no spawn could succeed, so a case it cannot see — a program executable only
+/// by a user this process is not — passes here and is caught at runtime by
+/// D49, suspending its capability as before. A false refusal would be a runner
+/// that will not start on a file that works, which is worse than the trap this
+/// closes.
+fn unstartable(program: &str) -> Option<String> {
+    if program.is_empty() {
+        return Some("its program is the empty string, which names nothing".to_owned());
+    }
+    if program.contains('/') {
+        return match executable(Path::new(program)) {
+            Ok(()) => None,
+            Err(why) => Some(format!("its program {program:?} {why}")),
+        };
+    }
+    let mut searched = 0usize;
+    for directory in std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default()) {
+        if directory.as_os_str().is_empty() {
+            continue;
+        }
+        searched += 1;
+        if executable(&directory.join(program)).is_ok() {
+            return None;
+        }
+    }
+    Some(format!(
+        "its program {program:?} is not on this process's PATH, in any of the {searched} \
+         directory(ies) on it, so there is nothing to start"
+    ))
+}
+
+/// Whether a path is something this process could execute, and what is wrong
+/// with it when it is not.
+fn executable(path: &Path) -> Result<(), String> {
+    let found = std::fs::metadata(path).map_err(|error| format!("cannot be looked at: {error}"))?;
+    if found.is_dir() {
+        return Err("is a directory, and a directory cannot be run".to_owned());
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if found.permissions().mode() & 0o111 == 0 {
+            return Err(format!(
+                "is not executable by anybody (mode {:o})",
+                found.permissions().mode() & 0o7777
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// Whether the host really has what a path stands for.
@@ -754,9 +879,13 @@ struct Inner {
 impl Capacity {
     /// Hold an offer, with every probed capability starting out unreadable.
     ///
-    /// Unknown, not free, until a probe has actually been read once: the first
-    /// sweep happens before the runner joins a hub, and if it somehow did not,
-    /// the safe answer is the one that makes a job wait.
+    /// Unknown, not free, until a probe has actually been read once. The first
+    /// sweep happens *beside* the join and not in front of it — a first sweep
+    /// awaited there made joining cost as long as the slowest probe
+    /// (`crate::run_until`, `watch`) — so a runner really does announce its offer
+    /// with no reading in it, and this is what makes that safe: a probed
+    /// capability with no reading is suspended at both ends (D49), so the
+    /// answer a job gets is the one that makes it wait.
     pub fn new(offer: CapabilityOffer, settings: ProbeSettings) -> Self {
         let availability = offer
             .entries()
@@ -931,6 +1060,104 @@ pub fn report(capacity: &Capacity) -> Vec<String> {
         ));
     }
     lines
+}
+
+/// What `herd-runner check --capabilities FILE` prints, and whether the file
+/// would let a runner start (D165).
+///
+/// The whole lesson of the outage this comes from is that the file was wrong
+/// *before* it was deployed and nothing said so until jobs were late. So this
+/// does what the runner does, in the order the runner does it, on a machine
+/// where being wrong costs nothing: it reads the file strictly, asks of every
+/// command probe whether its program could be started at all, and then runs
+/// each probe **once** and prints the verdict.
+///
+/// Two kinds of bad news, kept apart on purpose. A probe whose program cannot
+/// be started refuses — `false` comes back and the caller exits non-zero,
+/// because that is exactly what the runner will do with this file. A probe
+/// that runs and answers something unreadable is printed and does **not**
+/// refuse: that is D49's business, it suspends the capability at runtime, and
+/// it is frequently the honest answer of the moment rather than a mistake in
+/// the file — a lock that is held, a device in use.
+///
+/// One caveat, printed rather than hidden: this process's `PATH` is the one
+/// searched, and a runner under a unit file may have another. A probe found
+/// here and not there is a `PATH` the unit has to be told about.
+pub async fn check(path: &Path, probes: ProbeSettings) -> (Vec<String>, bool) {
+    let mut lines = Vec::new();
+    let file = match CapabilityFile::read_as_written(path) {
+        Ok(file) => file,
+        Err(why) => return (vec![why], false),
+    };
+    lines.push(format!(
+        "{} reads: {} capability(ies) declared, {} denied",
+        path.display(),
+        file.capabilities.len(),
+        file.deny.len()
+    ));
+    let mut refused = Vec::new();
+    for capability in &file.capabilities {
+        let kind = match capability.kind {
+            CapabilityKind::Exclusive => "exclusive".to_owned(),
+            CapabilityKind::Counted { slots } => format!("counted, {slots} slot(s)"),
+            CapabilityKind::Shared => "shared".to_owned(),
+        };
+        let mut said = format!("{}: {kind}", capability.name);
+        if !capability.excludes.is_empty() {
+            said.push_str(&format!(
+                ", not alongside {}",
+                capability.excludes.as_slice().join(" ")
+            ));
+        }
+        if capability.drain_first {
+            said.push_str(", drain-first");
+        }
+        lines.push(said);
+        let Some(probe) = &capability.busy_probe else {
+            continue;
+        };
+        if let BusyProbe::Command { command, .. } = probe {
+            if let Some(why) = command.first().and_then(|program| unstartable(program)) {
+                let said = format!(
+                    "  {}: REFUSED — {why}. A runner will not start on this file",
+                    probe.describe()
+                );
+                refused.push(said.clone());
+                lines.push(said);
+                continue;
+            }
+        }
+        let read = evaluate(probe, probes.timeout).await;
+        lines.push(match &read {
+            Availability::Free => format!("  {}: free", probe.describe()),
+            Availability::Busy { reason } => format!("  {}: busy — {reason}", probe.describe()),
+            // Not a refusal: D49 suspends the capability while this lasts,
+            // and the probe answered, so the file named something real.
+            Availability::Unknown { reason } => format!(
+                "  {}: unreadable — {reason}. This suspends {} for as long as it lasts (D49) \
+                 and does not stop a runner starting",
+                probe.describe(),
+                capability.name
+            ),
+        });
+    }
+    for name in &file.deny {
+        lines.push(format!("{name}: denied, whatever this host has"));
+    }
+    if refused.is_empty() {
+        lines.push(
+            "every probe in this file names a program that can be started. Note that the PATH \
+             searched is this process's; a runner started from a unit file may have another"
+                .to_owned(),
+        );
+    } else {
+        lines.push(format!(
+            "{} probe(s) in this file cannot be started, so a runner given it refuses to \
+             start (D165)",
+            refused.len()
+        ));
+    }
+    (lines, refused.is_empty())
 }
 
 /// Everything a runner needs to decide what it offers, before it has read a
@@ -1518,6 +1745,115 @@ mod tests {
         let error = config.resolve().expect_err("build is declared twice");
         assert!(error.contains("build"), "{error}");
         assert!(error.contains("twice"), "{error}");
+    }
+
+    /// **The outage of 2026-10-23, closed at the file.** A probe whose
+    /// program cannot be started at all refuses the runner's startup, naming
+    /// the file, the capability and the program (D165).
+    ///
+    /// The real file carried the literal, unsubstituted placeholders
+    /// `@probe@` and `@agents_user@`. Every sweep failed with ENOENT, `kvm`
+    /// and `gpu-venus` were suspended for as long as that file was live, and
+    /// jobs queued behind capabilities that could never clear — while the
+    /// runner looked perfectly healthy. The hub said so in every waiting
+    /// sentence, which nobody reads until something is already late.
+    ///
+    /// **This is not D49, and the two must not be conflated.** D49 is the
+    /// runtime rule and it is untouched: a probe that *runs* and answers
+    /// something unreadable suspends its capability, because an unreadable
+    /// probe is never permission to assume a thing nothing outside Herd is
+    /// holding. What is added here is a configuration judgement made once,
+    /// before the runner starts, about a program that can never answer at
+    /// all.
+    #[test]
+    fn a_probe_whose_program_cannot_be_started_refuses_the_file() {
+        let dir = crate::testing::TempDir::new("unstartable-probe");
+        let path = dir.path().join("capabilities.json");
+        std::fs::write(
+            &path,
+            br#"{"capabilities":[
+                {"name":"kvm","kind":{"type":"shared"},
+                 "busy_probe":{"type":"command",
+                               "command":["@probe@","qemu","@agents_user@"]}}
+            ]}"#,
+        )
+        .expect("written");
+        let error = CapabilityConfig {
+            file: Some(path.clone()),
+            detect: false,
+            ..CapabilityConfig::default()
+        }
+        .resolve()
+        .expect_err("a runner does not start on a probe it could never run");
+        assert!(
+            error.contains(&path.display().to_string()),
+            "the refusal names the file its owner wrote: {error}"
+        );
+        assert!(
+            error.contains("kvm"),
+            "and the capability it would suspend: {error}"
+        );
+        assert!(
+            error.contains("@probe@"),
+            "and the program that is not there: {error}"
+        );
+
+        // The file is still readable *as written*, which is what
+        // `herd-runner check` reports from: it names every probe rather than
+        // stopping at the first.
+        let read = CapabilityFile::read_as_written(&path).expect("the file itself parses");
+        assert_eq!(read.unstartable_probes().len(), 1);
+    }
+
+    /// And the probes that *can* be started do not refuse anything — neither
+    /// a program on `PATH`, nor one by absolute path, nor a lock file, whose
+    /// probe runs no program at all and whose unreadability is D49's business
+    /// and stays there.
+    #[test]
+    fn a_probe_that_names_a_real_program_or_a_lock_file_starts_a_runner() {
+        let dir = crate::testing::TempDir::new("startable-probe");
+        let path = dir.path().join("capabilities.json");
+        std::fs::write(
+            &path,
+            br#"{"capabilities":[
+                {"name":"kvm","kind":{"type":"shared"},
+                 "busy_probe":{"type":"command","command":["/bin/sh","-c","exit 1"]}},
+                {"name":"dri","kind":{"type":"shared"},
+                 "busy_probe":{"type":"command","command":["sh","-c","exit 1"]}},
+                {"name":"metal-pc","kind":{"type":"counted","slots":1},
+                 "busy_probe":{"type":"lock_file","path":"/run/no-such-lock-of-ours"}}
+            ]}"#,
+        )
+        .expect("written");
+        let read = CapabilityFile::read(&path)
+            .unwrap_or_else(|why| panic!("this file has to start a runner: {why}"));
+        assert!(read.unstartable_probes().is_empty());
+    }
+
+    /// The judgement itself, on the four shapes it has to tell apart.
+    #[test]
+    fn a_program_is_unstartable_only_when_no_spawn_could_work() {
+        assert!(unstartable("/bin/sh").is_none(), "an executable file");
+        assert!(unstartable("sh").is_none(), "a bare word on PATH");
+        assert!(unstartable("").is_some(), "the empty string names nothing");
+        assert!(
+            unstartable("@probe@").is_some(),
+            "the placeholder that caused this"
+        );
+        assert!(
+            unstartable("/nonexistent/herd-probe").is_some(),
+            "an absolute path with nothing at it"
+        );
+        assert!(
+            unstartable("/tmp").is_some(),
+            "a directory is not a program"
+        );
+        let dir = crate::testing::TempDir::new("unexecutable-probe");
+        let script = dir.path().join("probe.sh");
+        std::fs::write(&script, b"#!/bin/sh\nexit 1\n").expect("written");
+        let why = unstartable(script.to_str().expect("a utf-8 path"))
+            .expect("a file nobody may execute cannot be started");
+        assert!(why.contains("not executable"), "{why}");
     }
 
     #[test]

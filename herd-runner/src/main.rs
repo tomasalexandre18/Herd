@@ -319,12 +319,34 @@ struct Args {
     command: Option<Command>,
 }
 
-/// What this binary does instead of being a runner (E-33).
+/// What this binary does instead of being a runner.
 ///
-/// One subcommand, and it is the owner's: everything else about a runner is
-/// an option on the runner itself.
+/// Two subcommands, and both are the machine owner's: everything else about a
+/// runner is an option on the runner itself.
 #[derive(Debug, clap::Subcommand)]
 enum Command {
+    /// Validate a capability file and read each of its probes once (D165).
+    ///
+    /// `herd-runner check --capabilities /etc/herd/capabilities.json` reads
+    /// the file exactly as a runner reads it, says of every command probe
+    /// whether its program can be started at all, runs each probe once and
+    /// prints what it answered. It exits non-zero on anything that would
+    /// refuse a runner's startup, so it is the thing to run *before*
+    /// deploying a file rather than after a job is late.
+    ///
+    /// A probe that runs and answers something unreadable is printed and does
+    /// not fail this command: that suspends its capability at runtime (D49)
+    /// and is often the honest answer of the moment — a lock that is held.
+    Check {
+        /// The file to check. Defaults to `HERD_CAPABILITIES`, so a machine
+        /// whose unit sets it needs no argument here.
+        #[arg(long, env = "HERD_CAPABILITIES", value_name = "PATH")]
+        capabilities: Option<PathBuf>,
+        /// How long one probe may take before it is killed and read as
+        /// unreadable, in milliseconds.
+        #[arg(long, env = "HERD_PROBE_TIMEOUT", value_name = "MS")]
+        probe_timeout: Option<u64>,
+    },
     /// Set this machine's switch and leave (E-33).
     ///
     /// `herd-runner switch off --reason "I am gaming"` withdraws the machine:
@@ -350,6 +372,39 @@ fn seconds(value: f64) -> Duration {
 #[tokio::main]
 async fn main() -> Result<()> {
     let args = Args::parse();
+    // `herd-runner check --capabilities ...`: reads the file, reads its
+    // probes once, prints both and leaves. First of all, before the data root
+    // is resolved and before anything dials, because this runs on an
+    // operator's machine while she is still writing the file (D165).
+    if let Some(Command::Check {
+        capabilities,
+        probe_timeout,
+    }) = &args.command
+    {
+        let path = capabilities.clone().or_else(|| args.capabilities.clone());
+        let Some(path) = path else {
+            anyhow::bail!(
+                "herd-runner check needs a capability file: --capabilities PATH, or \
+                 HERD_CAPABILITIES in the environment"
+            );
+        };
+        let timeout = Duration::from_millis(probe_timeout.unwrap_or(DEFAULT_PROBE_TIMEOUT_MS));
+        let (lines, ok) = herd_runner::capability::check(
+            &path,
+            ProbeSettings {
+                interval: Duration::from_millis(DEFAULT_PROBE_INTERVAL_MS),
+                timeout,
+            },
+        )
+        .await;
+        for line in lines {
+            println!("herd-runner: {line}");
+        }
+        if !ok {
+            std::process::exit(1);
+        }
+        return Ok(());
+    }
     let data_root = match args.data_root {
         Some(path) => path,
         None => DataRoot::default_path().map_err(anyhow::Error::msg)?,
