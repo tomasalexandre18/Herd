@@ -7603,3 +7603,111 @@ work D152 refused to do per verdict.
 written and whose `exit_code_from` this entry leans on. D161 is still held by
 an unmerged branch, so the gaps are D143's, D154's and D161's, all three
 under D148's rule.
+
+---
+
+## 2026-10-23 — D161 Herd is shipped, not operated
+
+**Context.** The owner decided on 2026-10-23 that Herd no longer operates
+the hub or the runner: *"tu ne dois plus gérer le hub et le runner, cette
+responsabilité tombe au client, soit chatOnS OS."* Until now the project
+ran its own fleet — one hub in docker compose and one native runner on
+the NixOS server — and every milestone from M16 on was proved against
+that deployment. The two analyses written the same day found the fleet
+half-dead in ways only its author could see: two capabilities suspended
+behind an unsubstituted `@probe@` in the consumer's capability file,
+seven runner figures the operator cannot set, a `drain` that restarts
+into a loop, 90 GB of outputs with no eviction ever, a spool the runner
+cannot free, and a release workflow that has published nothing since
+v0.3.0. Every one of those was found by reading the server's disk.
+
+**Choice.** Herd becomes software we build and ship, not a service we
+run. We own the protocol, the four crates, the deployment files as
+reference texts, the releases and the documentation. The consumer owns
+every running instance: the hub container and its volume, the runner
+units and their data roots, the capability files and the probes, the
+tokens, the disk, the restarts and the upgrades. What crosses the line
+is always a named artefact — a file format, a flag, a document, an exit
+code, a schema — and never a person logging in. A fact about their
+machines reaches us as a bug report carrying a job id and two version
+numbers, or it does not reach us. `docs/handover.md` holds the plan: the
+line subsystem by subsystem, what must be built before the handover is
+honest, what we stop doing, what they must accept, the milestones
+revised, the order, and the risks.
+
+**The one rule that keeps this from being a withdrawal.** We may not
+hand over an instance that only its author can tell is healthy. So the
+handover is gated on one release, v0.3.4, that makes the instance
+judgeable from outside: a runner that refuses a probe it cannot start
+and a `herd-runner check` to run before starting it; a verdict a machine
+can read; the seven module options; a persisted `drain` read as `off`
+at startup; the version on the fleet listing; a reading costed at a
+figure and bounded per runner; and a release workflow that publishes
+without credentials we do not hold. Until that release exists the
+decision is taken and the handover is not done.
+
+**What is cut with it.** M15d's self-update (a third deployment path
+into machines we no longer deploy; D66 was the owner's requirement for
+a fleet he operated), M14's scheduler half (a timer and a `herdctl
+submit` on their side), M11's pack half and M12's peer-to-peer (a
+distributed cache for a fleet we do not run, with no measurement
+defending it). Each cut costs nothing today; `docs/handover.md` §7 names
+what each would cost to keep.
+
+**Alternatives rejected.**
+
+1. *Keep operating the server's pair as the reference deployment while
+   the consumer operates the rest.* Rejected: it is the arrangement that
+   produced today's fleet — one party with the keys and no obligation,
+   the other with the obligation and no keys. Two operators of one
+   instance is nobody operating it.
+2. *Shrink Herd to a library and let the consumer build the service.*
+   Rejected: the four crates, the unit and the compose file are the
+   product; invariant 1 is kept by refusing features, not by refusing
+   to ship.
+3. *Hand over now and fix the gate afterwards.* Rejected: a trap we
+   operated around becomes a trap we shipped the moment the handover is
+   announced, and the first grievance against a restart loop or a
+   half-dead runner would be answered by us logging in again.
+
+**Consequences.** `docs/status.md` describes the software, never a
+deployment; `docs/plan.md`'s M17 becomes a supported-platform milestone
+and M18 is walked by the consumer against a release; a new M19 is the
+handover itself; measurement access is replaced by the report format,
+the fleet listing and M13's status document, in that order. The
+remaining loss — we are told about problems instead of discovering them
+— is the decision, and is written down as such (`docs/handover.md` §8).
+
+**What the gate cost, and what the handover did not wait for.** Written
+on the day of the decision, this entry budgeted the gate at five to six
+days and made it a precondition. It was built in one. D162 puts a
+release on the page with no credentials to hold, and v0.3.4 is the first
+one since v0.3.0; D163 makes the seven figures module options; D164
+reads a persisted `drain` as `off`; D165 refuses a capability file whose
+probe cannot be started and adds `herd-runner check`; D166 writes a
+verdict a program can read and puts a runner's build and its suspended
+capabilities on the fleet listing. D167 is one this plan did not
+foresee: the consumer found a job reported finished while its outputs
+were still arriving. **D162 to D165 are in v0.3.4, cut at 17:43; D166
+and D167 merged after it and are in no release.** **One gate item is
+open** — a requirement reading is still admitted at a cost of zero and
+nothing bounds how many run on one runner. And the handover itself was
+announced before any of it landed, with the consumer accepting the
+inventory of the defects they were taking on, so alternative 3 above
+records a plan that was rejected and not the way it went.
+`docs/handover.md` §3.0 says where the gate stands, item by item.
+
+**On the number.** This entry is 161 and the six above it are 162 to
+167. It took the first free number on 2026-10-23 against a `main` that
+ended at D159 — D160 was being appended by PR #54 the same morning — and
+then six entries landed while it waited for the owner's word on the
+merge. It is appended rather than slid into its numeric place:
+`docs/decisions.md` is append-only (invariant 8), and an insertion into
+the middle of an append-only file is not a thing a reader of the diff
+can check. D148's rule is the one that applies — **a decision number
+cited in code is an identifier, not a position** — and D167 ruled the
+same way from the other side while this branch was open, counting 161
+with 143 and 154 as a gap, "all three under D148's rule". The number is
+cited by `docs/handover.md`, by this branch's commit and by the owner's
+approval of it; renumbering to 168 would buy one contiguous sequence and
+cost three citations that have already been read.
