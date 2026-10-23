@@ -7,25 +7,31 @@ needs a chatOnS deliverable (their declaration file, `cargo xtask pack` /
 automated test against the fixture consumer stands in, and the real check
 closes in M18.
 
+**State** is as of 2026-10-23 and says where the work is, never where it
+runs: `merged` is on `main`, `part` is one half of a two-milestone row,
+`planned` is unbuilt. What is deployed is a tag behind `main`, so a
+`merged` row is not a promise about the running system — `docs/status.md`
+holds the versions, the disk and who operates them.
+
 | E | Prio | What | Milestone | State | Note |
 |---|---|---|---|---|---|
-| E-01 | must | submit by commit, never machine | M10 | planned |  |
-| E-02 | must | ran-on line, verdict unchanged | M10 | planned | format frozen per Q7; results.json's real fields and a worked example are now known (issue #16); real verdict gated (M18) |
+| E-01 | must | submit by commit, never machine | M10 | merged | a submission names a declared command and a commit resolved in the requester's own checkout (D106); no field of it names a machine |
+| E-02 | must | ran-on line, verdict unchanged | M10 | merged | the `ran on: <runner> (<why>)` line is asserted on `herdctl`'s own stdout, first line, with the verdict unchanged behind it; format frozen per Q7; results.json's real fields and a worked example are now known (issue #16); real verdict gated (M18) |
 | E-03 | must | stream, detached mode, wait | M2 | merged | foreground streaming itself lands in M1 |
 | E-04 | must | waits explained with figures | M8 | merged | the sentence carries the position, **what is ahead** (the jobs in front by id and level, three named and the rest counted) and why, with the figures E-04 asks for — `1.2 GiB free in tmpfs, 2 GiB needed` comes out of one formatter and is asserted in those words against the real binaries. Said again on its own clock, `--wait-restatement`, 60 s by default and printed at startup: the record keeps M6's news-only rule, the stream gets at most `wait / cadence + 1` lines, which is **eleven over ten minutes** and not one per dispatch pass (D91). Both failure modes are tested by mutation — removing the clock gives 1 line over 20 cadences, restating per pass gives 79 against a bound of 22 |
 | E-05 | must | identical submissions deduplicated | M6 | merged | keyed on the command, the labels and the commit a declaration names, length-prefixed (D69, D156); only an open job is joined — work that is over is rerun (D70); the higher level wins; verified: two waits, one execution, one log |
 | E-06 | must | cancel kills process tree | M3 | merged | propagation and the sibling-untouched case asserted in M3; the kill becomes a process-tree kill in M4. The 'output produced before the cancel survives' half now waits for that output to exist before cancelling: on two cores the kill beat the job's first write in one run of six, and the test read a job that printed nothing as output lost (D101) |
 | E-07 | must | dry run shows placement | M9 | merged | `herdctl would-run` lists the eligible runners with the labels each answers for, what is queued ahead, and the verdict the claim step gives, out of **one** dispatch pass that is thrown away: the same `matcher::place`, the same `queue::order`, the jobs ahead of it placed against the same seats so the slot it would really find is the slot it reports. Nothing is minted (the hypothetical record carries an id this hub cannot mint), nothing is written, no slot and no reservation taken — verified by comparing **every byte of the state root** before and after, path by path, against a quiescent hub with one build already holding the only slot. Also verified not to lie: the real submission of the same job waits for the same reason |
-| E-08 | must | refuse dirty or unpushed | M10 | planned |  |
+| E-08 | must | refuse dirty or unpushed | M10 | merged | against a real git fixture: a dirty tree is refused naming the file, an unpushed commit naming the hash |
 | E-09 | should | deadline cancels unstarted job | M9 | merged | pulled forward: E-41 (must) needs it, **and** it is D88's only bound on a job no connected runner could ever fit. An absolute instant in Unix seconds, resolved from `--deadline +15m` or RFC 3339 by the CLI, judged on the hub's clock, recorded on the record (D94). It bounds waiting only: a job that has **started** is never touched by it (that is M4's time cap, exit 124), asserted with a job whose deadline passes while it runs and which finishes 0. A queued job past it ends `cancelled (deadline)`, exit 125 (D40), and the sentence names what it was waiting for when the moment came — so a job cancelled because its machine was switched off says `she is gaming` rather than only `deadline`. Verified: past at submission, past across a hub restart, and firing with no runner connected at all |
 | E-10 | should | depend on one other job | M9 | merged | capped: one parent, no conditions (invariant 1). Start after its **success**, which is exit 0 and nothing else; every other ending — non-zero, signalled, could-not-start, stopped-by-cap, cancelled, lost, impossible — ends the child `cancelled (parent)` naming the parent and how it ended (D95). A cycle is **unrepresentable** rather than checked: a parent must already exist, ids are minted in order, so a job can only name one older than itself — no job can name itself and no two can name each other, verified by guessing the next id and being refused. A parent this hub cannot read is never read as one that succeeded |
-| E-11 | must | consumer-declared commands, nix develop | M10 | planned | the field set, `[executor]` hooks and ten real commands are now known in full, including `labels_from` (D74) and the step timestamps (D77) (issue #16); gated: their real declaration file (M18) |
-| E-12 | must | packs by (commit, key), no shared build trees | M11 | planned | D10: hub registers, peers transfer; the real shape (`manifest.tsv`, `pack.meta`, `objects/<sha256>`, id = sha256 of the manifest) and measured figures (~400 MiB, ~560 files, verified under 2 s) are now known (issue #16); gated on their pack (M18). **D148 holds the line this row is on**: a pack is read next by a *job*, so it never touches the hub; a record is read next by a *requester*, so it does. M11 builds both and splits record-first if it overflows, with both halves' frames designed in one move to `PROTOCOL_VERSION` 2, approved 2026-10-16, because a break is paid by the deployment and must not be paid twice |
+| E-11 | must | consumer-declared commands, nix develop | M10 | merged | the field set, `[executor]` hooks and ten real commands are now known in full, including `labels_from` (D74) and the step timestamps (D77) (issue #16); gated: their real declaration file (M18) |
+| E-12 | must | packs by (commit, key), no shared build trees | M11 | planned | D10: hub registers, peers transfer; the real shape (`manifest.tsv`, `pack.meta`, `objects/<sha256>`, id = sha256 of the manifest) and measured figures (~400 MiB, ~560 files, verified under 2 s) are now known (issue #16); gated on their pack (M18). **D148 holds the line this row is on**: a pack is read next by a *job*, so it never touches the hub; a record is read next by a *requester*, so it does. M11 builds both and splits record-first if it overflows, with both halves' frames designed in one move to `PROTOCOL_VERSION` 2, approved 2026-10-16, because a break is paid by the deployment and must not be paid twice. **M11 is merged and this row is not**: what shipped is the record half (D148, D150, D152); the pack half has no frame on either protocol enum and no code behind one |
 | E-13 | should | content-addressed, complete or absent | M11 | planned | done with the store: retrofitting CAS would force a migration, and D10 needs it for free diffs |
 | E-14 | must | warm caches ready before job | M12 | planned | Q5/D9: no cache engine in Herd; their own words, "you move packs; our executor owns warm caches" (issue #16), shrink M12 to moving packs, key-aware placement and GC/budgets — the cache-specific prepare step is dropped for the generic step timestamps (D77); gated on their replication (M18) |
 | E-15 | must | full job record on disk | M2 | merged | byte-faithful logs (D18); a lost log chunk leaves a named marker, and a lost tail is asked for (D36). **Kept files are real** (D131): what a job leaves under `{out}` is collected before the workspace goes and written into the record's `files/` directory, capped at 32 MiB with a refusal carrying figures over it. **D148 keeps 32 MiB and changes what it means**: it stops being a refusal boundary and becomes the line between the inline carriage (the verdict frame, as today) and the streamed one (M11), so a requester never declares which it needs and cannot tell which it got. Retention of the record itself — 14/90 days by priority class — is still M12's; the separate budget for a job's large files shipped in M11 instead (D152), because streaming without a sweeper is a disk-full outage with a delay fuse. One latent defect closed on the way (D148): `FromHub::JobLog` sent a job's whole log in one frame, so a log over ~48 MiB built a frame past the ceiling and a `herdctl wait` got exit 125 with no verdict — the backlog now travels in 8 MiB frames, no protocol move |
 | E-16 | must | budgets, gc with pinning | M12 | planned | per runner, not central (D10); keepers pin. D148 adds the hub's **own** budget beside them, for the large files a record carries, with a floor in days and a named line when eviction breaks it — **built in M11** (D152), so what is left here is the per-runner budgets and keeper pinning; keepers pin packs only, because a record has left its runner by the time the job is reported finished |
-| E-17 | must | atomic publication everywhere | M11 | planned | a manifest registers only once every blob is held; job-record atomicity already in M2 (Q1) |
+| E-17 | must | atomic publication everywhere | M11 | planned | a manifest registers only once every blob is held; job-record atomicity already in M2 (Q1). The manifest is part of M11's unbuilt pack half, so this row stays planned although M11 is merged |
 | E-18 | must | four priorities with aging | M6 | merged | aging computed, not written (D67); default step 30 min, so the lowest level reaches the top in 90 min; the raise is upwards only (D72); the 90-min figure itself is a simulated-time and 6-second-real-clock assertion, not a measurement on a busy day |
 | E-19 | must | no fallback while available | M7 | merged | preference is one declared integer per runner (D81); a draining runner does not count as available (D80); the limit is `--stickiness-limit`, 3 h, printed at startup and in every waiting sentence; verified against two real runners: the second build never moved while the PC was merely busy — proved now by three of the hub's own restatements rather than by a 600 ms sleep (D101) — and moved in well under 10 s when it died. Switch-off case retested with E-33 in M9 |
 | E-20 | must | one queue for everything | M6 | merged | the queue is the unfinished job directories; one dispatch pass, which a submission goes through like everything else; no lane for a merger. "Every QEMU on every client listed as a job" needs their executor and the status document (M13, gated M18) |
@@ -55,74 +61,65 @@ closes in M18.
 | E-44 | must | restart loses nothing | M2 | merged | verified: hub killed mid-job, result lands, record complete. The tail-loss case now holds the job open with a file until the runner has *seen* the link go and writes its own marker when it is over, so "the tail was written while no hub existed" is established rather than assumed from two sleeps (D101) |
 | E-45 | must | one data root only | M4 | merged | cooperative confinement only — full containment needs a mount namespace E-46 forbids (D28) |
 | E-46 | must | unprivileged, root via helper | M4 | merged |  |
-| E-47 | must | server runner runs natively | M16 | planned |  |
-| E-48 | must | per-runner approval | M15 | planned |  |
+| E-47 | must | server runner runs natively | M16 | merged | the server's runner is a native, unprivileged systemd unit from `deploy/nixos-herd-runner.nix`, no container in its path; read back off the host with `systemctl cat herd-runner` |
+| E-48 | must | per-runner approval | M15 | merged | `herd-hub/tests/approval.rs` drives the real binaries: an unapproved runner is turned away and nothing is placed on it, one `herdctl runner approve` lets it run a real job, `remove` takes it back out, and the token an operator was shown is not readable back out of the hub's state |
 | E-49 | must | join in thirty minutes | M17 | planned | the timing is a manual check on real hardware |
 | E-50 | must | WSL2 supported platform | M17 | planned |  |
-| E-51 | must | version pin and refusal | M15 | planned | protocol-version refusal exists since M1 |
-| E-52 | should | restarts with its host | M16, M17 | planned | server in M16, the PC's logon task in M17 |
+| E-51 | must | version pin and refusal | M15 | merged | protocol-version refusal since M1, in one line naming both versions; a state root from a newer Herd is refused the same way, by version and with both figures (D73) |
+| E-52 | should | restarts with its host | M16, M17 | part | the server half is merged and read back off the host: a declarative unit whose generation holds its store path, so no garbage collection can take it. The PC's logon task is M17 |
 | E-53 | should | records readable during run | M2 | merged | plain files by Q1. **What a reader may see** (D103): `job.json` is the authority on where a job stands now; `events.jsonl` is the history and may be one transition behind it, never ahead. A reader wanting a state *and* its transition line waits on `events.jsonl` |
 | E-54 | could | offline re-judging | M2 | planned | E-15's kept files are now written (D131), so a record holds the result file a judge re-reads; the judge is their tool |
 | E-55 | could | peer-to-peer artefact exchange | M11 | planned | **promoted to the default** by D10: direct transfer is the only path, the hub never carries bytes |
 
-## State of play (2026-10-13)
+## State of play (2026-10-23)
 
-Nine milestones are merged to `main`: M1 (substrate, no must of its
-own), M2, M3, M4, M5 (the capability model), M6 (the queue and its
-priorities), M7 (matching, slots and stickiness), M8 (admission and
-explained waits) and M9 (owner control). **27 of 44 musts are
-merged**; 12 are verified against the real binaries by an independent
-adversarial pass (E-03, E-15, E-44 from M2; E-06, E-21 from M3; E-30,
-E-34, E-45, E-46 from M4; E-24, E-26, E-28 from M5). M6's four (E-05,
-E-18, E-20, E-43), M7's four (E-19, E-22, E-25, E-36), M8's four
-(E-04, E-29, E-31, E-32) and M9's three (E-07, E-27, E-33) are merged
-but have not had that pass. Four `should` rows are merged too: E-53
-and E-40 beside M2 and M3, E-09 and E-10 beside M9. The remaining 17
-musts are planned.
+**Thirteen milestones are merged to `main`:** M1 (the substrate, no must
+of its own), the scheduler spine M2 to M9, M10 (the command declaration
+contract), M11 (its record half only, see below), M15 (approval and
+versions) and M16 (the hub deployed, the server's runner native).
+**34 of 44 musts are merged.** The ten that are not are M11's two pack
+musts (E-12, E-17) and two each in M12, M13, M14 and M17. Four `should`
+rows are merged — E-09 and E-10 beside M9, E-40 beside M3, E-53 beside
+M2 — and E-52 is half of one. Twelve musts have had an independent
+adversarial pass against the real binaries (E-03, E-15, E-44 from M2;
+E-06, E-21 from M3; E-30, E-34, E-45, E-46 from M4; E-24, E-26, E-28
+from M5); the musts of M6 through M16 are merged and tested, but have
+not had that pass.
 
-Six things a reader must not mistake for done:
+Five things a reader must not mistake for done:
 
-1. **Authentication does not exist until M15.** A runner's name is
-   self-asserted, so a hand-crafted peer reaching the hub's port can
-   impersonate a runner and write a false verdict onto its job while
-   the real runner is down. The hub listens on loopback by default
-   (D14) and the ownership gate is not a credential (D57). **Herd must
-   not be exposed beyond loopback before M15.**
-2. **E-45 is cooperative confinement only** (D28): a job can write
+1. **Merged is not running.** The hub runs `herd-hub:0.3.3` and the
+   server's runner is pinned at the tag `v0.3.2`, so three fixes that
+   are on `main` are on no machine (D163, D164, D165), and the newest
+   release anybody can download is v0.3.0. `docs/status.md` carries the
+   live figures, the traps in the deployed runner, and who operates
+   what.
+2. **M11 is merged and E-12 and E-17 are not delivered.** What shipped
+   is the record half: a job's files come home, large ones stream, and
+   the hub sweeps them against its own budget (D148, D150, D152). The
+   pack half — the registry, the manifests, runner-to-runner transfer —
+   has no frame on either protocol enum and no code behind one.
+3. **E-45 is cooperative confinement only** (D28): a job can write
    anything the runner's user can. Full containment needs a mount
    namespace E-46 forbids the runner the privilege for. On the
-   deployment host the runner's user is additionally in the `docker`
-   group, root-equivalent through the container socket — the runner
-   warns about this at startup. It has been raised and settled: the
-   consumer required it in issue #16 and Herd agreed without
-   reservation (D78). The runner needs no Docker at all; three
-   checkable commitments land in M16, and taking the user out of the
-   group is a change on the host that the owner makes.
-3. **E-30's real kernel ceiling is only asserted under a delegated
-   cgroup**; without delegation the runner falls back to `RLIMIT_AS`,
-   weaker in three named ways (D23). The WSL replay on real hardware
-   is still a manual M17 check.
-4. **Nothing is deployed, so every format is still free to change.**
-   M8 moved both again: `PROTOCOL_VERSION` is **4** and
-   `RECORD_VERSION` is **4**. A runner now announces the memory it
-   keeps for itself and the tmpfs room jobs may reserve on it, and a
-   submission may carry the whole-job memory and tmpfs a requester
-   declares — all required rather than defaulted, for the reason D71
-   gives. A state root written before M8 is refused by name with both
-   figures; there is no migration and none is owed (D73). They freeze
-   at M16.
-5. **A fleet, with no authentication.** The hub holds many runners from
-   M7, keyed on the name an attempt belongs to. That makes point 1 above
-   worse rather than better: a hand-crafted peer can now join *beside*
-   the real runners under any name it likes. Loopback only until M15
-   still holds.
-6. **E-22's exact `-j 7` is now host-dependent.** It is asserted only
-   on a host with a real 17 GiB of memory, and skipped with its reason
-   elsewhere (D27, D89), so CI shows **three** skips rather than two —
-   GitHub Actions gives the runner 15 989 MiB. What is asserted on
-   every host is stronger than before: the figure on the record, the
-   figure in the explanatory line and the figure the process was given
-   are one value. The exact figure itself is no longer checked by CI.
+   deployment host that user is also in the `docker` group,
+   root-equivalent through the container socket, and the runner says so
+   at startup; it has been raised and settled (D78). The runner needs
+   no Docker itself, and taking the user out of that group is a change
+   on the host its operator makes.
+4. **E-30's real kernel ceiling is only asserted under a delegated
+   cgroup.** Without delegation the runner falls back to `RLIMIT_AS`,
+   weaker in three named ways (D23). That is most of why the suite
+   reports **12** loud skips on a host with no delegated subtree on a
+   block device (D27): every one of the twelve is a cgroup-delegation
+   or ZFS `io.max` assertion. E-30's WSL replay stays a manual M17
+   check.
+5. **The formats are frozen, and the figures are not the ones an older
+   reading of this file gives.** `PROTOCOL_VERSION` is **2** and
+   `RECORD_VERSION` is **1** since the v0.3.0 freeze. A peer or a state
+   root from another version is refused by name with both figures and
+   there is no migration (D73), so a fleet crosses a protocol line only
+   by a deliberate upgrade of every machine in it.
 
 ## Musts per milestone
 
