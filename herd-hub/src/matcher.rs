@@ -240,6 +240,32 @@ impl Parent {
 /// would hold a machine empty for ever.
 pub const DRAIN_FIRST_LIMIT: Duration = Duration::from_secs(15 * 60);
 
+/// How many requirement readings one runner may be running at once (D169).
+///
+/// **Two.** A reading holds no capability (D159), so until this figure
+/// existed nothing at all bounded how many of them one machine could be given
+/// — and the first consumer's nightly pass submitted 214 jobs in one second,
+/// every one of them needing a reading first. The matcher put some two
+/// hundred of them on the one runner of a one-runner fleet, on a 20 GiB,
+/// eight-thread lend. The host saturated, the runner's own kvm probe timed
+/// out in a loop for forty minutes, and 201 of the 214 jobs ended 125 with no
+/// test run.
+///
+/// Two rather than one because a reading is cheap and the point is a bound,
+/// not a queue of one: one reading in flight while the next is being handed
+/// out keeps a fleet of readings moving at the speed of the machine. Two
+/// rather than eight because the figure that matters is the one a machine
+/// survives *on top of* the real work it is already running, and a reading is
+/// admitted against the room but takes no slot — so nothing else is counting
+/// it.
+///
+/// It is the hub's figure and not the runner's, like [`DRAIN_FIRST_LIMIT`]
+/// and the reading cap it sits beside: a reading is the hub's own job —
+/// nobody declared it, no capability file mentions it — and a figure a runner
+/// announced would be a figure the hub would have to defend against a runner
+/// that announced two hundred.
+pub const READINGS_AT_ONCE: u32 = 2;
+
 /// What the claim step needs beyond the record and the fleet.
 ///
 /// A struct rather than three more arguments, and with a [`Default`], so that
@@ -251,11 +277,21 @@ pub struct Placing {
     pub parent: Parent,
     /// How long a drain-first job may hold a host empty (E-27).
     pub drain_first_limit: Option<Duration>,
+    /// How many requirement readings one runner may run at once (D169).
+    pub readings_at_once: Option<u32>,
 }
 
 impl Placing {
     fn drain_first_limit(&self) -> Duration {
         self.drain_first_limit.unwrap_or(DRAIN_FIRST_LIMIT)
+    }
+
+    /// Never zero: a cap of zero is a reading that is never placed, and every
+    /// job waiting on one would wait for ever. The hub refuses the setting at
+    /// startup (`Policy::refusal`); this is the second half of the same rule,
+    /// for the callers that build a [`Placing`] by hand.
+    fn readings_at_once(&self) -> u32 {
+        self.readings_at_once.unwrap_or(READINGS_AT_ONCE).max(1)
     }
 }
 
@@ -477,14 +513,25 @@ fn slots_for(job_labels: &LabelSet, capacity: &RunnerCapacity) -> u32 {
 ///
 /// A requirement reading takes **none** of them and the line says so in as
 /// many words (D159), so that the record of a reading cannot be read as a
-/// record of something that held the machine.
-fn what_it_takes(job_labels: &LabelSet, seat: &Seat, occupant: Occupant) -> String {
+/// record of something that held the machine. The one thing it does take is
+/// a place among the readings that machine may run at once, and the line says
+/// which place of how many (D169) — a figure a human cannot break down is a
+/// figure that gets broken down by hand, at night.
+fn what_it_takes(
+    job_labels: &LabelSet,
+    seat: &Seat,
+    occupant: Occupant,
+    readings_at_once: u32,
+) -> String {
     if !occupant.holds_capabilities() {
         return format!(
             "it is a requirement reading and holds none of them — no slot, no host-wide \
              machine, nothing emptied — because it builds and boots nothing; it is matched on \
-             the labels {} offers and has not denied, and nothing about contention (D159)",
-            seat.name
+             the labels {} offers and has not denied, and nothing about contention (D159); it \
+             is reading {} of the {readings_at_once} this hub runs there at once \
+             (--readings-at-once, D169)",
+            seat.name,
+            seat.holdings.readings_running() + 1
         );
     }
     let mut clauses = Vec::new();
@@ -725,6 +772,35 @@ fn judge(record: &JobRecord, seat: &Seat, placing: &Placing, now: Timestamp) -> 
         } else {
             Verdict::NotHere(reason)
         };
+    }
+    // And the one thing a reading *does* take of a machine: a place among the
+    // readings it is running (D169).
+    //
+    // D159 is kept whole — a reading holds no slot, empties no host and waits
+    // for no probe — and this is not one of those. It is a bound on the
+    // kind's own concurrency, read off the same holdings every other figure
+    // here is read off (D79), so there is no counter to leak and a reading
+    // that ends any of the eight ways a job ends gives its place back by
+    // ending. Without it nothing bounded readings at all: 214 jobs submitted
+    // in one second put some two hundred of them on one runner, and the host
+    // they were placed on stopped being a host (D169).
+    //
+    // `Later` and never `NotHere`: a reading over the cap is **queued**, not
+    // refused and not sent to a machine that suits it less. That is also what
+    // keeps it off the dead-runner timer — a reading that is waiting here has
+    // no attempt in the air, so there is nothing for the watchdog to count.
+    if !occupant.holds_capabilities() {
+        let at_once = placing.readings_at_once();
+        let already = u32::try_from(seat.holdings.readings_running()).unwrap_or(u32::MAX);
+        if already >= at_once {
+            return Verdict::Later(format!(
+                "on {}, {already} requirement reading(s) are already running and this hub \
+                 runs at most {at_once} there at once (--readings-at-once); this reading \
+                 takes no slot and no capability, and a machine given every reading at once \
+                 is a machine that stops answering (D169)",
+                seat.name
+            ));
+        }
     }
     // And what M7 adds: the parallelism one slot of this machine gets (E-22).
     // **Before admission, always**, because the memory a build needs is that
@@ -1044,7 +1120,14 @@ pub fn place(
         },
     };
     if let Some(at) = free(true).first().copied() {
-        return claim(record, &mut seats[at], fitted_at(at), eligible, None);
+        return claim(
+            record,
+            &mut seats[at],
+            fitted_at(at),
+            eligible,
+            None,
+            placing,
+        );
     }
 
     // The most preferred eligible runners are all busy. E-19: the job waits
@@ -1073,7 +1156,14 @@ pub fn place(
                 roughly(waited),
                 roughly(stickiness.limit)
             );
-            return claim(record, &mut seats[at], fitted_at(at), eligible, Some(moved));
+            return claim(
+                record,
+                &mut seats[at],
+                fitted_at(at),
+                eligible,
+                Some(moved),
+                placing,
+            );
         }
     }
     let mut why = format!("it is waiting for {sticking}: {because}");
@@ -1148,6 +1238,7 @@ fn claim(
     fitted: Fitted,
     eligible: usize,
     moved: Option<String>,
+    placing: &Placing,
 ) -> Placement {
     let Fitted {
         derived,
@@ -1155,7 +1246,12 @@ fn claim(
         tmpfs_mib,
     } = fitted;
     let occupant = record.occupant();
-    let takes = what_it_takes(record.labels_needed(), seat, occupant);
+    let takes = what_it_takes(
+        record.labels_needed(),
+        seat,
+        occupant,
+        placing.readings_at_once(),
+    );
     let labels = if record.labels_needed().is_empty() {
         "none".to_owned()
     } else {
@@ -2212,6 +2308,7 @@ mod tests {
             },
             1,
             None,
+            &Placing::default(),
         ));
         assert!(
             why.contains("could not be given its labels"),
@@ -3588,6 +3685,7 @@ mod tests {
             &Placing {
                 parent: Parent::None,
                 drain_first_limit: Some(DRAIN_FIRST_LIMIT),
+                readings_at_once: None,
             },
         ));
         assert!(why.contains("quiet host"), "{why}");
@@ -3665,5 +3763,139 @@ mod tests {
             "{why}"
         );
         assert!(why.contains("of which 1 is a requirement reading"), "{why}");
+    }
+
+    // --------------------- how many readings a runner takes (D169) ----
+
+    /// **The incident, through the claim step.** Two readings are running on
+    /// the one machine of the fleet; a third is **queued**, not claimed and
+    /// not refused, and the sentence says the figure and the flag that sets
+    /// it.
+    ///
+    /// Before D169 nothing counted them at all: a reading holds no slot
+    /// (D159), so the two already there were invisible to every gate in
+    /// `judge` and the third — and the two hundredth — was claimed.
+    #[test]
+    fn a_third_reading_waits_for_one_of_the_two_running_to_end() {
+        let running = vec![
+            out_on(a_reading("j0", &["build"], "j10"), "wsl-pc"),
+            out_on(a_reading("j1", &["build"], "j11"), "wsl-pc"),
+        ];
+        let mut fleet = fleet_with(her_pc(), &running);
+        let why = waited(place(
+            &a_reading("j2", &["build"], "j12"),
+            &mut fleet,
+            now(),
+            Stickiness::default(),
+            &Placing::default(),
+        ));
+        assert!(
+            why.contains("2 requirement reading(s) are already running"),
+            "{why}"
+        );
+        assert!(why.contains("at most 2 there at once"), "{why}");
+        assert!(why.contains("--readings-at-once"), "{why}");
+    }
+
+    /// And the queue moves: when one of the two ends, the third is claimed.
+    /// A reading over the cap waits, it is never refused.
+    #[test]
+    fn the_third_reading_is_claimed_once_one_of_the_two_has_ended() {
+        let running = vec![out_on(a_reading("j0", &["build"], "j10"), "wsl-pc")];
+        let mut fleet = fleet_with(her_pc(), &running);
+        let (runner, why) = placed(place(
+            &a_reading("j2", &["build"], "j12"),
+            &mut fleet,
+            now(),
+            Stickiness::default(),
+            &Placing::default(),
+        ));
+        assert_eq!(runner, "wsl-pc");
+        assert!(why.contains("it is reading 2 of the 2"), "{why}");
+    }
+
+    /// **The 214 submitted in one second, in miniature.** The seats are
+    /// carried through a pass, so readings offered in one pass contend with
+    /// each other and not only with what was running when it began: four
+    /// readings through one pass are two claims and two waits, never four
+    /// claims.
+    #[test]
+    fn readings_offered_in_one_pass_contend_with_each_other() {
+        let mut fleet = vec![her_pc()];
+        let mut claimed = 0;
+        let mut queued_behind = 0;
+        for n in 0..4 {
+            match place(
+                &a_reading(&format!("j{n}"), &["build"], &format!("j1{n}")),
+                &mut fleet,
+                now(),
+                Stickiness::default(),
+                &Placing::default(),
+            ) {
+                Placement::Claim { .. } => claimed += 1,
+                Placement::Wait { why } => {
+                    assert!(why.contains("--readings-at-once"), "{why}");
+                    queued_behind += 1;
+                }
+                other => panic!("a reading is claimed or queued, never {other:?}"),
+            }
+        }
+        assert_eq!((claimed, queued_behind), (2, 2));
+    }
+
+    /// The figure is a setting, so an operator with a bigger machine can
+    /// raise it and a test can make the bound bite at one.
+    #[test]
+    fn the_number_of_readings_at_once_is_a_setting() {
+        let running = vec![out_on(a_reading("j0", &["build"], "j10"), "wsl-pc")];
+        let mut fleet = fleet_with(her_pc(), &running);
+        let why = waited(place(
+            &a_reading("j2", &["build"], "j12"),
+            &mut fleet,
+            now(),
+            Stickiness::default(),
+            &Placing {
+                readings_at_once: Some(1),
+                ..Placing::default()
+            },
+        ));
+        assert!(
+            why.contains("1 requirement reading(s) are already running"),
+            "{why}"
+        );
+        assert!(why.contains("at most 1 there at once"), "{why}");
+        // And the other way: four at once claims the second.
+        let (runner, _) = placed(place(
+            &a_reading("j2", &["build"], "j12"),
+            &mut fleet,
+            now(),
+            Stickiness::default(),
+            &Placing {
+                readings_at_once: Some(4),
+                ..Placing::default()
+            },
+        ));
+        assert_eq!(runner, "wsl-pc");
+    }
+
+    /// D159 is kept whole: the cap is about readings and about nothing else.
+    /// A real job takes the slot it is entitled to with that machine's
+    /// readings at their cap.
+    #[test]
+    fn the_cap_holds_back_readings_and_nothing_else() {
+        let running = vec![
+            out_on(a_reading("j0", &[], "j10"), "wsl-pc"),
+            out_on(a_reading("j1", &[], "j11"), "wsl-pc"),
+        ];
+        let mut fleet = fleet_with(her_pc(), &running);
+        let (runner, why) = placed(place(
+            &a_build("j2", 1792),
+            &mut fleet,
+            now(),
+            Stickiness::default(),
+            &Placing::default(),
+        ));
+        assert_eq!(runner, "wsl-pc");
+        assert!(why.contains("build slot 1 of 1"), "{why}");
     }
 }

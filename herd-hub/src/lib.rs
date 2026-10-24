@@ -16,7 +16,8 @@ pub use job::{
     Timestamp, OUTPUT_BUDGET, OUTPUT_FLOOR, RECORD_VERSION,
 };
 pub use matcher::{
-    Parent, Placement, Placing, Seat, Stickiness, DRAIN_FIRST_LIMIT, STICKINESS_LIMIT,
+    Parent, Placement, Placing, Seat, Stickiness, DRAIN_FIRST_LIMIT, READINGS_AT_ONCE,
+    STICKINESS_LIMIT,
 };
 pub use queue::{Standing, AGING_STEP};
 pub use roster::{Admission, Approval, Roster, SharedSecret, ROSTER_VERSION};

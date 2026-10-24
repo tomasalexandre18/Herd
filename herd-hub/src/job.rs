@@ -499,6 +499,36 @@ pub struct Reading {
     /// Where the answer came from, in the record's own words (E-15).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub from: Option<String>,
+    /// How many readings of this job were **lost** to a machine that went
+    /// away, rather than answering anything at all (D169).
+    ///
+    /// A reading that ran and printed something that is not an answer, or
+    /// exited non-zero, or was stopped by its cap, has told this hub
+    /// something about the commit, and D74's rule applies: the job is refused
+    /// by name rather than placed on a guess. A reading that was **lost**
+    /// told it nothing. The two were one branch until a nightly pass buried
+    /// the one runner it had and 201 of 214 jobs ended 125 with no test run —
+    /// every one of them refused because a reading had been lost to a busy
+    /// machine, which is not a fact about the commit at all.
+    ///
+    /// So a lost reading is read again, and this is what bounds that: the
+    /// figure is [`crate::Policy::attempts_allowed`], the same number of goes
+    /// E-21 gives a job at a runner that disappears, and when it is spent the
+    /// job is refused naming both. Counted on the record, like every other
+    /// budget in this hub, so there is nothing to leak and nothing to rebuild
+    /// after a restart (D79).
+    ///
+    /// Additive with a `serde` default, so [`crate::RECORD_VERSION`] does not
+    /// move (D73): absent on an older record means no reading of that job was
+    /// ever lost, which is exactly what an older hub could have written.
+    #[serde(default, skip_serializing_if = "none_lost")]
+    pub lost: u32,
+}
+
+/// Whether a reading has lost none, so the field stays off every record that
+/// has nothing to say with it.
+fn none_lost(lost: &u32) -> bool {
+    *lost == 0
 }
 
 impl Reading {
@@ -509,6 +539,7 @@ impl Reading {
             by: None,
             answer: None,
             from: None,
+            lost: 0,
         }
     }
 
@@ -523,6 +554,35 @@ impl Reading {
         self.answer = Some(answer);
         self.from = Some(from.into());
         self
+    }
+
+    /// The same, after the job that was reading it was **lost**: counted, and
+    /// waiting to be read again (D169).
+    ///
+    /// `by` goes back to `None`, which is the whole mechanism: that is the
+    /// state a job starts in, and the pass that writes the loss down mints a
+    /// fresh reading for it exactly as it minted the first — through the
+    /// cache first, so a reading that was lost after another job's reading
+    /// of the same (commit, command, args) had already answered costs
+    /// nothing at all.
+    pub fn after_a_loss(mut self) -> Self {
+        self.lost = self.lost.saturating_add(1);
+        self.by = None;
+        self
+    }
+
+    /// Whether this job may be read again, having lost [`Reading::lost`]
+    /// readings already (D169).
+    ///
+    /// `budget` is [`crate::Policy::attempts_allowed`]: a job gets as many
+    /// goes at a reading lost to a machine that went away as it gets at a
+    /// machine that went away under it. Bounded because the alternative is a
+    /// job that reads for ever on a fleet that is down, which is a job
+    /// nobody is told about — the same argument D76 makes for its own
+    /// separate budget, and the reason this is a count on the record rather
+    /// than an unbounded retry.
+    pub fn may_be_read_again(&self, budget: u32) -> bool {
+        self.lost < budget
     }
 }
 
@@ -2153,5 +2213,72 @@ mod tests {
         assert_eq!(record.labels_needed(), &labels(&["build"]));
         assert_eq!(record.memory_need_mib(None), Ok(Some(512)));
         assert_eq!(record.tmpfs_need_mib(), 16);
+    }
+
+    /// A reading that was **lost** answered nothing, so the job is read
+    /// again — and the going back to `by: None` is the whole mechanism: that
+    /// is the state a job starts in, and the next pass mints a fresh reading
+    /// exactly as it minted the first (D169).
+    #[test]
+    fn a_reading_lost_before_it_answered_is_read_again_and_counted() {
+        let reading = Reading::of(herd_proto::LabelsFrom {
+            line: "sh tools/labels.sh".to_owned(),
+            baseline: labels(&["build"]),
+        })
+        .read_by(&JobId::new("j0000000002".to_owned()));
+        assert_eq!(reading.lost, 0);
+
+        let again = reading.after_a_loss();
+        assert_eq!(again.lost, 1);
+        assert_eq!(again.by, None, "a lost reading leaves nothing to wait for");
+        assert!(again.answer.is_none());
+    }
+
+    /// And it is bounded, because a job that reads for ever on a fleet that
+    /// is down is a job nobody is told about. The figure is
+    /// [`crate::Policy::attempts_allowed`]: as many goes at a reading lost to
+    /// a machine that went away as E-21 gives the job at the machine itself.
+    #[test]
+    fn a_job_whose_readings_keep_being_lost_runs_out_of_goes() {
+        let budget = crate::ATTEMPTS_ALLOWED;
+        let mut reading = Reading::of(herd_proto::LabelsFrom {
+            line: "sh tools/labels.sh".to_owned(),
+            baseline: labels(&["build"]),
+        });
+        // One reading is running; every turn of this loop loses it, exactly
+        // as `settle_readings` does: count the loss, then ask whether there
+        // is a go left for another.
+        let mut read = 1;
+        loop {
+            reading = reading.after_a_loss();
+            if !reading.may_be_read_again(budget) {
+                break;
+            }
+            read += 1;
+            assert!(read <= budget, "the budget must bound this loop");
+        }
+        assert_eq!(read, budget, "a job gets {budget} readings, and no more");
+        assert_eq!(reading.lost, budget);
+    }
+
+    /// The count is additive: a record written by a hub that never heard of
+    /// it reads as a job none of whose readings was lost, which is exactly
+    /// what that hub could have written — so [`RECORD_VERSION`] does not move
+    /// (D73).
+    #[test]
+    fn a_record_with_no_lost_count_reads_as_a_job_that_lost_none() {
+        let older = r#"{
+            "labels_from": {"line": "sh tools/labels.sh", "baseline": ["build"]}
+        }"#;
+        let reading: Reading = serde_json::from_str(older).expect("an older reading reads");
+        assert_eq!(reading.lost, 0);
+        assert!(reading.may_be_read_again(crate::ATTEMPTS_ALLOWED));
+        // And a reading that has lost none writes nothing about it, so a
+        // record this hub writes is one an older hub can still read.
+        let written = serde_json::to_string(&reading).expect("a reading writes");
+        assert!(!written.contains("lost"), "{written}");
+        assert!(serde_json::to_string(&reading.after_a_loss())
+            .expect("a reading writes")
+            .contains("\"lost\":1"));
     }
 }
