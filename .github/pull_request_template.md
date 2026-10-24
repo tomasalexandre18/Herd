@@ -18,3 +18,8 @@ What this deliberately does not do, and where it is meant to land instead.
 ## To record
 
 Anything load-bearing to append to `docs/decisions.md`, or "nothing".
+
+## Handoff
+
+Path of the task's handoff under `docs/orchestration/history/`, and the
+board items (`ORCH-nnn`) this PR moves, with their new state.

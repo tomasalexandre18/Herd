@@ -1,0 +1,23 @@
+I added the missing row to `docs/orchestration/gotchas/README.md`, updated the handoff and committed both. `./scripts/check-docs.sh` is green. I didn't push, as instructed.
+
+**What the handoff said was not done:** the row for `trace-switch-left-on.md` in the gotchas table, because the earlier session was interrupted before adding it.
+
+**What I did:**
+- Appended the row (`trace-switch-left-on.md`, 2026-10-24, "a trace switch left in `.claude/hooks/` logs every later session; remove it in the same step").
+- Updated the handoff's Done, Not done, Gates and Resume point sections.
+- The first handoff edit failed because `python3` isn't installed here. I redid it with the edit tool, and one intermediate version failed the docs check on a line over 79 columns. I rewrote the Resume point section to fix it.
+
+**Gate** (`./scripts/check-docs.sh`, final run, exit 0):
+```
+note: D170 is a gap in docs/decisions.md (held by an open PR, or lost); gaps stay (D148)
+note: D172 is a gap in docs/decisions.md (held by an open PR, or lost); gaps stay (D148)
+docs ok
+```
+The Rust gates were **not run**, since this is a prose-only change. CI runs them on the PR.
+
+**Commits on `v6-task`:**
+- `e2660cb`: the README row. The commit message says it also finished the handoff, but the handoff edit failed at that point, so only the README changed.
+- `adc927e`: the handoff update. Final HEAD.
+
+**PIDs:** none. The worktree is clean.
+exit=0

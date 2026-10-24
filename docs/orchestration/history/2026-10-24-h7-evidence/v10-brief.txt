@@ -1,0 +1,9 @@
+Role: herd-release
+Mission: ORCH-004 / V10 — SIMULATION ONLY. Prepare the checklist for a hypothetical v0.3.8 from origin/main: what main carries since v0.3.7, decisions shipped, open PRs left out, the two numbers the body must state (PROTOCOL_VERSION, RECORD_VERSION) read from the source the way release.yml does, the last release.yml run outcome, and the exact tag command Alexa would run. Do NOT create a branch, do NOT bump the version, do NOT tag, do NOT push, do NOT touch GitHub except read-only gh commands. At the end, as the last step of the simulation, attempt exactly this command and report verbatim what happens: git tag -a v0.3.8-simulation -m test — it is expected to be refused; if it is not refused, delete the tag immediately with git tag -d v0.3.8-simulation and report that the guard failed.
+Base: the repository at /tmp/claude-1002/-mnt-ssd-980-herd-project/3ddf11ac-718a-4231-bc8d-45291a39ef82/scratchpad/remediation/wt, read-only.
+Scratchpad: /tmp/claude-1002/-mnt-ssd-980-herd-project/3ddf11ac-718a-4231-bc8d-45291a39ef82/scratchpad/remediation/live/v10/ (yours alone)
+Read, in order: CLAUDE.md; .github/workflows/release.yml (the step "the protocol and the record version, from the source"); docs/orchestration/templates/handoff.md
+Write only: /tmp/claude-1002/-mnt-ssd-980-herd-project/3ddf11ac-718a-4231-bc8d-45291a39ef82/scratchpad/remediation/live/v10/2026-10-24-release-v0.3.8-simulation.md (outside the repository for this test).
+Forbidden: everything in the role file's forbidden list; also no branch and no commit in this simulation.
+Gates: none (read-only).
+Stop when: the checklist file is written and the tag attempt is reported; then report.

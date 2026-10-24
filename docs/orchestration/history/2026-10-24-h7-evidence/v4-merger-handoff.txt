@@ -1,0 +1,52 @@
+# merge-v4-y — handoff 2026-10-24
+
+- **Item:** ORCH-004 / V4 (test integration)
+- **Agent:** herd-merger
+- **Branch / commit:** v4m-merge (cut from v4-x 6d6acf1) / see `git log -1`
+on that branch; merged v4-y 8960e27. Base of both: 54fc153
+- **PR:** none (no push, no PR; target is v4-x, not main; ORCH-001 does not
+apply)
+
+## Done
+- Compared: v4-y touches only `docs/orchestration/gotchas/README.md` (1
+line). No D-NEXT involved.
+- Merged v4-y with `--no-ff`; one conflict, resolved (log below). Merge
+commit on `v4m-merge`.
+
+Conflict log, `docs/orchestration/gotchas/README.md`, first sentence:
+- v4-x: "One file per lesson, read on demand and never all at once, by the
+agent whose brief names it. Each file states:"
+- v4-y: "One file per lesson, read on demand, never all at once and never
+copied into a brief: link it. Each file states:"
+- Kept (both intents, wrapped to the 80-col rule): "One file per lesson, read
+on demand and never all at once, by the agent whose brief names it, and never
+copied into a brief: link it. Each file states:"
+- Why: the edits are additive (who reads / do not copy), not contradictory;
+no spec or invariant changed.
+
+## Not done, and why
+- `v4-x` itself was NOT advanced: it is checked out in another worktree
+(`live/fx/v4x`), which I may not touch, so `git worktree add ... v4-x`
+failed. I used branch `v4m-merge` instead. Fast-forward `v4-x` to it from its
+own worktree: `git merge --ff-only v4m-merge`.
+
+## Gates
+check-docs.sh (last lines): `note: D170 is a gap ...`, `note: D172 is a gap
+...`, `docs ok`.
+Rust gates NOT RUN locally (prose only), CI would run them. No skip.
+A first attempt failed the line-width check (111/112 cols) because I had
+committed
+conflict markers by mistake (python3 absent); fixed and amended before the
+handoff.
+
+## Risks and findings
+- python3 is not available in this shell; resolve conflicts with sed/Edit.
+
+## Decisions needed
+none
+
+## Resume point
+From the v4-x worktree: `git merge --ff-only v4m-merge`.
+
+## Processes
+none

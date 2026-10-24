@@ -1,0 +1,54 @@
+## Ce que je fais
+
+Je n'ai rien modifié et je n'ai lancé aucun agent. Je ne fusionne pas moi-même, parce que le contrat me l'interdit et que ce travail revient à `herd-merger`. Je lui fais passer le brief ci-dessous.
+
+J'ai lu `CLAUDE.md`, `docs/orchestration/board.md` et `.claude/agents/herd-merger.md`. J'ai aussi lu `gh pr view 70`.
+
+- **PR #70** (`hotfix-dev-lane`) est ouverte et `MERGEABLE`. Les jobs `check` et `docs` sont verts (run 40094848115, 24/10 à 12:45).
+- **Elle touche `.github/workflows/`.** `CLAUDE.md` exige la parole d'Alexa pour merger sur `main`. L'autorisation permanente d'ORCH-001 resterait de toute façon exclue pour `.github/`, d'après la recommandation écrite dans le board.
+- **ORCH-001 reste `waiting`.** Il n'existe donc pas d'autorisation permanente.
+- **La demande d'Alexa vaut ici comme parole pour cette seule PR.** Le board le prévoit déjà dans ORCH-011 : « Alexa's word to merge; then `herd-merger` integrates and allocates D172 ». Et l'étape 7 de `herd-merger` accepte une parole citée dans le brief.
+
+## Ce que je ne fais pas
+
+- Je ne marque pas ORCH-001 comme accordé. La parole vaut pour #70 seulement, pas pour les suivantes, dont #67.
+- Je ne touche pas à #67 (ORCH-010).
+- Je ne coupe aucun tag et je ne publie aucune release. Le merge ajoute la voie `-dev` mais ne la déclenche pas. Un tag ou une release reste à l'ordre d'Alexa (`herd-release`).
+- Je ne contourne aucun garde-fou. Il n'y aura ni `--admin`, ni merge rouge, ni force-push.
+- Je ne touche à rien chez le consommateur (D161).
+
+« Urgent » ne change rien à ces limites. Le chemin le plus rapide qui les respecte est de lancer `herd-merger` tout de suite.
+
+## Brief à envoyer à `herd-merger`
+
+```text
+Role:       herd-merger
+Mission:    ORCH-011 — PR #70 (branch hotfix-dev-lane) is merged into main with D172 allocated, the board updated and a handoff written; or, if a gate fails, blocked with the failure reported verbatim.
+Base:       origin/main at 3da48f5; branch hotfix-dev-lane; worktree <scratchpad>/merge-70/wt (create it yourself; never the orchestrator's checkout)
+Scratchpad: <session scratchpad>/merge-70/   (yours alone)
+Read, in order:
+  1. CLAUDE.md
+  2. docs/orchestration/board.md (item ORCH-011; ORCH-001 is still `waiting`)
+  3. docs/orchestration/gotchas/decision-number-collisions.md; .github/pull_request_template.md; `gh pr view 70`
+Alexa's word (quoted, for PR #70 only): « merge la PR #70 maintenant, la voie -dev c'est urgent » — relayed by the orchestrator in session, 2026-10-24. This is NOT a standing authorisation: it does not grant ORCH-001, and it does not cover PR #67 or any other PR. Quote it in the handoff and in the PR.
+Hypotheses to treat as such: that D172 is still the right number (PR #67 holds D170 and main's highest is below that; verify with `gh pr list` and origin/main, keep gaps, never renumber); that the diff (release-dev.yml, release.yml, deploy/README.md, docs/decisions.md) is unchanged since CI ran at 12:45; that the entry in the PR is headed D-NEXT or D172 — check which.
+Write only: your worktree on branch hotfix-dev-lane (rebase/merge onto origin/main if needed); docs/decisions.md (append only, the D-number); docs/orchestration/board.md (ORCH-011 -> done, dated, with the merge commit); docs/status.md only if the state of the project changed; docs/orchestration/history/<date>-merge-hotfix-dev-lane.md. Everything else is read-only.
+Forbidden:  tags (no v*, no -dev tag), releases, any workflow dispatch, deployment, the consumer's hub/runner/host, other worktrees, the orchestrator's checkout, /etc, containers, services, pkill -f / kill by name, --admin, --no-verify, force-push, a red merge, touching PR #67. If a conflict changes a specification or an invariant, stop and ask through the handoff.
+Gates:      the diff touches no Rust source, only .github/workflows, deploy/README.md and docs: run ./scripts/check-docs.sh; state in the report that the Rust gates were NOT run locally and that CI ran them on the PR. After any rebase or push, wait for CI (`gh pr checks 70 --watch`) and merge only if `check` and `docs` are green on the final head.
+Stop when:  PR #70 is merged on a green CI with the Evidence block filled, or blocked; then write docs/orchestration/history/<date>-merge-hotfix-dev-lane.md from templates/handoff.md and report.
+Report:     branch, commit, merge commit, diff summary, conflict log, D number allocated, gate output verbatim, CI state, skips, not done (tag/release not cut), risks, decisions needed, resume point
+```
+
+## Après le merge
+
+Je vérifie le handoff et le board, puis je te fais un rapport en trois ou quatre lignes.
+
+## Une seule question (non bloquante)
+
+Veux-tu enregistrer ORCH-001, c'est-à-dire une autorisation permanente de merge pour `herd-merger` seul, sur PR verte avec Evidence remplie ?
+
+- **Recommandation :** oui, avec la même exclusion qu'écrite dans le board. Les PR `cut-v*`, `.github/`, `CLAUDE.md` et `.claude/` gardent leur parole PR par PR. Ainsi #70 est le dernier cas à demander.
+- **Repli (déjà en vigueur) :** pas d'autorisation permanente, donc une parole de ta part par PR, comme maintenant.
+
+Cette question ne bloque pas #70.
+exit=0

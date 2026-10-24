@@ -1,0 +1,32 @@
+# v6-task — handoff 2026-10-24
+
+- **Item:** ORCH-004 (V6 fixture)
+- **Agent:** herd-step
+- **Branch / commit:** v6-task / see `git log -1`, based on
+  orchestration-remediation 54fc153
+- **PR:** none
+
+## Done
+`docs/orchestration/gotchas/trace-switch-left-on.md` written and
+committed. The row for it was added to the table of
+`docs/orchestration/gotchas/README.md` on resume.
+
+## Not done, and why
+Nothing.
+
+## Gates
+`./scripts/check-docs.sh`: `docs ok` (exit 0; notes only: D170 and D172
+are gaps, gaps stay). Rust gates NOT RUN (prose only); CI runs them.
+
+## Risks and findings
+None.
+
+## Decisions needed
+none
+
+## Resume point
+Done; nothing left. The row was added, the gate is green, both files
+are committed.
+
+## Processes
+none

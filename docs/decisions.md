@@ -8170,3 +8170,59 @@ otherwise unchanged. A 0.3.6 record reads here, and a record this writes
 reads on 0.3.6.
 
 **On the number.** This entry is D171. D170 is held by an unmerged branch.
+
+## 2026-10-24 — D173 The orchestrator briefs and verifies; agents write
+
+**Context.** `CLAUDE.md` (2026-10-13) said "Claude works alone. A
+sub-agent only for one long, isolated task, never several in parallel".
+The owner said otherwise on 2026-10-15 (*"tu es orchestrateur, tu lances
+des sous-agents"*, *"autant d'agent que besoin"*) and again on 2026-10-23
+(*"un agent toujours tu est orchestrateur"*), and those corrections lived
+only in Claude's auto-memory, which no execution agent loads. Between the
+two dates the orchestrator's own shell ran 60 `sed -i`, 29 `git commit`,
+62 `git merge`, 47 `gh pr merge`, 12 `git tag` and 14 `gh release`. The
+independent audit of 2026-10-24 found the contradiction, the unversioned
+rules, a scratchpad collision, a `pkill -f` that killed a neighbour's
+suite, two branches allocating one decision number, and no list of owed
+work or waiting decisions that survived a session.
+
+**Choice.** The organisation is multi-agent and the contract is in the
+repository, not in memory. The orchestrator (main session) plans, briefs,
+verifies evidence, escalates and reports; it never edits a repository
+file, commits, merges, resolves a conflict, tags or releases. Five roles
+under `.claude/agents/` do that work, one bounded task each, in their own
+worktree, ending with a dated handoff under `docs/orchestration/history/`.
+`docs/orchestration/board.md` is the one list of open work and waiting
+decisions; `docs/status.md` points at it. `herd-merger` is the only writer
+of this file: a branch writes `D-NEXT`, the merger allocates the next free
+number at integration, one branch at a time; gaps stay (D148).
+`scripts/check-docs.sh` rejects a duplicate number, a malformed header, a
+leftover `D-NEXT`, a board out of shape and a contract that says the
+orchestrator works alone; `scripts/check-orchestration.sh` proves each of
+those checks goes red. A `PreToolUse` hook refuses the main session's
+writes and git/gh write verbs — best effort, documented as such in
+`docs/orchestration/permissions.md`, with the review of traces as the
+real protection. Herd is shipped, not operated (D161) is restated as
+invariant 9 so that no injected persona can override it.
+
+**Alternatives rejected.** Keeping the rules in auto-memory: not loaded by
+agents, not versioned, lost on a `CLAUDE_CONFIG_DIR` move (it happened
+between 2026-10-15 and 2026-10-23). A `permissions.deny` on `Edit`: it
+applies to agents too and would paralyse `herd-step`. One file per
+decision now: it does not remove the allocation race by itself and costs a
+168-file migration; analysed in `docs/orchestration/decisions-structure.md`
+and left to the owner (ORCH-003).
+
+**Decided the same day.** Alexa, asked ORCH-001 through the orchestrator,
+answered *"non il peux merge par defaut"*: `herd-merger` merges any PR whose
+CI is green and whose Evidence block is filled, without a per-PR word and
+with no excluded path. Pushing a tag and publishing a release are a separate
+act and stay on Alexa's word, each one singly.
+
+**Still the owner's.** The invariant wording (ORCH-002); the journal's
+layout (ORCH-003); the shared `CLAUDE_CONFIG_DIR` (ORCH-030).
+
+**On the number.** This entry is D173; `origin/main` ends at D171, PR #67
+holds D170 and PR #70 holds D172, so 173 is the next free number above
+both. Written by the remediation agent under its bootstrap exception; from
+here on only `herd-merger` allocates.

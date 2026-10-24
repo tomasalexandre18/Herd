@@ -1,7 +1,8 @@
 # Status — 2026-10-23
 
 State now. Replaced every session, never appended to. Per-expectation
-detail is in `docs/coverage.md`, the reasoning in `docs/decisions.md`.
+detail is in `docs/coverage.md`, the reasoning in `docs/decisions.md`, and
+every open item or waiting decision in `docs/orchestration/board.md`.
 
 ## Who operates what
 
@@ -84,7 +85,6 @@ reading costed and bounded.
 
 ## Next action
 
-Cut a tag: the only way D163-D165 reach the running runner and the only
-way an operator gets a binary, on a release path green by hand and never
-yet proven on a tag. That is Alexa's word to give. Then the janitor list
-(D134), then M17's join.
+Cut a tag: the only way D163-D165 reach the running runner and the only way an
+operator gets a binary, on a release path green by hand and not yet proven on
+a tag. Alexa's word to give. Then the janitor list (D134), then M17's join.

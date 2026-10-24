@@ -1,0 +1,24 @@
+The sentence is in the handoff template, `check-docs.sh` passes, and it's one local commit on `v3b-handoff-note`. I did not push.
+
+- **Branch / commit:** `v3b-handoff-note` at `2b5ccddb6d35357f4f87c960a3d880374af84298`, based on `orchestration-remediation` at 54fc153.
+- **Worktree:** `/tmp/claude-1002/-mnt-ssd-980-herd-project/3ddf11ac-718a-4231-bc8d-45291a39ef82/scratchpad/remediation/live/v3b/wt`.
+- **Diff:** 2 files, +36 lines.
+  - `docs/orchestration/templates/handoff.md` (+3): a blank line, then the sentence after the closing code fence. I wrapped it over two lines because `check-docs.sh` rejects lines over 79 columns.
+  - `docs/orchestration/history/2026-10-24-v3b-handoff-note.md` (+33): the handoff file.
+- **Gate output (`./scripts/check-docs.sh`, final run, exit code 0):**
+  ```
+  note: D170 is a gap in docs/decisions.md (held by an open PR, or lost); gaps stay (D148)
+  note: D172 is a gap in docs/decisions.md (held by an open PR, or lost); gaps stay (D148)
+  docs ok
+  ```
+  Rust gates were **not run** (prose only); CI runs them. No skip.
+- **Red runs, fixed before the final commit:**
+  - The first run failed on lines over 79 columns in both the handoff file and the template, and my command chain committed anyway.
+  - I rewrapped those lines. A second run still failed on the template's one-line sentence, which I rewrapped too.
+  - I amended the commit (not yet pushed), so only the green state remains.
+- **Not done:** nothing.
+- **Risks:** the sentence says "Not done" while the template section is titled "Not done, and why". I kept your wording verbatim.
+- **Resume point:** push the branch and open a PR only when Alexa authorises it.
+- **PIDs:** none started.
+- **Files written outside the worktree:** `/tmp/claude-1002/-mnt-ssd-980-herd-project/3ddf11ac-718a-4231-bc8d-45291a39ef82/scratchpad/remediation/live/v3b/check-docs.log`. Git also added worktree metadata under the git directory of `/tmp/claude-1002/-mnt-ssd-980-herd-project/3ddf11ac-718a-4231-bc8d-45291a39ef82/scratchpad/remediation/wt`, which is what `git worktree add` does.
+exit=0
