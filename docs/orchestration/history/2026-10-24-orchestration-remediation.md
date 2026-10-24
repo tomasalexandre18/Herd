@@ -23,10 +23,11 @@ That is V6 for real.
 
 ## Not done, and why
 
-- Nothing merged: ORCH-002 is still waiting, and this PR is the one that
-  carries the invariant wording it asks about. ORCH-001 is decided
-  ("non il peux merge par defaut"): `herd-merger` merges by standing
-  authorisation; tags and releases stay on Alexa's word per act.
+- Nothing merged by this agent: PR #71 waits for a green CI on its head
+  and is merged by `herd-merger` under ORCH-001 ("non il peux merge par
+  defaut"); ORCH-002 ("je valide") is recorded. Tags and releases stay on
+  Alexa's word per act. The red `check` on `b40c8dc` was a flaky product
+  test (ORCH-022), re-run by the next push, not bypassed.
 - Two invariants (3 and 6) had been shortened without notice in the
   first rewrite; the orchestrator's review caught it and both are
   restored verbatim (gotcha `invariants-are-quoted-not-reflowed`).
