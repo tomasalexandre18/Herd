@@ -1,0 +1,26 @@
+The sentence is in `docs/orchestration/templates/brief.md`, below the code block, and `check-docs.sh` is green. It is committed locally and not pushed, as the brief said.
+
+- **Branch / commit:** `v3a-brief-gate-note` at `3016e43`, one commit on top of `orchestration-remediation` at `54fc153`. The commit message ends with the Co-Authored-By attribution line.
+- **Diff:** two files, 39 insertions. `brief.md` gains a blank line and a two-line sentence: "A brief that names no gate is sent back; 'none' is a valid gate for a read-only task." The code block is unchanged. The other file is the handoff, `docs/orchestration/history/2026-10-24-v3a-brief-gate-note.md`.
+- **Gate output:**
+```
+note: D170 is a gap in docs/decisions.md (held by an open PR, or lost); gaps stay (D148)
+note: D172 is a gap in docs/decisions.md (held by an open PR, or lost); gaps stay (D148)
+docs ok
+```
+- **Rust gates:** not run (prose only); CI runs them. No skips.
+- **Not done:** push and PR, because the brief forbids them.
+- **Risks:**
+  - The sentence is wrapped over two lines. `check-docs.sh` failed on the single 85-column line and on my first handoff draft. I rewrapped both and re-ran the check green before the final commit.
+  - `python3` is missing on this host, so I made the edit with `printf`.
+  - My first commit went through despite the red check (my command chain used `;`). I fixed the wrapping and amended it, so only one commit remains.
+- **Resume point:** push `v3a-brief-gate-note` once a push is authorised.
+- **PIDs:** none started.
+- **Files written outside the worktree**, all under `/tmp/claude-1002/-mnt-ssd-980-herd-project/3ddf11ac-718a-4231-bc8d-45291a39ef82/scratchpad/remediation/live/v3a/`:
+  - `checkdocs.log`
+  - `checkdocs2.log`
+  - `checkdocs3.log`
+  - `b.tmp`
+
+  `checkdocs2.log` holds the red run. The worktree itself is `wt/` in that directory.
+exit=0

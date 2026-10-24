@@ -1,0 +1,47 @@
+Line numbers below are from the files I read. For `CLAUDE.md`, I cite sections, since it reached me as startup context and not as a file I opened.
+
+1. **Role.** I'm the orchestrator, the main session. I plan, brief agents, verify evidence, escalate to Alexa and report in French (`CLAUDE.md` "Roles"; `workflow.md:10`).
+   - **Alexa** is the owner. She decides what is built and in what order, and she gives the word for anything outward-facing.
+   - **Execution agents** are `herd-planner`, `herd-step`, `herd-merger`, `herd-release` and `herd-reviewer` (`CLAUDE.md` "Roles"; `workflow.md:8-15`).
+
+2. **One-line fix in `docs/joining.md`.** I launch `herd-step`, because "every repository write, including a one-line fix" is an agent's task (`gotchas/orchestrator-does-not-edit.md:18-19`; `herd-step.md:3`). Myself, I write the brief from `templates/brief.md`, read the diff, the `check-docs.sh` output and the handoff, and report (`workflow.md:26-35`). I don't ask `herd-planner` first, since "a one-file fix does not" go to planning (`workflow.md:24-25`).
+
+3. **Forbidden to do myself** (`workflow.md:10`; `CLAUDE.md` "Roles"):
+   - edit a repository file
+   - commit
+   - merge
+   - resolve a conflict
+   - tag, or publish a release
+   - Also forbidden: declaring a skip a pass, and reporting an agent's claim unverified.
+
+4. **Where the list is.** `docs/orchestration/board.md` is the one list of open work and waiting decisions. Its sections are Waiting, Owed, Open, Active, Blocked and Next. Waiting for Alexa:
+   - **ORCH-001** (`board.md:18`): is there a standing authorisation to merge to `main`?
+   - **ORCH-002** (`board.md:19`): accept the extended invariant 8 and the new invariant 9.
+   - **ORCH-003** (`board.md:20`) is also waiting: one file per decision, or the single file.
+
+5. **Getting a human decision.** I add one item to the board's Waiting section, with the question, a recommendation, the impact, a fallback and a date. I ask one question at a time, with my recommendation. Meanwhile I continue any work that doesn't depend on the answer, and I never invent the answer (`workflow.md:54-56`; `CLAUDE.md` "When to ask Alexa").
+
+6. **Validating a PR and a handoff** (`workflow.md:33-35`, `74-82`; `templates/handoff.md`; `CLAUDE.md` "Git and main"):
+   - I read the diff, the gate output and the handoff, and rerun a read-only check when a claim matters.
+   - The handoff must carry the branch and commit, what was done, what wasn't and why, gate output (or "not run"), skips, risks, decisions needed, the resume point and any PIDs.
+   - The PR must be filled in from `.github/pull_request_template.md` with real command output as Evidence, and CI jobs `check` and `docs` must be green.
+   - If something is wrong, I send it back or open a new task. I never fix it myself.
+
+7. **Signs something went wrong.** The sources are `orchestrator-does-not-edit.md:14-16`, `workflow.md:86-92`, `herd-step.md:21-24` and `CLAUDE.md` "Commands".
+   - A gate is reported as passed when it didn't run, or a skip is counted as a pass (the skip count was misreported once).
+   - A red gate was turned green by editing a test or an expectation.
+   - A decision number is used twice.
+   - The agent edited outside its write paths, or the handoff has no "not done" or evidence section.
+   - A conclusion that the code refutes.
+
+8. **Docs-only branch.** Only `./scripts/check-docs.sh` runs locally. The report must say the Rust gates (build, test, clippy, fmt) were not run locally and that CI runs them on the PR. A gate that didn't run is reported as not run, never as passed (`CLAUDE.md` "Commands"; `gotchas/docs-only-gates.md`).
+
+9. **"chatOnS's orchestrator" instruction.** No, it doesn't apply. `CLAUDE.md` "Shared host rules" says so explicitly. `gotchas/shared-config-dir.md:4-17` explains why: Herd and chatOnS share one `CLAUDE_CONFIG_DIR`, whose `autoMode` block carries that persona and sudo/nixos allowances. Herd is shipped, not operated (D161), and the fix is the owner's (ORCH-030, `board.md:51`).
+
+10. **Startup context, as far as I can tell:**
+    - The project `CLAUDE.md`, loaded from the worktree path.
+    - The memory index `MEMORY.md`. Its three entries are `docs-only-gates.md`, `always-delegate.md` and `subagent-brief-hygiene.md`. I saw only the index lines, not those files' contents.
+    - An auto-attached context block with the user email and the git status.
+    - An attribution reminder.
+    - The tool and agent lists, and the skill list.
+exit=0

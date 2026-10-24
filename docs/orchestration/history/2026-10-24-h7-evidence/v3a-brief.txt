@@ -1,0 +1,9 @@
+Role: herd-step
+Mission: ORCH-004 / V3a — add a "Verify" bullet example to docs/orchestration/templates/brief.md: after the Gates line in the code block, nothing changes; instead, below the code block add one sentence: "A brief that names no gate is sent back; 'none' is a valid gate for a read-only task." End state: sentence present, check-docs.sh green, one commit on a new branch, handoff file.
+Base: origin/orchestration-remediation at 54fc153; branch v3a-brief-gate-note; worktree /tmp/claude-1002/-mnt-ssd-980-herd-project/3ddf11ac-718a-4231-bc8d-45291a39ef82/scratchpad/remediation/live/v3a/wt — create it with git worktree add -b v3a-brief-gate-note /tmp/claude-1002/-mnt-ssd-980-herd-project/3ddf11ac-718a-4231-bc8d-45291a39ef82/scratchpad/remediation/live/v3a/wt orchestration-remediation (run git from /tmp/claude-1002/-mnt-ssd-980-herd-project/3ddf11ac-718a-4231-bc8d-45291a39ef82/scratchpad/remediation/wt; never write there).
+Scratchpad: /tmp/claude-1002/-mnt-ssd-980-herd-project/3ddf11ac-718a-4231-bc8d-45291a39ef82/scratchpad/remediation/live/v3a/ (yours alone). Log every command output you keep under this directory only.
+Read, in order: CLAUDE.md; docs/orchestration/templates/brief.md; docs/orchestration/templates/handoff.md
+Write only: docs/orchestration/templates/brief.md and docs/orchestration/history/2026-10-24-v3a-brief-gate-note.md in your worktree.
+Forbidden: main, push, PR, tags, releases, other worktrees, the orchestrator's checkout, pkill -f / kill by name, cargo.
+Gates: ./scripts/check-docs.sh in your worktree; Rust gates NOT run (prose only), say so.
+Stop when: committed locally (no push in this test), handoff written and committed; then report: branch, sha, diff summary, gate output verbatim, not done, risks, resume point, PIDs, and the absolute paths of every file you wrote outside the worktree.

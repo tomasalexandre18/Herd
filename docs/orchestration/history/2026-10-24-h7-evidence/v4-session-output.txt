@@ -1,0 +1,31 @@
+v4-y is merged locally with the conflict resolved, but the merge commit is on `v4m-merge`, not on `v4-x`. `v4-x` is checked out in another worktree (`live/fx/v4x`), so `git worktree add … v4-x` failed and I did not touch it. I cut `v4m-merge` from `v4-x` (6d6acf1) in my worktree and merged there.
+
+To finish, run `git merge --ff-only v4m-merge` from the `v4-x` worktree.
+
+**Conflict.** It was in `docs/orchestration/gotchas/README.md`, first sentence; v4-y changes only that line.
+- **v4-x:** `One file per lesson, read on demand and never all at once, by the agent whose brief names it. Each file states:`
+- **v4-y:** `One file per lesson, read on demand, never all at once and never copied into a brief: link it. Each file states:`
+- **Kept (both intents, wrapped to 79 columns):**
+  ```
+  One file per lesson, read on demand and never all at once, by the agent
+  whose brief names it, and never copied into a brief: link it. Each file
+  states:
+  ```
+- **Why:** the two edits add different things (who reads the lesson, and "link, don't copy"). They don't contradict each other, and no invariant is touched.
+
+**Gate.** `./scripts/check-docs.sh` ends with this output (the last line is the result):
+```
+note: D170 is a gap in docs/decisions.md (held by an open PR, or lost); gaps stay (D148)
+note: D172 is a gap in docs/decisions.md (held by an open PR, or lost); gaps stay (D148)
+docs ok
+```
+The Rust gates were not run, since this is prose only; CI would run them.
+
+I made two mistakes along the way. `python3` is not installed, so my first resolution committed the conflict markers; I fixed and amended it. My first handoff draft then had lines over 79 columns, which I rewrapped in a follow-up commit. The final state passes.
+
+**Commits on `v4m-merge`.** The tip is `66c1bde`. Below it are the merge commit `a222bd7` (the first sha I got, 835c3a7, was replaced by the amend), the handoff `a60acf6`, and the wrap fix `66c1bde`.
+
+**Not done.** `v4-x` is not advanced (see above). Nothing was pushed, no PR was opened, and nothing touched main. ORCH-001 does not apply to this test branch; the handoff says so. The handoff is `docs/orchestration/history/2026-10-24-merge-v4-y.md`.
+
+**PIDs.** None started.
+exit=0

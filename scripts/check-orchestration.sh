@@ -124,6 +124,8 @@ hook 0 "{\"tool_name\":\"Bash\",\"cwd\":\"$R\",\"tool_input\":{\"command\":\"gre
 hook 0 "{\"tool_name\":\"Bash\",\"cwd\":\"$R\",\"tool_input\":{\"command\":\"git worktree add -b t /tmp/claude-1002/x/wt origin/main\"}}"
 hook 0 "{\"tool_name\":\"Bash\",\"cwd\":\"$R\",\"tool_input\":{\"command\":\"./scripts/check-docs.sh; ls $R/docs\"}}"
 hook 0 "{\"tool_name\":\"Bash\",\"cwd\":\"$R\",\"agent_id\":\"a1\",\"tool_input\":{\"command\":\"git commit -m hi\"}}"
+hook 0 "{\"tool_name\":\"Bash\",\"cwd\":\"$R\",\"agent_type\":\"herd-step\",\"tool_input\":{\"command\":\"git commit -m hi\"}}"
+hook 0 "{\"tool_name\":\"Edit\",\"cwd\":\"$R\",\"agent_type\":\"herd-merger\",\"tool_input\":{\"file_path\":\"$R/docs/status.md\"}}"
 hook 0 "not json at all"
 touch "$G.DISABLED.tmp"; mv "$G.DISABLED.tmp" .claude/hooks/DISABLED
 hook 0 "{\"tool_name\":\"Bash\",\"cwd\":\"$R\",\"tool_input\":{\"command\":\"git commit -m hi\"}}"
@@ -175,6 +177,7 @@ RG=.claude/hooks/release-guard.sh
 rg() { printf '{"tool_input":{"command":"%s"}}' "$2" | "$RG" >/dev/null 2>&1; rc=$?; [ "$rc" -eq "$1" ] && ok "release exit $1: $2" || bad "release expected $1 got $rc" "    $2"; }
 rg 2 "git tag -a v0.4.0 -m x"; rg 2 "git push origin v0.4.0"; rg 2 "git push --tags"
 rg 2 "gh release create v0.4.0"; rg 2 "gh workflow run release.yml"; rg 2 "docker load < hub.tar"; rg 2 "sudo systemctl restart herd-runner"
+rg 0 "git tag -l"; rg 0 "git tag --list 'v*'"; rg 0 "git tag -n9 v0.3.7"; rg 0 "git tag"; rg 2 "git tag -l; git tag -a v1 -m x"; rg 2 "git tag v0.4.0"
 rg 0 "git push origin cut-v0.4.0"; rg 0 "gh run list --workflow release.yml"; rg 0 "git log v0.3.7..origin/main --oneline"
 
 echo

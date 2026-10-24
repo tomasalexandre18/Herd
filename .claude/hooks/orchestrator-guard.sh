@@ -23,9 +23,11 @@ command -v perl >/dev/null 2>&1 || {
 
 input=$(cat)
 # One record: agent_id, agent_type, tool_name, cwd, file_path, command,
-# separated by
-# the unit separator (0x1f): a tab is IFS whitespace and `read` would
-# collapse an empty field into its neighbour.
+# separated by the unit separator (0x1f): a tab is IFS whitespace and `read` would
+# collapse an empty field into its neighbour. An agent spawned by the Agent
+# tool carries agent_id and agent_type; a session started as
+# `claude --agent herd-step` carries agent_type only; the orchestrator's
+# main thread carries neither (probed on 2.1.303, 2026-10-24).
 fields=$(printf '%s' "$input" | perl -MJSON::PP -0777 -ne '
   my $d = eval { JSON::PP->new->decode($_) } or exit 0;
   my $t = $d->{tool_input} || {};

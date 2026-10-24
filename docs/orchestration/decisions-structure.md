@@ -82,3 +82,16 @@ after; rollback is `git revert` of that one PR.
    new entry that says so.
 4. `check-docs.sh` fails on a duplicate, a malformed header or a leftover
    `D-NEXT`, and prints a note for every gap it does not know.
+
+## Decision (2026-10-24, Alexa, relayed by the orchestrator)
+
+Option A is applied now. Option B is the direction, **decided and
+deferred**: A is B's prerequisite, since what makes the single file costly
+is parallel writes at its tail, and separate files do not by themselves
+stop two branches creating the same `D170`; the `D-NEXT` placeholder with a
+single allocator does. Once the numbering is collision-free, the split is a
+scripted move in a separate PR, reversible by revert, with D148
+guaranteeing that a number cited in code is an identifier and needs no
+rewrite. The trigger and the owner are on the board as ORCH-003. No
+migration runs before Alexa's word. The analysis above is kept unchanged as
+the dated comparison B will rest on.

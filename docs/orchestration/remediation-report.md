@@ -98,4 +98,127 @@ Files that may change: `CLAUDE.md`, `.gitignore` (one line),
    migration **blocked on approval** (H5).
 5. Validation campaign V1–V12 (H7), recorded in `history/remediation.md`.
 
-Sections 6 to 10 of the mandate's report: *pending*.
+## 6. Inventory after (what changed, and why)
+
+| File | Change | Why |
+|---|---|---|
+| `CLAUDE.md` | rewritten, 141 lines | roles split (orchestrator / five agents), "works alone" gone, docs-only gate rule reconciled with D27, `main` authority stated as ORCH-001, invariant 8 extended and invariant 9 added (ORCH-002), shared-host rules, session start/end |
+| `.gitignore` | `.claude/` narrowed to `worktrees/`, agent memory, local settings, trace switches | roles, hooks and settings become versioned |
+| `.claude/agents/herd-{planner,step,merger,release,reviewer}.md` | new | one bounded role each; `disallowedTools` where the harness can remove a tool; `herd-release` carries its guard hook |
+| `.claude/hooks/orchestrator-guard.sh`, `release-guard.sh`, `.claude/settings.json` | new | best-effort technical restriction of the main session and of the release role; fail open; `DISABLED` switch |
+| `docs/orchestration/workflow.md`, `memory.md`, `permissions.md`, `decisions-structure.md`, `board.md`, `templates/`, `gotchas/`, `history/` | new | procedure, loading facts, permission matrix, journal analysis, canonical list, brief/handoff templates, dated lessons, handoffs and H7 evidence |
+| `docs/status.md` | 3 lines reflowed, pointer to the board | status stays state; 90 lines |
+| `docs/decisions.md` | D173 appended | the organisational decision, numbered above D172 (PR #70) |
+| `scripts/check-docs.sh` | extended | decision headers, duplicates, `D-NEXT`, gaps noted, contract contradiction, roles, hooks, settings, board shape, handoff names, width in `docs/orchestration/**` |
+| `scripts/check-orchestration.sh` | new, 87 assertions | every check proven red on a copy; collision corpus; both hooks positive and negative; run by CI's `docs` job |
+| `.github/pull_request_template.md` | `## Handoff` section | the PR names its handoff and board items |
+| `.github/workflows/ci.yml` | one line in job `docs` | runs `check-orchestration.sh` |
+
+Not touched: `herd-*/`, `herdctl/`, `deploy/`, `nix/`, `flake.*`,
+`Cargo.*`, `release*.yml`, `scripts/test.sh`, `scripts/report-skips.sh`,
+anything outside the repository.
+
+## 7. Contract and roles
+
+Effective responsibilities are in `CLAUDE.md` Roles and
+`workflow.md` "Roles and rights". Per operation: edit → `herd-step`;
+integrate, resolve, allocate `D`, update board and status, open PR, merge
+when authorised → `herd-merger`; plan → `herd-planner`; review a rule or
+permission change → `herd-reviewer`; prepare a release → `herd-release`;
+tag and publish → Alexa or whoever she names. Authority chain: Alexa →
+orchestrator (briefs, verifies, asks) → agent (does, hands off). Real vs
+procedural restrictions: `permissions.md` matrix; in one line, the
+harness removes whole tools from planner and reviewer, the hook refuses
+the main session's ordinary writes and the release role's publication
+verbs, and everything finer than that is contractual and reviewed.
+
+## 8. Memory and resumption
+
+Paths observed, rules reconciled and the loading facts per role are in
+`memory.md`; the lessons with dates and provenance in `gotchas/`. Loading
+was verified live: V1 cited `CLAUDE.md` as startup context and opened the
+board and workflow; `--agent` sessions followed their role file. The
+fresh-session procedure worked on this very task: the remediation agent's
+own context was cut mid-H7 and it resumed from
+`history/2026-10-24-orchestration-remediation.md` and the `live/`
+outputs, not from a conversation summary. Not recoverable: the exact
+relayed answer that unblocked ORCH-005 (it is in the orchestrator's
+transcript, not in a file). The proposed `MEMORY.md` is in `memory.md`;
+applying it is outside the repository and left to the orchestrator.
+
+## 9. Board, decisions, history
+
+Open items were verified against PRs #67 and #70, `docs/status.md`,
+`handover.md` §9 and D134/D149/D166 before being written; the audit's
+"Docker Hub credentials" item is closed by D162 and is not on the board.
+Format of a handoff: `templates/handoff.md`; six were produced in H7 by
+agents of three roles. `Dxxx` validation: unique, well-formed, `D-NEXT`
+rejected, gaps noted, file never rewritten — proven by
+`check-orchestration.sh`. `decisions.md` structure: **option A applied,
+option B decided as the direction and deferred** behind the trigger on
+the board (ORCH-003, Alexa's answer relayed on 2026-10-24); no migration
+run.
+
+## 10. Verifications V1–V12
+
+| Test | Verdict | Where |
+|---|---|---|
+| V1 fresh orchestrator | passed | `permissions.md` Live verification; `h7-evidence/v1-…` |
+| V2 delegated micro-task | passed | `v2-…`, `v2-step-handoff.txt` |
+| V3 two agents in parallel | passed | `v3a-…`, `v3b-…` |
+| V4 merger with simulated conflict | passed | `v4-…`, `v4-merger-handoff.txt` |
+| V5 human decision, then resumption | passed, with **simulated** owner messages | `v5a-…`, `v5b-…` |
+| V6 interrupted then fresh | passed (fixture) and passed again for real on this task | `v6-…`, this report §8 |
+| V7 agent refutes the brief | passed; found two guard holes, since closed | `v7-review.txt` |
+| V8 failure and skip | passed | `check-orchestration-final-run.txt`, V2/V3/V11 outputs |
+| V9 `Dxxx` control | passed | same |
+| V10 simulated release | passed; found the `git tag -l` false positive, since fixed | `v10-…` |
+| V11 orchestrator drift | passed (contract held; hook not needed); found ORCH-031 | `v11-…` |
+| V12 context cost | partially tested: file inventory from the sessions' own citations, no token measure available from `claude -p` | the session outputs |
+
+No verdict above is without an executed session or script; the
+corresponding output is in `history/2026-10-24-h7-evidence/`.
+
+## 11. Git changes and rollback
+
+Branch `orchestration-remediation` from `origin/main` `3da48f5`, pushed;
+commits listed by `git log origin/main..orchestration-remediation`. PR
+opened from the template with real Evidence and **left unmerged**
+(ORCH-001). CI on the PR is the proof of the Rust gates, which were not
+run locally (prose, scripts and `.claude` only). Rollback: close the PR
+and delete the branch; nothing outside the branch was changed. Test
+fixtures (`v2-gotcha-note`, `v3a-brief-gate-note`, `v3b-handoff-note`,
+`v4-x`, `v4-y`, `v4m-merge`, `v6-task`) were inspected, their evidence
+copied, then removed; none was pushed.
+
+## 12. Remaining gaps
+
+Blocking for "ready without reserve":
+
+- ORCH-001 — authority over `main` is documented as an open question,
+  not settled. Until Alexa answers, PRs are prepared and left open.
+- ORCH-002 — invariant 8 wording and invariant 9 need the owner's accept.
+
+Non-blocking:
+
+- ORCH-030 — shared `CLAUDE_CONFIG_DIR` with chatOnS (owner's host
+  configuration).
+- ORCH-031 — a brief that names no worktree lets an agent work in the
+  orchestrator's checkout; the guard exempts agents by design.
+- The guard is best effort (`git -c`, absolute binary path, `sh -c`) and
+  version-dependent; the review of traces remains the protection.
+- Open PRs #67 and #70 will need CI re-run after this PR merges; #67 is
+  stale (ORCH-010).
+
+## 13. Recommendation
+
+**PRÊTE SOUS RÉSERVES.** The contract, roles, board, checks and hooks
+exist, are versioned, go red when broken, and held under eleven live
+sessions. The reserves are the two owner decisions above (ORCH-001,
+ORCH-002) and the merge of this PR itself, without which the running
+orchestrator still reads the 2026-10-13 `CLAUDE.md`.
+
+## 14. Suggested next step
+
+Only after Alexa validates this organisation: a separate mandate for the
+technical audit of the Herd product. Nothing of it was started here.
