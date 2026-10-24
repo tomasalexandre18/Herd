@@ -63,8 +63,23 @@ lint fired on line 837, and the probe was removed.
 **12 skips**, the host's reference figure: 10 for cgroup v2 delegation
 being unavailable under this session's scope, 2 for `io.max` on ZFS
 (`a_ceiling_this_host_can_carry_is_proved_and_reported_with_its_device`
-and `an_io_weight_that_cannot_bite_is_said_out_loud`). A green run does
-not mean those were checked (D27).
+and `a_declared_ceiling_changes_what_the_inert_weight_line_says`). A green
+run does not mean those were checked (D27).
+
+> **Corrected at integration, 2026-10-25, by `herd-merger`.** This
+> paragraph originally named `an_io_weight_that_cannot_bite_is_said_out_loud`
+> as the second ZFS skip. It is not one: its reason begins *"cgroup v2
+> delegation is unavailable"*, so it is the tenth delegation skip, and it
+> lives in `herd-runner/tests/confinement.rs:1337`, not in
+> `herd-runner/src/confine.rs`. The two ZFS skips are the pair now named
+> above, both in `herd-runner/src/confine.rs` (`:1118`, `:1220`).
+> `05-experiments-review.md` §6 reached the same conclusion by reading;
+> this correction was made from a measured run on this host, 2026-10-25,
+> on the tree carrying all seven C0 branches — `wc -l`, `sort -u` and the
+> distinct-name count of `target/herd-skips.txt` all give **12**, and
+> `grep -c 'cgroup v2 delegation is unavailable'` gives **10**. The **12**
+> total and the **10 / 2** split this paragraph states are both confirmed;
+> only the one name was wrong.
 
 The first attempt at `./scripts/test.sh` died mid-compile with ENOSPC:
 the host's root was at 100 %. It was not this task's doing — the peak
