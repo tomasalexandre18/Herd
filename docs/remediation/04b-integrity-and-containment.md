@@ -46,7 +46,7 @@ commit Herd to behaviour nobody has decided on.
 2. **The one bad path and the one good path differ in one line of code and
    in nothing a caller can see.** F. The refused-path case is intentional and
    written down (`herd-hub/src/job.rs:1823-1826`); the digest case has no
-   such sentence and contradicts the rule stated four lines further down its
+   such sentence and contradicts the rule stated a few lines further down its
    own function (`herd-hub/src/store.rs:1717`). Both exit 0. §1.4.
 3. **(b) is confirmed, at both figures and with no refusal at either.** F.
    50 assignments → 50 jobs in hand; 250 → 250. The runner's own health
@@ -114,7 +114,8 @@ one code that means "everything you asked for happened"
 1. `record_outputs` pushes the manifest entry **after** the digest check, so
    a `continue` at `herd-hub/src/store.rs:1715` drops the entry entirely;
    the entry would have been pushed at `:1726`.
-2. Four lines under that `continue`, at `herd-hub/src/store.rs:1717`, the
+2. Two lines under that `continue` — six under the `if` at `:1711`, which
+   is the line the brief names — at `herd-hub/src/store.rs:1717`, the
    function states the opposite rule in bold: *"**The manifest first, the
    bytes if they are here.** … What a reader of `job.json` must never find is
    a path that is not there *and* no way to tell why."* The same rule is
