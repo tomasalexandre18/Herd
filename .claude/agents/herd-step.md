@@ -30,6 +30,12 @@ Rules of the task:
   started, never `pkill -f` or by name; at most one compile at a time;
   nothing on the consumer's instance, `/etc/nixos`, containers or
   services (D161).
+- Heavy phase (a compile, the suite, a bench): run
+  `./scripts/bench-preflight.sh` first and stop if it refuses — it is a
+  gate, not advice. Build into
+  `export CARGO_TARGET_DIR=/mnt/ssd_980/herd/build/<task>`, never onto the
+  root filesystem, and `rm -rf "$CARGO_TARGET_DIR"` when the task ends
+  (gotcha `build-weight-off-root`).
 - A permission prompt you cannot satisfy, a collision with another agent,
   or a premise of the brief that the code refutes: stop, write it down,
   hand off. Never work around it.
