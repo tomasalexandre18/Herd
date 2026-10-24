@@ -6,8 +6,8 @@ use anyhow::{Context, Result};
 use clap::Parser;
 use herd_hub::{
     Authority, Budget, Hub, JobDirStore, JobStore, Policy, Stickiness, AGING_STEP,
-    DEFAULT_LISTEN_ADDR, DRAIN_FIRST_LIMIT, LOST_AFTER, OUTPUT_BUDGET, OUTPUT_FLOOR, READING_CAP,
-    REQUEUE_BUDGET, STICKINESS_LIMIT, WAIT_RESTATEMENT,
+    DEFAULT_LISTEN_ADDR, DRAIN_FIRST_LIMIT, LOST_AFTER, OUTPUT_BUDGET, OUTPUT_FLOOR,
+    READINGS_AT_ONCE, READING_CAP, REQUEUE_BUDGET, STICKINESS_LIMIT, WAIT_RESTATEMENT,
 };
 use herd_proto::{HEALTH_EVERY, STILL_THERE_EVERY};
 
@@ -131,6 +131,18 @@ struct Args {
     /// runner's own cap still bounds this and is never raised by it (D108).
     #[arg(long, env = "HERD_READING_CAP", default_value_t = READING_CAP.as_secs_f64())]
     reading_cap: f64,
+    /// How many requirement readings one runner may run at once (D169).
+    ///
+    /// A reading takes no slot and no capability — it builds and boots
+    /// nothing (D159) — so this is the only thing that bounds how many of
+    /// them one machine is given. Two by default. It exists because a
+    /// consumer submitted 214 jobs in one second, every one of them needing
+    /// a reading first, and the hub put some two hundred of those readings
+    /// on the one runner it had. Beyond this figure a reading **queues**: it
+    /// is never refused, and it is named in the sentence of every job
+    /// waiting behind it. Zero is refused.
+    #[arg(long, env = "HERD_READINGS_AT_ONCE", default_value_t = READINGS_AT_ONCE)]
+    readings_at_once: u32,
     /// How much of this hub's volume a job's output files may hold, in all
     /// (D148, D152). `200GB`, `64MiB`, or a plain number of bytes.
     ///
@@ -235,6 +247,7 @@ async fn main() -> Result<()> {
         drain_first_limit: seconds(args.drain_first_limit),
         requeue_budget: args.requeue_budget,
         reading_cap: seconds(args.reading_cap),
+        readings_at_once: args.readings_at_once,
         ..Policy::default()
     };
     let state_root_id = store.state_root_id().to_owned();
@@ -294,7 +307,8 @@ async fn main() -> Result<()> {
          on a quiet follower's link every {:?}; a job that \
          needs a quiet host holds one empty for at most {:?}, and a job whose declared \
          requeue code comes back gets {} goes at it, separately from the {} goes it gets \
-         at a runner that goes away; a reading of what a job needs is capped at {:?}",
+         at a runner that goes away; a reading of what a job needs is capped at {:?}, and \
+         one runner runs at most {} of them at once",
         herd_hub::hub_version(),
         hub.local_addr(),
         args.state_dir.display(),
@@ -309,6 +323,7 @@ async fn main() -> Result<()> {
         policy.requeue_budget,
         policy.attempts_allowed,
         policy.reading_cap,
+        policy.readings_at_once,
     );
     hub.serve().await
 }

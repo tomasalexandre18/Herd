@@ -342,6 +342,15 @@ pub struct Policy {
     /// has to be able to make a reading overrun its cap without waiting five
     /// minutes, and through the hub's own code rather than a copy of it.
     pub reading_cap: Duration,
+    /// How many requirement readings one runner may be running at once
+    /// (D169).
+    ///
+    /// See [`crate::matcher::READINGS_AT_ONCE`]. A setting for the reason the
+    /// others are: an operator with a bigger machine may want more of them,
+    /// and a test has to be able to prove the bound holds without submitting
+    /// two hundred jobs. Zero is refused — it would be a reading that is
+    /// never placed, and every job waiting on one would wait for ever.
+    pub readings_at_once: u32,
     /// How long a verdict held for a still-crossing collection waits on
     /// **silence** before it is handed over anyway (D167).
     ///
@@ -368,6 +377,7 @@ impl Default for Policy {
             drain_first_limit: crate::matcher::DRAIN_FIRST_LIMIT,
             requeue_budget: REQUEUE_BUDGET,
             reading_cap: READING_CAP,
+            readings_at_once: crate::matcher::READINGS_AT_ONCE,
             collection_silence: COLLECTION_SILENCE,
         }
     }
@@ -406,6 +416,18 @@ impl Policy {
                 "--still-there-every 0 would keep a follower's link warm as fast as this hub \
                  can loop, which is not a cadence. Give 15 s, or a shorter figure a test can \
                  make a quiet minute pass under."
+                    .to_owned(),
+            );
+        }
+        // And a reading cap of zero, which is not a tight bound but an
+        // absent one: no reading is ever placed, so every job whose
+        // requirements are read on a machine waits for ever and nothing says
+        // why. Refused here rather than found in a queue that never moves.
+        if self.readings_at_once == 0 {
+            return Some(
+                "--readings-at-once 0 would place no requirement reading on any runner \
+                 at all, so every job whose command declares labels_from would wait for \
+                 ever. Give 1 if you want them strictly one at a time."
                     .to_owned(),
             );
         }
@@ -2372,6 +2394,7 @@ fn dispatch_a_pass(state: &State) -> Result<()> {
         let placing = matcher::Placing {
             parent: parent_of(state, record, &unfinished),
             drain_first_limit: Some(state.policy.drain_first_limit),
+            readings_at_once: Some(state.policy.readings_at_once),
         };
         // The whole claim decision, for this job, against the fleet as this
         // pass found it — and `seats` is carried *through* the loop, so a job
@@ -5318,6 +5341,7 @@ fn judge_one(state: &State, new: NewJob) -> Result<Vec<String>> {
         let placing = matcher::Placing {
             parent: parent_of(state, record, &unfinished),
             drain_first_limit: Some(state.policy.drain_first_limit),
+            readings_at_once: Some(state.policy.readings_at_once),
         };
         if record.id == hypothetical.id {
             let eligible = matcher::eligible(record, &seats, now, &placing);
@@ -7190,5 +7214,20 @@ mod tests {
             REFUSALS_REMEMBERED,
             "the ring must stop at {REFUSALS_REMEMBERED}, not grow with the connection"
         );
+    }
+
+    /// A reading cap of zero is not a tight bound but an absent one: no
+    /// reading is ever placed, so every job whose command declares
+    /// `labels_from` waits for ever. Refused at startup, where the message
+    /// names the figure the operator typed.
+    #[test]
+    fn a_hub_told_to_run_no_reading_at_all_refuses_to_start() {
+        let policy = Policy {
+            readings_at_once: 0,
+            ..Policy::default()
+        };
+        let refusal = policy.refusal().expect("a cap of zero is refused");
+        assert!(refusal.contains("--readings-at-once 0"), "{refusal}");
+        assert!(Policy::default().refusal().is_none());
     }
 }
