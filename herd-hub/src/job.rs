@@ -560,11 +560,11 @@ impl Reading {
     /// waiting to be read again (D169).
     ///
     /// `by` goes back to `None`, which is the whole mechanism: that is the
-    /// state a job starts in, and the next dispatch pass mints a fresh
-    /// reading for it exactly as it minted the first — through the cache
-    /// first, so a reading that was lost after another job's reading of the
-    /// same (commit, command, args) had already answered costs nothing at
-    /// all.
+    /// state a job starts in, and the pass that writes the loss down mints a
+    /// fresh reading for it exactly as it minted the first — through the
+    /// cache first, so a reading that was lost after another job's reading
+    /// of the same (commit, command, args) had already answered costs
+    /// nothing at all.
     pub fn after_a_loss(mut self) -> Self {
         self.lost = self.lost.saturating_add(1);
         self.by = None;

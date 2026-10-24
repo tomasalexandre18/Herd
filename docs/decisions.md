@@ -7711,3 +7711,191 @@ with 143 and 154 as a gap, "all three under D148's rule". The number is
 cited by `docs/handover.md`, by this branch's commit and by the owner's
 approval of it; renumbering to 168 would buy one contiguous sequence and
 cost three citations that have already been read.
+
+## 2026-10-24 — D169 A reading is bounded, and a lost one is read again
+
+**The incident, twice in one day.** At 03:10:56 the first consumer's nightly
+submitted **214 jobs in one second** — 48 `test`, 166 `test-pack`, priority
+nightly, commit 923fe476c0de — against a fleet of one runner, hub and runner
+both 0.3.5. Every one of those jobs needed its requirements read on a machine
+first (D74). A reading holds no slot, empties no host and waits for no probe
+(D159), so **nothing anywhere counted them**: the matcher put some two
+hundred readings on that one machine at once, on a 20 GiB, eight-thread lend.
+The host saturated. The runner's own kvm probe then timed out in a loop from
+03:11 to 03:50 — "did not answer within 2000 ms and was killed" — which
+suspends the capability (D49), so jobs needing kvm found no runner that could
+ever run them. **201 of the 214 ended 125 with no test run**; 6 passed, 5
+failed, 1 was memory-capped, and one job waited 6 h 55 for a reading that
+never came back.
+
+At 10:09 the batch resubmitted the 203 groups that had ended 125, once each.
+The same thing happened at sharper figures: **255 `herd-job` cgroups at once
+and a host load of 399 at 10:25**. They stopped the batch at 10:26 and the
+machine was normal by 10:29.
+
+**The runner stayed up, and so did the hub.** Nothing crashed either time;
+the host was simply buried. That is the honest description and it is a
+stronger argument for a bound than a crash would have been — what is being
+protected is not a process but a machine that stays usable enough for its
+probes to answer inside two seconds and for jobs to go on being placed. 255
+is the observed ceiling of "no bound at all".
+
+### 1. A reading takes a place among a runner's readings, and there are two
+
+The cap is **in the claim step's seat accounting**, not a gate in front of
+it. `judge` already decides everything one machine can do with one job, from
+the labels a runner offers down to the room a job declares, and a second
+place that decided what a machine may take would be a second answer to one
+question — the defect `out_there`'s own doc comment warns about, where the
+first job counted by one and not the other is a machine that reads idle on
+top of work. It is read off `Holdings::readings_running()`, which is derived
+from the records every pass and from nothing else (D79): there is no counter
+to leak, nothing to rebuild after a restart, and a reading gives its place
+back by ending, whichever of the eight ways it ends.
+
+Over the cap a reading gets `Verdict::Later`, which is the same "wait, never
+fail" every taken slot already gets (E-31): it **queues**, it is never
+refused, and it is never moved to a machine that suits it less. That is also
+what keeps a queued reading off the dead-runner timer — a reading that is
+waiting has no attempt in the air, so there is nothing for the watchdog to
+count.
+
+**Two, and it is a setting** (`--readings-at-once`, `HERD_READINGS_AT_ONCE`).
+Two rather than one because a reading is cheap and what is wanted is a bound,
+not a queue of one: one running while the next is handed out keeps a fleet of
+readings moving at the speed of the machine. Two rather than eight because
+the figure has to be survivable *on top of* the real work the machine is
+already running, and nothing else is counting readings. Zero is refused at
+startup, naming the flag: it would be a reading that is never placed and a
+queue that never moves. A hub-side figure and not a runner flag, like
+`--reading-cap` and `--drain-first-limit` beside it — a reading is the hub's
+own job, nobody declared it, and a figure a runner announced would be a
+figure the hub had to defend against a runner announcing two hundred.
+
+D159 said "no new knob, no new setting and no policy anywhere in this", and
+this is one. The sentence stands for what it was about: whether a reading
+*consumes the capability it was placed against*, which it still does not.
+What D159 did not settle is how many readings one machine is handed, because
+until a consumer submitted a whole pass at once the answer was never more
+than a handful. It is a bound on the kind's own concurrency, not a scheduling
+policy, and it is one number with a default that nobody has to set.
+
+**The alternative, and why not.** The consumer proposed that a reading take a
+slot of the label it reads. It is refused, for three reasons and the third is
+decisive. It re-creates D159's convoy exactly: a reading for an exclusive or
+host-wide label would wait for real work and then hold the machine empty,
+which is the stickiness grievance in another costume. It makes the bound a
+property of whichever capability file the fleet happens to ship rather than a
+figure an operator can see and set. And **the label it reads does not exist
+yet**: `reading_job` places a reading against `labels_from.baseline`, the
+declared baseline, precisely because what the commit needs is the thing the
+reading is about to answer. There is no slot of "the label it reads" to take
+at the moment the decision is made.
+
+### 2. A lost reading is read again, and a busy machine is not a gone one
+
+Two defects turned a buried host into 201 refusals, and the cap alone would
+have hidden rather than fixed them.
+
+**`settle_readings` had one branch for every way a reading can fail.** A
+reading that printed something that is not an answer, exited non-zero or was
+stopped by its cap has told the hub something about the commit, and D74's
+rule applies: refuse the job by name rather than place it on a guess. A
+reading that was **lost** told it nothing at all. Lumping the two together is
+how "a job is never placed on requirements nobody read" came to be said about
+jobs whose commits were perfectly fine and whose fleet was merely busy. A
+lost reading now puts the job back to where it started — `by` is `None`
+again, so the next pass mints a fresh one through the cache exactly as it
+minted the first — and the job is refused only when the goes are spent, in a
+sentence that says the fleet could not keep a reading alive rather than that
+the command is wrong.
+
+**The watchdog believed a clock over the machine.** It ends any attempt
+unheard of for `--lost-after` with "runner X stopped answering … so it is not
+coming back", and it said that of a runner that was connected and reporting.
+A health report names every job its runner is holding and nothing else, so a
+connected runner has **already answered the question**. The hub now asks it
+before it believes the clock: a report that names the attempt means the
+machine is busy, not gone — no go is spent, nothing is requeued, and the
+silence is said out loud once with what does bound it (the reading cap, or
+the job's own time cap on that machine, invariant 2). A report that does not
+name it means the attempt is gone from a machine that is here, which is both
+truer and *faster* than the timer. A connection nothing has come back on yet
+decides nothing, and is bounded by the link check on that same connection. A
+runner that is **not** connected is untouched: the clock decides, and a
+genuinely dead machine is still noticed in 60 s. The link-silence check above
+it is not changed at all.
+
+**What could not be confirmed, said plainly.** A health report that names an
+attempt already refreshes that attempt's clock — `is_current` does it for
+every frame it accepts, and the runner's `running_jobs` names every job it
+holds — so a runner reporting on time, inside the threshold, with the
+attempt still in hand, cannot have had it declared lost by that path alone.
+Two routes remain, and both are what the change above answers. One is a
+report whose **processing** straddles the threshold: the attempt's clock is
+set while the report is being walked and the link's is set when it is done,
+so a hub spending a minute on two hundred entries has the first clock
+expire while the second is young. The other is a link dropped and redialled:
+the new connection's clock starts fresh while every attempt's is still old,
+so the attempts are written off one by one against a machine that is
+plainly back — which is exactly the "attempt 1 of jXXXX is not the attempt
+this hub is waiting for" the runner logged all night. Neither was reproduced
+from the journal; both are closed by asking the machine instead of the
+clock.
+
+**And one line of latency that only showed up once the rest worked.** A job
+the hub gives up on — goes spent, ended `lost` — did not judge the queue
+afterwards, where the requeue beside it always has. Nothing noticed while
+the only thing waiting was a slot, because the next event along would find
+it; with D169 the thing waiting is a *reading to be minted*, and the next
+event on a quiet fleet is the restatement cadence. The end-to-end test
+measured it: a hundred seconds of a nightly nobody could account for. A job
+that is over is holding nothing, so the queue is judged, at both ends of
+that function.
+
+### The budgets, which must not quietly spend each other
+
+Three now, and they count three different things off the record (D79), which
+is what keeps them apart:
+
+* `Policy::attempts_allowed` (E-21, D39) counts goes at **a runner that went
+  away**, from the attempts on the record that ended without a verdict.
+* `--requeue-budget` (D76) counts goes at **a capability that turned out to
+  be taken**, from `Attempt::requeue_code`. A lost reading sets no requeue
+  code, so it can never spend this.
+* `Reading::lost` counts **readings of one job lost to a machine that went
+  away**, on that job's own record. The figure it is weighed against is
+  `attempts_allowed`, deliberately: a job gets as many goes at a reading lost
+  to a machine that disappeared as E-21 gives it at the machine itself. Two
+  figures for one idea would be a knob nobody could reason about.
+
+So the worst case is bounded and visible: `attempts` attempts at each of
+`attempts` readings, four in all at the defaults, and then one refusal naming
+both. No new requeue path was added — the watchdog's new answer *stops* a
+requeue, it never starts one — so nothing here can loop.
+
+**Nothing crosses the wire.** `PROTOCOL_VERSION` stays at 2 and
+`RECORD_VERSION` stays at 1 (D73). The one new field, `Reading::lost`, is
+`#[serde(default)]` and is not written when it is nought, so a record this
+hub writes reads on an older one as a job none of whose readings was lost —
+which is exactly what that hub could have written.
+
+### What is proven
+
+`herdctl/tests/bounded_readings.rs`, against a real hub, a real runner and
+the fixture consumer's own four executor steps on a real commit. Eight jobs
+submitted at once, each needing a reading of its own, and the overlap of the
+readings' attempts computed **from the records** — the same fact the claim
+step counts: at most two ever ran together, and at least two did, so a run
+where nothing overlapped fails saying it proved nothing. Every one of the
+eight ends with its own verdict and not one `lost`. The second test takes the
+machine away under a reading as many times as E-21 gives it goes, brings it
+back each time, and asserts the job runs: one reading lost on the record, a
+second reading that answered, and the job's own exit 0 where 0.3.5 gave 125.
+Both were run against `main` and both fail there, in the terms this entry
+is about: the first measures **eight readings at once** on the one runner,
+and the second reads back the job's own "is refused and was never placed".
+Beside them the arithmetic is unit-tested where it
+belongs — the cap in the claim step, including four readings through one pass
+being two claims and two waits; the budget on `Reading`; the watchdog's
+judgement as a pure function of what a runner last said.
