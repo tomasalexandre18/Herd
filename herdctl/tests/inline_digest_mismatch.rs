@@ -457,12 +457,9 @@ async fn a_path_the_hub_will_not_write_is_named_and_today_costs_no_exit_code() {
         record.outputs.files
     );
     assert!(
-        record
-            .outputs
-            .skipped
-            .iter()
-            .any(|sentence| sentence.contains("a path this hub will not write")
-                && sentence.contains("escape.json")),
+        record.outputs.skipped.iter().any(|sentence| sentence
+            .contains("a path this hub will not write")
+            && sentence.contains("escape.json")),
         "and named on the record instead: {:?}",
         record.outputs.skipped
     );
