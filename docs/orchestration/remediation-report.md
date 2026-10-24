@@ -56,7 +56,7 @@ session transcript, the 42 registered worktrees (none deleted).
 | Audit claim | Verified state on 2026-10-24 |
 |---|---|
 | `CLAUDE.md` says "Claude works alone" | True, line 112; also "A sub-agent only for one long, isolated task, never several in parallel, and never without Alexa's agreement" |
-| Oral authorisations contradict the Git clause | Transcript: 2026-10-15 "oui merge et corrige"; 2026-10-16 09:55 "tu peux merge toi meme". `CLAUDE.md` still says "`main` only moves on Alexa's explicit approval". Since then the orchestrator ran `gh pr merge` 47 times. **Ambiguous: open question ORCH-001** |
+| Oral authorisations contradict the Git clause | Transcript: 2026-10-15 "oui merge et corrige"; 2026-10-16 09:55 "tu peux merge toi meme". `CLAUDE.md` still says "`main` only moves on Alexa's explicit approval". Since then the orchestrator ran `gh pr merge` 47 times. **Ambiguous at H0, raised as ORCH-001; decided by Alexa the same day: "non il peux merge par defaut" — `herd-merger` merges CI-green, evidenced PRs; tags and releases stay on his word per act** |
 | Old memory under `/home/server/.claude/projects/-mnt-ssd-980-herd-project/memory/` | Present, 3 files dated 2026-10-15: `MEMORY.md`, `orchestrate-do-not-code.md`, `herd-cargo-needs-nix-develop.md`. Not loaded: `CLAUDE_CONFIG_DIR` points elsewhere |
 | New memory under `…/chatons/claude/config/projects/-mnt-ssd-980-herd-project/memory/` | Present, 4 files dated 2026-10-23: `MEMORY.md`, `always-delegate.md`, `docs-only-gates.md`, `subagent-brief-hygiene.md`. This is the one injected in the orchestrator's session |
 | No `.claude/agents/`, no typed roles | True. `.claude/` holds only `worktrees/` |
@@ -123,7 +123,8 @@ anything outside the repository.
 Effective responsibilities are in `CLAUDE.md` Roles and
 `workflow.md` "Roles and rights". Per operation: edit → `herd-step`;
 integrate, resolve, allocate `D`, update board and status, open PR, merge
-when authorised → `herd-merger`; plan → `herd-planner`; review a rule or
+under the standing authorisation ORCH-001 → `herd-merger`; plan →
+`herd-planner`; review a rule or
 permission change → `herd-reviewer`; prepare a release → `herd-release`;
 tag and publish → Alexa or whoever she names. Authority chain: Alexa →
 orchestrator (briefs, verifies, asks) → agent (does, hands off). Real vs
@@ -217,9 +218,9 @@ Non-blocking:
 
 **PRÊTE SOUS RÉSERVES.** The contract, roles, board, checks and hooks
 exist, are versioned, go red when broken, and held under eleven live
-sessions. The reserves are ORCH-002 (the owner's accept of invariants 8 and 9,
-asked on a diff that now restores 3 and 6 verbatim) and the merge of this
-PR itself, without which the running orchestrator still reads the
+sessions. The reserves are ORCH-002 (the owner's accept of invariants 8
+and 9, asked on a diff that now restores 3 and 6 verbatim) and the merge of
+this PR itself, without which the running orchestrator still reads the
 2026-10-13 `CLAUDE.md`. ORCH-001 was answered during the mandate.
 
 ## 14. Suggested next step

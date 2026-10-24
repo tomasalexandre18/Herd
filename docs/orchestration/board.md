@@ -45,7 +45,7 @@ started), `open` (not yet agreed or sized), `active` (an agent holds it),
 
 | ID | Item | Origin | Owner | State | Next action | Depends on | Evidence |
 |---|---|---|---|---|---|---|---|
-| ORCH-004 | Orchestration remediation (mandate 2026-10-24): contract, roles, memory, board, checks, validation | mandate v1.0 | remediation agent, then Alexa | active | H0–H7 done; PR open and **left unmerged**; Alexa answers ORCH-001 and ORCH-002, then `herd-merger` or Alexa merges | ORCH-001 | branch `orchestration-remediation`, `remediation-report.md` |
+| ORCH-004 | Orchestration remediation (mandate 2026-10-24): contract, roles, memory, board, checks, validation | mandate v1.0 | remediation agent, then herd-merger | active | H0–H7 done; PR #71 open; Alexa answers ORCH-002, then `herd-merger` merges under ORCH-001 | ORCH-002 | branch `orchestration-remediation`, `remediation-report.md` |
 
 ## Blocked — needs something outside the project
 
