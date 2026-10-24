@@ -61,7 +61,7 @@ assets are static musl binaries: nothing on the machine, no toolchain,
 no clone. Take the version you want from the releases page.
 
 ```sh
-v=v0.3.5
+v=v0.3.6
 base=https://github.com/tomasalexandre18/Herd/releases/download/$v
 curl -fLO $base/herd-runner-${v#v}-x86_64-unknown-linux-musl
 curl -fLO $base/SHA256SUMS
@@ -282,7 +282,7 @@ yours. The second is the only proof that counts.
 
 ```sh
 herdctl runner list
-# server: approved 2026-10-15T17:38:28Z, connected now, herd 0.3.5
+# server: approved 2026-10-15T17:38:28Z, connected now, herd 0.3.6
 
 herdctl run -- sh -c 'echo it works; nproc'
 ```
