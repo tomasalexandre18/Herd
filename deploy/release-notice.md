@@ -45,6 +45,34 @@ install -m 0755 herd-runner-<version>-x86_64-unknown-linux-musl \
 herd-runner --version
 ```
 
+## The two numbers in the release body
+
+The release body that quotes this notice prints `RECORD_VERSION` and
+`PROTOCOL_VERSION`, read out of the source that release was built from, each
+on a line a script can match. They answer the two questions no binary here
+will tell you.
+
+**`RECORD_VERSION` is the hub's state volume, and therefore rollback.** Every
+file the hub writes under its data root carries that number, and a hub reads
+only a state root whose number is **exactly** its own; anything else is
+refused by name — the path, the root's number, the hub's — and because the
+refusal comes out of recovery the hub does not start rather than guess. That
+cuts both ways: if this number differs from the one on the release you are
+running, **neither the upgrade nor the rollback across it can read your state
+root, and there is no offline migration tool**. Crossing it means starting on
+a fresh root, leaving every queued job and every uncollected verdict behind
+in the old one. So compare the two releases' numbers before you roll an image
+back; equal numbers mean a rollback is another `docker load` and nothing
+more.
+
+**`PROTOCOL_VERSION` is whether two builds can talk.** A hub refuses a runner
+or a `herdctl` announcing a different protocol version **by name**, naming
+both numbers, and that refusal is terminal — nothing but a new build changes
+it. A patch-level difference in *build* version at the same protocol version
+is only a warning, printed at startup, and the connection is served. So a
+protocol move is a fleet-wide step, as "Upgrading" above describes, and never
+one machine at a time.
+
 ## The hub is an image, and it is attached to this release
 
 The three binaries above are not the whole release. **The hub is normally

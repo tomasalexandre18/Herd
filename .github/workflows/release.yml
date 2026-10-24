@@ -25,9 +25,11 @@
 # describes an asset that is not there.
 #
 # **Rehearsing it without a tag.** `workflow_dispatch` with the `tag` input
-# left empty runs every step above the release: the build, both distribution
-# smokes, the static assertions, the sums, the image build, the archive
-# assertion and `image-smoke.sh` against the loaded archive. It creates no
+# left empty runs every step above the release: the build, the two version
+# numbers read out of the source, both distribution smokes, the static
+# assertions, the sums, the image build, the archive assertion and
+# `image-smoke.sh` against the loaded archive. What it does *not* run is the
+# body itself, which is written only for a tag. It creates no
 # tag and no release, and leaves the binaries and the archive on the run as
 # artifacts. Given a `tag` that already exists, it publishes the release for
 # it — which is how a tag whose run failed is recovered without cutting a new
@@ -106,6 +108,62 @@ jobs:
                  "bump workspace.package.version, or tag what the workspace says" >&2
             exit 1
           fi
+
+      # The two numbers an operator cannot get out of a binary and has had to
+      # ask us for. `RECORD_VERSION` decides whether rolling an image back
+      # across this release is safe: a hub reads only a state root whose
+      # number is exactly its own, and refuses to start on any other.
+      # `PROTOCOL_VERSION` decides whether a runner and a hub of two
+      # different builds talk at all. Both are read out of the source this
+      # release is built from, for the same reason the version above is read
+      # out of the workspace: a number typed into this file, or into a prose
+      # file, can disagree with the binaries it ships beside, and a number
+      # read here cannot. `nix eval` is not the route — no flake attribute
+      # carries either number, and inventing one would put a regex over a
+      # Rust file into the build's contract to serve a release note — so they
+      # are read where they are declared.
+      - name: the protocol and the record version, from the source
+        run: |
+          set -euo pipefail
+          proto_src=herd-proto/src/lib.rs
+          record_src=herd-hub/src/job.rs
+          protocol_version=$(sed -n \
+            's/^pub const PROTOCOL_VERSION: u32 = \([0-9]\{1,\}\);.*$/\1/p' \
+            "$proto_src")
+          record_version=$(sed -n \
+            's/^pub const RECORD_VERSION: u32 = \([0-9]\{1,\}\);.*$/\1/p' \
+            "$record_src")
+
+          # One number each, or the release stops here. A line that silently
+          # came out empty would be worse than no line at all: the body would
+          # carry `RECORD_VERSION:` with nothing after it, and the script this
+          # exists for would match nothing and conclude nothing while looking
+          # like it had checked. The pattern below refuses an empty value, a
+          # non-numeric one, and two declarations at once — a second match
+          # brings a newline with it, and a newline is not a digit. What it
+          # tolerates is anything after the semicolon, a trailing comment
+          # included: that still declares the same number, and a tag is the
+          # wrong place to find out somebody added one.
+          for found in \
+            "PROTOCOL_VERSION:$protocol_version:$proto_src" \
+            "RECORD_VERSION:$record_version:$record_src"; do
+            name=${found%%:*}
+            rest=${found#*:}
+            value=${rest%%:*}
+            src=${rest#*:}
+            case "$value" in
+              "" | *[!0-9]*)
+                echo "no single '$name' declaration read out of $src:" \
+                     "found '$value', which is not a number" >&2
+                exit 1
+                ;;
+            esac
+          done
+
+          echo "protocol_version=$protocol_version" >> "$GITHUB_ENV"
+          echo "record_version=$record_version" >> "$GITHUB_ENV"
+          echo "the source says PROTOCOL_VERSION $protocol_version," \
+               "RECORD_VERSION $record_version"
 
       # ~1 minute, and no toolchain is installed to do it: `pkgsStatic` is
       # nixpkgs' own musl cross set, so D12 still holds and the musl rustc,
@@ -254,6 +312,21 @@ jobs:
             echo "sha256sum --ignore-missing -c SHA256SUMS"
             echo "chmod +x herd-runner-$version-$triple"
             echo '```'
+            echo
+            echo "The two numbers this build carries, read out of the source"
+            echo "it was built from:"
+            echo
+            echo '```'
+            echo "RECORD_VERSION: $record_version"
+            echo "PROTOCOL_VERSION: $protocol_version"
+            echo '```'
+            echo
+            echo "\`RECORD_VERSION\` is the hub's state volume, and therefore"
+            echo "whether rolling back to an earlier image is safe;"
+            echo "\`PROTOCOL_VERSION\` is whether a runner and a hub of two"
+            echo "different builds talk at all. \"The two numbers\" in the"
+            echo "notice below says what to do about each. Both lines are"
+            echo "meant to be matched: \`^RECORD_VERSION: [0-9]+\$\`."
             echo
           } > body-head.md
 
