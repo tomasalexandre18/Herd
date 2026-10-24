@@ -2667,65 +2667,7 @@ fn settle_readings(state: &State, unfinished: &[JobRecord]) -> Result<bool> {
             crate::job::reading_key(&declaration.commit, &declaration.command, &declaration.args);
         match reading.by.clone() {
             None => {
-                // The cache, first and always: this is what makes a second
-                // submission of one (commit, command, args) free (D74).
-                if let Some(answer) = state
-                    .store
-                    .reading_answer(&key)
-                    .with_context(|| format!("asking the cache what {} needs", record.id))?
-                {
-                    let said = format!(
-                        "read before, and kept by (commit, command, args): {}",
-                        answer.line()
-                    );
-                    println!(
-                        "herd-hub: {} needs no reading: command {} of commit {} was read \
-                         before and the answer is {}",
-                        record.id,
-                        declaration.command,
-                        declaration.commit,
-                        answer.line()
-                    );
-                    if let Err(error) = state
-                        .store
-                        .record_reading(&record.id, reading.answered(answer, said))
-                    {
-                        eprintln!(
-                            "herd-hub: {} could not be given the cached answer to its \
-                             reading: {error}",
-                            record.id
-                        );
-                        continue;
-                    }
-                    written = true;
-                    continue;
-                }
-                // And otherwise an ordinary job that reads them.
-                let new = reading_job(state, record, &reading, &declaration);
-                let submission = state
-                    .store
-                    .submit(new)
-                    .with_context(|| format!("minting the reading {} waits for", record.id))?;
-                let by = submission.record().id.clone();
-                println!(
-                    "herd-hub: {by} reads what {} needs — command {} of commit {}, against \
-                     the baseline labels {} its declaration states (D74)",
-                    record.id,
-                    declaration.command,
-                    declaration.commit,
-                    if reading.labels_from.baseline.is_empty() {
-                        "none".to_owned()
-                    } else {
-                        reading.labels_from.baseline.to_string()
-                    }
-                );
-                if let Err(error) = state.store.record_reading(&record.id, reading.read_by(&by)) {
-                    eprintln!(
-                        "herd-hub: {by} was minted to read what {} needs and that could not \
-                         be written onto its record: {error}",
-                        record.id
-                    );
-                }
+                read_what_it_needs(state, record, reading, &declaration, &key)?;
                 written = true;
             }
             Some(by) => {
@@ -2776,14 +2718,14 @@ fn settle_readings(state: &State, unfinished: &[JobRecord]) -> Result<bool> {
                                 again.lost + 1,
                                 state.policy.attempts_allowed
                             );
-                            if let Err(error) = state.store.record_reading(&record.id, again) {
-                                eprintln!(
-                                    "herd-hub: {} could not be set to read again after {by} \
-                                     was lost: {error}",
-                                    record.id
-                                );
-                                continue;
-                            }
+                            // In **this** pass, not the next one. A record
+                            // merely set back to "nothing is reading it" is
+                            // a job that waits for whatever wakes the hub
+                            // next, which on a quiet fleet is the
+                            // restatement cadence — a minute of a nightly
+                            // nobody can account for, which is what the
+                            // end-to-end test measured before this line.
+                            read_what_it_needs(state, record, again, &declaration, &key)?;
                             written = true;
                             continue;
                         }
@@ -2896,6 +2838,82 @@ fn settle_readings(state: &State, unfinished: &[JobRecord]) -> Result<bool> {
         }
     }
     Ok(written)
+}
+
+/// Give this job an answer, or a job that will find one (D74).
+///
+/// The cache first and always, which is what makes a second submission of
+/// one (commit, command, args) free; and otherwise an ordinary job that
+/// reads them.
+///
+/// One function rather than the body of one `match` arm, because two things
+/// now reach it: a job whose requirements have never been read, and a job
+/// whose reading was lost before it answered anything (D169). The second
+/// must go through the cache exactly as the first does — a reading lost
+/// after another job's reading of the same three had already answered costs
+/// nothing at all — and two copies of that would be two answers to one
+/// question.
+fn read_what_it_needs(
+    state: &State,
+    record: &JobRecord,
+    reading: crate::job::Reading,
+    declaration: &herd_proto::Declaration,
+    key: &str,
+) -> Result<()> {
+    if let Some(answer) = state
+        .store
+        .reading_answer(key)
+        .with_context(|| format!("asking the cache what {} needs", record.id))?
+    {
+        let said = format!(
+            "read before, and kept by (commit, command, args): {}",
+            answer.line()
+        );
+        println!(
+            "herd-hub: {} needs no reading: command {} of commit {} was read before and the \
+             answer is {}",
+            record.id,
+            declaration.command,
+            declaration.commit,
+            answer.line()
+        );
+        if let Err(error) = state
+            .store
+            .record_reading(&record.id, reading.answered(answer, said))
+        {
+            eprintln!(
+                "herd-hub: {} could not be given the cached answer to its reading: {error}",
+                record.id
+            );
+        }
+        return Ok(());
+    }
+    let new = reading_job(state, record, &reading, declaration);
+    let submission = state
+        .store
+        .submit(new)
+        .with_context(|| format!("minting the reading {} waits for", record.id))?;
+    let by = submission.record().id.clone();
+    println!(
+        "herd-hub: {by} reads what {} needs — command {} of commit {}, against the baseline \
+         labels {} its declaration states (D74)",
+        record.id,
+        declaration.command,
+        declaration.commit,
+        if reading.labels_from.baseline.is_empty() {
+            "none".to_owned()
+        } else {
+            reading.labels_from.baseline.to_string()
+        }
+    );
+    if let Err(error) = state.store.record_reading(&record.id, reading.read_by(&by)) {
+        eprintln!(
+            "herd-hub: {by} was minted to read what {} needs and that could not be written \
+             onto its record: {error}",
+            record.id
+        );
+    }
+    Ok(())
 }
 
 /// The job that reads what another job needs: an ordinary job, and the one
@@ -5139,6 +5157,17 @@ fn give_the_job_another_go(
             metrics: record.metrics.clone(),
             outputs: kept.clone(),
         });
+    }
+    // A job that is over is a job that is holding nothing, and something may
+    // have been waiting for exactly that — a slot, the room, or, since D169,
+    // a reading of its own to be minted now that the one it was waiting for
+    // is written off. The other end of this function already judges the
+    // queue after a requeue; the end that gives up had been leaving it to
+    // whatever happened to wake the hub next, which on a quiet fleet is the
+    // restatement cadence. A reading read again a minute later is a minute
+    // of a nightly nobody can account for.
+    if let Err(error) = dispatch_queued_jobs(state) {
+        eprintln!("herd-hub: judging the queue after {job_id} was lost failed: {error:#}");
     }
     Ok(())
 }

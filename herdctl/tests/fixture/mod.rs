@@ -52,6 +52,9 @@ pub const PROBE: &str = "probe";
 /// The command [`Fixture::add_third_command`] adds, and nothing declares
 /// before it is called.
 pub const SKETCH: &str = "sketch";
+/// The command [`Fixture::add_a_command_nothing_coalesces`] adds, and
+/// nothing declares before it is called.
+pub const SURVEY: &str = "survey";
 
 /// The branch the fixture's one commit is on, and the tag pointing at it: two
 /// kinds of ref, so a test can prove that resolution peels a tag as well as
@@ -219,6 +222,24 @@ const THIRD_COMMAND: &str = r#"
 [commands.sketch]
 line = "sh tools/herd/step.sh sketch -- {args}"
 labels = ["grove-toolchain"]
+timeout_s = 600
+"#;
+
+/// A fourth command, appended by [`Fixture::add_a_command_nothing_coalesces`].
+///
+/// What `probe` is, less the one thing that makes a hundred submissions of it
+/// one job: it declares neither `coalesce` nor `dedup_key`, so a pass that
+/// submits a hundred of these submits a hundred jobs, each needing a reading
+/// of its own. That is the shape of a consumer's nightly (D169), and it
+/// cannot be got out of `probe`.
+const A_COMMAND_NOTHING_COALESCES: &str = r#"
+# A command whose requirements are read on a machine and which nothing
+# deduplicates: every submission is its own job and its own reading.
+[commands.survey]
+line = "sh tools/herd/step.sh survey -- {args}"
+labels = ["grove-toolchain"]
+labels_from = "sh tools/herd/labels.sh {commit} {args}"
+memory_mib = 64
 timeout_s = 600
 "#;
 
@@ -404,6 +425,17 @@ refuses)
     printf 'grove labels: this tree cannot say what it needs\n' >&2
     exit 7
     ;;
+slow)
+    # A reading that takes long enough to still be running when the next one
+    # is offered, so that a test can see how many of them a runner is given
+    # at once (D169). It asks for little, because the point of such a test is
+    # a dozen jobs at once and not the room they need.
+    sleep 1
+    printf 'labels=grove-toolchain,linux\n'
+    printf 'memory_mib=64\n'
+    printf 'tmpfs_mib=0\n'
+    printf 'scenarios=1\n'
+    ;;
 never-ends)
     # Longer than any cap a test gives the reading, and it prints the answer
     # afterwards: a reading stopped at its cap must refuse the job even though
@@ -449,6 +481,12 @@ pub const ANSWER_TWICE: &str = "twice";
 pub const ANSWER_NOT_A_FIGURE: &str = "not-a-figure";
 pub const ANSWER_REFUSES: &str = "refuses";
 pub const ANSWER_NEVER_ENDS: &str = "never-ends";
+/// An answer that takes a second to give, so that a test can see how many
+/// readings a runner is running at once (D169).
+pub const ANSWER_SLOW: &str = "slow";
+/// What [`ANSWER_SLOW`] answers with: little, because a test of how many
+/// readings run at once is not a test of the room they need.
+pub const SLOW_MEMORY_MIB: u64 = 64;
 /// The code [`LABELS_SOURCE`] exits with in its `refuses` mode.
 pub const REFUSES_CODE: i32 = 7;
 
@@ -649,6 +687,34 @@ impl Fixture {
         hash
     }
 
+    /// Add a command whose requirements are read on a machine and which
+    /// nothing deduplicates, commit it and push it (D169).
+    ///
+    /// Added by a mutator rather than written into [`DECLARATION`] because
+    /// the two commands that are always there are what M10's acceptance
+    /// asserts on, and a fixture that grew a third of them silently would
+    /// change tests that are about something else. Its name is [`SURVEY`].
+    pub fn add_a_command_nothing_coalesces(&self) -> String {
+        let path = self.root().join(DECLARATION_PATH);
+        let held = std::fs::read_to_string(&path).expect("the declaration reads");
+        assert!(
+            !held.contains(SURVEY),
+            "the declaration already declares {SURVEY:?}"
+        );
+        std::fs::write(&path, format!("{held}{A_COMMAND_NOTHING_COALESCES}"))
+            .expect("the declaration is added to");
+        self.git(&["add", "-A"]);
+        self.git(&["commit", "-qm", "declare a command nothing coalesces"]);
+        self.git(&["push", "-q", REMOTE, BRANCH]);
+        let hash = self.rev_parse("HEAD");
+        let holding = self.git(&["branch", "--remotes", "--contains", &hash]);
+        assert!(
+            holding.contains(&format!("{REMOTE}/{BRANCH}")),
+            "the command was pushed and no remote-tracking ref holds {hash}: {holding:?}"
+        );
+        hash
+    }
+
     /// Run one shell line the way a runner would run a hook: one `sh -c`, in
     /// `at`, with the executor's environment and nothing of this process's own
     /// but `PATH`.
@@ -771,6 +837,32 @@ pub struct Harness {
     pub state: TempDir,
     tasks: Vec<tokio::task::JoinHandle<()>>,
     _data_root: herd_runner::testing::TempDir,
+    /// The hub's own view of its fleet, so that a test which takes the
+    /// runner away waits on the hub noticing rather than on a sleep.
+    hub: herd_hub::HubHandle,
+    /// What the runner of this harness was started with, so that a test can
+    /// take it away mid-job and bring the same machine back — same name,
+    /// same token, same data root (E-21, D169).
+    runner: herd_runner::Config,
+    /// The runtime running it, when one is running. A runtime of its own
+    /// rather than a task of this test's, so that taking the machine away
+    /// takes every task of the runner's with it: see
+    /// [`Harness::the_runner_goes_away`].
+    runner_runtime: Option<tokio::runtime::Runtime>,
+}
+
+/// Start a runner on a runtime of its own, and leave it running.
+fn spawn_a_runner(config: &herd_runner::Config) -> tokio::runtime::Runtime {
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+        .expect("a runtime for the runner");
+    let config = config.clone();
+    runtime.spawn(async move {
+        let _ = herd_runner::run(config).await;
+    });
+    runtime
 }
 
 impl Harness {
@@ -885,7 +977,7 @@ impl Harness {
         .expect("the hub binds a free port");
         let hub_url = format!("ws://{}", hub.local_addr());
         let handle = hub.handle();
-        let mut tasks = vec![tokio::spawn(async move {
+        let tasks = vec![tokio::spawn(async move {
             let _ = hub.serve().await;
         })];
 
@@ -920,9 +1012,8 @@ impl Harness {
             ..herd_runner::Config::default()
         };
         tune(&mut config);
-        tasks.push(tokio::spawn(async move {
-            let _ = herd_runner::run(config).await;
-        }));
+        let runner = config.clone();
+        let runner_runtime = spawn_a_runner(&runner);
         // Wait on the hub's own state, never on a sleep.
         let deadline = Instant::now() + Duration::from_secs(10);
         while !handle.runner_connected() {
@@ -934,6 +1025,53 @@ impl Harness {
             state,
             tasks,
             _data_root: root,
+            hub: handle,
+            runner,
+            runner_runtime: Some(runner_runtime),
+        }
+    }
+
+    /// Take the runner away with its work still on it, as a machine that is
+    /// killed is (E-21), and wait for the hub to be alone.
+    ///
+    /// The **whole runtime** goes, which is the point: a runner is a tree of
+    /// tasks — the frames it writes, the health it reports, the jobs it is
+    /// running — and aborting only the one that was awaited leaves every
+    /// other one holding the socket, so the hub would never notice. Shutting
+    /// the runtime down drops all of them at once, and the connection closes
+    /// with them. `shutdown_background` rather than a drop because this is
+    /// called from inside an async context, where a blocking drop panics.
+    ///
+    /// Taken away rather than drained: a drain hands every attempt back by
+    /// name, which is the opposite of what this is for.
+    pub async fn the_runner_goes_away(&mut self) {
+        use std::time::{Duration, Instant};
+        let Some(runtime) = self.runner_runtime.take() else {
+            panic!("this harness has no runner to take away");
+        };
+        runtime.shutdown_background();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while self.hub.runner_connected() {
+            assert!(
+                Instant::now() < deadline,
+                "the hub never noticed the runner had gone"
+            );
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    }
+
+    /// The same machine back: same name, same token, same data root.
+    pub async fn the_runner_comes_back(&mut self) {
+        use std::time::{Duration, Instant};
+        assert!(
+            self.runner_runtime.is_none(),
+            "this harness already has a runner"
+        );
+        self.runner_runtime = Some(spawn_a_runner(&self.runner));
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !self.hub.runner_connected() {
+            assert!(Instant::now() < deadline, "the runner never rejoined");
+            tokio::time::sleep(Duration::from_millis(5)).await;
         }
     }
 
@@ -1042,6 +1180,9 @@ impl Drop for Harness {
     fn drop(&mut self) {
         for task in &self.tasks {
             task.abort();
+        }
+        if let Some(runner) = self.runner_runtime.take() {
+            runner.shutdown_background();
         }
     }
 }
