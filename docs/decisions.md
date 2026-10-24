@@ -7978,3 +7978,16 @@ Beside them the arithmetic is unit-tested where it
 belongs — the cap in the claim step, including four readings through one pass
 being two claims and two waits; the budget on `Reading`; the watchdog's
 judgement as a pure function of what a runner last said.
+
+## 2026-10-24 — D170 An entry describes its date, a later entry corrects it
+
+**The tail of this file narrates three states of the world that have ended.**
+D168 says "the last on `main` is D167" and that "D161 is still held by an
+unmerged branch", and D161 weighs renumbering itself to 168 and says that
+would "buy one contiguous sequence" — a number the entry after it then took.
+Each was accurate on the day it was written, and each was overtaken by the
+branch the other was waiting on. **Nothing is edited**: `docs/decisions.md`
+is append-only (invariant 8), so **an entry describes the world on its date,
+and a later entry is how that record is corrected** — the numbering stands
+under D148's rule, and this entry exists so that a reader arriving at the end
+lands on their feet.
