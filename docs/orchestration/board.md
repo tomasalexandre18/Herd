@@ -16,7 +16,7 @@ started), `open` (not yet agreed or sized), `active` (an agent holds it),
 | ID | Question | Origin | Owner | State | Recommendation | Fallback | Evidence |
 |---|---|---|---|---|---|---|---|
 | ORCH-001 | Does a standing authorisation to merge PRs to `main` exist, and for whom? `CLAUDE.md` (2026-10-13) said `main` moves only on Alexa's word; the transcript had "oui merge et corrige" (2026-10-15) and "tu peux merge toi meme" (2026-10-16). | remediation H0, 2026-10-24; decided by Alexa 2026-10-24, relayed by the orchestrator | Alexa | done | **Decided, wider than the recommendation:** *"non il peux merge par defaut"*. `herd-merger` holds a standing authorisation to merge any PR whose CI is green and whose Evidence block is filled, `cut-v*`, `.github/`, `CLAUDE.md` and `.claude/` included. **Kept distinct, not covered by it:** pushing a tag and publishing a release stay on Alexa's word, one act at a time (v0.3.6 and v0.3.7 were each approved singly). | — | `CLAUDE.md` "Git and main"; `docs/orchestration/history/2026-10-24-orchestration-remediation.md` |
-| ORCH-002 | Accept the extended wording of invariant 8 (board as canonical list; `herd-merger` the only writer of `docs/decisions.md`; `D-NEXT` placeholders) and the added invariant 9 (D161 restated)? **Correction 2026-10-24, before the question reached Alexa:** the orchestrator's own diff found invariants 3 and 6 shortened without notice (3 lost "bound to that interface only, never on a default or public one, and never behind a port forwarded on someone's box"; 6 lost "based on declared capabilities and priority"). Both are restored verbatim; `git diff 3da48f5 -- CLAUDE.md` now shows invariants 1–7 unchanged except one added sentence in 5 (D27). | remediation H1, 2026-10-24 | Alexa | waiting | Accept: 8 gains D148, the single writer and the board; 9 promotes D161 to an invariant; nothing is weakened, and the two cuts the review found are undone. | Revert `CLAUDE.md` invariants 8–9 to the 2026-10-13 text; keep the rest. | `git diff 3da48f5 -- CLAUDE.md` |
+| ORCH-002 | Accept the extended wording of invariant 8 (board as canonical list; `herd-merger` the only writer of `docs/decisions.md`; `D-NEXT` placeholders) and the added invariant 9 (D161 restated)? **Correction 2026-10-24, before the question reached Alexa:** the orchestrator's own diff found invariants 3 and 6 shortened without notice (3 lost "bound to that interface only, never on a default or public one, and never behind a port forwarded on someone's box"; 6 lost "based on declared capabilities and priority"). Both are restored verbatim; `git diff 3da48f5 -- CLAUDE.md` now shows invariants 1–7 unchanged except one added sentence in 5 (D27). | remediation H1, 2026-10-24; decided by Alexa 2026-10-24, relayed by the orchestrator | Alexa | done | **Decided:** *"je valide"* — invariant 8 as extended (D148, `herd-merger` the only writer of `docs/decisions.md`, the board as the one list, `check-docs.sh`) and invariant 9 (D161 promoted to an invariant) are accepted as written at `473dffb`. The orchestrator re-ran the invariants diff itself before relaying: 1–7 differ from `3da48f5` only by the added D27 sentence in 5. | — | `git diff 3da48f5 -- CLAUDE.md` |
 | ORCH-005 | Which account runs the nested validation sessions (V2, V3, V4, V6, V10)? | remediation H7, 2026-10-24 | Alexa | done | Done 2026-10-24: the sessions ran under this account after the orchestrator relayed the go; that relay is not in the remediation agent's surviving context, so the evidence of the answer is the orchestrator's transcript, not a file here. No other account's credentials were used. | — | `history/2026-10-24-h7-evidence/` |
 
 ## Owed — agreed, not started
@@ -45,7 +45,7 @@ started), `open` (not yet agreed or sized), `active` (an agent holds it),
 
 | ID | Item | Origin | Owner | State | Next action | Depends on | Evidence |
 |---|---|---|---|---|---|---|---|
-| ORCH-004 | Orchestration remediation (mandate 2026-10-24): contract, roles, memory, board, checks, validation | mandate v1.0 | remediation agent, then herd-merger | active | H0–H7 done; PR #71 open; Alexa answers ORCH-002, then `herd-merger` merges under ORCH-001 | ORCH-002 | branch `orchestration-remediation`, `remediation-report.md` |
+| ORCH-004 | Orchestration remediation (mandate 2026-10-24): contract, roles, memory, board, checks, validation | mandate v1.0 | remediation agent (bootstrap), then herd-merger | active | H0–H7 done; ORCH-001 and ORCH-002 decided; PR #71 merges under ORCH-001 once CI is green on its head (the remediation agent merges it on the orchestrator's instruction, as its last bootstrap act) | CI green | branch `orchestration-remediation`, `remediation-report.md` |
 
 ## Blocked — needs something outside the project
 
@@ -55,9 +55,9 @@ started), `open` (not yet agreed or sized), `active` (an agent holds it),
 
 ## Next
 
-1. Alexa answers ORCH-002 (one question); ORCH-001 is decided.
-2. `herd-merger` merges the remediation PR (#71) under ORCH-001 once CI is
-   green and ORCH-002 is answered; the orchestrator then applies the
+1. ORCH-001 and ORCH-002 are decided; PR #71 merges on green CI.
+2. After the merge the orchestrator starts a fresh session on the new
+   contract, applies the
    `MEMORY.md` pointer from `memory.md`
    and starts its next session from the board.
 3. ORCH-010: status restated after v0.3.7; ORCH-031: the brief rule.

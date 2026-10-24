@@ -48,18 +48,17 @@ See `remediation-report.md` §12.
 
 ## Decisions needed
 
-ORCH-002 (invariant 8 extended, invariant 9 added) — accept. ORCH-001 is
-decided and recorded in `CLAUDE.md`, the board, `workflow.md`,
+None. ORCH-001 ("non il peux merge par defaut") and ORCH-002 ("je
+valide") were decided by Alexa on 2026-10-24, relayed by the orchestrator,
+and are recorded on the board, in `CLAUDE.md`, `workflow.md`,
 `herd-merger.md` and D173.
 
 ## Resume point
 
-Read the board. When ORCH-002 is answered: brief `herd-merger` to
-integrate PR #71 (CI green, Evidence in the body; ORCH-001 grants the
-merge). No tag is involved. Then
-ORCH-010. If the running orchestrator has not yet got this contract, it
-still reads the 2026-10-13 `CLAUDE.md`: the first thing after the merge is
-a fresh session.
+Read the board. PR #71 merges on green CI (ORCH-001). Then: a fresh
+orchestrator session on the merged `main`; the `MEMORY.md` pointer from
+`memory.md`; ORCH-010 and ORCH-011 in the order Alexa chooses. No tag is
+involved anywhere.
 
 ## Processes
 

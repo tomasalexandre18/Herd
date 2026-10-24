@@ -195,10 +195,12 @@ copied, then removed; none was pushed.
 
 ## 12. Remaining gaps
 
-Blocking for "ready without reserve":
+Blocking for "ready without reserve": none left among the owner's
+decisions. Both were settled the same day:
 
-- ORCH-002 — invariant 8 wording and invariant 9 need the owner's accept.
-  Settled the same day and no longer a gap: ORCH-001, Alexa's *"non il
+- ORCH-002 — Alexa: *"je valide"*; invariants 8 and 9 accepted as written
+  at `473dffb`, after the orchestrator re-ran the invariants diff itself.
+- ORCH-001 — Alexa's *"non il
   peux merge par defaut"* — `herd-merger` merges any CI-green PR with
   filled Evidence, no path excluded; pushing a tag and publishing a
   release stay on Alexa's word, one act at a time.
@@ -218,10 +220,12 @@ Non-blocking:
 
 **PRÊTE SOUS RÉSERVES.** The contract, roles, board, checks and hooks
 exist, are versioned, go red when broken, and held under eleven live
-sessions. The reserves are ORCH-002 (the owner's accept of invariants 8
-and 9, asked on a diff that now restores 3 and 6 verbatim) and the merge of
-this PR itself, without which the running orchestrator still reads the
-2026-10-13 `CLAUDE.md`. ORCH-001 was answered during the mandate.
+sessions; both owner decisions (ORCH-001, ORCH-002) were taken during the
+mandate. The reserves that remain are not decisions but facts: the running
+orchestrator session still reads the 2026-10-13 `CLAUDE.md` until it is
+restarted on the merged `main`; the `MEMORY.md` pointer is not applied
+(outside the repository); the shared `CLAUDE_CONFIG_DIR` (ORCH-030) is the
+owner's host configuration; the guard is best effort (`permissions.md`).
 
 ## 14. Suggested next step
 
