@@ -255,6 +255,43 @@ docker load < result                       # Loaded image: herd-hub:0.3.3
 Same derivation, same tag, same line in `.env` as above; what differs is
 only where the bytes came from.
 
+### A `-dev` build, which is not a release at all
+
+A tag with `-dev` in it — `v0.3.8-dev1` — publishes the same four
+files from **any branch**, in about eight minutes, without going
+through `main` (`.github/workflows/release-dev.yml`, D172). It exists
+because the hour between knowing a fix and being able to install it was
+an hour of pull request, CI, merge, second pull request and merge
+again, and almost none of it was the fix.
+
+Three things about one, and they are the whole of what you need to
+decide with:
+
+- **It is a pre-release.** Nothing that asks this repository for its
+  *latest* release will ever be handed one. You take a dev build on
+  purpose, by name, or you do not have it.
+- **The merge gate did not run on it.** No pull request, no review, and
+  no `ci.yml` — not `nix flake check`, not `cargo fmt`, not
+  `cargo clippy`, not `./scripts/test.sh`. Those are run on the branch
+  by whoever pushes the tag, and nothing in GitHub checks that they
+  were. Everything *below* the gate did run, unchanged: the same Nix
+  derivations, the same static-linking assertion, the same two
+  distribution smokes, the same hub out of the loaded archive. The
+  bytes are as runnable as a release's; what is missing is a second
+  opinion.
+- **It is for finding problems, not for running a fleet.** One machine
+  whose owner is watching it and can put it back. The build's own
+  release body says this first, before anything you could copy and
+  paste.
+
+Deploying one is the four lines under "the image, from a release"
+above, with the dev tag's archive. Going back is the same lines with
+the newest tag that has no `-dev` in it — compare the two bodies'
+`RECORD_VERSION` before you do, for the reason `release-notice.md`
+gives. And **a dev build is never promoted**: a change that proves
+itself on one goes through a pull request and a tag of its own, and
+that tag is what a fleet runs.
+
 ## Step 4, exactly: `wss://` through Traefik and Cloudflare
 
 This is the half of M16 that **has never been run**. The loopback path

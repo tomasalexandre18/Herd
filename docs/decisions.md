@@ -8226,3 +8226,138 @@ layout (ORCH-003); the shared `CLAUDE_CONFIG_DIR` (ORCH-030).
 holds D170 and PR #70 holds D172, so 173 is the next free number above
 both. Written by the remediation agent under its bootstrap exception; from
 here on only `herd-merger` allocates.
+
+## 2026-10-24 — D172 A hotfix is installable in five minutes, and says so
+
+**Measured, on the day this was written.** v0.3.6 went out at 09:49 and put
+a regression on the first consumer's only runner; v0.3.7 undid it. The clock
+from the fix being written to the fix being installable: PR #68 opened
+11:05:23, merged 11:47:25; PR #69, which only bumped a version, opened
+11:55:12 and merged 12:03:27; the release run finished 12:08:47. **Sixty-three
+minutes**, of which the build that produced the bytes was **five minutes and
+nine seconds** — eight per cent. The other fifty-eight were two pull
+requests, two `ci.yml` runs at 362–490 s each, two merges, a conflict in this
+very file, and the gaps between a person noticing one step had finished and
+starting the next. None of that found anything. The regression it was
+guarding against had already shipped past it that morning.
+
+**So the lane is: a `v*.*.*-dev*` tag on any branch publishes a pre-release.**
+`.github/workflows/release-dev.yml` triggers on that tag and does nothing
+itself but call `release.yml` with `dev: true`. The observed cost of a
+`release.yml` run over the last four tags is 228–347 s, so a dev build is
+**four to six minutes from `git push --tags` to a file somebody can
+download** — and on the morning above it would have put the fix on that
+runner at about 11:10 instead of 12:09.
+
+**It calls the release workflow; it does not copy it.** This is the whole of
+the design and it is worth saying why, because a nine-line file that reads
+like a stub is easy to "improve" into a self-contained one. A dev build is
+the first thing anybody reaches for in an emergency, and a lane that builds
+*almost* like the release path is a lane that can clear a fix which then
+fails on the real tag an hour later — the exact failure the lane exists to
+prevent, reintroduced one layer down. So `workflow_call` was added to
+`release.yml` and a dev build is that build: the same
+`nix build .#static` and `nix build .#hub-image`, the same four-way static
+assertion, the same `release-smoke.sh` on `archlinux` and on `alpine`, the
+same `image-smoke.sh` against the loaded archive, the same `SHA256SUMS` and
+its count. Two inputs exist and nothing else changed: `dev`, and `tag` for
+the hand-run that already existed. Both are empty on a tag push and on the
+hand-run, so every `$DEV` test is inert on the path that cuts real releases —
+proven the way D168's work was proven, by extracting the body step's shell
+and running it offline with `gh` stubbed: on `DEV=false` the body comes out
+byte-identical to today's, and the only delta on `DEV=true` is the preamble
+prepended to it.
+
+**Three properties the lane may not lose.**
+
+*It is a pre-release.* `--prerelease` is forced by `$DEV` and no longer rests
+only on the tag carrying a hyphen. The first consumer's updater asks this
+repository for a release; a dev build that could answer that question would
+put an unreviewed hub on a fleet because somebody spelled a tag without a
+suffix. The flag is what makes taking a dev build a decision.
+
+*It carries the two numbers.* The step D168 added reads `RECORD_VERSION` and
+`PROTOCOL_VERSION` out of the source with `sed`, refuses an empty or
+non-numeric value before anything is built, and writes them as
+`^RECORD_VERSION: [0-9]+$`. It is reused unchanged and unconditionally. This
+is not decoration: their updater **halts when a body names no number**, so a
+dev build without the lines would stop their automation rather than be
+ignored by it — the one way a lane meant to speed things up could stop them
+altogether.
+
+*The body says what the build is, first.* Above the install lines, before
+anything a reader could copy: this is not a release, it came off branch X at
+commit Y, there was no pull request and no review, and the merge gate did not
+run on it here. The branch is asked of GitHub's
+`commits/{sha}/branches-where-head` rather than of git, because a tag push
+checks out one commit and fetching a history to learn one name would cost the
+lane the seconds it exists to save; an empty or failed answer is printed as
+one and never guessed at, and never fails the release.
+
+**What the lane trades away, stated plainly.** `nix flake check`, `cargo
+fmt`, `cargo clippy` and `./scripts/test.sh` do not run in GitHub on a dev
+tag. They are run on the branch, on the machine the change was written on,
+and **nothing checks that they were**. That is a real safety net removed, and
+the argument for removing it is not that the net never catches anything — it
+is that this net is being asked to guard the wrong thing. It guards `main`,
+where a mistake reaches everybody and is expensive to withdraw. A dev build
+reaches one machine, by name, chosen by an operator who has just been told in
+the first paragraph of its body that nobody reviewed it, and withdrawing it
+is `docker load` of the previous archive. The cost of a bad dev build is one
+watched host and a rollback; the cost of the net is an hour on every hotfix,
+paid whether or not anything is wrong. On the day measured above it was paid
+twice and caught neither regression. **A dev build is also never promoted** —
+a change that proves itself on one still goes through a pull request, the
+gate and a tag of its own — so nothing the gate would have caught can reach
+`main` by this route. The net is not removed; it is moved off the critical
+path of finding out.
+
+**And one thing the lane deliberately does not skip.** It would be easy to
+drop the two distribution smokes and save ninety seconds. They are the single
+most valuable minute and a half in the file: they are the only place anything
+runs these binaries on a host with no Nix, which is every host that matters,
+and the owner's stated reason for this lane is to find *new* problems in real
+conditions. A lane that skips the real-conditions proof to go faster is
+faster at nothing worth having. The same goes for the static assertions and
+the image smoke, which cost seconds.
+
+**Why one tag starts exactly one workflow.** `release.yml`'s trigger gained
+`"!v*.*.*-dev*"` beside its `"v*"`. Without it a dev tag would match both
+files and start two runs racing to create one release, and the loser's error
+would be the first thing anybody read in an emergency. The exclusion is the
+same pattern the dev lane includes, so the two cannot drift apart silently.
+
+**Why no branch input on the hand-run.** `release-dev.yml`'s
+`workflow_dispatch` takes a tag that already exists and nothing else. A
+release has to hang on a tag — that tag is the only handle by which an
+operator holding a strange binary six months from now gets back to the exact
+commit — and a dispatch given a branch would have to create one, which makes
+a workflow that mints tags out of a lane that is supposed to be nine lines.
+The case a branch input would serve is already served: `release.yml`'s own
+dispatch with an empty tag rehearses the whole build from any branch and
+creates nothing. So the dispatch here is the recovery door only — a dev tag
+whose run died halfway is republished without pushing a second tag for the
+same commit.
+
+**The tag names the workspace's version, and that is not negotiable either.**
+`release.yml` refuses a tag that is not `v$version` or a suffix of it, before
+building, because the file names and the image tag come from
+`Cargo.toml` and would otherwise lie about what is inside them. So a hotfix
+branch bumps `workspace.package.version` to the version it is fixing towards
+and tags `v<that>-dev1`. That is one line, and the branch needs it to become
+a release later regardless; cutting the assertion to save it would buy a dev
+build whose `herd-hub-image-0.3.7.tar.gz` contains 0.3.8, which an operator
+comparing two archives could not untangle.
+
+**What is deliberately not done.** No cache was added to speed the Nix build.
+A binary cache in the release path is an optional thing that can fail, and
+D162 is this project's own receipt for what an optional thing in the release
+path costs — three tags that produced nothing. No artefact was dropped and
+the image is still always built: both would make a dev run differ from the
+real one, and the point of calling `release.yml` was that it does not. Those
+three are worth about two of the five minutes between them and are written
+down here as rejected rather than forgotten, so that the next person who
+wants the lane faster starts from the reasons and not from the stopwatch.
+
+**On the number.** This entry is D172. D170 is held by an unmerged branch and
+D171 is the last on `main`.
