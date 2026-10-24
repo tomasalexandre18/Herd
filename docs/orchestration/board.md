@@ -40,6 +40,7 @@ started), `open` (not yet agreed or sized), `active` (an agent holds it),
 |---|---|---|---|---|---|---|---|
 | ORCH-020 | M11's pack half (E-12, E-17) is cut by D161; coverage.md still lists it | D161; `status.md` | herd-planner | open | Confirm with Alexa whether the rows become `refused` | Alexa | `docs/coverage.md` |
 | ORCH-021 | Hub re-reads every record per 200 ms poll (D152) | `status.md` 2026-10-23 | — | open | Only when a count makes it visible | — | `status.md` "not done" 3 |
+| ORCH-022 | CI `check` went red on head `b40c8dc` of PR #71 in `herd-hub/tests/follower_alive.rs:230` (`a_quiet_running_job_keeps_its_follower_hearing_from_the_hub`) on a diff of three Markdown files; the same test was green on `46f3fb1` minutes earlier: a flaky test, product side | CI run 40114565027, 2026-10-24 | herd-planner | open | Tracking only: belongs to the later technical audit; no change to the test from this mandate | the product audit | `gh run view 40114565027 --log-failed` |
 
 ## Active — an agent holds it
 

@@ -215,6 +215,10 @@ Non-blocking:
   version-dependent; the review of traces remains the protection.
 - Open PRs #67 and #70 will need CI re-run after this PR merges; #67 is
   stale (ORCH-010).
+- ORCH-022 — the Rust suite is flaky on CI: `follower_alive.rs:230` failed
+  on head `b40c8dc` (three Markdown files changed since the green run on
+  `46f3fb1`). Recorded for the product audit, not touched here; a red
+  `check` on this PR is re-run, never bypassed.
 
 ## 13. Recommendation
 
