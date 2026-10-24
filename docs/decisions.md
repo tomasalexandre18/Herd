@@ -7978,3 +7978,195 @@ Beside them the arithmetic is unit-tested where it
 belongs — the cap in the claim step, including four readings through one pass
 being two claims and two waits; the budget on `Reading`; the watchdog's
 judgement as a pure function of what a runner last said.
+
+## 2026-10-24 — D171 A wait is written down when its cause changes
+
+**The incident, an hour after the release that caused it.** 0.3.6 shipped
+D169 at about 11:10; the first consumer installed it and ran a full pass at
+12:10:20 — 214 job groups, one runner, `--readings-at-once` at its default
+of 2. **The bound worked**: the runner held at most four `herd-job` cgroups,
+load 16–21, and not one job ended 125. That is the whole of what D169 was
+for, and it held.
+
+Then the hub stopped answering. From about 12:14 `herdctl runner list`
+timed out — 10 s in their collector, then three tries at 30 s and one at
+180 s, every one `rc 124`. The runner's journal says the other half: *"the
+hub has said nothing for 60s, so this link is dead even though its socket is
+open"* at 12:14:15, 12:15:53 and 12:17:29, redialling each time, and at
+12:18:29 *"j0000002485 ended while there was no hub to tell"*. By then the
+runner held **nought** cgroups against a queue of **184 waiting**: the pass
+had stopped moving. The hub container was not busy — 1.8–3.9 % of a CPU,
+209 MiB, 13 PIDs. It was blocked, not saturated.
+
+**What was actually blocking it**, from the thread states and the state
+volume they captured before restarting: of the thirteen threads, exactly
+one was always in `D`, uninterruptible disk wait, and it moved between two
+different tokio workers across samples; the rest were waiting. In two
+minutes the hub modified **775 files** — `index/state.json`, and for every
+queued job both `jobs/<id>/job.json` and `jobs/<id>/events.jsonl`. One
+queued job, `j0000002656`, had accumulated **94 lines** in its
+`events.jsonl`, each one a full *"stays queued: queued 65th of 165 …"*
+explanation. Their hub log carried **20 683** `stays queued` lines since
+12:10, 1 931 of them inside one three-minute window.
+
+### The defect: a figure that moves inside a sentence that is compared
+
+A dispatch pass walks the queue in order and, for every job it leaves
+queued, calls `say_it_waits` with E-04's sentence. That sentence is two
+things wearing one coat. The **cause** is a fact about the job — the
+reading it waits for has not answered, the capability it needs is
+suspended, the runner it sticks to is busy — and it changes rarely. Around
+the cause the sentence wraps a snapshot of the whole queue: `queued 74th of
+184`, and the three jobs ahead of it by name.
+
+`record_waiting` wrote only "when it is news", and judged news by comparing
+the whole sentence. So one job arriving, starting or ending changed the
+total — and therefore the sentence — of every job standing still behind it.
+On a queue of 184 that is 184 rewritten records and 184 appended history
+lines per pass, each one `sync_all`'d with its directory, for a job about
+which nothing whatever had happened.
+
+Before D169 this could not bite. A reading was placed the moment it was
+minted, so a one-runner fleet never stood a queue deeper than a job or two
+and the per-job cost was paid twice. D169's bound is correct and is the one
+thing that worked that night; what it changed is that the queue is now
+*deep*, and it put a cost that had always been linear in the queue in front
+of a queue two hundred long.
+
+The rest follows without any further defect. A dispatch pass is a
+synchronous function called straight from async callers, so a pass that
+spends seconds in fsync is a tokio worker that spends seconds unavailable —
+and this hub has a dozen callers that each start one, serializing on
+`State::dispatching`, each occupying the worker that called it. With no
+worker left, nothing is polled: not the answer to a health report, which is
+what tells a runner its link is alive, and not the accept of the requester
+asking for a fleet listing. The runner's 60 s silence limit then expires, it
+redials, and the redial starts another pass. Measured on the host this was
+written on: one pass over 400 queued jobs took **3.21 s** writing a line for
+each and **62 ms** writing none.
+
+### The decision
+
+**News is what changed about this job, not what changed around it.** The
+sentence is three things, and only two of them are facts about the job it
+is written on: its **cause**, its own **standing** — the level it was
+submitted at and the level the queue weighs it at now (E-18) — and its
+**place among the others**. `say_it_waits` now takes the cause and the
+standing beside the whole sentence, compares cause-and-weighed-level
+against the pair it last wrote for that job, and touches the disk only
+when that has changed. Everything the record does keeps doing it: the
+first judgement of a job is written, a job that ages says so on the pass
+it happens, a job nobody is following still says on its disk why nothing
+is happening to it (E-53), and the line in `events.jsonl` still carries
+the whole sentence with the figures that held when it was written.
+
+The **countdown** to the next level is deliberately outside the key, while
+the level it counts down to is inside it. A countdown is a clock and not an
+event: including it would make every queued job a write a minute, which is
+the same defect at a fiftieth of the rate. The cost is named rather than
+hidden — between two level changes the record's "rising to merger in 12m"
+decays, and a reader of `job.json` alone sees a countdown up to one aging
+step old. What a requester is *told* does not decay, because it comes from
+memory.
+
+**The sentence is not lost; it moves to memory.** `Peers::waiting` holds,
+per queued job, the whole sentence the last pass built, and that is what
+every reader is given: the restatement clock E-04 asks for, and a `herdctl
+wait` that attaches an hour later. So a requester still learns its position
+and what is ahead, and learns this minute's, not the one that held when its
+cause was last written. The map sits beside the others in `Peers` for the
+reason they are there — it is a fact about a stream, not about a job — and
+it is pruned by the pass that fills it, against the queue it has just
+walked, so it is never larger than the queue and nothing survives the job
+it is about. A hub that restarts has an empty one, and its first pass
+writes every queued job's reason once, which is right: a new hub has told
+nobody anything.
+
+**E-04 and E-36 are kept whole, and were checked rather than assumed.**
+E-04 asks that a wait be explained with figures and said again at least
+every 60 s; its coverage row already says the record keeps the news-only
+rule and the *stream* carries the cadence. That is the mechanism this
+leans on — "ask and be told" was already the design, and only the record's
+definition of news changes. E-36 asks that every decision be explained,
+and no explanation is withdrawn: a placement still writes its line, a job
+that can never run still ends naming why, and a queued job still carries
+its reason on disk and answers for it when asked.
+
+### What was rejected
+
+* **Weakening D169's bound.** It is the one thing that worked, and the
+  symptom it would hide is not the one it caused.
+* **Writing the position on a slower clock.** It keeps the figure fresh on
+  disk at the cost of 184 fsyncs a minute of a non-event, and the history
+  stays unreadable — 7 000 lines over a forty-minute pass instead of
+  20 000.
+* **Dropping the position from the sentence.** Then nothing stale is
+  written, and E-04 loses the figure it asks for by name.
+* **Keeping the figures on the record and comparing a stripped copy.** One
+  truth, two spellings, and the next figure anyone adds to the sentence is
+  a defect that returns silently.
+
+**What is still paid, and it is bounded.** A whole queue submitted in one
+second ages in one second too, so every aging step every queued job is
+news at once: 184 records written in one burst, which on the figures above
+is about 1.5 s of fsync every thirty minutes at the default step. That is
+a thousandth of what this entry removes, it is a real event every time,
+and it is the thing the next entry — the one that moves persistence off
+the reactor — would make free.
+
+### The deeper defect, deliberately not fixed here
+
+A tokio worker in `D` state says the hub's persistence is not insulated
+from its reactor at all: every dispatch pass, every store write, runs on
+the runtime. This entry does not fix that, and the fix above does not
+depend on it being fixed — it takes the pass from 3.21 s to 62 ms at 400
+queued jobs, which is three orders of magnitude of headroom on the figure
+that mattered. Moving the pass off the reactor means either `spawn_blocking`
+at a dozen call sites, several of them synchronous functions reached from
+synchronous functions, or a dedicated pass thread fed by a channel — and
+both change how a pass's errors are returned and when `dispatching` is
+held, which is the guarantee D100's test is built on. That is its own
+decision, with its own tests, and not a thing to do in an hour against a
+stopped integration.
+
+**0.3.6 was ours and this follows it by an hour.** The two tests shipped
+with D169 covered the incident D169 was about — they proved the bound and
+the second reading — and neither stood a deep queue for longer than it took
+to prove the point, so neither could see a cost that is only paid per
+queued job per pass. The gap is recorded here as the shape of test that was
+missing, not as a one-off: a bound that makes a queue deep is a change to
+what every pass costs.
+
+### What is proven
+
+Two tests in `herd-hub/src/server.rs`, both run against `d57f23a` — the
+v0.3.6 tag as the consumer installed it — and both fail there.
+
+* `a_queue_that_moves_writes_nothing_about_the_jobs_standing_still_in_it`
+  stands 120 jobs against no runner, lets one more arrive before each of
+  twelve passes, and counts the `waiting` lines in one watched job's
+  `events.jsonl`. Neither its cause nor its level changes, so the count is
+  **1**: the line its first judgement wrote. On v0.3.6 it is **13**. The
+  same test then
+  asserts the other half — that a requester is told the current total while
+  the record carries the one its cause was written with — so the trade is
+  pinned where it can be seen rather than described here and nowhere else.
+* `a_deep_queue_leaves_the_runtime_a_worker_to_answer_with` stands 300
+  jobs, runs two concurrent dispatch passes on a two-worker runtime, and
+  asks the runtime — from outside it, so the measurement cannot be starved
+  by what it measures — to poll a task that does nothing. The bound is two
+  seconds, a requester's patience and not a figure about disks. Measured:
+  **17.3 s** on v0.3.6, **0.23 s** with this entry.
+
+`one_pass_over_a_large_queue_is_measured_and_the_figure_is_printed` keeps
+printing the two pass costs beside each other, and its second figure now
+means what it always claimed to: what a pass costs when the queue has
+moved, rather than what it costs when nothing at all has happened.
+
+**Nothing crosses the wire and nothing changes on disk.**
+`PROTOCOL_VERSION` stays at 2 and `RECORD_VERSION` stays at 1: no field is
+added to a record, and the field this is about is written less often and
+otherwise unchanged. A 0.3.6 record reads here, and a record this writes
+reads on 0.3.6.
+
+**On the number.** This entry is D171. D170 is held by an unmerged branch.
