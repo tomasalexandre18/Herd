@@ -213,11 +213,15 @@ pub fn what_is_ahead(
 /// How many of the jobs ahead are named one by one before the rest are
 /// counted.
 ///
-/// Three, because this string lands in `waiting_for` — a field the store
-/// writes a line of `events.jsonl` for whenever it changes — and a sentence
-/// naming all of a four-hundred-job queue would be a kilobyte of history per
-/// job per position. Three is enough to see *what kind* of work is in front,
+/// Three, because this string lands in `waiting_for`, and a sentence naming
+/// all of a four-hundred-job queue would be a kilobyte of history per job
+/// per position. Three is enough to see *what kind* of work is in front,
 /// which is the question E-04's "what is ahead" is asked for.
+///
+/// This clause is also why the names here are **not** part of what the hub
+/// judges news: they change whenever anything in front of the job moves,
+/// which on a deep queue is every pass. `say_it_waits` compares the cause
+/// and nothing else (D171).
 const AHEAD_NAMED: usize = 3;
 
 /// The same sentence, with what is ahead of the job in it (E-04).
@@ -249,11 +253,12 @@ fn ordinal(place: usize) -> String {
 /// A duration as a sentence carries it: coarse on purpose.
 ///
 /// Rounded to the minute above a minute, because this string lands in
-/// `waiting_for`, and the store writes that field only when it *changes*
-/// (and writes a line of `events.jsonl` with it). A countdown to the second
-/// would make every dispatch pass a write and a job that waits an hour an
-/// unreadable history — the very thing `record_waiting`'s "only when it is
-/// news" rule exists to prevent.
+/// `waiting_for`, and the store writes that field only when the job's
+/// *cause* changes (and writes a line of `events.jsonl` with it). A
+/// countdown to the second inside a **cause** would make every dispatch
+/// pass a write and a job that waits an hour an unreadable history — the
+/// very thing the "only when it is news" rule exists to prevent, and the
+/// thing a figure outside the cause did anyway until D171.
 pub(crate) fn roughly(how_long: Duration) -> String {
     let seconds = how_long.as_secs();
     if seconds < 60 {

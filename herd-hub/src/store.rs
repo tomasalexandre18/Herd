@@ -1989,6 +1989,14 @@ impl JobStore for JobDirStore {
     /// and spin the disk of a hub with nothing to do. And a reason that has
     /// not changed is not something that happened.
     ///
+    /// **This test is the second of two, and not the one that matters.**
+    /// What reaches here is a whole sentence, and a sentence carries the
+    /// queue's figures as well as the job's reason — so two sentences differ
+    /// whenever anything in the queue has moved, which on a deep queue is
+    /// every pass. The caller ([`crate::server`]'s `say_it_waits`) compares
+    /// the **cause** and calls this only when that is news (D171); what is
+    /// left here is the idempotence of the one door, and the no-ops below.
+    ///
     /// A job that is no longer queued is not waiting for anything, so this is
     /// a no-op on it: that closes the race where a dispatch pass decides a job
     /// must wait a moment after another pass has started it. A job that has

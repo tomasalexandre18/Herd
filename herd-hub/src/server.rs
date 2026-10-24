@@ -987,6 +987,28 @@ struct Peers {
     /// Kept beside [`Peers::wait_told`] and pruned by the same loop, for the
     /// same reason: it is a fact about a stream, not about a job.
     spoke_to_followers: HashMap<JobId, Instant>,
+    /// Why each queued job is waiting, as the last dispatch pass judged it
+    /// (D171).
+    ///
+    /// Two strings per job, because a waiting sentence is two different
+    /// things wearing one coat. The **cause** is a fact about this job — the
+    /// capability it needs is suspended, the reading it waits for has not
+    /// answered, the runner it is sticking to is busy — and it changes
+    /// rarely. The **sentence** wraps that cause in a snapshot of the whole
+    /// queue: "queued 74th of 184", and the three jobs ahead of it by name.
+    /// Those figures move whenever *any* job moves, which on a deep queue is
+    /// every pass.
+    ///
+    /// So the cause is what the record is written for (`record_waiting`,
+    /// news-only since M6) and the sentence is kept here, in memory, like
+    /// every other fact about a stream in this struct: a requester that asks
+    /// is told today's figures, and nothing is fsynced to say that a job is
+    /// still waiting for the reason it was waiting for a moment ago.
+    ///
+    /// Pruned by the pass that fills it, against the queue it has just
+    /// walked, so it is never larger than the queue and nothing survives the
+    /// job it is about.
+    waiting: HashMap<JobId, Waiting>,
     /// Verdicts this hub has **recorded** and not yet handed to a requester,
     /// because the collection they announce is still crossing (D167).
     ///
@@ -1020,6 +1042,26 @@ struct Peers {
 struct Follower {
     outbox: Outbox,
     wants_files: bool,
+}
+
+/// What one queued job's wait is, as the last pass judged it (D171).
+struct Waiting {
+    /// What was news about this job when its record was last written: its
+    /// cause, and the level the queue weighs it at.
+    ///
+    /// `None` until a pass has written one, which is what makes the first
+    /// judgement of a job news whatever a hub that died before it had
+    /// written one had said. Set only once the write has gone through, so a
+    /// disk that refused it is tried again by the next pass rather than
+    /// remembered as done.
+    recorded: Option<String>,
+    /// The whole sentence the last pass built, cause and figures together.
+    ///
+    /// This is what a requester is told, and the reason it is held at all:
+    /// the record carries the sentence that held when the cause last
+    /// changed, and on a queue that is draining that sentence's position is
+    /// stale within seconds.
+    sentence: String,
 }
 
 /// A verdict waiting for its collection (D167).
@@ -1541,6 +1583,19 @@ impl State {
             );
             peers.followers_to_write_to(id)
         })
+    }
+
+    /// Why a queued job is waiting, with the figures the **last pass** found
+    /// (E-04, D171).
+    ///
+    /// Preferred over the record's own `waiting_for` everywhere a requester
+    /// is told, and for one reason: the record is written when the *cause*
+    /// changes, so a job whose cause has held for twenty minutes carries the
+    /// position it had twenty minutes ago. A queue drains; an ordinal does
+    /// not survive it. `None` for a job this hub has not judged since it
+    /// started, and then the record is the only answer there is.
+    fn why_it_waits(&self, id: &JobId) -> Option<String> {
+        self.with_peers(|peers| peers.waiting.get(id).map(|w| w.sentence.clone()))
     }
 
     /// The hub wrote the job down after all: it is moving again.
@@ -2496,6 +2551,12 @@ fn dispatch_a_pass(state: &State) -> Result<()> {
         seat.reserved_for = held_empty.get(&seat.name).cloned();
     }
     let total = queue.len();
+    // Every job this pass found still waiting, so that what the hub holds in
+    // memory about waits ([`Peers::waiting`]) is emptied of the jobs that are
+    // no longer in the queue. Derived from the pass that has just walked it,
+    // which is the only thing that knows the answer exactly — so there is no
+    // eviction policy and nothing to leak (D79's habit, applied to a map).
+    let mut said_it_waits: HashSet<JobId> = HashSet::new();
     for (place, record) in queue.iter().enumerate() {
         // A job whose requirements are still being read is not placed, by
         // anything, ever: there is nothing to place it against but the
@@ -2504,14 +2565,16 @@ fn dispatch_a_pass(state: &State) -> Result<()> {
         // be done for it this pass, so what is left is to say so.
         if record.awaits_a_reading() {
             let standing = queue::standing(record, now, state.policy.aging_step);
+            let because = format!("it is waiting because {}", waiting_for_a_reading(record));
             let sentence = queue::waiting_sentence_behind(
                 place + 1,
                 total,
                 &standing,
                 &queue::what_is_ahead(&queue, place, now, state.policy.aging_step),
-                &format!("it is waiting because {}", waiting_for_a_reading(record)),
+                &because,
             );
-            say_it_waits(state, &record.id, &sentence)?;
+            said_it_waits.insert(record.id.clone());
+            say_it_waits(state, &record.id, &standing, &because, &sentence)?;
             continue;
         }
         // The one job this one named, if it named one (E-10). Looked up here
@@ -2540,17 +2603,19 @@ fn dispatch_a_pass(state: &State) -> Result<()> {
                     // seat that is gone, and the next pass — which a
                     // released runner triggers — judges it afresh.
                     let standing = queue::standing(record, now, state.policy.aging_step);
+                    let because = format!(
+                        "it is waiting because runner {runner}'s connection ended while this \
+                         pass was placing it there"
+                    );
                     let sentence = queue::waiting_sentence_behind(
                         place + 1,
                         total,
                         &standing,
                         &queue::what_is_ahead(&queue, place, now, state.policy.aging_step),
-                        &format!(
-                            "it is waiting because runner {runner}'s connection ended while \
-                             this pass was placing it there"
-                        ),
+                        &because,
                     );
-                    say_it_waits(state, &record.id, &sentence)?;
+                    said_it_waits.insert(record.id.clone());
+                    say_it_waits(state, &record.id, &standing, &because, &sentence)?;
                 }
             }
             // This job waits, and the queue behind it does not. **That is
@@ -2563,14 +2628,16 @@ fn dispatch_a_pass(state: &State) -> Result<()> {
             // bounded by the stickiness limit it asks to be visible.
             Placement::Wait { why } => {
                 let standing = queue::standing(record, now, state.policy.aging_step);
+                let because = format!("it is waiting because {why}");
                 let sentence = queue::waiting_sentence_behind(
                     place + 1,
                     total,
                     &standing,
                     &queue::what_is_ahead(&queue, place, now, state.policy.aging_step),
-                    &format!("it is waiting because {why}"),
+                    &because,
                 );
-                say_it_waits(state, &record.id, &sentence)?;
+                said_it_waits.insert(record.id.clone());
+                say_it_waits(state, &record.id, &standing, &because, &sentence)?;
             }
             // Nothing anywhere can ever run it, so it ends here rather than
             // waiting for a machine that cannot exist (E-36). Terminal, and
@@ -2603,6 +2670,11 @@ fn dispatch_a_pass(state: &State) -> Result<()> {
             }
         }
     }
+    // A job that is no longer waiting is a job this hub has nothing to
+    // remember about a wait. Pruned here, against the pass that has just
+    // judged the whole queue, so a claimed job, a cancelled one and one that
+    // was found impossible all go in the same breath.
+    state.with_peers(|peers| peers.waiting.retain(|id, _| said_it_waits.contains(id)));
     Ok(())
 }
 
@@ -3256,7 +3328,12 @@ async fn say_again_why_jobs_wait(state: Arc<State>) {
             // yet had a reason for says nothing rather than saying nothing
             // useful.
             if wait_due && record.state == JobState::Queued {
-                if let Some(reason) = record.waiting_for {
+                // The sentence the last pass built, which carries this
+                // minute's position, before the one the record carries from
+                // whenever the cause last changed (D171). E-04 asks for the
+                // figures, and a restatement is exactly where a stale one
+                // would be read.
+                if let Some(reason) = state.why_it_waits(&job_id).or(record.waiting_for) {
                     // The clock is reset where the decision is taken, under
                     // the lock, so two passes cannot both find it due.
                     state
@@ -3306,25 +3383,81 @@ async fn say_again_why_jobs_wait(state: Arc<State>) {
 /// Record why a queued job is not starting, and tell whoever is waiting for
 /// it.
 ///
-/// The record first and unconditionally, so that a job nobody is following
-/// still says on its disk why nothing is happening to it (E-53). The note goes
-/// out only when the reason is *news*, because a requester following a job
-/// that waits an hour on one lock file wants one sentence, not one per
-/// dispatch pass — M8 owns the periodic re-statement E-04 asks for.
-fn say_it_waits(state: &State, job_id: &JobId, reason: &str) -> Result<()> {
-    let news = state
-        .store
-        .record_waiting(job_id, reason)
-        .with_context(|| format!("recording why {job_id} is waiting"))?;
+/// A job nobody is following still says on its disk why nothing is happening
+/// to it (E-53), and the note goes out only when the reason is *news*,
+/// because a requester following a job that waits an hour on one lock file
+/// wants one sentence, not one per dispatch pass — M8 owns the periodic
+/// re-statement E-04 asks for.
+///
+/// **News is what changed about this job, not what changed around it**
+/// (D171). The whole `sentence` is three things: the job's **cause**
+/// (`because` — the reading it waits for, the capability that is suspended,
+/// the machine it sticks to), the job's own **standing** (the level it was
+/// submitted at and the level the queue weighs it at now, E-18), and its
+/// **place among the others** — `74th of 184`, and the three jobs ahead by
+/// name.
+///
+/// Only the first two are facts about this job, and only they are news. The
+/// place changes whenever any *other* job is submitted, started or ended, so
+/// comparing whole sentences made every pass news for every queued job, and
+/// each one cost a rewritten `job.json` and an appended `events.jsonl` line,
+/// both fsynced, on a thread the runtime needed. A hundred and eighty-four
+/// of those per pass is what stopped the hub answering (D171).
+///
+/// The countdown to the next level is deliberately *not* in the key either:
+/// it is a clock, not an event, and it would make every job a write a
+/// minute. The level it counts down to **is** in the key, so a job that ages
+/// says so on its record the pass it happens.
+///
+/// Nothing is lost: the whole sentence is kept in [`Peers::waiting`] and is
+/// what every reader is given, so E-04's figures stay as fresh as the last
+/// pass without the disk hearing about it.
+fn say_it_waits(
+    state: &State,
+    job_id: &JobId,
+    standing: &queue::Standing,
+    because: &str,
+    sentence: &str,
+) -> Result<()> {
+    let news_of_this_job = format!(
+        "{} weighed as {}; {because}",
+        standing.declared, standing.effective
+    );
+    let news = state.with_peers(|peers| {
+        let waiting = peers
+            .waiting
+            .entry(job_id.clone())
+            .or_insert_with(|| Waiting {
+                recorded: None,
+                sentence: sentence.to_owned(),
+            });
+        waiting.sentence = sentence.to_owned();
+        waiting.recorded.as_deref() != Some(news_of_this_job.as_str())
+    });
     if !news {
         return Ok(());
     }
-    println!("herd-hub: {job_id} stays queued: {reason}");
+    let written = state
+        .store
+        .record_waiting(job_id, sentence)
+        .with_context(|| format!("recording why {job_id} is waiting"))?;
+    // Remembered once it is on the disk and not before: a write that failed
+    // propagates out of here, and the next pass must judge this news all
+    // over again rather than believe it was written down.
+    state.with_peers(|peers| {
+        if let Some(waiting) = peers.waiting.get_mut(job_id) {
+            waiting.recorded = Some(news_of_this_job);
+        }
+    });
+    if !written {
+        return Ok(());
+    }
+    println!("herd-hub: {job_id} stays queued: {sentence}");
     // News resets the cadence: a requester told the reason this second does
     // not want the same sentence again a second later because a clock
     // happened to come round (E-04's flooding half).
     state.with_peers(|peers| peers.wait_told.insert(job_id.clone(), Instant::now()));
-    let note = format!("this job is queued and has not started: {reason}");
+    let note = format!("this job is queued and has not started: {sentence}");
     for follower in state.followers_to_tell(job_id) {
         let _ = follower.send(FromHub::JobNote {
             job_id: job_id.clone(),
@@ -6184,7 +6317,12 @@ fn answer_a_wait(state: &State, outbox: &Outbox, job_id: JobId, wants_files: boo
         });
     }
     let metrics = record.metrics.clone();
-    let waiting_for = record.waiting_for.clone();
+    // The live sentence first, the record second (D171): a wait that attaches
+    // to a job queued behind two hundred others is told where it is now, not
+    // where it was when its cause was last written down.
+    let waiting_for = state
+        .why_it_waits(&record.id)
+        .or(record.waiting_for.clone());
     match record.state {
         // Answered from the record, which is the point of writing
         // one: a wait works an hour later, on another machine,
@@ -7273,8 +7411,11 @@ mod tests {
         let began = Instant::now();
         dispatch_queued_jobs(&state).expect("the pass runs");
         let writing = began.elapsed();
-        // The second writes nothing, because no sentence is news. That is
-        // what a steady-state pass costs.
+        // The second writes nothing, because no job's cause is news. That is
+        // what a steady-state pass costs — and since D171 it is also what a
+        // pass over a queue that has *moved* costs, which is the figure that
+        // matters: the one this pair measures held on v0.3.6 only because
+        // nothing between the two passes changed.
         let began = Instant::now();
         dispatch_queued_jobs(&state).expect("the pass runs again");
         let steady = began.elapsed();
@@ -7290,6 +7431,225 @@ mod tests {
              carry: something is quadratic"
         );
         assert!(steady < writing, "{steady:?} against {writing:?}");
+    }
+
+    /// How many `waiting` lines this job's `events.jsonl` holds.
+    ///
+    /// Read off the disk rather than counted through an instrumented store,
+    /// because the disk is what the first consumer measured: one of their
+    /// queued jobs had **94** of these lines, every one of them the same
+    /// explanation with a different ordinal in it (D171).
+    fn waiting_lines(store: &JobDirStore, id: &JobId) -> usize {
+        let path = store.job_dir(id).join("events.jsonl");
+        std::fs::read_to_string(&path)
+            .unwrap_or_default()
+            .lines()
+            .filter(|line| line.contains(r#""event":"waiting""#))
+            .count()
+    }
+
+    /// **The incident, as a count.** A queue that *moves* must not cost a
+    /// durable write on every job that is standing still in it (D171).
+    ///
+    /// The sentence a pass writes on a queued record carries the queue's
+    /// figures — `queued 76th of 120`, and the jobs ahead by name — so one
+    /// job arriving changes the sentence of every job already waiting while
+    /// changing the reason for none of them. `record_waiting` compared
+    /// sentences, found news every time, and rewrote `job.json` and appended
+    /// to `events.jsonl` for all of them, each fsynced.
+    ///
+    /// Twelve jobs arrive here, one per pass. The watched job's cause never
+    /// changes, so its history must hold the **one** line its first
+    /// judgement wrote. Before D171 it held thirteen, and on the first
+    /// consumer's 184-job queue that arithmetic is what filled a tokio
+    /// worker with uninterruptible disk wait for forty minutes.
+    #[test]
+    fn a_queue_that_moves_writes_nothing_about_the_jobs_standing_still_in_it() {
+        const QUEUED: usize = 120;
+        const ARRIVALS: usize = 12;
+        let dir = tempfile::tempdir().expect("a temporary state directory");
+        let store = Arc::new(JobDirStore::open(dir.path()).expect("the state root opens"));
+        for which in 0..QUEUED {
+            store
+                .create_job(NewJob::new(vec!["true".to_owned(), format!("{which}")]))
+                .expect("minted");
+        }
+        let state = Arc::new(State {
+            store: Arc::clone(&store) as Arc<dyn JobStore>,
+            policy: Policy::default(),
+            authority: Authority::default(),
+            started: Instant::now(),
+            peers: Mutex::new(Peers::default()),
+            dispatching: Mutex::new(()),
+        });
+
+        // The first judgement of a job is news and is written: a job nobody
+        // is following still says on its disk why nothing is happening to it
+        // (E-53). That line is the one this test allows.
+        dispatch_queued_jobs(&state).expect("the pass runs");
+        let watched = JobId::new("j0000000076".to_owned());
+        assert_eq!(
+            waiting_lines(&store, &watched),
+            1,
+            "the first pass to judge a job writes why it waits"
+        );
+
+        // And now the queue moves, exactly as the first consumer's did: jobs
+        // keep arriving behind it. Nothing about *why* the watched job waits
+        // changes at all — there is still no runner — but its sentence does,
+        // because the total in it does.
+        for arrival in 0..ARRIVALS {
+            store
+                .create_job(NewJob::new(vec![
+                    "true".to_owned(),
+                    format!("arrival {arrival}"),
+                ]))
+                .expect("minted");
+            dispatch_queued_jobs(&state).expect("the pass runs");
+        }
+
+        let lines = waiting_lines(&store, &watched);
+        assert_eq!(
+            lines, 1,
+            "{watched} is waiting for the reason it has waited for all along, and this hub \
+             wrote that down {lines} times over {ARRIVALS} passes: a queue that moves must \
+             not cost a record rewrite and an fsynced history line for every job standing \
+             still in it (D171)"
+        );
+
+        // E-04 is kept, and this is where: the figures a requester is told
+        // are **this** pass's, not the ones that held when the cause was
+        // last written down.
+        let fresh = state.why_it_waits(&watched).expect("the pass judged it");
+        assert!(
+            fresh.contains(&format!("of {}", QUEUED + ARRIVALS)),
+            "a requester asking why its job waits is told the queue as it is now: {fresh}"
+        );
+        // And the record carries the sentence that held when the cause was
+        // news, which is what a hub that restarts reads back. Said here so
+        // the trade is written down where it can be seen.
+        let recorded = store
+            .job(&watched)
+            .expect("the record reads")
+            .expect("the job is there")
+            .waiting_for
+            .expect("a reason");
+        assert!(
+            recorded.contains(&format!("of {QUEUED}")),
+            "the record keeps the sentence its cause was written with: {recorded}"
+        );
+    }
+
+    /// **The symptom, on a runtime.** A hub standing a deep queue must still
+    /// have a worker to answer with (D171).
+    ///
+    /// The first consumer's hub stopped answering `herdctl runner list`
+    /// entirely — three tries at 30 s and one at 180 s, all `rc 124` — while
+    /// using 1.8 % of a CPU. Their thread dump said why: of thirteen
+    /// threads, one was always in `D`, uninterruptible disk wait, and the
+    /// rest were waiting behind it. A dispatch pass is a blocking function
+    /// called straight from async callers, so a pass that spends seconds in
+    /// fsync is a tokio worker that spends seconds unavailable.
+    ///
+    /// This stands two passes against a two-worker runtime — the hub has a
+    /// dozen callers that each start one, and they serialize on
+    /// `dispatching` — and asks the runtime, from outside it, to poll a task
+    /// that does nothing at all. Under the defect no worker is free to do
+    /// it for as long as the passes run.
+    ///
+    /// **The figures, measured on the host this was written on**: 17.3 s on
+    /// v0.3.6, 0.23 s with D171. The bound is two seconds — a requester's
+    /// patience, deliberately not a figure about disks — which leaves either
+    /// side of it an order of magnitude of room on a slower box.
+    #[test]
+    fn a_deep_queue_leaves_the_runtime_a_worker_to_answer_with() {
+        const QUEUED: usize = 300;
+        const PASSES: usize = 4;
+        const WORKERS: usize = 2;
+        const PATIENCE: Duration = Duration::from_secs(2);
+
+        let dir = tempfile::tempdir().expect("a temporary state directory");
+        let store = Arc::new(JobDirStore::open(dir.path()).expect("the state root opens"));
+        for which in 0..QUEUED {
+            store
+                .create_job(NewJob::new(vec!["true".to_owned(), format!("{which}")]))
+                .expect("minted");
+        }
+        let state = Arc::new(State {
+            store: Arc::clone(&store) as Arc<dyn JobStore>,
+            policy: Policy::default(),
+            authority: Authority::default(),
+            started: Instant::now(),
+            peers: Mutex::new(Peers::default()),
+            dispatching: Mutex::new(()),
+        });
+        // Outside the measurement: the pass that judges every job for the
+        // first time writes a line for each, and is allowed to.
+        dispatch_queued_jobs(&state).expect("the first pass runs");
+
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(WORKERS)
+            .enable_all()
+            .build()
+            .expect("a runtime");
+        // One blocking pass loop per worker, each making the queue move
+        // between its passes, which is what every caller of
+        // `dispatch_queued_jobs` does: it is a synchronous function and it
+        // holds the worker that called it.
+        let mut passes = Vec::new();
+        for caller in 0..WORKERS {
+            let (state, store) = (Arc::clone(&state), Arc::clone(&store));
+            passes.push(runtime.spawn(async move {
+                for arrival in 0..PASSES {
+                    // Distinct work per caller: two submissions of the same
+                    // piece of work coalesce, and this test needs the queue
+                    // to grow.
+                    store
+                        .create_job(NewJob::new(vec![
+                            "true".to_owned(),
+                            format!("arrival {caller}.{arrival}"),
+                        ]))
+                        .expect("minted");
+                    dispatch_queued_jobs(&state).expect("the pass runs");
+                }
+            }));
+        }
+
+        // The requester, asked for from this thread rather than from a task,
+        // so that nothing about the measurement can be starved by the thing
+        // it is measuring. Twenty of them, because the first could be lucky
+        // and land before a pass has begun.
+        let mut worst = Duration::ZERO;
+        for _ in 0..20 {
+            let began = Instant::now();
+            let (answered, answer) = std_mpsc::channel();
+            runtime.spawn(async move {
+                let _ = answered.send(());
+            });
+            match answer.recv_timeout(Duration::from_secs(60)) {
+                Ok(()) => worst = worst.max(began.elapsed()),
+                Err(_) => {
+                    worst = Duration::from_secs(60);
+                    break;
+                }
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        for pass in passes {
+            runtime.block_on(pass).expect("the passes end");
+        }
+
+        println!(
+            "herd-hub: with {QUEUED} jobs queued and {WORKERS} passes running, the slowest \
+             turn the runtime gave a task that does nothing was {worst:?}."
+        );
+        assert!(
+            worst < PATIENCE,
+            "a task that does nothing waited {worst:?} for a turn while {WORKERS} dispatch \
+             passes ran over a {QUEUED}-job queue: the hub has no worker left to answer a \
+             requester or a health report with, which is how it stopped answering anything \
+             (D171)"
+        );
     }
 
     /// What the hub can check about a declaration without a repository, and
