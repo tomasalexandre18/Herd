@@ -17,21 +17,23 @@ host below is one they reported, dated the day they said it, never ours.
 The fleet as the consumer reported it at **11:54 on 2026-10-24**: the
 hub is **`herd-hub:0.3.6`**, the server's runner is **0.3.6** through a
 flake pin (their nixos-config `66d3eac`), `herdctl` is **0.3.6**, and
-the PC 4060's binary is staged for its next fill. They installed v0.3.6
-with their own `update.sh` and **no hand steps**: the fetch verified
-five assets and their sums, and their `same_numbers` check read
-`RECORD_VERSION: 1` and `PROTOCOL_VERSION: 2` out of the release body.
-They left `--readings-at-once` at its default of 2.
+the binary for the **PC 4060**, their own second machine, is staged for
+its next fill. They installed v0.3.6 with their own `update.sh` and
+**no hand steps**: the fetch verified five assets and their sums, and
+their `same_numbers` check read `RECORD_VERSION: 1` and
+`PROTOCOL_VERSION: 2` out of the release body. `--readings-at-once` is
+left at its default of 2.
 
-**The fleet is effectively one runner.** The PC 4060 has been returned
-to its owner, so the server's runner is the only machine connected. That
-is the shape of the fleet now, not a dip it is coming back from.
+**The fleet is effectively one runner.** The PC 4060 ran one at 0.3.3
+until its owner took it back, so the server's runner is the only machine
+connected — and it is not M17's prepared machine (D149), which is a
+different one again. That is the shape of the fleet now, not a dip it is
+coming back from.
 
-`main` carries M1-M11, M15 and M16, and decisions through D169. The
-fleet is on **protocol version 2** and **record version 1**, neither
-moved since v0.3.0 (D73). The gates are green with **12** loud skips
-(D27), every one a cgroup-delegation or ZFS `io.max` assertion, measured
-on this host on three separate branches today, byte-identical each time.
+`main` carries M1-M11, M15, M16 and decisions through D169. The fleet is
+on **protocol version 2** and **record version 1**, both unmoved since
+v0.3.0 (D73). The gates are green with **12** loud skips (D27), all of
+cgroup delegation or ZFS `io.max`, the same set on three branches today.
 
 **v0.3.4, v0.3.5 and v0.3.6** are published, cut on 2026-10-23 and
 2026-10-24, each verified by consuming it: the path that produced
@@ -42,18 +44,17 @@ bare matchable lines (D168), so an operator's updater decides alone.
 ## What v0.3.6 fixed, and what it cost the consumer
 
 On 2026-10-24 the consumer submitted a **214-job nightly pass at once**
-against the single runner. Every job needed a requirement reading, a
-reading reserved nothing at all, and about **200 ran together** on a
-20 GiB, eight-thread lend. The host saturated, the kvm probe missed its
-2 000 ms answer in a loop and the capability was suspended (D49), and
-**201 of the 214 jobs ended 125 with no test run**. A second occurrence
-the same day reached **255 concurrent readings at host load 399**, and
-both hub and runner stayed up. v0.3.6 bounds readings per runner
-(`--readings-at-once`, default 2, queued and never refused), stops a
-*lost* reading from refusing the job it was read for, and makes the
-watchdog ask the holding runner's last health report before believing
-its own clock (D169). That closes yesterday's open item, a requirement
-reading that weighs nothing.
+against the single runner. Every job needed a requirement reading, which
+reserved nothing at all, and about **200 ran together** on a 20 GiB,
+eight-thread lend. The host saturated, the kvm probe missed its 2 000 ms
+answer in a loop and the capability was suspended (D49), and **201 of
+the 214 jobs ended 125 with no test run**. A second occurrence the same
+day reached **255 concurrent readings at host load 399**; both stayed
+up. v0.3.6 bounds readings per runner (`--readings-at-once`, default 2,
+queued and never refused), stops a *lost* reading from refusing the job
+it was read for, and makes the watchdog ask the holding runner's last
+health report before believing its own clock (D169). That closes
+yesterday's open item, a reading that weighs nothing.
 
 ## What is not done, and why
 
@@ -64,10 +65,10 @@ reading that weighs nothing.
    either protocol enum — so E-12 and E-17 are undelivered.
 3. **The hub re-reads every job record** on each 200 ms poll of a
    waiting `--outputs-to` (D152), invisible at today's count.
-4. **M17's second machine is prepared, not joined** (D149): the unknown
-   is whether a user scope on WSL2 gets a delegated subtree with
-   `memory` in it. With the PC 4060 gone, that join is also what would
-   end the single-runner fleet.
+4. **M17's second machine is prepared, not joined** (D149), a different
+   machine from the PC 4060: the unknown is whether a user scope on
+   WSL2 gets a delegated subtree with `memory` in it. With the 4060
+   gone, that join is also what would end the single-runner fleet.
 5. **One shared token**: any requester may ask for the merger level.
 6. **D166 shipped only half of the fleet listing**: `herdctl runner
    list` gives each runner's version and suspended capabilities but not
@@ -84,7 +85,6 @@ it exists a figure about their host comes from them, not from us.
 ## Next action
 
 **The consumer's next full pass is 2026-10-25 at 03:00** — 214 jobs at
-once against one runner — and the first real test of the cap at 2 on a
-20 GiB, eight-thread lend. The default is a recommendation, not a
-measurement, and their run is what would change it. Then the janitor
-list (D134), then M17's join.
+once against one runner, the first test of the cap at 2 on a 20 GiB,
+eight-thread lend. The default is a recommendation, not a measurement;
+their run would change it. Then D134's janitor list, then M17's join.
