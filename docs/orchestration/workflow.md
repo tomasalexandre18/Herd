@@ -10,7 +10,7 @@ owes before it stops. `CLAUDE.md` is the contract; this is the procedure.
 | orchestrator (main session) | receives the goal, reads the board, picks agents, writes briefs, reads evidence, asks Alexa one question at a time, reports in French | edit a repository file, commit, merge, resolve a conflict, tag, release, declare a skip a pass, report an agent's claim unverified |
 | `herd-planner` | analyses a request, lists alternatives and hypotheses to refute, cuts bounded tasks | modify the product, merge, settle an owner decision |
 | `herd-step` | one bounded task on its own branch and worktree, with the gates the task needs, evidence and a handoff | leave its write paths, touch `main`, another agent's worktree, or the running instance |
-| `herd-merger` | integrates one branch: rebase or merge, conflicts, gates, D-number allocation, board and status update, PR, and the merge itself when ORCH-001 allows | bypass a gate, decide a specification or invariant change, operate Herd |
+| `herd-merger` | integrates one branch: rebase or merge, conflicts, gates, D-number allocation, board and status update, PR, and the merge itself (standing authorisation ORCH-001) | bypass a gate, decide a specification or invariant change, operate Herd |
 | `herd-release` | prepares a release: checklist, version, body, evidence; simulation only until Alexa orders a tag | tag, push a tag, publish, deploy |
 | `herd-reviewer` | adversarial review of a plan, a rule change, a permission change or an unresolvable conflict; lists missing evidence and adverse cases | edit anything, replace the owner |
 
@@ -40,17 +40,19 @@ What is technically enforced and what is only written is in
    `origin/main`, resolves conflicts in its worktree, allocates `D`
    numbers (`D-NEXT` → next free number, gaps stay), runs the gates the
    change needs, updates `board.md` and `docs/status.md`, opens or
-   updates the PR with Evidence, and merges only if the board records
-   the authorisation (ORCH-001) or Alexa gave the word for this PR.
+   updates the PR with Evidence, waits for CI, and merges: Alexa's standing
+   authorisation (ORCH-001, 2026-10-24) covers every PR whose CI is green
+   and whose Evidence block is filled. A tag is never part of this step.
 8. **Release.** On Alexa's order, `herd-release` prepares the checklist
    and the PR that bumps the version; the tag itself is pushed by whoever
    Alexa names in that order. Nothing in this project deploys.
 
 ## Permissions and escalation
 
-- Alexa decides: milestone order, invariants, merges to `main` until
-  ORCH-001 is settled, tags, releases, GitHub issues, anything on the
-  consumer's side.
+- Alexa decides: milestone order, invariants, pushing a tag, publishing a
+  release (each act singly), GitHub issues, anything on the consumer's
+  side. Merging a CI-green PR with filled Evidence is `herd-merger`'s
+  (ORCH-001); merging a version PR does not publish its release.
 - A question for Alexa is one item in the board's *Waiting* section:
   question, recommendation, impact, fallback, date. Work that does not
   depend on it continues. Nobody invents the answer.

@@ -4,7 +4,8 @@
 - **Agent:** the remediation agent (mandate v1.0, bootstrap exception)
 - **Branch / commit:** `orchestration-remediation` / see `git log
   origin/main..`, based on `origin/main` `3da48f5`
-- **PR:** opened from this branch, left unmerged (ORCH-001)
+- **PR:** #71, open; mergeable by `herd-merger` under ORCH-001 (decided
+  2026-10-24) once CI is green and Alexa has answered ORCH-002
 
 ## Done
 
@@ -22,7 +23,13 @@ That is V6 for real.
 
 ## Not done, and why
 
-- Nothing merged: ORCH-001 is waiting. The PR is prepared.
+- Nothing merged: ORCH-002 is still waiting, and this PR is the one that
+  carries the invariant wording it asks about. ORCH-001 is decided
+  ("non il peux merge par defaut"): `herd-merger` merges by standing
+  authorisation; tags and releases stay on Alexa's word per act.
+- Two invariants (3 and 6) had been shortened without notice in the
+  first rewrite; the orchestrator's review caught it and both are
+  restored verbatim (gotcha `invariants-are-quoted-not-reflowed`).
 - The `MEMORY.md` pointer (in `memory.md`) is not applied: outside the
   repository.
 - ORCH-030 (shared `CLAUDE_CONFIG_DIR`) is the owner's host configuration.
@@ -41,13 +48,15 @@ See `remediation-report.md` §12.
 
 ## Decisions needed
 
-ORCH-001 (merge authority) — recommendation on the board; ORCH-002
-(invariant wording) — accept.
+ORCH-002 (invariant 8 extended, invariant 9 added) — accept. ORCH-001 is
+decided and recorded in `CLAUDE.md`, the board, `workflow.md`,
+`herd-merger.md` and D173.
 
 ## Resume point
 
-Read the board. If ORCH-001 is answered: brief `herd-merger` to integrate
-this PR (its CI must be green; the PR's Evidence is in the body). Then
+Read the board. When ORCH-002 is answered: brief `herd-merger` to
+integrate PR #71 (CI green, Evidence in the body; ORCH-001 grants the
+merge). No tag is involved. Then
 ORCH-010. If the running orchestrator has not yet got this contract, it
 still reads the 2026-10-13 `CLAUDE.md`: the first thing after the merge is
 a fresh session.

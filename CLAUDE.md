@@ -44,21 +44,26 @@ where we say "requester". Translate when triaging; do not adopt their words.
    memory cap and time cap. A runner stops cleanly in **≤ 5 s** when its owner
    asks, and refuses new jobs while draining.
 3. **Runners dial out for control; no port is ever opened on a router.** A
-   runner needs nothing inbound to work. It may listen on a **private mesh
-   interface** only (D10, D11). Herd itself builds and requires no network.
+   runner opens the control connection to the hub and needs nothing inbound to
+   work. It may listen on a **private mesh interface** to serve content to
+   peers (D10, D11) — bound to that interface only, never on a default or
+   public one, and never behind a port forwarded on someone's box. Herd itself
+   builds and requires no network.
 4. **The protocol is the contract.** All messages live in `herd-proto`, the
    handshake carries a protocol version, nothing is sent ad hoc.
 5. **Done means a passing test.** "It compiles" is not done. Every milestone
    ships unit tests plus one real end-to-end hub+runner test. A skipped
    assertion is printed as skipped and never reported as passed (D27).
-6. **A requester never names a machine.** Selection is the hub's job.
+6. **A requester never names a machine.** Selection is the hub's job, based on
+   declared capabilities and priority.
 7. **No secrets in the repo.** Config via environment variables or a file path
    given at startup.
 8. **Docs discipline.** `docs/status.md` is *state*, replaced every session,
    never a journal. `docs/decisions.md` is append-only, one dated entry per
    decision, numbers are identifiers and gaps stay (D148); only
    `herd-merger` appends to it, one branch at a time. `docs/plan.md` holds
-   the milestones, `docs/coverage.md` maps the consumer's expectations.
+   the milestones and `docs/coverage.md` maps the first consumer's numbered
+   expectations to them.
    `docs/orchestration/board.md` is the one list of open work and
    waiting decisions; `scripts/check-docs.sh` enforces what it can.
 9. **Herd is shipped, not operated (D161).** Nobody in this project logs
@@ -104,12 +109,13 @@ passed.
   `.github/pull_request_template.md`, with real command output as Evidence.
 - CI must be green before merge: jobs `check` and `docs`. Never
   `--no-verify`, never force-push, never a red merge.
-- **`main` moves only on Alexa's word.** Whether a standing authorisation
-  exists is ORCH-001 in `docs/orchestration/board.md`; until it is recorded
-  there as granted, a PR is prepared, verified and left unmerged. When a
-  merge is authorised, `herd-merger` performs it.
-- Tags and releases are Alexa's to order; `herd-release` prepares, Alexa or
-  an explicitly authorised run publishes.
+- **Merging is `herd-merger`'s, by standing authorisation** (Alexa,
+  2026-10-24, ORCH-001: *"non il peux merge par defaut"*): any PR whose CI
+  is green and whose Evidence block is filled, `cut-v*`, `.github/`,
+  `CLAUDE.md` and `.claude/` included. Nobody else merges.
+- **Pushing a tag and publishing a release stay on Alexa's word, one act
+  at a time.** Merging a version PR and publishing its release are two
+  different acts; `herd-release` prepares and never publishes.
 
 ## Shared host rules
 

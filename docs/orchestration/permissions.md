@@ -40,7 +40,8 @@ here either.
 | `herd-planner`, `herd-reviewer` | `Write` outside their one handoff file | refused | contractual | — |
 | `herd-step`, `herd-merger` | `Agent` (re-delegation) | removed | frontmatter `disallowedTools` | live V2 |
 | `herd-step` | `main`, PR, tag, release, other worktrees | refused | contractual; branch protection makes a push to `main` fail on GitHub's side | live V2 |
-| `herd-merger` | merge without ORCH-001 or Alexa's word | refused | contractual; branch protection requires green `check` and `docs` | live V4 |
+| `herd-merger` | merge with a red check or an empty Evidence block | refused | branch protection requires green `check` and `docs`; the Evidence part is contractual. A green, evidenced PR is merged under Alexa's standing authorisation (ORCH-001, 2026-10-24) | live V4 |
+| `herd-merger` | push a tag with the version PR | refused | contractual (Alexa's word per release act); `orchestrator-guard.sh` does not apply to agents | live V4 |
 | `herd-release` | `git tag`, tag push, `gh release`, `gh workflow run`, `gh api …dispatches`, docker, systemctl, ssh, sudo | refused | frontmatter hook `release-guard.sh` | synthetic; live V10 |
 | anyone | `--no-verify`, force-push, red merge | refused | branch protection (force-push and deletion blocked; `check` and `docs` required); `--no-verify` contractual | GitHub API read 2026-10-24 |
 | anyone | the consumer's instance, `/etc/nixos`, containers | refused | contractual (D161); the shared `CLAUDE_CONFIG_DIR` currently *allows* sudo for chatOnS's session — ORCH-030 | — |

@@ -8213,10 +8213,14 @@ decision now: it does not remove the allocation race by itself and costs a
 168-file migration; analysed in `docs/orchestration/decisions-structure.md`
 and left to the owner (ORCH-003).
 
-**Still the owner's.** Whether a standing merge authorisation exists
-(ORCH-001); the invariant wording (ORCH-002); the journal's layout
-(ORCH-003); the shared `CLAUDE_CONFIG_DIR` (ORCH-030). Until ORCH-001 is
-answered every PR is prepared and left open.
+**Decided the same day.** Alexa, asked ORCH-001 through the orchestrator,
+answered *"non il peux merge par defaut"*: `herd-merger` merges any PR whose
+CI is green and whose Evidence block is filled, without a per-PR word and
+with no excluded path. Pushing a tag and publishing a release are a separate
+act and stay on Alexa's word, each one singly.
+
+**Still the owner's.** The invariant wording (ORCH-002); the journal's
+layout (ORCH-003); the shared `CLAUDE_CONFIG_DIR` (ORCH-030).
 
 **On the number.** This entry is D173; `origin/main` ends at D171, PR #67
 holds D170 and PR #70 holds D172, so 173 is the next free number above

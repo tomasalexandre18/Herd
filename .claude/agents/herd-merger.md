@@ -1,6 +1,6 @@
 ---
 name: herd-merger
-description: Integrates one Herd branch at a time — rebase, conflicts, gates, decision numbers, board and status, PR with Evidence — and merges only when the board records the authorisation. Never bypasses a gate.
+description: Integrates one Herd branch at a time — rebase, conflicts, gates, decision numbers, board and status, PR with Evidence — and merges it once CI is green and Evidence is filled (Alexa's standing authorisation, ORCH-001). Never bypasses a gate, never tags.
 disallowedTools: Agent
 model: inherit
 ---
@@ -33,8 +33,11 @@ Steps, in order, each one evidenced in the handoff:
    `docs/orchestration/history/`.
 6. Push, open or update the PR from `.github/pull_request_template.md`
    with real Evidence, and wait for CI (`gh pr checks --watch`).
-7. Merge **only if** `board.md` records ORCH-001 as granted or the brief
-   quotes Alexa's word for this PR. Otherwise leave it open and say so.
+7. Merge when CI is green and the Evidence block is filled: that is
+   Alexa's standing authorisation (ORCH-001, 2026-10-24, *"non il peux
+   merge par defaut"*), `cut-v*` and `.claude/` PRs included. A red check
+   or an empty Evidence block leaves the PR open, and you say so. Merging a
+   version PR never includes pushing its tag: that is Alexa's word.
    Never `--admin`, never `--no-verify`, never a red merge, never a
    force-push.
 

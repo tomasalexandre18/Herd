@@ -14,7 +14,10 @@ nobody can settle — not for routine edits.
 Your job is to try to break it. For the artefact the brief names:
 
 - State the claim it makes and the evidence it offers; mark every claim
-  that has no evidence or whose evidence is a promise.
+  that has no evidence or whose evidence is a promise. When `CLAUDE.md`
+  "Invariants" is in the diff, name every removed word, however small:
+  a shortened invariant is a weakened one (gotcha
+  `invariants-are-quoted-not-reflowed`).
 - List the adverse cases: how an agent could follow the text and still
   do harm, how a rule could be bypassed, what a fresh session would get
   wrong reading it, what contradicts `CLAUDE.md`, an invariant, D27 or

@@ -102,7 +102,7 @@ Files that may change: `CLAUDE.md`, `.gitignore` (one line),
 
 | File | Change | Why |
 |---|---|---|
-| `CLAUDE.md` | rewritten, 141 lines | roles split (orchestrator / five agents), "works alone" gone, docs-only gate rule reconciled with D27, `main` authority stated as ORCH-001, invariant 8 extended and invariant 9 added (ORCH-002), shared-host rules, session start/end |
+| `CLAUDE.md` | rewritten, 147 lines | roles split (orchestrator / five agents), "works alone" gone, docs-only gate rule reconciled with D27, merging recorded as `herd-merger`'s standing authorisation and tags/releases as Alexa's per act (ORCH-001, decided 2026-10-24), invariant 8 extended and invariant 9 added (ORCH-002), shared-host rules, session start/end. **Correction:** the first rewrite had shortened invariants 3 and 6 without saying so; the orchestrator's review caught it and both are restored verbatim — invariants 1–7 now differ from `3da48f5` only by one added sentence in 5 (D27) |
 | `.gitignore` | `.claude/` narrowed to `worktrees/`, agent memory, local settings, trace switches | roles, hooks and settings become versioned |
 | `.claude/agents/herd-{planner,step,merger,release,reviewer}.md` | new | one bounded role each; `disallowedTools` where the harness can remove a tool; `herd-release` carries its guard hook |
 | `.claude/hooks/orchestrator-guard.sh`, `release-guard.sh`, `.claude/settings.json` | new | best-effort technical restriction of the main session and of the release role; fail open; `DISABLED` switch |
@@ -183,8 +183,8 @@ corresponding output is in `history/2026-10-24-h7-evidence/`.
 
 Branch `orchestration-remediation` from `origin/main` `3da48f5`, pushed;
 commits listed by `git log origin/main..orchestration-remediation`. PR
-opened from the template with real Evidence and **left unmerged**
-(ORCH-001). CI on the PR is the proof of the Rust gates, which were not
+#71, opened from the template with real Evidence; mergeable by
+`herd-merger` under ORCH-001 once CI is green and ORCH-002 is answered. CI on the PR is the proof of the Rust gates, which were not
 run locally (prose, scripts and `.claude` only). Rollback: close the PR
 and delete the branch; nothing outside the branch was changed. Test
 fixtures (`v2-gotcha-note`, `v3a-brief-gate-note`, `v3b-handoff-note`,
@@ -195,9 +195,11 @@ copied, then removed; none was pushed.
 
 Blocking for "ready without reserve":
 
-- ORCH-001 — authority over `main` is documented as an open question,
-  not settled. Until Alexa answers, PRs are prepared and left open.
 - ORCH-002 — invariant 8 wording and invariant 9 need the owner's accept.
+  Settled the same day and no longer a gap: ORCH-001, Alexa's *"non il
+  peux merge par defaut"* — `herd-merger` merges any CI-green PR with
+  filled Evidence, no path excluded; pushing a tag and publishing a
+  release stay on Alexa's word, one act at a time.
 
 Non-blocking:
 
@@ -214,9 +216,10 @@ Non-blocking:
 
 **PRÊTE SOUS RÉSERVES.** The contract, roles, board, checks and hooks
 exist, are versioned, go red when broken, and held under eleven live
-sessions. The reserves are the two owner decisions above (ORCH-001,
-ORCH-002) and the merge of this PR itself, without which the running
-orchestrator still reads the 2026-10-13 `CLAUDE.md`.
+sessions. The reserves are ORCH-002 (the owner's accept of invariants 8 and 9,
+asked on a diff that now restores 3 and 6 verbatim) and the merge of this
+PR itself, without which the running orchestrator still reads the
+2026-10-13 `CLAUDE.md`. ORCH-001 was answered during the mandate.
 
 ## 14. Suggested next step
 
