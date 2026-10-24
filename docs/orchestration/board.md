@@ -57,6 +57,7 @@ started), `open` (not yet agreed or sized), `active` (an agent holds it),
 
 1. Alexa answers ORCH-002 (one question); ORCH-001 is decided.
 2. `herd-merger` merges the remediation PR (#71) under ORCH-001 once CI is
-   green and ORCH-002 is answered; the orchestrator then applies the `MEMORY.md` pointer from `memory.md`
+   green and ORCH-002 is answered; the orchestrator then applies the
+   `MEMORY.md` pointer from `memory.md`
    and starts its next session from the board.
 3. ORCH-010: status restated after v0.3.7; ORCH-031: the brief rule.

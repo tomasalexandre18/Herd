@@ -184,8 +184,9 @@ corresponding output is in `history/2026-10-24-h7-evidence/`.
 Branch `orchestration-remediation` from `origin/main` `3da48f5`, pushed;
 commits listed by `git log origin/main..orchestration-remediation`. PR
 #71, opened from the template with real Evidence; mergeable by
-`herd-merger` under ORCH-001 once CI is green and ORCH-002 is answered. CI on the PR is the proof of the Rust gates, which were not
-run locally (prose, scripts and `.claude` only). Rollback: close the PR
+`herd-merger` under ORCH-001 once CI is green and ORCH-002 is answered.
+CI on the PR is the proof of the Rust gates, which were not run locally
+(prose, scripts and `.claude` only). Rollback: close the PR
 and delete the branch; nothing outside the branch was changed. Test
 fixtures (`v2-gotcha-note`, `v3a-brief-gate-note`, `v3b-handoff-note`,
 `v4-x`, `v4-y`, `v4m-merge`, `v6-task`) were inspected, their evidence
