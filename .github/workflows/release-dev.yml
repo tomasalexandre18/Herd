@@ -1,0 +1,78 @@
+# The hotfix lane. A `v*.*.*-dev*` tag on **any** branch publishes a
+# development build — the three static binaries, the hub's image archive and
+# `SHA256SUMS` — as a GitHub pre-release, without going through `main`.
+#
+# **Why it exists.** On 2026-10-23 two releases went out an hour apart, the
+# second undoing a regression the first had put on the first consumer's only
+# runner. Almost none of that hour was the fix. It was a pull request, CI, a
+# merge, a conflict in `docs/decisions.md`, a second pull request to cut the
+# version, CI again, a merge, a tag and a release build. The fix itself was
+# minutes. This lane removes the procedure and keeps the build (D172).
+#
+# **It is nine lines and not a second workflow**, deliberately. Everything
+# that makes the bytes is `release.yml`, called below: the same
+# `nix build .#static` and `nix build .#hub-image`, the same assertion that
+# nothing is dynamically linked, the same hub-runner-two-jobs smoke on
+# `archlinux` and on `alpine`, the same hub started out of the loaded
+# archive, the same `RECORD_VERSION` and `PROTOCOL_VERSION` read out of the
+# source with `sed` and asserted numeric (D168). A dev build an operator
+# cannot install, or one that behaves unlike the release that will follow it,
+# would cost more than the hour it saves — and a copy of those steps living
+# here would come to differ from the original without anybody deciding that
+# it should.
+#
+# **What the lane really skips is `ci.yml`, which never ran here anyway.**
+# `ci.yml` triggers on a pull request and on a push to `main`, so no tag has
+# ever started it. The seven minutes this lane saves are not saved by
+# omitting a job from this file; they are saved by there being no pull
+# request. That is also where the honesty lives: `nix flake check`, `cargo
+# fmt`, `cargo clippy` and `./scripts/test.sh` are run **on the branch, by
+# whoever pushes the tag**, and nothing in GitHub checks that they were. The
+# release body says so in its first paragraph, because the person deciding
+# whether to install this is the person who needs to know it.
+#
+# **The version in the tag is the workspace's version**, because the file
+# names and the image tag come from `Cargo.toml` and would otherwise lie
+# about what is inside them — `release.yml` asserts it and refuses the tag
+# before building anything. So a hotfix branch bumps
+# `workspace.package.version` to the version it is fixing towards and tags
+# `v<that>-dev1`, `-dev2`, and so on. That bump is one line, and the branch
+# needs it to become a release later regardless.
+name: release-dev
+
+on:
+  push:
+    tags:
+      # The same pattern `release.yml` excludes, so that exactly one of the
+      # two workflows answers any tag. Three numbers and then `-dev`:
+      # `v0.3.8-dev1`. A `-rc1` is not this lane — a release candidate is
+      # cut from `main` and goes through `release.yml` like a release.
+      - "v*.*.*-dev*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: >-
+          A dev tag that already exists, to publish again. This is the
+          recovery door: a tag whose run failed halfway — a flaky smoke, a
+          GitHub outage — is republished from here without pushing a second
+          tag for the same commit. It does not create tags, and there is no
+          branch input: see the file's comments for why.
+        required: true
+        default: ""
+
+permissions:
+  contents: write
+
+jobs:
+  publish:
+    name: development build
+    permissions:
+      # The called workflow's token can hold no more than this job's, and
+      # it publishes a release.
+      contents: write
+    uses: ./.github/workflows/release.yml
+    with:
+      dev: true
+      # Empty on a tag push, and ignored there: the called workflow sees
+      # this run's own ref and releases under the tag that started it.
+      tag: ${{ inputs.tag || '' }}
