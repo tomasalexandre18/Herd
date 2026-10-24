@@ -16,3 +16,7 @@ result-*
 # purpose: a test fixture may legitimately be called `expected.out`.
 hub.out
 hub.err
+
+# The guard's own logging switches: a local debugging aid, never content.
+.claude/hooks/.log-to
+.claude/hooks/.log-raw

@@ -18,3 +18,4 @@ versioned source.
 | `own-scratchpad-no-pkill.md` | 2026-10-23 | one scratchpad subdirectory per agent; never `pkill -f` |
 | `shared-config-dir.md` | 2026-10-24 | `CLAUDE_CONFIG_DIR` is shared with chatOnS; its `autoMode` persona does not apply to Herd |
 | `decision-number-collisions.md` | 2026-10-16, 2026-10-23 | parallel branches take the same `D` number; the merger allocates, gaps stay |
+| `brief-names-the-worktree.md` | 2026-10-24 | a brief names the agent's worktree; the hook cannot keep an agent out of the checkout, only the brief can |

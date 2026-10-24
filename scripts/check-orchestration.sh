@@ -104,6 +104,8 @@ hook() { # <expected exit> <json>
 hook 2 "{\"tool_name\":\"Edit\",\"cwd\":\"$R\",\"tool_input\":{\"file_path\":\"$R/docs/status.md\"}}"
 hook 2 "{\"tool_name\":\"Write\",\"cwd\":\"$R\",\"tool_input\":{\"file_path\":\"docs/status.md\"}}"
 hook 0 "{\"tool_name\":\"Edit\",\"cwd\":\"$R\",\"agent_id\":\"abc\",\"tool_input\":{\"file_path\":\"$R/docs/status.md\"}}"
+hook 0 "{\"tool_name\":\"Edit\",\"cwd\":\"$R\",\"agent_type\":\"herd-step\",\"tool_input\":{\"file_path\":\"$R/docs/status.md\"}}"
+hook 0 "{\"tool_name\":\"Bash\",\"cwd\":\"$R\",\"agent_type\":\"herd-merger\",\"tool_input\":{\"command\":\"git merge --no-ff x\"}}"
 hook 0 "{\"tool_name\":\"Write\",\"cwd\":\"$R\",\"tool_input\":{\"file_path\":\"/tmp/claude-1002/x/brief.md\"}}"
 hook 0 "{\"tool_name\":\"Edit\",\"cwd\":\"$R\",\"tool_input\":{\"file_path\":\"$R/.claude/worktrees/agent-1/docs/x.md\"}}"
 hook 2 "{\"tool_name\":\"Bash\",\"cwd\":\"$R\",\"tool_input\":{\"command\":\"cd x && git commit -m hi\"}}"
@@ -126,6 +128,44 @@ hook 0 "not json at all"
 touch "$G.DISABLED.tmp"; mv "$G.DISABLED.tmp" .claude/hooks/DISABLED
 hook 0 "{\"tool_name\":\"Bash\",\"cwd\":\"$R\",\"tool_input\":{\"command\":\"git commit -m hi\"}}"
 rm -f .claude/hooks/DISABLED
+echo "== the holes the V7 review found (ORCH-004), now closed"
+# A ".." segment must not let a path pose as an agent worktree, and must not
+# hide the repository prefix behind another directory.
+hook 2 "{\"tool_name\":\"Edit\",\"cwd\":\"$R\",\"tool_input\":{\"file_path\":\"$R/.claude/worktrees/../../docs/x.md\"}}"
+hook 2 "{\"tool_name\":\"Write\",\"cwd\":\"$R\",\"tool_input\":{\"file_path\":\"/tmp/..$R/docs/x.md\"}}"
+hook 2 "{\"tool_name\":\"Edit\",\"cwd\":\"$R/docs\",\"tool_input\":{\"file_path\":\"../CLAUDE.md\"}}"
+# ... while a real agent worktree still passes, "." and ".." included.
+hook 0 "{\"tool_name\":\"Edit\",\"cwd\":\"$R\",\"tool_input\":{\"file_path\":\"$R/.claude/worktrees/a-1/./docs/x.md\"}}"
+hook 0 "{\"tool_name\":\"Edit\",\"cwd\":\"$R\",\"tool_input\":{\"file_path\":\"$R/.claude/worktrees/a-1/../a-2/docs/x.md\"}}"
+# A relative redirection while the shell stands in the checkout.
+hook 2 "{\"tool_name\":\"Bash\",\"cwd\":\"$R\",\"tool_input\":{\"command\":\"echo x > a.md\"}}"
+hook 2 "{\"tool_name\":\"Bash\",\"cwd\":\"$R\",\"tool_input\":{\"command\":\"cd docs && echo x > a.md\"}}"
+hook 2 "{\"tool_name\":\"Bash\",\"cwd\":\"/tmp/claude-1002/x\",\"tool_input\":{\"command\":\"cd $R/docs && echo x > a.md\"}}"
+# Git verbs that rewrite a checkout without committing anything.
+hook 2 "{\"tool_name\":\"Bash\",\"cwd\":\"$R\",\"tool_input\":{\"command\":\"git reset --hard\"}}"
+hook 2 "{\"tool_name\":\"Bash\",\"cwd\":\"$R\",\"tool_input\":{\"command\":\"git checkout -- docs/status.md\"}}"
+hook 2 "{\"tool_name\":\"Bash\",\"cwd\":\"$R\",\"tool_input\":{\"command\":\"git stash\"}}"
+hook 2 "{\"tool_name\":\"Bash\",\"cwd\":\"$R\",\"tool_input\":{\"command\":\"git clean -fd\"}}"
+# An agent is still free to do all of it.
+hook 0 "{\"tool_name\":\"Bash\",\"cwd\":\"$R\",\"agent_id\":\"a1\",\"tool_input\":{\"command\":\"cd docs && echo x > a.md\"}}"
+hook 0 "{\"tool_name\":\"Bash\",\"cwd\":\"$R\",\"agent_type\":\"herd-merger\",\"tool_input\":{\"command\":\"git reset --hard\"}}"
+# The orchestrator's own reading and scratchpad writing stay possible.
+hook 0 "{\"tool_name\":\"Bash\",\"cwd\":\"$R\",\"tool_input\":{\"command\":\"git log -1 > /tmp/claude-1002/x/out\"}}"
+hook 0 "{\"tool_name\":\"Bash\",\"cwd\":\"$R\",\"tool_input\":{\"command\":\"./scripts/check-docs.sh 2>&1 | tail -5\"}}"
+hook 0 "{\"tool_name\":\"Bash\",\"cwd\":\"$R\",\"tool_input\":{\"command\":\"wc -l docs/status.md >/dev/null\"}}"
+# The guard needs perl: without it it fails open, so its absence is a failure
+# of this host, not a pass (V7, finding 7).
+command -v perl >/dev/null 2>&1 && ok "perl is present, the guard can parse" \
+  || bad "no perl: orchestrator-guard.sh fails open on this host" ""
+# The guard's logging switches must not sit in the tree: .log-raw writes whole
+# hook payloads to disk (V7, finding 5).
+if [ -e .claude/hooks/.log-to ] || [ -e .claude/hooks/.log-raw ]; then
+  bad "a logging switch is live in .claude/hooks" "    remove .log-to / .log-raw"
+else ok "no logging switch left in .claude/hooks"; fi
+git check-ignore -q .claude/hooks/.log-to && git check-ignore -q .claude/hooks/.log-raw \
+  && ok "the logging switches are gitignored" \
+  || bad "the logging switches are not gitignored (invariant 7)" ""
+
 echo "== known bypasses, documented in docs/orchestration/permissions.md (these pass on purpose)"
 hook 0 "{\"tool_name\":\"Bash\",\"cwd\":\"$R\",\"tool_input\":{\"command\":\"git -c a=b commit -m hi\"}}"
 hook 0 "{\"tool_name\":\"Bash\",\"cwd\":\"$R\",\"tool_input\":{\"command\":\"/usr/bin/git commit -m hi\"}}"
