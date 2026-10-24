@@ -1,0 +1,107 @@
+# Review — orchestrator-guard.sh and its registration (ORCH-004 / V7)
+
+Reviewer: herd-reviewer. Read-only; the only file written is this one.
+
+## Brief premises
+
+- **(a) CLAUDE.md limit is 200 lines — REFUTED.** `scripts/check-docs.sh:13`
+  reads `limit=150`. CLAUDE.md is 141 lines (`wc -l`), so 9 lines of room,
+  not 59. Any contract addition larger than 9 lines turns `docs` red.
+- **(b) The guard uses `permission_mode` — REFUTED.** The field appears
+  nowhere in `.claude/`, `scripts/` or `docs/` (grep, no hit). The guard keys
+  on `agent_id` / `agent_type`: `orchestrator-guard.sh:29` (extraction) and
+  `:41` (`[ -n "$agent_id$agent_type" ] && exit 0`).
+  `permissions.md:18-20` says explicitly that the mode is *not* a lever.
+- **(c) A `permissions.deny` on Edit is simpler and stronger — REFUTED.**
+  `permissions.md:9-12`: deny applies to the main session and to every
+  spawned agent, so it would paralyse `herd-step`. It is simpler but not
+  usable. The claim is the doc's own and I could not test it offline (no live
+  session); it is consistent with Claude Code's documented behaviour but is a
+  claim, not evidence, until the live V7 run is recorded (`permissions.md:58-61`
+  is still a placeholder).
+
+## Findings, by severity
+
+### 1. High — the claimed Edit/Write rule is bypassed by `..` segments
+No path normalisation at `orchestrator-guard.sh:50-54`. Tested (hook run on a
+synthetic input, cwd = repo root, no agent field):
+- `file_path = $R/.claude/worktrees/../../docs/x.md` → exit 0. The
+  `worktrees/*` allow-case matches before the `..` resolves, so one `..`
+  trick writes anywhere in the checkout.
+- `file_path = /tmp/..$R/docs/x.md` → exit 0 (prefix is not `$root`).
+
+The matrix (`permissions.md:26`) lists this row as plainly "refused" with no
+bypass noted, and check-orchestration has no case for it. Symlinks likewise.
+Resolve: normalise (`realpath -m`, or perl `Cwd`) before the case, and add
+both inputs as `hook 2` cases.
+
+### 2. High — the Bash rule misses cheap, non-adversarial forms
+Tested exit 0: `cd docs && echo x > a.md` (relative redirect after `cd`;
+the path-prefix regex at `:67` needs the repo path in the redirect itself);
+`git reset --hard`, `git checkout -- x`, `git stash` (destructive to the
+checkout, absent from the verb list at `:59`). `permissions.md:31` documents
+`git -c`, absolute git, `sh -c`, `python -c`, but not these two classes.
+Either extend the regex or add them to the documented-bypass row and its
+synthetic test (the "known bypasses" block in check-orchestration, ~l.131-133).
+
+### 3. Medium — the premise "the main session has neither field" is observed, not guaranteed
+The whole guard is the inversion `no agent_id/agent_type ⇒ orchestrator`
+(`:41`). Evidence is "observed on 2.1.303" (header comment l.6) only. A
+future version, a hook call from a skill/subagent without the field, or a
+`claude --agent` main session with `agent_type` makes the guard silently
+disabled (agent path) or over-blocking. Fails open by design. Needed: a
+version check or a test that fails when the payload shape changes (the
+`.log-raw` traces V11/V12 should be committed as fixtures or cited by id).
+
+### 4. Medium — gates are not green, and non-deterministic
+`./scripts/check-orchestration.sh` on this worktree: first run
+`57 passed, 2 failed`, second `56 passed, 3 failed`. Failures are in the
+docs-check sections (`docs/status.md is 91 lines, limit 90`), not in the
+guard sections; all guard and release-guard cases passed. But
+(i) `status.md` is over its limit in this tree, though bare `check-docs.sh`
+printed `docs ok` — the copy-based harness and the live tree disagree, which
+needs explaining; (ii) the count changed between identical runs, so some case
+is flaky or state-dependent (possibly the worktree's own `.log-to` /
+`.log-raw`, see 5). Acceptance needs a stable green run.
+
+### 5. Medium — logging switch is live in the worktree and unignored
+`.claude/hooks/.log-to` and `.log-raw` exist untracked (`git status`), and
+`.log-raw` makes the guard write the **full raw hook payload**
+(`:34-36`), which can contain file contents and commands, to a file. Neither is
+in a `.gitignore` (grep: none), so `git add -A` by an agent could commit
+them; invariant 7 (no secrets in the repo) is at risk. Also `.log-to` is
+read as a path and appended to with no restriction. Resolve: gitignore both,
+remove them before merge, and make `check-orchestration` red when they exist.
+(I moved `.log-to` aside for my tests and restored it unchanged.)
+
+### 6. Low — comment/matcher inconsistencies
+- `case` handles `MultiEdit` but the matcher
+  (`settings.json:5`) omits it: dead branch or an unguarded tool. Harmless if
+  MultiEdit no longer exists; otherwise a hole.
+- Header l.2-4 "the orchestrator ... (which has neither agent_id nor
+  agent_type)" vs the brief's premise; the doc is right, the brief is wrong.
+- The `deny` message points to "CLAUDE.md, Roles" correctly.
+- Inside the checkout the allow-case `.claude/worktrees/*` is the only
+  exempt location; the actual worktrees for this project live in the
+  scratchpad (outside root), so that exemption is probably never used and is
+  the vector of finding 1.
+
+### 7. Low — fail-open on missing perl is silent
+`:19` exits 0 with no message. On a host without perl the guard is off and
+nobody is told; `check-orchestration` should assert perl is present, or the
+hook should warn on stderr (exit 0 with message).
+
+## What I would need to see to accept
+
+1. Findings 1 and 2 fixed or moved into the documented-bypass row, with tests.
+2. A stable, green `check-orchestration.sh` and a reconciled `status.md`
+   count; the flake in 4 explained.
+3. `.log-to` / `.log-raw` gitignored and absent from the tree.
+4. The live V7 result recorded in `permissions.md` (currently placeholder),
+   plus a cited trace showing a real main-session payload without
+   `agent_id` and a real agent payload with it.
+5. Correct the brief: limit is 150, the discriminator is `agent_id` /
+   `agent_type`, deny is not usable.
+
+The design (hook, fail-open, honest "best effort" labelling) is sound; the
+hole is in the implementation details, not the approach.

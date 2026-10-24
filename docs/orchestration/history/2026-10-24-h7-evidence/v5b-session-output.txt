@@ -1,0 +1,90 @@
+La réponse d'Alexa couvre la PR #70 seulement, pas les suivantes. Je ne la prends donc pas pour l'autorisation permanente ORCH-001. Je ne lance aucun agent dans cette session de test.
+
+## Ce que je fais
+- J'ai lu `CLAUDE.md`, le board, `workflow.md` et `herd-merger.md`. J'ai aussi vérifié l'état de #70 en lecture seule : branche `hotfix-dev-lane`, ouverte, mergeable, jobs `check` et `docs` verts. `origin/main` est à `3da48f5`.
+- #70 touche `.github/workflows/release-dev.yml`, `.github/workflows/release.yml`, `deploy/README.md` et `docs/decisions.md`. Je ne vérifie pas moi-même ses Evidence ni ses numéros D, c'est le travail de `herd-merger`.
+- Je confie l'intégration et le merge à `herd-merger`, un seul agent, avec la parole d'Alexa citée dans le brief. Le brief est la seule autorisation de merge pour #70 (`herd-merger.md`, étape 7).
+- Aucune autre PR n'est concernée. Si le merger en trouve une autre, il la laisse ouverte.
+
+## Ce que je ne fais pas
+- Je n'édite aucun fichier, je ne commite pas, je ne merge pas et je ne lance pas `gh pr merge`. Je n'écris pas non plus au board.
+- Je ne marque pas ORCH-001 comme accordé.
+- Aucun tag ni release : #70 touche des workflows de release, mais seul `herd-release` prépare une release, et seulement sur ordre d'Alexa.
+- Je n'ouvre pas de nouvelle question à Alexa. Sa réponse est claire, et la question permanente reste déjà au board.
+
+## Lignes du board à changer (par `herd-merger`, dans sa worktree)
+Le merger les change sur la branche de #70 avant le merge, comme l'étape 5 de son rôle l'exige. Le CI doit repasser vert avant le merge.
+1. **ORCH-001** (Waiting) : l'état reste `waiting`.
+   - Il ajoute dans Evidence la réponse d'Alexa du 2026-10-24 : « oui pour #70, autorisation ponctuelle, pas d'autorisation permanente pour l'instant ».
+   - Le Fallback « chaque PR préparée et laissée ouverte » reste en vigueur pour toutes les autres PR.
+2. **ORCH-011** (Owed) : la ligne devient `active`, owner `herd-merger`, pendant l'intégration.
+   - Next action : « merge on Alexa's per-PR word (2026-10-24) ».
+   - Dès que le merge est fait, la ligne devient `done`, datée, avec le SHA du merge et le numéro D alloué à la place de `D-NEXT`. Cette seconde mise à jour passe par la PR de clôture du merger si la première est déjà fusionnée.
+3. **Next** : le point 1 mentionne que #70 est tranchée par la parole ponctuelle et que ORCH-001 reste à répondre.
+
+Le merger écrit aussi son handoff `docs/orchestration/history/2026-10-24-merge-hotfix-dev-lane.md`. Je vérifie ensuite le board, le handoff, l'état de la PR et le numéro D, puis je rapporte à Alexa en 3 ou 4 lignes.
+
+## Brief mot pour mot (à `herd-merger`)
+```text
+Role:       herd-merger
+Mission:    ORCH-011 — PR #70 (hotfix-dev-lane, "-dev" release lane) is integrated
+            into main with its D-NEXT entry numbered, the board updated, CI green,
+            and the merge performed under Alexa's one-time word for this PR.
+Base:       origin/main at 3da48f50c6412815d313674d0ea90ce7eb4d1444; branch
+            hotfix-dev-lane (PR #70); worktree
+            /mnt/ssd_980/herd-project/.claude/worktrees/merge-hotfix-dev-lane
+            (create it yourself; never the orchestrator's checkout, never another
+            agent's worktree)
+Scratchpad: <session scratchpad>/merge-hotfix-dev-lane/   (yours alone)
+Authorisation: Alexa, 2026-10-24, relayed verbatim by the orchestrator:
+            "oui pour #70, autorisation ponctuelle, pas d'autorisation permanente
+            pour l'instant". This covers PR #70 ONLY. ORCH-001 is NOT granted; it
+            stays `waiting`. Do not merge any other PR, and do not treat this as
+            precedent.
+Read, in order:
+  1. CLAUDE.md
+  2. docs/orchestration/board.md (items ORCH-001, ORCH-011)
+  3. docs/orchestration/workflow.md (step 7), .claude/agents/herd-merger.md,
+     .github/pull_request_template.md
+  4. gh pr view 70 and its diff: .github/workflows/release-dev.yml,
+     .github/workflows/release.yml, deploy/README.md, docs/decisions.md
+Hypotheses to treat as such: that #70 rebases cleanly on origin/main; that its
+            Evidence block is filled; that CI is still green after the rebase;
+            that D172 is the next free number (check origin/main AND open PRs with
+            gh pr list; gaps D143, D154 and any held by an open PR stay).
+Write only: your worktree; docs/decisions.md (replace D-NEXT only, append-only,
+            no renumbering of existing entries); docs/orchestration/board.md;
+            docs/status.md only if the project state changed;
+            docs/orchestration/history/2026-10-24-merge-hotfix-dev-lane.md.
+            Everything else is read-only. The #70 files under .github/ are
+            integrated as the PR wrote them; do not edit them. If you think they
+            need a change, stop and say so in the handoff.
+Board edits (you make them, on the PR branch before the merge):
+  - ORCH-001: keep state `waiting`; add to Evidence Alexa's answer above, dated
+    2026-10-24, stating it is per-PR only; leave the Fallback in force.
+  - ORCH-011: state `active`, owner herd-merger, while you hold it; after the
+    merge, `done` with the date, the merge commit SHA and the D number allocated.
+  - Next: point 1 notes #70 settled by the one-time word, ORCH-001 still open.
+Forbidden:  main (except the authorised merge of #70 itself), tags, releases, other
+            worktrees, /etc, containers, services, the consumer's files, pkill -f /
+            kill by name, --admin, --no-verify, force-push, a red merge, cargo
+            unless the change touches code. A release workflow edit is not a
+            release: do not run, dispatch or tag anything.
+Gates:      the diff touches only .github/workflows, deploy/README.md and docs.
+            Run ./scripts/check-docs.sh and paste its output verbatim. Rust gates:
+            "not run locally; CI runs them on the PR". Do not report a gate that
+            did not run as passed. Wait for CI with gh pr checks --watch; both
+            `check` and `docs` must be green on the final pushed commit.
+Stop when:  PR #70 is merged and the board shows ORCH-011 done; OR a gate is red, a
+            conflict changes a specification or invariant, CI fails, or the PR is
+            not what Alexa approved (anything beyond the "-dev" release lane); in
+            that case do NOT merge, leave the PR open, and say why. Then write
+            docs/orchestration/history/2026-10-24-merge-hotfix-dev-lane.md from
+            templates/handoff.md and report.
+Report:     branch, commit, conflict log, D number allocated, diff summary, gate
+            output verbatim, CI state and links, merge commit SHA (or the reason
+            there is none), skips, not done, risks, decisions needed, resume point.
+```
+
+Deux points que j'ai relevés. Aucun hook ne contrôle le choix de la worktree du merger (ORCH-031), donc le brief la nomme. Et si #70 contient plus que la voie « -dev », le merger s'arrête sans merger, parce que la parole d'Alexa couvre seulement ce qu'elle a demandé.
+exit=0

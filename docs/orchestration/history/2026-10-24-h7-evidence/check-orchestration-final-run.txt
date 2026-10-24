@@ -1,0 +1,91 @@
+== check-docs.sh goes green on the repository as it is
+ok    unmodified copy passes
+== check-docs.sh goes red on each defect it claims to catch
+ok    duplicate decision number D27
+ok    D-NEXT placeholder
+ok    malformed decision header
+ok    CLAUDE.md saying the orchestrator works alone
+ok    CLAUDE.md no longer pointing at the board
+ok    a missing role file
+ok    a role whose name does not match its file
+ok    board sections out of shape
+ok    board row with missing cells
+ok    board row with an unknown state
+ok    board id used twice
+ok    board missing
+ok    undated handoff
+ok    over-long line in docs/orchestration
+ok    hook not executable
+ok    settings.json invalid
+== the number is an identifier: the historical gaps stay silent, a new gap is noted, nothing is rewritten
+ok    known gaps D143, D154 not noted
+ok    decisions.md unchanged by the check
+== two branches allocating the same number collide at integration, and the check says so
+ok    branch A allocated D4 and passes
+ok    the collision D4/D4 is rejected with the number named
+ok    B reallocated to D5 passes
+== orchestrator-guard.sh: blocks the main session's writes, lets agents and inspection through
+ok    guard exit 2: {"tool_name":"Edit","cwd":"<repo>","tool_input":{"file_path":"<repo>/docs/status.md"}}
+ok    guard exit 2: {"tool_name":"Write","cwd":"<repo>","tool_input":{"file_path":"docs/status.md"}}
+ok    guard exit 0: {"tool_name":"Edit","cwd":"<repo>","agent_id":"abc","tool_input":{"file_path":"<repo>/docs
+ok    guard exit 0: {"tool_name":"Edit","cwd":"<repo>","agent_type":"herd-step","tool_input":{"file_path":"<re
+ok    guard exit 0: {"tool_name":"Bash","cwd":"<repo>","agent_type":"herd-merger","tool_input":{"command":"git
+ok    guard exit 0: {"tool_name":"Write","cwd":"<repo>","tool_input":{"file_path":"/tmp/claude-1002/x/brief.md
+ok    guard exit 0: {"tool_name":"Edit","cwd":"<repo>","tool_input":{"file_path":"<repo>/.claude/worktrees/age
+ok    guard exit 2: {"tool_name":"Bash","cwd":"<repo>","tool_input":{"command":"cd x && git commit -m hi"}}
+ok    guard exit 2: {"tool_name":"Bash","cwd":"<repo>","tool_input":{"command":"gh pr merge 70 --squash"}}
+ok    guard exit 2: {"tool_name":"Bash","cwd":"<repo>","tool_input":{"command":"git merge --no-ff feature"}}
+ok    guard exit 2: {"tool_name":"Bash","cwd":"<repo>","tool_input":{"command":"sed -i 's/a/b/' docs/status.md
+ok    guard exit 2: {"tool_name":"Bash","cwd":"<repo>","tool_input":{"command":"cat > docs/status.md <<EOF\nx\
+ok    guard exit 2: {"tool_name":"Bash","cwd":"<repo>","tool_input":{"command":"git tag -a v1 -m x"}}
+ok    guard exit 2: {"tool_name":"Bash","cwd":"<repo>","tool_input":{"command":"gh release create v1"}}
+ok    guard exit 2: {"tool_name":"Bash","cwd":"<repo>","tool_input":{"command":"git push origin main"}}
+ok    guard exit 2: {"tool_name":"Bash","cwd":"<repo>","tool_input":{"command":"echo x > <repo>/CLAUDE.md"}}
+ok    guard exit 0: {"tool_name":"Bash","cwd":"<repo>","tool_input":{"command":"git log --oneline -5; git diff
+ok    guard exit 0: {"tool_name":"Bash","cwd":"<repo>","tool_input":{"command":"gh pr view 70; gh pr checks 70
+ok    guard exit 0: {"tool_name":"Bash","cwd":"<repo>","tool_input":{"command":"cat > /tmp/claude-1002/x/brief
+ok    guard exit 0: {"tool_name":"Bash","cwd":"<repo>","tool_input":{"command":"grep -n 'git commit' docs/deci
+ok    guard exit 0: {"tool_name":"Bash","cwd":"<repo>","tool_input":{"command":"git worktree add -b t /tmp/cla
+ok    guard exit 0: {"tool_name":"Bash","cwd":"<repo>","tool_input":{"command":"./scripts/check-docs.sh; ls <r
+ok    guard exit 0: {"tool_name":"Bash","cwd":"<repo>","agent_id":"a1","tool_input":{"command":"git commit -m 
+ok    guard exit 0: {"tool_name":"Bash","cwd":"<repo>","agent_type":"herd-step","tool_input":{"command":"git c
+ok    guard exit 0: {"tool_name":"Edit","cwd":"<repo>","agent_type":"herd-merger","tool_input":{"file_path":"<
+ok    guard exit 0: not json at all
+ok    guard exit 0: {"tool_name":"Bash","cwd":"<repo>","tool_input":{"command":"git commit -m hi"}}
+== the holes the V7 review found (ORCH-004), now closed
+ok    guard exit 2: {"tool_name":"Edit","cwd":"<repo>","tool_input":{"file_path":"<repo>/.claude/worktrees/../
+ok    guard exit 2: {"tool_name":"Write","cwd":"<repo>","tool_input":{"file_path":"/tmp/..<repo>/docs/x.md"}}
+ok    guard exit 2: {"tool_name":"Edit","cwd":"<repo>/docs","tool_input":{"file_path":"../CLAUDE.md"}}
+ok    guard exit 0: {"tool_name":"Edit","cwd":"<repo>","tool_input":{"file_path":"<repo>/.claude/worktrees/a-1
+ok    guard exit 0: {"tool_name":"Edit","cwd":"<repo>","tool_input":{"file_path":"<repo>/.claude/worktrees/a-1
+ok    guard exit 2: {"tool_name":"Bash","cwd":"<repo>","tool_input":{"command":"echo x > a.md"}}
+ok    guard exit 2: {"tool_name":"Bash","cwd":"<repo>","tool_input":{"command":"cd docs && echo x > a.md"}}
+ok    guard exit 2: {"tool_name":"Bash","cwd":"/tmp/claude-1002/x","tool_input":{"command":"cd <repo>/docs && 
+ok    guard exit 2: {"tool_name":"Bash","cwd":"<repo>","tool_input":{"command":"git reset --hard"}}
+ok    guard exit 2: {"tool_name":"Bash","cwd":"<repo>","tool_input":{"command":"git checkout -- docs/status.md
+ok    guard exit 2: {"tool_name":"Bash","cwd":"<repo>","tool_input":{"command":"git stash"}}
+ok    guard exit 2: {"tool_name":"Bash","cwd":"<repo>","tool_input":{"command":"git clean -fd"}}
+ok    guard exit 0: {"tool_name":"Bash","cwd":"<repo>","agent_id":"a1","tool_input":{"command":"cd docs && ech
+ok    guard exit 0: {"tool_name":"Bash","cwd":"<repo>","agent_type":"herd-merger","tool_input":{"command":"git
+ok    guard exit 0: {"tool_name":"Bash","cwd":"<repo>","tool_input":{"command":"git log -1 > /tmp/claude-1002/
+ok    guard exit 0: {"tool_name":"Bash","cwd":"<repo>","tool_input":{"command":"./scripts/check-docs.sh 2>&1 |
+ok    guard exit 0: {"tool_name":"Bash","cwd":"<repo>","tool_input":{"command":"wc -l docs/status.md >/dev/nul
+ok    perl is present, the guard can parse
+ok    no logging switch left in .claude/hooks
+ok    the logging switches are gitignored
+== known bypasses, documented in docs/orchestration/permissions.md (these pass on purpose)
+ok    guard exit 0: {"tool_name":"Bash","cwd":"<repo>","tool_input":{"command":"git -c a=b commit -m hi"}}
+ok    guard exit 0: {"tool_name":"Bash","cwd":"<repo>","tool_input":{"command":"/usr/bin/git commit -m hi"}}
+== release-guard.sh
+ok    release exit 2: git tag -a v0.4.0 -m x
+ok    release exit 2: git push origin v0.4.0
+ok    release exit 2: git push --tags
+ok    release exit 2: gh release create v0.4.0
+ok    release exit 2: gh workflow run release.yml
+ok    release exit 2: docker load < hub.tar
+ok    release exit 2: sudo systemctl restart herd-runner
+ok    release exit 0: git push origin cut-v0.4.0
+ok    release exit 0: gh run list --workflow release.yml
+ok    release exit 0: git log v0.3.7..origin/main --oneline
+
+check-orchestration: 81 passed, 0 failed

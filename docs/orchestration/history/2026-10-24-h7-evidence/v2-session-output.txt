@@ -1,0 +1,25 @@
+The note is in the gotchas README and committed locally. After I fixed the handoff's line widths, `./scripts/check-docs.sh` ended with `docs ok`.
+
+- **Branch:** `v2-gotcha-note`, based on `orchestration-remediation` at 54fc153.
+- **Worktree:** `/tmp/claude-1002/-mnt-ssd-980-herd-project/3ddf11ac-718a-4231-bc8d-45291a39ef82/scratchpad/remediation/live/v2/wt`
+- **Commit:** f11f895, "Explain two-date rows in the gotchas index". It is one commit, not pushed.
+- **Diff summary:**
+  - `docs/orchestration/gotchas/README.md` gains a blank line and the sentence "Two dates on a row mean the lesson was first recorded and then reaffirmed." under the table.
+  - `docs/orchestration/history/2026-10-24-v2-gotcha-note.md` is the new handoff.
+- **Gate output, verbatim:**
+```
+note: D170 is a gap in docs/decisions.md (held by an open PR, or lost); gaps stay (D148)
+note: D172 is a gap in docs/decisions.md (held by an open PR, or lost); gaps stay (D148)
+docs ok
+```
+  The Rust gates were not run, because this change is prose only. CI runs them.
+- **Skips:** none.
+- **Not done:** no push and no PR, as the brief says.
+- **Risks:**
+  - My first commit went in while `check-docs.sh` was red on over-wide lines in the handoff. I fixed them and amended the commit, which was still local. The gate output above is from the fixed state.
+  - Two rows have two dates, not one: `decision-number-collisions.md` as well as `orchestrator-does-not-edit.md`. The note covers both.
+  - I did not open the two lesson files to check that the second date really is a reaffirmation. I used your wording.
+- **Decisions needed:** none.
+- **Resume point:** run `git log -1 v2-gotcha-note`. Push and open the PR only once ORCH-001 allows it.
+- **PIDs:** none started.
+exit=0
