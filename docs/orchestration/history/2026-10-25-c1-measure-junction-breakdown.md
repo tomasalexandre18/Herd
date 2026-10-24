@@ -128,7 +128,24 @@ output in the campaign's raw logs, listed under "Resume point".
 
 ## Decisions needed
 
-None from this task. C1 was a measurement and it is complete; the
+**One, for `herd-merger` rather than Alexa.** `origin/main` moved while
+this was being measured (C0 merged: `docs/remediation/` now holds 00,
+03a, 03b, 03c, 04a, 04b, 05 and a `README.md` index). This branch is
+based on `0a2cf73` as the brief required and merges cleanly — no file is
+touched on both sides. But `docs/remediation/README.md` indexes the
+dossier and does not list `05` or `06`. **Recommendation:** the merger
+adds the `06` row (and `05`, if it is also missing) when integrating,
+since the brief forbade this task from editing another author's file
+under `docs/remediation/`. **Fallback:** leave it; the gap is visible
+and the README already says a gap means "not written", which would then
+be wrong rather than merely incomplete.
+
+Also for the merger: `06` corrects five published figures in `04a` and
+`05` (listed in `06` under "These corrections land on the dossier"). It
+does not edit those files. Whether they are amended or left with `06` as
+the correction of record is the merger's call.
+
+**Nothing for Alexa.** C1 was a measurement and it is complete; the
 architecture decision it was blocking now has a whole event under it.
 
 If the orchestrator wants one more experiment before that decision, the

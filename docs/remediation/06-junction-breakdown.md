@@ -672,3 +672,30 @@ Said plainly, because the brief asked for it.
    what makes the five-way split observable from outside at all, so the
    brief's most useful sentence is also its most accurate one.
 
+
+## These corrections land on the dossier, not only on a brief
+
+`origin/main` moved while this was being measured: C0 merged, and
+`04a-cost-surface.md` and `05-experiments-review.md` are now in this
+directory. The figures corrected above are **theirs**, not a brief's
+paraphrase of them, so they are corrections to published pieces:
+
+| where | what it says | measured here |
+|-------|--------------|---------------|
+| `05` §1 line 35 | `record_waiting` is "four `fsync`s" | **three**: 2 `fsync` + 1 `fdatasync`, counted under `strace` |
+| `04a` F line 134 | `collections_owed` is "~11 µs per directory" | **8.3–10.0 µs** in release |
+| `04a` line 117 | **247.16 ms** at `T` = 20 000 | **186.32 ms** at `N` = 50, 210.56 ms at `N` = 1 000 |
+| `05` line 218 | both reads, `N` = 1 000: **13.25 / 12.82 ms** | **18.8 ms** solo (9.01 + 9.78) |
+| `05` line 230 | one pass, cause changed: **~8.3 s** | **9.633 s** inside a live junction |
+
+None of these changes any conclusion either piece draws — post C still
+dwarfs post A by two orders of magnitude, and the `fsync` count being
+three rather than four makes `record_waiting` cheaper, not dearer, while
+leaving it 320 times D171's quiet path. They are corrections of record,
+and `06` does not edit anyone else's file to make them.
+
+**And one open `I` in the dossier is now closed.** `00-baseline.md` §5
+says the repository states both 12 and 13 loud skips and that "no one
+here ran the suite". It was run, on this branch, at the end of this task:
+**12**, and they are named in this task's handoff — ten for cgroup v2
+delegation, two for the ZFS ceiling.
