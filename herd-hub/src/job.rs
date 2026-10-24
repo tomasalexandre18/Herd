@@ -1824,6 +1824,25 @@ pub trait JobStore: Send + Sync + 'static {
     /// and named on the record**, not an error: a verdict must never be lost
     /// over a malformed path, and a path that cannot be written down is a
     /// fact about one file rather than about the job.
+    ///
+    /// **It is dropped from the manifest too, and that is the one case that
+    /// is** (D-NEXT). The manifest is the list of paths this store joins onto
+    /// its own directory — `write_output_chunk` resolves a chunk against it,
+    /// `job_outputs` reads a file back by it, the sweeper measures by it — so
+    /// a path that must never be joined must never be on it. The `skipped`
+    /// sentence is then the only place that file exists on the record, which
+    /// is the price of not writing an unjoinable path down. **The exit code a
+    /// requester reads for this case was never decided**: it is 0 today
+    /// because the manifest has nothing to count short, and whether a path
+    /// the hub refuses should also cost a requester its zero is open.
+    ///
+    /// **Bytes that contradict their own manifest entry are a different
+    /// case, and the entry survives them** (D-NEXT). The entry is written
+    /// down before the bytes are judged, so a refused frame leaves a file
+    /// that is announced and not held — the same shape as a streamed file
+    /// still crossing — and a requester counting its promises against what it
+    /// holds finds it short. This is the rule for every other absence here;
+    /// the digest case was the one exception and it produced a false success.
     fn record_outputs(&self, id: &JobId, outputs: &herd_proto::JobOutputs) -> Result<()>;
     /// The files this job's record holds, read back off the disk.
     ///
