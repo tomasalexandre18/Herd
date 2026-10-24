@@ -35,6 +35,16 @@
 # it — which is how a tag whose run failed is recovered without cutting a new
 # version.
 #
+# **The dev lane calls this file; it does not copy it.** `release-dev.yml`
+# publishes `v*.*.*-dev*` tags off any branch, and it does so through
+# `workflow_call` below with `dev: true`, so a dev build is this build —
+# same derivations, same static assertions, same two distribution smokes,
+# same image smoke, same two version lines. All `dev` changes is the body,
+# which gains a preamble saying what the build is, and the pre-release flag,
+# which stops being a consequence of the hyphen and becomes a decision. Two
+# copies of the steps below would drift, and the first anyone would learn of
+# it is a hotfix that behaves unlike the release that follows it (D172).
+#
 # This file is **not** the merge gate. `ci.yml` is, with its `check` and
 # `docs` jobs, and nothing here touches it.
 name: release
@@ -43,6 +53,11 @@ on:
   push:
     tags:
       - "v*"
+      # …but never a `-dev` tag. `release-dev.yml` owns those and calls this
+      # workflow back for them; without this exclusion one dev tag would
+      # start two runs racing to create one release, and the loser's error
+      # would be the first thing read in an emergency.
+      - "!v*.*.*-dev*"
   workflow_dispatch:
     inputs:
       tag:
@@ -52,6 +67,23 @@ on:
           and attached to this run, and no release is created.
         required: false
         default: ""
+  workflow_call:
+    inputs:
+      tag:
+        description: >-
+          Tag to publish on. It must already exist. Empty rehearses the
+          build and creates nothing, exactly as the hand-run does.
+        required: false
+        type: string
+        default: ""
+      dev:
+        description: >-
+          Publish as a development build: a pre-release whatever its tag
+          looks like, with a preamble on the body saying it skipped the
+          merge gate and naming the branch and commit it came from.
+        required: false
+        type: boolean
+        default: false
 
 concurrency:
   group: release-${{ github.ref }}
@@ -74,8 +106,15 @@ jobs:
     timeout-minutes: 45
     env:
       # One place where "which tag, if any" is decided. A tag push releases
-      # under its own name; a hand-run releases only if it was given one.
-      TAG: ${{ github.ref_type == 'tag' && github.ref_name || github.event.inputs.tag }}
+      # under its own name — and that holds when `release-dev.yml` called
+      # this workflow, because a called workflow sees the caller's ref, so a
+      # dev tag arrives here the same way any other tag does. A hand-run, and
+      # a call started by hand, release only if given one.
+      TAG: ${{ github.ref_type == 'tag' && github.ref_name || inputs.tag }}
+      # "true" only when `release-dev.yml` called this workflow. A tag push
+      # and a hand-run leave `inputs` empty, which renders false, so every
+      # `$DEV` test below is inert on the path that cuts real releases.
+      DEV: ${{ inputs.dev || false }}
     steps:
       - uses: actions/checkout@v7
 
@@ -300,8 +339,91 @@ jobs:
       # three files and no fourth.
       - name: write the release body, the half about the binaries
         if: env.TAG != ''
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -euo pipefail
+
+          # The dev preamble, and an empty file on every other path so that
+          # the two `cat`s that assemble the body never have to know which
+          # lane they are on. It goes **first** in the body, above the
+          # install lines, because a reader deciding whether to put this on
+          # a production runner has to meet "this is not a release" before
+          # they meet a `sha256sum` command that looks like a release's.
+          : > body-dev.md
+          if [ "$DEV" = "true" ]; then
+            # Which branch, asked of GitHub rather than of git: a tag push
+            # checks out one commit, so the local clone knows no branches,
+            # and fetching the whole history to learn one name would cost
+            # the lane the seconds it exists to save. The answer can be
+            # empty — the branch may have moved on in the minutes since the
+            # tag was pushed — and an empty answer is printed as one rather
+            # than guessed at.
+            branch=$(gh api \
+              "repos/${{ github.repository }}/commits/${{ github.sha }}/branches-where-head" \
+              --jq 'map(.name) | join(", ")' 2>/dev/null || true)
+            if [ -z "$branch" ]; then
+              branch="no branch has this commit at its head any more"
+            fi
+
+            {
+              echo "## This is a development build. It is not a release."
+              echo
+              echo "\`$TAG\` was built from **$branch**, commit"
+              echo "\`${{ github.sha }}\`, and published straight off that"
+              echo "branch. There was no pull request and no review, and"
+              echo "**the merge gate did not run on it here**: not"
+              echo "\`nix flake check\`, not \`cargo fmt\`, not"
+              echo "\`cargo clippy\`, not the suite. Those were run on the"
+              echo "branch, on the machine the change was written on,"
+              echo "before this tag was pushed, and that run is the whole"
+              echo "of the proof behind these bytes. If it was not made,"
+              echo "nothing in this build knows it."
+              echo
+              echo "What *did* run is everything below the gate, unchanged"
+              echo "and not a second implementation of it: the same Nix"
+              echo "derivations a release is built from, the same assertion"
+              echo "that every binary is statically linked and names no"
+              echo "Nix store path, the same hub-runner-two-jobs smoke"
+              echo "inside an \`archlinux\` container and an \`alpine\` one,"
+              echo "and the same hub started out of the loaded image"
+              echo "archive. So these artefacts are as portable and as"
+              echo "runnable as a release's. What is missing is the"
+              echo "opinion of anybody but the person who tagged it."
+              echo
+              echo "It is marked a pre-release, so nothing that asks this"
+              echo "repository for its *latest* release can be handed it by"
+              echo "accident. A dev build is taken on purpose or not at all."
+              echo
+              echo "**What it is for.** Finding out on a real host, today,"
+              echo "whether a change works and what else it moved. Almost"
+              echo "everything in the notice further down was learnt that"
+              echo "way and could not have been learnt any other. The hour"
+              echo "between knowing a fix and being able to install it is"
+              echo "what this lane spends CI's seven minutes to buy back"
+              echo "(D172)."
+              echo
+              echo "**One machine, not a fleet.** Put it on a host whose"
+              echo "owner is watching it and can put it back. A dev build"
+              echo "that proves itself does not get promoted: the change"
+              echo "goes through a pull request and a tag of its own like"
+              echo "anything else, and that tag is what a fleet runs."
+              echo
+              echo "**If it misbehaves**, there is nothing to fix in place."
+              echo "Install the newest tag with no \`-dev\` in it. Compare"
+              echo "its \`RECORD_VERSION\` with the one printed below"
+              echo "first: if they differ, going back cannot read the state"
+              echo "root this build wrote, and the notice says what that"
+              echo "costs. Then say what you saw, naming the **commit**"
+              echo "above and not the version — several dev builds carry"
+              echo "the same version, and the version alone would not tell"
+              echo "us which one you ran."
+              echo
+              echo "---"
+              echo
+            } > body-dev.md
+          fi
+
           {
             echo "Static x86_64 Linux binaries for Herd $version, linked"
             echo "against musl: they run on any distribution and need no Nix."
@@ -345,7 +467,7 @@ jobs:
             cat deploy/release-notice.md
           } > body-tail.md
 
-          cat body-head.md body-tail.md > release-body.md
+          cat body-dev.md body-head.md body-tail.md > release-body.md
 
       # `gh` rather than a third-party action: it is on the runner already,
       # and a release is the one step here that cannot be undone quietly.
@@ -361,9 +483,13 @@ jobs:
           # A tag carrying a suffix — `v0.1.0-rc1`, and the throwaway tag this
           # workflow was first proven with — is published as a pre-release,
           # so a rehearsal never sits in the place a reader looks for the
-          # current version.
+          # current version. A dev build is one whatever its tag looks like:
+          # that flag is the whole of what stops an updater asking this
+          # repository for its latest release from installing an untested
+          # build on a production runner, so it is not left resting on a
+          # hyphen somebody could spell differently (D172).
           prerelease=
-          if [ "${TAG#*-}" != "$TAG" ]; then
+          if [ "$DEV" = "true" ] || [ "${TAG#*-}" != "$TAG" ]; then
             prerelease=--prerelease
           fi
 
@@ -495,6 +621,6 @@ jobs:
             echo
           } > body-image.md
 
-          cat body-head.md body-image.md body-tail.md > release-body.md
+          cat body-dev.md body-head.md body-image.md body-tail.md > release-body.md
           gh release edit "$TAG" --notes-file release-body.md
           gh release view "$TAG"
