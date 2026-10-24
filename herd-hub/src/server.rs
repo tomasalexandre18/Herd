@@ -955,6 +955,15 @@ struct Peers {
     /// noticed. A shortfall that is still there at the next report, with
     /// nothing written in between, is a loss rather than a chunk in flight.
     short_log: HashMap<JobId, u64>,
+    /// Attempts the watchdog has already said are slow rather than lost
+    /// (D169).
+    ///
+    /// The watchdog wakes twenty times per threshold, so a busy runner's slow
+    /// attempt would otherwise produce a line every three seconds for as long
+    /// as it ran — which is the shape of log nobody reads. Said once per
+    /// attempt and then kept quiet, and cleared by [`State::attempt_is_over`]
+    /// with everything else about an attempt that is done.
+    slowness_said: HashSet<JobId>,
     /// When whoever is following each queued job was last told why it is
     /// waiting (E-04).
     ///
@@ -1784,6 +1793,7 @@ impl State {
             peers.tail_asked.remove(id);
             peers.attempt_seen.remove(id);
             peers.short_log.remove(id);
+            peers.slowness_said.remove(id);
         });
     }
 
@@ -1803,6 +1813,124 @@ impl State {
                 })
                 .collect()
         })
+    }
+
+    /// What the runner holding this attempt says about it **now**, rather
+    /// than when the hub last heard anything (D169).
+    ///
+    /// The per-attempt clock is the right instrument for a machine that is
+    /// gone and the wrong one for a machine that is merely slow, and the two
+    /// are not told apart by a timer. A health report names every job its
+    /// runner is holding and nothing else, so a runner that is connected is
+    /// a runner that has already answered the question: either its last
+    /// report names this attempt, in which case the attempt is running and
+    /// the machine is busy, or it does not, in which case the attempt is
+    /// gone from a machine that is plainly here.
+    ///
+    /// `unheard_for` is the age of the clock the watchdog is about to act on,
+    /// and the report is only evidence if it is **newer** than that: a report
+    /// composed before the job was handed out says nothing about it. Reports
+    /// older than the threshold cannot arise here — the watchdog drops a link
+    /// nothing comes back on before it looks at any attempt — but the
+    /// comparison is made rather than assumed, because the one case it would
+    /// get wrong is a job requeued onto a runner whose report is in flight,
+    /// and that would spend a go on a machine that did nothing wrong.
+    fn what_the_runner_says(
+        &self,
+        runner: &str,
+        job_id: &JobId,
+        attempt: u32,
+        unheard_for: Duration,
+    ) -> WhatTheRunnerSays {
+        let word = self.with_peers(|peers| {
+            peers.runners.get(runner).map(|connected| TheRunnersWord {
+                reports: connected.reports_seen,
+                reported: connected.last_health.elapsed(),
+                names_it: connected
+                    .jobs
+                    .iter()
+                    .any(|held| &held.job_id == job_id && held.attempt == attempt),
+            })
+        });
+        what_a_runner_says(word, unheard_for)
+    }
+
+    /// Whether this is the first time the watchdog has found this attempt
+    /// slow. See [`Peers::slowness_said`].
+    fn first_word_of_slowness(&self, job_id: &JobId) -> bool {
+        self.with_peers(|peers| peers.slowness_said.insert(job_id.clone()))
+    }
+}
+
+/// What the runner holding an attempt last said about it (D169).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WhatTheRunnerSays {
+    /// It is connected and its last report names the attempt: the attempt is
+    /// alive, and the machine is busy rather than gone.
+    StillRunningIt { reported: Duration },
+    /// It is connected and has not reported on this link yet, so it has not
+    /// been asked the question. Not evidence of anything, and bounded: a
+    /// connection nothing comes back on is dropped by the link check at
+    /// `lost_after`, and then there is no runner and the clock decides.
+    NotYetSaying,
+    /// It is connected and its last report does not name the attempt: the
+    /// attempt is over on a machine that is here to say so.
+    NotAnyMore { reported: Duration },
+    /// Nobody of that name is connected. Nothing to go on but the clock,
+    /// which is what the clock is for (E-21).
+    NothingAtAll,
+}
+
+/// What this hub knows about the runner an attempt was handed to, at the
+/// moment the watchdog is about to act on the clock (D169).
+///
+/// `None` for a runner that is not connected. Gathered by
+/// [`State::what_the_runner_says`] and judged by [`what_a_runner_says`],
+/// which are two functions so that the judgement is a pure one a test can
+/// put in any state at all without a socket.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct TheRunnersWord {
+    /// How many health reports this connection has had.
+    reports: u64,
+    /// How long ago the last of them was recorded.
+    reported: Duration,
+    /// Whether that report named this attempt.
+    names_it: bool,
+}
+
+/// Whether the clock may be believed about an attempt, given what its runner
+/// has said (D169).
+///
+/// The watchdog times an *attempt*, and that is still right: a runner killed
+/// and restarted is connected and healthy while the job it was running
+/// exists nowhere. What was wrong is believing the clock when the machine is
+/// on the line and has just said otherwise. A health report names every job
+/// its runner is holding and nothing else, so a connected runner has already
+/// answered the question — and an answer beats a timer that was only ever a
+/// stand-in for one.
+///
+/// A report is only evidence if it is **newer** than the hub's last word
+/// about the attempt: a report composed before the job was handed out says
+/// nothing about it, and reading it as "the runner does not have this" would
+/// spend a go on a machine that did nothing wrong.
+fn what_a_runner_says(word: Option<TheRunnersWord>, unheard_for: Duration) -> WhatTheRunnerSays {
+    let Some(word) = word else {
+        return WhatTheRunnerSays::NothingAtAll;
+    };
+    if word.reports == 0 {
+        return WhatTheRunnerSays::NotYetSaying;
+    }
+    if word.reported >= unheard_for {
+        return WhatTheRunnerSays::NotYetSaying;
+    }
+    if word.names_it {
+        WhatTheRunnerSays::StillRunningIt {
+            reported: word.reported,
+        }
+    } else {
+        WhatTheRunnerSays::NotAnyMore {
+            reported: word.reported,
+        }
     }
 }
 
@@ -2627,6 +2755,62 @@ fn settle_readings(state: &State, unfinished: &[JobRecord]) -> Result<bool> {
                     continue;
                 };
                 if !outcome.is_success() {
+                    // A reading that was **lost** answered nothing, so there
+                    // is nothing about this commit to refuse the job with: it
+                    // is read again (D169). Told apart from every other way a
+                    // reading can fail, which are facts about the commit and
+                    // do refuse it — that one branch, covering both, is what
+                    // turned 201 of one nightly's 214 jobs into exit 125 on a
+                    // host that was merely buried.
+                    if matches!(outcome, JobOutcome::Lost { .. }) {
+                        let again = reading.clone().after_a_loss();
+                        if again.may_be_read_again(state.policy.attempts_allowed) {
+                            println!(
+                                "herd-hub: {by} was reading what {} needs and was lost \
+                                 before it answered, so nothing was learnt about command \
+                                 {} of commit {}; it is read again (reading {} of {}, \
+                                 D169)",
+                                record.id,
+                                declaration.command,
+                                declaration.commit,
+                                again.lost + 1,
+                                state.policy.attempts_allowed
+                            );
+                            if let Err(error) = state.store.record_reading(&record.id, again) {
+                                eprintln!(
+                                    "herd-hub: {} could not be set to read again after {by} \
+                                     was lost: {error}",
+                                    record.id
+                                );
+                                continue;
+                            }
+                            written = true;
+                            continue;
+                        }
+                        end_the_job(
+                            state,
+                            record,
+                            JobOutcome::Impossible {
+                                reason: refused_for_want_of_requirements(
+                                    record,
+                                    &declaration,
+                                    &by,
+                                    &format!(
+                                        "it {}, and that is the {} reading of this job lost \
+                                         to a machine that went away — the same number of \
+                                         goes E-21 gives a job at a runner that disappears \
+                                         (D169). Nothing is wrong with the command: the \
+                                         fleet could not keep a reading of it alive",
+                                        how_it_ended(outcome),
+                                        again.lost
+                                    ),
+                                ),
+                            },
+                            "its readings keep being lost",
+                        )?;
+                        written = true;
+                        continue;
+                    }
                     // D74's second limit: a reading that exits non-zero, or
                     // that its cap stopped, refuses the job. Both arrive
                     // here, and the sentence says which it was in the words a
@@ -4731,14 +4915,109 @@ async fn watch_for_a_lost_runner(state: Arc<State>) {
                 .attempt()
                 .map(|attempt| attempt.runner.clone())
                 .unwrap_or_default();
-            let reason = format!(
-                "runner {runner} stopped answering: nothing about attempt {attempt} of this \
-                 job for {unheard_for:?}, so it is not coming back"
-            );
+            // Before the clock is believed: what the machine itself says
+            // (D169). A runner that is here and reporting has already
+            // answered "is this attempt still yours", and its answer beats a
+            // timer that was only ever a stand-in for it.
+            let reason = match state.what_the_runner_says(&runner, &job_id, attempt, unheard_for) {
+                // Here, and holding it. The attempt is not lost, no go is
+                // spent, and nothing is requeued: the machine is busy, and a
+                // job taken away from a busy machine is a job that has to be
+                // run again somewhere. What bounds it is the cap the job
+                // runs under on that machine — the hub's reading cap for a
+                // reading, the declared or the owner's time cap for anything
+                // else (invariant 2) — and, if the machine stops answering
+                // altogether, the link check above.
+                WhatTheRunnerSays::StillRunningIt { reported } => {
+                    say_the_attempt_is_slow(
+                        &state,
+                        &record,
+                        &runner,
+                        attempt,
+                        unheard_for,
+                        reported,
+                    );
+                    continue;
+                }
+                // Here, and not yet asked: the link is new, or nothing has
+                // come back on it yet. Nothing is decided on a machine that
+                // has not spoken, and the wait is bounded by the link check
+                // above — a connection nothing comes back on is dropped at
+                // the threshold, and then there is no runner and the clock
+                // decides.
+                WhatTheRunnerSays::NotYetSaying => continue,
+                // Here, and not holding it. Said in those words rather than
+                // "stopped answering", which would be untrue of a machine
+                // that is on the line: this is a runner that was restarted,
+                // or that dropped the attempt without the hub hearing why.
+                WhatTheRunnerSays::NotAnyMore { reported } => format!(
+                    "runner {runner} is connected and the health report it sent {reported:?} \
+                     ago does not name attempt {attempt} of this job, and nothing has been \
+                     heard about that attempt for {unheard_for:?}: the attempt is gone from a \
+                     machine that is still here"
+                ),
+                // Nothing to go on but the clock, which is what it is for.
+                WhatTheRunnerSays::NothingAtAll => format!(
+                    "runner {runner} stopped answering: nothing about attempt {attempt} of \
+                     this job for {unheard_for:?}, so it is not coming back"
+                ),
+            };
             if let Err(error) = give_the_job_another_go(&state, &job_id, attempt, &reason) {
                 eprintln!("herd-hub: {job_id} could not be requeued: {error:#}");
             }
         }
+    }
+}
+
+/// Say, once, that an attempt is slow on a machine that is still here
+/// (D169).
+///
+/// The half of the fix that is not arithmetic. A job the hub has stopped
+/// hearing about is a job somebody is waiting on, and "nothing is written in
+/// your transcript for four minutes" is the state the first consumer read as
+/// a hang. So the silence is named — whose machine, how long, and what
+/// bounds it — and the job is **not** taken away from the runner that is
+/// running it.
+///
+/// Once per attempt: the watchdog wakes twenty times per threshold, and the
+/// same sentence twenty times a minute is a sentence nobody reads.
+fn say_the_attempt_is_slow(
+    state: &State,
+    record: &JobRecord,
+    runner: &str,
+    attempt: u32,
+    unheard_for: Duration,
+    reported: Duration,
+) {
+    if !state.first_word_of_slowness(&record.id) {
+        return;
+    }
+    let what = if record.is_a_reading() {
+        "this requirement reading"
+    } else {
+        "this job"
+    };
+    let bound = if record.is_a_reading() {
+        format!(
+            "its {:?} reading cap (--reading-cap)",
+            state.policy.reading_cap
+        )
+    } else {
+        "the time cap it runs under on that machine".to_owned()
+    };
+    let note = format!(
+        "nothing has been heard about attempt {attempt} of {what} for {unheard_for:?}, and \
+         runner {runner} is connected and said {reported:?} ago that it is still running it. \
+         A busy machine is not a lost one: the attempt keeps its go, nothing is requeued, \
+         and what ends it is {bound} or the runner going silent altogether. This wait \
+         carries on."
+    );
+    println!("herd-hub: {}: {note}", record.id);
+    for follower in state.followers_to_tell(&record.id) {
+        let _ = follower.send(FromHub::JobNote {
+            job_id: record.id.clone(),
+            note: note.clone(),
+        });
     }
 }
 
@@ -7213,6 +7492,90 @@ mod tests {
             said.said.len(),
             REFUSALS_REMEMBERED,
             "the ring must stop at {REFUSALS_REMEMBERED}, not grow with the connection"
+        );
+    }
+
+    // ----------- a busy runner is not a lost one (E-21, D169) ----
+
+    /// A runner that is here and says it is still running the attempt is not
+    /// a runner that stopped answering, whatever the clock says.
+    ///
+    /// This is the half of the nightly incident that turned a buried host
+    /// into 201 jobs ending 125: an attempt nothing had been heard about for
+    /// the threshold was ended with "it is not coming back" while the machine
+    /// was on the line and running it, and the runner's own frames about it
+    /// were then refused as superseded.
+    #[test]
+    fn a_runner_that_says_it_is_running_the_attempt_is_not_a_lost_one() {
+        let says = what_a_runner_says(
+            Some(TheRunnersWord {
+                reports: 12,
+                reported: Duration::from_secs(1),
+                names_it: true,
+            }),
+            Duration::from_secs(90),
+        );
+        assert!(
+            matches!(says, WhatTheRunnerSays::StillRunningIt { .. }),
+            "{says:?}"
+        );
+    }
+
+    /// And the other direction, which is what the clock was standing in for:
+    /// a runner that is here and does **not** name the attempt has answered
+    /// the question, so the attempt is over and the job gets its next go at
+    /// once rather than a threshold later.
+    #[test]
+    fn a_runner_that_no_longer_names_the_attempt_has_lost_it() {
+        let says = what_a_runner_says(
+            Some(TheRunnersWord {
+                reports: 12,
+                reported: Duration::from_secs(1),
+                names_it: false,
+            }),
+            Duration::from_secs(90),
+        );
+        assert!(
+            matches!(says, WhatTheRunnerSays::NotAnyMore { .. }),
+            "{says:?}"
+        );
+    }
+
+    /// A report that is older than the hub's last word about the attempt is
+    /// not evidence about it: it was composed before the job was handed out.
+    /// Reading it as "the runner does not have this" would spend a go on a
+    /// machine that did nothing wrong.
+    #[test]
+    fn a_report_older_than_the_last_word_about_the_attempt_says_nothing() {
+        let stale = what_a_runner_says(
+            Some(TheRunnersWord {
+                reports: 12,
+                reported: Duration::from_secs(90),
+                names_it: false,
+            }),
+            Duration::from_secs(61),
+        );
+        assert_eq!(stale, WhatTheRunnerSays::NotYetSaying);
+        // Nor is a connection nothing has come back on yet — a runner that
+        // has just redialled has not been asked anything.
+        let fresh_link = what_a_runner_says(
+            Some(TheRunnersWord {
+                reports: 0,
+                reported: Duration::from_millis(5),
+                names_it: false,
+            }),
+            Duration::from_secs(90),
+        );
+        assert_eq!(fresh_link, WhatTheRunnerSays::NotYetSaying);
+    }
+
+    /// And the case E-21 exists for is untouched: no runner of that name is
+    /// connected, so there is nothing to go on but the clock.
+    #[test]
+    fn a_runner_that_is_not_there_leaves_the_clock_to_decide() {
+        assert_eq!(
+            what_a_runner_says(None, Duration::from_secs(90)),
+            WhatTheRunnerSays::NothingAtAll
         );
     }
 
