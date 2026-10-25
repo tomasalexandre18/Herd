@@ -8362,7 +8362,7 @@ wants the lane faster starts from the reasons and not from the stopwatch.
 **On the number.** This entry is D172. D170 is held by an unmerged branch and
 D171 is the last on `main`.
 
-## 2026-10-25 — D-NEXT A refused file is named, never erased
+## 2026-10-25 — D175 A refused file is named, never erased
 
 **The defect, measured and not supposed.** A verdict carrying two inline
 output files, one of whose bytes do not hash to the sha256 beside them,
@@ -8483,5 +8483,5 @@ budget. That is already true of every streamed collection that never
 completed; this entry adds the inline digest case to it. Not fixed here: it
 is the sweeper's rule, not this defect's.
 
-**On the number.** Left as `D-NEXT`; `herd-merger` allocates it at
-integration.
+**On the number.** This entry is D175. D174 is held by the unmerged branch
+of PR #72 and D173 is the last on `main`.
