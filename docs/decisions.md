@@ -8652,3 +8652,59 @@ before a line of the fix and green after, one per consequence:
 `two_attempts_of_one_job_are_two_entries_in_the_machines_own_count`,
 `handing_one_attempt_back_leaves_the_other_attempt_of_that_job_running`,
 `an_acknowledgement_lets_go_of_the_attempt_that_holds_the_result_and_no_other`.
+
+## 2026-10-25 — D-NEXT The watchdog measures each silence inside its own loop
+
+**Decision.** `watch_for_a_lost_runner` reads the age of the attempt it is
+about to judge **again, inside the loop**, immediately before judging it,
+and skips the job if that fresh figure is inside `lost_after`. The list it
+walks still carries the figures the pass began with; nothing is now decided
+on them.
+
+**The defect.** The pass reads every open attempt's age into a list and then
+walks it. The walk *places*: `give_the_job_another_go` requeues, a requeue
+judges the queue on the way out, and `dispatch_queued_jobs` can give a job
+further down the list a brand-new attempt. The hub's relay loop does the
+same thing from the other side, at whatever moment a runner speaks, because
+a frame about an attempt ends it and requeues its job. The record is re-read
+inside the loop, so the **attempt number** acted on is the fresh one — while
+the duration beside the id is the silence of the attempt *before* it.
+
+It is not a cosmetic exaggeration of the silence. `what_a_runner_says`
+decides whether a connected machine's health report is evidence about an
+attempt by comparing the report's age with the age of the clock the watchdog
+is about to act on: a report older than that clock "says nothing", because
+it was composed before the job was handed out. With the stale figure the
+comparison comes out backwards — a report composed before the new attempt
+existed reads as *newer* than the attempt's silence, so *"its report does
+not name this attempt"* is taken as proof that the attempt is gone from a
+machine that is plainly here. The attempt is then ended, a go is spent, and
+with `attempts_allowed` at 2 the second such ending is a job that ends
+`Lost`. It was observed killing a 0.2 s-old attempt with a sentence about
+60 s of silence.
+
+**Why re-read rather than re-snapshot.** Reading the whole list again at the
+top of the loop would be the same bug one iteration later: what matters is
+that the figure and the attempt number come from the same instant, and the
+only instant that is true of is the one just before the judgement. The
+re-read is one `HashMap` lookup under the peers lock, per job the pass has
+already decided to act on, which is at most once per job per tick.
+
+**Found by the thing it breaks, not by reading.** It surfaced while C5's
+link-cut oracle was being made to hold: a runner at its ceiling loses its
+link, the watchdog ends its attempts, the runner redials still running them,
+and the requeues and the refusals interleave. That is the tick where the two
+figures disagree.
+
+**No version moves.** Nothing on the wire, nothing on disk.
+`PROTOCOL_VERSION` stays 2 and `RECORD_VERSION` stays 1.
+
+**Evidence.** `an_attempt_the_pass_itself_placed_is_not_judged_on_the_age_before_it`
+in `herd-hub/src/server.rs`, red on the branch before the fix with
+`j0000000002 is lost: … nothing has been heard about that attempt for
+90.0004s` written about an attempt the same pass had created milliseconds
+earlier, green after. One pass of the watchdog is extracted into
+`one_watchdog_pass` for it — unchanged, because a `loop` with a ticker in it
+cannot be run once — and the test store gains a second forced window,
+`record_state` ending another job's attempt as a job is queued, which is
+what a frame arriving on a link does.

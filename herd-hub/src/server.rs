@@ -5107,6 +5107,33 @@ fn one_watchdog_pass(state: &State) {
         if attempt == 0 {
             continue;
         }
+        // **The age again, now, and not the one in the list above**
+        // (D-NEXT). This loop places: requeueing a job judges the queue on
+        // the way out, and a frame arriving on a link while the pass runs
+        // does the same thing from the other side — so by the time a job
+        // further down the list is reached it may have been given a whole
+        // new attempt. The record is re-read a line above, so `attempt` is
+        // that fresh one, while the figure beside the id is the silence of
+        // the attempt *before* it. Acting on the pair writes off an attempt
+        // that is milliseconds old with a sentence about a minute of
+        // nothing, and spends the job's last go on it.
+        //
+        // The two figures agree in every ordinary tick. The tick where they
+        // do not is the one that follows a link coming back, which is
+        // exactly where the fleet has least to spare — and the stale figure
+        // does not merely exaggerate the silence: `what_a_runner_says`
+        // decides whether a health report is evidence by comparing the
+        // report's age with this one, so a report composed *before* the new
+        // attempt existed reads as newer than it and "it does not name this
+        // attempt" is taken as proof that the attempt is gone.
+        let unheard_for = state
+            .unheard_of_for(std::slice::from_ref(&job_id))
+            .first()
+            .map(|(_, age)| *age)
+            .unwrap_or(unheard_for);
+        if unheard_for <= state.policy.lost_after {
+            continue;
+        }
         let runner = record
             .attempt()
             .map(|attempt| attempt.runner.clone())
