@@ -345,6 +345,39 @@ of this tree — the same complaint, cascaded. The D170/D174 lines are notes
 about gaps held by open PRs, not failures. Both go green when the merger
 allocates the two numbers. **Not fixed, by instruction.**
 
+### CI, settled — both jobs seen finish
+
+Run `40181843868` on `309db6e`, watched to completion:
+
+```text
+$ gh pr checks 82
+docs    fail    11s     .../job/121134357452
+check   pass    7m47s   .../job/121134357225
+```
+
+- **`check`: PASSED.** `test suite: PASSED`, with **15** `COULD NOT RUN`
+  skips — the CI host's figure, not this host's 12, and **exactly the 15 the
+  same job reported on `ceff7b7`** (job `121116345331`, read back and
+  compared). **No new skip on CI either.**
+- **`docs`: failed, on the two `D-NEXT` placeholders and nothing else.** The
+  job's log, read back:
+
+```text
+docs/decisions.md still has a D-NEXT placeholder; herd-merger allocates the number at integration:
+8595:## 2026-10-25 — D-NEXT A runner holds its own ceiling
+8690:## 2026-10-25 — D-NEXT A runner announces its ceiling and the hub honours it
+note: D170 is a gap in docs/decisions.md (held by an open PR, or lost); gaps stay (D148)
+note: D174 is a gap in docs/decisions.md (held by an open PR, or lost); gaps stay (D148)
+docs check failed
+```
+
+  No line-length complaint, no new rule broken, and
+  `check-orchestration.sh` was skipped by the workflow because the step
+  before it failed. The same job failed the same way on `ceff7b7`: this is
+  the branch's standing red
+  (`gotchas/a-decision-branch-cannot-be-all-green.md`) and it goes green
+  when the merger allocates the two numbers.
+
 ## Risks and findings
 
 1. **One unexplained red I could not reproduce, and did not see the figure
