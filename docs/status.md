@@ -44,12 +44,12 @@ scope, **2** because the data root is on ZFS and no hard `io.max` can be
 carried — both in `herd-runner/src/confine.rs`. Measured here 2026-10-25;
 D151's 13 is **not reproducible** (`05-experiments-review.md` §6).
 
-**Two defects the audit found are fixed** (2026-10-25): **D175**, a
-verdict carrying an inline file whose bytes did not hash to the digest
-beside them exited 0 and said nothing was missing; **D176**, a verdict
-could name a commit the tree was never at, and a runner now reports the
-revision it really ran. `PROTOCOL_VERSION` 2 and `RECORD_VERSION` 1 both
-unchanged.
+**Three defects are fixed** (2026-10-25): **D175**, an inline file whose
+bytes did not hash to the digest beside it exited 0 saying nothing was
+missing; **D176**, a verdict could name a commit the tree was never at;
+**D177**, a runner's live-job map keyed by job id alone let a second
+attempt replace the first. No version moves. D177 makes the books honest,
+not two attempts of one job safe: a workspace is still per job.
 
 `docs/remediation/` holds ten pieces: the baseline, audits A and B, the
 contradictory review, the two experiments and their adversarial review,
@@ -78,8 +78,8 @@ and **not** adopted), `08` (the unsynced-write cost).
    is whether a WSL2 user scope gets a delegated subtree with `memory`.
 7. **One shared token**: any requester may ask for the merger level, and
    `wss://` is configured and never dialled.
-8. **Two tests are known unstable**, product side and untouched:
-   `herd-hub/tests/slots.rs:206` and `follower_alive.rs:230`.
+8. **Three tests are known unstable**, product side and untouched:
+   `slots.rs:206`, `follower_alive.rs:230`, `durability.rs:701` (ORCH-022).
 
 ## Next action
 
