@@ -1381,6 +1381,9 @@ async fn join(config: &Config) -> Result<Socket> {
             // size and no preference: both are what the hub asks of a runner
             // (E-22, E-19).
             host: herd_proto::HostSize::default(),
+            // Nor a ceiling on jobs held at once: a requester holds none, so
+            // there is no figure here to be silent about (D-NEXT).
+            jobs_at_once: None,
             preference: 0,
             // Nor does a requester measure anything about a host (E-32).
             load_milli: None,

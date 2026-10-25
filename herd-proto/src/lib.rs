@@ -1265,6 +1265,35 @@ pub enum ToHub {
         /// absent, and an absent figure is absent: never zero.
         #[serde(default, skip_serializing_if = "HostSize::is_silent")]
         host: HostSize,
+        /// The most jobs this runner will hold at once, as it worked the
+        /// figure out for itself (D-NEXT, invariant 2).
+        ///
+        /// It travels for the reason [`health_every_ms`](ToHub::Hello) does:
+        /// the mistake it prevents needs **both** sides at once. A runner
+        /// derives a ceiling from what it declared — the memory it lends,
+        /// less the floor it keeps, over the cap it puts on every job — and
+        /// hands back every assignment past it as
+        /// [`ToHub::AttemptAbandoned`]. The hub, meanwhile, charges a job
+        /// only the memory the job *declared*, so a queue of jobs that
+        /// declare none costs a machine nothing and is placed on one runner
+        /// without bound. Each side is self-consistent; together they spend
+        /// one of every surplus job's goes on a refusal that was certain
+        /// before it was sent. Only the pairing is wrong, so the pairing is
+        /// what the handshake has to be able to see.
+        ///
+        /// **`None` means the peer did not say, and nothing else.** Not
+        /// unlimited, not zero, not a figure guessed from `host` — a hub that
+        /// read silence as a number would be enforcing a ceiling its runner
+        /// never agreed to, and a hub that read it as "unlimited" would be
+        /// doing what it does today, which is at least honest about not
+        /// knowing. So a runner that says nothing is placed on exactly as it
+        /// is placed on now. `None` from every requester, which holds no
+        /// jobs at all.
+        ///
+        /// A ceiling here is **a bound beside the memory admission and never
+        /// instead of it**: whichever bites first is the one that bites.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        jobs_at_once: Option<u32>,
         /// How preferred this runner is when more than one could run a job
         /// (E-19).
         ///

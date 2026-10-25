@@ -739,6 +739,9 @@ struct Announced {
     capacity: RunnerCapacity,
     /// How big its host is (E-22).
     host: HostSize,
+    /// The most jobs it says it will hold at once, or `None` from a runner
+    /// that did not say (D-NEXT).
+    jobs_at_once: Option<u32>,
     /// How preferred it is when more than one machine could run a job (E-19).
     preference: i32,
     /// The load it measured as it dialled, times 1000 (E-32). Recorded,
@@ -793,6 +796,21 @@ struct ConnectedRunner {
     /// the one thing a job's `-j` is computed from. Announced in the
     /// handshake, because it belongs to the machine and not to the moment.
     host: HostSize,
+    /// The most jobs this machine says it will hold at once, as **it** worked
+    /// the figure out (D-NEXT, invariant 2).
+    ///
+    /// On the connection beside `host` and for the same reason: it is a fact
+    /// about the machine and its configuration, not about the moment, and a
+    /// redial brings its own — a runner restarted with a smaller
+    /// `--job-memory-max` announces a larger ceiling and the hub should use
+    /// that one, not the one the previous process declared.
+    ///
+    /// **`None` is "it did not say", and is placed on exactly as it is placed
+    /// on today.** Never read as unlimited and never as zero, and never
+    /// derived here from `host`: the runner's arithmetic also uses the cap it
+    /// puts on every job, which no frame carries, so a figure the hub
+    /// invented would be a ceiling the runner never agreed to.
+    jobs_at_once: Option<u32>,
     /// How preferred this machine is when more than one could run a job
     /// (E-19). Declared by whoever runs it; zero when it says nothing.
     preference: i32,
@@ -1201,6 +1219,7 @@ impl State {
                     outbox: outbox.clone(),
                     capacity: announced.capacity,
                     host: announced.host,
+                    jobs_at_once: announced.jobs_at_once,
                     preference: announced.preference,
                     load_milli: announced.load_milli,
                     kick,
@@ -1284,6 +1303,7 @@ impl State {
                         name: runner.name.clone(),
                         preference: runner.preference,
                         host: runner.host,
+                        jobs_at_once: runner.jobs_at_once,
                         draining: runner.draining,
                         capacity: runner.capacity.clone(),
                         holdings,
@@ -2134,6 +2154,7 @@ async fn serve_peer(state: Arc<State>, stream: TcpStream) -> Result<()> {
             health_every_ms,
             capabilities,
             host,
+            jobs_at_once,
             preference,
             load_milli,
             switch,
@@ -2188,6 +2209,7 @@ async fn serve_peer(state: Arc<State>, stream: TcpStream) -> Result<()> {
                     version: peer_version,
                     capacity: RunnerCapacity::new(name, capabilities),
                     host,
+                    jobs_at_once,
                     preference,
                     load_milli,
                     switch,
@@ -7307,6 +7329,7 @@ mod tests {
                     version: hub_version().to_owned(),
                     capacity: offering_kvm_free(),
                     host: HostSize::default(),
+                    jobs_at_once: None,
                     preference: 0,
                     load_milli: None,
                     switch: herd_proto::Switch::On,

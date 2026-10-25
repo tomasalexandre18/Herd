@@ -2754,6 +2754,18 @@ pub async fn serve_once(config: Config, session: Session, confined: Arc<Confined
             .with_context(|| format!("dialling {}", config.hub_url))?;
     let (mut sink, mut source) = socket.split();
 
+    // This machine's own ceiling, worked out once from what this machine
+    // itself declared and from nothing the hub has said: the memory it lends,
+    // the floor it keeps, the cap it puts on every job. It is computed here,
+    // before the handshake, so that **the figure announced and the figure
+    // enforced are one value** and cannot drift — the same `Arc` is sent in
+    // the hello below and handed to `serve_hub`, which is where it is held
+    // against every assignment.
+    let ceiling = Arc::new(confine::jobs_at_once(
+        &config.host,
+        confined.caps().memory_max,
+    ));
+
     let hello = ToHub::Hello {
         protocol_version: PROTOCOL_VERSION,
         // Which build this is, beside which protocol it speaks (E-51). The
@@ -2771,6 +2783,12 @@ pub async fn serve_once(config: Config, session: Session, confined: Arc<Confined
         // the hub's claim step needs about a machine that it cannot work out
         // for itself (E-22, E-19).
         host: config.host,
+        // And the ceiling derived from that host, so the hub stops placing
+        // work this runner is certain to hand straight back (D-NEXT). Announced,
+        // never asked for: the runner enforces this figure whatever the hub
+        // does with it, and a hub that ignores it only costs the fleet the
+        // attempts it costs today.
+        jobs_at_once: Some(u32::try_from(ceiling.most()).unwrap_or(u32::MAX)),
         preference: config.preference,
         // And where its owner's switch stands, which is announced rather than
         // assumed: a runner restarted while switched off has not changed its
@@ -2857,6 +2875,7 @@ pub async fn serve_once(config: Config, session: Session, confined: Arc<Confined
         &session,
         &mut source,
         confined,
+        ceiling,
         config.hub_silence_limit,
     )
     .await;
@@ -2891,19 +2910,21 @@ async fn serve_hub(
     session: &Session,
     source: &mut Source,
     confined: Arc<Confined>,
+    // This machine's own ceiling, worked out by `serve_once` from what this
+    // machine itself declared — the memory it lends, the floor it keeps, the
+    // cap it puts on every job — and from nothing the hub has said. Handed in
+    // rather than recomputed because it is the **same value** the hello
+    // announced (D-NEXT): a figure announced and a figure enforced that were
+    // derived twice could differ, and the one that matters is this one.
+    //
+    // It is a property of the host and of its configuration, neither of which
+    // a connection can change. **Held whatever the hub does with the
+    // announcement**: a runner that learned its limits from the peer handing
+    // out the work would have no limits at all the day that peer is wrong
+    // (invariant 2).
+    ceiling: Arc<confine::JobsAtOnce>,
     silence_limit: Duration,
 ) -> Result<()> {
-    // This machine's own ceiling, worked out once from what this machine
-    // itself declared — the memory it lends, the floor it keeps, the cap it
-    // puts on every job — and from nothing the hub has said. Held here rather
-    // than on the session because it is a property of the host and of its
-    // configuration, neither of which a connection can change: a runner that
-    // learned its limits from the peer handing out the work would have no
-    // limits at all the day that peer is wrong (invariant 2).
-    let ceiling = Arc::new(confine::jobs_at_once(
-        &config.host,
-        confined.caps().memory_max,
-    ));
     while let Some(message) = next_message(source, silence_limit).await? {
         match message {
             FromHub::AssignJob {

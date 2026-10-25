@@ -292,6 +292,7 @@ fn every_message_to_the_hub_round_trips() {
             host: HostSize::new(Some(17 * 1024), Some(20))
                 .with_floor(Some(3481))
                 .with_tmpfs(Some(8192)),
+            jobs_at_once: Some(6),
             preference: 10,
             load_milli: Some(1420),
             switch: Switch::Off {
@@ -310,6 +311,7 @@ fn every_message_to_the_hub_round_trips() {
             health_every_ms: None,
             capabilities: CapabilityOffer::empty(),
             host: HostSize::default(),
+            jobs_at_once: None,
             preference: 0,
             load_milli: None,
             switch: Switch::On,
@@ -1480,5 +1482,124 @@ fn a_wait_that_predates_wants_files_is_read_as_wanting_them() {
     assert!(
         says_no.contains(r#""wants_files":false"#),
         "a requester that declines the wait says so on the wire: {says_no}"
+    );
+}
+
+/// `jobs_at_once` is additive in **both** directions, which is what the rule
+/// at `docs/decisions.md:7293` and `herd-hub/src/job.rs:44-51` actually ask
+/// for and what lets D-NEXT ship without moving [`PROTOCOL_VERSION`].
+///
+/// A field is additive only when a peer that does not know it and a peer that
+/// does can each read what the other wrote, **and** when what is missing
+/// means exactly what its default says. Both halves are asserted here,
+/// because only one of them is about serde:
+///
+/// * **A hello from a peer built before the field** — the frame `main`
+///   produces today, written out literally rather than generated, so that a
+///   later edit to the struct cannot quietly change what "older" means —
+///   decodes with `jobs_at_once: None`. That is "it did not say", and §1 of
+///   the doc comment on the field is that this is never read as unlimited,
+///   never as zero and never as a figure derived from `host`.
+/// * **A hello from a peer built after it** is read by a deserialiser that
+///   has never heard of the field. Modelled by a struct of exactly the fields
+///   the older `Hello` had: serde ignores what it does not know, so the older
+///   hub reads every figure it used to read and is merely one fact poorer.
+#[test]
+fn a_hello_carries_its_job_ceiling_in_both_directions_without_moving_the_version() {
+    // ---- Older peer → today's code. The frame as `main` emits it.
+    let from_before = r#"{"type":"hello","protocol_version":2,"peer_version":"0.3.7",
+        "role":"runner","name":"wsl-pc","instance":"run-4242",
+        "host":{"memory_mib":17408,"threads":20,"memory_floor_mib":3481},
+        "preference":10,"switch":{"position":"on"}}"#;
+    let ToHub::Hello {
+        jobs_at_once,
+        host,
+        preference,
+        ..
+    } = from_frame::<ToHub>(from_before).expect("an older peer's hello still decodes")
+    else {
+        panic!("that frame is a hello");
+    };
+    assert_eq!(
+        jobs_at_once, None,
+        "a peer that was built before the field said nothing about a ceiling, and \"did not \
+         say\" is the only thing that may be read out of its silence"
+    );
+    // And the rest of the frame is untouched by the new field: an additive
+    // change that moved another figure would not be additive.
+    assert_eq!(host.memory_mib, Some(17408));
+    assert_eq!(preference, 10);
+
+    // ---- Today's peer → an older deserialiser.
+    let with_ceiling = to_frame(&ToHub::Hello {
+        protocol_version: PROTOCOL_VERSION,
+        peer_version: "0.3.8".to_owned(),
+        role: Role::Runner,
+        token: None,
+        name: Some("wsl-pc".to_owned()),
+        instance: Some("run-4242".to_owned()),
+        state_root: None,
+        health_every_ms: Some(15_000),
+        capabilities: CapabilityOffer::empty(),
+        host: HostSize::new(Some(17 * 1024), Some(20)).with_floor(Some(3481)),
+        jobs_at_once: Some(7),
+        preference: 10,
+        load_milli: None,
+        switch: Switch::On,
+    })
+    .expect("encodes");
+    assert!(
+        with_ceiling.contains(r#""jobs_at_once":7"#),
+        "the figure has to be on the wire to be worth anything: {with_ceiling}"
+    );
+
+    /// The `Hello` an older hub compiled against: every field it knew, and
+    /// not the one it did not. Serde ignores what it has no field for, which
+    /// is the whole of why this change is additive.
+    #[derive(serde::Deserialize)]
+    struct HelloAsAnOlderHubReadsIt {
+        protocol_version: u32,
+        peer_version: String,
+        name: Option<String>,
+        #[serde(default)]
+        health_every_ms: Option<u64>,
+        #[serde(default)]
+        host: HostSize,
+        #[serde(default)]
+        preference: i32,
+    }
+    let older: HelloAsAnOlderHubReadsIt =
+        serde_json::from_str(&with_ceiling).expect("an older hub reads a newer runner's hello");
+    assert_eq!(older.protocol_version, PROTOCOL_VERSION);
+    assert_eq!(older.peer_version, "0.3.8");
+    assert_eq!(older.name.as_deref(), Some("wsl-pc"));
+    assert_eq!(older.health_every_ms, Some(15_000));
+    assert_eq!(older.host.memory_mib, Some(17 * 1024));
+    assert_eq!(older.preference, 10);
+
+    // And absent really is absent on the wire, not a zero that an older hub
+    // would read as a ceiling of none: `skip_serializing_if` is the half of
+    // the contract that the `#[serde(default)]` above cannot state.
+    let silent = to_frame(&ToHub::Hello {
+        protocol_version: PROTOCOL_VERSION,
+        peer_version: "0.3.8".to_owned(),
+        role: Role::Requester,
+        token: None,
+        name: None,
+        instance: None,
+        state_root: None,
+        health_every_ms: None,
+        capabilities: CapabilityOffer::empty(),
+        host: HostSize::default(),
+        jobs_at_once: None,
+        preference: 0,
+        load_milli: None,
+        switch: Switch::On,
+    })
+    .expect("encodes");
+    assert!(
+        !silent.contains("jobs_at_once"),
+        "a peer with no ceiling to declare must not put the word on the wire at all, or \
+         \"did not say\" and \"said nothing fits\" become the same bytes: {silent}"
     );
 }
