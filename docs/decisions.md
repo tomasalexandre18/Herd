@@ -8590,7 +8590,7 @@ deployment.
 integrated in the same pass, D174 is held by the unmerged branch of PR #72
 and D170 by that of PR #67.
 
-## 2026-10-25 — D-NEXT A runner's live jobs are keyed by job and attempt
+## 2026-10-25 — D177 A runner's live jobs are keyed by job and attempt
 
 **Decision.** `herd_runner::Session`'s map of the jobs a runner has in hand
 is keyed by **(job, attempt)** and no longer by job id alone. Every
@@ -8625,6 +8625,20 @@ seen in a real run:
   `insert` had already destroyed the first attempt's unacknowledged verdict,
   which D19 says is never destroyed.
 
+**The acknowledgement resolves; it does not carry.** No field was added to
+any frame here. `FromHub::JobResultAck` still carries a job id and **no
+attempt number**, so the attempt an acknowledgement is about is read off
+the map: it is the one **holding an end**, which is that frame's own
+meaning — the hub has this job's end on its disk, and an attempt that is
+still running has no end for an acknowledgement to be about. Keyed by both,
+that is the resolution of one named entry instead of "whatever stood under
+the id". One caveat, said here rather than left to be found: if two
+attempts of one job were both holding an end, one acknowledgement would
+free both. That state is not reachable today — a second attempt is only
+assigned after the hub has written the first off, and a written-off
+attempt's entry is dropped by `drop_stale` — and freeing an arbitrary one
+of them would be worse.
+
 **Why the key and not a guard.** A guard in `take_job` — refuse a second
 attempt of a job this runner is already running — is also wanted, and is a
 separate decision about what a runner may accept. It does not make this one
@@ -8652,3 +8666,17 @@ before a line of the fix and green after, one per consequence:
 `two_attempts_of_one_job_are_two_entries_in_the_machines_own_count`,
 `handing_one_attempt_back_leaves_the_other_attempt_of_that_job_running`,
 `an_acknowledgement_lets_go_of_the_attempt_that_holds_the_result_and_no_other`.
+
+**Two of those three tests assert a state that part 3 of C5 forbids
+outright.** The two that call `take_job` twice for one job id —
+`two_attempts_of_one_job_are_two_entries_in_the_machines_own_count` and
+`handing_one_attempt_back_leaves_the_other_attempt_of_that_job_running` —
+make that second call exactly what part 3's `NotTaken::StillRunningThisJob`
+refuses. They are not a specification that a runner *may* hold two live
+attempts of one job; they are a specification that the map must be able to
+say so when it happens. Read as a licence they would block the refusal that
+part 3 adds, which is the opposite of what they are for.
+
+**On the number.** This entry is D177. D176 and D175 were integrated on
+2026-10-25, D174 is held by the unmerged branch of PR #72 and D170 by that
+of PR #67; gaps stay (D148).

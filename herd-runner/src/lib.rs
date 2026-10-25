@@ -531,7 +531,7 @@ struct Ended {
 }
 
 /// What one entry of [`Inner::jobs`] is about: **a job and the attempt of it
-/// that this runner has in hand** (D-NEXT).
+/// that this runner has in hand** (D177).
 ///
 /// The key is both, and that is the whole of it. A runner can hold two
 /// attempts of one job at once — the hub writes an attempt off while the link
