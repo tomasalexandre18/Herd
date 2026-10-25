@@ -112,6 +112,24 @@ pub struct Seat {
     /// own figure or has none — and having none means placing exactly as it
     /// placed before this field existed.
     pub jobs_at_once: Option<u32>,
+    /// What this machine last said it was **already holding**, when it
+    /// handed an assignment back because it was at the ceiling above
+    /// (D-NEXT). `None` is "nothing to correct", and is the ordinary state.
+    ///
+    /// [`Seat::reserved`]`.jobs` is the hub's count, read off the records,
+    /// and there is one state in which the records are wrong by a lot: a
+    /// runner whose link dropped goes on running its jobs, the watchdog ends
+    /// those attempts and requeues them, and when the machine redials the
+    /// hub sees a seat holding nothing. Offering it back the jobs it is
+    /// still running is what this figure prevents — the two counts are
+    /// compared and the larger one is the one the ceiling is held against,
+    /// because the machine is the authority on what the machine is running.
+    ///
+    /// Only ever a **floor** under the hub's own count, never a replacement
+    /// for it: within one pass `claim` goes on taking `reserved.jobs` up as
+    /// jobs are offered, so two jobs offered together still contend for the
+    /// last place whatever this says.
+    pub it_said_it_is_holding: Option<u32>,
     /// On its way out (invariant 2). It takes no new job, and — the decision
     /// D80 records — it does not count as *available* either, so a job does
     /// not stick to a machine that is leaving.
@@ -657,13 +675,37 @@ fn admission(record: &JobRecord, seat: &Seat, threads: Option<u32>) -> Admission
                 seat.name
             ));
         }
-        if seat.reserved.jobs >= at_once {
+        // The hub's count, and the machine's own where the machine has
+        // contradicted it (D-NEXT). The larger wins, because the only way
+        // the two differ is the hub's being stale: a runner that redialled
+        // after an outage is holding jobs whose attempts the watchdog ended
+        // while the link was down, so the records read that seat as empty
+        // and the machine knows it is full. Taking the larger is also what
+        // makes this correction cost nothing in the ordinary case, where the
+        // machine has said nothing and the figure is the hub's alone.
+        let out_there = seat
+            .reserved
+            .jobs
+            .max(seat.it_said_it_is_holding.unwrap_or(0));
+        if out_there >= at_once {
             return Admission::ShortNow(format!(
-                "on {}, {} job(s) already out there and {A_CEILING_THE_RUNNER_ANNOUNCED} \
-                 {at_once} at once, so it takes nothing more until one of them ends: {}",
+                "on {}, {out_there} job(s) already out there and \
+                 {A_CEILING_THE_RUNNER_ANNOUNCED} {at_once} at once, so it takes nothing more \
+                 until one of them ends: {}{}",
                 seat.name,
-                seat.reserved.jobs,
-                seat.reserved.sentence()
+                seat.reserved.sentence(),
+                match seat.it_said_it_is_holding {
+                    // Said out loud, because it is the one figure here that
+                    // did not come off the records: an operator reading
+                    // "0 job(s) out there and it holds at most 2" would be
+                    // reading a contradiction otherwise.
+                    Some(holding) if holding > seat.reserved.jobs => format!(
+                        " — {holding} of them by the machine's own count, which it gave when it \
+                         last handed an assignment back; this hub's records knew of {}",
+                        seat.reserved.jobs
+                    ),
+                    _ => String::new(),
+                }
             ));
         }
     }
@@ -1653,6 +1695,7 @@ mod tests {
             name: name.to_owned(),
             preference,
             host,
+            it_said_it_is_holding: None,
             // Silent, on every seat these tests build but the ones that are
             // about the ceiling. That is deliberate and it is itself the
             // assertion D-NEXT's "absent is not a figure" needs: a runner that
@@ -2425,6 +2468,7 @@ mod tests {
             ended_at: None,
             ended: None,
             requeue_code: None,
+            at_its_ceiling: false,
             why: "claimed by wsl-pc: labels build".to_owned(),
             steps: Vec::new(),
             commit: None,
@@ -2534,6 +2578,7 @@ mod tests {
             ended_at: None,
             ended: None,
             requeue_code: None,
+            at_its_ceiling: false,
             why: format!("claimed by {runner}"),
             steps: Vec::new(),
             commit: None,
@@ -3597,6 +3642,7 @@ mod tests {
             ended_at: Some(record.submitted_at),
             requeue_code,
             ended: Some("ended".to_owned()),
+            at_its_ceiling: false,
             why: "claimed by somebody".to_owned(),
             commit: None,
             steps: Vec::new(),

@@ -41,10 +41,21 @@ copies them into the release body verbatim.
 A runner on this version announces a ceiling; a hub on this version honours
 it and holds the surplus in the queue. A hub on **`v0.3.7`** — the version
 in the field — cannot read the announcement and goes on sending, and the
-runner now refuses. Each refusal spends one of that job's two goes, so a
-job refused twice **ends with no verdict**. On `v0.3.7` the same queue cost
-no refusals at all, because the runner had no ceiling: it ran everything.
-Runner-first therefore does not preserve today's cost, it loses jobs.
+runner now refuses.
+
+**What a refusal costs changed on 2026-10-25, and the order still matters.**
+Since §8 a refusal at a machine's own ceiling spends none of that job's two
+goes: it has a budget of its own, eight, and a job that reaches it ends
+naming the budget and the machines. So a runner-first fleet no longer
+*loses* jobs to the order — the sentence this note carried before, that a
+job refused twice ends with no verdict, is no longer true of this version.
+What a runner-first fleet pays instead is **churn**: a hub that cannot read
+the announcement goes on offering work the runner will hand straight back,
+so every surplus job makes a round trip, an attempt record and a journal
+line per offer, and a queue that would have waited quietly instead cycles
+until the machine has room. On `v0.3.7` that cost was zero, because the
+runner had no ceiling: it ran everything, which is what invariant 2 is
+about.
 
 Hub-first costs nothing: a hub on this version reads no `jobs_at_once` from
 a `v0.3.7` runner's hello, which means *"it did not say"*, and places on it
@@ -52,9 +63,8 @@ exactly as it does today.
 
 **Nothing in Herd detects or enforces this order.** `Welcome` carries no
 echo of the field and the protocol version deliberately does not move, so a
-fleet upgraded in the wrong order gets no signal until jobs start ending
-`lost`. §7.6 has the detail.
-
+fleet upgraded in the wrong order gets no signal beyond those refusals.
+§7.6 has the detail and §8 has what they now cost.
 ### RN-2. A runner started **without `--host-memory` now takes one job at a time.**
 
 `herd-runner/src/main.rs` fills in `host.memory_mib` only when
@@ -708,3 +718,108 @@ the hub has no reason to prefer its own arithmetic to the machine's. What
 would settle it: a fleet where a misconfigured runner's announcement costs
 throughput that nobody can see the cause of — which §7.3's sentence is
 written to make visible.
+
+---
+
+## 8. What a ceiling refusal costs (D-NEXT, on Alexa's decision of 2026-10-25)
+
+`herd-reviewer`'s contradictory review of PR #82 found one thing it would
+not sign: **§1.2, a link outage that turns N running jobs into N jobs ending
+`lost`.** This section is what was done about it. Alexa's words, of the same
+day:
+
+> §4 : oui, un refus de plafond ne dépense pas de vie (forme de
+> `goes_a_runner_took`, additif sur l'enregistrement d'essai, approuvé).
+>
+> Condition de fusion ajoutée : un test hub réel qui coupe le lien 60 s avec
+> un runner à son plafond, 0 job mort, 0 job sans verdict. Il doit être
+> rouge sur `fa2ee15` avant le correctif. Rien ne fusionne sans lui.
+
+### 8.1 The chain, re-read line by line on this branch — F
+
+1. A runner at its ceiling N loses its link. Its jobs keep running
+   (`herd-runner/src/lib.rs`, the comment at the end of `serve_hub`: *"the
+   jobs still running hold senders of their own … They report on the next
+   link"*), so its own count is still N.
+2. After `lost_after` the hub's watchdog ends all N attempts and requeues
+   each job as attempt 2 of 2. Its count for that machine is now **0**.
+3. The runner redials. The hub calls `dispatch_queued_jobs` **on the hello,
+   before reading one frame from it**, and nothing avoids the machine a job
+   has just come off. All N go back.
+4. The runner is still holding the originals, refuses every one, and each
+   refusal was the job's last go. **N jobs end `lost` with no verdict.**
+
+### 8.2 The test, which is the condition of merge — F
+
+`herd-hub/tests/announced_job_ceiling.rs`,
+`a_link_cut_while_the_runner_is_full_loses_no_job`. A real hub, a real
+runner announcing [`CEILING`] = 2 and running two jobs, a TCP relay between
+them that the test **cuts**: the sockets are shut down under both peers and
+every redial is dropped for the length of the outage, so both processes stay
+alive and only the wire goes. The oracle is Alexa's two figures and nothing
+else: no job dead, no job without a verdict.
+
+| | on `fa2ee15`, before the fix | after |
+|---|---|---|
+| suite timings (`--lost-after 3s`, 4 s outage) | **2 of 2 `lost`**, each *"this was attempt 2 of 2"* | 2 of 2 exited 0, ten runs in a row |
+| the real 60 s (`--lost-after 60s`, 65 s outage) | **2 of 2 `lost`** | 2 of 2 exited 0 (140 s) |
+
+The suite keeps the short one and drives the same watchdog through
+`--lost-after`, which `herd-hub/src/main.rs` already exposes; the 60 s shape
+was run by hand and its output is in the pull request. A test that was never
+red proves nothing, so both reds were taken on the branch as it stood.
+
+### 8.3 The change — F
+
+1. **`at_its_ceiling: Option<u32>` on `ToHub::AttemptAbandoned`**,
+   `#[serde(default, skip_serializing_if = "Option::is_none")]`: how many
+   jobs the runner was holding, when **its own count of what it holds** is
+   why it refused. `None` on every other abandonment, and `None` is what an
+   older runner's frame decodes to — which is what every abandonment meant
+   before the field existed.
+2. **`at_its_ceiling: bool` on the attempt record**, left off the record
+   entirely when false. `JobRecord::goes_a_runner_took` filters on it beside
+   D76's `requeue_code`, so a ceiling refusal spends none of E-21's goes.
+3. **A budget of its own**: `CEILING_REFUSALS_ALLOWED` = 8, a `Policy`
+   figure. A job handed back an eighth time ends `Lost` with a sentence
+   naming the budget, both figures, that none of E-21's goes were spent, and
+   every machine that said it was full. `a_job_refused_past_the_bound_ends_and_names_it`
+   drives it at a budget of one.
+4. **The hub remembers the machine's own count** until that runner's next
+   health report, and `admission` holds the ceiling against the larger of
+   that and `seat.reserved.jobs`. Without this the surplus would be offered
+   straight back and the refusals would cycle; with it the job **waits**,
+   and the report — which names every attempt the runner holds — ends the
+   correction and judges the queue at once.
+5. **A runner never holds two attempts of one job.** `take_job` refuses a
+   second attempt of a job it is already running, `abandon` drops only the
+   entry that belongs to the attempt it is about, and `release` drops only a
+   job that is holding an end. This is the review's §1.3 — pre-existing, and
+   made reachable by jobs now surviving to a third attempt. Without it the
+   first attempt ran untracked, the machine's ceiling was short by one for
+   the rest of its life, and the live attempt vanished from the health
+   report, where the watchdog then wrote it off for silence.
+
+**Neither number moves.** `PROTOCOL_VERSION` stays 2 and `RECORD_VERSION`
+stays 1, asserted by `neither_version_number_moves` and by
+`the_record_version_does_not_move`; and
+`a_record_crosses_the_field_in_both_directions` writes a record with the new
+field, reads it with a struct that does not have it, writes that back and
+reads it again — a rollback is one of those directions and an upgrade is the
+other. **No `JobEventKind` variant was added.**
+
+### 8.4 What is left — H
+
+**The hub still dispatches to a runner before reading one frame from it.**
+This change makes that safe — the refusal costs nothing and teaches the hub
+at once — and does not make it right. The criterion is on the board as
+**ORCH-061**, to be carried into the S3 brief: *the keeper's pass must not
+place on a runner whose reconciliation has not arrived.*
+
+**The watchdog acts on an age read before its own pass placed anything.**
+`watch_for_a_lost_runner` takes one snapshot of every open attempt's age and
+then walks it, and the walk requeues, which dispatches, which can give a job
+further down the list a brand-new attempt — judged against the old figure.
+Fixed here by reading the age again inside the loop, after the record; it is
+the one tick that follows a link coming back, which is where a fleet has
+least to spare.

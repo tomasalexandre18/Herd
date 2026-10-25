@@ -61,6 +61,7 @@ started), `open` (not yet agreed or sized), `active` (an agent holds it),
 | ORCH-021 | **Four** O(`T`) walks of the whole volume, not one. D152's 200 ms poll re-reads every record; `04a` adds `collections_owed` on a runner junction, `sweep_outputs` (`store.rs:642`) and store startup (`store.rs:439` plus recovery). And **nothing ever deletes a job directory** (the only `remove_dir_all` on a job path is the part directory, `:1981`), so `T` is monotone in the number of jobs the herd has ever run | `status.md` 2026-10-23; widened by `04a-cost-surface.md`, 2026-10-25 | — | open | Not "when a count makes it visible" any more: it is measured, and then resized. 815 ms worst turn at `T` = 20 000 against 33 ms at `N` = 1 000 (04a); but `06` broke the whole junction into five posts and the historical read is 0.16 % of it at `N` = 1 000 against 99.5 % for durable writing. So this stays owed as a cheap local cleanup in `store.rs` that blocks nothing, and it is no longer the gate on an executor change — see the rewritten `ORCH-047` | ORCH-047 | `docs/remediation/04a-cost-surface.md`; `status.md` "not done" 4 |
 | ORCH-048 | Both skip counters can **over-count**. `scripts/test.sh` and `scripts/report-skips.sh` dedupe on the whole line, and two of the twelve reasons embed a run-specific path containing a PID, so two emissions of one assertion read as two assertions. It does not bite today — each of the twelve is in exactly one test binary — so **H** on the trigger, **F** on the mechanism | `05-experiments-review.md` §6, 2026-10-25 | herd-step | open | One `sed`: dedupe on the text up to the second colon, which is the test name. It is a change to a gate, so it goes through its own task and its own PR, never as a hunk of something else | — | `docs/remediation/05-experiments-review.md` §6 |
 | ORCH-022 | **Two** known-unstable tests, product side. `herd-hub/tests/follower_alive.rs` `a_quiet_running_job_keeps_its_follower_hearing_from_the_hub` — the failing `assert!` begins at line 230, its condition `longest < spread / 2` on line 231 — went red on head `b40c8dc` of PR #71 on a diff of three Markdown files and was green on `46f3fb1` minutes earlier. `00-baseline.md §8` names a second: `herd-hub/tests/slots.rs:206` `a_runner_killed_mid_job_gives_its_slot_back` | CI run 40114565027, 2026-10-24; widened by `00-baseline.md §8`, 2026-10-25 | herd-planner | open | Tracking only: belongs to the later technical audit; no change to either test from this mandate. Neither fired in the C0 integration run of 2026-10-25, which is evidence of flakiness and not of a fix | the product audit | `gh run view 40114565027 --log-failed`; `docs/remediation/00-baseline.md` §8; `03b §9`; `03c §2.8` |
+| ORCH-061 | **A criterion the S3 brief must carry, written here so that it survives the branch that found it.** The hub dispatches to a runner that has just redialled **before reading one frame from it**: the hello handler calls `dispatch_queued_jobs` and only then enters `relay_from_runner` (`herd-hub/src/server.rs`, the line that calls the pass). Nothing in the matcher avoids the machine a job has just come off, so a runner whose link dropped is handed back every job it is still running the instant it returns. **The keeper's pass must not place on a runner whose reconciliation has not arrived** — a first health report, or whatever the keeper puts in its place. C5's third decision makes that safe (the refusal costs no go and teaches the hub at once) and does not make it right | PR #82's contradictory review §1.2, 2026-10-25; carried forward by the C5 no-life-spent task | herd-planner (writes the S3 brief), then herd-step | owed | Copy this criterion into the S3 brief when it is written, as a condition and not a remark, and name the test that would show it: a runner at its ceiling whose link drops, redialling, with the hub placing nothing on it until it has spoken | ORCH-057 (S3 is `07`'s recommendation) | `docs/remediation/07-target-architecture.md` "S3 — The keeper"; `herd-hub/tests/announced_job_ceiling.rs` `a_link_cut_while_the_runner_is_full_loses_no_job`; `decisions.md` the third `D-NEXT` of 2026-10-25 |
 
 ## Active — an agent holds it
 
@@ -90,18 +91,18 @@ started), `open` (not yet agreed or sized), `active` (an agent holds it),
    walk is 0.16 % of a junction at `N` = 1 000 against 99.5 % for durable
    writing. The row is rewritten above and the walk stays owed as
    ORCH-021, a cheap cleanup that blocks nothing.
-3. **C5 (ORCH-060) is reviewed, hardened and waiting on `herd-merger`.**
-   Both halves plus the review-hardening commit are on
-   `runner-holds-its-own-limits` in one PR, with the real-hub measurement
-   behind it (12 ceiling-spent attempts and 6 of 8 jobs `lost` before, in
-   four of five runs; 0 and 0 after). It carries **two** `D-NEXT` entries
-   and needs two numbers in order, and the merger also owes one prose
-   correction inside the second entry (see the row). Nothing of it is in
-   the C0b pass. **One question for Alexa is still open on it** and is the
-   review's blocking finding: whether a refusal for a runner's own ceiling
-   should spend one of the job's goes, given that a link outage longer than
-   `lost_after` can otherwise end N running jobs `lost`. Nothing on this
-   branch prejudges it.
+3. **C5 (ORCH-060) is complete and waiting on `herd-merger`.** Everything is
+   on `runner-holds-its-own-limits` in one PR: the runner's ceiling, the
+   announcement the hub honours, the review hardening, and now the review's
+   blocking finding closed on Alexa's decision of 2026-10-25 — a refusal at
+   a machine's own ceiling spends none of the job's goes, bounded by
+   `CEILING_REFUSALS_ALLOWED` = 8. **Alexa's condition of merge is met**:
+   `a_link_cut_while_the_runner_is_full_loses_no_job` was red on `fa2ee15`
+   with 2 of 2 jobs ending `lost`, at the suite timings and again at the
+   real 60 s, and is green after — ten runs in a row, plus one more at the
+   real 60 s. The branch carries **three** `D-NEXT` entries and needs three
+   numbers in order. Nothing of it is in the C0b pass, and no question of
+   it is open with Alexa any more.
 4. Then the owed rows that nothing blocks: ORCH-048 (the skip counters
    over-count), ORCH-031 (the brief must name its worktree), ORCH-015,
    ORCH-016.

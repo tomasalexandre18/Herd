@@ -309,10 +309,10 @@ impl JobStore for TracingStore {
         id: &JobId,
         attempt: u32,
         reason: &str,
-        requeue_code: Option<i32>,
+        how: herd_hub::job::HowItEnded,
     ) -> StoreResult<()> {
         self.around("end_attempt", || {
-            self.inner.end_attempt(id, attempt, reason, requeue_code)
+            self.inner.end_attempt(id, attempt, reason, how)
         })
     }
     fn append_log(

@@ -1563,6 +1563,41 @@ pub enum ToHub {
         job_id: JobId,
         attempt: u32,
         reason: String,
+        /// How many jobs this runner was already holding, when **its own
+        /// count of what it holds is why it refused** (D-NEXT, invariant 2).
+        ///
+        /// Two refusals say it: the ceiling the runner announced, and a job
+        /// it is already running another attempt of. Both are the same fact
+        /// — this machine has no place for this assignment, by its own
+        /// bookkeeping — and both carry the same consequence.
+        ///
+        /// `None` on every other abandonment — a drain, a withdrawn switch, a
+        /// command line that will not do, an attempt the hub wrote off — and
+        /// that is the whole of what this field decides. A refusal for a
+        /// machine's own count is not a runner that went away: the machine
+        /// is here, healthy, and holding exactly the work it said it would
+        /// hold, so the job has lost nothing and must not be charged a go for
+        /// it (`herd_hub::job::JobRecord::goes_a_runner_took`). The hub
+        /// cannot read that off the `reason`, which is prose; it has to be
+        /// said in a field.
+        ///
+        /// The **count** rather than a flag, because the hub needs it twice.
+        /// It is why the attempt is not charged, and it is also the machine's
+        /// own answer to "how full are you": a runner that has just redialled
+        /// is holding jobs the hub's records no longer know about, since the
+        /// watchdog ended those attempts while the link was down and the jobs
+        /// went on running. Without the figure the hub would place the same
+        /// surplus again the moment it requeued it.
+        ///
+        /// Additive, and both numbers stay where they are: `#[serde(default)]`
+        /// with `None` meaning exactly what its absence says, which is the one
+        /// shape `herd-hub/src/job.rs`'s rule lets through. An older hub drops
+        /// the key and reads the abandonment it always read; an older runner
+        /// sends no key and a hub on this version reads `None`, which is "not
+        /// a ceiling refusal" and is what every abandonment meant before this
+        /// field existed.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        at_its_ceiling: Option<u32>,
     },
     /// Requester asks for a job to be cancelled (E-06).
     ///

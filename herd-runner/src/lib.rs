@@ -467,6 +467,19 @@ pub(crate) enum NotTaken {
     /// runner that reached it says so rather than finding out what N times
     /// its memory ceiling does to its host.
     AtItsCeiling { running: usize, most: usize },
+    /// It is **already running another attempt of this very job**, and one
+    /// machine runs one job once (D-NEXT).
+    ///
+    /// Not a statement about the hub either, and not an error: the hub wrote
+    /// the first attempt off while the link was down and the job went on
+    /// running here, so the two sides disagree about what this machine
+    /// holds. Like [`NotTaken::AtItsCeiling`] it is a refusal about this
+    /// runner's **own count**, so it spends none of the job's goes.
+    StillRunningThisJob {
+        held: u32,
+        running: usize,
+        most: usize,
+    },
 }
 
 impl NotTaken {
@@ -482,6 +495,12 @@ impl NotTaken {
             NotTaken::AtItsCeiling { running, .. } => format!(
                 "the runner is already running {running} job(s) and never started this job: {}",
                 ceiling.why()
+            ),
+            NotTaken::StillRunningThisJob { held, running, .. } => format!(
+                "the runner is still running attempt {held} of this job and never started this \
+                 one: one machine runs one job once, so the place this attempt would need is \
+                 the place the job it is a second go at is already in. It is holding \
+                 {running} job(s)"
             ),
         }
     }
@@ -1277,6 +1296,36 @@ impl Session {
                     most: most_at_once,
                 });
             }
+            // **One machine runs one job once.** The map is keyed by job id
+            // alone, so taking a second attempt of a job this runner is
+            // already running would *replace* the first one's entry: the
+            // first keeps running with nothing counting it, this machine's
+            // own ceiling is short by one for the rest of its life, and the
+            // first task's eventual end writes over the second's
+            // bookkeeping. Reachable exactly where C5 lives — the hub writes
+            // an attempt off while the link is down, the job goes on running
+            // here, and the next attempt of it comes back to this same
+            // machine the moment it redials.
+            //
+            // Handed back rather than queued behind the first, for the
+            // reason every other refusal here is: what becomes of the job is
+            // the hub's policy and never the runner's. And handed back as a
+            // refusal **about this runner's own count**, which spends none
+            // of the job's goes (D-NEXT): the machine is here and healthy,
+            // and the only thing that happened is that the hub's view of
+            // what it holds ran ahead of its own.
+            if let Some(held) = inner
+                .jobs
+                .get(job_id)
+                .filter(|job| job.end.is_none())
+                .map(|job| job.attempt)
+            {
+                return Err(NotTaken::StillRunningThisJob {
+                    held,
+                    running,
+                    most: most_at_once,
+                });
+            }
             let cancel = CancelToken::new();
             inner.jobs.insert(
                 InHand::of(job_id, attempt),
@@ -1573,6 +1622,39 @@ impl Session {
     /// Nothing is held afterwards: the runner is not keeping a result, it is
     /// saying there is none. The hub decides what becomes of the job.
     pub(crate) fn abandon(&self, job_id: &JobId, attempt: u32, reason: &str) {
+        self.give_it_back(job_id, attempt, reason, None)
+    }
+
+    /// Give an attempt back because **this machine is already as full as it
+    /// said it would be** (D-NEXT, invariant 2).
+    ///
+    /// The same frame as [`Session::abandon`] and one field more: how many
+    /// jobs this runner was holding when it refused. Said in a field and not
+    /// only in the sentence, because the hub acts on it — a refusal for a
+    /// machine's own ceiling says nothing is wrong with the job and must not
+    /// spend one of its goes — and prose is not something a hub may parse.
+    pub(crate) fn abandon_at_its_ceiling(
+        &self,
+        job_id: &JobId,
+        attempt: u32,
+        reason: &str,
+        running: usize,
+    ) {
+        self.give_it_back(
+            job_id,
+            attempt,
+            reason,
+            Some(u32::try_from(running).unwrap_or(u32::MAX)),
+        )
+    }
+
+    fn give_it_back(
+        &self,
+        job_id: &JobId,
+        attempt: u32,
+        reason: &str,
+        at_its_ceiling: Option<u32>,
+    ) {
         self.with(|inner| {
             // **This attempt's entry, and only this attempt's.** Giving one
             // attempt back must not take another attempt of the same job off
@@ -1587,6 +1669,7 @@ impl Session {
                     job_id: job_id.clone(),
                     attempt,
                     reason: reason.to_owned(),
+                    at_its_ceiling,
                 },
             );
         });

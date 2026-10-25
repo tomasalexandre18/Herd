@@ -8808,7 +8808,7 @@ carry a `D-NEXT` at the time of writing.
 ## 2026-10-25 — D-NEXT A runner announces its ceiling and the hub honours it
 
 **Alexa's decision, of today, quoted.** The entry above ends by naming this
-as the fix it deliberately did not make, and as Alexa's call. She made it:
+as the fix it deliberately did not make, and as Alexa's call. He made it:
 
 > D-C : oui. `#[serde(default)] jobs_at_once: Option<u32>` sur Hello.
 > Absent = « n'a pas dit ». Aucune version ne bouge. C5 peut livrer.
@@ -8887,7 +8887,7 @@ default says, which is the one shape the rule at `docs/decisions.md:7293`
 and `herd-hub/src/job.rs:44-51` allows to leave both numbers alone. This
 entry is therefore **additive under the repository's own rule**, which is
 the ground on which it ships without Alexa's approval of a version move —
-she gave the approval for the field itself.
+he gave the approval for the field itself.
 
 **What this costs, in the one direction that is left.** A fleet whose
 runners are upgraded before its hub pays exactly what the entry above
@@ -8904,5 +8904,116 @@ disk, no record shape moved, and a field no peer reads is a field no peer
 misreads.
 
 **On the number.** `D-NEXT`: `herd-merger` allocates it. This branch carries
-**two** `D-NEXT` entries — the runner's ceiling above and this one — and
-they are meant to be two decisions with two numbers, in this order.
+**three** `D-NEXT` entries — the runner's ceiling above, this one, and the
+one below about what a ceiling refusal costs — and they are meant to be
+three decisions with three numbers, in this order.
+
+## 2026-10-25 — D-NEXT A refusal at a machine's own ceiling spends no go
+
+**Alexa's decision, of today, quoted.**
+
+> §4 : oui, un refus de plafond ne dépense pas de vie (forme de
+> `goes_a_runner_took`, additif sur l'enregistrement d'essai, approuvé).
+>
+> Condition de fusion ajoutée : un test hub réel qui coupe le lien 60 s avec
+> un runner à son plafond, 0 job mort, 0 job sans verdict. Il doit être rouge
+> sur `fa2ee15` avant le correctif. Rien ne fusionne sans lui.
+
+**The defect, read line by line on this branch before it was written down.**
+The two entries above gave the runner a ceiling and had the hub honour it.
+Together they left one sequence that loses work on an ordinary link blip, and
+`herd-reviewer` found it:
+
+1. A runner at its ceiling N loses its link. Its jobs keep running — the
+   runner is explicit that they hold senders of their own and report on the
+   next link — so **its** count is still N.
+2. After `lost_after` the hub's watchdog ends all N attempts and requeues
+   each job. The hub's count for that machine is now **0**, and the two sides
+   disagree by N.
+3. The runner redials. The hub dispatches to it **on the hello, before
+   reading one frame from it** (`herd-hub/src/server.rs`, the dispatch
+   precedes `relay_from_runner`), and nothing avoids the machine a job has
+   just come off. All N go straight back.
+4. The runner is still holding the originals, so it refuses every one. Each
+   refusal was a `ToHub::AttemptAbandoned`, which `give_the_job_another_go`
+   counted against `attempts_allowed` = 2 — and the watchdog had already
+   spent the first. **All N jobs ended `lost`, with no verdict, on a fleet
+   where nothing had failed.**
+
+On `v0.3.7` the same outage ended with those jobs *finishing*: the runner had
+no ceiling, so it ran 2N jobs — bad for the host, which is what invariant 2
+is about — but the work produced verdicts. C5 turned "host overloaded, work
+done twice" into "N jobs lost", and that is the wrong one to discover on the
+consumer's nightly.
+
+**Choice. A third budget, counted apart from the other two.**
+
+1. **One `#[serde(default)]` field on `ToHub::AttemptAbandoned`**,
+   `at_its_ceiling: Option<u32>`: how many jobs the runner was holding, when
+   **its own count of what it holds** is why it refused. `None` on every
+   other abandonment, and `None` is what an older runner's frame decodes to,
+   which is what every abandonment meant before. The count and not a flag,
+   because the hub needs the figure twice (3 below).
+2. **One `#[serde(default)]` field on the attempt record**,
+   `at_its_ceiling: bool`, left off the record entirely when false. It is the
+   same shape as D76's `requeue_code` one field up, and it is what
+   `JobRecord::goes_a_runner_took` now filters on beside it. Both numbers
+   stay where they are — `PROTOCOL_VERSION` 2 and `RECORD_VERSION` 1 — and a
+   test reads a record across the field in **both** directions rather than
+   this entry asserting it.
+3. **The hub remembers the machine's own count until its next health
+   report.** A refusal is the machine telling the hub what the hub's records
+   cannot: *I am holding this many*. `admission` holds the ceiling against
+   the larger of `seat.reserved.jobs` and that figure, so the surplus
+   **waits** instead of being offered straight back, and the health report —
+   which names every attempt the runner holds — ends the correction and
+   judges the queue at once.
+4. **A runner never holds two attempts of one job.** `take_job` refuses a
+   second attempt of a job it is already running, and nothing that is keyed
+   by job id alone drops an entry that belongs to another attempt. Without
+   this the first attempt ran untracked and the machine's own ceiling was
+   short by one for the rest of its life (the reviewer's §1.3, pre-existing
+   and made load-bearing by C5).
+
+**The bound, and what happens at it.** `CEILING_REFUSALS_ALLOWED` = **8**,
+`--ceiling-refusals-allowed` on the `Policy`. A job handed back an eighth
+time ends `Lost`, and the sentence says which budget ran out, both figures,
+that none of E-21's goes were spent, and every machine that said it was full.
+
+**Why eight.** This ending costs the fleet one frame each way and says
+nothing is wrong with the job or with the machine; unlike E-21's two and
+D76's three, nothing here has actually failed. With 3 above in place a fleet
+that is merely recovering produces about one refusal per job per health
+cadence and settles in one or two, so eight leaves room for an outage that
+settles badly, a second blip on the first, and a late report. What eight will
+not outlast is a disagreement that is never going to settle — two processes
+answering to one runner name, a peer that announces a ceiling it does not
+honour — and naming that is the whole reason the exemption is bounded at all.
+
+**Alternative rejected — no bound.** It is the only thing worse than the
+defect: a job refused for ever, holding a queue place, with nobody told.
+
+**Alternative rejected — the hub reading the runner's count from every health
+report.** It would hold a machine full for a whole cadence after a job on it
+ended, which is throughput this change must not cost. The correction is kept
+only while the machine has contradicted the hub, and the next report ends it.
+
+**Alternative rejected — a new `JobEventKind`.** Looked for and not needed,
+for the reason the entry above gives: it is `#[serde(tag = "event")]` with no
+`#[serde(other)]` arm, so a new variant would make `events.jsonl` unreadable
+to a hub rolled back.
+
+**Not decided here, and left for S3.** The hub dispatches to a runner that
+has just redialled **before reading one frame from it**. This entry makes
+that safe — the refusal costs nothing and teaches the hub at once — but it
+does not make it right. The keeper's pass must not place on a runner whose
+reconciliation has not arrived; the criterion is written into the S3 brief on
+the board.
+
+**Reversibility.** High. The field is additive on both surfaces, the budget
+is a `Policy` figure, and removing the correction is removing one `max` in
+`admission`. A hub reverted beside runners that are not simply goes back to
+charging a go for a refusal, which is where this entry started.
+
+**On the number.** `D-NEXT`: `herd-merger` allocates it. The third and last
+of this branch's three, in this order.

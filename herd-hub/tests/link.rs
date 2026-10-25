@@ -2094,6 +2094,7 @@ async fn a_declared_command_is_handed_over_whole_on_every_attempt() {
             job_id: job_id.clone(),
             attempt,
             reason: "this runner is draining".to_owned(),
+            at_its_ceiling: None,
         })
         .await;
     let second = loop {
