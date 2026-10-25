@@ -77,7 +77,11 @@ printf '%s' "$out" | grep -qE 'note: D143 ' && bad "D143 is a known gap and must
 echo "== two branches allocating the same number collide at integration, and the check says so"
 # Fake corpus: main has D1..D3; branch A and branch B both wrote D-NEXT; the
 # merger allocates A as D4, then B must see D4 taken.
-mkdir -p "$tmp/corpus"; cd "$tmp/corpus" && git init -q . && cp -r "$root/scripts" . && mkdir -p docs/orchestration/history .claude/agents .claude/hooks && cp "$root/CLAUDE.md" "$root/README.md" . && cp -r "$root/docs/orchestration" docs/ && cp "$root/.claude/agents/"*.md .claude/agents/ && cp "$root/.claude/hooks/"*.sh .claude/hooks/ && cp "$root/.claude/settings.json" .claude/ && cp "$root/docs/coverage.md" "$root/docs/status.md" docs/
+# Without -e, a failed cd would leave every relative path below pointing at the
+# real repository, so each step that decides where we are is fatal.
+mkdir -p "$tmp/corpus" && cd "$tmp/corpus" || { echo "FATAL: cannot enter $tmp/corpus; touching nothing" >&2; exit 1; }
+git init -q . && cp -r "$root/scripts" . && mkdir -p docs/orchestration/history .claude/agents .claude/hooks && cp "$root/CLAUDE.md" "$root/README.md" . && cp -r "$root/docs/orchestration" docs/ && cp "$root/.claude/agents/"*.md .claude/agents/ && cp "$root/.claude/hooks/"*.sh .claude/hooks/ && cp "$root/.claude/settings.json" .claude/ && cp "$root/docs/coverage.md" "$root/docs/status.md" docs/ \
+  || { echo "FATAL: corpus setup failed" >&2; exit 1; }
 printf '# Decisions\n\n## 2026-10-01 — D1 One\n\nBody.\n\n## 2026-10-02 — D2 Two\n\nBody.\n\n## 2026-10-03 — D3 Three\n\nBody.\n' > docs/decisions.md
 git add -A >/dev/null && git -c user.name=t -c user.email=t@t commit -qm base
 git checkout -qb a && printf '\n## 2026-10-04 — D-NEXT From A\n\nBody.\n' >> docs/decisions.md && git -c user.name=t -c user.email=t@t commit -qam a
@@ -93,7 +97,7 @@ out=$(./scripts/check-docs.sh 2>&1); printf '%s' "$out" | grep -q 'D4' && [ "$(p
 # the right move: B takes D5, the gap list stays empty
 sed -i 's/— D4 From B/— D5 From B/' docs/decisions.md
 out=$(./scripts/check-docs.sh 2>&1); [ $? -eq 0 ] && ok "B reallocated to D5 passes" || bad "D5 should pass" "$out"
-cd "$root"
+cd "$root" || exit 1
 
 echo "== orchestrator-guard.sh: blocks the main session's writes, lets agents and inspection through"
 G=.claude/hooks/orchestrator-guard.sh; R=$root
