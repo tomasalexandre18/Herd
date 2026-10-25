@@ -421,6 +421,45 @@ pub fn reclaim_a_past_life(root: &DataRoot, ceiling: &Ceiling) -> Vec<String> {
         }
     }
 
+    // The spools under `outputs/`, for the same reason and with one more.
+    //
+    // A collection too big to ride its verdict is moved out of the workspace
+    // into `<data root>/outputs/<job>-<attempt>/` and kept there until the
+    // hub says it holds every byte (D19, D148). That hold lives in **this
+    // process's memory**: the only place a spool is ever registered is at the
+    // end of the job that produced it (`Session::end_job`), and nothing
+    // anywhere reads `outputs/` back. So a runner that was `SIGKILL`ed leaves
+    // bytes that no later runner can ever offer and no acknowledgement can
+    // ever free — the hub asking for them is answered "this runner holds no
+    // collection for it" — and until now nothing removed them either. On the
+    // first consumer's own machine that is a directory that only grows, which
+    // is the plainest breach of invariant 2 there is.
+    //
+    // Named with the figure, like every other thing reclaimed here, because
+    // these are somebody's build outputs and a line saying how much went is
+    // the only trace left of them.
+    let spools = root.path().join(crate::outputs::SPOOL_DIR);
+    if let Ok(entries) = fs::read_dir(&spools) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let weight = crate::root::measure_tree(&path, root.path())
+                .map(crate::size::show_bytes)
+                .unwrap_or_else(|_| "an unmeasurable number of".to_owned());
+            match reclaim_directory(&path, root.path()) {
+                Ok(()) => said.push(format!(
+                    "reclaimed {weight} of output left in {} by a previous life: no runner \
+                     can offer a spool it did not make, so these bytes could never have \
+                     reached the hub",
+                    path.display()
+                )),
+                Err(error) => said.push(format!(
+                    "COULD NOT reclaim the leftover output spool {}: {error}",
+                    path.display()
+                )),
+            }
+        }
+    }
+
     // The cgroups, whose names carry the pid of the runner that made them.
     if let Some(base) = ceiling.base() {
         if let Ok(entries) = fs::read_dir(base) {
@@ -550,6 +589,39 @@ mod tests {
         let second = JobTag::mint(&job);
         assert_ne!(first, second, "two tags for one id must still differ");
         assert_eq!(pid_in(first.as_str()), Some(std::process::id()));
+    }
+
+    /// **The leak invariant 2 cared about most, closed.** A collection too
+    /// big to ride its verdict is moved to `<data root>/outputs/<job>-<n>/`
+    /// and removed only on the hub's acknowledgement
+    /// (`herd-runner/src/lib.rs`, `files_acknowledged`). A runner that was
+    /// `SIGKILL`ed never gets that acknowledgement, and the next runner
+    /// cannot offer the bytes either — the only place a spool is registered
+    /// is the end of the job that produced it — so before this they stayed on
+    /// the consumer's disk for ever.
+    #[test]
+    fn the_reaper_reclaims_an_output_spool_a_previous_life_left_behind() {
+        let _reaping = crate::testing::one_reaper_at_a_time();
+        let temp = crate::testing::TempDir::new("reclaim-spool");
+        let root = DataRoot::open(temp.path()).expect("a throwaway data root");
+        let spool = temp.path().join("outputs").join("j0000000001-1");
+        fs::create_dir_all(&spool).expect("the spool directory");
+        fs::write(spool.join("results.json"), vec![b'x'; 4096]).expect("the spooled file");
+        let ceiling = Ceiling::detect(
+            crate::confine::Confinement::with_data_root(temp.path()).job_limits(),
+            None,
+        );
+
+        let said = reclaim_a_past_life(&root, &ceiling);
+
+        assert!(
+            !spool.exists(),
+            "a spool no runner can ever offer must not outlive the runner that made it"
+        );
+        assert!(
+            said.iter().any(|line| line.contains("j0000000001-1")),
+            "and what went has to be named, with the figure: {said:?}"
+        );
     }
 
     /// A tag reaches the filesystem as a cgroup name and a path, so an id

@@ -8589,3 +8589,100 @@ deployment.
 **On the number.** This entry is D176. D175 is the refused-file decision
 integrated in the same pass, D174 is held by the unmerged branch of PR #72
 and D170 by that of PR #67.
+
+---
+
+## 2026-10-25 — D-NEXT A runner holds its own ceiling
+
+**Context.** Invariant 2's first half — *a runner never destabilizes its
+host* — had no local defence. `serve_hub` spawned a task for every
+`AssignJob` with no condition at all, and `take_job` refused for `draining`
+and for the owner's switch and **for nothing else**: no count, no capacity,
+no admission. Measured: 50 assignments from a hub that is not one produced
+50 jobs, 250 produced 250, and the runner's own health report said 50 and
+250 (`docs/remediation/04b-integrity-and-containment.md` §2.2). The bound on
+how much work lands on a machine was a property of the **hub's arithmetic**,
+and that arithmetic charges a job only what it *declared* — so a queue of
+jobs that declare no memory need costs the hub nothing and is placed without
+limit. Meanwhile the runner caps every job at the same kernel memory ceiling
+whatever it declared, so N jobs permit N times that ceiling: 250 × 256 MiB
+is 62 GiB of permitted memory on a machine with 11 GiB free. A runner facing
+a hub that is wrong, of another build, or a peer wearing the hub's name had
+nothing of its own to fall back on, and the name a runner answers to is
+self-declared while M15's token only guards admission.
+
+**Choice.** Three things, all on the runner.
+
+1. **A ceiling derived from what the machine itself declared.** A runner
+   holds at most as many jobs at once as the memory it says it lends, less
+   the floor it says it keeps, divided by the cap it puts on every job
+   (`herd_runner::jobs_at_once`). At the shipped 2 GiB a job that is 12 on
+   the 31 GiB server and 7 on the 17 GiB PC. The floor is the host's own
+   when it names one and `herd_proto::default_memory_floor_mib` when it does
+   not — the same default the binary fills in before it dials, so the figure
+   a runner enforces is the figure it announced. A host that will not say
+   how much memory it lends holds **one**: D23's rule says an unreadable
+   figure is not read as zero, and it is not read as plenty either. Never
+   zero, because `Confined::prepare` already refuses a cap that is a wall
+   and a count of zero is that same wall one level up. The owner's three
+   existing knobs — `--host-memory`, `--host-memory-floor`,
+   `--job-memory-max` — are the whole control surface; no new flag.
+2. **The count is read inside the lock that writes the job down.** Two
+   assignments arriving together cannot both find room for the last place,
+   and the refusal's reason comes back from inside that lock rather than
+   being read off the session afterwards — a runner that refused because it
+   was full and then drained would otherwise have told the hub it was
+   draining.
+3. **A refused attempt is `ToHub::AttemptAbandoned` and nothing else.** The
+   hub requeues it (`give_the_job_another_go`), bounded by
+   `attempts_allowed` exactly as it already is for a drain, and
+   `herd-hub/tests/link.rs` already proves an abandoned attempt comes back
+   out as attempt 2. The job is never lost and never silently dropped.
+
+Also in this entry, because it is the same question: the startup reaper now
+reclaims `<data root>/outputs/`. A streamed collection is moved there and
+removed only on the hub's acknowledgement, the hold lives in the process's
+memory, and the only place a spool is ever registered is the end of the job
+that produced it — so after a `SIGKILL` the bytes can never be offered
+again, no acknowledgement can ever free them, and nothing removed them. That
+was unbounded disk growth on the consumer's own machine. Each one is now
+named with its size in the startup report.
+
+**Alternative rejected — a new frame, or a new `JobEventKind`.** Both were
+looked for first and neither is needed. A new variant on `FromHub`/`ToHub`
+would be caught by their `#[serde(other)]` arm, but `JobEventKind`
+(`herd-hub/src/job.rs`) is `#[serde(tag = "event")]` with no such arm, so a
+new event would make `events.jsonl` unreadable to an earlier hub. Nothing on
+the wire changed: `PROTOCOL_VERSION` stays 2 and `RECORD_VERSION` stays 1.
+
+**Alternative rejected — mirror the hub's arithmetic.** The runner cannot:
+`AssignJob` carries no declared memory need, only a command. A backstop set
+on what jobs usually take is a backstop that is absent on the day they do
+not, so the worst case — the cap every job is actually permitted — is what
+is counted.
+
+**Alternative rejected — queue the overflow instead of refusing it.** A
+runner holding work the hub believes is running is a runner the hub's
+watchdog will declare lost, and "refuses new jobs while draining" is already
+the shape invariant 2 asks for.
+
+**What this costs, and it is not nothing.** The hub has no per-runner job
+ceiling for jobs that declare no memory need, so it can legitimately place
+more than a runner now accepts, and each refusal spends one of that job's
+goes. A job refused three times ends without a verdict instead of waiting.
+The fix for that is for the runner to **announce** its ceiling so the hub
+stops over-placing — one `#[serde(default)]` field on `Hello`, additive
+under the rule at `docs/decisions.md:7293` and moving neither version
+number. That is a protocol surface change and therefore Alexa's call, and it
+is deliberately not in this entry.
+
+**Reversibility.** High, and it leaves nothing behind. Nothing was written
+to disk, no record shape moved, no frame is new. Removing the ceiling is
+removing one check in `take_job` and the figure handed to it; a fleet with
+one runner reverted and one not differs only in how many jobs each accepts.
+The `outputs/` sweep is the one irreversible half, and only in the sense
+that bytes it removes are gone — they were bytes no runner could ever have
+offered, and a revert simply stops the sweep.
+
+**On the number.** `D-NEXT`: `herd-merger` allocates it. Two other branches
+carry a `D-NEXT` at the time of writing.
