@@ -180,16 +180,36 @@ impl FakeHub {
                 other => panic!("the runner said {other:?} instead of hello"),
             }
         };
-        assert!(
-            matches!(
-                hello,
-                ToHub::Hello {
-                    role: Role::Runner,
-                    ..
-                }
-            ),
-            "the peer that dialled is not a runner: {hello:?}"
+        let ToHub::Hello {
+            role: Role::Runner,
+            jobs_at_once,
+            ..
+        } = &hello
+        else {
+            panic!("the peer that dialled is not a runner: {hello:?}");
+        };
+        // **The runner announced its ceiling, and this hub is about to ignore
+        // it on purpose.** Both halves matter.
+        //
+        // That it announced it, and announced *this* figure: the hello
+        // carries the same number `serve_hub` holds every assignment against,
+        // because `serve_once` derives it once and uses the one value for
+        // both. If those two ever came apart, a hub honouring the
+        // announcement would place to a ceiling the runner does not have.
+        assert_eq!(
+            *jobs_at_once,
+            Some(EXPECTED_CEILING as u32),
+            "the runner must announce the ceiling it enforces, not a second arithmetic"
         );
+        // And that ignoring it changes nothing about what follows. This is
+        // the **rollback case** in miniature — a hub older than D-NEXT, or a hub
+        // that is simply not one — and the whole point of C5's first half is
+        // that the runner is not weakened by it. Everything below goes on
+        // measuring 8 held and the rest handed back, and it must: a fleet
+        // whose hub ignores the field pays in attempts exactly what it paid
+        // before the field existed, which is the acknowledged cost and not a
+        // regression. What a hub that *honours* it costs instead is measured
+        // against the real hub, in `announced_job_ceiling.rs`.
         let welcome = FromHub::Welcome {
             protocol_version: PROTOCOL_VERSION,
             hub_version: herd_runner::runner_version().to_owned(),

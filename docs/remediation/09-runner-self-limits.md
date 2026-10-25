@@ -7,9 +7,22 @@
 host* — had no defence on the runner. This piece gives it one, says how a
 refusal is spoken without touching the protocol, and closes the `outputs/`
 leak, which is the same question asked about disk.
-**What this is not:** no protocol change. `PROTOCOL_VERSION` stays 2,
-`RECORD_VERSION` stays 1, no frame variant and no `JobEventKind` variant was
-added, and nothing on the hub was changed.
+**Scope, as it now stands.** C5 shipped in two halves. The first gave the
+runner a ceiling of its own and a way to refuse past it; the second, on
+Alexa's decision **D-C of 2026-10-25**, has the runner **announce** that
+ceiling so the hub stops placing work the runner is certain to hand back.
+
+**What this is not:** no version moved. `PROTOCOL_VERSION` stays 2 and
+`RECORD_VERSION` stays 1, no frame variant was added and **no
+`JobEventKind` variant was added** — the wait a capped runner causes is said
+with the `waiting` line that already existed. The one protocol surface that
+changed is one `#[serde(default)]` field on `ToHub::Hello`, which is
+additive under the repository's own rule (`docs/decisions.md:7293`,
+`herd-hub/src/job.rs:44-51`).
+
+**§0.5 corrects this document.** Its first version, written before D-C,
+said "nothing on the hub was changed". That is no longer true: §7 is the
+hub half.
 
 **Evidence standard.** Every claim carries **F** (measured here, or read at
 a named `file:line` on this branch), **H** (hypothesis, with what would
@@ -17,7 +30,7 @@ settle it) or **I** (unknown).
 
 ---
 
-## 0. The five things that matter
+## 0. The six things that matter
 
 1. **The ceiling is derived from what the machine itself declared.** F. A
    runner holds at most `(memory it lends − floor it keeps) / cap it puts on
@@ -42,6 +55,32 @@ settle it) or **I** (unknown).
    A spool left by a `SIGKILL`ed runner could never be offered by any later
    runner and nothing removed it. The startup reaper now reclaims it and
    names it with its size. §3.
+
+6. **And the hub now honours what the runner announced.** F. The runner
+   declares its ceiling in `ToHub::Hello`, the hub holds every placement
+   against it, and the surplus **waits** instead of being sent and handed
+   back. Measured against the real hub: eight memory-silent jobs on a runner
+   that holds two spent **12 attempts on the ceiling before and 0 after**,
+   and **six of the eight ended `lost` with no verdict at all** before,
+   against eight of eight exiting 0 after. §7.
+
+---
+
+## 0.5 What this document said before, and no longer says
+
+The version of this page committed at `aa4699a` ended its header with
+*"and nothing on the hub was changed"*, and §5 named the announcement as
+**the** fix, as Alexa's call, and as deliberately not done. Alexa made that
+call on 2026-10-25 (D-C):
+
+> D-C : oui. `#[serde(default)] jobs_at_once: Option<u32>` sur Hello.
+> Absent = « n'a pas dit ». Aucune version ne bouge. C5 peut livrer.
+
+So the sentence is withdrawn. **The hub was changed**, in two files and in
+one place that decides anything: `herd-hub/src/matcher.rs`'s `admission`.
+§5 is kept as it was written, because what it costs is still what it costs
+when the hub is older than this change — that is §7.6 — and §7 is the new
+half. §§1-4 and §6 are unchanged and still hold; §6 gains one paragraph.
 
 ---
 
@@ -302,3 +341,250 @@ Nothing they have to change, and one thing they should read.
   `<data root>/outputs/<job>-<attempt>/` and says how much went. Those bytes
   were never recoverable; if anybody was harvesting that directory by hand,
   that stops working and they should say so.
+* **And once both sides are on this version, that paragraph stops
+  applying.** The hub now honours the ceiling a runner announces, so a
+  surplus job **waits in the queue** instead of being sent and refused. A
+  fleet still sees the refusal sentence when a runner is newer than its hub
+  — §7.6 — and there it is a version gap, not a capacity problem.
+
+---
+
+## 7. The hub half (D-NEXT, on Alexa's D-C of 2026-10-25)
+
+### 7.1 What the runner says — F
+
+One field on `ToHub::Hello`:
+
+```rust
+#[serde(default, skip_serializing_if = "Option::is_none")]
+jobs_at_once: Option<u32>,
+```
+
+`None` means **the peer did not say**, and nothing else: never unlimited,
+never zero, never a figure derived from `host`. The register is
+`health_every_ms`'s, and for the same reason — the mistake it prevents needs
+both sides at once. The runner derives a ceiling and refuses past it; the
+hub charges a job only what it declared and so has no bound on
+memory-silent jobs at all (§1.1). Each is self-consistent; together they
+spend one of every surplus job's goes on a refusal that was certain before
+it was sent.
+
+**The figure announced is the figure enforced, and that is structural, not a
+convention. F.** `serve_once` computes `jobs_at_once(&config.host,
+confined.caps().memory_max)` **once**, before the handshake, sends that
+value in the hello and hands the same `Arc` to `serve_hub`, which is where
+every assignment is held against it. There is no second derivation that
+could drift. Asserted from the outside in
+`herd-hub/tests/fake_hub_flood.rs`, which reads the hello and checks the
+figure is the ceiling the same runner then enforces.
+
+**Neither version moves. F.** `PROTOCOL_VERSION` is 2
+(`herd-proto/src/lib.rs:113`) and `RECORD_VERSION` is 1
+(`herd-hub/src/job.rs:52`), asserted by
+`announced_job_ceiling::neither_version_number_moves`. The field is
+`#[serde(default)]` and means, when absent, exactly what its default says,
+which is the one shape the rule at `docs/decisions.md:7293` allows to leave
+both alone.
+
+### 7.2 Where the hub counts, and why there — F
+
+In `herd-hub/src/matcher.rs`, at the top of `admission`, against
+`seat.reserved.jobs`.
+
+That is the right place for three reasons, and each of them is a defect
+avoided:
+
+* **`reserved.jobs` is already the count.** It is the number of attempts out
+  on that machine that have not ended, taken off the records by `out_there`
+  — the single filter the labels (`holdings`) and the memory and tmpfs
+  (`reserved`) are all taken off. A second counter kept beside it would be a
+  second answer to one question, and the first job counted by one and not
+  the other is a machine the hub reads as having room on top of work that is
+  running.
+* **It is derived, never accumulated (D79).** There is no table to release,
+  so a job that ends any of the eight ways gives its place back by ending,
+  and a hub that restarts recomputes the count from the records instead of
+  rebuilding it.
+* **It is taken again *inside* the pass.** `claim` calls
+  `seat.reserved.take(...)`, so two jobs offered in one pass contend for the
+  last place rather than both finding it free. Asserted:
+  `a_runner_at_the_ceiling_it_announced_takes_nothing_more_and_says_so`
+  fills a ceiling of three and refuses the fourth in the same pass.
+
+**Before the memory arithmetic, not after.** It is the blunter of the two,
+and the sentence a waiting job reads should be the one that is actually
+holding it up: a job told how many mebibytes are free on a machine that will
+not take it anyway has been told the wrong thing.
+
+**A bound beside the memory admission, never instead of it. F.** The two
+answer different questions and neither subsumes the other — admission weighs
+what a job declared, so a queue of jobs declaring nothing is this field's
+alone to bound; and this field knows nothing about size, so a job larger
+than the machine is still admission's to refuse, and still refused as
+*impossible there* rather than as a wait. Asserted in
+`the_ceiling_and_the_memory_admission_are_two_bounds_and_either_may_bite`,
+in both directions and in the impossible case.
+
+**It counts every job out there, readings included. F.** D159 keeps a
+requirement reading out of the slot algebra and D169 caps readings
+separately; neither makes a reading weightless on the machine it runs on,
+and the runner's own ceiling counts every job it is running (`end.is_none()`,
+§1.3). A hub counting a smaller set than the runner would read room that is
+not there. Asserted in `the_ceiling_counts_readings_too_because_the_runner_s_does`.
+
+### 7.3 What a queued job is told — F
+
+`Admission::ShortNow`, which is `Verdict::Later`, which is
+`Placement::Wait`, which the hub writes as a **`waiting` line** — a
+`JobEventKind` that already existed. **No variant was added to that enum**,
+and that was a stop condition on this work: it is `#[serde(tag = "event")]`
+with no `#[serde(other)]` arm, so a new kind would make `events.jsonl`
+unreadable to a hub rolled back, which is worse than a lost field.
+`announced_job_ceiling` asserts that every line written in its run is one of
+the eight kinds that already existed.
+
+The whole sentence, copied from that test's own output on this branch
+today, wrapped here and otherwise verbatim:
+
+```
+queued 1st of 1 at priority step, rising to merger in 30m; it is waiting
+because it is waiting for capped-runner: on capped-runner, 2 job(s)
+already out there and it said it holds at most 2 at once, so it takes
+nothing more until one of them ends: 2 jobs running there hold 0 MiB of
+memory and 0 MiB of tmpfs; no other eligible runner is free either. It
+moves to another eligible runner only when capped-runner stops being
+available, or after 3h in the queue (--stickiness-limit); it has waited
+under a minute; nothing is ahead of it
+```
+
+The clause this change contributes is the middle one; the queue's standing,
+the stickiness limit and *nothing is ahead of it* were already there and are
+what make it readable. Three things in that clause are deliberate: it names
+the machine, it carries **both** figures — what is out there and what the
+machine said it holds — and it says **what ends the wait**.
+
+`0 MiB of memory` is not a bug. It is the clause that makes the defect
+legible: those two jobs really did declare nothing, which is exactly why the
+memory admission could never have been what stopped the third, and why this
+field had to exist.
+
+### 7.4 Can a job sit for ever behind a cap? — F
+
+No, and three separate things stop it:
+
+1. **A place comes back when a job ends.** Every job runs under a time cap
+   (invariant 2), so a machine at its ceiling empties whether or not its
+   jobs behave, and ending a job triggers a dispatch pass.
+2. **`ShortNow` is bounded by the stickiness limit.** A job held by a
+   ceiling sticks to that machine — correctly, since a job ending there is
+   what frees the room — but only until `--stickiness-limit`, after which it
+   takes any other eligible runner that is free. Asserted in
+   `a_job_held_by_a_ceiling_waits_for_that_machine_and_then_moves`.
+3. **A ceiling of zero is not a wait at all.** Our own runner never
+   announces zero (`jobs_at_once` is floored at one, §1.2), but a peer that
+   is not ours could, and `ShortNow` on such a machine would be a wait
+   nothing on that machine could ever end. It is answered as `NotHere`
+   instead: nothing is placed there and nothing waits for it. Asserted in
+   `a_ceiling_of_zero_is_a_machine_nothing_waits_for`.
+
+And a job's own deadline still cancels it while it waits (E-09), which is
+the bound D88 leaves on a job no connected runner can take.
+
+### 7.5 Measured, on the real hub — F
+
+`herd-hub/tests/announced_job_ceiling.rs`. A real hub, a real runner
+announcing a ceiling of **2** (4 GiB lent, 2 GiB floor, 1 GiB a job), and
+**8 memory-silent jobs** submitted at once — memory-silent because
+`herdctl::Declared::default()` declares nothing, so `admission` costs each
+of them at zero and the memory accounting cannot be what bounds them. Eight
+*distinct* commands: two submissions of one command join one job (E-05), and
+a queue of identical sleeps is one job wearing eight requesters, which paces
+itself perfectly and would prove nothing.
+
+| | before the hub half | after |
+|---|---|---|
+| peak attempts out on the runner at once | 7 | **2** |
+| attempts spent **because of the ceiling** | 12 | **0** |
+| attempts spent for anything else | 0 | **0** |
+| attempts recorded in all, for 8 jobs | 14 | **8** |
+| jobs that reached their own verdict | 2 of 8 | **8 of 8** |
+| jobs that ended `lost`, with no verdict | **6 of 8** | **0** |
+
+Both columns were measured on this branch, today, by running the same test
+twice: the "before" column with the gate in `admission` disabled, which is
+why it is a measurement and not a recollection.
+
+**The last row is the damage, and it is worse than the attempt count makes
+it look.** `attempts_allowed` is 2. A job refused twice has spent both its
+goes on refusals that were certain before they were sent, and
+`give_the_job_another_go` then ends it — so six of eight perfectly runnable
+jobs ended with no verdict at all, each carrying this reason:
+
+```
+the runner is already running 2 job(s) and never started this job: this
+machine lends 4 GiB and keeps 2 GiB as its own floor, and caps every job
+at 1 GiB, so it holds at most 2 job(s) at once; this was attempt 2 of 2
+at a runner that went away, so the job is not attempted again (E-21)
+```
+
+That sentence is §5's warning happening. It is also exactly the sentence §6
+tells the first consumer to grep for — and after this change it is a sign of
+a version gap (§7.6), not of a fleet short of capacity.
+
+**Attribution, not a total. F.** Alexa's oracle is *"essais dépensés pour
+cause de plafond runner = 0, autres essais inchangés"*, and a count of
+everything cannot say that. The two are told apart by the sentence: a
+refusal for the ceiling carries the runner's own words — built by
+`jobs_at_once`, carried in `AttemptAbandoned`, written verbatim into the
+record's `attempt_ended` line by `end_attempt` — and a timeout, a cancel or
+a lost runner carries one of the hub's. `ceiling_refusals` in that file is
+the whole of the distinction, and the "attempts spent for anything else"
+row is what it leaves behind.
+
+**And the silent runner is unchanged. F.** Every seat the matcher's own
+tests build announces nothing, deliberately, so the whole existing suite is
+the assertion that a runner which did not say is placed on exactly as it was
+before this field existed;
+`a_runner_that_announced_no_ceiling_is_placed_on_exactly_as_it_was` states
+it directly, placing forty memory-silent jobs on one machine and checking
+that nothing stops them.
+
+### 7.6 The rollback case, which is the cost that stays — F
+
+**`fake_hub_flood.rs` still shows 8 held and 242 handed back, and it should
+for ever.** Its "hub" is a hand-written WebSocket server that floods a real
+runner on purpose; it reads the announcement — the bench now asserts that it
+arrived and that it is the figure the runner enforces — and then ignores it,
+which is precisely a hub older than this change, or a hub that is not one.
+The
+runner protects itself regardless, which is invariant 2 and the premise of
+C5's first half.
+
+So a fleet whose runners are upgraded before its hub pays exactly what it
+paid before this change: one go per surplus job, and a job refused
+`attempts_allowed` times ends without a verdict (§5). That is the
+acknowledged cost of the rollback, written down here rather than discovered
+on someone's machine. The upgrade order that avoids it is **hub first**.
+
+### 7.7 What is still open
+
+**I — whether the consumer's fleet ever hits either bound.** Their queue,
+their declarations and their machines were not read (D161). What they should
+look at is §6.
+
+**H — the ceiling is derived from the per-job memory cap and nothing else.**
+A machine whose real constraint is cores, disk bandwidth or file handles
+announces a figure that says nothing about it. That is deliberate — the cap
+is the one currency the runner certainly controls — but it means
+`jobs_at_once` is a memory ceiling wearing a general name. What would settle
+whether a second figure is wanted: a consumer report of a runner saturated
+while well inside its announced count.
+
+**H — the hub trusts the figure.** A runner announcing a very large ceiling
+is placed on as though it had none, which is the same as today and is
+therefore not a regression; a runner announcing a very small one holds its
+own fleet back. Neither is checked against `host`, deliberately (§7.1), and
+the hub has no reason to prefer its own arithmetic to the machine's. What
+would settle it: a fleet where a misconfigured runner's announcement costs
+throughput that nobody can see the cause of — which §7.3's sentence is
+written to make visible.

@@ -67,7 +67,7 @@ started), `open` (not yet agreed or sized), `active` (an agent holds it),
 | ID | Item | Origin | Owner | State | Next action | Depends on | Evidence |
 |---|---|---|---|---|---|---|---|
 | ORCH-004 | Orchestration remediation (mandate 2026-10-24): contract, roles, memory, board, checks, validation | mandate v1.0 | remediation agent (bootstrap), then herd-merger | done | Done 2026-10-24: H0–H7 complete, ORCH-001 and ORCH-002 decided, PR #71 merged as `a2ad025` under ORCH-001 | — | PR #71; `remediation-report.md` |
-| ORCH-060 | C5 — the runner's limits: what a runner declares it can carry, and what actually bounds it on a host | remediation programme, Alexa 2026-10-25 | herd-step | active | **In flight while this pass ran, on its own branch, and no part of it is merged here.** The C0b integrator saw no branch and no handoff for it and has asserted nothing about it; it lands through its own PR, with its own gates | — | its branch and its handoff, when they exist |
+| ORCH-060 | C5 — the runner's limits: what a runner declares it can carry, and what actually bounds it on a host | remediation programme, Alexa 2026-10-25 | herd-merger | owed | **Both halves done on `runner-holds-its-own-limits`, in one PR, not merged.** The runner's half (`aa4699a`): a ceiling derived from what the machine declared, refusals as `AttemptAbandoned`, the `outputs/` leak closed. The hub's half (D-NEXT, Alexa's D-C of 2026-10-25): `jobs_at_once: Option<u32>` on `Hello`, honoured in `matcher::admission` beside the memory seat. Measured on the real hub — eight memory-silent jobs on a runner holding two spent **12 attempts on the ceiling and left 6 of 8 jobs `lost` with no verdict**; now **0 spent and 0 lost**. `PROTOCOL_VERSION` 2 and `RECORD_VERSION` 1 both unmoved, asserted by a test. Four Rust gates green; `check-docs.sh` red on **exactly** the two `D-NEXT` entries, the expected failure (`gotchas/a-decision-branch-cannot-be-all-green.md`). Next: `herd-merger` allocates **two** D numbers, in order — the runner's ceiling first, the announced cap second | — | PR on `runner-holds-its-own-limits`; `docs/remediation/09-runner-self-limits.md` §7; `docs/orchestration/history/2026-10-25-c5-announced-job-ceiling.md` |
 
 ## Blocked — needs something outside the project
 
@@ -88,8 +88,11 @@ started), `open` (not yet agreed or sized), `active` (an agent holds it),
    walk is 0.16 % of a junction at `N` = 1 000 against 99.5 % for durable
    writing. The row is rewritten above and the walk stays owed as
    ORCH-021, a cheap cleanup that blocks nothing.
-3. C5 (ORCH-060) is the one chantier still in flight; nothing of it is in
-   this pass.
+3. **C5 (ORCH-060) is finished and waiting on `herd-merger`.** Both
+   halves are on `runner-holds-its-own-limits` in one PR, with the real-hub
+   measurement behind it (12 ceiling-spent attempts and 6 of 8 jobs `lost`
+   before; 0 and 0 after). It carries **two** `D-NEXT` entries and needs
+   two numbers in order. Nothing of it is in the C0b pass.
 4. Then the owed rows that nothing blocks: ORCH-048 (the skip counters
    over-count), ORCH-031 (the brief must name its worktree), ORCH-015,
    ORCH-016.

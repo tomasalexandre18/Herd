@@ -8686,3 +8686,105 @@ offered, and a revert simply stops the sweep.
 
 **On the number.** `D-NEXT`: `herd-merger` allocates it. Two other branches
 carry a `D-NEXT` at the time of writing.
+
+## 2026-10-25 — D-NEXT A runner announces its ceiling and the hub honours it
+
+**Alexa's decision, of today, quoted.** The entry above ends by naming this
+as the fix it deliberately did not make, and as Alexa's call. She made it:
+
+> D-C : oui. `#[serde(default)] jobs_at_once: Option<u32>` sur Hello.
+> Absent = « n'a pas dit ». Aucune version ne bouge. C5 peut livrer.
+
+**Context.** The entry above gave the runner a ceiling of its own and left a
+bill behind. The hub charges a job only the memory the job *declared*
+(`herd-hub/src/matcher.rs`, `needs_memory` of `None` costs zero), so a queue
+of jobs that declare no memory need costs a machine nothing and is placed on
+one runner without any bound at all. With the runner's ceiling in place and
+nothing else, that ceiling bites in ordinary operation, and every bite is a
+`ToHub::AttemptAbandoned` that `give_the_job_another_go` counts against
+`attempts_allowed`. Measured on the real hub, eight memory-silent jobs
+against a runner holding two: **12 attempts spent on the ceiling, and six of
+the eight jobs ended `lost` with no verdict at all**, each carrying the
+runner's refusal and *"this was attempt 2 of 2"*. Six perfectly runnable
+jobs failed because two sides that were each individually right could not
+see each other's figure. That is the same shape as E-40's health cadence,
+and it has the same answer: the figure travels in the handshake.
+
+**Choice.** One field, and one gate.
+
+1. **`jobs_at_once: Option<u32>` on `ToHub::Hello`**, `#[serde(default,
+   skip_serializing_if = "Option::is_none")]`. **Absent means the peer did
+   not say**, and nothing else: never unlimited, never zero, never a figure
+   the hub derives from `host`. A runner that says nothing is placed on
+   exactly as it was before the field existed. `None` from every requester,
+   which holds no jobs.
+2. **The runner fills it from the ceiling it already computes**, and from
+   the same value: `serve_once` derives it once before the handshake, sends
+   it, and hands the same `Arc` to `serve_hub`, which holds every assignment
+   against it. The figure announced and the figure enforced cannot drift
+   because there is only one of them.
+3. **The hub holds placement against it in `admission`**, against
+   `seat.reserved.jobs` — the count of attempts out on that machine that
+   have not ended, taken off the records by the one `out_there` filter the
+   labels and the memory are also taken off (D79), and taken again by
+   `claim` inside the pass so that two jobs offered together contend for the
+   last place. A machine at its ceiling is `ShortNow`: the job **waits** and
+   sticks to it, because a job ending there is what frees the place.
+4. **The runner goes on enforcing it whatever the hub does.** That is
+   invariant 2 and the premise of the entry above; nothing here makes the
+   local ceiling conditional on the hub behaving.
+
+**A bound beside the memory admission, never instead of it.** Neither
+subsumes the other: admission weighs what a job declared, so a queue
+declaring nothing is this field's alone to bound; and this field knows
+nothing about size, so a job larger than the machine is still refused by
+admission, and still as *impossible there* rather than as a wait. Whichever
+bites first is the one that bites, and the sentence names that one.
+
+**Alternative rejected — a new `JobEventKind`.** Looked for first and not
+needed: a capped runner's wait is said with the `waiting` line that already
+exists. `JobEventKind` is `#[serde(tag = "event")]` with **no
+`#[serde(other)]` arm**, so a new kind would make `events.jsonl` unreadable
+to a hub rolled back — worse than a lost field. A test asserts that every
+line written in a capped run is one of the eight kinds that already existed.
+
+**Alternative rejected — the hub deriving a ceiling from `host`.** It
+cannot: the runner's arithmetic also uses the cap it puts on every job,
+which no frame carries. A figure the hub invented would be a ceiling the
+runner never agreed to and could not be held to. A test reads the hub's own
+source and fails if any shipped line fills one in.
+
+**Alternative rejected — reading `Some(0)` as a wait.** A peer announcing
+zero would start a wait nothing on that machine could ever end, since there
+is no job there that could finish and free a place. It is answered as
+`NotHere`: nothing is placed and nothing waits for it. Our own runner never
+announces zero — the ceiling is floored at one, because invariant 2 asks for
+a cap and not a wall.
+
+**Neither version moves.** `PROTOCOL_VERSION` stays **2**
+(`herd-proto/src/lib.rs:113`) and `RECORD_VERSION` stays **1**
+(`herd-hub/src/job.rs:52`), asserted by a test and not only stated. The
+field is `#[serde(default)]` and means, when absent, exactly what its
+default says, which is the one shape the rule at `docs/decisions.md:7293`
+and `herd-hub/src/job.rs:44-51` allows to leave both numbers alone. This
+entry is therefore **additive under the repository's own rule**, which is
+the ground on which it ships without Alexa's approval of a version move —
+she gave the approval for the field itself.
+
+**What this costs, in the one direction that is left.** A fleet whose
+runners are upgraded before its hub pays exactly what the entry above
+measured: the hub ignores the announcement, over-places, and the runner
+hands the surplus back one go at a time.
+`herd-hub/tests/fake_hub_flood.rs` is that case and still shows 8 held and
+242 handed back — deliberately, for ever. **The upgrade order that avoids it
+is hub first.**
+
+**Reversibility.** High. Removing the gate is removing one `if` at the top
+of `admission`; a hub reverted beside runners that are not simply goes back
+to over-placing, which is where this entry started. Nothing is written to
+disk, no record shape moved, and a field no peer reads is a field no peer
+misreads.
+
+**On the number.** `D-NEXT`: `herd-merger` allocates it. This branch carries
+**two** `D-NEXT` entries — the runner's ceiling above and this one — and
+they are meant to be two decisions with two numbers, in this order.
