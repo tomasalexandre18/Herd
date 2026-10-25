@@ -5108,7 +5108,7 @@ fn one_watchdog_pass(state: &State) {
             continue;
         }
         // **The age again, now, and not the one in the list above**
-        // (D-NEXT). This loop places: requeueing a job judges the queue on
+        // (D178). This loop places: requeueing a job judges the queue on
         // the way out, and a frame arriving on a link while the pass runs
         // does the same thing from the other side — so by the time a job
         // further down the list is reached it may have been given a whole
@@ -8080,7 +8080,7 @@ mod tests {
     }
 
     /// **The watchdog measures each attempt's silence inside its own loop,
-    /// not once before the walk** (D-NEXT).
+    /// not once before the walk** (D178).
     ///
     /// `watch_for_a_lost_runner` reads the age of every open attempt into a
     /// list and then walks it. The walk *places*: requeueing a job judges

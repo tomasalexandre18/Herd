@@ -8681,7 +8681,7 @@ part 3 adds, which is the opposite of what they are for.
 2026-10-25, D174 is held by the unmerged branch of PR #72 and D170 by that
 of PR #67; gaps stay (D148).
 
-## 2026-10-25 — D-NEXT The watchdog measures each silence inside its own loop
+## 2026-10-25 — D178 The watchdog measures each silence inside its own loop
 
 **Decision.** `watch_for_a_lost_runner` reads the age of the attempt it is
 about to judge **again, inside the loop**, immediately before judging it,
@@ -8737,3 +8737,8 @@ earlier, green after. One pass of the watchdog is extracted into
 cannot be run once — and the test store gains a second forced window,
 `record_state` ending another job's attempt as a job is queued, which is
 what a frame arriving on a link does.
+
+**On the number.** This entry is D178. D177 is C5 part 1, integrated in the
+same pass and merged first — this branch was stacked on it, and the merge
+of `main` into this one is in its history. D174 is held by the unmerged
+branch of PR #72 and D170 by that of PR #67; gaps stay (D148).
