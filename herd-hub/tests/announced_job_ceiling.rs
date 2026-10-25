@@ -621,3 +621,488 @@ fn the_runners_ceiling_sentence_is_not_the_hubs() {
          {THE_HUBS_CEILING_SENTENCE:?}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// The link that drops while the machine is full.
+// ---------------------------------------------------------------------------
+
+/// How long the link is down in the test that stays in this suite.
+///
+/// Longer than [`LOST_AFTER_HERE`], because the whole sequence begins with
+/// the hub's watchdog firing. Alexa's condition names **60 s**, which is the
+/// deployed `herd_hub::LOST_AFTER`; the figure is a setting
+/// (`--lost-after`/`HERD_LOST_AFTER`, `herd-hub/src/main.rs`) and this test
+/// drives the same watchdog through it, because a suite that waited out a
+/// minute per run would be a suite nobody runs. The 60 s shape was run by
+/// hand once and its output is in the pull request; what is kept here is the
+/// mechanism, not the clock.
+const THE_OUTAGE: Duration = Duration::from_secs(4);
+
+/// The hub's silence threshold for this test, and the cadence its runner
+/// really reports at. Three to one, which is `herd_proto::SILENCE_MARGIN`:
+/// anything tighter is refused at the handshake, and rightly.
+const LOST_AFTER_HERE: Duration = Duration::from_secs(3);
+const HEALTH_EVERY_HERE: Duration = Duration::from_secs(1);
+
+/// How long each job runs. Long enough to still be running when the link
+/// comes back — which is the whole premise, since the defect is the runner
+/// holding jobs the hub has already written off — and short enough that the
+/// run is seconds.
+const SLEEP_ACROSS_THE_OUTAGE: u64 = 6;
+
+/// How long this one test may take. Its own figure rather than [`PATIENCE`]:
+/// an outage, a watchdog, a redial and a whole second go at every job do not
+/// fit inside a bound written for a trivial queue, and a test that borrowed
+/// that bound would fail for the clock rather than for the defect.
+const PATIENCE_ACROSS_AN_OUTAGE: Duration = Duration::from_secs(120);
+
+/// A TCP relay between the runner and the hub that the test can **cut**.
+///
+/// A real outage, not a simulated one. The sockets are shut down under both
+/// peers, every redial while the cut lasts is answered and dropped, and
+/// nothing but the clock tells either side what happened. It cannot be done
+/// by stopping the hub: the defect needs the runner's jobs to go on running
+/// while the hub's watchdog writes their attempts off, so both processes have
+/// to stay alive and only the wire between them may go.
+///
+/// Blocking sockets on their own threads rather than `tokio::io`, because
+/// `herd-hub` does not build tokio's `io-util` and a relay is not a reason to
+/// widen what the crate compiles.
+struct ALinkTheTestCanCut {
+    url: String,
+    state: std::sync::Arc<std::sync::Mutex<Wire>>,
+    stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+}
+
+#[derive(Default)]
+struct Wire {
+    cut: bool,
+    open: Vec<std::sync::Arc<std::net::TcpStream>>,
+}
+
+impl ALinkTheTestCanCut {
+    fn in_front_of(hub_url: &str) -> Self {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::{Arc, Mutex};
+
+        let hub: std::net::SocketAddr = hub_url
+            .trim_start_matches("ws://")
+            .parse()
+            .expect("the harness hands out ws://host:port");
+        let listening =
+            std::net::TcpListener::bind("127.0.0.1:0").expect("a free loopback port for the relay");
+        let addr = listening.local_addr().expect("the relay knows its port");
+        listening
+            .set_nonblocking(true)
+            .expect("a listener can be polled");
+        let state = Arc::new(Mutex::new(Wire::default()));
+        let stop = Arc::new(AtomicBool::new(false));
+        {
+            let state = Arc::clone(&state);
+            let stop = Arc::clone(&stop);
+            std::thread::spawn(move || loop {
+                if stop.load(Ordering::SeqCst) {
+                    return;
+                }
+                let from_runner = match listening.accept() {
+                    Ok((stream, _)) => stream,
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        std::thread::sleep(Duration::from_millis(5));
+                        continue;
+                    }
+                    Err(_) => return,
+                };
+                if from_runner.set_nonblocking(false).is_err() {
+                    continue;
+                }
+                // Taken before the dial out, so that a cut arriving in the
+                // middle of this cannot leave a pair of sockets nobody holds.
+                let mut wire = state.lock().unwrap_or_else(|p| p.into_inner());
+                if wire.cut {
+                    // The outage: the dial is answered by the kernel and then
+                    // nothing, which is what a link that is down looks like
+                    // from a runner that keeps trying.
+                    drop(from_runner);
+                    continue;
+                }
+                let Ok(to_hub) = std::net::TcpStream::connect(hub) else {
+                    continue;
+                };
+                let from_runner = Arc::new(from_runner);
+                let to_hub = Arc::new(to_hub);
+                wire.open.push(Arc::clone(&from_runner));
+                wire.open.push(Arc::clone(&to_hub));
+                drop(wire);
+                pump(Arc::clone(&from_runner), Arc::clone(&to_hub));
+                pump(to_hub, from_runner);
+            });
+        }
+        Self {
+            url: format!("ws://{addr}"),
+            state,
+            stop,
+        }
+    }
+
+    /// Cut the link: every socket either way is shut down, and every redial
+    /// is dropped until [`ALinkTheTestCanCut::restore`].
+    fn cut(&self) {
+        let mut wire = self.state.lock().unwrap_or_else(|p| p.into_inner());
+        wire.cut = true;
+        for socket in wire.open.drain(..) {
+            let _ = socket.shutdown(std::net::Shutdown::Both);
+        }
+    }
+
+    fn restore(&self) {
+        let mut wire = self.state.lock().unwrap_or_else(|p| p.into_inner());
+        wire.cut = false;
+    }
+}
+
+impl Drop for ALinkTheTestCanCut {
+    fn drop(&mut self) {
+        self.stop.store(true, std::sync::atomic::Ordering::SeqCst);
+        self.cut();
+    }
+}
+
+/// One direction of the relay, on its own thread, ending both sockets when
+/// either end does.
+fn pump(from: std::sync::Arc<std::net::TcpStream>, to: std::sync::Arc<std::net::TcpStream>) {
+    std::thread::spawn(move || {
+        use std::io::{Read, Write};
+        let mut buffer = [0u8; 16 * 1024];
+        loop {
+            let read = match (&*from).read(&mut buffer) {
+                Ok(0) | Err(_) => break,
+                Ok(read) => read,
+            };
+            if (&*to).write_all(&buffer[..read]).is_err() {
+                break;
+            }
+        }
+        let _ = from.shutdown(std::net::Shutdown::Both);
+        let _ = to.shutdown(std::net::Shutdown::Both);
+    });
+}
+
+/// **A link that drops while the runner is at its ceiling loses no job.**
+///
+/// Alexa's condition of merge, of 2026-10-25:
+///
+/// > un test hub réel qui coupe le lien 60 s avec un runner à son plafond,
+/// > 0 job mort, 0 job sans verdict.
+///
+/// The sequence, every step of which was read on this branch before it was
+/// written down:
+///
+/// 1. A runner announcing [`CEILING`] is running [`CEILING`] jobs. It is full
+///    on both sides' arithmetic, and the two agree.
+/// 2. The link drops. The jobs keep running — `herd-runner`'s own comment is
+///    explicit that they hold senders of their own and report on the next
+///    link — so the runner's count stays at its ceiling.
+/// 3. After `lost_after` the hub's watchdog ends every attempt out on that
+///    machine and requeues each job. The hub's count for the runner is now
+///    **0**, and the runner's is still [`CEILING`].
+/// 4. The runner redials. The hub dispatches to it on the hello, before it
+///    has read one frame from it (`herd-hub/src/server.rs`), and nothing
+///    avoids the machine a job has just come off.
+/// 5. The runner is still holding the originals, so it refuses — and before
+///    this branch's fix each refusal spent one of that job's two goes, which
+///    was the second and last. Every job ended `lost`, with no verdict, on a
+///    link blip and a fleet that was working perfectly.
+///
+/// The oracle is Alexa's two figures and nothing else: **no job dead, no job
+/// without a verdict**. It says nothing about how long the detour took or how
+/// many attempts it cost — a job requeued by a watchdog has genuinely lost an
+/// attempt to a runner that went away, which is E-21 working — only that the
+/// work came back with an answer.
+/// A hub whose watchdog a test can outlast, a runner holding [`CEILING`],
+/// and a link between them the test can cut.
+///
+/// `policy` is the hub's, already carrying this file's timings, so a caller
+/// has only to change what its own case is about.
+async fn a_capped_runner_behind_a_cuttable_link(
+    label: &'static str,
+    policy: herd_hub::Policy,
+) -> (
+    Harness,
+    ALinkTheTestCanCut,
+    DataRootDir,
+    tokio::task::JoinHandle<()>,
+) {
+    let harness = Harness::with_hub_timed(policy).await;
+    let link = ALinkTheTestCanCut::in_front_of(&harness.hub_url);
+    let data_root = DataRootDir::new(label);
+    let mut confinement = herd_runner::Confinement::with_data_root(data_root.path());
+    confinement.memory_max = PER_JOB_BYTES;
+    let config = herd_runner::Config {
+        // Through the relay, which is the only thing this test adds to an
+        // ordinary runner.
+        hub_url: link.url.clone(),
+        name: Some("capped-runner".to_owned()),
+        token: Some(harness.approve("capped-runner")),
+        confinement,
+        host: herd_proto::HostSize::new(Some(LENT_MIB), Some(4)).with_floor(Some(FLOOR_MIB)),
+        health_every: HEALTH_EVERY_HERE,
+        // So that the redial after the outage is prompt. The shape under test
+        // is what the hub does with a runner that has just come back, not how
+        // long a runner waits before coming back.
+        redial: herd_runner::Backoff {
+            first: Duration::from_millis(100),
+            cap: Duration::from_millis(400),
+            ..herd_runner::Backoff::default()
+        },
+        ..herd_runner::Config::default()
+    };
+    let running = tokio::spawn(async move {
+        let _ = herd_runner::run(config).await;
+    });
+    let deadline = Instant::now() + PATIENCE;
+    while !harness.runner_joined() {
+        assert!(Instant::now() < deadline, "the runner never joined the hub");
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    (harness, link, data_root, running)
+}
+
+/// This file's timings, as a hub policy a caller can go on changing.
+fn a_watchdog_a_test_can_outlast() -> herd_hub::Policy {
+    herd_hub::Policy {
+        lost_after: LOST_AFTER_HERE,
+        health_every: HEALTH_EVERY_HERE,
+        ..herd_hub::Policy::default()
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_link_cut_while_the_runner_is_full_loses_no_job() {
+    let (harness, link, _data_root, running) = a_capped_runner_behind_a_cuttable_link(
+        "link-cut-at-the-ceiling",
+        a_watchdog_a_test_can_outlast(),
+    )
+    .await;
+
+    let requester = harness.requester();
+    let state_dir = harness.state_dir().to_owned();
+    // Exactly as many jobs as the machine holds: the premise is a runner **at
+    // its ceiling**, not one with a queue behind it. Each command distinct,
+    // because two submissions of one command are one job (E-05).
+    let mut submitted = Vec::new();
+    for n in 0..CEILING {
+        submitted.push(
+            support::submit_job(
+                &requester,
+                support::shell(&format!(
+                    "echo across the outage {n}; sleep {SLEEP_ACROSS_THE_OUTAGE}"
+                )),
+            )
+            .await
+            .expect("the hub accepts the submission"),
+        );
+    }
+
+    // Waited for, never slept over: the cut has to land on a machine that is
+    // really full, and a sleep that ended early would cut a link with nothing
+    // on it.
+    let deadline = Instant::now() + PATIENCE;
+    loop {
+        let out_there = submitted
+            .iter()
+            .filter(|id| {
+                matches!(
+                    harness.state_of(id),
+                    herd_hub::JobState::Assigned | herd_hub::JobState::Running
+                )
+            })
+            .count();
+        if out_there == CEILING {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "only {out_there} of {CEILING} jobs reached the runner, so the link would be cut \
+             on a machine that was not at its ceiling"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+
+    // ---- The outage.
+    println!("cutting the link for {THE_OUTAGE:?}, with the runner at its ceiling of {CEILING}");
+    link.cut();
+    tokio::time::sleep(THE_OUTAGE).await;
+    // The hub must really have given up on them, or this test cut a link and
+    // measured nothing: the whole sequence begins with the watchdog.
+    let written_off = submitted
+        .iter()
+        .filter(|id| !matches!(harness.state_of(id), herd_hub::JobState::Running))
+        .count();
+    assert_eq!(
+        written_off, CEILING,
+        "after {THE_OUTAGE:?} with no link and a silence threshold of {LOST_AFTER_HERE:?}, the \
+         hub's watchdog has to have written off every attempt out on that machine; {written_off} \
+         of {CEILING} were. Without that this test never reaches the defect it is named for"
+    );
+    link.restore();
+    println!("the link is back; the runner is still running its {CEILING} original job(s)");
+
+    // ---- Alexa's oracle, and nothing else.
+    let deadline = Instant::now() + PATIENCE_ACROSS_AN_OUTAGE;
+    loop {
+        let unfinished = submitted
+            .iter()
+            .filter(|id| !harness.state_of(id).is_terminal())
+            .count();
+        if unfinished == 0 {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "{unfinished} of {CEILING} jobs never ended at all inside \
+             {PATIENCE_ACROSS_AN_OUTAGE:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+
+    let mut dead: Vec<String> = Vec::new();
+    for id in &submitted {
+        let record = record_of(&state_dir, id);
+        let outcome = &record["state"]["outcome"];
+        if outcome["type"] != "exited" || outcome["code"] != 0 {
+            dead.push(format!("{id}: {outcome}"));
+        }
+    }
+    assert!(
+        dead.is_empty(),
+        "0 job dead and 0 job without a verdict is the condition this change merges under, and \
+         {} of {CEILING} came back without one: {dead:?}. Every one of these was a runnable job \
+         on a healthy machine; what killed it was a link blip and a refusal that spent its last \
+         go",
+        dead.len()
+    );
+    println!("every one of the {CEILING} jobs came back with its own verdict");
+
+    running.abort();
+    let _ = running.await;
+    drop(link);
+    drop(harness);
+}
+
+/// **The exemption is bounded, and the bound says so on the record**
+/// (D-NEXT).
+///
+/// A refusal at a machine's own ceiling spends none of the job's goes at a
+/// runner that went away — that is the test above. An exemption with no
+/// bound at all would be a job that can be handed back for ever with nobody
+/// told, which is the one outcome worse than a job that ends. So it has a
+/// budget of its own, `herd_hub::CEILING_REFUSALS_ALLOWED`, and this is what
+/// happens when a job reaches it.
+///
+/// Driven at a budget of **one** rather than by provoking eight refusals: a
+/// test that spent the real figure would be testing the number instead of
+/// the behaviour, and the number is a setting precisely so that a test does
+/// not have to. The same outage as above, and the one refusal it produces is
+/// the whole budget.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_job_refused_past_the_bound_ends_and_names_it() {
+    let (harness, link, _data_root, running) = a_capped_runner_behind_a_cuttable_link(
+        "link-cut-bound",
+        herd_hub::Policy {
+            ceiling_refusals_allowed: 1,
+            ..a_watchdog_a_test_can_outlast()
+        },
+    )
+    .await;
+    let requester = harness.requester();
+    let state_dir = harness.state_dir().to_owned();
+
+    let mut submitted = Vec::new();
+    for n in 0..CEILING {
+        submitted.push(
+            support::submit_job(
+                &requester,
+                support::shell(&format!(
+                    "echo at the bound {n}; sleep {SLEEP_ACROSS_THE_OUTAGE}"
+                )),
+            )
+            .await
+            .expect("the hub accepts the submission"),
+        );
+    }
+    let deadline = Instant::now() + PATIENCE;
+    loop {
+        let out_there = submitted
+            .iter()
+            .filter(|id| {
+                matches!(
+                    harness.state_of(id),
+                    herd_hub::JobState::Assigned | herd_hub::JobState::Running
+                )
+            })
+            .count();
+        if out_there == CEILING {
+            break;
+        }
+        assert!(Instant::now() < deadline, "the runner never filled up");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+
+    link.cut();
+    tokio::time::sleep(THE_OUTAGE).await;
+    link.restore();
+
+    let deadline = Instant::now() + PATIENCE_ACROSS_AN_OUTAGE;
+    while submitted
+        .iter()
+        .any(|id| !harness.state_of(id).is_terminal())
+    {
+        assert!(Instant::now() < deadline, "the jobs never ended at all");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+
+    // At least one of them met the bound, and what it was told is the point:
+    // not "a runner went away", which would be false and would send an
+    // operator looking at a machine that never failed, but the budget, the
+    // figure, and the machine whose count never agreed with the hub's.
+    let ended_at_the_bound: Vec<String> = submitted
+        .iter()
+        .map(|id| record_of(&state_dir, id))
+        .filter(|record| record["state"]["outcome"]["type"] == "lost")
+        .filter_map(|record| {
+            record["state"]["outcome"]["reason"]
+                .as_str()
+                .map(str::to_owned)
+        })
+        .filter(|reason| reason.contains("as full as the ceiling they announced"))
+        .collect();
+    assert!(
+        !ended_at_the_bound.is_empty(),
+        "with a budget of one and an outage that produces a refusal, a job has to reach the \
+         bound; what the {CEILING} jobs ended as: {:?}",
+        submitted
+            .iter()
+            .map(|id| record_of(&state_dir, id)["state"]["outcome"].clone())
+            .collect::<Vec<_>>()
+    );
+    let said = ended_at_the_bound.first().expect("at least one");
+    assert!(
+        said.contains("1 time(s) of the 1 allowed"),
+        "the sentence has to carry both figures, or it is a job told it is over and not why: \
+         {said}"
+    );
+    assert!(
+        said.contains("capped-runner"),
+        "and name the machine whose count never agreed: {said}"
+    );
+    assert!(
+        said.contains("None of those refusals spent"),
+        "and say that the goes it still had were not what ran out: {said}"
+    );
+    println!("what a job that reaches the bound is told:\n  {said}");
+
+    running.abort();
+    let _ = running.await;
+    drop(link);
+    drop(harness);
+}

@@ -194,6 +194,46 @@ impl JobState {
     }
 }
 
+/// Which kind of ending an attempt that produced no verdict had.
+///
+/// **Three budgets, so three endings.** A job gets two goes at a runner that
+/// disappeared (E-21, D39), its own separate budget of goes at a capability
+/// that had gone under it (D76), and its own separate budget again at a
+/// machine that was already as full as the ceiling it announced (D-NEXT).
+/// Every one of them is counted by reading the attempts back off the record
+/// (D79), so the kind of ending has to be *on* the attempt — and it has to
+/// arrive here, at the one function that writes it, rather than be guessed
+/// afterwards from the reason, which is prose for a human.
+///
+/// One parameter rather than a flag beside a code, because the three are
+/// mutually exclusive and a pair of orthogonal arguments would let a caller
+/// say something that cannot be true.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HowItEnded {
+    /// About the runner, which is the ordinary case: it stopped answering,
+    /// it was asked to stop, its owner withdrew the machine, the hub wrote
+    /// the attempt off. Spends one of E-21's goes.
+    TheRunnerWentAway,
+    /// The job exited with the requeue code it declared, so what failed was
+    /// a capability and not the job (D76). Spends that budget and no other.
+    TheJobAnsweredItsRequeueCode(i32),
+    /// The runner handed the assignment straight back because it was already
+    /// holding as many jobs as it told the hub it would hold (D-NEXT).
+    /// Spends that budget and no other: the machine is here and the job is
+    /// untouched.
+    TheRunnerWasAtItsCeiling,
+}
+
+/// A flag that is left off the record entirely when it is not set.
+///
+/// `skip_serializing_if` wants a predicate on a reference, and a `bool` field
+/// that is false in every record but a handful should not widen every record
+/// in a state root. Paired with `#[serde(default)]`, so absent and `false`
+/// are the same fact and the record version stays where it is.
+fn not_set(flag: &bool) -> bool {
+    !*flag
+}
+
 /// One go at running a job on one runner.
 ///
 /// A job is attempted once, and — when the runner it was on is lost — once
@@ -234,6 +274,31 @@ pub struct Attempt {
     ///
     /// `None` on every other ending: a verdict, a loss, an abandonment.
     pub requeue_code: Option<i32>,
+    /// Whether this attempt ended because the runner was **already as full as
+    /// the ceiling it announced** (D-NEXT, invariant 2).
+    ///
+    /// The third budget, and the same shape as [`Attempt::requeue_code`] one
+    /// field up. E-21's two goes exist for *a runner that disappeared*; D76's
+    /// separate budget for *a capability that had gone*; this one for a
+    /// machine that is here, healthy, and holding exactly the work it said it
+    /// would hold. Nothing is wrong with the job and nothing is wrong with
+    /// the machine — the two sides simply disagreed about a count for a
+    /// moment — so charging the job one of the goes it keeps for a runner
+    /// that vanished loses work that was never in trouble. Before this field
+    /// existed, a link outage longer than `lost_after` ended with every job
+    /// the runner had been holding recorded `lost` with no verdict at all.
+    ///
+    /// Counted on its own, by [`JobRecord::goes_a_ceiling_refused`], against
+    /// [`crate::CEILING_REFUSALS_ALLOWED`] — because an exemption with no
+    /// bound is a job that can be refused for ever and told nobody.
+    ///
+    /// `false` on every other ending, which is what its absence means: the
+    /// field is `#[serde(default)]` and is left off the record entirely when
+    /// it is false, so `RECORD_VERSION` stays 1 and a hub without it reads
+    /// every record a hub with it wrote (see the rule above this struct's
+    /// `RECORD_VERSION`).
+    #[serde(default, skip_serializing_if = "not_set")]
+    pub at_its_ceiling: bool,
     /// Why this attempt ended without a verdict, when that is what happened.
     /// `None` on the attempt that produced one: the job's outcome is the
     /// answer, so there is nothing to excuse (see [`Attempt::ended_at`] for
@@ -1336,11 +1401,56 @@ impl JobRecord {
     /// one of these, which is the whole of D76's "separate budget" — a leased
     /// machine answering 75 must not spend the goes that exist for a machine
     /// that disappears.
+    ///
+    /// Nor is an attempt a runner handed back **because it was already as
+    /// full as the ceiling it announced** (D-NEXT). That machine did not
+    /// disappear: it is on the line, healthy, running exactly what it said it
+    /// would run, and the job it declined is untouched. Charging it a go cost
+    /// whole queues their verdicts on an ordinary link blip — the runner's
+    /// jobs go on running across a dropped link, the hub's watchdog requeues
+    /// them, and the moment the runner redials the hub hands the same jobs
+    /// straight back to the machine that is still holding them. That refusal
+    /// was the job's last go. It has a bound of its own,
+    /// [`JobRecord::goes_a_ceiling_refused`].
     pub fn goes_a_runner_took(&self) -> u32 {
         self.attempts
             .iter()
-            .filter(|attempt| attempt.ended_at.is_some() && attempt.requeue_code.is_none())
+            .filter(|attempt| {
+                attempt.ended_at.is_some()
+                    && attempt.requeue_code.is_none()
+                    && !attempt.at_its_ceiling
+            })
             .count() as u32
+    }
+
+    /// How many times this job has been handed back by a runner that was
+    /// already at the ceiling it announced (D-NEXT).
+    ///
+    /// The bound on the exemption above, and derived from the attempts for
+    /// the reason every other budget here is: a counter would be a second
+    /// answer to a question the record already answers, and one more thing
+    /// to leak across a restart (D79).
+    pub fn goes_a_ceiling_refused(&self) -> u32 {
+        self.attempts
+            .iter()
+            .filter(|attempt| attempt.at_its_ceiling)
+            .count() as u32
+    }
+
+    /// The runners that refused this job for a ceiling of their own, in
+    /// order, each named once.
+    ///
+    /// For the one sentence an operator reads about a job that ran out of
+    /// this budget: *which* machines kept saying they were full is the whole
+    /// of what there is to act on.
+    pub fn runners_that_were_full(&self) -> Vec<String> {
+        let mut named: Vec<String> = Vec::new();
+        for attempt in &self.attempts {
+            if attempt.at_its_ceiling && !named.contains(&attempt.runner) {
+                named.push(attempt.runner.clone());
+            }
+        }
+        named
     }
 
     /// How much of the requeue budget this job has spent (D76).
@@ -2045,13 +2155,7 @@ pub trait JobStore: Send + Sync + 'static {
     /// Idempotent: ending an attempt that is already ended keeps the first
     /// reason, because the first reason is the true one and a record is not a
     /// journal of the hub's second thoughts.
-    fn end_attempt(
-        &self,
-        id: &JobId,
-        attempt: u32,
-        reason: &str,
-        requeue_code: Option<i32>,
-    ) -> Result<()>;
+    fn end_attempt(&self, id: &JobId, attempt: u32, reason: &str, how: HowItEnded) -> Result<()>;
 
     /// Append one chunk of a job's output in the order the runner produced it,
     /// as the bytes the process wrote (D18): a job's output is not text.
@@ -2315,5 +2419,130 @@ mod tests {
         assert!(serde_json::to_string(&reading.after_a_loss())
             .expect("a reading writes")
             .contains("\"lost\":1"));
+    }
+}
+
+#[cfg(test)]
+mod a_ceiling_refusal_on_the_record {
+    use super::*;
+
+    /// An attempt as a hub **without** this field writes and reads one: the
+    /// same struct minus `at_its_ceiling`, which is what a rollback is.
+    #[derive(Debug, Serialize, Deserialize)]
+    struct AttemptAsAnOlderHubReadsIt {
+        number: u32,
+        runner: String,
+        started_at: Timestamp,
+        ended_at: Option<Timestamp>,
+        requeue_code: Option<i32>,
+        ended: Option<String>,
+        why: String,
+        #[serde(default)]
+        steps: Vec<StepRun>,
+        #[serde(default)]
+        commit: Option<CommitRun>,
+    }
+
+    fn ended(number: u32, runner: &str, how: Option<&str>) -> Attempt {
+        let at = Timestamp::now();
+        Attempt {
+            number,
+            runner: runner.to_owned(),
+            started_at: at,
+            ended_at: Some(at),
+            requeue_code: None,
+            at_its_ceiling: false,
+            ended: how.map(str::to_owned),
+            why: "claimed by somebody".to_owned(),
+            steps: Vec::new(),
+            commit: None,
+        }
+    }
+
+    /// **Neither version number moves.** Asserted here as well as in
+    /// `herd-hub/tests/announced_job_ceiling.rs`, because this is the file
+    /// whose rule the new field has to satisfy: `#[serde(default)]`, absent
+    /// meaning exactly what the default says, and therefore additive.
+    #[test]
+    fn the_record_version_does_not_move() {
+        assert_eq!(RECORD_VERSION, 1);
+        assert_eq!(herd_proto::PROTOCOL_VERSION, 2);
+    }
+
+    /// A record written by a hub **with** the field is read by one without
+    /// it, and the other way round. Both directions, because a rollback is
+    /// one of them and an upgrade is the other, and a state root that only
+    /// survives one of those is a state root an operator loses.
+    #[test]
+    fn a_record_crosses_the_field_in_both_directions() {
+        let mut full = ended(1, "capped-runner", Some("the runner was full"));
+        full.at_its_ceiling = true;
+        let written = serde_json::to_string(&full).expect("an attempt writes");
+        assert!(
+            written.contains("\"at_its_ceiling\":true"),
+            "the flag is on the record when it is set: {written}"
+        );
+
+        // Forwards: a hub without the field reads what a hub with it wrote,
+        // and everything it does know is unchanged.
+        let older: AttemptAsAnOlderHubReadsIt =
+            serde_json::from_str(&written).expect("an older hub reads it");
+        assert_eq!(older.number, 1);
+        assert_eq!(older.runner, "capped-runner");
+        assert_eq!(older.ended.as_deref(), Some("the runner was full"));
+        assert_eq!(older.requeue_code, None);
+
+        // Backwards: a hub with the field reads what a hub without it wrote,
+        // and reads the absence as `false` — which is what every attempt
+        // ever written before this field meant.
+        let written_before = serde_json::to_string(&older).expect("an older attempt writes");
+        assert!(
+            !written_before.contains("at_its_ceiling"),
+            "the older shape carries no such key: {written_before}"
+        );
+        let read_back: Attempt =
+            serde_json::from_str(&written_before).expect("this hub reads an older attempt");
+        assert!(
+            !read_back.at_its_ceiling,
+            "an attempt written before this field existed is not a ceiling refusal"
+        );
+
+        // And the key is off the wire entirely when the flag is not set, so
+        // no existing record grows a byte.
+        let plain = serde_json::to_string(&ended(1, "wsl-pc", Some("lost"))).expect("writes");
+        assert!(
+            !plain.contains("at_its_ceiling"),
+            "an ordinary attempt is written exactly as it was: {plain}"
+        );
+    }
+
+    /// **The three budgets are counted apart**, which is the whole of the
+    /// change: a refusal at a machine's own ceiling spends none of E-21's
+    /// goes, none of D76's, and one of its own.
+    #[test]
+    fn a_ceiling_refusal_spends_its_own_budget_and_no_other() {
+        let mut record =
+            JobRecord::hypothetical(NewJob::new(vec!["true".to_owned()]), Timestamp::now());
+        let mut refused = ended(1, "capped-runner", Some("the runner was full"));
+        refused.at_its_ceiling = true;
+        let mut again = ended(2, "capped-runner", Some("the runner was full"));
+        again.at_its_ceiling = true;
+        let mut requeued = ended(3, "metal-pc", Some("it exited 75"));
+        requeued.requeue_code = Some(75);
+        let went_away = ended(4, "wsl-pc", Some("the runner stopped answering"));
+        record.attempts = vec![refused, again, requeued, went_away];
+
+        assert_eq!(
+            record.goes_a_runner_took(),
+            1,
+            "only the attempt that ended at a runner that went away"
+        );
+        assert_eq!(record.requeues_spent(), 1, "and only the 75 (D76)");
+        assert_eq!(
+            record.goes_a_ceiling_refused(),
+            2,
+            "and both refusals at a machine's own ceiling, on their own budget"
+        );
+        assert_eq!(record.runners_that_were_full(), vec!["capped-runner"]);
     }
 }

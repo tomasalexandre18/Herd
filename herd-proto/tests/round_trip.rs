@@ -871,6 +871,7 @@ fn the_link_frames_are_tagged_json_objects() {
             job_id: JobId::new("j1"),
             attempt: 1,
             reason: "the runner was asked to stop".to_owned(),
+            at_its_ceiling: None,
         })
         .expect("encodes"),
         r#"{"type":"attempt_abandoned","job_id":"j1","attempt":1,"reason":"the runner was asked to stop"}"#
@@ -1079,6 +1080,7 @@ fn every_link_frame_round_trips() {
         job_id: JobId::new("j1"),
         attempt: 1,
         reason: String::new(),
+        at_its_ceiling: None,
     });
     round_trip_from_hub(FromHub::HealthRecorded {});
     round_trip_from_hub(FromHub::StillThere {

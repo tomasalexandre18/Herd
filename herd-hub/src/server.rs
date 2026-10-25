@@ -67,7 +67,9 @@ use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::WebSocketStream;
 
 use crate::capability::RunnerCapacity;
-use crate::job::{JobRecord, JobState, JobStore, LogWrite, NewJob, Raise, Submission, Timestamp};
+use crate::job::{
+    HowItEnded, JobRecord, JobState, JobStore, LogWrite, NewJob, Raise, Submission, Timestamp,
+};
 use crate::matcher::{self, Placement, Seat, Stickiness};
 use crate::queue;
 
@@ -146,6 +148,33 @@ pub const FRAME_CEILING_BYTES: usize = herd_proto::FRAME_CEILING as usize;
 /// going round the herd for ever. M6's priorities do not change this; a third
 /// attempt would be a different promise and nobody has asked for one.
 pub const ATTEMPTS_ALLOWED: u32 = 2;
+
+/// How many times one job may be handed back by a runner that was already as
+/// full as the ceiling it announced, before the hub stops trying (D-NEXT).
+///
+/// **Eight**, and it is a bound on an exemption rather than a budget for
+/// something that went wrong. A ceiling refusal costs the fleet one frame
+/// each way: the machine is here and healthy, the job is untouched, and the
+/// only thing that happened is that the two sides disagreed for a moment
+/// about a count they can both see. So it does not spend one of E-21's two
+/// goes ([`crate::job::JobRecord::goes_a_runner_took`]) — but an exemption
+/// with no bound at all is a job that can be refused for ever with nobody
+/// told, which is the one outcome worse than a job that ends.
+///
+/// Eight because of what the disagreement is. The hub stops placing on a
+/// machine the moment that machine says it is full, and starts again when
+/// its next health report squares the two counts, so a fleet that is merely
+/// recovering — a link that dropped, a runner that redialled still holding
+/// the jobs the watchdog wrote off — produces about one refusal per job per
+/// health cadence while it settles, and settles in one or two. Eight leaves
+/// room for an outage that settles badly, for a second blip on top of the
+/// first, and for a machine whose report is late; it is four times E-21's
+/// two and nearly three times D76's three, which is right, because unlike
+/// either of those nothing here has actually failed. What eight will not
+/// outlast is a disagreement that is never going to settle — two processes
+/// answering to one runner name, or a peer that announces a ceiling it does
+/// not then honour — and that is the case this bound exists to name.
+pub const CEILING_REFUSALS_ALLOWED: u32 = 8;
 
 /// How often a job that is still waiting says so again (E-04).
 ///
@@ -336,6 +365,19 @@ pub struct Policy {
     /// because a lease somebody else holds all afternoon would otherwise
     /// requeue a job for ever, which is a job nobody is told about.
     pub requeue_budget: u32,
+    /// How many times one job may be handed back by a runner that was
+    /// already at the ceiling it announced (D-NEXT).
+    ///
+    /// See [`CEILING_REFUSALS_ALLOWED`]. **Separate from both
+    /// [`Policy::attempts_allowed`] and [`Policy::requeue_budget`]**, and
+    /// for the same reason they are separate from each other: the three
+    /// count different things that go wrong, and a budget that could reach
+    /// another's would leave a job with nothing left for the case that
+    /// budget exists for. A setting for the reason the others are — a test
+    /// has to be able to reach the bound without submitting eight refusals
+    /// through a real link, and through the hub's own arithmetic rather than
+    /// a copy of it.
+    pub ceiling_refusals_allowed: u32,
     /// How long the `run` step of a `labels_from` reading may take (D74).
     ///
     /// See [`READING_CAP`]. A setting for the reason the others are: a test
@@ -376,6 +418,7 @@ impl Default for Policy {
             still_there_every: herd_proto::STILL_THERE_EVERY,
             drain_first_limit: crate::matcher::DRAIN_FIRST_LIMIT,
             requeue_budget: REQUEUE_BUDGET,
+            ceiling_refusals_allowed: CEILING_REFUSALS_ALLOWED,
             reading_cap: READING_CAP,
             readings_at_once: crate::matcher::READINGS_AT_ONCE,
             collection_silence: COLLECTION_SILENCE,
@@ -811,6 +854,24 @@ struct ConnectedRunner {
     /// puts on every job, which no frame carries, so a figure the hub
     /// invented would be a ceiling the runner never agreed to.
     jobs_at_once: Option<u32>,
+    /// What this runner last said it was **already holding**, when it handed
+    /// an assignment back because it was at the ceiling above (D-NEXT).
+    ///
+    /// A correction to the hub's own count, and nothing more. The hub reads
+    /// what is out on a machine off the records (D79), and there is one
+    /// state in which the records are wrong: a runner whose link dropped
+    /// goes on running its jobs, the watchdog ends those attempts and
+    /// requeues them, and the moment the machine redials the hub sees a
+    /// seat holding nothing and offers it back every job it is still
+    /// running. The refusal that follows is the machine telling the hub what
+    /// its records cannot: *I am holding this many*. Held until the next
+    /// health report, which is the reconciliation — that report names every
+    /// job the runner holds, so after it the records and the machine have
+    /// been squared and the hub's own count is the fresher of the two.
+    ///
+    /// `None` is "nothing to correct", which is the ordinary state and the
+    /// one every runner joins in.
+    it_said_it_is_holding: Option<u32>,
     /// How preferred this machine is when more than one could run a job
     /// (E-19). Declared by whoever runs it; zero when it says nothing.
     preference: i32,
@@ -1220,6 +1281,7 @@ impl State {
                     capacity: announced.capacity,
                     host: announced.host,
                     jobs_at_once: announced.jobs_at_once,
+                    it_said_it_is_holding: None,
                     preference: announced.preference,
                     load_milli: announced.load_milli,
                     kick,
@@ -1304,6 +1366,7 @@ impl State {
                         preference: runner.preference,
                         host: runner.host,
                         jobs_at_once: runner.jobs_at_once,
+                        it_said_it_is_holding: runner.it_said_it_is_holding,
                         draining: runner.draining,
                         capacity: runner.capacity.clone(),
                         holdings,
@@ -1515,13 +1578,16 @@ impl State {
         )
     }
 
+    /// True when this report ended a correction a ceiling refusal had left
+    /// on the runner (D-NEXT), which is a machine that has room again and
+    /// therefore a queue worth judging.
     fn record_health(
         &self,
         outbox: &Outbox,
         jobs: Vec<RunningJob>,
         draining: bool,
         load_milli: Option<u64>,
-    ) {
+    ) -> bool {
         self.with_peers(|peers| {
             if let Some(runner) = peers
                 .runners
@@ -1532,6 +1598,18 @@ impl State {
                 runner.reports_seen += 1;
                 runner.draining = draining;
                 runner.jobs = jobs;
+                // The reconciliation, which is what ends the correction a
+                // ceiling refusal left behind (D-NEXT). This report names
+                // every attempt the machine is holding and nothing else, so
+                // whatever the two sides disagreed about has now been said
+                // out loud: the attempts the records no longer know about
+                // are answered as stale, and from here the hub's own count
+                // is the fresher of the two. Cleared rather than replaced by
+                // `jobs.len()`, because a figure kept between reports would
+                // hold a machine full for a whole cadence after a job on it
+                // ended — which is the throughput this change is trying not
+                // to cost.
+                let was_corrected = runner.it_said_it_is_holding.take().is_some();
                 // A figure that could not be read this time does not erase
                 // the last one that could: an absent load is unknown, and the
                 // most recent figure the machine managed to give is still the
@@ -1539,6 +1617,24 @@ impl State {
                 if load_milli.is_some() {
                     runner.load_milli = load_milli;
                 }
+                was_corrected
+            } else {
+                false
+            }
+        })
+    }
+
+    /// Record what a runner said it was already holding when it refused an
+    /// assignment for the ceiling it announced (D-NEXT).
+    ///
+    /// By name rather than by connection, because the caller is in the relay
+    /// loop and has the name; and a no-op for a runner that is no longer
+    /// registered, which is the ordinary race of a refusal arriving as a
+    /// link ends.
+    fn the_runner_says_it_is_holding(&self, name: &str, holding: u32) {
+        self.with_peers(|peers| {
+            if let Some(runner) = peers.runners.get_mut(name) {
+                runner.it_said_it_is_holding = Some(holding);
             }
         });
     }
@@ -3603,7 +3699,17 @@ async fn relay_from_runner(
                         its_own.push(job);
                     }
                 }
-                state.record_health(outbox, its_own, draining, load_milli);
+                // And if this report ended a ceiling correction, the queue is
+                // judged **now** (D-NEXT). Nothing else would: a health
+                // report is not an event the dispatch pass is woken by, so a
+                // job held back because a machine said it was full would
+                // wait for whatever happened to wake the hub next — on a
+                // quiet fleet, the restatement cadence, which is a minute of
+                // a machine standing idle with work queued for it. The same
+                // shape as the switch below, and for the same reason.
+                if state.record_health(outbox, its_own, draining, load_milli) {
+                    dispatch_queued_jobs(state)?;
+                }
                 // And the owner's switch, which rides on every report (E-33).
                 // A position that moved is said out loud **and** re-judges the
                 // queue at once: `off` means the jobs waiting for this machine
@@ -3959,12 +4065,30 @@ async fn relay_from_runner(
                 job_id,
                 attempt,
                 reason,
+                at_its_ceiling,
             } => {
                 if !is_current(state, name, outbox, &mut said, &job_id, attempt) {
                     continue;
                 }
                 println!("herd-hub: attempt {attempt} of {job_id} was abandoned: {reason}");
-                if let Err(error) = give_the_job_another_go(state, &job_id, attempt, &reason) {
+                // **Before the requeue**, because the requeue judges the
+                // queue on its way out and that pass has to see this: the
+                // machine's own count of what it is holding is the one thing
+                // that stops the hub offering the same surplus straight back
+                // to it (D-NEXT). A runner that has just redialled is
+                // holding jobs the records no longer know about — the
+                // watchdog ended those attempts while the link was down and
+                // the jobs went on running — so until that runner's next
+                // health report squares the two counts, its figure is the
+                // true one and the hub's is the stale one.
+                let how = match at_its_ceiling {
+                    Some(holding) => {
+                        state.the_runner_says_it_is_holding(name, holding);
+                        HowItEnded::TheRunnerWasAtItsCeiling
+                    }
+                    None => HowItEnded::TheRunnerWentAway,
+                };
+                if let Err(error) = give_the_job_another_go(state, &job_id, attempt, &reason, how) {
                     eprintln!("herd-hub: {job_id} could not be requeued: {error:#}");
                 }
             }
@@ -5117,6 +5241,25 @@ async fn watch_for_a_lost_runner(state: Arc<State>) {
             if attempt == 0 {
                 continue;
             }
+            // **The age again, now, and not the one in the list above.** This
+            // loop places: a requeue judges the queue on its way out, so by
+            // the time a job further down the list is reached it may have
+            // been given a whole new attempt on a runner that has just
+            // redialled — and the figure beside its id is then the silence
+            // of the attempt *before* that one. Acting on it writes off an
+            // attempt that is milliseconds old with a sentence about a
+            // minute of nothing, and spends the job's last go on it. The two
+            // figures agree in every ordinary tick; the one tick where they
+            // do not is exactly the one that follows a link coming back,
+            // which is where the fleet already has least to spare.
+            let unheard_for = state
+                .unheard_of_for(std::slice::from_ref(&job_id))
+                .first()
+                .map(|(_, age)| *age)
+                .unwrap_or(unheard_for);
+            if unheard_for <= state.policy.lost_after {
+                continue;
+            }
             let runner = record
                 .attempt()
                 .map(|attempt| attempt.runner.clone())
@@ -5168,7 +5311,17 @@ async fn watch_for_a_lost_runner(state: Arc<State>) {
                      this job for {unheard_for:?}, so it is not coming back"
                 ),
             };
-            if let Err(error) = give_the_job_another_go(&state, &job_id, attempt, &reason) {
+            // Every ending the watchdog writes is about the runner: it went
+            // quiet, or it is here and no longer holding the attempt. None
+            // of them is a machine saying it is full, which only a runner
+            // can say and only in the frame that says it (D-NEXT).
+            if let Err(error) = give_the_job_another_go(
+                &state,
+                &job_id,
+                attempt,
+                &reason,
+                HowItEnded::TheRunnerWentAway,
+            ) {
                 eprintln!("herd-hub: {job_id} could not be requeued: {error:#}");
             }
         }
@@ -5238,6 +5391,7 @@ fn give_the_job_another_go(
     job_id: &JobId,
     attempt: u32,
     reason: &str,
+    how: HowItEnded,
 ) -> Result<()> {
     let Some(record) = state
         .store
@@ -5265,41 +5419,81 @@ fn give_the_job_another_go(
     // disappears, and before this was counted separately three 75s left a job
     // with nothing left for the case E-21 is about.
     let goes_taken = record.goes_a_runner_took();
+    // And how much of the **other** budget is gone: the one for a machine
+    // that is here and full (D-NEXT). Separate from the goes above for D76's
+    // reason, one budget further on — a runner that said it was already
+    // holding what it promised to hold is not a runner that disappeared, so
+    // a job refused by one must not come to the end of the goes E-21 keeps
+    // for a machine that really went.
+    let ceilings_hit = record.goes_a_ceiling_refused();
     state
         .store
-        .end_attempt(job_id, attempt, reason, None)
+        .end_attempt(job_id, attempt, reason, how)
         .with_context(|| format!("ending attempt {attempt} of {job_id}"))?;
     state.attempt_is_over(job_id);
+    // Which of the two budgets this ending spends, and how much of it is
+    // gone (D-NEXT). A machine that was already as full as the ceiling it
+    // announced is not a machine that went away: the job never started
+    // there, nothing of it was lost, and E-21's goes are untouched. It has a
+    // budget of its own, bounded, because an exemption with no bound is a
+    // job that can be refused for ever and told nobody.
+    let at_its_ceiling = matches!(how, HowItEnded::TheRunnerWasAtItsCeiling);
+    let (spent, allowed) = if at_its_ceiling {
+        (ceilings_hit + 1, state.policy.ceiling_refusals_allowed)
+    } else {
+        (goes_taken + 1, state.policy.attempts_allowed)
+    };
+
     // Whatever that attempt wrote and the hub never received is gone with it:
     // the runner held it in memory. Said in the log, at the place where it is
     // missing, rather than left to be noticed by its absence (D29).
-    name_what_that_attempt_lost(
-        state,
-        job_id,
-        record
-            .attempt()
-            .map_or("", |attempt| attempt.runner.as_str()),
-    );
+    //
+    // Nothing to say for a refusal at a ceiling: the job was handed back
+    // before it started, so there is no output the hub never received, and a
+    // line claiming there might be would be a line an operator chases.
+    if !at_its_ceiling {
+        name_what_that_attempt_lost(
+            state,
+            job_id,
+            record
+                .attempt()
+                .map_or("", |attempt| attempt.runner.as_str()),
+        );
+    }
 
-    if goes_taken + 1 < state.policy.attempts_allowed {
+    if spent < allowed {
         state
             .store
             .record_state(job_id, JobState::Queued)
             .with_context(|| format!("requeueing {job_id}"))?;
-        println!(
-            "herd-hub: {job_id} is queued again for attempt {} of {} at a runner that went \
-             away: {reason}",
-            goes_taken + 1,
-            state.policy.attempts_allowed
-        );
+        if at_its_ceiling {
+            println!(
+                "herd-hub: {job_id} is queued again, handed back {spent} of {allowed} times by \
+                 a machine that was already as full as the ceiling it announced; no go at a \
+                 runner that went away was spent on it: {reason}"
+            );
+        } else {
+            println!(
+                "herd-hub: {job_id} is queued again for attempt {spent} of {allowed} at a \
+                 runner that went away: {reason}"
+            );
+        }
         for follower in state.followers_to_tell(job_id) {
             let _ = follower.send(FromHub::JobNote {
                 job_id: job_id.clone(),
-                note: format!(
-                    "attempt {attempt} of this job ended without a verdict ({reason}); it is \
-                     queued again as attempt {}. This wait carries on.",
-                    attempt + 1
-                ),
+                note: if at_its_ceiling {
+                    format!(
+                        "attempt {attempt} of this job was handed straight back ({reason}); it \
+                         is queued again, and a refusal for a machine's own ceiling does not \
+                         spend one of this job's goes. This wait carries on."
+                    )
+                } else {
+                    format!(
+                        "attempt {attempt} of this job ended without a verdict ({reason}); it \
+                         is queued again as attempt {}. This wait carries on.",
+                        attempt + 1
+                    )
+                },
             });
         }
         // There may be a runner here already — the one that replaced the one
@@ -5314,14 +5508,46 @@ fn give_the_job_another_go(
 
     // Out of goes. An end, and a named one: not an exit code, because no
     // process gave one (D15).
+    //
+    // The sentence says *which* budget ran out, because the two mean
+    // opposite things to whoever reads it. "A runner went away twice" is a
+    // fleet that lost a machine under a job. "Eight machines said they were
+    // full" is a fleet whose hub and whose runners do not agree about a
+    // count they can both see — nothing failed, and the thing to look at is
+    // the disagreement and the machines named in it (D-NEXT).
     let outcome = JobOutcome::Lost {
-        reason: format!(
-            "{reason}; this was attempt {} of {} at a runner that went away, so the job is not \
-             attempted again (E-21). A go spent on a capability that had gone under it would \
-             not have counted towards these (D76)",
-            goes_taken + 1,
-            state.policy.attempts_allowed
-        ),
+        reason: if at_its_ceiling {
+            // The record in hand was read before this attempt was ended, so
+            // it does not yet carry this refusal: the machine refusing right
+            // now is added to the ones that refused before it.
+            let mut full = record.runners_that_were_full();
+            if let Some(refusing) = record.attempt().map(|attempt| attempt.runner.clone()) {
+                if !full.contains(&refusing) {
+                    full.push(refusing);
+                }
+            }
+            format!(
+                "{reason}; this job has been handed straight back {spent} time(s) of the \
+                 {allowed} allowed by machines that were already as full as the ceiling they \
+                 announced, so it is not offered again (D-NEXT). None of those refusals spent \
+                 one of its {} goes at a runner that went away (E-21): nothing failed and no \
+                 machine went anywhere, the hub's count of what is out on {} and theirs simply \
+                 never agreed",
+                state.policy.attempts_allowed,
+                if full.is_empty() {
+                    "that machine".to_owned()
+                } else {
+                    full.join(", ")
+                }
+            )
+        } else {
+            format!(
+                "{reason}; this was attempt {spent} of {allowed} at a runner that went away, \
+                 so the job is not attempted again (E-21). A go spent on a capability that had \
+                 gone under it would not have counted towards these (D76), nor would one spent \
+                 on a machine that was already full (D-NEXT)"
+            )
+        },
     };
     state
         .store
@@ -5405,7 +5631,12 @@ async fn requeue_for_a_lost_capability(
     );
     state
         .store
-        .end_attempt(job_id, attempt, &reason, Some(code))
+        .end_attempt(
+            job_id,
+            attempt,
+            &reason,
+            HowItEnded::TheJobAnsweredItsRequeueCode(code),
+        )
         .with_context(|| format!("ending attempt {attempt} of {job_id}"))?;
     state.attempt_is_over(job_id);
     let _ = outbox.send(FromHub::JobResultAck {
@@ -6976,7 +7207,7 @@ mod tests {
 
     use super::*;
     use crate::job::Mint;
-    use crate::job::{JobEvent, LogWrite, NewJob, Result as StoreResult};
+    use crate::job::{HowItEnded, JobEvent, LogWrite, NewJob, Result as StoreResult};
     use crate::store::JobDirStore;
     use herd_proto::LogStream;
 
@@ -7138,9 +7369,9 @@ mod tests {
             id: &JobId,
             attempt: u32,
             reason: &str,
-            requeue_code: Option<i32>,
+            how: HowItEnded,
         ) -> StoreResult<()> {
-            self.inner.end_attempt(id, attempt, reason, requeue_code)
+            self.inner.end_attempt(id, attempt, reason, how)
         }
         fn append_log(
             &self,
