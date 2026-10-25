@@ -472,7 +472,7 @@ impl fmt::Display for Unmeasurable {
 
 /// Sum the apparent size of every regular file under a directory, restoring
 /// the access the walk needs, and refusing to call an unreadable tree empty.
-fn measure_tree(path: &Path, up_to: &Path) -> Result<u64, Unmeasurable> {
+pub(crate) fn measure_tree(path: &Path, up_to: &Path) -> Result<u64, Unmeasurable> {
     let mut total = 0u64;
     let mut pending = vec![path.to_path_buf()];
     while let Some(directory) = pending.pop() {

@@ -76,7 +76,7 @@ use tokio::sync::{watch, Semaphore};
 use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::{MaybeTlsStream, WebSocketStream};
 
-pub use confine::{Confined, Confinement};
+pub use confine::{jobs_at_once, Confined, Confinement, JobsAtOnce};
 use spool::Spooled;
 
 /// Where a runner looks for its hub unless told otherwise.
@@ -441,6 +441,48 @@ impl std::fmt::Display for StandBy {
 }
 
 impl std::error::Error for StandBy {}
+
+/// Why this runner would not take a job the hub assigned it.
+///
+/// Every one of these becomes a `ToHub::AttemptAbandoned` and nothing else:
+/// the attempt is handed straight back with a reason, the job is untouched,
+/// and what becomes of it — one more go somewhere else, or an end — stays the
+/// hub's policy and never the runner's. That is the frame the protocol
+/// already has for exactly this (`herd_proto::ToHub::AttemptAbandoned`), and
+/// using it is why a runner holding its own limits needs no new variant on
+/// any enum and no new version number.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum NotTaken {
+    /// The runner is stopping (invariant 2) and the hub had already sent the
+    /// assignment.
+    Draining,
+    /// Its owner has withdrawn the machine (E-33).
+    Switched(herd_proto::Switch),
+    /// It is already holding as many jobs as it can hold at its own caps
+    /// (invariant 2, and [`confine::jobs_at_once`]). **Not a statement about
+    /// the hub**: a hub whose arithmetic is right never reaches this, and a
+    /// runner that reached it says so rather than finding out what N times
+    /// its memory ceiling does to its host.
+    AtItsCeiling { running: usize, most: usize },
+}
+
+impl NotTaken {
+    /// The sentence the hub is given, which is the whole of what a reader of
+    /// the record learns about why this machine said no.
+    pub(crate) fn sentence(&self, ceiling: &confine::JobsAtOnce) -> String {
+        match self {
+            NotTaken::Draining => "the runner is draining and never started this job".to_owned(),
+            NotTaken::Switched(switch) => format!(
+                "the runner is switched {} and never started this job",
+                switch.sentence()
+            ),
+            NotTaken::AtItsCeiling { running, .. } => format!(
+                "the runner is already running {running} job(s) and never started this job: {}",
+                ceiling.why()
+            ),
+        }
+    }
+}
 
 /// How a job is being ended from outside it.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1183,13 +1225,27 @@ impl Session {
 
     /// Take a job in hand, and give back the token that ends it.
     ///
-    /// `None` when this runner will not run it: it is draining and the hub
-    /// had already sent the assignment, which the caller reports as an
-    /// abandoned attempt.
-    pub(crate) fn take_job(&self, job_id: &JobId, attempt: u32) -> Option<CancelToken> {
+    /// `Err` when this runner will not run it, and the variant says which of
+    /// the three reasons it was: the caller reports every one of them to the
+    /// hub as an abandoned attempt, and the sentence it builds is the only
+    /// thing that tells the hub's operator apart "she is gaming on the PC"
+    /// from "this machine is full".
+    ///
+    /// **The reason comes back from inside the lock**, rather than being read
+    /// off the session afterwards. Three refusals now share this path and two
+    /// of them can change between the refusal and the question: a runner that
+    /// refused because it was full and then drained would have told the hub
+    /// it was draining, which is a different fact about a different machine
+    /// state and would have been wrong on the record.
+    pub(crate) fn take_job(
+        &self,
+        job_id: &JobId,
+        attempt: u32,
+        most_at_once: usize,
+    ) -> Result<CancelToken, NotTaken> {
         self.with(|inner| {
             if inner.draining {
-                return None;
+                return Err(NotTaken::Draining);
             }
             // And the owner's switch, in the same place and under the same
             // lock — which is the whole of the race E-33 can lose: a job the
@@ -1199,7 +1255,24 @@ impl Session {
             // path, an abandoned attempt), which is exactly right: nothing is
             // lost and the machine is given back.
             if !inner.switch.claims() {
-                return None;
+                return Err(NotTaken::Switched(inner.switch.clone()));
+            }
+            // And this machine's own ceiling, in the same place and under the
+            // same lock, for the same reason: the count has to be read and the
+            // entry written without an instant in between, or two assignments
+            // arriving together would both find room for the last one.
+            //
+            // **Jobs that are still running, not jobs still on the books.** A
+            // finished job whose verdict the hub has not acknowledged holds a
+            // record and some unsent bytes; it holds no process and no memory
+            // ceiling, and counting it would let a slow hub shut a working
+            // machine down.
+            let running = inner.jobs.values().filter(|job| job.end.is_none()).count();
+            if running >= most_at_once {
+                return Err(NotTaken::AtItsCeiling {
+                    running,
+                    most: most_at_once,
+                });
             }
             let cancel = CancelToken::new();
             inner.jobs.insert(
@@ -1213,7 +1286,7 @@ impl Session {
                     trimmed: 0,
                 },
             );
-            Some(cancel)
+            Ok(cancel)
         })
     }
 
@@ -2820,6 +2893,17 @@ async fn serve_hub(
     confined: Arc<Confined>,
     silence_limit: Duration,
 ) -> Result<()> {
+    // This machine's own ceiling, worked out once from what this machine
+    // itself declared — the memory it lends, the floor it keeps, the cap it
+    // puts on every job — and from nothing the hub has said. Held here rather
+    // than on the session because it is a property of the host and of its
+    // configuration, neither of which a connection can change: a runner that
+    // learned its limits from the peer handing out the work would have no
+    // limits at all the day that peer is wrong (invariant 2).
+    let ceiling = Arc::new(confine::jobs_at_once(
+        &config.host,
+        confined.caps().memory_max,
+    ));
     while let Some(message) = next_message(source, silence_limit).await? {
         match message {
             FromHub::AssignJob {
@@ -2831,6 +2915,7 @@ async fn serve_hub(
             } => {
                 let session = session.clone();
                 let confined = Arc::clone(&confined);
+                let ceiling = Arc::clone(&ceiling);
                 // A declared command runs through the consumer's four
                 // executor steps; an ad-hoc one is the whole of what runs.
                 // Both go through [`job::execute`], which is where the caps,
@@ -2838,6 +2923,14 @@ async fn serve_hub(
                 let declared_timeout = timeout_s.map(Duration::from_secs);
                 // One task per job: a long job must not stop the runner from
                 // hearing the hub, and must not end when the link does.
+                //
+                // **The task is spawned for every assignment and the ceiling
+                // is held inside it**, at `take_job`, rather than here. The
+                // count has to be read under the same lock that writes the
+                // job down or two assignments arriving together would both
+                // find room for the last place; a check here would be that
+                // race with a wider window. What a refused assignment costs
+                // is one task that sends one frame and ends.
                 tokio::spawn(async move {
                     job::execute(
                         job_id,
@@ -2847,6 +2940,7 @@ async fn serve_hub(
                         declared_timeout,
                         session,
                         confined,
+                        ceiling,
                     )
                     .await
                 });
@@ -3240,8 +3334,8 @@ mod tests {
         let session = Session::new();
         let job_id = JobId::new("j0000000057");
         let _cancel = session
-            .take_job(&job_id, 1)
-            .expect("a fresh session is not draining");
+            .take_job(&job_id, 1, 4)
+            .expect("a fresh session is not draining and is not full");
 
         // The buffered output, as the runner holds it with no link up. These
         // are the items that each draw a refusal out of the hub.
@@ -3316,9 +3410,67 @@ mod tests {
         let session = Session::new();
         session.start_draining("the owner asked");
         assert!(session.draining());
+        assert_eq!(
+            session.take_job(&JobId::new("j1"), 1, 4).err(),
+            Some(NotTaken::Draining),
+            "a draining runner must refuse a job the hub had already sent, and say which \
+             refusal it was"
+        );
+    }
+
+    /// **The half of invariant 2 that had no local defence.** A runner's
+    /// bound on how much work lands on its host was, until this, a property
+    /// of the hub's arithmetic: `take_job` refused for a drain and for the
+    /// owner's switch and for no count at all, so 250 assignments from a hub
+    /// that was not one produced 250 jobs
+    /// (`herd-hub/tests/fake_hub_flood.rs`, and §2 of
+    /// `docs/remediation/04b-integrity-and-containment.md`).
+    ///
+    /// Here at the lock, where the count is read and the job written down
+    /// without an instant in between.
+    #[tokio::test]
+    async fn a_runner_at_its_own_ceiling_refuses_and_says_what_the_figures_were() {
+        let session = Session::new();
+        let most = 3;
+        for n in 1..=most {
+            session
+                .take_job(&JobId::new(format!("j{n:010}")), 1, most)
+                .expect("a runner under its ceiling takes the job");
+        }
+        assert_eq!(
+            session.take_job(&JobId::new("j0000000004"), 1, most).err(),
+            Some(NotTaken::AtItsCeiling {
+                running: most,
+                most
+            }),
+            "a runner holding all it can hold must refuse the next one, whatever the hub \
+             believes about it"
+        );
+    }
+
+    /// A finished job whose verdict nobody has acknowledged holds a record
+    /// and some unsent bytes. It holds no process and no memory ceiling, so
+    /// it is not what the ceiling counts — a hub slow to acknowledge must not
+    /// be able to shut a working machine down.
+    #[tokio::test]
+    async fn a_result_waiting_for_an_acknowledgement_does_not_hold_a_place() {
+        let session = Session::new();
+        let finished = JobId::new("j0000000001");
+        session
+            .take_job(&finished, 1, 1)
+            .expect("the first job is taken");
+        session.finish(
+            &finished,
+            JobOutcome::Exited { code: 0 },
+            JobMetrics::default(),
+            Vec::new(),
+            herd_proto::JobOutputs::default(),
+            None,
+        );
+        assert_eq!(session.results_held(), 1, "the verdict is still held");
         assert!(
-            session.take_job(&JobId::new("j1"), 1).is_none(),
-            "a draining runner must refuse a job the hub had already sent"
+            session.take_job(&JobId::new("j0000000002"), 1, 1).is_ok(),
+            "a machine whose one job has ended has its place back, acknowledged or not"
         );
     }
 
@@ -3527,8 +3679,8 @@ mod tests {
         let session = Session::new();
         let job_id = JobId::new("j0000000009");
         let _cancel = session
-            .take_job(&job_id, 1)
-            .expect("a fresh session is not draining");
+            .take_job(&job_id, 1, 4)
+            .expect("a fresh session is not draining and is not full");
 
         let workspace = confined
             .root()
@@ -3663,8 +3815,8 @@ mod tests {
         std::fs::create_dir_all(spool).expect("a spool directory");
         std::fs::write(spool.join("results.json"), &bytes).expect("the spooled file");
         let _cancel = session
-            .take_job(job_id, 1)
-            .expect("a fresh session is not draining");
+            .take_job(job_id, 1, 4)
+            .expect("a fresh session is not draining and is not full");
         herd_proto::JobOutputs {
             files: vec![herd_proto::OutputFile {
                 path: "results.json".to_owned(),
