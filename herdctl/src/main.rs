@@ -541,7 +541,7 @@ enum Done {
         /// is also what makes this invocation exit non-zero.
         short_of_its_files: Option<String>,
         /// What the hub said about this job's collection that is not the
-        /// shortfall: the refusal, and every `skipped` sentence (D-NEXT).
+        /// shortfall: the refusal, and every `skipped` sentence (D175).
         ///
         /// Already printed by [`keep_the_outputs`], where a reader needs
         /// them in order. Carried out as well so they reach the verdict
@@ -722,6 +722,14 @@ async fn main() -> ExitCode {
             if let Some(reason) = no_verdict_reason(&finished.outcome) {
                 said.push(no_verdict_message(&reason));
             }
+            // A verdict attributed to a commit the tree was not at (D176).
+            // Said, and nothing more: the exit code stays the job's own,
+            // because the verdict is the job's and a side channel does not
+            // become one (D20). What a wrapper branches on is
+            // `commit_diverged` in the document, not this sentence.
+            if let Some(commit) = finished.commit.as_ref().filter(|c| c.diverged()) {
+                said.push(format!("this job {}", commit.line()));
+            }
             // The shortfall last, after the per-file lines `keep_the_outputs`
             // has already written, and in `said` rather than straight to
             // stderr so that the document carries it too (D167).
@@ -735,7 +743,7 @@ async fn main() -> ExitCode {
             // **After the printing loop, because they have already been
             // said** — `keep_the_outputs` prints them where a reader needs
             // them, ahead of the per-file lines. What is added here is the
-            // document's copy and nothing else (D-NEXT).
+            // document's copy and nothing else (D175).
             said.extend(about_the_outputs);
             let code = code_for(&finished.outcome, files_short);
             let verdict = Verdict::of(&finished, said, code);
@@ -1251,7 +1259,7 @@ async fn keep_the_outputs(
 ) -> Kept {
     let mut collection = finished.outputs.clone();
     // **Said where a reader needs them, and kept so the document has them
-    // too** (D-NEXT). Every sentence about this job's files used to reach
+    // too** (D175). Every sentence about this job's files used to reach
     // stderr and nothing else, so a wrapper had to grep prose for facts D166
     // added a file to carry: which path is absent and why, what the hub
     // refused, what it would not believe. They are collected in the order
@@ -1360,7 +1368,7 @@ async fn keep_the_outputs(
 
 /// What [`keep_the_outputs`] comes back with: the one sentence that costs
 /// this invocation its zero, and the sentences that only have to be on the
-/// record (D-NEXT).
+/// record (D175).
 ///
 /// Two fields and not one list, because the difference between them is the
 /// exit code and a reader of this type should not have to infer it.

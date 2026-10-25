@@ -59,6 +59,7 @@
 //! all, because the runner is not saying how the job went, it is saying this
 //! go did not happen.
 
+use std::path::PathBuf;
 use std::process::Stdio;
 use std::sync::atomic::{AtomicU64, AtomicU8, Ordering};
 use std::sync::Arc;
@@ -175,8 +176,11 @@ pub async fn execute(
             match step::planned(
                 declaration,
                 &job_id,
-                workspace.in_dir(),
-                workspace.out_dir(),
+                step::Places {
+                    in_dir: workspace.in_dir(),
+                    out_dir: workspace.out_dir(),
+                    ran: &workspace.ran_path(),
+                },
                 &command[0],
                 declared_timeout,
                 caps.timeout,
@@ -207,7 +211,12 @@ pub async fn execute(
     let log_bytes = Arc::new(AtomicU64::new(0));
     let tripped = Arc::new(AtomicU8::new(NO_CAP));
 
-    let mut ran = Attempt::default();
+    let mut ran = Attempt {
+        // Only a declared command has a `fetch` step to answer for, and only
+        // it is given `{ran}` to answer with (D176).
+        ran_path: declaration.as_ref().map(|_| workspace.ran_path()),
+        ..Attempt::default()
+    };
     // The attempt's own clock, started by the first process there is.
     let mut started: Option<Instant> = None;
     // On the live list from the first process on, so a runner that is stopped
@@ -632,6 +641,10 @@ struct Attempt {
     /// D30's cap and D166's setup failure.
     unmeasurable: Option<Unmeasurable>,
     peak_rss: Option<u64>,
+    /// Where this job's `fetch` hook may have written the revision it really
+    /// reached, for a declared command (D176). `None` for an ad-hoc job,
+    /// which has no executor step and no `{ran}`.
+    ran_path: Option<PathBuf>,
 }
 
 impl Attempt {
@@ -997,6 +1010,14 @@ impl Attempt {
             duration_ms: u64::try_from(at.took.as_millis()).unwrap_or(u64::MAX),
             exit_code,
             ended,
+            // Only `fetch`, and only once it has ended: it is the step that
+            // puts the tree at the commit, so it is the step whose answer
+            // this is. A revision read after `run` would be whatever the
+            // job's own command left behind (D176).
+            ran_commit: match step {
+                Step::Fetch => self.the_revision_it_reached(session, job_id),
+                _ => None,
+            },
         };
         self.steps.push(run.clone());
         session.send(ToHub::StepFinished {
@@ -1004,6 +1025,35 @@ impl Attempt {
             attempt,
             step: run,
         });
+    }
+
+    /// What this job's `fetch` hook said the tree really reached, if it said
+    /// anything (D176).
+    ///
+    /// Three answers and one of them is absence, which is the one every
+    /// consumer gives until it adds `{ran}` to its own `fetch` line. A file
+    /// that is there and cannot be used is **also** absence on the record —
+    /// the runner has no revision to put there — and the job's log says why,
+    /// so a hook writing the wrong thing does not look like a hook writing
+    /// nothing.
+    fn the_revision_it_reached(&self, session: &Session, job_id: &JobId) -> Option<String> {
+        let path = self.ran_path.as_ref()?;
+        match step::ran_commit(path) {
+            step::RanCommit::Said(revision) => Some(revision),
+            step::RanCommit::Nothing => None,
+            step::RanCommit::Unusable(why) => {
+                say_in_the_log(
+                    session,
+                    job_id,
+                    &format!(
+                        "the fetch step left a file at {} and {why}, so this attempt reports \
+                         no revision and nothing here confirms which commit was built",
+                        path.display()
+                    ),
+                );
+                None
+            }
+        }
     }
 }
 

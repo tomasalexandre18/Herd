@@ -3153,12 +3153,14 @@ fn end_the_job(state: &State, record: &JobRecord, outcome: JobOutcome, said: &st
     // so that there is one answer to "what did this job leave?" and not one
     // per place a job can end.
     let kept = read_the_outputs(state, &record.id);
+    let commit = the_commit_it_ran(state, &record.id);
     for follower in state.stop_following(&record.id) {
         let _ = follower.send(FromHub::JobFinished {
             job_id: record.id.clone(),
             outcome: outcome.clone(),
             metrics: JobMetrics::default(),
             outputs: kept.clone(),
+            commit: commit.clone(),
         });
     }
     Ok(())
@@ -4629,12 +4631,14 @@ fn hand_them_the_verdict(
         return;
     }
     let kept = read_the_outputs(state, job_id);
+    let commit = the_commit_it_ran(state, job_id);
     for follower in to {
         let _ = follower.send(FromHub::JobFinished {
             job_id: job_id.clone(),
             outcome: outcome.clone(),
             metrics: metrics.clone(),
             outputs: kept.clone(),
+            commit: commit.clone(),
         });
     }
 }
@@ -4844,6 +4848,35 @@ fn read_the_outputs(state: &State, job_id: &JobId) -> herd_proto::JobOutputs {
                  requester is given none: {error}"
             );
             herd_proto::JobOutputs::default()
+        }
+    }
+}
+
+/// What the attempt that produced this job's verdict said about the revision
+/// it really ran, read off the record (D176).
+///
+/// Off the record and not out of the frame being handled, for
+/// [`read_the_outputs`]' own reason: a `herdctl wait` attaching an hour after
+/// the job ran has to be told the same thing as the requester who followed
+/// it, and the record is the only place both of them can read.
+///
+/// The **last** attempt, because a job requeued onto another machine (E-21)
+/// prepared twice and the verdict is the last attempt's. `None` for a job
+/// that is not a declared command, for one no runner ever reached, and for
+/// one whose record cannot be read — none of which is a claim that the tree
+/// was at the declared commit.
+fn the_commit_it_ran(state: &State, job_id: &JobId) -> Option<herd_proto::CommitRun> {
+    match state.store.job(job_id) {
+        Ok(record) => record?
+            .attempts
+            .last()
+            .and_then(|attempt| attempt.commit.clone()),
+        Err(error) => {
+            eprintln!(
+                "herd-hub: the revision {job_id} ran could not be read back, so its \
+                 requester is told nothing about it: {error}"
+            );
+            None
         }
     }
 }
@@ -5279,6 +5312,7 @@ fn give_the_job_another_go(
         .with_context(|| format!("recording {job_id} as lost"))?;
     eprintln!("herd-hub: {job_id} is lost: {reason}");
     let kept = read_the_outputs(state, job_id);
+    let commit = the_commit_it_ran(state, job_id);
     for follower in state.stop_following(job_id) {
         let _ = follower.send(FromHub::JobFinished {
             job_id: job_id.clone(),
@@ -5289,6 +5323,7 @@ fn give_the_job_another_go(
             // away reported no verdict, so it reported no output either.
             metrics: record.metrics.clone(),
             outputs: kept.clone(),
+            commit: commit.clone(),
         });
     }
     // A job that is over is a job that is holding nothing, and something may
@@ -5419,12 +5454,14 @@ async fn requeue_for_a_lost_capability(
         .with_context(|| format!("recording {job_id} as out of requeues"))?;
     eprintln!("herd-hub: {job_id} has spent its requeue budget: {reason}");
     let kept = read_the_outputs(state, job_id);
+    let commit = the_commit_it_ran(state, job_id);
     for follower in state.stop_following(job_id) {
         let _ = follower.send(FromHub::JobFinished {
             job_id: job_id.clone(),
             outcome: outcome.clone(),
             metrics: record.metrics.clone(),
             outputs: kept.clone(),
+            commit: commit.clone(),
         });
     }
     Ok(())
@@ -6375,11 +6412,13 @@ fn answer_a_wait(state: &State, outbox: &Outbox, job_id: JobId, wants_files: boo
                     // in one frame, so there is no fetch command to add and
                     // no second round trip (D131).
                     let kept = read_the_outputs(state, &job_id);
+                    let commit = the_commit_it_ran(state, &job_id);
                     let verdict = FromHub::JobFinished {
                         job_id: job_id.clone(),
                         outcome,
                         metrics,
                         outputs: kept,
+                        commit,
                     };
                     // Whoever `attach` left following — this connection, if a
                     // verdict was held a moment ago and has since been let go
@@ -6631,9 +6670,11 @@ fn cancel_job(state: &State, outbox: &Outbox, job_id: &JobId) -> Result<()> {
                     },
                     // A job cancelled before it started cost no machine
                     // anything, so there is nothing measured to send — and
-                    // nothing left behind either: it never had a workspace.
+                    // nothing left behind either: it never had a workspace,
+                    // so no `fetch` of it ever reported a revision.
                     metrics: JobMetrics::default(),
                     outputs: herd_proto::JobOutputs::default(),
+                    commit: None,
                 });
             }
             format!("{job_id} was queued and is cancelled")

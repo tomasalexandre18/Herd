@@ -8,7 +8,7 @@
 //! raise, and a requester that asked for two files, got one, and read **0** —
 //! the one code that means "everything you asked for happened".
 //!
-//! These were benches that only printed. They are expectations now (D-NEXT):
+//! These were benches that only printed. They are expectations now (D175):
 //! the figures below fail on the code of 2026-10-24 and pass on the code that
 //! keeps the entry and refuses only the bytes.
 //!
@@ -300,7 +300,7 @@ async fn inline_bytes_that_contradict_their_digest_never_exit_zero() {
     // 1. The manifest names both files. **This is the fix**: the entry is
     //    written down before the bytes are judged, so refusing the bytes
     //    leaves a file that is announced and not held instead of a file that
-    //    was never mentioned. Before D-NEXT this was 1.
+    //    was never mentioned. Before D175 this was 1.
     let named: Vec<&str> = record
         .outputs
         .files
@@ -328,7 +328,7 @@ async fn inline_bytes_that_contradict_their_digest_never_exit_zero() {
     );
 
     // 3. **The exit code.** One of two promised files is not here, so this
-    //    run did part of what it says. Before D-NEXT this was 0.
+    //    run did part of what it says. Before D175 this was 0.
     assert_eq!(
         code, 2,
         "a requester promised two files and handed one must never read 0; stderr was:\n{said}"

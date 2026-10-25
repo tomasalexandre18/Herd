@@ -45,7 +45,7 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
-use herd_proto::{JobId, LabelSet, LogStream, Priority, Requirements, StepRun};
+use herd_proto::{CommitRun, JobId, LabelSet, LogStream, Priority, Requirements, Step, StepRun};
 use serde::{Deserialize, Serialize};
 
 use crate::durable;
@@ -1723,7 +1723,7 @@ impl JobStore for JobDirStore {
                 // them describes. A length and a digest that nobody compares are
                 // worth nothing, and the comparison is cheap next to the write.
                 //
-                // **Refusing the bytes is not refusing the entry** (D-NEXT).
+                // **Refusing the bytes is not refusing the entry** (D175).
                 // This check used to stand above the push and `continue` past
                 // it, which erased the only trace of the file a requester
                 // counts off: the manifest. The record then described a
@@ -2093,6 +2093,10 @@ impl JobStore for JobDirStore {
             ended: None,
             why: why.to_owned(),
             steps: Vec::new(),
+            // Nothing is known about the revision until the attempt's own
+            // `fetch` step is recorded, and "nothing is known" is what
+            // `None` says (D176).
+            commit: None,
         });
         // The figure travels with the job, not only inside the attempt's
         // sentence: whatever reads this job's requirements reads the N it was
@@ -2106,6 +2110,14 @@ impl JobStore for JobDirStore {
 
     fn record_step(&self, id: &JobId, attempt: u32, step: StepRun) -> Result<()> {
         let (_live, mut record) = self.open_for_writing(id)?;
+        // Taken before the attempt is borrowed, because the commit is the
+        // job's and the revision is the attempt's, and the comparison needs
+        // both. `None` for a job that is not a declared command: there is no
+        // declared commit for a revision to agree or disagree with (D176).
+        let declared = record
+            .declaration
+            .as_ref()
+            .map(|declaration| declaration.commit.clone());
         let Some(entry) = record
             .attempts
             .iter_mut()
@@ -2116,6 +2128,19 @@ impl JobStore for JobDirStore {
                 step.step
             )));
         };
+        // The one place the two strings meet (D176). Written on **every**
+        // `fetch` of a declared command and not only on a divergence: an
+        // attempt whose runner said nothing has to say *that* on the record,
+        // because an absent answer that reads as agreement is the defect
+        // this field exists to end.
+        if step.step == Step::Fetch {
+            if let Some(declared) = declared {
+                entry.commit = Some(CommitRun {
+                    declared,
+                    ran: step.ran_commit.clone(),
+                });
+            }
+        }
         // Replaced rather than appended twice: the complete list arrives
         // again with the verdict, and four steps are four steps however many
         // times the runner says so. The order is the order they ran in, which
@@ -2855,6 +2880,7 @@ mod tests {
             ended: exit_code
                 .is_none()
                 .then(|| "stopped at the time cap, 2700 s".to_owned()),
+            ran_commit: None,
         }
     }
 
@@ -4857,7 +4883,7 @@ mod tests {
     }
 
     /// Bytes that contradict their own manifest entry cost the **bytes**,
-    /// never the entry (D-NEXT).
+    /// never the entry (D175).
     ///
     /// The one case in the design of outputs that used to break its own
     /// rule — *the manifest first, the bytes if they are here* — and the one
