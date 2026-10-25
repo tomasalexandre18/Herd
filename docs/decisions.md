@@ -8699,8 +8699,9 @@ figures disagree.
 **No version moves.** Nothing on the wire, nothing on disk.
 `PROTOCOL_VERSION` stays 2 and `RECORD_VERSION` stays 1.
 
-**Evidence.** `an_attempt_the_pass_itself_placed_is_not_judged_on_the_age_before_it`
-in `herd-hub/src/server.rs`, red on the branch before the fix with
+**Evidence.** In `herd-hub/src/server.rs`, the test
+`an_attempt_the_pass_itself_placed_is_not_judged_on_the_age_before_it`,
+red on the branch before the fix with
 `j0000000002 is lost: … nothing has been heard about that attempt for
 90.0004s` written about an attempt the same pass had created milliseconds
 earlier, green after. One pass of the watchdog is extracted into
