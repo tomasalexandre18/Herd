@@ -794,7 +794,7 @@ The suite keeps the short one and drives the same watchdog through
 `--lost-after`, which `herd-hub/src/main.rs` already exposes. **The 60 s
 shape is in the suite too, behind `#[ignore]`** —
 `a_link_cut_while_the_runner_is_full_loses_no_job_at_the_deployed_sixty_seconds`,
-found by `cargo test -- --ignored`, about 150 s of wall clock and nearly all
+found by `cargo test -- --ignored`, 171 s of wall clock measured and nearly all
 of it waiting. Both tests are one body with one oracle and differ only in
 their figures, which is the point: the oracle does not depend on the clock.
 A test that was never red proves nothing, so both reds were taken on the

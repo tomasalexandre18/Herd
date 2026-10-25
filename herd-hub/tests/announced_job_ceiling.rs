@@ -897,17 +897,17 @@ async fn a_link_cut_while_the_runner_is_full_loses_no_job() {
 /// an outage longer than it.
 ///
 /// `#[ignore]`, and found by `cargo test -- --ignored`. **What it costs:**
-/// about **two and a half minutes of wall clock**, nearly all of it waiting
-/// — a 65 s outage, a 60 s watchdog threshold, and jobs that have to still
-/// be running when the link comes back, so they sleep 90 s. It is not in the
-/// default suite because a suite with a two-minute sleep in it is a suite
-/// nobody runs, and because it proves nothing the test above does not: both
-/// drive the same watchdog, the same refusal and the same oracle, and the
-/// only difference is `--lost-after` (`herd_hub::LOST_AFTER`, a setting since
-/// the hub had one). What it does buy is the figures themselves, which is why
-/// it stays in the file rather than in a pull request body.
+/// **171 s of wall clock, measured on this workstation**, nearly all of it
+/// waiting — a 65 s outage, a 60 s watchdog threshold, and jobs that have to
+/// still be running when the link comes back, so they sleep 90 s. It is not in
+/// the default suite because a suite with three minutes of sleep in it is a
+/// suite nobody runs, and because it proves nothing the test above does not:
+/// both drive the same watchdog, the same refusal and the same oracle, and
+/// the only difference is `--lost-after` (`herd_hub::LOST_AFTER`, a setting
+/// since the hub had one). What it does buy is the figures themselves, which
+/// is why it stays in the file rather than in a pull request body.
 #[tokio::test(flavor = "multi_thread")]
-#[ignore = "about 150 s of wall clock: the deployed 60 s threshold, a 65 s outage and 90 s jobs"]
+#[ignore = "171 s of wall clock, measured: the deployed 60 s threshold, a 65 s outage and 90 s jobs"]
 async fn a_link_cut_while_the_runner_is_full_loses_no_job_at_the_deployed_sixty_seconds() {
     no_job_is_lost_to_an_outage(
         "link-cut-at-the-ceiling-for-real",
