@@ -7351,7 +7351,7 @@ mod tests {
                         &other,
                         record.attempt_number(),
                         "the runner said on its link that it was not running this",
-                        None,
+                        HowItEnded::TheRunnerWentAway,
                     )?;
                     self.inner.record_state(&other, JobState::Queued)?;
                 }
@@ -8396,6 +8396,7 @@ mod tests {
                 kick,
                 Announced {
                     version: hub_version().to_owned(),
+                    jobs_at_once: None,
                     capacity: offering_kvm_free(),
                     host: HostSize::default(),
                     preference: 0,

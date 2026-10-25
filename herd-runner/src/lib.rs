@@ -1237,6 +1237,36 @@ impl Session {
         })
     }
 
+    /// Put an attempt in hand **without** `take_job`'s refusals: no drain
+    /// check, no switch check, no ceiling, and no "one machine runs one job
+    /// once" (D-NEXT).
+    ///
+    /// For the three tests about what the map does when it holds two
+    /// attempts of one job. `take_job` refuses that state and is what keeps
+    /// it out, so this is the only door left to it — and the three tests are
+    /// the reason the refusal is a guard rather than the only thing standing
+    /// between the hub's view of a machine and the machine's own count. A
+    /// state that cannot be reached today is reached by the next admission
+    /// rule somebody writes.
+    #[cfg(test)]
+    fn put_in_hand(&self, job_id: &JobId, attempt: u32) -> CancelToken {
+        self.with(|inner| {
+            let cancel = CancelToken::new();
+            inner.jobs.insert(
+                InHand::of(job_id, attempt),
+                JobInHand {
+                    next_seq: 0,
+                    unacked: VecDeque::new(),
+                    unacked_bytes: 0,
+                    end: None,
+                    cancel: cancel.clone(),
+                    trimmed: 0,
+                },
+            );
+            cancel
+        })
+    }
+
     fn with<T>(&self, f: impl FnOnce(&mut Inner) -> T) -> T {
         let mut inner = self
             .inner
@@ -1296,14 +1326,15 @@ impl Session {
                     most: most_at_once,
                 });
             }
-            // **One machine runs one job once.** The map is keyed by job id
-            // alone, so taking a second attempt of a job this runner is
-            // already running would *replace* the first one's entry: the
-            // first keeps running with nothing counting it, this machine's
-            // own ceiling is short by one for the rest of its life, and the
-            // first task's eventual end writes over the second's
-            // bookkeeping. Reachable exactly where C5 lives — the hub writes
-            // an attempt off while the link is down, the job goes on running
+            // **One machine runs one job once.** The map holds both attempts
+            // honestly since the entries were keyed by job *and* attempt
+            // (D-NEXT, part 1) — and a map that can hold two attempts of one
+            // job is not permission to run them. A **workspace belongs to a
+            // job**: `DataRoot::open_workspace` takes a `JobId` and clears
+            // the directory if it is already there, so a second attempt here
+            // would wipe the working directory out from under the first one's
+            // process. Reachable exactly where C5 lives — the hub writes an
+            // attempt off while the link is down, the job goes on running
             // here, and the next attempt of it comes back to this same
             // machine the moment it redials.
             //
@@ -1316,9 +1347,10 @@ impl Session {
             // what it holds ran ahead of its own.
             if let Some(held) = inner
                 .jobs
-                .get(job_id)
-                .filter(|job| job.end.is_none())
-                .map(|job| job.attempt)
+                .iter()
+                .filter(|(which, job)| &which.job_id == job_id && job.end.is_none())
+                .map(|(which, _)| which.attempt)
+                .next()
             {
                 return Err(NotTaken::StillRunningThisJob {
                     held,
@@ -3581,6 +3613,7 @@ mod tests {
             .expect("the first job is taken");
         session.finish(
             &finished,
+            1,
             JobOutcome::Exited { code: 0 },
             JobMetrics::default(),
             Vec::new(),
@@ -3614,12 +3647,8 @@ mod tests {
     async fn two_attempts_of_one_job_are_two_entries_in_the_machines_own_count() {
         let session = Session::new();
         let job_id = JobId::new("j0000000401");
-        let _first = session
-            .take_job(&job_id, 1)
-            .expect("a fresh session is not draining");
-        let _second = session
-            .take_job(&job_id, 2)
-            .expect("a fresh session is not draining");
+        let _first = session.put_in_hand(&job_id, 1);
+        let _second = session.put_in_hand(&job_id, 2);
         assert_eq!(
             session.jobs_running(),
             2,
@@ -3657,12 +3686,8 @@ mod tests {
     async fn handing_one_attempt_back_leaves_the_other_attempt_of_that_job_running() {
         let session = Session::new();
         let job_id = JobId::new("j0000000402");
-        let first = session
-            .take_job(&job_id, 1)
-            .expect("a fresh session is not draining");
-        let _second = session
-            .take_job(&job_id, 2)
-            .expect("a fresh session is not draining");
+        let first = session.put_in_hand(&job_id, 1);
+        let _second = session.put_in_hand(&job_id, 2);
 
         session.abandon(
             &job_id,
@@ -3718,7 +3743,7 @@ mod tests {
         let session = Session::new();
         let job_id = JobId::new("j0000000403");
         let _first = session
-            .take_job(&job_id, 1)
+            .take_job(&job_id, 1, 8)
             .expect("a fresh session is not draining");
         session.finish(
             &job_id,
@@ -3739,9 +3764,11 @@ mod tests {
         // sent attempt 2 of the same job here. Taking it must not throw the
         // verdict of attempt 1 away: a result nothing acknowledged is a
         // result only this machine has (D19).
+        // Through `take_job`, which is reachable: its refusal is about a
+        // job this runner is **running**, and attempt 1 has ended here.
         let second = session
-            .take_job(&job_id, 2)
-            .expect("a fresh session is not draining");
+            .take_job(&job_id, 2, 8)
+            .expect("attempt 1 has ended, so nothing of this job is running here");
         assert_eq!(
             session.results_held(),
             1,
