@@ -21,3 +21,4 @@ versioned source.
 | `invariants-are-quoted-not-reflowed.md` | 2026-10-24 | an invariant's text changes only as a quoted proposal to Alexa; a rewrite diffs the section word for word |
 | `brief-names-the-worktree.md` | 2026-10-24 | a brief names the agent's worktree; the hook cannot keep an agent out of the checkout, only the brief can |
 | `build-weight-off-root.md` | 2026-10-24 | `/` filled to 100 % with agent `target/` dirs; preflight before a heavy phase, `CARGO_TARGET_DIR` on `/mnt/ssd_980`, delete it after |
+| `a-decision-branch-cannot-be-all-green.md` | 2026-10-25 | a branch writing a `D-NEXT` entry fails `check-docs.sh` by design; three green gates plus that one note is the deliverable |

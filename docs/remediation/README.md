@@ -9,7 +9,7 @@ carries **no tag**; tag `v0.3.7` is `3da48f5`, two merges earlier. No Rust,
 `Cargo.*` or Nix file differs between the two, so the product audited here
 is `v0.3.7`'s product — see `00-baseline.md §2`.
 
-**Date of this index:** 2026-10-24.
+**Date of this index:** 2026-10-25, refreshed at the C0b integration.
 
 ---
 
@@ -21,20 +21,31 @@ is `v0.3.7`'s product — see `00-baseline.md §2`.
 | [`03a-identity-and-storage.md`](03a-identity-and-storage.md) | `audit-identity-storage` | Audit A, mandate §4.1: who owns which state and where it persists, the job/attempt automaton and its commit points, what `JobResultAck` / `LogAck` / `JobFilesAck` each actually guarantee, the identity chain from a requester's commit to an artefact, and six integrity risks. Settles that the hub's durability discipline is real and is one module (`durable.rs`); that Herd is **at-least-once execution with at-most-once recording** and claims nothing stronger; that the **commit link of the identity chain is open-loop** — declared on the way out, never confirmed on the way back; and that one inline path can let a short collection read as whole. |
 | [`03b-concurrency-and-progression.md`](03b-concurrency-and-progression.md) | `audit-concurrency-progression` | Audit B, mandate §4.2: the hub's tasks and locks, where a blocking call is made from an async context, why a deep queue or a slow store stops progression, backpressure, fairness and starvation, stop/drain/restart, host failure modes, both incidents re-examined, and the two unstable tests. Settles that the hub's **persistence and its scheduler share the reactor with nothing bounding a pass**; that a pass is O(queue depth) in reads and runs once per event; that invariant 2 is enforced only in the hub; that the hub has **no stop path**; and that one unwritable record aborts a whole dispatch pass. |
 | [`03c-contradictory-review.md`](03c-contradictory-review.md) | `audit-contradictory-review` | The contradictory review of A and B, by a third reader who wrote neither: every **F** in both reports taken back to the code at `0a2cf73`. Settles that the "frontal contradiction" between A and B on D171 **does not exist** — the two were set against each other on a misreading; that the mandate's base label is wrong; that all of A's and B's checked findings hold, two of them more strongly than stated and one citation off by 39 lines; and it names the blind spot the A/B split created. Ends in one ranked list across both audits and a minimal four-run experiment sequence. |
-| `04a-cost-surface.md` | — | **Expected; being written now.** Its subject is the cost surface. Nothing about its content or its conclusions is stated here, and nothing in this dossier should be read as anticipating them. |
-| `04b-integrity-and-containment.md` | — | **Expected; being written now.** Its subject is integrity and containment. Same rule: its findings are its own, and this index does not guess them. |
+| [`04a-cost-surface.md`](04a-cost-surface.md) | `experiment-cost-surface` | Experiment 6.1: of `N` (open jobs), `T` (closed job directories) and `W` (workers), which one the cost of a dispatch pass follows. Measured, not read. Settles that `T` is walked on a runner junction and that the walk is O(whole volume) — 815 ms worst turn at `T` = 20 000 against 33 ms at `N` = 1 000. **Read it with `05`:** that 25x compares the `T` walk against the `N` *reads only*, and leaves out the durable writes that are the larger half of the same junction. Two of its four recommendations did not survive review. |
+| [`04b-integrity-and-containment.md`](04b-integrity-and-containment.md) | `experiment-integrity-containment` | Experiment 6.3: the inline digest drop and a runner's admission under flood. Settles that a verdict carrying an inline file whose bytes do not match its sha256 exited **0** while saying nothing was missing — the defect C2 later fixed — and sets out the `#[serde(default)]` argument that a new `StepRun` field needs neither a protocol nor a record break, which C3 later used and proved. |
+| [`05-experiments-review.md`](05-experiments-review.md) | `review-experiments` | Adversarial review of 04a and 04b by a third reader who ran both again. **This is the piece that reversed 04a's ranking**: counting the durable writes a pass ends with — 8.3 s and 9.2 s for 1 000 of them, against 13 ms for the two reads and ~200 ms for the whole `T` = 20 000 walk — the order reverses by about an order of magnitude. Also: 04a's recommendation 1 cannot be implemented as written (an owed collection is on a *finished* job, which `unfinished_jobs` never holds), recommendation 4 is refuted by measurement, and one O(`T`) walk 04a never named. |
+| [`06-junction-breakdown.md`](06-junction-breakdown.md) | `measure-junction-breakdown` | C1: the whole cost of one runner junction, split into the five posts Alexa asked for — historical reads, open-job reads, durable writes, lock wait, dispatch compute — summing to the window by construction. Settles the ranking `05` reversed, with a number on each post: **durable writing is 68–99.5 % of a junction**, the two reads together are under 0.3 % once the queue is deep, dispatch compute is a fifth of a percent, and lock wait is zero until a second runner dials — at which point it is the whole of the first junction's writes. Device-bound and proved so: debug against release moves the three CPU posts by ×3.7–×8.0 and the write post by ×1.00. Touches no file under `herd-hub/src`. |
+| [`07-target-architecture.md`](07-target-architecture.md) | `arch-target-decision` | C4: six architectures compared on durability, progression, crash recovery and migration cost, with one named recommendation — "the keeper": one owned thread performs every store mutation, the reactor wakes it by message and never waits on a disk, its unit of work is bounded and re-armed, and the hub's writes split into two durability tiers. **It is a recommendation and not an adoption.** Its load-bearing claim — that `waiting_for` has no crash-durability requirement — is a question for Alexa, board row ORCH-052. |
+| [`08-s0-unsynced-write-cost.md`](08-s0-unsynced-write-cost.md) | `s0-unsynced-write-cost` | S0: what those durable writes would cost if they were not synchronous — the measured size of the prize behind the tiering. Also names the one ordering invariant that must hold before any `fsync` is dropped: D103 forbids `events.jsonl` being ahead of `job.json`, the `fsync`s hold that today, and without them it is the filesystem's to hold. Safe on ZFS, whose transaction groups commit atomically and in order; **not guaranteed elsewhere**, which is why the server's state root must be named — board row ORCH-053. |
 
-The mandate's §10 skeleton also names `01-contract.md`,
-`02-consumer-boundary.md`, `05-invariants.md` and the pieces after them.
-They do not exist yet. The numbering above keeps their places rather than
-renumbering what is written, so a gap in this table means *not written*,
-never *lost*.
+The mandate's §10 skeleton also names `01-contract.md` and
+`02-consumer-boundary.md`. They do not exist yet. The numbering above
+keeps their places rather than renumbering what is written, so a gap in
+this table means *not written*, never *lost*.
+
+**One number was reused, deliberately.** The skeleton's `05` was
+`05-invariants.md`; the `05` that exists is the adversarial review of the
+two experiments, and `06`, `07` and `08` follow the order the work was
+actually done in rather than the skeleton's. The skeleton's invariants
+piece is unwritten and now has no number reserved for it.
 
 ---
 
 ## How to read the dossier
 
-**Everything here is a constat. Nothing here is a mesure.**
+**The dossier is now half constat and half mesure, and each piece says
+which it is.** It did not start that way: until 2026-10-25 nothing here
+had been run.
 
 - **Constats** — `00-baseline.md`, `03a`, `03b`, `03c`. Every one of them
   was produced by reading the repository at `0a2cf73`. No build, no test,
@@ -45,19 +56,35 @@ never *lost*.
   written on**, and the document says so at the point of use. It is
   evidence of an incident; it is not a measurement any of these authors
   made.
-- **Mesures** — none, yet. The experiments that would turn the hypotheses
-  into measurements are specified and not run: `03a §8`, `03b §10` and the
-  minimal four-run sequence in `03c §6`. `00-baseline.md §11` lists what a
-  campaign needs before the first of them can be started — an isolated
-  host above all, because this machine is shared with a system in
-  production.
+- **Mesures** — `04a`, `04b`, `05`, `06`, `08`. These ran on the shared
+  workstation, each in its own worktree, under `nix develop`, with `-j 4`
+  and `/proc/loadavg` watched. They are not an isolated host, which
+  `00-baseline.md §11` asked for and which this campaign never got; every
+  one of them characterises its own noise before reporting its signal and
+  names the limits of what it reproduces. Read a figure from any of them
+  with the host in mind.
+- **Neither** — `07`. It is a design comparison and a recommendation. It
+  ran nothing and it changed nothing; every figure in it was measured by
+  `04a`, `05` or `06` and is attributed there.
+
+**Where a later piece overturns an earlier one, the later one wins, and
+the earlier one is not edited.** This has happened once and it matters:
+`04a` ranked the `T` walk as the dominant cost of a dispatch pass, `05`
+showed that ranking left out the durable writes that are the larger half
+of the same junction, and `06` measured all five posts and put the walk at
+0.16 % of the window against 99.5 % for the writes. `04a` still reads as
+it was signed. The board's ORCH-047 carries the corrected conclusion, and
+a reader who takes 04a's recommendations without `05` and `06` beside them
+will reach the wrong order of work.
 
 **The three marks, used throughout.** **F** = observed at `0a2cf73`, with a
 path and a line, a test name, or a decision entry. **H** = a hypothesis the
 code suggests and nothing here settles. **I** = unknown. A figure nobody
 verified is marked **I** rather than repeated; `00-baseline.md §5` is the
-worked example — the repository states both 12 and 13 loud skips, and the
-honest answer is that no one here ran the suite.
+worked example — the repository stated both 12 and 13 loud skips and the
+honest answer at the time was that no one here had run the suite. It has
+been run since, repeatedly: **12**, split 10 cgroup-v2 delegation and 2
+ZFS ceiling. D151's 13 is not reproducible on this host.
 
 **Where the pieces disagree, `03c` is the arbiter of fact** — it re-checked
 both of the others against the code — but it is not an arbiter of what to
@@ -66,11 +93,12 @@ do. Where a question is open, it stays open and is listed as such
 
 ---
 
-## What this dossier does not authorize
+## What this dossier does and does not authorize
 
-**Nothing in it authorizes a modification of the software.** It is a
-reading. No finding here is a work order, no ranked list is a backlog, and
-no recommendation in `03c §7` becomes a plan by being written down.
+**No piece of this dossier authorizes a modification of the software.**
+The pieces are readings and measurements. No finding here is a work order,
+no ranked list is a backlog, and no recommendation — `03c §7`'s or `07`'s
+— becomes a plan by being written down.
 
 Every change — to the code, to the protocol, to the gates, to the
 architecture — is **Alexa's decision, one at a time, each with its own
@@ -78,6 +106,22 @@ recommendation and its own consequences**, as `CLAUDE.md` and the mandate
 both require. The audit's job is to make each of those decisions
 answerable; it is not to pre-empt one.
 
-Concretely, and for the avoidance of doubt: no Rust was changed, no test
-was changed to go green, no tag was cut, no release was published, and
-`main` was not touched by any piece of this dossier.
+**Two changes to the product have since been made, and neither came from a
+piece of this dossier.** They came from Alexa's word on a remediation
+programme, and they are tracked on the board, not here:
+
+- **C2** (ORCH-055, **D175**) — the false success `04b` found: a verdict
+  carrying an inline file whose bytes did not hash to the sha256 beside
+  them exited 0 and said nothing was missing. A refused file is now named
+  and never erased.
+- **C3** (ORCH-056, **D176**) — the open-loop commit link `03a` found: a
+  verdict could be attributed to a commit the tree was never at. A runner
+  now reports the revision it really ran.
+
+Both were kept inside the limit Alexa set: **`PROTOCOL_VERSION` stays 2
+and `RECORD_VERSION` stays 1**, asserted by test and verified again by the
+integrator on both branch tips and on the merged tree.
+
+Concretely, and for the avoidance of doubt: no test was changed to go
+green, no tag was cut, no release was published, and nothing was deployed
+to the server or to the first consumer's instance.
