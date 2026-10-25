@@ -145,7 +145,12 @@ pub async fn execute(
             return;
         }
     } else if command.is_empty() {
-        report_could_not_start(&job_id, &session, "a job needs a command to run".to_owned());
+        report_could_not_start(
+            &job_id,
+            attempt,
+            &session,
+            "a job needs a command to run".to_owned(),
+        );
         return;
     }
 
@@ -155,7 +160,7 @@ pub async fn execute(
     let workspace = match confined.root().open_workspace(&job_id) {
         Ok(workspace) => workspace,
         Err(reason) => {
-            report_could_not_start(&job_id, &session, reason);
+            report_could_not_start(&job_id, attempt, &session, reason);
             return;
         }
     };
@@ -169,8 +174,8 @@ pub async fn execute(
             // `{in}` and `{out}` exist before `up` runs, under this job's own
             // directory and therefore inside the one data root (D107, E-45).
             if let Err(reason) = workspace.open_exchange() {
-                reclaim_or_say(&workspace, &job_id, &session);
-                report_could_not_start(&job_id, &session, reason);
+                reclaim_or_say(&workspace, &job_id, attempt, &session);
+                report_could_not_start(&job_id, attempt, &session, reason);
                 return;
             }
             match step::planned(
@@ -187,7 +192,7 @@ pub async fn execute(
             ) {
                 Ok(stages) => stages,
                 Err(refusal) => {
-                    reclaim_or_say(&workspace, &job_id, &session);
+                    reclaim_or_say(&workspace, &job_id, attempt, &session);
                     session.abandon(&job_id, attempt, &refusal);
                     return;
                 }
@@ -195,8 +200,13 @@ pub async fn execute(
         }
     };
     if stages.is_empty() {
-        reclaim_or_say(&workspace, &job_id, &session);
-        report_could_not_start(&job_id, &session, "a job needs a command to run".to_owned());
+        reclaim_or_say(&workspace, &job_id, attempt, &session);
+        report_could_not_start(
+            &job_id,
+            attempt,
+            &session,
+            "a job needs a command to run".to_owned(),
+        );
         return;
     }
 
@@ -239,7 +249,7 @@ pub async fn execute(
         // step runs: the record has to name which of them bound the job
         // however the job ends (D108).
         if let Some(said) = &stage.announce {
-            say_in_the_log(&session, &job_id, said);
+            say_in_the_log(&session, &job_id, attempt, said);
         }
 
         let step_started_unix_ms = unix_ms_now();
@@ -339,6 +349,7 @@ pub async fn execute(
                 started = Some(Instant::now());
                 live = Some(confined.live().add(
                     job_id.clone(),
+                    attempt,
                     tag.clone(),
                     pid,
                     cgroup.as_ref().map(|cgroup| cgroup.dir().to_path_buf()),
@@ -361,6 +372,7 @@ pub async fn execute(
                 stdout,
                 LogStream::Stdout,
                 job_id.clone(),
+                attempt,
                 Arc::clone(&log_bytes),
                 Arc::clone(&tripped),
                 caps.log_cap,
@@ -370,6 +382,7 @@ pub async fn execute(
                 stderr,
                 LogStream::Stderr,
                 job_id.clone(),
+                attempt,
                 Arc::clone(&log_bytes),
                 Arc::clone(&tripped),
                 caps.log_cap,
@@ -560,7 +573,7 @@ pub async fn execute(
     // exactly what a runner must not do to its host — so it is said in the
     // job's own record and not only in the runner's log.
     drop(cgroup);
-    reclaim_or_say(&workspace, &job_id, &session);
+    reclaim_or_say(&workspace, &job_id, attempt, &session);
 
     // What the hub is told, and the one place the three ways of ending part.
     //
@@ -586,9 +599,13 @@ pub async fn execute(
                 JobOutcome::StoppedByCap { .. } => outcome,
                 _ => JobOutcome::Cancelled { reason },
             };
-            session.finish(&job_id, outcome, metrics, ran.steps, outputs, spool);
+            session.finish(
+                &job_id, attempt, outcome, metrics, ran.steps, outputs, spool,
+            );
         }
-        None => session.finish(&job_id, outcome, metrics, ran.steps, outputs, spool),
+        None => session.finish(
+            &job_id, attempt, outcome, metrics, ran.steps, outputs, spool,
+        ),
     }
     if let Some(token) = live {
         confined.live().remove(token);
@@ -796,8 +813,10 @@ impl Attempt {
             // failed to run what it was given, which is not the job failing
             // (D20).
             None | Some(Step::Run) => self.verdict = Some(JobOutcome::CouldNotStart { reason }),
-            Some(Step::Down) => self.say_the_takedown_did_not_come_off(session, job_id, &how),
-            Some(step) => self.say_the_job_never_started(session, job_id, step, &how),
+            Some(Step::Down) => {
+                self.say_the_takedown_did_not_come_off(session, job_id, attempt, &how)
+            }
+            Some(step) => self.say_the_job_never_started(session, job_id, attempt, step, &how),
         }
     }
 
@@ -910,7 +929,7 @@ impl Attempt {
         // path somebody has to go and fix (D166).
         if let Some(reason) = refused_workspace {
             if self.refused_workspace(stage.step, reason) {
-                self.say_the_takedown_did_not_come_off(session, job_id, &how);
+                self.say_the_takedown_did_not_come_off(session, job_id, attempt, &how);
             }
             return;
         }
@@ -930,7 +949,7 @@ impl Attempt {
             // change it, however it ends (D108).
             Some(Step::Down) => {
                 if !came_off {
-                    self.say_the_takedown_did_not_come_off(session, job_id, &how);
+                    self.say_the_takedown_did_not_come_off(session, job_id, attempt, &how);
                 }
             }
             // `up` and `fetch`: preparation. A step that did not come off
@@ -943,7 +962,7 @@ impl Attempt {
                 Some(asked) => self.ending = Some(asked),
                 None => {
                     if !came_off {
-                        self.say_the_job_never_started(session, job_id, step, &how);
+                        self.say_the_job_never_started(session, job_id, attempt, step, &how);
                     }
                 }
             },
@@ -955,6 +974,7 @@ impl Attempt {
         &mut self,
         session: &Session,
         job_id: &JobId,
+        attempt: u32,
         step: Step,
         how: &str,
     ) {
@@ -962,6 +982,7 @@ impl Attempt {
         say_in_the_log(
             session,
             job_id,
+            attempt,
             &format!(
                 "the {step} step {how}, so this job never started and the declared command \
                  was not run"
@@ -972,10 +993,17 @@ impl Attempt {
     /// A takedown that did not come off: said in the job's log, because bytes
     /// left on a host nobody will collect are what invariant 2 forbids above
     /// all — and the verdict is left exactly as it was.
-    fn say_the_takedown_did_not_come_off(&self, session: &Session, job_id: &JobId, how: &str) {
+    fn say_the_takedown_did_not_come_off(
+        &self,
+        session: &Session,
+        job_id: &JobId,
+        attempt: u32,
+        how: &str,
+    ) {
         say_in_the_log(
             session,
             job_id,
+            attempt,
             &format!(
                 "the down step {how}, so this job's workspace may be left on this host. The \
                  job's verdict is unchanged."
@@ -1015,7 +1043,7 @@ impl Attempt {
             // this is. A revision read after `run` would be whatever the
             // job's own command left behind (D176).
             ran_commit: match step {
-                Step::Fetch => self.the_revision_it_reached(session, job_id),
+                Step::Fetch => self.the_revision_it_reached(session, job_id, attempt),
                 _ => None,
             },
         };
@@ -1036,7 +1064,12 @@ impl Attempt {
     /// the runner has no revision to put there — and the job's log says why,
     /// so a hook writing the wrong thing does not look like a hook writing
     /// nothing.
-    fn the_revision_it_reached(&self, session: &Session, job_id: &JobId) -> Option<String> {
+    fn the_revision_it_reached(
+        &self,
+        session: &Session,
+        job_id: &JobId,
+        attempt: u32,
+    ) -> Option<String> {
         let path = self.ran_path.as_ref()?;
         match step::ran_commit(path) {
             step::RanCommit::Said(revision) => Some(revision),
@@ -1045,6 +1078,7 @@ impl Attempt {
                 say_in_the_log(
                     session,
                     job_id,
+                    attempt,
                     &format!(
                         "the fetch step left a file at {} and {why}, so this attempt reports \
                          no revision and nothing here confirms which commit was built",
@@ -1109,9 +1143,10 @@ fn unix_ms_now() -> i64 {
 /// are the lines that explain a verdict a step produced. Numbered from the
 /// job's own counter like any other chunk — a number of its own invention
 /// would read, at the hub, as every chunk in between having been lost (D29).
-fn say_in_the_log(session: &Session, job_id: &JobId, said: &str) {
+fn say_in_the_log(session: &Session, job_id: &JobId, attempt: u32, said: &str) {
     session.send_chunk(
         job_id,
+        attempt,
         LogStream::Stderr,
         format!("herd-runner: {said}\n").into_bytes(),
     );
@@ -1153,7 +1188,7 @@ fn kill_everything_of(cgroup: Option<&JobCgroup>, pids: &[u32], tag: &JobTag, jo
 /// The runner owns every inode under there, so this failing means something
 /// stranger than a mode — and whatever it is, the requester reading the job's
 /// log must be able to see that this host now carries bytes nobody collected.
-fn reclaim_or_say(workspace: &Workspace, job_id: &JobId, session: &Session) {
+fn reclaim_or_say(workspace: &Workspace, job_id: &JobId, attempt: u32, session: &Session) {
     let Err(error) = workspace.reclaim() else {
         return;
     };
@@ -1167,7 +1202,7 @@ fn reclaim_or_say(workspace: &Workspace, job_id: &JobId, session: &Session) {
     // stderr is not somewhere a requester can read. Numbered from the job's
     // own counter like any other chunk — a number of its own invention would
     // read, at the hub, as every chunk in between having been lost (D29).
-    session.send_chunk(job_id, LogStream::Stderr, said.into_bytes());
+    session.send_chunk(job_id, attempt, LogStream::Stderr, said.into_bytes());
 }
 
 /// What the watchdog needs to know about the step it is watching.
@@ -1363,9 +1398,10 @@ fn outcome_of(status: std::process::ExitStatus) -> JobOutcome {
 /// And no output file either: every caller here is a job whose `{out}` was
 /// never made, or was made and could not be run in. There is nothing under it
 /// to collect, and saying so with the default is the same statement.
-fn report_could_not_start(job_id: &JobId, session: &Session, reason: String) {
+fn report_could_not_start(job_id: &JobId, attempt: u32, session: &Session, reason: String) {
     session.finish(
         job_id,
+        attempt,
         JobOutcome::CouldNotStart { reason },
         JobMetrics::default(),
         Vec::new(),
@@ -1380,10 +1416,14 @@ fn report_could_not_start(job_id: &JobId, session: &Session, reason: String) {
 /// The cap is counted across both streams and across every step, because the
 /// cap is about the log the hub stores and the requester reads, which is one
 /// log.
+// Eight: the pipe, which attempt's log it is, the cap shared across both
+// pumps and the session to send on. Same reason as the three above.
+#[allow(clippy::too_many_arguments)]
 async fn stream_output<R>(
     mut pipe: R,
     stream: LogStream,
     job_id: JobId,
+    attempt: u32,
     log_bytes: Arc<AtomicU64>,
     tripped: Arc<AtomicU8>,
     log_cap: u64,
@@ -1408,7 +1448,7 @@ async fn stream_output<R>(
                 // The bytes as they were read: a job's output is not text, and
                 // a chunk boundary may fall in the middle of a character
                 // (D18). Nothing here rewrites what the process wrote.
-                session.send_chunk(&job_id, stream, buffer[..keep].to_vec());
+                session.send_chunk(&job_id, attempt, stream, buffer[..keep].to_vec());
                 if keep < read {
                     tripped.store(LOG_CAP, Ordering::SeqCst);
                     break;
@@ -1417,6 +1457,7 @@ async fn stream_output<R>(
             Err(error) => {
                 session.send_chunk(
                     &job_id,
+                    attempt,
                     LogStream::Stderr,
                     format!("herd-runner: reading the job's output failed: {error}\n").into_bytes(),
                 );

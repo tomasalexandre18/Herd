@@ -8589,3 +8589,66 @@ deployment.
 **On the number.** This entry is D176. D175 is the refused-file decision
 integrated in the same pass, D174 is held by the unmerged branch of PR #72
 and D170 by that of PR #67.
+
+## 2026-10-25 — D-NEXT A runner's live jobs are keyed by job and attempt
+
+**Decision.** `herd_runner::Session`'s map of the jobs a runner has in hand
+is keyed by **(job, attempt)** and no longer by job id alone. Every
+operation on an entry names both; an acknowledgement, which names no
+attempt, resolves to the attempt that is *holding an end*; and
+`Session::end_job` takes an attempt rather than an `Option<u32>` it had to
+compare after the lookup.
+
+**The defect.** A runner can hold two attempts of one job at once, and the
+path is ordinary rather than exotic: the link drops, the hub's watchdog ends
+the attempt it has stopped hearing about and queues the job again, the job
+goes on running on the machine, and the next attempt of it is offered to
+that same machine the moment it redials. Keyed by job id, `take_job`'s
+`insert` *replaced* the first entry. Three consequences, every one of them
+seen in a real run:
+
+- **a running attempt stopped being counted.** `jobs_running()` reads the
+  map, so a machine running two processes reported one. The place it did not
+  have was then available to the next assignment, which is invariant 2
+  broken by the bookkeeping rather than by a job.
+- **output was numbered under the wrong attempt.** `send_chunk` looked the
+  job up and sent the chunk under whatever `attempt` the entry carried, so
+  the first attempt's output arrived at the hub labelled as the second's —
+  where it is refused as superseded, and the log of the attempt that is
+  really running is short with nothing saying so.
+- **an acknowledgement took the live attempt out.**
+  `FromHub::JobResultAck` carries a job id and nothing else, so `release`
+  removed whatever entry stood under that id. Once a second attempt had been
+  assigned, that was the attempt that was *running*: it then ran with
+  nothing counting it, nothing naming it in a health report, and a hub that
+  wrote it off for silence while the process was working perfectly. The same
+  `insert` had already destroyed the first attempt's unacknowledged verdict,
+  which D19 says is never destroyed.
+
+**Why the key and not a guard.** A guard in `take_job` — refuse a second
+attempt of a job this runner is already running — is also wanted, and is a
+separate decision about what a runner may accept. It does not make this one
+unnecessary: a map that cannot represent what is on the machine is a map
+that lies about it whatever the admission rule is, and the three defects
+above are all failures of representation. Keyed by both, the four
+attempt-aware lookups that used to be "find by id, then compare the number"
+become one lookup that cannot find the wrong thing, and `JobInHand` loses
+its own `attempt` field — two places to read an attempt number from are two
+numbers that can disagree.
+
+**What it does not fix, and must be said.** A workspace belongs to a **job**
+and not to an attempt (`DataRoot::open_workspace` takes a `JobId`, and
+clears the directory if it is already there), so two attempts of one job on
+one machine still clear each other's working directory. This change makes
+the machine's own books honest; it does not make running one job twice on
+one host safe, and nothing here should be read as saying it does.
+
+**No version moves.** Nothing on the wire and nothing on the hub's disk
+changes: this is one crate's internal map. `PROTOCOL_VERSION` stays 2 and
+`RECORD_VERSION` stays 1.
+
+**Evidence.** Three tests in `herd-runner/src/lib.rs`, red on `199e4df`
+before a line of the fix and green after, one per consequence:
+`two_attempts_of_one_job_are_two_entries_in_the_machines_own_count`,
+`handing_one_attempt_back_leaves_the_other_attempt_of_that_job_running`,
+`an_acknowledgement_lets_go_of_the_attempt_that_holds_the_result_and_no_other`.

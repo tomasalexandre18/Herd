@@ -530,11 +530,47 @@ struct Ended {
     outputs: JobOutputs,
 }
 
+/// What one entry of [`Inner::jobs`] is about: **a job and the attempt of it
+/// that this runner has in hand** (D-NEXT).
+///
+/// The key is both, and that is the whole of it. A runner can hold two
+/// attempts of one job at once — the hub writes an attempt off while the link
+/// is down, the job goes on running here, and the next attempt of it comes
+/// back to this same machine the moment it redials — and keyed by job id
+/// alone the second entry simply *replaced* the first. Three things followed,
+/// every one of them observed: the first attempt ran with nothing counting it
+/// against this machine's own ceiling, its held output was numbered as the
+/// second attempt's, and handing either one back or acknowledging either one's
+/// verdict let go of whichever entry happened to be there.
+///
+/// It does **not** make running one job twice on one machine a good idea: a
+/// workspace belongs to a job and not to an attempt, so two attempts of one
+/// job here still clear each other's working directory. What this key buys is
+/// that the machine's own books say what is really on it, whoever decides what
+/// may be taken.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct InHand {
+    job_id: JobId,
+    attempt: u32,
+}
+
+impl InHand {
+    fn of(job_id: &JobId, attempt: u32) -> Self {
+        Self {
+            job_id: job_id.clone(),
+            attempt,
+        }
+    }
+}
+
 /// One job this runner has in hand, and everything the hub may still need
 /// from it.
+///
+/// Which attempt of which job is the key it is filed under ([`InHand`]) and
+/// is deliberately not repeated here: two places to read an attempt number
+/// from are two numbers that can disagree.
 #[derive(Debug)]
 struct JobInHand {
-    attempt: u32,
     /// The number the next chunk of this job's output will carry. Per
     /// attempt: a second attempt is a second process and counts from zero.
     next_seq: u64,
@@ -776,7 +812,9 @@ struct Inner {
     /// A new link starts with a full window and the hub says where to resume
     /// from ([`herd_proto::FromHub::JobFilesHeld`]).
     files_credit: Option<Arc<Semaphore>>,
-    jobs: HashMap<JobId, JobInHand>,
+    /// Every attempt this runner has in hand, by job **and** attempt
+    /// ([`InHand`]).
+    jobs: HashMap<InHand, JobInHand>,
     /// Collections whose bytes this runner still owes the hub, by job.
     ///
     /// Outlives `jobs`: a verdict is acknowledged and the job released long
@@ -1119,11 +1157,11 @@ impl Session {
     /// read what went into a job's record when there was no hub to send it
     /// to — which is exactly the case the record must still carry.
     #[cfg(test)]
-    fn held_output_of(&self, job_id: &JobId) -> String {
+    fn held_output_of(&self, job_id: &JobId, attempt: u32) -> String {
         self.with(|inner| {
             inner
                 .jobs
-                .get(job_id)
+                .get(&InHand::of(job_id, attempt))
                 .map(|job| {
                     job.unacked
                         .iter()
@@ -1165,9 +1203,8 @@ impl Session {
             }
             let cancel = CancelToken::new();
             inner.jobs.insert(
-                job_id.clone(),
+                InHand::of(job_id, attempt),
                 JobInHand {
-                    attempt,
                     next_seq: 0,
                     unacked: VecDeque::new(),
                     unacked_bytes: 0,
@@ -1190,15 +1227,20 @@ impl Session {
     /// Numbering here makes the order on the wire the order of the numbers, so
     /// a jump in `seq` means one thing only: chunks that are gone, which is
     /// what the hub's marker names (D29).
-    pub(crate) fn send_chunk(&self, job_id: &JobId, stream: LogStream, data: Vec<u8>) {
+    pub(crate) fn send_chunk(
+        &self,
+        job_id: &JobId,
+        attempt: u32,
+        stream: LogStream,
+        data: Vec<u8>,
+    ) {
         self.with(|inner| {
-            let Some(job) = inner.jobs.get_mut(job_id) else {
+            let Some(job) = inner.jobs.get_mut(&InHand::of(job_id, attempt)) else {
                 return;
             };
             let seq = job.next_seq;
             job.next_seq += 1;
             job.remember(seq, stream, &data);
-            let attempt = job.attempt;
             send_on(
                 &inner.link,
                 ToHub::LogChunk {
@@ -1236,9 +1278,14 @@ impl Session {
     /// stopping never waits for bytes, and a runner that dies mid-stream has
     /// then already delivered the verdict, so the job is readable and only
     /// its evidence is pending.
+    // Eight, because every one of them is a different half of one record and
+    // there is no grouping of them that a reader would not have to unpick
+    // again. Same reason as the three in `job.rs`.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn finish(
         &self,
         job_id: &JobId,
+        attempt: u32,
         outcome: JobOutcome,
         metrics: JobMetrics,
         steps: Vec<StepRun>,
@@ -1246,7 +1293,7 @@ impl Session {
         spool: Option<PathBuf>,
     ) {
         let streaming = self.with(|inner| {
-            let Some(job) = inner.jobs.get_mut(job_id) else {
+            let Some(job) = inner.jobs.get_mut(&InHand::of(job_id, attempt)) else {
                 return false;
             };
             let end = Ended {
@@ -1256,7 +1303,7 @@ impl Session {
                 outputs,
             };
             job.end = Some(end.clone());
-            let (attempt, chunks_sent) = (job.attempt, job.next_seq);
+            let chunks_sent = job.next_seq;
             if !send_on(
                 &inner.link,
                 finished_frame(job_id, attempt, chunks_sent, &end),
@@ -1451,7 +1498,13 @@ impl Session {
     /// saying there is none. The hub decides what becomes of the job.
     pub(crate) fn abandon(&self, job_id: &JobId, attempt: u32, reason: &str) {
         self.with(|inner| {
-            inner.jobs.remove(job_id);
+            // **This attempt's entry, and only this attempt's.** Giving one
+            // attempt back must not take another attempt of the same job off
+            // this machine's count: that is a place the machine does not
+            // have, and the next assignment would be accepted onto a host
+            // already as full as it said it would ever be — invariant 2
+            // broken by the bookkeeping rather than by a job.
+            inner.jobs.remove(&InHand::of(job_id, attempt));
             send_on(
                 &inner.link,
                 ToHub::AttemptAbandoned {
@@ -1463,11 +1516,55 @@ impl Session {
         });
     }
 
-    /// The hub has this job's end on its disk: let the job go, output and all,
-    /// and remove the spool file if the verdict came from one.
-    fn release(&self, job_id: &JobId) {
+    /// The hub has written a job's verdict down ([`FromHub::JobResultAck`]):
+    /// let go of the attempt whose verdict it was.
+    ///
+    /// **Which attempt, when the frame names none.** The acknowledgement
+    /// carries a job id and nothing else, and the attempt it is about is the
+    /// one *holding an end* — which is this function's own sentence read
+    /// literally: the hub has **this job's end** on its disk, and an attempt
+    /// that is still running has no end for an acknowledgement to be about.
+    /// Before the attempt was part of the key, the entry under that id was
+    /// taken out whatever it was, and once a second attempt of the same job
+    /// had been assigned here that was the attempt that was *running*: it
+    /// then ran with nothing counting it, nothing naming it in a health
+    /// report, and a hub that wrote it off for silence while the process was
+    /// working perfectly.
+    fn result_acknowledged(&self, job_id: &JobId) {
+        let holding_an_end: Vec<InHand> = self.with(|inner| {
+            inner
+                .jobs
+                .iter()
+                .filter(|(which, job)| &which.job_id == job_id && job.end.is_some())
+                .map(|(which, _)| which.clone())
+                .collect()
+        });
+        if holding_an_end.is_empty() {
+            // Nothing in hand: a verdict acknowledged twice, or one this
+            // runner let go of when its attempt was written off. Not an
+            // error — and the spool is still swept, because a verdict a
+            // previous life of this runner wrote is held nowhere else and
+            // this is the acknowledgement that frees its file (D34).
+            self.release(job_id, None);
+            return;
+        }
+        for which in holding_an_end {
+            self.release(job_id, Some(&which));
+        }
+    }
+
+    /// The hub has a job's end on its disk: let the attempt that was holding
+    /// it go, output and all, and remove the spool file if the verdict came
+    /// from one.
+    ///
+    /// `entry` is that attempt, and `None` is a job this runner holds nothing
+    /// of any more — the spool is swept either way, because that is where a
+    /// verdict written by a previous life of this runner lives (D34).
+    fn release(&self, job_id: &JobId, entry: Option<&InHand>) {
         let (delivered, trimmed): (Vec<Spooled>, u64) = self.with(|inner| {
-            let trimmed = inner.jobs.remove(job_id).map_or(0, |job| job.trimmed);
+            let trimmed = entry
+                .and_then(|which| inner.jobs.remove(which))
+                .map_or(0, |job| job.trimmed);
             (
                 take_spooled(inner, |spooled| spooled.job_id() == job_id),
                 trimmed,
@@ -1495,10 +1592,8 @@ impl Session {
     /// The hub has this job's output up to `through_seq`.
     fn log_acknowledged(&self, job_id: &JobId, attempt: u32, through_seq: u64) {
         self.with(|inner| {
-            if let Some(job) = inner.jobs.get_mut(job_id) {
-                if job.attempt == attempt {
-                    job.forget_through(through_seq);
-                }
+            if let Some(job) = inner.jobs.get_mut(&InHand::of(job_id, attempt)) {
+                job.forget_through(through_seq);
             }
         });
     }
@@ -1511,7 +1606,7 @@ impl Session {
     /// short, so the end has to arrive after what was missing.
     fn resend_log(&self, job_id: &JobId, attempt: u32, from_seq: u64) {
         self.with(|inner| {
-            let Some(job) = inner.jobs.get(job_id) else {
+            let Some(job) = inner.jobs.get(&InHand::of(job_id, attempt)) else {
                 eprintln!(
                     "herd-runner: the hub asked for output of {job_id} from {from_seq}, and \
                      this runner holds nothing of that job any more"
@@ -1538,9 +1633,6 @@ impl Session {
                 }
                 return;
             };
-            if job.attempt != attempt {
-                return;
-            }
             let held: Vec<(u64, LogStream, Vec<u8>)> = job
                 .unacked
                 .iter()
@@ -1570,14 +1662,16 @@ impl Session {
     }
 
     /// Ask a job to end, if this runner has it at that attempt.
-    fn end_job(&self, job_id: &JobId, attempt: Option<u32>, ending: Ending) -> bool {
+    /// `attempt` is not optional, and could not be: a cancellation is about
+    /// one attempt of one job, and the entry it is about is the one filed
+    /// under both ([`InHand`]). Before the attempt was part of the key this
+    /// took an `Option<u32>` and compared the number it found — the same
+    /// question, asked in a place where the answer could be wrong.
+    fn end_job(&self, job_id: &JobId, attempt: u32, ending: Ending) -> bool {
         self.with(|inner| {
-            let Some(job) = inner.jobs.get(job_id) else {
+            let Some(job) = inner.jobs.get(&InHand::of(job_id, attempt)) else {
                 return false;
             };
-            if attempt.is_some_and(|attempt| attempt != job.attempt) {
-                return false;
-            }
             job.cancel.end(ending)
         })
     }
@@ -1610,12 +1704,9 @@ impl Session {
                 }
                 inner.said_stale.push_back((job_id.clone(), attempt));
             }
-            let Some(job) = inner.jobs.get(job_id) else {
+            let Some(job) = inner.jobs.get(&InHand::of(job_id, attempt)) else {
                 return (false, say_it);
             };
-            if job.attempt != attempt {
-                return (false, say_it);
-            }
             job.cancel
                 .end(Ending::Abandoned(format!("stale attempt: {reason}")));
             (job.end.is_none(), say_it)
@@ -1635,7 +1726,7 @@ impl Session {
         // itself; one that had already finished is dropped here and now,
         // result included — it is not this job's attempt any more.
         if !running {
-            self.release(job_id);
+            self.release(job_id, Some(&InHand::of(job_id, attempt)));
         }
         say_it
     }
@@ -1693,12 +1784,12 @@ impl Session {
             inner.link = Some(outbox);
             inner.files_credit = Some(credit);
             inner.files_stall_after = stall_after;
-            let ids: Vec<JobId> = inner.jobs.keys().cloned().collect();
-            for job_id in ids {
-                let Some(job) = inner.jobs.get(&job_id) else {
+            let held: Vec<InHand> = inner.jobs.keys().cloned().collect();
+            for which in held {
+                let Some(job) = inner.jobs.get(&which) else {
                     continue;
                 };
-                let attempt = job.attempt;
+                let (job_id, attempt) = (which.job_id.clone(), which.attempt);
                 let chunks_sent = job.next_seq;
                 let end = job.end.clone();
                 let held: Vec<(u64, LogStream, Vec<u8>)> = job.unacked.iter().cloned().collect();
@@ -1770,10 +1861,10 @@ impl Session {
         self.with(|inner| {
             inner.draining = true;
             let mut ending = Vec::new();
-            for (job_id, job) in inner.jobs.iter() {
+            for (which, job) in inner.jobs.iter() {
                 if job.end.is_none() {
                     job.cancel.end(Ending::Abandoned(reason.to_owned()));
-                    ending.push(job_id.clone());
+                    ending.push(which.job_id.clone());
                 }
             }
             // So that the hub stops handing out work to a runner on its way
@@ -1874,21 +1965,25 @@ impl Session {
         let (in_hand, running) = self.with(|inner| {
             let mut in_hand = Vec::new();
             let mut running = Vec::new();
-            for (job_id, job) in inner.jobs.iter() {
+            let mut acknowledged: Vec<InHand> = Vec::new();
+            for (which, job) in inner.jobs.iter() {
                 match &job.end {
-                    Some(end) => in_hand.push((
-                        job_id.clone(),
-                        end.outcome.clone(),
-                        finished_frame(job_id, job.attempt, job.next_seq, end),
-                    )),
+                    Some(end) => {
+                        in_hand.push((
+                            which.job_id.clone(),
+                            end.outcome.clone(),
+                            finished_frame(&which.job_id, which.attempt, job.next_seq, end),
+                        ));
+                        acknowledged.push(which.clone());
+                    }
                     None => {
                         job.cancel.end(Ending::Abandoned(why.clone()));
-                        running.push(job_id.clone());
+                        running.push(which.job_id.clone());
                     }
                 }
             }
-            for (job_id, _, _) in &in_hand {
-                inner.jobs.remove(job_id);
+            for which in &acknowledged {
+                inner.jobs.remove(which);
             }
             (in_hand, running)
         });
@@ -1939,12 +2034,12 @@ impl Session {
             inner
                 .jobs
                 .iter()
-                .filter_map(|(job_id, job)| {
+                .filter_map(|(which, job)| {
                     job.end.as_ref().map(|end| {
                         (
-                            job_id.clone(),
+                            which.job_id.clone(),
                             end.outcome.clone(),
-                            finished_frame(job_id, job.attempt, job.next_seq, end),
+                            finished_frame(&which.job_id, which.attempt, job.next_seq, end),
                         )
                     })
                 })
@@ -1975,9 +2070,9 @@ fn running_jobs(inner: &Inner) -> Vec<RunningJob> {
         .jobs
         .iter()
         .filter(|(_, job)| job.end.is_none())
-        .map(|(job_id, job)| RunningJob {
-            job_id: job_id.clone(),
-            attempt: job.attempt,
+        .map(|(which, job)| RunningJob {
+            job_id: which.job_id.clone(),
+            attempt: which.attempt,
             chunks_sent: job.next_seq,
         })
         .collect()
@@ -2322,6 +2417,7 @@ async fn drain(config: &Config, session: &Session, confined: &Arc<Confined>, rea
             // invariant 2 forbids.
             session.send_chunk(
                 &ended.job_id,
+                ended.attempt,
                 LogStream::Stderr,
                 format!(
                     "herd-runner: this runner was stopped and the workspace {} of job {} \
@@ -2755,7 +2851,7 @@ async fn serve_hub(
                     .await
                 });
             }
-            FromHub::JobResultAck { job_id } => session.release(&job_id),
+            FromHub::JobResultAck { job_id } => session.result_acknowledged(&job_id),
             FromHub::JobFilesHeld {
                 job_id,
                 attempt,
@@ -2779,7 +2875,7 @@ async fn serve_hub(
                 attempt,
                 reason,
             } => {
-                if session.end_job(&job_id, Some(attempt), Ending::Cancelled(reason.clone())) {
+                if session.end_job(&job_id, attempt, Ending::Cancelled(reason.clone())) {
                     println!("herd-runner: ending {job_id} because {reason}");
                 } else {
                     // Already over, or never here. Not an error: a cancel
@@ -3072,7 +3168,6 @@ mod tests {
     #[test]
     fn held_output_is_bounded_and_drops_the_oldest_first() {
         let mut job = JobInHand {
-            attempt: 1,
             next_seq: 0,
             unacked: VecDeque::new(),
             unacked_bytes: 0,
@@ -3098,7 +3193,6 @@ mod tests {
     #[test]
     fn an_acknowledged_chunk_is_forgotten_and_the_rest_is_kept() {
         let mut job = JobInHand {
-            attempt: 1,
             next_seq: 0,
             unacked: VecDeque::new(),
             unacked_bytes: 0,
@@ -3153,7 +3247,12 @@ mod tests {
         // are the items that each draw a refusal out of the hub.
         let buffered = 1497;
         for _ in 0..buffered {
-            session.send_chunk(&job_id, LogStream::Stdout, b"a line of a build\n".to_vec());
+            session.send_chunk(
+                &job_id,
+                1,
+                LogStream::Stdout,
+                b"a line of a build\n".to_vec(),
+            );
         }
 
         // One refusal per buffered item, which is what the hub really sends —
@@ -3293,7 +3392,11 @@ mod tests {
             .take_job(&job_id, 2)
             .expect("a fresh session is not draining");
 
-        session.abandon(&job_id, 2, "this machine is already as full as it said it would be");
+        session.abandon(
+            &job_id,
+            2,
+            "this machine is already as full as it said it would be",
+        );
 
         assert_eq!(
             session.jobs_running(),
@@ -3347,6 +3450,7 @@ mod tests {
             .expect("a fresh session is not draining");
         session.finish(
             &job_id,
+            1,
             JobOutcome::Exited { code: 0 },
             JobMetrics::default(),
             Vec::new(),
@@ -3375,7 +3479,7 @@ mod tests {
         // And now the acknowledgement arrives. It is about the verdict, so
         // it lets the verdict go — and leaves the attempt that is running
         // exactly where it is.
-        session.release(&job_id);
+        session.result_acknowledged(&job_id);
         assert_eq!(
             session.results_held(),
             0,
@@ -3442,6 +3546,7 @@ mod tests {
         let _ = gone.wait();
         let token = confined.live().add(
             job_id.clone(),
+            1,
             reclaim::JobTag::mint(&job_id),
             dead,
             None,
@@ -3455,7 +3560,7 @@ mod tests {
         drain(&config, &session, &confined, "the owner asked it to stop").await;
         confined.live().remove(token);
 
-        let record = session.held_output_of(&job_id);
+        let record = session.held_output_of(&job_id, 1);
         assert!(
             record.contains("could not be reclaimed") && record.contains("left on this host"),
             "a workspace the stop left behind must be in the job's own record, not \
@@ -3601,6 +3706,7 @@ mod tests {
             let outputs = a_collection_to_send(&session, &job_id, &spool);
             session.finish(
                 &job_id,
+                1,
                 JobOutcome::Exited { code: 0 },
                 JobMetrics::default(),
                 Vec::new(),
@@ -3663,6 +3769,7 @@ mod tests {
         let (_, said) = crate::testing::stderr_lines_about("j0000000214", || {
             session.finish(
                 &job_id,
+                1,
                 JobOutcome::Exited { code: 0 },
                 JobMetrics::default(),
                 Vec::new(),

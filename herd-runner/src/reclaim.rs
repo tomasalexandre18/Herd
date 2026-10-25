@@ -252,6 +252,10 @@ fn minter_is_gone(pid: u32) -> bool {
 #[derive(Debug)]
 struct Live {
     job_id: JobId,
+    /// Which attempt of it: a chunk of a job's log belongs to an attempt,
+    /// and this registry is where the stop path finds the one it has to say
+    /// a left-behind workspace in.
+    attempt: u32,
     tag: JobTag,
     pid: u32,
     cgroup: Option<PathBuf>,
@@ -268,6 +272,7 @@ struct Live {
 #[derive(Debug, Clone)]
 pub struct EndedJob {
     pub job_id: JobId,
+    pub attempt: u32,
     pub said: String,
     pub workspace: PathBuf,
     pub workspace_left: Option<String>,
@@ -286,6 +291,7 @@ impl LiveJobs {
     pub fn add(
         &self,
         job_id: JobId,
+        attempt: u32,
         tag: JobTag,
         pid: u32,
         cgroup: Option<PathBuf>,
@@ -297,6 +303,7 @@ impl LiveJobs {
                 token,
                 Live {
                     job_id,
+                    attempt,
                     tag,
                     pid,
                     cgroup,
@@ -373,6 +380,7 @@ impl LiveJobs {
                     job.pid
                 ),
                 job_id: job.job_id,
+                attempt: job.attempt,
                 workspace: job.workspace.base_dir().to_path_buf(),
                 workspace_left,
             });
