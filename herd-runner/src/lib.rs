@@ -3223,6 +3223,177 @@ mod tests {
         );
     }
 
+    /// **Two attempts of one job on one machine are two things, and the
+    /// machine's own count has to say two.**
+    ///
+    /// Reachable wherever an attempt outlives the hub's opinion of it: the
+    /// link drops, the hub's watchdog writes the attempt off and queues the
+    /// job again, the job goes on running here, and the next attempt of it
+    /// comes back to this same machine the moment it redials. Keyed by job
+    /// id alone, the second assignment *replaced* the first one's entry —
+    /// so the first went on running with nothing counting it, nothing
+    /// naming it in a health report, and its held output numbered as if it
+    /// belonged to the attempt that replaced it.
+    ///
+    /// What this asserts is only the bookkeeping. Whether a runner should
+    /// take a second attempt of a job it is already running is a separate
+    /// question with a separate answer; this is about a map that cannot
+    /// hold the truth either way.
+    #[tokio::test]
+    async fn two_attempts_of_one_job_are_two_entries_in_the_machines_own_count() {
+        let session = Session::new();
+        let job_id = JobId::new("j0000000401");
+        let _first = session
+            .take_job(&job_id, 1)
+            .expect("a fresh session is not draining");
+        let _second = session
+            .take_job(&job_id, 2)
+            .expect("a fresh session is not draining");
+        assert_eq!(
+            session.jobs_running(),
+            2,
+            "this machine is running two processes and its own count says {}: a count that \
+             is short is a host that accepts work it has no room for (invariant 2)",
+            session.jobs_running()
+        );
+        // And the health report names both, each under its own number. The
+        // hub times an *attempt*, so a report that leaves one out is how a
+        // perfectly healthy job gets written off for silence.
+        let reported: Vec<u32> = session.with(|inner| {
+            let mut attempts: Vec<u32> = running_jobs(inner)
+                .into_iter()
+                .filter(|job| job.job_id == job_id)
+                .map(|job| job.attempt)
+                .collect();
+            attempts.sort_unstable();
+            attempts
+        });
+        assert_eq!(
+            reported,
+            vec![1, 2],
+            "both attempts of {job_id} are running here and the health report names {reported:?}"
+        );
+    }
+
+    /// **Handing one attempt back must not let go of another one.**
+    ///
+    /// The first of the three consequences that were really observed: the
+    /// runner refuses attempt 2 of a job, says so to the hub, and the
+    /// *running* attempt 1 disappears from its own count. The place the
+    /// machine does not have is then handed to the next assignment, which
+    /// is invariant 2 broken by the bookkeeping rather than by a job.
+    #[tokio::test]
+    async fn handing_one_attempt_back_leaves_the_other_attempt_of_that_job_running() {
+        let session = Session::new();
+        let job_id = JobId::new("j0000000402");
+        let first = session
+            .take_job(&job_id, 1)
+            .expect("a fresh session is not draining");
+        let _second = session
+            .take_job(&job_id, 2)
+            .expect("a fresh session is not draining");
+
+        session.abandon(&job_id, 2, "this machine is already as full as it said it would be");
+
+        assert_eq!(
+            session.jobs_running(),
+            1,
+            "attempt 1 of {job_id} is still running on this machine and its own count says {}",
+            session.jobs_running()
+        );
+        let reported: Vec<u32> = session.with(|inner| {
+            running_jobs(inner)
+                .into_iter()
+                .filter(|job| job.job_id == job_id)
+                .map(|job| job.attempt)
+                .collect()
+        });
+        assert_eq!(
+            reported,
+            vec![1],
+            "the health report must name the attempt that is running and not the one that \
+             was handed back: {reported:?}"
+        );
+        // And it is attempt 1's token that is still live, not a token the
+        // abandonment left behind: this is the process that is working.
+        assert!(
+            first.tx.borrow().is_none(),
+            "handing attempt 2 back must not end attempt 1"
+        );
+    }
+
+    /// **An acknowledgement lets go of the attempt whose result it is
+    /// about, and of no other.**
+    ///
+    /// The third consequence, and the one that cost a job: `JobResultAck`
+    /// carries a job id and no attempt number, so an acknowledgement for a
+    /// result the hub has just written took out whatever entry stood under
+    /// that id — which, once a second attempt of the same job had been
+    /// assigned here, was the attempt that was *running*. It then ran with
+    /// nothing counting it and nothing naming it in a health report, and
+    /// the hub wrote it off for silence while the process was working
+    /// perfectly.
+    ///
+    /// The attempt an acknowledgement is about is the one **holding an
+    /// end**: that is this function's own sentence — the hub has this job's
+    /// end on its disk — and a job that is running has no end for an
+    /// acknowledgement to be about.
+    #[tokio::test]
+    async fn an_acknowledgement_lets_go_of_the_attempt_that_holds_the_result_and_no_other() {
+        let session = Session::new();
+        let job_id = JobId::new("j0000000403");
+        let _first = session
+            .take_job(&job_id, 1)
+            .expect("a fresh session is not draining");
+        session.finish(
+            &job_id,
+            JobOutcome::Exited { code: 0 },
+            JobMetrics::default(),
+            Vec::new(),
+            herd_proto::JobOutputs::default(),
+            None,
+        );
+        assert_eq!(
+            session.results_held(),
+            1,
+            "attempt 1 has a verdict and this runner holds it against an acknowledgement (E-44)"
+        );
+
+        // The hub wrote attempt 1 off while the link was down and has since
+        // sent attempt 2 of the same job here. Taking it must not throw the
+        // verdict of attempt 1 away: a result nothing acknowledged is a
+        // result only this machine has (D19).
+        let second = session
+            .take_job(&job_id, 2)
+            .expect("a fresh session is not draining");
+        assert_eq!(
+            session.results_held(),
+            1,
+            "taking attempt 2 of {job_id} destroyed the unacknowledged verdict of attempt 1"
+        );
+
+        // And now the acknowledgement arrives. It is about the verdict, so
+        // it lets the verdict go — and leaves the attempt that is running
+        // exactly where it is.
+        session.release(&job_id);
+        assert_eq!(
+            session.results_held(),
+            0,
+            "the acknowledged verdict is let go of"
+        );
+        assert_eq!(
+            session.jobs_running(),
+            1,
+            "attempt 2 of {job_id} is running here and an acknowledgement about attempt 1 \
+             must not take it off this machine's count: {} left",
+            session.jobs_running()
+        );
+        assert!(
+            second.tx.borrow().is_none(),
+            "and the running attempt's own token is untouched"
+        );
+    }
+
     /// Finding 6 of M4's verification: on the **stop** path a workspace left
     /// behind was written to the runner's stderr and nowhere a requester can
     /// read, while the job-end path put it in the job's own record.
