@@ -8709,7 +8709,6 @@ earlier, green after. One pass of the watchdog is extracted into
 cannot be run once — and the test store gains a second forced window,
 `record_state` ending another job's attempt as a job is queued, which is
 what a frame arriving on a link does.
----
 
 ## 2026-10-25 — D-NEXT A runner holds its own ceiling
 
@@ -8978,8 +8977,50 @@ consumer's nightly.
 
 **The bound, and what happens at it.** `CEILING_REFUSALS_ALLOWED` = **8**,
 `--ceiling-refusals-allowed` on the `Policy`. A job handed back an eighth
-time ends `Lost`, and the sentence says which budget ran out, both figures,
-that none of E-21's goes were spent, and every machine that said it was full.
+time ends, and **the ending is one of its own** — see the next three
+paragraphs, which are Alexa's answer of 2026-10-25 to *"que devient un job
+au 9e refus ?"*: *"Verdict lisible machine exigé, pas lost."*
+
+**A new `JobOutcome` variant: `refused_as_full`.** It carries the sentence a
+person reads and, beside it, the figures a program needs: `refusals`,
+`refusals_allowed`, and `runners` — every machine that handed the job back,
+each named once, with the count **it** said it was holding. `herdctl`'s
+verdict document gets `"cause": "refused_as_full"` by construction, since
+that field is the variant's own serde tag (D166), with
+`"exit_code": 125` and `"exit_code_from": "herd"`: nobody ran this job, so
+there is no verdict, and 125 is what Herd says when it has none. Not 124,
+which would say a budget stopped it; not 1, which would say it failed. The
+record's `at_its_ceiling` is widened from a flag to the machine's own count,
+additively, so the figure survives to the end — *"the machine configured for
+one job at a time refused this four times"* is something to act on and
+*"four machines were full"* is not.
+
+**Why none of the four endings it is nearest to would do.** `Lost` is
+E-21's *the machine went silent*, and no machine went anywhere: it was
+reported that way before this variant existed, which told a reader to go and
+look for a dead host. `Impossible` is written in its own doc as *what no
+fleet can fix*, and this is fixable by adding capacity, so it would be a
+lie. `Exited { code }` is forbidden by `JobOutcome`'s own rule — Herd's
+failures never wear the consumer's exit code. `CouldNotStart` is Herd trying
+to run a job and failing, which is not what happened either. A new way for a
+job to end is a new variant: `JobOutcome`'s own doc says so, and every
+variant carries named fields so that one can gain a field later.
+
+**What the new variant costs, said plainly rather than discovered.** Neither
+`JobOutcome` nor `JobState` carries `#[serde(other)]`, by deliberate design
+— `herd-hub/src/job.rs` says a state this Herd does not know must be *a read
+error naming it* rather than a job quietly read as something else — so **a
+hub older than this one will refuse to read a record that ends this way**. It
+is one-way: this hub reads everything an older hub wrote. The precedent is
+exactly two days old and in this file: D166 added `SetupFailed` to the same
+enum with neither `PROTOCOL_VERSION` nor `RECORD_VERSION` moving (`f2c0ea7`,
+both still 2 and 1 before and after). Neither moves here either, and
+`announced_job_ceiling::neither_version_number_moves` asserts both. The
+exposure is a rollback *while such a job is on the state root*: the records
+of jobs that ended any other way are untouched, and the hub says so by
+refusing to read rather than by guessing. An older `herdctl` following such
+a job ends the run with no verdict, which is D124's deliberate behaviour for
+a frame it cannot read.
 
 **Why eight.** This ending costs the fleet one frame each way and says
 nothing is wrong with the job or with the machine; unlike E-21's two and
@@ -9017,4 +9058,4 @@ is a `Policy` figure, and removing the correction is removing one `max` in
 charging a go for a refusal, which is where this entry started.
 
 **On the number.** `D-NEXT`: `herd-merger` allocates it. The third and last
-of this branch's three, in this order.
+of the three this PR carries, in this order.

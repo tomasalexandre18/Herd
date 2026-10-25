@@ -920,6 +920,70 @@ pub enum JobOutcome {
     /// actionable thing in the whole report — the setup that is broken is
     /// its own.
     SetupFailed { reason: String },
+    /// Every machine this job was offered to handed it straight back because
+    /// it was already as full as the ceiling it announced, until the hub ran
+    /// out of tries (D-NEXT).
+    ///
+    /// **The subject is the machines, not the job.** Nothing failed and
+    /// nothing was lost: the job never started anywhere, no process was
+    /// killed, and every runner that refused it was on the line and healthy,
+    /// holding exactly the work it had told the hub it would hold. What ran
+    /// out is the hub's own bound on how many such refusals one job may
+    /// collect, which exists because an exemption with no bound is a job
+    /// that can be refused for ever and told nobody.
+    ///
+    /// **Why it is not one of the four endings it is nearest to.**
+    /// [`JobOutcome::Lost`] is E-21's *the machine went silent*, and no
+    /// machine went anywhere here — it was reported as `lost` before this
+    /// variant existed, which told a reader to go and look for a dead host.
+    /// [`JobOutcome::Impossible`] is deliberately *what no fleet can fix*,
+    /// and this is fixable by adding capacity, so it would be a lie.
+    /// [`JobOutcome::Exited`] is forbidden by this type's own rule: Herd's
+    /// failures never wear the consumer's exit code.
+    /// [`JobOutcome::CouldNotStart`] is Herd trying to run a job and
+    /// failing, which is not what happened either.
+    ///
+    /// **The figures are fields, not prose.** `reason` is the sentence a
+    /// person reads; everything a program needs to decide what to do is
+    /// beside it — how many refusals, the bound they ran into, and every
+    /// machine that said it was full with the figure it gave. A reader that
+    /// has to parse `reason` is a reader that breaks the day the wording
+    /// improves (D166).
+    RefusedAsFull {
+        reason: String,
+        /// How many times this job was handed straight back for a machine's
+        /// own ceiling. Equal to `refusals_allowed` whenever this ending is
+        /// the one that was reached.
+        refusals: u32,
+        /// The bound that ran out
+        /// (`herd_hub::CEILING_REFUSALS_ALLOWED`, or whatever the hub was
+        /// started with).
+        refusals_allowed: u32,
+        /// Every machine that handed it back, in the order they did, each
+        /// named once.
+        runners: Vec<RunnerThatWasFull>,
+    },
+}
+
+/// One machine that handed a job straight back because it was already as
+/// full as the ceiling it announced ([`JobOutcome::RefusedAsFull`]).
+///
+/// A struct rather than a pair of parallel lists, because the name and the
+/// figure only mean anything together: *"four machines were full"* is not
+/// something to act on, and *"the machine that is configured for one job at
+/// a time refused it four times"* is.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RunnerThatWasFull {
+    /// The machine's name, as its attempt recorded it.
+    pub name: String,
+    /// How many jobs it said it was **already holding** when it refused,
+    /// which is the ceiling it announced — that figure being why it refused.
+    ///
+    /// `None` for a refusal recorded by a hub that did not keep the figure.
+    /// Never read as zero: a machine holding nothing would have taken the
+    /// job.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub holding: Option<u32>,
 }
 
 impl JobOutcome {
@@ -956,6 +1020,7 @@ impl JobOutcome {
             JobOutcome::Lost { .. } => "lost",
             JobOutcome::Impossible { .. } => "impossible",
             JobOutcome::SetupFailed { .. } => "setup_failed",
+            JobOutcome::RefusedAsFull { .. } => "refused_as_full",
         }
     }
 }

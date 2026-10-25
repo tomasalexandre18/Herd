@@ -1605,3 +1605,86 @@ fn a_hello_carries_its_job_ceiling_in_both_directions_without_moving_the_version
          \"did not say\" and \"said nothing fits\" become the same bytes: {silent}"
     );
 }
+
+/// **A job that no machine had room for ends as that, and says so in fields**
+/// (D-NEXT).
+///
+/// The one-way cost of a new `JobOutcome` variant, asserted rather than only
+/// written down: this build reads every ending an older one wrote, and an
+/// older build reads this one as nothing at all. Neither `JobOutcome` nor
+/// `JobState` carries `#[serde(other)]`, by design — a state this Herd does
+/// not know is a read error naming it rather than a job quietly misread — so
+/// the second half of that is what it must be, and the test stands in for the
+/// older build with a struct of exactly the variants it had.
+#[test]
+fn a_job_refused_as_full_travels_with_its_figures_and_is_unreadable_to_an_older_peer() {
+    let refused = JobOutcome::RefusedAsFull {
+        reason: "no machine had room".to_owned(),
+        refusals: 8,
+        refusals_allowed: 8,
+        runners: vec![
+            herd_proto::RunnerThatWasFull {
+                name: "capped-runner".to_owned(),
+                holding: Some(2),
+            },
+            herd_proto::RunnerThatWasFull {
+                name: "wsl-pc".to_owned(),
+                holding: None,
+            },
+        ],
+    };
+    // The cause a program reads **is** the serde tag, by construction (D166).
+    assert_eq!(refused.cause(), "refused_as_full");
+    let wire = serde_json::to_string(&refused).expect("an outcome writes");
+    assert!(
+        wire.contains(r#""type":"refused_as_full""#),
+        "the tag is the cause: {wire}"
+    );
+    assert_eq!(
+        serde_json::from_str::<JobOutcome>(&wire).expect("and reads back"),
+        refused,
+        "the figures cross unchanged"
+    );
+    // A machine that could not say how much it was holding is absent from
+    // the wire, not zero: a machine holding nothing would have taken the job.
+    assert!(
+        wire.contains(r#"{"name":"wsl-pc"}"#),
+        "an absent figure is absent: {wire}"
+    );
+
+    // Today → an older peer. This is the half that does **not** work, and it
+    // is the documented cost of the variant rather than a surprise. The
+    // fields are never read: what matters is the shape serde is given.
+    #[allow(dead_code)]
+    #[derive(serde::Deserialize)]
+    #[serde(tag = "type", rename_all = "snake_case")]
+    enum OutcomeAsAnOlderHubReadsIt {
+        Exited { code: i32 },
+        Lost { reason: String },
+        Impossible { reason: String },
+        SetupFailed { reason: String },
+    }
+    let read_back = serde_json::from_str::<OutcomeAsAnOlderHubReadsIt>(&wire);
+    assert!(
+        read_back.is_err(),
+        "a hub older than this one must refuse to read this record and name what it found, \
+         not read it as something else; if this ever succeeds, something grew a catch-all"
+    );
+    let why = read_back.err().expect("an error").to_string();
+    assert!(
+        why.contains("refused_as_full"),
+        "and the error names the ending it does not know: {why}"
+    );
+
+    // And the direction that does work, which is the one that matters for a
+    // state root: every ending an older hub wrote is still read by this one.
+    for older in [
+        r#"{"type":"exited","code":0}"#,
+        r#"{"type":"lost","reason":"its runner went away"}"#,
+        r#"{"type":"impossible","reason":"two labels that exclude each other"}"#,
+        r#"{"type":"setup_failed","reason":"a path it may not read"}"#,
+    ] {
+        serde_json::from_str::<JobOutcome>(older)
+            .unwrap_or_else(|why| panic!("this build must read {older}: {why}"));
+    }
+}

@@ -30,7 +30,7 @@ settle it) or **I** (unknown).
 
 ---
 
-## Release notes — the two things that must ship with this version
+## Release notes — the three things that must ship with this version
 
 Not bullets in a section somebody reads afterwards. These two are the whole
 of what this change does to a fleet that is not ours, and `herd-release`
@@ -92,6 +92,32 @@ is unknown to us and stays unknown (invariant 9, D161).** Nobody here logs
 into their machines to find out. That is exactly why this is a release note
 and not a footnote: the only person who can check is the one running the
 fleet, and they can only check if they are told.
+
+### RN-3. A hub rolled **back** past this version cannot read a record that ends `refused_as_full`.
+
+A job that every machine handed back because each was already as full as the
+ceiling it announced now ends `JobOutcome::RefusedAsFull` rather than `lost`
+(§8.3, item 3). That is a new variant of a tagged enum, which is additive by
+the type's own rule and moves neither `PROTOCOL_VERSION` nor
+`RECORD_VERSION` — D166 added `SetupFailed` to the same enum two days ago on
+exactly those terms.
+
+What it is not is free in the other direction. Neither `JobOutcome` nor
+`JobState` carries `#[serde(other)]`, deliberately: a state a hub does not
+know must be *a read error naming it* rather than a job quietly read as
+something else. So a hub **rolled back** to a build without this variant,
+on a state root that holds such a job, refuses to read that job's record and
+says which word it did not know. The records of jobs that ended any other
+way are untouched, and this hub reads everything an older hub wrote.
+
+An older `herdctl` following such a job ends its run with no verdict for it,
+which is D124's deliberate behaviour for a frame it cannot read.
+
+**What to do about it:** nothing, if the rollback window matters more than
+the ending, in which case the figure to set is
+`--ceiling-refusals-allowed` high enough that no job reaches the bound
+during it. Otherwise it is a documented one-way step, like every other new
+ending this enum has taken.
 
 ---
 
@@ -765,9 +791,14 @@ else: no job dead, no job without a verdict.
 | the real 60 s (`--lost-after 60s`, 65 s outage) | **2 of 2 `lost`** | 2 of 2 exited 0 (140 s) |
 
 The suite keeps the short one and drives the same watchdog through
-`--lost-after`, which `herd-hub/src/main.rs` already exposes; the 60 s shape
-was run by hand and its output is in the pull request. A test that was never
-red proves nothing, so both reds were taken on the branch as it stood.
+`--lost-after`, which `herd-hub/src/main.rs` already exposes. **The 60 s
+shape is in the suite too, behind `#[ignore]`** —
+`a_link_cut_while_the_runner_is_full_loses_no_job_at_the_deployed_sixty_seconds`,
+found by `cargo test -- --ignored`, about 150 s of wall clock and nearly all
+of it waiting. Both tests are one body with one oracle and differ only in
+their figures, which is the point: the oracle does not depend on the clock.
+A test that was never red proves nothing, so both reds were taken on the
+branch as it stood.
 
 ### 8.3 The change — F
 
@@ -777,14 +808,23 @@ red proves nothing, so both reds were taken on the branch as it stood.
    why it refused. `None` on every other abandonment, and `None` is what an
    older runner's frame decodes to — which is what every abandonment meant
    before the field existed.
-2. **`at_its_ceiling: bool` on the attempt record**, left off the record
-   entirely when false. `JobRecord::goes_a_runner_took` filters on it beside
-   D76's `requeue_code`, so a ceiling refusal spends none of E-21's goes.
+2. **`at_its_ceiling: Option<u32>` on the attempt record**, left off the
+   record entirely when absent. `JobRecord::goes_a_runner_took` filters on it
+   beside D76's `requeue_code`, so a ceiling refusal spends none of E-21's
+   goes. The figure it keeps is the machine's own count, because that is what
+   the ending in 3 reports to a program.
 3. **A budget of its own**: `CEILING_REFUSALS_ALLOWED` = 8, a `Policy`
-   figure. A job handed back an eighth time ends `Lost` with a sentence
-   naming the budget, both figures, that none of E-21's goes were spent, and
-   every machine that said it was full. `a_job_refused_past_the_bound_ends_and_names_it`
-   drives it at a budget of one.
+   figure. A job handed back an eighth time ends — and **it does not end
+   `lost`**. Alexa, 2026-10-25: *"que devient un job au 9e refus ? Verdict
+   lisible machine exigé, pas lost."* It ends
+   `JobOutcome::RefusedAsFull`, a new variant carrying `refusals`,
+   `refusals_allowed` and `runners` — every machine that said it was full,
+   each named once, with the count it gave — beside the sentence a person
+   reads. `herdctl`'s verdict document reports
+   `"cause": "refused_as_full"`, `"exit_code": 125`,
+   `"exit_code_from": "herd"`.
+   `a_job_refused_past_the_bound_ends_and_names_it` drives it at a budget of
+   one and asserts every field, and that **no** job ended `lost`.
 4. **The hub remembers the machine's own count** until that runner's next
    health report, and `admission` holds the ceiling against the larger of
    that and `seat.reserved.jobs`. Without this the surplus would be offered
@@ -808,6 +848,18 @@ field, reads it with a struct that does not have it, writes that back and
 reads it again — a rollback is one of those directions and an upgrade is the
 other. **No `JobEventKind` variant was added.**
 
+**One thing is one-way, and it is RN-3 below.** A new `JobOutcome` variant
+is additive by the type's own rule and the precedent is two days old — D166
+added `SetupFailed` with neither number moving — but neither `JobOutcome`
+nor `JobState` carries `#[serde(other)]`, by design: a state this Herd does
+not know is *a read error naming it* rather than a job quietly misread. So a
+hub older than this one **will refuse to read a record that ends
+`refused_as_full`**, and an older `herdctl` following such a job ends its
+run with no verdict (D124). This hub reads everything an older one wrote;
+the other direction is the cost, and
+`round_trip::a_job_refused_as_full_travels_with_its_figures_and_is_unreadable_to_an_older_peer`
+asserts both halves of it.
+
 ### 8.4 What is left — H
 
 **The hub still dispatches to a runner before reading one frame from it.**
@@ -820,6 +872,11 @@ place on a runner whose reconciliation has not arrived.*
 `watch_for_a_lost_runner` takes one snapshot of every open attempt's age and
 then walks it, and the walk requeues, which dispatches, which can give a job
 further down the list a brand-new attempt — judged against the old figure.
-Fixed here by reading the age again inside the loop, after the record; it is
+**Fixed in its own PR, underneath this one** (Alexa, 2026-10-25, part 2 of
+three), by reading the age again inside the loop, after the record. It is
 the one tick that follows a link coming back, which is where a fleet has
-least to spare.
+least to spare. The runner's job map (part 1) is likewise its own PR, so
+item 5 above reads the map keyed by job **and** attempt, and its reason is
+now the one that survives that key: a workspace belongs to a job, so a
+second attempt here would clear the working directory out from under the
+first one's process.

@@ -3244,6 +3244,9 @@ fn how_it_ended(outcome: &JobOutcome) -> String {
         JobOutcome::SetupFailed { reason } => {
             format!("ran on a machine that could not do its part: {reason}")
         }
+        JobOutcome::RefusedAsFull { reason, .. } => {
+            format!("was handed back by every machine it was offered to: {reason}")
+        }
     }
 }
 
@@ -4084,7 +4087,7 @@ async fn relay_from_runner(
                 let how = match at_its_ceiling {
                     Some(holding) => {
                         state.the_runner_says_it_is_holding(name, holding);
-                        HowItEnded::TheRunnerWasAtItsCeiling
+                        HowItEnded::TheRunnerWasAtItsCeiling { holding }
                     }
                     None => HowItEnded::TheRunnerWentAway,
                 };
@@ -5449,7 +5452,7 @@ fn give_the_job_another_go(
     // there, nothing of it was lost, and E-21's goes are untouched. It has a
     // budget of its own, bounded, because an exemption with no bound is a
     // job that can be refused for ever and told nobody.
-    let at_its_ceiling = matches!(how, HowItEnded::TheRunnerWasAtItsCeiling);
+    let at_its_ceiling = matches!(how, HowItEnded::TheRunnerWasAtItsCeiling { .. });
     let (spent, allowed) = if at_its_ceiling {
         (ceilings_hit + 1, state.policy.ceiling_refusals_allowed)
     } else {
@@ -5521,45 +5524,66 @@ fn give_the_job_another_go(
     // Out of goes. An end, and a named one: not an exit code, because no
     // process gave one (D15).
     //
-    // The sentence says *which* budget ran out, because the two mean
-    // opposite things to whoever reads it. "A runner went away twice" is a
-    // fleet that lost a machine under a job. "Eight machines said they were
-    // full" is a fleet whose hub and whose runners do not agree about a
-    // count they can both see — nothing failed, and the thing to look at is
-    // the disagreement and the machines named in it (D-NEXT).
-    let outcome = JobOutcome::Lost {
-        reason: if at_its_ceiling {
-            // The record in hand was read before this attempt was ended, so
-            // it does not yet carry this refusal: the machine refusing right
-            // now is added to the ones that refused before it.
-            let mut full = record.runners_that_were_full();
-            if let Some(refusing) = record.attempt().map(|attempt| attempt.runner.clone()) {
-                if !full.contains(&refusing) {
-                    full.push(refusing);
-                }
+    // **And a different ending for each budget, not one ending with two
+    // sentences** (D-NEXT). "A runner went away twice" is a fleet that lost
+    // a machine under a job: that is `lost`, which is what E-21 named it.
+    // "Eight machines said they were full" is a fleet whose hub and whose
+    // runners do not agree about a count they can both see — nothing
+    // failed, no machine went anywhere, and the thing to act on is the
+    // disagreement or the capacity. Reporting the second as `lost` sent a
+    // reader looking for a dead host; it is
+    // `JobOutcome::RefusedAsFull`, which carries the figures in fields so
+    // that nothing has to be read out of the sentence.
+    let outcome = if at_its_ceiling {
+        // The record in hand was read before this attempt was ended, so it
+        // does not yet carry this refusal: the machine refusing right now is
+        // added to the ones that refused before it.
+        let mut full = record.runners_that_were_full();
+        if let Some(refusing) = record.attempt().map(|attempt| attempt.runner.clone()) {
+            if !full.iter().any(|was| was.name == refusing) {
+                full.push(herd_proto::RunnerThatWasFull {
+                    name: refusing,
+                    holding: match how {
+                        HowItEnded::TheRunnerWasAtItsCeiling { holding } => Some(holding),
+                        _ => None,
+                    },
+                });
             }
-            format!(
+        }
+        let named = if full.is_empty() {
+            "that machine".to_owned()
+        } else {
+            full.iter()
+                .map(|was| match was.holding {
+                    Some(holding) => format!("{} (holding {holding})", was.name),
+                    None => was.name.clone(),
+                })
+                .collect::<Vec<_>>()
+                .join(", ")
+        };
+        JobOutcome::RefusedAsFull {
+            reason: format!(
                 "{reason}; this job has been handed straight back {spent} time(s) of the \
                  {allowed} allowed by machines that were already as full as the ceiling they \
                  announced, so it is not offered again (D-NEXT). None of those refusals spent \
                  one of its {} goes at a runner that went away (E-21): nothing failed and no \
-                 machine went anywhere, the hub's count of what is out on {} and theirs simply \
-                 never agreed",
+                 machine went anywhere, the hub's count of what is out on {named} and theirs \
+                 simply never agreed. Add capacity, or look at why the two counts disagree",
                 state.policy.attempts_allowed,
-                if full.is_empty() {
-                    "that machine".to_owned()
-                } else {
-                    full.join(", ")
-                }
-            )
-        } else {
-            format!(
+            ),
+            refusals: spent,
+            refusals_allowed: allowed,
+            runners: full,
+        }
+    } else {
+        JobOutcome::Lost {
+            reason: format!(
                 "{reason}; this was attempt {spent} of {allowed} at a runner that went away, \
                  so the job is not attempted again (E-21). A go spent on a capability that had \
                  gone under it would not have counted towards these (D76), nor would one spent \
                  on a machine that was already full (D-NEXT)"
-            )
-        },
+            ),
+        }
     };
     state
         .store
@@ -5569,8 +5593,15 @@ fn give_the_job_another_go(
                 outcome: outcome.clone(),
             },
         )
-        .with_context(|| format!("recording {job_id} as lost"))?;
-    eprintln!("herd-hub: {job_id} is lost: {reason}");
+        .with_context(|| format!("recording the end of {job_id}"))?;
+    if at_its_ceiling {
+        eprintln!(
+            "herd-hub: {job_id} was refused as full {spent} time(s) of {allowed} and is not \
+             offered again: {reason}"
+        );
+    } else {
+        eprintln!("herd-hub: {job_id} is lost: {reason}");
+    }
     let kept = read_the_outputs(state, job_id);
     let commit = the_commit_it_ran(state, job_id);
     for follower in state.stop_following(job_id) {

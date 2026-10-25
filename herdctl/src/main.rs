@@ -708,6 +708,7 @@ async fn main() -> ExitCode {
                 // carry no verdict.
                 | JobOutcome::Cancelled { .. }
                 | JobOutcome::Impossible { .. }
+                | JobOutcome::RefusedAsFull { .. }
                 | JobOutcome::Lost { .. } => {}
             }
             // An exit code outside 0..=255 is one no process can have worn,

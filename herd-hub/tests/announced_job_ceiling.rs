@@ -826,6 +826,7 @@ fn pump(from: std::sync::Arc<std::net::TcpStream>, to: std::sync::Arc<std::net::
 async fn a_capped_runner_behind_a_cuttable_link(
     label: &'static str,
     policy: herd_hub::Policy,
+    health_every: Duration,
 ) -> (
     Harness,
     ALinkTheTestCanCut,
@@ -845,7 +846,7 @@ async fn a_capped_runner_behind_a_cuttable_link(
         token: Some(harness.approve("capped-runner")),
         confinement,
         host: herd_proto::HostSize::new(Some(LENT_MIB), Some(4)).with_floor(Some(FLOOR_MIB)),
-        health_every: HEALTH_EVERY_HERE,
+        health_every,
         // So that the redial after the outage is prompt. The shape under test
         // is what the hub does with a runner that has just come back, not how
         // long a runner waits before coming back.
@@ -878,9 +879,79 @@ fn a_watchdog_a_test_can_outlast() -> herd_hub::Policy {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn a_link_cut_while_the_runner_is_full_loses_no_job() {
-    let (harness, link, _data_root, running) = a_capped_runner_behind_a_cuttable_link(
+    no_job_is_lost_to_an_outage(
         "link-cut-at-the-ceiling",
-        a_watchdog_a_test_can_outlast(),
+        AnOutage {
+            lost_after: LOST_AFTER_HERE,
+            health_every: HEALTH_EVERY_HERE,
+            how_long: THE_OUTAGE,
+            job_sleep: SLEEP_ACROSS_THE_OUTAGE,
+            patience: PATIENCE_ACROSS_AN_OUTAGE,
+        },
+    )
+    .await;
+}
+
+/// **The same mechanism at the figures a deployed hub really runs**, which is
+/// Alexa's condition of merge in its own words: a 60 s silence threshold and
+/// an outage longer than it.
+///
+/// `#[ignore]`, and found by `cargo test -- --ignored`. **What it costs:**
+/// about **two and a half minutes of wall clock**, nearly all of it waiting
+/// — a 65 s outage, a 60 s watchdog threshold, and jobs that have to still
+/// be running when the link comes back, so they sleep 90 s. It is not in the
+/// default suite because a suite with a two-minute sleep in it is a suite
+/// nobody runs, and because it proves nothing the test above does not: both
+/// drive the same watchdog, the same refusal and the same oracle, and the
+/// only difference is `--lost-after` (`herd_hub::LOST_AFTER`, a setting since
+/// the hub had one). What it does buy is the figures themselves, which is why
+/// it stays in the file rather than in a pull request body.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "about 150 s of wall clock: the deployed 60 s threshold, a 65 s outage and 90 s jobs"]
+async fn a_link_cut_while_the_runner_is_full_loses_no_job_at_the_deployed_sixty_seconds() {
+    no_job_is_lost_to_an_outage(
+        "link-cut-at-the-ceiling-for-real",
+        AnOutage {
+            // The deployed figure, read off the hub rather than retyped.
+            lost_after: herd_hub::LOST_AFTER,
+            health_every: herd_proto::HEALTH_EVERY,
+            how_long: herd_hub::LOST_AFTER + Duration::from_secs(5),
+            job_sleep: 90,
+            patience: Duration::from_secs(300),
+        },
+    )
+    .await;
+}
+
+/// What a run of the test below is: how long the link is down, how long the
+/// hub waits before it gives up on an attempt, and how long the jobs run.
+///
+/// A struct rather than five arguments, because every one of them is a
+/// duration and a caller that swapped two would get a test that passed for
+/// the wrong reason.
+struct AnOutage {
+    lost_after: Duration,
+    health_every: Duration,
+    how_long: Duration,
+    job_sleep: u64,
+    patience: Duration,
+}
+
+/// **Alexa's condition of merge**: a runner at its ceiling loses its link,
+/// keeps running its jobs, and no job dies and none ends without a verdict.
+///
+/// The body of both tests above. The oracle is hers and nothing else, and it
+/// does not depend on the clock — which is the reason one set of figures can
+/// live in the suite and the other behind `#[ignore]`.
+async fn no_job_is_lost_to_an_outage(label: &'static str, outage: AnOutage) {
+    let (harness, link, _data_root, running) = a_capped_runner_behind_a_cuttable_link(
+        label,
+        herd_hub::Policy {
+            lost_after: outage.lost_after,
+            health_every: outage.health_every,
+            ..herd_hub::Policy::default()
+        },
+        outage.health_every,
     )
     .await;
 
@@ -895,7 +966,8 @@ async fn a_link_cut_while_the_runner_is_full_loses_no_job() {
             support::submit_job(
                 &requester,
                 support::shell(&format!(
-                    "echo across the outage {n}; sleep {SLEEP_ACROSS_THE_OUTAGE}"
+                    "echo across the outage {n}; sleep {}",
+                    outage.job_sleep
                 )),
             )
             .await
@@ -929,9 +1001,12 @@ async fn a_link_cut_while_the_runner_is_full_loses_no_job() {
     }
 
     // ---- The outage.
-    println!("cutting the link for {THE_OUTAGE:?}, with the runner at its ceiling of {CEILING}");
+    println!(
+        "cutting the link for {:?}, with the runner at its ceiling of {CEILING}",
+        outage.how_long
+    );
     link.cut();
-    tokio::time::sleep(THE_OUTAGE).await;
+    tokio::time::sleep(outage.how_long).await;
     // The hub must really have given up on them, or this test cut a link and
     // measured nothing: the whole sequence begins with the watchdog.
     let written_off = submitted
@@ -940,15 +1015,16 @@ async fn a_link_cut_while_the_runner_is_full_loses_no_job() {
         .count();
     assert_eq!(
         written_off, CEILING,
-        "after {THE_OUTAGE:?} with no link and a silence threshold of {LOST_AFTER_HERE:?}, the \
-         hub's watchdog has to have written off every attempt out on that machine; {written_off} \
-         of {CEILING} were. Without that this test never reaches the defect it is named for"
+        "after {:?} with no link and a silence threshold of {:?}, the hub's watchdog has to \
+         have written off every attempt out on that machine; {written_off} of {CEILING} were. \
+         Without that this test never reaches the defect it is named for",
+        outage.how_long, outage.lost_after
     );
     link.restore();
     println!("the link is back; the runner is still running its {CEILING} original job(s)");
 
     // ---- Alexa's oracle, and nothing else.
-    let deadline = Instant::now() + PATIENCE_ACROSS_AN_OUTAGE;
+    let deadline = Instant::now() + outage.patience;
     loop {
         let unfinished = submitted
             .iter()
@@ -959,8 +1035,8 @@ async fn a_link_cut_while_the_runner_is_full_loses_no_job() {
         }
         assert!(
             Instant::now() < deadline,
-            "{unfinished} of {CEILING} jobs never ended at all inside \
-             {PATIENCE_ACROSS_AN_OUTAGE:?}"
+            "{unfinished} of {CEILING} jobs never ended at all inside {:?}",
+            outage.patience
         );
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
@@ -1012,6 +1088,7 @@ async fn a_job_refused_past_the_bound_ends_and_names_it() {
             ceiling_refusals_allowed: 1,
             ..a_watchdog_a_test_can_outlast()
         },
+        HEALTH_EVERY_HERE,
     )
     .await;
     let requester = harness.requester();
@@ -1061,31 +1138,50 @@ async fn a_job_refused_past_the_bound_ends_and_names_it() {
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
 
-    // At least one of them met the bound, and what it was told is the point:
-    // not "a runner went away", which would be false and would send an
-    // operator looking at a machine that never failed, but the budget, the
-    // figure, and the machine whose count never agreed with the hub's.
-    let ended_at_the_bound: Vec<String> = submitted
+    // At least one of them met the bound, and **what it is recorded as** is
+    // the point. Alexa, 2026-10-25: *"que devient un job au 9e refus ?
+    // Verdict lisible machine exigé, pas lost."* So: not `lost`, which would
+    // be false and would send an operator looking at a machine that never
+    // failed; an ending of its own, carrying the figures in **fields** so
+    // that nothing has to be read out of the sentence (D166's rule, one
+    // ending further on).
+    let ends: Vec<serde_json::Value> = submitted
         .iter()
-        .map(|id| record_of(&state_dir, id))
-        .filter(|record| record["state"]["outcome"]["type"] == "lost")
-        .filter_map(|record| {
-            record["state"]["outcome"]["reason"]
-                .as_str()
-                .map(str::to_owned)
-        })
-        .filter(|reason| reason.contains("as full as the ceiling they announced"))
+        .map(|id| record_of(&state_dir, id)["state"]["outcome"].clone())
+        .collect();
+    let refused: Vec<&serde_json::Value> = ends
+        .iter()
+        .filter(|outcome| outcome["type"] == "refused_as_full")
         .collect();
     assert!(
-        !ended_at_the_bound.is_empty(),
+        !refused.is_empty(),
         "with a budget of one and an outage that produces a refusal, a job has to reach the \
-         bound; what the {CEILING} jobs ended as: {:?}",
-        submitted
-            .iter()
-            .map(|id| record_of(&state_dir, id)["state"]["outcome"].clone())
-            .collect::<Vec<_>>()
+         bound; what the {CEILING} jobs ended as: {ends:?}"
     );
-    let said = ended_at_the_bound.first().expect("at least one");
+    assert!(
+        !ends.iter().any(|outcome| outcome["type"] == "lost"),
+        "a job refused at a machine's own ceiling must not end `lost`: no machine went \
+         anywhere and nothing failed. {ends:?}"
+    );
+    let end = refused.first().expect("at least one");
+    assert_eq!(
+        end["refusals"], 1,
+        "how many refusals, as a number a program reads: {end}"
+    );
+    assert_eq!(
+        end["refusals_allowed"], 1,
+        "and the bound it ran into, beside it: {end}"
+    );
+    assert_eq!(
+        end["runners"][0]["name"], "capped-runner",
+        "and every machine that said it was full, by name: {end}"
+    );
+    assert_eq!(
+        end["runners"][0]["holding"], CEILING,
+        "with the figure that machine itself gave — the count it was holding, which is the \
+         ceiling it announced, that being why it refused: {end}"
+    );
+    let said = end["reason"].as_str().expect("a sentence for a person");
     assert!(
         said.contains("1 time(s) of the 1 allowed"),
         "the sentence has to carry both figures, or it is a job told it is over and not why: \
@@ -1099,7 +1195,7 @@ async fn a_job_refused_past_the_bound_ends_and_names_it() {
         said.contains("None of those refusals spent"),
         "and say that the goes it still had were not what ran out: {said}"
     );
-    println!("what a job that reaches the bound is told:\n  {said}");
+    println!("what a job that reaches the bound is recorded as:\n  {end:#}");
 
     running.abort();
     let _ = running.await;

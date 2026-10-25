@@ -11,7 +11,7 @@ use std::fmt;
 
 use herd_proto::{
     CommitRun, Declaration, JobId, JobOutcome, LabelSet, LabelsFrom, LogStream, Occupant, Priority,
-    Requirements, StepRun,
+    Requirements, RunnerThatWasFull, StepRun,
 };
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
@@ -221,17 +221,11 @@ pub enum HowItEnded {
     /// holding as many jobs as it told the hub it would hold (D-NEXT).
     /// Spends that budget and no other: the machine is here and the job is
     /// untouched.
-    TheRunnerWasAtItsCeiling,
-}
-
-/// A flag that is left off the record entirely when it is not set.
-///
-/// `skip_serializing_if` wants a predicate on a reference, and a `bool` field
-/// that is false in every record but a handful should not widen every record
-/// in a state root. Paired with `#[serde(default)]`, so absent and `false`
-/// are the same fact and the record version stays where it is.
-fn not_set(flag: &bool) -> bool {
-    !*flag
+    TheRunnerWasAtItsCeiling {
+        /// What the machine said it was already holding, which is the
+        /// ceiling it announced.
+        holding: u32,
+    },
 }
 
 /// One go at running a job on one runner.
@@ -292,13 +286,22 @@ pub struct Attempt {
     /// [`crate::CEILING_REFUSALS_ALLOWED`] — because an exemption with no
     /// bound is a job that can be refused for ever and told nobody.
     ///
-    /// `false` on every other ending, which is what its absence means: the
+    /// **The figure is the machine's own count** of what it was already
+    /// holding when it refused — which is the ceiling it announced, that
+    /// being why it refused. Kept rather than a bare flag because it is what
+    /// `JobOutcome::RefusedAsFull` reports to a program: *"the machine
+    /// configured for one job at a time refused this four times"* is
+    /// something to act on and *"four machines were full"* is not.
+    ///
+    /// `None` on every other ending, which is what its absence means: the
     /// field is `#[serde(default)]` and is left off the record entirely when
-    /// it is false, so `RECORD_VERSION` stays 1 and a hub without it reads
+    /// it is absent, so `RECORD_VERSION` stays 1 and a hub without it reads
     /// every record a hub with it wrote (see the rule above this struct's
-    /// `RECORD_VERSION`).
-    #[serde(default, skip_serializing_if = "not_set")]
-    pub at_its_ceiling: bool,
+    /// `RECORD_VERSION`). Never read as zero: a machine holding nothing
+    /// would have taken the job.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub at_its_ceiling: Option<u32>,
+
     /// Why this attempt ended without a verdict, when that is what happened.
     /// `None` on the attempt that produced one: the job's outcome is the
     /// answer, so there is nothing to excuse (see [`Attempt::ended_at`] for
@@ -1418,7 +1421,7 @@ impl JobRecord {
             .filter(|attempt| {
                 attempt.ended_at.is_some()
                     && attempt.requeue_code.is_none()
-                    && !attempt.at_its_ceiling
+                    && attempt.at_its_ceiling.is_none()
             })
             .count() as u32
     }
@@ -1433,7 +1436,7 @@ impl JobRecord {
     pub fn goes_a_ceiling_refused(&self) -> u32 {
         self.attempts
             .iter()
-            .filter(|attempt| attempt.at_its_ceiling)
+            .filter(|attempt| attempt.at_its_ceiling.is_some())
             .count() as u32
     }
 
@@ -1443,12 +1446,19 @@ impl JobRecord {
     /// For the one sentence an operator reads about a job that ran out of
     /// this budget: *which* machines kept saying they were full is the whole
     /// of what there is to act on.
-    pub fn runners_that_were_full(&self) -> Vec<String> {
-        let mut named: Vec<String> = Vec::new();
+    pub fn runners_that_were_full(&self) -> Vec<RunnerThatWasFull> {
+        let mut named: Vec<RunnerThatWasFull> = Vec::new();
         for attempt in &self.attempts {
-            if attempt.at_its_ceiling && !named.contains(&attempt.runner) {
-                named.push(attempt.runner.clone());
+            let Some(holding) = attempt.at_its_ceiling else {
+                continue;
+            };
+            if named.iter().any(|full| full.name == attempt.runner) {
+                continue;
             }
+            named.push(RunnerThatWasFull {
+                name: attempt.runner.clone(),
+                holding: Some(holding),
+            });
         }
         named
     }
@@ -2451,7 +2461,7 @@ mod a_ceiling_refusal_on_the_record {
             started_at: at,
             ended_at: Some(at),
             requeue_code: None,
-            at_its_ceiling: false,
+            at_its_ceiling: None,
             ended: how.map(str::to_owned),
             why: "claimed by somebody".to_owned(),
             steps: Vec::new(),
@@ -2476,11 +2486,11 @@ mod a_ceiling_refusal_on_the_record {
     #[test]
     fn a_record_crosses_the_field_in_both_directions() {
         let mut full = ended(1, "capped-runner", Some("the runner was full"));
-        full.at_its_ceiling = true;
+        full.at_its_ceiling = Some(2);
         let written = serde_json::to_string(&full).expect("an attempt writes");
         assert!(
-            written.contains("\"at_its_ceiling\":true"),
-            "the flag is on the record when it is set: {written}"
+            written.contains("\"at_its_ceiling\":2"),
+            "the machine's own count is on the record when it refused: {written}"
         );
 
         // Forwards: a hub without the field reads what a hub with it wrote,
@@ -2502,8 +2512,8 @@ mod a_ceiling_refusal_on_the_record {
         );
         let read_back: Attempt =
             serde_json::from_str(&written_before).expect("this hub reads an older attempt");
-        assert!(
-            !read_back.at_its_ceiling,
+        assert_eq!(
+            read_back.at_its_ceiling, None,
             "an attempt written before this field existed is not a ceiling refusal"
         );
 
@@ -2524,9 +2534,9 @@ mod a_ceiling_refusal_on_the_record {
         let mut record =
             JobRecord::hypothetical(NewJob::new(vec!["true".to_owned()]), Timestamp::now());
         let mut refused = ended(1, "capped-runner", Some("the runner was full"));
-        refused.at_its_ceiling = true;
+        refused.at_its_ceiling = Some(2);
         let mut again = ended(2, "capped-runner", Some("the runner was full"));
-        again.at_its_ceiling = true;
+        again.at_its_ceiling = Some(2);
         let mut requeued = ended(3, "metal-pc", Some("it exited 75"));
         requeued.requeue_code = Some(75);
         let went_away = ended(4, "wsl-pc", Some("the runner stopped answering"));
@@ -2543,6 +2553,13 @@ mod a_ceiling_refusal_on_the_record {
             2,
             "and both refusals at a machine's own ceiling, on their own budget"
         );
-        assert_eq!(record.runners_that_were_full(), vec!["capped-runner"]);
+        assert_eq!(
+            record.runners_that_were_full(),
+            vec![RunnerThatWasFull {
+                name: "capped-runner".to_owned(),
+                holding: Some(2),
+            }],
+            "named once, with the figure the machine itself gave"
+        );
     }
 }

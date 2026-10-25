@@ -2090,7 +2090,7 @@ impl JobStore for JobDirStore {
             started_at: at,
             ended_at: None,
             requeue_code: None,
-            at_its_ceiling: false,
+            at_its_ceiling: None,
             ended: None,
             why: why.to_owned(),
             steps: Vec::new(),
@@ -2178,9 +2178,12 @@ impl JobStore for JobDirStore {
         // them.
         entry.requeue_code = match how {
             HowItEnded::TheJobAnsweredItsRequeueCode(code) => Some(code),
-            HowItEnded::TheRunnerWentAway | HowItEnded::TheRunnerWasAtItsCeiling => None,
+            HowItEnded::TheRunnerWentAway | HowItEnded::TheRunnerWasAtItsCeiling { .. } => None,
         };
-        entry.at_its_ceiling = matches!(how, HowItEnded::TheRunnerWasAtItsCeiling);
+        entry.at_its_ceiling = match how {
+            HowItEnded::TheRunnerWasAtItsCeiling { holding } => Some(holding),
+            HowItEnded::TheRunnerWentAway | HowItEnded::TheJobAnsweredItsRequeueCode(_) => None,
+        };
         record.updated_at = at;
         self.write_record(&record)?;
         self.append_event(id, &JobEvent::attempt_ended(at, attempt, reason))
