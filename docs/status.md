@@ -44,12 +44,12 @@ scope, **2** because the data root is on ZFS and no hard `io.max` can be
 carried — both in `herd-runner/src/confine.rs`. Measured here 2026-10-25;
 D151's 13 is **not reproducible** (`05-experiments-review.md` §6).
 
-**Three defects are fixed** (2026-10-25): **D175**, an inline file whose
-bytes did not hash to the digest beside it exited 0 saying nothing was
-missing; **D176**, a verdict could name a commit the tree was never at;
-**D177**, a runner's live-job map keyed by job id alone let a second
-attempt replace the first. No version moves. D177 makes the books honest,
-not two attempts of one job safe: a workspace is still per job.
+**Four defects are fixed** (2026-10-25). **D175**: an inline file whose
+bytes did not hash to its digest exited 0. **D176**: a verdict could name
+a commit the tree was never at. **D177**: a runner's live-job map keyed by
+job id alone let a second attempt replace the first — honest books, but a
+workspace is still per job. **D178**: the watchdog judged an attempt it
+had just placed on the silence of the one before it. No version moves.
 
 `docs/remediation/` holds ten pieces: the baseline, audits A and B, the
 contradictory review, the two experiments and their adversarial review,
