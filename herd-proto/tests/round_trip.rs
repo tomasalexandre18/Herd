@@ -47,6 +47,7 @@ fn every_step() -> Vec<StepRun> {
             duration_ms: 95_400,
             exit_code: Some(0),
             ended: None,
+            ran_commit: None,
         },
         StepRun {
             step: Step::Fetch,
@@ -54,6 +55,7 @@ fn every_step() -> Vec<StepRun> {
             duration_ms: 1_200,
             exit_code: Some(0),
             ended: None,
+            ran_commit: None,
         },
         StepRun {
             step: Step::Run,
@@ -61,6 +63,7 @@ fn every_step() -> Vec<StepRun> {
             duration_ms: 2_700_000,
             exit_code: None,
             ended: Some("stopped at the time cap, 2700 s".to_owned()),
+            ran_commit: None,
         },
         StepRun {
             step: Step::Down,
@@ -68,6 +71,7 @@ fn every_step() -> Vec<StepRun> {
             duration_ms: 400,
             exit_code: Some(1),
             ended: None,
+            ran_commit: None,
         },
     ]
 }
@@ -502,6 +506,7 @@ fn every_message_from_the_hub_round_trips() {
                 outcome: outcome.clone(),
                 metrics,
                 outputs: herd_proto::JobOutputs::default(),
+                commit: None,
             });
         }
         // The requester's half of D131: whatever the record holds reaches the
@@ -512,6 +517,7 @@ fn every_message_from_the_hub_round_trips() {
                 outcome: outcome.clone(),
                 metrics: JobMetrics::default(),
                 outputs,
+                commit: None,
             });
         }
     }
@@ -1358,12 +1364,74 @@ fn a_verdict_from_a_build_that_predates_a_job_s_outputs_still_decodes() {
         outcome: JobOutcome::Exited { code: 0 },
         metrics: JobMetrics::default(),
         outputs: herd_proto::JobOutputs::default(),
+        commit: None,
     })
     .expect("encodes");
     assert!(
         !today.contains("outputs"),
         "a job that kept nothing must put nothing on the wire: {today}"
     );
+    // The same of `commit`, added later and for the same reasons (D176):
+    // a hub with nothing to say about a job's revision sends an older
+    // requester the bytes it has always sent.
+    assert!(
+        !today.contains("commit"),
+        "a job with no revision to report must put nothing on the wire: {today}"
+    );
+}
+
+/// A revision really does cross the wire, both ways, on both frames that
+/// carry one (D176).
+///
+/// The one property worth a test of its own: a divergence is only an oracle
+/// if the two strings survive encoding, and a field that silently dropped
+/// them would still make every other test here pass.
+#[test]
+fn a_reported_revision_crosses_the_wire_on_the_step_and_on_the_verdict() {
+    let step = StepRun {
+        step: Step::Fetch,
+        started_unix_ms: 1_791_878_248_400,
+        duration_ms: 1_200,
+        exit_code: Some(0),
+        ended: None,
+        ran_commit: Some("9f41".repeat(10)),
+    };
+    round_trip_to_hub(ToHub::StepFinished {
+        job_id: JobId::new("j1"),
+        attempt: 1,
+        step: step.clone(),
+    });
+    round_trip_to_hub(ToHub::JobFinished {
+        job_id: JobId::new("j1"),
+        attempt: 1,
+        outcome: JobOutcome::Exited { code: 0 },
+        chunks_sent: 1,
+        metrics: JobMetrics::default(),
+        steps: vec![step],
+        outputs: herd_proto::JobOutputs::default(),
+    });
+    round_trip_from_hub(FromHub::JobFinished {
+        job_id: JobId::new("j1"),
+        outcome: JobOutcome::Exited { code: 0 },
+        metrics: JobMetrics::default(),
+        outputs: herd_proto::JobOutputs::default(),
+        commit: Some(herd_proto::CommitRun {
+            declared: "cb5a".repeat(10),
+            ran: Some("9f41".repeat(10)),
+        }),
+    });
+    // And silence, which has to survive as silence rather than as a string
+    // nobody said.
+    round_trip_from_hub(FromHub::JobFinished {
+        job_id: JobId::new("j1"),
+        outcome: JobOutcome::Exited { code: 0 },
+        metrics: JobMetrics::default(),
+        outputs: herd_proto::JobOutputs::default(),
+        commit: Some(herd_proto::CommitRun {
+            declared: "cb5a".repeat(10),
+            ran: None,
+        }),
+    });
 }
 
 /// **The direction an absent `wants_files` has to default in** (D167).

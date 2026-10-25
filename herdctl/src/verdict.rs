@@ -91,6 +91,28 @@ pub struct Verdict {
     /// person would have read. It is prose: **nothing is meant to match on
     /// it**, which is what the fields above are for.
     pub said: Vec<String>,
+    /// The commit this job was submitted for, forty hex, or `null` for a job
+    /// that declared none (D176).
+    pub declared_commit: Option<String>,
+    /// The revision the machine says it really ran, or `null` for **"nobody
+    /// said"**.
+    ///
+    /// `null` is not agreement and must not be read as any. It is what a
+    /// consumer whose `fetch` hook does not write `{ran}` gets, what a job
+    /// that never reached a machine gets, and what a hub predating the field
+    /// gets. [`Verdict::commit_diverged`] is the field to branch on.
+    pub ran_commit: Option<String>,
+    /// Whether the two above contradict each other: `true` for a verdict
+    /// attributed to a commit the tree was **not** at, `false` for two
+    /// strings that agree, `null` for a question nobody can answer because
+    /// one of the two is missing.
+    ///
+    /// **`true` does not make the job a failure.** The exit code is the
+    /// job's and a side channel does not become one (D20): what the three
+    /// fields give a wrapper is the first thing on a Herd verdict that can
+    /// contradict its own commit, and what to do about that is the
+    /// wrapper's to decide until Herd is told otherwise.
+    pub commit_diverged: Option<bool>,
     /// The outcome exactly as the protocol carries it, tag and all, for a
     /// reader that wants the whole thing rather than the summary above.
     /// `null` when Herd never got one.
@@ -179,6 +201,22 @@ impl Verdict {
             ran_on: finished.ran_on.clone(),
             cap: CapReport::of(&finished.outcome),
             said,
+            declared_commit: finished
+                .commit
+                .as_ref()
+                .map(|commit| commit.declared.clone()),
+            ran_commit: finished
+                .commit
+                .as_ref()
+                .and_then(|commit| commit.ran.clone()),
+            // Three states in one field, and the third is the honest one:
+            // a comparison nobody can make is `null`, never `false` (D23's
+            // rule, applied to a boolean).
+            commit_diverged: finished
+                .commit
+                .as_ref()
+                .filter(|commit| commit.ran.is_some())
+                .map(herd_proto::CommitRun::diverged),
             outcome: Some(finished.outcome.clone()),
             metrics: Some(finished.metrics.clone()),
         }
@@ -223,6 +261,10 @@ impl Verdict {
             ran_on: None,
             cap: None,
             said: vec![said],
+            // A run that got no outcome learned nothing about any tree.
+            declared_commit: None,
+            ran_commit: None,
+            commit_diverged: None,
             outcome: None,
             metrics: None,
         }
@@ -290,6 +332,83 @@ mod tests {
                 runner: "server".to_owned(),
                 why: "the only runner offering kvm".to_owned(),
             }),
+            commit: None,
+        }
+    }
+
+    /// A job whose declared commit and reported revision are both known.
+    fn finished_at(declared: &str, ran: Option<&str>) -> Finished {
+        Finished {
+            commit: Some(herd_proto::CommitRun {
+                declared: declared.to_owned(),
+                ran: ran.map(str::to_owned),
+            }),
+            ..finished(JobOutcome::Exited { code: 0 })
+        }
+    }
+
+    /// The three states of the commit question, as a program reads them
+    /// (D176).
+    ///
+    /// The one that matters is the middle: a job that **passed** and whose
+    /// tree was at another revision is `passed: true` and
+    /// `commit_diverged: true` at once, because the verdict is the job's and
+    /// a side channel does not become one (D20). A document that quietly
+    /// turned the pass into a failure would be deciding for the consumer.
+    #[test]
+    fn a_verdict_says_which_revision_ran_and_whether_it_is_the_declared_one() {
+        let agreed = Verdict::of(
+            &finished_at(&"a".repeat(40), Some(&"a".repeat(40))),
+            vec![],
+            0,
+        );
+        assert_eq!(agreed.commit_diverged, Some(false));
+        assert_eq!(agreed.ran_commit.as_deref(), Some("a".repeat(40).as_str()));
+
+        let diverged = Verdict::of(
+            &finished_at(&"a".repeat(40), Some(&"b".repeat(40))),
+            vec![],
+            0,
+        );
+        assert_eq!(diverged.commit_diverged, Some(true));
+        assert!(
+            diverged.passed,
+            "a divergence is recorded beside the verdict and never instead of it (D20)"
+        );
+        assert_eq!(diverged.exit_code, 0, "and it does not touch the code");
+
+        // Silence. `null`, not `false`: nobody made the comparison, and a
+        // `false` here would be a comparison that came out clean.
+        let silent = Verdict::of(&finished_at(&"a".repeat(40), None), vec![], 0);
+        assert_eq!(silent.commit_diverged, None);
+        assert_eq!(silent.ran_commit, None);
+        assert_eq!(
+            silent.declared_commit.as_deref(),
+            Some("a".repeat(40).as_str())
+        );
+
+        // And a job that declared nothing at all says nothing at all.
+        let ad_hoc = Verdict::of(&finished(JobOutcome::Exited { code: 0 }), vec![], 0);
+        assert_eq!(ad_hoc.declared_commit, None);
+        assert_eq!(ad_hoc.commit_diverged, None);
+    }
+
+    /// Every field of this document is **there**, `null` or not, so a reader
+    /// indexes it rather than probing it — the module's own rule, which a
+    /// new field is the easiest thing to break.
+    #[test]
+    fn the_three_commit_fields_are_always_keys_of_the_document() {
+        let json = serde_json::to_value(Verdict::of(
+            &finished(JobOutcome::Exited { code: 0 }),
+            vec![],
+            0,
+        ))
+        .expect("the document serialises");
+        for key in ["declared_commit", "ran_commit", "commit_diverged"] {
+            assert!(
+                json.get(key).is_some(),
+                "{key} has to be a key of every verdict, null or not: {json}"
+            );
         }
     }
 

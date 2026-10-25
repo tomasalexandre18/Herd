@@ -2334,6 +2334,7 @@ mod tests {
             requeue_code: None,
             why: "claimed by wsl-pc: labels build".to_owned(),
             steps: Vec::new(),
+            commit: None,
         }];
         let held = holdings(std::slice::from_ref(&running));
         assert_eq!(held["wsl-pc"].len(), 1);
@@ -2442,6 +2443,7 @@ mod tests {
             requeue_code: None,
             why: format!("claimed by {runner}"),
             steps: Vec::new(),
+            commit: None,
         }];
         record
     }
@@ -3503,6 +3505,7 @@ mod tests {
             requeue_code,
             ended: Some("ended".to_owned()),
             why: "claimed by somebody".to_owned(),
+            commit: None,
             steps: Vec::new(),
         };
         record.attempts = vec![

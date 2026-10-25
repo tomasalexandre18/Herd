@@ -335,10 +335,18 @@ fn where_the_amplification_comes_from() {
 
 /// 5. 04b's additive claim, both ways, on real types.
 ///
-/// 04b (§3.2, §3.5) says a `#[serde(default)] ran_commit` on `StepRun` needs
-/// no protocol or record break, and that "a rollback works too". The first
-/// half is checked here on the real `StepRun` and the real `JobRecord`; the
-/// second half is checked by asking what an old binary *writes back*.
+/// 04b (§3.2, §3.5) says a `#[serde(default)]` field on `StepRun` needs no
+/// protocol or record break, and that "a rollback works too". The first half
+/// is checked here on the real `StepRun` and the real `JobRecord`; the second
+/// half is checked by asking what an old binary *writes back*.
+///
+/// **`ran_commit` has since shipped (D176), so it is no longer an unknown
+/// field to this build and cannot stand for one.** `a_field_from_later` took
+/// its place here, which costs the bench nothing: what it measures is what
+/// happens to *any* field this build has never heard of, and that was always
+/// the general statement. The same two directions are now **asserted**
+/// rather than printed, on `ran_commit` itself, in
+/// `herd-hub/tests/ran_commit_across_versions.rs`.
 #[test]
 #[ignore = "a bench; run it on purpose"]
 fn an_unknown_field_survives_a_read_and_not_a_write() {
@@ -350,17 +358,17 @@ fn an_unknown_field_survives_a_read_and_not_a_write() {
         "started_unix_ms": 1,
         "duration_ms": 2,
         "exit_code": 0,
-        "ran_commit": "0a2cf73"
+        "a_field_from_later": "0a2cf73"
     }"#;
     let step: herd_proto::StepRun =
         serde_json::from_str(newer_step).expect("an older build decodes a newer step");
     println!(
-        "StepRun with an unknown `ran_commit`: decoded, step = {:?}",
+        "StepRun with an unknown `a_field_from_later`: decoded, step = {:?}",
         step.step
     );
 
     // Forwards on the wire: the same, inside a frame.
-    let newer_frame = r#"{"type":"set_switch","switch":{"position":"on"},"why":"a probe","ran_commit":"0a2cf73"}"#;
+    let newer_frame = r#"{"type":"set_switch","switch":{"position":"on"},"why":"a probe","a_field_from_later":"0a2cf73"}"#;
     let frame: herd_proto::FromHub =
         serde_json::from_str(newer_frame).expect("an older build decodes a newer frame");
     println!("FromHub with an unknown field: decoded as {frame:?}");
@@ -389,6 +397,7 @@ fn an_unknown_field_survives_a_read_and_not_a_write() {
                 duration_ms: 2,
                 exit_code: Some(0),
                 ended: None,
+                ran_commit: None,
             },
         )
         .expect("the step records");
@@ -398,7 +407,7 @@ fn an_unknown_field_survives_a_read_and_not_a_write() {
     // What a *newer* hub would have written: the same record, one field more.
     let newer = text.replacen(
         "\"duration_ms\":2",
-        "\"duration_ms\":2,\"ran_commit\":\"0a2cf73\"",
+        "\"duration_ms\":2,\"a_field_from_later\":\"0a2cf73\"",
         1,
     );
     assert_ne!(newer, text, "the injection landed");
@@ -410,14 +419,14 @@ fn an_unknown_field_survives_a_read_and_not_a_write() {
         .expect("the record reads")
         .expect("it is there");
     println!(
-        "old build read a record carrying ran_commit: ok, {} step(s)",
+        "old build read a record carrying a_field_from_later: ok, {} step(s)",
         read.attempts.last().map(|a| a.steps.len()).unwrap_or(0)
     );
     println!(
         "  the planted field is still on the disk: {}",
         fs::read_to_string(&path)
             .expect("reads")
-            .contains("ran_commit")
+            .contains("a_field_from_later")
     );
 
     // ...and then writes the same record back, which is what `record_waiting`
@@ -427,8 +436,8 @@ fn an_unknown_field_survives_a_read_and_not_a_write() {
         .expect("the old build writes the record again");
     let after = fs::read_to_string(&path).expect("reads");
     println!(
-        "  after one write by the old build, ran_commit is still there: {}",
-        after.contains("ran_commit")
+        "  after one write by the old build, a_field_from_later is still there: {}",
+        after.contains("a_field_from_later")
     );
 }
 

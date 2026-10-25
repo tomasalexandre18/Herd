@@ -10,7 +10,7 @@ use std::error::Error;
 use std::fmt;
 
 use herd_proto::{
-    Declaration, JobId, JobOutcome, LabelSet, LabelsFrom, LogStream, Occupant, Priority,
+    CommitRun, Declaration, JobId, JobOutcome, LabelSet, LabelsFrom, LogStream, Occupant, Priority,
     Requirements, StepRun,
 };
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
@@ -266,6 +266,22 @@ pub struct Attempt {
     /// attempt of a job that is not a declared command.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub steps: Vec<StepRun>,
+    /// What this attempt said about the revision it really ran, beside the
+    /// commit the job is recorded against (D176).
+    ///
+    /// Written by the hub when the attempt's `fetch` step is recorded, from
+    /// the step's own `ran_commit` and the job's own declaration — the only
+    /// two places either figure exists. `None` until then, and `None` for
+    /// ever on an attempt of a job that is not a declared command: an ad-hoc
+    /// job declares no commit, so there is nothing for a revision to agree
+    /// or disagree with.
+    ///
+    /// **This is the oracle, and it only ever records.** A divergence here
+    /// changes no exit code and no verdict (D20); what it does is make
+    /// "declared X, ran Y" a fact on the record, where before there was
+    /// nothing that could contradict a verdict's commit after the fact.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub commit: Option<CommitRun>,
 }
 
 /// What a requester asked for, as the hub takes it in.
@@ -1824,6 +1840,25 @@ pub trait JobStore: Send + Sync + 'static {
     /// and named on the record**, not an error: a verdict must never be lost
     /// over a malformed path, and a path that cannot be written down is a
     /// fact about one file rather than about the job.
+    ///
+    /// **It is dropped from the manifest too, and that is the one case that
+    /// is** (D175). The manifest is the list of paths this store joins onto
+    /// its own directory — `write_output_chunk` resolves a chunk against it,
+    /// `job_outputs` reads a file back by it, the sweeper measures by it — so
+    /// a path that must never be joined must never be on it. The `skipped`
+    /// sentence is then the only place that file exists on the record, which
+    /// is the price of not writing an unjoinable path down. **The exit code a
+    /// requester reads for this case was never decided**: it is 0 today
+    /// because the manifest has nothing to count short, and whether a path
+    /// the hub refuses should also cost a requester its zero is open.
+    ///
+    /// **Bytes that contradict their own manifest entry are a different
+    /// case, and the entry survives them** (D175). The entry is written
+    /// down before the bytes are judged, so a refused frame leaves a file
+    /// that is announced and not held — the same shape as a streamed file
+    /// still crossing — and a requester counting its promises against what it
+    /// holds finds it short. This is the rule for every other absence here;
+    /// the digest case was the one exception and it produced a false success.
     fn record_outputs(&self, id: &JobId, outputs: &herd_proto::JobOutputs) -> Result<()>;
     /// The files this job's record holds, read back off the disk.
     ///
