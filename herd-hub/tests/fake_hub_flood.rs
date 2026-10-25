@@ -27,9 +27,13 @@
 //! short enough that nothing here can outlive the test even if it fails.
 //! Everything binds loopback on port 0 and writes under a temporary data
 //! root. The host's one-minute load is read before the flood and while it
-//! runs, and the flood is **skipped, D27-fashion, or stopped and reported**
-//! rather than finished if it crosses [`LOAD_CEILING`] — the host is shared
-//! with a production system.
+//! runs, and if it crosses [`LOAD_CEILING`] the flood is **skipped,
+//! D27-fashion** — the host is shared with a production system. That is true
+//! of both readings: a host already busy is skipped before anything starts,
+//! and a host that becomes busy mid-flood is cut short, printed, and skipped
+//! as well. **A cut-short flood is never asserted on.** It has read fewer
+//! abandonments than the test expects, and asserting the full figure on a
+//! truncated reading would make a busy host look like a broken runner.
 //!
 //! **The host this runs on is declared, not read.** The ceiling is derived
 //! from what the runner says about its machine, so a bench that let it read
@@ -352,9 +356,6 @@ struct Flood {
     a_refusal: Option<String>,
     /// How long the control link took to answer, or `None` if it did not.
     probe: Option<Duration>,
-    /// Whether the load guard cut the flood short: the figures are then what
-    /// it had, not what it would have had.
-    cut_short: Option<f64>,
 }
 
 /// One flood, or `None` when the host was too busy to measure anything on.
@@ -497,6 +498,29 @@ async fn flood(label: &str, how_many: usize) -> Option<Flood> {
         job_workspaces(data_root.path())
     );
 
+    // **A flood cut short is a skip, not a smaller flood.** The settle loop
+    // above is where all `how_many - EXPECTED_CEILING` abandonments are read,
+    // so a loop that broke early has read fewer of them — and
+    // [`a_flood_past_the_ceiling_is_held`] asserts the exact figure. Before
+    // this, the cut-short path handed those truncated figures on and the
+    // assertion turned a busy host into a **red** test. That is the opposite
+    // of what this file's own D27 paragraph promises, and the opposite of
+    // what the guard is for: the guard exists to protect the host, not to
+    // invent failures on it. An assertion that did not run is printed as a
+    // skip and never counted as a pass (D27).
+    if let Some(load) = bit {
+        herd_runner::testing::skipped(
+            label,
+            &format!(
+                "the host's one-minute load reached {load} mid-flood, over this bench's \
+                 ceiling of {LOAD_CEILING}, so the flood was cut short before it had read \
+                 every abandonment; the figures it did have are printed above and are not \
+                 asserted on. The host is shared with a production system"
+            ),
+        );
+        return None;
+    }
+
     Some(Flood {
         workspaces,
         peak_workspaces,
@@ -504,7 +528,6 @@ async fn flood(label: &str, how_many: usize) -> Option<Flood> {
         abandoned,
         a_refusal,
         probe: reading.probe,
-        cut_short: bit,
     })
 }
 
@@ -515,14 +538,9 @@ async fn flood(label: &str, how_many: usize) -> Option<Flood> {
 /// it, and the host never sees more workspaces than the runner said it could
 /// hold.
 fn a_flood_past_the_ceiling_is_held(found: &Flood, how_many: usize) {
-    if let Some(load) = found.cut_short {
-        println!(
-            "the load guard bit at {load}: the figures below are what the flood had when it \
-             was cut short, and the ceiling is still asserted on them because a runner that \
-             exceeded it would have done so before the guard bit"
-        );
-    }
-
+    // Every [`Flood`] that reaches here is a complete one: a flood the load
+    // guard cut short never becomes a `Flood` at all, it becomes a
+    // `HERD-SKIPPED` line and a `None` (D27).
     assert!(
         found.peak_workspaces <= EXPECTED_CEILING,
         "the host saw {} job workspaces at once and this runner said it holds \
@@ -553,7 +571,7 @@ fn a_flood_past_the_ceiling_is_held(found: &Flood, how_many: usize) {
         .as_deref()
         .expect("the runner says why it refused");
     assert!(
-        refusal.contains("holds at most") && refusal.contains("floor"),
+        refusal.contains(herd_runner::A_RUNNERS_OWN_CEILING) && refusal.contains("floor"),
         "the refusal has to carry the arithmetic, or nobody can tell a full machine from a \
          broken one: {refusal}"
     );

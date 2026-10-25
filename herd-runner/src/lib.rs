@@ -76,7 +76,10 @@ use tokio::sync::{watch, Semaphore};
 use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::{MaybeTlsStream, WebSocketStream};
 
-pub use confine::{jobs_at_once, Confined, Confinement, JobsAtOnce};
+pub use confine::{
+    jobs_at_once, Confined, Confinement, JobsAtOnce, A_RUNNERS_OWN_CEILING, DEFAULT_MEMORY_MAX,
+    JOBS_AT_ONCE_WHEN_A_HOST_WILL_NOT_SAY,
+};
 use spool::Spooled;
 
 /// Where a runner looks for its hub unless told otherwise.
@@ -2784,10 +2787,23 @@ pub async fn serve_once(config: Config, session: Session, confined: Arc<Confined
         // for itself (E-22, E-19).
         host: config.host,
         // And the ceiling derived from that host, so the hub stops placing
-        // work this runner is certain to hand straight back (D-NEXT). Announced,
-        // never asked for: the runner enforces this figure whatever the hub
-        // does with it, and a hub that ignores it only costs the fleet the
-        // attempts it costs today.
+        // work this runner is certain to hand straight back (D-NEXT).
+        // Announced, never asked for: the runner enforces this figure
+        // whatever the hub does with it.
+        //
+        // **A hub that ignores it is not free, and the version to measure
+        // that against is `v0.3.7`, the one in the field.** On `v0.3.7` this
+        // runner had no ceiling at all, so a hub placing a queue of
+        // memory-silent jobs on it cost *no* refusals — it ran them all, two
+        // deep or ten, which is the invariant 2 defect this change closes.
+        // A fleet whose runners are upgraded before its hub pays refusals it
+        // never paid before, and `attempts_allowed` is 2, so a job refused
+        // twice ends with no verdict. The order is therefore **hub first**,
+        // and nothing here detects it: `Welcome` carries no echo of this
+        // field, the protocol version deliberately does not move, and a
+        // runner cannot tell a hub that honoured its announcement from one
+        // that never read it (`docs/remediation/09-runner-self-limits.md`
+        // §7.6).
         jobs_at_once: Some(u32::try_from(ceiling.most()).unwrap_or(u32::MAX)),
         preference: config.preference,
         // And where its owner's switch stands, which is announced rather than

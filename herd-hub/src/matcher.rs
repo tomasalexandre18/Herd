@@ -282,6 +282,23 @@ pub const DRAIN_FIRST_LIMIT: Duration = Duration::from_secs(15 * 60);
 /// that announced two hundred.
 pub const READINGS_AT_ONCE: u32 = 2;
 
+/// The clause that marks a sentence as **the hub holding a job back for a
+/// ceiling a runner announced** — the hub's words, about the runner, and not
+/// the runner's own.
+///
+/// It exists for the same reason `herd_runner::A_RUNNERS_OWN_CEILING` does,
+/// and against it. Both sentences are about the same ceiling and both reach
+/// an operator's record: this one on a `waiting` line while the job is held,
+/// that one inside an `attempt_ended` line when a runner really did refuse.
+/// They used to share the words *"holds at most"*, so a reader — or a test —
+/// matching on that substring could not tell a job that waited (which costs
+/// nothing) from a job whose go was spent (which can cost the job). **Neither
+/// clause is a substring of the other, and neither sentence contains the
+/// other's clause.** `herd-hub/tests/announced_job_ceiling.rs` asserts that
+/// against both sentences as they are really built, so the distinction
+/// cannot be lost by an edit to either wording.
+pub const A_CEILING_THE_RUNNER_ANNOUNCED: &str = "it said it holds at most";
+
 /// What the claim step needs beyond the record and the fleet.
 ///
 /// A struct rather than three more arguments, and with a [`Default`], so that
@@ -642,8 +659,8 @@ fn admission(record: &JobRecord, seat: &Seat, threads: Option<u32>) -> Admission
         }
         if seat.reserved.jobs >= at_once {
             return Admission::ShortNow(format!(
-                "on {}, {} job(s) already out there and it said it holds at most {at_once} at \
-                 once, so it takes nothing more until one of them ends: {}",
+                "on {}, {} job(s) already out there and {A_CEILING_THE_RUNNER_ANNOUNCED} \
+                 {at_once} at once, so it takes nothing more until one of them ends: {}",
                 seat.name,
                 seat.reserved.jobs,
                 seat.reserved.sentence()

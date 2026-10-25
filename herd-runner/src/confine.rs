@@ -239,6 +239,32 @@ impl JobsAtOnce {
 /// already needs before it will place anything that costs memory there.
 pub const JOBS_AT_ONCE_WHEN_A_HOST_WILL_NOT_SAY: usize = 1;
 
+/// The clause that marks a sentence as **this runner's own ceiling**, and the
+/// one thing that tells a runner-origin refusal apart from the hub's.
+///
+/// Attribution, not decoration. A refusal for this ceiling travels verbatim:
+/// [`JobsAtOnce::why`] goes into `ToHub::AttemptAbandoned`'s `reason`, and
+/// `end_attempt` writes it unchanged into the record's `attempt_ended` line.
+/// Whoever reads that record later — an operator, or
+/// `herd-hub/tests/announced_job_ceiling.rs`'s oracle — has nothing but the
+/// words to decide whether the attempt was spent on the runner's ceiling or
+/// on a timeout, a cancel or a runner that went away.
+///
+/// The hub has a ceiling sentence of its own,
+/// `herd_hub::matcher::A_CEILING_THE_RUNNER_ANNOUNCED` — *"it said it holds
+/// at most N at once"* — which it writes on a `waiting` line when it holds a
+/// job back. The two used to share the words *"holds at most"*, so a test
+/// matching on that substring could not say which side had spoken. **Neither
+/// of these two clauses is a substring of the other, and neither sentence
+/// contains the other's clause**, which is what makes the attribution
+/// decidable; `herd-hub/tests/announced_job_ceiling.rs` asserts it against
+/// both real sentences rather than trusting this paragraph.
+///
+/// Every branch of [`jobs_at_once`] carries it, the silent host included: a
+/// runner that refuses because it will not say how big it is is refusing for
+/// its ceiling exactly as much as one that did the arithmetic.
+pub const A_RUNNERS_OWN_CEILING: &str = "this runner holds at most";
+
 /// How many jobs a runner of this size, capping every job at `memory_max`,
 /// holds at once.
 ///
@@ -262,9 +288,9 @@ pub fn jobs_at_once(host: &herd_proto::HostSize, memory_max: u64) -> JobsAtOnce 
             most: JOBS_AT_ONCE_WHEN_A_HOST_WILL_NOT_SAY,
             why: format!(
                 "this machine does not say how much memory it lends, so how many jobs of {} \
-                 fit on it cannot be derived: it holds \
-                 {JOBS_AT_ONCE_WHEN_A_HOST_WILL_NOT_SAY} at once until --host-memory says \
-                 otherwise",
+                 fit on it cannot be derived: {A_RUNNERS_OWN_CEILING} \
+                 {JOBS_AT_ONCE_WHEN_A_HOST_WILL_NOT_SAY} job(s) at once until --host-memory \
+                 says otherwise",
                 show_bytes(memory_max)
             ),
         };
@@ -278,7 +304,7 @@ pub fn jobs_at_once(host: &herd_proto::HostSize, memory_max: u64) -> JobsAtOnce 
         most,
         why: format!(
             "this machine lends {} and keeps {} as its own floor, and caps every job at {}, \
-             so it holds at most {most} job(s) at once",
+             so {A_RUNNERS_OWN_CEILING} {most} job(s) at once",
             herd_proto::size_mib(lent),
             herd_proto::size_mib(floor),
             show_bytes(memory_max)

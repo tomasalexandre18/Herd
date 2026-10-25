@@ -90,11 +90,18 @@ started), `open` (not yet agreed or sized), `active` (an agent holds it),
    walk is 0.16 % of a junction at `N` = 1 000 against 99.5 % for durable
    writing. The row is rewritten above and the walk stays owed as
    ORCH-021, a cheap cleanup that blocks nothing.
-3. **C5 (ORCH-060) is finished and waiting on `herd-merger`.** Both
-   halves are on `runner-holds-its-own-limits` in one PR, with the real-hub
-   measurement behind it (12 ceiling-spent attempts and 6 of 8 jobs `lost`
-   before; 0 and 0 after). It carries **two** `D-NEXT` entries and needs
-   two numbers in order. Nothing of it is in the C0b pass.
+3. **C5 (ORCH-060) is reviewed, hardened and waiting on `herd-merger`.**
+   Both halves plus the review-hardening commit are on
+   `runner-holds-its-own-limits` in one PR, with the real-hub measurement
+   behind it (12 ceiling-spent attempts and 6 of 8 jobs `lost` before, in
+   four of five runs; 0 and 0 after). It carries **two** `D-NEXT` entries
+   and needs two numbers in order, and the merger also owes one prose
+   correction inside the second entry (see the row). Nothing of it is in
+   the C0b pass. **One question for Alexa is still open on it** and is the
+   review's blocking finding: whether a refusal for a runner's own ceiling
+   should spend one of the job's goes, given that a link outage longer than
+   `lost_after` can otherwise end N running jobs `lost`. Nothing on this
+   branch prejudges it.
 4. Then the owed rows that nothing blocks: ORCH-048 (the skip counters
    over-count), ORCH-031 (the brief must name its worktree), ORCH-015,
    ORCH-016.

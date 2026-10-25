@@ -75,18 +75,28 @@ eight kinds that already existed.
 (4 GiB lent, 2 GiB floor, 1 GiB a job), **8 memory-silent jobs** with eight
 *distinct* commands.
 
-| | before the hub half | after |
+| | before the hub half (5 runs) | after |
 |---|---|---|
-| peak attempts out on the runner at once | 7 | **2** |
-| attempts spent **because of the ceiling** | 12 | **0** |
+| peak attempts out on the runner at once | 6 or 7 | **2** |
+| attempts spent **because of the ceiling** | 12 in 4 runs, 9 in 1 | **0** |
 | attempts spent for anything else | 0 | **0** |
-| attempts recorded in all, for 8 jobs | 14 | **8** |
-| jobs that reached their own verdict | 2 of 8 | **8 of 8** |
-| jobs that ended `lost`, no verdict | **6 of 8** | **0** |
+| attempts recorded in all, for 8 jobs | 14 in 4 runs; not read in the 5th | **8** |
+| jobs that reached their own verdict | 2 of 8 in 4 runs, 4 of 8 in 1 | **8 of 8** |
+| jobs that ended `lost`, no verdict | **6 of 8 in 4 runs, 4 of 8 in 1** | **0** |
 
-Both columns measured today on this branch, by running the same test with
-and without the gate in `admission`. The "before" is therefore a
-measurement, not a recollection.
+Both columns measured on this branch, by running the same test with and
+without the gate in `admission`. The "before" is therefore a measurement,
+not a recollection.
+
+> **Corrected 2026-10-25 by `c5-review-hardening`.** This table first printed
+> `7`, `12` and `6 of 8` as single figures. They are the *modal* figures of a
+> timing-dependent race, and the "before" oracle was afterwards run **five
+> times** in the contradictory review of PR #82: four runs gave 6 of 8 lost
+> and 12 attempts spent, one gave 4 and 9, and the peak was 6 in two runs and
+> 7 in three. The finding — that a majority of perfectly runnable jobs die
+> with no verdict — held in all five.
+> `docs/remediation/09-runner-self-limits.md`
+> §7.5 carries the same correction.
 
 **`fake_hub_flood.rs` still shows 8 held and 242 handed back**, re-run today
 and unchanged, as the orchestrator's correction required.

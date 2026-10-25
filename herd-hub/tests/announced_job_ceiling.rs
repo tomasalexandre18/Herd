@@ -26,11 +26,14 @@
 //! attempt unchanged.** The two are told apart by *attribution*, never by a
 //! total that happens to be zero: a refusal for the ceiling carries the
 //! runner's own sentence — the one built by `herd_runner::jobs_at_once`,
-//! which says `holds at most N job(s) at once` — and that sentence is written
-//! verbatim into the record's `attempt_ended` line by `end_attempt`. A
-//! timeout, a cancel or a lost runner writes a different sentence and is
-//! counted as what it is. [`ceiling_refusals`] is the whole of that
-//! distinction.
+//! which says `this runner holds at most N job(s) at once` — and that
+//! sentence is written verbatim into the record's `attempt_ended` line by
+//! `end_attempt`. A timeout, a cancel or a lost runner writes a different
+//! sentence and is counted as what it is. [`ceiling_refusals`] is the whole
+//! of that distinction, and it matches on
+//! `herd_runner::A_RUNNERS_OWN_CEILING` — the runner's constant, not a copy
+//! of its words — which is also the clause that tells the runner's sentence
+//! apart from the hub's own *"it said it holds at most N at once"*.
 //!
 //! The surplus is expected to **wait**, not to be sent and handed back, and
 //! what it is told is asserted too: a `waiting` line, which is a
@@ -67,16 +70,42 @@ const CEILING: usize = 2;
 /// come straight back as abandoned attempts.
 const HOW_MANY: usize = 8;
 
+/// What the **harness's** runner announces, from `support::host()` (64 GiB
+/// lent, an 8 GiB floor) and `herd_runner::DEFAULT_MEMORY_MAX` (2 GiB a job):
+/// `(65536 - 8192) / 2048`. Deliberately far out of the way of every other
+/// test in this suite, and asserted rather than described by
+/// [`a_queue_well_inside_the_announced_ceiling_is_paced_by_nothing`].
+const THE_HARNESS_CEILING: usize = 28;
+
+/// How many jobs that test submits. The gap between this and
+/// [`THE_HARNESS_CEILING`] is its whole premise.
+const HOW_MANY_WELL_INSIDE: usize = 4;
+
 /// What each job does. Long enough that the jobs submitted together really do
 /// overlap — a queue that drained one job at a time would never test a
 /// ceiling — and short enough that the whole file is a few seconds.
 const SLEEP_SECONDS: u64 = 1;
 
-/// The phrase the runner's own refusal carries, from
-/// `herd_runner::jobs_at_once`'s sentence. This is the attribution the oracle
-/// turns on, so it is a constant with the reason beside it rather than a
-/// string literal buried in an assertion.
-const THE_RUNNERS_CEILING_SENTENCE: &str = "holds at most";
+/// The phrase the runner's own refusal carries, **taken from the runner
+/// rather than copied from it**.
+///
+/// This is the attribution the oracle turns on, so it cannot be a literal:
+/// a literal is a second copy of the runner's wording that nothing keeps in
+/// step, and an edit to `herd_runner::jobs_at_once`'s sentence would leave
+/// this file matching a phrase no runner says any more — at which point
+/// [`ceiling_refusals`] returns nothing for ever and the oracle reads green
+/// on a fleet losing jobs.
+///
+/// It was `"holds at most"` and that was worse than untied: the hub's own
+/// sentence ([`THE_HUBS_CEILING_SENTENCE`]) contained the same words, so the
+/// substring could not say which side had spoken, which is exactly the
+/// attribution this file claims to perform.
+const THE_RUNNERS_CEILING_SENTENCE: &str = herd_runner::A_RUNNERS_OWN_CEILING;
+
+/// And the hub's own clause for the same ceiling, likewise taken from the
+/// hub. Used where this file wants a sentence the **hub** wrote — a
+/// `waiting` line — and never where it wants the runner's.
+const THE_HUBS_CEILING_SENTENCE: &str = herd_hub::matcher::A_CEILING_THE_RUNNER_ANNOUNCED;
 
 /// Neither version number moves, which is the condition D-NEXT shipped under.
 ///
@@ -228,10 +257,23 @@ async fn no_attempt_is_spent_on_a_ceiling_the_hub_was_told_about() {
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
 
-    assert!(
-        peak_out_there <= CEILING,
-        "the hub had {peak_out_there} attempts out on a runner that announced {CEILING}: the \
-         announcement is recorded and not acted on"
+    // **Equality, not `<=`.** A one-sided bound here passes at zero, and zero
+    // is what it would read if `harness.state_of` ever stopped returning
+    // `Assigned | Running` for a job that is out there — the assertion the
+    // whole file is named for would then measure nothing while staying green.
+    // The lower half is as certain as the upper one: [`HOW_MANY`] jobs are
+    // submitted at once against a ceiling of [`CEILING`], each sleeps
+    // [`SLEEP_SECONDS`], and this loop samples every 20 ms, so a run in which
+    // the ceiling was never once full is a run in which the queue was not
+    // placed at all.
+    println!("peak attempts out on the runner at once: {peak_out_there}");
+    assert_eq!(
+        peak_out_there, CEILING,
+        "the hub's busiest moment had {peak_out_there} attempts out on a runner that announced \
+         {CEILING}. More means the announcement is recorded and not acted on; fewer means this \
+         test never filled the ceiling it claims to measure — a queue of {HOW_MANY} jobs that \
+         never once put {CEILING} on the machine was paced by something else, or `state_of` no \
+         longer says when a job is out there"
     );
 
     // ---- The oracle, both halves.
@@ -266,7 +308,7 @@ async fn no_attempt_is_spent_on_a_ceiling_the_hub_was_told_about() {
     let said: Vec<String> = submitted
         .iter()
         .flat_map(|id| waiting_reasons(&state_dir, id))
-        .filter(|reason| reason.contains("holds at most"))
+        .filter(|reason| reason.contains(THE_HUBS_CEILING_SENTENCE))
         .collect();
     assert!(
         !said.is_empty(),
@@ -321,25 +363,53 @@ async fn no_attempt_is_spent_on_a_ceiling_the_hub_was_told_about() {
     drop(harness);
 }
 
-/// **A runner that said nothing is placed on exactly as it was.**
+/// **A queue far inside an announced ceiling costs nothing**: four jobs on
+/// the harness runner, which announces [`THE_HARNESS_CEILING`].
 ///
-/// The other side of "absent means it did not say". This runner is the
-/// harness's own, which announces a ceiling of 28 — far above anything this
-/// test submits — so the ceiling cannot be what paces it, and the hub places
-/// the whole queue at once exactly as it did before D-NEXT.
+/// It used to be headed *"a runner that said nothing is placed on exactly as
+/// it was"*, and that was not what it did: the runner in it announces 28.
+/// **No end-to-end test in this suite exercises `jobs_at_once: None`, and
+/// none can** — our runner derives a ceiling from what its own machine
+/// declared and always announces one, floored at 1, so there is no way to
+/// start a real `herd-runner` that says nothing. A hub speaking to a peer
+/// that is silent is covered where it can be: by `herd-proto`'s
+/// `round_trip`, which decodes a `main`-shaped hello to `None`, and by the
+/// matcher's own unit tests, whose seats announce nothing by default and
+/// which include
+/// `a_runner_that_announced_no_ceiling_is_placed_on_exactly_as_it_was`.
 ///
-/// Its value is as a regression: a hub that had started *deriving* a ceiling
-/// for itself, or reading silence as a small number, would pace this queue
-/// too, and the field's whole contract would be broken in the one direction
-/// no runner can report.
+/// What this test is for, now that it says so: a hub that started deriving a
+/// ceiling of its own, or reading a *large* announcement as a small number,
+/// would pace this queue. The 28 is therefore asserted rather than described
+/// — a doc comment naming a figure that the test never reads is the same
+/// defect one level up, and the gap between 28 and four is the whole
+/// premise.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_queue_well_inside_the_announced_ceiling_is_paced_by_nothing() {
+    // Asserted, not assumed: this is what makes "well inside" true. It is
+    // derived from `support::host()` and the harness's own confinement, so a
+    // change to either shows up here instead of quietly turning this test
+    // into a test of a ceiling that bites.
+    let announced = herd_runner::jobs_at_once(&support::host(), herd_runner::DEFAULT_MEMORY_MAX);
+    assert_eq!(
+        announced.most(),
+        THE_HARNESS_CEILING,
+        "the harness runner announces {} and this test submits {HOW_MANY_WELL_INSIDE}: if the \
+         two ever meet, this stops being a test of a queue nothing paces. Its sentence: {}",
+        announced.most(),
+        announced.why()
+    );
+    // "Well inside" is the premise, and it is arithmetic rather than a
+    // heading. A `const` block, so the day the two figures meet this file
+    // stops compiling instead of quietly testing something else.
+    const _: () = assert!(THE_HARNESS_CEILING > HOW_MANY_WELL_INSIDE);
+
     let harness = Harness::with_hub_and_runner().await;
     let requester = harness.requester();
     let state_dir = harness.state_dir().to_owned();
 
     let mut submitted = Vec::new();
-    for _ in 0..4 {
+    for _ in 0..HOW_MANY_WELL_INSIDE {
         submitted.push(
             support::submit_job(&requester, support::shell("true"))
                 .await
@@ -401,6 +471,18 @@ fn the_figure_announced_is_the_one_the_runner_derives() {
 /// figure the hub worked out from `host` alone would be a ceiling the runner
 /// never agreed to and could not be held to. Asserted by reading the hub's
 /// source, in the manner of `no_line_of_this_module_weighs_a_load_against_anything`.
+///
+/// **What this test used to miss, measured.** It looked for
+/// `jobs_at_once = Some(` and `jobs_at_once.unwrap_or(` — an *assignment* and
+/// an unwrap. The hub does neither: it builds `Announced` with field-init
+/// shorthand (`herd-hub/src/server.rs`), so the spelling a hub would really
+/// use to invent a ceiling has a **colon**. The review of PR #82 mutated that
+/// line to `jobs_at_once: Some(999),` and this test passed. What it matches
+/// now is any line of shipped hub code that puts a `Some(` beside the field
+/// name at all, in whatever punctuation, plus the `.or(`/`.unwrap_or(` shapes
+/// that fill in a silence — the only lines the shipped hub needs are the
+/// field's two declarations and the places it is moved along unchanged, and
+/// none of those names `Some`.
 #[test]
 fn the_hub_never_derives_a_ceiling_of_its_own() {
     let matcher = include_str!("../src/matcher.rs");
@@ -413,13 +495,129 @@ fn the_hub_never_derives_a_ceiling_of_its_own() {
             .split_once("#[cfg(test)]")
             .map(|(before, _)| before)
             .unwrap_or(source);
+        // **And it really read the hub.** The split above is on the first
+        // `#[cfg(test)]` in the file, which is the tests module today; a
+        // single `#[cfg(test)]` helper added near the top of either file
+        // would shrink the scanned region to a handful of lines, or to none,
+        // and every assertion below would go on passing over nothing. Both
+        // files are thousands of lines of shipped code and will stay so while
+        // this field exists.
+        let scanned = shipped.lines().count();
+        assert!(
+            scanned > 1000,
+            "{name}: only {scanned} lines were scanned for an invented ceiling. The region is \
+             everything before the first `#[cfg(test)]`, so a test helper moved up the file \
+             empties this guard without failing it"
+        );
+        let mut found_the_field = false;
         for (number, line) in shipped.lines().enumerate() {
+            // Everything before a `//`. This also truncates a `//` inside a
+            // string literal, which costs a little reach and never a false
+            // failure; there is no such line in either file today.
             let code = line.split("//").next().unwrap_or("");
-            assert!(
-                !code.contains("jobs_at_once = Some(") && !code.contains("jobs_at_once.unwrap_or("),
-                "{name}:{} fills in a ceiling the runner did not announce: {line}",
-                number + 1
-            );
+            for (at, _) in code.match_indices("jobs_at_once") {
+                found_the_field = true;
+                let rest = &code[at + "jobs_at_once".len()..];
+                // What the hub does legitimately: declare the field, read it
+                // (`if let Some(at_once) = seat.jobs_at_once`), and move it
+                // along unchanged. What it must never do is put a value
+                // *into* it. So the shape under test is "the field, then a
+                // `:` or an `=`, then something built here" — which is where
+                // `Some(` would appear, in whatever punctuation. A `Some(`
+                // to the **left** of the field name is a read and is fine.
+                let filled_in = rest
+                    .strip_prefix(':')
+                    .or_else(|| rest.strip_prefix(" ="))
+                    .or_else(|| rest.strip_prefix('='))
+                    .filter(|after| !after.starts_with('='));
+                if let Some(after) = filled_in {
+                    assert!(
+                        !after.contains("Some("),
+                        "{name}:{} fills in a ceiling the runner did not announce: {line}",
+                        number + 1
+                    );
+                }
+                // And the silence must not be read as a number by any of the
+                // shapes that turn a `None` into one.
+                for turning_silence_into_a_figure in [
+                    ".unwrap_or(",
+                    ".or(",
+                    ".map_or(",
+                    ".unwrap_or_else(",
+                    ".get_or_insert",
+                ] {
+                    assert!(
+                        !rest.starts_with(turning_silence_into_a_figure),
+                        "{name}:{} reads a runner's silence as a ceiling: {line}",
+                        number + 1
+                    );
+                }
+            }
         }
+        // And the field is still named in both files, so a rename that left
+        // this test matching a word the hub no longer uses fails here rather
+        // than passing silently over code it stopped understanding.
+        assert!(
+            found_the_field,
+            "{name} no longer mentions `jobs_at_once` anywhere in its shipped code: this guard \
+             is now watching a field that moved"
+        );
     }
+}
+
+/// **The runner's ceiling sentence and the hub's cannot be mistaken for each
+/// other**, asserted on the two sentences as they are really built.
+///
+/// [`ceiling_refusals`] is the oracle's whole attribution, and it works by
+/// matching words. Both sides have a sentence about this ceiling and both
+/// reach the same record: the hub's on a `waiting` line, which costs the job
+/// nothing, and the runner's inside an `attempt_ended` line, which spent one
+/// of that job's goes. Until this branch both contained *"holds at most"*,
+/// so the substring could not say which had spoken. This is the assertion
+/// that keeps them apart — against the real sentences, not against the two
+/// constants, because a wording edit that reintroduced the ambiguity would
+/// leave the constants looking fine.
+#[test]
+fn the_runners_ceiling_sentence_is_not_the_hubs() {
+    let runner = herd_runner::jobs_at_once(
+        &herd_proto::HostSize::new(Some(LENT_MIB), Some(4)).with_floor(Some(FLOOR_MIB)),
+        PER_JOB_BYTES,
+    );
+    let runner_said = runner.why().to_owned();
+    // A host that says nothing takes the other branch of the same function,
+    // and a refusal from such a runner is no less a ceiling refusal.
+    let silent_said = herd_runner::jobs_at_once(&herd_proto::HostSize::default(), PER_JOB_BYTES)
+        .why()
+        .to_owned();
+    // The hub's, built the way `admission` builds it. Not the real call —
+    // this file already exercises that end to end — but the same constant,
+    // which is what the matching turns on.
+    let hub_said = format!(
+        "on capped-runner, {CEILING} job(s) already out there and {THE_HUBS_CEILING_SENTENCE} \
+         {CEILING} at once, so it takes nothing more until one of them ends"
+    );
+
+    for said in [&runner_said, &silent_said] {
+        assert!(
+            said.contains(THE_RUNNERS_CEILING_SENTENCE),
+            "every branch of the runner's arithmetic has to carry its own attribution, and \
+             this one does not: {said}"
+        );
+        assert!(
+            !said.contains(THE_HUBS_CEILING_SENTENCE),
+            "a runner's sentence that contains the hub's clause makes a refusal \
+             indistinguishable from a wait: {said}"
+        );
+    }
+    assert!(
+        hub_said.contains(THE_HUBS_CEILING_SENTENCE)
+            && !hub_said.contains(THE_RUNNERS_CEILING_SENTENCE),
+        "and the hub's sentence must not carry the runner's: {hub_said}"
+    );
+    assert!(
+        !THE_RUNNERS_CEILING_SENTENCE.contains(THE_HUBS_CEILING_SENTENCE)
+            && !THE_HUBS_CEILING_SENTENCE.contains(THE_RUNNERS_CEILING_SENTENCE),
+        "neither clause may be a substring of the other: {THE_RUNNERS_CEILING_SENTENCE:?} and \
+         {THE_HUBS_CEILING_SENTENCE:?}"
+    );
 }
