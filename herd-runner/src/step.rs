@@ -34,17 +34,26 @@
 //!
 //! ## The declared line is a template too
 //!
-//! A command's own line may name `{job}`, `{in}` and `{out}` like any hook,
-//! and they are filled — before the line is pasted into `{line}`, and never
-//! over the text a requester's arguments put there. [`line_filled`] is where
-//! that order is kept and why it is the order it is.
+//! A command's own line may name `{job}`, `{in}`, `{out}` and `{ran}` like
+//! any hook, and they are filled — before the line is pasted into `{line}`,
+//! and never over the text a requester's arguments put there.
+//! [`line_filled`] is where that order is kept and why it is the order it is.
+//!
+//! ## The revision a `fetch` reached
+//!
+//! `{ran}` names a file the consumer's `fetch` hook may write the revision it
+//! really reached into, and [`ran_commit`] is how the runner reads it back
+//! after that step. Herd runs no `git` and knows no VCS (E-11): the hook
+//! answers, and the runner carries the answer home without parsing it. A
+//! hook that writes nothing is the ordinary case and says nothing, which is
+//! not the same as saying the tree was where it was asked to be.
 
 use std::path::Path;
 use std::time::Duration;
 
 use herd_proto::{
     filled_outside_the_arguments, Declaration, JobId, Step, IN_TOKEN, JOB_TOKEN, LINE_TOKEN,
-    OUT_TOKEN,
+    OUT_TOKEN, RAN_TOKEN,
 };
 
 /// The shell every hook is handed to.
@@ -139,6 +148,21 @@ pub(crate) fn why_that_line_will_not_do(
     ))
 }
 
+/// The paths of this job's own workspace a declaration may name — the
+/// runner's three, as one argument.
+///
+/// One struct rather than three parameters because they travel together and
+/// always will: they are all the same workspace's, they are all filled in
+/// the same pass, and a fourth would otherwise be a fourth argument.
+pub(crate) struct Places<'a> {
+    /// `{in}`: what this job consumes.
+    pub in_dir: &'a Path,
+    /// `{out}`: what it leaves behind.
+    pub out_dir: &'a Path,
+    /// `{ran}`: where its `fetch` hook may say which revision it reached.
+    pub ran: &'a Path,
+}
+
 /// The four stages of a declared command, or the sentence the attempt is
 /// given back with.
 ///
@@ -147,23 +171,24 @@ pub(crate) fn why_that_line_will_not_do(
 pub(crate) fn planned(
     declaration: &Declaration,
     job_id: &JobId,
-    in_dir: &Path,
-    out_dir: &Path,
+    places: Places<'_>,
     line: &str,
     declared_timeout: Option<Duration>,
     own_timeout: Duration,
 ) -> Result<Vec<Stage>, String> {
-    // The runner's three, in one pass each (D107). `{line}` is filled *after*
+    // The runner's four, in one pass each (D107). `{line}` is filled *after*
     // they are, and on purpose: it is a requester's own string, and filling it
     // first would make a brace inside it a template — which is the one way a
     // declaration's trust could reach past the declaration.
-    let in_dir = in_dir.display().to_string();
-    let out_dir = out_dir.display().to_string();
+    let in_dir = places.in_dir.display().to_string();
+    let out_dir = places.out_dir.display().to_string();
+    let ran_path = places.ran.display().to_string();
     let filled = declaration
         .executor
         .filled(JOB_TOKEN, job_id.as_str())
         .filled(IN_TOKEN, &in_dir)
-        .filled(OUT_TOKEN, &out_dir);
+        .filled(OUT_TOKEN, &out_dir)
+        .filled(RAN_TOKEN, &ran_path);
     // Every token but `{line}`, which is expected to still be there. Checked
     // over the whole executor rather than hook by hook, because a `{down}`
     // nobody could fill would be found after `up` had already made a
@@ -177,8 +202,8 @@ pub(crate) fn planned(
     if !left.is_empty() {
         return Err(format!(
             "command {} of commit {} still names {} after this runner filled {JOB_TOKEN}, \
-             {IN_TOKEN} and {OUT_TOKEN}: a hook or an environment value holding a token \
-             nobody fills would be run with a brace in it",
+             {IN_TOKEN}, {OUT_TOKEN} and {RAN_TOKEN}: a hook or an environment value holding \
+             a token nobody fills would be run with a brace in it",
             declaration.command,
             declaration.commit,
             left.join(" and ")
@@ -186,7 +211,14 @@ pub(crate) fn planned(
     }
     // The declared line is a template of its own, and its tokens are filled
     // before it is pasted in — see [`line_filled`].
-    let line = line_filled(line, &declaration.args, job_id.as_str(), &in_dir, &out_dir);
+    let line = line_filled(
+        line,
+        &declaration.args,
+        job_id.as_str(),
+        &in_dir,
+        &out_dir,
+        &ran_path,
+    );
     let filled = filled.filled(LINE_TOKEN, &line);
 
     let env: Vec<(String, String)> = filled
@@ -241,12 +273,97 @@ pub(crate) fn planned(
 /// Holding the arguments out of the pass is [`filled_outside_the_arguments`],
 /// in `herd-proto`, because the hub's `{j}` has the same problem and one of
 /// the two solving it alone is how the two would drift.
-fn line_filled(line: &str, args: &[String], job: &str, in_dir: &str, out_dir: &str) -> String {
+fn line_filled(
+    line: &str,
+    args: &[String],
+    job: &str,
+    in_dir: &str,
+    out_dir: &str,
+    ran_path: &str,
+) -> String {
     filled_outside_the_arguments(line, args, |text| {
         text.replace(JOB_TOKEN, job)
             .replace(IN_TOKEN, in_dir)
             .replace(OUT_TOKEN, out_dir)
+            .replace(RAN_TOKEN, ran_path)
     })
+}
+
+/// How many bytes of the `{ran}` file this runner looks at.
+///
+/// A revision is one short line. Anything beyond this is not a revision, and
+/// reading a job-sized file into memory to find that out is a job writing
+/// into the runner's address space.
+const RAN_READ_MAX: u64 = 4096;
+
+/// The longest revision this runner will carry home.
+///
+/// Wide enough for every hash a VCS has shipped — a git sha256 is 64 — and
+/// narrow enough that the figure on a record is a revision and not a
+/// paragraph. Herd does not know what produced the string, so the only
+/// checks it makes are the ones that hold for *any* answer: one line, no
+/// control characters, bounded.
+const RAN_MAX: usize = 128;
+
+/// What the `{ran}` file said, if anything.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum RanCommit {
+    /// The hook wrote a revision, and this is it, untouched but for the
+    /// whitespace around it.
+    Said(String),
+    /// No file, or an empty one: this job's hook reports no revision. The
+    /// ordinary case, and not an error.
+    Nothing,
+    /// There was a file and it cannot be used as an answer, with the reason.
+    ///
+    /// Reported as *silence* on the record — the runner has no revision to
+    /// put there — and said out loud in the job's log, because a consumer
+    /// whose hook writes the wrong thing would otherwise see exactly what a
+    /// consumer whose hook writes nothing sees.
+    Unusable(String),
+}
+
+/// Read back what this job's `fetch` hook left at `{ran}` (D-NEXT).
+///
+/// Strict in the three ways an answer from outside Herd has to be strict, and
+/// incurious in every other way: the string is never parsed, never matched
+/// against a shape Herd invented, and never lowercased. Herd compares it with
+/// the declared commit byte for byte and that is all it ever does with it.
+pub(crate) fn ran_commit(path: &Path) -> RanCommit {
+    use std::io::Read;
+
+    let file = match std::fs::File::open(path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return RanCommit::Nothing,
+        Err(error) => {
+            return RanCommit::Unusable(format!("it could not be opened: {error}"));
+        }
+    };
+    let mut held = String::new();
+    // Bounded before anything else: the file is the job's to write and the
+    // runner's to read, which is exactly the direction a cap belongs in.
+    if let Err(error) = file.take(RAN_READ_MAX).read_to_string(&mut held) {
+        return RanCommit::Unusable(format!("it could not be read as text: {error}"));
+    }
+    let said = held.lines().next().unwrap_or_default().trim();
+    if said.is_empty() {
+        return RanCommit::Nothing;
+    }
+    if said.len() > RAN_MAX {
+        return RanCommit::Unusable(format!(
+            "its first line is {} characters and a revision this runner will carry is at \
+             most {RAN_MAX}",
+            said.len()
+        ));
+    }
+    if !said.chars().all(|c| c.is_ascii_graphic()) {
+        return RanCommit::Unusable(
+            "its first line holds something that is not a printable ASCII word, and a \
+             revision on a record has to be one"
+                .to_owned(),
+        );
+    }
+    RanCommit::Said(said.to_owned())
 }
 
 /// Which figure bounds the `run` step.
@@ -331,8 +448,11 @@ mod tests {
         planned(
             declaration,
             &JobId::new("j0000000007"),
-            &PathBuf::from("/data/jobs/j0000000007/in"),
-            &PathBuf::from("/data/jobs/j0000000007/out"),
+            Places {
+                in_dir: &PathBuf::from("/data/jobs/j0000000007/in"),
+                out_dir: &PathBuf::from("/data/jobs/j0000000007/out"),
+                ran: &PathBuf::from("/data/jobs/j0000000007/ran"),
+            },
             line,
             None,
             Duration::from_secs(60),
@@ -496,8 +616,11 @@ mod tests {
             planned(
                 &declaration,
                 &JobId::new("j1"),
-                Path::new("/in"),
-                Path::new("/out"),
+                Places {
+                    in_dir: Path::new("/in"),
+                    out_dir: Path::new("/out"),
+                    ran: Path::new("/ran"),
+                },
                 "true",
                 declared.map(Duration::from_secs),
                 own,
@@ -564,8 +687,11 @@ mod tests {
         let stages = planned(
             &declared(&format!("inside {LINE_TOKEN}")),
             &JobId::new("j1"),
-            Path::new("/in"),
-            Path::new("/out"),
+            Places {
+                in_dir: Path::new("/in"),
+                out_dir: Path::new("/out"),
+                ran: Path::new("/ran"),
+            },
             "true",
             Some(Duration::from_secs(5)),
             Duration::from_secs(60),
@@ -580,6 +706,96 @@ mod tests {
             );
         }
         assert_eq!(stages[2].timeout, Duration::from_secs(5));
+    }
+
+    /// `{ran}` is filled like the other three the runner owns, in every
+    /// hook, in the environment, and in the declared line.
+    #[test]
+    fn the_path_the_fetch_hook_answers_at_is_filled_everywhere_the_others_are() {
+        let mut declaration = declared(&format!("pack --into {RAN_TOKEN} {LINE_TOKEN}"));
+        declaration.executor.fetch = format!("reach it and say so > {RAN_TOKEN}");
+        declaration
+            .executor
+            .env
+            .insert("REVISION_AT".to_owned(), RAN_TOKEN.to_owned());
+        let stages = plan(&declaration, &format!("build --note {RAN_TOKEN}"))
+            .expect("a declaration naming {ran} plans");
+        let fetch = &stages[1].arguments[1];
+        assert_eq!(fetch, "reach it and say so > /data/jobs/j0000000007/ran");
+        assert_eq!(
+            stages[1].env,
+            [
+                (
+                    "RESULTS".to_owned(),
+                    "/data/jobs/j0000000007/out/results.json".to_owned()
+                ),
+                (
+                    "REVISION_AT".to_owned(),
+                    "/data/jobs/j0000000007/ran".to_owned()
+                )
+            ]
+        );
+        assert!(
+            stages[2].arguments[1].contains("build --note /data/jobs/j0000000007/ran"),
+            "the declared line is a template too (D107): {:?}",
+            stages[2].arguments[1]
+        );
+    }
+
+    /// The three answers the `{ran}` file can give, and the one it must not:
+    /// a file that cannot be used is **silence**, not a revision and not a
+    /// failure of the job.
+    #[test]
+    fn the_revision_file_is_read_strictly_and_its_absence_is_not_an_error() {
+        let dir = crate::testing::TempDir::new("ran-commit");
+        let path = dir.path().join("ran");
+
+        assert_eq!(
+            ran_commit(&path),
+            RanCommit::Nothing,
+            "no file is the state every consumer is in before it writes one"
+        );
+
+        // The ordinary answer, with the newline a shell's `>` leaves.
+        std::fs::write(&path, "0a2cf73a1b2c3d4e5f60718293a4b5c6d7e8f901\n").expect("written");
+        assert_eq!(
+            ran_commit(&path),
+            RanCommit::Said("0a2cf73a1b2c3d4e5f60718293a4b5c6d7e8f901".to_owned())
+        );
+
+        // A hook that wrote and said nothing.
+        std::fs::write(&path, "   \n").expect("written");
+        assert_eq!(ran_commit(&path), RanCommit::Nothing);
+
+        // Herd does not know what produced the string: a revision that is
+        // not a git hash is carried home untouched, because E-11 means Herd
+        // names no consumer's tool and knows no VCS.
+        std::fs::write(&path, "svn:r48217").expect("written");
+        assert_eq!(ran_commit(&path), RanCommit::Said("svn:r48217".to_owned()));
+
+        // Only the first line: a hook that printed its own chatter after the
+        // answer still answered.
+        std::fs::write(&path, "abc123\nand some chatter\n").expect("written");
+        assert_eq!(ran_commit(&path), RanCommit::Said("abc123".to_owned()));
+
+        // Bounded, and not truncated: half a revision reported as a
+        // revision would be worse than none.
+        std::fs::write(&path, "x".repeat(RAN_MAX + 1)).expect("written");
+        assert!(matches!(ran_commit(&path), RanCommit::Unusable(_)));
+
+        // A line with a control character in it is not a word, and a record
+        // is not somewhere to paste one.
+        std::fs::write(&path, "abc\u{7}123").expect("written");
+        assert!(matches!(ran_commit(&path), RanCommit::Unusable(_)));
+
+        // Nor is a file that is not text at all.
+        std::fs::write(&path, [0xff, 0xfe, 0x00]).expect("written");
+        assert!(matches!(ran_commit(&path), RanCommit::Unusable(_)));
+
+        // A whole job's worth of bytes is read up to the cap and no
+        // further: the file is the job's to write and the runner's to read.
+        std::fs::write(&path, "y".repeat(16 << 20)).expect("written");
+        assert!(matches!(ran_commit(&path), RanCommit::Unusable(_)));
     }
 
     #[test]

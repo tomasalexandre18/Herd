@@ -24,8 +24,8 @@ use std::time::{Duration, Instant};
 
 use herd_hub::{Hub, JobDirStore, JobStore};
 use herd_proto::{
-    Declaration, Executor, JobId, JobOutcome, Step, StepRun, COMMIT_TOKEN, IN_TOKEN, LINE_TOKEN,
-    OUT_TOKEN,
+    CommitRun, Declaration, Executor, JobId, JobOutcome, Step, StepRun, COMMIT_TOKEN, IN_TOKEN,
+    LINE_TOKEN, OUT_TOKEN, RAN_TOKEN,
 };
 use herd_runner::testing::TempDir;
 use herd_runner::Confinement;
@@ -124,8 +124,10 @@ impl Harness {
         .await
         .expect("the hub answers with an outcome");
         Ran {
-            outcome: finished.outcome,
             steps: self.steps_of(&finished.job_id),
+            recorded_commit: self.commit_of(&finished.job_id),
+            told_the_requester: finished.commit.clone(),
+            outcome: finished.outcome,
             log,
         }
     }
@@ -143,6 +145,18 @@ impl Harness {
             .first()
             .map(|attempt| attempt.steps.clone())
             .unwrap_or_default()
+    }
+
+    /// What the record says the job's **first** attempt ran, beside the
+    /// commit it declared (D-NEXT).
+    fn commit_of(&self, job_id: &JobId) -> Option<CommitRun> {
+        self.store
+            .job(job_id)
+            .expect("the record is readable")
+            .expect("the hub minted this job")
+            .attempts
+            .first()
+            .and_then(|attempt| attempt.commit.clone())
     }
 
     /// The one data root this runner was configured with, as a string: what
@@ -164,6 +178,11 @@ struct Ran {
     outcome: JobOutcome,
     steps: Vec<StepRun>,
     log: String,
+    /// What the hub's record says about the revision this attempt ran.
+    recorded_commit: Option<CommitRun>,
+    /// And what the requester was told in the verdict frame, which has to be
+    /// the same thing: the record is the one place both are read from.
+    told_the_requester: Option<CommitRun>,
 }
 
 impl Ran {
@@ -986,4 +1005,167 @@ async fn a_run_step_whose_line_is_not_a_command_is_still_a_verdict_about_the_lin
         ran.log
     );
     assert_eq!(fixture.trace(), ["up", "fetch", "run", "down"]);
+}
+
+/// **The revision a `fetch` really reached, end to end** (D-NEXT, invariant
+/// 5).
+///
+/// A real hub, a real runner, a real shell, and a `fetch` hook that answers
+/// at `{ran}` the way a consumer's own would: `… && printf '%s' "$(…)" >
+/// {ran}`. Three cases, because the field is worth nothing unless all three
+/// are told apart on the record:
+///
+/// * the hook answers with the commit the job declared — agreement;
+/// * the hook answers with something else — a **divergence**, recorded,
+///   with the job's verdict untouched;
+/// * the hook answers nothing, which is where every consumer starts.
+///
+/// The commit the fixture declares is `cb5a…`, forty hex, as `herdctl`
+/// would have resolved it (E-01).
+#[tokio::test]
+async fn a_fetch_hook_that_answers_at_ran_puts_the_revision_on_the_record() {
+    let declared = "cb5a".repeat(10);
+    let harness = Harness::new("ran-agreed", |_| {}).await;
+    let fixture = Fixture::new("ran-agreed").and_then(
+        Step::Fetch,
+        &format!("printf '%s\\n' {declared} > {RAN_TOKEN}"),
+    );
+    let ran = harness.run(line("true"), fixture.declared(None)).await;
+
+    assert_eq!(ran.outcome, JobOutcome::Exited { code: 0 }, "{}", ran.log);
+    assert_eq!(
+        ran.step(Step::Fetch)
+            .expect("the fetch step ran")
+            .ran_commit
+            .as_deref(),
+        Some(declared.as_str()),
+        "the runner carried home what the hook wrote, newline trimmed"
+    );
+    let commit = ran
+        .recorded_commit
+        .clone()
+        .expect("the record compared the two");
+    assert_eq!(commit.declared, declared);
+    assert_eq!(commit.ran.as_deref(), Some(declared.as_str()));
+    assert!(!commit.diverged(), "the tree was where it was asked to be");
+    assert_eq!(
+        ran.told_the_requester.as_ref(),
+        Some(&commit),
+        "the requester is told what the record says, and from the record"
+    );
+
+    // No step but `fetch` answers this question: a revision read after
+    // `run` would be whatever the job's own command left behind.
+    for step in [Step::Up, Step::Run, Step::Down] {
+        assert_eq!(
+            ran.step(step).and_then(|run| run.ran_commit.clone()),
+            None,
+            "only fetch reports a revision, not {step}"
+        );
+    }
+}
+
+/// The case the whole field exists for: a `fetch` that **exits 0 without
+/// reaching the declared commit**.
+///
+/// Before this, the verdict was attributed to a commit the tree was never
+/// at and nothing on the record could contradict it. Now the record says
+/// both, the requester is told both, and the job's own verdict is exactly
+/// what it was — a divergence is recorded, never refused, and never turned
+/// into a failure behind the consumer's back (D20).
+#[tokio::test]
+async fn a_fetch_that_reached_another_revision_is_a_divergence_and_not_a_refusal() {
+    let declared = "cb5a".repeat(10);
+    let elsewhere = "9f41".repeat(10);
+    let harness = Harness::new("ran-diverged", |_| {}).await;
+    // A `fetch` that exits 0 having gone somewhere else entirely: a stale
+    // mirror, a fallback, a `switch` whose failure an `&&` swallowed.
+    let fixture = Fixture::new("ran-diverged").and_then(
+        Step::Fetch,
+        &format!("printf '%s\\n' {elsewhere} > {RAN_TOKEN}"),
+    );
+    let ran = harness.run(line("true"), fixture.declared(None)).await;
+
+    assert_eq!(
+        ran.outcome,
+        JobOutcome::Exited { code: 0 },
+        "the job passed, and that is still the verdict: {}",
+        ran.log
+    );
+    let commit = ran.recorded_commit.expect("the record compared the two");
+    assert!(commit.diverged(), "{commit:?}");
+    assert_eq!(commit.declared, declared);
+    assert_eq!(commit.ran.as_deref(), Some(elsewhere.as_str()));
+    assert!(
+        commit.line().contains(&declared) && commit.line().contains(&elsewhere),
+        "the record's own sentence names both: {}",
+        commit.line()
+    );
+    assert_eq!(
+        ran.told_the_requester,
+        Some(commit),
+        "a divergence a requester cannot see is not an oracle"
+    );
+    assert_eq!(fixture.trace(), ["up", "fetch", "run", "down"]);
+}
+
+/// Every consumer's first day: a `fetch` hook that names `{ran}` nowhere.
+///
+/// Nothing fails, nothing is refused, and the record says **"did not
+/// report"** rather than leaving a blank that reads as agreement.
+#[tokio::test]
+async fn a_fetch_hook_that_says_nothing_is_recorded_as_having_said_nothing() {
+    let harness = Harness::new("ran-silent", |_| {}).await;
+    let fixture = Fixture::new("ran-silent");
+    let ran = harness.run(line("true"), fixture.declared(None)).await;
+
+    assert_eq!(ran.outcome, JobOutcome::Exited { code: 0 }, "{}", ran.log);
+    assert_eq!(
+        ran.step(Step::Fetch)
+            .expect("the fetch step ran")
+            .ran_commit,
+        None
+    );
+    let commit = ran
+        .recorded_commit
+        .expect("the record still says something");
+    assert_eq!(commit.ran, None);
+    assert!(!commit.diverged(), "silence is not a divergence");
+    assert!(
+        commit.line().contains("did not report a revision"),
+        "{}",
+        commit.line()
+    );
+}
+
+/// A hook that writes something that is not an answer.
+///
+/// The record gets silence — the runner has no revision to put on it — and
+/// the **job's log** says why, so a consumer whose hook writes the wrong
+/// thing does not look like a consumer whose hook writes nothing. The job
+/// itself is untouched: a bad answer to a question Herd asked politely is
+/// not a reason to fail somebody's build.
+#[tokio::test]
+async fn a_revision_file_that_cannot_be_used_is_said_in_the_log_and_not_on_the_record() {
+    let harness = Harness::new("ran-unusable", |_| {}).await;
+    let fixture = Fixture::new("ran-unusable").and_then(
+        Step::Fetch,
+        // A hook that wrote its own error message into the answer.
+        &format!("printf 'fatal: not a git repository\\n' > {RAN_TOKEN}"),
+    );
+    let ran = harness.run(line("true"), fixture.declared(None)).await;
+
+    assert_eq!(ran.outcome, JobOutcome::Exited { code: 0 }, "{}", ran.log);
+    assert_eq!(
+        ran.step(Step::Fetch)
+            .expect("the fetch step ran")
+            .ran_commit,
+        None,
+        "an answer Herd cannot use is not an answer"
+    );
+    assert!(
+        ran.log.contains("so this attempt reports no revision"),
+        "the job's log says why it is silent: {}",
+        ran.log
+    );
 }

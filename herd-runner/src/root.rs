@@ -364,6 +364,27 @@ impl Workspace {
         &self.exchange_out
     }
 
+    /// The path `{ran}` names: where this job's `fetch` hook may write the
+    /// revision it really reached (D-NEXT).
+    ///
+    /// **Named and never created.** `{in}` and `{out}` are directories a hook
+    /// writes *into* and so have to exist before `up` runs; this is a file a
+    /// hook writes, and a file the runner created would be an empty one — a
+    /// zero-length "answer" where there was no answer. Absent is how a
+    /// consumer that reports nothing is told apart from one that does, so
+    /// absent is how it starts.
+    ///
+    /// Beside the working directory rather than inside it: `work` is where
+    /// the consumer's own tree ends up, and a file Herd put in the middle of
+    /// a checkout is an untracked file in somebody's repository — enough to
+    /// change what their own `fetch` or their own build sees. It is still
+    /// under the job's base directory, which [`DataRoot::resolve`] already
+    /// put inside the data root, so E-45 has one gate and not a second habit
+    /// here.
+    pub fn ran_path(&self) -> PathBuf {
+        self.base.join("ran")
+    }
+
     /// Make `{in}` and `{out}`, or say which one could not be made.
     ///
     /// Separate from [`DataRoot::open_workspace`] because only a declared

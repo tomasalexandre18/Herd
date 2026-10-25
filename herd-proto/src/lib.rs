@@ -30,9 +30,10 @@ pub use capability::{
     LabelSet, Occupant, OfferedCapability,
 };
 pub use declaration::{
-    args_as_line, declared_spans, filled_outside_the_arguments, shell_quote, Declaration, Executor,
-    LabelsFrom, Requirements, Step, StepRun, ARGS_TOKEN, COMMIT_TOKEN, IN_TOKEN, JOB_TOKEN,
-    LABELS_KEY, LINE_TOKEN, MEMORY_KEY, OUT_TOKEN, READING_KEYS, SCENARIOS_KEY, TMPFS_KEY,
+    args_as_line, declared_spans, filled_outside_the_arguments, shell_quote, CommitRun,
+    Declaration, Executor, LabelsFrom, Requirements, Step, StepRun, ARGS_TOKEN, COMMIT_TOKEN,
+    IN_TOKEN, JOB_TOKEN, LABELS_KEY, LINE_TOKEN, MEMORY_KEY, OUT_TOKEN, RAN_TOKEN, READING_KEYS,
+    SCENARIOS_KEY, TMPFS_KEY,
 };
 pub use outputs::{
     check_relative, JobOutputs, OutputFile, FRAME_CEILING, INLINE_OUTPUT_MAX, OUTPUT_CHUNK_BYTES,
@@ -2048,6 +2049,21 @@ pub enum FromHub {
         /// bytes, then the verdict.
         #[serde(default, skip_serializing_if = "JobOutputs::is_silent")]
         outputs: JobOutputs,
+        /// What the attempt that produced this verdict said about the
+        /// revision it really ran, beside the commit the job declared
+        /// (D-NEXT).
+        ///
+        /// Read off the **record** like `outputs` and for the same reason: a
+        /// `herdctl wait` attaching an hour later gets the same answer the
+        /// requester who followed the job got.
+        ///
+        /// `None` from three different places, and none of them is
+        /// agreement: a job that is not a declared command and so has no
+        /// commit at all, a job no runner ever reached, and a hub that
+        /// predates the field. What a divergence looks like is
+        /// `Some(CommitRun)` whose [`CommitRun::diverged`] is true.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        commit: Option<CommitRun>,
     },
     /// The hub has the job's outcome on its disk, and the runner may forget it.
     ///

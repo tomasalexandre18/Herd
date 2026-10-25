@@ -710,6 +710,14 @@ async fn main() -> ExitCode {
             if let Some(reason) = no_verdict_reason(&finished.outcome) {
                 said.push(no_verdict_message(&reason));
             }
+            // A verdict attributed to a commit the tree was not at (D-NEXT).
+            // Said, and nothing more: the exit code stays the job's own,
+            // because the verdict is the job's and a side channel does not
+            // become one (D20). What a wrapper branches on is
+            // `commit_diverged` in the document, not this sentence.
+            if let Some(commit) = finished.commit.as_ref().filter(|c| c.diverged()) {
+                said.push(format!("this job {}", commit.line()));
+            }
             // The shortfall last, after the per-file lines `keep_the_outputs`
             // has already written, and in `said` rather than straight to
             // stderr so that the document carries it too (D167).

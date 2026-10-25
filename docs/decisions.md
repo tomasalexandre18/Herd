@@ -8361,3 +8361,105 @@ wants the lane faster starts from the reasons and not from the stopwatch.
 
 **On the number.** This entry is D172. D170 is held by an unmerged branch and
 D171 is the last on `main`.
+
+---
+
+## 2026-10-25 — D-NEXT A verdict says which revision it really ran
+
+**Context.** Nothing a runner sent carried a revision. `StepRun` held the
+step, the start, the duration and the exit code; the commit existed on the
+way *out* only — `Declaration::commit`, the text of the `fetch` and `up`
+lines `herdctl` filled, and the deduplication key. So "this verdict is about
+commit X" rested entirely on the assumption that a `fetch` exiting 0 left the
+tree at X. A `fetch` with a fallback, a stale mirror, a `switch` whose
+failure an `&&` swallowed, or a shared cache all produce a verdict attributed
+to a commit the tree was never at, and **nothing on the record could
+contradict it afterwards**. There was no oracle for the first consumer's I01
+at all: not a weak check, but nothing to check against.
+
+**Choice.** A new placeholder, `{ran}`, filled by the runner like `{job}`,
+`{in}` and `{out}`, naming a path inside the job's own workspace that the
+consumer's `fetch` hook may write the revision it really reached into. The
+runner reads it **after the `fetch` step**, trims it, bounds it, and puts it
+on that step as `ran_commit: Option<String>`. The hub compares it with
+`Declaration::commit` when it records the step, and writes `CommitRun {
+declared, ran }` onto the attempt. The requester is told the same thing in
+the verdict frame, and `herdctl`'s verdict document carries
+`declared_commit`, `ran_commit` and `commit_diverged`.
+
+**A divergence is recorded and never refused.** The job's verdict, its exit
+code and its outcome are exactly what they were: the verdict is the job's and
+a side channel does not become one (D20). A refusal would turn a reporting
+gap into a new failure mode on the day the field ships, on a fleet where some
+runners report and some do not — and a hub that refuses on a *mismatch* is
+the recording hub plus one `if`, which can be added later on the divergences
+this field makes visible. What was missing was not enforcement; it was a fact
+on the record.
+
+**Absence means "did not say", never "it matched".** `None` on the step,
+`"ran": null` on the record, `null` on the verdict document, and
+`commit_diverged: null` rather than `false` when the comparison cannot be
+made. A default that agreed would read an older runner's silence, and every
+consumer's first day, as a clean bill of health — the same mistake a plain
+`Vec` default would have made of the health report's `suspended` (D169's
+neighbourhood, and D23's rule).
+
+**No protocol break and no migration.** `PROTOCOL_VERSION` stays **2** and
+`RECORD_VERSION` stays **1**, asserted by a test. Every addition is
+`#[serde(default)]` and means, absent, exactly what its default says, which
+is the additive rule this project already wrote down twice. The record has no
+step type of its own — it holds `Vec<herd_proto::StepRun>` — so the wire
+change and the record change are one change and cannot be staged apart.
+
+**What it costs on a rollback, said plainly.** A hub of an earlier version
+**reads** a record carrying the field and **erases it the first time it
+writes that record back**. Serde drops what it never decoded and has nothing
+to re-emit. The reachable paths are ordinary: `record_state` on any job still
+in flight, and `note_outputs_fetched` on a finished job, at the first fetch
+of its outputs. A rollback therefore reads every record and preserves this
+field on none of the ones it touches. For a diagnostic field that is an
+acceptable cost; it is written here and asserted in
+`herd-hub/tests/ran_commit_across_versions.rs` so that it is known rather
+than discovered.
+
+**Why a token and not an environment variable.** Both would hand the hook a
+path. They differ on the day a consumer updates its declaration before every
+machine in the fleet has been restarted. An older runner leaves `{ran}`
+unfilled, the shell treats the brace as the ordinary filename it is, the hook
+succeeds, and the runner reports nothing. An unset `$HERD_RAN_COMMIT_FILE`
+makes the same line `> ""`, which fails, and a failed `fetch` is a job that
+never started — every job of that consumer, on every machine not yet
+restarted. The first failure mode is a stray file in a workspace that is
+about to be reclaimed; the second is a fleet-wide outage. Both are asserted
+with a real `/bin/sh` in that test file.
+
+**Rejected.** *The runner runs `git rev-parse` itself* — Herd would learn one
+VCS and stop being project-agnostic (E-11: Herd's code names no consumer
+command); the token gets the same fact without Herd knowing what produced it.
+*The hub re-resolves the commit* — it would need the repository, the network
+and VCS knowledge (invariants 1 and 3). *A fifth `verify` step* — four steps,
+fixed order, no conditions; a step with a condition is the workflow language
+invariant 1 refuses to be (D77). *The hook prints the revision and the runner
+greps the log* — a job's log is the bytes the job's process wrote (D18), and
+parsing prose is what D166 exists to make unnecessary. *Refusing a divergence
+in this increment* — above. *A new `events.jsonl` variant for a divergence* —
+`JobEventKind` has no `#[serde(other)]`, so a new variant is the one addition
+to the record that an older hub could **not** read; the divergence is a field
+on the attempt instead.
+
+**Herd runs no `git` and parses nothing.** It hands the consumer's hook a
+path, reads back one line, checks that it is one printable word of at most
+128 characters, and compares it with the declared commit byte for byte. That
+is the same shape as `labels_from`, where the consumer's own command answers
+and Herd reads the answer strictly. A file that is there and unusable is
+reported as **silence** on the record and said out loud in the job's log, so
+a hook writing the wrong thing does not look like a hook writing nothing.
+
+**What the consumer can do today, with nothing shipped.** Append
+`&& [ "$(git rev-parse HEAD)" = "<hash>" ]` to the `fetch` hook. A divergence
+is then a preparation failure — the job never runs, exit 125 — instead of a
+wrong verdict. It is containment and not a fix: the guarantee sits in their
+file, Herd's record still says nothing, and a consumer who changes that line
+loses the protection with nobody noticing. It is worth asking for anyway,
+because it protects the next build and this entry protects the one after the
+deployment.

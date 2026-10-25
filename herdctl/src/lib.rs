@@ -73,6 +73,13 @@ pub struct Finished {
     /// a job is exactly the machine somebody needs named. `None` means the
     /// hub never placed the job at all — it was refused, or it was impossible.
     pub ran_on: Option<RanOn>,
+    /// What the attempt said about the revision it really ran, beside the
+    /// commit this job declared, as the hub holds it (D-NEXT).
+    ///
+    /// `None` is "nobody said", from any of its three causes — an ad-hoc job,
+    /// a job no runner reached, a hub that predates the field — and from none
+    /// of them does it follow that the tree was at the declared commit.
+    pub commit: Option<herd_proto::CommitRun>,
 }
 
 /// The two parts of E-02's framing line, kept rather than only printed.
@@ -597,6 +604,7 @@ pub async fn run_job_wanting(
                 outcome,
                 metrics,
                 outputs,
+                commit,
             } => {
                 if Framing::belongs_to(&outcome) {
                     framing.release(&mut said);
@@ -608,6 +616,7 @@ pub async fn run_job_wanting(
                     metrics,
                     outputs,
                     ran_on: framing.placed.clone(),
+                    commit,
                 });
             }
             FromHub::Refused { reason } => {
@@ -777,6 +786,7 @@ pub async fn wait_for_job_wanting(
                 outcome,
                 metrics,
                 outputs,
+                commit,
             } => {
                 if Framing::belongs_to(&outcome) {
                     framing.release(&mut said);
@@ -788,6 +798,7 @@ pub async fn wait_for_job_wanting(
                     metrics,
                     outputs,
                     ran_on: framing.placed.clone(),
+                    commit,
                 });
             }
             FromHub::JobLog { data, .. } => {

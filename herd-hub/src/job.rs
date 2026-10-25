@@ -10,7 +10,7 @@ use std::error::Error;
 use std::fmt;
 
 use herd_proto::{
-    Declaration, JobId, JobOutcome, LabelSet, LabelsFrom, LogStream, Occupant, Priority,
+    CommitRun, Declaration, JobId, JobOutcome, LabelSet, LabelsFrom, LogStream, Occupant, Priority,
     Requirements, StepRun,
 };
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
@@ -266,6 +266,22 @@ pub struct Attempt {
     /// attempt of a job that is not a declared command.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub steps: Vec<StepRun>,
+    /// What this attempt said about the revision it really ran, beside the
+    /// commit the job is recorded against (D-NEXT).
+    ///
+    /// Written by the hub when the attempt's `fetch` step is recorded, from
+    /// the step's own `ran_commit` and the job's own declaration — the only
+    /// two places either figure exists. `None` until then, and `None` for
+    /// ever on an attempt of a job that is not a declared command: an ad-hoc
+    /// job declares no commit, so there is nothing for a revision to agree
+    /// or disagree with.
+    ///
+    /// **This is the oracle, and it only ever records.** A divergence here
+    /// changes no exit code and no verdict (D20); what it does is make
+    /// "declared X, ran Y" a fact on the record, where before there was
+    /// nothing that could contradict a verdict's commit after the fact.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub commit: Option<CommitRun>,
 }
 
 /// What a requester asked for, as the hub takes it in.

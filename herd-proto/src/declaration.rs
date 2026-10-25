@@ -21,7 +21,7 @@
 //! |---|---|---|
 //! | `{args}`, `{commit}` | `herdctl` | the requester typed the arguments and resolved the commit in its own checkout (D106) |
 //! | `{j}` | the hub | it is a property of the machine the hub chose, derived as it chooses one (E-22, D82) |
-//! | `{job}`, `{in}`, `{out}`, `{line}` | the runner | the id is the hub's but the directories are the runner's own, and `{line}` is the command line going into the `run` hook |
+//! | `{job}`, `{in}`, `{out}`, `{ran}`, `{line}` | the runner | the id is the hub's, the directories and `{ran}`'s path are the runner's own, and `{line}` is the command line going into the `run` hook |
 //!
 //! `{args}` and `{commit}` are filled **before the job is minted**, which is
 //! not a detail: the line on the record is then the line that will run, so
@@ -45,6 +45,22 @@ pub const ARGS_TOKEN: &str = "{args}";
 pub const IN_TOKEN: &str = "{in}";
 /// The directory this job leaves its artefacts in (M11).
 pub const OUT_TOKEN: &str = "{out}";
+/// The path this job's `fetch` hook may write the revision it really reached
+/// into (D-NEXT).
+///
+/// **A path, not a value.** Herd holds no repository and runs no VCS (E-11,
+/// invariant 1), so it cannot resolve a revision and does not try. What it
+/// does is hand the consumer's own hook a file name inside the job's
+/// workspace and read back the one line the hook leaves there — the same
+/// shape as [`LabelsFrom`], where the consumer's command answers and Herd
+/// reads the answer strictly.
+///
+/// **Writing it is optional and stays optional.** A `fetch` hook that names
+/// this token nowhere leaves no file, the runner reports no revision, and
+/// the record says so in as many words. Silence is a normal state: never an
+/// error, never a refusal, and never read as agreement (D23's rule).
+pub const RAN_TOKEN: &str = "{ran}";
+
 /// The declared command line, as it goes into the `run` hook.
 ///
 /// The one token that is not a value but the command itself: the consumer's
@@ -59,14 +75,15 @@ pub const LINE_TOKEN: &str = "{line}";
 /// brace in it.
 ///
 /// [`crate::PARALLELISM_TOKEN`] is in the list because it is Herd's own and
-/// the hub fills it (E-22); it is the only one of the seven that may also be
+/// the hub fills it (E-22); it is the only one of the eight that may also be
 /// absent from a declaration that asks for no `-j`.
-pub const TOKENS: [&str; 7] = [
+pub const TOKENS: [&str; 8] = [
     JOB_TOKEN,
     COMMIT_TOKEN,
     ARGS_TOKEN,
     IN_TOKEN,
     OUT_TOKEN,
+    RAN_TOKEN,
     LINE_TOKEN,
     crate::PARALLELISM_TOKEN,
 ];
@@ -271,6 +288,90 @@ pub struct StepRun {
     /// `exit_code` is there, and the two are never both absent.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ended: Option<String>,
+    /// The revision the tree was really at when this step ended, as the
+    /// consumer's own hook reported it through [`RAN_TOKEN`] (D-NEXT).
+    ///
+    /// Set on the `fetch` step and on no other: `fetch` is the step that puts
+    /// the tree at the commit, so it is the step whose end the question is
+    /// about. A revision read after `run` would be whatever the job's own
+    /// command left behind.
+    ///
+    /// **`None` means "this runner did not report a revision", never "it
+    /// matched".** A peer that predates the field, a consumer whose hook
+    /// writes nothing, and a file that could not be read all land here, and
+    /// none of them is evidence that the tree was at the declared commit. The
+    /// rule is D23's and the shape is the one the health report's `suspended`
+    /// needed: a default that *agreed* would read an old peer's silence as a
+    /// clean bill of health.
+    ///
+    /// Herd does not know what produced this string and never parses it. It
+    /// is compared with [`Declaration::commit`], byte for byte, by the hub.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ran_commit: Option<String>,
+}
+
+/// What an attempt said about the revision it really ran, beside the commit
+/// the job declared (D-NEXT).
+///
+/// The hub builds one of these when a declared command's `fetch` step is
+/// recorded, holds it on the attempt, and hands it to the requester with the
+/// verdict. It is the first thing on a Herd record that can **contradict** a
+/// verdict's commit: before it, "this verdict is about commit X" rested
+/// entirely on the assumption that a `fetch` exiting 0 left the tree at X,
+/// and nothing on the record could say otherwise.
+///
+/// **It records; it refuses nothing.** A divergence does not fail the job,
+/// does not change its exit code, and does not change the verdict: the
+/// verdict is the job's and a side channel does not become one (D20).
+/// Whether a divergence should also *stop* a job is a second decision, to be
+/// taken on the divergences this field makes visible rather than before
+/// there are any.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CommitRun {
+    /// The commit the job declared, forty lowercase hex, as `herdctl`
+    /// resolved it in the requester's own checkout (E-01, D106).
+    pub declared: String,
+    /// What the runner reported, or `None` for "this runner did not report a
+    /// revision".
+    ///
+    /// Serialised **even when it is `None`**, as an explicit `null`: an
+    /// absent key and a key that is there and empty read the same to a
+    /// careless reader, and the whole point of the field is that silence is
+    /// not agreement.
+    #[serde(default)]
+    pub ran: Option<String>,
+}
+
+impl CommitRun {
+    /// Whether the revision reported contradicts the commit declared.
+    ///
+    /// `false` for silence, which is not agreement either — [`CommitRun::ran`]
+    /// is what tells the two apart, and the one question this answers is "is
+    /// there a divergence on the record".
+    pub fn diverged(&self) -> bool {
+        self.ran
+            .as_deref()
+            .is_some_and(|ran| ran != self.declared.as_str())
+    }
+
+    /// The one sentence a reader is given for this, in Herd's own words.
+    pub fn line(&self) -> String {
+        match &self.ran {
+            Some(ran) if ran == &self.declared => {
+                format!("declared {}, and the runner ran {ran}", self.declared)
+            }
+            Some(ran) => format!(
+                "declared {}, ran {ran}: this attempt's tree was at a different revision \
+                 from the one this job is recorded against",
+                self.declared
+            ),
+            None => format!(
+                "declared {}; this runner did not report a revision, so nothing here \
+                 confirms the tree was at it",
+                self.declared
+            ),
+        }
+    }
 }
 
 impl StepRun {
@@ -802,6 +903,66 @@ fetch cb5a2e8b4f1d9c7a3e05b8d6f2a1c4e79b0d3f68
         assert_eq!(read.memory_mib, 4096);
     }
 
+    /// The three states of the commit question, and the one that is easiest
+    /// to get wrong (D-NEXT).
+    ///
+    /// Silence is **not** a divergence and it is **not** agreement. A type
+    /// that collapsed it into either would be the whole defect back again
+    /// in a smaller box.
+    #[test]
+    fn a_reported_revision_is_told_from_silence_and_from_a_divergence() {
+        let declared = "cb5a".repeat(10);
+        let agreed = CommitRun {
+            declared: declared.clone(),
+            ran: Some(declared.clone()),
+        };
+        assert!(!agreed.diverged());
+        assert!(agreed.line().contains(&declared));
+
+        let diverged = CommitRun {
+            declared: declared.clone(),
+            ran: Some("9f41".repeat(10)),
+        };
+        assert!(diverged.diverged());
+        assert!(
+            diverged.line().contains("a different revision"),
+            "{}",
+            diverged.line()
+        );
+
+        let silent = CommitRun {
+            declared,
+            ran: None,
+        };
+        assert!(!silent.diverged(), "nobody answered, so nobody disagreed");
+        assert!(
+            silent.line().contains("did not report a revision"),
+            "{}",
+            silent.line()
+        );
+    }
+
+    /// Silence is an explicit `null` and never an absent key, so that a
+    /// reader cannot miss it by looking only at the keys that are there.
+    #[test]
+    fn silence_is_written_down_rather_than_left_out() {
+        let json = serde_json::to_string(&CommitRun {
+            declared: "cb5a".repeat(10),
+            ran: None,
+        })
+        .expect("it serialises");
+        assert!(json.contains("\"ran\":null"), "{json}");
+    }
+
+    /// A step from a peer that never heard of the field decodes as having
+    /// said nothing, which is the only default that is honest.
+    #[test]
+    fn a_step_with_no_revision_on_it_decodes_as_having_said_nothing() {
+        let older = r#"{"step":"fetch","started_unix_ms":1,"duration_ms":2,"exit_code":0}"#;
+        let step: StepRun = serde_json::from_str(older).expect("it decodes");
+        assert_eq!(step.ran_commit, None);
+    }
+
     #[test]
     fn a_step_s_line_says_its_duration_and_its_code() {
         let ran = StepRun {
@@ -810,6 +971,7 @@ fetch cb5a2e8b4f1d9c7a3e05b8d6f2a1c4e79b0d3f68
             duration_ms: 95_400,
             exit_code: Some(0),
             ended: None,
+            ran_commit: None,
         };
         assert_eq!(ran.line(), "up: 95.400 s, exit 0");
         let capped = StepRun {
@@ -818,6 +980,7 @@ fetch cb5a2e8b4f1d9c7a3e05b8d6f2a1c4e79b0d3f68
             duration_ms: 2_700_000,
             exit_code: None,
             ended: Some("stopped at the time cap, 2700 s".to_owned()),
+            ran_commit: None,
         };
         assert_eq!(
             capped.line(),
