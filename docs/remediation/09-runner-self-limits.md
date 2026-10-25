@@ -30,6 +30,61 @@ settle it) or **I** (unknown).
 
 ---
 
+## Release notes — the two things that must ship with this version
+
+Not bullets in a section somebody reads afterwards. These two are the whole
+of what this change does to a fleet that is not ours, and `herd-release`
+copies them into the release body verbatim.
+
+### RN-1. Upgrade the **hub** before the runners.
+
+A runner on this version announces a ceiling; a hub on this version honours
+it and holds the surplus in the queue. A hub on **`v0.3.7`** — the version
+in the field — cannot read the announcement and goes on sending, and the
+runner now refuses. Each refusal spends one of that job's two goes, so a
+job refused twice **ends with no verdict**. On `v0.3.7` the same queue cost
+no refusals at all, because the runner had no ceiling: it ran everything.
+Runner-first therefore does not preserve today's cost, it loses jobs.
+
+Hub-first costs nothing: a hub on this version reads no `jobs_at_once` from
+a `v0.3.7` runner's hello, which means *"it did not say"*, and places on it
+exactly as it does today.
+
+**Nothing in Herd detects or enforces this order.** `Welcome` carries no
+echo of the field and the protocol version deliberately does not move, so a
+fleet upgraded in the wrong order gets no signal until jobs start ending
+`lost`. §7.6 has the detail.
+
+### RN-2. A runner started **without `--host-memory` now takes one job at a time.**
+
+`herd-runner/src/main.rs` fills in `host.memory_mib` only when
+`--host-memory` is given or an enclosing cgroup limit can be read. With no
+figure, `confine::jobs_at_once` returns
+`JOBS_AT_ONCE_WHEN_A_HOST_WILL_NOT_SAY` = **1**, and both the runner and
+the hub hold that machine to one job at a time, for ever.
+
+That is correct and deliberate — D23: an absent figure is absent, never a
+figure invented from the machine, and the only count certainly safe on a
+host of unknown size is one. It is also a **fleet-wide throughput cliff
+caused by a missing flag**, and before this version such a runner took
+memory-silent jobs without bound.
+
+The runner says so at startup, by name:
+
+```
+this machine does not say how much memory it lends, so how many jobs of
+2 GiB fit on it cannot be derived: this runner holds at most 1 job(s) at
+once until --host-memory says otherwise
+```
+
+**Whether any runner in the first consumer's fleet starts without that flag
+is unknown to us and stays unknown (invariant 9, D161).** Nobody here logs
+into their machines to find out. That is exactly why this is a release note
+and not a footnote: the only person who can check is the one running the
+fleet, and they can only check if they are told.
+
+---
+
 ## 0. The six things that matter
 
 1. **The ceiling is derived from what the machine itself declared.** F. A
@@ -183,8 +238,14 @@ to tell a full machine from a broken one:
 ```
 the runner is already running 8 job(s) and never started this job: this
 machine lends 4 GiB and keeps 2 GiB as its own floor, and caps every job at
-256 MiB, so it holds at most 8 job(s) at once
+256 MiB, so this runner holds at most 8 job(s) at once
 ```
+
+*"this runner holds at most"* is `herd_runner::A_RUNNERS_OWN_CEILING`, and
+it is in the sentence rather than beside it because this is how a reader —
+and `herd-hub/tests/announced_job_ceiling.rs`'s oracle — knows the words
+came from the runner and not from the hub, which has a ceiling sentence of
+its own (§7.3, §7.5).
 
 ### 2.2 What becomes of the job — F
 
@@ -327,7 +388,9 @@ Nothing they have to change, and one thing they should read.
   at least 1. At the defaults that is 12 on a 31 GiB machine and 7 on a
   17 GiB one. If a runner of theirs announces no `--host-memory`, it will
   hold **one job at a time** — the startup line says so by name, and adding
-  `--host-memory` is the whole fix.
+  `--host-memory` is the whole fix. **This is RN-2 at the top of this page,
+  and it ships as a release note**, because whether any of their runners
+  starts without the flag is unknown to us and must stay so (D161).
 * **A refused job is requeued, not failed** — but a job refused
   `attempts_allowed` times ends without a verdict. If they see jobs ending
   with no verdict and the reason *"the runner is already running N job(s)"*,
@@ -336,7 +399,11 @@ Nothing they have to change, and one thing they should read.
   more machines. Not a Herd bug: a fleet whose declared capacity is smaller
   than its queue.
 * **The startup line to grep for** is the one beginning *"this machine lends
-  … and caps every job at …, so it holds at most N job(s) at once"*.
+  … and caps every job at …, so this runner holds at most N job(s) at
+  once"*. The clause *"this runner holds at most"* is the runner's own and
+  appears in no sentence the hub writes, so it is also what tells a refusal
+  the runner made apart from a job the hub is merely holding back (which
+  says *"it said it holds at most N at once"* and costs the job nothing).
 * **Disk**: a runner restarted after a kill now deletes any leftover
   `<data root>/outputs/<job>-<attempt>/` and says how much went. Those bytes
   were never recoverable; if anybody was harvesting that directory by hand,
@@ -501,30 +568,46 @@ of them at zero and the memory accounting cannot be what bounds them. Eight
 a queue of identical sleeps is one job wearing eight requesters, which paces
 itself perfectly and would prove nothing.
 
-| | before the hub half | after |
+| | before the hub half (5 runs) | after |
 |---|---|---|
-| peak attempts out on the runner at once | 7 | **2** |
-| attempts spent **because of the ceiling** | 12 | **0** |
+| peak attempts out on the runner at once | 6 or 7 | **2** |
+| attempts spent **because of the ceiling** | 12 in 4 runs, 9 in 1 | **0** |
 | attempts spent for anything else | 0 | **0** |
-| attempts recorded in all, for 8 jobs | 14 | **8** |
-| jobs that reached their own verdict | 2 of 8 | **8 of 8** |
-| jobs that ended `lost`, with no verdict | **6 of 8** | **0** |
+| attempts recorded in all, for 8 jobs | 14 in 4 runs; **I** in the fifth | **8** |
+| jobs that reached their own verdict | 2 of 8 in 4 runs, 4 of 8 in 1 | **8 of 8** |
+| jobs that ended `lost`, with no verdict | **6 of 8 in 4 runs, 4 of 8 in 1** | **0** |
 
-Both columns were measured on this branch, today, by running the same test
-twice: the "before" column with the gate in `admission` disabled, which is
-why it is a measurement and not a recollection.
+**The "before" column is a spread, not a sample. F.** It was measured by
+running the same test with the gate in `admission` neutered
+(`seat.jobs_at_once` read as `None`), **five times**, in the contradictory
+review of PR #82 — four runs gave 6 of 8 lost and 12 attempts spent, one
+gave 4 and 9, and the peak was 6 in two runs and 7 in three. An earlier
+version of this table printed `7`, `12` and `6 of 8` as if each were the
+figure; they are the modal figures of a timing-dependent race between the
+hub's dispatch pass and the runner's refusals, and a sixth run could
+contradict any single one of them. **The finding does not rest on the
+spread:** in every one of the five runs a majority of perfectly runnable
+jobs ended with no verdict at all, and that is what this row says.
+
+The "after" column is not timing-dependent and was measured on this branch:
+peak 2, 8 attempts for 8 jobs, every job exited 0. The one row the five runs
+did not each record separately is the total attempt count, marked **I**
+above: 14 was read in the four runs that spent 12, and the fifth run's total
+was not read off its records.
 
 **The last row is the damage, and it is worse than the attempt count makes
 it look.** `attempts_allowed` is 2. A job refused twice has spent both its
 goes on refusals that were certain before they were sent, and
-`give_the_job_another_go` then ends it — so six of eight perfectly runnable
-jobs ended with no verdict at all, each carrying this reason:
+`give_the_job_another_go` then ends it — so a majority of eight perfectly
+runnable jobs (six in four of the five runs, four in the fifth) ended with
+no verdict at all, each carrying this reason:
 
 ```
 the runner is already running 2 job(s) and never started this job: this
 machine lends 4 GiB and keeps 2 GiB as its own floor, and caps every job
-at 1 GiB, so it holds at most 2 job(s) at once; this was attempt 2 of 2
-at a runner that went away, so the job is not attempted again (E-21)
+at 1 GiB, so this runner holds at most 2 job(s) at once; this was attempt
+2 of 2 at a runner that went away, so the job is not attempted again
+(E-21)
 ```
 
 That sentence is §5's warning happening. It is also exactly the sentence §6
@@ -540,6 +623,20 @@ record's `attempt_ended` line by `end_attempt` — and a timeout, a cancel or
 a lost runner carries one of the hub's. `ceiling_refusals` in that file is
 the whole of the distinction, and the "attempts spent for anything else"
 row is what it leaves behind.
+
+**And the two sentences are now told apart with certainty. F.** The runner's
+carries `herd_runner::A_RUNNERS_OWN_CEILING` — *"this runner holds at most
+N job(s) at once"* — and the hub's own ceiling sentence, the one it writes
+on a `waiting` line, carries
+`herd_hub::matcher::A_CEILING_THE_RUNNER_ANNOUNCED` — *"it said it holds at
+most N at once"*. Both used to contain the words *"holds at most"*, and the
+test matched that as a literal of its own: it could not say which side had
+spoken — which is precisely the attribution claimed here — and a wording
+edit on either side would have left it matching a phrase nothing says, so
+the oracle would have read green on a fleet losing jobs. The test now
+imports both constants and asserts, against the sentences as they are
+really built, that neither contains the other's clause
+(`the_runners_ceiling_sentence_is_not_the_hubs`).
 
 **And the silent runner is unchanged. F.** Every seat the matcher's own
 tests build announces nothing, deliberately, so the whole existing suite is
@@ -560,11 +657,34 @@ The
 runner protects itself regardless, which is invariant 2 and the premise of
 C5's first half.
 
-So a fleet whose runners are upgraded before its hub pays exactly what it
-paid before this change: one go per surplus job, and a job refused
-`attempts_allowed` times ends without a verdict (§5). That is the
-acknowledged cost of the rollback, written down here rather than discovered
-on someone's machine. The upgrade order that avoids it is **hub first**.
+**Upgrade the hub first. This is a condition, not a preference.**
+
+An earlier version of this section said a runner-first fleet "pays exactly
+what it paid before this change". That is **false**, and the version it is
+false against is the one in the field. Compared with `v0.3.7`:
+
+* On `v0.3.7` a runner had **no ceiling at all**. A hub placing a queue of
+  memory-silent jobs on one machine cost **zero** refusals — the runner
+  accepted every one and ran them all. That was bad for the host and is the
+  invariant 2 defect C5 closes, but the jobs produced verdicts.
+* A fleet whose runners are on this version while its hub is on `v0.3.7`
+  pays refusals it **never paid before**: one `AttemptAbandoned` per
+  surplus assignment, on a hub that cannot read the announcement and will
+  go on sending them. `attempts_allowed` is 2, so by §7.5's mechanism a job
+  refused twice does not wait — it **ends with no verdict**.
+
+So runner-first does not preserve today's cost; it converts "host
+overloaded, work done twice" into "jobs lost". Hub-first costs nothing: a
+hub on this version placing work on a `v0.3.7` runner reads no `jobs_at_once`
+in the hello, which means *"it did not say"*, and places exactly as it does
+today.
+
+**And nothing detects the order. F.** `Welcome` carries no echo of the
+field, the protocol version deliberately does not move (§7.1), and a runner
+cannot tell a hub that honoured its announcement from one that never read
+it. A consumer who upgrades runners first gets no signal at all until jobs
+start ending `lost` with §7.5's sentence. That is why the order belongs in
+the PR body and in whatever goes out with the release, and not only here.
 
 ### 7.7 What is still open
 
