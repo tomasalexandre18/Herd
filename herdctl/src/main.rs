@@ -717,9 +717,11 @@ async fn main() -> ExitCode {
             if let Some(reason) = impossible_exit_code_reason(&finished.outcome) {
                 said.push(no_verdict_message(&reason));
             }
-            // Cancelled, or lost with its runner: a real end, and not one that
-            // carries a verdict. Said in words, because 125 cannot say which
-            // of them it was (D20).
+            // Cancelled; lost with its runner; impossible; or refused by every
+            // machine it was offered to because each was already as full as the
+            // ceiling it announced: real ends, and not ones that carry a
+            // verdict. Said in words, because 125 cannot say which of them it
+            // was (D20).
             if let Some(reason) = no_verdict_reason(&finished.outcome) {
                 said.push(no_verdict_message(&reason));
             }
