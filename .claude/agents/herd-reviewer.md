@@ -37,5 +37,11 @@ Your review is kept whatever the orchestrator decides.
 Shared host: own scratchpad subdirectory; never `pkill -f`; nothing on
 the consumer's instance (D161).
 
+If the brief does ask for a heavy phase, run `./scripts/bench-preflight.sh`
+first and stop if it refuses; build into
+`export CARGO_TARGET_DIR=/mnt/ssd_980/herd/build/<task>`, never onto the
+root filesystem, and `rm -rf "$CARGO_TARGET_DIR"` when the task ends
+(gotcha `build-weight-off-root`).
+
 Report: findings ordered by severity, each with evidence and the change
 that would resolve it; then stop.
