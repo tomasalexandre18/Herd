@@ -8361,3 +8361,127 @@ wants the lane faster starts from the reasons and not from the stopwatch.
 
 **On the number.** This entry is D172. D170 is held by an unmerged branch and
 D171 is the last on `main`.
+
+## 2026-10-25 — D-NEXT A refused file is named, never erased
+
+**The defect, measured and not supposed.** A verdict carrying two inline
+output files, one of whose bytes do not hash to the sha256 beside them,
+produced: `herdctl` exit code **0**, one manifest entry of two on
+`job.json`, and one file of two under `--outputs-to`. The bench that
+measured it is `herdctl/tests/inline_digest_mismatch.rs` and the figures are
+in `docs/remediation/04b-integrity-and-containment.md` §1. **0 is the one
+code that means "everything you asked for happened"**, and a requester that
+asked for a job's evidence read it on a collection it did not get.
+
+**The chain, in four links.** `record_outputs` pushed the manifest entry
+*after* the digest check, so a refusal `continue`d past the push and the
+entry was never written. `herdctl` counts its shortfall **off the manifest**
+— `missing = files.iter().filter(|f| !f.is_held()).count()` — so an entry
+that does not exist is not missing. `missing` was 0, `files_short` was
+false, and `code_for` had nothing to raise. **The one mechanism D167 built
+to stop a short collection reading as a whole one was bypassed by the one
+path that removes the evidence of the shortfall.**
+
+**The rule it broke was written two lines below it.** The same function
+states: *"the manifest first, the bytes if they are here … what a reader of
+`job.json` must never find is a path that is not there **and** no way to
+tell why"*. That rule is repeated in `job_outputs`, in
+`herdctl::write_outputs`, and in the streamed path D148 built it for. Every
+other absence — a file still crossing, a collection the sweeper took, a file
+the store cannot read back — keeps its entry and names its absence. The
+digest case was the single exception in the whole design of outputs, and it
+was not an exception anybody decided: no sentence anywhere states it.
+
+**The correction is at the cause: the entry is written down before the
+bytes are judged.** Two statements swapped in
+`JobDirStore::record_outputs`. The refusal still refuses the bytes, still
+names both digests on `skipped`, and still never writes the file. What it no
+longer does is erase the only trace a requester counts. The file is then
+*announced and not held*, which is the shape the rest of the system already
+knows how to read: `herdctl` counts it short, exits 2, and says which path
+and why.
+
+**Not a filter in `herdctl`, and not a new field.** Two alternatives were
+rejected. Making `herdctl` exit non-zero whenever `skipped` is non-empty
+would turn D131's ordinary sentences — a symlink, a fifo, a name that is not
+UTF-8 — into failures, and those are decided facts about one file that
+D131 ruled are *"a loud sentence and never an exit code"*. Carrying a new
+"refused" flag on the record or the wire would cost a field for a fact the
+manifest already expresses by an entry that is not held. **Neither
+`PROTOCOL_VERSION` nor `RECORD_VERSION` moves**, no frame gains a field, and
+no record written before this reads differently after it.
+
+**The neighbouring case is left alone, deliberately, and it is not the same
+case.** A file whose *path* the hub will not join onto its own directory —
+`../escape.json` — keeps no manifest entry, and its requester still reads 0.
+That drop is decided and right: the manifest is the list of paths this store
+joins onto its own directory, `write_output_chunk` resolves a chunk against
+it and `job_outputs` reads a file back by it, so a path that must never be
+joined must never be on it. The record names the file on `skipped` and that
+is where it exists. **What was never decided is the exit code**, and
+searching `docs/decisions.md` finds nothing that rules on it: D131 settled
+the record, D167 settled the short collection, neither mentions a path the
+hub refuses. It is inherited from the drop, exactly as the digest case's 0
+was. It is now pinned by a test that says so in its own comment, so that
+changing it is a decision and not an accident. **Alexa's to take**, with one
+recommendation: a hub-refused path should cost the zero too, by the same
+reasoning as this entry, and it needs a shape that does not put an
+unjoinable path on the manifest.
+
+**And the stopgap, which is not the fix.** Every sentence `herdctl` had
+about a job's files — the refusal, the `skipped` lines, the per-path "not on
+the hub" lines — reached stderr and nothing else. A wrapper that wanted to
+protect itself had to grep prose, which is the parsing D166 added a verdict
+document to make unnecessary. They are now in `Verdict::said` as well as on
+stderr, in the order they are printed. They do **not** move the exit code:
+a fact about one file is never a verdict about the job (D131, D20).
+
+**Impact statement for the first consumer.**
+
+*What changes.* Jobs whose verdict carried an inline output file whose bytes
+contradicted their own sha256 used to exit **0** with that file silently
+absent. They now exit **2** — `herdctl`'s own code for "this command did
+part of what it says" (D167) — with the path named on stderr and in the
+verdict document. Nothing else changes: a failing build still exits 1, a
+capped job still exits 124, a job with no verdict still exits 125, and a job
+whose files all arrived still exits 0. The job's own verdict is untouched in
+every case; 2 appears only where 0 would have, and the verdict document
+labels it `"exit_code_from": "herd"`, never `"job"`.
+
+*When it can happen.* Only when a runner's frame disagrees with itself: a
+runner of a different build, a corrupted spool read, memory corruption. A
+runner of the same build computes the length and the digest from the buffer
+it sends and cannot produce it. We have no evidence it has happened on your
+instance; nothing on a record distinguishes it after the fact except the
+`skipped` sentence, which is on `job.json` and always was.
+
+*What a requester adapts.* If your tooling treats any non-zero `herdctl`
+exit as "the build failed", a 2 will now read as a failure where it used to
+read as a pass. That is the intent — the output set really was incomplete —
+but the right reading is "the build's verdict is in the document; this run
+did not bring back everything it was asked for". Read `exit_code` together
+with `exit_code_from` from `--verdict-to`: `"job"` is the build's answer,
+`"herd"` is ours about this invocation. You can also drop any workaround
+that compares the file count under `--outputs-to` with what you expected:
+that is what the 2 now tells you.
+
+*Going back.* Reverting this commit restores the old behaviour. **A record
+written by the corrected version stays readable**: the only difference is an
+extra manifest entry for a file that is not on disk, which is the same shape
+as a streamed collection still crossing, and `RECORD_VERSION` is unchanged
+at 1. An old `herdctl` reading such a record counts that entry as missing
+and exits 2 — the corrected behaviour, from the record alone — so a rollback
+of the hub is clean and a rollback of `herdctl` alone does not restore the
+false success for jobs already recorded. Nothing has to be migrated, deleted
+or rewritten in either direction.
+
+**One consequence worth naming, and it is pre-existing.** A job holding a
+manifest entry whose bytes never landed never satisfies
+`collection_is_whole`, and the output sweeper only takes whole collections
+(D152), so such a job's kept files are never evicted under the output
+budget. That is already true of every streamed collection that never
+completed; this entry adds the inline digest case to it. Not fixed here: it
+is the sweeper's rule, not this defect's.
+
+**On the number.** Left as `D-NEXT`; `herd-merger` allocates it at
+integration.

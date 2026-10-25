@@ -1,24 +1,23 @@
-//! **Experiment 6.3 (a): what a requester's exit code says when a verdict's
-//! inline bytes contradict their own digest.**
+//! **A verdict whose inline bytes contradict their own digest never exits 0.**
 //!
-//! The audit (`docs/remediation/03a-identity-and-storage.md` §5.2) predicted
-//! that `herdctl` exits **0** here: `record_outputs` drops the manifest entry
-//! whose bytes disagree with their digest (`herd-hub/src/store.rs:1711-1716`)
-//! instead of keeping the entry and naming the absence, so the shortfall
-//! `herdctl` counts off the manifest (`herdctl/src/main.rs:1283`) is zero and
-//! `code_for` (`herdctl/src/main.rs:591-596`) has nothing to raise.
+//! The defect this pins was measured, not supposed
+//! (`docs/remediation/04b-integrity-and-containment.md` §1). `record_outputs`
+//! used to drop the *manifest entry* of a file whose bytes disagreed with
+//! their sha256, so the shortfall `herdctl` counts off the manifest
+//! (`herdctl/src/main.rs`, `missing`) was zero, `code_for` had nothing to
+//! raise, and a requester that asked for two files, got one, and read **0** —
+//! the one code that means "everything you asked for happened".
 //!
-//! These are **bench files, not an expectation Herd commits to**. They
-//! measure what the code does today and are named so a reader cannot mistake
-//! them for a contract: `measure_*`. Nothing here is fixed, because fixing it
-//! is a product change that is not this task's.
+//! These were benches that only printed. They are expectations now (D-NEXT):
+//! the figures below fail on the code of 2026-10-24 and pass on the code that
+//! keeps the entry and refuses only the bytes.
 //!
 //! A real runner cannot produce the frame under test — it computes the length
 //! and the digest from the same buffer it sends
-//! (`herd-proto/src/outputs.rs:213-220`) — so the runner here is hand-written,
+//! (`herd-proto/src/outputs.rs`) — so the runner here is hand-written,
 //! exactly as `herd-hub/tests/link.rs` does for the same reason. `herdctl` is
 //! the **real binary**, run as a child, because the exit code is the thing
-//! being measured and only a process has one.
+//! being asserted and only a process has one.
 
 use std::process::Output;
 use std::sync::Arc;
@@ -214,17 +213,33 @@ fn stderr(output: &Output) -> String {
     String::from_utf8_lossy(&output.stderr).into_owned()
 }
 
-/// **The measurement.** A passing job whose verdict carries one inline file
-/// that contradicts its own sha256, and the exit code the shell would read
-/// from `herdctl run --outputs-to`.
+/// **The non-regression test.** A passing job whose verdict carries one
+/// inline file that contradicts its own sha256, and the exit code the shell
+/// would read from `herdctl run --outputs-to`.
+///
+/// Five things are asserted together because each on its own is a plausible
+/// half-fix, and 04b §4.1 names them as the five:
+///
+/// 1. the record carries **two** manifest entries, not one — the file whose
+///    bytes were refused is named, not erased;
+/// 2. the `skipped` sentence naming both digests is beside them;
+/// 3. `herdctl` exits **2**, because one of two promised files is not here;
+/// 4. the honest file still arrives, byte for byte — a fix that loses the
+///    good file to protect against the bad one is worse than the defect;
+/// 5. the bytes that lied are **not** written anywhere.
+///
+/// And a sixth, which is this task's other half: the verdict document
+/// carries the sentence, so a wrapper never has to parse stderr (D166).
 #[tokio::test]
-async fn measure_the_exit_code_when_inline_bytes_contradict_their_digest() {
+async fn inline_bytes_that_contradict_their_digest_never_exit_zero() {
     let bench = Bench::start().await;
     let mut puppet = Puppet::join(&bench).await;
     let kept = tempfile::tempdir().expect("a temporary output directory");
+    let verdict_to = kept.path().join("verdict.json");
 
     let hub_url = bench.hub_url.clone();
-    let kept_path = kept.path().to_path_buf();
+    let kept_path = kept.path().join("outputs");
+    let verdict_path = verdict_to.clone();
     let requester = tokio::spawn(async move {
         tokio::process::Command::new(env!("CARGO_BIN_EXE_herdctl"))
             .arg("--hub")
@@ -232,6 +247,8 @@ async fn measure_the_exit_code_when_inline_bytes_contradict_their_digest() {
             .arg("run")
             .arg("--outputs-to")
             .arg(&kept_path)
+            .arg("--verdict-to")
+            .arg(&verdict_path)
             .arg("--")
             .arg("/bin/sh")
             .arg("-c")
@@ -272,39 +289,103 @@ async fn measure_the_exit_code_when_inline_bytes_contradict_their_digest() {
         .job(&job_id)
         .expect("the store reads")
         .expect("the hub knows this job");
-    let on_disk: Vec<String> = std::fs::read_dir(kept.path())
-        .expect("the output directory reads")
-        .filter_map(|entry| Some(entry.ok()?.file_name().to_string_lossy().into_owned()))
-        .collect();
+    let outputs_dir = kept.path().join("outputs");
 
-    // Printed rather than asserted on: this file measures, it does not pin.
-    // The figures a reader of 04b needs are all here, in one place.
-    println!("--- experiment 6.3 (a) ---");
-    println!("herdctl exit code: {code}");
-    println!(
-        "manifest entries on the record: {}",
-        record.outputs.files.len()
-    );
-    println!("record manifest: {:?}", record.outputs.files);
-    println!("record skipped: {:?}", record.outputs.skipped);
-    println!("top level of --outputs-to: {on_disk:?}");
-    println!("herdctl stderr:\n{said}");
-
-    // The one thing this asserts is that the measurement happened at all:
-    // the hub took the verdict and the requester came back. Everything the
-    // experiment is about is in the printed figures, which 04b quotes.
     assert!(
         matches!(record.state, herd_hub::JobState::Finished { .. }),
         "the hub recorded the verdict: {:?}",
         record.state
     );
+
+    // 1. The manifest names both files. **This is the fix**: the entry is
+    //    written down before the bytes are judged, so refusing the bytes
+    //    leaves a file that is announced and not held instead of a file that
+    //    was never mentioned. Before D-NEXT this was 1.
+    let named: Vec<&str> = record
+        .outputs
+        .files
+        .iter()
+        .map(|file| file.path.as_str())
+        .collect();
+    assert_eq!(
+        named,
+        vec!["files/results.json", "files/honest.txt"],
+        "a file whose bytes this hub refused is still named on the record, \
+         or a requester has no way to count it short: {:?}",
+        record.outputs.files
+    );
+
+    // 2. And the record says why it is not here, naming both digests.
+    let why = record
+        .outputs
+        .skipped
+        .iter()
+        .find(|sentence| sentence.contains("files/results.json"))
+        .unwrap_or_else(|| panic!("the record says why: {:?}", record.outputs.skipped));
+    assert!(
+        why.contains("a frame this hub will not believe") && why.contains("sha256"),
+        "the sentence names the refusal and the two digests: {why}"
+    );
+
+    // 3. **The exit code.** One of two promised files is not here, so this
+    //    run did part of what it says. Before D-NEXT this was 0.
+    assert_eq!(
+        code, 2,
+        "a requester promised two files and handed one must never read 0; stderr was:\n{said}"
+    );
+
+    // 4. The honest file still arrives, byte for byte.
+    let honest = std::fs::read(outputs_dir.join("files/honest.txt"))
+        .expect("the honest file was written under --outputs-to");
+    assert_eq!(
+        honest, b"this one is true\n",
+        "a fix that loses the good file to protect against the bad one is worse than the defect"
+    );
+
+    // 5. And the bytes that lied are nowhere.
+    assert!(
+        !outputs_dir.join("files/results.json").exists(),
+        "bytes this hub refused must not reach the requester's directory"
+    );
+
+    // 6. The fact is machine-readable, not only prose on stderr (D166).
+    let verdict: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(&verdict_to).expect("the verdict document was written"),
+    )
+    .expect("the verdict document is JSON");
+    let document = verdict["said"].to_string();
+    assert!(
+        document.contains("a frame this hub will not believe"),
+        "the verdict document carries what was skipped: {document}"
+    );
+    assert!(
+        document.contains("1 of 2 output file(s) are not here"),
+        "the verdict document carries the shortfall: {document}"
+    );
+    assert_eq!(
+        verdict["exit_code_from"], "herd",
+        "a 2 is this command's own code and never the job's (D166)"
+    );
 }
 
-/// The control: the **path** case, which the design states as intentional
-/// (`herd-hub/src/job.rs:1823-1826`). Measured beside the digest case so 04b
-/// can say whether the two really are the same code path and the same code.
+/// The neighbouring case, pinned as it stands: a path the hub will not
+/// write keeps **no** manifest entry, and its requester still reads 0.
+///
+/// **This is not the digest case and must not be fixed by the same change.**
+/// The manifest is the list of paths this store joins onto its own
+/// directory — a chunk is resolved against it, a file is read back by it —
+/// so a path that must never be joined must never be on it. The `skipped`
+/// sentence is where that file exists on the record, and that much *is*
+/// decided (`herd-hub/src/job.rs`, D131).
+///
+/// **The exit code is not decided, and that is why it is asserted here.**
+/// Nothing in `docs/decisions.md` ever ruled on it: the 0 falls out of the
+/// dropped entry, the same way the digest case's 0 did. Pinning it makes a
+/// change to it deliberate instead of accidental — if this assertion ever
+/// fails, somebody decided something, and the decision belongs in
+/// `docs/decisions.md` before the test is edited.
 #[tokio::test]
-async fn measure_the_exit_code_when_a_path_is_one_the_hub_will_not_write() {
+async fn a_path_the_hub_will_not_write_is_named_and_today_costs_no_exit_code() {
     let bench = Bench::start().await;
     let mut puppet = Puppet::join(&bench).await;
     let kept = tempfile::tempdir().expect("a temporary output directory");
@@ -365,18 +446,27 @@ async fn measure_the_exit_code_when_a_path_is_one_the_hub_will_not_write() {
         .expect("the store reads")
         .expect("the hub knows this job");
 
-    println!("--- experiment 6.3 (a), control: a refused path ---");
-    println!("herdctl exit code: {}", status_code(&output));
-    println!(
-        "manifest entries on the record: {}",
-        record.outputs.files.len()
-    );
-    println!("record skipped: {:?}", record.outputs.skipped);
-    println!("herdctl stderr:\n{}", stderr(&output));
-
     assert!(
         matches!(record.state, herd_hub::JobState::Finished { .. }),
         "the hub recorded the verdict: {:?}",
         record.state
+    );
+    assert!(
+        record.outputs.files.is_empty(),
+        "an unjoinable path is kept off the manifest on purpose: {:?}",
+        record.outputs.files
+    );
+    assert!(
+        record.outputs.skipped.iter().any(|sentence| sentence
+            .contains("a path this hub will not write")
+            && sentence.contains("escape.json")),
+        "and named on the record instead: {:?}",
+        record.outputs.skipped
+    );
+    assert_eq!(
+        status_code(&output),
+        0,
+        "today, and undecided: see this test's own comment before changing it. stderr was:\n{}",
+        stderr(&output)
     );
 }

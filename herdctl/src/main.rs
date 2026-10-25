@@ -540,6 +540,17 @@ enum Done {
         /// wrapper reading that file is the reader this fact is for, and it
         /// is also what makes this invocation exit non-zero.
         short_of_its_files: Option<String>,
+        /// What the hub said about this job's collection that is not the
+        /// shortfall: the refusal, and every `skipped` sentence (D-NEXT).
+        ///
+        /// Already printed by [`keep_the_outputs`], where a reader needs
+        /// them in order. Carried out as well so they reach the verdict
+        /// document: a wrapper that is told "a file was dropped and here is
+        /// why" had, until this, only prose on stderr to find it in, which
+        /// is the parsing D166 exists to make unnecessary. They do **not**
+        /// move the exit code — D131's sentences are facts about one file
+        /// and never a verdict about the job.
+        about_the_outputs: Vec<String>,
     },
     /// The command did its own job; nothing ran.
     Said,
@@ -675,6 +686,7 @@ async fn main() -> ExitCode {
         Ok(Done::Job {
             finished,
             short_of_its_files,
+            about_the_outputs,
         }) => {
             // Each sentence goes to stderr, never to stdout: stdout carried
             // the job's own output and must stay the job's alone. They are
@@ -720,6 +732,11 @@ async fn main() -> ExitCode {
             for sentence in &said {
                 eprintln!("herdctl: {sentence}");
             }
+            // **After the printing loop, because they have already been
+            // said** — `keep_the_outputs` prints them where a reader needs
+            // them, ahead of the per-file lines. What is added here is the
+            // document's copy and nothing else (D-NEXT).
+            said.extend(about_the_outputs);
             let code = code_for(&finished.outcome, files_short);
             let verdict = Verdict::of(&finished, said, code);
             // And whose number it is. A 2 is this command's own, never the
@@ -827,10 +844,11 @@ async fn run(args: Args, known: &Cell<WhatExists>) -> Result<Done> {
                 |said| say_it(known, said),
             )
             .await?;
-            let short_of_its_files = keep_the_outputs(&config, &keeping, &finished).await;
+            let kept = keep_the_outputs(&config, &keeping, &finished).await;
             Ok(Done::Job {
                 finished: Box::new(finished),
-                short_of_its_files,
+                short_of_its_files: kept.short_of_its_files,
+                about_the_outputs: kept.about_the_outputs,
             })
         }
         Action::Submit {
@@ -1009,10 +1027,11 @@ async fn run(args: Args, known: &Cell<WhatExists>) -> Result<Done> {
                 |said| say_it(known, said),
             )
             .await?;
-            let short_of_its_files = keep_the_outputs(&config, &keeping, &finished).await;
+            let kept = keep_the_outputs(&config, &keeping, &finished).await;
             Ok(Done::Job {
                 finished: Box::new(finished),
-                short_of_its_files,
+                short_of_its_files: kept.short_of_its_files,
+                about_the_outputs: kept.about_the_outputs,
             })
         }
         Action::Cancel { job_id } => {
@@ -1229,8 +1248,16 @@ async fn keep_the_outputs(
     config: &herdctl::Config,
     keeping: &Keeping,
     finished: &herdctl::Finished,
-) -> Option<String> {
+) -> Kept {
     let mut collection = finished.outputs.clone();
+    // **Said where a reader needs them, and kept so the document has them
+    // too** (D-NEXT). Every sentence about this job's files used to reach
+    // stderr and nothing else, so a wrapper had to grep prose for facts D166
+    // added a file to carry: which path is absent and why, what the hub
+    // refused, what it would not believe. They are collected in the order
+    // they are printed and handed back. What they are not is an exit code —
+    // a fact about one file is never a verdict about the job (D131, D20).
+    let mut about_the_outputs = Vec::new();
     // A fetch that failed outright leaves nothing in hand, and a requester
     // that asked for files has then certainly not got them: short, whatever
     // the manifest says.
@@ -1240,6 +1267,7 @@ async fn keep_the_outputs(
             Ok(said) => {
                 for line in said {
                     eprintln!("herdctl: {line}");
+                    about_the_outputs.push(line);
                 }
             }
             // Never the verdict, for D20's reason: the verdict is the job's
@@ -1257,9 +1285,12 @@ async fn keep_the_outputs(
     let outputs = &collection;
     if let Some(refusal) = &outputs.refused {
         eprintln!("herdctl: {refusal}");
+        about_the_outputs.push(refusal.clone());
     }
     for said in &outputs.skipped {
-        eprintln!("herdctl: this job's output: {said}");
+        let sentence = format!("this job's output: {said}");
+        eprintln!("herdctl: {sentence}");
+        about_the_outputs.push(sentence);
     }
     let Some(directory) = &keeping.outputs_to else {
         // Nothing asked for, so nothing written — and still one line when
@@ -1272,7 +1303,10 @@ async fn keep_the_outputs(
                 outputs.count()
             );
         }
-        return None;
+        return Kept {
+            short_of_its_files: None,
+            about_the_outputs,
+        };
     };
     // **What is short, counted off the manifest and not off the directory.**
     // An entry with no bytes is one this requester was promised and does not
@@ -1305,19 +1339,37 @@ async fn keep_the_outputs(
     // consequence, and a wrapper needs to find the reason without parsing
     // 195 lines — which is what the verdict document's `said` is for, so
     // this is returned rather than printed here (D167).
-    if let Some(sentence) = could_not_fetch.or(could_not_write) {
-        return Some(sentence);
-    }
-    if missing > 0 {
-        return Some(format!(
+    let short_of_its_files = if let Some(sentence) = could_not_fetch.or(could_not_write) {
+        Some(sentence)
+    } else if missing > 0 {
+        Some(format!(
             "{}: {missing} of {} output file(s) are not here. Every missing path is named \
              above and every one is still on this job's record. This run did part of what it \
              says, so it does not exit 0.",
             finished.job_id,
             outputs.files.len(),
-        ));
+        ))
+    } else {
+        None
+    };
+    Kept {
+        short_of_its_files,
+        about_the_outputs,
     }
-    None
+}
+
+/// What [`keep_the_outputs`] comes back with: the one sentence that costs
+/// this invocation its zero, and the sentences that only have to be on the
+/// record (D-NEXT).
+///
+/// Two fields and not one list, because the difference between them is the
+/// exit code and a reader of this type should not have to infer it.
+struct Kept {
+    /// The shortfall, or `None` when nothing was promised and missing
+    /// (D167).
+    short_of_its_files: Option<String>,
+    /// The refusal and the `skipped` sentences, already printed.
+    about_the_outputs: Vec<String>,
 }
 
 /// Whether this invocation is going to fetch the job's output files (D167).

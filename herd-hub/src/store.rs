@@ -1705,15 +1705,6 @@ impl JobStore for JobDirStore {
                         continue;
                     }
                 };
-                // The bytes on this frame have to be the file the manifest beside
-                // them describes. A length and a digest that nobody compares are
-                // worth nothing, and the comparison is cheap next to the write.
-                if let Some(why) = file.disagreement() {
-                    summary
-                        .skipped
-                        .push(format!("a frame this hub will not believe: {why}"));
-                    continue;
-                }
                 // **The manifest first, the bytes if they are here.** A streamed
                 // collection's verdict carries every path, length and digest and
                 // none of the data: the entry is written down now, so a record is
@@ -1728,6 +1719,28 @@ impl JobStore for JobDirStore {
                     bytes: file.len,
                     sha256: file.sha256.clone(),
                 });
+                // The bytes on this frame have to be the file the manifest beside
+                // them describes. A length and a digest that nobody compares are
+                // worth nothing, and the comparison is cheap next to the write.
+                //
+                // **Refusing the bytes is not refusing the entry** (D-NEXT).
+                // This check used to stand above the push and `continue` past
+                // it, which erased the only trace of the file a requester
+                // counts off: the manifest. The record then described a
+                // collection of one where the runner had announced two, and a
+                // requester that counts what it was promised against what it
+                // holds counted nothing short and exited 0. The entry is down
+                // before the bytes are judged, so what is announced and not
+                // held is *named* — exactly as it is for a streamed file still
+                // crossing, for a file the sweeper took, and for a file this
+                // store cannot read back. One rule, no exception for the one
+                // case where the bytes are a lie.
+                if let Some(why) = file.disagreement() {
+                    summary
+                        .skipped
+                        .push(format!("a frame this hub will not believe: {why}"));
+                    continue;
+                }
                 let Some(data) = &file.data else {
                     continue;
                 };
@@ -4841,6 +4854,80 @@ mod tests {
         let record = store.job(&job.id).expect("reads").expect("there");
         assert_eq!(record.outputs.refused.as_deref(), Some(refusal));
         assert!(record.outputs.files.is_empty());
+    }
+
+    /// Bytes that contradict their own manifest entry cost the **bytes**,
+    /// never the entry (D-NEXT).
+    ///
+    /// The one case in the design of outputs that used to break its own
+    /// rule — *the manifest first, the bytes if they are here* — and the one
+    /// that produced a false success: with the entry gone, a requester that
+    /// counts what it was promised against what it holds counts nothing
+    /// short and exits 0 on a collection it never received
+    /// (`docs/remediation/04b-integrity-and-containment.md` §1). Asserted
+    /// here as well as end to end, because this is the line that decides it
+    /// and a unit test says so without a hub, a runner and a child process.
+    #[test]
+    fn bytes_that_disagree_with_their_digest_cost_the_bytes_and_not_the_entry() {
+        let (dir, store) = store();
+        let job = store
+            .create_job(NewJob::at(
+                vec!["true".to_owned()],
+                LabelSet::default(),
+                Priority::Step,
+            ))
+            .expect("minted");
+        // One honest file, and one whose bytes are swapped for others of the
+        // same length — so only the digest is wrong and the length check is
+        // not what trips.
+        let mut outputs = collected(&[
+            ("files/results.json", b"{\"ok\":true}"),
+            ("files/honest.txt", b"this one is true\n"),
+        ]);
+        outputs.files[0].data = Some(b"{\"ok\":fals}".to_vec());
+
+        store
+            .record_outputs(&job.id, &outputs)
+            .expect("a frame this hub will not believe is not an error either");
+
+        let record = store.job(&job.id).expect("reads").expect("there");
+        let named: Vec<&str> = record
+            .outputs
+            .files
+            .iter()
+            .map(|file| file.path.as_str())
+            .collect();
+        assert_eq!(
+            named,
+            vec!["files/results.json", "files/honest.txt"],
+            "the refused file is announced and not held, never erased: {:?}",
+            record.outputs.files
+        );
+        assert!(
+            record
+                .outputs
+                .skipped
+                .iter()
+                .any(|said| said.contains("a frame this hub will not believe")
+                    && said.contains("files/results.json")),
+            "and the record says why: {:?}",
+            record.outputs.skipped
+        );
+
+        let kept = dir
+            .path()
+            .join(JOBS_DIR)
+            .join(job.id.as_str())
+            .join(KEPT_FILES_DIR);
+        assert!(
+            !kept.join("files/results.json").exists(),
+            "the bytes are still refused: naming the file is not believing it"
+        );
+        assert_eq!(
+            fs::read(kept.join("files/honest.txt")).expect("the honest file is kept"),
+            b"this one is true\n".to_vec(),
+            "one lying file does not cost the files beside it"
+        );
     }
 
     /// A path that would climb out of the job's directory is **dropped and
