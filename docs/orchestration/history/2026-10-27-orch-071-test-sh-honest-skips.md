@@ -2,8 +2,8 @@
 
 - **Item:** ORCH-071
 - **Agent:** herd-step
-- **Branch / commit:** `orch-071-test-sh-honest-skips` / `c67b5bb`, based on
-  origin/main `96fc10b`
+- **Branch / commit:** `orch-071-test-sh-honest-skips`, whose tip is this
+  file's own commit, based on origin/main `96fc10b`
 - **PR:** #88
 
 ## Done
