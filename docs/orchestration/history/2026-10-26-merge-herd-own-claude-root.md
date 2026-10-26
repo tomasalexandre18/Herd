@@ -16,10 +16,11 @@
 
 **`main` had moved, further than the brief said.** The brief read `main`
 at `860c4f5` (PR #75). It was at `c1d5ce7` (PR #84): `860c4f5` is an
-ancestor, and five more PRs — #76 to #84 — had landed, carrying the whole
-orchestration corpus, the C0b pass and C5 parts 1 and 2. That is why
-GitHub said `CONFLICTING`: 121 files changed on `main`'s side against
-five on the branch's, and exactly **one** file touched by both.
+ancestor, and eight more PRs had landed, #76 to #84 with #82 superseded
+and never merged, carrying the whole orchestration corpus, the C0b pass
+and C5 parts 1 and 2. That is why GitHub said `CONFLICTING`: 124 files
+changed on `main`'s side against five on the branch's, and exactly **one**
+file touched by both.
 
 **One conflict, in `docs/decisions.md`**, at the tail, where both sides
 appended after D171:
@@ -255,7 +256,7 @@ is printed as a skip and none is reported as a pass (D27).
    now" still describes the clean fix as the owner's and outside the
    repository. ORCH-067 carries it; it was not rewritten here, because a
    gotcha sheet is its author's and a dated resolved line is enough.
-5. **The brief's reading of `main` was two days and nine PRs stale.**
+5. **The brief's reading of `main` was two days and eight PRs stale.**
    Nothing broke because of it — the extra PRs touched the conflicted
    file at the same place — but the base commit in a brief is worth
    re-reading rather than trusting.
