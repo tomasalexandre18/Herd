@@ -121,6 +121,28 @@ for f in docs/orchestration/history/*.md; do
   case "$(basename "$f")" in README.md|[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]-*.md) ;; *) note "$f: a handoff is named YYYY-MM-DD-<task>.md";; esac
 done
 
+# A brief kept under history/ names the agent's own worktree. The guard
+# exempts agents by design (docs/orchestration/permissions.md "Live
+# verification"), so nothing but the brief keeps one out of the
+# orchestrator's checkout: in V11 a brief that named no worktree let its
+# agent edit and stage docs/status.md there (ORCH-031). The worktree is an
+# absolute path written right after the word "worktree"; `git worktree add`
+# does not count, because that names the command, not the destination. A
+# brief whose agent writes nothing in the repository says read-only on its
+# Base line instead -- "everything else is read-only" on the Write only
+# line is a different statement and does not exempt it.
+checkout=/mnt/ssd_980/herd-project
+for f in docs/orchestration/history/*brief* docs/orchestration/history/*/*brief*; do
+  [ -f "$f" ] || continue
+  named=$(grep -oE '[Ww]orktree[^/]{0,4}/[^ ,;:)`"]+' "$f" | sed -E 's|^[^/]*||; s|[.`]+$||')
+  if [ -z "$named" ]; then
+    grep -E '^[^A-Za-z]*Base[^A-Za-z]' "$f" | grep -qi 'read-only' ||
+      note "$f: a brief must name the agent's own worktree as an absolute path, or say read-only on its Base line (ORCH-031, V11)"
+  elif printf '%s\n' "$named" | grep -qxF "$checkout"; then
+    note "$f: the worktree it names is $checkout, the orchestrator's checkout; an agent works in its own worktree (ORCH-031, V11)"
+  fi
+done
+
 if [ "$fail" -eq 0 ]; then
   echo "docs ok"
 else
