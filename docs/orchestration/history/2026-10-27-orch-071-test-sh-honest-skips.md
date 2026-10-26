@@ -2,9 +2,9 @@
 
 - **Item:** ORCH-071
 - **Agent:** herd-step
-- **Branch / commit:** `orch-071-test-sh-honest-skips` / see below, based on
+- **Branch / commit:** `orch-071-test-sh-honest-skips` / `c67b5bb`, based on
   origin/main `96fc10b`
-- **PR:** see below
+- **PR:** #88
 
 ## Done
 
@@ -251,6 +251,14 @@ data root on ZFS, which has no block device for `io.max`. CI's runner
 reports 15 when green; the two numbers are different hosts, not a
 disagreement.
 
+
+## Board row for the merger
+
+`docs/orchestration/board.md` was deliberately not edited. This is the
+ORCH-071 row as it should read, to replace the `open` one in *Owed*; flip
+the state to `done` on merge.
+
+| ORCH-071 | `./scripts/test.sh` printed **"Every assertion ran on this host: nothing was skipped"** on a **red** run in which most of the suite never started: `cargo test` stops after the binary that fails, so `confinement` — the binary carrying the cgroup skips — never ran and `$HERD_SKIP_LOG` stayed empty. `scripts/report-skips.sh`, which CI runs with `if: always()`, had the same defect and printed the same sentence into PR #86's failing `check` job and its summary. A skip log empty because nothing ran, reported as nothing to skip, is false reassurance in exactly the direction D27 exists to prevent | finding of PR #87, 2026-10-26 | herd-step (author), herd-merger (integration) | active | Fixed on `orch-071-test-sh-honest-skips`, PR #88: both scripts now consult whether the run was a complete one — `SKIPS UNKNOWN on this host` for an empty log, `AT LEAST n` for a partial one, the unqualified green sentence byte-for-byte unchanged and reachable only from a complete green run; `--no-fail-fast` is now the script's own default so a failing binary no longer truncates the log; a run narrowed by its own arguments no longer speaks for the whole suite. Eighteen cases in `check-orchestration.sh`, ten of which go red against 96fc10b. Nothing left but the merge; flip to `done` then | — | PR #88 Evidence: the red run now prints `AT LEAST 12` (this workstation; CI's runner reports 15 when green) with exit 101 and ORCH-069's two targets still red and unedited; `check-orchestration: 111 passed, 0 failed`; `history/2026-10-27-orch-071-test-sh-honest-skips.md` |
 
 ## Risks and findings
 
