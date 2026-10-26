@@ -165,14 +165,16 @@ rc=0
 Before this branch both printed `Every assertion ran on this host: nothing
 was skipped.`, which is what PR #86's failing `check` job printed.
 
-### 4. nix develop --command cargo clippy --workspace --all-targets -- -D warnings
+### 4. cargo clippy --workspace --all-targets -- -D warnings
+
+(`nix develop --command` in front of it, as every Rust command here is.)
 
 ```text
     Finished `dev` profile [unoptimized + debuginfo] target(s) in 13.61s
 clippy EXIT=0
 ```
 
-### 5. nix develop --command cargo fmt --all --check
+### 5. cargo fmt --all --check
 
 ```text
 fmt EXIT=0
