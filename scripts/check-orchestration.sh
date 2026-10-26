@@ -61,6 +61,23 @@ fresh; rm "$tmp/repo/docs/orchestration/board.md"
 expect_red "board missing" 'board.md is missing'
 fresh; printf '# late\n' > "$tmp/repo/docs/orchestration/history/undated-task.md"
 expect_red "undated handoff" 'named YYYY-MM-DD'
+# A brief kept under history/ must name the agent's own worktree (ORCH-031,
+# V11). The rule has to be able to go red, and the read-only exemption has
+# to be narrow enough that the "everything else is read-only" boilerplate
+# every brief carries does not trigger it.
+H="$tmp/repo/docs/orchestration/history"
+fresh; printf 'Role: herd-step\nBase: origin/main at abc1234; branch x\nWrite only: docs/x.md; everything else is read-only\n' > "$H/2026-10-26-noworktree-brief.txt"
+expect_red "a brief naming no worktree (the Write only boilerplate does not exempt it)" "own worktree as an absolute path"
+fresh; printf 'Role: herd-step\nBase: origin/main at abc1234; branch x\nWorktree: /mnt/ssd_980/herd-project\n' > "$H/2026-10-26-checkout-brief.txt"
+expect_red "a brief naming the orchestrator's checkout as its worktree" "orchestrator's checkout"
+fresh; printf 'Role: herd-step\nBase: origin/main at abc1234; branch x\nWorktree: git worktree add -b x /scratch/x/wt origin/main\n' > "$H/2026-10-26-command-brief.txt"
+expect_red "a brief whose only path is inside a git worktree add command" "own worktree as an absolute path"
+fresh; printf 'Role: herd-step\nBase: origin/main at abc1234; branch x\nWorktree: /scratch/orch-031/wt (yours alone)\nWrite only: docs/x.md; everything else is read-only\n' > "$H/2026-10-26-named-brief.txt"
+expect_green "a brief naming an absolute worktree of its own"
+fresh; printf 'Role: herd-release\nBase: the repository at /scratch/x/wt, read-only.\nGates: none (read-only).\n' > "$H/2026-10-26-readonly-brief.txt"
+expect_green "a read-only brief, which writes nothing in the repository"
+fresh; printf '# a handoff, not a brief\n\nNo worktree named anywhere in it.\n' > "$H/2026-10-26-orch-031-brief-worktree.md"
+expect_green "a handoff whose task name merely contains the word brief"
 fresh; printf 'x%.0s' $(seq 1 85) >> "$tmp/repo/docs/orchestration/workflow.md"; echo >> "$tmp/repo/docs/orchestration/workflow.md"
 expect_red "over-long line in docs/orchestration" 'workflow.md has lines over 79'
 fresh; chmod -x "$tmp/repo/.claude/hooks/orchestrator-guard.sh"
