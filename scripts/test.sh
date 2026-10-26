@@ -132,8 +132,13 @@ else
   rule
 fi
 
-if [ "$status" -eq 0 ]; then
+# The last line is a marker scripts/report-skips.sh reads back out of a
+# captured run, so `test suite: PASSED` on its own means the whole suite
+# finished and nothing else does.
+if [ "$status" -eq 0 ] && [ "$narrowed" = no ]; then
   echo "test suite: PASSED"
+elif [ "$status" -eq 0 ]; then
+  echo "test suite: PASSED (a part of the suite: narrowed by its arguments)"
 else
   echo "test suite: FAILED (cargo test exited $status)" >&2
 fi

@@ -278,6 +278,15 @@ verdict "test.sh: a narrowed green run does not speak for the whole suite" 0 \
 run_test_sh 0 "$S1" -p herd-runner
 verdict "test.sh: a narrowed green run says its count may be short" 0 \
   "there may be more"
+# ... and its verdict marker says so too, so that a capture of it cannot be
+# read back as a whole run by report-skips.sh.
+if printf '%s\n' "$out" | grep -qF -- "test suite: PASSED (a part of the suite" \
+  && ! printf '%s\n' "$out" | grep -qxF -- "test suite: PASSED"; then
+  ok "test.sh: a narrowed run's marker is not a plain PASSED"
+else
+  bad "test.sh: a narrowed run must not print the whole-suite marker" \
+    "    $(printf '%s\n' "$out" | tail -1)"
+fi
 # --no-fail-fast by default, so a failing binary does not truncate the log —
 # and never twice, which cargo rejects outright.
 run_test_sh 0 ''
@@ -314,6 +323,11 @@ $S2
 test suite: PASSED"
 verdict "report-skips.sh: a finished run reports the real count" 0 \
   " 2 assertion(s) COULD NOT RUN on this host and were skipped." "AT LEAST"
+# A capture of a narrowed run is not a whole run either, however green.
+run_report "running 5 tests
+test suite: PASSED (a part of the suite: narrowed by its arguments)"
+verdict "report-skips.sh: a narrowed run is not read as a whole one" 0 \
+  "SKIPS UNKNOWN on this host" "nothing was skipped"
 # No marker at all — a cancelled or killed job — is not a finished run either.
 run_report "error: linking with cc failed"
 verdict "report-skips.sh: an output with no verdict marker is not a pass" 0 \

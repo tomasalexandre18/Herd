@@ -19,10 +19,11 @@
 # `check` job printed "nothing was skipped" from a run whose later test
 # binaries never started, on a runner that reports 15 skips when green. So
 # the output is first read for the marker scripts/test.sh prints last:
-# `test suite: PASSED` means the suite finished and the list below it is the
-# whole list; anything else — `test suite: FAILED`, or no marker at all
-# because the job was cancelled or never got that far — means the list is a
-# floor at best. Then nothing is claimed that was not observed (D27).
+# a plain `test suite: PASSED` means the whole suite finished and the list
+# below it is the whole list; anything else — `test suite: FAILED`, the
+# marker's narrowed form, or no marker at all because the job was cancelled
+# or never got that far — means the list is a floor at best. Then nothing is
+# claimed that was not observed (D27).
 #
 # This script never fails the job: the suite's own step owns that verdict.
 
@@ -65,18 +66,19 @@ fi
 
 if [ -z "$skips" ]; then
   echo "=============================================================="
-  echo " SKIPS UNKNOWN on this host: the suite did not finish, and no"
-  echo " HERD-SKIPPED line reached this output."
+  echo " SKIPS UNKNOWN on this host: this output is not a complete run of"
+  echo " the suite — no plain \`test suite: PASSED\` from scripts/test.sh —"
+  echo " and no HERD-SKIPPED line reached it either."
   echo " That is NOT the same as nothing having been skipped: a test binary"
   echo " that never ran records no skip of its own. See the suite's own step."
   echo "=============================================================="
   summary <<'MARKDOWN'
 ### Herd test suite: skips unknown on this host
-The suite did not finish, so this run does **not** say which assertions
-this host could make. An empty skip list from an incomplete run means
-*unknown*, not *none* (D27). Fix the failure in the suite's step and rerun.
+This output is not a complete run of the suite, so it does **not** say
+which assertions this host could make. An empty skip list from an
+incomplete run means *unknown*, not *none* (D27). See the suite's own step.
 MARKDOWN
-  echo "::warning title=Herd skip list unknown::the suite did not finish, so the assertions this host could not make were not collected"
+  echo "::warning title=Herd skip list unknown::this is not a complete run of the suite, so the assertions this host could not make were not collected"
   exit 0
 fi
 
@@ -85,7 +87,7 @@ if [ "$finished" = yes ]; then
   caveat=" A green run does NOT mean these were checked."
 else
   headline="AT LEAST $count assertion(s) COULD NOT RUN on this host and were skipped."
-  caveat=" The suite did not finish, so this list is a floor and not a count."
+  caveat=" This output is not a complete run of the suite, so the list below is a floor and not a count."
 fi
 
 echo "=============================================================="
@@ -104,8 +106,8 @@ echo "=============================================================="
   else
     echo "### Herd test suite: at least $count assertion(s) skipped on this host"
     echo
-    echo "The suite did not finish, so this is a floor and not a count:"
-    echo "a test binary that never ran recorded no skip of its own."
+    echo "This is not a complete run of the suite, so this is a floor and"
+    echo "not a count: a test binary that never ran recorded no skip."
   fi
   echo
   printf '%s\n' "$skips" | sed 's/^HERD-SKIPPED: /- /'
