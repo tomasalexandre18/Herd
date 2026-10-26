@@ -48,6 +48,39 @@ the sorted id lists shows one addition and no loss.
    handoff proposed `ORCH-066`, which `main` had already taken, and the
    finding itself turns out to be narrower than stated.
 
+3. **Alexa's two answers of 2026-10-26, relayed mid-integration and
+   recorded here because `board.md` has one writer at a time.**
+
+   - **ORCH-052 → `done`.** *"oui"*: a power cut may cost a stale wait
+     explanation in the window between a hub restart and its first pass.
+     The single claim `07`'s recommendation rests on is granted. The row
+     says what it unblocks — `waiting_for` carries no crash-durability
+     requirement, so `07`'s tiering is not forbidden by it — and says
+     what it does **not** do on its own, which is authorise dropping a
+     `fsync`.
+   - **ORCH-053 → `done`.** *"ext4"*, not ZFS. Recorded with **two
+     independent sources**, not one twice: the owner's answer, and the
+     first consumer's own evidence of 2026-10-24 on the wedged hub,
+     which reported the state volume
+     `/mnt/ssd_980/docker/volumes/herd_herd-state/_data` as "ext4 on
+     NVMe". The owner's word and the operator's measurement agree.
+   - **ORCH-074 opened** for what that answer costs, because it
+     **inverts** `08`'s conclusion rather than confirming it.
+     `08-s0-unsynced-write-cost.md` holds that D103's invariant —
+     `events.jsonl` never ahead of `job.json` — is kept today by the
+     `fsync`s, is safe on ZFS because transaction groups commit
+     atomically and in order, and is not guaranteed elsewhere. On ext4
+     it is not guaranteed, so the prize `08` measured is real but not
+     free: part of what the syncs buy is the ordering. Owner
+     `herd-planner`, state `open`.
+   - **`Next` item 1 rewritten.** It had listed both as the two open
+     questions for Alexa. It now records the answers and points at
+     ORCH-074 — and says **ORCH-047 is the one row still `waiting`**,
+     which it is: every other row in that section is `done`. I nearly
+     wrote "nothing is waiting on Alexa" and checked the column first.
+   - Nothing else: `07` was not adopted, no `fsync` was touched, `08`
+     was not reopened.
+
 **`docs/status.md` corrected on one figure** and otherwise taken as the
 branch wrote it: it said *"`main` is 66 commits past v0.3.7"*, true at
 `c1d5ce7` and 21 commits stale by this integration. It now reads **88**,
@@ -162,9 +195,11 @@ the longest silence (707.812046ms) is most of the run (1.075503747s), so the fol
 
 ## Decisions needed
 
-**None from this integration.** Still Alexa's and untouched: PR #67's
-fate (the branch recommends closing it), ORCH-068, and every tag or
-release.
+**None from this integration.** Two of Alexa's open questions were
+answered during it and are recorded above (ORCH-052, ORCH-053); the
+answers opened ORCH-074 rather than closing the subject. Still Alexa's
+and untouched: **ORCH-047**, the one row left `waiting`; PR #67's fate,
+which the branch recommends closing; ORCH-068; and every tag or release.
 
 ## Resume point
 
