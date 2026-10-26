@@ -3,7 +3,7 @@
 - **Item:** ORCH-031
 - **Agent:** herd-step
 - **Branch / commit:** orch-031-brief-worktree, based on origin/main c1d5ce7
-- **PR:** opened against `main` after this file was committed
+- **PR:** #87
 
 ## Done
 
