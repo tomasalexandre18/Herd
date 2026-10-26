@@ -185,6 +185,11 @@ load-flake like the two tests recorded in
 That section says "whether any other test is unstable" is unknown and
 needs repeated runs; these are those runs, and the answer is two more.
 
+This was then settled from the other side: on PR #87 both CI jobs passed,
+and CI's `check` job runs `nix develop --command ./scripts/test.sh` — the
+very command that is red here (`.github/workflows/ci.yml`). The same
+commit, the same command: green on `ubuntu-latest`, red on this machine.
+
 Both failures are about a memory figure coming out smaller than the test
 expects, which is also the theme of the 12 skips:
 
