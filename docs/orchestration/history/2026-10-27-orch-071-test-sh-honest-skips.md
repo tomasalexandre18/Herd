@@ -64,10 +64,9 @@ case asserts what the report must say *and* what it must not.
   merger allocates numbers. `--no-fail-fast` as the suite's default is
   arguably worth a decision entry; a `D-NEXT` candidate is in *Decisions
   needed* for whoever wants it.
-- **No unqualified green whole-suite run on this host.** The suite is red
-  here for ORCH-069, so that path is proved by the fake-`cargo` cases, not by
-  a real run. On a host where the suite is green it prints exactly the old
-  sentence.
+- **No unqualified green whole-suite run on this workstation.** The suite is
+  red here for ORCH-069. CI supplied that run instead, green, and it prints
+  exactly the old sentence with its own count — see gate 9 below.
 - **ORCH-069 untouched.** `herd-hub/tests/admission.rs:419` and
   `herd-hub/tests/slots.rs:744` are red and were left red; no test, no
   expectation and no assertion was edited.
@@ -245,6 +244,25 @@ The first of those prints, in full, the sentence this task is about:
     test suite: FAILED (cargo test exited 101)
 ```
 
+### 9. The green whole-suite run, on CI's host, after this branch
+
+`check` and `docs` both **pass** on PR #88 (run 40420732698, `check` in
+7m55s). The suite's own step and the `report the assertions this host could
+not make` step agree, and the green wording is untouched:
+
+```text
+test suite	 15 assertion(s) COULD NOT RUN on this host and were skipped.
+test suite	test suite: PASSED
+
+report the assertions this host could not make	==============================
+report the assertions this host could not make	 15 assertion(s) COULD NOT RUN on this host and were skipped.
+report the assertions this host could not make	 A green run does NOT mean these were checked.
+report the assertions this host could not make	==============================
+```
+
+So the complete-and-green path prints the old sentence and the exact count,
+on a real host, with no "AT LEAST" and no "UNKNOWN" — 15 there, 12 here.
+
 **Skips, named with their host:** 12 on this workstation, a floor and not a
 count on that red run — 10 for the absence of cgroup v2 delegation, 2 for a
 data root on ZFS, which has no block device for `io.max`. CI's runner
@@ -262,6 +280,14 @@ the state to `done` on merge.
 
 ## Risks and findings
 
+- **ORCH-069 did not reproduce on CI.** The brief said the two failures
+  reproduce on a pristine `main`, and they do — *on this workstation*. CI's
+  `check` on this very branch is **green**, both failing targets included. So
+  the two are host-dependent, not deterministic everywhere, and the one that
+  failed twice here did so at two different assertions (`admission.rs:419`
+  the first time, a timeout in `real_herd/mod.rs:789` the second). Whoever
+  holds ORCH-069 should know that: it is a property of this host plus the
+  code, not of the code alone.
 - **`report-skips.sh` reads a text marker**, not an exit status, because CI
   hands it a captured file and nothing else. If someone changes the wording
   of `test.sh`'s last line, `report-skips.sh` degrades to "unknown" — the
