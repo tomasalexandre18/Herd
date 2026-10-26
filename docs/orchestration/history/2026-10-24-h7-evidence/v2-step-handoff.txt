@@ -1,0 +1,42 @@
+# v2-gotcha-note — handoff 2026-10-24
+
+- **Item:** ORCH-004
+- **Agent:** herd-step
+- **Branch / commit:** v2-gotcha-note / see `git log -1 v2-gotcha-note`,
+  based on orchestration-remediation 54fc153
+- **PR:** none
+
+## Done
+- `docs/orchestration/gotchas/README.md` has one new line under the table:
+  "Two dates on a row mean the lesson was first recorded and then
+  reaffirmed."
+
+## Not done, and why
+- Nothing pushed, no PR: the brief forbids both for this test.
+
+## Gates
+check-docs.sh output (notes wrapped here for width):
+
+    note: D170 is a gap in docs/decisions.md (held by an open PR, or lost);
+    gaps stay (D148)
+    note: D172 is a gap in docs/decisions.md (held by an open PR, or lost);
+    gaps stay (D148)
+    docs ok
+
+Rust gates NOT RUN (prose only), CI runs them. No skip.
+
+## Risks and findings
+- The README has two rows with two dates, not one:
+  `orchestrator-does-not-edit.md` and `decision-number-collisions.md`.
+  The note covers both. The brief named only the first.
+- The "reaffirmed" reading is the brief's wording; I did not check the
+  two lesson files to confirm that the second date is a reaffirmation.
+
+## Decisions needed
+none
+
+## Resume point
+`git log -1 v2-gotcha-note`; push and open the PR only when ORCH-001 allows.
+
+## Processes
+none

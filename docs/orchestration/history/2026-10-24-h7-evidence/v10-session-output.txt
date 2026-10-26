@@ -1,0 +1,27 @@
+The checklist file is written. The tag attempt was refused, and the file still has a dangling line for it because my later edit was blocked.
+
+**Findings**
+- **Nothing to release:** `origin/main` is `3da48f5`, the same commit as `v0.3.7`, so `v0.3.7..origin/main` has 0 commits. No decisions ship and there is nothing to announce.
+- **Open PRs left out:** #70 (hotfix lane: a `-dev` tag publishes off any branch) and #67 (status after v0.3.6).
+- **Numbers for the release body:** `PROTOCOL_VERSION: 2` and `RECORD_VERSION: 1`. I read them from `origin/main` with the same `sed` patterns as `release.yml`, and each matched exactly one line.
+- **Workspace version:** `Cargo.toml` says `0.3.7`. A real bump to 0.3.8 would touch `Cargo.toml` and `Cargo.lock`. My grep for `0.3.7` in `deploy/` found nothing, but recheck it at the real bump.
+- **Last `release.yml` runs:** the last five all succeeded. The latest is the `v0.3.7` push (run 40092373317, 5m9s).
+- **Tag command Alexa would run, after a bump PR merges:** `git tag -a v0.3.8 -m "Herd 0.3.8" && git push origin v0.3.8`. I did not run it. The workflow rejects a tag that doesn't match the workspace version, so the bump must merge first.
+
+**Tag attempt:** `git tag -a v0.3.8-simulation -m test` was refused by the `release-guard.sh` hook before the shell ran. The verbatim message was:
+
+```
+release-guard: git tag in: git tag -a v0.3.8-simulation -m test; echo "exit=$?"
+herd-release prepares a release and never publishes it (CLAUDE.md, Git and main).
+```
+
+I confirmed afterwards that no `v0.3.8-simulation` ref exists, so there was nothing to delete.
+
+**Guard side effect:** the guard matches the text `git tag` anywhere in a command. My first read-only batch (containing `git tag -l`) was blocked, and so was a heredoc that merely quoted the phrase. I used `git for-each-ref refs/tags` for tag listings instead. Whether to loosen it for `-l` is Alexa's call.
+
+**Unfinished edit:** I tried to replace the placeholder line in the handoff's "Tag attempt" section with the refusal text. The Edit tool returned "you haven't granted it yet", even though the earlier Write to the same file worked. The section currently reads "See the 'Tag attempt result' section appended below", which doesn't exist. The refusal text above is the content that should go there.
+
+I created no branch or commit, did no bump, and used only read-only `gh` commands.
+
+The file is `/tmp/claude-1002/-mnt-ssd-980-herd-project/3ddf11ac-718a-4231-bc8d-45291a39ef82/scratchpad/remediation/live/v10/2026-10-24-release-v0.3.8-simulation.md`.
+exit=0

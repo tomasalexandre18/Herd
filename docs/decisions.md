@@ -8171,6 +8171,578 @@ reads on 0.3.6.
 
 **On the number.** This entry is D171. D170 is held by an unmerged branch.
 
+## 2026-10-24 — D173 The orchestrator briefs and verifies; agents write
+
+**Context.** `CLAUDE.md` (2026-10-13) said "Claude works alone. A
+sub-agent only for one long, isolated task, never several in parallel".
+The owner said otherwise on 2026-10-15 (*"tu es orchestrateur, tu lances
+des sous-agents"*, *"autant d'agent que besoin"*) and again on 2026-10-23
+(*"un agent toujours tu est orchestrateur"*), and those corrections lived
+only in Claude's auto-memory, which no execution agent loads. Between the
+two dates the orchestrator's own shell ran 60 `sed -i`, 29 `git commit`,
+62 `git merge`, 47 `gh pr merge`, 12 `git tag` and 14 `gh release`. The
+independent audit of 2026-10-24 found the contradiction, the unversioned
+rules, a scratchpad collision, a `pkill -f` that killed a neighbour's
+suite, two branches allocating one decision number, and no list of owed
+work or waiting decisions that survived a session.
+
+**Choice.** The organisation is multi-agent and the contract is in the
+repository, not in memory. The orchestrator (main session) plans, briefs,
+verifies evidence, escalates and reports; it never edits a repository
+file, commits, merges, resolves a conflict, tags or releases. Five roles
+under `.claude/agents/` do that work, one bounded task each, in their own
+worktree, ending with a dated handoff under `docs/orchestration/history/`.
+`docs/orchestration/board.md` is the one list of open work and waiting
+decisions; `docs/status.md` points at it. `herd-merger` is the only writer
+of this file: a branch writes `D-NEXT`, the merger allocates the next free
+number at integration, one branch at a time; gaps stay (D148).
+`scripts/check-docs.sh` rejects a duplicate number, a malformed header, a
+leftover `D-NEXT`, a board out of shape and a contract that says the
+orchestrator works alone; `scripts/check-orchestration.sh` proves each of
+those checks goes red. A `PreToolUse` hook refuses the main session's
+writes and git/gh write verbs — best effort, documented as such in
+`docs/orchestration/permissions.md`, with the review of traces as the
+real protection. Herd is shipped, not operated (D161) is restated as
+invariant 9 so that no injected persona can override it.
+
+**Alternatives rejected.** Keeping the rules in auto-memory: not loaded by
+agents, not versioned, lost on a `CLAUDE_CONFIG_DIR` move (it happened
+between 2026-10-15 and 2026-10-23). A `permissions.deny` on `Edit`: it
+applies to agents too and would paralyse `herd-step`. One file per
+decision now: it does not remove the allocation race by itself and costs a
+168-file migration; analysed in `docs/orchestration/decisions-structure.md`
+and left to the owner (ORCH-003).
+
+**Decided the same day.** Alexa, asked ORCH-001 through the orchestrator,
+answered *"non il peux merge par defaut"*: `herd-merger` merges any PR whose
+CI is green and whose Evidence block is filled, without a per-PR word and
+with no excluded path. Pushing a tag and publishing a release are a separate
+act and stay on Alexa's word, each one singly.
+
+**Still the owner's.** The invariant wording (ORCH-002); the journal's
+layout (ORCH-003); the shared `CLAUDE_CONFIG_DIR` (ORCH-030).
+
+**On the number.** This entry is D173; `origin/main` ends at D171, PR #67
+holds D170 and PR #70 holds D172, so 173 is the next free number above
+both. Written by the remediation agent under its bootstrap exception; from
+here on only `herd-merger` allocates.
+
+## 2026-10-24 — D172 A hotfix is installable in five minutes, and says so
+
+**Measured, on the day this was written.** v0.3.6 went out at 09:49 and put
+a regression on the first consumer's only runner; v0.3.7 undid it. The clock
+from the fix being written to the fix being installable: PR #68 opened
+11:05:23, merged 11:47:25; PR #69, which only bumped a version, opened
+11:55:12 and merged 12:03:27; the release run finished 12:08:47. **Sixty-three
+minutes**, of which the build that produced the bytes was **five minutes and
+nine seconds** — eight per cent. The other fifty-eight were two pull
+requests, two `ci.yml` runs at 362–490 s each, two merges, a conflict in this
+very file, and the gaps between a person noticing one step had finished and
+starting the next. None of that found anything. The regression it was
+guarding against had already shipped past it that morning.
+
+**So the lane is: a `v*.*.*-dev*` tag on any branch publishes a pre-release.**
+`.github/workflows/release-dev.yml` triggers on that tag and does nothing
+itself but call `release.yml` with `dev: true`. The observed cost of a
+`release.yml` run over the last four tags is 228–347 s, so a dev build is
+**four to six minutes from `git push --tags` to a file somebody can
+download** — and on the morning above it would have put the fix on that
+runner at about 11:10 instead of 12:09.
+
+**It calls the release workflow; it does not copy it.** This is the whole of
+the design and it is worth saying why, because a nine-line file that reads
+like a stub is easy to "improve" into a self-contained one. A dev build is
+the first thing anybody reaches for in an emergency, and a lane that builds
+*almost* like the release path is a lane that can clear a fix which then
+fails on the real tag an hour later — the exact failure the lane exists to
+prevent, reintroduced one layer down. So `workflow_call` was added to
+`release.yml` and a dev build is that build: the same
+`nix build .#static` and `nix build .#hub-image`, the same four-way static
+assertion, the same `release-smoke.sh` on `archlinux` and on `alpine`, the
+same `image-smoke.sh` against the loaded archive, the same `SHA256SUMS` and
+its count. Two inputs exist and nothing else changed: `dev`, and `tag` for
+the hand-run that already existed. Both are empty on a tag push and on the
+hand-run, so every `$DEV` test is inert on the path that cuts real releases —
+proven the way D168's work was proven, by extracting the body step's shell
+and running it offline with `gh` stubbed: on `DEV=false` the body comes out
+byte-identical to today's, and the only delta on `DEV=true` is the preamble
+prepended to it.
+
+**Three properties the lane may not lose.**
+
+*It is a pre-release.* `--prerelease` is forced by `$DEV` and no longer rests
+only on the tag carrying a hyphen. The first consumer's updater asks this
+repository for a release; a dev build that could answer that question would
+put an unreviewed hub on a fleet because somebody spelled a tag without a
+suffix. The flag is what makes taking a dev build a decision.
+
+*It carries the two numbers.* The step D168 added reads `RECORD_VERSION` and
+`PROTOCOL_VERSION` out of the source with `sed`, refuses an empty or
+non-numeric value before anything is built, and writes them as
+`^RECORD_VERSION: [0-9]+$`. It is reused unchanged and unconditionally. This
+is not decoration: their updater **halts when a body names no number**, so a
+dev build without the lines would stop their automation rather than be
+ignored by it — the one way a lane meant to speed things up could stop them
+altogether.
+
+*The body says what the build is, first.* Above the install lines, before
+anything a reader could copy: this is not a release, it came off branch X at
+commit Y, there was no pull request and no review, and the merge gate did not
+run on it here. The branch is asked of GitHub's
+`commits/{sha}/branches-where-head` rather than of git, because a tag push
+checks out one commit and fetching a history to learn one name would cost the
+lane the seconds it exists to save; an empty or failed answer is printed as
+one and never guessed at, and never fails the release.
+
+**What the lane trades away, stated plainly.** `nix flake check`, `cargo
+fmt`, `cargo clippy` and `./scripts/test.sh` do not run in GitHub on a dev
+tag. They are run on the branch, on the machine the change was written on,
+and **nothing checks that they were**. That is a real safety net removed, and
+the argument for removing it is not that the net never catches anything — it
+is that this net is being asked to guard the wrong thing. It guards `main`,
+where a mistake reaches everybody and is expensive to withdraw. A dev build
+reaches one machine, by name, chosen by an operator who has just been told in
+the first paragraph of its body that nobody reviewed it, and withdrawing it
+is `docker load` of the previous archive. The cost of a bad dev build is one
+watched host and a rollback; the cost of the net is an hour on every hotfix,
+paid whether or not anything is wrong. On the day measured above it was paid
+twice and caught neither regression. **A dev build is also never promoted** —
+a change that proves itself on one still goes through a pull request, the
+gate and a tag of its own — so nothing the gate would have caught can reach
+`main` by this route. The net is not removed; it is moved off the critical
+path of finding out.
+
+**And one thing the lane deliberately does not skip.** It would be easy to
+drop the two distribution smokes and save ninety seconds. They are the single
+most valuable minute and a half in the file: they are the only place anything
+runs these binaries on a host with no Nix, which is every host that matters,
+and the owner's stated reason for this lane is to find *new* problems in real
+conditions. A lane that skips the real-conditions proof to go faster is
+faster at nothing worth having. The same goes for the static assertions and
+the image smoke, which cost seconds.
+
+**Why one tag starts exactly one workflow.** `release.yml`'s trigger gained
+`"!v*.*.*-dev*"` beside its `"v*"`. Without it a dev tag would match both
+files and start two runs racing to create one release, and the loser's error
+would be the first thing anybody read in an emergency. The exclusion is the
+same pattern the dev lane includes, so the two cannot drift apart silently.
+
+**Why no branch input on the hand-run.** `release-dev.yml`'s
+`workflow_dispatch` takes a tag that already exists and nothing else. A
+release has to hang on a tag — that tag is the only handle by which an
+operator holding a strange binary six months from now gets back to the exact
+commit — and a dispatch given a branch would have to create one, which makes
+a workflow that mints tags out of a lane that is supposed to be nine lines.
+The case a branch input would serve is already served: `release.yml`'s own
+dispatch with an empty tag rehearses the whole build from any branch and
+creates nothing. So the dispatch here is the recovery door only — a dev tag
+whose run died halfway is republished without pushing a second tag for the
+same commit.
+
+**The tag names the workspace's version, and that is not negotiable either.**
+`release.yml` refuses a tag that is not `v$version` or a suffix of it, before
+building, because the file names and the image tag come from
+`Cargo.toml` and would otherwise lie about what is inside them. So a hotfix
+branch bumps `workspace.package.version` to the version it is fixing towards
+and tags `v<that>-dev1`. That is one line, and the branch needs it to become
+a release later regardless; cutting the assertion to save it would buy a dev
+build whose `herd-hub-image-0.3.7.tar.gz` contains 0.3.8, which an operator
+comparing two archives could not untangle.
+
+**What is deliberately not done.** No cache was added to speed the Nix build.
+A binary cache in the release path is an optional thing that can fail, and
+D162 is this project's own receipt for what an optional thing in the release
+path costs — three tags that produced nothing. No artefact was dropped and
+the image is still always built: both would make a dev run differ from the
+real one, and the point of calling `release.yml` was that it does not. Those
+three are worth about two of the five minutes between them and are written
+down here as rejected rather than forgotten, so that the next person who
+wants the lane faster starts from the reasons and not from the stopwatch.
+
+**On the number.** This entry is D172. D170 is held by an unmerged branch and
+D171 is the last on `main`.
+
+## 2026-10-25 — D175 A refused file is named, never erased
+
+**The defect, measured and not supposed.** A verdict carrying two inline
+output files, one of whose bytes do not hash to the sha256 beside them,
+produced: `herdctl` exit code **0**, one manifest entry of two on
+`job.json`, and one file of two under `--outputs-to`. The bench that
+measured it is `herdctl/tests/inline_digest_mismatch.rs` and the figures are
+in `docs/remediation/04b-integrity-and-containment.md` §1. **0 is the one
+code that means "everything you asked for happened"**, and a requester that
+asked for a job's evidence read it on a collection it did not get.
+
+**The chain, in four links.** `record_outputs` pushed the manifest entry
+*after* the digest check, so a refusal `continue`d past the push and the
+entry was never written. `herdctl` counts its shortfall **off the manifest**
+— `missing = files.iter().filter(|f| !f.is_held()).count()` — so an entry
+that does not exist is not missing. `missing` was 0, `files_short` was
+false, and `code_for` had nothing to raise. **The one mechanism D167 built
+to stop a short collection reading as a whole one was bypassed by the one
+path that removes the evidence of the shortfall.**
+
+**The rule it broke was written two lines below it.** The same function
+states: *"the manifest first, the bytes if they are here … what a reader of
+`job.json` must never find is a path that is not there **and** no way to
+tell why"*. That rule is repeated in `job_outputs`, in
+`herdctl::write_outputs`, and in the streamed path D148 built it for. Every
+other absence — a file still crossing, a collection the sweeper took, a file
+the store cannot read back — keeps its entry and names its absence. The
+digest case was the single exception in the whole design of outputs, and it
+was not an exception anybody decided: no sentence anywhere states it.
+
+**The correction is at the cause: the entry is written down before the
+bytes are judged.** Two statements swapped in
+`JobDirStore::record_outputs`. The refusal still refuses the bytes, still
+names both digests on `skipped`, and still never writes the file. What it no
+longer does is erase the only trace a requester counts. The file is then
+*announced and not held*, which is the shape the rest of the system already
+knows how to read: `herdctl` counts it short, exits 2, and says which path
+and why.
+
+**Not a filter in `herdctl`, and not a new field.** Two alternatives were
+rejected. Making `herdctl` exit non-zero whenever `skipped` is non-empty
+would turn D131's ordinary sentences — a symlink, a fifo, a name that is not
+UTF-8 — into failures, and those are decided facts about one file that
+D131 ruled are *"a loud sentence and never an exit code"*. Carrying a new
+"refused" flag on the record or the wire would cost a field for a fact the
+manifest already expresses by an entry that is not held. **Neither
+`PROTOCOL_VERSION` nor `RECORD_VERSION` moves**, no frame gains a field, and
+no record written before this reads differently after it.
+
+**The neighbouring case is left alone, deliberately, and it is not the same
+case.** A file whose *path* the hub will not join onto its own directory —
+`../escape.json` — keeps no manifest entry, and its requester still reads 0.
+That drop is decided and right: the manifest is the list of paths this store
+joins onto its own directory, `write_output_chunk` resolves a chunk against
+it and `job_outputs` reads a file back by it, so a path that must never be
+joined must never be on it. The record names the file on `skipped` and that
+is where it exists. **What was never decided is the exit code**, and
+searching `docs/decisions.md` finds nothing that rules on it: D131 settled
+the record, D167 settled the short collection, neither mentions a path the
+hub refuses. It is inherited from the drop, exactly as the digest case's 0
+was. It is now pinned by a test that says so in its own comment, so that
+changing it is a decision and not an accident. **Alexa's to take**, with one
+recommendation: a hub-refused path should cost the zero too, by the same
+reasoning as this entry, and it needs a shape that does not put an
+unjoinable path on the manifest.
+
+**And the stopgap, which is not the fix.** Every sentence `herdctl` had
+about a job's files — the refusal, the `skipped` lines, the per-path "not on
+the hub" lines — reached stderr and nothing else. A wrapper that wanted to
+protect itself had to grep prose, which is the parsing D166 added a verdict
+document to make unnecessary. They are now in `Verdict::said` as well as on
+stderr, in the order they are printed. They do **not** move the exit code:
+a fact about one file is never a verdict about the job (D131, D20).
+
+**Impact statement for the first consumer.**
+
+*What changes.* Jobs whose verdict carried an inline output file whose bytes
+contradicted their own sha256 used to exit **0** with that file silently
+absent. They now exit **2** — `herdctl`'s own code for "this command did
+part of what it says" (D167) — with the path named on stderr and in the
+verdict document. Nothing else changes: a failing build still exits 1, a
+capped job still exits 124, a job with no verdict still exits 125, and a job
+whose files all arrived still exits 0. The job's own verdict is untouched in
+every case; 2 appears only where 0 would have, and the verdict document
+labels it `"exit_code_from": "herd"`, never `"job"`.
+
+*When it can happen.* Only when a runner's frame disagrees with itself: a
+runner of a different build, a corrupted spool read, memory corruption. A
+runner of the same build computes the length and the digest from the buffer
+it sends and cannot produce it. We have no evidence it has happened on your
+instance; nothing on a record distinguishes it after the fact except the
+`skipped` sentence, which is on `job.json` and always was.
+
+*What a requester adapts.* If your tooling treats any non-zero `herdctl`
+exit as "the build failed", a 2 will now read as a failure where it used to
+read as a pass. That is the intent — the output set really was incomplete —
+but the right reading is "the build's verdict is in the document; this run
+did not bring back everything it was asked for". Read `exit_code` together
+with `exit_code_from` from `--verdict-to`: `"job"` is the build's answer,
+`"herd"` is ours about this invocation. You can also drop any workaround
+that compares the file count under `--outputs-to` with what you expected:
+that is what the 2 now tells you.
+
+*Going back.* Reverting this commit restores the old behaviour. **A record
+written by the corrected version stays readable**: the only difference is an
+extra manifest entry for a file that is not on disk, which is the same shape
+as a streamed collection still crossing, and `RECORD_VERSION` is unchanged
+at 1. An old `herdctl` reading such a record counts that entry as missing
+and exits 2 — the corrected behaviour, from the record alone — so a rollback
+of the hub is clean and a rollback of `herdctl` alone does not restore the
+false success for jobs already recorded. Nothing has to be migrated, deleted
+or rewritten in either direction.
+
+**One consequence worth naming, and it is pre-existing.** A job holding a
+manifest entry whose bytes never landed never satisfies
+`collection_is_whole`, and the output sweeper only takes whole collections
+(D152), so such a job's kept files are never evicted under the output
+budget. That is already true of every streamed collection that never
+completed; this entry adds the inline digest case to it. Not fixed here: it
+is the sweeper's rule, not this defect's.
+
+**On the number.** This entry is D175. D174 is held by the unmerged branch
+of PR #72 and D173 is the last on `main`.
+
+## 2026-10-25 — D176 A verdict says which revision it really ran
+
+**Context.** Nothing a runner sent carried a revision. `StepRun` held the
+step, the start, the duration and the exit code; the commit existed on the
+way *out* only — `Declaration::commit`, the text of the `fetch` and `up`
+lines `herdctl` filled, and the deduplication key. So "this verdict is about
+commit X" rested entirely on the assumption that a `fetch` exiting 0 left the
+tree at X. A `fetch` with a fallback, a stale mirror, a `switch` whose
+failure an `&&` swallowed, or a shared cache all produce a verdict attributed
+to a commit the tree was never at, and **nothing on the record could
+contradict it afterwards**. There was no oracle for the first consumer's I01
+at all: not a weak check, but nothing to check against.
+
+**Choice.** A new placeholder, `{ran}`, filled by the runner like `{job}`,
+`{in}` and `{out}`, naming a path inside the job's own workspace that the
+consumer's `fetch` hook may write the revision it really reached into. The
+runner reads it **after the `fetch` step**, trims it, bounds it, and puts it
+on that step as `ran_commit: Option<String>`. The hub compares it with
+`Declaration::commit` when it records the step, and writes `CommitRun {
+declared, ran }` onto the attempt. The requester is told the same thing in
+the verdict frame, and `herdctl`'s verdict document carries
+`declared_commit`, `ran_commit` and `commit_diverged`.
+
+**A divergence is recorded and never refused.** The job's verdict, its exit
+code and its outcome are exactly what they were: the verdict is the job's and
+a side channel does not become one (D20). A refusal would turn a reporting
+gap into a new failure mode on the day the field ships, on a fleet where some
+runners report and some do not — and a hub that refuses on a *mismatch* is
+the recording hub plus one `if`, which can be added later on the divergences
+this field makes visible. What was missing was not enforcement; it was a fact
+on the record.
+
+**Absence means "did not say", never "it matched".** `None` on the step,
+`"ran": null` on the record, `null` on the verdict document, and
+`commit_diverged: null` rather than `false` when the comparison cannot be
+made. A default that agreed would read an older runner's silence, and every
+consumer's first day, as a clean bill of health — the same mistake a plain
+`Vec` default would have made of the health report's `suspended` (D169's
+neighbourhood, and D23's rule).
+
+**No protocol break and no migration.** `PROTOCOL_VERSION` stays **2** and
+`RECORD_VERSION` stays **1**, asserted by a test. Every addition is
+`#[serde(default)]` and means, absent, exactly what its default says, which
+is the additive rule this project already wrote down twice. The record has no
+step type of its own — it holds `Vec<herd_proto::StepRun>` — so the wire
+change and the record change are one change and cannot be staged apart.
+
+**What it costs on a rollback, said plainly.** A hub of an earlier version
+**reads** a record carrying the field and **erases it the first time it
+writes that record back**. Serde drops what it never decoded and has nothing
+to re-emit. The reachable paths are ordinary: `record_state` on any job still
+in flight, and `note_outputs_fetched` on a finished job, at the first fetch
+of its outputs. A rollback therefore reads every record and preserves this
+field on none of the ones it touches. For a diagnostic field that is an
+acceptable cost; it is written here and asserted in
+`herd-hub/tests/ran_commit_across_versions.rs` so that it is known rather
+than discovered.
+
+**Why a token and not an environment variable.** Both would hand the hook a
+path. They differ on the day a consumer updates its declaration before every
+machine in the fleet has been restarted. An older runner leaves `{ran}`
+unfilled, the shell treats the brace as the ordinary filename it is, the hook
+succeeds, and the runner reports nothing. An unset `$HERD_RAN_COMMIT_FILE`
+makes the same line `> ""`, which fails, and a failed `fetch` is a job that
+never started — every job of that consumer, on every machine not yet
+restarted. The first failure mode is a stray file in a workspace that is
+about to be reclaimed; the second is a fleet-wide outage. Both are asserted
+with a real `/bin/sh` in that test file.
+
+**Rejected.** *The runner runs `git rev-parse` itself* — Herd would learn one
+VCS and stop being project-agnostic (E-11: Herd's code names no consumer
+command); the token gets the same fact without Herd knowing what produced it.
+*The hub re-resolves the commit* — it would need the repository, the network
+and VCS knowledge (invariants 1 and 3). *A fifth `verify` step* — four steps,
+fixed order, no conditions; a step with a condition is the workflow language
+invariant 1 refuses to be (D77). *The hook prints the revision and the runner
+greps the log* — a job's log is the bytes the job's process wrote (D18), and
+parsing prose is what D166 exists to make unnecessary. *Refusing a divergence
+in this increment* — above. *A new `events.jsonl` variant for a divergence* —
+`JobEventKind` has no `#[serde(other)]`, so a new variant is the one addition
+to the record that an older hub could **not** read; the divergence is a field
+on the attempt instead.
+
+**Herd runs no `git` and parses nothing.** It hands the consumer's hook a
+path, reads back one line, checks that it is one printable word of at most
+128 characters, and compares it with the declared commit byte for byte. That
+is the same shape as `labels_from`, where the consumer's own command answers
+and Herd reads the answer strictly. A file that is there and unusable is
+reported as **silence** on the record and said out loud in the job's log, so
+a hook writing the wrong thing does not look like a hook writing nothing.
+
+**What the consumer can do today, with nothing shipped.** Append
+`&& [ "$(git rev-parse HEAD)" = "<hash>" ]` to the `fetch` hook. A divergence
+is then a preparation failure — the job never runs, exit 125 — instead of a
+wrong verdict. It is containment and not a fix: the guarantee sits in their
+file, Herd's record still says nothing, and a consumer who changes that line
+loses the protection with nobody noticing. It is worth asking for anyway,
+because it protects the next build and this entry protects the one after the
+deployment.
+
+**On the number.** This entry is D176. D175 is the refused-file decision
+integrated in the same pass, D174 is held by the unmerged branch of PR #72
+and D170 by that of PR #67.
+
+## 2026-10-25 — D177 A runner's live jobs are keyed by job and attempt
+
+**Decision.** `herd_runner::Session`'s map of the jobs a runner has in hand
+is keyed by **(job, attempt)** and no longer by job id alone. Every
+operation on an entry names both; an acknowledgement, which names no
+attempt, resolves to the attempt that is *holding an end*; and
+`Session::end_job` takes an attempt rather than an `Option<u32>` it had to
+compare after the lookup.
+
+**The defect.** A runner can hold two attempts of one job at once, and the
+path is ordinary rather than exotic: the link drops, the hub's watchdog ends
+the attempt it has stopped hearing about and queues the job again, the job
+goes on running on the machine, and the next attempt of it is offered to
+that same machine the moment it redials. Keyed by job id, `take_job`'s
+`insert` *replaced* the first entry. Three consequences, every one of them
+seen in a real run:
+
+- **a running attempt stopped being counted.** `jobs_running()` reads the
+  map, so a machine running two processes reported one. The place it did not
+  have was then available to the next assignment, which is invariant 2
+  broken by the bookkeeping rather than by a job.
+- **output was numbered under the wrong attempt.** `send_chunk` looked the
+  job up and sent the chunk under whatever `attempt` the entry carried, so
+  the first attempt's output arrived at the hub labelled as the second's —
+  where it is refused as superseded, and the log of the attempt that is
+  really running is short with nothing saying so.
+- **an acknowledgement took the live attempt out.**
+  `FromHub::JobResultAck` carries a job id and nothing else, so `release`
+  removed whatever entry stood under that id. Once a second attempt had been
+  assigned, that was the attempt that was *running*: it then ran with
+  nothing counting it, nothing naming it in a health report, and a hub that
+  wrote it off for silence while the process was working perfectly. The same
+  `insert` had already destroyed the first attempt's unacknowledged verdict,
+  which D19 says is never destroyed.
+
+**The acknowledgement resolves; it does not carry.** No field was added to
+any frame here. `FromHub::JobResultAck` still carries a job id and **no
+attempt number**, so the attempt an acknowledgement is about is read off
+the map: it is the one **holding an end**, which is that frame's own
+meaning — the hub has this job's end on its disk, and an attempt that is
+still running has no end for an acknowledgement to be about. Keyed by both,
+that is the resolution of one named entry instead of "whatever stood under
+the id". One caveat, said here rather than left to be found: if two
+attempts of one job were both holding an end, one acknowledgement would
+free both. That state is not reachable today — a second attempt is only
+assigned after the hub has written the first off, and a written-off
+attempt's entry is dropped by `drop_stale` — and freeing an arbitrary one
+of them would be worse.
+
+**Why the key and not a guard.** A guard in `take_job` — refuse a second
+attempt of a job this runner is already running — is also wanted, and is a
+separate decision about what a runner may accept. It does not make this one
+unnecessary: a map that cannot represent what is on the machine is a map
+that lies about it whatever the admission rule is, and the three defects
+above are all failures of representation. Keyed by both, the four
+attempt-aware lookups that used to be "find by id, then compare the number"
+become one lookup that cannot find the wrong thing, and `JobInHand` loses
+its own `attempt` field — two places to read an attempt number from are two
+numbers that can disagree.
+
+**What it does not fix, and must be said.** A workspace belongs to a **job**
+and not to an attempt (`DataRoot::open_workspace` takes a `JobId`, and
+clears the directory if it is already there), so two attempts of one job on
+one machine still clear each other's working directory. This change makes
+the machine's own books honest; it does not make running one job twice on
+one host safe, and nothing here should be read as saying it does.
+
+**No version moves.** Nothing on the wire and nothing on the hub's disk
+changes: this is one crate's internal map. `PROTOCOL_VERSION` stays 2 and
+`RECORD_VERSION` stays 1.
+
+**Evidence.** Three tests in `herd-runner/src/lib.rs`, red on `199e4df`
+before a line of the fix and green after, one per consequence:
+`two_attempts_of_one_job_are_two_entries_in_the_machines_own_count`,
+`handing_one_attempt_back_leaves_the_other_attempt_of_that_job_running`,
+`an_acknowledgement_lets_go_of_the_attempt_that_holds_the_result_and_no_other`.
+
+**Two of those three tests assert a state that part 3 of C5 forbids
+outright.** The two that call `take_job` twice for one job id —
+`two_attempts_of_one_job_are_two_entries_in_the_machines_own_count` and
+`handing_one_attempt_back_leaves_the_other_attempt_of_that_job_running` —
+make that second call exactly what part 3's `NotTaken::StillRunningThisJob`
+refuses. They are not a specification that a runner *may* hold two live
+attempts of one job; they are a specification that the map must be able to
+say so when it happens. Read as a licence they would block the refusal that
+part 3 adds, which is the opposite of what they are for.
+
+**On the number.** This entry is D177. D176 and D175 were integrated on
+2026-10-25, D174 is held by the unmerged branch of PR #72 and D170 by that
+of PR #67; gaps stay (D148).
+
+## 2026-10-25 — D178 The watchdog measures each silence inside its own loop
+
+**Decision.** `watch_for_a_lost_runner` reads the age of the attempt it is
+about to judge **again, inside the loop**, immediately before judging it,
+and skips the job if that fresh figure is inside `lost_after`. The list it
+walks still carries the figures the pass began with; nothing is now decided
+on them.
+
+**The defect.** The pass reads every open attempt's age into a list and then
+walks it. The walk *places*: `give_the_job_another_go` requeues, a requeue
+judges the queue on the way out, and `dispatch_queued_jobs` can give a job
+further down the list a brand-new attempt. The hub's relay loop does the
+same thing from the other side, at whatever moment a runner speaks, because
+a frame about an attempt ends it and requeues its job. The record is re-read
+inside the loop, so the **attempt number** acted on is the fresh one — while
+the duration beside the id is the silence of the attempt *before* it.
+
+It is not a cosmetic exaggeration of the silence. `what_a_runner_says`
+decides whether a connected machine's health report is evidence about an
+attempt by comparing the report's age with the age of the clock the watchdog
+is about to act on: a report older than that clock "says nothing", because
+it was composed before the job was handed out. With the stale figure the
+comparison comes out backwards — a report composed before the new attempt
+existed reads as *newer* than the attempt's silence, so *"its report does
+not name this attempt"* is taken as proof that the attempt is gone from a
+machine that is plainly here. The attempt is then ended, a go is spent, and
+with `attempts_allowed` at 2 the second such ending is a job that ends
+`Lost`. It was observed killing a 0.2 s-old attempt with a sentence about
+60 s of silence.
+
+**Why re-read rather than re-snapshot.** Reading the whole list again at the
+top of the loop would be the same bug one iteration later: what matters is
+that the figure and the attempt number come from the same instant, and the
+only instant that is true of is the one just before the judgement. The
+re-read is one `HashMap` lookup under the peers lock, per job the pass has
+already decided to act on, which is at most once per job per tick.
+
+**Found by the thing it breaks, not by reading.** It surfaced while C5's
+link-cut oracle was being made to hold: a runner at its ceiling loses its
+link, the watchdog ends its attempts, the runner redials still running them,
+and the requeues and the refusals interleave. That is the tick where the two
+figures disagree.
+
+**No version moves.** Nothing on the wire, nothing on disk.
+`PROTOCOL_VERSION` stays 2 and `RECORD_VERSION` stays 1.
+
+**Evidence.** In `herd-hub/src/server.rs`, the test
+`an_attempt_the_pass_itself_placed_is_not_judged_on_the_age_before_it`,
+red on the branch before the fix with
+`j0000000002 is lost: … nothing has been heard about that attempt for
+90.0004s` written about an attempt the same pass had created milliseconds
+earlier, green after. One pass of the watchdog is extracted into
+`one_watchdog_pass` for it — unchanged, because a `loop` with a ticker in it
+cannot be run once — and the test store gains a second forced window,
+`record_state` ending another job's attempt as a job is queued, which is
+what a frame arriving on a link does.
+
+**On the number.** This entry is D178. D177 is C5 part 1, integrated in the
+same pass and merged first — this branch was stacked on it, and the merge
+of `main` into this one is in its history. D174 is held by the unmerged
+branch of PR #72 and D170 by that of PR #67; gaps stay (D148).
+
 ---
 
 ## 2026-10-24 — D174 Herd's sessions keep their state in Herd's own root
@@ -8252,5 +8824,11 @@ The irreversible part is not here: it is the owner creating the root and
 merging the two memory sets into it, which is a copy and not a move, so
 the directories we read from are left exactly as they are.
 
-**On the number.** This entry is D174. D172 and D173 are held by
-unmerged branches (PR #70, PR #71).
+**On the number.** This entry is D174. The number was taken on
+2026-10-24, above D172 and D173, which PR #70 and PR #71 have since
+merged; D175 to D178 were allocated after it and left D174 free, so the
+entry keeps it and appends here, after D178. The file is append-only and
+a number is an identifier, not a position (D148): D148 after D149 and
+D161 after D167 are the same case, a branch that merged late with the
+number it had taken earlier. D170 is held by the unmerged branch of
+PR #67; gaps stay.

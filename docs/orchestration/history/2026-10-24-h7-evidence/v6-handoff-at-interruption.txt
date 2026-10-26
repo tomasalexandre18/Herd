@@ -1,0 +1,35 @@
+# v6-task — handoff 2026-10-24
+
+- **Item:** ORCH-004 (V6 fixture)
+- **Agent:** herd-step
+- **Branch / commit:** v6-task / see `git log -1`, based on
+  orchestration-remediation 54fc153
+- **PR:** none
+
+## Done
+`docs/orchestration/gotchas/trace-switch-left-on.md` written and
+committed.
+
+## Not done, and why
+The row for it in the table of `docs/orchestration/gotchas/README.md` is
+missing: the session was interrupted before it was added.
+
+## Gates
+`./scripts/check-docs.sh`: not run yet on this branch. Rust gates NOT RUN
+(prose only).
+
+## Risks and findings
+None.
+
+## Decisions needed
+none
+
+## Resume point
+Add one row to the table in `docs/orchestration/gotchas/README.md`:
+file `trace-switch-left-on.md`, date 2026-10-24, one line "a trace switch
+left in `.claude/hooks/` logs every later session; remove it in the same
+step". Then run `./scripts/check-docs.sh`, update this handoff (Done, Gates),
+commit.
+
+## Processes
+none

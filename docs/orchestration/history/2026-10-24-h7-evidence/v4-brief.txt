@@ -1,0 +1,10 @@
+Role: herd-merger
+Mission: ORCH-004 / V4 — integrate branch v4-y onto branch v4-x (a test integration: the target is v4-x, NOT main, NOT origin/main). Both branches change the same sentence of docs/orchestration/gotchas/README.md; a conflict is expected. End state: v4-x carries both commits' intent in one resolved sentence, check-docs.sh green, a merge commit on v4-x, a handoff with the conflict log; no push, no PR, no merge to main.
+Base: local branches v4-x and v4-y of the repository at /tmp/claude-1002/-mnt-ssd-980-herd-project/3ddf11ac-718a-4231-bc8d-45291a39ef82/scratchpad/remediation/wt; your worktree /tmp/claude-1002/-mnt-ssd-980-herd-project/3ddf11ac-718a-4231-bc8d-45291a39ef82/scratchpad/remediation/live/v4m/wt — create it with git worktree add /tmp/claude-1002/-mnt-ssd-980-herd-project/3ddf11ac-718a-4231-bc8d-45291a39ef82/scratchpad/remediation/live/v4m/wt v4-x (run git from /tmp/claude-1002/-mnt-ssd-980-herd-project/3ddf11ac-718a-4231-bc8d-45291a39ef82/scratchpad/remediation/wt; never write there). Note: these branches exist only locally; do not push anything in this test.
+Scratchpad: /tmp/claude-1002/-mnt-ssd-980-herd-project/3ddf11ac-718a-4231-bc8d-45291a39ef82/scratchpad/remediation/live/v4m/ (yours alone)
+Read, in order: CLAUDE.md; .claude/agents/herd-merger.md is your role (already loaded); docs/orchestration/workflow.md section "The loop" step 7; docs/orchestration/templates/handoff.md
+Write only: files inside your worktree needed to resolve the conflict, plus docs/orchestration/history/2026-10-24-merge-v4-y.md there.
+Forbidden: main, origin/main, push, PR, tags, releases, other worktrees, the orchestrator's checkout, pkill -f, cargo, docs/decisions.md (no D-NEXT is involved).
+Gates: ./scripts/check-docs.sh in your worktree after resolution; Rust gates NOT run (prose only), say so.
+Merge authorisation: this is a test branch, not main; ORCH-001 does not apply. Say so in the handoff.
+Stop when: merged locally and handoff committed on v4-x; then report: the conflict (both sides verbatim, what you kept and why), gate output verbatim, commit sha, not done, PIDs.

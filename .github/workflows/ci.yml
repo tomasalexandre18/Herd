@@ -66,3 +66,4 @@ jobs:
     steps:
       - uses: actions/checkout@v7
       - run: ./scripts/check-docs.sh
+      - run: ./scripts/check-orchestration.sh

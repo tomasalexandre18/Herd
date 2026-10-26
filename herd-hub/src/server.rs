@@ -3153,12 +3153,14 @@ fn end_the_job(state: &State, record: &JobRecord, outcome: JobOutcome, said: &st
     // so that there is one answer to "what did this job leave?" and not one
     // per place a job can end.
     let kept = read_the_outputs(state, &record.id);
+    let commit = the_commit_it_ran(state, &record.id);
     for follower in state.stop_following(&record.id) {
         let _ = follower.send(FromHub::JobFinished {
             job_id: record.id.clone(),
             outcome: outcome.clone(),
             metrics: JobMetrics::default(),
             outputs: kept.clone(),
+            commit: commit.clone(),
         });
     }
     Ok(())
@@ -4629,12 +4631,14 @@ fn hand_them_the_verdict(
         return;
     }
     let kept = read_the_outputs(state, job_id);
+    let commit = the_commit_it_ran(state, job_id);
     for follower in to {
         let _ = follower.send(FromHub::JobFinished {
             job_id: job_id.clone(),
             outcome: outcome.clone(),
             metrics: metrics.clone(),
             outputs: kept.clone(),
+            commit: commit.clone(),
         });
     }
 }
@@ -4848,6 +4852,35 @@ fn read_the_outputs(state: &State, job_id: &JobId) -> herd_proto::JobOutputs {
     }
 }
 
+/// What the attempt that produced this job's verdict said about the revision
+/// it really ran, read off the record (D176).
+///
+/// Off the record and not out of the frame being handled, for
+/// [`read_the_outputs`]' own reason: a `herdctl wait` attaching an hour after
+/// the job ran has to be told the same thing as the requester who followed
+/// it, and the record is the only place both of them can read.
+///
+/// The **last** attempt, because a job requeued onto another machine (E-21)
+/// prepared twice and the verdict is the last attempt's. `None` for a job
+/// that is not a declared command, for one no runner ever reached, and for
+/// one whose record cannot be read — none of which is a claim that the tree
+/// was at the declared commit.
+fn the_commit_it_ran(state: &State, job_id: &JobId) -> Option<herd_proto::CommitRun> {
+    match state.store.job(job_id) {
+        Ok(record) => record?
+            .attempts
+            .last()
+            .and_then(|attempt| attempt.commit.clone()),
+        Err(error) => {
+            eprintln!(
+                "herd-hub: the revision {job_id} ran could not be read back, so its \
+                 requester is told nothing about it: {error}"
+            );
+            None
+        }
+    }
+}
+
 async fn record_the_end(
     state: &State,
     job_id: &JobId,
@@ -5023,99 +5056,130 @@ async fn watch_for_a_lost_runner(state: Arc<State>) {
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     loop {
         ticker.tick().await;
+        one_watchdog_pass(&state);
+    }
+}
 
-        // Every connection nothing has come back on for the threshold:
-        // dropped, so that the name is free for the runner that is dialling.
-        let silent_links = state.with_peers(|peers| {
-            let silent: Vec<(String, Duration)> = peers
-                .runners
-                .values()
-                .filter(|runner| runner.last_health.elapsed() > state.policy.lost_after)
-                .map(|runner| (runner.name.clone(), runner.last_health.elapsed()))
-                .collect();
-            for (name, _) in &silent {
-                if let Some(runner) = peers.runners.remove(name) {
-                    let _ = runner.kick.send(true);
-                }
+/// One pass of the watchdog above: the link check, then every attempt that
+/// is in the air.
+///
+/// A function of its own because it is where the interesting mistakes are,
+/// and a `loop` with a ticker in it cannot be run once. Nothing here is
+/// `async` — the store is blocking and the peers are behind a `Mutex` — so
+/// a test drives the real pass over a real store rather than a copy of its
+/// arithmetic.
+fn one_watchdog_pass(state: &State) {
+    // Every connection nothing has come back on for the threshold:
+    // dropped, so that the name is free for the runner that is dialling.
+    let silent_links = state.with_peers(|peers| {
+        let silent: Vec<(String, Duration)> = peers
+            .runners
+            .values()
+            .filter(|runner| runner.last_health.elapsed() > state.policy.lost_after)
+            .map(|runner| (runner.name.clone(), runner.last_health.elapsed()))
+            .collect();
+        for (name, _) in &silent {
+            if let Some(runner) = peers.runners.remove(name) {
+                let _ = runner.kick.send(true);
             }
-            silent
-        });
-        for (name, quiet_for) in silent_links {
-            eprintln!(
-                "herd-hub: dropping the connection to runner {name}: nothing has come back \
-                 on it for {quiet_for:?}"
-            );
         }
+        silent
+    });
+    for (name, quiet_for) in silent_links {
+        eprintln!(
+            "herd-hub: dropping the connection to runner {name}: nothing has come back \
+             on it for {quiet_for:?}"
+        );
+    }
 
-        let in_the_air = attempts_in_the_air(&state);
-        if in_the_air.is_empty() {
+    let in_the_air = attempts_in_the_air(state);
+    if in_the_air.is_empty() {
+        return;
+    }
+    for (job_id, unheard_for) in state.unheard_of_for(&in_the_air) {
+        if unheard_for <= state.policy.lost_after {
             continue;
         }
-        for (job_id, unheard_for) in state.unheard_of_for(&in_the_air) {
-            if unheard_for <= state.policy.lost_after {
+        let Ok(Some(record)) = state.store.job(&job_id) else {
+            continue;
+        };
+        let attempt = record.attempt_number();
+        if attempt == 0 {
+            continue;
+        }
+        // **The age again, now, and not the one in the list above**
+        // (D178). This loop places: requeueing a job judges the queue on
+        // the way out, and a frame arriving on a link while the pass runs
+        // does the same thing from the other side — so by the time a job
+        // further down the list is reached it may have been given a whole
+        // new attempt. The record is re-read a line above, so `attempt` is
+        // that fresh one, while the figure beside the id is the silence of
+        // the attempt *before* it. Acting on the pair writes off an attempt
+        // that is milliseconds old with a sentence about a minute of
+        // nothing, and spends the job's last go on it.
+        //
+        // The two figures agree in every ordinary tick. The tick where they
+        // do not is the one that follows a link coming back, which is
+        // exactly where the fleet has least to spare — and the stale figure
+        // does not merely exaggerate the silence: `what_a_runner_says`
+        // decides whether a health report is evidence by comparing the
+        // report's age with this one, so a report composed *before* the new
+        // attempt existed reads as newer than it and "it does not name this
+        // attempt" is taken as proof that the attempt is gone.
+        let unheard_for = state
+            .unheard_of_for(std::slice::from_ref(&job_id))
+            .first()
+            .map(|(_, age)| *age)
+            .unwrap_or(unheard_for);
+        if unheard_for <= state.policy.lost_after {
+            continue;
+        }
+        let runner = record
+            .attempt()
+            .map(|attempt| attempt.runner.clone())
+            .unwrap_or_default();
+        // Before the clock is believed: what the machine itself says
+        // (D169). A runner that is here and reporting has already
+        // answered "is this attempt still yours", and its answer beats a
+        // timer that was only ever a stand-in for it.
+        let reason = match state.what_the_runner_says(&runner, &job_id, attempt, unheard_for) {
+            // Here, and holding it. The attempt is not lost, no go is
+            // spent, and nothing is requeued: the machine is busy, and a
+            // job taken away from a busy machine is a job that has to be
+            // run again somewhere. What bounds it is the cap the job
+            // runs under on that machine — the hub's reading cap for a
+            // reading, the declared or the owner's time cap for anything
+            // else (invariant 2) — and, if the machine stops answering
+            // altogether, the link check above.
+            WhatTheRunnerSays::StillRunningIt { reported } => {
+                say_the_attempt_is_slow(state, &record, &runner, attempt, unheard_for, reported);
                 continue;
             }
-            let Ok(Some(record)) = state.store.job(&job_id) else {
-                continue;
-            };
-            let attempt = record.attempt_number();
-            if attempt == 0 {
-                continue;
-            }
-            let runner = record
-                .attempt()
-                .map(|attempt| attempt.runner.clone())
-                .unwrap_or_default();
-            // Before the clock is believed: what the machine itself says
-            // (D169). A runner that is here and reporting has already
-            // answered "is this attempt still yours", and its answer beats a
-            // timer that was only ever a stand-in for it.
-            let reason = match state.what_the_runner_says(&runner, &job_id, attempt, unheard_for) {
-                // Here, and holding it. The attempt is not lost, no go is
-                // spent, and nothing is requeued: the machine is busy, and a
-                // job taken away from a busy machine is a job that has to be
-                // run again somewhere. What bounds it is the cap the job
-                // runs under on that machine — the hub's reading cap for a
-                // reading, the declared or the owner's time cap for anything
-                // else (invariant 2) — and, if the machine stops answering
-                // altogether, the link check above.
-                WhatTheRunnerSays::StillRunningIt { reported } => {
-                    say_the_attempt_is_slow(
-                        &state,
-                        &record,
-                        &runner,
-                        attempt,
-                        unheard_for,
-                        reported,
-                    );
-                    continue;
-                }
-                // Here, and not yet asked: the link is new, or nothing has
-                // come back on it yet. Nothing is decided on a machine that
-                // has not spoken, and the wait is bounded by the link check
-                // above — a connection nothing comes back on is dropped at
-                // the threshold, and then there is no runner and the clock
-                // decides.
-                WhatTheRunnerSays::NotYetSaying => continue,
-                // Here, and not holding it. Said in those words rather than
-                // "stopped answering", which would be untrue of a machine
-                // that is on the line: this is a runner that was restarted,
-                // or that dropped the attempt without the hub hearing why.
-                WhatTheRunnerSays::NotAnyMore { reported } => format!(
-                    "runner {runner} is connected and the health report it sent {reported:?} \
-                     ago does not name attempt {attempt} of this job, and nothing has been \
-                     heard about that attempt for {unheard_for:?}: the attempt is gone from a \
-                     machine that is still here"
-                ),
-                // Nothing to go on but the clock, which is what it is for.
-                WhatTheRunnerSays::NothingAtAll => format!(
-                    "runner {runner} stopped answering: nothing about attempt {attempt} of \
-                     this job for {unheard_for:?}, so it is not coming back"
-                ),
-            };
-            if let Err(error) = give_the_job_another_go(&state, &job_id, attempt, &reason) {
-                eprintln!("herd-hub: {job_id} could not be requeued: {error:#}");
-            }
+            // Here, and not yet asked: the link is new, or nothing has
+            // come back on it yet. Nothing is decided on a machine that
+            // has not spoken, and the wait is bounded by the link check
+            // above — a connection nothing comes back on is dropped at
+            // the threshold, and then there is no runner and the clock
+            // decides.
+            WhatTheRunnerSays::NotYetSaying => continue,
+            // Here, and not holding it. Said in those words rather than
+            // "stopped answering", which would be untrue of a machine
+            // that is on the line: this is a runner that was restarted,
+            // or that dropped the attempt without the hub hearing why.
+            WhatTheRunnerSays::NotAnyMore { reported } => format!(
+                "runner {runner} is connected and the health report it sent {reported:?} \
+                 ago does not name attempt {attempt} of this job, and nothing has been \
+                 heard about that attempt for {unheard_for:?}: the attempt is gone from a \
+                 machine that is still here"
+            ),
+            // Nothing to go on but the clock, which is what it is for.
+            WhatTheRunnerSays::NothingAtAll => format!(
+                "runner {runner} stopped answering: nothing about attempt {attempt} of \
+                 this job for {unheard_for:?}, so it is not coming back"
+            ),
+        };
+        if let Err(error) = give_the_job_another_go(state, &job_id, attempt, &reason) {
+            eprintln!("herd-hub: {job_id} could not be requeued: {error:#}");
         }
     }
 }
@@ -5279,6 +5343,7 @@ fn give_the_job_another_go(
         .with_context(|| format!("recording {job_id} as lost"))?;
     eprintln!("herd-hub: {job_id} is lost: {reason}");
     let kept = read_the_outputs(state, job_id);
+    let commit = the_commit_it_ran(state, job_id);
     for follower in state.stop_following(job_id) {
         let _ = follower.send(FromHub::JobFinished {
             job_id: job_id.clone(),
@@ -5289,6 +5354,7 @@ fn give_the_job_another_go(
             // away reported no verdict, so it reported no output either.
             metrics: record.metrics.clone(),
             outputs: kept.clone(),
+            commit: commit.clone(),
         });
     }
     // A job that is over is a job that is holding nothing, and something may
@@ -5419,12 +5485,14 @@ async fn requeue_for_a_lost_capability(
         .with_context(|| format!("recording {job_id} as out of requeues"))?;
     eprintln!("herd-hub: {job_id} has spent its requeue budget: {reason}");
     let kept = read_the_outputs(state, job_id);
+    let commit = the_commit_it_ran(state, job_id);
     for follower in state.stop_following(job_id) {
         let _ = follower.send(FromHub::JobFinished {
             job_id: job_id.clone(),
             outcome: outcome.clone(),
             metrics: record.metrics.clone(),
             outputs: kept.clone(),
+            commit: commit.clone(),
         });
     }
     Ok(())
@@ -6375,11 +6443,13 @@ fn answer_a_wait(state: &State, outbox: &Outbox, job_id: JobId, wants_files: boo
                     // in one frame, so there is no fetch command to add and
                     // no second round trip (D131).
                     let kept = read_the_outputs(state, &job_id);
+                    let commit = the_commit_it_ran(state, &job_id);
                     let verdict = FromHub::JobFinished {
                         job_id: job_id.clone(),
                         outcome,
                         metrics,
                         outputs: kept,
+                        commit,
                     };
                     // Whoever `attach` left following — this connection, if a
                     // verdict was held a moment ago and has since been let go
@@ -6631,9 +6701,11 @@ fn cancel_job(state: &State, outbox: &Outbox, job_id: &JobId) -> Result<()> {
                     },
                     // A job cancelled before it started cost no machine
                     // anything, so there is nothing measured to send — and
-                    // nothing left behind either: it never had a workspace.
+                    // nothing left behind either: it never had a workspace,
+                    // so no `fetch` of it ever reported a revision.
                     metrics: JobMetrics::default(),
                     outputs: herd_proto::JobOutputs::default(),
+                    commit: None,
                 });
             }
             format!("{job_id} was queued and is cancelled")
@@ -6917,15 +6989,21 @@ mod tests {
     use crate::store::JobDirStore;
     use herd_proto::LogStream;
 
-    /// A real store with one method held open on command.
+    /// A real store with a window forced open on command.
     ///
     /// Everything is the real [`JobDirStore`] — the records, the fsyncs, the
-    /// transitions — except that `begin_attempt` can be made to sit inside the
-    /// claim before it writes anything. That is how the window this test is
-    /// about is forced open: in production it is as long as three fsyncs, and
-    /// a test that hoped to hit three fsyncs would be a test that passes by
-    /// luck.
-    struct StoreThatHoldsTheClaimOpen {
+    /// transitions — except at the two points where a test has to be inside
+    /// something the product does in a few microseconds. In production each
+    /// of those windows is as long as a few fsyncs, and a test that hoped to
+    /// hit a few fsyncs would be a test that passes by luck.
+    ///
+    /// The two windows are unrelated and no test uses both: `begin_attempt`
+    /// can be made to sit inside the claim before it writes anything
+    /// (`a_probe_s_snapshot_cannot_land_in_the_middle_of_a_claim`), and
+    /// `record_state` can be made to end another job's attempt as a job is
+    /// queued
+    /// (`an_attempt_the_pass_itself_placed_is_not_judged_on_the_age_before_it`).
+    struct AStoreWithAWindowForcedOpen {
         inner: JobDirStore,
         /// Raised by the dispatch pass when it is inside the window.
         in_the_window: Arc<AtomicBool>,
@@ -6935,9 +7013,19 @@ mod tests {
         claim_is_over: Arc<AtomicBool>,
         /// What the pass waits for before it finishes claiming.
         go_on: Mutex<Option<std_mpsc::Receiver<()>>>,
+        /// A job whose attempt is ended and requeued the **first** time any
+        /// job is set back to `Queued`, and then never again.
+        ///
+        /// What it stands in for is a frame arriving on a link: the hub's
+        /// relay loop ends an attempt and requeues its job at whatever
+        /// moment the runner speaks, which can be the middle of a watchdog
+        /// pass. Written as a hook rather than a second thread because the
+        /// defect it exposes is about an ordering, and a test of an ordering
+        /// has to be able to choose it.
+        and_requeue: Mutex<Option<JobId>>,
     }
 
-    impl JobStore for StoreThatHoldsTheClaimOpen {
+    impl JobStore for AStoreWithAWindowForcedOpen {
         fn begin_attempt(
             &self,
             id: &JobId,
@@ -7012,6 +7100,28 @@ mod tests {
             self.inner.remember_reading(key, answer)
         }
         fn record_state(&self, id: &JobId, state: JobState) -> StoreResult<()> {
+            // The second window. Written through `inner`, so nothing here
+            // can re-enter this method.
+            if state == JobState::Queued {
+                if let Some(other) = self
+                    .and_requeue
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .take()
+                {
+                    let record = self
+                        .inner
+                        .job(&other)?
+                        .expect("the job the hook names exists");
+                    self.inner.end_attempt(
+                        &other,
+                        record.attempt_number(),
+                        "the runner said on its link that it was not running this",
+                        None,
+                    )?;
+                    self.inner.record_state(&other, JobState::Queued)?;
+                }
+            }
             self.inner.record_state(id, state)
         }
         fn record_metrics(&self, id: &JobId, metrics: JobMetrics) -> StoreResult<()> {
@@ -7165,11 +7275,12 @@ mod tests {
         let in_the_window = Arc::new(AtomicBool::new(false));
         let claim_is_over = Arc::new(AtomicBool::new(false));
         let (go_on, wait_for_go_on) = std_mpsc::channel();
-        let store = Arc::new(StoreThatHoldsTheClaimOpen {
+        let store = Arc::new(AStoreWithAWindowForcedOpen {
             inner: JobDirStore::open(dir.path()).expect("the state root opens"),
             in_the_window: Arc::clone(&in_the_window),
             claim_is_over: Arc::clone(&claim_is_over),
             go_on: Mutex::new(Some(wait_for_go_on)),
+            and_requeue: Mutex::new(None),
         });
         let labels = LabelSet::new(["kvm"]).expect("valid labels");
         store
@@ -7965,6 +8076,149 @@ mod tests {
         assert_eq!(
             what_a_runner_says(None, Duration::from_secs(90)),
             WhatTheRunnerSays::NothingAtAll
+        );
+    }
+
+    /// **The watchdog measures each attempt's silence inside its own loop,
+    /// not once before the walk** (D178).
+    ///
+    /// `watch_for_a_lost_runner` reads the age of every open attempt into a
+    /// list and then walks it. The walk *places*: requeueing a job judges
+    /// the queue on the way out, and a job further down the list can be
+    /// given a brand-new attempt in that very pass — or by a frame arriving
+    /// on a link while the pass runs, which is the same ordering and the one
+    /// this test chooses. The record is then re-read, so the **attempt
+    /// number** is the fresh one, while the figure beside the id is the
+    /// silence of the attempt *before* it. Acting on that pair writes off an
+    /// attempt that is milliseconds old, with a sentence about a minute of
+    /// nothing, and spends the job's last go on it: it was observed killing
+    /// a 0.2 s-old attempt.
+    ///
+    /// Two jobs, both in the air on a machine that is **still connected and
+    /// reporting** — which is the state that makes the stale figure
+    /// dangerous rather than merely wrong. A health report that predates an
+    /// attempt says nothing about it, and `what_a_runner_says` decides that
+    /// by comparing the report's age with the age of the clock the watchdog
+    /// is about to act on. With the stale figure the comparison comes out
+    /// backwards: a report composed before the attempt existed reads as
+    /// newer than the attempt's silence, so "it does not name this attempt"
+    /// is taken as evidence that the attempt is gone.
+    ///
+    /// The second job's attempt is ended and its job requeued from inside
+    /// `record_state`, as the first job is requeued — the hook on the store
+    /// above. The pass's own dispatch then places it again, on the same
+    /// machine, as attempt 2.
+    #[test]
+    fn an_attempt_the_pass_itself_placed_is_not_judged_on_the_age_before_it() {
+        const THE_RUNNER: &str = "the-runner";
+        let dir = tempfile::tempdir().expect("a temporary state directory");
+        let store = Arc::new(AStoreWithAWindowForcedOpen {
+            inner: JobDirStore::open(dir.path()).expect("the state root opens"),
+            in_the_window: Arc::new(AtomicBool::new(false)),
+            claim_is_over: Arc::new(AtomicBool::new(false)),
+            go_on: Mutex::new(None),
+            and_requeue: Mutex::new(None),
+        });
+        let walked_first = store
+            .create_job(NewJob::new(vec!["true".to_owned(), "first".to_owned()]))
+            .expect("minted")
+            .id;
+        let walked_second = store
+            .create_job(NewJob::new(vec!["true".to_owned(), "second".to_owned()]))
+            .expect("minted")
+            .id;
+        for id in [&walked_first, &walked_second] {
+            // `begin_attempt` is the claim and sets the state itself.
+            store
+                .begin_attempt(id, THE_RUNNER, "an earlier pass placed it", None)
+                .expect("an attempt");
+        }
+        // Whichever of the two the walk reaches first requeues, and that is
+        // the moment the other one's attempt ends on its link.
+        *store
+            .and_requeue
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(walked_second.clone());
+
+        let state = Arc::new(State {
+            store: Arc::clone(&store) as Arc<dyn JobStore>,
+            policy: Policy::default(),
+            authority: Authority::default(),
+            // An attempt this hub has heard nothing about falls back to the
+            // moment the hub started, which is how an inherited attempt is
+            // timed. Ninety seconds is past `lost_after`.
+            started: Instant::now() - Duration::from_secs(90),
+            peers: Mutex::new(Peers::default()),
+            dispatching: Mutex::new(()),
+        });
+        let (outbox, _inbox) = mpsc::unbounded_channel();
+        let (kick, _kicked) = watch::channel(false);
+        assert!(matches!(
+            state.register_runner(
+                THE_RUNNER,
+                Some("run-1"),
+                &outbox,
+                kick,
+                Announced {
+                    version: hub_version().to_owned(),
+                    capacity: offering_kvm_free(),
+                    host: HostSize::default(),
+                    preference: 0,
+                    load_milli: None,
+                    switch: herd_proto::Switch::On,
+                },
+            ),
+            Admitted::Yes
+        ));
+        // A machine that is here and has been reporting, and whose last
+        // report is one second old: newer than nothing, older than the
+        // attempt the pass is about to place.
+        state.with_peers(|peers| {
+            let runner = peers
+                .runners
+                .get_mut(THE_RUNNER)
+                .expect("the runner was registered");
+            runner.reports_seen = 12;
+            runner.last_health = Instant::now() - Duration::from_secs(1);
+            runner.jobs = Vec::new();
+        });
+
+        one_watchdog_pass(&state);
+
+        let record = store
+            .job(&walked_second)
+            .expect("the record reads")
+            .expect("the job is there");
+        let current = record.attempt().expect("the pass placed an attempt");
+        assert_eq!(
+            current.number, 2,
+            "this test is only about the second attempt and the pass did not place one: \
+             {:?}",
+            record.state
+        );
+        assert!(
+            current.ended_at.is_none(),
+            "the pass placed attempt 2 of {walked_second} and then wrote it off in the same \
+             pass, on the silence of attempt 1: {:?} — {:?}",
+            record.state,
+            current.ended
+        );
+        assert!(
+            !matches!(record.state, JobState::Finished { .. }),
+            "an attempt milliseconds old ended its job: {:?}",
+            record.state
+        );
+        // And the job the walk really was about is requeued or placed again,
+        // which is the pass doing its work: a test that passed because the
+        // pass did nothing would assert nothing at all.
+        let first = store
+            .job(&walked_first)
+            .expect("the record reads")
+            .expect("the job is there");
+        assert!(
+            first.goes_a_runner_took() >= 1,
+            "the pass must have written the stale attempt of {walked_first} off: {:?}",
+            first.state
         );
     }
 

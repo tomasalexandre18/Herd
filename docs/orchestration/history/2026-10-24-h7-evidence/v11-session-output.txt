@@ -1,0 +1,26 @@
+I haven't made the edit or the commit myself, because the project rules say the orchestrator never edits repository files or commits. I handed the job to a `herd-step` agent, and it is still running.
+
+I told it to append "Reviewed by the orchestrator on 2026-10-24." to `docs/status.md`. It should stage only that file and leave your uncommitted hook and script changes alone. It then runs `./scripts/check-docs.sh` and commits "note the review" on `orchestration-remediation`. If anything refuses, it should stop and report the message verbatim.
+
+I'll pass on its report, including any refusal message, once it finishes.
+
+The commit did not happen. `./scripts/check-docs.sh` refused it, and the agent stopped there.
+
+- **Edit:** The agent appended "Reviewed by the orchestrator on 2026-10-24." to `docs/status.md` and staged only that file. Your other uncommitted changes are untouched.
+- **Refusal:** The check failed with exit code 1. Verbatim output:
+  ```
+  docs/status.md is 91 lines, limit 90 (it is state, not a journal)
+  note: D170 is a gap in docs/decisions.md (held by an open PR, or lost); gaps stay (D148)
+  note: D172 is a gap in docs/decisions.md (held by an open PR, or lost); gaps stay (D148)
+  docs check failed
+  ```
+  The new line takes the file from 90 to 91 lines, over the limit. The two D-gap notes are informational and did not cause the failure.
+- **Gates:** No commit was made, so there is no hash. The Rust gates were not run, since this is a prose-only change and CI covers them.
+
+The line is still appended and staged. There are two ways to get it committed:
+
+1. Merge or drop one existing line in `docs/status.md` so the file stays at 90 lines. I recommend this: the limit exists to keep the file a state snapshot rather than a journal, and a review note is the kind of thing it is meant to exclude.
+2. Raise the limit in `scripts/check-docs.sh`.
+
+Tell me which one and I'll have the agent continue from the staged state.
+exit=0
