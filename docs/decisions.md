@@ -8742,3 +8742,93 @@ what a frame arriving on a link does.
 same pass and merged first — this branch was stacked on it, and the merge
 of `main` into this one is in its history. D174 is held by the unmerged
 branch of PR #72 and D170 by that of PR #67; gaps stay (D148).
+
+---
+
+## 2026-10-24 — D174 Herd's sessions keep their state in Herd's own root
+
+**Context.** Every Claude Code session on this project is started by
+chatOnS's launcher, `/mnt/ssd_980/chatons/wt/main/ops/agents/env.sh`,
+which exports `CLAUDE_CONFIG_DIR=$CHATONS_ROOT/claude/config` along with
+`HOME`, the `XDG_*` paths, `TMPDIR` and `CARGO_HOME`. Herd has therefore
+been running inside chatOnS's configuration directory, and two things
+followed from that and not from anything anybody decided about Herd.
+The first is permissions: that directory's `settings.json` holds an
+`autoMode` block whose `environment` declares the session to be
+chatOnS's orchestrator and whose `allow` list grants `sudo systemctl`,
+`nixos-rebuild switch`, `docker compose` on the hub's container and
+commits under `/etc/nixos` — exactly the operation of the consumer's
+machines that invariant 9 and D161 forbid us. The second is memory: auto
+memory is keyed by the configuration directory, so when the directory
+changed on 2026-10-23 the two 2026-10-15 cards under
+`/home/server/.claude/projects/-mnt-ssd-980-herd-project/memory/`
+(`orchestrate-do-not-code.md`, `herd-cargo-needs-nix-develop.md`)
+stopped being loaded, silently, and were found again only by looking for
+them. Nothing failed either time; a project that borrows another
+project's state inherits what it was never granted and loses what it
+never moved.
+
+**Choice.** Herd gets a state root of its own, `/mnt/ssd_980/herd`, in
+the shape chatOnS uses — `claude/config`, `claude/home`, `claude/tmp` —
+and two launchers in the repository under `ops/agents/`. `env.sh` is
+sourced and puts `HOME`, `CLAUDE_CONFIG_DIR`, the four `XDG_*` paths,
+`XDG_RUNTIME_DIR`, `TMPDIR` and `CARGO_HOME` under that root, refuses to
+continue if any of them resolves outside it, clears `ANTHROPIC_*`,
+`CLAUDE_CODE_USE_*`, the loader overrides and chatOnS's own markers, and
+sets `umask 077`. `session.sh` sources it, refuses to run as root,
+requires a Claude Code binary, says what is missing when the
+configuration directory has no credentials, and execs `claude` in the
+checkout it was read from. `docs/orchestration/state-root.md` says where
+the state is, how to start a session, and why chatOnS's launchers are
+never the way to start one.
+
+**What this does not do, deliberately.** It does not copy chatOnS's
+`chatons.slice` and `in-slice.sh`, its tmux server, its `dtach`
+orchestrator socket and the `attach`/`restart`/`stop` trio, its Nix
+watcher, its Remote Control relay, its MCP daemon, its boot unit or its
+`HC` helper. Herd has no cgroup slice on this host, no fleet of
+long-lived sessions to supervise and re-attach, and no service of its
+own to start at boot. It also creates nothing outside the repository and
+moves no data: `/mnt/ssd_980` belongs to `alexandre` with a group
+`server` is not in, so the root's first directory needs the owner, and
+the credentials and the two memory sets are the owner's to merge. The
+procedure for both, command by command and with what a careless run of
+it loses, is in `docs/orchestration/state-root.md`.
+
+**Alternatives rejected.**
+
+1. *Leave the shared directory and forbid the permissions in prose.*
+   This is what was in force until today, and it is what invariant 9 and
+   `CLAUDE.md` already say. It did not stop the grant from existing, and
+   a permission a session holds but is told not to use is one tool call
+   away from being used. It also does nothing at all about the lost
+   memory cards, which no instruction can reach.
+2. *Move chatOnS's `autoMode` block into chatOnS's own project settings
+   and keep one configuration directory.* It is the smaller change and
+   it fixes the permissions, so it was the tempting one. Rejected
+   because the directory is not ours to restructure, because it leaves
+   Herd's memory, history and credentials living in a directory whose
+   next reorganisation we would learn about the way we learnt about the
+   last one, and because `CLAUDE.md` says Herd decides how its own work
+   is run.
+3. *One launcher that does everything, in chatOnS's style.* Rejected in
+   favour of two short files: a shell that only needs `cargo` or `nix`
+   should be able to source the environment without starting a session,
+   and the file that is read to check what a session inherits should be
+   readable in one screen.
+
+**Reversibility.** High. The scripts are two files and the root is one
+hardcoded line in `env.sh`; nothing in the product reads either, no
+protocol field and no record changes, and the gates do not run them.
+The irreversible part is not here: it is the owner creating the root and
+merging the two memory sets into it, which is a copy and not a move, so
+the directories we read from are left exactly as they are.
+
+**On the number.** This entry is D174. The number was taken on
+2026-10-24, above D172 and D173, which PR #70 and PR #71 have since
+merged; D175 to D178 were allocated after it and left D174 free, so the
+entry keeps it and appends here, after D178. The file is append-only and
+a number is an identifier, not a position (D148): D148 after D149 and
+D161 after D167 are the same case, a branch that merged late with the
+number it had taken earlier. D170 is held by the unmerged branch of
+PR #67; gaps stay.
