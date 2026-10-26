@@ -222,6 +222,18 @@ ZFS `io.max`, those two being
 and `a_declared_ceiling_changes_what_the_inert_weight_line_says`. Each
 is printed as a skip and none is reported as a pass (D27).
 
+**CI reports 15 skips, not 12**, and the three extra ones settle
+ORCH-069's mechanism rather than leaving it an inference. On run
+40403915407 `check` printed " 15 assertion(s) COULD NOT RUN on this host
+and were skipped." and then "test suite: PASSED", and among the names is
+`HERD-SKIPPED: the_derived_j_is_recorded_and_is_what_the_job_is_given` —
+the very test that is red here. A GitHub runner is under the 17 GiB its
+guard asks of `MemTotal`, so there the case is skipped; this workstation
+has the `MemTotal` and not the free memory, so here it is asserted and
+fails. The twelve the brief expected are this host's number, not CI's.
+`admission.rs:419` is not skipped on CI and passes there, so its
+constants happen to match a GitHub runner's figures.
+
 ## Risks and findings
 
 1. **ORCH-069, the two red assertions above.** Reported, not worked
