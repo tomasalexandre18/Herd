@@ -125,14 +125,16 @@ done
 # exempts agents by design (docs/orchestration/permissions.md "Live
 # verification"), so nothing but the brief keeps one out of the
 # orchestrator's checkout: in V11 a brief that named no worktree let its
-# agent edit and stage docs/status.md there (ORCH-031). The worktree is an
+# agent edit and stage docs/status.md there (ORCH-031). A brief is a file
+# named <task>-brief.<ext>, as templates/brief.md says; a handoff whose task
+# name merely contains "brief" is not one. The worktree is an
 # absolute path written right after the word "worktree"; `git worktree add`
 # does not count, because that names the command, not the destination. A
 # brief whose agent writes nothing in the repository says read-only on its
 # Base line instead -- "everything else is read-only" on the Write only
 # line is a different statement and does not exempt it.
 checkout=/mnt/ssd_980/herd-project
-for f in docs/orchestration/history/*brief* docs/orchestration/history/*/*brief*; do
+for f in docs/orchestration/history/*-brief.* docs/orchestration/history/*/*-brief.*; do
   [ -f "$f" ] || continue
   named=$(grep -oE '[Ww]orktree[^/]{0,4}/[^ ,;:)`"]+' "$f" | sed -E 's|^[^/]*||; s|[.`]+$||')
   if [ -z "$named" ]; then

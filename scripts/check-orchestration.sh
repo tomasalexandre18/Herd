@@ -76,6 +76,8 @@ fresh; printf 'Role: herd-step\nBase: origin/main at abc1234; branch x\nWorktree
 expect_green "a brief naming an absolute worktree of its own"
 fresh; printf 'Role: herd-release\nBase: the repository at /scratch/x/wt, read-only.\nGates: none (read-only).\n' > "$H/2026-10-26-readonly-brief.txt"
 expect_green "a read-only brief, which writes nothing in the repository"
+fresh; printf '# a handoff, not a brief\n\nNo worktree named anywhere in it.\n' > "$H/2026-10-26-orch-031-brief-worktree.md"
+expect_green "a handoff whose task name merely contains the word brief"
 fresh; printf 'x%.0s' $(seq 1 85) >> "$tmp/repo/docs/orchestration/workflow.md"; echo >> "$tmp/repo/docs/orchestration/workflow.md"
 expect_red "over-long line in docs/orchestration" 'workflow.md has lines over 79'
 fresh; chmod -x "$tmp/repo/.claude/hooks/orchestrator-guard.sh"
