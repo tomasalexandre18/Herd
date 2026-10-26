@@ -22,11 +22,11 @@ onward are all published, the credential preflight that killed
 v0.3.1-v0.3.3 being gone (D162). A **`v*.*.*-dev*` tag** publishes a
 pre-release in four to six minutes, built as a real tag builds (D172).
 
-**`main` is 88 commits past v0.3.7** and the workspace version still
-reads `0.3.7` (`git rev-list --count v0.3.7..main`, `Cargo.toml` line 6;
-read 2026-10-26, this merge included). Nothing merged since the tag has
-shipped, the four fixes below included. `PROTOCOL_VERSION` is **2** and
-`RECORD_VERSION` **1** (`herd-proto/src/lib.rs:114`, `herd-hub/src/job.rs:52`).
+**`main` is 83 commits past v0.3.7** at `f7425d8`, before this merge,
+and the workspace version still reads `0.3.7` (`Cargo.toml` line 6;
+read 2026-10-26). Nothing merged since the tag has shipped, the four
+fixes below included. `PROTOCOL_VERSION` is **2** and `RECORD_VERSION`
+**1** on `main` (`herd-proto/src/lib.rs:114`, `herd-hub/src/job.rs:52`).
 
 ## What is known about the consumer's machines, and when
 

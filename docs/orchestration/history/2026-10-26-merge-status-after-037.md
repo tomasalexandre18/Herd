@@ -83,10 +83,14 @@ the sorted id lists shows one addition and no loss.
 
 **`docs/status.md` corrected on one figure** and otherwise taken as the
 branch wrote it: it said *"`main` is 66 commits past v0.3.7"*, true at
-`c1d5ce7` and 21 commits stale by this integration. It now reads **88**,
-which is the count once this merge lands, and says "this merge included"
-so the provenance of the number is on the line. The file is **90 lines**,
-the limit, and no line exceeds 79 columns.
+`c1d5ce7` and 21 commits stale by this integration. It now reads **83 at
+`f7425d8`, before this merge** — anchored to a sha rather than to a
+prediction. I first wrote the post-merge value, 88, and it went stale
+inside this same integration the moment Alexa's answers added a second
+commit: a count of commits on `main` cannot be stated by a commit that is
+about to change it. Anchored to `f7425d8` the sentence stays true however
+many commits follow. The file is **90 lines**, the limit, and no line
+exceeds 79 columns.
 
 **The task's own handoff exists** on the branch:
 `docs/orchestration/history/2026-10-26-status-after-037.md`.
