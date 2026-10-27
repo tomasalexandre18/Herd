@@ -137,7 +137,7 @@ pub async fn execute(
     let cancel = match session.take_job(&job_id, attempt, ceiling.most()) {
         Ok(cancel) => cancel,
         // A refusal for this machine's own ceiling says so in a field as well
-        // as in the sentence (D-NEXT): the hub charges a job a go for an
+        // as in the sentence (D182): the hub charges a job a go for an
         // attempt that ended *because of the runner*, and a machine that is
         // here, healthy and holding exactly what it said it would hold is not
         // that. The other two refusals are about this runner going away —

@@ -261,7 +261,7 @@ impl Puppet {
             health_every_ms: health_every.map(|every| every.as_millis() as u64),
             capabilities: Default::default(),
             host: herd_proto::HostSize::default(),
-            // This stand-in holds no job and says so by not saying (D-NEXT).
+            // This stand-in holds no job and says so by not saying (D181).
             jobs_at_once: None,
             preference: 0,
             load_milli: None,
@@ -1878,7 +1878,7 @@ async fn the_hub_s_first_answer(hub_url: &str, name: &str, instance: &str) -> Fr
         // A peer whose identity the hub is about to refuse offers nothing.
         capabilities: Default::default(),
         host: herd_proto::HostSize::default(),
-        // This stand-in holds no job and says so by not saying (D-NEXT).
+        // This stand-in holds no job and says so by not saying (D181).
         jobs_at_once: None,
         preference: 0,
         load_milli: None,

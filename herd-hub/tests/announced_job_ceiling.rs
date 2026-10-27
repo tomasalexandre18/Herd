@@ -1,4 +1,4 @@
-//! **The hub honours the ceiling a runner announced** (D-NEXT, invariant 2).
+//! **The hub honours the ceiling a runner announced** (D181, invariant 2).
 //!
 //! C5 gave the runner a ceiling of its own and a way to refuse past it, and
 //! that half is proved by `fake_hub_flood.rs`: a hand-written server floods a
@@ -40,7 +40,7 @@
 //! `JobEventKind` that already existed. **Nothing new was added to that
 //! enum.** It is `#[serde(tag = "event")]` with no `#[serde(other)]` arm, so
 //! a new variant would make `events.jsonl` unreadable to an earlier hub —
-//! worse than a lost field, and outside what D-NEXT approved.
+//! worse than a lost field, and outside what D181 approved.
 
 mod support;
 
@@ -107,7 +107,7 @@ const THE_RUNNERS_CEILING_SENTENCE: &str = herd_runner::A_RUNNERS_OWN_CEILING;
 /// `waiting` line — and never where it wants the runner's.
 const THE_HUBS_CEILING_SENTENCE: &str = herd_hub::matcher::A_CEILING_THE_RUNNER_ANNOUNCED;
 
-/// Neither version number moves, which is the condition D-NEXT shipped under.
+/// Neither version number moves, which is the condition D181 and D182 shipped under.
 ///
 /// Asserted rather than described, because both are compatibility statements
 /// about somebody else's machine: a handshake at protocol version 3 refuses
@@ -195,7 +195,7 @@ fn attempts_of(state_dir: &std::path::Path, job_id: &JobId) -> usize {
 /// memory need, so `admission` costs each of these jobs at zero and the
 /// memory seat accounting can never be what bounds them. The announced
 /// ceiling is the only thing in the hub that can, and this test fails on the
-/// code as it stood before D-NEXT — the hub assigns all eight in one pass, the
+/// code as it stood before D181 — the hub assigns all eight in one pass, the
 /// runner takes two and hands six back, and six attempts are spent on
 /// refusals that were certain before they were sent.
 #[tokio::test(flavor = "multi_thread")]
@@ -353,7 +353,7 @@ async fn no_attempt_is_spent_on_a_ceiling_the_hub_was_told_about() {
             assert!(
                 known.contains(kind),
                 "{id} recorded a {kind:?} line: a new JobEventKind variant makes events.jsonl \
-                 unreadable to an earlier hub, which is outside what D-NEXT approved"
+                 unreadable to an earlier hub, which is outside what D181 approved"
             );
         }
     }
@@ -1066,7 +1066,7 @@ async fn no_job_is_lost_to_an_outage(label: &'static str, outage: AnOutage) {
 }
 
 /// **The exemption is bounded, and the bound says so on the record**
-/// (D-NEXT).
+/// (D182).
 ///
 /// A refusal at a machine's own ceiling spends none of the job's goes at a
 /// runner that went away — that is the test above. An exemption with no

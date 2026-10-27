@@ -452,7 +452,7 @@ Nothing they have to change, and one thing they should read.
 
 ---
 
-## 7. The hub half (D-NEXT, on Alexa's D-C of 2026-10-25)
+## 7. The hub half (D181, on Alexa's D-C of 2026-10-25)
 
 ### 7.1 What the runner says — F
 
@@ -747,7 +747,7 @@ written to make visible.
 
 ---
 
-## 8. What a ceiling refusal costs (D-NEXT, on Alexa's decision of 2026-10-25)
+## 8. What a ceiling refusal costs (D182, on Alexa's decision of 2026-10-25)
 
 `herd-reviewer`'s contradictory review of PR #82 found one thing it would
 not sign: **§1.2, a link outage that turns N running jobs into N jobs ending

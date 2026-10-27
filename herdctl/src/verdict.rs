@@ -538,7 +538,7 @@ mod tests {
     }
 
     /// **A job no machine had room for is a verdict a program can read, and
-    /// it is not `lost`** (D-NEXT).
+    /// it is not `lost`** (D182).
     ///
     /// Alexa's requirement of 2026-10-25, in one assertion: the cause is the
     /// ending's own name, the 125 is Herd's and says so in

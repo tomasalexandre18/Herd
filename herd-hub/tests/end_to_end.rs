@@ -330,7 +330,7 @@ async fn a_peer_announcing_is_refused(announced: u32) {
             health_every_ms: None,
             capabilities: Default::default(),
             host: herd_proto::HostSize::default(),
-            // This stand-in holds no job and says so by not saying (D-NEXT).
+            // This stand-in holds no job and says so by not saying (D181).
             jobs_at_once: None,
             preference: 0,
             load_milli: None,

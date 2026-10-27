@@ -206,7 +206,7 @@ impl FakeHub {
             "the runner must announce the ceiling it enforces, not a second arithmetic"
         );
         // And that ignoring it changes nothing about what follows. This is
-        // the **rollback case** in miniature — a hub older than D-NEXT, or a hub
+        // the **rollback case** in miniature — a hub older than D181, or a hub
         // that is simply not one — and the whole point of C5's first half is
         // that the runner is not weakened by it. Everything below goes on
         // measuring 8 held and the rest handed back, and it must: a fleet

@@ -150,7 +150,7 @@ pub const FRAME_CEILING_BYTES: usize = herd_proto::FRAME_CEILING as usize;
 pub const ATTEMPTS_ALLOWED: u32 = 2;
 
 /// How many times one job may be handed back by a runner that was already as
-/// full as the ceiling it announced, before the hub stops trying (D-NEXT).
+/// full as the ceiling it announced, before the hub stops trying (D182).
 ///
 /// **Eight**, and it is a bound on an exemption rather than a budget for
 /// something that went wrong. A ceiling refusal costs the fleet one frame
@@ -366,7 +366,7 @@ pub struct Policy {
     /// requeue a job for ever, which is a job nobody is told about.
     pub requeue_budget: u32,
     /// How many times one job may be handed back by a runner that was
-    /// already at the ceiling it announced (D-NEXT).
+    /// already at the ceiling it announced (D182).
     ///
     /// See [`CEILING_REFUSALS_ALLOWED`]. **Separate from both
     /// [`Policy::attempts_allowed`] and [`Policy::requeue_budget`]**, and
@@ -783,7 +783,7 @@ struct Announced {
     /// How big its host is (E-22).
     host: HostSize,
     /// The most jobs it says it will hold at once, or `None` from a runner
-    /// that did not say (D-NEXT).
+    /// that did not say (D181).
     jobs_at_once: Option<u32>,
     /// How preferred it is when more than one machine could run a job (E-19).
     preference: i32,
@@ -840,7 +840,7 @@ struct ConnectedRunner {
     /// handshake, because it belongs to the machine and not to the moment.
     host: HostSize,
     /// The most jobs this machine says it will hold at once, as **it** worked
-    /// the figure out (D-NEXT, invariant 2).
+    /// the figure out (D181, invariant 2).
     ///
     /// On the connection beside `host` and for the same reason: it is a fact
     /// about the machine and its configuration, not about the moment, and a
@@ -855,7 +855,7 @@ struct ConnectedRunner {
     /// invented would be a ceiling the runner never agreed to.
     jobs_at_once: Option<u32>,
     /// What this runner last said it was **already holding**, when it handed
-    /// an assignment back because it was at the ceiling above (D-NEXT).
+    /// an assignment back because it was at the ceiling above (D182).
     ///
     /// A correction to the hub's own count, and nothing more. The hub reads
     /// what is out on a machine off the records (D79), and there is one
@@ -1579,7 +1579,7 @@ impl State {
     }
 
     /// True when this report ended a correction a ceiling refusal had left
-    /// on the runner (D-NEXT), which is a machine that has room again and
+    /// on the runner (D182), which is a machine that has room again and
     /// therefore a queue worth judging.
     fn record_health(
         &self,
@@ -1599,7 +1599,7 @@ impl State {
                 runner.draining = draining;
                 runner.jobs = jobs;
                 // The reconciliation, which is what ends the correction a
-                // ceiling refusal left behind (D-NEXT). This report names
+                // ceiling refusal left behind (D182). This report names
                 // every attempt the machine is holding and nothing else, so
                 // whatever the two sides disagreed about has now been said
                 // out loud: the attempts the records no longer know about
@@ -1625,7 +1625,7 @@ impl State {
     }
 
     /// Record what a runner said it was already holding when it refused an
-    /// assignment for the ceiling it announced (D-NEXT).
+    /// assignment for the ceiling it announced (D182).
     ///
     /// By name rather than by connection, because the caller is in the relay
     /// loop and has the name; and a no-op for a runner that is no longer
@@ -3703,7 +3703,7 @@ async fn relay_from_runner(
                     }
                 }
                 // And if this report ended a ceiling correction, the queue is
-                // judged **now** (D-NEXT). Nothing else would: a health
+                // judged **now** (D182). Nothing else would: a health
                 // report is not an event the dispatch pass is woken by, so a
                 // job held back because a machine said it was full would
                 // wait for whatever happened to wake the hub next — on a
@@ -4078,7 +4078,7 @@ async fn relay_from_runner(
                 // queue on its way out and that pass has to see this: the
                 // machine's own count of what it is holding is the one thing
                 // that stops the hub offering the same surplus straight back
-                // to it (D-NEXT). A runner that has just redialled is
+                // to it (D182). A runner that has just redialled is
                 // holding jobs the records no longer know about — the
                 // watchdog ended those attempts while the link was down and
                 // the jobs went on running — so until that runner's next
@@ -5330,7 +5330,7 @@ fn one_watchdog_pass(state: &State) {
         // Every ending the watchdog writes is about the runner: it went
         // quiet, or it is here and no longer holding the attempt. None of
         // them is a machine saying it is full, which only a runner can say
-        // and only in the frame that says it (D-NEXT).
+        // and only in the frame that says it (D182).
         if let Err(error) = give_the_job_another_go(
             state,
             &job_id,
@@ -5435,7 +5435,7 @@ fn give_the_job_another_go(
     // with nothing left for the case E-21 is about.
     let goes_taken = record.goes_a_runner_took();
     // And how much of the **other** budget is gone: the one for a machine
-    // that is here and full (D-NEXT). Separate from the goes above for D76's
+    // that is here and full (D182). Separate from the goes above for D76's
     // reason, one budget further on — a runner that said it was already
     // holding what it promised to hold is not a runner that disappeared, so
     // a job refused by one must not come to the end of the goes E-21 keeps
@@ -5447,7 +5447,7 @@ fn give_the_job_another_go(
         .with_context(|| format!("ending attempt {attempt} of {job_id}"))?;
     state.attempt_is_over(job_id);
     // Which of the two budgets this ending spends, and how much of it is
-    // gone (D-NEXT). A machine that was already as full as the ceiling it
+    // gone (D182). A machine that was already as full as the ceiling it
     // announced is not a machine that went away: the job never started
     // there, nothing of it was lost, and E-21's goes are untouched. It has a
     // budget of its own, bounded, because an exemption with no bound is a
@@ -5525,7 +5525,7 @@ fn give_the_job_another_go(
     // process gave one (D15).
     //
     // **And a different ending for each budget, not one ending with two
-    // sentences** (D-NEXT). "A runner went away twice" is a fleet that lost
+    // sentences** (D182). "A runner went away twice" is a fleet that lost
     // a machine under a job: that is `lost`, which is what E-21 named it.
     // "Eight machines said they were full" is a fleet whose hub and whose
     // runners do not agree about a count they can both see — nothing
@@ -5565,7 +5565,7 @@ fn give_the_job_another_go(
             reason: format!(
                 "{reason}; this job has been handed straight back {spent} time(s) of the \
                  {allowed} allowed by machines that were already as full as the ceiling they \
-                 announced, so it is not offered again (D-NEXT). None of those refusals spent \
+                 announced, so it is not offered again (D182). None of those refusals spent \
                  one of its {} goes at a runner that went away (E-21): nothing failed and no \
                  machine went anywhere, the hub's count of what is out on {named} and theirs \
                  simply never agreed. Add capacity, or look at why the two counts disagree",
@@ -5581,7 +5581,7 @@ fn give_the_job_another_go(
                 "{reason}; this was attempt {spent} of {allowed} at a runner that went away, \
                  so the job is not attempted again (E-21). A go spent on a capability that had \
                  gone under it would not have counted towards these (D76), nor would one spent \
-                 on a machine that was already full (D-NEXT)"
+                 on a machine that was already full (D182)"
             ),
         }
     };

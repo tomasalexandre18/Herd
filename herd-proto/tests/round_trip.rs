@@ -1489,7 +1489,7 @@ fn a_wait_that_predates_wants_files_is_read_as_wanting_them() {
 
 /// `jobs_at_once` is additive in **both** directions, which is what the rule
 /// at `docs/decisions.md:7293` and `herd-hub/src/job.rs:44-51` actually ask
-/// for and what lets D-NEXT ship without moving [`PROTOCOL_VERSION`].
+/// for and what lets D181 ship without moving [`PROTOCOL_VERSION`].
 ///
 /// A field is additive only when a peer that does not know it and a peer that
 /// does can each read what the other wrote, **and** when what is missing
@@ -1607,7 +1607,7 @@ fn a_hello_carries_its_job_ceiling_in_both_directions_without_moving_the_version
 }
 
 /// **A job that no machine had room for ends as that, and says so in fields**
-/// (D-NEXT).
+/// (D182).
 ///
 /// The one-way cost of a new `JobOutcome` variant, asserted rather than only
 /// written down: this build reads every ending an older one wrote, and an

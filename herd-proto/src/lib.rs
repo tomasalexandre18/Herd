@@ -922,7 +922,7 @@ pub enum JobOutcome {
     SetupFailed { reason: String },
     /// Every machine this job was offered to handed it straight back because
     /// it was already as full as the ceiling it announced, until the hub ran
-    /// out of tries (D-NEXT).
+    /// out of tries (D182).
     ///
     /// **The subject is the machines, not the job.** Nothing failed and
     /// nothing was lost: the job never started anywhere, no process was
@@ -1331,7 +1331,7 @@ pub enum ToHub {
         #[serde(default, skip_serializing_if = "HostSize::is_silent")]
         host: HostSize,
         /// The most jobs this runner will hold at once, as it worked the
-        /// figure out for itself (D-NEXT, invariant 2).
+        /// figure out for itself (D181, invariant 2).
         ///
         /// It travels for the reason [`health_every_ms`](ToHub::Hello) does:
         /// the mistake it prevents needs **both** sides at once. A runner
@@ -1629,7 +1629,7 @@ pub enum ToHub {
         attempt: u32,
         reason: String,
         /// How many jobs this runner was already holding, when **its own
-        /// count of what it holds is why it refused** (D-NEXT, invariant 2).
+        /// count of what it holds is why it refused** (D182, invariant 2).
         ///
         /// Two refusals say it: the ceiling the runner announced, and a job
         /// it is already running another attempt of. Both are the same fact

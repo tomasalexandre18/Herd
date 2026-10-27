@@ -200,7 +200,7 @@ pub fn exit_code_for(outcome: &JobOutcome) -> u8 {
         // list: nobody ran this job at all. Not 124, which would say a
         // budget stopped it; not 1, which would say it failed. Which of the
         // five it was is `cause` in the verdict document and the sentence on
-        // stderr, never the number (D-NEXT, D20).
+        // stderr, never the number (D182, D20).
         | JobOutcome::RefusedAsFull { .. }
         // 125 and **not** 124, which is the whole of D166's third part: the
         // machine the job ran on could not do its own part, so nobody
@@ -233,7 +233,7 @@ pub fn no_verdict_reason(outcome: &JobOutcome) -> Option<String> {
         // offered to could have run it and none of them had room. The
         // sentence names the machines and the bound, because adding capacity
         // — or finding out why the hub's count and a runner's disagree — is
-        // the whole of what there is to do about it (D-NEXT).
+        // the whole of what there is to do about it (D182).
         JobOutcome::RefusedAsFull {
             reason,
             refusals,
@@ -1415,7 +1415,7 @@ async fn join(config: &Config) -> Result<Socket> {
             // (E-22, E-19).
             host: herd_proto::HostSize::default(),
             // Nor a ceiling on jobs held at once: a requester holds none, so
-            // there is no figure here to be silent about (D-NEXT).
+            // there is no figure here to be silent about (D181).
             jobs_at_once: None,
             preference: 0,
             // Nor does a requester measure anything about a host (E-32).

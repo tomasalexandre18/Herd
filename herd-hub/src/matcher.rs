@@ -97,7 +97,7 @@ pub struct Seat {
     pub preference: i32,
     pub host: HostSize,
     /// The most jobs this runner said it holds at once, in its handshake
-    /// (D-NEXT, invariant 2). `None` from a runner that did not say.
+    /// (D181, invariant 2). `None` from a runner that did not say.
     ///
     /// **A bound beside the memory admission, never instead of it.** The two
     /// answer different questions and neither subsumes the other: admission
@@ -114,7 +114,7 @@ pub struct Seat {
     pub jobs_at_once: Option<u32>,
     /// What this machine last said it was **already holding**, when it
     /// handed an assignment back because it was at the ceiling above
-    /// (D-NEXT). `None` is "nothing to correct", and is the ordinary state.
+    /// (D182). `None` is "nothing to correct", and is the ordinary state.
     ///
     /// [`Seat::reserved`]`.jobs` is the hub's count, read off the records,
     /// and there is one state in which the records are wrong by a lot: a
@@ -633,7 +633,7 @@ enum Admission {
 /// before any requirement is read (D82).
 fn admission(record: &JobRecord, seat: &Seat, threads: Option<u32>) -> Admission {
     // **First, and before any figure about size**: the count the runner
-    // itself put on how many jobs it will hold at once (D-NEXT, invariant 2).
+    // itself put on how many jobs it will hold at once (D181, invariant 2).
     //
     // Here rather than anywhere else because this is the function that reads
     // [`Seat::reserved`], and `reserved.jobs` is already the count this needs
@@ -676,7 +676,7 @@ fn admission(record: &JobRecord, seat: &Seat, threads: Option<u32>) -> Admission
             ));
         }
         // The hub's count, and the machine's own where the machine has
-        // contradicted it (D-NEXT). The larger wins, because the only way
+        // contradicted it (D182). The larger wins, because the only way
         // the two differ is the hub's being stale: a runner that redialled
         // after an outage is holding jobs whose attempts the watchdog ended
         // while the link was down, so the records read that seat as empty
@@ -1698,7 +1698,7 @@ mod tests {
             it_said_it_is_holding: None,
             // Silent, on every seat these tests build but the ones that are
             // about the ceiling. That is deliberate and it is itself the
-            // assertion D-NEXT's "absent is not a figure" needs: a runner that
+            // assertion D181's "absent is not a figure" needs: a runner that
             // said nothing is placed on exactly as it was before this field
             // existed, and every test in this module that passed without it
             // has to go on passing unchanged.
@@ -4041,7 +4041,7 @@ mod tests {
         assert!(why.contains("build slot 1 of 1"), "{why}");
     }
 
-    // ------------------------------------------- D-NEXT: the announced ceiling
+    // ------------------------------------------- D181: the announced ceiling
 
     /// A runner that announced it holds `at_once` jobs, and nothing else
     /// changed about it.
@@ -4099,7 +4099,7 @@ mod tests {
             assert_eq!(
                 runner, "build-host",
                 "job {n} of a memory-silent queue: nothing in the hub bounds this, which is \
-                 the defect D-NEXT answers and not something to be fixed by silence"
+                 the defect D181 answers and not something to be fixed by silence"
             );
             running.push(job);
         }

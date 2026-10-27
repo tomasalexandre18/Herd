@@ -199,7 +199,7 @@ impl JobState {
 /// **Three budgets, so three endings.** A job gets two goes at a runner that
 /// disappeared (E-21, D39), its own separate budget of goes at a capability
 /// that had gone under it (D76), and its own separate budget again at a
-/// machine that was already as full as the ceiling it announced (D-NEXT).
+/// machine that was already as full as the ceiling it announced (D182).
 /// Every one of them is counted by reading the attempts back off the record
 /// (D79), so the kind of ending has to be *on* the attempt — and it has to
 /// arrive here, at the one function that writes it, rather than be guessed
@@ -218,7 +218,7 @@ pub enum HowItEnded {
     /// a capability and not the job (D76). Spends that budget and no other.
     TheJobAnsweredItsRequeueCode(i32),
     /// The runner handed the assignment straight back because it was already
-    /// holding as many jobs as it told the hub it would hold (D-NEXT).
+    /// holding as many jobs as it told the hub it would hold (D182).
     /// Spends that budget and no other: the machine is here and the job is
     /// untouched.
     TheRunnerWasAtItsCeiling {
@@ -269,7 +269,7 @@ pub struct Attempt {
     /// `None` on every other ending: a verdict, a loss, an abandonment.
     pub requeue_code: Option<i32>,
     /// Whether this attempt ended because the runner was **already as full as
-    /// the ceiling it announced** (D-NEXT, invariant 2).
+    /// the ceiling it announced** (D182, invariant 2).
     ///
     /// The third budget, and the same shape as [`Attempt::requeue_code`] one
     /// field up. E-21's two goes exist for *a runner that disappeared*; D76's
@@ -1406,7 +1406,7 @@ impl JobRecord {
     /// that disappears.
     ///
     /// Nor is an attempt a runner handed back **because it was already as
-    /// full as the ceiling it announced** (D-NEXT). That machine did not
+    /// full as the ceiling it announced** (D182). That machine did not
     /// disappear: it is on the line, healthy, running exactly what it said it
     /// would run, and the job it declined is untouched. Charging it a go cost
     /// whole queues their verdicts on an ordinary link blip — the runner's
@@ -1427,7 +1427,7 @@ impl JobRecord {
     }
 
     /// How many times this job has been handed back by a runner that was
-    /// already at the ceiling it announced (D-NEXT).
+    /// already at the ceiling it announced (D182).
     ///
     /// The bound on the exemption above, and derived from the attempts for
     /// the reason every other budget here is: a counter would be a second

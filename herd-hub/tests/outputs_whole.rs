@@ -126,7 +126,7 @@ impl Requester {
             health_every_ms: None,
             capabilities: Default::default(),
             host: herd_proto::HostSize::default(),
-            // This stand-in holds no job and says so by not saying (D-NEXT).
+            // This stand-in holds no job and says so by not saying (D181).
             jobs_at_once: None,
             preference: 0,
             load_milli: None,
@@ -363,7 +363,7 @@ async fn a_collection_that_cannot_complete_ends_the_wait_and_names_what_is_missi
                     memory_floor_mib: Some(1024),
                     tmpfs_mib: Some(4096),
                 },
-                // This stand-in holds no job and says so by not saying (D-NEXT).
+                // This stand-in holds no job and says so by not saying (D181).
                 jobs_at_once: None,
                 preference: 0,
                 load_milli: None,

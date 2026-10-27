@@ -468,7 +468,7 @@ pub(crate) enum NotTaken {
     /// its memory ceiling does to its host.
     AtItsCeiling { running: usize, most: usize },
     /// It is **already running another attempt of this very job**, and one
-    /// machine runs one job once (D-NEXT).
+    /// machine runs one job once (D182).
     ///
     /// Not a statement about the hub either, and not an error: the hub wrote
     /// the first attempt off while the link was down and the job went on
@@ -1239,7 +1239,7 @@ impl Session {
 
     /// Put an attempt in hand **without** `take_job`'s refusals: no drain
     /// check, no switch check, no ceiling, and no "one machine runs one job
-    /// once" (D-NEXT).
+    /// once" (D180, D182).
     ///
     /// For the three tests about what the map does when it holds two
     /// attempts of one job. `take_job` refuses that state and is what keeps
@@ -1328,7 +1328,7 @@ impl Session {
             }
             // **One machine runs one job once.** The map holds both attempts
             // honestly since the entries were keyed by job *and* attempt
-            // (D-NEXT, part 1) — and a map that can hold two attempts of one
+            // (D177, C5 part 1) — and a map that can hold two attempts of one
             // job is not permission to run them. A **workspace belongs to a
             // job**: `DataRoot::open_workspace` takes a `JobId` and clears
             // the directory if it is already there, so a second attempt here
@@ -1342,7 +1342,7 @@ impl Session {
             // reason every other refusal here is: what becomes of the job is
             // the hub's policy and never the runner's. And handed back as a
             // refusal **about this runner's own count**, which spends none
-            // of the job's goes (D-NEXT): the machine is here and healthy,
+            // of the job's goes (D182): the machine is here and healthy,
             // and the only thing that happened is that the hub's view of
             // what it holds ran ahead of its own.
             if let Some(held) = inner
@@ -1658,7 +1658,7 @@ impl Session {
     }
 
     /// Give an attempt back because **this machine is already as full as it
-    /// said it would be** (D-NEXT, invariant 2).
+    /// said it would be** (D182, invariant 2).
     ///
     /// The same frame as [`Session::abandon`] and one field more: how many
     /// jobs this runner was holding when it refused. Said in a field and not
@@ -2902,7 +2902,7 @@ pub async fn serve_once(config: Config, session: Session, confined: Arc<Confined
         // for itself (E-22, E-19).
         host: config.host,
         // And the ceiling derived from that host, so the hub stops placing
-        // work this runner is certain to hand straight back (D-NEXT).
+        // work this runner is certain to hand straight back (D181).
         // Announced, never asked for: the runner enforces this figure
         // whatever the hub does with it.
         //
@@ -3045,7 +3045,7 @@ async fn serve_hub(
     // machine itself declared — the memory it lends, the floor it keeps, the
     // cap it puts on every job — and from nothing the hub has said. Handed in
     // rather than recomputed because it is the **same value** the hello
-    // announced (D-NEXT): a figure announced and a figure enforced that were
+    // announced (D181): a figure announced and a figure enforced that were
     // derived twice could differ, and the one that matters is this one.
     //
     // It is a property of the host and of its configuration, neither of which
