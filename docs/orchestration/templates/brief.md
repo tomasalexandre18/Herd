@@ -9,7 +9,7 @@ Base:       origin/main at <sha>; branch <name>
 Worktree:   <absolute path>   (required; yours alone; create it with
             git worktree add -b <branch> <path> origin/main)
 Scratchpad: <absolute path>/<task>/   (required; yours alone)
-Read, in order:
+Read, in order (in your worktree, never the orchestrator's checkout):
   1. CLAUDE.md
   2. docs/orchestration/board.md (item ORCH-nnn)
   3. <the two or three files the task really needs>
@@ -37,3 +37,15 @@ under `docs/orchestration/history/` is named `<task>-brief.txt`, and
 writes nothing in the repository says `read-only` on its `Base:` line
 instead; "everything else is read-only" on the `Write only:` line is a
 different statement and does not exempt it.
+
+That checkout is also **stale by construction**, and reading it is the
+second half of the same trap. The guard blocks every git write verb
+there, `git fetch` included, so it cannot be brought up to date and never
+will be. On 2026-10-27 it stood 150 commits behind `origin/main`, and its
+`board.md` held 18 rows ending at ORCH-032 while `origin/main` carried 85
+up to ORCH-107 — an agent that read it reported a board row as missing
+that had been on `main` for days, and the orchestrator reports two
+earlier briefs written from a stale `main`. So: read `origin/main` for
+anything you will act on or assert, with `git show origin/main:<path>` or
+a `git fetch` in your own worktree. That checkout stays readable only
+for what does not change, such as a file's history.

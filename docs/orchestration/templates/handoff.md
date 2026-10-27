@@ -10,7 +10,8 @@ another task's file.
 - **Item:** ORCH-nnn
 - **Agent:** herd-<role>
 - **Branch / commit:** <name> / <sha>, based on origin/main <sha>
-- **PR:** #<n> or none
+- **PR:** none — an agent pushes its branch and opens none (one PR per
+  batch, `docs/orchestration/workflow.md`); `herd-merger` names it here
 
 ## Done
 <what exists now, as facts a reader can check>
