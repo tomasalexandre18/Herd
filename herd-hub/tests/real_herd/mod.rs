@@ -1040,3 +1040,58 @@ pub fn ran_on_parts(line: &str) -> (String, String) {
     );
     (runner.to_owned(), why.to_owned())
 }
+
+/// The lending figures a test is about to declare, checked against the host
+/// that is about to run it (ORCH-069).
+///
+/// `--host-memory` and `--host-tmpfs` are what a runner is **asked** to lend,
+/// not what it announces. The runner lowers each to what is really there —
+/// `MemTotal` (D89), the room under the tightest cgroup ceiling enclosing it
+/// (D119), the size of the mount — and the hub then derives every figure in
+/// every sentence from the lowered one. A test that declares 8 GiB and
+/// asserts a sentence built from 8 GiB is therefore asserting something about
+/// the machine it happens to be running on.
+///
+/// That is exactly how two assertions came to be red on one workstation and
+/// *never executed* anywhere else: `slots.rs` declared 17 GiB and guarded on
+/// `MemTotal` alone, which let the cgroup clamp through unnoticed and skipped
+/// the assertion on every host with less memory than the owner's PC;
+/// `admission.rs` declared 8 GiB and guarded on nothing at all. Three agents
+/// spent a day proving the failures were not theirs.
+///
+/// So the figures the tests declare are now small enough that no host able to
+/// build this workspace can clamp them, and this says so **by name** if one
+/// ever does. Deliberately an assertion and not a skip: a skip is not a pass
+/// (D27), and the cure for an assertion nobody runs is not a wider guard. A
+/// host with under two gibibytes of room cannot compile `herd-hub` at all, so
+/// a failure here is a broken machine, and it reads like one.
+pub fn a_lend_this_host_can_really_make(memory_mib: u64, tmpfs_mib: u64) {
+    if let Some(total) = herd_runner::metrics::total_memory_mib() {
+        assert!(
+            total >= memory_mib,
+            "this host's MemTotal is {total} MiB and the runner below is told to lend \
+             {memory_mib} MiB, which it would clamp to the machine (D89). Every figure \
+             asserted after that would be this host's and not this test's."
+        );
+    }
+    if let Some(enclosure) = herd_runner::room::measure() {
+        assert!(
+            enclosure.room_mib() >= memory_mib,
+            "the runner below is told to lend {memory_mib} MiB of memory, but {}, so it \
+             would announce {} instead (D119) and every figure asserted after that would be \
+             this cgroup's and not this test's. Run the suite outside the slice, or raise \
+             the slice's ceiling.",
+            enclosure.why(),
+            herd_proto::size_mib(enclosure.room_mib())
+        );
+    }
+    let mount = herd_runner::metrics::DEFAULT_TMPFS_PATH;
+    if let Ok(room) = herd_runner::metrics::tmpfs_room_mib(mount) {
+        assert!(
+            room >= tmpfs_mib,
+            "{mount} holds {room} MiB in all and the runner below is told to lend \
+             {tmpfs_mib} MiB of tmpfs, which it would clamp to the mount. Every tmpfs figure \
+             asserted after that would be this host's and not this test's."
+        );
+    }
+}

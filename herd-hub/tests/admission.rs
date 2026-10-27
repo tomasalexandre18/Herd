@@ -17,21 +17,52 @@ use std::time::{Duration, Instant};
 
 use real_herd::Herd;
 
-/// A runner that lends four gibibytes of tmpfs and eight of memory, keeping
-/// one back as its floor. Small figures on purpose: the arithmetic is the
-/// same at four gibibytes as at thirty-one, and a test can reason about it.
+/// A runner that lends four gibibytes of tmpfs and two of memory, keeping
+/// half a gibibyte back as its floor, so the admission here is 1.5 GiB. Small
+/// figures on purpose: the arithmetic is the same at two gibibytes as at
+/// thirty-one, and a test can reason about it.
+///
+/// **Two and not eight** (ORCH-069). A lend is what a runner is *asked* for;
+/// what it announces is that figure lowered to what is really there — and in
+/// particular to the room under the tightest cgroup ceiling enclosing it
+/// (D119). Eight gibibytes is more than a bounded slice leaves free on a busy
+/// workstation, so `a_killed_hub_reads_the_reservations_back_off_the_records`
+/// was asserting `7 GiB` against a figure that moved with whatever else was
+/// running on the machine — `6.9 GiB` on the run that found it. Two
+/// gibibytes is under the room of any host that can build this workspace, and
+/// [`real_herd::a_lend_this_host_can_really_make`] says so by name instead of
+/// skipping if one ever is that tight.
+///
+/// The per-job memory cap goes down with the lend. The count of jobs a runner
+/// holds at once is its admission divided by that cap (`jobs_at_once`), so
+/// shrinking the lend alone would have taken this machine from three
+/// concurrent jobs to one, and every test here that holds one job while a
+/// second is judged would have been refused on the runner's own ceiling
+/// instead of on the arithmetic it is about. 1.5 GiB of admission at 512 MiB
+/// a job is three, which is what 7 GiB at 2 GiB a job used to be.
+///
+/// Every figure asserted in this file comes out of these five, so this is the
+/// one place to read them from.
 fn a_small_lender() -> Vec<&'static str> {
     vec![
         "--host-tmpfs",
         "4GiB",
         "--host-memory",
-        "8GiB",
+        "2GiB",
         "--host-memory-floor",
-        "1GiB",
+        "512MiB",
         "--host-threads",
         "4",
+        "--job-memory-max",
+        "512MiB",
     ]
 }
+
+/// What [`a_small_lender`] declares, in MiB, for the precondition that says
+/// out loud whether this host can really let it lend that much.
+const THE_LEND_MIB: u64 = 2 * 1024;
+/// And its tmpfs, which the runner clamps to the mount's own size.
+const THE_TMPFS_MIB: u64 = 4 * 1024;
 
 fn state_of(herd: &Herd, job: &str) -> String {
     herd.record(job)["state"]["type"]
@@ -115,6 +146,7 @@ fn a_job_that_marks_its_interval_until_the_test_says_so(
 /// things.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_refusal_carries_the_free_figure_and_the_needed_figure() {
+    real_herd::a_lend_this_host_can_really_make(THE_LEND_MIB, THE_TMPFS_MIB);
     let herd = Herd::new();
     let _hub = herd.start_hub("hub").await;
     let _runner = herd.start_runner_with("lender", "runner", "runner", &a_small_lender());
@@ -196,6 +228,7 @@ async fn a_refusal_carries_the_free_figure_and_the_needed_figure() {
 /// afterwards.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_starved_reservation_waits_then_starts_and_leaks_nothing() {
+    real_herd::a_lend_this_host_can_really_make(THE_LEND_MIB, THE_TMPFS_MIB);
     let herd = Herd::new();
     let _hub = herd.start_hub("hub").await;
     let _runner = herd.start_runner_with("lender", "runner", "runner", &a_small_lender());
@@ -279,6 +312,7 @@ async fn a_starved_reservation_waits_then_starts_and_leaks_nothing() {
 /// ten-minute wait at sixty seconds gets.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_waiting_job_says_why_again_on_a_clock_and_does_not_flood() {
+    real_herd::a_lend_this_host_can_really_make(THE_LEND_MIB, THE_TMPFS_MIB);
     let herd = Herd::new();
     // A cadence of 200 ms, and a wait of four seconds: twenty cadences, which
     // is twice the ten minutes E-04's acceptance criterion names.
@@ -359,12 +393,13 @@ async fn a_waiting_job_says_why_again_on_a_clock_and_does_not_flood() {
 /// (D79).
 #[tokio::test(flavor = "multi_thread")]
 async fn a_killed_hub_reads_the_reservations_back_off_the_records() {
+    real_herd::a_lend_this_host_can_really_make(THE_LEND_MIB, THE_TMPFS_MIB);
     let herd = Herd::new();
     let hub = herd.start_hub("first").await;
     let _runner = herd.start_runner_with("lender", "runner", "runner", &a_small_lender());
     herd.wait_for_runner().await;
 
-    // A job holding 3 of the 4 gibibytes of tmpfs and 4 of the 7 admissible
+    // A job holding 3 of the 4 gibibytes of tmpfs and 1 of the 1.5 admissible
     // gibibytes of memory, and **still running** when the hub dies and for as
     // long as the assertions below need it: held on a file rather than on a
     // `sleep`, because everything from here to the last judgement has to
@@ -374,7 +409,7 @@ async fn a_killed_hub_reads_the_reservations_back_off_the_records() {
     // the hub had no reason to write any more (D100's lesson, in M8's test).
     let (release, script) = a_job_held_until_the_test_says_so(&herd, "inherited");
     let holding = herd
-        .submit_reserving(Some(4 * 1024), Some(3 * 1024), &script)
+        .submit_reserving(Some(1024), Some(3 * 1024), &script)
         .await;
 
     herd.wait_until("the job is running", || {
@@ -407,9 +442,11 @@ async fn a_killed_hub_reads_the_reservations_back_off_the_records() {
     );
     assert!(said.contains("1 job running there holds"), "{said}");
 
-    // And the memory half of the same fact.
+    // And the memory half of the same fact: 1.5 GiB of admission here (2 GiB
+    // lent less a 512 MiB floor), 1 GiB of it held by the inherited job, so
+    // 512 MiB free and another gibibyte does not fit.
     let too_much_memory = herd
-        .submit_reserving(Some(5 * 1024), None, "printf 'should wait too\\n'")
+        .submit_reserving(Some(1024), None, "printf 'should wait too\\n'")
         .await;
     herd.wait_until("the new hub has judged the memory one", || {
         herd.waiting_for(&too_much_memory).contains("memory")
@@ -417,8 +454,8 @@ async fn a_killed_hub_reads_the_reservations_back_off_the_records() {
     .await;
     let said = herd.waiting_for(&too_much_memory);
     assert!(
-        said.contains("3 GiB free of its 7 GiB memory admission, 5 GiB needed"),
-        "the inherited job's 4 GiB of declared memory must still be held: {said}"
+        said.contains("512 MiB free of its 1.5 GiB memory admission, 1 GiB needed"),
+        "the inherited job's 1 GiB of declared memory must still be held: {said}"
     );
     // Both sentences above are only worth anything while the attempt whose
     // reservation they count is still out there, so that is asserted rather
@@ -455,6 +492,7 @@ async fn a_killed_hub_reads_the_reservations_back_off_the_records() {
 /// placement, and is a gate on nothing.
 #[tokio::test(flavor = "multi_thread")]
 async fn the_load_is_on_the_placement_line_and_stops_nothing() {
+    real_herd::a_lend_this_host_can_really_make(THE_LEND_MIB, THE_TMPFS_MIB);
     let herd = Herd::new();
     let _hub = herd.start_hub("hub").await;
     let _runner = herd.start_runner_with("lender", "runner", "runner", &a_small_lender());

@@ -19,7 +19,9 @@ Forbidden:  main, tags, releases, other worktrees, the orchestrator's
             checkout /mnt/ssd_980/herd-project, /etc, containers,
             services, the consumer's files, pkill -f / kill by name,
             cargo unless the change touches code
-Gates:      <exact commands>, or "check-docs.sh only; Rust gates not run"
+Gates:      <exact commands>, or "check-docs.sh only; Rust gates not run";
+            each one redirected to a file, never piped to head or tail
+            (why: workflow.md, "Failure")
 Stop when:  <done criterion> or a decision is needed; then write
             docs/orchestration/history/<date>-<task>.md from
             templates/handoff.md and report
