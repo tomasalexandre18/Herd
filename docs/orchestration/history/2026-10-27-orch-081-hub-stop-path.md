@@ -242,16 +242,108 @@ $ nix develop --command cargo build --workspace
     Finished `dev` profile [unoptimized + debuginfo] target(s) in 26.69s
 ```
 
-`./scripts/test.sh` and `./scripts/check-docs.sh`: see the PR's Evidence
-block for the verbatim runs, which are the ones taken on the final tree.
+`./scripts/check-docs.sh`:
 
-**Skips.** Whatever `scripts/test.sh` prints on this host, copied as skips
-and never counted as passes (D27). The two assertions known to be red on
-this workstation for a host reason are **ORCH-069's**, not this task's:
-`herd-hub/tests/slots.rs:744` and `herd-hub/tests/admission.rs:419` compare a
-figure derived from live `MemTotal` against constants written for a 17 GiB
-machine. On a GitHub runner `slots.rs:744` is **skipped**, and by D27 a skip
-is not a pass, so it is never reported as "green on CI".
+```text
+$ ./scripts/check-docs.sh
+note: D170 is a gap in docs/decisions.md (held by an open PR, or lost); gaps stay (D148)
+docs ok
+```
+
+`./scripts/test.sh`: **red on this workstation, for host reasons, and the
+same reasons are red on pristine `cd59ef5`.**
+
+```text
+$ nix develop --command ./scripts/test.sh
+error: 2 targets failed:
+    `-p herd-hub --test admission`
+    `-p herd-hub --test slots`
+…
+ AT LEAST 12 assertion(s) COULD NOT RUN on this host and were
+ skipped, and the suite did not finish (cargo test exited 101),
+ so this list is a floor and not a count.
+test suite: FAILED (cargo test exited 101)
+```
+
+Two distinct host causes, neither this branch's, and both separated by
+experiment rather than by assertion:
+
+1. **ORCH-069, the memory constants.** `herd-hub/tests/slots.rs:744`
+   (`the_derived_j_is_recorded_and_is_what_the_job_is_given`) and the
+   `admission` failures. The runner here announces **2.6 GiB**, not the
+   host's 8 GiB, because an enclosing `memory.high 18 GiB on /chatons.slice`
+   already holds 15.3 GiB — so `admission.rs:419`'s
+   `"3 GiB free of its 7 GiB memory admission, 5 GiB needed"` can never be
+   reached and the tests ahead of it time out. **Checked against a pristine
+   worktree at `cd59ef5`**, built and run on its own: `admission` fails
+   there too and *worse* — four tests rather than two, the set drifting with
+   free memory.
+
+   ```text
+   # worktree at cd59ef5, nothing from this branch
+   $ nix develop --command cargo test -p herd-hub --test admission -- --test-threads 1
+   failures:
+       a_killed_hub_reads_the_reservations_back_off_the_records
+       a_refusal_carries_the_free_figure_and_the_needed_figure
+       a_starved_reservation_waits_then_starts_and_leaks_nothing
+       the_load_is_on_the_placement_line_and_stops_nothing
+   test result: FAILED. 1 passed; 4 failed; 0 ignored; 0 measured; 0 filtered out; finished in 139.56s
+   ```
+
+2. **Host contention, at `real_herd/mod.rs:649`.** That line is
+   `herdctl … never came back` — the harness's 30 s `PATIENCE` on one
+   `herdctl` process, not a refusal and not a product answer. `uptime` read
+   **load average 20.62** while this was running, with several agents
+   compiling and running suites on this machine. A batch `killed_hub` run
+   reported four failures; a second batch run reported a *different* three,
+   all at that one line, which is the signature of contention and not of a
+   defect. Run individually under the same load, the four tests that matter
+   to this change are all green:
+
+   ```text
+   $ nix develop --command cargo test -p herd-hub --test killed_hub <name> -- --test-threads 1
+   --- a_hub_asked_to_stop_mid_job_loses_nothing
+   test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 17 filtered out; finished in 20.98s
+   --- a_connection_that_served_starts_the_redial_counters_over
+   test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 17 filtered out; finished in 12.28s
+   --- a_health_cadence_of_zero_is_refused_on_both_sides
+   test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 17 filtered out; finished in 10.59s
+   --- a_busy_runner_asked_to_stop_is_gone_in_five_seconds
+   test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 17 filtered out; finished in 11.16s
+   ```
+
+   The first two are the ones this change could plausibly have broken:
+   `a_hub_asked_to_stop_mid_job_loses_nothing` sends the very `SIGTERM` this
+   PR reinterprets, and `a_connection_that_served_starts_the_redial_counters_over`
+   is D104's — the one that cares which branch a runner takes on an ending
+   link. Both green.
+
+The new tests, run three times in a row under the same load:
+
+```text
+$ nix develop --command cargo test -p herd-hub --test stopping -- --test-threads 1
+--- run 1 ---
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 21.85s
+--- run 2 ---
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 22.25s
+--- run 3 ---
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 21.92s
+
+$ nix develop --command cargo test -p herd-hub --lib -- stop
+test server::tests::a_second_stop_signal_changes_nothing ... ok
+test server::tests::a_hub_that_is_stopping_starts_no_dispatch_pass ... ok
+test server::tests::the_stop_waits_for_the_pass_in_flight_and_gives_up_at_its_bound ... ok
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 177 filtered out; finished in 0.12s
+```
+
+**Skips, copied and never counted as passes (D27).** `scripts/test.sh`
+printed **at least 12**, every one of them cgroup v2 delegation on this
+unprivileged host (`Permission denied` creating a cgroup under
+`/sys/fs/cgroup/chatons.slice/…`), and the script says itself that the
+figure is a **floor and not a count** because the run did not finish. They
+are in the task's scratchpad verbatim; none of them is this branch's and
+none is reported as a pass. Separately, `slots.rs:744` is **skipped** on a
+GitHub runner — so "green on CI" is never said of it here either.
 
 ## Risks and findings
 
@@ -281,6 +373,15 @@ is not a pass, so it is never reported as "green on CI".
    deliberate act.
 5. **The premise of the brief held.** `SIGTERM` really did kill the hub
    outright on `cd59ef5`; nothing in the code refuted it.
+6. **The workstation is at load average 20.6 and that is now a distinct,
+   reproducible source of red.** Several agents are compiling and running
+   suites on it at once, and a `herdctl` that takes more than the harness's
+   30 s `PATIENCE` fails a test at `real_herd/mod.rs:649` with
+   `herdctl … never came back`. Two batch runs of `killed_hub` produced two
+   *different* sets of failures at that one line; all of them pass run
+   singly. This is separate from ORCH-069 and has no board row; it is worth
+   one, because the next agent to see it will spend the same hour I did
+   proving it is not theirs.
 
 ## Decisions needed
 
