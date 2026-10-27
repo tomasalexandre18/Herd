@@ -72,12 +72,14 @@ use tokio::io::{AsyncRead, AsyncReadExt};
 use tokio::process::{Child, Command};
 
 use crate::cgroup::JobCgroup;
-use crate::confine::{job_environment, kill_process_group, ChildSetup, Confined, POLL_INTERVAL};
+use crate::confine::{
+    job_environment, kill_process_group, ChildSetup, Confined, JobsAtOnce, POLL_INTERVAL,
+};
 use crate::metrics::{host_load_milli, process_rss_bytes};
 use crate::reclaim::{kill_by_marker, JobTag};
 use crate::root::{Unmeasurable, Workspace};
 use crate::step::{self, Stage};
-use crate::{CancelToken, Ending, Session};
+use crate::{CancelToken, Ending, NotTaken, Session};
 
 /// Output is read in chunks this size; a chunk is sent as soon as the process
 /// has written anything, which is what makes a log arrive while it is running.
@@ -104,6 +106,12 @@ const LOG_CAP: u8 = 1;
 
 /// Run one job: announce it, stream every step's output, cap each step,
 /// report how it ended and what it cost.
+///
+/// Eight arguments, and they are the job: what to run, how it was declared,
+/// what it is allowed to cost, who to tell and how full this machine already
+/// is. Collapsing them into a struct would name the struct after this
+/// function and move the same list one line up.
+#[allow(clippy::too_many_arguments)]
 pub async fn execute(
     job_id: JobId,
     attempt: u32,
@@ -112,30 +120,47 @@ pub async fn execute(
     declared_timeout: Option<Duration>,
     session: Session,
     confined: Arc<Confined>,
+    ceiling: Arc<JobsAtOnce>,
 ) {
     // Taken in hand first, before a byte is written anywhere: that is what
     // numbers this job's output, holds its result against an acknowledgement,
     // and gives back the token every way of ending it goes through.
-    let Some(cancel) = session.take_job(&job_id, attempt) else {
-        // Assigned while this runner takes no job: the hub sent it before it
-        // heard that this runner is stopping (invariant 2) or that its owner
-        // has withdrawn the machine (E-33). Handed straight back, so the job
-        // waits for a runner that will actually run it rather than failing —
-        // and the reason names which of the two it was, because "the PC said
-        // no" and "she is gaming on the PC" are different facts.
-        session.abandon(
-            &job_id,
-            attempt,
-            &format!(
-                "{} and never started this job",
-                if session.draining() {
-                    "the runner is draining".to_owned()
-                } else {
-                    format!("the runner is switched {}", session.switch().sentence())
-                }
-            ),
-        );
-        return;
+    //
+    // It is also the one place this machine's own limits are held. Assigned
+    // while this runner takes no job — because it is stopping (invariant 2),
+    // because its owner has withdrawn the machine (E-33), or because it is
+    // already as full as its own caps let it be (invariant 2 again) — the
+    // attempt is handed straight back, so the job waits for a runner that
+    // will actually run it rather than failing. The reason names which of the
+    // three it was, because "the PC said no", "she is gaming on the PC" and
+    // "that machine is full" are different facts about different machines.
+    let cancel = match session.take_job(&job_id, attempt, ceiling.most()) {
+        Ok(cancel) => cancel,
+        // A refusal for this machine's own ceiling says so in a field as well
+        // as in the sentence (D182): the hub charges a job a go for an
+        // attempt that ended *because of the runner*, and a machine that is
+        // here, healthy and holding exactly what it said it would hold is not
+        // that. The other two refusals are about this runner going away —
+        // draining, or withdrawn by its owner — and are counted as they
+        // always were.
+        Err(not_taken @ (NotTaken::AtItsCeiling { .. } | NotTaken::StillRunningThisJob { .. })) => {
+            let running = match not_taken {
+                NotTaken::AtItsCeiling { running, .. }
+                | NotTaken::StillRunningThisJob { running, .. } => running,
+                _ => unreachable!("the pattern above admits nothing else"),
+            };
+            session.abandon_at_its_ceiling(
+                &job_id,
+                attempt,
+                &not_taken.sentence(&ceiling),
+                running,
+            );
+            return;
+        }
+        Err(not_taken) => {
+            session.abandon(&job_id, attempt, &not_taken.sentence(&ceiling));
+            return;
+        }
     };
 
     // Before anything is made on this host: a command line nobody could run.

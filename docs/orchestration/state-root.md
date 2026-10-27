@@ -17,12 +17,33 @@ Everything a session writes is under one root, `/mnt/ssd_980/herd`.
 | `XDG_CONFIG_HOME` … `XDG_STATE_HOME` | under `$HOME` |
 | `XDG_RUNTIME_DIR` | `/mnt/ssd_980/herd/claude/run` |
 | `TMPDIR`, `TMP`, `TEMP` | `/mnt/ssd_980/herd/claude/tmp` |
-| `CARGO_HOME` | `/mnt/ssd_980/herd/cargo` |
+| `CARGO_HOME` | `/mnt/ssd_980/herd/claude/cargo` |
 
 `env.sh` creates each of them and **refuses to continue** if any one
 resolves outside the root. The checkout itself is not state and stays
 where it is; `HERD_REPO` points at the checkout the script was read
 from, so a worktree's copy starts a session in that worktree.
+
+## What is deliberately outside the root
+
+`GH_CONFIG_DIR`. `gh` keeps its login there, and the `HOME` above no
+longer points at the host user's, so without that variable a session has
+no GitHub login at all: no `gh pr create`, no `gh pr merge`, and not even
+a `git push`, because `origin` is https and the credential helper is `gh
+auth git-credential`, which reads the same directory. That login belongs
+to the host user and is shared like the Claude Code binary rather than
+copied; it holds no Herd state, `env.sh` never creates it, and the guard
+above does not cover it. `env.sh` points it at the host user's
+`~/.config/gh`, and `HERD_GH_CONFIG_DIR` overrides that. A path only: no
+token is ever in this repository (invariant 7).
+
+The shipped `env.sh` set none of this until 2026-10-27 while the file the
+sessions on the host are really started by did, so an agent started by
+`session.sh` as shipped could not open or merge a pull request
+(ORCH-068). `scripts/check-orchestration.sh` now copies both scripts,
+rewrites the one hardcoded root line to a scratch directory, sources
+them, and asserts what a session needs — the login among it. The next
+drift goes red there.
 
 ## Starting a session
 
@@ -33,9 +54,11 @@ source /mnt/ssd_980/herd-project/ops/agents/env.sh       # just a shell
 ```
 
 `session.sh` refuses to run as root, finds the Claude Code binary on
-`PATH` or at `HERD_CLAUDE_BIN`, and says so loudly when the config
-directory holds no `.credentials.json` — see the migration below, which
-has to put one there before the first session.
+`PATH` or at `HERD_CLAUDE_BIN`, says so loudly when the config directory
+holds no `.credentials.json` — see the migration below, which has to put
+one there before the first session — and warns, without refusing, when
+`GH_CONFIG_DIR` holds no `hosts.yml`, because that session will not be
+able to open a pull request at the end of its task.
 
 ## Why Herd is not started by chatOnS's scripts
 
@@ -74,12 +97,17 @@ a tool, not state. `HERD_CLAUDE_BIN` exists for exactly that.
 chatOnS's launchers carry a cgroup slice (`chatons.slice`, `in-slice.sh`),
 a private tmux server, a `dtach` orchestrator socket with `attach.sh` and
 `restart.sh`, a Nix watcher, a Remote Control relay, an MCP daemon, a
-boot `systemd` unit, and `HC`. None of it is here. Herd has no slice on
-this host, no fleet of long-lived agent sessions to supervise and
-re-attach, and no service of its own to start at boot; a Herd session is
-started by a person or by an orchestrator that already has a terminal.
+boot `systemd` unit, and `HC`. None of that supervision is here. Herd has
+no slice on this host, no fleet of long-lived agent sessions to supervise
+and re-attach, and no service of its own to start at boot; a Herd session
+is started by a person or by an orchestrator that already has a terminal.
 Adding a supervisor would be a second thing to keep working, and the
 first thing to drift.
+
+The one piece Herd keeps is a `dtach` **binary** of its own, under
+`$HERD_CLAUDE_ROOT/tools/dtach/bin`, which `env.sh` puts on `PATH` so the
+one long-lived session can be detached and re-attached. A tool under
+Herd's own root, not chatOnS's socket and not a supervisor.
 
 ## Not done here: creating the root, and moving the data
 
@@ -142,7 +170,7 @@ What a careless run of that procedure loses:
   in both directories with different lengths; copying the chatOnS one
   first and `-n` second keeps the longer.
 - **An hour of downloading**, if `CARGO_HOME` is not seeded:
-  `cp -a /mnt/ssd_980/chatons/cargo/registry /mnt/ssd_980/herd/cargo/`
+  `cp -a /mnt/ssd_980/chatons/cargo/registry /mnt/ssd_980/herd/claude/cargo/`
   avoids refetching the registry. Optional, and needs the network.
 
 `.claude.json` is deliberately not copied: it holds chatOnS's project

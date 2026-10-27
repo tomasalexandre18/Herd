@@ -254,10 +254,10 @@ impl JobStore for CostlyStore {
         id: &JobId,
         attempt: u32,
         reason: &str,
-        requeue_code: Option<i32>,
+        how: herd_hub::job::HowItEnded,
     ) -> StoreResult<()> {
         self.charge("end_attempt", 1);
-        self.inner.end_attempt(id, attempt, reason, requeue_code)
+        self.inner.end_attempt(id, attempt, reason, how)
     }
     fn append_log(
         &self,
