@@ -3,7 +3,8 @@
 # have to be enforced by hand in review.
 set -uo pipefail
 
-# Column counting below is per character, not per byte.
+# A stable locale for grep, sed and sort below. The column count has its own
+# locale (LC_ALL=C, see the 79-column check) and does not rely on this one.
 export LC_ALL=C.UTF-8
 
 fail=0
@@ -20,21 +21,36 @@ n=$(wc -l < docs/status.md)
 [ "$n" -le "$limit" ] || note "docs/status.md is $n lines, limit $limit (it is state, not a journal)"
 
 # Prose wraps at 79 columns. Table rows and fenced code are exempt.
-# awk selects the lines; the width is measured by the shell, because awk
-# implementations disagree on `length` for UTF-8 (mawk, the default awk on
-# the CI runner, counts bytes, so `—` and `≤` would fail a wrapped line).
+#
+# The width is counted inside awk, in one pass per file. It used to be
+# measured by the shell, one `read` per line, because awk implementations
+# disagree on `length` for UTF-8: mawk, the default awk on the CI runner,
+# counts bytes, so a wrapped line holding `—` or `≤` looked over-long. That
+# shell loop was the whole cost of this script -- 5.9 s of 5.9 s over a
+# 37k-line corpus -- and check-orchestration.sh pays it 25 times over, which
+# took the `docs` job to 5m12s against its 5-minute cap (PR #100, 2026-10-27).
+#
+# Counting it here instead needs no assumption about awk's locale support:
+# under LC_ALL=C every awk works on bytes, and the character count of valid
+# UTF-8 is its byte count minus its continuation bytes (0x80-0xBF), since
+# every encoded character contributes exactly one leading byte. Verified to
+# give byte-identical findings to the shell loop under gawk and under mawk,
+# over a corpus seeded with 150 violations built from `—`, `≤`, `é` and a
+# 4-byte emoji. The multibyte property has its own cases in
+# check-orchestration.sh, so a relapse to byte counting goes red.
 for f in CLAUDE.md README.md docs/*.md docs/orchestration/*.md \
          docs/orchestration/*/*.md; do
   [ -f "$f" ] || continue
-  long=$(awk '
+  long=$(LC_ALL=C awk '
     /^```/ { fence = !fence; next }
     fence { next }
     /^\|/ { next }
-    { printf "%d\t%s\n", FNR, $0 }
-  ' "$f" | while IFS="$(printf '\t')" read -r lineno text; do
-    [ "${#text}" -le 79 ] ||
-      printf '    %s:%s (%d cols)\n' "$f" "$lineno" "${#text}"
-  done)
+    {
+      line = $0
+      cols = length(line) - gsub(/[\200-\277]/, "", line)
+      if (cols > 79) printf "    %s:%d (%d cols)\n", FILENAME, FNR, cols
+    }
+  ' "$f")
   [ -z "$long" ] || note "$f has lines over 79 columns:
 $long"
 done
