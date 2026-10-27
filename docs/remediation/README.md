@@ -11,7 +11,13 @@ is `v0.3.7`'s product — see `00-baseline.md §2`.
 
 **Date of this index:** 2026-10-25, refreshed at the C0b integration, again
 at the integrations of PR #90 (`11`), PR #91 (`10`) and PR #85 (`09`), and
-again when `12` was written on `cd59ef5`.
+again when `12` was written on `cd59ef5` and when `13` was written on
+`orch-080-crash-point-enumeration`.
+
+**`13` is written against a later base than every piece before it** — the
+commit named at its own head, not `0a2cf73` — and says so there: it had to
+describe the tree the remediation steps are being taken on rather than the
+tree that was audited.
 
 ---
 
@@ -33,6 +39,7 @@ again when `12` was written on `cd59ef5`.
 | [`10-ordering-on-ext4.md`](10-ordering-on-ext4.md) | `plan-orch-074` | ORCH-074: the mechanism that holds D103's ordering — `events.jsonl` never ahead of `job.json` — on **ext4**, where `08`'s ZFS argument does not transfer. Settles that **D103 needs no new ordering mechanism**, because the writes `07` de-syncs are not the writes D103 binds: `JobEvent::state()` is `None` for `Waiting`, `move_to` and `raise` already leave `events.jsonl` naming a reason the record does not, `recover` never reads `events.jsonl`, `job_events` already drops a torn tail, and timestamps are not comparable by decision. What holds the order for a **decisive** write is the record's own two syncs returning before the event append is issued — a syscall-return guarantee, independent of the filesystem. **A larger hazard was found in its place:** a `job.json` that comes back empty or torn makes the hub refuse to start on the *whole* state root, D52's quarantine covering labels only. ext4's cross-file ordering could not be established from documentation on this host and is marked `I`; the plan is built so as not to need it. **Amended against `11-sync-prices.md`, which refuted the plan's own hypothesis H-1:** the single durability tier splits into three independent steps — **A** the event `fdatasync` (~31 %, needing no crash evidence of any kind), **B** the directory `fsync` (~65 % cumulative), **C** the record `fsync` (~98 %, deferred and possibly never taken) — and the directory sync's standing *rises* rather than falls: only it makes the record's **rename** durable, so on a decisive write it stays unconditionally. Produces the ordered task list ORCH-079 to ORCH-090. Touches no file under `herd-hub/src`. |
 | [`11-sync-prices.md`](11-sync-prices.md) | `orch-077-price-the-syncs` | ORCH-077: the three durable operations of `record_waiting` — the record `fsync`, the directory `fsync` and the event `fdatasync` — priced **separately**, in all eight combinations, on **both** filesystem classes in one session on one host. Settles that one `fsync` on ext4/NVMe costs **989 µs** and not the tens-to-low-hundreds of microseconds that was hoped, so the class the deployment runs on is **1.2x** faster per sync than the 1.19 ms `08` derived, and 1.3-1.7x faster than this harness's own ZFS figures — not 10-100x; that the three syncs are **additive, not redundant**, so keeping one and dropping two collects **65 %** of the prize and not nearly all of it, the kept sync still costing 21x the unsynced floor; and that `08`'s **9.970 s** junction at `N` = 1 000 becomes **3.128 s** on ext4 — 3x smaller, not an order of magnitude, and still seconds. Corrects `06`'s `sync_dir` figure of 6.6 µs, which was measured with no `rename` between the file sync and the directory sync and so understates the real directory sync by about two hundred times. Touches no file under `herd-hub/src`. |
 | [`12-ordering-oracle.md`](12-ordering-oracle.md) | `orch-079-ordering-oracle` | ORCH-079: the **ordering oracle**, and the proof that it can go red. `06` and `08` counted the hub's `fsync`s; neither ordered them. This asserts, for **every** store call that writes a record and appends an event — all 13 `write_record` sites and all 11 `append_event` sites, driven as 16 calls over one job's whole life — that the record's `fsync` **and** its directory `fsync` have **returned** before the first byte of the event line is **issued**. **This is the one piece of the dossier that changes a file under `herd-hub/src`**, and only to observe: the recording half is `#[cfg(test)]`, and nine lines of product code make the observation unforgeable — a zero-sized `Synced` that only the three sync calls produce, so deleting a sync deletes the note that says it happened. Settles that **no transition breaks the order on `cd59ef5`**; shows the oracle **red twice** on a scratch copy outside the branch — once with the directory `fsync` dropped, the ORCH-083/084 hazard itself, once with `record_waiting`'s two writes swapped — and green on the unmodified tree; and cross-checks the same run from outside the process with `strace`, 13 event writes and 0 violations. **It is the gate ORCH-083 and ORCH-084 have to stay green against.** No behaviour of the hub changes; `PROTOCOL_VERSION` stays 2 and `RECORD_VERSION` stays 1. |
+| [`13-crash-point-enumeration.md`](13-crash-point-enumeration.md) | `orch-080-crash-point-enumeration` | ORCH-080: every on-disk state a power cut can leave in one job directory, **built by construction** rather than sampled by crashing — 7 shapes of `job.json` × 11 of `events.jsonl` × 4 of stale temporary = **308 states**, each written byte for byte and each opened. Settles that the hazard **B** (ORCH-084, the directory `fsync`) creates is exactly **4** of the 308 — `events.jsonl` one line ahead of `job.json` over a *reason*, unreachable today because `sync_dir` returns before the event is issued — and that it is acceptable for an explanatory write and not for a decisive one. Confirms by construction, with the line numbers, that a `job.json` the hub cannot parse makes it **refuse the whole state root** (`store.rs:1141-1142` → `:899` → `:436` → `main.rs:224`), taking every other job with it, with D52's quarantine covering **labels only** (`store.rs:1150-1157`) and the index unable to route around it — and **proposes**, without making, that a parse failure quarantine the record the way a rejected label set already does. Confirms ORCH-086: nothing removes a stale temporary at `JobDirStore::open`, and adds that one left in `files/` is **counted against the output budget** for ever (`directory_bytes`, `store.rs:2733-2749`, has no dot-filter). Touches no file under `herd-hub/src`. |
 
 The mandate's §10 skeleton also names `01-contract.md` and
 `02-consumer-boundary.md`. They do not exist yet. The numbering above
@@ -47,6 +54,16 @@ order the pieces landed. The brief for ORCH-074 asked for
 `09-ordering-on-ext4.md` and its author wrote `10` instead, so `09` was
 claimed twice for a time; whether it is reused deliberately a second
 time, or `10` stands as written, is still **ORCH-091**.
+
+**`12` and `13` were written as the same number, and `13` gave way.**
+`12-ordering-oracle.md` is ORCH-079's (PR #95) and `13` is ORCH-080's
+(PR #92); both were written as `12` on the same day. `13` renumbered
+itself rather than contest the number, before either had landed, and
+checked `13` free against every open branch first. **Both are in the
+table above now** — this paragraph was written while `12` was still on an
+unmerged branch and says so, rewritten at `13`'s integration, which is
+the integration after `12`'s. Nothing was lost and nothing was renamed
+twice.
 
 **One number was reused, deliberately.** The skeleton's `05` was
 `05-invariants.md`; the `05` that exists is the adversarial review of the
@@ -71,19 +88,23 @@ had been run.
   written on**, and the document says so at the point of use. It is
   evidence of an incident; it is not a measurement any of these authors
   made.
-- **Mesures** — `04a`, `04b`, `05`, `06`, `08`, `11`. These ran on the shared
+- **Mesures** — `04a`, `04b`, `05`, `06`, `08`, `11`, `13`. These ran on the shared
   workstation, each in its own worktree, under `nix develop`, with `-j 4`
   and `/proc/loadavg` watched. They are not an isolated host, which
   `00-baseline.md §11` asked for and which this campaign never got; every
   one of them characterises its own noise before reporting its signal and
   names the limits of what it reproduces. Read a figure from any of them
-  with the host in mind.
-- **Neither** — `07` and `12`. `07` is a design comparison and a
-  recommendation: it ran nothing and it changed nothing, and every figure
-  in it was measured by `04a`, `05` or `06` and is attributed there. `12`
-  is a **gate**: it ran, it carries no figure, and it is the only piece
-  that changes a file under `herd-hub/src` — to observe, never to alter
-  what the hub does.
+  with the host in mind. **`13` is the exception inside that list**: it ran
+  on the same workstation and in the same way, but it carries no timing at
+  all — it builds states on disk and asserts what the code does with them,
+  so its figures are counts and verdicts and the host does not enter them.
+- **Neither** — `07`, `12` and `13` in their different ways. `07` is a
+  design comparison and a recommendation: it ran nothing and it changed
+  nothing, and every figure in it was measured by `04a`, `05` or `06` and
+  is attributed there. `12` is a **gate**: it ran, it carries no figure,
+  and it is the only piece that changes a file under `herd-hub/src` — to
+  observe, never to alter what the hub does. `13` ran and carries no
+  figure either, for the reason just given.
 
 **Where a later piece overturns an earlier one, the later one wins, and
 the earlier one is not edited.** This has now happened twice. The second

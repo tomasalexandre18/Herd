@@ -53,6 +53,7 @@ pub mod root;
 pub mod size;
 pub mod spool;
 mod step;
+mod sweep;
 pub mod switch;
 #[doc(hidden)]
 pub mod testing;
@@ -747,8 +748,14 @@ struct FilesOut {
     attempt: u32,
     /// Where the bytes are: the renamed `{out}`, under the data root.
     spool: PathBuf,
-    /// What the verdict announced, in the order it announced it.
-    manifest: Vec<herd_proto::OutputFile>,
+    /// What the verdict announced, in the order it announced it — or, for a
+    /// collection swept off the disk at startup, what the spool holds.
+    ///
+    /// A path and a length and no digest, because neither half of the
+    /// transfer wants one here: the hub verifies a collection against the
+    /// manifest **on its own record**, and a runner that carried a second
+    /// copy of the digest could only ever disagree with it.
+    manifest: Vec<sweep::SpooledFile>,
     /// Bytes of each entry handed to the link so far.
     sent: Vec<u64>,
     /// Whether any chunk of each entry has been sent, which is how a
@@ -756,10 +763,56 @@ struct FilesOut {
     /// file and the hub has to be told to create it, so it gets exactly one
     /// empty chunk.
     touched: Vec<bool>,
+    /// Found on the disk at startup rather than produced by a job of this
+    /// runner ([`crate::sweep`]).
+    ///
+    /// The two are the same thing to send, and different things to *judge*:
+    /// a collection this runner produced is one the hub is certainly waiting
+    /// for, because the verdict that announced it went out a moment ago. A
+    /// swept one may be years of the hub's history old, and the only honest
+    /// way to find out whether anybody still wants it is to let the hub say
+    /// so on the link it has just joined.
+    swept: bool,
+    /// Whether the hub has said anything at all about this collection on the
+    /// connection that is up.
+    ///
+    /// Only read for a swept one, and only to tell "the hub is owed this" from
+    /// "the hub never mentioned it", which is the whole terminal rule: see
+    /// [`Session::the_hub_has_said_what_it_is_owed`].
+    heard: bool,
+    /// Whether a chunk of it has been put on the link since this runner
+    /// started.
+    ///
+    /// The terminal rule is about an *offer* nobody answered, so it may not
+    /// run on a collection that was never offered: a health report can
+    /// overtake a pump that has not had the link's window yet, and a spool
+    /// set aside on that race would be one the hub was about to take.
+    probed: bool,
 }
 
 impl FilesOut {
     fn new(attempt: u32, spool: PathBuf, manifest: Vec<herd_proto::OutputFile>) -> Self {
+        Self::of(
+            attempt,
+            spool,
+            manifest
+                .into_iter()
+                .map(|file| sweep::SpooledFile {
+                    path: file.path,
+                    len: file.len,
+                })
+                .collect(),
+            false,
+        )
+    }
+
+    /// A collection found on the disk at startup, offered again on the path
+    /// that was always meant to finish it.
+    fn swept(attempt: u32, spool: PathBuf, files: Vec<sweep::SpooledFile>) -> Self {
+        Self::of(attempt, spool, files, true)
+    }
+
+    fn of(attempt: u32, spool: PathBuf, manifest: Vec<sweep::SpooledFile>, swept: bool) -> Self {
         let count = manifest.len();
         Self {
             attempt,
@@ -767,6 +820,9 @@ impl FilesOut {
             manifest,
             sent: vec![0; count],
             touched: vec![false; count],
+            swept,
+            heard: false,
+            probed: false,
         }
     }
 
@@ -797,6 +853,11 @@ impl FilesOut {
     /// other part of the runner contends on would make a streaming job
     /// contend with its own health report.
     fn next(&mut self) -> Option<ChunkPlan> {
+        // Decided here because this runs under the lock for every chunk
+        // anyway: a collection that has a chunk to send is one that is about
+        // to be offered, and the terminal rule may only judge an offer the
+        // hub had the chance to answer.
+        self.probed = true;
         for index in 0..self.manifest.len() {
             let entry = &self.manifest[index];
             if entry.len == 0 {
@@ -890,6 +951,15 @@ struct Inner {
     /// nobody has acknowledged yet. Not jobs: nothing of them is running, and
     /// nothing of them is counted as work this runner is doing.
     spooled: Vec<Spooled>,
+    /// Collections a previous life of this runner left under `outputs/`,
+    /// read at startup and **not yet offered to anybody**.
+    ///
+    /// They wait here rather than going straight into `collections` for the
+    /// reason a spooled verdict waits in `spooled`: a job id means something
+    /// only inside one hub state, so until a hub has said which state root it
+    /// serves, bytes found on this disk cannot be attributed to any job at
+    /// all ([`Session::settle_against_state_root`]).
+    swept: Vec<sweep::Swept>,
     /// The runner is stopping: it takes no new job (invariant 2).
     draining: bool,
     /// When the hub last welcomed a connection of this session, if ever.
@@ -949,6 +1019,7 @@ impl Default for Inner {
             jobs: HashMap::new(),
             collections: HashMap::new(),
             spooled: Vec::new(),
+            swept: Vec::new(),
             draining: false,
             welcomed_at: None,
             said_stale: VecDeque::new(),
@@ -1215,6 +1286,12 @@ impl Session {
     /// delivered. Zero on an ordinary start.
     pub fn spooled_results(&self) -> usize {
         self.with(|inner| inner.spooled.len())
+    }
+
+    /// How many collections this runner still owes the hub bytes for,
+    /// whether it produced them or swept them off the disk at startup.
+    pub fn held_collections(&self) -> usize {
+        self.with(|inner| inner.collections.len())
     }
 
     /// Everything held of one job's output, as text. For a test that has to
@@ -1597,6 +1674,11 @@ impl Session {
     fn files_held(&self, job_id: &JobId, attempt: u32, held: &[herd_proto::FileHeld]) {
         let resuming = self.with(|inner| match inner.collections.get_mut(job_id) {
             Some(files) if files.attempt == attempt => {
+                // The hub has mentioned this collection, which for one swept
+                // off the disk at startup is the whole question: somebody is
+                // still waiting for these bytes, so they are not an orphan
+                // and they are not set aside.
+                files.heard = true;
                 files.resume_from(held);
                 true
             }
@@ -1646,6 +1728,105 @@ impl Session {
                     }
                 );
             }
+        }
+    }
+
+    /// Offer every swept collection on the link that has just come up.
+    ///
+    /// **One chunk is both the resumption and the question.** A chunk of a
+    /// file the hub already holds whole is not refused and not written twice:
+    /// the store sees the finished file and answers with the state of the
+    /// collection (`write_output_chunk`, the `already here and whole` arm),
+    /// so a collection the hub has in full is acknowledged on the spot and
+    /// the spool goes through [`Session::files_acknowledged`] — the ordinary
+    /// path, costing one frame. A collection the hub is genuinely owed is
+    /// resumed by the `JobFilesHeld` it sends unprompted at join, which
+    /// arrives first. And one the hub will never take is refused in silence
+    /// (`files_may_land`), which is what
+    /// [`Session::the_hub_has_said_what_it_is_owed`] is for.
+    ///
+    /// Called once the link is attached, which is why it is not part of
+    /// settling: nothing can be offered on a connection that has no outbox
+    /// yet. `heard` and `probed` are a *connection's* record of what was
+    /// asked and answered, so they start again here.
+    pub fn offer_swept_collections(&self) {
+        let offering: Vec<JobId> = self.with(|inner| {
+            inner
+                .collections
+                .iter_mut()
+                .filter(|(_, files)| files.swept)
+                .map(|(job_id, files)| {
+                    files.heard = false;
+                    files.probed = false;
+                    job_id.clone()
+                })
+                .collect()
+        });
+        for job_id in offering {
+            self.pump_files(job_id);
+        }
+    }
+
+    /// The hub has now told this runner everything it is still owed, so
+    /// whatever it did not mention it is not waiting for.
+    ///
+    /// **Where the barrier comes from.** A hub sends one
+    /// [`herd_proto::FromHub::JobFilesHeld`] per outstanding collection the
+    /// moment a runner joins, before it reads a single frame from the
+    /// connection, and it answers every health report with
+    /// [`herd_proto::FromHub::HealthRecorded`]. Frames on one link are
+    /// ordered, so the first answer to a report is proof that the whole owed
+    /// list has already arrived. No new frame, and no clock.
+    ///
+    /// Only a **swept** collection that was actually offered on this
+    /// connection is judged on it. One this runner produced was announced by
+    /// a verdict a moment ago and the hub may not have got to it yet; one
+    /// never offered was never asked about.
+    ///
+    /// What reaches here is therefore narrow, and that is deliberate. A hub
+    /// that already holds the collection answers the offer with
+    /// `JobFilesAck` and the spool goes on the ordinary path; a hub that is
+    /// owed it asks for it. Silence is the third case only: the record is
+    /// gone, the attempt was superseded, the job's collection was evicted, or
+    /// the files are offered by a machine the record does not name — every
+    /// branch of `files_may_land` that refuses without a frame. Nothing will
+    /// ever acknowledge those, and a spool offered on every connection for
+    /// ever is the same leak with more network.
+    ///
+    /// Set aside rather than removed, and the asymmetry is the point.
+    /// Acknowledgement is a sentence from the hub and the spool goes on it
+    /// ([`Session::files_acknowledged`]); this is *silence*, and a hub whose
+    /// record scan failed is silent in exactly the same way about every
+    /// runner it has. So the bytes are kept under a name that says nobody
+    /// claimed them, the line carries the figure, and what to do with the
+    /// disk stays a decision a human makes with that line in front of them.
+    fn the_hub_has_said_what_it_is_owed(&self) {
+        let unclaimed: Vec<(JobId, u32, PathBuf)> = self.with(|inner| {
+            let orphans: Vec<JobId> = inner
+                .collections
+                .iter()
+                .filter(|(_, files)| files.swept && files.probed && !files.heard)
+                .map(|(job_id, _)| job_id.clone())
+                .collect();
+            orphans
+                .into_iter()
+                .filter_map(|job_id| {
+                    inner
+                        .collections
+                        .remove(&job_id)
+                        .map(|files| (job_id, files.attempt, files.spool))
+                })
+                .collect()
+        });
+        for (job_id, attempt, spool) in unclaimed {
+            eprintln!(
+                "herd-runner: the collection this runner holds for {job_id} (attempt \
+                 {attempt}) was offered to the hub and the hub has neither asked for it \
+                 nor acknowledged it: its record is gone, the attempt was superseded, its \
+                 collection was evicted there, or this machine is not the one that record \
+                 names. Nothing will ever acknowledge it, so it is NOT offered again. {}",
+                sweep::set_aside(&spool, sweep::UNCLAIMED)
+            );
         }
     }
 
@@ -2085,6 +2266,72 @@ impl Session {
         said
     }
 
+    /// Pick up the **collections** a previous life of this runner left under
+    /// `outputs/`, so that the hub's own resumption can finish them.
+    ///
+    /// The other half of [`Session::pick_up`], and the same shape: nothing is
+    /// deleted, nothing is assumed, and what cannot be read is named and left
+    /// exactly as it is. Until now a spool survived its runner with nothing
+    /// in the tree that so much as enumerated it — the only code that removes
+    /// one needs the process that produced it to still be holding it in
+    /// memory — so a restart stranded the bytes for ever. See [`crate::sweep`]
+    /// for why this re-registers rather than reaps.
+    ///
+    /// Bounded, because this is the startup path and a runner must start or
+    /// refuse to start (invariant 2, D134's argument): the walk opens nothing
+    /// and hashes nothing, and it stops after [`sweep::MOST_ENTRIES_SWEPT`]
+    /// entries whatever is left to look at.
+    pub fn pick_up_collections(&self, root: &root::DataRoot) -> Vec<String> {
+        let (swept, said) = sweep::pick_up(root);
+        self.with(|inner| inner.swept = swept);
+        said
+    }
+
+    /// Take the collections swept off the disk into the live map, now that
+    /// the hub's state root says they are this hub's.
+    ///
+    /// Never over a collection this runner is already holding for that job: a
+    /// live attempt's bytes are the ones the verdict announced, and a spool
+    /// found on the disk is at best an older attempt of the same job.
+    fn take_in_swept_collections(&self) -> Vec<String> {
+        self.with(|inner| {
+            let mut said = Vec::new();
+            let mut swept = std::mem::take(&mut inner.swept);
+            // Highest attempt first, so that where two spools of one job are
+            // on the disk the one offered is the later attempt — the one the
+            // hub's own records name. Only one of them can be offered at all,
+            // because this map is keyed by job alone (ORCH-065), and the
+            // other is named rather than dropped silently.
+            swept.sort_by(|a, b| {
+                b.attempt()
+                    .cmp(&a.attempt())
+                    .then_with(|| a.job_id().as_str().cmp(b.job_id().as_str()))
+            });
+            for swept in swept {
+                if inner.collections.contains_key(swept.job_id()) {
+                    said.push(format!(
+                        "the collection found in {} is not offered: this runner is already \
+                         holding one for {}, and it can hold only one collection per job. \
+                         It is left exactly as it is",
+                        swept.path().display(),
+                        swept.job_id()
+                    ));
+                    continue;
+                }
+                said.push(swept.offered());
+                let (job_id, attempt, spool) = (
+                    swept.job_id().clone(),
+                    swept.attempt(),
+                    swept.path().to_path_buf(),
+                );
+                inner
+                    .collections
+                    .insert(job_id, FilesOut::swept(attempt, spool, swept.into_files()));
+            }
+            said
+        })
+    }
+
     /// Settle, against the state root the hub has just announced, what this
     /// data root is holding — before a single frame of it is offered.
     ///
@@ -2130,7 +2377,10 @@ impl Session {
         let recorded = root.hub_state_root();
         let mine = recorded.as_deref();
         if mine == Some(hub_root) {
-            return Vec::new();
+            // The ordinary case, and the one moment a swept collection may be
+            // attributed to a job at all: this data root belongs to the state
+            // that minted the ids its spools are named for.
+            return self.take_in_swept_collections();
         }
         let mut said = Vec::new();
         let why = match mine {
@@ -2151,6 +2401,22 @@ impl Session {
             ));
             for spooled in foreign {
                 said.extend(spooled.for_a_foreign_state_root(&why));
+            }
+        }
+        // And the collections on the disk, which carry the same hazard in a
+        // heavier form: a spool named `j0000000001-1` from a state root that
+        // was recreated names a job id this hub has since minted for somebody
+        // else, and the files are refused — or, where the attempt and the
+        // runner happen to line up, written onto that other job's record.
+        // Not offered, and the bytes are kept under a name that says why.
+        let foreign: Vec<sweep::Swept> = self.with(|inner| std::mem::take(&mut inner.swept));
+        if !foreign.is_empty() {
+            said.push(format!(
+                "{} collection(s) spooled here cannot belong to this hub's state: {why}",
+                foreign.len()
+            ));
+            for swept in foreign {
+                said.push(swept.for_a_foreign_state_root(&why));
             }
         }
         let (in_hand, running) = self.with(|inner| {
@@ -2385,6 +2651,15 @@ pub async fn run_until(config: Config, stop: impl Future<Output = String>) -> Re
     // down and nobody acknowledged. A verdict on a disk is only saved once it
     // reaches the hub, and no human belongs in that loop (D34).
     for line in session.pick_up(confined.root()) {
+        eprintln!("herd-runner: {line}");
+    }
+    // And the collections it left beside them: the bytes of a streamed
+    // output are held on this disk until the hub says it has every one of
+    // them, and the only code that removes a spool needs the process that
+    // produced it to still be running. A restart therefore stranded them,
+    // for ever and unseen. They go back on the hub's own resumption path
+    // here, which finishes them where it can and names them where it cannot.
+    for line in session.pick_up_collections(confined.root()) {
         eprintln!("herd-runner: {line}");
     }
     let probing: tokio::task::JoinHandle<()>;
@@ -2998,6 +3273,10 @@ pub async fn serve_once(config: Config, session: Session, confined: Arc<Confined
     // deliver. A job finished while the hub was away is still a job that ran,
     // and output the hub never wrote is still output the job produced.
     session.attach(outbox, credit, config.files_stall_after);
+    // And the collections a previous life of this runner left on the disk
+    // (ORCH-092). Here rather than at the settling above, because a
+    // collection is offered on a link and there was none until a line ago.
+    session.offer_swept_collections();
     // And what every probe says, before this connection can be dispatched on.
     session.announce_capabilities();
     let reporting = tokio::spawn(report_health(session.clone(), config.health_every));
@@ -3139,7 +3418,13 @@ async fn serve_hub(
             } => {
                 session.drop_stale(&job_id, attempt, &reason);
             }
-            FromHub::HealthRecorded {} => {}
+            // The link is alive — and, the first time on a connection, proof
+            // that the hub has already said which collections it is owed: it
+            // sends them unprompted the moment a runner joins, before it
+            // reads anything, and frames on one link are ordered. A spool
+            // found on the disk that the hub has not mentioned by now is one
+            // nothing will ever acknowledge.
+            FromHub::HealthRecorded {} => session.the_hub_has_said_what_it_is_owed(),
             // The orchestrator's half of E-33, arriving through the hub. It is
             // written down **and then** applied, so that the two ways of
             // setting a switch leave one state behind: an owner who later looks
@@ -4119,5 +4404,247 @@ mod tests {
             spool.join("packs"),
             "the shallowest one, because that is the one an operator fixes"
         );
+    }
+
+    /// A data root holding one spool, as a runner that streamed a collection
+    /// and was then restarted leaves one — the state of the first consumer's
+    /// 65 GB, built here rather than read off anybody's machine (D161).
+    fn a_root_holding_a_spool(
+        name: &str,
+        job_id: &JobId,
+        attempt: u32,
+    ) -> (crate::testing::TempDir, root::DataRoot, PathBuf) {
+        let temp = crate::testing::TempDir::new(name);
+        let root = root::DataRoot::open(temp.path()).expect("a throwaway data root");
+        let spool = root.outputs_dir().join(format!("{job_id}-{attempt}"));
+        std::fs::create_dir_all(&spool).expect("the spool directory");
+        std::fs::write(spool.join("results.json"), b"the one file of a collection")
+            .expect("the spooled file");
+        root.remember_hub_state_root("s-the-one-that-made-these-ids")
+            .expect("the data root records a state root");
+        (temp, root, spool)
+    }
+
+    /// **The leak, closed.** A spool a restarted runner found on its disk is
+    /// offered again on the hub's own resumption path, and the
+    /// acknowledgement the hub already sends removes it — through the code
+    /// that was always meant to remove it, with nothing new deleting
+    /// anything.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_swept_spool_is_offered_again_and_its_acknowledgement_removes_it() {
+        let job_id = JobId::new("j0000002484");
+        let (_temp, root, spool) = a_root_holding_a_spool("sweep-offered", &job_id, 3);
+        let session = Session::new();
+        let credit = Arc::new(Semaphore::new(FILES_IN_FLIGHT));
+        let (outbox, mut inbox) = mpsc::unbounded_channel();
+        session.attach(outbox, Arc::clone(&credit), Duration::from_millis(50));
+
+        let said = session.pick_up_collections(&root).join("\n");
+        assert!(said.is_empty(), "nothing to complain about: {said}");
+        let said = session
+            .settle_against_state_root(&root, "s-the-one-that-made-these-ids")
+            .join("\n");
+        assert!(said.contains("picked up the collection"), "{said}");
+        assert!(said.contains("j0000002484"), "{said}");
+
+        // The hub joins and says what it is owed, exactly as
+        // `ask_for_the_files_still_owed` does for every redial: not a byte of
+        // it. The runner resumes from there.
+        session.files_held(&job_id, 3, &[]);
+        let mut chunks = 0;
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while chunks == 0 {
+            assert!(Instant::now() < deadline, "no chunk of a swept spool");
+            while let Ok(message) = inbox.try_recv() {
+                if let ToHub::JobFileChunk {
+                    job_id: of, path, ..
+                } = message
+                {
+                    assert_eq!(of, job_id);
+                    assert_eq!(path, "results.json");
+                    chunks += 1;
+                    credit.add_permits(1);
+                }
+            }
+            tokio::task::yield_now().await;
+        }
+        assert!(
+            spool.exists(),
+            "the spool stays until the hub says it has it"
+        );
+        session.files_acknowledged(&job_id, 3);
+        assert!(
+            !spool.exists(),
+            "the existing acknowledgement path removes the spool: that is the whole design"
+        );
+    }
+
+    /// A spool for a job the hub no longer knows — cancelled, written off, or
+    /// a record that is gone — reaches a **terminal** state rather than being
+    /// offered on every connection for ever. Its bytes are kept.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_swept_spool_no_hub_asks_for_is_set_aside_and_never_offered_again() {
+        let job_id = JobId::new("j0000002855");
+        let (_temp, root, spool) = a_root_holding_a_spool("sweep-unclaimed", &job_id, 1);
+        let session = Session::new();
+        let credit = Arc::new(Semaphore::new(FILES_IN_FLIGHT));
+        let (outbox, mut inbox) = mpsc::unbounded_channel();
+        session.attach(outbox, Arc::clone(&credit), Duration::from_millis(50));
+        session.pick_up_collections(&root);
+        session.settle_against_state_root(&root, "s-the-one-that-made-these-ids");
+        assert_eq!(session.held_collections(), 1);
+
+        // Offered on the link, and the hub says nothing at all about it:
+        // neither the `JobFilesHeld` it sends for what it is owed nor the
+        // `JobFilesAck` it sends for what it already holds. That is the one
+        // state nothing will ever resolve.
+        session.offer_swept_collections();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut offered = false;
+        while !offered {
+            assert!(
+                Instant::now() < deadline,
+                "the collection was never offered"
+            );
+            while let Ok(message) = inbox.try_recv() {
+                if matches!(message, ToHub::JobFileChunk { .. }) {
+                    offered = true;
+                    credit.add_permits(1);
+                }
+            }
+            tokio::task::yield_now().await;
+        }
+        // The answer to the first health report: the barrier that says the
+        // hub has already told this runner everything it is owed.
+        session.the_hub_has_said_what_it_is_owed();
+        assert_eq!(
+            session.held_collections(),
+            0,
+            "a collection nothing will acknowledge must not be held for ever"
+        );
+        assert!(!spool.exists());
+        let aside = root
+            .outputs_dir()
+            .join(format!("{job_id}-1.{}", sweep::UNCLAIMED));
+        assert_eq!(
+            std::fs::read(aside.join("results.json")).expect("the bytes are kept"),
+            b"the one file of a collection",
+            "silence is weaker evidence than a sentence: the bytes are set aside, not \
+             deleted"
+        );
+        // And a later start does not pick it up again, which is what makes
+        // the state terminal rather than a rename undone every boot.
+        let (swept, _) = sweep::pick_up(&root);
+        assert!(swept.is_empty());
+    }
+
+    /// The hub *has* mentioned it, so it is not an orphan: the barrier leaves
+    /// a collection the hub is waiting for exactly where it is.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_swept_spool_the_hub_asked_for_survives_the_barrier() {
+        let job_id = JobId::new("j0000002500");
+        let (_temp, root, spool) = a_root_holding_a_spool("sweep-asked-for", &job_id, 1);
+        let session = Session::new();
+        let credit = Arc::new(Semaphore::new(FILES_IN_FLIGHT));
+        let (outbox, _inbox) = mpsc::unbounded_channel();
+        session.attach(outbox, credit, Duration::from_millis(50));
+        session.pick_up_collections(&root);
+        session.settle_against_state_root(&root, "s-the-one-that-made-these-ids");
+        session.offer_swept_collections();
+        session.files_held(&job_id, 1, &[]);
+        session.the_hub_has_said_what_it_is_owed();
+        assert_eq!(session.held_collections(), 1, "the hub is waiting for it");
+        assert!(spool.exists());
+    }
+
+    /// A collection this runner produced a moment ago is **never** judged by
+    /// the barrier: the hub may simply not have got to its verdict yet.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_live_collection_is_never_set_aside_by_the_barrier() {
+        let temp = crate::testing::TempDir::new("sweep-live");
+        let session = Session::new();
+        let credit = Arc::new(Semaphore::new(FILES_IN_FLIGHT));
+        let (outbox, _inbox) = mpsc::unbounded_channel();
+        session.attach(outbox, credit, Duration::from_millis(50));
+        let job_id = JobId::new("j0000002600");
+        let spool = temp.path().join("spool-live");
+        let outputs = a_collection_to_send(&session, &job_id, &spool);
+        session.finish(
+            &job_id,
+            1,
+            JobOutcome::Exited { code: 0 },
+            JobMetrics::default(),
+            Vec::new(),
+            outputs,
+            Some(spool.clone()),
+        );
+        session.the_hub_has_said_what_it_is_owed();
+        assert_eq!(session.held_collections(), 1);
+        assert!(spool.exists(), "{}", spool.display());
+    }
+
+    /// The hub's state root was recreated — the consumer's v0.3.7 recreate —
+    /// so every spool on this disk is named for job ids that now mean other
+    /// jobs. None of it is offered, and none of it is destroyed.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_swept_spool_of_a_state_root_that_is_gone_is_never_offered() {
+        let job_id = JobId::new("j0000000001");
+        let (_temp, root, spool) = a_root_holding_a_spool("sweep-foreign", &job_id, 1);
+        let session = Session::new();
+        session.pick_up_collections(&root);
+        let said = session
+            .settle_against_state_root(&root, "s-a-state-root-that-replaced-it")
+            .join("\n");
+        assert!(
+            said.contains("1 collection(s) spooled here cannot belong to this hub's state"),
+            "{said}"
+        );
+        assert!(said.contains("NOT offered"), "{said}");
+        assert_eq!(
+            session.held_collections(),
+            0,
+            "offering these would write one job's output onto another job's record"
+        );
+        assert!(!spool.exists());
+        let aside = root
+            .outputs_dir()
+            .join(format!("{job_id}-1.{}", sweep::FOREIGN));
+        assert_eq!(
+            std::fs::read(aside.join("results.json")).expect("the bytes are kept"),
+            b"the one file of a collection"
+        );
+    }
+
+    /// A spool on the disk is never a live attempt's: if this runner is
+    /// already holding a collection for that job, the swept one is named and
+    /// left rather than put in its place.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_swept_spool_never_displaces_a_collection_in_hand() {
+        let job_id = JobId::new("j0000002700");
+        let (_temp, root, spool) = a_root_holding_a_spool("sweep-displace", &job_id, 1);
+        let session = Session::new();
+        let credit = Arc::new(Semaphore::new(FILES_IN_FLIGHT));
+        let (outbox, _inbox) = mpsc::unbounded_channel();
+        session.attach(outbox, credit, Duration::from_millis(50));
+        let live = root.path().join("live-spool");
+        let outputs = a_collection_to_send(&session, &job_id, &live);
+        session.finish(
+            &job_id,
+            1,
+            JobOutcome::Exited { code: 0 },
+            JobMetrics::default(),
+            Vec::new(),
+            outputs,
+            Some(live.clone()),
+        );
+        session.pick_up_collections(&root);
+        let said = session
+            .settle_against_state_root(&root, "s-the-one-that-made-these-ids")
+            .join("\n");
+        assert!(said.contains("already holding one for"), "{said}");
+        assert_eq!(session.held_collections(), 1);
+        // Neither one was touched.
+        assert!(spool.exists());
+        assert!(live.exists());
     }
 }
