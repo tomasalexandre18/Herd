@@ -226,6 +226,8 @@ async fn the_hub_refuses_a_frame_it_does_not_know_rather_than_ignoring_it() {
         health_every_ms: None,
         capabilities: Default::default(),
         host: herd_proto::HostSize::default(),
+        // This stand-in holds no job and says so by not saying (D181).
+        jobs_at_once: None,
         preference: 0,
         load_milli: None,
         switch: herd_proto::Switch::On,

@@ -196,6 +196,12 @@ pub fn exit_code_for(outcome: &JobOutcome) -> u8 {
         | JobOutcome::Cancelled { .. }
         | JobOutcome::Impossible { .. }
         | JobOutcome::Lost { .. }
+        // 125 like the rest of them, and for the plainest reason in the
+        // list: nobody ran this job at all. Not 124, which would say a
+        // budget stopped it; not 1, which would say it failed. Which of the
+        // five it was is `cause` in the verdict document and the sentence on
+        // stderr, never the number (D182, D20).
+        | JobOutcome::RefusedAsFull { .. }
         // 125 and **not** 124, which is the whole of D166's third part: the
         // machine the job ran on could not do its own part, so nobody
         // established anything about this job. 124 would say a budget killed
@@ -222,6 +228,33 @@ pub fn no_verdict_reason(outcome: &JobOutcome) -> Option<String> {
         // about one of these is change the submission (E-36).
         JobOutcome::Impossible { reason } => Some(format!(
             "no runner could ever run this job, so it was not queued for one: {reason}"
+        )),
+        // And the one that is the opposite of that: every machine it was
+        // offered to could have run it and none of them had room. The
+        // sentence names the machines and the bound, because adding capacity
+        // — or finding out why the hub's count and a runner's disagree — is
+        // the whole of what there is to do about it (D182).
+        JobOutcome::RefusedAsFull {
+            reason,
+            refusals,
+            refusals_allowed,
+            runners,
+        } => Some(format!(
+            "no machine had room for this job: it was handed straight back {refusals} time(s) \
+             of the {refusals_allowed} this hub allows, by {}. Nothing ran and nothing failed. \
+             {reason}",
+            if runners.is_empty() {
+                "machines that were already full".to_owned()
+            } else {
+                runners
+                    .iter()
+                    .map(|was| match was.holding {
+                        Some(holding) => format!("{} (holding {holding})", was.name),
+                        None => was.name.clone(),
+                    })
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            }
         )),
         _ => None,
     }
@@ -1381,6 +1414,9 @@ async fn join(config: &Config) -> Result<Socket> {
             // size and no preference: both are what the hub asks of a runner
             // (E-22, E-19).
             host: herd_proto::HostSize::default(),
+            // Nor a ceiling on jobs held at once: a requester holds none, so
+            // there is no figure here to be silent about (D181).
+            jobs_at_once: None,
             preference: 0,
             // Nor does a requester measure anything about a host (E-32).
             load_milli: None,
