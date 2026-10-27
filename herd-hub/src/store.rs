@@ -147,8 +147,12 @@ pub struct JobDirStore {
 /// consulted in place of a record: a record is always read from its file.
 #[derive(Debug)]
 struct Live {
-    /// The next id to try. Ids are claimed by `mkdir`, so this is a hint that
-    /// cannot collide even if it is wrong.
+    /// The next id to try. Ids are claimed by `mkdir`, so this is a hint
+    /// that cannot collide even if it is wrong — but it is never allowed to
+    /// be *low*: `store.json`'s `ids_minted` is raised to each sequence
+    /// before the `mkdir` that spends it, so a hub that comes back knows
+    /// how far this root got even when the directories that would have said
+    /// so are gone.
     next_sequence: u64,
     /// How many job directories exist. The index carries this number so that
     /// an index which has fallen behind the directories is detected.
@@ -223,9 +227,35 @@ struct StoreFile {
     /// is given one, rather than failing to open.
     #[serde(default)]
     state_root_id: String,
+    /// The highest job sequence this state root has ever handed out — the
+    /// high-water mark — put here **before** the directory that claims it.
+    ///
+    /// **Here and not in `index/state.json`, because this is the one number
+    /// in the store that cannot be derived a second time.** The index is a
+    /// summary of what the directories already say, and every path in
+    /// [`JobDirStore::usable_index`] that doubts it throws it away and reads
+    /// the records instead: right for a derived file, fatal for this one.
+    /// Once the directories a mark counted are gone, nothing else on the
+    /// disk remembers them. So the mark lives in the file that already
+    /// refuses to start when it cannot be read, beside the identity it is
+    /// the companion of — `state_root_id` says *which* root a `j…` belongs
+    /// to, and this says that one root never hands the same `j…` out twice.
+    ///
+    /// `#[serde(default)]` so that a root written before this field — which
+    /// is every root in existence — reads as a root that has never minted,
+    /// and its first open takes the mark from the highest job directory
+    /// instead. Zero means exactly that: nothing handed out yet, so the
+    /// first id is `j0000000001`.
+    #[serde(default)]
+    ids_minted: u64,
 }
 
 /// `index/state.json`.
+///
+/// Note what is **not** here: the high-water mark of [`StoreFile`]. This
+/// file is checked against the directories and discarded whenever the two
+/// disagree, so a number that only this file remembers would be lost by
+/// exactly the paths that exist to be cheap about losing things.
 #[derive(Debug, Serialize, Deserialize)]
 struct IndexFile {
     index_version: u32,
@@ -319,8 +349,9 @@ impl JobDirStore {
     /// must not start believing it has no state when in truth it cannot read
     /// the state it has (the same rule E-45 applies to a runner's data root).
     ///
-    /// Recovery reads the names in `jobs/` — which is also where the next id
-    /// comes from — and then reads only the records the index says are
+    /// Recovery reads the names in `jobs/`, takes the next id from the
+    /// higher of `store.json`'s high-water mark and the last of those names,
+    /// and then reads only the records the index says are
     /// unfinished. The index is used only if it parses, carries a version this
     /// Herd knows, accounts for exactly as many job directories as there are,
     /// names only jobs that exist, and leaves out no job whose record is not
@@ -379,6 +410,16 @@ impl JobDirStore {
         // the root that is gone — plausible, false, and indistinguishable
         // from the real thing without this (D42, and M2 flagged it).
         let mut state_root_id = String::new();
+        // And the mark of how far this root's ids have got. Absent is zero,
+        // which is also "nothing minted yet"; the two cannot be told apart
+        // and need not be, because recovery takes the higher of this and the
+        // directories either way. A `store.json` that does not parse is
+        // already refused above, and that refusal now covers the mark too:
+        // of everything in this root the mark is the one thing no amount of
+        // reading the disk can reconstruct, so a hub that cannot read it is
+        // a hub that cannot promise an id is fresh, and it says so rather
+        // than minting one it may have minted before.
+        let mut ids_minted = 0u64;
         if let Some(text) = read_optional(&store_file)? {
             let found: StoreFile = serde_json::from_str(&text)
                 .map_err(|error| failed("reading", &store_file, &error))?;
@@ -391,17 +432,21 @@ impl JobDirStore {
                 )));
             }
             state_root_id = found.state_root_id;
+            ids_minted = found.ids_minted;
         }
         if state_root_id.is_empty() {
             state_root_id = mint_a_state_root_id();
         }
         // Rewriting it at every start is also the test that the root is
-        // writable, and it is where a reader learns what the layout is.
+        // writable, and it is where a reader learns what the layout is. The
+        // mark is carried through unchanged here: raising it is recovery's
+        // job, once it has seen what the directories say.
         write_json(
             &store_file,
             &StoreFile {
                 layout_version: LAYOUT_VERSION,
                 state_root_id: state_root_id.clone(),
+                ids_minted,
             },
         )?;
 
@@ -433,7 +478,7 @@ impl JobDirStore {
                 sweeping: false,
             }),
         };
-        store.recover()?;
+        store.recover(ids_minted)?;
         // The first sweep, which is also the first measurement: see the
         // paragraph above.
         JobStore::sweep_outputs(&store)?;
@@ -857,7 +902,28 @@ impl JobDirStore {
         self.root.join(INDEX_DIR).join(INDEX_FILE)
     }
 
-    fn recover(&self) -> Result<()> {
+    /// Put the high-water mark on the disk, with the rest of `store.json`
+    /// exactly as it was.
+    ///
+    /// Through the one writer (D8), so it is a temporary, an `fsync`, a
+    /// rename and a directory `fsync`: a reader — a runner asking who this
+    /// root is, a test, an operator — sees the mark it had or the mark it
+    /// has, never a file halfway between them, and the mark survives the
+    /// machine and not merely the process.
+    fn mark_minted(&self, ids_minted: u64) -> Result<()> {
+        write_json(
+            &self.root.join(STORE_FILE),
+            &StoreFile {
+                layout_version: LAYOUT_VERSION,
+                state_root_id: self.state_root_id.clone(),
+                ids_minted,
+            },
+        )
+    }
+
+    /// `ids_minted` is the mark [`Self::open_with`] read out of
+    /// `store.json`, zero on a root that has none.
+    fn recover(&self, ids_minted: u64) -> Result<()> {
         let jobs_dir = self.jobs_dir();
         let names =
             durable::names_in(&jobs_dir).map_err(|error| failed("listing", &jobs_dir, &error))?;
@@ -876,7 +942,60 @@ impl JobDirStore {
         }
         sequences.sort_unstable();
         let jobs_accounted = sequences.len() as u64;
-        let next_sequence = sequences.last().copied().unwrap_or(0) + 1;
+
+        // How far this root's ids have got, from the two things that know:
+        // the mark, and the directories that are still here. **The higher
+        // wins**, and that is not a tie-break but the only safe reading —
+        // each is *evidence that an id was handed out*, and evidence of that
+        // only ever accumulates. A surviving directory proves its own id was
+        // minted whatever the mark says; the mark proves ids were minted
+        // whatever is left in `jobs/`. Taking the lower would re-issue an id
+        // one of them has already seen.
+        //
+        // The two disagree in two directions, and both are real:
+        //
+        // - **The mark is behind the directories.** Every root written
+        //   before this field, including one running in production right
+        //   now: the mark reads as zero and the directories are the whole
+        //   truth. Also a `store.json` restored from an older copy than
+        //   `jobs/`. Taking the directories migrates the root, once.
+        // - **The mark is ahead of the directories.** The ordinary case the
+        //   whole mechanism exists for: a hub killed between raising the
+        //   mark and `mkdir`, or a `jobs/` that has had records removed from
+        //   it — by retention, by an operator reclaiming space, by a partial
+        //   restore. Taking the mark is what keeps the next id above ids
+        //   nobody can see any more.
+        let highest_on_disk = sequences.last().copied().unwrap_or(0);
+        let highest_minted = ids_minted.max(highest_on_disk);
+        let next_sequence = highest_minted + 1;
+        // And a root the directories raised is written back **now**, before
+        // this hub answers anything: if it waited for the first mint, an
+        // operator who emptied `jobs/` between the upgrade and the next job
+        // would get `j0000000001` all over again, which is the whole defect.
+        if highest_minted > ids_minted {
+            if ids_minted == 0 {
+                eprintln!(
+                    "herd-hub: {} carries no high-water mark for job ids; taking {} from \
+                     the highest job directory here. From now on the next id is above every \
+                     id this root has handed out, whatever is removed from {}",
+                    self.root.join(STORE_FILE).display(),
+                    id_of(highest_minted),
+                    jobs_dir.display(),
+                );
+            } else {
+                eprintln!(
+                    "herd-hub: {} says this root has handed out ids up to {}, and {} is in \
+                     {}; the higher one wins, because a job directory is proof its id was \
+                     handed out. A mark behind the directories is a store.json older than \
+                     the jobs beside it",
+                    self.root.join(STORE_FILE).display(),
+                    id_of(ids_minted),
+                    id_of(highest_on_disk),
+                    jobs_dir.display(),
+                );
+            }
+            self.mark_minted(highest_minted)?;
+        }
 
         // With no job directories there is nothing to read and nothing to
         // rebuild, so a brand new state root says nothing about its index.
@@ -1398,7 +1517,18 @@ impl JobDirStore {
         // which ids are taken, so a wrong hint costs one extra attempt.
         let id = loop {
             let sequence = live.next_sequence;
-            live.next_sequence += 1;
+            // The mark goes on the disk **before** the directory that claims
+            // the id, and that order is the whole guarantee. A hub killed
+            // between the two comes back having spent an id it never used,
+            // which is a gap — and a number is an identifier, so gaps stay
+            // (D148). The other order comes back believing a spent id free
+            // on a root whose directory has since been removed, and hands
+            // one `j…` to two different jobs, which no later reader of the
+            // logs, the records or the consumer's issues can ever undo. One
+            // atomic write per mint buys that, beside the seven this
+            // function already pays.
+            self.mark_minted(sequence)?;
+            live.next_sequence = sequence + 1;
             let id = id_of(sequence);
             let dir = self.job_dir(&id);
             match durable::create_dir_exclusive(&dir) {
@@ -2926,6 +3056,246 @@ mod tests {
         );
     }
 
+    // --- The high-water mark of job ids -------------------------------
+    //
+    // `state_root_id` above answers "which root is this `j…` from?". These
+    // answer the other half: one root never hands the same `j…` out twice,
+    // however little of `jobs/` is left.
+
+    /// The mark `store.json` carries.
+    fn mark_of(root: &Path) -> u64 {
+        serde_json::from_str::<serde_json::Value>(&read(&root.join(STORE_FILE)))
+            .expect("store.json is json")["ids_minted"]
+            .as_u64()
+            .expect("a mark, and a number")
+    }
+
+    /// `store.json` with its mark set and every other field as it was.
+    fn set_mark(root: &Path, ids_minted: u64) {
+        edit_store_file(root, |file| {
+            file["ids_minted"] = serde_json::json!(ids_minted);
+        });
+    }
+
+    /// `store.json` as every root written before this field carries it: no
+    /// mark at all. The consumer's running hub is one of these.
+    fn drop_mark(root: &Path) {
+        edit_store_file(root, |file| {
+            file.as_object_mut()
+                .expect("store.json is an object")
+                .remove("ids_minted");
+        });
+    }
+
+    fn edit_store_file(root: &Path, change: impl FnOnce(&mut serde_json::Value)) {
+        let path = root.join(STORE_FILE);
+        let mut file: serde_json::Value =
+            serde_json::from_str(&read(&path)).expect("store.json is json");
+        change(&mut file);
+        durable::write_file(&path, file.to_string().as_bytes()).expect("written");
+    }
+
+    /// Every job directory, gone — what M12's retention, an operator
+    /// reclaiming space and a partial restore all look like from here.
+    fn empty_the_jobs_dir(root: &Path) {
+        let jobs = root.join(JOBS_DIR);
+        for name in durable::names_in(&jobs).expect("jobs/ lists") {
+            fs::remove_dir_all(jobs.join(name)).expect("the job directory is removed");
+        }
+    }
+
+    fn sequence(id: &JobId) -> u64 {
+        sequence_of(id.as_str()).expect("an id this store minted")
+    }
+
+    fn mint(store: &JobDirStore, command: &str) -> JobId {
+        store
+            .create_job(NewJob::new(vec![command.to_owned()]))
+            .expect("minted")
+            .id
+    }
+
+    /// The defect this exists for: the next id used to be a function of
+    /// what was still on the disk, so a `jobs/` that had been emptied
+    /// started again at `j0000000001` — ids the consumer's issue tracker,
+    /// our tombstones and their own logs still name.
+    #[test]
+    fn the_next_id_is_above_every_id_this_root_has_ever_minted() {
+        let dir = tempfile::tempdir().expect("a temporary directory");
+        let spent = {
+            let store = JobDirStore::open(dir.path()).expect("the state root opens");
+            let mut last = None;
+            for n in 0..3 {
+                last = Some(sequence(&mint(&store, &format!("job-{n}"))));
+            }
+            last.expect("three jobs")
+        };
+        assert_eq!(spent, 3);
+
+        // Both places that remembered those three: the directories, and
+        // the derived index that counts them.
+        empty_the_jobs_dir(dir.path());
+        fs::remove_dir_all(dir.path().join(INDEX_DIR)).expect("the index is gone");
+
+        let store = JobDirStore::open(dir.path()).expect("the emptied root reopens");
+        let next = mint(&store, "after");
+        assert!(
+            sequence(&next) > spent,
+            "an emptied jobs/ handed out {next} again, at or below {}",
+            id_of(spent)
+        );
+    }
+
+    /// The order inside `mint`, and the crash it is for. The mark is raised
+    /// and on the disk **before** the `mkdir` that claims the id, so the
+    /// only thing a kill in that window can cost is a gap — and a number is
+    /// an identifier, so gaps stay (D148).
+    #[test]
+    fn an_id_is_marked_spent_before_the_directory_that_claims_it() {
+        let dir = tempfile::tempdir().expect("a temporary directory");
+        let spent = {
+            let store = JobDirStore::open(dir.path()).expect("the state root opens");
+            let job = mint(&store, "true");
+            assert_eq!(
+                mark_of(dir.path()),
+                sequence(&job),
+                "the record was written under an id the disk does not say is spent"
+            );
+            sequence(&job)
+        };
+
+        // What that window leaves behind, written by hand because it is one
+        // statement wide: four ids raised, no directory for any of them.
+        set_mark(dir.path(), spent + 4);
+        let store = JobDirStore::open(dir.path()).expect("the root reopens");
+        assert_eq!(
+            sequence(&mint(&store, "false")),
+            spent + 5,
+            "the ids a crash spent are a gap, never handed out a second time"
+        );
+    }
+
+    /// Migration, which is every root in existence: no mark, and the
+    /// directories are the only evidence there is. The upgrade takes it
+    /// from them **at the first open** rather than at the first mint, so an
+    /// operator who empties `jobs/` in between does not undo it.
+    #[test]
+    fn a_root_with_no_mark_takes_one_from_its_highest_job_directory() {
+        let dir = tempfile::tempdir().expect("a temporary directory");
+        {
+            let store = JobDirStore::open(dir.path()).expect("the state root opens");
+            for n in 0..2 {
+                mint(&store, &format!("job-{n}"));
+            }
+        }
+        drop_mark(dir.path());
+
+        {
+            let store = JobDirStore::open(dir.path()).expect("the upgraded root opens");
+            assert_eq!(
+                mark_of(dir.path()),
+                2,
+                "the upgrade must write the mark, not merely hold it"
+            );
+            drop(store);
+        }
+        empty_the_jobs_dir(dir.path());
+        let store = JobDirStore::open(dir.path()).expect("the emptied root reopens");
+        assert_eq!(
+            sequence(&mint(&store, "after")),
+            3,
+            "the mark the upgrade took did not survive the directories it came from"
+        );
+    }
+
+    /// A mark **behind** a surviving directory: a `store.json` restored
+    /// from an older copy than `jobs/`. The higher wins, because each is
+    /// evidence that an id was handed out and evidence of that only
+    /// accumulates — a directory proves its own id whatever the mark says.
+    #[test]
+    fn a_mark_behind_the_directories_loses_to_them() {
+        let dir = tempfile::tempdir().expect("a temporary directory");
+        {
+            let store = JobDirStore::open(dir.path()).expect("the state root opens");
+            for n in 0..3 {
+                mint(&store, &format!("job-{n}"));
+            }
+        }
+        set_mark(dir.path(), 1);
+
+        let store = JobDirStore::open(dir.path()).expect("the root reopens");
+        assert_eq!(
+            mark_of(dir.path()),
+            3,
+            "the directories must raise the mark back, and on the disk"
+        );
+        let next = mint(&store, "after");
+        assert_eq!(
+            sequence(&next),
+            4,
+            "{next} has a record of its own beside it already"
+        );
+    }
+
+    /// A mark that is not a number. Of everything in a state root this is
+    /// the one thing no reading of the disk can reconstruct, so the hub
+    /// refuses to start and names the file, rather than guessing low and
+    /// handing out an id it may have handed out before.
+    #[test]
+    fn a_mark_that_cannot_be_read_stops_the_hub_naming_the_file() {
+        let dir = tempfile::tempdir().expect("a temporary directory");
+        {
+            let store = JobDirStore::open(dir.path()).expect("the state root opens");
+            mint(&store, "true");
+        }
+        edit_store_file(dir.path(), |file| {
+            file["ids_minted"] = serde_json::json!("lots");
+        });
+
+        let error =
+            JobDirStore::open(dir.path()).expect_err("a mark nobody can read is not a mark");
+        assert!(
+            error.to_string().contains(STORE_FILE),
+            "the refusal must name the file an operator has to fix: {error}"
+        );
+    }
+
+    /// The mark and the index do not meet. `usable_index` believes the
+    /// index only while `jobs_accounted` equals the directory count, and a
+    /// root whose records have been removed has a mark far above both — so
+    /// if the mark lived in that file, or were counted by that check, every
+    /// start after a removal would throw the index away. It lives in
+    /// `store.json` and the check never sees it.
+    #[test]
+    fn a_mark_far_above_the_directory_count_is_not_the_index_s_business() {
+        let dir = tempfile::tempdir().expect("a temporary directory");
+        {
+            let store = JobDirStore::open(dir.path()).expect("the state root opens");
+            for n in 0..2 {
+                mint(&store, &format!("job-{n}"));
+            }
+        }
+        set_mark(dir.path(), 10_000);
+
+        let store = JobDirStore::open(dir.path()).expect("the root reopens");
+        let index: serde_json::Value =
+            serde_json::from_str(&read(&dir.path().join(INDEX_DIR).join(INDEX_FILE)))
+                .expect("the index is json");
+        assert!(
+            index.get("ids_minted").is_none(),
+            "the mark must not be in a file that is thrown away on doubt: {index}"
+        );
+        assert_eq!(
+            index["jobs_accounted"], 2,
+            "the index still counts directories, and 10 000 is not one of them: {index}"
+        );
+        assert_eq!(
+            sequence(&mint(&store, "after")),
+            10_001,
+            "and the next id still comes from the mark"
+        );
+    }
+
     #[test]
     fn a_minted_job_is_queued_and_has_a_fresh_id() {
         let (_dir, store) = store();
@@ -3646,8 +4016,9 @@ mod tests {
         );
     }
 
-    /// Nothing but the job directories decides which ids exist, so a store
-    /// whose index is gone still mints an id that collides with nothing.
+    /// The index decides nothing about which ids exist — the job
+    /// directories and `store.json`'s mark do — so a store whose index is
+    /// gone still mints an id that collides with nothing.
     #[test]
     fn ids_come_from_the_directories_and_are_never_reused() {
         let dir = tempfile::tempdir().expect("a temporary directory");
