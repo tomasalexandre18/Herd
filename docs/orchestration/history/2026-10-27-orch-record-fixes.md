@@ -3,7 +3,9 @@
 - **Item:** ORCH-112 (new); corrects ORCH-111's row and the handoff
   `2026-10-27-merge-batch-docs-gate-orch-batched-pr.md`
 - **Agent:** herd-step
-- **Branch / commit:** `orch-record-fixes` / see *Gates*, based on
+- **Branch / commit:** `orch-record-fixes` / `c0eb015` carries the four
+  prose changes and this handoff; a second commit only adds this sha to
+  the line you are reading. Based on
   `origin/main` `64cc532` (re-read in my own worktree, not taken from
   the brief, which named the same sha)
 - **PR:** none — an agent pushes its branch and opens none (one PR per
