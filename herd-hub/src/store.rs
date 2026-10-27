@@ -560,6 +560,40 @@ impl JobDirStore {
             .all(|file| file_length(&kept.join(&file.path)) == Some(file.bytes))
     }
 
+    /// What `files/` and `parts/` hold of a collection, **given the record
+    /// that names it**.
+    ///
+    /// [`JobStore::output_holdings`] is this with a record read for it. It is
+    /// split out so that [`JobStore::collection_owed`] can answer from the
+    /// record it has already read instead of reading `job.json` a second time
+    /// for the same job: one definition, one read, and the same list either
+    /// way.
+    fn holdings_of(&self, id: &JobId, record: &JobRecord) -> Vec<herd_proto::FileHeld> {
+        let kept = self.job_dir(id).join(KEPT_FILES_DIR);
+        let parts = self.job_dir(id).join(OUTPUT_PARTS_DIR);
+        let mut held = Vec::new();
+        for file in &record.outputs.files {
+            if herd_proto::check_relative(&file.path).is_err() {
+                continue;
+            }
+            // Whole first, then part-written, then nothing at all — and a
+            // path that is in neither place is simply absent from this list,
+            // which is how the runner is told to send it from the beginning.
+            let bytes = match file_length(&kept.join(&file.path)) {
+                Some(bytes) => bytes,
+                None => match file_length(&parts.join(&file.path)) {
+                    Some(bytes) => bytes,
+                    None => continue,
+                },
+            };
+            held.push(herd_proto::FileHeld {
+                path: file.path.clone(),
+                bytes,
+            });
+        }
+        held
+    }
+
     /// Add bytes that have just become whole to the running total, and sweep
     /// if that has put the hub over its budget (D152).
     ///
@@ -2077,29 +2111,7 @@ impl JobStore for JobDirStore {
         let Some(record) = JobStore::job(self, id)? else {
             return Ok(Vec::new());
         };
-        let kept = self.job_dir(id).join(KEPT_FILES_DIR);
-        let parts = self.job_dir(id).join(OUTPUT_PARTS_DIR);
-        let mut held = Vec::new();
-        for file in &record.outputs.files {
-            if herd_proto::check_relative(&file.path).is_err() {
-                continue;
-            }
-            // Whole first, then part-written, then nothing at all — and a
-            // path that is in neither place is simply absent from this list,
-            // which is how the runner is told to send it from the beginning.
-            let bytes = match file_length(&kept.join(&file.path)) {
-                Some(bytes) => bytes,
-                None => match file_length(&parts.join(&file.path)) {
-                    Some(bytes) => bytes,
-                    None => continue,
-                },
-            };
-            held.push(herd_proto::FileHeld {
-                path: file.path.clone(),
-                bytes,
-            });
-        }
-        Ok(held)
+        Ok(self.holdings_of(id, &record))
     }
 
     fn read_output_chunk(
@@ -2453,8 +2465,34 @@ impl JobStore for JobDirStore {
         }
     }
 
+    /// The record, read with **no lock held**.
+    ///
+    /// The store's `Mutex<Live>` guards `Live`; this reads a file. The guard
+    /// this used to take was bound to `_live` and never looked at, so it
+    /// bought exclusion and nothing else — the first of the two granularity
+    /// faults `07 §1.3` names, and the one `07 §7 S2` asks to be undone
+    /// first, because `collections_owed` reaches this method once per
+    /// directory and so took and released the lock 20 001 times on a store
+    /// of 20 000 jobs.
+    ///
+    /// **What makes the exclusion unnecessary.** `job.json` is written in
+    /// exactly one place ([`Self::write_record`]) and through
+    /// [`durable::write_file_with`], which publishes by `rename`. A reader
+    /// gets the whole old record or the whole new one, never a torn one:
+    /// that is `durable`'s opening paragraph, and `durable`'s own tests are
+    /// what hold it.
+    ///
+    /// **What no caller loses.** The guard was taken and released *inside*
+    /// this one call, so two reads of this store never had a consistent view
+    /// of each other and nothing that happens between two of them is new.
+    /// Within the call a concurrent writer can now interleave nothing at
+    /// all: one `read_to_string` of one atomically published file. What it
+    /// can do is finish a write a few microseconds after this read began, so
+    /// the record returned is that much older — which was already true the
+    /// instant the guard was dropped. Every writer re-reads the record under
+    /// the lock through [`Self::open_unless_over`] before writing, so no
+    /// decision is taken on a record a reader handed back.
     fn job(&self, id: &JobId) -> Result<Option<JobRecord>> {
-        let _live = self.lock()?;
         self.read_record(id)
     }
 
@@ -2510,16 +2548,53 @@ impl JobStore for JobDirStore {
         Ok(Some(events))
     }
 
+    /// The queue, with the lock held over `pending` and let go before a byte
+    /// is read.
+    ///
+    /// This is the second of `07 §1.3`'s two granularity faults: the lock
+    /// used to be held for the whole `N`-record walk — 9.11 ms at `N` = 1 000
+    /// and 189 ms at 20 051 directories on this workstation (`06` phase 1f) —
+    /// which is that long with every writer in the hub blocked behind one
+    /// reader. `07 §7 S2`'s exit criterion is "no writer is blocked more than
+    /// 1 ms by a reader", and a lock held over a `BTreeSet` walk is what
+    /// makes that sentence true.
+    ///
+    /// **What the lock used to do besides exclude**, and how it is kept:
+    /// [`Self::move_to`] writes a terminal record *before* it takes the job
+    /// out of `pending`, both under one hold of this lock, so holding it
+    /// across the walk made (`pending`, records) one snapshot and every
+    /// record returned non-terminal. Let go, the walk can read a record that
+    /// ended after the snapshot — and returning it would hand the dispatch
+    /// pass a job that is over, which [`Self::open_for_writing`] refuses by
+    /// name and which aborts the whole pass (`07 §2`, constraint 5). The
+    /// terminal test below is that guarantee, restated where it is cheap, and
+    /// the postcondition is the old one exactly: every record returned was
+    /// queued at the snapshot and is not over.
+    ///
+    /// **What a concurrent writer can now interleave.** Records are no longer
+    /// read at one instant, so the list can mix a job's priority or waiting
+    /// reason as of the start of the walk with another's as of its end. That
+    /// costs nothing a caller had: the queue is recomputed from this list at
+    /// every pass, every order it feeds (`queue::order`) is a total order on
+    /// priority and id, and a raise that lands mid-walk is a raise that takes
+    /// effect at this pass or the next either way. A job that *joins*
+    /// `pending` after the snapshot is absent — already true of every caller
+    /// the moment this function returned.
     fn unfinished_jobs(&self) -> Result<Vec<JobRecord>> {
-        let live = self.lock()?;
-        let mut records = Vec::with_capacity(live.pending.len());
-        for sequence in live.pending.iter().copied() {
+        let queued: Vec<u64> = {
+            let live = self.lock()?;
+            live.pending.iter().copied().collect()
+        };
+        let mut records = Vec::with_capacity(queued.len());
+        for sequence in queued {
             // `read_stored`, because the queue is what the hub acts on and a
             // quarantined job is not in it: recovery keeps it out of
             // `pending`, and reading one here would be a hub that cannot even
             // list its queue (D52).
             if let Stored::Read(record) = self.read_stored(&id_of(sequence))? {
-                records.push(*record);
+                if !record.state.is_terminal() {
+                    records.push(*record);
+                }
             }
         }
         Ok(records)
@@ -2565,6 +2640,27 @@ impl JobStore for JobDirStore {
         swept
     }
 
+    /// Every collection still owed, walked **without taking the store's lock
+    /// once** (`07 §7 S2`).
+    ///
+    /// It used to take and release it 20 001 times on a store of 20 000 jobs,
+    /// through [`JobStore::collection_owed`] → [`JobStore::job`] →
+    /// `self.lock()`, which serialised the whole walk: eight callers cost
+    /// ×8.60 one caller where the identical I/O without the mutex cost ×1.66,
+    /// and 85 % of a caller's time was waiting rather than reading (`06`
+    /// phase 1f). It is not restructured into one long hold instead — that
+    /// would be 200 ms of every writer blocked at `T` = 20 000 — because
+    /// [`JobStore::job`] needs no hold at all: `job.json` is published by
+    /// `rename` and the walk touches nothing in `Live`.
+    ///
+    /// **What the per-call lock was not buying, and so is not lost.** This
+    /// returns a `Vec` its caller consumes with no lock held, so the
+    /// agreement between a record and the directory beside it that the lock
+    /// gave *within* one `collection_owed` call was already discarded the
+    /// instant the walk moved on — and for the first of 20 000 entries, 200 ms
+    /// before the caller ever saw it. The answer is advisory by construction
+    /// and is recomputed at every redial, which is exactly why D79 derives it
+    /// from the disk rather than keeping it in memory.
     fn collections_owed(&self) -> Result<Vec<crate::job::CollectionOwed>> {
         let mut owed = Vec::new();
         // A scan of the job directories, like the one that rebuilds the queue
@@ -2612,7 +2708,10 @@ impl JobStore for JobDirStore {
         if self.collection_is_whole(id, &record) {
             return Ok(None);
         }
-        let held = self.output_holdings(id)?;
+        // From the record already in hand, rather than through
+        // [`JobStore::output_holdings`], which would read the same `job.json`
+        // a second time for the same job.
+        let held = self.holdings_of(id, &record);
         // Whoever ran the attempt that produced it. No attempt means a record
         // nothing can be asked of, which is not a state a streamed collection
         // can honestly be in — skipped rather than guessed at.
@@ -5132,6 +5231,72 @@ mod tests {
         assert!(
             store.collections_owed().expect("reads").is_empty(),
             "a complete collection is owed nothing"
+        );
+    }
+
+    /// **The store's lock guards `Live` and is never held across a record
+    /// read** (`07 §7 S2`).
+    ///
+    /// Proved rather than read. The lock is taken on this thread and *kept*,
+    /// and another thread is then asked every read-only question the history
+    /// walk asks. Each of them used to reach `self.lock()` — `collections_owed`
+    /// 20 001 times on a store of 20 000 jobs — so each of them would wait
+    /// here for ever, and the assertion is that all of them come back while
+    /// the guard is still held. The guard is let go before anything is
+    /// asserted, so a read that has gone back under it fails this test
+    /// instead of hanging the suite.
+    ///
+    /// `unfinished_jobs` is deliberately not on the list: `pending` *is*
+    /// `Live`, so it does take the lock. What it no longer does is hold it
+    /// across the `N` records it then reads.
+    #[test]
+    fn every_record_read_answers_while_another_thread_holds_the_store_lock() {
+        use std::sync::mpsc;
+        use std::time::Duration;
+
+        let (_dir, store) = store();
+        let id = mint(&store, "a-command");
+        let held = store.lock().expect("the lock");
+        let (said, heard) = mpsc::channel();
+        // A shared borrow, so that the guard above and the reader below hold
+        // the same store at the same time.
+        let reader = &store;
+        let answered = std::thread::scope(|scope| {
+            scope.spawn(move || {
+                assert!(
+                    JobStore::job(reader, &id)
+                        .expect("the record reads")
+                        .is_some(),
+                    "the job this test minted is on the disk"
+                );
+                assert!(
+                    JobStore::collection_owed(reader, &id)
+                        .expect("the one-job answer reads")
+                        .is_none(),
+                    "a job that announced no files owes none"
+                );
+                assert!(
+                    JobStore::collections_owed(reader)
+                        .expect("the walk reads")
+                        .is_empty(),
+                    "a store of one file-less job owes nothing"
+                );
+                assert!(
+                    JobStore::output_holdings(reader, &id)
+                        .expect("the holdings read")
+                        .is_empty(),
+                    "a job that announced no files holds none"
+                );
+                said.send(()).expect("the reader reports back");
+            });
+            let answered = heard.recv_timeout(Duration::from_secs(10));
+            drop(held);
+            answered
+        });
+        answered.expect(
+            "every record read answered while another thread held the store's lock; one that \
+             waits for it has gone back under the guard, and a reader that blocks every writer \
+             is what 07 §7 S2 took out",
         );
     }
 
