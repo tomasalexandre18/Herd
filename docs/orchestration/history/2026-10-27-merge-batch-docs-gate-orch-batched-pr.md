@@ -300,6 +300,24 @@ FAIL  PATH dropped the inherited entries; the guard below needs coreutils
   stable and there is no `/etc/profiles/per-user`. If the `docs` job on
   this PR goes red on that one case, it is this and not the batch —
   and it still does not get merged red.
+- **Correction, 2026-10-27, added by `herd-step` on branch
+  `orch-record-fixes` after the author of the bullet above flagged it
+  himself:** *"it fails the same way on `origin/main`'s copy"* is
+  stronger than what was measured. It is an inference from the diff, not
+  an observation — the suite was **not run on pre-batch `main`**, where a
+  run cost ~155 s on the old `check-orchestration.sh` and a roughly
+  1-in-8 failure rate would have needed many runs to be conclusive. What
+  the diff genuinely proves is that the case is untouched by this batch,
+  so the failure is **not a regression of this batch**; it proves
+  nothing about whether the case reproduces on `main`, and that is still
+  to be measured. The original wording stays above because a handoff is
+  evidence, and the board row ORCH-111 now carries the tightened claim.
+  Two of this file's own figures disagree while I am here: the bullet
+  above says the suite is red "about twice in thirty-two runs" where
+  *Gates*, branch 2, says "about four times in thirty-two runs" and the
+  board row says four; and the run count to name it reads "twenty-five
+  runs" below against "thirty-odd runs" on the board row. Neither was
+  recorded run by run, so take them as orders of magnitude.
 - **Three hypotheses refuted rather than assumed** before the name was
   found: it is **not** the pipe (four green runs under the same direct
   `| tail -2`), **not** a lost counter increment (`140 + 1` is the

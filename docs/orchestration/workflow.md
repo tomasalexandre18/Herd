@@ -172,6 +172,13 @@ handoff's *not done* and *decisions needed* verbatim.
 ## Failure
 
 - A red gate blocks; nobody edits history or a test to turn it green.
+- **A gate's output goes to a file, and the file is what you read** —
+  `./scripts/check-docs.sh > out.txt 2>&1`, never a pipe to `head`,
+  `tail` or anything that truncates. A gate's output is the evidence,
+  and an intermittent failure's first sample is the one you cannot get
+  back: on 2026-10-27 the first two samples of ORCH-111 went into
+  `tail -2`, and it took about thirty further runs to recover what they
+  would have shown.
 - A skip is printed as a skip (D27) and copied into the handoff as such.
 - A disagreement between an agent and its brief is a finding in the
   handoff: the agent stops, states the evidence, and the orchestrator
