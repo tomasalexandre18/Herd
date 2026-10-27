@@ -22,8 +22,8 @@ pub use matcher::{
 pub use queue::{Standing, AGING_STEP};
 pub use roster::{Admission, Approval, Roster, SharedSecret, ROSTER_VERSION};
 pub use server::{
-    hub_version, Authority, Hub, HubHandle, Policy, Restating, RunnerStatus, ATTEMPTS_ALLOWED,
-    DEFAULT_LISTEN_ADDR, FRAME_CEILING_BYTES, LOST_AFTER, MAX_FRAME_BYTES, READING_CAP,
-    REQUEUE_BUDGET, WAIT_RESTATEMENT,
+    hub_version, Authority, Hub, HubHandle, Policy, Restating, RunnerStatus, Stop, StopSignals,
+    ATTEMPTS_ALLOWED, DEFAULT_LISTEN_ADDR, FRAME_CEILING_BYTES, LOST_AFTER, MAX_FRAME_BYTES,
+    READING_CAP, REQUEUE_BUDGET, STOP_WITHIN, WAIT_RESTATEMENT,
 };
 pub use store::{JobDirStore, LAYOUT_VERSION};
