@@ -59,19 +59,19 @@ an incomplete run reports its skips as unknown, never as none.
 
 **Seven defects are fixed and in no release.** **D175** an inline file
 whose bytes did not hash to its digest exited 0; **D176** a verdict could
-name a commit the tree was never at; **D177** a runner's live-job map
-keyed by job id alone let a second attempt replace the first; **D178**
-the watchdog judged an attempt it had just placed on the silence of the
-one before it; **D180-D182** (C5, 2026-10-27) a runner now holds its own
-ceiling, announces it in `Hello`, and a refusal there spends none of the
-job's goes — two additive `herd-proto` fields and one new `JobOutcome`,
-`refused_as_full`, which a hub rolled back past it refuses to read. No
-version number moves for any of them.
+name a commit the tree was never at; **D177** a live-job map keyed by job
+id let a second attempt replace the first; **D178** the watchdog judged
+an attempt it had just placed on the silence of the one before it;
+**D180-D182** (C5) a runner holds its own ceiling, announces it in
+`Hello`, and a refusal there spends none of the job's goes — two additive
+`herd-proto` fields and one new `JobOutcome`, `refused_as_full`, which an
+older hub refuses to read. No version number moves for any of them.
 
-`docs/remediation/` holds thirteen pieces: the baseline, audits A and B,
+`docs/remediation/` holds fourteen pieces: the baseline, audits A and B,
 their review, two experiments and their review, `06` (a junction in five
-posts), `07` (architecture, **adopted as the direction by D183**), `08`,
-`09` (C5), `10` (D103's order on ext4), `11` (each `fsync` priced).
+posts), `07` (architecture, **adopted by D183**), `08`, `09` (C5), `10`
+(D103's order on ext4), `11` (each `fsync` priced), `12` (**the ordering
+oracle**: both record syncs return before the event's first byte).
 
 ## What the software still does not do
 
