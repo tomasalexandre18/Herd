@@ -2,8 +2,12 @@
 
 - **Item:** ORCH-092
 - **Agent:** herd-step
-- **Branch / commit:** `orch-092-spool-sweep` / `b250358`, based on
-  `origin/main` `cd59ef5`
+- **Branch / commit:** `orch-092-spool-sweep`, with `origin/main`
+  `a789153` merged into it (written against `cd59ef5`; PR #85, #93 and #94
+  landed while it was being written). The merge was clean; the only code it
+  cost is one new field, `ToHub::Hello::jobs_at_once`, in the end-to-end
+  test. Merged rather than rebased because the branch was already pushed
+  and `CLAUDE.md` forbids a force-push
 - **PR:** #98
 
 ## Done
@@ -45,7 +49,9 @@ in this change deletes a collection's bytes.
 **No protocol change.** `herd-proto` is untouched; `PROTOCOL_VERSION` stays
 2 (D73). No frame was added and no frame's meaning changed.
 
-**`Inner::collections` is still keyed by `JobId` alone** (`lib.rs:885`).
+**`Inner::collections` is still keyed by `JobId` alone** — `lib.rs:949`
+with `a789153` merged in, which carries PR #85: D177 and #85
+corrected `Inner::jobs`, and left this map as it was.
 Nothing here changes that, which is ORCH-065 / D177's ground and PR #85's.
 
 ### What the hub does with a re-offered collection, established by test
@@ -334,6 +340,13 @@ half. See the decision below.
   owner-facing flag (`--drop-unclaimed-spools-after <duration>`), off by
   default, removing only directories already named `.unclaimed` by a sweep
   that completed.
+- **Where it belongs:** beside `docs/disk-policy.md` (ORCH-093, merged as
+  PR #94), which names the same disk from the hub's side and says in §5
+  that the runner's 65 GB is this item's. That document also makes the
+  sharper point: the spools sit on the **same filesystem** as the hub's
+  volume, so Herd has two budgets over one disk and nothing reconciles
+  them. An `.unclaimed` retention rule should be written as part of that
+  reconciliation, not on its own.
 
 ## Resume point
 

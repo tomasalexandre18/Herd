@@ -77,6 +77,7 @@ impl Peer {
             preference: 0,
             load_milli: None,
             switch: herd_proto::Switch::On,
+            jobs_at_once: None,
         };
         let mut joined = Self {
             socket: {
