@@ -27,10 +27,30 @@
 //! them drops or reorders a sync on a path that writes a record *and* an
 //! event, the assertions below go red.
 //!
+//! # What ORCH-083 changed here, and what it did not
+//!
+//! **ORCH-083 (D183 step A) has been taken.** `record_waiting`'s `waiting`
+//! line no longer waits for the disk, so the one call that writes it has no
+//! `AppendSynced` to observe and the oracle no longer expects one *there*.
+//!
+//! **Nothing that was asserted is asserted less.** The three returns D103
+//! rests on are all on the record side, and all three are still required,
+//! for that call as for the other fifteen: the record's `sync_all` returned
+//! before its `rename` was issued, the `rename` returned before the directory
+//! `fsync` was issued, and the directory `fsync` returned before the **first
+//! byte** of the event line was issued. Step A removed a syscall that
+//! happened *after* the last of those, and the only expectation that moved is
+//! the one that named it. Twelve of the thirteen event lines still carry it;
+//! which call is allowed not to is written out below rather than derived, and
+//! the tripwire at the end of the file holds `store.rs` to exactly one
+//! unsynced appender, so a *transition* cannot be moved onto that door
+//! without this file going red twice over.
+//!
 //! # What it observes, and what that proves
 //!
 //! The observation point is [`crate::durable::watch`], five calls placed
-//! inside the real `write_file_with` and the real `append_line`. The store
+//! inside the real `write_file_with` and the real `append_one_line`, the body
+//! both `append_line` and `append_line_unsynced` run. The store
 //! here is a real [`JobDirStore`] on a real directory, driven through the
 //! calls the hub itself makes. **Nothing is replicated**: unlike
 //! `herd-hub/tests/sync_prices.rs`, which times a faithful *copy* of
@@ -45,7 +65,8 @@
 //!    line was issued;
 //! 4. and the whole observed sequence of record and event operations is
 //!    exactly the one named per transition, so a reordering inside one call
-//!    cannot hide behind an earlier complete write.
+//!    cannot hide behind an earlier complete write — and so a line moved from
+//!    one append door to the other is a change to that sequence.
 //!
 //! **It does not prove** that the bytes reached the platters in that order —
 //! no in-process observation can, and D103 does not need it: a `fsync` that
@@ -71,8 +92,19 @@ use herd_proto::{JobOutcome, Step as ProtoStep};
 /// by hand stays complete.
 const RECORD_WRITE_SITES: usize = 13;
 
-/// How many `self.append_event(` call sites `store.rs` holds. Same rule.
-const EVENT_APPEND_SITES: usize = 11;
+/// How many `self.append_event(` call sites `store.rs` holds — the appenders
+/// that **wait for the disk**. Same rule.
+const EVENT_APPEND_SITES: usize = 10;
+
+/// How many `self.append_event_unsynced(` call sites `store.rs` holds — the
+/// appenders that do **not** wait for the disk (D183 step A).
+///
+/// **One, and it is `record_waiting`'s.** This number is the narrowness of
+/// step A expressed as an assertion: a second site, on any writer, has to be
+/// argued for against D103 before this moves, because the argument that
+/// carries step A is about a `waiting` reason and not about a transition
+/// (`docs/remediation/10-ordering-on-ext4.md` §1 F-1 to F-5, D183).
+const UNSYNCED_EVENT_APPEND_SITES: usize = 1;
 
 /// Which of the two files of a job directory an observed operation is on.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -96,6 +128,22 @@ const EVENT: &[(Op, On)] = &[
     (Op::AppendSynced, On::Events),
 ];
 
+/// One appended event line, as `durable::append_line_unsynced` performs it —
+/// **D183 step A**, `record_waiting`'s `waiting` line and nothing else.
+///
+/// The first element is the same one, and it is the one D103 turns on: the
+/// rule below reads `AppendIssued` against the record write beside it, and
+/// that assertion is unchanged, unweakened and still made for this call. What
+/// is gone is the step **after** it, because there is no longer a syscall
+/// there to observe. Nothing that was asserted about the order is asserted
+/// less; one operation stopped existing.
+///
+/// Which calls get this shape is written out per transition below, so moving a
+/// *transition* onto the unsynced door would not quietly pass: the call's
+/// observed sequence would hold one step where the oracle was told to expect
+/// two, and the equality at the end of [`Oracle::transition`] goes red.
+const EVENT_UNSYNCED: &[(Op, On)] = &[(Op::AppendIssued, On::Events)];
+
 /// What one store call is expected to do to a job's two files, in order.
 ///
 /// Written out per transition rather than derived, so that the expectation
@@ -105,8 +153,12 @@ const EVENT: &[(Op, On)] = &[
 enum Part {
     /// `job.json` rewritten whole.
     Record,
-    /// One line appended to `events.jsonl`.
+    /// One line appended to `events.jsonl`, and put on the disk.
     Event,
+    /// One line appended to `events.jsonl` without waiting for the disk.
+    /// **Exactly one call below is allowed this**, and the tripwire at the
+    /// end of the file holds `store.rs` to the same count.
+    EventUnsynced,
 }
 
 fn expected(parts: &[Part]) -> Vec<(Op, On)> {
@@ -115,6 +167,7 @@ fn expected(parts: &[Part]) -> Vec<(Op, On)> {
         want.extend_from_slice(match part {
             Part::Record => RECORD,
             Part::Event => EVENT,
+            Part::EventUnsynced => EVENT_UNSYNCED,
         });
     }
     want
@@ -387,9 +440,14 @@ fn every_transition_fsyncs_the_record_and_its_directory_before_appending_its_eve
     );
 
     // --- 4. why a queued job is not starting (store.rs `record_waiting`) ---
+    // **The one unsynced appender** (D183 step A, ORCH-083). The record's
+    // three operations are still required, in order, and the first byte of
+    // the line still may not be issued until the directory `fsync` has
+    // returned — which is the whole of what D103 needs and all this call ever
+    // proved. What is gone is the `fdatasync` that followed it.
     oracle.transition(
         "record_waiting — why a queued job is not starting",
-        &[Part::Record, Part::Event],
+        &[Part::Record, Part::EventUnsynced],
         || {
             assert!(
                 store
@@ -588,6 +646,18 @@ fn every_transition_fsyncs_the_record_and_its_directory_before_appending_its_eve
         13,
         "one line per event append the oracle drove: {events:#?}"
     );
+    // The unsynced line is one of the thirteen, and it reads back like any
+    // other: step A gave up survival of a power cut, not visibility. E-53
+    // asks a reader to be able to follow a job while it runs, and that is
+    // served by the page cache, which is what an unsynced append fills.
+    assert!(
+        events.iter().any(|event| matches!(
+            &event.what,
+            crate::job::JobEventKind::Waiting { reason }
+                if reason == "no runner has the labels this job asks for"
+        )),
+        "the unsynced waiting line is not readable: {events:#?}"
+    );
     let record = store
         .job(&id)
         .expect("the record reads")
@@ -599,12 +669,17 @@ fn every_transition_fsyncs_the_record_and_its_directory_before_appending_its_eve
 /// The list above is complete only while `store.rs` has the writers it had
 /// when it was written.
 ///
-/// This is a **tripwire, not a proof**: it counts the two call sites in the
-/// source text. A thirteenth `write_record` or a twelfth `append_event` makes
-/// it red, and whoever added it then decides whether the oracle has to cover
-/// it. It cannot tell a covered site from an uncovered one, and a site
-/// renamed or reached through a new helper would slip past it — which is why
-/// it carries the reason in its message rather than a bare number.
+/// This is a **tripwire, not a proof**: it counts the call sites in the source
+/// text. A fourteenth `write_record` or a twelfth event appender makes it red,
+/// and whoever added it then decides whether the oracle has to cover it. It
+/// cannot tell a covered site from an uncovered one, and a site renamed or
+/// reached through a new helper would slip past it — which is why it carries
+/// the reason in its message rather than a bare number.
+///
+/// Since D183 step A it counts the event appenders in **two** classes, and
+/// the second one is pinned at one. That is the narrowness of step A made
+/// mechanical: the door that does not wait for the disk cannot acquire a
+/// second user without this test saying so.
 #[test]
 fn no_writer_of_a_record_or_an_event_was_added_without_the_oracle_seeing_it() {
     let source = include_str!("../store.rs");
@@ -621,5 +696,27 @@ fn no_writer_of_a_record_or_an_event_was_added_without_the_oracle_seeing_it() {
         "store.rs no longer has {EVENT_APPEND_SITES} event appenders. D103 binds every one \
          of them to the record write beside it; a new one has to be driven by the ordering \
          oracle above before this number moves."
+    );
+    assert_eq!(
+        source.matches("self.append_event_unsynced(").count(),
+        UNSYNCED_EVENT_APPEND_SITES,
+        "store.rs no longer has exactly {UNSYNCED_EVENT_APPEND_SITES} appender that does not \
+         wait for the disk. D183 authorises step A for `record_waiting`'s `waiting` line and \
+         for nothing else: a `waiting` reason is not a state transition (10 §1 F-1), is \
+         already permitted to disagree with the record (F-2), is never read on recovery \
+         (F-3) and is rewritten by the next dispatch pass (D171). None of that is true of a \
+         transition, a verdict or an attempt, so a second site here is a decision and not a \
+         refactor."
+    );
+    // The two doors together still account for every event line. Counted on
+    // the shared prefix, so an appender cannot be added under a third name
+    // that neither exact pattern above would catch.
+    assert_eq!(
+        source.matches("self.append_event").count(),
+        EVENT_APPEND_SITES + UNSYNCED_EVENT_APPEND_SITES,
+        "store.rs no longer has {} event appenders in total. Step A split them into a synced \
+         door and an unsynced one; it did not change how many there are, and a third door \
+         would be invisible to the two exact counts above.",
+        EVENT_APPEND_SITES + UNSYNCED_EVENT_APPEND_SITES
     );
 }

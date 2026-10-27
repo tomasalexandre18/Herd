@@ -21,9 +21,20 @@
 //! 1. `write_record` → `durable::write_file_with(job.json)`
 //!    (`durable.rs:35-57`): create `.job.json.tmp-<pid>-<n>`, write, **R**
 //!    `file.sync_all()`, `rename` onto `job.json`, **D** `sync_dir(parent)`.
-//! 2. `append_event` → `durable::append_line(events.jsonl)`
-//!    (`durable.rs:64-72`): one `write_all` of the line plus its terminator,
-//!    **E** `file.sync_data()`.
+//! 2. `append_event_unsynced` → `durable::append_line_unsynced(events.jsonl)`:
+//!    one `write_all` of the line plus its terminator, and **no** sync.
+//!
+//! **Step 2 said `append_event` → `durable::append_line`, with **E**
+//! `file.sync_data()`, until ORCH-083.** D183 step A dropped that sync for
+//! this one line. **The enumeration below is unchanged by it, and so are its
+//! 308 outcomes**, for the reason this file was built the way it was: the
+//! states are written byte for byte rather than crashed into existence, and
+//! every byte prefix of `events.jsonl` was already enumerated — including the
+//! two-line prefix a lost append leaves. Step A therefore adds no state and
+//! removes none; it moves probability within a set that was already complete,
+//! and it moves it toward `events.jsonl` being *behind* the record, which is
+//! the direction D103 permits. What would add a state is **step B**, and §4.1
+//! and §6 of `docs/remediation/13-crash-point-enumeration.md` say which four.
 //!
 //! A power cut at an arbitrary instant in that sequence leaves exactly three
 //! things to vary, and this file varies all three independently:
@@ -765,11 +776,18 @@ fn one_torn_record_takes_every_other_job_with_it() {
 /// ordering D103 forbids — and the hub opens, says nothing, and repairs
 /// nothing.
 ///
-/// Today this state is unreachable: `write_file_with`'s `sync_dir`
-/// (`durable.rs:56`) returns before `append_line` is issued, so the rename is
-/// on the platter before the event exists. **Dropping that directory `fsync`
-/// is what makes this state reachable**, which is why ORCH-084 is held behind
-/// this enumeration.
+/// Today this state is unreachable: `write_file_with`'s `sync_dir` returns
+/// before the event append is issued, so the rename is on the platter before
+/// the event exists. **Dropping that directory `fsync` is what makes this
+/// state reachable**, which is why ORCH-084 is held behind this enumeration.
+///
+/// **ORCH-083 did not make it reachable, and this is where that is said.**
+/// Step A dropped the sync on the *event* side, which is on the far side of
+/// the record's two returns: an event line that is never synced can be
+/// missing, and cannot be present ahead of a record that is not. The
+/// unreachability above rests on `sync_dir` returning, not on the event being
+/// synced, so it survives step A untouched — and this case stays an assertion
+/// about what step **B** would cost.
 #[test]
 #[ignore = "ORCH-080's enumeration; run with --ignored"]
 fn an_event_ahead_of_the_record_is_neither_seen_nor_repaired() {

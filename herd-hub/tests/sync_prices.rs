@@ -18,6 +18,14 @@
 //! | **D** | `sync_dir(parent)` after the rename | `durable.rs` `write_file_with` |
 //! | **E** | `file.sync_data()` on the appended event line | `durable.rs` `append_line` |
 //!
+//! **Since ORCH-083 the hub's own waiting write performs `RD-`, not `RDE`.**
+//! D183 step A dropped **E** for the `waiting` line, so `record_waiting` now
+//! goes through `durable::append_line_unsynced`; `durable::append_line` and
+//! its `sync_data()` still carry every **transition** line. The lattice below
+//! is a replica and is unchanged — all eight subsets are still timed, which
+//! is what lets this file price a step before it is taken — but the control
+//! row is now compared against `RD-` (`Syncs::STORE`).
+//!
 //! All eight subsets of `{R, D, E}` are timed over the same waiting write, so
 //! the marginal price of each sync is readable both on its own and in the
 //! presence of the others. `{R, D, E}` — every sync on — is the control: it
@@ -137,6 +145,19 @@ impl Syncs {
         record: true,
         dir: true,
         event: true,
+    };
+
+    /// Which of the three the hub's own `record_waiting` performs **today**.
+    ///
+    /// `RDE` until ORCH-083; **`RD-`** since — D183 step A dropped **E**, the
+    /// event `fdatasync`, for the `waiting` line alone, the record keeping
+    /// both of its syncs. Named here so the control below compares the
+    /// replica with the subset the store actually runs, instead of with a
+    /// figure someone remembers.
+    const STORE: Self = Self {
+        record: true,
+        dir: true,
+        event: false,
     };
 
     /// The eight subsets, in order of how many syncs they keep: the two poles
@@ -674,8 +695,14 @@ fn the_eight_subsets_of_one_waiting_write() {
         rows.push((syncs.code(), syncs.kept(), spread));
     }
 
-    // The control: the hub's own write path, on its own fresh corpus. It has
-    // all three syncs, so it must land on the `RDE` row.
+    // The control: the hub's own write path, on its own fresh corpus.
+    //
+    // **Since ORCH-083 (D183 step A) it keeps two syncs, not three**, so the
+    // row it must land on is `RD-` and no longer `RDE`. The replica is
+    // deliberately left with all eight subsets — the lattice is the
+    // measurement and dropping a column from it would make this file say less
+    // than it did — so the comparison below names the store's own subset
+    // rather than assuming it.
     let corpus = Corpus::build(count);
     corpus.warm();
     let store_samples: Vec<Duration> = corpus
@@ -701,7 +728,12 @@ fn the_eight_subsets_of_one_waiting_write() {
     for (code, kept, spread) in &rows {
         println!("  {code:<6} |  {kept}   | {}", spread.say());
     }
-    println!("  {:<6} |  3   | {}", "store", store.say());
+    println!(
+        "  {:<6} |  {}   | {}",
+        "store",
+        Syncs::STORE.kept(),
+        store.say()
+    );
 
     let median_of = |want: Syncs| {
         medians
@@ -715,9 +747,14 @@ fn the_eight_subsets_of_one_waiting_write() {
 
     println!("\n  -- the control --");
     println!(
-        "  RDE replica {} against the store's {}: the replica is the same experiment",
-        fmt(all),
+        "  {} replica {} against the store's {}: the replica is the same experiment",
+        Syncs::STORE.code(),
+        fmt(median_of(Syncs::STORE)),
         fmt(store.median)
+    );
+    println!(
+        "  RDE, which the store performed before ORCH-083: {}",
+        fmt(all)
     );
 
     println!("\n  -- each sync's marginal price, two ways --");
