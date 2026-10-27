@@ -14,7 +14,7 @@ the end.
 ## 1. What this settles, in four lines
 
 1. **One `fsync` on ext4/NVMe costs 989 µs**, not the tens-to-low-hundreds
-   of microseconds that was hoped for — five to fifty times above that
+   of microseconds that was hoped for — three to fifty times above that
    range, and only **1.2x** better than the 1.19 ms `08` derived on
    ZFS/SATA (1.3-1.7x better than this harness's own ZFS figures). The
    hypothesis this task was set to test is **refuted**.

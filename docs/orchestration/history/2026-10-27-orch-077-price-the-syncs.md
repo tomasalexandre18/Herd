@@ -64,11 +64,12 @@ of microseconds rather than the 1.19 ms `08` derived on ZFS/SATA, so
 keeping one sync may collect nearly the whole prize — is **refuted on both
 halves**:
 
-1. One `fsync` on ext4/NVMe is **989 µs**, five to fifty times above the
-   hoped range, and only **1.2x** better than the 1.19 ms `08` derived (and
-   1.3-1.7x better than this harness's own ZFS per-sync figures). The
-   class the deployment runs on is not an order of magnitude faster per
-   sync; it is a fifth to two thirds faster.
+1. One `fsync` on ext4/NVMe is **989 µs**, three to fifty times above the
+   hoped range — 3.3x the top of it, 49x the bottom — and only **1.2x**
+   better than the 1.19 ms `08` derived (1.3-1.7x better than this
+   harness's own ZFS per-sync figures). The class the deployment runs on
+   is not an order of magnitude faster per sync; it is a fifth to two
+   thirds faster.
 2. The three syncs are **additive, not redundant**. On ext4 the three
    marginals sum to 3.05 ms against a measured `RDE` of 3.00 ms, and the
    "alone" and "added last" columns agree within 11 %. So keeping one and
