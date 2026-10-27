@@ -190,6 +190,28 @@ check-orchestration: 141 passed, 0 failed
 check-orchestration exit=0
 ```
 
+**`check-orchestration.sh` was run six times in all and went red once:
+ORCH-111, not this batch.** Runs 1 and 3-6 gave `141 passed, 0 failed`;
+run 2 gave `140 passed, 1 failed`, on `PATH dropped the inherited
+entries`. Verbatim:
+
+```text
+ok    PATH puts dtach, the wrappers, the per-user profile and sw/bin in front
+FAIL  PATH dropped the inherited entries; the guard below needs coreutils
+    …/stateroot/claude/tools/dtach/bin:/run/wrappers/bin:/etc/profiles/per-user/server/bin:/run/current-system/sw/bin:/wrong/home/.local/bin:/run/wrappers/bin:/wrong/home/.nix-profile/bin:/nix/profile/bin:/wrong/home/.local/state/nix/profile/bin:/etc/profiles/per-user//bin:/nix/var/nix/profiles/default/bin:/run/current-system/sw/bin
+```
+
+The same shape as every previous sample: the **front four are correct**
+(`per-user/server/bin`), the inherited tail is **profile-derived with an
+empty user** (`per-user//bin`) and is not the launching shell's `$PATH`
+at all. The batch touches neither `scripts/check-orchestration.sh` nor
+`ops/agents/env.sh`, so it is again **not a regression**. 1 in 6 here,
+against the row's roughly 1 in 8. Recorded on ORCH-111's row; the
+mechanism I wrote there as a lead is consistent with it and still not
+proved by it. **CI runs this script in the `docs` job**
+(`.github/workflows/ci.yml:69`), so the job can go red on it for
+nothing.
+
 **837 passed, 0 failed**, summed over every `test result:` line. Host
 one-minute load 3.78 before the suite and 2.76 after, over 12 cores.
 Nothing was run in parallel with the suite and no second compile ran at
@@ -307,6 +329,9 @@ pushed.
   back inside E-21's 3 s. One target, bounded load, the log — not a
   suite run.
 - **ORCH-120** is Alexa's and blocks nothing.
+- **ORCH-111 has a sixth sample** and still no measurement of its
+  mechanism. Its next action is unchanged and does not need a rerun of
+  anything here.
 
 ## Processes
 
