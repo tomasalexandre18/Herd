@@ -2821,6 +2821,13 @@ fn raise_in_place(record: &mut JobRecord, to: Priority, at: Timestamp) -> Raise 
     Raise::Raised { from, to }
 }
 
+/// D103's ordering oracle: every writer above puts the record's two syncs on
+/// the disk before the first byte of the event beside it. Its own file,
+/// because it is a gate in front of ORCH-083 and ORCH-084 and not one more
+/// test of the store.
+#[cfg(test)]
+mod ordering_oracle;
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -21,6 +21,218 @@ use std::sync::atomic::{AtomicU64, Ordering};
 /// path never share one, however they are scheduled.
 static TEMPORARIES: AtomicU64 = AtomicU64::new(0);
 
+/// The observation point D103's ordering oracle watches from.
+///
+/// This module exists because counting syncs is not ordering them. `06` and
+/// `08` of the remediation dossier counted; neither could say that the
+/// record's `fsync` **and** its directory `fsync` had *returned* before the
+/// first byte of the event append was *issued*, which is the whole of what
+/// holds D103 on a decisive write (`docs/remediation/10-ordering-on-ext4.md`).
+///
+/// **In a product build `note` is an empty `#[inline(always)]` function and
+/// `Op` is a value that is constructed and dropped.** Nothing is allocated,
+/// no atomic is read and no lock is taken: the recording half is
+/// `#[cfg(test)]` and is not compiled into `herd-hub` at all. The calls
+/// themselves are in the real `write_file_with` and the real `append_line`,
+/// so what the oracle watches is the code path the hub runs and not a replica
+/// of it — which is the one thing a replica-based harness like
+/// `herd-hub/tests/sync_prices.rs` cannot claim.
+pub(crate) mod watch {
+    use super::Synced;
+
+    /// One durable operation of this module, named at the instant that
+    /// matters for ordering.
+    ///
+    /// Three of the five say a syscall has **returned**; `AppendIssued` says
+    /// one is about to be **issued**. That asymmetry is deliberate: D103's
+    /// requirement is about returns on one side and the issue on the other,
+    /// and an oracle that compared two returns would be a weaker statement.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub enum Op {
+        /// `sync_all` on the temporary that is about to become this path has
+        /// returned. The path carried is the **destination**, not the
+        /// temporary, because the destination is what a reader names.
+        TemporarySynced,
+        /// `rename` of that temporary over this path has returned: the record
+        /// is now visible, and not yet durably named.
+        Renamed,
+        /// `sync_dir` on this path's parent has returned: the rename itself
+        /// will survive the machine.
+        DirectorySynced,
+        /// The `write_all` of one appended line to this path is about to be
+        /// issued. Nothing of the line is on the file yet.
+        AppendIssued,
+        /// `sync_data` on that appended line has returned.
+        AppendSynced,
+    }
+
+    /// Say that a sync **returned**, holding the proof that it did.
+    ///
+    /// The `Synced` is the point of this signature. An observation point
+    /// that could be written beside a sync could also be left behind when
+    /// the sync is deleted, and then an oracle built on it would stay green
+    /// through exactly the change it exists to catch. [`Synced`] is produced
+    /// by nothing but the three functions that make the calls, so deleting a
+    /// sync deletes the only value that can be noted for it and the file
+    /// stops compiling until someone deletes the note too — at which point
+    /// the oracle goes red. The red run in
+    /// `docs/remediation/12-ordering-oracle.md` is that path walked once.
+    #[cfg(not(test))]
+    #[inline(always)]
+    pub fn returned(_op: Op, _path: &std::path::Path, _proof: &Synced) {}
+
+    /// Say that a write is about to be **issued**. There is nothing to prove
+    /// yet: that is what "issued" means.
+    #[cfg(not(test))]
+    #[inline(always)]
+    pub fn issuing(_op: Op, _path: &std::path::Path) {}
+
+    #[cfg(test)]
+    pub use recording::{armed, issuing, returned, Armed, Step};
+
+    #[cfg(test)]
+    mod recording {
+        use super::{Op, Synced};
+        use std::path::{Path, PathBuf};
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::{Mutex, MutexGuard, OnceLock};
+
+        /// One observed operation, with the path it was performed on.
+        #[derive(Clone, Debug)]
+        pub struct Step {
+            pub op: Op,
+            pub path: PathBuf,
+        }
+
+        /// Read before the lock, so that the thousands of durable writes the
+        /// rest of the suite performs while no oracle is armed pay one
+        /// relaxed load and nothing else.
+        static ARMED: AtomicBool = AtomicBool::new(false);
+
+        struct Watch {
+            root: PathBuf,
+            trace: Vec<Step>,
+        }
+
+        fn watch() -> &'static Mutex<Option<Watch>> {
+            static WATCH: OnceLock<Mutex<Option<Watch>>> = OnceLock::new();
+            WATCH.get_or_init(|| Mutex::new(None))
+        }
+
+        /// Only one oracle at a time, so that two armings cannot interleave
+        /// their traces. Held for as long as the [`Armed`] guard lives.
+        fn one_at_a_time() -> &'static Mutex<()> {
+            static GATE: OnceLock<Mutex<()>> = OnceLock::new();
+            GATE.get_or_init(|| Mutex::new(()))
+        }
+
+        /// Watch every durable operation under `root` until the guard is
+        /// dropped.
+        ///
+        /// `root` is a state root of this test's own, so the operations the
+        /// rest of the suite performs in parallel are filtered out by their
+        /// path and cannot appear in the trace.
+        pub fn armed(root: &Path) -> Armed {
+            let gate = one_at_a_time()
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            *watch()
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(Watch {
+                root: root.to_path_buf(),
+                trace: Vec::new(),
+            });
+            ARMED.store(true, Ordering::SeqCst);
+            Armed { _gate: gate }
+        }
+
+        /// The live watch. Dropping it stops the recording.
+        pub struct Armed {
+            _gate: MutexGuard<'static, ()>,
+        }
+
+        impl Armed {
+            /// Everything observed since the last `take`, and start again
+            /// from empty.
+            pub fn take(&self) -> Vec<Step> {
+                let mut held = watch()
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                match held.as_mut() {
+                    Some(watch) => std::mem::take(&mut watch.trace),
+                    None => Vec::new(),
+                }
+            }
+        }
+
+        impl Drop for Armed {
+            fn drop(&mut self) {
+                ARMED.store(false, Ordering::SeqCst);
+                *watch()
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
+            }
+        }
+
+        /// A sync returned, and here is what returned it.
+        pub fn returned(op: Op, path: &Path, _proof: &Synced) {
+            note(op, path);
+        }
+
+        /// A write is about to be issued.
+        pub fn issuing(op: Op, path: &Path) {
+            note(op, path);
+        }
+
+        fn note(op: Op, path: &Path) {
+            if !ARMED.load(Ordering::SeqCst) {
+                return;
+            }
+            let mut held = watch()
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let Some(watch) = held.as_mut() else {
+                return;
+            };
+            if !path.starts_with(&watch.root) {
+                return;
+            }
+            watch.trace.push(Step {
+                op,
+                path: path.to_path_buf(),
+            });
+        }
+    }
+}
+
+/// Proof that one `fsync`-class syscall **returned**.
+///
+/// Zero-sized, and produced by nothing but [`sync_all_of`], [`sync_data_of`]
+/// and [`sync_dir_of`], each of which makes the call before it hands one
+/// back. [`watch::returned`] takes one, so the note that says a sync
+/// happened cannot outlive the sync: delete the call and the note no longer
+/// compiles. That is what makes D103's ordering oracle a guard rather than a
+/// description — see `herd-hub/src/store/ordering_oracle.rs`.
+pub(crate) struct Synced(());
+
+/// `fsync` an open file's bytes and metadata.
+fn sync_all_of(file: &File) -> io::Result<Synced> {
+    file.sync_all()?;
+    Ok(Synced(()))
+}
+
+/// `fdatasync` an open file's data.
+fn sync_data_of(file: &File) -> io::Result<Synced> {
+    file.sync_data()?;
+    Ok(Synced(()))
+}
+
+/// [`sync_dir`], with the proof that it returned.
+fn sync_dir_of(path: &Path) -> io::Result<Synced> {
+    sync_dir(path)?;
+    Ok(Synced(()))
+}
+
 /// Replace `path` with `bytes`, atomically.
 pub fn write_file(path: &Path, bytes: &[u8]) -> io::Result<()> {
     write_file_with(path, |file| file.write_all(bytes))
@@ -43,9 +255,12 @@ pub fn write_file_with(
         fill(&mut file)?;
         // The bytes, before the name: a rename that beats its own contents to
         // the disk would publish an empty file.
-        file.sync_all()?;
+        let bytes = sync_all_of(&file)?;
+        watch::returned(watch::Op::TemporarySynced, path, &bytes);
         drop(file);
-        fs::rename(&temporary, path)
+        fs::rename(&temporary, path)?;
+        watch::issuing(watch::Op::Renamed, path);
+        Ok(())
     })();
     if written.is_err() {
         let _ = fs::remove_file(&temporary);
@@ -53,7 +268,9 @@ pub fn write_file_with(
     }
     // The name, too, has to survive: without this the rename itself can be
     // lost while the file's contents are safe.
-    sync_dir(parent)
+    let name = sync_dir_of(parent)?;
+    watch::returned(watch::Op::DirectorySynced, path, &name);
+    Ok(())
 }
 
 /// Append one line, as one write, and put it on the disk before returning.
@@ -67,8 +284,14 @@ pub fn append_line(path: &Path, line: &str) -> io::Result<()> {
     record.push_str(line);
     record.push('\n');
     let mut file = OpenOptions::new().create(true).append(true).open(path)?;
+    // The last instant before the first byte of this line is issued. The
+    // ordering oracle (`store::ordering_oracle`) reads this point against the
+    // record write that D103 requires to be complete before it.
+    watch::issuing(watch::Op::AppendIssued, path);
     file.write_all(record.as_bytes())?;
-    file.sync_data()
+    let line = sync_data_of(&file)?;
+    watch::returned(watch::Op::AppendSynced, path, &line);
+    Ok(())
 }
 
 /// Append bytes to a job's log, without waiting for the disk.
