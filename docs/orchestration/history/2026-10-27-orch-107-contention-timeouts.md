@@ -140,6 +140,32 @@ note: D170 is a gap in docs/decisions.md (held by an open PR, or lost); gaps sta
 docs ok
 ```
 
+**Correction 2026-10-27, by `herd-merger` at batch 4's integration:
+`check-docs.sh` is green at `f75b09d` and RED at `af280ef`, the commit
+that adds this handoff.** Verbatim on the branch as pushed:
+
+```
+docs/orchestration/history/2026-10-27-orch-107-contention-timeouts.md has lines over 79 columns:
+    …:194 (106 cols)  …:196 (93)  …:197 (102)  …:209 (96)  …:290 (135)
+docs check failed
+```
+
+The gate was run before the handoff was written, so the handoff itself
+was never gated — and what it caught is **ORCH-117's family**: the width
+pass exempts a table row only at column 1 (`check-docs.sh`,
+`/^\|/ { next }`), so the four-run table above, indented inside a
+numbered item, was width-checked like prose. Three layout changes were
+made at integration and **no figure and no word of the evidence was
+altered**: the four-run table is the same four runs as a list, the long
+test name sits on its own line, and the scratchpad path sits in a
+column-1 fence. Recorded on ORCH-117's row.
+
+**One figure in *Decisions needed* 1 is wrong:** CI's skip count is
+**14**, not 15 — run 40538722315, `main` at `3bcb018`, job `check`:
+`14 assertion(s) COULD NOT RUN`. It does not change the recommendation,
+which is stronger with 12 / 14 / 14 than with 12 / 14 / 15: the local
+figure moves with the load and still is not CI's.
+
 `./scripts/check-orchestration.sh`:
 
 ```
@@ -189,12 +215,17 @@ the better design, and the check went to 141 passed, 0 failed.
 1. **The prebuild explains less than the board hoped, and the reading is a
    negative one.** Four full suite runs under bounded induced load:
 
-   | run | condition | burners | peak 1-min load | result |
-   |---|---|---|---|---|
-   | B | binaries warm, raw `cargo test --workspace --no-fail-fast` | 6 | 9.62 | green, 837 passed, 3m20 |
-   | A | same tree, `./scripts/test.sh` | 6 | 11.27 | green, 837 passed, 3m55 |
-   | B2 | binaries absent, built **inside** the tests | 8 | 17.12 | green, 837 passed, 5m05 |
-   | A2 | binaries absent, `test.sh` builds them first | 8 | 18.15 | **1 failure**, 836 passed, 5m20 |
+   Each run: its condition, the CPU burners beside the suite, the peak
+   one-minute load, the result.
+
+   - **B** — binaries warm, 6 burners, peak 1-min load 9.62, raw
+     `cargo test --workspace --no-fail-fast`: green, 837 passed, 3m20.
+   - **A** — same tree, 6 burners, peak 1-min load 11.27,
+     `./scripts/test.sh`: green, 837 passed, 3m55.
+   - **B2** — binaries absent, built **inside** the tests, 8 burners,
+     peak 1-min load 17.12: green, 837 passed, 5m05.
+   - **A2** — binaries absent, `test.sh` builds them first, 8 burners,
+     peak 1-min load 18.15: **1 failure**, 836 passed, 5m20.
 
    **Zero `:649`/`:789` timeouts in all four**, including B2, which still
    built inside the tests at load 17. So on this evidence the in-test build
@@ -206,7 +237,8 @@ the better design, and the check went to 141 passed, 0 failed.
    evidence — it is a host with more concurrent suites than cores.
 
 2. **A different failure, and it may be the product's — ORCH-119.** Run A2,
-   at load 18.15, failed `announced_job_ceiling::a_job_refused_past_the_bound_ends_and_names_it`
+   at load 18.15, failed
+   `announced_job_ceiling::a_job_refused_past_the_bound_ends_and_names_it`
    at `announced_job_ceiling.rs:1179`: `holding: 2` expected, `holding: 1`
    read. The runner's websocket was reset without a closing handshake, the
    hub said `runner capped-runner is gone; an attempt it was running is lost
@@ -287,4 +319,7 @@ check listed none. `herd-runner` (PID 2213) and `herd-hub` (PID 3226), a day
 old, are the first consumer's own instance and were not touched (D161).
 
 Own `target/` removed once the branch was pushed:
-`/mnt/ssd_980/herd/claude/tmp/claude-1002/-mnt-ssd-980-herd-project/3ddf11ac-718a-4231-bc8d-45291a39ef82/scratchpad/orch-107/wt/target`
+
+```text
+/mnt/ssd_980/herd/claude/tmp/claude-1002/-mnt-ssd-980-herd-project/3ddf11ac-718a-4231-bc8d-45291a39ef82/scratchpad/orch-107/wt/target
+```

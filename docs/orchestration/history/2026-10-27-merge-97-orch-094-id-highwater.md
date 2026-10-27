@@ -190,6 +190,17 @@ building the binaries they drive. That is one observation and not a proof,
 but it points the same way as the trap ORCH-092's author hit, and it is a
 candidate explanation for part of ORCH-107 rather than a separate item.
 
+**Correction 2026-10-27, by `herd-merger` at batch 4's integration
+(ORCH-107): the candidate explanation is refuted.** The `real_herd`
+tests *did* spend part of their patience building, `--all-targets` or
+not: their own `cargo build --offline -p herd-hub -p herd-runner -p
+herdctl` resolves a narrower feature set (dev-dependencies unify
+features across a workspace) and still compiled for **9.70 s**
+immediately after `--all-targets`, against **0.06 s** after the
+identical command. `scripts/test.sh` now runs that identical command
+before any test starts. The observation above -- three targets red
+there, two here -- is unchanged; what it was attributed to is.
+
 **Skips (D27): at least 12**, all the cgroup-v2-delegation family of
 `herd-runner --test confinement`, each printed as a skip and none counted
 as a pass. A **floor, not a count** (D179): the run did not finish.
