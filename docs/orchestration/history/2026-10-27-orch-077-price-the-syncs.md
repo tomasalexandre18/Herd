@@ -7,7 +7,7 @@
 - **Worktree:** `…/scratchpad/orch-077/wt` (scratchpad
   `…/scratchpad/orch-077/work`); nothing written in
   `/mnt/ssd_980/herd-project`
-- **PR:** see "Resume point"
+- **PR:** [#90](https://github.com/tomasalexandre18/Herd/pull/90)
 
 ## Done
 
@@ -288,20 +288,11 @@ Fifth round, 2026-10-27 on `orch-077-price-the-syncs` at `69a34de`: only `slots.
 
 ## Resume point
 
-The branch is pushed; **no PR is open yet** — `gh` was not run from this
-agent. Next: open a PR against `main` from
-`.github/pull_request_template.md` with the figures above as Evidence,
-title `Price each fsync of record_waiting on both filesystems`:
-
-```sh
-cd <a checkout at orch-077-price-the-syncs>
-gh pr create --base main --head orch-077-price-the-syncs \
-  --title "Price each fsync of record_waiting on both filesystems" \
-  --body-file <the filled template>
-```
-
-Then `herd-merger` integrates on green CI under ORCH-001, adds the three
-board entries above, and files ORCH-078. **Do not merge from here.**
+**PR [#90](https://github.com/tomasalexandre18/Herd/pull/90) is open** against
+`main`, filled in from the template with the figures above as Evidence.
+Next: wait for CI `check` and `docs` to go green, then `herd-merger`
+integrates under ORCH-001, adds the three board entries above and files
+ORCH-078. **Do not merge from here.**
 
 To re-take any figure:
 
