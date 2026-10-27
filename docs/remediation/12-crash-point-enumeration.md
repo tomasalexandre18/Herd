@@ -133,9 +133,11 @@ sequence falls into one of these classes, because the reader's decision
 function has very little in it.
 
 1. **`recover` reads `job.json` and nothing else.** `events.jsonl` is read
-   only by `job_events` (`store.rs:2307`), on a query — `grep -n EVENTS_FILE
-   herd-hub/src/store.rs` gives `:1285` (the append) and `:2312` (that read)
-   and no third site (F). So the startup verdict is a function of the record
+   only by `job_events` (`store.rs:2307`), on a query. `grep -n
+   'join(EVENTS_FILE)' herd-hub/src/store.rs` gives `:1285` (the append),
+   `:2312` (that read) and two sites inside `mod tests`, which begins at
+   `:2825`; there is no third site in the module's own code (F). So the
+   startup verdict is a function of the record
    alone, and the table in §3 has to be read down the `job.json` column.
 2. **`job_events`' per-line decision is one test**, `line.ends_with('\n')`
    (`store.rs:2318`). Two prefixes ending strictly inside the *same* line are
