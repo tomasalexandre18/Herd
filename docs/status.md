@@ -67,10 +67,10 @@ silence of the one before it. No version moves for any of them. **Not on
 `main`:** PR #85 (ORCH-064, C5 part 3), which adds two additive
 `herd-proto` fields — a runner's own ceiling and a free refusal (E-21).
 
-`docs/remediation/` holds ten pieces: the baseline, audits A and B, their
-contradictory review, two experiments and the review of them, `06` (a
-junction in five posts), `07` (target architecture, recommended and
-**not** adopted), `08` (the unsynced-write cost).
+`docs/remediation/` holds eleven pieces: the baseline, audits A and B,
+their contradictory review, two experiments and the review of them, `06`
+(a junction in five posts), `07` (target architecture, recommended and
+**not** adopted), `08` (unsynced-write cost), `11` (each `fsync` priced).
 
 ## What the software still does not do
 
