@@ -6,9 +6,9 @@
 # is never modified. No toolchain needed.
 #
 # Cost: each expect_red/expect_green runs check-docs.sh over a fresh full
-# copy of the real repository -- 26 whole-corpus runs as this file stands.
+# copy of the real repository -- 32 whole-corpus runs as this file stands.
 # That multiplier is the constraint on anyone adding an all-docs rule to
-# check-docs.sh: a rule linear in the corpus is paid 26 times here, and the
+# check-docs.sh: a rule linear in the corpus is paid 32 times here, and the
 # `docs` CI job is capped at 5 minutes. Adding a case here costs one more
 # run of every rule. The fixtures are deliberately not trimmed: a control
 # measured on a toy corpus is not known to work on the real one.
@@ -103,6 +103,32 @@ fresh; { printf "$em%.0s" $(seq 1 80); echo; } >> "$W"
 expect_red "an 80-character line of 3-byte characters is over the limit" 'workflow.md has lines over 79'
 fresh; { printf "$goat%.0s" $(seq 1 79); echo; } >> "$W"
 expect_green "a 79-character line of 4-byte characters (316 bytes) is within the limit"
+# Fenced code and table rows are exempt, and each exemption has its own
+# cases below because nothing above told today's anchors from loosened
+# ones: a herd-reviewer pass (ORCH-117, 2026-10-27) loosened each in turn
+# and this harness stayed byte-identical to its control over six runs.
+# Only outright removal of an exemption was caught, incidentally, by the
+# 85-character case. The five cases pin both directions: the exemption
+# exists at all (3, 4), it applies at any indent (1, 2 -- the defect
+# ORCH-117 names, red before the anchor moved), and it does not close a
+# fence early (5), which is the regression a naive `fence = !fence` at
+# any indent causes. Known limit, no case: a fence opened with a tab and
+# closed with spaces does not pair, because the indent is counted in
+# characters; no such fence exists in the corpus.
+wide=$(printf 'y%.0s' $(seq 1 100))
+fresh; printf '\n1. An item with its evidence:\n\n   ```text\n   %s\n   ```\n' "$wide" >> "$W"
+expect_green "an indented fenced block exempts its over-long content"
+fresh; printf '\n2. An item with its table:\n\n   | %s | %s |\n' "$wide" "$wide" >> "$W"
+expect_green "an indented table row is exempt, as one at column 1 is"
+fresh; { printf '\n```text\n'; printf 'z%.0s' $(seq 1 1600); printf '\n```\n'; } >> "$W"
+expect_green "a fence at column 1 exempts a 1600-character line"
+fresh; printf '\n| %s | %s |\n' "$wide" "$wide" >> "$W"
+expect_green "a table row at column 1 is exempt over 79 columns"
+# Exactly one indented fence marker inside the outer block, deliberately
+# unpaired: a plain toggle survives an even number of them, so an even
+# fixture would pass under the naive patch too and assert nothing.
+fresh; printf '\n```markdown\n   ```text\n%s\n```\n' "$wide" >> "$W"
+expect_green 'an indented ``` inside a fence at column 1 does not close it'
 fresh; chmod -x "$tmp/repo/.claude/hooks/orchestrator-guard.sh"
 expect_red "hook not executable" 'not executable'
 fresh; printf '{ not json' > "$tmp/repo/.claude/settings.json"

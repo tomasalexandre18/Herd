@@ -27,10 +27,16 @@ What is technically enforced and what is only written is in
    The brief names the base commit, the worktree, the write paths, the
    files to read in order, the gates to run and the stop condition.
 4. **Execute.** `herd-step` works in `.claude/worktrees/<task>/` or a
-   scratchpad subdirectory on branch `<task>`, pushes the branch, and
-   ends with a handoff from `templates/handoff.md` saved as
-   `docs/orchestration/history/<date>-<task>.md` on that branch. It
-   **opens no pull request**: the branch and the handoff are the delivery.
+   scratchpad subdirectory on branch `<task>` and ends with a handoff
+   from `templates/handoff.md` saved as
+   `docs/orchestration/history/<date>-<task>.md` on that branch. **The
+   docs gate is the last thing run** — after the handoff is committed,
+   before the push — and the output quoted in the handoff is that run's:
+   a handoff is itself a docs file, so a gate run before it was written
+   tested a different tree, and under one PR per batch one ungated
+   handoff reddens the whole batch's PR, where it blocks every other
+   branch in it. **Then** the branch is pushed. It **opens no pull
+   request**: the branch and the handoff are the delivery.
 5. **Verify.** The orchestrator reads the diff, the gate output and the
    handoff. It reruns a read-only check when a claim matters. It never
    fixes what it finds; it sends it back or opens a new task.
