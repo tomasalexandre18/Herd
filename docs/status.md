@@ -16,7 +16,7 @@ queue that no longer writes a non-event per queued job per pass (D171);
 v0.3.6 carried the bounded reading (D169). v0.3.4 onward are published
 (D162); a **`v*.*.*-dev*` tag** publishes a pre-release (D172).
 
-**`main` is 137 commits past v0.3.7** counted on PR #85's head, and the
+**`main` is 219 commits past v0.3.7** counted on PR #102's head, and the
 workspace version still reads `0.3.7`. Nothing merged since the tag has
 shipped. `PROTOCOL_VERSION` is **2** and `RECORD_VERSION` **1**.
 
@@ -27,7 +27,7 @@ reaches us as a report. Each figure below carries the date it reached us.
 
 - **Versions, reported 2026-10-24:** their nightly ran on **0.3.5**
   (D169), then **0.3.6** with a full pass (D171). **Whether v0.3.7
-  reached them is not recorded here.**
+  reached them is not recorded.**
 - **Disk:** about **90 GB across 1 571 jobs** against D152's 200 GB
   budget, nothing ever evicted (read 2026-10-23). **125 runner spools
   holding 65 GB**, under seven days old (2026-10-26); a runner now
@@ -48,17 +48,16 @@ reaches us as a report. Each figure below carries the date it reached us.
 M1-M11, M15 and M16; protocol version 2; a job may return 1 GiB by
 default (`confine.rs:82`). **A skip count is per host** (D27, ORCH-070):
 **12** here, **15** on CI; D151's 13 is not reproducible (`05` §6).
-**D179**: an incomplete run reports its skips as unknown, a floor.
+**D179**: an incomplete run reports its skips as a floor, not a count.
 
-**The suite is red here, and it is two host rows, not one.** **ORCH-069**
-is `slots.rs:744` alone — a figure derived from this host's live
-`MemTotal`, as is `admission.rs:419`, which its row does not name. CI
-does **not** settle it: `MemTotal` there is 15983 MiB, under the guard's
-17408, so CI *skips* it and a skip is never a pass (D27). **ORCH-107** is
-the rest and most of it — the real-hub tests **time out** at
-`real_herd/mod.rs:649`/`:789` rather than assert anything wrong.
+**The suite is green here for the first time: 836 passed, 0 failed, 12
+skipped** (PR #102). **ORCH-069 is done**: two assertions declared a lend
+larger than the cgroup enclosing the runner leaves free, so it was clamped
+(D119) and the hub's sentences carried it; both fixtures now declare 2 GiB
+and `slots.rs` skips nowhere. **ORCH-107** is what is left: under several
+heavy agents the real-hub tests **time out**, asserting nothing wrong.
 
-**Ten changes are in no release.** Eight defects — **D175** a file whose
+**Eleven changes are in no release.** Eight defects — **D175** a file whose
 bytes did not hash to its digest exited 0; **D176** a verdict could name
 a commit the tree was never at; **D177** a live-job map keyed by job id
 let a second attempt replace the first; **D178** the watchdog judged an
@@ -67,12 +66,13 @@ holds and announces its own ceiling, and a refusal there spends none of
 its goes; **ORCH-094** the hub re-minted ids once anything removed a
 record. Two new behaviours: **D184** `SIGTERM` stops the hub instead of
 killing it, bounded at five seconds and non-zero on an overrun; and
-**ORCH-092**, a runner sweeps its output spool at startup.
+**ORCH-092**, a runner sweeps its output spool at startup. One cost cut,
+**D183 step A** (ORCH-083): the `waiting` event line alone is unsynced,
+one of thirteen, the record still fully synced, 3.10 ms → 2.10 ms.
 
 `docs/remediation/` holds fifteen pieces: the baseline, audits A and B,
-their review, two experiments and their review, `06` (a junction), `07`
-(architecture, **adopted by D183**), `08`, `09` (C5), `10` (order on
-ext4), `11` (`fsync` prices), `12` (the oracle), `13` (308 crash points).
+their review, two experiments and their review, and `06`-`13`: junction,
+architecture (**D183**), C5, ext4 order, prices, oracle, 308 crash points.
 
 ## What the software still does not do
 
