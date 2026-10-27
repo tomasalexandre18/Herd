@@ -279,16 +279,16 @@ experiment rather than by assertion:
    there too and *worse* — four tests rather than two, the set drifting with
    free memory.
 
-   ```text
-   # worktree at cd59ef5, nothing from this branch
-   $ nix develop --command cargo test -p herd-hub --test admission -- --test-threads 1
-   failures:
-       a_killed_hub_reads_the_reservations_back_off_the_records
-       a_refusal_carries_the_free_figure_and_the_needed_figure
-       a_starved_reservation_waits_then_starts_and_leaks_nothing
-       the_load_is_on_the_placement_line_and_stops_nothing
-   test result: FAILED. 1 passed; 4 failed; 0 ignored; 0 measured; 0 filtered out; finished in 139.56s
-   ```
+```text
+# worktree at cd59ef5, nothing from this branch
+$ nix develop --command cargo test -p herd-hub --test admission -- --test-threads 1
+failures:
+    a_killed_hub_reads_the_reservations_back_off_the_records
+    a_refusal_carries_the_free_figure_and_the_needed_figure
+    a_starved_reservation_waits_then_starts_and_leaks_nothing
+    the_load_is_on_the_placement_line_and_stops_nothing
+test result: FAILED. 1 passed; 4 failed; 0 ignored; 0 measured; 0 filtered out; finished in 139.56s
+```
 
 2. **Host contention, at `real_herd/mod.rs:649`.** That line is
    `herdctl … never came back` — the harness's 30 s `PATIENCE` on one
@@ -300,23 +300,24 @@ experiment rather than by assertion:
    defect. Run individually under the same load, the four tests that matter
    to this change are all green:
 
-   ```text
-   $ nix develop --command cargo test -p herd-hub --test killed_hub <name> -- --test-threads 1
-   --- a_hub_asked_to_stop_mid_job_loses_nothing
-   test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 17 filtered out; finished in 20.98s
-   --- a_connection_that_served_starts_the_redial_counters_over
-   test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 17 filtered out; finished in 12.28s
-   --- a_health_cadence_of_zero_is_refused_on_both_sides
-   test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 17 filtered out; finished in 10.59s
-   --- a_busy_runner_asked_to_stop_is_gone_in_five_seconds
-   test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 17 filtered out; finished in 11.16s
-   ```
+```text
+$ nix develop --command cargo test -p herd-hub --test killed_hub <name> -- --test-threads 1
+--- a_hub_asked_to_stop_mid_job_loses_nothing
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 17 filtered out; finished in 20.98s
+--- a_connection_that_served_starts_the_redial_counters_over
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 17 filtered out; finished in 12.28s
+--- a_health_cadence_of_zero_is_refused_on_both_sides
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 17 filtered out; finished in 10.59s
+--- a_busy_runner_asked_to_stop_is_gone_in_five_seconds
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 17 filtered out; finished in 11.16s
+```
 
    The first two are the ones this change could plausibly have broken:
    `a_hub_asked_to_stop_mid_job_loses_nothing` sends the very `SIGTERM` this
-   PR reinterprets, and `a_connection_that_served_starts_the_redial_counters_over`
-   is D104's — the one that cares which branch a runner takes on an ending
-   link. Both green.
+   PR reinterprets, and
+   `a_connection_that_served_starts_the_redial_counters_over` is D104's —
+   the one that cares which branch a runner takes on an ending link. Both
+   green.
 
 The new tests, run three times in a row under the same load:
 
