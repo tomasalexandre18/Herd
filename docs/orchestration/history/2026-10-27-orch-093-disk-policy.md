@@ -3,8 +3,8 @@
 - **Item:** ORCH-093
 - **Agent:** herd-planner
 - **Branch / commit:** `orch-093-disk-policy` / see the PR, based on
-  origin/main `cd59ef5`
-- **PR:** see below
+  origin/main `cd59ef5` (branch head `7785623` plus this line)
+- **PR:** #94
 
 ## Done
 
