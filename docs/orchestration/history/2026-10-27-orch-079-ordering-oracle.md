@@ -2,8 +2,10 @@
 
 - **Item:** ORCH-079
 - **Agent:** herd-step
-- **Branch / commit:** `orch-079-ordering-oracle` / `be8ba2b`, based on
-  origin/main `cd59ef5`
+- **Branch:** `orch-079-ordering-oracle`, written on origin/main `cd59ef5`
+  and then **merged up to** origin/main `2ca6dc7` (PR #85 landed mid-task),
+  which is where the gates below were last run. Not rebased: `CLAUDE.md`
+  says never force-push, and a rebase of a pushed branch needs one
 - **PR:** #95
 
 ## Done

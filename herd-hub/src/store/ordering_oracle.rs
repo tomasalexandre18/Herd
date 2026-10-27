@@ -527,7 +527,12 @@ fn every_transition_fsyncs_the_record_and_its_directory_before_appending_its_eve
         &[Part::Record, Part::Event],
         || {
             store
-                .end_attempt(&id, attempt, "the runner said so", None)
+                .end_attempt(
+                    &id,
+                    attempt,
+                    "the runner went away",
+                    crate::job::HowItEnded::TheRunnerWentAway,
+                )
                 .expect("ended");
         },
     );

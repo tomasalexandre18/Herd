@@ -1,7 +1,10 @@
 # 12 — D103's ordering oracle, and the proof that it can go red
 
-**Item:** ORCH-079. **Base:** `origin/main` at `cd59ef5`. **Branch:**
-`orch-079-ordering-oracle`. **Date:** 2026-10-27.
+**Item:** ORCH-079. **Base:** `origin/main` at `cd59ef5`, where the oracle
+was written and every run in §5 and §6 was made. `origin/main` moved to
+`2ca6dc7` (PR #85) while this was being written; the branch is merged up to
+it and the gates re-run there. **Branch:** `orch-079-ordering-oracle`.
+**Date:** 2026-10-27.
 
 **Which kind of piece this is: neither a constat nor a mesure.** It is a
 **gate**. `06` and `08` *counted* the hub's `fsync`s; neither *ordered*

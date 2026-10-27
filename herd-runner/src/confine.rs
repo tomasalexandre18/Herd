@@ -189,6 +189,129 @@ impl Confinement {
     }
 }
 
+/// How many jobs this runner holds at once, and the sentence that says why.
+///
+/// **Derived from what this machine itself declared, and from nothing the hub
+/// says.** Invariant 2's first half — *a runner never destabilizes its host* —
+/// was until now defended only by the hub's arithmetic: `take_job` refused for
+/// a drain and for the owner's switch and for no count at all, so a hub that
+/// was wrong, of another build, or not a hub at all sent 250 assignments and
+/// got 250 jobs (`herd-hub/tests/fake_hub_flood.rs`). A machine's own bound
+/// has to be held on the machine.
+///
+/// The arithmetic is the one invariant 2 is actually about: every job here
+/// runs under the same kernel memory ceiling ([`Confinement::memory_max`], one
+/// figure for every job and not a per-job negotiation), so N jobs permit N
+/// times that much, and the bound is how many of them fit in the memory this
+/// host says it lends after the floor it says it keeps. At 2 GiB a job, a
+/// 31 GiB server keeping 6 GiB for itself holds 12; the owner's 17 GiB PC
+/// keeping 3 GiB holds 6.
+///
+/// It is a **worst case**, deliberately: the cap is what a job is permitted,
+/// not what it takes, and a bound set on what jobs usually take is a bound
+/// that is not there on the day they do not.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct JobsAtOnce {
+    most: usize,
+    why: String,
+}
+
+impl JobsAtOnce {
+    /// The most jobs this runner starts at once.
+    pub fn most(&self) -> usize {
+        self.most
+    }
+
+    /// How that figure was arrived at, in the words both the startup report
+    /// and the refusal the hub is sent quote.
+    pub fn why(&self) -> &str {
+        &self.why
+    }
+}
+
+/// What a machine that will not say how big it is holds at once.
+///
+/// One. Not a guess at a larger number: the figure exists to bound a host
+/// nobody can do arithmetic about, and the only count that is certainly safe
+/// on a machine of unknown size is the one invariant 2 would allow on the
+/// smallest machine there is. Its owner lifts it by saying how much the
+/// machine lends (`--host-memory`), which is the same sentence the hub
+/// already needs before it will place anything that costs memory there.
+pub const JOBS_AT_ONCE_WHEN_A_HOST_WILL_NOT_SAY: usize = 1;
+
+/// The clause that marks a sentence as **this runner's own ceiling**, and the
+/// one thing that tells a runner-origin refusal apart from the hub's.
+///
+/// Attribution, not decoration. A refusal for this ceiling travels verbatim:
+/// [`JobsAtOnce::why`] goes into `ToHub::AttemptAbandoned`'s `reason`, and
+/// `end_attempt` writes it unchanged into the record's `attempt_ended` line.
+/// Whoever reads that record later — an operator, or
+/// `herd-hub/tests/announced_job_ceiling.rs`'s oracle — has nothing but the
+/// words to decide whether the attempt was spent on the runner's ceiling or
+/// on a timeout, a cancel or a runner that went away.
+///
+/// The hub has a ceiling sentence of its own,
+/// `herd_hub::matcher::A_CEILING_THE_RUNNER_ANNOUNCED` — *"it said it holds
+/// at most N at once"* — which it writes on a `waiting` line when it holds a
+/// job back. The two used to share the words *"holds at most"*, so a test
+/// matching on that substring could not say which side had spoken. **Neither
+/// of these two clauses is a substring of the other, and neither sentence
+/// contains the other's clause**, which is what makes the attribution
+/// decidable; `herd-hub/tests/announced_job_ceiling.rs` asserts it against
+/// both real sentences rather than trusting this paragraph.
+///
+/// Every branch of [`jobs_at_once`] carries it, the silent host included: a
+/// runner that refuses because it will not say how big it is is refusing for
+/// its ceiling exactly as much as one that did the arithmetic.
+pub const A_RUNNERS_OWN_CEILING: &str = "this runner holds at most";
+
+/// How many jobs a runner of this size, capping every job at `memory_max`,
+/// holds at once.
+///
+/// The floor is the host's own when it names one and
+/// [`herd_proto::default_memory_floor_mib`] when it does not — the same
+/// default the runner binary fills in before it dials, so the figure a runner
+/// enforces is the figure it announced. A host that will not say how much
+/// memory it lends gets [`JOBS_AT_ONCE_WHEN_A_HOST_WILL_NOT_SAY`], because an
+/// unreadable figure is not read as plenty (D23's rule) any more than it is
+/// read as zero.
+///
+/// Never zero: [`Confined::prepare`] already refuses a memory ceiling that
+/// would refuse every job, on the ground that invariant 2 asks for a cap and
+/// not for a wall, and a count of zero is that same wall one level up. A
+/// machine too small to hold one job at its own ceiling holds one anyway, and
+/// the sentence says what the arithmetic was.
+pub fn jobs_at_once(host: &herd_proto::HostSize, memory_max: u64) -> JobsAtOnce {
+    let per_job_mib = (memory_max / (1 << 20)).max(1);
+    let Some(lent) = host.memory_mib else {
+        return JobsAtOnce {
+            most: JOBS_AT_ONCE_WHEN_A_HOST_WILL_NOT_SAY,
+            why: format!(
+                "this machine does not say how much memory it lends, so how many jobs of {} \
+                 fit on it cannot be derived: {A_RUNNERS_OWN_CEILING} \
+                 {JOBS_AT_ONCE_WHEN_A_HOST_WILL_NOT_SAY} job(s) at once until --host-memory \
+                 says otherwise",
+                show_bytes(memory_max)
+            ),
+        };
+    };
+    let floor = host
+        .memory_floor_mib
+        .unwrap_or_else(|| herd_proto::default_memory_floor_mib(lent));
+    let admissible = lent.saturating_sub(floor);
+    let most = usize::try_from((admissible / per_job_mib).max(1)).unwrap_or(usize::MAX);
+    JobsAtOnce {
+        most,
+        why: format!(
+            "this machine lends {} and keeps {} as its own floor, and caps every job at {}, \
+             so {A_RUNNERS_OWN_CEILING} {most} job(s) at once",
+            herd_proto::size_mib(lent),
+            herd_proto::size_mib(floor),
+            show_bytes(memory_max)
+        ),
+    }
+}
+
 /// A confinement that has been checked against this host: the data root is
 /// usable, this process is unprivileged, the helper list is well formed, and
 /// the memory ceiling is either a cgroup subtree or a named fallback.
@@ -374,7 +497,8 @@ impl Confined {
         // somebody changing a scheduler by hand.
         let io_weight_reach = crate::blockio::io_weight_reach(root.path());
         // Before the first job and before the hub: a runner that was killed
-        // left processes, cgroups and workspaces nothing else will collect.
+        // left processes, cgroups, workspaces and output spools nothing else
+        // will collect.
         let reclaimed = reclaim_a_past_life(&root, &ceiling);
         Ok(Self {
             root,
@@ -801,6 +925,77 @@ pub fn kill_process_group(_pid: u32) {}
 mod tests {
     use super::*;
     use crate::testing::TempDir;
+    use herd_proto::HostSize;
+
+    // ------------------- how many jobs this machine holds at once ---------
+
+    /// The two machines the first consumer actually has, at the shipped
+    /// per-job ceiling. 31 GiB less a 6 GiB floor is 25 GiB, which is twelve
+    /// jobs of 2 GiB; 17 GiB less 3 GiB is 14 GiB, which is seven.
+    #[test]
+    fn the_ceiling_is_how_many_per_job_caps_fit_in_what_the_host_lends() {
+        let server = HostSize::new(Some(31 * 1024), Some(12)).with_floor(Some(6 * 1024));
+        assert_eq!(jobs_at_once(&server, DEFAULT_MEMORY_MAX).most(), 12);
+        let pc = HostSize::new(Some(17 * 1024), Some(8)).with_floor(Some(3 * 1024));
+        assert_eq!(jobs_at_once(&pc, DEFAULT_MEMORY_MAX).most(), 7);
+    }
+
+    /// A host that names no floor is not a host with no floor: the figure
+    /// the runner binary would have filled in is the figure the arithmetic
+    /// uses, so what a runner enforces is what it announces.
+    #[test]
+    fn a_host_that_names_no_floor_keeps_the_default_one_back() {
+        let silent = HostSize::new(Some(31 * 1024), Some(12));
+        let named = HostSize::new(Some(31 * 1024), Some(12))
+            .with_floor(Some(herd_proto::default_memory_floor_mib(31 * 1024)));
+        assert_eq!(
+            jobs_at_once(&silent, DEFAULT_MEMORY_MAX),
+            jobs_at_once(&named, DEFAULT_MEMORY_MAX)
+        );
+    }
+
+    /// D23's rule, applied to a count: a figure that cannot be read is not
+    /// read as plenty. A machine that will not say how big it is runs one job
+    /// at a time and the sentence says what would lift it.
+    #[test]
+    fn a_host_that_will_not_say_how_big_it_is_holds_one_job() {
+        let silent = HostSize::default();
+        let ceiling = jobs_at_once(&silent, DEFAULT_MEMORY_MAX);
+        assert_eq!(ceiling.most(), JOBS_AT_ONCE_WHEN_A_HOST_WILL_NOT_SAY);
+        assert!(
+            ceiling.why().contains("--host-memory"),
+            "the sentence has to name the flag that lifts it: {}",
+            ceiling.why()
+        );
+    }
+
+    /// Invariant 2 asks for a cap, not for a wall — the sentence
+    /// [`Confined::prepare`] refuses a zero memory ceiling with. A machine
+    /// too small to hold one job at its own ceiling holds one anyway.
+    #[test]
+    fn a_machine_too_small_for_one_job_still_holds_one() {
+        let tiny = HostSize::new(Some(2048), Some(2)).with_floor(Some(2048));
+        assert_eq!(jobs_at_once(&tiny, DEFAULT_MEMORY_MAX).most(), 1);
+        let inverted = HostSize::new(Some(1024), Some(1)).with_floor(Some(8192));
+        assert_eq!(
+            jobs_at_once(&inverted, DEFAULT_MEMORY_MAX).most(),
+            1,
+            "a floor past the memory lent must not wrap round"
+        );
+    }
+
+    /// The owner's three knobs are the whole of the control surface: a
+    /// smaller per-job cap on the same machine holds proportionally more.
+    #[test]
+    fn a_smaller_per_job_cap_holds_more_of_them() {
+        let host = HostSize::new(Some(31 * 1024), Some(12)).with_floor(Some(6 * 1024));
+        assert_eq!(jobs_at_once(&host, 512 << 20).most(), 50);
+        assert!(
+            jobs_at_once(&host, 512 << 20).why().contains("512 MiB"),
+            "the sentence quotes the cap it divided by: {}",
+            jobs_at_once(&host, 512 << 20).why()
+        );
+    }
 
     #[test]
     fn a_prepared_confinement_reports_its_caps_and_its_root() {
