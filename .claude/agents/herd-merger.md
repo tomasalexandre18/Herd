@@ -38,7 +38,11 @@ Steps, in order, each one evidenced in the handoff:
 5. Update `docs/orchestration/board.md` (item state, not-done, blocks)
    and, when the state of the project changed, `docs/status.md` (≤ 90
    lines, state not journal). Check that every branch of the batch left
-   its handoff in `docs/orchestration/history/`.
+   its handoff in `docs/orchestration/history/`. Then run the board
+   check both ways — every branch's own `board.md` line verbatim in the
+   merged file, and the merged file differing from each branch only by
+   the other branches' hunks: workflow.md, *One PR per batch of
+   branches*, says why a batch with no conflict needs it most.
 6. Push the integration branch and open **one** PR for the batch from
    `.github/pull_request_template.md`: *Branches in this batch* lists
    every branch with its `ORCH-nnn` and handoff, and the Evidence block

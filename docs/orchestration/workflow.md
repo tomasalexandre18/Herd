@@ -79,6 +79,16 @@ nobody re-adopts them by drift.
 - The batch PR's Evidence block carries **each branch's own evidence
   separately**. A batch is not permission for one blurred summary: a
   reader must still see what each change proved on its own.
+- **The merged board is read line by line, not only for conflicts.**
+  Required of `herd-merger`: once the batch is merged, take the exact
+  line each branch wrote into `board.md` and require it **verbatim** in
+  the merged file; then check the other direction — the merged board
+  differs from each branch's version only by the other branches' own
+  hunks. Batch 3 had **no conflict at all**: three branches wrote more
+  than three lines apart, so git merged every hunk without asking. Its
+  danger was therefore not a hurried conflict resolution but a board
+  merge nobody had to read, and a silent revert with nothing to resolve
+  is caught by this check and by nothing else. It takes a minute.
 - Superseded single PRs, if any were already open, are closed naming the
   batch PR; their branches stay.
 
