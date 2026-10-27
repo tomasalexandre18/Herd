@@ -145,6 +145,33 @@ count** because the run did not finish (D179):
   machine. The board now names ORCH-069 as `slots.rs:744` **alone**, and
   that is one site short.
 
+**The base run, means (2), at `origin/main` `c831d55` in this same
+worktree** — the three targets that failed, run there alone:
+
+```text
+$ nix develop --command cargo test -p herd-hub --test admission -- --test-threads 1
+thread 'a_killed_hub_reads_the_reservations_back_off_the_records' panicked at herd-hub/tests/admission.rs:419:5
+test result: FAILED. 4 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 17.17s
+
+$ nix develop --command cargo test --no-fail-fast -p herd-hub --test killed_hub --test slots -- --test-threads 1
+test result: ok. 18 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 45.73s   (killed_hub)
+thread 'the_derived_j_is_recorded_and_is_what_the_job_is_given' panicked at herd-hub/tests/slots.rs:744:9
+test result: FAILED. 7 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 7.13s (slots)
+```
+
+`admission` and `slots` fail **identically on the base**, so neither is
+this branch's. `killed_hub` passes **18/18 on the base alone**, and it
+also passes 18/18 on this branch's head when run alone:
+
+```text
+$ nix develop --command cargo test -p herd-hub --test killed_hub -- --test-threads 1
+test result: ok. 18 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 48.72s
+(exit 0)
+```
+
+It fails only inside the whole suite, with the `real_herd/mod.rs:649`
+timeout and no wrong value. That is ORCH-107 and not this branch.
+
 ## Decisions needed
 
 None for this PR.
