@@ -171,7 +171,6 @@ enum Written {
 /// and saying so is the point.
 fn check_the_rule(what: &str, trace: &[Step], records_expected: bool) {
     let mut written: HashMap<PathBuf, Written> = HashMap::new();
-    let mut events = 0usize;
     for (index, step) in trace.iter().enumerate() {
         let Some(name) = step.path.file_name().and_then(|name| name.to_str()) else {
             continue;
@@ -210,7 +209,6 @@ fn check_the_rule(what: &str, trace: &[Step], records_expected: bool) {
                 *at = Written::Durable;
             }
             (Op::AppendIssued, EVENTS_FILE) => {
-                events += 1;
                 if !records_expected {
                     continue;
                 }
@@ -247,7 +245,6 @@ fn check_the_rule(what: &str, trace: &[Step], records_expected: bool) {
             path.display()
         );
     }
-    let _ = events;
 }
 
 /// A trace, one operation per line, for a failure message.
