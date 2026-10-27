@@ -579,6 +579,20 @@ records expire it is not:
 becomes removable.** `[P]` This is the first task of M12's retention, not
 part of it. ORCH-094.
 
+**Added at this document's integration by `herd-merger`, and not
+reviewed with the rest of it. The diagnosis above stands; §7's proposed
+placement does not.** The mark was implemented on
+`orch-094-id-highwater`, PR #97, as `ids_minted` in **`store.json`**
+beside `state_root_id` — not in `IndexFile`. The reason is evidence and
+not taste: `index/state.json` is *derived*, and every path in
+`usable_index` that doubts it throws it away and re-reads the records.
+That is right for a summary the directories can rebuild and fatal for a
+number nothing on disk can reconstruct once those directories are gone.
+`store.json` is the root's authoritative file, already refuses the start
+when unreadable, and its neighbouring field answers the companion
+question: `state_root_id` says *which* root a `j…` belongs to, and the
+mark says that one root never hands the same `j…` out twice.
+
 ---
 
 ## 4. Hypotheses, and what would refute each
@@ -669,7 +683,7 @@ and keep the order.
 | ID | Item | Origin | Owner | State | Next action | Depends on | Evidence |
 |---|---|---|---|---|---|---|---|
 | ORCH-093 | The hub's disk policy: re-derive `--output-budget` from the consumer's figures and size M12's record retention | mandate 2026-10-27; D148's open debt | herd-planner | done | Merge this document; brief ORCH-094 and ORCH-095 from it | — | `docs/disk-policy.md` |
-| ORCH-094 | **Blocker.** Persist the job-id high-water mark: `next_sequence` is re-derived from the highest surviving directory, so a hub idle past its retention window re-mints `j0000000001` | `docs/disk-policy.md` §3.6; `store.rs:879`, `:229-233` | herd-step | owed | One task: a durable high-water mark in `IndexFile` (or beside it), honoured at `recover`, with a test that removes every directory and asserts no id is re-used | — | `herd-hub/src/store.rs:879` |
+| ORCH-094 | **Blocker.** Persist the job-id high-water mark: `next_sequence` is re-derived from the highest surviving directory, so a hub idle past its retention window re-mints `j0000000001` | `docs/disk-policy.md` §3.6; `store.rs:879`, `:229-233` | herd-step | done | **Done 2026-10-27 on PR #97, and not where this row proposed it.** The mark is `ids_minted` in `store.json` beside `state_root_id`, honoured at `recover`, raised and `fsync`ed before the `mkdir` that claims the id, with a test that removes every directory and asserts no id is re-used. `IndexFile` was the wrong home: `usable_index` discards it on any doubt. Amended at integration by `herd-merger`; the reason is at the end of §3.6. **This row is not brought onto the board — PR #97 carries the board's ORCH-094 row** | — | `herd-hub/src/store.rs` (`StoreFile::ids_minted`, `mark_minted`, `recover`, `mint`); PR #97 |
 | ORCH-095 | The budget becomes a function of the volume: `B` defaults to `min(200 GB, 25 % of capacity)`, new `--volume-free-floor R`, effective ceiling `min(B, held + max(0, free − R))` from `statvfs` at each trigger, and a startup line that distinguishes a derived figure from the fallback | `docs/disk-policy.md` §2.6; D148's debt | herd-step | waiting | Alexa decides §6 B first; then one task over `main.rs`, `job.rs` and `held_more` | Decision §6 B | `docs/disk-policy.md` §2.3, §2.6 |
 | ORCH-096 | Warn on the approach, in days and not in percent: warn when `B − held` is less than what arrived in the last 24 h, from one rolling counter on `Live`; and bring the inside-the-floor line under the once-per-episode flag the over-budget line already has | `docs/disk-policy.md` §2.5, §2.7; `store.rs:797-841` | herd-step | owed | One task over `store.rs` after ORCH-095 lands | ORCH-095 | `herd-hub/src/store.rs:810-841` |
 | ORCH-097 | `--output-budget` dry run: what would this budget take, with nothing removed. The walk, the record reads and the four-key sort already exist; the dry run stops before `evict` | `docs/disk-policy.md` §2.8 | herd-step | open | Size it; decide whether it is a hub flag or a `herdctl` call | ORCH-095 | `herd-hub/src/store.rs:642-732` |
@@ -687,7 +701,7 @@ Four of these rows touch `herd-hub/src/store.rs`, so they cannot share a
 worktree or run at once. The order below is the dependency order and also
 the conflict order:
 
-1. **ORCH-094** — `store.rs` (`recover`, `IndexFile`), `main.rs` none.
+1. **ORCH-094** — `store.rs` (`recover`, `StoreFile`), `main.rs` none.
    Must land before anything can remove a record.
 2. **ORCH-095** — `main.rs` (the arguments and the startup line),
    `job.rs` (`Budget`, the defaults), `store.rs` (`held_more`, the
