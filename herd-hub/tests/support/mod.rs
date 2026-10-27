@@ -38,6 +38,24 @@ pub fn confinement(data_root: &DataRootDir) -> herd_runner::Confinement {
     herd_runner::Confinement::with_data_root(data_root.path())
 }
 
+/// The machine a runner in these tests says it is.
+///
+/// **Declared, and never read off whatever host the suite runs on.** A runner
+/// holds its own ceiling on how many jobs it starts at once, derived from the
+/// memory it says it lends, the floor it says it keeps and the cap it puts on
+/// every job (`herd_runner::jobs_at_once`). Left to read the real machine, a
+/// harness runner would hold 28 jobs on the development server and 6 on a CI
+/// box of 16 GiB, and a test like
+/// `no_job_is_claimed_twice_when_passes_overlap` — twelve jobs submitted at
+/// once — would be asserting something different on each. The ceiling itself
+/// is asserted where it belongs, in `herd-hub/tests/fake_hub_flood.rs` and in
+/// `herd-runner`'s own unit tests; here it only has to be out of the way of
+/// the trivial commands these tests run, which is what the caps beside it
+/// already are.
+pub fn host() -> herd_proto::HostSize {
+    herd_proto::HostSize::new(Some(64 * 1024), Some(16)).with_floor(Some(8 * 1024))
+}
+
 /// A data root and the confinement prepared on it, for a test that drives
 /// [`herd_runner::serve_once`] itself rather than letting
 /// [`herd_runner::run`] redial.
@@ -145,6 +163,7 @@ impl Harness {
             // `herdctl runner approve`.
             token: Some(harness.approve("test-runner")),
             confinement: confinement(&data_root),
+            host: host(),
             ..herd_runner::Config::default()
         };
         harness.tasks.push(tokio::spawn(async move {
@@ -246,6 +265,7 @@ impl Harness {
             confinement: confinement(&data_root),
             capabilities,
             probes,
+            host: host(),
             ..herd_runner::Config::default()
         };
         harness.tasks.push(tokio::spawn(async move {

@@ -1,7 +1,11 @@
 # 12 — Crash-point enumeration, by construction
 
 **Date:** 2026-10-27.
-**Base:** `origin/main` at `cd59ef5`. Every `file:line` below was read there.
+**Base:** `origin/main` at `2ca6dc7` (PR #85 merged). Every `file:line`
+below was read there, and re-read there after this branch was merged with
+it: `09`'s work moved several of them, and the numbers below are the ones
+that hold on `2ca6dc7`, not the ones that held on `cd59ef5` where the
+branch started.
 **Author:** `herd-step`, ORCH-080.
 **Branch:** `orch-080-crash-point-enumeration`.
 **Harness:** `herd-hub/tests/crash_points.rs`, ten `#[ignore]`d cases.
@@ -25,7 +29,7 @@ judged on.
 added on this branch; nothing under `herd-hub/src` is touched. It describes
 today's tree.
 
-**Marks.** **F** — read at a named `file:line` on `cd59ef5`, or asserted by a
+**Marks.** **F** — read at a named `file:line` on `2ca6dc7`, or asserted by a
 case of the harness and named. **H** — a hypothesis. **I** — unknown.
 
 ---
@@ -61,7 +65,7 @@ event exists. Dropping the directory `fsync` is what makes it reachable.
 right (F, case `nothing_removes_a_stale_temporary_at_open`). And one of them
 is not merely untidy: a `.results.json.tmp-…` left in `files/` by the
 inline-output write (`store.rs:1752`) is **counted against the output budget**
-by `directory_bytes` (`store.rs:2730-2746`, which has no dot-filter) and is
+by `directory_bytes` (`store.rs:2733-2749`, which has no dot-filter) and is
 never swept, because the sweeper ranks whole collections and this job holds
 none (F, case `a_temporary_in_files_is_held_output_for_ever`). A hub that is
 killed often enough loses disk it will never report as free.
@@ -133,14 +137,14 @@ sequence falls into one of these classes, because the reader's decision
 function has very little in it.
 
 1. **`recover` reads `job.json` and nothing else.** `events.jsonl` is read
-   only by `job_events` (`store.rs:2307`), on a query. `grep -n
+   only by `job_events` (`store.rs:2310`), on a query. `grep -n
    'join(EVENTS_FILE)' herd-hub/src/store.rs` gives `:1285` (the append),
    `:2312` (that read) and two sites inside `mod tests`, which begins at
-   `:2825`; there is no third site in the module's own code (F). So the
+   `:2828`; there is no third site in the module's own code (F). So the
    startup verdict is a function of the record
    alone, and the table in §3 has to be read down the `job.json` column.
 2. **`job_events`' per-line decision is one test**, `line.ends_with('\n')`
-   (`store.rs:2318`). Two prefixes ending strictly inside the *same* line are
+   (`store.rs:2321`). Two prefixes ending strictly inside the *same* line are
    therefore indistinguishable to it, and one representative per line covers
    the class. A prefix ending on a boundary is its own class, and with three
    lines there are four of them.
@@ -268,10 +272,10 @@ unconditional (F).
    collections nobody has fetched — because of one of them is not
    proportionate, and no other part of the store behaves this way: a
    `readings` cache that will not parse is started without, loudly
-   (`store.rs:2666-2672`); an index that will not parse is rebuilt
+   (`store.rs:2669-2676`); an index that will not parse is rebuilt
    (`store.rs:990-993`); a `log.seq` that holds no number is reported and
    worked around (`store.rs:1231-1241`); a torn *tail* of `events.jsonl` is
-   dropped (`store.rs:2317-2328`). The record is the one file with no
+   dropped (`store.rs:2320-2331`). The record is the one file with no
    degraded mode, and D52 — the decision that exists precisely to stop one
    record stopping a hub — stops three lines short of it.
 2. **Nobody can fix it.** Herd is shipped, not operated (invariant 9, D161).
@@ -305,7 +309,7 @@ tripping over one mid-write and is also what keeps a dead one off every
 listing the hub makes.
 
 With one exception, and it is the one that matters. `directory_bytes`
-(`store.rs:2730-2746`) has no such filter, and `sweep_now` calls it on
+(`store.rs:2733-2749`) has no such filter, and `sweep_now` calls it on
 `jobs/<id>/files` (`store.rs:661`). So a temporary left there by the
 inline-output write (`store.rs:1752`) is **held output**:
 
@@ -361,7 +365,7 @@ Neither reaches `JobDirStore::open`, which never reads the file. So both are a
 failed query on one job with the hub running — the right blast radius, and the
 contrast with §4.2 is the whole argument of §5.
 
-**Is it what we want?** The torn tail: yes, and `store.rs:2319-2321` says why
+**Is it what we want?** The torn tail: yes, and `store.rs:2322-2324` says why
 in one sentence. The two errors: **arguable**. A history is a history; a
 reader asking for one and being handed an error learns less than a reader
 handed the lines that are whole plus a line saying the rest is unreadable. But
@@ -390,8 +394,8 @@ Why it fits what is already there:
   built. The change is which arm a parse failure takes.
 - **The quarantined job is already excluded from everything that acts.**
   `read_record` refuses it by name (`store.rs:1172-1178`), `unfinished_jobs`
-  skips it (`store.rs:2354-2359`), `collections_owed` skips it
-  (`store.rs:2416-2420`). Nothing would dispatch a torn record.
+  skips it (`store.rs:2357-2361`), `collections_owed` skips it
+  (`store.rs:2419-2423`). Nothing would dispatch a torn record.
 - **It keeps the record untouched.** D52's phrasing — *"Its record is
   untouched; the hub is running"* — is what makes this safe to propose: the
   bytes stay for whoever wants to look, and Herd does not repair what it
@@ -462,7 +466,7 @@ each, so a reader can run one.
 
 ## 8. F, H and I
 
-**F** — observed at `cd59ef5` or asserted by a named case.
+**F** — observed at `2ca6dc7` or asserted by a named case.
 
 1. `recover` reads `job.json` only; `events.jsonl` has two sites in
    `store.rs`, the append at `:1285` and `job_events` at `:2312`.

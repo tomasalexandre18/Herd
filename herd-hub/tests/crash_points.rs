@@ -47,9 +47,9 @@
 //!
 //! The hub's startup decision is a function of very little. `recover`
 //! (`store.rs:860`) reads `job.json` and nothing else — `events.jsonl` is
-//! read only by `job_events` (`store.rs:2307`), on a query, never at open —
+//! read only by `job_events` (`store.rs:2310`), on a query, never at open —
 //! and `job_events`' decision per line is a single test, `line.ends_with('\n')`
-//! (`store.rs:2318`). So:
+//! (`store.rs:2321`). So:
 //!
 //! * two prefixes of `events.jsonl` that end strictly inside the *same* line
 //!   are indistinguishable to the reader, and one representative per line
@@ -437,14 +437,14 @@ fn events_expected(shape: Events) -> Option<usize> {
     match shape {
         Events::Boundary(n) => Some(n),
         // `job_events` stops at the first line with no terminator
-        // (`store.rs:2317-2328`), so a prefix ending inside line `n` yields
+        // (`store.rs:2320-2331`), so a prefix ending inside line `n` yields
         // the `n - 1` lines before it.
         Events::MidLine(n) => Some(n - 1),
         // A whole line that is not JSON is an error and not a torn tail:
-        // `store.rs:2333-2334`.
+        // `store.rs:2336-2337`.
         Events::NulWholeLine => None,
         Events::NulTornTail => Some(2),
-        // `read_optional` is `read_to_string` (`store.rs:2650-2655`), so a
+        // `read_optional` is `read_to_string` (`store.rs:2653-2658`), so a
         // tail that is not UTF-8 refuses the whole file, not its last line.
         Events::NotUtf8 => None,
         Events::Absent => Some(0),
@@ -638,7 +638,7 @@ fn every_crash_point_a_waiting_write_can_leave() {
                 };
                 assert_eq!(
                     *held_bytes, want_held,
-                    "{case}: `directory_bytes` (store.rs:2730-2746) has no dot-filter, \
+                    "{case}: `directory_bytes` (store.rs:2733-2749) has no dot-filter, \
                      so a temporary left in `files/` is held output"
                 );
 
@@ -689,7 +689,7 @@ fn every_crash_point_a_waiting_write_can_leave() {
 /// **The headline.** A `job.json` this hub cannot parse does not quarantine
 /// one job: it refuses the whole state root, and the hub does not start.
 ///
-/// The chain, at `cd59ef5`: `store.rs:1141-1142` (the `?` on
+/// The chain, at `2ca6dc7`: `store.rs:1141-1142` (the `?` on
 /// `serde_json::from_str`) → `store.rs:899` (`self.read_stored(&id)?` in
 /// `recover`) → `store.rs:436` (`store.recover()?` in `open_with`).
 ///
@@ -874,7 +874,7 @@ fn nothing_removes_a_stale_temporary_at_open() {
 
 /// And the one that is not merely untidy: a temporary left in `files/` by the
 /// inline-output write (`store.rs:1752`) is counted against the output budget
-/// by `directory_bytes` (`store.rs:2730-2746`, which has no dot-filter) and is
+/// by `directory_bytes` (`store.rs:2733-2749`, which has no dot-filter) and is
 /// never swept, because the sweeper only ever removes a whole job's `files/`
 /// through the records it ranks — and this job holds no collection at all.
 #[test]
@@ -930,8 +930,8 @@ fn an_interrupted_mint_loses_the_job_quietly() {
 }
 
 /// `job_events`' two refusals, separated. A torn *tail* is dropped and is not
-/// an error (`store.rs:2317-2328`); a whole line that is not JSON, and a file
-/// that is not UTF-8, are errors (`store.rs:2333-2334` and `store.rs:2650`).
+/// an error (`store.rs:2320-2331`); a whole line that is not JSON, and a file
+/// that is not UTF-8, are errors (`store.rs:2336-2337` and `store.rs:2653`).
 /// Neither reaches `JobDirStore::open`, which never reads the file — so both
 /// are a failed query on one job, not a hub that will not start.
 #[test]

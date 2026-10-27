@@ -33,7 +33,7 @@ separated into *what we have* and *whether it is what we want*, one proposal,
 and F/H/I.
 
 **`docs/remediation/README.md`** — the index row for `12`, the date line, the
-note that `12` is the first piece based on `cd59ef5` rather than `0a2cf73`,
+note that `12` is written against a later base than every piece before it,
 and `12` added to the *mesures* list with the sentence that it carries no
 timing.
 
@@ -42,7 +42,7 @@ result. No other row touched.
 
 ### The three findings
 
-1. **The brief's finding is verified, at `cd59ef5`.** A `job.json` the hub
+1. **The brief's finding is verified, at `2ca6dc7`.** A `job.json` the hub
    cannot parse makes it refuse the **whole state root**:
    `store.rs:1141-1142` (the `?` on `serde_json::from_str::<VersionProbe>`)
    → `store.rs:899` (`self.read_stored(&id)?` in `recover`) → `store.rs:436`
@@ -60,7 +60,7 @@ result. No other row touched.
    `JobDirStore::open`; all 99 states that carry one still carry it
    afterwards. New beside it: a temporary left in `files/` by the
    inline-output write (`store.rs:1752`) is **counted against the output
-   budget** by `directory_bytes` (`store.rs:2730-2746`, which has no
+   budget** by `directory_bytes` (`store.rs:2733-2749`, which has no
    dot-filter) — 4096 bytes measured — and the sweeper cannot take it back.
 
 ## Not done, and why
