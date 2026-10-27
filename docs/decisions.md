@@ -8832,3 +8832,86 @@ a number is an identifier, not a position (D148): D148 after D149 and
 D161 after D167 are the same case, a branch that merged late with the
 number it had taken earlier. D170 is held by the unmerged branch of
 PR #67; gaps stay.
+
+---
+
+## 2026-10-27 — D179 Every binary runs; an incomplete run's skips are unknown
+
+**Decision.** `scripts/test.sh` passes `--no-fail-fast` to `cargo test`
+itself, unless the caller already passed it, and both `scripts/test.sh` and
+`scripts/report-skips.sh` decide what to say about skips from whether the
+run they are reporting on was a *complete* one. Only a complete, green,
+unnarrowed run prints the unqualified sentence `Every assertion ran on this
+host: nothing was skipped.` — byte for byte the wording it has always had,
+and the one `deploy/README.md` quotes the opening of (line 542). Every
+other case says less: an empty skip log after a non-zero status is reported
+as `SKIPS UNKNOWN on this host`, a partial one as `AT LEAST n`, and a run
+narrowed by the caller's own arguments speaks only for the tests it
+selected. `scripts/test.sh` ends with a verdict marker that says which of
+those cases it was, and `report-skips.sh` reads that marker, because CI
+hands it a captured file and no exit status.
+
+**The failure this prevents.** `cargo test` stops launching test binaries
+once one of them has failed. On this workstation the suite is red for
+ORCH-069 in `herd-hub`, so `confinement` — the binary that carries the ten
+cgroup v2 skips and the two ZFS `io.max` skips — never ran at all, and
+`$HERD_SKIP_LOG` stayed empty. An empty log was read as *nothing was
+skipped*, so a red run on which most of the suite never started printed
+"Every assertion ran on this host: nothing was skipped". That is false
+reassurance in precisely the direction invariant 5 and **D27** exist to
+forbid: a skipped assertion must be printed as skipped and never counted as
+checked, and a skip log that is empty because nothing ran is the same lie by
+omission. `scripts/report-skips.sh` had the identical defect and CI runs it
+with `if: always()`, which is how the sentence reached PR #86's **failing**
+`check` job and its job summary — the one place where a gate's verdict is
+actually read.
+
+**Why `--no-fail-fast` becomes the script's own default, not a flag at the
+call site.** The suite is a gate. A gate is asked "what is wrong", and all
+of the failures at once is the useful answer; stopping at the first failing
+target hides the rest and, as above, truncates the skip list to the point of
+falsehood. A default that every caller has to remember is not a default, and
+the callers here are CI, agents and briefs, none of which should have to
+know about cargo's scheduling to get an honest report. It is not added twice:
+`cargo test` refuses `--no-fail-fast` more than once, so the script adds it
+only when the caller did not. The cost is accepted and is real — a red run
+is **longer**, because every binary runs.
+
+**Why the exit status is consulted as well.** `--no-fail-fast` does not make
+the log provably complete: a compile error, a cancelled job or a binary
+killed mid-flight each truncate it. So completeness is never assumed from
+the flag; it is read from the status, or from the marker when only a capture
+is available. An empty log on a run that did not finish means *unknown*, not
+*none*, and the report says so.
+
+**Alternative rejected.** Leave the reasoning where the author first put it
+— a comment block in `scripts/test.sh` explaining when the green sentence is
+true — and change no output. Rejected because this changes what a gate's
+output *means*, which is exactly what this file is for: its opening is
+quoted in `deploy/README.md`, it is pasted into handoffs and into PR
+Evidence blocks, and it is read by whoever judges a merge. A reader who
+finds "nothing was skipped" in a PR has no reason to go looking for a
+comment in a shell script to learn that it may mean "nothing ran"; and a
+comment binds nobody, so the next person to touch either script would have
+had nothing to break. A second alternative, fixing `scripts/test.sh` alone,
+was rejected on the same ground: it would have left the false sentence in
+CI's summary, which is where the claim does its damage.
+
+**Evidence.** Eighteen cases in `scripts/check-orchestration.sh`, which goes
+from 93 to **111**; a fake `cargo` on `PATH` records its arguments, writes
+the skip lines it was given and exits with the status it was given, so every
+combination of (the run finished, something was skipped, the caller narrowed
+it) is reproducible in a second with no toolchain. Ten of the eighteen go
+red against `origin/main` `96fc10b`, proved by reverting both scripts and
+re-running them. On this workstation the red suite now prints `AT LEAST 12
+assertion(s) COULD NOT RUN on this host and were skipped, and the suite did
+not finish (cargo test exited 101), so this list is a floor and not a count`
+where it used to print the green sentence; on CI's runner, green and
+complete, it prints the old sentence with that host's own count of 15. No
+test, no expectation and no assertion was edited, no skip became a pass, and
+the exit code is still cargo's own.
+
+**On the number.** This entry is D179, allocated at integration above D178,
+the highest on `origin/main` `96fc10b` and on every open PR (#67, #85, #88).
+D143, D154 and D170 stay gaps; D170 is held by the unmerged branch of PR #67
+(D148).

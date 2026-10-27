@@ -1,4 +1,4 @@
-# Status — 2026-10-26
+# Status — 2026-10-27
 
 State now. Replaced every session, never appended to. **What is owed and
 what Alexa has not decided lives in `docs/orchestration/board.md`**
@@ -22,9 +22,9 @@ onward are all published, the credential preflight that killed
 v0.3.1-v0.3.3 being gone (D162). A **`v*.*.*-dev*` tag** publishes a
 pre-release in four to six minutes, built as a real tag builds (D172).
 
-**`main` is 83 commits past v0.3.7** at `f7425d8`, before this merge,
+**`main` is 100 commits past v0.3.7** at this merge (`96fc10b` was 90),
 and the workspace version still reads `0.3.7` (`Cargo.toml` line 6;
-read 2026-10-26). Nothing merged since the tag has shipped, the four
+read 2026-10-27). Nothing merged since the tag has shipped, the four
 fixes below included. `PROTOCOL_VERSION` is **2** and `RECORD_VERSION`
 **1** on `main` (`herd-proto/src/lib.rs:114`, `herd-hub/src/job.rs:52`).
 
@@ -49,14 +49,14 @@ and nothing here may (D161). Each figure carries the date it reached us.
 ## What `main` carries
 
 M1-M11, M15 and M16; protocol version 2; a job may return 1 GiB by
-default (`herd-runner/src/confine.rs:82`). The four Rust gates and
-`check-docs.sh` were green here on **2026-10-25** with **12 loud skips**
-(D27): **10** because cgroup v2 delegation is unavailable in this
-session's scope (`herd-runner/tests/confinement.rs`), **2** because the
-data root is on ZFS and no hard `io.max` can be carried
-(`herd-runner/src/confine.rs:1118` and `:1220`). The Rust gates were
-**not re-run** for this file, which is prose. D151's 13 is not
-reproducible (`05-experiments-review.md` §6).
+default (`herd-runner/src/confine.rs:82`). **A skip count is per host**
+(D27, ORCH-070): **12** here — **10** for cgroup v2 delegation
+(`herd-runner/tests/confinement.rs`), **2** for a ZFS data root with no
+hard `io.max` (`confine.rs:1118`, `:1220`) — and **15** on CI; D151's 13
+is not reproducible (`05-experiments-review.md` §6). **The suite is red
+here and green on CI**: ORCH-069's two assertions are a property of this
+host plus the code, so CI is the verdict. **D179**: every binary runs,
+and an incomplete run reports its skips as unknown, never as none.
 
 **Four defects are fixed and in no release** (2026-10-25). **D175**: an
 inline file whose bytes did not hash to its digest exited 0. **D176**: a
