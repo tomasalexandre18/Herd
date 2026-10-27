@@ -9,8 +9,14 @@ carries **no tag**; tag `v0.3.7` is `3da48f5`, two merges earlier. No Rust,
 `Cargo.*` or Nix file differs between the two, so the product audited here
 is `v0.3.7`'s product — see `00-baseline.md §2`.
 
-**Date of this index:** 2026-10-25, refreshed at the C0b integration and
-again at the integrations of PR #90 (`11`) and PR #91 (`10`).
+**Date of this index:** 2026-10-25, refreshed at the C0b integration, again
+at the integrations of PR #90 (`11`) and PR #91 (`10`), and again when `12`
+was written on `orch-080-crash-point-enumeration`.
+
+**`12` is written against `cd59ef5`, not `0a2cf73`**, and says so at its
+head: it is the first piece of this dossier whose base is a later commit,
+because it had to describe the tree the remediation steps are being taken
+on rather than the tree that was audited.
 
 ---
 
@@ -30,6 +36,7 @@ again at the integrations of PR #90 (`11`) and PR #91 (`10`).
 | [`08-s0-unsynced-write-cost.md`](08-s0-unsynced-write-cost.md) | `s0-unsynced-write-cost` | S0: what those durable writes would cost if they were not synchronous — the measured size of the prize behind the tiering. Also names the one ordering invariant that must hold before any `fsync` is dropped: D103 forbids `events.jsonl` being ahead of `job.json`, the `fsync`s hold that today, and without them it is the filesystem's to hold. Safe on ZFS, whose transaction groups commit atomically and in order; **not guaranteed elsewhere**, which is why the server's state root must be named — board row ORCH-053. |
 | [`10-ordering-on-ext4.md`](10-ordering-on-ext4.md) | `plan-orch-074` | ORCH-074: the mechanism that holds D103's ordering — `events.jsonl` never ahead of `job.json` — on **ext4**, where `08`'s ZFS argument does not transfer. Settles that **D103 needs no new ordering mechanism**, because the writes `07` de-syncs are not the writes D103 binds: `JobEvent::state()` is `None` for `Waiting`, `move_to` and `raise` already leave `events.jsonl` naming a reason the record does not, `recover` never reads `events.jsonl`, `job_events` already drops a torn tail, and timestamps are not comparable by decision. What holds the order for a **decisive** write is the record's own two syncs returning before the event append is issued — a syscall-return guarantee, independent of the filesystem. **A larger hazard was found in its place:** a `job.json` that comes back empty or torn makes the hub refuse to start on the *whole* state root, D52's quarantine covering labels only. ext4's cross-file ordering could not be established from documentation on this host and is marked `I`; the plan is built so as not to need it. **Amended against `11-sync-prices.md`, which refuted the plan's own hypothesis H-1:** the single durability tier splits into three independent steps — **A** the event `fdatasync` (~31 %, needing no crash evidence of any kind), **B** the directory `fsync` (~65 % cumulative), **C** the record `fsync` (~98 %, deferred and possibly never taken) — and the directory sync's standing *rises* rather than falls: only it makes the record's **rename** durable, so on a decisive write it stays unconditionally. Produces the ordered task list ORCH-079 to ORCH-090. Touches no file under `herd-hub/src`. |
 | [`11-sync-prices.md`](11-sync-prices.md) | `orch-077-price-the-syncs` | ORCH-077: the three durable operations of `record_waiting` — the record `fsync`, the directory `fsync` and the event `fdatasync` — priced **separately**, in all eight combinations, on **both** filesystem classes in one session on one host. Settles that one `fsync` on ext4/NVMe costs **989 µs** and not the tens-to-low-hundreds of microseconds that was hoped, so the class the deployment runs on is **1.2x** faster per sync than the 1.19 ms `08` derived, and 1.3-1.7x faster than this harness's own ZFS figures — not 10-100x; that the three syncs are **additive, not redundant**, so keeping one and dropping two collects **65 %** of the prize and not nearly all of it, the kept sync still costing 21x the unsynced floor; and that `08`'s **9.970 s** junction at `N` = 1 000 becomes **3.128 s** on ext4 — 3x smaller, not an order of magnitude, and still seconds. Corrects `06`'s `sync_dir` figure of 6.6 µs, which was measured with no `rename` between the file sync and the directory sync and so understates the real directory sync by about two hundred times. Touches no file under `herd-hub/src`. |
+| [`12-crash-point-enumeration.md`](12-crash-point-enumeration.md) | `orch-080-crash-point-enumeration` | ORCH-080: every on-disk state a power cut can leave in one job directory, **built by construction** rather than sampled by crashing — 7 shapes of `job.json` × 11 of `events.jsonl` × 4 of stale temporary = **308 states**, each written byte for byte and each opened. Settles that the hazard **B** (ORCH-084, the directory `fsync`) creates is exactly **4** of the 308 — `events.jsonl` one line ahead of `job.json` over a *reason*, unreachable today because `sync_dir` returns before the event is issued — and that it is acceptable for an explanatory write and not for a decisive one. Confirms by construction, with the line numbers, that a `job.json` the hub cannot parse makes it **refuse the whole state root** (`store.rs:1141-1142` → `:899` → `:436` → `main.rs:224`), taking every other job with it, with D52's quarantine covering **labels only** (`store.rs:1150-1157`) and the index unable to route around it — and **proposes**, without making, that a parse failure quarantine the record the way a rejected label set already does. Confirms ORCH-086: nothing removes a stale temporary at `JobDirStore::open`, and adds that one left in `files/` is **counted against the output budget** for ever (`directory_bytes`, `store.rs:2730-2746`, has no dot-filter). Touches no file under `herd-hub/src`. |
 
 The mandate's §10 skeleton also names `01-contract.md` and
 `02-consumer-boundary.md`. They do not exist yet. The numbering above
@@ -68,13 +75,16 @@ had been run.
   written on**, and the document says so at the point of use. It is
   evidence of an incident; it is not a measurement any of these authors
   made.
-- **Mesures** — `04a`, `04b`, `05`, `06`, `08`, `11`. These ran on the shared
+- **Mesures** — `04a`, `04b`, `05`, `06`, `08`, `11`, `12`. These ran on the shared
   workstation, each in its own worktree, under `nix develop`, with `-j 4`
   and `/proc/loadavg` watched. They are not an isolated host, which
   `00-baseline.md §11` asked for and which this campaign never got; every
   one of them characterises its own noise before reporting its signal and
   names the limits of what it reproduces. Read a figure from any of them
-  with the host in mind.
+  with the host in mind. **`12` is the exception inside that list**: it ran
+  on the same workstation and in the same way, but it carries no timing at
+  all — it builds states on disk and asserts what the code does with them,
+  so its figures are counts and verdicts and the host does not enter them.
 - **Neither** — `07`. It is a design comparison and a recommendation. It
   ran nothing and it changed nothing; every figure in it was measured by
   `04a`, `05` or `06` and is attributed there.
