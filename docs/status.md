@@ -22,7 +22,7 @@ onward are all published, the credential preflight that killed
 v0.3.1-v0.3.3 being gone (D162). A **`v*.*.*-dev*` tag** publishes a
 pre-release in four to six minutes, built as a real tag builds (D172).
 
-**`main` is 100 commits past v0.3.7** at this merge (`96fc10b` was 90),
+**`main` is 102 commits past v0.3.7** at `fba3abb` (`96fc10b` was 90),
 and the workspace version still reads `0.3.7` (`Cargo.toml` line 6;
 read 2026-10-27). Nothing merged since the tag has shipped, the four
 fixes below included. `PROTOCOL_VERSION` is **2** and `RECORD_VERSION`
