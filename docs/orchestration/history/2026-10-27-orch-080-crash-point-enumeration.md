@@ -2,10 +2,10 @@
 
 - **Item:** ORCH-080
 - **Agent:** herd-step
-- **Branch / commit:** `orch-080-crash-point-enumeration` / see the PR's head,
+- **Branch / commit:** `orch-080-crash-point-enumeration` / `043d145`,
   based on `origin/main` `cd59ef5`
-- **PR:** see the branch; opened from `.github/pull_request_template.md`,
-  **not merged**
+- **PR:** [#92](https://github.com/tomasalexandre18/Herd/pull/92), filled
+  in from `.github/pull_request_template.md`. **Not merged**
 - **Worktree:** this agent's own, `/mnt/ssd_980/herd/claude/tmp/claude-1002`
   then `/-mnt-ssd-980-herd-project`, the session id
   `3ddf11ac-718a-4231-bc8d-45291a39ef82`, then `/scratchpad/orch-080/wt` —
