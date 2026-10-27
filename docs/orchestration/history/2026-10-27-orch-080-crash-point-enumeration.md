@@ -187,6 +187,25 @@ ten cases are `#[ignore]`d by attribute, which is not a skipped assertion but
 a case the suite does not run, and the handoff reports both states of it
 above.
 
+### CI, run 40485375703 on `24c2e53`
+
+Both required jobs green:
+
+```text
+check   pass   8m24s
+docs    pass   3m56s
+test suite: PASSED
+15 assertion(s) COULD NOT RUN on this host and were skipped.
+```
+
+**15, not 12** — the skip count is per host (ORCH-070), and three of CI's
+are not this workstation's. One of the three is
+`the_derived_j_is_recorded_and_is_what_the_job_is_given`, which is **red
+here and skipped there**. By D27 that skip is **not** a pass, and this
+handoff does not claim the suite is green on CI for `slots.rs:744`: it
+claims CI skipped it. The other two jobs of the run are the gates
+`herd-merger` reads.
+
 ## Risks and findings
 
 - **The proposal of `12 §5` is a behaviour change on a crash path and is not
