@@ -27,14 +27,14 @@ signal is sent, nothing is killed, and nothing outside the temporary directory
 is written. The table is **asserted**, not only printed, so it cannot drift
 from the code without going red.
 
-**`docs/remediation/12-crash-point-enumeration.md`** — the write-up: the three
+**`docs/remediation/13-crash-point-enumeration.md`** — the write-up: the three
 axes, the completeness argument, the 7 × 11 verdict grid, each behaviour
 separated into *what we have* and *whether it is what we want*, one proposal,
 and F/H/I.
 
-**`docs/remediation/README.md`** — the index row for `12`, the date line, the
-note that `12` is written against a later base than every piece before it,
-and `12` added to the *mesures* list with the sentence that it carries no
+**`docs/remediation/README.md`** — the index row for `13`, the date line, the
+note that `13` is written against a later base than every piece before it,
+and `13` added to the *mesures* list with the sentence that it carries no
 timing.
 
 **`docs/orchestration/board.md`** — ORCH-080 moved `owed` → `done` with its
@@ -66,10 +66,10 @@ result. No other row touched.
 ## Not done, and why
 
 - **No change to `herd-hub/src`.** The brief says propose, do not make. §5 of
-  `12` proposes quarantining a record that will not parse; it is a separate
+  `13` proposes quarantining a record that will not parse; it is a separate
   task and a separate decision.
 - **No new board row for that proposal.** The brief says update ORCH-080's
-  row and nothing else in the board. The proposal is in `12 §5` and in the
+  row and nothing else in the board. The proposal is in `13 §5` and in the
   PR's *To record*; whoever allocates the row should rank it **before**
   ORCH-085.
 - **No `D-NEXT` entry.** Not asked for, and nothing here decides anything.
@@ -209,13 +209,13 @@ claims CI skipped it. The other two jobs of the run are the gates
 ### The merge of PR #85, and the gates run again on top of it
 
 PR #85 landed on `main` as `2ca6dc7` while this branch was open. It touches
-`herd-hub/src/store.rs`, so **every `file:line` in `12`, in the harness and
+`herd-hub/src/store.rs`, so **every `file:line` in `13`, in the harness and
 in the board row was re-read on `2ca6dc7` and corrected** before the merge
 was committed. The ones that moved are all in the second half of
 `store.rs` — `job_events`, `read_optional`, `directory_bytes`,
 `unfinished_jobs`, `collections_owed`, `read_the_readings` and `mod tests`
 — and every one was re-checked by printing the line.
-`12`'s base is restated as `2ca6dc7` and says at its head why it
+`13`'s base is restated as `2ca6dc7` and says at its head why it
 is not `0a2cf73` like the pieces before it.
 
 **The enumeration is unchanged by the merge.** Same 308 states, same
@@ -306,7 +306,7 @@ The comparison worktree was removed after the run; nothing of it remains.
 
 ## Risks and findings
 
-- **The proposal of `12 §5` is a behaviour change on a crash path and is not
+- **The proposal of `13 §5` is a behaviour change on a crash path and is not
   made.** Quarantining a record that will not parse, instead of refusing the
   root, is small in lines — the `Stored::Quarantined` machinery, the list, the
   per-start message and the count at `main.rs:234` all exist — but it changes
@@ -317,7 +317,7 @@ The comparison worktree was removed after the run; nothing of it remains.
   split the board already states.** If a future branch drops `sync_dir`
   unconditionally, the four `⚠` states become reachable for a terminal
   transition, and that is a lie about a verdict. The harness asserts the
-  narrow case and would not by itself catch the wide one; `12 §4.1 H` says
+  narrow case and would not by itself catch the wide one; `13 §4.1 H` says
   what to add.
 - **A premise of the brief, narrowed, not refuted.** The brief asks to "start
   a real hub on each". 308 hub *processes* would need 308 ports and far more
@@ -329,10 +329,15 @@ The comparison worktree was removed after the run; nothing of it remains.
   multi-job root.
 - **One citation in the brief needed a small correction.** `07`'s stale-
   temporary material is at **§5 item 5**, not §5.5; §5.5 does not exist.
-- **A number collision is possible at rebase.** ORCH-079 may be adding a
-  document at the same time. If `12` collides, renumber this one; nothing in
-  `12` or in the index row depends on the number except the filename and the
-  anchors.
+- **The number collision the brief warned of happened, and this branch
+  gave way.** ORCH-079 (PR #95, branch `orch-079-ordering-oracle`) is
+  adding `12-ordering-oracle.md`. This piece was written as `12` on the
+  same day, so it **renumbered itself to `13`** rather than contest the
+  number, which is what the brief asked for. `13` was checked free against
+  every open branch — PRs #93, #94, #95 and #96 — before it was taken, and
+  the index now says in one paragraph why `12` is absent from it. Nothing
+  depends on the number except the filename, the heading and the
+  cross-references, and all three moved together.
 
 ## Decisions needed
 
@@ -359,7 +364,7 @@ nix develop --command cargo test -p herd-hub --test crash_points \
   -- --ignored --nocapture --test-threads=1
 ```
 
-Read `docs/remediation/12-crash-point-enumeration.md` §4.1 and §6 before
+Read `docs/remediation/13-crash-point-enumeration.md` §4.1 and §6 before
 dropping `sync_dir`: they say exactly which four states B creates and under
 what condition they are acceptable. The proposal of §5 wants a board row of
 its own, allocated by whoever owns the board.

@@ -1,4 +1,4 @@
-# 12 — Crash-point enumeration, by construction
+# 13 — Crash-point enumeration, by construction
 
 **Date:** 2026-10-27.
 **Base:** `origin/main` at `2ca6dc7` (PR #85 merged). Every `file:line`
