@@ -61,6 +61,23 @@ fresh; rm "$tmp/repo/docs/orchestration/board.md"
 expect_red "board missing" 'board.md is missing'
 fresh; printf '# late\n' > "$tmp/repo/docs/orchestration/history/undated-task.md"
 expect_red "undated handoff" 'named YYYY-MM-DD'
+# A brief kept under history/ must name the agent's own worktree (ORCH-031,
+# V11). The rule has to be able to go red, and the read-only exemption has
+# to be narrow enough that the "everything else is read-only" boilerplate
+# every brief carries does not trigger it.
+H="$tmp/repo/docs/orchestration/history"
+fresh; printf 'Role: herd-step\nBase: origin/main at abc1234; branch x\nWrite only: docs/x.md; everything else is read-only\n' > "$H/2026-10-26-noworktree-brief.txt"
+expect_red "a brief naming no worktree (the Write only boilerplate does not exempt it)" "own worktree as an absolute path"
+fresh; printf 'Role: herd-step\nBase: origin/main at abc1234; branch x\nWorktree: /mnt/ssd_980/herd-project\n' > "$H/2026-10-26-checkout-brief.txt"
+expect_red "a brief naming the orchestrator's checkout as its worktree" "orchestrator's checkout"
+fresh; printf 'Role: herd-step\nBase: origin/main at abc1234; branch x\nWorktree: git worktree add -b x /scratch/x/wt origin/main\n' > "$H/2026-10-26-command-brief.txt"
+expect_red "a brief whose only path is inside a git worktree add command" "own worktree as an absolute path"
+fresh; printf 'Role: herd-step\nBase: origin/main at abc1234; branch x\nWorktree: /scratch/orch-031/wt (yours alone)\nWrite only: docs/x.md; everything else is read-only\n' > "$H/2026-10-26-named-brief.txt"
+expect_green "a brief naming an absolute worktree of its own"
+fresh; printf 'Role: herd-release\nBase: the repository at /scratch/x/wt, read-only.\nGates: none (read-only).\n' > "$H/2026-10-26-readonly-brief.txt"
+expect_green "a read-only brief, which writes nothing in the repository"
+fresh; printf '# a handoff, not a brief\n\nNo worktree named anywhere in it.\n' > "$H/2026-10-26-orch-031-brief-worktree.md"
+expect_green "a handoff whose task name merely contains the word brief"
 fresh; printf 'x%.0s' $(seq 1 85) >> "$tmp/repo/docs/orchestration/workflow.md"; echo >> "$tmp/repo/docs/orchestration/workflow.md"
 expect_red "over-long line in docs/orchestration" 'workflow.md has lines over 79'
 fresh; chmod -x "$tmp/repo/.claude/hooks/orchestrator-guard.sh"
@@ -183,6 +200,138 @@ rg 2 "git tag -a v0.4.0 -m x"; rg 2 "git push origin v0.4.0"; rg 2 "git push --t
 rg 2 "gh release create v0.4.0"; rg 2 "gh workflow run release.yml"; rg 2 "docker load < hub.tar"; rg 2 "sudo systemctl restart herd-runner"
 rg 0 "git tag -l"; rg 0 "git tag --list 'v*'"; rg 0 "git tag -n9 v0.3.7"; rg 0 "git tag"; rg 2 "git tag -l; git tag -a v1 -m x"; rg 2 "git tag v0.4.0"
 rg 0 "git push origin cut-v0.4.0"; rg 0 "gh run list --workflow release.yml"; rg 0 "git log v0.3.7..origin/main --oneline"
+
+echo "== the skip report never claims more than it saw (ORCH-071, D27)"
+# A fake `cargo` on PATH stands in for the suite: it records its arguments,
+# writes the skip lines it was given to $HERD_SKIP_LOG, and exits with the
+# status it was given. So each combination of (the suite finished, something
+# was skipped) is reproducible in a second and with no toolchain — including
+# the one that lied: red, with an empty skip log because the binary carrying
+# the skips never ran.
+mkdir -p "$tmp/bin"
+cat > "$tmp/bin/cargo" <<'FAKE'
+#!/usr/bin/env bash
+printf '%s\n' "$@" > "$FAKE_CARGO_ARGV"
+[ -n "${FAKE_CARGO_SKIPS:-}" ] && printf '%s\n' "$FAKE_CARGO_SKIPS" >> "$HERD_SKIP_LOG"
+exit "${FAKE_CARGO_STATUS:-0}"
+FAKE
+chmod +x "$tmp/bin/cargo"
+export FAKE_CARGO_ARGV="$tmp/cargo-argv"
+S1='HERD-SKIPPED: ceiling_is_a_cgroup: no cgroup v2 delegation on this host'
+S2='HERD-SKIPPED: io_max_is_written: the workspace is on ZFS'
+
+# run_test_sh <cargo exit status> <skip lines, possibly empty> [args...]
+run_test_sh() {
+  local st=$1 sk=$2; shift 2
+  out=$(cd "$tmp/repo" && PATH="$tmp/bin:$PATH" FAKE_CARGO_STATUS="$st" \
+    FAKE_CARGO_SKIPS="$sk" ./scripts/test.sh "$@" 2>&1); rc=$?
+}
+# verdict <name> <expected exit> <must appear> [<must not appear>]
+verdict() {
+  local name=$1 want=$2 must=$3 never=${4:-} why=''
+  [ "$rc" -eq "$want" ] || why="    exit=$rc, expected $want"
+  printf '%s' "$out" | grep -qF -- "$must" || why="$why
+    missing from the report: $must"
+  if [ -n "$never" ] && printf '%s' "$out" | grep -qF -- "$never"; then
+    why="$why
+    said what it must not say: $never"
+  fi
+  if [ -z "$why" ]; then ok "$name"; else bad "$name" "$why
+$(printf '%s\n' "$out" | sed 's/^/    /' | tail -14)"; fi
+}
+
+fresh
+# The defect: a red run whose skip log is empty because most of the suite
+# never started. "Unknown" is the only honest answer; the reassurance is a
+# lie, and the failure stays a failure.
+run_test_sh 101 ''
+verdict "test.sh: red with an empty skip log reports it unknown" 101 \
+  "SKIPS UNKNOWN on this host" "nothing was skipped"
+# A red run that did collect skips knows a floor, not a count.
+run_test_sh 101 "$S1
+$S2"
+verdict "test.sh: red with skips reports them as a floor" 101 \
+  "AT LEAST 2 assertion(s) COULD NOT RUN" "nothing was skipped"
+printf '%s' "$out" | grep -qF -- "$S2" && ok "test.sh: the floor lists the skips it has" \
+  || bad "test.sh: the floor must still list the skips" "$out"
+# And the green cases keep their exact, unqualified wording.
+run_test_sh 0 ''
+verdict "test.sh: green with an empty skip log says nothing was skipped" 0 \
+  "Every assertion ran on this host: nothing was skipped." "UNKNOWN"
+run_test_sh 0 "$S1
+$S2"
+verdict "test.sh: green with skips reports the real count" 0 \
+  " 2 assertion(s) COULD NOT RUN on this host and were skipped." "AT LEAST"
+# report-skips.sh decides completeness on the marker test.sh prints last, so
+# the two must agree on its wording; they are read by CI one after the other.
+verdict "test.sh: a finished run prints the marker report-skips.sh reads" 0 \
+  "test suite: PASSED"
+run_test_sh 101 ''
+verdict "test.sh: an unfinished run prints the failed marker" 101 \
+  "test suite: FAILED (cargo test exited 101)"
+
+# A run narrowed by its own arguments ran a part of the suite, so its empty
+# skip log is not evidence that every assertion ran.
+run_test_sh 0 '' -p herd-proto
+verdict "test.sh: a narrowed green run does not speak for the whole suite" 0 \
+  "narrowed by its own arguments" "Every assertion ran on this host"
+run_test_sh 0 "$S1" -p herd-runner
+verdict "test.sh: a narrowed green run says its count may be short" 0 \
+  "there may be more"
+# ... and its verdict marker says so too, so that a capture of it cannot be
+# read back as a whole run by report-skips.sh.
+if printf '%s\n' "$out" | grep -qF -- "test suite: PASSED (a part of the suite" \
+  && ! printf '%s\n' "$out" | grep -qxF -- "test suite: PASSED"; then
+  ok "test.sh: a narrowed run's marker is not a plain PASSED"
+else
+  bad "test.sh: a narrowed run must not print the whole-suite marker" \
+    "    $(printf '%s\n' "$out" | tail -1)"
+fi
+# --no-fail-fast by default, so a failing binary does not truncate the log —
+# and never twice, which cargo rejects outright.
+run_test_sh 0 ''
+[ "$(grep -cx -- '--no-fail-fast' "$FAKE_CARGO_ARGV")" = 1 ] \
+  && ok "test.sh: --no-fail-fast is passed by default" \
+  || bad "test.sh: --no-fail-fast missing" "    $(tr '\n' ' ' < "$FAKE_CARGO_ARGV")"
+run_test_sh 0 '' --no-fail-fast
+[ "$(grep -cx -- '--no-fail-fast' "$FAKE_CARGO_ARGV")" = 1 ] \
+  && ok "test.sh: the caller's own --no-fail-fast is not doubled" \
+  || bad "test.sh: --no-fail-fast doubled, cargo would refuse" "    $(tr '\n' ' ' < "$FAKE_CARGO_ARGV")"
+
+# report-skips.sh reads a captured run in CI, where it runs with if: always()
+# and so also sees red ones. It decides on the marker test.sh prints last.
+# run_report <file contents>
+run_report() {
+  printf '%s\n' "$1" > "$tmp/test-output.txt"
+  out=$(cd "$tmp/repo" && ./scripts/report-skips.sh "$tmp/test-output.txt" 2>&1); rc=$?
+}
+run_report "running 3 tests
+test suite: FAILED (cargo test exited 101)"
+verdict "report-skips.sh: a red run with no skip line reports it unknown" 0 \
+  "SKIPS UNKNOWN on this host" "nothing was skipped"
+run_report "$S1
+$S2
+test suite: FAILED (cargo test exited 101)"
+verdict "report-skips.sh: a red run with skips reports them as a floor" 0 \
+  "AT LEAST 2 assertion(s)" "nothing was skipped"
+run_report "running 3 tests
+test suite: PASSED"
+verdict "report-skips.sh: a finished run with no skips says nothing was skipped" 0 \
+  "Every assertion ran on this host: nothing was skipped." "UNKNOWN"
+run_report "$S1
+$S2
+test suite: PASSED"
+verdict "report-skips.sh: a finished run reports the real count" 0 \
+  " 2 assertion(s) COULD NOT RUN on this host and were skipped." "AT LEAST"
+# A capture of a narrowed run is not a whole run either, however green.
+run_report "running 5 tests
+test suite: PASSED (a part of the suite: narrowed by its arguments)"
+verdict "report-skips.sh: a narrowed run is not read as a whole one" 0 \
+  "SKIPS UNKNOWN on this host" "nothing was skipped"
+# No marker at all — a cancelled or killed job — is not a finished run either.
+run_report "error: linking with cc failed"
+verdict "report-skips.sh: an output with no verdict marker is not a pass" 0 \
+  "SKIPS UNKNOWN on this host" "nothing was skipped"
 
 echo
 echo "check-orchestration: $pass passed, $fail failed"

@@ -17,3 +17,6 @@ Herd stays specialized on purpose: no workflow language, no plugins, no cloud.
 - Plan: [`docs/plan.md`](docs/plan.md)
 - Runner confinement and its configuration:
   [`docs/runner-confinement.md`](docs/runner-confinement.md)
+- Where this project's own Claude sessions keep their state, and how one is
+  started:
+  [`docs/orchestration/state-root.md`](docs/orchestration/state-root.md)

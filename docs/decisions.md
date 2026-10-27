@@ -8590,7 +8590,7 @@ deployment.
 integrated in the same pass, D174 is held by the unmerged branch of PR #72
 and D170 by that of PR #67.
 
-## 2026-10-25 — D-NEXT A runner's live jobs are keyed by job and attempt
+## 2026-10-25 — D177 A runner's live jobs are keyed by job and attempt
 
 **Decision.** `herd_runner::Session`'s map of the jobs a runner has in hand
 is keyed by **(job, attempt)** and no longer by job id alone. Every
@@ -8625,6 +8625,20 @@ seen in a real run:
   `insert` had already destroyed the first attempt's unacknowledged verdict,
   which D19 says is never destroyed.
 
+**The acknowledgement resolves; it does not carry.** No field was added to
+any frame here. `FromHub::JobResultAck` still carries a job id and **no
+attempt number**, so the attempt an acknowledgement is about is read off
+the map: it is the one **holding an end**, which is that frame's own
+meaning — the hub has this job's end on its disk, and an attempt that is
+still running has no end for an acknowledgement to be about. Keyed by both,
+that is the resolution of one named entry instead of "whatever stood under
+the id". One caveat, said here rather than left to be found: if two
+attempts of one job were both holding an end, one acknowledgement would
+free both. That state is not reachable today — a second attempt is only
+assigned after the hub has written the first off, and a written-off
+attempt's entry is dropped by `drop_stale` — and freeing an arbitrary one
+of them would be worse.
+
 **Why the key and not a guard.** A guard in `take_job` — refuse a second
 attempt of a job this runner is already running — is also wanted, and is a
 separate decision about what a runner may accept. It does not make this one
@@ -8653,7 +8667,21 @@ before a line of the fix and green after, one per consequence:
 `handing_one_attempt_back_leaves_the_other_attempt_of_that_job_running`,
 `an_acknowledgement_lets_go_of_the_attempt_that_holds_the_result_and_no_other`.
 
-## 2026-10-25 — D-NEXT The watchdog measures each silence inside its own loop
+**Two of those three tests assert a state that part 3 of C5 forbids
+outright.** The two that call `take_job` twice for one job id —
+`two_attempts_of_one_job_are_two_entries_in_the_machines_own_count` and
+`handing_one_attempt_back_leaves_the_other_attempt_of_that_job_running` —
+make that second call exactly what part 3's `NotTaken::StillRunningThisJob`
+refuses. They are not a specification that a runner *may* hold two live
+attempts of one job; they are a specification that the map must be able to
+say so when it happens. Read as a licence they would block the refusal that
+part 3 adds, which is the opposite of what they are for.
+
+**On the number.** This entry is D177. D176 and D175 were integrated on
+2026-10-25, D174 is held by the unmerged branch of PR #72 and D170 by that
+of PR #67; gaps stay (D148).
+
+## 2026-10-25 — D178 The watchdog measures each silence inside its own loop
 
 **Decision.** `watch_for_a_lost_runner` reads the age of the attempt it is
 about to judge **again, inside the loop**, immediately before judging it,
@@ -8710,7 +8738,187 @@ cannot be run once — and the test store gains a second forced window,
 `record_state` ending another job's attempt as a job is queued, which is
 what a frame arriving on a link does.
 
-## 2026-10-25 — D-NEXT A runner holds its own ceiling
+**On the number.** This entry is D178. D177 is C5 part 1, integrated in the
+same pass and merged first — this branch was stacked on it, and the merge
+of `main` into this one is in its history. D174 is held by the unmerged
+branch of PR #72 and D170 by that of PR #67; gaps stay (D148).
+
+---
+
+## 2026-10-24 — D174 Herd's sessions keep their state in Herd's own root
+
+**Context.** Every Claude Code session on this project is started by
+chatOnS's launcher, `/mnt/ssd_980/chatons/wt/main/ops/agents/env.sh`,
+which exports `CLAUDE_CONFIG_DIR=$CHATONS_ROOT/claude/config` along with
+`HOME`, the `XDG_*` paths, `TMPDIR` and `CARGO_HOME`. Herd has therefore
+been running inside chatOnS's configuration directory, and two things
+followed from that and not from anything anybody decided about Herd.
+The first is permissions: that directory's `settings.json` holds an
+`autoMode` block whose `environment` declares the session to be
+chatOnS's orchestrator and whose `allow` list grants `sudo systemctl`,
+`nixos-rebuild switch`, `docker compose` on the hub's container and
+commits under `/etc/nixos` — exactly the operation of the consumer's
+machines that invariant 9 and D161 forbid us. The second is memory: auto
+memory is keyed by the configuration directory, so when the directory
+changed on 2026-10-23 the two 2026-10-15 cards under
+`/home/server/.claude/projects/-mnt-ssd-980-herd-project/memory/`
+(`orchestrate-do-not-code.md`, `herd-cargo-needs-nix-develop.md`)
+stopped being loaded, silently, and were found again only by looking for
+them. Nothing failed either time; a project that borrows another
+project's state inherits what it was never granted and loses what it
+never moved.
+
+**Choice.** Herd gets a state root of its own, `/mnt/ssd_980/herd`, in
+the shape chatOnS uses — `claude/config`, `claude/home`, `claude/tmp` —
+and two launchers in the repository under `ops/agents/`. `env.sh` is
+sourced and puts `HOME`, `CLAUDE_CONFIG_DIR`, the four `XDG_*` paths,
+`XDG_RUNTIME_DIR`, `TMPDIR` and `CARGO_HOME` under that root, refuses to
+continue if any of them resolves outside it, clears `ANTHROPIC_*`,
+`CLAUDE_CODE_USE_*`, the loader overrides and chatOnS's own markers, and
+sets `umask 077`. `session.sh` sources it, refuses to run as root,
+requires a Claude Code binary, says what is missing when the
+configuration directory has no credentials, and execs `claude` in the
+checkout it was read from. `docs/orchestration/state-root.md` says where
+the state is, how to start a session, and why chatOnS's launchers are
+never the way to start one.
+
+**What this does not do, deliberately.** It does not copy chatOnS's
+`chatons.slice` and `in-slice.sh`, its tmux server, its `dtach`
+orchestrator socket and the `attach`/`restart`/`stop` trio, its Nix
+watcher, its Remote Control relay, its MCP daemon, its boot unit or its
+`HC` helper. Herd has no cgroup slice on this host, no fleet of
+long-lived sessions to supervise and re-attach, and no service of its
+own to start at boot. It also creates nothing outside the repository and
+moves no data: `/mnt/ssd_980` belongs to `alexandre` with a group
+`server` is not in, so the root's first directory needs the owner, and
+the credentials and the two memory sets are the owner's to merge. The
+procedure for both, command by command and with what a careless run of
+it loses, is in `docs/orchestration/state-root.md`.
+
+**Alternatives rejected.**
+
+1. *Leave the shared directory and forbid the permissions in prose.*
+   This is what was in force until today, and it is what invariant 9 and
+   `CLAUDE.md` already say. It did not stop the grant from existing, and
+   a permission a session holds but is told not to use is one tool call
+   away from being used. It also does nothing at all about the lost
+   memory cards, which no instruction can reach.
+2. *Move chatOnS's `autoMode` block into chatOnS's own project settings
+   and keep one configuration directory.* It is the smaller change and
+   it fixes the permissions, so it was the tempting one. Rejected
+   because the directory is not ours to restructure, because it leaves
+   Herd's memory, history and credentials living in a directory whose
+   next reorganisation we would learn about the way we learnt about the
+   last one, and because `CLAUDE.md` says Herd decides how its own work
+   is run.
+3. *One launcher that does everything, in chatOnS's style.* Rejected in
+   favour of two short files: a shell that only needs `cargo` or `nix`
+   should be able to source the environment without starting a session,
+   and the file that is read to check what a session inherits should be
+   readable in one screen.
+
+**Reversibility.** High. The scripts are two files and the root is one
+hardcoded line in `env.sh`; nothing in the product reads either, no
+protocol field and no record changes, and the gates do not run them.
+The irreversible part is not here: it is the owner creating the root and
+merging the two memory sets into it, which is a copy and not a move, so
+the directories we read from are left exactly as they are.
+
+**On the number.** This entry is D174. The number was taken on
+2026-10-24, above D172 and D173, which PR #70 and PR #71 have since
+merged; D175 to D178 were allocated after it and left D174 free, so the
+entry keeps it and appends here, after D178. The file is append-only and
+a number is an identifier, not a position (D148): D148 after D149 and
+D161 after D167 are the same case, a branch that merged late with the
+number it had taken earlier. D170 is held by the unmerged branch of
+PR #67; gaps stay.
+
+---
+
+## 2026-10-27 — D179 Every binary runs; an incomplete run's skips are unknown
+
+**Decision.** `scripts/test.sh` passes `--no-fail-fast` to `cargo test`
+itself, unless the caller already passed it, and both `scripts/test.sh` and
+`scripts/report-skips.sh` decide what to say about skips from whether the
+run they are reporting on was a *complete* one. Only a complete, green,
+unnarrowed run prints the unqualified sentence `Every assertion ran on this
+host: nothing was skipped.` — byte for byte the wording it has always had,
+and the one `deploy/README.md` quotes the opening of (line 542). Every
+other case says less: an empty skip log after a non-zero status is reported
+as `SKIPS UNKNOWN on this host`, a partial one as `AT LEAST n`, and a run
+narrowed by the caller's own arguments speaks only for the tests it
+selected. `scripts/test.sh` ends with a verdict marker that says which of
+those cases it was, and `report-skips.sh` reads that marker, because CI
+hands it a captured file and no exit status.
+
+**The failure this prevents.** `cargo test` stops launching test binaries
+once one of them has failed. On this workstation the suite is red for
+ORCH-069 in `herd-hub`, so `confinement` — the binary that carries the ten
+cgroup v2 skips and the two ZFS `io.max` skips — never ran at all, and
+`$HERD_SKIP_LOG` stayed empty. An empty log was read as *nothing was
+skipped*, so a red run on which most of the suite never started printed
+"Every assertion ran on this host: nothing was skipped". That is false
+reassurance in precisely the direction invariant 5 and **D27** exist to
+forbid: a skipped assertion must be printed as skipped and never counted as
+checked, and a skip log that is empty because nothing ran is the same lie by
+omission. `scripts/report-skips.sh` had the identical defect and CI runs it
+with `if: always()`, which is how the sentence reached PR #86's **failing**
+`check` job and its job summary — the one place where a gate's verdict is
+actually read.
+
+**Why `--no-fail-fast` becomes the script's own default, not a flag at the
+call site.** The suite is a gate. A gate is asked "what is wrong", and all
+of the failures at once is the useful answer; stopping at the first failing
+target hides the rest and, as above, truncates the skip list to the point of
+falsehood. A default that every caller has to remember is not a default, and
+the callers here are CI, agents and briefs, none of which should have to
+know about cargo's scheduling to get an honest report. It is not added twice:
+`cargo test` refuses `--no-fail-fast` more than once, so the script adds it
+only when the caller did not. The cost is accepted and is real — a red run
+is **longer**, because every binary runs.
+
+**Why the exit status is consulted as well.** `--no-fail-fast` does not make
+the log provably complete: a compile error, a cancelled job or a binary
+killed mid-flight each truncate it. So completeness is never assumed from
+the flag; it is read from the status, or from the marker when only a capture
+is available. An empty log on a run that did not finish means *unknown*, not
+*none*, and the report says so.
+
+**Alternative rejected.** Leave the reasoning where the author first put it
+— a comment block in `scripts/test.sh` explaining when the green sentence is
+true — and change no output. Rejected because this changes what a gate's
+output *means*, which is exactly what this file is for: its opening is
+quoted in `deploy/README.md`, it is pasted into handoffs and into PR
+Evidence blocks, and it is read by whoever judges a merge. A reader who
+finds "nothing was skipped" in a PR has no reason to go looking for a
+comment in a shell script to learn that it may mean "nothing ran"; and a
+comment binds nobody, so the next person to touch either script would have
+had nothing to break. A second alternative, fixing `scripts/test.sh` alone,
+was rejected on the same ground: it would have left the false sentence in
+CI's summary, which is where the claim does its damage.
+
+**Evidence.** Eighteen cases in `scripts/check-orchestration.sh`, which goes
+from 93 to **111**; a fake `cargo` on `PATH` records its arguments, writes
+the skip lines it was given and exits with the status it was given, so every
+combination of (the run finished, something was skipped, the caller narrowed
+it) is reproducible in a second with no toolchain. Ten of the eighteen go
+red against `origin/main` `96fc10b`, proved by reverting both scripts and
+re-running them. On this workstation the red suite now prints `AT LEAST 12
+assertion(s) COULD NOT RUN on this host and were skipped, and the suite did
+not finish (cargo test exited 101), so this list is a floor and not a count`
+where it used to print the green sentence; on CI's runner, green and
+complete, it prints the old sentence with that host's own count of 15. No
+test, no expectation and no assertion was edited, no skip became a pass, and
+the exit code is still cargo's own.
+
+**On the number.** This entry is D179, allocated at integration above D178,
+the highest on `origin/main` `96fc10b` and on every open PR (#67, #85, #88).
+D143, D154 and D170 stay gaps; D170 is held by the unmerged branch of PR #67
+(D148).
+
+---
+
+## 2026-10-25 — D180 A runner holds its own ceiling
 
 **Context.** Invariant 2's first half — *a runner never destabilizes its
 host* — had no local defence. `serve_hub` spawned a task for every
@@ -8802,10 +9010,12 @@ The `outputs/` sweep is the one irreversible half, and only in the sense
 that bytes it removes are gone — they were bytes no runner could ever have
 offered, and a revert simply stops the sweep.
 
-**On the number.** `D-NEXT`: `herd-merger` allocates it. Two other branches
-carry a `D-NEXT` at the time of writing.
+**On the number.** This entry is D180, allocated at integration above D179,
+the highest on `origin/main` `cd59ef5` and on every open PR (#67, #85).
+It is the first of the three this PR carries. D143, D154 and D170 stay
+gaps; D170 is held by the unmerged branch of PR #67 (D148).
 
-## 2026-10-25 — D-NEXT A runner announces its ceiling and the hub honours it
+## 2026-10-25 — D181 A runner announces its ceiling and the hub honours it
 
 **Alexa's decision, of today, quoted.** The entry above ends by naming this
 as the fix it deliberately did not make, and as Alexa's call. He made it:
@@ -8903,12 +9113,12 @@ to over-placing, which is where this entry started. Nothing is written to
 disk, no record shape moved, and a field no peer reads is a field no peer
 misreads.
 
-**On the number.** `D-NEXT`: `herd-merger` allocates it. This branch carries
-**three** `D-NEXT` entries — the runner's ceiling above, this one, and the
-one below about what a ceiling refusal costs — and they are meant to be
-three decisions with three numbers, in this order.
+**On the number.** This entry is D181, the second of the three this PR
+carries: the runner's own ceiling in D180 above, this one, and D182 below
+about what a ceiling refusal costs. Three decisions, three numbers, in that
+order.
 
-## 2026-10-25 — D-NEXT A refusal at a machine's own ceiling spends no go
+## 2026-10-25 — D182 A refusal at a machine's own ceiling spends no go
 
 **Alexa's decision, of today, quoted.**
 
@@ -9057,5 +9267,5 @@ is a `Policy` figure, and removing the correction is removing one `max` in
 `admission`. A hub reverted beside runners that are not simply goes back to
 charging a go for a refusal, which is where this entry started.
 
-**On the number.** `D-NEXT`: `herd-merger` allocates it. The third and last
-of the three this PR carries, in this order.
+**On the number.** This entry is D182, the third and last of the three this
+PR carries, after D180 and D181 and in that order.
