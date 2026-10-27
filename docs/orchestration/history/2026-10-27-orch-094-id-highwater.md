@@ -2,9 +2,9 @@
 
 - **Item:** ORCH-094
 - **Agent:** herd-step
-- **Branch / commit:** `orch-094-id-highwater` / see PR, based on
+- **Branch / commit:** `orch-094-id-highwater` / `1ac89d1`, based on
   origin/main `cd59ef5`
-- **PR:** see the branch's pull request (opened, **not merged**)
+- **PR:** #97, opened and **not merged**
 - **Worktree:**
 
 ```text
