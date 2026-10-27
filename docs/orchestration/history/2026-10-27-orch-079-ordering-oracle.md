@@ -4,7 +4,7 @@
 - **Agent:** herd-step
 - **Branch / commit:** `orch-079-ordering-oracle` / `be8ba2b`, based on
   origin/main `cd59ef5`
-- **PR:** #92
+- **PR:** #95
 
 ## Done
 
@@ -181,7 +181,7 @@ None.
 
 ## Resume point
 
-`herd-merger` integrates PR #92 once CI is green (ORCH-001). After that,
+`herd-merger` integrates PR #95 once CI is green (ORCH-001). After that,
 ORCH-080 (the crash-point enumeration) and then ORCH-083 (step A, the event
 `fdatasync`) — both of which must keep the oracle's
 `every_transition_fsyncs_the_record_and_its_directory_before_appending…`
