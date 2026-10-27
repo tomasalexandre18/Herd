@@ -22,11 +22,11 @@ onward are all published, the credential preflight that killed
 v0.3.1-v0.3.3 being gone (D162). A **`v*.*.*-dev*` tag** publishes a
 pre-release in four to six minutes, built as a real tag builds (D172).
 
-**`main` is 102 commits past v0.3.7** at `fba3abb` (`96fc10b` was 90),
-and the workspace version still reads `0.3.7` (`Cargo.toml` line 6;
-read 2026-10-27). Nothing merged since the tag has shipped, the four
-fixes below included. `PROTOCOL_VERSION` is **2** and `RECORD_VERSION`
-**1** on `main` (`herd-proto/src/lib.rs:114`, `herd-hub/src/job.rs:52`).
+**`main` is 118 commits past v0.3.7** at PR #91's integration (`fba3abb`
+was 102), and the workspace version still reads `0.3.7` (`Cargo.toml`
+line 6; read 2026-10-27). Nothing merged since the tag has shipped, the
+four fixes below included. `PROTOCOL_VERSION` is **2** and
+`RECORD_VERSION` **1** (`herd-proto/src/lib.rs:114`, `job.rs:52`).
 
 ## What is known about the consumer's machines, and when
 
@@ -67,10 +67,10 @@ silence of the one before it. No version moves for any of them. **Not on
 `main`:** PR #85 (ORCH-064, C5 part 3), which adds two additive
 `herd-proto` fields — a runner's own ceiling and a free refusal (E-21).
 
-`docs/remediation/` holds eleven pieces: the baseline, audits A and B,
-their contradictory review, two experiments and the review of them, `06`
-(a junction in five posts), `07` (target architecture, recommended and
-**not** adopted), `08` (unsynced-write cost), `11` (each `fsync` priced).
+`docs/remediation/` holds twelve pieces: the baseline, audits A and B,
+their contradictory review, two experiments and their review, `06` (a
+junction in five posts), `07` (architecture, recommended and **not**
+adopted), `08`, `10` (D103's order on ext4), `11` (each `fsync` priced).
 
 ## What the software still does not do
 

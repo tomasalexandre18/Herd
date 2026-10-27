@@ -9,7 +9,8 @@ carries **no tag**; tag `v0.3.7` is `3da48f5`, two merges earlier. No Rust,
 `Cargo.*` or Nix file differs between the two, so the product audited here
 is `v0.3.7`'s product — see `00-baseline.md §2`.
 
-**Date of this index:** 2026-10-25, refreshed at the C0b integration.
+**Date of this index:** 2026-10-25, refreshed at the C0b integration and
+again at the integrations of PR #90 (`11`) and PR #91 (`10`).
 
 ---
 
@@ -27,6 +28,7 @@ is `v0.3.7`'s product — see `00-baseline.md §2`.
 | [`06-junction-breakdown.md`](06-junction-breakdown.md) | `measure-junction-breakdown` | C1: the whole cost of one runner junction, split into the five posts Alexa asked for — historical reads, open-job reads, durable writes, lock wait, dispatch compute — summing to the window by construction. Settles the ranking `05` reversed, with a number on each post: **durable writing is 68–99.5 % of a junction**, the two reads together are under 0.3 % once the queue is deep, dispatch compute is a fifth of a percent, and lock wait is zero until a second runner dials — at which point it is the whole of the first junction's writes. Device-bound and proved so: debug against release moves the three CPU posts by ×3.7–×8.0 and the write post by ×1.00. Touches no file under `herd-hub/src`. |
 | [`07-target-architecture.md`](07-target-architecture.md) | `arch-target-decision` | C4: six architectures compared on durability, progression, crash recovery and migration cost, with one named recommendation — "the keeper": one owned thread performs every store mutation, the reactor wakes it by message and never waits on a disk, its unit of work is bounded and re-armed, and the hub's writes split into two durability tiers. **It is a recommendation and not an adoption.** Its load-bearing claim — that `waiting_for` has no crash-durability requirement — is a question for Alexa, board row ORCH-052. |
 | [`08-s0-unsynced-write-cost.md`](08-s0-unsynced-write-cost.md) | `s0-unsynced-write-cost` | S0: what those durable writes would cost if they were not synchronous — the measured size of the prize behind the tiering. Also names the one ordering invariant that must hold before any `fsync` is dropped: D103 forbids `events.jsonl` being ahead of `job.json`, the `fsync`s hold that today, and without them it is the filesystem's to hold. Safe on ZFS, whose transaction groups commit atomically and in order; **not guaranteed elsewhere**, which is why the server's state root must be named — board row ORCH-053. |
+| [`10-ordering-on-ext4.md`](10-ordering-on-ext4.md) | `plan-orch-074` | ORCH-074: the mechanism that holds D103's ordering — `events.jsonl` never ahead of `job.json` — on **ext4**, where `08`'s ZFS argument does not transfer. Settles that **D103 needs no new ordering mechanism**, because the writes `07` de-syncs are not the writes D103 binds: `JobEvent::state()` is `None` for `Waiting`, `move_to` and `raise` already leave `events.jsonl` naming a reason the record does not, `recover` never reads `events.jsonl`, `job_events` already drops a torn tail, and timestamps are not comparable by decision. What holds the order for a **decisive** write is the record's own two syncs returning before the event append is issued — a syscall-return guarantee, independent of the filesystem. **A larger hazard was found in its place:** a `job.json` that comes back empty or torn makes the hub refuse to start on the *whole* state root, D52's quarantine covering labels only. ext4's cross-file ordering could not be established from documentation on this host and is marked `I`; the plan is built so as not to need it. **Amended against `11-sync-prices.md`, which refuted the plan's own hypothesis H-1:** the single durability tier splits into three independent steps — **A** the event `fdatasync` (~31 %, needing no crash evidence of any kind), **B** the directory `fsync` (~65 % cumulative), **C** the record `fsync` (~98 %, deferred and possibly never taken) — and the directory sync's standing *rises* rather than falls: only it makes the record's **rename** durable, so on a decisive write it stays unconditionally. Produces the ordered task list ORCH-079 to ORCH-090. Touches no file under `herd-hub/src`. |
 | [`11-sync-prices.md`](11-sync-prices.md) | `orch-077-price-the-syncs` | ORCH-077: the three durable operations of `record_waiting` — the record `fsync`, the directory `fsync` and the event `fdatasync` — priced **separately**, in all eight combinations, on **both** filesystem classes in one session on one host. Settles that one `fsync` on ext4/NVMe costs **989 µs** and not the tens-to-low-hundreds of microseconds that was hoped, so the class the deployment runs on is **1.2x** faster per sync than the 1.19 ms `08` derived, and 1.3-1.7x faster than this harness's own ZFS figures — not 10-100x; that the three syncs are **additive, not redundant**, so keeping one and dropping two collects **65 %** of the prize and not nearly all of it, the kept sync still costing 21x the unsynced floor; and that `08`'s **9.970 s** junction at `N` = 1 000 becomes **3.128 s** on ext4 — 3x smaller, not an order of magnitude, and still seconds. Corrects `06`'s `sync_dir` figure of 6.6 µs, which was measured with no `rename` between the file sync and the directory sync and so understates the real directory sync by about two hundred times. Touches no file under `herd-hub/src`. |
 
 The mandate's §10 skeleton also names `01-contract.md` and
@@ -34,12 +36,14 @@ The mandate's §10 skeleton also names `01-contract.md` and
 keeps their places rather than renumbering what is written, so a gap in
 this table means *not written*, never *lost*.
 
-**`09` and `10` are both absent from this table, for different reasons.**
+**`09` is the one number absent from this table.**
 `09-runner-self-limits.md` is written and is on an unmerged branch
 (`runner-holds-its-own-limits`, PR #85); it gets its row when that
-branch lands. **`10` is unclaimed on every ref** — no file of that number
-exists anywhere in the repository — so `11` is the next piece written and
-`10` stays free for whoever needs it.
+branch lands. **`10` was unclaimed on every ref until PR #91**, which is
+why `11` was written and merged before it; the two are now both here and
+the table is in number order rather than in the order they landed.
+Whether `09` is then reused deliberately a second time, or `10` stands
+as written, is **ORCH-091**.
 
 **One number was reused, deliberately.** The skeleton's `05` was
 `05-invariants.md`; the `05` that exists is the adversarial review of the
