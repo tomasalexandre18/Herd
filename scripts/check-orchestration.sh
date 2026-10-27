@@ -80,6 +80,21 @@ fresh; printf '# a handoff, not a brief\n\nNo worktree named anywhere in it.\n' 
 expect_green "a handoff whose task name merely contains the word brief"
 fresh; printf 'x%.0s' $(seq 1 85) >> "$tmp/repo/docs/orchestration/workflow.md"; echo >> "$tmp/repo/docs/orchestration/workflow.md"
 expect_red "over-long line in docs/orchestration" 'workflow.md has lines over 79'
+# The 79 columns are characters, not bytes. check-docs.sh counts them inside
+# awk, where `length` is bytes on the CI runner's mawk; it corrects for that
+# by subtracting the UTF-8 continuation bytes. Nothing above would notice if
+# that correction were dropped -- an 85-character ASCII line is 85 bytes
+# either way -- so the property gets its own cases, one on each side of the
+# limit, with a 3-byte and a 4-byte character.
+em=$(printf '\342\200\224')        # U+2014 EM DASH, 3 bytes, 1 column
+goat=$(printf '\360\237\220\220')  # U+1F410 GOAT, 4 bytes, 1 column
+W="$tmp/repo/docs/orchestration/workflow.md"
+fresh; { printf "$em%.0s" $(seq 1 79); echo; } >> "$W"
+expect_green "a 79-character line of 3-byte characters (237 bytes) is within the limit"
+fresh; { printf "$em%.0s" $(seq 1 80); echo; } >> "$W"
+expect_red "an 80-character line of 3-byte characters is over the limit" 'workflow.md has lines over 79'
+fresh; { printf "$goat%.0s" $(seq 1 79); echo; } >> "$W"
+expect_green "a 79-character line of 4-byte characters (316 bytes) is within the limit"
 fresh; chmod -x "$tmp/repo/.claude/hooks/orchestrator-guard.sh"
 expect_red "hook not executable" 'not executable'
 fresh; printf '{ not json' > "$tmp/repo/.claude/settings.json"
