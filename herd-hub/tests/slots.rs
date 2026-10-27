@@ -12,7 +12,6 @@ mod real_herd;
 
 use std::time::{Duration, Instant};
 
-use herd_runner::testing::skipped;
 use real_herd::Herd;
 
 /// A runner that has one build slot and an iGPU nobody may share: the owner's
@@ -680,18 +679,43 @@ async fn every_placement_in_a_busy_day_greps_to_exactly_one_line() {
     }
 }
 
-/// The derived `-j` reaches the process, and the figure on the record is that
-/// same figure (E-22).
+/// The derived `-j` reaches the process, the record carries that same figure,
+/// and the figure is a **known constant on every host** (E-22).
 ///
 /// The job prints what it was given, so "recorded" and "passed" are compared
 /// against each other rather than both read from the hub.
+///
+/// Two jobs on one runner, because the derivation is the minimum of two
+/// branches and a test that drove one of them would still pass with the other
+/// deleted:
+///
+/// | per-thread figure | memory branch | thread branch | derived |
+/// |---|---|---|---|
+/// | 256 MiB | 1536 / 256 = **6** | 20 | `-j 6` |
+/// | 64 MiB  | 1536 / 64 = 24     | **20** | `-j 20` |
+///
+/// **Why 2 GiB and not the owner's own 17 GiB.** A lend is a figure a runner
+/// is *asked* for; what it announces is that figure lowered to what is really
+/// there — `MemTotal` (D89) and the room under the tightest cgroup ceiling
+/// enclosing it (D119). This test used to declare 17 GiB and guard on
+/// `MemTotal` alone, which left the cgroup clamp through unseen — red on a
+/// workstation inside a bounded slice — and skipped the assertion outright on
+/// every host smaller than the owner's PC, CI included. Red in one place and
+/// never executed anywhere else, which by D27 means the figure was proved
+/// nowhere (ORCH-069).
+///
+/// Three quarters of 2 048 MiB is 1 536 MiB on every machine that can build
+/// this workspace, so both rows above are constants and both assertions are
+/// exact; [`real_herd::a_lend_this_host_can_really_make`] says so by name
+/// rather than skipping if a host ever is that tight. E-22's own figure —
+/// 17 GiB and 1 792 MiB a thread is `-j 7` — is asserted on the arithmetic
+/// itself, with no host in it at all, in `herd_proto::placement`.
 #[tokio::test(flavor = "multi_thread")]
 async fn the_derived_j_is_recorded_and_is_what_the_job_is_given() {
+    real_herd::a_lend_this_host_can_really_make(THE_LEND_MIB, 0);
     let herd = Herd::new();
     let _hub = herd.start_hub("hub").await;
     let file = capability_file(&herd, "pc", ONE_SLOT_AND_AN_IGPU);
-    // The owner's PC as her figures have it: 17 GiB usable, 20 threads to
-    // WSL. At 1 792 MiB per build thread that is E-22's own `-j 7`.
     let _runner = herd.start_runner_with(
         "wsl-pc",
         "runner",
@@ -701,20 +725,50 @@ async fn the_derived_j_is_recorded_and_is_what_the_job_is_given() {
             &file,
             "--no-detect",
             "--host-memory",
-            "17GiB",
+            "2GiB",
             "--host-threads",
             "20",
+            // Written out, so the share the `-j` comes out of belongs to this
+            // test rather than to a default that could move. The floor is
+            // admission's business (E-29) and not the derivation's, but one
+            // at or above the lend is a runner that refuses to start.
+            "--host-memory-floor",
+            "512MiB",
         ],
     );
     herd.wait_for_runner().await;
 
+    // 256 MiB a thread: the share binds, at six of the twenty threads this
+    // host says it has.
+    the_derived_figure_is(&herd, 256, 6).await;
+    // 64 MiB a thread: the share would cover twenty-four, so the thread count
+    // is what the figure comes out at. Without the minimum this would be 24,
+    // and twenty-four build threads on twenty hardware threads is the
+    // oversubscription the derivation exists to avoid.
+    the_derived_figure_is(&herd, 64, 20).await;
+}
+
+/// How much memory the runner above is told to lend. 2 GiB: small enough that
+/// no host running this suite can clamp it, large enough that three quarters
+/// of it is a whole number of gibibytes.
+const THE_LEND_MIB: u64 = 2 * 1024;
+
+/// Run one build that prints the `-j` it was handed, and insist that the
+/// figure the process got, the figure on its record and the figure in the
+/// line explaining its placement are one value — and that the value is
+/// `expected` (E-22, E-36).
+///
+/// `expected` is written out by the caller and never computed here: a test
+/// that derived its expectation the way the hub derives the figure would pass
+/// whatever the hub produced, the wrong answer included.
+async fn the_derived_figure_is(herd: &Herd, build_thread_mib: u64, expected: u64) {
     let ran = herd
         .herdctl(&[
             "run",
             "--label",
             "build",
             "--build-thread-mib",
-            "1792",
+            &build_thread_mib.to_string(),
             "--",
             "/bin/sh",
             "-c",
@@ -726,82 +780,76 @@ async fn the_derived_j_is_recorded_and_is_what_the_job_is_given() {
         "the build failed: {}",
         String::from_utf8_lossy(&ran.stderr)
     );
-    // **Host-dependent, and skipped rather than fudged where it cannot be
-    // made** (D27). M8 made the runner clamp `--host-memory` to the machine's
-    // real `MemTotal`, because a figure larger than the machine makes E-29's
-    // admission floor guard memory that does not exist (D89). So the exact
-    // figure E-22 names — `-j 7` from 17 GiB — can only be asserted on a host
-    // that really has 17 GiB. The arithmetic itself is asserted without a host
-    // at all in `herd_proto::placement`; what is asserted here on *every*
-    // host is the thing only the real binaries can show: that the figure on
-    // the record is the figure the process was given.
     // After E-02's framing line, which is what the requester's stdout begins
     // with: the `-j` the hub derived is in the *job's* own words (D109).
     let said = real_herd::job_output(&ran.stdout).trim().to_owned();
-    let lends_seventeen_gibibytes =
-        herd_runner::metrics::total_memory_mib().is_some_and(|total| total >= 17 * 1024);
-    if lends_seventeen_gibibytes {
-        assert_eq!(
-            said,
-            "built with -j7",
-            "the figure E-22 asks for, in the process's own words. The hub explained the \
-             placement it made, and the figures in that line are the ones to read: {}",
-            herd.said("hub")
-                .lines()
-                .filter(|line| line.contains("is attempt 1 on runner"))
-                .collect::<Vec<_>>()
-                .join("\n")
-        );
-    } else {
-        skipped(
-            "the_derived_j_is_recorded_and_is_what_the_job_is_given (E-22's own -j 7)",
-            &format!(
-                "this host has {:?} MiB of MemTotal, under the 17 GiB the figure is derived \
-                 from, and a lending figure larger than the machine is clamped (D89). The \
-                 process said {said:?} instead; the derivation itself is asserted without a \
-                 host in herd_proto::placement",
-                herd_runner::metrics::total_memory_mib()
-            ),
-        );
-    }
+    assert_eq!(
+        said,
+        format!("built with -j{expected}"),
+        "{build_thread_mib} MiB a thread, out of three quarters of the {THE_LEND_MIB} MiB \
+         this runner lends, capped by its 20 threads. The hub explained the placement it \
+         made, and the figures in that line are the ones to read: {}",
+        herd.said("hub")
+            .lines()
+            .filter(|line| line.contains("is attempt 1 on runner"))
+            .collect::<Vec<_>>()
+            .join("\n")
+    );
 
     // And the same figure on the record, where M10's requirements reading
-    // will have to find it (D82).
-    let job = std::fs::read_dir(herd.state.path().join("jobs"))
-        .expect("jobs")
-        .filter_map(Result::ok)
-        .map(|entry| {
-            entry
-                .path()
-                .file_name()
-                .expect("a job id")
-                .to_string_lossy()
-                .into_owned()
-        })
-        .max()
-        .expect("the build is the newest job");
-    let record = herd.record(&job);
-    assert_eq!(record["build_thread_mib"], 1792, "{record}");
+    // will have to find it (D82). Found by its own per-thread figure rather
+    // than by taking the newest directory, so that two builds in one test
+    // cannot be read for each other.
+    let record = the_build_declaring(herd, build_thread_mib);
     let why = record["attempts"][0]["why"]
         .as_str()
         .expect("every attempt carries its explanation")
         .to_owned();
-    assert!(why.contains("1792 MiB per build thread"), "{why}");
-    // **The assertion that holds on every host**, and the one only the real
-    // binaries can make: the figure written on the record, the figure in the
-    // line explaining the placement, and the figure the process was actually
-    // given are one value. Under M7's own defect — a `-j` derived at the
-    // moment of handing over, with the record told afterwards — these three
-    // could differ, and that is what this is here to catch.
+    assert!(
+        why.contains(&format!("{build_thread_mib} MiB per build thread")),
+        "{why}"
+    );
+    // The two figures the derivation was made from, as the runner announced
+    // them. A lend the host clamped would show up here, as a memory figure
+    // that is not this test's, instead of as an unexplained `-j`.
+    assert!(
+        why.contains(&format!("{THE_LEND_MIB} MiB and 20 threads")),
+        "{why}"
+    );
+    // **The three figures are one value**: the one written on the record, the
+    // one in the line explaining the placement, and the one the process was
+    // actually given. Under M7's own defect — a `-j` derived at the moment of
+    // handing over, with the record told afterwards — these three could
+    // differ, and that is what this is here to catch.
     let derived = record["parallelism"]
         .as_u64()
         .unwrap_or_else(|| panic!("a derived -j is on the record: {record}"));
+    assert_eq!(derived, expected, "{record}");
     assert_eq!(said, format!("built with -j{derived}"), "{record}");
     assert!(why.contains(&format!("-j {derived}")), "{why}");
-    if lends_seventeen_gibibytes {
-        assert_eq!(derived, 7, "{record}");
-        assert!(why.contains("17408 MiB and 20 threads"), "{why}");
-    }
+}
+
+/// The record of the one build that declared `build_thread_mib` MiB a thread.
+///
+/// Exactly one, insisted on: a helper that silently took the first of two
+/// would make the assertions above pass by reading the other job's record.
+fn the_build_declaring(herd: &Herd, build_thread_mib: u64) -> serde_json::Value {
+    let mut found: Vec<serde_json::Value> = std::fs::read_dir(herd.state.path().join("jobs"))
+        .expect("jobs")
+        .filter_map(Result::ok)
+        .filter_map(|entry| {
+            let record = std::fs::read_to_string(entry.path().join("job.json")).ok()?;
+            serde_json::from_str::<serde_json::Value>(&record).ok()
+        })
+        .filter(|record| record["build_thread_mib"].as_u64() == Some(build_thread_mib))
+        .collect();
+    assert_eq!(
+        found.len(),
+        1,
+        "one build declared {build_thread_mib} MiB a thread, and the records hold {} of them",
+        found.len()
+    );
+    found.remove(0)
 }
 
 /// A figure of zero is refused where it is written, not announced as a size
