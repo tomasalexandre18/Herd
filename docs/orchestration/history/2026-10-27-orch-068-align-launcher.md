@@ -269,8 +269,8 @@ None. ORCH-068's question was answered before the task started.
 ## Resume point
 
 `herd-merger` reviews and merges the pull request for
-`orch-068-align-launcher` (PR #93) once CI's `check` and `docs` are green.
-else is owed on ORCH-068.
+`orch-068-align-launcher` (PR #93) once CI's `check` and `docs` are
+green. Nothing else is owed on ORCH-068.
 
 ## Processes
 
