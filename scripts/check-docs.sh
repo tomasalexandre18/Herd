@@ -1,6 +1,14 @@
 #!/usr/bin/env bash
 # Enforces the docs discipline of CLAUDE.md invariant 8, so that it does not
 # have to be enforced by hand in review.
+#
+# Adding a rule here: check-orchestration.sh runs this whole script 26 times,
+# each over a full copy of the real repository, because a control only ever
+# seen green is not known to work and each case needs its own fresh corpus.
+# The cost of any rule that is linear in the corpus is therefore multiplied
+# by 26 in the `docs` CI job, which has a 5-minute cap. One such rule already
+# took that job past the cap (2026-10-27; see the 79-column check below).
+# Measure a new whole-corpus rule against the suite, not against one run.
 set -uo pipefail
 
 # A stable locale for grep, sed and sort below. The column count has its own

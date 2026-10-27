@@ -5,6 +5,14 @@
 # let legitimate inspection through. Runs on a scratch copy; the repository
 # is never modified. No toolchain needed.
 #
+# Cost: each expect_red/expect_green runs check-docs.sh over a fresh full
+# copy of the real repository -- 26 whole-corpus runs as this file stands.
+# That multiplier is the constraint on anyone adding an all-docs rule to
+# check-docs.sh: a rule linear in the corpus is paid 26 times here, and the
+# `docs` CI job is capped at 5 minutes. Adding a case here costs one more
+# run of every rule. The fixtures are deliberately not trimmed: a control
+# measured on a toy corpus is not known to work on the real one.
+#
 # Usage: ./scripts/check-orchestration.sh
 set -uo pipefail
 root=$(cd "$(dirname "$0")/.." && pwd)
