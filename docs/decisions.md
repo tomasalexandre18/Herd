@@ -9341,3 +9341,72 @@ line of `herd-hub/src/durable.rs` plus `record_waiting`, behind
 as D180-D182 and above them. D143, D154 and D170 stay gaps (D148); D170 is
 held by PR #67, closed unmerged as obsolete on the day this was written,
 so it stays a gap rather than returning to the pool.
+
+## 2026-10-27 — D184 The hub stops in five seconds; an overrun is a crash
+
+**What is decided.** `herd-hub` answers `SIGTERM` and `SIGINT` with a
+stop path instead of dying where it stands, and that path is bounded:
+`STOP_WITHIN = 5 s`, in `herd-hub/src/server.rs`. The hub stops
+accepting connections and submissions, starts no further dispatch pass,
+waits up to five seconds for the pass in flight, and exits. Board row
+**ORCH-081**, PR #96.
+
+**Where the figure comes from.** It mirrors **invariant 2's runner
+bound** — a runner stops cleanly in ≤ 5 s when its owner asks — and it is
+`07-target-architecture.md`'s **V9** made real. Invariant 2 binds a
+runner and says nothing about a hub; this entry does not extend the
+invariant, it gives the hub a figure of its own that happens to be the
+same one, so that an operator has one number to remember.
+
+**Where it is justified and where it is not, said plainly.** The thing
+waited for is one dispatch pass at `N` = 1 000. `11-sync-prices.md` §7
+measured that pass at **3.128 s on ext4/NVMe**, the class the
+deployment runs on (ORCH-053, Alexa 2026-10-26: *"ext4"*), and the bound
+holds there. It does **not** hold on ZFS/SATA: `11` measures 6.949 s and
+`08-s0-unsynced-write-cost.md` 9.970 s for the same depth. A hub on ZFS
+with a thousand queued jobs overruns five seconds. That is written into
+the constant's own doc comment rather than left for someone to discover,
+and it is the reason the figure is recorded as a bound with a domain and
+not as a law.
+
+**An overrun is a crash and not a corruption.** Past the bound the hub
+says so by name and exits **non-zero**. It costs exactly what a
+`SIGKILL` at the same instant would cost and no more: every write in
+`herd-hub/src/durable.rs` is a synced temporary renamed into place or a
+synced append (D8), and `JobDirStore::open` already recovers an attempt
+a hub died inside. Nothing half-written is left behind by the overrun
+itself. **The non-zero exit is the point of the overrun**, not an
+accident of it: a stop that is still a crash stays countable, by the
+operator and by `docker compose`, instead of being laundered into a
+clean exit because the hub was asked politely.
+
+**Five seconds and docker compose.** `docker compose stop` sends
+`SIGTERM` and `SIGKILL`s after a **ten-second** default grace. A bound of
+five fits inside it with room; a larger bound would have the stop path
+killed mid-drain by the very mechanism it exists to serve, which is worse
+than no stop path at all because it is harder to see.
+
+**What this does not decide.** Nothing of the durability tier. D183
+authorises step A alone (ORCH-083) and this entry is one of its two
+prerequisites, the other being ORCH-079's ordering oracle; the tier is
+defensible only because the *ordinary* stop stops being a crash, and
+that is all this entry buys it. No frame, no `PROTOCOL_VERSION` (2), no
+`RECORD_VERSION` (1) moves, and nothing at all is sent to a peer on the
+way out — a clean stop is still, on the wire, indistinguishable from a
+kill. Changing that touches which branch a runner takes on an ending
+link (D104) and is its own task.
+
+**Reversibility.** High. The constant is one line and the stop path is
+behind one entry point; `Hub::serve()` is unchanged and installs no
+handler, because a library must not install one on its caller's process.
+
+**On the number, and on whose word it is not.** This entry is D184,
+allocated at the integration of PR #96. **Alexa was asked whether to
+record the bound and had not answered when this was written**, and the
+author of PR #96 stated five seconds as a *proposal* in the code for
+exactly that reason. It is written down here so the first operator who
+sees a non-zero exit on `docker compose stop` has something to read, and
+so that a figure nobody agreed to does not become a promise by sitting
+silently in a constant. **Alexa may overturn it**; if he does, the entry
+stays and a later one says so, because a number is an identifier and
+decisions.md is append-only (D148).

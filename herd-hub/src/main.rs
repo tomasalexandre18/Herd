@@ -5,9 +5,9 @@ use std::sync::Arc;
 use anyhow::{Context, Result};
 use clap::Parser;
 use herd_hub::{
-    Authority, Budget, Hub, JobDirStore, JobStore, Policy, Stickiness, AGING_STEP,
-    DEFAULT_LISTEN_ADDR, DRAIN_FIRST_LIMIT, LOST_AFTER, OUTPUT_BUDGET, OUTPUT_FLOOR,
-    READINGS_AT_ONCE, READING_CAP, REQUEUE_BUDGET, STICKINESS_LIMIT, WAIT_RESTATEMENT,
+    Authority, Budget, Hub, JobDirStore, JobStore, Policy, Stickiness, Stop, StopSignals,
+    AGING_STEP, DEFAULT_LISTEN_ADDR, DRAIN_FIRST_LIMIT, LOST_AFTER, OUTPUT_BUDGET, OUTPUT_FLOOR,
+    READINGS_AT_ONCE, READING_CAP, REQUEUE_BUDGET, STICKINESS_LIMIT, STOP_WITHIN, WAIT_RESTATEMENT,
 };
 use herd_proto::{HEALTH_EVERY, STILL_THERE_EVERY};
 
@@ -212,6 +212,13 @@ fn seconds(value: f64) -> std::time::Duration {
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    // **Before everything**, including the option parsing and the opening of
+    // the state root (ORCH-081). Until these handlers exist, `SIGTERM` kills
+    // this process where it stands, and opening the state root sweeps it —
+    // which on a large volume is the longest, least interruptible moment
+    // this binary has. Installed here, a signal that lands in that moment is
+    // buffered and acted on the instant the serving loop begins.
+    let signals = StopSignals::listen();
     let args = Args::parse();
     // Read before the state root is opened, because opening it sweeps: a
     // budget that does not parse must stop the hub here, where the message
@@ -325,5 +332,39 @@ async fn main() -> Result<()> {
         policy.reading_cap,
         policy.readings_at_once,
     );
-    hub.serve().await
+    // Said at startup and not only at the stop, because it is a promise an
+    // operator plans around: a container's own grace period has to outlast
+    // this, or the stop path is cut off by a SIGKILL before it can finish
+    // (ORCH-081).
+    println!(
+        "herd-hub: SIGTERM and SIGINT stop this hub cleanly — it stops accepting connections \
+         and submissions, lets the dispatch pass in flight finish, and exits, giving that \
+         pass at most {STOP_WITHIN:?}. Give the container at least that much grace. Jobs \
+         already running are not cancelled and their runners keep their verdicts until a hub \
+         records them."
+    );
+    match hub.serve_until_stopped(signals).await? {
+        Stop::Clean { asked, took } => {
+            println!(
+                "herd-hub: {asked}, and it stopped cleanly: the dispatch pass in flight was \
+                 over after {took:?}, inside the {STOP_WITHIN:?} this hub allows. Nothing \
+                 queued was lost and no attempt was numbered on the way out."
+            );
+            Ok(())
+        }
+        // Non-zero, and loudly: an ordinary stop that is quietly a crash is
+        // the thing this path exists to remove, so one that is still a crash
+        // must be countable. The store is no worse off than after a SIGKILL
+        // at the same instant — the writes are atomic and the next start
+        // names any attempt this one died inside — but the operator is owed
+        // the fact that it happened.
+        Stop::Overran { asked, after } => anyhow::bail!(
+            "{asked}, and the dispatch pass in flight had not finished after {after:?}, so \
+             this hub is leaving under it. That costs exactly what a SIGKILL at this instant \
+             would have cost and no more: every record is replaced whole or not at all, and \
+             the next start names any attempt this one died inside. If it keeps happening, \
+             the queue at this hub's depth takes longer to judge than the bound allows."
+        ),
+        Stop::ListenerFailed(error) => Err(error),
+    }
 }

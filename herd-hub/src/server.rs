@@ -48,6 +48,7 @@
 
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::net::SocketAddr;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -79,6 +80,49 @@ pub const DEFAULT_LISTEN_ADDR: &str = "127.0.0.1:8787";
 
 /// How long a runner may be unheard from before it is lost (E-21).
 pub const LOST_AFTER: Duration = Duration::from_secs(60);
+
+/// How long a hub asked to stop gives the dispatch pass already in flight
+/// (ORCH-081, `07` S1 and V9).
+///
+/// **Recorded as D184, and not an invariant.** It was written down at the
+/// integration of PR #96 with the figure, its domain and its failure mode;
+/// Alexa had not answered the question when it was, so D184 says so and he
+/// may overturn it. Invariant 2 binds a *runner* to five seconds and says
+/// nothing about the hub; `07` V9 proposes the same figure
+/// for the hub, mirroring the runner, and this is that figure made real. It
+/// is written here rather than left as an option because an operator has no
+/// way to choose it well, and because the number has to be quotable: every
+/// instance of this hub is stopped by `docker compose stop`, which sends
+/// `SIGTERM` and then `SIGKILL` after its own grace period — ten seconds by
+/// default. Five leaves that default room to spare.
+///
+/// **Why five is reachable.** The thing waited for is one pass, and the pass
+/// is almost entirely `fsync`: `08` measures a junction at `N` = 1 000 at
+/// 9.970 s on ZFS/SATA, and `11` recomputes the same pass on the class the
+/// deployment runs on — ext4 on NVMe — at **3.128 s**. Three seconds fits
+/// inside five with room for the rest of the stop; seven to ten do not. So
+/// the bound holds on the deployment's filesystem at the queue depth that
+/// has been measured, and a hub on ZFS with a thousand queued jobs can
+/// overrun it. It is not tightened further because `11` also shows the ext4
+/// figure is a median of a tight distribution, not a ceiling.
+///
+/// **What happens past it** is [`Stop::Overran`]: the hub says so by name and
+/// exits anyway, which costs exactly what a `SIGKILL` at the same instant
+/// would have cost and no more — every write in [`crate::durable`] is a
+/// synced temporary renamed into place or a synced append, so a reader sees
+/// the whole old file or the whole new one, and `JobDirStore::open` already
+/// recovers an attempt the hub died in the middle of (the killed-hub tests).
+/// A stop that overruns is a crash; it is not a corruption.
+pub const STOP_WITHIN: Duration = Duration::from_secs(5);
+
+/// How often the stop looks at whether the pass in flight is over.
+///
+/// Five milliseconds, which is 0.1 % of [`STOP_WITHIN`] and so costs the
+/// measurement nothing, and about a thousandth of the 3.128 s pass it is
+/// waiting on. Polling rather than a condition variable because the lock
+/// being waited for is a `std::sync::Mutex` held across blocking I/O by
+/// design, and a stop that *blocked* on it could not also honour its bound.
+const STOP_POLL: Duration = Duration::from_millis(5);
 
 /// How long a held verdict waits on a collection that has gone **silent**
 /// before it is handed over anyway: **30 s** (D167).
@@ -580,6 +624,7 @@ impl Hub {
                 started: Instant::now(),
                 peers: Mutex::new(Peers::default()),
                 dispatching: Mutex::new(()),
+                stopping: AtomicBool::new(false),
             }),
         })
     }
@@ -603,7 +648,48 @@ impl Hub {
 
     /// Serve until the listener fails. Dropping the returned future releases
     /// the port and ends the hub's own four housekeeping tasks.
+    ///
+    /// No signal is listened for here: an in-process hub shares its process
+    /// with its test, and a library that installed a `SIGTERM` handler on
+    /// behalf of its caller would be deciding what the caller's process does
+    /// when it is stopped. [`Hub::serve_until_stopped`] is the binary's
+    /// entry point, and it is where the handler lives.
     pub async fn serve(self) -> Result<()> {
+        match self.serve_until(None).await? {
+            Stop::ListenerFailed(error) => Err(error),
+            // Unreachable with no signals handed in, and written out rather
+            // than `unreachable!()` because an exhaustive match that cannot
+            // panic is cheaper than one that can.
+            stopped => {
+                let _ = stopped;
+                Ok(())
+            }
+        }
+    }
+
+    /// Serve until the listener fails **or the operator asks this hub to
+    /// stop** (ORCH-081, `07` S1).
+    ///
+    /// What the binary calls. On `SIGTERM` or `SIGINT` the hub stops
+    /// accepting connections and submissions, waits up to [`STOP_WITHIN`]
+    /// for the dispatch pass in flight, and returns; the caller decides what
+    /// the process does about it. See [`Stop`] for the three ways it ends and
+    /// [`let_the_pass_finish`] for what "in flight" is allowed to mean.
+    ///
+    /// The handlers are **not** installed here: they are handed in, because
+    /// they have to be installed before the state root is opened. See
+    /// [`StopSignals::listen`].
+    pub async fn serve_until_stopped(self, signals: StopSignals) -> Result<Stop> {
+        self.serve_until(Some(signals)).await
+    }
+
+    /// The whole of the serving loop, with the stop handed in.
+    ///
+    /// One body for both entry points, so that the in-process hub every test
+    /// drives and the hub the consumer runs cannot drift in what they do
+    /// while they are up. `None` is a hub nothing can ask to stop, which is
+    /// the in-process one.
+    async fn serve_until(self, signals: Option<StopSignals>) -> Result<Stop> {
         // Held in a guard rather than aborted at the end, **because the end
         // is not always reached**: a caller that drops this future — every
         // end-to-end test does, by aborting the task it runs in — would
@@ -629,7 +715,243 @@ impl Hub {
                 });
             }
         };
-        serving.await
+        let mut signals = signals;
+        let asked: String = {
+            let stop = async {
+                match signals.as_mut() {
+                    Some(signals) => signals.asked().await,
+                    None => std::future::pending().await,
+                }
+            };
+            tokio::select! {
+                failed = serving => {
+                    let failed: Result<()> = failed;
+                    return Ok(Stop::ListenerFailed(failed.expect_err(
+                        "the accept loop has no way out but its own error",
+                    )));
+                }
+                asked = stop => asked,
+            }
+        };
+        // **The flag before anything else.** The `select!` above has already
+        // dropped the accept loop, so nothing new is being accepted; this
+        // closes the other door, on the connections that are already up, and
+        // it has to be closed before the wait below rather than after it —
+        // otherwise a submission landing during the wait is minted onto a
+        // hub that is seconds from gone.
+        self.state.stop_now();
+        eprintln!(
+            "herd-hub: {asked}. No new connection and no new submission is accepted, and no \
+             further dispatch pass starts. Waiting up to {:?} for the pass in flight. Jobs \
+             already running are not cancelled: they belong to their runners, which hold \
+             their verdicts until a hub records them (E-44).",
+            STOP_WITHIN,
+        );
+        // The second signal, and every one after it, from here until the
+        // process goes. It is read so that an operator who sends another one
+        // is answered rather than ignored, and it is answered with a
+        // sentence and nothing else: hurrying a stop that is already under
+        // way is exactly the thing that would make it worse (ORCH-081).
+        let _noting_further_signals = signals.map(|mut signals| {
+            Housekeeping(vec![tokio::spawn(async move {
+                loop {
+                    let again = signals.asked().await;
+                    eprintln!(
+                        "herd-hub: {again}, and this hub is already stopping. A stop under way \
+                         is never hurried — hurrying it is what would turn it back into the \
+                         crash it exists to stop being. It gives up on its own at \
+                         {STOP_WITHIN:?}; SIGKILL if you cannot wait, and the state root comes \
+                         up from that too."
+                    );
+                }
+            })])
+        });
+        let stop = match let_the_pass_finish(&self.state, STOP_WITHIN).await {
+            Some(took) => Stop::Clean { asked, took },
+            None => Stop::Overran {
+                asked,
+                after: STOP_WITHIN,
+            },
+        };
+        Ok(stop)
+    }
+}
+
+/// How serving ended.
+///
+/// Three outcomes and no fourth, because the caller has a different thing to
+/// say about each: a stop the hub completed, a stop it gave up on, and a hub
+/// that was not stopped at all but fell over.
+#[derive(Debug)]
+pub enum Stop {
+    /// The hub was asked to stop, and the pass in flight finished inside
+    /// [`STOP_WITHIN`]. `took` is how long the waiting really took, which is
+    /// worth printing: it is the only measurement anyone has of this hub's
+    /// pass on the operator's own filesystem.
+    Clean { asked: String, took: Duration },
+    /// The hub was asked to stop and the pass in flight had not finished
+    /// `after` this long, so the hub is leaving under it.
+    ///
+    /// The store is left exactly as a `SIGKILL` at the same instant would
+    /// have left it — atomically replaced files and synced appends, and an
+    /// interrupted attempt the next `JobDirStore::open` names — so this is a
+    /// crash and not a corruption. It is still worth a non-zero exit: an
+    /// ordinary stop that is quietly a crash is the thing ORCH-081 exists to
+    /// remove, and one that is loudly a crash can at least be counted.
+    Overran { asked: String, after: Duration },
+    /// Nobody asked for anything; the accept loop failed.
+    ListenerFailed(anyhow::Error),
+}
+
+/// The handlers for the signals an operator stops this hub with (ORCH-081).
+///
+/// `SIGTERM` is how every instance of this hub is stopped: it is in docker
+/// compose at the consumer's site, so `docker compose stop`, a redeploy and a
+/// host reboot all arrive as one. `SIGINT` is the same request typed by hand.
+/// `SIGKILL` cannot be waited for and is not meant to be — a hub that could
+/// not be killed outright would be a worse hub, and the state root comes up
+/// from one.
+///
+/// **A value, installed before the state root is opened**, rather than a
+/// future the serving loop makes for itself. Two reasons, and the first is
+/// the one that matters. Until a handler is installed, `SIGTERM`'s default
+/// disposition is to kill the process — so a hub signalled during its own
+/// startup, which on a large state root means during a sweep of it, would die
+/// exactly the way this path exists to stop it dying. Installing first closes
+/// that window: the signal is then *buffered* by the stream, and the serving
+/// loop finds it waiting the instant it begins. The second reason is that the
+/// same streams serve the drain, so a second `SIGTERM` is read by the handler
+/// that is already there rather than by a second registration racing the
+/// first.
+pub struct StopSignals {
+    #[cfg(unix)]
+    terminate: Option<tokio::signal::unix::Signal>,
+    #[cfg(unix)]
+    interrupt: Option<tokio::signal::unix::Signal>,
+}
+
+impl StopSignals {
+    /// Install the handlers. The **first** thing the binary does.
+    ///
+    /// A signal this process cannot listen for at all is said once, in a line
+    /// naming it, and then never waited on — which leaves the hub, for that
+    /// signal, exactly as it is without this path: killed by the default
+    /// disposition. Loud, and better than refusing to start over it.
+    pub fn listen() -> Self {
+        #[cfg(unix)]
+        {
+            use tokio::signal::unix::{signal, SignalKind};
+            let installed = |kind: SignalKind, name: &str| match signal(kind) {
+                Ok(stream) => Some(stream),
+                Err(error) => {
+                    eprintln!(
+                        "herd-hub: cannot listen for {name} ({error}), so {name} will kill this \
+                         hub outright instead of stopping it cleanly. The state root comes up \
+                         from that, and a stop that is really a crash is the thing this path \
+                         exists to remove — so it is worth fixing."
+                    );
+                    None
+                }
+            };
+            Self {
+                terminate: installed(SignalKind::terminate(), "SIGTERM"),
+                interrupt: installed(SignalKind::interrupt(), "SIGINT"),
+            }
+        }
+        #[cfg(not(unix))]
+        {
+            Self {}
+        }
+    }
+
+    /// Resolve when one of them arrives, with what to call it.
+    ///
+    /// Pending for ever when neither handler could be installed, which is the
+    /// only honest thing left: there is nothing to wait for.
+    async fn asked(&mut self) -> String {
+        #[cfg(unix)]
+        {
+            let terminate = async {
+                match self.terminate.as_mut() {
+                    Some(stream) => {
+                        stream.recv().await;
+                    }
+                    None => std::future::pending().await,
+                }
+            };
+            let interrupt = async {
+                match self.interrupt.as_mut() {
+                    Some(stream) => {
+                        stream.recv().await;
+                    }
+                    None => std::future::pending().await,
+                }
+            };
+            tokio::select! {
+                _ = terminate => "this hub was asked to stop (SIGTERM)".to_owned(),
+                _ = interrupt => "this hub was asked to stop (SIGINT)".to_owned(),
+            }
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = tokio::signal::ctrl_c().await;
+            "this hub was asked to stop".to_owned()
+        }
+    }
+}
+
+/// Wait for the dispatch pass in flight to finish, for at most `within`.
+///
+/// `Some(took)` is a hub that may leave: no pass holds the claim lock, so
+/// nothing is half way through judging the queue. `None` is the bound
+/// expiring with a pass still running.
+///
+/// **What is waited for, exactly.** One pass. [`State::dispatching`] is held
+/// for the whole of a pass and taken by nothing else that writes, so the
+/// lock standing free is the hub's own statement that no pass is in flight —
+/// and because [`dispatch_queued_jobs`] starts none once the flag is set,
+/// the lock cannot be taken again behind this. The dry run
+/// ([`judge_one`]) takes it too and is waited for in the same breath, which
+/// costs a few microseconds and keeps the rule simple: one lock, one answer.
+///
+/// **What is not waited for.** Running jobs, output still crossing the link,
+/// a requester's open follow. A hub that waited for a running job would wait
+/// hours, and it does not need to: the job is the runner's, the verdict is
+/// held on the runner's disk until a hub records it (E-44, D34), and a hub
+/// restarting under a running job is the path the killed-hub tests already
+/// prove (D17).
+///
+/// **There is no flush step here, and that is a fact about today.** Every
+/// write in [`crate::durable`] is already synchronous — a synced temporary
+/// renamed into place, or an append with the bytes on the disk before it
+/// returns — so a pass that has returned has nothing left in memory to
+/// flush. The moment a durability tier puts a write on an unsynced path
+/// (`07` S4), the flush belongs here, between the lock coming free and the
+/// return, and the bound above has to cover it.
+async fn let_the_pass_finish(state: &State, within: Duration) -> Option<Duration> {
+    let began = Instant::now();
+    loop {
+        // Taken and dropped rather than held: holding it would add the one
+        // thing this function must not have, a way for the stop itself to
+        // block a pass it is measuring. Nothing can take it again — the flag
+        // is set — so free once is free.
+        //
+        // **Poisoned counts as free**, as it does at every other site that
+        // takes this lock. A poisoned claim lock is a pass that panicked:
+        // the pass is over, which is the question being asked here, and
+        // treating it as held would spin out the whole bound and report a
+        // clean stop as an overrun.
+        let free = !matches!(
+            state.dispatching.try_lock(),
+            Err(std::sync::TryLockError::WouldBlock)
+        );
+        if free {
+            return Some(began.elapsed());
+        }
+        if began.elapsed() >= within {
+            return None;
+        }
+        tokio::time::sleep(STOP_POLL).await;
     }
 }
 
@@ -761,6 +1083,27 @@ struct State {
     /// [`State::peers`], never the other way**, which is what makes holding
     /// both safe; nothing taken inside `with_peers` reaches back for this.
     dispatching: Mutex<()>,
+    /// Set once, the moment this hub has been asked to stop, and never
+    /// cleared.
+    ///
+    /// Two things read it, and both of them are about *not starting* work
+    /// the hub will not be here to finish. A submission is refused by name
+    /// ([`accept_submissions`]), before anything is minted, so a requester
+    /// learns that no job exists rather than being handed an id the hub then
+    /// walks away from. And a dispatch pass does not begin
+    /// ([`dispatch_queued_jobs`]), so a queued job stays queued for the hub
+    /// that comes back, instead of being numbered onto a runner this hub is
+    /// about to disconnect from.
+    ///
+    /// What it does **not** touch is the pass already running, the jobs
+    /// already on runners, or anything a connected peer is in the middle of
+    /// saying. Those are what the stop waits for ([`let_the_pass_finish`])
+    /// or deliberately leaves alone (a running job belongs to its runner,
+    /// and a hub restarting under it is the tested path: E-44, D17).
+    ///
+    /// Monotonic on purpose: nothing un-stops a hub, so a second `SIGTERM`
+    /// finds the flag already set and changes nothing (ORCH-081).
+    stopping: AtomicBool,
 }
 
 /// What a runner announced about itself in its handshake, past its name.
@@ -1380,6 +1723,21 @@ impl State {
                 })
                 .collect()
         })
+    }
+
+    /// Whether this hub has been asked to stop (ORCH-081).
+    fn stopping(&self) -> bool {
+        self.stopping.load(Ordering::SeqCst)
+    }
+
+    /// Say that this hub has been asked to stop, and whether this is the
+    /// first time it has been said.
+    ///
+    /// `false` on every call after the first, which is the whole of the
+    /// idempotence: a second `SIGTERM` arriving mid-drain sets a flag that is
+    /// already set, and the caller can tell that it has nothing new to do.
+    fn stop_now(&self) -> bool {
+        !self.stopping.swap(true, Ordering::SeqCst)
     }
 
     /// Where a job that has been claimed is sent.
@@ -2608,6 +2966,18 @@ fn attempts_in_the_air(state: &State) -> Vec<JobId> {
 /// result — deciding that such an attempt is lost is the watchdog's, on the
 /// clock, never a guess made here.
 fn dispatch_queued_jobs(state: &State) -> Result<()> {
+    // A hub on its way out starts no pass (ORCH-081). Not a refusal and not
+    // an error: the queue is on the disk, the jobs in it are still queued,
+    // and the hub that comes back dispatches them — which is strictly better
+    // than numbering an attempt onto a runner this hub is about to
+    // disconnect from, leaving the record `assigned` for a job nobody is
+    // running until the watchdog times it out. It is also what makes the
+    // stop's bound mean something: with no new pass starting, the only thing
+    // [`let_the_pass_finish`] can be waiting for is the one pass that was
+    // already running when the signal arrived.
+    if state.stopping() {
+        return Ok(());
+    }
     let _one_pass = state
         .dispatching
         .lock()
@@ -6332,6 +6702,21 @@ async fn accept_submissions(state: &State, outbox: &Outbox, source: &mut Source)
         };
         match message {
             ToHub::SubmitJob { asked, wants_files } => {
+                // First of the refusals, and **before anything is minted**,
+                // which is what makes it safe for `herdctl` to read it as
+                // "no job exists" (D142, `Said::Refused`): a hub that is
+                // stopping must not hand out an id and then walk away from
+                // it. The requester is told which hub and why, so that a
+                // redeploy reads as a redeploy and not as a fault, and E-05
+                // makes submitting again safe the moment the next hub is up.
+                if state.stopping() {
+                    let _ = outbox.send(FromHub::Refused {
+                        reason: "this hub has been asked to stop and is not taking new jobs; \
+                                 nothing was minted, so submit again once it is back"
+                            .to_owned(),
+                    });
+                    return Ok(());
+                }
                 if asked.command.is_empty() {
                     let _ = outbox.send(FromHub::Refused {
                         reason: "a job needs a command to run".to_owned(),
@@ -7240,6 +7625,7 @@ fn message_kind(message: &ToHub) -> &'static str {
 
 #[cfg(test)]
 mod tests {
+    use std::path::Path;
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::mpsc as std_mpsc;
 
@@ -7559,6 +7945,7 @@ mod tests {
             started: Instant::now(),
             peers: Mutex::new(Peers::default()),
             dispatching: Mutex::new(()),
+            stopping: AtomicBool::new(false),
         });
         let (outbox, _inbox) = mpsc::unbounded_channel();
         let (kick, _kicked) = watch::channel(false);
@@ -7780,6 +8167,7 @@ mod tests {
             started: Instant::now(),
             peers: Mutex::new(Peers::default()),
             dispatching: Mutex::new(()),
+            stopping: AtomicBool::new(false),
         });
 
         // The first pass writes a waiting line on every record: 400 records,
@@ -7858,6 +8246,7 @@ mod tests {
             started: Instant::now(),
             peers: Mutex::new(Peers::default()),
             dispatching: Mutex::new(()),
+            stopping: AtomicBool::new(false),
         });
 
         // The first judgement of a job is news and is written: a job nobody
@@ -7959,6 +8348,7 @@ mod tests {
             started: Instant::now(),
             peers: Mutex::new(Peers::default()),
             dispatching: Mutex::new(()),
+            stopping: AtomicBool::new(false),
         });
         // Outside the measurement: the pass that judges every job for the
         // first time writes a line for each, and is allowed to.
@@ -8191,6 +8581,7 @@ mod tests {
             started: Instant::now(),
             peers: Mutex::new(Peers::default()),
             dispatching: Mutex::new(()),
+            stopping: AtomicBool::new(false),
         };
         let (outbox, mut inbox) = mpsc::unbounded_channel();
         // A job this hub has no record of is exactly what a written-off
@@ -8416,6 +8807,7 @@ mod tests {
             started: Instant::now() - Duration::from_secs(90),
             peers: Mutex::new(Peers::default()),
             dispatching: Mutex::new(()),
+            stopping: AtomicBool::new(false),
         });
         let (outbox, _inbox) = mpsc::unbounded_channel();
         let (kick, _kicked) = watch::channel(false);
@@ -8502,5 +8894,136 @@ mod tests {
         let refusal = policy.refusal().expect("a cap of zero is refused");
         assert!(refusal.contains("--readings-at-once 0"), "{refusal}");
         assert!(Policy::default().refusal().is_none());
+    }
+
+    /// A state with one queued job and nothing else, for the stop path's
+    /// tests. Built here rather than in each of them because what they are
+    /// about is the flag and the lock, not the fleet.
+    fn a_state_with_one_queued_job(dir: &Path) -> Arc<State> {
+        let store = Arc::new(JobDirStore::open(dir).expect("the state root opens"));
+        store
+            .create_job(NewJob::new(vec!["true".to_owned()]))
+            .expect("minted");
+        Arc::new(State {
+            store: store as Arc<dyn JobStore>,
+            policy: Policy::default(),
+            authority: Authority::default(),
+            started: Instant::now(),
+            peers: Mutex::new(Peers::default()),
+            dispatching: Mutex::new(()),
+            stopping: AtomicBool::new(false),
+        })
+    }
+
+    /// ORCH-081: a hub that has been asked to stop starts no further pass.
+    ///
+    /// The job stays **queued**, which is the whole of the point: it is on
+    /// the disk, the hub that comes back finds it there and dispatches it,
+    /// and no attempt was numbered onto a runner this hub was about to
+    /// disconnect from. Asserted through the record rather than through a
+    /// counter, because the record is what survives the process.
+    #[test]
+    fn a_hub_that_is_stopping_starts_no_dispatch_pass() {
+        let dir = tempfile::tempdir().expect("a temporary state directory");
+        let state = a_state_with_one_queued_job(dir.path());
+        let only = |state: &State| {
+            state
+                .store
+                .unfinished_jobs()
+                .expect("the queue reads")
+                .pop()
+                .expect("the one job is there")
+        };
+
+        // While it is serving, a pass judges the job and says on its record
+        // why it is waiting (E-53).
+        dispatch_queued_jobs(&state).expect("the pass runs");
+        let judged = only(&state);
+        assert!(
+            judged.waiting_for.is_some(),
+            "a serving hub says why a queued job waits: {judged:?}"
+        );
+
+        // Once it is stopping, a pass is not merely quiet — it does not
+        // begin. Nothing is written, and the job is exactly as it was.
+        assert!(state.stop_now(), "the first stop is the first");
+        dispatch_queued_jobs(&state).expect("a stopping hub's pass is a no-op, never an error");
+        let after = only(&state);
+        assert_eq!(after.state, judged.state, "the job's state is untouched");
+        assert!(
+            matches!(after.state, JobState::Queued),
+            "a job queued when the hub was asked to stop is still queued for the next hub: \
+             {after:?}"
+        );
+    }
+
+    /// ORCH-081: a second stop is not a stop at all.
+    ///
+    /// `stop_now` is how the serving loop tells a signal it has to act on
+    /// from one it only has to answer with a sentence, and the thing that
+    /// must never happen is the second signal shortening or restarting the
+    /// drain already running — hurrying a stop is what would turn it back
+    /// into the crash it exists to stop being.
+    #[test]
+    fn a_second_stop_signal_changes_nothing() {
+        let dir = tempfile::tempdir().expect("a temporary state directory");
+        let state = a_state_with_one_queued_job(dir.path());
+        assert!(state.stop_now(), "the first ask is news");
+        assert!(!state.stop_now(), "the second is not");
+        assert!(!state.stop_now(), "nor the third");
+        assert!(state.stopping(), "and the hub is still stopping");
+    }
+
+    /// ORCH-081: the stop waits for the pass in flight, and the wait is
+    /// bounded.
+    ///
+    /// The pass is stood in for by a thread holding the claim lock, which is
+    /// exactly what a real pass is to anything outside it — the lock is held
+    /// for the whole of a pass and for nothing else that writes. Two
+    /// questions in one test because they are two halves of one promise: the
+    /// stop really does wait, and it really does give up.
+    ///
+    /// **Nothing here asserts a wall-clock duration against the bound.** The
+    /// figures asserted are orderings — the wait returned `None` while the
+    /// lock was held, `Some` once it was free — because a shared host can
+    /// stretch any millisecond it likes and a test that failed for that
+    /// would be read as a product fault.
+    #[tokio::test]
+    async fn the_stop_waits_for_the_pass_in_flight_and_gives_up_at_its_bound() {
+        let dir = tempfile::tempdir().expect("a temporary state directory");
+        let state = a_state_with_one_queued_job(dir.path());
+
+        // A pass in flight: the lock held, by a thread that will not let go
+        // until it is told.
+        let (let_go, told_to_let_go) = std_mpsc::channel::<()>();
+        let holding = {
+            let state = Arc::clone(&state);
+            std::thread::spawn(move || {
+                let _pass = state
+                    .dispatching
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                let _ = told_to_let_go.recv();
+            })
+        };
+        // The lock is taken on another thread, so wait for it to really be
+        // held rather than assuming the thread was scheduled.
+        while state.dispatching.try_lock().is_ok() {
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+
+        assert!(
+            let_the_pass_finish(&state, Duration::from_millis(50))
+                .await
+                .is_none(),
+            "a stop whose bound expires with the pass still running gives up and says so"
+        );
+
+        let_go.send(()).expect("the holder is listening");
+        holding.join().expect("the holding thread ends");
+        assert!(
+            let_the_pass_finish(&state, STOP_WITHIN).await.is_some(),
+            "with the pass over, the stop may leave"
+        );
     }
 }
