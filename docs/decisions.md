@@ -9269,3 +9269,75 @@ charging a go for a refusal, which is where this entry started.
 
 **On the number.** This entry is D182, the third and last of the three this
 PR carries, after D180 and D181 and in that order.
+
+---
+
+## 2026-10-27 — D183 The keeper is the target, its tier taken in thirds
+
+**Alexa's decision, of today, quoted.** Asked whether to adopt
+`docs/remediation/07-target-architecture.md`'s "keeper" as the target
+architecture, taking the durability tier in **three** steps and starting
+with step A alone — board row ORCH-075, the first of three questions put
+to him in order — he answered:
+
+> 1) oui
+
+**What is adopted: a direction.** `07`'s recommendation is now the
+direction the hub's architecture goes in. One owned thread performs every
+store mutation; the reactor wakes it by message and never waits on a disk;
+its unit of work is bounded and re-armed. The ground for it was already
+half laid by ORCH-047 (Alexa, 2026-10-26, *"je valide"*): durable writes
+first, the `T` walk later cleanup. `06-junction-breakdown.md` measured why
+— durable writing is 68-99.5 % of a runner junction, the two reads under
+0.3 % once the queue is deep.
+
+**What is authorised: step A, and nothing else of the tier.** The single
+durability tier of `07` splits into three independent steps, and this
+entry authorises **A** alone: dropping the event `fdatasync` of
+`record_waiting`, about **31 %** of the write cost (`11-sync-prices.md`
+§6: ext4 `RD-` 2.10 ms against `RDE` 3.00 ms). Board row **ORCH-083**. A
+is the step that needs least, and it needs least for a reason that can be
+checked rather than believed: the record keeps **both** its syncs, so
+`events.jsonl` can only ever fall *behind* `job.json` and never run ahead
+of it, which is the direction D103 explicitly permits. It assumes nothing
+about the filesystem and needs no crash evidence of any kind.
+
+**What is not authorised, said plainly because an adoption is read later
+by someone who was not here.** Step **B** — dropping the directory
+`fsync`, ~65 % cumulative, board row ORCH-084 — is **not** adopted by this
+answer. It is its own step and it waits on ORCH-080's crash-point
+enumeration. Step **C** — dropping the record `fsync`, ~98 %, board row
+ORCH-085 — is **not** adopted, stays deferred, and may never be taken: it
+is the only step that touches record integrity. And **nothing of the tier
+is dropped at all before ORCH-079 and ORCH-081 are done**: ORCH-079 is the
+D103 ordering oracle, the regression test every later step has to keep
+green, and ORCH-081 is the hub's stop path.
+
+**Why in thirds and not in one jump.** `11-sync-prices.md` refuted the
+hypothesis the plan had been written on. One `fsync` on ext4/NVMe costs
+**989 µs**, not the tens of microseconds that was hoped, and the three
+syncs are **additive, not redundant**, so keeping one and dropping two
+collects 65 % of the prize and not nearly all of it. A tier taken in one
+jump would have spent ORCH-080's crash evidence to buy the last third of a
+saving whose first third is free.
+
+**The directory sync's standing rose rather than fell.** `sync_all` makes
+the record's bytes durable; only `sync_dir` makes its **rename** durable.
+On a decisive write it therefore stays unconditionally, and ORCH-079 is
+the guard against anyone removing it on the strength of a figure.
+
+**Nothing moves with this entry.** No `fsync` is dropped by it, no file
+under `herd-hub/src` changes with it, and neither `PROTOCOL_VERSION` nor
+`RECORD_VERSION` is concerned. It is a direction plus one authorised step;
+each step still ships as its own task, with its own test and its own
+gates, and B and C each come back as their own question.
+
+**Reversibility.** Of the adoption, total — it is a direction and a
+sentence. Of step A when it is taken, high and declared: ORCH-083 owns one
+line of `herd-hub/src/durable.rs` plus `record_waiting`, behind
+`--durable-waits`, default off.
+
+**On the number.** This entry is D183, allocated at the same integration
+as D180-D182 and above them. D143, D154 and D170 stay gaps (D148); D170 is
+held by PR #67, closed unmerged as obsolete on the day this was written,
+so it stays a gap rather than returning to the pool.
