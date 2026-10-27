@@ -92,11 +92,52 @@ nothing disputes it**: `scripts/check-docs.sh` applies its prose rules
 to `docs/*.md`, so the file is checked where it sits, and no index names
 it or claims it. **The word "closed" is not accurate, though, and the
 PR body says so:** `docs/remediation/README.md` reserves numbers for
-pieces not yet written (`01`, `02`) and PR #92 is adding `12` to it
+pieces not yet written (`01`, `02`) and PR #92 is adding `13` to it
 right now. What is true is the part the placement rests on — the dossier
 is the audit required by the 2026-10-24 mandate, and this document is a
 planner's derivation from the consumer's figures, not an audit piece.
 The sentence was left as its author wrote it.
+
+### Four more board edits, from ORCH-080, at the same integration
+
+PR #92 (ORCH-080, CI green, not yet merged) produced findings with no
+row, because its brief bounded its agent to its own row. The board has
+one writer, so they are written here, in the same branch, rather than
+left for a later PR. **None of them is PR #94's work and the PR
+description says so.**
+
+- **ORCH-106 — new, `waiting` on Alexa.** A torn `job.json` makes the
+  hub refuse the **whole state root** and exit before binding a port
+  (`store.rs:1141-1142` → `:899` → `:436` → `main.rs:224`, verified at
+  `2ca6dc7`), so a container restarts straight back into the same wall;
+  `usable_index` cannot route around it (`store.rs:1052-1054`). It is
+  the only place in the store with no degraded mode, nobody can repair
+  it from here (D161), and the restart loop buries the message. The
+  recommendation is the shape ORCH-080 designed: `serde_json` failure
+  returns `Ok(Stored::Quarantined(…))` as a rejected label set already
+  does at `store.rs:1150-1157`. **The caveat is carried:** the
+  `RECORD_VERSION` mismatch arm should probably stay an error, since
+  damage and a wrong binary are different failures. **It is Alexa's**
+  — it changes what a hub does at startup on his consumer's running
+  system — and it is ranked **before ORCH-085**, whose own row now
+  depends on it.
+- **ORCH-107 — new, `open`.** The real-hub tests' host-contention
+  flakiness, which has had no row and is not ORCH-069: timeouts at
+  `real_herd/mod.rs:649`/`:789`, 21 failures in five targets at PR
+  #93's integration, and ORCH-081's agent hit the same at load 20.62.
+  Two agents have each spent time proving those failures were not
+  theirs; the row exists to stop a third.
+- **ORCH-086 amended, not duplicated** — it is the same item, wider.
+  All 99 constructed stale temporaries survive `JobDirStore::open`, and
+  a temporary left in `files/` is **counted against the output budget**
+  by `directory_bytes` (`store.rs:2733-2749`) while the sweeper can
+  never take it back, since it ranks whole collections. That is a slow
+  leak into the budget ORCH-093 and ORCH-095 are re-deriving, and the
+  row now says so.
+- **ORCH-069 narrowed for the third time.** Its `admission` half is
+  gone: on this host those failures are timeouts, not the memory
+  constant, which is never reached. ORCH-069 is now `slots.rs:744`
+  alone; the rest is ORCH-107. `## Next` item 6 follows.
 
 ### `docs/decisions.md`
 
