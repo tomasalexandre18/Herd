@@ -145,6 +145,11 @@ integration at a time: a batch **is** one integration, larger.
   assembled from a shell variable that could be empty.
 - One `herd-merger` at a time; the board shows which batch it holds. A
   batch is one integration, larger, never several integrations at once.
+- The orchestrator's checkout `/mnt/ssd_980/herd-project` is **stale by
+  construction** — the guard blocks it from fetching — so it is never a
+  source for the current state of `main`: read `origin/main`, in your own
+  worktree or with `git show origin/main:<path>`. Why, and what it cost
+  on 2026-10-27: `templates/brief.md`.
 - Never two agents on the same worktree, scratchpad subdirectory or
   decision entry. When two tasks would touch the same file, the second is
   based on the first's branch.

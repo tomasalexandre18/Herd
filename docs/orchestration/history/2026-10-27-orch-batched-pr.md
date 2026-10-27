@@ -60,6 +60,23 @@ concurrency rule.
 - `.claude/agents/herd-release.md`: "No PR merge either" becomes "No
   pull request either: you push `cut-v<version>` and hand off".
 
+Added after the orchestrator's review of this handoff (same branch):
+
+- `docs/orchestration/templates/brief.md`: the `Read, in order:` line now
+  says "in your worktree, never the orchestrator's checkout", and a new
+  paragraph gives the rule with its reason — that checkout is **stale by
+  construction** because the guard blocks it from fetching, so it is
+  never a source for the current state of `main`; read `origin/main`
+  instead, and keep it only for what does not change, such as a file's
+  history. The paragraph states what it cost on 2026-10-27, including
+  the false claim this handoff first made.
+- `docs/orchestration/workflow.md` "Concurrency and host rules": one
+  bullet stating the same rule in two sentences and pointing at
+  `templates/brief.md` for the reason. One place plus a pointer; the
+  role files are not a third copy. `herd-step.md` already forbids
+  *writing* in that checkout, which is a different statement and was
+  left as it was.
+
 What was checked and needed no change:
 
 - `scripts/check-docs.sh`: asserts nothing about one PR per task and
@@ -257,6 +274,22 @@ check-orchestration: 138 passed, 0 failed
 exit=0
 ```
 
+Both gates were run again, unchanged, on the tree that carries the
+correction of 2026-10-27 (the brief-template rule and the withdrawal
+above). `check-docs.sh`: `docs ok`, exit 0, the same `D170` note.
+`check-orchestration.sh`:
+
+```text
+== check-docs.sh goes green on the repository as it is
+ok    unmodified copy passes
+…
+check-orchestration: 138 passed, 0 failed
+exit=0
+```
+
+The elided middle is identical to the block above, line for line; the
+full run is at 151 lines and nothing in it changed.
+
 No skip: neither script prints a `HERD-SKIPPED` line.
 
 ## Risks and findings
@@ -274,13 +307,26 @@ No skip: neither script prints a `HERD-SKIPPED` line.
   one line shorter, but reflowing invariant text is exactly what the
   gotcha `invariants-are-quoted-not-reflowed` warns against, so it was
   left alone and is reported here instead.
-- **ORCH-069 and ORCH-107 are not on `main`'s board.** `workflow.md` now
-  names them as the two fixes that make local-gate reconsiderable, but
-  `docs/orchestration/board.md` at `f19efe6` lists only up to ORCH-032;
-  those ids live on branches not yet merged. A reader who follows them
-  today finds nothing. They become findable when the batch carrying
-  those rows lands; no action needed on this branch.
-- **This branch changes `CLAUDE.md` and three agent files**, so loop
+- **A claim this handoff first made was false, and is withdrawn here.**
+  The first version of this section said: "ORCH-069 and ORCH-107 are not
+  on `main`'s board. `docs/orchestration/board.md` at `f19efe6` lists
+  only up to ORCH-032; those ids live on branches not yet merged. A
+  reader who follows them today finds nothing." **That is wrong.** Both
+  rows are in `f19efe6`, this branch's own base — `git show
+  f19efe6:docs/orchestration/board.md | grep '^| ORCH-069 '` prints the
+  row, and the file carries 85 rows up to ORCH-107. They landed with PR
+  #94 at `c831d55`, before this base. `workflow.md` names them and a
+  reader finds them. Nothing on this branch needed fixing for it.
+  **The cause, which is the real finding:** the board I read was the one
+  in `/mnt/ssd_980/herd-project`, the orchestrator's checkout, which the
+  guard cannot let fetch and which stood 150 commits behind
+  `origin/main` with 18 board rows ending at ORCH-032. The rule that
+  stops the next agent is now written in `templates/brief.md`, with the
+  pointer in `workflow.md` "Concurrency and host rules". Reported by the
+  orchestrator on 2026-10-27, checked against `origin/main` before this
+  correction was written.
+- **This branch changes `CLAUDE.md`, three agent files and two
+  orchestration documents**, so loop
   step 6 owes it a `herd-reviewer` pass before the batch PR merges.
 - **Rebase expected.** `herd-merger` holds `board.md` for the #92 + #98
   batch; this branch does not touch that file, but `workflow.md` and
