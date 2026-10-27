@@ -177,12 +177,10 @@ check-orchestration: 141 passed, 0 failed
 elapsed: 9887 ms
 ```
 
-**One failure here and a second one later, and neither has a name — see
-*Risks*.** The first run of `check-orchestration.sh` after this merge
-printed `140 passed, 1 failed`, and so did the run before the handoff
-commit. Both times I had piped the run to `tail -2`/`tail -3` and lost
-the `FAIL` line. It is ORCH-111, and it is not swept under the green
-figure above.
+**The suite is red about twice in twenty-five runs on this host, and the
+case now has a name — ORCH-111, see *Risks*.** It is
+`PATH keeps what it inherited behind the four`, and it is not swept
+under the green figure above.
 
 ### Batch — the four Rust gates and `check-docs.sh`
 
@@ -262,25 +260,50 @@ and by D27 a skip is never a pass.
 
 ## Risks and findings
 
-- **ORCH-111, and it is the one thing in this batch I could not
-  close.** `check-orchestration.sh` reported `140 passed, 1 failed`
-  **twice** on this merged tree — once right after the second merge,
-  once again before the handoff commit — and **both times I destroyed
-  the evidence** by piping the run to `tail -2`/`tail -3`. It then
-  refused to recur: **nineteen consecutive green runs** with the output
-  fully captured, four of them under the same direct pipe to `tail -2`
-  and three with the corpus dirtied immediately beforehand. So it is
-  about two in twenty-five, it is real rather than a misread — `140 + 1`
-  is the suite's own 141, so one `ok` became one `bad` and no counter
-  was merely lost — and three hypotheses are refuted rather than
-  assumed: it is **not** the pipe, **not** a lost counter increment, and
-  **not** network flakiness in the `session.sh` cases, which run under
-  `env -i` against a fake `gh` config directory and a fake `claude`
-  binary and open no socket. A control that is red one run in twelve is
-  a control nobody will trust, and this is the control that guards the
-  docs gate, so it has a row, `open`. **My own mistake is part of the
-  finding, and I made it twice:** a gate's output is the evidence and I
-  truncated it. Keep the whole output.
+- **ORCH-111 — `check-orchestration.sh` fails one case about twice in
+  twenty-five runs on this workstation, and the case is now named.**
+  It is **`PATH keeps what it inherited behind the four`**,
+  `scripts/check-orchestration.sh:438`, which asserts that sourcing
+  `ops/agents/env.sh` leaves the caller's own `$PATH` appended verbatim
+  behind the four prefixes:
+
+  ```text
+  FAIL  PATH dropped the inherited entries; the guard below needs coreutils
+      …/stateroot/claude/tools/dtach/bin:/run/wrappers/bin:/etc/profiles/per-user/server/bin:/run/current-system/sw/bin:/wrong/home/.local/bin:/run/wrappers/bin:/wrong/home/.nix-profile/bin:/nix/profile/bin:/wrong/home/.local/state/nix/profile/bin:/etc/profiles/per-user//bin:/nix/var/nix/profiles/default/bin:/run/current-system/sw/bin
+  ```
+
+  **The captured output is the finding.** The four prefixes in front are
+  correct in that same run, so it is the *inheritance* that broke, not
+  the prefix. And the tail behind them is **not the harness's `$PATH`**
+  — it is a freshly profile-derived one, built from the case's own
+  `HOME=/wrong/home` and with an **empty user**
+  (`/etc/profiles/per-user//bin`). So in a red run something inside
+  `env -i PATH="$PATH" HOME=/wrong/home bash -c '. env.sh'` re-derives
+  `PATH` from a profile instead of inheriting the one it was handed.
+  That is a lead, not a cause, and it is not mine to chase here.
+- **ORCH-111 is pre-existing and host-shaped, not a regression of this
+  batch.** The case is untouched by either branch —
+  `git diff origin/main HEAD -- scripts/check-orchestration.sh` contains
+  no line mentioning `PATH`, `env.sh` or `envval` — so it fails the same
+  way on `origin/main`'s copy. It is the same family as ORCH-069 and
+  ORCH-107: this workstation's environment, not the code. **But CI runs
+  this script** (`.github/workflows/ci.yml:69`), so it can turn a `docs`
+  job red for nothing. It has not been seen red there, where `PATH` is
+  stable and there is no `/etc/profiles/per-user`. If the `docs` job on
+  this PR goes red on that one case, it is this and not the batch —
+  and it still does not get merged red.
+- **Three hypotheses refuted rather than assumed** before the name was
+  found: it is **not** the pipe (four green runs under the same direct
+  `| tail -2`), **not** a lost counter increment (`140 + 1` is the
+  suite's own 141, so one `ok` genuinely became one `bad`), and **not**
+  network flakiness in the `session.sh` cases, which run under `env -i`
+  against a fake `gh` config directory and a fake `claude` binary and
+  open no socket.
+- **My own mistake is part of the finding, and I made it twice:** the
+  first two samples were lost because I piped the run to
+  `tail -2`/`tail -3`. A gate's output is the evidence. That is the only
+  reason this took twenty-five runs to name, and it is why the row's
+  next action says to keep the whole output.
 - **The `docs` job time after this batch is measured on CI, not here**
   — the figure is in the PR's Evidence and in the report below. Locally
   the two scripts together are **under 10 seconds** where they were
