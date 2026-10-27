@@ -1402,12 +1402,38 @@ impl JobDirStore {
 
     fn append_event(&self, id: &JobId, event: &JobEvent) -> Result<()> {
         let path = self.job_dir(id).join(EVENTS_FILE);
-        let line = serde_json::to_string(&EventLine {
+        let line = self.event_line(&path, event)?;
+        durable::append_line(&path, &line).map_err(|error| failed("appending to", &path, &error))
+    }
+
+    /// Append an event line without waiting for the disk — **D183 step A**.
+    ///
+    /// One caller, [`JobDirStore::record_waiting`], and it stays one. The line
+    /// is identical to the one [`JobDirStore::append_event`] writes and lands
+    /// in the same file in the same order; what it gives up is survival of a
+    /// power cut, for a line that says why a queued job is not starting.
+    ///
+    /// That this is not a D103 question is checked rather than asserted:
+    /// the record's two syncs have returned before the first byte of this
+    /// line is issued, so the pair can only fall *behind*, which D103 permits
+    /// (`docs/remediation/10-ordering-on-ext4.md` §1 and the amendment,
+    /// `11-sync-prices.md` §6). Every **transition** line still goes through
+    /// `append_event` and still waits for the disk. The ordering oracle
+    /// drives both doors and would go red if a transition moved to this one.
+    fn append_event_unsynced(&self, id: &JobId, event: &JobEvent) -> Result<()> {
+        let path = self.job_dir(id).join(EVENTS_FILE);
+        let line = self.event_line(&path, event)?;
+        durable::append_line_unsynced(&path, &line)
+            .map_err(|error| failed("appending to", &path, &error))
+    }
+
+    /// One line of `events.jsonl`, with the record version in front of it.
+    fn event_line(&self, path: &Path, event: &JobEvent) -> Result<String> {
+        serde_json::to_string(&EventLine {
             record_version: RECORD_VERSION,
             event: event.clone(),
         })
-        .map_err(|error| failed("writing", &path, &error))?;
-        durable::append_line(&path, &line).map_err(|error| failed("appending to", &path, &error))
+        .map_err(|error| failed("writing", path, &error))
     }
 
     /// One transition, with the lock already held.
@@ -2159,9 +2185,13 @@ impl JobStore for JobDirStore {
         record.updated_at = at;
         // The record first, so that the moment the line is readable in
         // `events.jsonl` the record agrees with it — the same order every
-        // other write here uses.
+        // other write here uses. **This order is what lets the line below go
+        // unsynced** (D183 step A): `write_record` returns only after the
+        // record's `sync_all` and its directory `fsync` have returned, so the
+        // pair can only end up with the line missing beside a whole record,
+        // and never the other way about.
         self.write_record(&record)?;
-        self.append_event(id, &JobEvent::waiting(at, reason.to_owned()))?;
+        self.append_event_unsynced(id, &JobEvent::waiting(at, reason.to_owned()))?;
         Ok(true)
     }
 

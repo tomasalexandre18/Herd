@@ -273,12 +273,58 @@ pub fn write_file_with(
     Ok(())
 }
 
+/// Whether an appended line is on the disk when the append returns.
+///
+/// Both answers are correct for some line of `events.jsonl`, and which line
+/// gets which is D183's step A: a **transition** is a fact about where a job
+/// stands and waits for the disk; a **`waiting` reason** is an explanation of
+/// why a queued job is not starting and does not.
+enum Durably {
+    /// `fdatasync` before returning.
+    Yes,
+    /// The bytes are in the page cache and visible to every reader; a power
+    /// cut can lose them, and a `kill -9` cannot, because the cache is the
+    /// kernel's.
+    No,
+}
+
 /// Append one line, as one write, and put it on the disk before returning.
 ///
-/// Used for `events.jsonl`, where a transition must be readable the moment it
-/// is recorded. `line` must not contain a newline of its own; the terminator
-/// is added here so that a line is never published without one.
+/// Used for the transition lines of `events.jsonl`, where a transition must be
+/// readable the moment it is recorded. `line` must not contain a newline of
+/// its own; the terminator is added here so that a line is never published
+/// without one.
 pub fn append_line(path: &Path, line: &str) -> io::Result<()> {
+    append_one_line(path, line, Durably::Yes)
+}
+
+/// Append one line, as one write, without waiting for the disk.
+///
+/// **D183 step A.** One caller: the `waiting` line of `record_waiting`
+/// (`store.rs`). It is the cheap third of a waiting write — 907 µs of
+/// 3.00 ms on ext4/NVMe (`docs/remediation/11-sync-prices.md` §6) — and it
+/// is the only one of the three that can be dropped without touching D103.
+///
+/// Why it cannot touch D103 is arithmetic rather than judgement: the record's
+/// `sync_all` **and** its directory `fsync` have returned before the first
+/// byte of this line is issued (`write_file_with` above), so a line written
+/// here can only ever be *missing* beside a record that is whole, never
+/// present beside a record that is not. D103 forbids `events.jsonl` being
+/// **ahead** of `job.json` and permits it being behind; this moves the pair
+/// in the permitted direction only. `herd-hub/src/store/ordering_oracle.rs`
+/// is the standing proof of the premise, not a description of it.
+///
+/// What it costs: after a power cut, `events.jsonl` may be missing a
+/// `waiting` line whose reason `job.json` still names. Already reachable
+/// before this (`store.rs`'s `move_to` and `raise` both clear the reason and
+/// leave the line), never read by recovery, and rewritten by the next
+/// dispatch pass (D171). It is **not** for a transition line, and
+/// [`append_line`] above is what every transition still goes through.
+pub fn append_line_unsynced(path: &Path, line: &str) -> io::Result<()> {
+    append_one_line(path, line, Durably::No)
+}
+
+fn append_one_line(path: &Path, line: &str, durably: Durably) -> io::Result<()> {
     debug_assert!(!line.contains('\n'), "one line per append");
     let mut record = String::with_capacity(line.len() + 1);
     record.push_str(line);
@@ -286,11 +332,17 @@ pub fn append_line(path: &Path, line: &str) -> io::Result<()> {
     let mut file = OpenOptions::new().create(true).append(true).open(path)?;
     // The last instant before the first byte of this line is issued. The
     // ordering oracle (`store::ordering_oracle`) reads this point against the
-    // record write that D103 requires to be complete before it.
+    // record write that D103 requires to be complete before it. It is noted
+    // on both paths: dropping the sync below drops nothing of the order.
     watch::issuing(watch::Op::AppendIssued, path);
     file.write_all(record.as_bytes())?;
-    let line = sync_data_of(&file)?;
-    watch::returned(watch::Op::AppendSynced, path, &line);
+    match durably {
+        Durably::Yes => {
+            let line = sync_data_of(&file)?;
+            watch::returned(watch::Op::AppendSynced, path, &line);
+        }
+        Durably::No => {}
+    }
     Ok(())
 }
 
@@ -583,6 +635,27 @@ mod tests {
         }
         assert_eq!(
             String::from_utf8(read(&path)).expect("utf-8"),
+            "{\"n\":0}\n{\"n\":1}\n{\"n\":2}\n"
+        );
+    }
+
+    /// The unsynced append writes the same bytes in the same shape as the
+    /// synced one. Only the waiting for the disk differs, and nothing a
+    /// reader can see does — which is what makes D183 step A invisible to
+    /// `job_events` and to the first consumer.
+    #[test]
+    fn an_unsynced_append_writes_exactly_what_a_synced_one_writes() {
+        let dir = tempfile::tempdir().expect("a temporary directory");
+        let synced = dir.path().join("synced.jsonl");
+        let unsynced = dir.path().join("unsynced.jsonl");
+        for n in 0..3 {
+            let line = format!("{{\"n\":{n}}}");
+            append_line(&synced, &line).expect("appended");
+            append_line_unsynced(&unsynced, &line).expect("appended");
+        }
+        assert_eq!(read(&synced), read(&unsynced));
+        assert_eq!(
+            String::from_utf8(read(&unsynced)).expect("utf-8"),
             "{\"n\":0}\n{\"n\":1}\n{\"n\":2}\n"
         );
     }
