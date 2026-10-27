@@ -21,7 +21,9 @@ Forbidden:  main, tags, releases, other worktrees, the orchestrator's
             cargo unless the change touches code
 Gates:      <exact commands>, or "check-docs.sh only; Rust gates not run";
             each one redirected to a file, never piped to head or tail
-            (why: workflow.md, "Failure")
+            (why: workflow.md, "Failure"); the docs gate runs last, after
+            the handoff is committed and before the push, and the output
+            quoted in the handoff is that run's
 Stop when:  <done criterion> or a decision is needed; then write
             docs/orchestration/history/<date>-<task>.md from
             templates/handoff.md and report

@@ -2,11 +2,11 @@
 # Enforces the docs discipline of CLAUDE.md invariant 8, so that it does not
 # have to be enforced by hand in review.
 #
-# Adding a rule here: check-orchestration.sh runs this whole script 26 times,
+# Adding a rule here: check-orchestration.sh runs this whole script 32 times,
 # each over a full copy of the real repository, because a control only ever
 # seen green is not known to work and each case needs its own fresh corpus.
 # The cost of any rule that is linear in the corpus is therefore multiplied
-# by 26 in the `docs` CI job, which has a 5-minute cap. One such rule already
+# by 32 in the `docs` CI job, which has a 5-minute cap. One such rule already
 # took that job past the cap (2026-10-27; see the 79-column check below).
 # Measure a new whole-corpus rule against the suite, not against one run.
 set -uo pipefail
@@ -35,7 +35,7 @@ n=$(wc -l < docs/status.md)
 # disagree on `length` for UTF-8: mawk, the default awk on the CI runner,
 # counts bytes, so a wrapped line holding `—` or `≤` looked over-long. That
 # shell loop was the whole cost of this script -- 5.9 s of 5.9 s over a
-# 37k-line corpus -- and check-orchestration.sh pays it 25 times over, which
+# 37k-line corpus -- and check-orchestration.sh paid it 25 times over, which
 # took the `docs` job to 5m12s against its 5-minute cap (PR #100, 2026-10-27).
 #
 # Counting it here instead needs no assumption about awk's locale support:
@@ -46,13 +46,33 @@ n=$(wc -l < docs/status.md)
 # over a corpus seeded with 150 violations built from `—`, `≤`, `é` and a
 # 4-byte emoji. The multibyte property has its own cases in
 # check-orchestration.sh, so a relapse to byte counting goes red.
+#
+# A fence opens at any indent and closes only at the indent it opened on,
+# and a table row is exempt at any indent (ORCH-117). Both anchors were at
+# column 1 until 2026-10-27, so a fenced block or a table nested inside a
+# list item was width-checked like prose: three fences and one table, on
+# that one day, in handoffs whose evidence has to stay verbatim. Closing
+# only at the opening indent is what keeps a nested fence -- the shape a
+# handoff quoting a fenced block produces -- from closing the outer one
+# early; a plain toggle at any indent would. The indent is counted in
+# characters, so a fence opened with a tab and closed with spaces does not
+# pair; no such fence exists in the corpus, and it is a known limit, not a
+# guard. What this does not change: a stray unbalanced fence at column 1
+# already swallows the rest of its file, before and after this change, so
+# the column-1 anchor was never what protected against that. All 92 files
+# are balanced today; an END check for an unbalanced fence is ORCH-122.
 for f in CLAUDE.md README.md docs/*.md docs/orchestration/*.md \
          docs/orchestration/*/*.md; do
   [ -f "$f" ] || continue
   long=$(LC_ALL=C awk '
-    /^```/ { fence = !fence; next }
+    /^[[:space:]]*```/ {
+      ind = match($0, /[^ \t]/) - 1
+      if (!fence) { fence = 1; find = ind }
+      else if (ind == find) { fence = 0 }
+      next
+    }
     fence { next }
-    /^\|/ { next }
+    /^[[:space:]]*\|/ { next }
     {
       line = $0
       cols = length(line) - gsub(/[\200-\277]/, "", line)
