@@ -304,6 +304,29 @@ four are reported from the full-suite run only.
 
 The comparison worktree was removed after the run; nothing of it remains.
 
+### CI on the final head, run 40490743051 on `fdf1e81`
+
+The run that matters: the merged tree, the corrected line numbers and the
+renumber to `13`, all in it.
+
+```text
+check   pass   7m13s
+docs    pass   3m40s
+test suite: PASSED
+15 assertion(s) COULD NOT RUN on this host and were skipped.
+```
+
+and the harness is `#[ignore]`d there as it is here — ten lines reading
+`ignored, ORCH-080's enumeration; run with --ignored`.
+
+**The same D27 caution as before, restated for this run.** 15 skips on CI
+against 12 here, because the count is per host (ORCH-070); one of the three
+extra is `the_derived_j_is_recorded_and_is_what_the_job_is_given`, which is
+**red on this workstation and skipped on CI**. A skip is not a pass, and
+nothing in this handoff calls that one green. What CI's green says is that
+`check` and `docs` — the two gates `herd-merger` reads — both pass on
+`fdf1e81`.
+
 ## Risks and findings
 
 - **The proposal of `13 §5` is a behaviour change on a crash path and is not
