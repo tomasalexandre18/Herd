@@ -34,4 +34,5 @@ locally (prose only), CI runs them">
 
 ## Processes
 <PIDs started and ended, or "none">
+<own `target/` deleted once the branch was pushed, with the path; why not, if not — the reason is in workflow.md "Concurrency and host rules">
 ```

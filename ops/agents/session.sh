@@ -24,8 +24,9 @@ claude_bin=${HERD_CLAUDE_BIN:-claude}
 if ! command -v "$claude_bin" >/dev/null 2>&1; then
   echo "herd session: no '$claude_bin' on PATH" >&2
   echo "  the Claude Code binary is a shared tool, not shared state: point" >&2
-  echo "  HERD_CLAUDE_BIN at one, e.g. the nix-built copy on this host," >&2
-  echo "  /mnt/ssd_980/chatons/ops/agents/tools/bin/claude" >&2
+  echo "  HERD_CLAUDE_BIN at one. env.sh already puts this host's per-user" >&2
+  echo "  profile on PATH, which is where the binary is; reaching for" >&2
+  echo "  another project's copy is how the state root was lost before." >&2
   exit 1
 fi
 
@@ -42,6 +43,21 @@ if [ ! -s "$CLAUDE_CONFIG_DIR/.credentials.json" ]; then
     echo '  stdin is not a terminal, so /login is impossible here.' >&2
     exit 1
   fi
+fi
+
+# A session that cannot reach GitHub cannot open a pull request, cannot merge
+# one, and cannot `git push`: `origin` is https and the credential helper is
+# `gh auth git-credential`. env.sh points GH_CONFIG_DIR at the host user's
+# login because HOME no longer does; if that directory holds no `hosts.yml`
+# the session finds out at the end of a task instead of at the start, which
+# is the ORCH-068 failure. Say it now. Not fatal: a session that only reads,
+# builds and tests needs none of it.
+if [ ! -s "$GH_CONFIG_DIR/hosts.yml" ]; then
+  echo "herd session: no hosts.yml in $GH_CONFIG_DIR" >&2
+  echo '  this session cannot open or merge a pull request, and a push to' >&2
+  echo '  an https remote will fail. Run `gh auth login` as the host user,' >&2
+  echo '  or point HERD_GH_CONFIG_DIR at a directory already logged in.' >&2
+  echo '  Never copy a token into this repository (invariant 7).' >&2
 fi
 
 cd "$HERD_REPO"
