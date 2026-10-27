@@ -2,10 +2,9 @@
 
 - **Item:** ORCH-081
 - **Agent:** herd-step
-- **Branch / commit:** `orch-081-hub-stop-path` / see the PR, based on
+- **Branch / commit:** `orch-081-hub-stop-path` / `4b879ae`, based on
   origin/main `cd59ef5`
-- **PR:** see the board row; opened from
-  `.github/pull_request_template.md` with the output below as Evidence
+- **PR:** #96
 
 ## Done
 
