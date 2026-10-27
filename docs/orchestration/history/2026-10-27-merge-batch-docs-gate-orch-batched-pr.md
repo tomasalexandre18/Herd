@@ -177,8 +177,8 @@ check-orchestration: 141 passed, 0 failed
 elapsed: 9887 ms
 ```
 
-**The suite is red about twice in twenty-five runs on this host, and the
-case now has a name — ORCH-111, see *Risks*.** It is
+**The suite is red about four times in thirty-two runs on this host,
+and the case now has a name — ORCH-111, see *Risks*.** It is
 `PATH keeps what it inherited behind the four`, and it is not swept
 under the green figure above.
 
@@ -261,7 +261,7 @@ and by D27 a skip is never a pass.
 ## Risks and findings
 
 - **ORCH-111 — `check-orchestration.sh` fails one case about twice in
-  twenty-five runs on this workstation, and the case is now named.**
+  thirty-two runs on this workstation, and the case is now named.**
   It is **`PATH keeps what it inherited behind the four`**,
   `scripts/check-orchestration.sh:438`, which asserts that sourcing
   `ops/agents/env.sh` leaves the caller's own `$PATH` appended verbatim
@@ -298,7 +298,12 @@ FAIL  PATH dropped the inherited entries; the guard below needs coreutils
   suite's own 141, so one `ok` genuinely became one `bad`), and **not**
   network flakiness in the `session.sh` cases, which run under `env -i`
   against a fake `gh` config directory and a fake `claude` binary and
-  open no socket.
+  open no socket. A fourth, tested once the case had a name: it does
+  **not** track the caller's own `$PATH` — green with the sandbox's
+  extra nix-store entries present, green with `PATH` stripped to the
+  three standard directories, green again with them back. It is
+  genuinely intermittent, which is why the lead above is about `env.sh`
+  sometimes re-deriving and not about the environment it is handed.
 - **A quirk of `check-docs.sh` found by tripping over it, worth knowing
   before someone else loses ten minutes to it.** The fence rule is
   `/^```/`, anchored at column 1, so a fenced block **indented inside a
