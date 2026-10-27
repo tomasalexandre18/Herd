@@ -267,10 +267,10 @@ and by D27 a skip is never a pass.
   `ops/agents/env.sh` leaves the caller's own `$PATH` appended verbatim
   behind the four prefixes:
 
-  ```text
-  FAIL  PATH dropped the inherited entries; the guard below needs coreutils
-      …/stateroot/claude/tools/dtach/bin:/run/wrappers/bin:/etc/profiles/per-user/server/bin:/run/current-system/sw/bin:/wrong/home/.local/bin:/run/wrappers/bin:/wrong/home/.nix-profile/bin:/nix/profile/bin:/wrong/home/.local/state/nix/profile/bin:/etc/profiles/per-user//bin:/nix/var/nix/profiles/default/bin:/run/current-system/sw/bin
-  ```
+```text
+FAIL  PATH dropped the inherited entries; the guard below needs coreutils
+    …/stateroot/claude/tools/dtach/bin:/run/wrappers/bin:/etc/profiles/per-user/server/bin:/run/current-system/sw/bin:/wrong/home/.local/bin:/run/wrappers/bin:/wrong/home/.nix-profile/bin:/nix/profile/bin:/wrong/home/.local/state/nix/profile/bin:/etc/profiles/per-user//bin:/nix/var/nix/profiles/default/bin:/run/current-system/sw/bin
+```
 
   **The captured output is the finding.** The four prefixes in front are
   correct in that same run, so it is the *inheritance* that broke, not
@@ -299,6 +299,15 @@ and by D27 a skip is never a pass.
   network flakiness in the `session.sh` cases, which run under `env -i`
   against a fake `gh` config directory and a fake `claude` binary and
   open no socket.
+- **A quirk of `check-docs.sh` found by tripping over it, worth knowing
+  before someone else loses ten minutes to it.** The fence rule is
+  `/^```/`, anchored at column 1, so a fenced block **indented inside a
+  list item is not exempt** and its lines are width-checked like prose.
+  The gate caught two such lines in this very handoff. It is not a bug —
+  a fence at column 1 is the only one the rule promises to see — but it
+  is silent about why, and the fix is to put the block at column 1 and
+  not to re-wrap a path. Unchanged by this batch; left alone, because
+  loosening the anchor is a rule change and not an integration.
 - **My own mistake is part of the finding, and I made it twice:** the
   first two samples were lost because I piped the run to
   `tail -2`/`tail -3`. A gate's output is the evidence. That is the only
