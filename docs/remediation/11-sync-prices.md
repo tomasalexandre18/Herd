@@ -14,8 +14,10 @@ the end.
 ## 1. What this settles, in four lines
 
 1. **One `fsync` on ext4/NVMe costs 989 µs**, not the tens-to-low-hundreds
-   of microseconds that was hoped for. The hypothesis this task was set to
-   test is **refuted**.
+   of microseconds that was hoped for — five to fifty times above that
+   range, and only **1.2x** better than the 1.19 ms `08` derived on
+   ZFS/SATA (1.3-1.7x better than this harness's own ZFS figures). The
+   hypothesis this task was set to test is **refuted**.
 2. **The three syncs are additive, not redundant.** Each costs about the
    same whether it is the only sync or the last of three, on both
    filesystem classes. No sync pays for another.

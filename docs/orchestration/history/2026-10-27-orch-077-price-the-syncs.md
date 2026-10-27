@@ -65,9 +65,10 @@ keeping one sync may collect nearly the whole prize — is **refuted on both
 halves**:
 
 1. One `fsync` on ext4/NVMe is **989 µs**, five to fifty times above the
-   hoped range, and only **1.3x** better than the ZFS/SATA figure it was
-   contrasted with. The class the deployment runs on is not an order of
-   magnitude faster per sync; it is a third faster.
+   hoped range, and only **1.2x** better than the 1.19 ms `08` derived (and
+   1.3-1.7x better than this harness's own ZFS per-sync figures). The
+   class the deployment runs on is not an order of magnitude faster per
+   sync; it is a fifth to two thirds faster.
 2. The three syncs are **additive, not redundant**. On ext4 the three
    marginals sum to 3.05 ms against a measured `RDE` of 3.00 ms, and the
    "alone" and "added last" columns agree within 11 %. So keeping one and
@@ -274,7 +275,7 @@ For **Done**, or wherever ORCH-077 is filed — the row does not exist on
 the board at `2d177eb` (highest id present: ORCH-074):
 
 ```
-| ORCH-077 | Price the three `fsync`s of `record_waiting` separately, on both filesystem classes, because every durable-write figure in the dossier was taken on ZFS/SATA while the deployment runs on ext4/NVMe (ORCH-053) | ORCH-074, 2026-10-27 | herd-step (author), herd-merger (integration) | done | Done 2026-10-27 in `11-sync-prices.md`. **H-1 is refuted on both halves:** one `fsync` on ext4/NVMe is **989 µs**, not the tens-to-low-hundreds of microseconds hoped for and only **1.3x** better than `08`'s ZFS/SATA figure; and the three syncs are **additive, not redundant** — the three marginals sum to 3.05 ms against a measured 3.00 ms — so keeping one and dropping two collects **65 %** of the prize, not nearly all of it, the kept sync still costing 21x the 51 µs unsynced floor. **`08`'s 9.970 s junction at `N` = 1 000 becomes 3.128 s on ext4**: 3x smaller, not an order of magnitude, and still seconds, so the problem does not go away on the class that matters. Also corrects `06`'s 6.6 µs `sync_dir`, measured on a directory with nothing owed under it, by about two hundred times | — | `docs/remediation/11-sync-prices.md`; `herd-hub/tests/sync_prices.rs`; `history/2026-10-27-orch-077-price-the-syncs.md` |
+| ORCH-077 | Price the three `fsync`s of `record_waiting` separately, on both filesystem classes, because every durable-write figure in the dossier was taken on ZFS/SATA while the deployment runs on ext4/NVMe (ORCH-053) | ORCH-074, 2026-10-27 | herd-step (author), herd-merger (integration) | done | Done 2026-10-27 in `11-sync-prices.md`. **H-1 is refuted on both halves:** one `fsync` on ext4/NVMe is **989 µs**, not the tens-to-low-hundreds of microseconds hoped for and only **1.2x** better than the 1.19 ms `08` derived; and the three syncs are **additive, not redundant** — the three marginals sum to 3.05 ms against a measured 3.00 ms — so keeping one and dropping two collects **65 %** of the prize, not nearly all of it, the kept sync still costing 21x the 51 µs unsynced floor. **`08`'s 9.970 s junction at `N` = 1 000 becomes 3.128 s on ext4**: 3x smaller, not an order of magnitude, and still seconds, so the problem does not go away on the class that matters. Also corrects `06`'s 6.6 µs `sync_dir`, measured with no `rename` between the file sync and the directory sync, by about two hundred times | — | `docs/remediation/11-sync-prices.md`; `herd-hub/tests/sync_prices.rs`; `history/2026-10-27-orch-077-price-the-syncs.md` |
 ```
 
 For **Open** — the missing plan, which is a finding this task could not
