@@ -4,6 +4,11 @@ Saved as `docs/orchestration/history/<YYYY-MM-DD>-<task>.md` on the task's
 branch by the agent that did the work. One file per task; never append to
 another task's file.
 
+The docs gate is the **last thing run** — after this file is committed,
+before the push — and the output under *Gates* is that run's: a handoff
+is itself a docs file, so a gate run before it was written tested a
+different tree.
+
 ```markdown
 # <task> — handoff <YYYY-MM-DD>
 
