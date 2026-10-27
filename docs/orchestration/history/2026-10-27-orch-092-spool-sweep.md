@@ -2,9 +2,9 @@
 
 - **Item:** ORCH-092
 - **Agent:** herd-step
-- **Branch / commit:** `orch-092-spool-sweep` / see the PR, based on
+- **Branch / commit:** `orch-092-spool-sweep` / `b250358`, based on
   `origin/main` `cd59ef5`
-- **PR:** see the board row
+- **PR:** #98
 
 ## Done
 
@@ -338,7 +338,7 @@ half. See the decision below.
 ## Resume point
 
 ```sh
-gh pr view <n>          # the PR for this branch; do not merge, herd-merger does
+gh pr view 98          # the PR for this branch; do not merge, herd-merger does
 ```
 
 Then: this branch is independent of PR #85 by construction but touches
