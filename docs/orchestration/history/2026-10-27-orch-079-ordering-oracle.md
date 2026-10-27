@@ -97,36 +97,39 @@ the index's date line).
     Finished `dev` profile [unoptimized + debuginfo] target(s) in 3.63s
 ```
 
-`./scripts/test.sh` — **RED on this workstation, for host reasons**, load
-`2.83 5.10 5.30` before and `5.80 5.58 5.50` after:
+`./scripts/test.sh` — **RED on this workstation, for host reasons, in
+every one of four runs**, and I could not get a clean one. The last, taken
+at load `2.75 4.18 6.50` and ending at `11.27 7.09 6.95`:
 
 ```
-test the_load_is_on_the_placement_line_and_stops_nothing ... FAILED
-test a_killed_hub_reads_the_reservations_back_off_the_records ... FAILED
-test the_derived_j_is_recorded_and_is_what_the_job_is_given ... FAILED
-error: 2 targets failed:
+error: 6 targets failed:
  AT LEAST 12 assertion(s) COULD NOT RUN on this host and were
 test suite: FAILED (cargo test exited 101)
 ```
 
-Separated:
+23 failures, and they separate into two kinds and no third:
 
 - `herd-hub/tests/slots.rs:744`
   (`the_derived_j_is_recorded_and_is_what_the_job_is_given`) is **ORCH-069**,
   known, a figure derived from this host's live `MemTotal` against constants
-  written for a 17 GiB machine. Not mine, and **not "green on CI"**: on a
-  GitHub runner that assertion is *skipped*, and a skip is not a pass (D27).
-- The two `killed_hub` failures are **deadline timeouts in end-to-end tests
-  that spawn real hub and runner processes**, while another agent was
-  integrating PR #85 on the same host. `cargo test -p herd-hub --test
-  approval --test killed_hub` at the same commit, run alone: *ok. 5 passed*
-  and *ok. 18 passed*. Two earlier full runs of the suite failed on
-  different members of this same family (`approval.rs:432`,
-  `real_herd/mod.rs:649` and `:789`), which is the signature of load and not
-  of a change.
-- Everything else was green, the two oracle tests included.
+  written for a 17 GiB machine. Not mine, and **not "green on CI"**: on the
+  GitHub runner that assertion is *skipped* — it is in the CI run's own
+  15-line skip list — and a skip is not a pass (D27).
+- The other 22 are **deadline timeouts in the end-to-end tests that spawn
+  real hub and runner processes** (`real_herd/mod.rs:649` and `:789`,
+  `approval.rs:432`, and the like), while another agent was integrating and
+  then building PR #85 on the same host. Which ones fail changes from run
+  to run — four runs produced four different subsets — which is the
+  signature of load and not of a change. Run alone at the same commit:
+  `cargo test -p herd-hub --test approval --test killed_hub` → *ok. 5
+  passed* and *ok. 18 passed*.
+- Nothing from the oracle, in any run.
 
-The oracle itself, run alone at load `13.16 8.38 5.52`:
+**The authoritative run is CI's.** `check` and `docs` on head `240aa70`:
+**pass**, `test suite: PASSED`, **15 skips**, both oracle tests `ok`. Run
+40489593808.
+
+The oracle alone on this workstation, at load `13.16 8.38 5.52`:
 
 ```
 running 2 tests
@@ -144,9 +147,9 @@ docs ok
 ```
 
 **Skips: 12 on this workstation**, reported by `test.sh` as "AT LEAST 12"
-because the suite did not finish — which is the honest answer and not a
-count. 10 cgroup-v2 delegation, 2 the ZFS/IO ceiling, the same 12 the
-dossier records for this host. CI reports 15. A skip is never a pass (D27).
+because the suite did not finish — the honest answer, not a count. **15 on
+CI**, listed in the run above, `slots.rs:744` among them. A skip is never
+a pass (D27).
 
 ## Risks and findings
 
@@ -169,10 +172,10 @@ dossier records for this host. CI reports 15. A skip is never a pass (D27).
 4. **Nothing about concurrency.** One thread, one job. Two writers racing
    on one record are excluded by the store's lock, which this does not
    test; `03b` already treats it.
-5. **The suite is red on this host and I am not able to show it green.**
-   Two of the three failures are load, one is ORCH-069. CI on the PR is
-   where a clean run has to come from, and `slots.rs:744` will be *skipped*
-   there rather than passed.
+5. **The suite is red on this host in all four runs and I could not get it
+   green.** One failure is ORCH-069, the other 22 are load. The clean run is
+   CI's — `check` pass on head `240aa70`, `test suite: PASSED`, 15 skips —
+   and `slots.rs:744` is *skipped* there, not passed.
 6. **The board row for ORCH-079 said "no product code"** and that is no
    longer true. Nine lines, named above and in §8 of the write-up. Nothing
    the hub does changes.
