@@ -57,15 +57,15 @@ machine. **CI settles only one**: `slots.rs:744` is *skipped* there and
 a skip is never a pass (D27); `admission.rs:419` runs green. **D179**:
 an incomplete run reports its skips as unknown, never as none.
 
-**Seven defects are fixed and in no release.** **D175** an inline file
+**Eight defects are fixed and in no release.** **D175** an inline file
 whose bytes did not hash to its digest exited 0; **D176** a verdict could
 name a commit the tree was never at; **D177** a live-job map keyed by job
 id let a second attempt replace the first; **D178** the watchdog judged
 an attempt it had just placed on the silence of the one before it;
 **D180-D182** (C5) a runner holds its own ceiling, announces it in
-`Hello`, and a refusal there spends none of the job's goes — two additive
-`herd-proto` fields and one new `JobOutcome`, `refused_as_full`, which an
-older hub refuses to read. No version number moves for any of them.
+`Hello`, and a refusal there spends none of its goes — one new
+`JobOutcome` an older hub refuses to read; and **ORCH-094**, the hub
+re-minted job ids as soon as anything removed a record. No version moves.
 
 `docs/remediation/` holds fourteen pieces: the baseline, audits A and B,
 their review, two experiments and their review, `06` (a junction in five
