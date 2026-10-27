@@ -113,10 +113,10 @@ than I proposed, not a larger one.
 | **B** | **D**, the directory `fsync` | ~65 % | §1's D103 scope clarification | the enumeration (§0.3 tier 2) |
 | **C** | **R**, the record `fsync` | ~98 % | §2's integrity hazard answered | tier 2, and arguably tier 4 |
 
-**Step A is the one to take first, and `11` is what makes it obvious.** Your
-brief's instinct was right: at these figures **M1 becomes the interesting
-row**, because a third is now the going rate for *every* sync and M1 is the
-only third that costs nothing anywhere else. Dropping E alone:
+**Step A is the one to take first, and `11` is what makes it obvious.** At
+these figures **§4's M1 row becomes the interesting one**, because a third is
+now the going rate for *every* sync and M1 is the only third that costs
+nothing anywhere else. Dropping E alone:
 
 - **cannot violate D103 in any direction.** The record keeps both its syncs
   and stays fully durable; the event line merely becomes less durable. D103
