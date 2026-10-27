@@ -691,7 +691,7 @@ async fn every_placement_in_a_busy_day_greps_to_exactly_one_line() {
 ///
 /// | per-thread figure | memory branch | thread branch | derived |
 /// |---|---|---|---|
-/// | 256 MiB | 1536 / 256 = **6** | 20 | `-j 6` |
+/// | 128 MiB | 1536 / 128 = **12** | 20 | `-j 12` |
 /// | 64 MiB  | 1536 / 64 = 24     | **20** | `-j 20` |
 ///
 /// **Why 2 GiB and not the owner's own 17 GiB.** A lend is a figure a runner
@@ -729,18 +729,26 @@ async fn the_derived_j_is_recorded_and_is_what_the_job_is_given() {
             "--host-threads",
             "20",
             // Written out, so the share the `-j` comes out of belongs to this
-            // test rather than to a default that could move. The floor is
-            // admission's business (E-29) and not the derivation's, but one
-            // at or above the lend is a runner that refuses to start.
+            // test rather than to a default that could move — and small, for
+            // a reason worth knowing. A build declares what one *thread*
+            // needs and the hub admits the derived `-j` times that figure, so
+            // the admission a derived build is weighed against is the lend
+            // less this floor while the share it is derived from is three
+            // quarters of the lend. At the default floor the two are the same
+            // number, and a `-j` one thread larger than it should be would
+            // not be admitted at all: the test would hang on a job nothing
+            // ever claims instead of failing on the figure. 64 MiB leaves
+            // 1 984 MiB of admission against a 1 536 MiB share, so a wrong
+            // figure still runs and is still read.
             "--host-memory-floor",
-            "512MiB",
+            "64MiB",
         ],
     );
     herd.wait_for_runner().await;
 
-    // 256 MiB a thread: the share binds, at six of the twenty threads this
+    // 128 MiB a thread: the share binds, at twelve of the twenty threads this
     // host says it has.
-    the_derived_figure_is(&herd, 256, 6).await;
+    the_derived_figure_is(&herd, 128, 12).await;
     // 64 MiB a thread: the share would cover twenty-four, so the thread count
     // is what the figure comes out at. Without the minimum this would be 24,
     // and twenty-four build threads on twenty hardware threads is the
