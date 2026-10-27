@@ -194,6 +194,17 @@ impl DataRoot {
         self.path.join(HELD)
     }
 
+    /// Where one directory per unacknowledged collection waits for the hub
+    /// ([`crate::outputs::spool_path`]), and what the startup sweep reads
+    /// ([`crate::sweep::pick_up`]).
+    ///
+    /// Outside `jobs/`, like `held-results/` beside it and for the same
+    /// reason: the startup reaper clears a workspace, and a collection the
+    /// hub has not acknowledged is the only copy of a result (D19).
+    pub fn outputs_dir(&self) -> PathBuf {
+        self.path.join(crate::outputs::SPOOL_DIR)
+    }
+
     /// Which hub state root this data root's durable things belong to, if a
     /// hub has ever said.
     ///
