@@ -262,6 +262,48 @@ a quiet host**, so this paragraph is an attribution with its evidence
 named, not a measurement: the local suite is reported **red**, and CI on
 the branch is the arbiter.
 
+#### The six reds, measured against pristine `main` rather than attributed
+
+The paragraph above was written as an attribution. It has since been
+**measured**, on the same host, with the load down to `4.28 6.96 8.19`:
+`origin/main` at `2ca6dc7` was checked out into a second worktree with no
+file of this branch in it, and the two targets that carry every failure
+were run there.
+
+```text
+# pristine origin/main 2ca6dc7, no file of this branch present
+$ cargo test -p herd-hub --test admission
+test result: FAILED. 0 passed; 5 failed; …
+    a_killed_hub_reads_the_reservations_back_off_the_records
+    a_refusal_carries_the_free_figure_and_the_needed_figure
+    a_starved_reservation_waits_then_starts_and_leaks_nothing
+    a_waiting_job_says_why_again_on_a_clock_and_does_not_flood
+    the_load_is_on_the_placement_line_and_stops_nothing
+
+$ cargo test -p herd-runner --test busy_probe
+test result: FAILED. 6 passed; 2 failed; …
+    a_probe_child_that_left_the_group_dies_when_the_runner_is_stopped
+    a_runner_told_to_stop_takes_its_probes_children_with_it
+```
+
+**The same seven names, in the same two targets, on `main` with none of
+this branch's files present** — so the red is this host's and `main`'s
+together, and not this branch's. The only Rust difference between this
+branch and `main` is one added test target: `git diff origin/main --stat
+-- '*.rs'` is `herd-hub/tests/crash_points.rs | 1013 +`, and every case in
+it is `#[ignore]`d.
+
+Two further facts worth keeping apart. **The admission failures are
+timeouts, not ORCH-069's assertion** — every one of them panics at
+`real_herd/mod.rs:649` or `:789` with *"timed out waiting until …"*, so
+`admission.rs:419`'s memory constant is never reached on this host and
+ORCH-069 names only `slots.rs:744` of what is red here today. And
+`announced_job_ceiling`, `killed_hub`, `owner_control` and `slots` were
+**not re-run**: `cargo test` stops after the first failing target, so those
+four are reported from the full-suite run only.
+
+The comparison worktree was removed after the run; nothing of it remains.
+
 ## Risks and findings
 
 - **The proposal of `12 §5` is a behaviour change on a crash path and is not
