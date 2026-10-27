@@ -536,4 +536,51 @@ mod tests {
         assert_eq!(never.cause, NO_VERDICT_CAUSE);
         assert_eq!(never.job_exists, JobExists::Nothing);
     }
+
+    /// **A job no machine had room for is a verdict a program can read, and
+    /// it is not `lost`** (D182).
+    ///
+    /// Alexa's requirement of 2026-10-25, in one assertion: the cause is the
+    /// ending's own name, the 125 is Herd's and says so in
+    /// `exit_code_from`, and the sentence on stderr names the machines and
+    /// the bound — because adding capacity, or finding out why the hub's
+    /// count and a runner's disagree, is the whole of what there is to do
+    /// about it.
+    #[test]
+    fn a_job_no_machine_had_room_for_names_its_own_cause_and_wears_herd_s_125() {
+        let refused = JobOutcome::RefusedAsFull {
+            reason: "the hub's count and theirs never agreed".to_owned(),
+            refusals: 8,
+            refusals_allowed: 8,
+            runners: vec![herd_proto::RunnerThatWasFull {
+                name: "capped-runner".to_owned(),
+                holding: Some(2),
+            }],
+        };
+        let said = crate::no_verdict_reason(&refused).expect("there is no verdict to give");
+        let verdict = Verdict::of(
+            &finished(refused.clone()),
+            vec![said.clone()],
+            crate::NO_VERDICT_CODE,
+        );
+        assert_eq!(verdict.cause, "refused_as_full");
+        assert_eq!(verdict.exit_code, crate::NO_VERDICT_CODE);
+        assert_eq!(verdict.exit_code_from, ExitCodeFrom::Herd);
+        assert!(!verdict.passed, "nothing ran, so nothing passed");
+        // And **not** the ending a reader would go looking for a dead host
+        // over, which is what this was reported as before it had a name.
+        assert_ne!(verdict.cause, "lost");
+        // The sentence beside the 125, which is where a person reads which
+        // of the five "no verdict" ends it was (D20), and which the
+        // document keeps verbatim.
+        assert_eq!(verdict.said, vec![said.clone()]);
+        assert!(
+            said.contains("8 time(s) of the 8"),
+            "both figures, in the sentence as well as in the fields: {said}"
+        );
+        assert!(
+            said.contains("capped-runner (holding 2)"),
+            "and the machine with the count it gave: {said}"
+        );
+    }
 }

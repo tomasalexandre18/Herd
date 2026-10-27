@@ -50,8 +50,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::durable;
 use crate::job::{
-    Attempt, JobEvent, JobMetrics, JobRecord, JobState, JobStore, LogWrite, NewJob, Raise, Reading,
-    Result, StoreError, Submission, Timestamp, RECORD_VERSION,
+    Attempt, HowItEnded, JobEvent, JobMetrics, JobRecord, JobState, JobStore, LogWrite, NewJob,
+    Raise, Reading, Result, StoreError, Submission, Timestamp, RECORD_VERSION,
 };
 
 /// The version of the directory layout above. A state root written by a newer
@@ -2220,6 +2220,7 @@ impl JobStore for JobDirStore {
             started_at: at,
             ended_at: None,
             requeue_code: None,
+            at_its_ceiling: None,
             ended: None,
             why: why.to_owned(),
             steps: Vec::new(),
@@ -2283,13 +2284,7 @@ impl JobStore for JobDirStore {
         self.write_record(&record)
     }
 
-    fn end_attempt(
-        &self,
-        id: &JobId,
-        attempt: u32,
-        reason: &str,
-        requeue_code: Option<i32>,
-    ) -> Result<()> {
+    fn end_attempt(&self, id: &JobId, attempt: u32, reason: &str, how: HowItEnded) -> Result<()> {
         let (_live, mut record) = self.open_for_writing(id)?;
         let Some(entry) = record
             .attempts
@@ -2307,10 +2302,18 @@ impl JobStore for JobDirStore {
         let at = Timestamp::now();
         entry.ended_at = Some(at);
         entry.ended = Some(reason.to_owned());
-        // Which kind of ending this was, which is what keeps D76's budget
-        // apart from E-21's: both are counted by reading these attempts back,
-        // and an attempt that could not say would be counted by both.
-        entry.requeue_code = requeue_code;
+        // Which kind of ending this was, which is what keeps the three
+        // budgets apart: all three are counted by reading these attempts
+        // back, and an attempt that could not say would be counted by all of
+        // them.
+        entry.requeue_code = match how {
+            HowItEnded::TheJobAnsweredItsRequeueCode(code) => Some(code),
+            HowItEnded::TheRunnerWentAway | HowItEnded::TheRunnerWasAtItsCeiling { .. } => None,
+        };
+        entry.at_its_ceiling = match how {
+            HowItEnded::TheRunnerWasAtItsCeiling { holding } => Some(holding),
+            HowItEnded::TheRunnerWentAway | HowItEnded::TheJobAnsweredItsRequeueCode(_) => None,
+        };
         record.updated_at = at;
         self.write_record(&record)?;
         self.append_event(id, &JobEvent::attempt_ended(at, attempt, reason))
@@ -2950,6 +2953,13 @@ fn raise_in_place(record: &mut JobRecord, to: Priority, at: Timestamp) -> Raise 
     record.waiting_for = None;
     Raise::Raised { from, to }
 }
+
+/// D103's ordering oracle: every writer above puts the record's two syncs on
+/// the disk before the first byte of the event beside it. Its own file,
+/// because it is a gate in front of ORCH-083 and ORCH-084 and not one more
+/// test of the store.
+#[cfg(test)]
+mod ordering_oracle;
 
 #[cfg(test)]
 mod tests {
@@ -3772,7 +3782,12 @@ mod tests {
             (
                 "the end of an attempt",
                 store
-                    .end_attempt(&job.id, attempt, "a late sentence", None)
+                    .end_attempt(
+                        &job.id,
+                        attempt,
+                        "a late sentence",
+                        HowItEnded::TheRunnerWentAway,
+                    )
                     .expect_err("end attempt"),
             ),
             (

@@ -920,6 +920,70 @@ pub enum JobOutcome {
     /// actionable thing in the whole report — the setup that is broken is
     /// its own.
     SetupFailed { reason: String },
+    /// Every machine this job was offered to handed it straight back because
+    /// it was already as full as the ceiling it announced, until the hub ran
+    /// out of tries (D182).
+    ///
+    /// **The subject is the machines, not the job.** Nothing failed and
+    /// nothing was lost: the job never started anywhere, no process was
+    /// killed, and every runner that refused it was on the line and healthy,
+    /// holding exactly the work it had told the hub it would hold. What ran
+    /// out is the hub's own bound on how many such refusals one job may
+    /// collect, which exists because an exemption with no bound is a job
+    /// that can be refused for ever and told nobody.
+    ///
+    /// **Why it is not one of the four endings it is nearest to.**
+    /// [`JobOutcome::Lost`] is E-21's *the machine went silent*, and no
+    /// machine went anywhere here — it was reported as `lost` before this
+    /// variant existed, which told a reader to go and look for a dead host.
+    /// [`JobOutcome::Impossible`] is deliberately *what no fleet can fix*,
+    /// and this is fixable by adding capacity, so it would be a lie.
+    /// [`JobOutcome::Exited`] is forbidden by this type's own rule: Herd's
+    /// failures never wear the consumer's exit code.
+    /// [`JobOutcome::CouldNotStart`] is Herd trying to run a job and
+    /// failing, which is not what happened either.
+    ///
+    /// **The figures are fields, not prose.** `reason` is the sentence a
+    /// person reads; everything a program needs to decide what to do is
+    /// beside it — how many refusals, the bound they ran into, and every
+    /// machine that said it was full with the figure it gave. A reader that
+    /// has to parse `reason` is a reader that breaks the day the wording
+    /// improves (D166).
+    RefusedAsFull {
+        reason: String,
+        /// How many times this job was handed straight back for a machine's
+        /// own ceiling. Equal to `refusals_allowed` whenever this ending is
+        /// the one that was reached.
+        refusals: u32,
+        /// The bound that ran out
+        /// (`herd_hub::CEILING_REFUSALS_ALLOWED`, or whatever the hub was
+        /// started with).
+        refusals_allowed: u32,
+        /// Every machine that handed it back, in the order they did, each
+        /// named once.
+        runners: Vec<RunnerThatWasFull>,
+    },
+}
+
+/// One machine that handed a job straight back because it was already as
+/// full as the ceiling it announced ([`JobOutcome::RefusedAsFull`]).
+///
+/// A struct rather than a pair of parallel lists, because the name and the
+/// figure only mean anything together: *"four machines were full"* is not
+/// something to act on, and *"the machine that is configured for one job at
+/// a time refused it four times"* is.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RunnerThatWasFull {
+    /// The machine's name, as its attempt recorded it.
+    pub name: String,
+    /// How many jobs it said it was **already holding** when it refused,
+    /// which is the ceiling it announced — that figure being why it refused.
+    ///
+    /// `None` for a refusal recorded by a hub that did not keep the figure.
+    /// Never read as zero: a machine holding nothing would have taken the
+    /// job.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub holding: Option<u32>,
 }
 
 impl JobOutcome {
@@ -956,6 +1020,7 @@ impl JobOutcome {
             JobOutcome::Lost { .. } => "lost",
             JobOutcome::Impossible { .. } => "impossible",
             JobOutcome::SetupFailed { .. } => "setup_failed",
+            JobOutcome::RefusedAsFull { .. } => "refused_as_full",
         }
     }
 }
@@ -1265,6 +1330,35 @@ pub enum ToHub {
         /// absent, and an absent figure is absent: never zero.
         #[serde(default, skip_serializing_if = "HostSize::is_silent")]
         host: HostSize,
+        /// The most jobs this runner will hold at once, as it worked the
+        /// figure out for itself (D181, invariant 2).
+        ///
+        /// It travels for the reason [`health_every_ms`](ToHub::Hello) does:
+        /// the mistake it prevents needs **both** sides at once. A runner
+        /// derives a ceiling from what it declared — the memory it lends,
+        /// less the floor it keeps, over the cap it puts on every job — and
+        /// hands back every assignment past it as
+        /// [`ToHub::AttemptAbandoned`]. The hub, meanwhile, charges a job
+        /// only the memory the job *declared*, so a queue of jobs that
+        /// declare none costs a machine nothing and is placed on one runner
+        /// without bound. Each side is self-consistent; together they spend
+        /// one of every surplus job's goes on a refusal that was certain
+        /// before it was sent. Only the pairing is wrong, so the pairing is
+        /// what the handshake has to be able to see.
+        ///
+        /// **`None` means the peer did not say, and nothing else.** Not
+        /// unlimited, not zero, not a figure guessed from `host` — a hub that
+        /// read silence as a number would be enforcing a ceiling its runner
+        /// never agreed to, and a hub that read it as "unlimited" would be
+        /// doing what it does today, which is at least honest about not
+        /// knowing. So a runner that says nothing is placed on exactly as it
+        /// is placed on now. `None` from every requester, which holds no
+        /// jobs at all.
+        ///
+        /// A ceiling here is **a bound beside the memory admission and never
+        /// instead of it**: whichever bites first is the one that bites.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        jobs_at_once: Option<u32>,
         /// How preferred this runner is when more than one could run a job
         /// (E-19).
         ///
@@ -1534,6 +1628,41 @@ pub enum ToHub {
         job_id: JobId,
         attempt: u32,
         reason: String,
+        /// How many jobs this runner was already holding, when **its own
+        /// count of what it holds is why it refused** (D182, invariant 2).
+        ///
+        /// Two refusals say it: the ceiling the runner announced, and a job
+        /// it is already running another attempt of. Both are the same fact
+        /// — this machine has no place for this assignment, by its own
+        /// bookkeeping — and both carry the same consequence.
+        ///
+        /// `None` on every other abandonment — a drain, a withdrawn switch, a
+        /// command line that will not do, an attempt the hub wrote off — and
+        /// that is the whole of what this field decides. A refusal for a
+        /// machine's own count is not a runner that went away: the machine
+        /// is here, healthy, and holding exactly the work it said it would
+        /// hold, so the job has lost nothing and must not be charged a go for
+        /// it (`herd_hub::job::JobRecord::goes_a_runner_took`). The hub
+        /// cannot read that off the `reason`, which is prose; it has to be
+        /// said in a field.
+        ///
+        /// The **count** rather than a flag, because the hub needs it twice.
+        /// It is why the attempt is not charged, and it is also the machine's
+        /// own answer to "how full are you": a runner that has just redialled
+        /// is holding jobs the hub's records no longer know about, since the
+        /// watchdog ended those attempts while the link was down and the jobs
+        /// went on running. Without the figure the hub would place the same
+        /// surplus again the moment it requeued it.
+        ///
+        /// Additive, and both numbers stay where they are: `#[serde(default)]`
+        /// with `None` meaning exactly what its absence says, which is the one
+        /// shape `herd-hub/src/job.rs`'s rule lets through. An older hub drops
+        /// the key and reads the abandonment it always read; an older runner
+        /// sends no key and a hub on this version reads `None`, which is "not
+        /// a ceiling refusal" and is what every abandonment meant before this
+        /// field existed.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        at_its_ceiling: Option<u32>,
     },
     /// Requester asks for a job to be cancelled (E-06).
     ///

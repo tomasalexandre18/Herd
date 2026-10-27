@@ -96,6 +96,40 @@ pub struct Seat {
     /// requester (invariant 6).
     pub preference: i32,
     pub host: HostSize,
+    /// The most jobs this runner said it holds at once, in its handshake
+    /// (D181, invariant 2). `None` from a runner that did not say.
+    ///
+    /// **A bound beside the memory admission, never instead of it.** The two
+    /// answer different questions and neither subsumes the other: admission
+    /// weighs what a job *declared* it would take, so a queue of jobs that
+    /// declare nothing costs a machine nothing and this is the only figure
+    /// that stops them; and this one knows nothing about size, so a single
+    /// job larger than the machine is still admission's to refuse. Whichever
+    /// bites first is the one that bites.
+    ///
+    /// Never derived here. The runner's arithmetic uses the cap it puts on
+    /// every job, which no frame carries, so the hub either has the runner's
+    /// own figure or has none — and having none means placing exactly as it
+    /// placed before this field existed.
+    pub jobs_at_once: Option<u32>,
+    /// What this machine last said it was **already holding**, when it
+    /// handed an assignment back because it was at the ceiling above
+    /// (D182). `None` is "nothing to correct", and is the ordinary state.
+    ///
+    /// [`Seat::reserved`]`.jobs` is the hub's count, read off the records,
+    /// and there is one state in which the records are wrong by a lot: a
+    /// runner whose link dropped goes on running its jobs, the watchdog ends
+    /// those attempts and requeues them, and when the machine redials the
+    /// hub sees a seat holding nothing. Offering it back the jobs it is
+    /// still running is what this figure prevents — the two counts are
+    /// compared and the larger one is the one the ceiling is held against,
+    /// because the machine is the authority on what the machine is running.
+    ///
+    /// Only ever a **floor** under the hub's own count, never a replacement
+    /// for it: within one pass `claim` goes on taking `reserved.jobs` up as
+    /// jobs are offered, so two jobs offered together still contend for the
+    /// last place whatever this says.
+    pub it_said_it_is_holding: Option<u32>,
     /// On its way out (invariant 2). It takes no new job, and — the decision
     /// D80 records — it does not count as *available* either, so a job does
     /// not stick to a machine that is leaving.
@@ -265,6 +299,23 @@ pub const DRAIN_FIRST_LIMIT: Duration = Duration::from_secs(15 * 60);
 /// announced would be a figure the hub would have to defend against a runner
 /// that announced two hundred.
 pub const READINGS_AT_ONCE: u32 = 2;
+
+/// The clause that marks a sentence as **the hub holding a job back for a
+/// ceiling a runner announced** — the hub's words, about the runner, and not
+/// the runner's own.
+///
+/// It exists for the same reason `herd_runner::A_RUNNERS_OWN_CEILING` does,
+/// and against it. Both sentences are about the same ceiling and both reach
+/// an operator's record: this one on a `waiting` line while the job is held,
+/// that one inside an `attempt_ended` line when a runner really did refuse.
+/// They used to share the words *"holds at most"*, so a reader — or a test —
+/// matching on that substring could not tell a job that waited (which costs
+/// nothing) from a job whose go was spent (which can cost the job). **Neither
+/// clause is a substring of the other, and neither sentence contains the
+/// other's clause.** `herd-hub/tests/announced_job_ceiling.rs` asserts that
+/// against both sentences as they are really built, so the distinction
+/// cannot be lost by an edit to either wording.
+pub const A_CEILING_THE_RUNNER_ANNOUNCED: &str = "it said it holds at most";
 
 /// What the claim step needs beyond the record and the fleet.
 ///
@@ -581,6 +632,83 @@ enum Admission {
 /// function of it for a job that declared a per-thread figure, and N is chosen
 /// before any requirement is read (D82).
 fn admission(record: &JobRecord, seat: &Seat, threads: Option<u32>) -> Admission {
+    // **First, and before any figure about size**: the count the runner
+    // itself put on how many jobs it will hold at once (D181, invariant 2).
+    //
+    // Here rather than anywhere else because this is the function that reads
+    // [`Seat::reserved`], and `reserved.jobs` is already the count this needs
+    // — the number of attempts out on this machine that have not ended, taken
+    // off the records by the one `out_there` filter every other figure about
+    // a machine is taken off (D79), and taken *again* by `claim` inside the
+    // pass so that two jobs offered together contend for the last place. A
+    // second counter kept beside it would be a second answer to one question,
+    // and the first job counted by one and not the other would be a machine
+    // the hub reads as having room on top of work that is running.
+    //
+    // Before the memory arithmetic because it is the cheaper and the blunter
+    // of the two, and because the sentence a waiting job should read is the
+    // one that is actually holding it up: a machine at its own ceiling is
+    // full whatever its memory says, and a job told how many mebibytes are
+    // free on a machine that will not take it anyway has been told the wrong
+    // thing. It does not replace what follows — a job too big for this
+    // machine is still refused below, on a machine holding nothing at all.
+    //
+    // Counted over **every** job out there, readings included (D159, D169),
+    // because the runner's own ceiling counts every job it is running and the
+    // two sides have to be counting the same set. A ceiling the hub applied
+    // to a smaller set than the runner does would let the runner refuse work
+    // the hub thought it had room for, which is the whole defect this closes.
+    if let Some(at_once) = seat.jobs_at_once {
+        if at_once == 0 {
+            // A runner that says it holds nothing is not a machine this job
+            // waits for. `NotHere` and not `ShortNow`, because `ShortNow`
+            // sticks the job to the machine until the stickiness limit, and a
+            // machine whose ceiling is zero has no job that could end there
+            // to free the place: the wait it would start is one nothing on
+            // that machine can finish. Our own runner never announces zero —
+            // `jobs_at_once` is floored at one — so this is about a peer that
+            // is not ours, and the reading that costs nothing is the right
+            // one.
+            return Admission::NotHere(format!(
+                "{} says it holds 0 jobs at once, so nothing can ever be placed there and \
+                 nothing waits for it",
+                seat.name
+            ));
+        }
+        // The hub's count, and the machine's own where the machine has
+        // contradicted it (D182). The larger wins, because the only way
+        // the two differ is the hub's being stale: a runner that redialled
+        // after an outage is holding jobs whose attempts the watchdog ended
+        // while the link was down, so the records read that seat as empty
+        // and the machine knows it is full. Taking the larger is also what
+        // makes this correction cost nothing in the ordinary case, where the
+        // machine has said nothing and the figure is the hub's alone.
+        let out_there = seat
+            .reserved
+            .jobs
+            .max(seat.it_said_it_is_holding.unwrap_or(0));
+        if out_there >= at_once {
+            return Admission::ShortNow(format!(
+                "on {}, {out_there} job(s) already out there and \
+                 {A_CEILING_THE_RUNNER_ANNOUNCED} {at_once} at once, so it takes nothing more \
+                 until one of them ends: {}{}",
+                seat.name,
+                seat.reserved.sentence(),
+                match seat.it_said_it_is_holding {
+                    // Said out loud, because it is the one figure here that
+                    // did not come off the records: an operator reading
+                    // "0 job(s) out there and it holds at most 2" would be
+                    // reading a contradiction otherwise.
+                    Some(holding) if holding > seat.reserved.jobs => format!(
+                        " — {holding} of them by the machine's own count, which it gave when it \
+                         last handed an assignment back; this hub's records knew of {}",
+                        seat.reserved.jobs
+                    ),
+                    _ => String::new(),
+                }
+            ));
+        }
+    }
     // A job already out there whose holding cannot be costed stops this
     // machine admitting anything that costs memory. Named, never read as
     // zero: the alternative is a machine that reads idle on top of a build.
@@ -1567,6 +1695,14 @@ mod tests {
             name: name.to_owned(),
             preference,
             host,
+            it_said_it_is_holding: None,
+            // Silent, on every seat these tests build but the ones that are
+            // about the ceiling. That is deliberate and it is itself the
+            // assertion D181's "absent is not a figure" needs: a runner that
+            // said nothing is placed on exactly as it was before this field
+            // existed, and every test in this module that passed without it
+            // has to go on passing unchanged.
+            jobs_at_once: None,
             draining: false,
             switch: herd_proto::Switch::On,
             reserved_for: None,
@@ -2332,6 +2468,7 @@ mod tests {
             ended_at: None,
             ended: None,
             requeue_code: None,
+            at_its_ceiling: None,
             why: "claimed by wsl-pc: labels build".to_owned(),
             steps: Vec::new(),
             commit: None,
@@ -2441,6 +2578,7 @@ mod tests {
             ended_at: None,
             ended: None,
             requeue_code: None,
+            at_its_ceiling: None,
             why: format!("claimed by {runner}"),
             steps: Vec::new(),
             commit: None,
@@ -3504,6 +3642,7 @@ mod tests {
             ended_at: Some(record.submitted_at),
             requeue_code,
             ended: Some("ended".to_owned()),
+            at_its_ceiling: None,
             why: "claimed by somebody".to_owned(),
             commit: None,
             steps: Vec::new(),
@@ -3900,5 +4039,302 @@ mod tests {
         ));
         assert_eq!(runner, "wsl-pc");
         assert!(why.contains("build slot 1 of 1"), "{why}");
+    }
+
+    // ------------------------------------------- D181: the announced ceiling
+
+    /// A runner that announced it holds `at_once` jobs, and nothing else
+    /// changed about it.
+    fn their_server_holding_at_most(at_once: u32) -> Seat {
+        let mut seat = their_server();
+        seat.jobs_at_once = Some(at_once);
+        seat
+    }
+
+    /// The same, for the machine with the preference on it.
+    fn her_pc_holding_at_most(at_once: u32) -> Seat {
+        let mut seat = her_pc();
+        seat.jobs_at_once = Some(at_once);
+        seat
+    }
+
+    /// A job that declares **no memory need at all** — which is the whole
+    /// reason this field exists. `admission` costs such a job at zero
+    /// (`needs_memory` is `None`, so `memory_mib` is 0), so the memory seat
+    /// accounting never stops a queue of them, however long it is.
+    fn costs_nothing(id: &str) -> JobRecord {
+        queued(id, &[])
+    }
+
+    /// The same, declaring a whole-job memory need — and still asking for no
+    /// capability, so that nothing but the two bounds under test can be what
+    /// holds it up.
+    fn costing(id: &str, memory_mib: u64) -> JobRecord {
+        let mut record = queued(id, &[]);
+        record.memory_mib = Some(memory_mib);
+        record
+    }
+
+    /// The defect, stated as a test: without a ceiling the hub places an
+    /// unbounded number of memory-silent jobs on one machine.
+    ///
+    /// Kept as the first of these on purpose. It is what a runner that says
+    /// nothing still gets — today's behaviour, unchanged, which is what
+    /// "absent means it did not say" has to mean in the placement and not
+    /// only in the doc comment.
+    #[test]
+    fn a_runner_that_announced_no_ceiling_is_placed_on_exactly_as_it_was() {
+        let mut fleet = vec![their_server()];
+        assert_eq!(fleet[0].jobs_at_once, None);
+        let mut running = Vec::new();
+        for n in 0..40 {
+            let job = costs_nothing(&format!("j{n}"));
+            let (runner, _) = placed(place(
+                &job,
+                &mut fleet,
+                now(),
+                Stickiness::default(),
+                &Placing::default(),
+            ));
+            assert_eq!(
+                runner, "build-host",
+                "job {n} of a memory-silent queue: nothing in the hub bounds this, which is \
+                 the defect D181 answers and not something to be fixed by silence"
+            );
+            running.push(job);
+        }
+        assert_eq!(fleet[0].reserved.jobs, 40);
+        assert_eq!(
+            fleet[0].reserved.memory_mib, 0,
+            "and the forty of them are costed at nothing, which is why the memory admission \
+             could never have been what stopped them"
+        );
+    }
+
+    /// The same queue against a runner that *did* say. It fills to the figure
+    /// it announced and not one job past it, and the job behind reads a
+    /// sentence with the arithmetic in it.
+    #[test]
+    fn a_runner_at_the_ceiling_it_announced_takes_nothing_more_and_says_so() {
+        let mut fleet = vec![their_server_holding_at_most(3)];
+        for n in 0..3 {
+            let (runner, _) = placed(place(
+                &costs_nothing(&format!("j{n}")),
+                &mut fleet,
+                now(),
+                Stickiness::default(),
+                &Placing::default(),
+            ));
+            assert_eq!(runner, "build-host", "job {n} is inside the ceiling");
+        }
+        // The fourth, in the same pass: the count the ceiling is held
+        // against is taken again by `claim`, so two jobs offered together
+        // contend for the last place instead of both finding it free.
+        let why = waited(place(
+            &costs_nothing("j3"),
+            &mut fleet,
+            now(),
+            Stickiness::default(),
+            &Placing::default(),
+        ));
+        assert!(
+            why.contains("3 job(s) already out there and it said it holds at most 3 at once"),
+            "the sentence has to carry both figures, or an operator cannot tell a full \
+             machine from a broken one: {why}"
+        );
+        assert!(
+            why.contains("takes nothing more until one of them ends"),
+            "and it has to say what ends the wait: {why}"
+        );
+        assert_eq!(
+            fleet[0].reserved.jobs, 3,
+            "and the refused job took no place on the way past"
+        );
+    }
+
+    /// **A bound beside the memory one, never instead of it.** Whichever
+    /// bites first is the one that bites, and the sentence names that one.
+    #[test]
+    fn the_ceiling_and_the_memory_admission_are_two_bounds_and_either_may_bite() {
+        // The ceiling bites first: two jobs of 1 GiB on a machine admitting
+        // 25 GiB, which has room for twenty more and will take none.
+        let mut fleet = vec![their_server_holding_at_most(2)];
+        for n in 0..2 {
+            placed(place(
+                &costing(&format!("j{n}"), 1024),
+                &mut fleet,
+                now(),
+                Stickiness::default(),
+                &Placing::default(),
+            ));
+        }
+        let why = waited(place(
+            &costing("j2", 1024),
+            &mut fleet,
+            now(),
+            Stickiness::default(),
+            &Placing::default(),
+        ));
+        assert!(
+            why.contains("it said it holds at most 2 at once"),
+            "the ceiling is what is holding this job up and the sentence must say so, not \
+             quote 23 GiB of free memory at a machine that will not take it: {why}"
+        );
+
+        // The memory bites first: one 20 GiB job on a machine that announced
+        // room for eight, and the second 20 GiB job does not fit although
+        // seven places are open.
+        let mut fleet = vec![their_server_holding_at_most(8)];
+        placed(place(
+            &costing("j0", 20 * 1024),
+            &mut fleet,
+            now(),
+            Stickiness::default(),
+            &Placing::default(),
+        ));
+        let why = waited(place(
+            &costing("j1", 20 * 1024),
+            &mut fleet,
+            now(),
+            Stickiness::default(),
+            &Placing::default(),
+        ));
+        assert!(
+            why.contains("5 GiB free of its 25 GiB memory admission"),
+            "a ceiling with places left must not stop the memory admission doing its job: \
+             {why}"
+        );
+
+        // And a job larger than the machine is still *impossible* there,
+        // not a wait: the ceiling knows nothing about size and must not
+        // turn a refusal that can never clear into one that waits for ever.
+        let mut fleet = vec![their_server_holding_at_most(8)];
+        let why = waited(place(
+            &costing("j0", 40 * 1024),
+            &mut fleet,
+            now(),
+            Stickiness::default(),
+            &Placing::default(),
+        ));
+        assert!(
+            why.contains("can never fit there however empty it gets"),
+            "{why}"
+        );
+    }
+
+    /// A peer that announces a ceiling of zero is a machine nothing waits
+    /// for, not a machine every job waits at for ever.
+    ///
+    /// Our own runner never announces zero — `herd_runner::jobs_at_once` is
+    /// floored at one, deliberately, because invariant 2 asks for a cap and
+    /// not a wall — so this is about a peer that is not ours. It still has
+    /// to be answered: `ShortNow` sticks a job to the machine it is waiting
+    /// for, and on a machine whose ceiling is zero there is no job that
+    /// could end there to free the place.
+    #[test]
+    fn a_ceiling_of_zero_is_a_machine_nothing_waits_for() {
+        let mut fleet = vec![their_server_holding_at_most(0), her_pc()];
+        let (runner, _) = placed(place(
+            &costs_nothing("j0"),
+            &mut fleet,
+            now(),
+            Stickiness::default(),
+            &Placing::default(),
+        ));
+        assert_eq!(
+            runner, "wsl-pc",
+            "the job goes to the other machine in this same pass rather than sticking to \
+             one that has told it there is nothing to wait for"
+        );
+        let mut alone = vec![their_server_holding_at_most(0)];
+        let why = waited(place(
+            &costs_nothing("j1"),
+            &mut alone,
+            now(),
+            Stickiness::default(),
+            &Placing::default(),
+        ));
+        assert!(
+            why.contains("says it holds 0 jobs at once") && why.contains("nothing waits for it"),
+            "{why}"
+        );
+    }
+
+    /// The ceiling counts **every** job out there, requirement readings
+    /// included, because the runner's own ceiling does.
+    ///
+    /// D159 keeps a reading out of the slot algebra and D169 caps readings
+    /// separately; neither makes a reading weightless on the machine it runs
+    /// on. A hub counting a smaller set than the runner would read room that
+    /// is not there and place work the runner is certain to hand back, which
+    /// is the whole defect this closes.
+    #[test]
+    fn the_ceiling_counts_readings_too_because_the_runner_s_does() {
+        let running = vec![
+            out_on(a_reading("j0", &[], "j10"), "build-host"),
+            out_on(a_reading("j1", &[], "j11"), "build-host"),
+        ];
+        let mut fleet = fleet_with(their_server_holding_at_most(2), &running);
+        assert_eq!(fleet[0].reserved.jobs, 2);
+        assert_eq!(fleet[0].reserved.readings, 2);
+        let why = waited(place(
+            &costs_nothing("j2"),
+            &mut fleet,
+            now(),
+            Stickiness::default(),
+            &Placing::default(),
+        ));
+        assert!(
+            why.contains("2 job(s) already out there and it said it holds at most 2 at once"),
+            "two readings fill a ceiling of two, because two readings fill the runner's: {why}"
+        );
+    }
+
+    /// A machine at its ceiling is still **eligible**: it is busy, not
+    /// unsuitable. That is what keeps the job waiting for the machine it
+    /// prefers instead of falling to a lesser one — and what bounds the wait
+    /// is the stickiness limit, exactly as it is for memory.
+    #[test]
+    fn a_job_held_by_a_ceiling_waits_for_that_machine_and_then_moves() {
+        let running: Vec<JobRecord> = (0..2)
+            .map(|n| out_on(costs_nothing(&format!("j{n}")), "wsl-pc"))
+            .collect();
+        let mut her = fleet_with(her_pc_holding_at_most(2), &running);
+        her.push(their_server());
+        // Her PC is preferred (10 against 0) and full, so the job waits for
+        // it rather than taking the free server.
+        let why = waited(place(
+            &costs_nothing("j9"),
+            &mut her,
+            now(),
+            Stickiness::default(),
+            &Placing::default(),
+        ));
+        assert!(why.contains("it is waiting for wsl-pc"), "{why}");
+        assert!(why.contains("it said it holds at most 2 at once"), "{why}");
+        assert!(
+            why.contains("build-host could take it and is less preferred"),
+            "{why}"
+        );
+
+        // And past the stickiness limit it moves, which is what stops a
+        // ceiling from being a place a job can sit behind for ever.
+        let mut her = fleet_with(her_pc_holding_at_most(2), &running);
+        her.push(their_server());
+        let waited_too_long = costs_nothing("j9");
+        let later = waited_too_long
+            .submitted_at
+            .after(Stickiness::default().limit + Duration::from_secs(60));
+        let (runner, why) = placed(place(
+            &waited_too_long,
+            &mut her,
+            later,
+            Stickiness::default(),
+            &Placing::default(),
+        ));
+        assert_eq!(
+            runner, "build-host",
+            "past the stickiness limit the job takes the less preferred machine: {why}"
+        );
     }
 }
