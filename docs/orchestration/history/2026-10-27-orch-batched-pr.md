@@ -3,8 +3,9 @@
 - **Item:** none allocated (see *Decisions needed*; the board was being
   written by `herd-merger` for the #92 + #98 batch and was left alone)
 - **Agent:** herd-step
-- **Branch / commit:** `orch-batched-pr` / see below, based on
-  origin/main `f19efe6`
+- **Branch / commit:** `orch-batched-pr` / `2a59185`, based on
+  origin/main `f19efe6`. This line naming the sha is the one change in
+  the small commit that follows it.
 - **PR:** none — the branch is the delivery (one PR per batch,
   `docs/orchestration/workflow.md`), which is the rule this branch writes
 
