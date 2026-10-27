@@ -226,10 +226,12 @@ to touch (D161).
    that caused all of it is itself proved by no test that runs here**
    (ORCH-116).
 7. **A skip count is a per-host figure** (ORCH-070): 12 on this
-   workstation, 15 on CI's `check`, the same tree. ORCH-071 is done (PR
-   #88, **D179**): an incomplete or narrowed run now says so instead of
-   reporting no skips. ORCH-048, the over-counting in the same two
-   scripts, is untouched by it.
+   workstation and **14** on CI's `check` since ORCH-069 — it was 15,
+   and the one that left is `slots.rs`'s derived `-j`, which CI run
+   40535627242 **runs and passes** instead of skipping. ORCH-071 is
+   done (PR #88, **D179**): an incomplete or narrowed run now says so
+   instead of reporting no skips. ORCH-048, the over-counting in the
+   same two scripts, is untouched by it.
 8. **The durability tier has begun: step A is on `main`** (ORCH-083,
    **D183**, PR #102). `record_waiting`'s `waiting` line no longer
    waits for the disk; **one event line of thirteen is unsynced and

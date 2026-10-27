@@ -244,6 +244,14 @@ and the count is a count and not a floor because the run completed
 The ninth of those is ORCH-116: it is the only proof D119's clamp has,
 and it has never run on the machine the clamp was biting.
 
+**CI's skip count fell from 15 to 14**, and the one that left is the
+assertion this batch was about: CI run 40535627242 reports
+`the_derived_j_is_recorded_and_is_what_the_job_is_given ... ok` where it
+used to report a `HERD-SKIPPED` line for it. That is ORCH-069's claim
+confirmed from the other side — the assertion had never run anywhere,
+and it now runs in both places. `docs/status.md` and the board's item 7
+are corrected to 14.
+
 ## Risks and findings
 
 1. **The board merged without a conflict, and that is worth saying out

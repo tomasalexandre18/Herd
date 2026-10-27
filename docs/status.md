@@ -47,7 +47,7 @@ reaches us as a report. Each figure below carries the date it reached us.
 
 M1-M11, M15 and M16; protocol version 2; a job may return 1 GiB by
 default (`confine.rs:82`). **A skip count is per host** (D27, ORCH-070):
-**12** here, **15** on CI; D151's 13 is not reproducible (`05` §6).
+**12** here, **14** on CI; D151's 13 is not reproducible (`05` §6).
 **D179**: an incomplete run reports its skips as a floor, not a count.
 
 **The suite is green here for the first time: 836 passed, 0 failed, 12
