@@ -337,6 +337,21 @@ test server::tests::the_stop_waits_for_the_pass_in_flight_and_gives_up_at_its_bo
 test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 177 filtered out; finished in 0.12s
 ```
 
+**CI on PR #96, run 40489471904, head `b02a58b`: both jobs green.**
+
+```text
+$ gh pr checks 96
+check   pass    8m34s   …/runs/40489471904/job/122139535263
+docs    pass    4m21s   …/runs/40489471904/job/122139535583
+```
+
+That is the whole suite green on a host whose memory constants match, which
+is what separates ORCH-069 from this branch for good. The runner reported
+**15 skips**, and among them is
+`the_derived_j_is_recorded_and_is_what_the_job_is_given` — `slots.rs:744`.
+By D27 that is a skip and **not** a pass, so it is not
+claimed as one here.
+
 **Skips, copied and never counted as passes (D27).** `scripts/test.sh`
 printed **at least 12**, every one of them cgroup v2 delegation on this
 unprivileged host (`Permission denied` creating a cgroup under
