@@ -23,9 +23,11 @@ Rules of the task:
   counted as a pass (D27). A red gate is reported red; you do not edit a
   test or an expectation to make it green.
 - Commit on your branch with an imperative English subject ≤ 72 chars and
-  push the branch. **No PR, no merge, no tag, no release, no `main`**, no
-  write to `docs/decisions.md` except a new entry headed `D-NEXT` when the
-  brief asks for one (the merger allocates the number).
+  push the branch. **No PR, no merge, no tag, no release, no `main`** —
+  one PR per batch, opened by `herd-merger`
+  (`docs/orchestration/workflow.md`) — and no write to
+  `docs/decisions.md` except a new entry headed `D-NEXT` when the brief
+  asks for one (the merger allocates the number).
 - Shared host: your own scratchpad subdirectory; kill only PIDs you
   started, never `pkill -f` or by name; at most one compile at a time;
   nothing on the consumer's instance, `/etc/nixos`, containers or
