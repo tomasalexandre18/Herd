@@ -4,7 +4,7 @@
 - **Agent:** herd-step
 - **Branch / commit:** `orch-068-align-launcher`, based on origin/main
   `cd59ef5`
-- **PR:** see the branch's pull request
+- **PR:** #93
 
 ## Done
 
@@ -269,7 +269,7 @@ None. ORCH-068's question was answered before the task started.
 ## Resume point
 
 `herd-merger` reviews and merges the pull request for
-`orch-068-align-launcher` once CI's `check` and `docs` are green. Nothing
+`orch-068-align-launcher` (PR #93) once CI's `check` and `docs` are green.
 else is owed on ORCH-068.
 
 ## Processes
