@@ -4,7 +4,7 @@
 - **Agent:** herd-merger
 - **Branch / commit:** `orch-080-crash-point-enumeration` / the merge of
   `6f5b1c0` with `origin/main` `f19efe6`, based on origin/main `f19efe6`
-- **PR:** #92
+- **PR:** the batch PR (ORCH-080 + ORCH-092); #92 is closed as superseded
 
 ## Done
 
@@ -154,7 +154,8 @@ arm probably staying an error.
 
 ## Resume point
 
-PR #98 (`orch-092-spool-sweep`) is the last of this queue.
+This half is integrated as part of the ORCH-080 + ORCH-092 batch; see
+`2026-10-27-merge-batch-orch-080-092.md` for the batch-level handoff.
 
 ## Processes
 
