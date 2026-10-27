@@ -5,7 +5,8 @@
 - **Branch / commit:** `merge-batch-2` / see *Gates*, based on
   `origin/main` `1e739fb` (re-read and confirmed, not taken from the
   brief)
-- **PR:** one per batch, named below with its CI run
+- **PR:** [#101](https://github.com/tomasalexandre18/Herd/pull/101), CI run
+  `40519934848` — `docs` pass 21s, `check` pass 8m29s
 
 ## Done
 
@@ -325,10 +326,14 @@ FAIL  PATH dropped the inherited entries; the guard below needs coreutils
   `tail -2`/`tail -3`. A gate's output is the evidence. That is the only
   reason this took twenty-five runs to name, and it is why the row's
   next action says to keep the whole output.
-- **The `docs` job time after this batch is measured on CI, not here**
-  — the figure is in the PR's Evidence and in the report below. Locally
-  the two scripts together are **under 10 seconds** where they were
-  ~160, against a 5-minute cap.
+- **The `docs` job time after this batch, measured where it was
+  failing: 21 s.** PR #101, CI run `40519934848` — `docs` pass in 21 s
+  and `check` pass in 8m29s, both green on the head that was merged.
+  That is the figure that matters, because the job was being *killed* at
+  5 minutes having already printed its pass. Locally the two scripts
+  together are under 10 seconds where they were ~160. **ORCH-111 did not
+  redden it**, as expected on a runner with a stable `PATH` and no
+  `/etc/profiles/per-user`.
 - **ORCH-108 was not re-allocated.** `orch-batched-pr`'s author refused
   it on finding it already taken by the spool-deletion decision, and he
   was right: ORCH-108 is on `origin/main`. The next genuinely free ids,
