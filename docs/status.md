@@ -16,7 +16,7 @@ queue that no longer writes a non-event per queued job per pass (D171);
 v0.3.6 carried the bounded reading (D169). v0.3.4 onward are published
 (D162); a **`v*.*.*-dev*` tag** publishes a pre-release (D172).
 
-**`main` is 228 commits past v0.3.7** counted on batch 4's head, and the
+**`main` is 240 commits past v0.3.7** counted on batch 5's head, and the
 workspace version still reads `0.3.7`. Nothing merged since the tag has
 shipped. `PROTOCOL_VERSION` is **2** and `RECORD_VERSION` **1**.
 
@@ -50,14 +50,12 @@ M1-M11, M15 and M16; protocol version 2; a job may return 1 GiB by default
 ORCH-107): **12** here at rest, **14** under load, **14** on CI — compare the
 **list**, not the number (**ORCH-120**); D151's 13 is unreproducible (`05`).
 
-**The suite is green here: 837 passed, 0 failed, 12 skipped** (batch 4), and
-**D179** still reports an incomplete run's skips as a floor. **ORCH-069 is
-done** — the cgroup clamp (D119), both fixtures now declaring 2 GiB — and so
-is **ORCH-107**: the real-hub tests built the binaries they drive inside
-their own 30 s patience, `scripts/test.sh` now builds them first, no constant
-moved and nothing became a skip. The 21 at load 19 stay **unexplained**.
+**The suite is green here: 838 passed, 0 failed, 12 skipped** (batch 5), and
+**D179** still reports an incomplete run's skips as a floor. **ORCH-069**
+(the D119 cgroup clamp) and **ORCH-107** (real-hub tests build their own
+binaries first) are done; the 21 at load 19 stay **unexplained**.
 
-**Eleven changes are in no release.** Eight defects — **D175** a file whose
+**Twelve changes are in no release.** Eight defects — **D175** a file whose
 bytes did not hash to its digest exited 0; **D176** a verdict could name
 a commit the tree was never at; **D177** a live-job map keyed by job id
 let a second attempt replace the first; **D178** the watchdog judged an
@@ -66,13 +64,14 @@ holds and announces its own ceiling, and a refusal there spends none of
 its goes; **ORCH-094** the hub re-minted ids once anything removed a
 record. Two new behaviours: **D184** `SIGTERM` stops the hub instead of
 killing it, bounded at five seconds and non-zero on an overrun; and
-**ORCH-092**, a runner sweeps its output spool at startup. One cost cut,
-**D183 step A** (ORCH-083): the `waiting` event line alone is unsynced,
-one of thirteen, the record still fully synced, 3.10 ms → 2.10 ms.
+**ORCH-092**, a runner sweeps its output spool at startup. Two cost cuts:
+**D183 step A** (ORCH-083), the `waiting` event line alone unsynced, one
+of thirteen, the record still fully synced, 3.10 ms → 2.10 ms; and
+**ORCH-082**, the store's lock no longer spans a record read — eight
+concurrent readers ×8.49 → ×1.71, and one reader unchanged.
 
-`docs/remediation/` holds fifteen pieces: the baseline, audits A and B,
-their review, two experiments and their review, and `06`-`13`: junction,
-architecture (**D183**), C5, ext4 order, prices, oracle, 308 crash points.
+`docs/remediation/` holds fifteen pieces: the baseline, audits A and B and
+their review, two experiments and their review, and `06`-`13` (**D183**).
 
 ## What the software still does not do
 
@@ -81,8 +80,9 @@ Each of these is a board row; the board holds its owner and next step.
 1. **The reaper's janitor list is unbuilt** (D134): a failing `up` leaves
    workspaces behind and Herd records only that `down` failed (ORCH-012).
 2. **A requirement reading still weighs nothing** — no memory, no tmpfs
-   (`matcher.rs:421`). **Durable writing is 99.5 % of a runner junction**
-   at `N` = 1 000 and nothing ever deletes a job directory (ORCH-021).
+   (`matcher.rs:421`). Nothing ever deletes a job directory (ORCH-021);
+   **~94 % of a `T` walk is per-record CPU** (ORCH-123, a hypothesis); and
+   bytes resent after an eviction are unfreeable for ever (**ORCH-124**).
 3. **M11's pack half does not exist**, with no frame on either protocol
    enum, so E-12 and E-17 are undelivered (ORCH-020).
 4. **M17's second machine is prepared, not joined**, **one shared token**
