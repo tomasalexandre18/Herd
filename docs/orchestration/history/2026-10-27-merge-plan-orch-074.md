@@ -161,6 +161,26 @@ same tree. **CI's 15 is the number a gate is judged on.**
    verbatim into its row and into `## Next`; it is not something this
    integration verified.
 
+8. **The largest finding of this integration came out of CI's own skip
+   report, and it corrects the project rather than the PR.** On a
+   GitHub runner `slots.rs:744` is **skipped, not passed**. Run
+   40437561694 names it verbatim: `the_derived_j_is_recorded_and_is_
+   what_the_job_is_given (E-22's own -j 7): this host has Some(15983)
+   MiB of MemTotal, under the 17 GiB the figure is derived from`.
+   **15983 MiB is under the guard's 17408**, so the D27 guard is false
+   there and the assertion is never made; on this workstation
+   `MemTotal` is 31.1 GiB, the guard is true, the assertion runs and
+   fails. **By D27 a skip is not a pass.** So "ORCH-069 is green on CI"
+   — written into the row across several rounds, into `## Next` item 7
+   and into two of the orchestrator's briefs — has never been evidence
+   that this assertion passes anywhere: it compared a skip with a
+   failure. `admission.rs:419` is not in the skip list and genuinely
+   does run green on CI, so the two halves of ORCH-069 now part
+   company: the `slots` half is explained — the guard admits exactly
+   the hosts whose constants the assertion was not written for — and
+   `admission` is the half still open. ORCH-069 and `## Next` item 7
+   are amended with this; no figure elsewhere was touched.
+
 ## Decisions needed
 
 **None from this integration.** Two rows now wait on Alexa and neither
