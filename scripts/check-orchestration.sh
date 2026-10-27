@@ -333,6 +333,135 @@ run_report "error: linking with cc failed"
 verdict "report-skips.sh: an output with no verdict marker is not a pass" 0 \
   "SKIPS UNKNOWN on this host" "nothing was skipped"
 
+
+echo "== ops/agents: the launcher gives a session what it needs (ORCH-068)"
+# The live launcher on the host and the shipped one drifted: the shipped copy
+# set no GH_CONFIG_DIR, so a session started by it had no GitHub login at all
+# — no `gh pr create`, no `gh pr merge`, and no `git push`, because `origin`
+# is https and the credential helper is `gh auth git-credential`. Nothing in
+# the repository noticed. These assertions are what notices.
+#
+# The real state root is never touched: the scripts are copied and the one
+# hardcoded root line is rewritten to a scratch directory, exactly as the
+# check-docs.sh cases above run on a scratch copy.
+E="$tmp/ops/agents"; mkdir -p "$E"
+cp "$root/ops/agents/env.sh" "$root/ops/agents/session.sh" "$E/"
+sandroot=$tmp/stateroot
+sed -i "s|^HERD_STATE_ROOT=.*|HERD_STATE_ROOT=$sandroot|" "$E/env.sh"
+grep -qxF "HERD_STATE_ROOT=$sandroot" "$E/env.sh" \
+  && ok "env.sh keeps its state root on one rewritable line" \
+  || bad "env.sh: the hardcoded HERD_STATE_ROOT line was not found" \
+         "    expected a line 'HERD_STATE_ROOT=/...' in ops/agents/env.sh"
+
+# Source it from a hostile environment: someone else's HOME, chatOnS markers,
+# an ambient API key — all of which a real relapse would carry in.
+dump=$(env -i PATH="$PATH" HOME=/wrong/home CHATONS_ROOT=/x HC=1 \
+  ANTHROPIC_API_KEY=sk-not-a-real-key ANTHROPIC_BASE_URL=http://elsewhere \
+  bash -c '
+    . "$1" || exit 9
+    for v in HERD_STATE_ROOT HERD_CLAUDE_ROOT HOME CLAUDE_CONFIG_DIR \
+             XDG_CONFIG_HOME XDG_RUNTIME_DIR TMPDIR TEMP CARGO_HOME \
+             HISTFILE GH_CONFIG_DIR PATH ANTHROPIC_API_KEY \
+             ANTHROPIC_BASE_URL CHATONS_ROOT HC; do
+      printf "%s=%s\n" "$v" "${!v-<unset>}"
+    done' _ "$E/env.sh" 2>&1)
+envis() { # <NAME=value> : the sourced environment has exactly this
+  printf '%s\n' "$dump" | grep -qxF "$1" && ok "env.sh: $1" \
+    || bad "env.sh: expected $1" "$(printf '%s\n' "$dump" | sed 's/^/    /')"
+}
+envval() { printf '%s\n' "$dump" | sed -n "s/^$1=//p"; }
+envis "HOME=$sandroot/claude/home"
+envis "CLAUDE_CONFIG_DIR=$sandroot/claude/config"
+envis "XDG_CONFIG_HOME=$sandroot/claude/home/.config"
+envis "XDG_RUNTIME_DIR=$sandroot/claude/run"
+envis "TMPDIR=$sandroot/claude/tmp"
+envis "TEMP=$sandroot/claude/tmp"
+envis "HISTFILE=$sandroot/claude/home/.bash_history"
+# Under the Claude root, not beside it: the registry in use on this host is
+# at <root>/claude/cargo and the shipped file once said <root>/cargo.
+envis "CARGO_HOME=$sandroot/claude/cargo"
+envis 'ANTHROPIC_API_KEY=<unset>'
+envis 'ANTHROPIC_BASE_URL=<unset>'
+envis 'CHATONS_ROOT=<unset>'
+envis 'HC=<unset>'
+for d in home config run tmp cargo; do
+  [ -d "$sandroot/claude/$d" ] && ok "env.sh creates $d" \
+    || bad "env.sh did not create $sandroot/claude/$d" ""
+done
+
+# GH_CONFIG_DIR is the whole point of ORCH-068. It must be set, absolute, a
+# `gh` directory, and deliberately OUTSIDE the state root: the login belongs
+# to the host user and is shared like the Claude Code binary, not copied in.
+gh_dir=$(envval GH_CONFIG_DIR)
+case $gh_dir in
+  "$sandroot"|"$sandroot"/*) bad "GH_CONFIG_DIR is inside the state root" "    $gh_dir" ;;
+  /*/gh) ok "GH_CONFIG_DIR is an absolute gh directory outside the state root" ;;
+  *) bad "GH_CONFIG_DIR must be an absolute path ending in /gh" "    got '$gh_dir'; a session without it cannot open or merge a pull request, nor push to an https remote" ;;
+esac
+# An operator may point it somewhere else without editing the file.
+alt=$(env -i PATH="$PATH" HOME=/wrong/home HERD_GH_CONFIG_DIR=/opt/ghconf \
+  bash -c '. "$1" >/dev/null 2>&1; printf "%s" "${GH_CONFIG_DIR-<unset>}"' _ "$E/env.sh")
+[ "$alt" = /opt/ghconf ] && ok "HERD_GH_CONFIG_DIR overrides the default" \
+  || bad "HERD_GH_CONFIG_DIR ignored" "    got '$alt'"
+
+# PATH: the four directories in front, in order, and what was inherited still
+# behind them, or this file stops being sourceable anywhere but this host.
+path_val=$(envval PATH)
+case $path_val in
+  "$sandroot/claude/tools/dtach/bin:/run/wrappers/bin:/etc/profiles/per-user/"*"/bin:/run/current-system/sw/bin:"*)
+    ok "PATH puts dtach, the wrappers, the per-user profile and sw/bin in front" ;;
+  *) bad "PATH prefix is wrong" "    $path_val" ;;
+esac
+printf '%s' "$path_val" | grep -qF ":$PATH" \
+  && ok "PATH keeps what it inherited behind the four" \
+  || bad "PATH dropped the inherited entries; the guard below needs coreutils" "    $path_val"
+
+# The guard still refuses a state path that escapes the root, and says which.
+# A second copy with one path moved out: assigning CARGO_HOME in the caller
+# would prove nothing, since env.sh assigns it unconditionally.
+cp "$E/env.sh" "$tmp/env-escape.sh"
+sed -i 's|^export CARGO_HOME=.*|export CARGO_HOME=/var/empty/herd-escaped|' "$tmp/env-escape.sh"
+out=$(env -i PATH="$PATH" HOME=/wrong/home \
+  bash -c '. "$1" || exit 7' _ "$tmp/env-escape.sh" 2>&1); rc=$?
+[ "$rc" -eq 7 ] && printf '%s' "$out" | grep -q 'state path outside' \
+  && ok "the guard refuses a state path outside the root" \
+  || bad "the guard let a path outside the root through" "    exit=$rc $out"
+
+# session.sh: the same facts, from the launcher a person actually types.
+mkdir -p "$tmp/fakebin"
+cat > "$tmp/fakebin/claude" <<'FAKE'
+#!/usr/bin/env bash
+echo "FAKE-CLAUDE-RAN $*"
+FAKE
+chmod +x "$tmp/fakebin/claude"
+printf '{}\n' > "$sandroot/claude/config/.credentials.json"
+mkdir -p "$tmp/gh-empty" "$tmp/gh-logged-in"
+printf 'github.com:\n    user: someone\n' > "$tmp/gh-logged-in/hosts.yml"
+runsession() { # <GH_CONFIG_DIR>
+  out=$(env -i PATH="$PATH" HOME=/wrong/home HERD_GH_CONFIG_DIR="$1" \
+    HERD_CLAUDE_BIN="$tmp/fakebin/claude" \
+    bash "$E/session.sh" --version </dev/null 2>&1); rc=$?
+}
+runsession "$tmp/gh-logged-in"
+{ [ "$rc" -eq 0 ] && printf '%s' "$out" | grep -q 'FAKE-CLAUDE-RAN --version' \
+  && ! printf '%s' "$out" | grep -q 'hosts.yml'; } \
+  && ok "session.sh starts the session and says nothing when gh is logged in" \
+  || bad "session.sh misbehaved with a logged-in gh" "    exit=$rc $out"
+runsession "$tmp/gh-empty"
+{ printf '%s' "$out" | grep -q 'cannot open or merge a pull request' \
+  && printf '%s' "$out" | grep -q 'FAKE-CLAUDE-RAN'; } \
+  && ok "session.sh warns, and still starts, when gh has no login" \
+  || bad "session.sh did not warn about a gh directory with no hosts.yml" "    exit=$rc $out"
+mv "$sandroot/claude/config/.credentials.json" "$tmp/creds-aside"
+runsession "$tmp/gh-logged-in"
+{ [ "$rc" -eq 1 ] && printf '%s' "$out" | grep -q 'no .credentials.json'; } \
+  && ok "session.sh refuses without credentials when no terminal can log in" \
+  || bad "session.sh should refuse without credentials and no tty" "    exit=$rc $out"
+mv "$tmp/creds-aside" "$sandroot/claude/config/.credentials.json"
+# Nothing in this section may name a token; only paths belong in the repo.
+grep -qE 'oauth_token|ghp_|github_pat_' "$root/ops/agents/env.sh" "$root/ops/agents/session.sh" \
+  && bad "a credential appears in ops/agents (invariant 7)" "" \
+  || ok "ops/agents names paths only, never a token (invariant 7)"
 echo
 echo "check-orchestration: $pass passed, $fail failed"
 [ "$fail" -eq 0 ]
