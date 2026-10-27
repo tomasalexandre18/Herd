@@ -150,11 +150,24 @@ to use for ZFS.
 measured the record half end to end at **2.36 ms** rather than the
 predicted 1.20 ms, and recorded the gap without explaining it.
 
-The gap is D. `06`'s 6.6 µs is a directory sync with **nothing owed under
-it**; the `sync_dir` inside `write_file_with` runs immediately after a
-`rename`, so the directory it syncs always has dirty metadata and always
-commits. Measured in the position the code actually puts it in, D is
-**1.32 ms on ZFS and 991 µs on ext4** — two hundred times `06`'s figure.
+The gap is D, and the mechanism is visible in `06`'s own loop
+(`herd-hub/tests/junction_breakdown.rs:579-592`). It creates a file,
+`sync_all`s it, and then syncs the directory — **with no `rename` in
+between**. That file sync has already committed the only change the
+directory had, so the directory sync that follows finds **nothing owed
+under it** and returns in microseconds.
+
+`durable::write_file_with` does something different: it syncs the
+temporary, **then renames it over the destination**, and only then syncs
+the directory. The rename is a directory change made *after* the file
+sync, so the real `sync_dir` always has dirty metadata to commit and
+always pays a flush.
+
+Measured in the position the code actually puts it in, D is **1.32 ms on
+ZFS and 991 µs on ext4** — about two hundred times `06`'s figure. The
+paired cells in §5 show it is the rename and not the ordering that costs:
+a directory sync with no record sync before it is 1.47 ms on ZFS and
+968 µs on ext4, within noise of the sync that follows one.
 
 So `06`'s per-primitive `sync_dir` figure should not be used to size D,
 and any arithmetic that treats the directory sync as free is wrong by

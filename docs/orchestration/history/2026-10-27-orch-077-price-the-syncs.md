@@ -216,11 +216,16 @@ not this one. No skip is counted as a pass (D27).
 5. **A correction to `06`, which `08` noticed and did not diagnose.**
    `06` measured `sync_dir` at **6.6 µs** and predicted 2.39 ms for the
    record half; `08` measured 2.36 ms against a predicted 1.20 ms and
-   recorded the gap without explaining it. The gap is **D**. `06`'s
-   6.6 µs is a directory sync with nothing owed under it, while the
-   `sync_dir` inside `write_file_with` always follows a `rename` and so
-   always commits. In the position the code puts it in, D is **1.32 ms on
-   ZFS and 991 µs on ext4** — about **two hundred times** `06`'s figure.
+   recorded the gap without explaining it. The gap is **D**, and the
+   mechanism is in `06`'s own loop
+   (`herd-hub/tests/junction_breakdown.rs:579-592`): it creates a file,
+   `sync_all`s it, then syncs the directory **with no `rename` in
+   between**, so the file sync had already committed the directory's only
+   change and the directory sync found nothing owed.
+   `durable::write_file_with` renames *between* the two syncs, so its
+   `sync_dir` always has dirty metadata and always pays a flush. In the
+   position the code puts it in, D is **1.32 ms on ZFS and 991 µs on
+   ext4** — about **two hundred times** `06`'s figure.
    Any arithmetic treating the directory sync as free is wrong by about a
    third of a waiting write.
 6. **Nothing run here proves the device honours a flush.** What can be

@@ -79,12 +79,14 @@ had been run.
 **Where a later piece overturns an earlier one, the later one wins, and
 the earlier one is not edited.** This has now happened twice. The second
 time is narrower than the first: `11` found that `06`'s `sync_dir` figure
-of 6.6 µs was measured on a directory with nothing owed under it, while
-the `sync_dir` inside `write_file_with` always follows a `rename` and so
-always commits — measured in the position the code puts it in, it is
-1.32 ms on ZFS and 991 µs on ext4. `06` still reads as it was signed, and
-`08` recorded the resulting discrepancy without diagnosing it. The first
-time is the one that reordered the work:
+of 6.6 µs was measured with no `rename` between the file sync and the
+directory sync, so the file sync had already committed the directory's
+only change and the directory sync found nothing owed. The real
+`write_file_with` renames *between* the two, so its `sync_dir` always has
+dirty metadata and always pays a flush — 1.32 ms on ZFS and 991 µs on
+ext4, about two hundred times `06`'s figure. `06` still reads as it was
+signed, and `08` recorded the resulting discrepancy without diagnosing
+it. The first time is the one that reordered the work:
 `04a` ranked the `T` walk as the dominant cost of a dispatch pass, `05`
 showed that ranking left out the durable writes that are the larger half
 of the same junction, and `06` measured all five posts and put the walk at
