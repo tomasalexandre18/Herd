@@ -206,6 +206,62 @@ handoff does not claim the suite is green on CI for `slots.rs:744`: it
 claims CI skipped it. The other two jobs of the run are the gates
 `herd-merger` reads.
 
+### The merge of PR #85, and the gates run again on top of it
+
+PR #85 landed on `main` as `2ca6dc7` while this branch was open. It touches
+`herd-hub/src/store.rs`, so **every `file:line` in `12`, in the harness and
+in the board row was re-read on `2ca6dc7` and corrected** before the merge
+was committed. The ones that moved are all in the second half of
+`store.rs` — `job_events`, `read_optional`, `directory_bytes`,
+`unfinished_jobs`, `collections_owed`, `read_the_readings` and `mod tests`
+— and every one was re-checked by printing the line.
+`12`'s base is restated as `2ca6dc7` and says at its head why it
+is not `0a2cf73` like the pieces before it.
+
+**The enumeration is unchanged by the merge.** Same 308 states, same
+verdicts, re-run on the merged tree:
+
+```text
+308 states built
+  176 refuse the whole state root at `JobDirStore::open`
+  44 open with the job silently gone from the queue
+  4 leave `events.jsonl` AHEAD of `job.json` (D103's one rule)
+  99 leave a stale temporary that nothing removes
+  0 are quarantined (D52 covers labels only, store.rs:1150-1157)
+
+test result: ok. 10 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 12.23s
+```
+
+`build`, `fmt --check`, `clippy -D warnings` and `check-docs.sh` were all
+re-run on the merged tree and are all clean.
+
+`nix develop --command ./scripts/test.sh` on the merged tree is **redder
+than before — six targets, not two**:
+
+```text
+error: 6 targets failed:
+    `-p herd-hub --test admission`
+    `-p herd-hub --test announced_job_ceiling`
+    `-p herd-hub --test killed_hub`
+    `-p herd-hub --test owner_control`
+    `-p herd-hub --test slots`
+    `-p herd-runner --test busy_probe`
+ AT LEAST 14 assertion(s) COULD NOT RUN on this host and were skipped
+test suite: FAILED (cargo test exited 101)
+```
+
+**This is the shared host, and the evidence says so rather than my saying
+so.** Almost every new failure is a timeout at one of two lines —
+`herd-hub/tests/real_herd/mod.rs:649` and `:789`, both "timed out waiting
+until …" — and `/proc/loadavg` read at the end of the run was
+**`13.46 14.73 10.15`** on a box several agents were building on. Two
+independent checks separate it from the code: **`main`'s own CI at
+`2ca6dc7` is `success`** (run 40486480230), and this branch adds no `src`
+and one fully `#[ignore]`d test file. **I did not re-run the six targets on
+a quiet host**, so this paragraph is an attribution with its evidence
+named, not a measurement: the local suite is reported **red**, and CI on
+the branch is the arbiter.
+
 ## Risks and findings
 
 - **The proposal of `12 §5` is a behaviour change on a crash path and is not
