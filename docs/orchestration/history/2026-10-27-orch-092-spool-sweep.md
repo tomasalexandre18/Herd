@@ -202,6 +202,19 @@ binaries inside the test, so running the suite without building
 a different, much larger red set every time (7 targets, then 3, then 2, all
 on the same code). Build first, then run the suite, or the reading is noise.
 
+**Correction 2026-10-27, by `herd-merger` at batch 4's integration
+(ORCH-107): the cause is right and the cure named here is wrong.**
+`cargo build --workspace --all-targets` does **not** remove the in-test
+build. `real_herd::binaries` runs `cargo build --offline -p herd-hub -p
+herd-runner -p herdctl`, which resolves a **narrower** feature set --
+dev-dependencies unify features across a workspace -- so the two builds
+never share fingerprints: measured at **9.70 s** of compiling
+immediately after `--all-targets`, against **0.06 s** after the
+identical command. Only the identical command removes it, and
+`scripts/test.sh` now runs it before any test starts, advisory. The
+wording above stays as it was written; nothing of its reading of the
+cause is withdrawn.
+
 The new tests, run on their own:
 
 ```text

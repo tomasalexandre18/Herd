@@ -110,6 +110,16 @@ tests were re-run green unmodified afterwards (`5 passed` and
 `8 passed`). `cargo build --workspace --all-targets` before every run,
 so no `real_herd` test built its binaries inside its own 30 s patience.
 
+**Correction 2026-10-27, by `herd-merger` at batch 4's integration
+(ORCH-107): the second clause is false.** `--all-targets` does not
+remove the in-test build -- `real_herd::binaries` runs
+`cargo build --offline -p herd-hub -p herd-runner -p herdctl`, a
+narrower feature set, measured at **9.70 s** of compiling immediately
+after `--all-targets` and **0.06 s** after the identical command. The
+mutation results above are unaffected: they are figures from
+`slots.rs` and `admission.rs`, not waits. `scripts/test.sh` now runs
+the identical command itself.
+
 1. `BUILD_SHARE_DENOMINATOR` 4 → 5 (the share fraction), caught by the
    **first** job:
    `left: "built with -j9"` / `right: "built with -j12"`, with the hub's
@@ -273,6 +283,13 @@ none.
 sequence, and its own row already names the first experiment: one
 controlled pair of runs to settle how much of the timeout flakiness is
 the missing `cargo build --workspace --all-targets`.
+
+**Correction 2026-10-27 (batch 4): ORCH-107 is `done`, and the answer
+was "almost none of it".** The prebuild named here is not the one the
+tests run, so it never removed the in-test build; `scripts/test.sh` now
+runs the tests' own command first. Four runs at peak loads 9.6 to 18.2
+gave zero `:649`/`:789` timeouts, and the 21 failures at load 19 are
+**unexplained**.
 
 ## Processes
 

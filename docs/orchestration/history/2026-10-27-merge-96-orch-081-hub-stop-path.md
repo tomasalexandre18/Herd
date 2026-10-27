@@ -213,3 +213,13 @@ as a pass. A **floor, not a count** (D179): the run did not finish.
 **`cargo build --workspace --all-targets` was run first again**, and again
 `killed_hub` did not time out. Three runs now: without the prebuild, three
 targets red and the third a `real_herd/mod.rs:649` timeout; with it, two.
+
+**Correction 2026-10-27, by `herd-merger` at batch 4's integration
+(ORCH-107): that prebuild does not remove the in-test build, so the
+three runs are not evidence for it.** `real_herd::binaries` runs
+`cargo build --offline -p herd-hub -p herd-runner -p herdctl`, a
+narrower feature set than `cargo test --workspace` resolves, and it
+still compiled for **9.70 s** immediately after `--all-targets` --
+against **0.06 s** after the identical command, which `scripts/test.sh`
+now runs itself. What the three runs observed stands as observed; the
+explanation offered for it does not.

@@ -174,6 +174,19 @@ impl Drop for Process {
 /// real binaries that silently drives yesterday's binary is worse than no
 /// test at all. So the build is asked for here, once per test process, and
 /// failing to build is failing the test.
+///
+/// It is not free, and `scripts/test.sh` runs the same command up front so
+/// that it is free here: the feature set `cargo build -p herd-hub -p
+/// herd-runner -p herdctl` resolves is **not** the one `cargo test
+/// --workspace` resolves — dev-dependencies unify features across the
+/// workspace — so this build has real work to do even on a tree that was
+/// just built, and it does it with every core it can take while the hub and
+/// the runner of some other test of the same binary are already running
+/// against [`PATIENCE`]. Measured on this project on 2026-10-27: 9.7 s and
+/// three crates recompiled right after `cargo build --workspace
+/// --all-targets`, 0.06 s and nothing after the same command test.sh now
+/// runs. What it cost is kept in [`BUILD_STORY`] so that a wait which runs
+/// out can say whether it was waiting on the product or on rustc.
 pub fn binaries() -> &'static Path {
     static BINARIES: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
     BINARIES.get_or_init(|| {
@@ -196,13 +209,119 @@ pub fn binaries() -> &'static Path {
         if directory.file_name().is_some_and(|name| name == "release") {
             cargo.arg("--release");
         }
-        let built = cargo.status().expect("cargo runs");
+        let started = Instant::now();
+        // Captured rather than inherited so that "did it compile anything?"
+        // is a fact and not a guess from the clock, and reprinted so that
+        // `--nocapture` still shows the build exactly as it used to.
+        let built = cargo.output().expect("cargo runs");
+        let took = started.elapsed();
+        let said = String::from_utf8_lossy(&built.stderr).into_owned();
+        eprint!("{said}");
         assert!(
-            built.success(),
-            "the binaries this test drives could not be built"
+            built.status.success(),
+            "the binaries this test drives could not be built:\n{said}"
         );
+        let _ = BUILD_STORY.set(BuildStory {
+            took,
+            ended: Instant::now(),
+            compiled: said.contains("Compiling"),
+        });
         directory
     })
+}
+
+/// What the in-test [`binaries`] build cost this test process.
+///
+/// Set once, from inside the `OnceLock` that does the build, so every thread
+/// of the process reads the same figures however many of them queued behind
+/// it.
+struct BuildStory {
+    /// How long the build took.
+    took: Duration,
+    /// When it finished, to compare against when a wait began.
+    ended: Instant,
+    /// Whether it actually compiled something, or merely checked.
+    compiled: bool,
+}
+
+static BUILD_STORY: std::sync::OnceLock<BuildStory> = std::sync::OnceLock::new();
+
+/// Why a wait that began at `waiting_since` may have run out — in the two
+/// terms that are not the same bug.
+///
+/// A timeout in these tests used to print one sentence for two unrelated
+/// causes: *the hub did not answer in 30 s*, which is the product's and must
+/// stay red, and *this process was compiling the binaries it drives, or was
+/// sharing twelve cores with four other agents*, which is neither the
+/// product's nor the test's. Telling them apart cost every agent that met
+/// one an hour of reruns (ORCH-107). It is cheap to say which, so the wait
+/// says which, and the suite keeps the same [`PATIENCE`]: nothing here moves
+/// a deadline, grows one with load, or turns a timeout into a skip — a
+/// deadline that stretches to fit the machine stops catching a product that
+/// got slower, and a skip whose count moves with the load is a count nobody
+/// can reason about — a suite lying quietly (D27, D179, and `slots.rs`'s
+/// months of a skip nobody noticed).
+pub fn why_a_wait_ran_out(waiting_since: Instant) -> String {
+    let mut why = String::from("why this wait may have run out:\n");
+    match BUILD_STORY.get() {
+        None => why.push_str(
+            "  * the in-test cargo build never ran in this process, so it is \
+             not the cause.\n",
+        ),
+        Some(story) if !story.compiled => why.push_str(&format!(
+            "  * the in-test cargo build had nothing to do ({:?}), so the \
+             binaries were ready long before this wait: this is the hub, the \
+             runner, or the machine — not the build.\n",
+            story.took
+        )),
+        Some(story) if story.ended > waiting_since => why.push_str(&format!(
+            "  * THE BINARIES WERE STILL BEING BUILT when this wait began: \
+             the in-test cargo build compiled for {:?} and finished inside \
+             this wait's own window. Run `scripts/test.sh`, which builds \
+             them first, before believing anything about the product here.\n",
+            story.took
+        )),
+        Some(story) => why.push_str(&format!(
+            "  * the in-test cargo build compiled for {:?} and finished {:?} \
+             before this wait began — every core it could take, on the same \
+             cores as the hub and the runner this wait is about. Run \
+             `scripts/test.sh`, which builds them first, before believing \
+             anything about the product here.\n",
+            story.took,
+            waiting_since.saturating_duration_since(story.ended)
+        )),
+    }
+    why.push_str(&format!("  * {}\n", host_load()));
+    why
+}
+
+/// The host's load as this wait ran out, against the cores it had.
+///
+/// The one fact that settles "is it me or is it this machine?" without a
+/// rerun: a one-minute figure well above the core count means the wait lost
+/// its cores to something else on the host, which is not a slow product.
+fn host_load() -> String {
+    let cores = std::thread::available_parallelism()
+        .map(|how_many| how_many.get())
+        .unwrap_or(0);
+    match std::fs::read_to_string("/proc/loadavg") {
+        Ok(text) => {
+            let mut figures = text.split_whitespace();
+            let (one, five, fifteen) = (
+                figures.next().unwrap_or("?"),
+                figures.next().unwrap_or("?"),
+                figures.next().unwrap_or("?"),
+            );
+            format!(
+                "host load average {one} / {five} / {fifteen} (1, 5, 15 min) \
+                 over {cores} cores, read as this wait ran out"
+            )
+        }
+        Err(e) => format!(
+            "the host's load average could not be read ({e}); the machine \
+             has {cores} cores"
+        ),
+    }
 }
 
 pub fn binary(name: &str) -> PathBuf {
@@ -637,16 +756,27 @@ impl Herd {
     }
 
     pub async fn herdctl(&self, arguments: &[&str]) -> std::process::Output {
+        // Resolved before the clock starts, because `binary` is what builds
+        // the binaries on its first call in the process (see [`binaries`]):
+        // a build inside this timeout would be charged to `herdctl`.
+        let herdctl = binary("herdctl");
+        let waiting_since = Instant::now();
         tokio::time::timeout(
             PATIENCE,
-            Command::new(binary("herdctl"))
+            Command::new(herdctl)
                 .arg("--hub")
                 .arg(self.url())
                 .args(arguments)
                 .output(),
         )
         .await
-        .unwrap_or_else(|_| panic!("herdctl {arguments:?} never came back"))
+        .unwrap_or_else(|_| {
+            panic!(
+                "herdctl {arguments:?} never came back inside {PATIENCE:?}.\n{}{}",
+                why_a_wait_ran_out(waiting_since),
+                self.everything_said()
+            )
+        })
         .expect("herdctl runs")
     }
 
@@ -665,7 +795,12 @@ impl Herd {
 
     /// Wait until the runner has joined, by giving it something to run.
     pub async fn wait_for_runner(&self) {
-        let deadline = Instant::now() + PATIENCE;
+        // Before the clock, as in `herdctl`: the first call in the process is
+        // the one that builds the binaries, and that build is not this
+        // runner's fault.
+        let _ = binaries();
+        let waiting_since = Instant::now();
+        let deadline = waiting_since + PATIENCE;
         loop {
             let output = self
                 .herdctl(&["run", "--", "/bin/sh", "-c", "printf ready"])
@@ -675,8 +810,9 @@ impl Herd {
             }
             assert!(
                 Instant::now() < deadline,
-                "the runner never joined: {}",
-                String::from_utf8_lossy(&output.stderr)
+                "the runner never joined inside {PATIENCE:?}: {}\n{}",
+                String::from_utf8_lossy(&output.stderr),
+                why_a_wait_ran_out(waiting_since)
             );
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
@@ -784,11 +920,13 @@ impl Herd {
     }
 
     pub async fn wait_until(&self, what: &str, mut condition: impl FnMut() -> bool) {
-        let deadline = Instant::now() + PATIENCE;
+        let waiting_since = Instant::now();
+        let deadline = waiting_since + PATIENCE;
         while !condition() {
             assert!(
                 Instant::now() < deadline,
-                "timed out waiting until {what}.\n{}",
+                "timed out after {PATIENCE:?} waiting until {what}.\n{}{}",
+                why_a_wait_ran_out(waiting_since),
                 self.everything_said()
             );
             tokio::time::sleep(Duration::from_millis(20)).await;

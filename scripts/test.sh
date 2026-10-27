@@ -68,6 +68,43 @@ for arg in "$@"; do
   esac
 done
 
+# The binaries the `real_herd` tests drive are built by the tests themselves
+# (`real_herd::binaries`, `capabilities::binaries`), because `cargo test` does
+# not build *another* package's binary for this package's integration test and
+# a stale `herd-runner` under test is worse than no test. That build is not
+# idempotent with `cargo test`'s own: `cargo build -p herd-hub -p herd-runner
+# -p herdctl` resolves a narrower feature set than `cargo test --workspace`
+# does — dev-dependencies unify features across the workspace — so it has real
+# work to do on a tree that was just built. Measured here on 2026-10-27: right
+# after `cargo build --workspace --all-targets` it still recompiled rustix,
+# linux-raw-sys and the herd-hub binary, 9.7 s at every core it could take,
+# *inside* a test process whose hub and runner were already running against a
+# 30 s PATIENCE, with every other test thread of that binary queued behind it
+# on the build directory's lock. Hence ORCH-107: timeouts under load that were
+# the suite's own build, not the product.
+#
+# Running the identical command here, before any test starts, makes it a
+# 0.06 s no-op in the tests. It weakens nothing: the tests still run it and
+# still fail if it fails — they simply no longer compile while timing a hub.
+# The profile has to match, or the two builds invalidate each other.
+#
+# It is advisory, and failing it is not an exit. The tests own this build:
+# they run it themselves and fail on it with the real diagnostic, and the
+# suite's own exit status and skip report are what this script exists to
+# report honestly (D27, D179). Exiting here on a failed prebuild would print
+# neither, which is the one thing the skip report must never do.
+prebuild=(cargo build --offline -p herd-hub -p herd-runner -p herdctl)
+for arg in "$@"; do
+  case "$arg" in
+    --) break ;;
+    --release) prebuild+=(--release) ;;
+  esac
+done
+echo "Building the binaries the real_herd tests drive, so that they do not:"
+echo "  ${prebuild[*]}"
+"${prebuild[@]}" || echo "  (it did not build; the tests will build it and say why)"
+echo
+
 if [ "$own_flag" = no ]; then
   cargo test --workspace --no-fail-fast "$@"
 else

@@ -16,7 +16,7 @@ queue that no longer writes a non-event per queued job per pass (D171);
 v0.3.6 carried the bounded reading (D169). v0.3.4 onward are published
 (D162); a **`v*.*.*-dev*` tag** publishes a pre-release (D172).
 
-**`main` is 219 commits past v0.3.7** counted on PR #102's head, and the
+**`main` is 228 commits past v0.3.7** counted on batch 4's head, and the
 workspace version still reads `0.3.7`. Nothing merged since the tag has
 shipped. `PROTOCOL_VERSION` is **2** and `RECORD_VERSION` **1**.
 
@@ -45,17 +45,17 @@ reaches us as a report. Each figure below carries the date it reached us.
 
 ## What `main` carries
 
-M1-M11, M15 and M16; protocol version 2; a job may return 1 GiB by
-default (`confine.rs:82`). **A skip count is per host** (D27, ORCH-070):
-**12** here, **14** on CI; D151's 13 is not reproducible (`05` §6).
-**D179**: an incomplete run reports its skips as a floor, not a count.
+M1-M11, M15 and M16; protocol version 2; a job may return 1 GiB by default
+(`confine.rs:82`). **A skip count is per host and per load** (D27, ORCH-070,
+ORCH-107): **12** here at rest, **14** under load, **14** on CI — compare the
+**list**, not the number (**ORCH-120**); D151's 13 is unreproducible (`05`).
 
-**The suite is green here for the first time: 836 passed, 0 failed, 12
-skipped** (PR #102). **ORCH-069 is done**: two assertions declared a lend
-larger than the cgroup enclosing the runner leaves free, so it was clamped
-(D119) and the hub's sentences carried it; both fixtures now declare 2 GiB
-and `slots.rs` skips nowhere. **ORCH-107** is what is left: under several
-heavy agents the real-hub tests **time out**, asserting nothing wrong.
+**The suite is green here: 837 passed, 0 failed, 12 skipped** (batch 4), and
+**D179** still reports an incomplete run's skips as a floor. **ORCH-069 is
+done** — the cgroup clamp (D119), both fixtures now declaring 2 GiB — and so
+is **ORCH-107**: the real-hub tests built the binaries they drive inside
+their own 30 s patience, `scripts/test.sh` now builds them first, no constant
+moved and nothing became a skip. The 21 at load 19 stay **unexplained**.
 
 **Eleven changes are in no release.** Eight defects — **D175** a file whose
 bytes did not hash to its digest exited 0; **D176** a verdict could name

@@ -208,6 +208,16 @@ test suite: FAILED (cargo test exited 101)
 Building `--all-targets` first, as the brief instructs, again paid: **no
 `real_herd` target failed and nothing timed out** in this run.
 
+**Correction 2026-10-27, by `herd-merger` at batch 4's integration
+(ORCH-107): it cannot have paid in the way this says.**
+`cargo build --workspace --all-targets` leaves the tests' own
+`cargo build --offline -p herd-hub -p herd-runner -p herdctl` with real
+work -- a narrower feature set, so no shared fingerprints: **9.70 s** of
+compiling right after it, against **0.06 s** after the identical
+command, which `scripts/test.sh` now runs itself before any test starts.
+The green run above is still a green run; the reason given for it is
+withdrawn.
+
 **The two failures are the two known host failures, and I observed both
 of them failing on a *figure*, neither on a timeout.**
 
