@@ -667,6 +667,16 @@ async fn main() -> Result<()> {
             herd_proto::size_mib
         )
     );
+    // And the one figure this machine holds against the hub rather than with
+    // it: how many jobs it starts at once, derived from the two above and
+    // from its own per-job memory cap. Printed here beside them because it is
+    // the same arithmetic, and because an operator who sees an attempt handed
+    // back for this reason has to be able to find the figure that did it
+    // (invariant 2).
+    println!(
+        "herd-runner: {}",
+        herd_runner::jobs_at_once(&host, confinement.memory_max).why()
+    );
     println!("herd-runner: joining {}", args.hub);
     herd_runner::run(Config {
         hub_url: args.hub,
