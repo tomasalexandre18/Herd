@@ -280,7 +280,14 @@ FAIL  PATH dropped the inherited entries; the guard below needs coreutils
   (`/etc/profiles/per-user//bin`). So in a red run something inside
   `env -i PATH="$PATH" HOME=/wrong/home bash -c '. env.sh'` re-derives
   `PATH` from a profile instead of inheriting the one it was handed.
-  That is a lead, not a cause, and it is not mine to chase here.
+  **`env.sh` is not the one doing it:** `ops/agents/env.sh:84-90` only
+  ever *prepends* — `PATH=$herd_path_head${PATH:+:$PATH}` — so it cannot
+  produce that tail, and its own `id -un` resolved correctly in the same
+  red run, which is exactly why the front says `per-user/server/bin`
+  while the tail says `per-user//bin`. The child therefore read a
+  profile **before** `env.sh` ran, and the open question is what makes a
+  non-interactive `bash -c` under `env -i` do that only sometimes. That
+  is a lead, not a cause, and chasing it is not an integration.
 - **ORCH-111 is pre-existing and host-shaped, not a regression of this
   batch.** The case is untouched by either branch —
   `git diff origin/main HEAD -- scripts/check-orchestration.sh` contains
