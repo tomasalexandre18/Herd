@@ -543,11 +543,22 @@ after this one per `10 §6`.
 ## Processes
 
 PIDs started: `cargo`, `rustc`, `nix develop` and test binaries under this
-worktree, plus two `until`-loop shells that waited on `/proc/loadavg`. All
-exited on their own; none was killed, no `pkill`, no `killall`, nothing by
-name. No hub or runner process was started at all — `crash_points.rs` starts
-none by construction, and `./scripts/test.sh`'s own `real_herd` binaries are
-its children and ended with it.
+worktree, plus three `until`-loop shells that waited on `/proc/loadavg`
+before a measurement. All exited on their own; none was killed, no `pkill`,
+no `killall`, nothing by name. No hub or runner process was started on
+purpose — `crash_points.rs` starts none by construction, and
+`./scripts/test.sh`'s own `real_herd` binaries are its children and ended
+with it.
+
+**Two long-lived processes on this host are not mine and were not touched:**
+`herd-runner` (pid 2213) and `herd-hub` (pid 3226), both about 22 hours old
+at the end of this task, which is the consumer's own instance. Nothing was
+sent to either, and no signal of any kind was sent to any process in this
+task (D161, invariant 9).
+
+Another agent was compiling on the host during the session — `rustc`
+processes not mine, twice. Nothing was done about them, and every figure in
+this file names the load it was taken at.
 
 Own `target/` deleted after the push:
 
