@@ -177,11 +177,12 @@ check-orchestration: 141 passed, 0 failed
 elapsed: 9887 ms
 ```
 
-**One failure, once, and it has no name — see *Risks*.** The first run
-of `check-orchestration.sh` after this merge printed `140 passed, 1
-failed`; I had piped it to `tail -3` and lost the `FAIL` line, and it
-did not recur in nine further runs on the identical tree. It is
-ORCH-111, not swept under the figure above.
+**One failure here and a second one later, and neither has a name — see
+*Risks*.** The first run of `check-orchestration.sh` after this merge
+printed `140 passed, 1 failed`, and so did the run before the handoff
+commit. Both times I had piped the run to `tail -2`/`tail -3` and lost
+the `FAIL` line. It is ORCH-111, and it is not swept under the green
+figure above.
 
 ### Batch — the four Rust gates and `check-docs.sh`
 
@@ -263,15 +264,23 @@ and by D27 a skip is never a pass.
 
 - **ORCH-111, and it is the one thing in this batch I could not
   close.** `check-orchestration.sh` reported `140 passed, 1 failed`
-  once, on this merged tree, and I destroyed the evidence by piping the
-  run to `tail -3`. Ten runs total: one red, nine green, three of the
-  nine under the same pipe. Two hypotheses refuted rather than assumed:
-  it is **not** the pipe, and it is **not** network flakiness in the
-  `session.sh` cases, which run under `env -i` against a fake `gh`
-  config directory and a fake `claude` binary and touch no network.
-  A 1-in-10 failure in the suite that guards the docs gate is worth a
-  row, so it has one, `open`. **My own mistake is part of the finding:**
-  a gate's output is evidence and I truncated it. Keep the whole output.
+  **twice** on this merged tree — once right after the second merge,
+  once again before the handoff commit — and **both times I destroyed
+  the evidence** by piping the run to `tail -2`/`tail -3`. It then
+  refused to recur: **nineteen consecutive green runs** with the output
+  fully captured, four of them under the same direct pipe to `tail -2`
+  and three with the corpus dirtied immediately beforehand. So it is
+  about two in twenty-five, it is real rather than a misread — `140 + 1`
+  is the suite's own 141, so one `ok` became one `bad` and no counter
+  was merely lost — and three hypotheses are refuted rather than
+  assumed: it is **not** the pipe, **not** a lost counter increment, and
+  **not** network flakiness in the `session.sh` cases, which run under
+  `env -i` against a fake `gh` config directory and a fake `claude`
+  binary and open no socket. A control that is red one run in twelve is
+  a control nobody will trust, and this is the control that guards the
+  docs gate, so it has a row, `open`. **My own mistake is part of the
+  finding, and I made it twice:** a gate's output is the evidence and I
+  truncated it. Keep the whole output.
 - **The `docs` job time after this batch is measured on CI, not here**
   — the figure is in the PR's Evidence and in the report below. Locally
   the two scripts together are **under 10 seconds** where they were
