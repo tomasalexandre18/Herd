@@ -35,8 +35,9 @@ You produce, in your own worktree and branch `cut-v<version>`:
 Forbidden, and the hook enforces the shell part: `git tag`, `git push`
 with a tag or `--tags`, `gh release create|edit|upload|delete`, any
 `workflow_dispatch` of `release*.yml`, any deployment, anything on the
-consumer's instance (D161). No PR merge either: the bump PR goes through
-`herd-merger`.
+consumer's instance (D161). No pull request either: you push
+`cut-v<version>` and hand off; `herd-merger` opens its PR and merges it
+(one PR per batch, `docs/orchestration/workflow.md`).
 
 Handoff: `docs/orchestration/history/<date>-release-v<version>.md` from
 the template. Then stop.

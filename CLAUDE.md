@@ -96,19 +96,20 @@ nix develop --command cargo fmt --all --check
 
 Gates before a commit: a change that touches any file outside `CLAUDE.md`,
 `README.md`, `docs/`, `.claude/` and `.github/*.md` runs all four Rust gates
-plus `check-docs.sh`. A prose-only change runs `check-docs.sh` and says in
-its report that the Rust gates were **not run** locally and that CI runs
-them on the PR. A gate that did not run is reported as not run, never as
-passed.
+plus `check-docs.sh`. A prose-only change runs `check-docs.sh` and says in its
+report that the Rust gates were **not run** locally and that CI runs them on
+the batch PR. A gate that did not run is reported as not run, never as passed.
 
 ## Git and main
 
 - One branch per task, in its own worktree, named for the task.
 - Small commits, imperative English subject ≤ 72 chars.
-- Every change to `main` goes through a pull request filled in from
-  `.github/pull_request_template.md`, with real command output as Evidence.
+- **One PR per batch of branches** (Alexa, 2026-10-27): an agent pushes its
+  branch and **opens no PR**. `herd-merger` merges the batch one branch at a
+  time onto one integration branch and opens **one** PR from the template,
+  Evidence per branch. Why, and the refusals: `docs/orchestration/workflow.md`.
 - CI must be green before merge: jobs `check` and `docs`. Never
-  `--no-verify`, never force-push, never a red merge.
+  `--no-verify`, never force-push, never a red merge, never `--admin`.
 - **Merging is `herd-merger`'s, by standing authorisation** (Alexa,
   2026-10-24, ORCH-001: *"non il peux merge par defaut"*): any PR whose CI
   is green and whose Evidence block is filled, `cut-v*`, `.github/`,
@@ -143,8 +144,7 @@ ask about file layout, naming, crate internals, test style or libraries.
 ## Session start, session end
 
 Start: read this file, then `docs/orchestration/board.md`, then the latest
-handoff in `docs/orchestration/history/`. Resume from the handoff, not
-from a conversation summary. End: the agent that did the last task updates
-the board and writes its handoff; the orchestrator verifies both and
-reports in three or four lines. An open item is never dropped because a
-session ended.
+handoff in `docs/orchestration/history/`. Resume from the handoff, not from a
+conversation summary. End: the agent that did the last task updates the board
+and writes its handoff; the orchestrator verifies both and reports in three or
+four lines. An open item is never dropped because a session ended.

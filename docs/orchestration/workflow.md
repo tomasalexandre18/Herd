@@ -9,9 +9,9 @@ owes before it stops. `CLAUDE.md` is the contract; this is the procedure.
 |---|---|---|
 | orchestrator (main session) | receives the goal, reads the board, picks agents, writes briefs, reads evidence, asks Alexa one question at a time, reports in French | edit a repository file, commit, merge, resolve a conflict, tag, release, declare a skip a pass, report an agent's claim unverified |
 | `herd-planner` | analyses a request, lists alternatives and hypotheses to refute, cuts bounded tasks | modify the product, merge, settle an owner decision |
-| `herd-step` | one bounded task on its own branch and worktree, with the gates the task needs, evidence and a handoff | leave its write paths, touch `main`, another agent's worktree, or the running instance |
-| `herd-merger` | integrates one branch: rebase or merge, conflicts, gates, D-number allocation, board and status update, PR, and the merge itself (standing authorisation ORCH-001) | bypass a gate, decide a specification or invariant change, operate Herd |
-| `herd-release` | prepares a release: checklist, version, body, evidence; simulation only until Alexa orders a tag | tag, push a tag, publish, deploy |
+| `herd-step` | one bounded task on its own branch and worktree, with the gates the task needs, evidence and a handoff; pushes the branch | open a pull request, leave its write paths, touch `main`, another agent's worktree, or the running instance |
+| `herd-merger` | integrates a batch of branches, one at a time onto one integration branch: conflicts, gates, D-number allocation, board and status update, **one** PR for the batch, and the merge itself (standing authorisation ORCH-001) | bypass a gate, decide a specification or invariant change, operate Herd |
+| `herd-release` | prepares a release: checklist, version, body, evidence; simulation only until Alexa orders a tag | tag, push a tag, publish, deploy, open its own PR |
 | `herd-reviewer` | adversarial review of a plan, a rule change, a permission change or an unresolvable conflict; lists missing evidence and adverse cases | edit anything, replace the owner |
 
 What is technically enforced and what is only written is in
@@ -29,23 +29,81 @@ What is technically enforced and what is only written is in
 4. **Execute.** `herd-step` works in `.claude/worktrees/<task>/` or a
    scratchpad subdirectory on branch `<task>`, pushes the branch, and
    ends with a handoff from `templates/handoff.md` saved as
-   `docs/orchestration/history/<date>-<task>.md` on that branch.
+   `docs/orchestration/history/<date>-<task>.md` on that branch. It
+   **opens no pull request**: the branch and the handoff are the delivery.
 5. **Verify.** The orchestrator reads the diff, the gate output and the
    handoff. It reruns a read-only check when a claim matters. It never
    fixes what it finds; it sends it back or opens a new task.
 6. **Review when it is a rule.** A change to `CLAUDE.md`, agents,
    permissions, hooks, `check-docs.sh` or an invariant gets a
    `herd-reviewer` pass before integration; a micro-edit does not.
-7. **Integrate.** `herd-merger` takes one branch at a time: rebases on
-   `origin/main`, resolves conflicts in its worktree, allocates `D`
-   numbers (`D-NEXT` → next free number, gaps stay), runs the gates the
-   change needs, updates `board.md` and `docs/status.md`, opens or
-   updates the PR with Evidence, waits for CI, and merges: Alexa's standing
-   authorisation (ORCH-001, 2026-10-24) covers every PR whose CI is green
-   and whose Evidence block is filled. A tag is never part of this step.
+7. **Integrate.** `herd-merger` takes a **batch** of finished branches —
+   everything ready when it starts — and merges them **one at a time**
+   onto one integration branch off `origin/main`: conflicts resolved in
+   its worktree, `D` numbers allocated once in order (`D-NEXT` → next
+   free number, gaps stay), the gates the diff needs, `board.md` and
+   `docs/status.md` written once. It then opens **one** PR for the batch
+   from `.github/pull_request_template.md`, with **each branch's own
+   evidence separately** in the Evidence block, waits for CI, and merges:
+   Alexa's standing authorisation (ORCH-001, 2026-10-24) covers every PR
+   whose CI is green and whose Evidence block is filled. `main` moves no
+   other way. A tag is never part of this step. The rule, and the three
+   method changes refused with it: *One PR per batch of branches*, below.
 8. **Release.** On Alexa's order, `herd-release` prepares the checklist
-   and the PR that bumps the version; the tag itself is pushed by whoever
-   Alexa names in that order. Nothing in this project deploys.
+   and pushes the `cut-v<version>` branch that bumps the version;
+   `herd-merger` opens its PR, as for any other branch. The tag itself is
+   pushed by whoever Alexa names in that order. Nothing in this project
+   deploys.
+
+## One PR per batch of branches
+
+Alexa, 2026-10-27, verbatim: *"pour le moment on applique uniquement le
+une PR = plusieur lot, le reste non"* — answering a proposal modelled on
+how the first consumer works. One part of that proposal is adopted; three
+are refused. The refusals are written down here with their reason so that
+nobody re-adopts them by drift.
+
+**Adopted: one pull request per batch of several steps.**
+
+- One branch per task is unchanged. An agent finishes by **pushing its
+  branch and handing off; it does not open a pull request.**
+- `herd-merger` takes a **batch** of finished branches and merges them
+  **one at a time** onto a single integration branch — one at a time so
+  that a later red CI is attributable to a known merge commit rather than
+  to a blur. It resolves the conflicts once, allocates the `D` numbers
+  once in order, writes the board once, and opens **one** pull request
+  for the batch.
+- The batch is **everything ready when the merger starts**, not a fixed
+  count. That is the orchestrator's call, recorded here so that it is not
+  re-litigated.
+- The batch PR's Evidence block carries **each branch's own evidence
+  separately**. A batch is not permission for one blurred summary: a
+  reader must still see what each change proved on its own.
+- Superseded single PRs, if any were already open, are closed naming the
+  batch PR; their branches stay.
+
+**Unchanged.** CI is the gate: jobs `check` and `docs` green on the
+pushed head, Evidence filled, then the merge under ORCH-001. Never
+`--no-verify`, never force-push, never a red merge, never `--admin`. One
+integration at a time: a batch **is** one integration, larger.
+
+**Refused, for now.**
+
+- **Testing only what was touched.** The consumer's case is seven hours
+  of tests per change; ours is about eight minutes on CI. Working out
+  which tests a change affects costs more than it saves at that size, and
+  is sometimes wrong.
+- **Making this workstation's local run the gate.** Not a matter of
+  principle but a measured fact of 2026-10-27: the suite is red here for
+  host reasons — ORCH-069 (constants written for a 17 GiB machine) and
+  ORCH-107 (19 of 21 failures were timeouts under load, not wrong
+  values) — and skips are per host, 12 here against 15 on CI, so judging
+  on the local number is judging a different suite. Three agents each
+  spent time that day proving failures were not theirs. This becomes
+  **reconsiderable once ORCH-069 and ORCH-107 are fixed**: it is a
+  sequence, not a doctrine.
+- **A nightly full pass**, which this project does not have. Not adopted,
+  **and the piece that is missing**: a known gap, not an oversight.
 
 ## Permissions and escalation
 
@@ -85,7 +143,8 @@ What is technically enforced and what is only written is in
   **own** scratchpad subdirectory and nothing else: not another agent's,
   not the orchestrator's checkout, and by a literal path, never one
   assembled from a shell variable that could be empty.
-- One `herd-merger` at a time; the board shows which branch it holds.
+- One `herd-merger` at a time; the board shows which batch it holds. A
+  batch is one integration, larger, never several integrations at once.
 - Never two agents on the same worktree, scratchpad subdirectory or
   decision entry. When two tasks would touch the same file, the second is
   based on the first's branch.
