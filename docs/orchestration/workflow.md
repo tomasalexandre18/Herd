@@ -61,8 +61,30 @@ What is technically enforced and what is only written is in
 
 ## Concurrency and host rules
 
-- At most **two** heavy agents (compiling or running the suite) at once;
-  any number of read-only or prose agents.
+- How many heavy agents (compiling or running the suite) run at once is a
+  judgement on the machine, not a count: look at the load average, the
+  free memory **and the free disk** before launching another, at roughly
+  8.5 GB of build tree each. While the first consumer is stopped — it is
+  the machine's main source of load — more than two are allowed (Alexa,
+  2026-10-27, with five running on this 12-core, 31 GiB host at load
+  1.21). The ceiling of **two** returns the day the consumer resumes.
+  Any number of read-only or prose agents, always.
+- **An agent removes its own `target/` as soon as its branch is on the
+  origin.** Not housekeeping: `/mnt/ssd_980` is the same filesystem the
+  first consumer's production writes to — the hub's docker volume
+  (`herd_herd-state`, 107 GB) and the runner's data root
+  (`/mnt/ssd_980/herd-runner`, 69 GB) are on it, and the hub's own output
+  budget is 200 GB against the ~344 GB free. On 2026-10-27 six finished
+  tasks had left 48 GB of abandoned build trees behind, a seventh of that
+  free space; it had happened every session. An agent that keeps its
+  build tree is competing with the consumer's hub for disk. The branch is
+  the deliverable and the build tree is not, so it is the agent's own job
+  at handoff, not the orchestrator's afterwards. The condition is
+  **pushed**, not merged — an agent never waits for `herd-merger` — and
+  never before its own gates have run. It removes the `target/` in its
+  **own** scratchpad subdirectory and nothing else: not another agent's,
+  not the orchestrator's checkout, and by a literal path, never one
+  assembled from a shell variable that could be empty.
 - One `herd-merger` at a time; the board shows which branch it holds.
 - Never two agents on the same worktree, scratchpad subdirectory or
   decision entry. When two tasks would touch the same file, the second is
