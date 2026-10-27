@@ -28,10 +28,19 @@ is `v0.3.7`'s product — see `00-baseline.md §2`.
 | [`07-target-architecture.md`](07-target-architecture.md) | `arch-target-decision` | C4: six architectures compared on durability, progression, crash recovery and migration cost, with one named recommendation — "the keeper": one owned thread performs every store mutation, the reactor wakes it by message and never waits on a disk, its unit of work is bounded and re-armed, and the hub's writes split into two durability tiers. **It is a recommendation and not an adoption.** Its load-bearing claim — that `waiting_for` has no crash-durability requirement — is a question for Alexa, board row ORCH-052. |
 | [`08-s0-unsynced-write-cost.md`](08-s0-unsynced-write-cost.md) | `s0-unsynced-write-cost` | S0: what those durable writes would cost if they were not synchronous — the measured size of the prize behind the tiering. Also names the one ordering invariant that must hold before any `fsync` is dropped: D103 forbids `events.jsonl` being ahead of `job.json`, the `fsync`s hold that today, and without them it is the filesystem's to hold. Safe on ZFS, whose transaction groups commit atomically and in order; **not guaranteed elsewhere**, which is why the server's state root must be named — board row ORCH-053. |
 
+| [`11-sync-prices.md`](11-sync-prices.md) | `orch-077-price-the-syncs` | ORCH-077: the three durable operations of `record_waiting` — the record `fsync`, the directory `fsync` and the event `fdatasync` — priced **separately**, in all eight combinations, on **both** filesystem classes in one session on one host. Settles that one `fsync` on ext4/NVMe costs **989 µs** and not the tens-to-low-hundreds of microseconds that was hoped, so the class the deployment runs on is **1.3x** faster per sync than `08`'s ZFS/SATA cell and not 10-100x; that the three syncs are **additive, not redundant**, so keeping one and dropping two collects **65 %** of the prize and not nearly all of it, the kept sync still costing 21x the unsynced floor; and that `08`'s **9.970 s** junction at `N` = 1 000 becomes **3.128 s** on ext4 — 3x smaller, not an order of magnitude, and still seconds. Corrects `06`'s `sync_dir` figure of 6.6 µs, which was measured on a directory with nothing owed under it and understates the real directory sync by about two hundred times. Touches no file under `herd-hub/src`. |
+
 The mandate's §10 skeleton also names `01-contract.md` and
 `02-consumer-boundary.md`. They do not exist yet. The numbering above
 keeps their places rather than renumbering what is written, so a gap in
 this table means *not written*, never *lost*.
+
+**`09` and `10` are both absent from this table, for different reasons.**
+`09-runner-self-limits.md` is written and is on an unmerged branch
+(`runner-holds-its-own-limits`, PR #85); it gets its row when that
+branch lands. **`10` is unclaimed on every ref** — no file of that number
+exists anywhere in the repository — so `11` is the next piece written and
+`10` stays free for whoever needs it.
 
 **One number was reused, deliberately.** The skeleton's `05` was
 `05-invariants.md`; the `05` that exists is the adversarial review of the
@@ -56,7 +65,7 @@ had been run.
   written on**, and the document says so at the point of use. It is
   evidence of an incident; it is not a measurement any of these authors
   made.
-- **Mesures** — `04a`, `04b`, `05`, `06`, `08`. These ran on the shared
+- **Mesures** — `04a`, `04b`, `05`, `06`, `08`, `11`. These ran on the shared
   workstation, each in its own worktree, under `nix develop`, with `-j 4`
   and `/proc/loadavg` watched. They are not an isolated host, which
   `00-baseline.md §11` asked for and which this campaign never got; every
@@ -68,7 +77,14 @@ had been run.
   `04a`, `05` or `06` and is attributed there.
 
 **Where a later piece overturns an earlier one, the later one wins, and
-the earlier one is not edited.** This has happened once and it matters:
+the earlier one is not edited.** This has now happened twice. The second
+time is narrower than the first: `11` found that `06`'s `sync_dir` figure
+of 6.6 µs was measured on a directory with nothing owed under it, while
+the `sync_dir` inside `write_file_with` always follows a `rename` and so
+always commits — measured in the position the code puts it in, it is
+1.32 ms on ZFS and 991 µs on ext4. `06` still reads as it was signed, and
+`08` recorded the resulting discrepancy without diagnosing it. The first
+time is the one that reordered the work:
 `04a` ranked the `T` walk as the dominant cost of a dispatch pass, `05`
 showed that ranking left out the durable writes that are the larger half
 of the same junction, and `06` measured all five posts and put the walk at
