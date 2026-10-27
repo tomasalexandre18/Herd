@@ -237,6 +237,11 @@ note: D170 is a gap in docs/decisions.md (held by an open PR, or lost); gaps sta
 docs ok
 ```
 
+**CI on `d63f763`:** `check` **pass** (8m35s), `docs` **pass** (4m40s),
+run `40495608347`. That is the gate that decides, and it is green. It is
+not a statement about `herd-hub/tests/slots.rs:744`: that assertion is
+*skipped* on CI, and by D27 a skip is never reported as a pass.
+
 **Skips (D27):** 12 `HERD-SKIPPED` assertions, the host's usual set — every
 one is cgroup v2 delegation being unavailable to this user
 (`a_ceiling_this_host_can_carry_is_proved_and_reported_with_its_device`,
