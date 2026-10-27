@@ -84,8 +84,11 @@ pub const LOST_AFTER: Duration = Duration::from_secs(60);
 /// How long a hub asked to stop gives the dispatch pass already in flight
 /// (ORCH-081, `07` S1 and V9).
 ///
-/// **A proposal, not an invariant.** Invariant 2 binds a *runner* to five
-/// seconds and says nothing about the hub; `07` V9 proposes the same figure
+/// **Recorded as D184, and not an invariant.** It was written down at the
+/// integration of PR #96 with the figure, its domain and its failure mode;
+/// Alexa had not answered the question when it was, so D184 says so and he
+/// may overturn it. Invariant 2 binds a *runner* to five seconds and says
+/// nothing about the hub; `07` V9 proposes the same figure
 /// for the hub, mirroring the runner, and this is that figure made real. It
 /// is written here rather than left as an option because an operator has no
 /// way to choose it well, and because the number has to be quotable: every
