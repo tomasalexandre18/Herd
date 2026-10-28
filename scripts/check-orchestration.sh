@@ -31,6 +31,24 @@ pass=0; fail=0
 ok()   { pass=$((pass+1)); printf 'ok    %s\n' "$1"; }
 bad()  { fail=$((fail+1)); printf 'FAIL  %s\n%s\n' "$1" "$2"; }
 
+# Every assertion below reads a captured output through a HERE-STRING
+# (`grep -q ... <<<"$out"`) and never by piping `printf` into `grep`. Under
+# the `pipefail` set above that pipe is a race and not a matter of style:
+# `grep -q` exits the moment it matches, `printf` is then killed by SIGPIPE
+# on the bytes it has left to write, and `pipefail` reports the pipeline as
+# failed -- so the assertion declares a text missing that it has just
+# recognised, and prints that very text as its diagnostic. Two things have
+# to hold for it to fire, both measured on this host on 2026-10-28 at
+# load1 13-15, 200 runs per size: the output must be larger than the 4 KiB
+# stdio buffer `printf` writes a pipe in, so that it takes more than one
+# write, and a complete matching line must sit in the first of those
+# writes, so that `grep` can decide before the last one. Payloads of 945,
+# 1950, 3960 and 4161 bytes false-failed 0/200; 4965 and 7980 bytes 1/200;
+# 64 kB 14/200; 1 MB 200/200. The here-string false-failed 0/200 at every
+# size, because it is a temporary file and not a pipe: no reader can exit
+# early and there is no writer to kill. Keep it that way -- an assertion
+# here must not pipe a captured output into `grep`.
+
 # A fresh copy of the files check-docs.sh reads.
 fresh() {
   rm -rf "$tmp/repo"; mkdir -p "$tmp/repo"
@@ -39,7 +57,7 @@ fresh() {
 # expect_red <name> <grep pattern of the message> : check-docs.sh on $tmp/repo fails and says why
 expect_red() {
   out=$(cd "$tmp/repo" && ./scripts/check-docs.sh 2>&1); rc=$?
-  if [ "$rc" -ne 0 ] && printf '%s' "$out" | grep -qE -- "$2"; then ok "$1"
+  if [ "$rc" -ne 0 ] && grep -qE -- "$2" <<<"$out"; then ok "$1"
   else bad "$1" "    exit=$rc, output:
 $(printf '%s\n' "$out" | sed 's/^/    /' | head -8)"; fi
 }
@@ -146,7 +164,7 @@ expect_red "settings.json invalid" 'not valid JSON'
 echo "== the number is an identifier: the historical gaps stay silent, a new gap is noted, nothing is rewritten"
 fresh; before=$(sha256sum "$tmp/repo/docs/decisions.md")
 out=$(cd "$tmp/repo" && ./scripts/check-docs.sh 2>&1)
-printf '%s' "$out" | grep -qE 'note: D143 ' && bad "D143 is a known gap and must not be noted" "$out" || ok "known gaps D143, D154 not noted"
+grep -qE 'note: D143 ' <<<"$out" && bad "D143 is a known gap and must not be noted" "$out" || ok "known gaps D143, D154 not noted"
 [ "$before" = "$(sha256sum "$tmp/repo/docs/decisions.md")" ] && ok "decisions.md unchanged by the check" || bad "decisions.md was modified by the check" ""
 
 echo "== two branches allocating the same number collide at integration, and the check says so"
@@ -168,7 +186,7 @@ out=$(./scripts/check-docs.sh 2>&1); [ $? -eq 0 ] && ok "branch A allocated D4 a
 git checkout -q b && sed -i 's/— D-NEXT From B/— D4 From B/' docs/decisions.md && git -c user.name=t -c user.email=t@t commit -qam "allocate D4 again"
 # a textual merge of a into b conflicts on the file; this is what resolving it by keeping both entries produces
 printf '# Decisions\n\n## 2026-10-01 — D1 One\n\nBody.\n\n## 2026-10-02 — D2 Two\n\nBody.\n\n## 2026-10-03 — D3 Three\n\nBody.\n\n## 2026-10-04 — D4 From A\n\nBody.\n\n## 2026-10-04 — D4 From B\n\nBody.\n' > docs/decisions.md
-out=$(./scripts/check-docs.sh 2>&1); printf '%s' "$out" | grep -q 'D4' && [ "$(printf '%s' "$out" | grep -c 'number twice')" -ge 1 ] && ok "the collision D4/D4 is rejected with the number named" || bad "collision not rejected" "$out"
+out=$(./scripts/check-docs.sh 2>&1); grep -q 'D4' <<<"$out" && [ "$(grep -c 'number twice' <<<"$out")" -ge 1 ] && ok "the collision D4/D4 is rejected with the number named" || bad "collision not rejected" "$out"
 # the right move: B takes D5, the gap list stays empty
 sed -i 's/— D4 From B/— D5 From B/' docs/decisions.md
 out=$(./scripts/check-docs.sh 2>&1); [ $? -eq 0 ] && ok "B reallocated to D5 passes" || bad "D5 should pass" "$out"
@@ -291,9 +309,9 @@ run_test_sh() {
 verdict() {
   local name=$1 want=$2 must=$3 never=${4:-} why=''
   [ "$rc" -eq "$want" ] || why="    exit=$rc, expected $want"
-  printf '%s' "$out" | grep -qF -- "$must" || why="$why
+  grep -qF -- "$must" <<<"$out" || why="$why
     missing from the report: $must"
-  if [ -n "$never" ] && printf '%s' "$out" | grep -qF -- "$never"; then
+  if [ -n "$never" ] && grep -qF -- "$never" <<<"$out"; then
     why="$why
     said what it must not say: $never"
   fi
@@ -313,7 +331,7 @@ run_test_sh 101 "$S1
 $S2"
 verdict "test.sh: red with skips reports them as a floor" 101 \
   "AT LEAST 2 assertion(s) COULD NOT RUN" "nothing was skipped"
-printf '%s' "$out" | grep -qF -- "$S2" && ok "test.sh: the floor lists the skips it has" \
+grep -qF -- "$S2" <<<"$out" && ok "test.sh: the floor lists the skips it has" \
   || bad "test.sh: the floor must still list the skips" "$out"
 # And the green cases keep their exact, unqualified wording.
 run_test_sh 0 ''
@@ -341,8 +359,8 @@ verdict "test.sh: a narrowed green run says its count may be short" 0 \
   "there may be more"
 # ... and its verdict marker says so too, so that a capture of it cannot be
 # read back as a whole run by report-skips.sh.
-if printf '%s\n' "$out" | grep -qF -- "test suite: PASSED (a part of the suite" \
-  && ! printf '%s\n' "$out" | grep -qxF -- "test suite: PASSED"; then
+if grep -qF -- "test suite: PASSED (a part of the suite" <<<"$out" \
+  && ! grep -qxF -- "test suite: PASSED" <<<"$out"; then
   ok "test.sh: a narrowed run's marker is not a plain PASSED"
 else
   bad "test.sh: a narrowed run must not print the whole-suite marker" \
@@ -427,7 +445,7 @@ dump=$(env -i PATH="$PATH" HOME=/wrong/home CHATONS_ROOT=/x HC=1 \
       printf "%s=%s\n" "$v" "${!v-<unset>}"
     done' _ "$E/env.sh" 2>&1)
 envis() { # <NAME=value> : the sourced environment has exactly this
-  printf '%s\n' "$dump" | grep -qxF "$1" && ok "env.sh: $1" \
+  grep -qxF "$1" <<<"$dump" && ok "env.sh: $1" \
     || bad "env.sh: expected $1" "$(printf '%s\n' "$dump" | sed 's/^/    /')"
 }
 envval() { printf '%s\n' "$dump" | sed -n "s/^$1=//p"; }
@@ -473,7 +491,7 @@ case $path_val in
     ok "PATH puts dtach, the wrappers, the per-user profile and sw/bin in front" ;;
   *) bad "PATH prefix is wrong" "    $path_val" ;;
 esac
-printf '%s' "$path_val" | grep -qF ":$PATH" \
+grep -qF ":$PATH" <<<"$path_val" \
   && ok "PATH keeps what it inherited behind the four" \
   || bad "PATH dropped the inherited entries; the guard below needs coreutils" "    $path_val"
 
@@ -484,7 +502,7 @@ cp "$E/env.sh" "$tmp/env-escape.sh"
 sed -i 's|^export CARGO_HOME=.*|export CARGO_HOME=/var/empty/herd-escaped|' "$tmp/env-escape.sh"
 out=$(env -i PATH="$PATH" HOME=/wrong/home \
   bash -c '. "$1" || exit 7' _ "$tmp/env-escape.sh" 2>&1); rc=$?
-[ "$rc" -eq 7 ] && printf '%s' "$out" | grep -q 'state path outside' \
+[ "$rc" -eq 7 ] && grep -q 'state path outside' <<<"$out" \
   && ok "the guard refuses a state path outside the root" \
   || bad "the guard let a path outside the root through" "    exit=$rc $out"
 
@@ -504,18 +522,18 @@ runsession() { # <GH_CONFIG_DIR>
     bash "$E/session.sh" --version </dev/null 2>&1); rc=$?
 }
 runsession "$tmp/gh-logged-in"
-{ [ "$rc" -eq 0 ] && printf '%s' "$out" | grep -q 'FAKE-CLAUDE-RAN --version' \
-  && ! printf '%s' "$out" | grep -q 'hosts.yml'; } \
+{ [ "$rc" -eq 0 ] && grep -q 'FAKE-CLAUDE-RAN --version' <<<"$out" \
+  && ! grep -q 'hosts.yml' <<<"$out"; } \
   && ok "session.sh starts the session and says nothing when gh is logged in" \
   || bad "session.sh misbehaved with a logged-in gh" "    exit=$rc $out"
 runsession "$tmp/gh-empty"
-{ printf '%s' "$out" | grep -q 'cannot open or merge a pull request' \
-  && printf '%s' "$out" | grep -q 'FAKE-CLAUDE-RAN'; } \
+{ grep -q 'cannot open or merge a pull request' <<<"$out" \
+  && grep -q 'FAKE-CLAUDE-RAN' <<<"$out"; } \
   && ok "session.sh warns, and still starts, when gh has no login" \
   || bad "session.sh did not warn about a gh directory with no hosts.yml" "    exit=$rc $out"
 mv "$sandroot/claude/config/.credentials.json" "$tmp/creds-aside"
 runsession "$tmp/gh-logged-in"
-{ [ "$rc" -eq 1 ] && printf '%s' "$out" | grep -q 'no .credentials.json'; } \
+{ [ "$rc" -eq 1 ] && grep -q 'no .credentials.json' <<<"$out"; } \
   && ok "session.sh refuses without credentials when no terminal can log in" \
   || bad "session.sh should refuse without credentials and no tty" "    exit=$rc $out"
 mv "$tmp/creds-aside" "$sandroot/claude/config/.credentials.json"
@@ -599,7 +617,7 @@ gate_run() {
 gate_case() {
   name=$1; want=$2; pat=$3; shift 3
   out=$(gate_run "$@"); rc=$?
-  if [ "$rc" -eq "$want" ] && printf '%s' "$out" | grep -qE -- "$pat"; then
+  if [ "$rc" -eq "$want" ] && grep -qE -- "$pat" <<<"$out"; then
     ok "gate: $name"
   else
     bad "gate: $name" "    want exit $want matching /$pat/, got exit $rc:
@@ -612,10 +630,10 @@ gate_case "a clean tree with the expected skip list is GREEN" 0 '^gate: GREEN sh
 # The verdict names the sha it is about: an authorisation that does not say
 # which commit it covers is not an authorisation (ORCH-001).
 out=$(gate_run); sha=$(cd "$gatedir" && git rev-parse HEAD)
-printf '%s' "$out" | grep -q "gate: GREEN sha=$sha " \
+grep -q "gate: GREEN sha=$sha " <<<"$out" \
   && ok "gate: the GREEN verdict names the exact sha" \
   || bad "gate: the verdict must name the sha" "$(printf '%s\n' "$out" | tail -4)"
-printf '%s' "$out" | grep -qE 'skips=|steps=0-8:ok' \
+grep -qE 'skips=|steps=0-8:ok' <<<"$out" \
   && ok "gate: the verdict is one line and says the steps all ran" \
   || bad "gate: verdict shape" "$(printf '%s\n' "$out" | tail -4)"
 # One output file, and the verdict is its last line.
@@ -650,7 +668,7 @@ gate_fresh
 printf 'HERD-SKIPPED: a_needs_cgroup_delegation: no delegated subtree here\nHERD-SKIPPED: b_needs_bfq: no device offers bfq\nHERD-SKIPPED: c_nobody_expected_this: a new reason\n' > "$tmp/gate-skips"
 gate_case "a skip that is not on the expected list is RED" 1 '7:unexpected-skip'
 out=$(gate_run)
-printf '%s' "$out" | grep -qF '+ c_nobody_expected_this' \
+grep -qF '+ c_nobody_expected_this' <<<"$out" \
   && ok "gate: the unexpected skip is named, not counted" \
   || bad "gate: the unexpected skip must be named" "$(printf '%s\n' "$out" | tail -8)"
 # The same run, with the load-conditional list allowing that skip above the
@@ -675,14 +693,9 @@ printf 'HERD-SKIPPED: a_needs_cgroup_delegation: no delegated subtree here\nHERD
 printf 'HERD-SKIPPED: c_load_gated_bench: the host went busy\n' > "$tmp/gate-expected-load"
 printf '0.10 0.10 0.10 1/1 1\n' > "$tmp/gate-loadavg"
 out=$(gate_run HERD_GATE_LOADAVG="$tmp/gate-loadavg" HERD_STUB_LOAD_AFTER=12.00); rc=$?
-# These assertions read `$out` through a HERE-STRING and not through
-# `printf | grep -q`, which is this file's older idiom, because that idiom
-# false-fails under `set -o pipefail`: `grep -q` exits on its match, printf
-# dies of SIGPIPE on what is left, and the pipeline reports the failure of a
-# text that matched. Measured 2026-10-28 under a one-minute load of 8.7: 2
-# false failures in 4000 with the pipe, 0 in 4000 with the here-string -- and
-# twice for real the same afternoon, once turning a `gate.sh` run RED on a
-# clean tree at step 2. The ~30 older sites are a finding, not fixed here.
+# These assertions read `$out` through a here-string, as every assertion in
+# this file now does: the note above `fresh` says what the pipe they used to
+# be written with gets wrong, and what it was measured at.
 [ "$rc" -eq 0 ] && grep -qF 'load1 rose from 0.10 to 12.00' <<<"$out" \
   && ok "gate: a quiet start and a busy finish still gets the load list" \
   || bad "gate: the second load reading must apply the load list" \
@@ -711,7 +724,7 @@ gate_fresh
 printf 'HERD-SKIPPED: a_needs_cgroup_delegation: no delegated subtree here\n' > "$tmp/gate-skips"
 gate_case "an expected skip that did not appear is a note, not a failure" 0 \
   'an expected skip did not appear'
-out=$(gate_run); printf '%s' "$out" | grep -qE 'gate: GREEN' \
+out=$(gate_run); grep -qE 'gate: GREEN' <<<"$out" \
   && ok "gate: a smaller skip list does not turn the gate red (list, not count)" \
   || bad "gate: a smaller list must stay green with a note" "$(printf '%s\n' "$out" | tail -6)"
 
@@ -986,7 +999,7 @@ pp_push() { # <git push args...>: output in $out, exit in $pp_rc
 pp_case() { # <name> <expected exit> <grep pattern> <git push args...>
   name=$1; want=$2; pat=$3; shift 3
   pp_push "$@"
-  if [ "$pp_rc" -eq "$want" ] && printf '%s' "$out" | grep -qE -- "$pat"; then
+  if [ "$pp_rc" -eq "$want" ] && grep -qE -- "$pat" <<<"$out"; then
     ok "pre-push: $name"
   else
     bad "pre-push: $name" "    want exit $want matching /$pat/, got exit $pp_rc:
@@ -1158,7 +1171,7 @@ osha=$(cd "$pdir2" && git rev-parse HEAD); pp_receipt "$osha"
 out=$(cd "$pdir2" && HERD_GATE_RECEIPTS="$prec" \
   git push --force origin "HEAD:refs/heads/main" 2>&1); pp_rc=$?
 if [ "$pp_rc" -eq 1 ] \
-   && printf '%s' "$out" | grep -q 'cannot tell a fast-forward'; then
+   && grep -q 'cannot tell a fast-forward' <<<"$out"; then
   ok "pre-push: a remote tip this clone has never seen is refused, not guessed"
 else
   bad "pre-push: an unknown remote tip must be refused" "    exit $pp_rc:
@@ -1258,8 +1271,8 @@ chmod +x "$pdir/.git/hooks/pre-push"
 pp_push -q origin "HEAD:refs/heads/main"
 # Which hook spoke is the whole question here, not which rule it applied:
 # ours prints `pre-push: REFUSED`, the stray prints its own marker.
-if [ "$pp_rc" -ne 0 ] && printf '%s' "$out" | grep -q 'pre-push: REFUSED' \
-   && ! printf '%s' "$out" | grep -q 'stray-git-hooks-pre-push-ran'; then
+if [ "$pp_rc" -ne 0 ] && grep -q 'pre-push: REFUSED' <<<"$out" \
+   && ! grep -q 'stray-git-hooks-pre-push-ran' <<<"$out"; then
   ok "pre-push: with the setting on, this hook runs and .git/hooks does not"
 else
   bad "pre-push: the installed hook must run instead of .git/hooks" \
