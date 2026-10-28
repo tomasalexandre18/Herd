@@ -186,23 +186,52 @@ larger. A tag and a release stay Alexa's word, one act at a time. The
 orchestrator still never merges or pushes, and that one is still
 enforced from outside the text, by `orchestrator-guard.sh`.
 
-**Refused, for now.**
+**The three refusals of 2026-10-27, with their dates.** A refusal of
+Alexa's is history, not a draft: one of these was adopted the next day
+and is marked, not deleted.
 
-- **Testing only what was touched.** The consumer's case is seven hours
-  of tests per change; ours is about eight minutes on CI. Working out
-  which tests a change affects costs more than it saves at that size, and
-  is sometimes wrong.
-- **Making this workstation's local run the gate.** Not a matter of
-  principle but a measured fact of 2026-10-27: the suite is red here for
-  host reasons — ORCH-069 (constants written for a 17 GiB machine) and
-  ORCH-107 (19 of 21 failures were timeouts under load, not wrong
-  values) — and skips are per host, 12 here against 15 on CI, so judging
-  on the local number is judging a different suite. Three agents each
-  spent time that day proving failures were not theirs. This becomes
-  **reconsiderable once ORCH-069 and ORCH-107 are fixed**: it is a
-  sequence, not a doctrine.
-- **A nightly full pass**, which this project does not have. Not adopted,
-  **and the piece that is missing**: a known gap, not an oversight.
+- **Testing only what was touched. Still refused, 2026-10-27.** The
+  consumer's case is seven hours of tests per change; ours is about eight
+  minutes. Working out which tests a change affects costs more than it
+  saves at that size, and is sometimes wrong.
+- **Making this workstation's local run the gate. ADOPTED 2026-10-28**
+  (ORCH-120, Alexa's words above). The reasoning that refused it on
+  2026-10-27 stands below as it was written, with its two factual errors
+  marked where they occur, because what changed is the facts it rested
+  on and not the judgement:
+
+  > Not a matter of principle but a measured fact of 2026-10-27: the
+  > suite is red here for host reasons [**no longer true**] — ORCH-069
+  > (constants written for a 17 GiB machine) and ORCH-107 (19 of 21
+  > failures were timeouts under load, not wrong values) — and skips are
+  > per host, 12 here against 15 on CI [**the 15 is wrong**], so judging
+  > on the local number is judging a different suite. Three agents each
+  > spent time that day proving failures were not theirs. This becomes
+  > **reconsiderable once ORCH-069 and ORCH-107 are fixed**: it is a
+  > sequence, not a doctrine.
+
+  The sequence it named arrived: ORCH-069 landed (PR #102) and ORCH-107
+  landed (batch 4), which is what put the question on the board as
+  ORCH-120 rather than leaving it closed. **The suite is no longer red
+  here for host reasons**, and the skip figures were wrong — **12 here
+  at rest, 14 here under load** (`flood-fifty` and `flood-two-fifty`
+  skip themselves above a one-minute load of 8), against **14 on CI**,
+  measured (ORCH-116, run 40538722315). The *"15 on CI"* came from run
+  40439537929, a **red** run that printed *"AT LEAST 15 assertion(s)"* —
+  a floor from an incomplete run, which is exactly what D179 exists to
+  label as such.
+  **The point that clause was making survives its own numbers and is
+  now the design of the gate:** a skip count is not a quantity anyone
+  can reason about, and a skip list is. `gate.sh` therefore diffs the
+  run's skip lines against a committed expectation and never judges a
+  count.
+- **A nightly full pass. Still refused, 2026-10-27**, and this project
+  still does not have one: **the piece that is missing**, a known gap,
+  not an oversight. Since 2026-10-28 it is a **larger** gap. The
+  post-push run on `main` is no longer a second opinion behind a
+  required check, it is the only thing a second machine ever says about
+  a landing, and nothing at all catches GitHub-side drift — an action
+  version, the runner image — between two landings.
 
 ## Permissions and escalation
 
