@@ -179,7 +179,15 @@ done
 # read by one awk for the whole set -- one landing per batch. check-docs.sh
 # is run 32 times by check-orchestration.sh against the `docs` job's
 # 5-minute cap (see the note at the top of this file).
-landing_from=2026-10-28
+# The constant is a floor, and it moved once: the method landed on
+# 2026-10-28 and a merge handoff of that same date was already on `main`,
+# written under the pull-request method and not rewritable (history is
+# append-only, and 68 handoffs carry the old field names). The first
+# landing under the method is dated 2026-10-29 or later -- it comes after
+# the last pull request, which is what carried this rule -- so that is
+# the floor. Moving it is one line, and the rule is a no-op until a
+# landing is dated on or after it.
+landing_from=2026-10-29
 landings=""
 for f in docs/orchestration/history/*-merge-*.md; do
   [ -f "$f" ] || continue
