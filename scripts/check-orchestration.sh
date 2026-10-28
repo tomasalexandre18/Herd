@@ -30,16 +30,25 @@ set -uo pipefail
 #
 # That is not tidiness. Several captures below run
 # `env -i PATH=... HOME=/wrong/home bash -c ...` to prove a script rebuilds
-# its own environment, and `env -i` strips `__ETC_PROFILE_DONE`. When bash's
-# fd 0 is a *socket*, its isnetconn() check makes it source SYS_BASHRC
-# (/etc/bashrc) although it is not interactive; /etc/bashrc then finds that
-# variable empty, sources /etc/profile and /etc/set-environment, and rebuilds
-# PATH out of the child's own HOME=/wrong/home -- discarding the PATH the
-# case supplied. The assertions then correctly report a PATH and a stub
-# directory that are no longer there, and nothing in the diff is at fault.
-# Measured on this host on 2026-10-28, same tree, same minute: 253 passed /
-# 0 failed with fd 0 on /dev/null, 232 passed / 21 failed with fd 0 on an
-# AF_UNIX socketpair (in-memory; no listening socket, no port, no network).
+# its own environment, and `env -i` strips `__ETC_PROFILE_DONE`. A
+# `bash -c` whose fd 0 is a *socket* sources SYS_BASHRC (/etc/bashrc)
+# although it is not interactive: bash takes a socket on fd 0 for an
+# rshd/sshd session (isnetconn()), and it looks only on the -c path, so
+# this script's own shell is never the one affected -- it is these
+# children, which inherit fd 0 from here. /etc/bashrc then finds that
+# variable empty, sources /etc/profile and /etc/set-environment, and
+# rebuilds PATH out of the child's own HOME=/wrong/home -- discarding the
+# PATH the case supplied. The assertions then correctly report a PATH and
+# a stub directory that are no longer there, and nothing in the diff is
+# at fault.
+#
+# Measured on this host on 2026-10-28. Whole script, same tree, same
+# minute: 253 passed / 0 failed with fd 0 on /dev/null, 232 passed /
+# 21 failed with fd 0 on an AF_UNIX socketpair (in-memory; no listening
+# socket, no port, no network). One capture in isolation, with the socket
+# on fd 0 either way: without the redirection the child reports
+# __ETC_BASHRC_SOURCED=1 and a PATH rebuilt from /wrong/home; with it,
+# the variable is unset and the supplied PATH arrives intact.
 #
 # Only a socket arms it: /dev/null, a pipe, a regular file and a closed fd 0
 # are all inert, which is why this went unseen -- the caller chose, and the

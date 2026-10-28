@@ -60,10 +60,11 @@ set -uo pipefail
 # The gate is independent of the stdin it was handed, for two reasons that
 # both end in a landing. Nothing below reads fd 0, so this costs nothing.
 #
-#  - Step 2 runs check-orchestration.sh, whose captures go wrong when fd 0
-#    is a socket (the note at the top of that script measures it). It guards
-#    itself; this guards every other child the gate starts, present and
-#    future, so a landing can never be derailed by its caller's fd 0.
+#  - Step 2 runs check-orchestration.sh, whose `bash -c` captures go wrong
+#    when fd 0 is a socket (the note at the top of that script measures
+#    it). It guards itself, and the gate runs no `bash -c` of its own, so
+#    this is defence in depth: it guards every other child the gate starts,
+#    present and future, so no landing can be derailed by its caller's fd 0.
 #  - scripts/githooks/pre-push calls `gate.sh --verify-receipt` from inside
 #    a `while read -r ...` loop over the ref list git feeds it on stdin. A
 #    child that consumed any of that stdin would silently drop a ref from

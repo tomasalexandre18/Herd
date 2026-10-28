@@ -37,6 +37,30 @@ survived — the caller chose and the script had no say. The socketpair is
 in-memory: no listening socket, no port, no network, so invariant 3 is
 not in play.
 
+One refinement to the mechanism, found while verifying the fix and now in
+the comment: bash looks at fd 0 **only on the `-c` path**
+(`command_execution_string` in its `run_startup_files()`), so a bash
+running a script *file* never arms, whatever is on its stdin. The script
+itself was therefore never the shell at risk; its `bash -c` children were,
+inheriting fd 0 from it. That is why the redirection has to sit in the
+parent, and it is also why `gate.sh`, which runs no `bash -c` of its own,
+is defence in depth rather than a second defect — said so in its comment.
+Isolated, with the socket on fd 0 both times:
+
+```
+script file, no `exec </dev/null`:
+  self_fd0=socket:[74839290]
+  bashrc=1 PATH=/wrong/home/.local/bin:...:/etc/profiles/per-user//bin:...
+the same script with `exec </dev/null`:
+  self_fd0=/dev/null
+  bashrc=unset PATH=<exactly the PATH the capture supplied>
+```
+
+The lever was re-checked live, in the same backgrounded shape the gate
+runs were started in, so that a green run could not be green because the
+lever had quietly stopped arming: `bash -c` under it reports
+`fd0=socket:[74828981] bashrc=1`.
+
 Redirecting stdin was taken over `__ETC_PROFILE_DONE=1` and over
 `NOSYSBASHRC=1`: the first suppresses the symptom while the child still
 executes `/etc/bashrc`, the second is a NixOS-specific knob, and only the
@@ -132,15 +156,18 @@ run 5  devnull  exit=0  check-orchestration: 256 passed, 0 failed
 run 5  socket   exit=0  check-orchestration: 256 passed, 0 failed
 ```
 
+An intermediate gate also ran GREEN on `99d638f`, under `/dev/null` and
+again under the socket (`steps=0-8:ok`, 12 skips, at-rest list both
+times).
+
 The last runs, on the tree that carries this file, are not quoted here —
 a gate run made before this file existed tested a different tree
-(`templates/handoff.md`). They are `./scripts/gate.sh` on the handoff
-commit with fd 0 on `/dev/null`, and the same gate once more with fd 0 on
-an `AF_UNIX` socketpair — the direct test of whether a landing can still
-be derailed by its caller's fd 0. Their logs go to
-`<scratchpad>/gate-final-devnull.log` and
-`<scratchpad>/gate-final-socket.log`, their receipts to
-`target/herd-gate/`, and their verbatim verdicts to the agent's report.
+(`templates/handoff.md`). They are `./scripts/gate.sh` on the branch tip
+with fd 0 on `/dev/null`, and the same gate once more with fd 0 on an
+`AF_UNIX` socketpair — the direct test of whether a landing can still be
+derailed by its caller's fd 0. Their logs go to the agent's scratchpad,
+their receipts to `target/herd-gate/`, and their verbatim verdicts to the
+agent's report.
 
 **Skips: 12**, every one of them a cgroup v2 delegation skip, and the
 observed list matched `scripts/expected-skips/local.txt` exactly (step 7:
@@ -225,10 +252,13 @@ fd 0 should both print `256 passed, 0 failed`.
 
 ## Processes
 
-- PID 1833328, `./scripts/gate.sh` on `f056c25`, started and reaped by
-  this agent; exited 0 on its own. Two more `./scripts/gate.sh` runs are
-  started and reaped the same way after this file is committed; their PIDs
-  are in the agent's report. No other process started, nothing killed.
+- `./scripts/gate.sh` runs, each started and reaped by this agent and each
+  exiting 0 on its own: PID 1833328 on `f056c25`, PID 1925655 on
+  `99d638f` under `/dev/null`, PID 1992001 on `99d638f` under the socket.
+  Two more follow on the branch tip once this file is committed; every PID
+  is in the agent's report. Short-lived `perl` probes were waited on by
+  PID in the same way. Nothing was killed, and nothing was matched by
+  name.
 - `CARGO_TARGET_DIR=/mnt/ssd_980/herd/build/orch-111`, off the root
   filesystem and outside the worktree (8.6 GB at its peak), deleted once
   the branch was pushed. The worktree's own `target/` held only the gate
