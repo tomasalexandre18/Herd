@@ -247,8 +247,11 @@ git check-ignore -q .claude/hooks/.log-to && git check-ignore -q .claude/hooks/.
   && ok "the logging switches are gitignored" \
   || bad "the logging switches are not gitignored (invariant 7)" ""
 
-echo "== known bypasses, documented in docs/orchestration/permissions.md (these pass on purpose)"
-hook 0 "{\"tool_name\":\"Bash\",\"cwd\":\"$R\",\"tool_input\":{\"command\":\"git -c a=b commit -m hi\"}}"
+echo "== the one known bypass left, documented in docs/orchestration/permissions.md"
+# `git -c key=val <verb>` used to be asserted here as a second deliberate
+# bypass. It was closed on 2026-10-28 and its cases moved to the
+# orchestrator-guard section below, so there is one place that says what the
+# guard does with a global option and not two.
 hook 0 "{\"tool_name\":\"Bash\",\"cwd\":\"$R\",\"tool_input\":{\"command\":\"/usr/bin/git commit -m hi\"}}"
 
 echo "== release-guard.sh"
@@ -722,10 +725,14 @@ echo "== orchestrator-guard.sh: a global option must not move the verb out of re
 # 2026-10-28, because every git rule in it matched the verb in first
 # position. The idiom is about to be documented in workflow.md and
 # herd-merger.md for driving another worktree, so it is the bypass certain
-# to be used by accident. The two known bypasses asserted above
-# (`git -c a=b commit`, `/usr/bin/git commit`) are deliberate and stay
-# exactly as they are: closing one of those is a decision, not a side
-# effect of this fix.
+# to be used by accident. `git -c key=val <verb>` and
+# `git --config-env=key=var <verb>` were the deliberate, asserted bypass
+# until 2026-10-28; Alexa closed them when the pull request left the loop,
+# because the guard stopped being a convenience in front of a required
+# status check and became one of only two mechanisms in front of `main`.
+# `/usr/bin/git commit` stays open and stays documented: it is a path, not
+# an option, and a rule on every absolute path to every git on the host
+# buys less than it costs.
 OG="$root/.claude/hooks/orchestrator-guard.sh"
 og() { # <expected exit> <command, JSON-escaped>
   printf '{"tool_name":"Bash","cwd":"%s","tool_input":{"command":"%s"}}' \
@@ -741,10 +748,25 @@ og 2 'git --git-dir /x/.git push origin main'
 og 2 'git --work-tree=/x merge origin/main'
 og 2 'git -C \"/a b\" push origin main'
 og 2 'cd /tmp && git -C /x push origin main'
-# Measured, and honest about it: `-c key=val` anywhere in the option list
-# still bypasses, because `-c` is the deliberate bypass and stripping it
-# here would close it by the back door. Nobody types this by accident.
-og 0 'git -C /x -c a=b rebase origin/main'
+# The config forms, closed 2026-10-28: `-c key=val` and
+# `--config-env=key=var`, alone, repeated, and mixed with another global
+# option, in front of a write verb.
+og 2 'git -c a=b commit -m hi'
+og 2 'git -c a=b push origin main'
+og 2 'git -c a=b merge origin/main'
+og 2 'git -c a=b -c c=d merge origin/main'
+og 2 'git -C /x -c a=b rebase origin/main'
+og 2 'git -c a=b -C /x push origin main'
+og 2 'git -c core.hooksPath= push origin main'
+og 2 'git --config-env=a=B commit -m hi'
+og 2 'git --config-env a=B push origin main'
+og 2 'git -c a=b reset --hard origin/main'
+og 2 'cd /tmp && git -c a=b push origin main'
+# Closing them must not cost the orchestrator a read: `-c` in front of a
+# read verb is how one asks git to stop colouring its output.
+og 0 'git -c color.ui=false log --oneline -3'
+og 0 'git -c a=b status --short'
+og 0 'git --config-env=a=B diff origin/main --stat'
 # The orchestrator reads constantly, and a guard that blocks reading is a
 # guard that gets switched off. Inspection through -C stays free.
 og 0 'git -C /x fetch origin'
@@ -753,8 +775,7 @@ og 0 'git -C /x log --oneline -5'
 og 0 'git -C /x diff origin/main --stat'
 og 0 'git --no-pager log -1'
 og 0 'git --git-dir=/x/.git log --oneline -3'
-# Unchanged on purpose: the two documented bypasses keep their verdict.
-og 0 'git -c a=b commit -m hi'
+# Unchanged on purpose: the one documented bypass keeps its verdict.
 og 0 '/usr/bin/git commit -m hi'
 # The relative-redirection rule resolves its target now, instead of denying
 # every relative target while the shell stands in the checkout. A write that
@@ -1093,6 +1114,66 @@ pp_push -q --no-verify origin "HEAD:refs/heads/main"
 [ "$pp_rc" -eq 0 ] \
   && ok "pre-push: --no-verify bypasses the hook entirely (known limit)" \
   || bad "pre-push: --no-verify is expected to bypass the hook" "    exit $pp_rc: $out"
+# --- the setting is repository-wide, and it REPLACES .git/hooks ----------
+# Measured on git 2.54.0, and the reason this is written down: one
+# `git config core.hooksPath scripts/githooks` in a checkout arms that
+# checkout and every worktree added from it, because they share one config
+# file. Making it per worktree instead needs `extensions.worktreeConfig`:
+# without it, `--worktree` is REFUSED in a repository that has more than one
+# working tree (ours has 88) and silently means `--local` in one that has a
+# single working tree -- so it is no way to narrow the setting by accident.
+# And the setting does not ADD a hook directory, it replaces the
+# default one: pointed at a directory that is not there, it runs nothing and
+# silences `.git/hooks` as well. That is the state of a checkout between
+# setting the config and landing the batch that brings `scripts/githooks/`:
+# inert, and harmless only as long as the repository keeps no git hooks of
+# its own.
+pp_fresh
+sha=$(pp_commit "$tmp/push-good.md")
+# One working tree: `--worktree` is accepted and means `--local`, which is
+# the shared config -- not a narrowing.
+(cd "$pdir" && git config --worktree core.hooksPath scripts/githooks) >/dev/null 2>&1 \
+  && ok "pre-push: with one working tree, --worktree means --local" \
+  || bad "pre-push: --worktree was expected to act as --local here" ""
+git -C "$pdir" worktree add -q "$tmp/push-wt2" -b wt2 >/dev/null 2>&1
+# Two working trees, extensions.worktreeConfig unset: refused outright.
+(cd "$pdir" && git config --worktree core.hooksPath scripts/githooks) >/dev/null 2>&1 \
+  && bad "pre-push: --worktree must be refused with several working trees" "" \
+  || ok "pre-push: --worktree is refused without extensions.worktreeConfig"
+if (cd "$tmp/push-wt2" && ./scripts/githooks/pre-push --check-install >/dev/null 2>&1); then
+  ok "pre-push: a worktree added from an installed checkout inherits it"
+else
+  bad "pre-push: a worktree must inherit core.hooksPath from its checkout" ""
+fi
+git -C "$pdir" worktree remove --force "$tmp/push-wt2" >/dev/null 2>&1
+rm -rf "${tmp:?}/push-wt2"
+# A stray hook in .git/hooks, which would refuse every push if it ran.
+mkdir -p "$pdir/.git/hooks"
+printf '#!/bin/sh\necho stray-git-hooks-pre-push-ran >&2\nexit 1\n' \
+  > "$pdir/.git/hooks/pre-push"
+chmod +x "$pdir/.git/hooks/pre-push"
+pp_push -q origin "HEAD:refs/heads/main"
+# Which hook spoke is the whole question here, not which rule it applied:
+# ours prints `pre-push: REFUSED`, the stray prints its own marker.
+if [ "$pp_rc" -ne 0 ] && printf '%s' "$out" | grep -q 'pre-push: REFUSED' \
+   && ! printf '%s' "$out" | grep -q 'stray-git-hooks-pre-push-ran'; then
+  ok "pre-push: with the setting on, this hook runs and .git/hooks does not"
+else
+  bad "pre-push: the installed hook must run instead of .git/hooks" \
+    "    exit $pp_rc: $(printf '%s' "$out" | head -3)"
+fi
+mv "$pdir/scripts/githooks" "$pdir/scripts/githooks-away"
+pp_push -q origin "HEAD:refs/heads/main"
+[ "$pp_rc" -eq 0 ] \
+  && ok "pre-push: a core.hooksPath naming a missing directory runs nothing" \
+  || bad "pre-push: a missing hooks directory must not refuse the push" \
+    "    exit $pp_rc: $(printf '%s' "$out" | head -3)"
+# And --check-install cannot see that: it answers about the config, not
+# about the directory. A worktree whose hooks directory has not arrived yet
+# reports "installed".
+(cd "$pdir" && ./scripts/githooks-away/pre-push --check-install >/dev/null 2>&1) \
+  && ok "pre-push: --check-install answers about the config, not the directory" \
+  || bad "pre-push: --check-install was expected to pass on the config alone" ""
 rm -rf "${pdir:?}" "${prem:?}" "${prec:?}" "${ptrace:?}"
 rm -f "${tmp:?}"/push-good.md "${tmp:?}"/push-oneline.md \
   "${tmp:?}"/push-nosection.md "${tmp:?}"/push-placeholder.md \

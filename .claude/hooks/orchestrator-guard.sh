@@ -18,12 +18,17 @@
 # to be the documented idiom for driving another worktree, so it was the one
 # bypass certain to be used by accident rather than on purpose.
 #
-# Still slips past, by decision or for want of a better rule:
-# `git -c key=val commit` -- a deliberate, asserted bypass (the "known
-# bypasses" section of scripts/check-orchestration.sh and
-# docs/orchestration/permissions.md); closing it is a decision of its own,
-# not a side effect of this one -- `/usr/bin/git commit`, `sh -c`,
-# `python -c`, a verb built up in a shell variable, and an alias.
+# Closed since 2026-10-28 as well: `git -c key=val <verb>` and
+# `git --config-env=key=var <verb>`. Both were documented, asserted
+# bypasses, accepted while this guard sat in front of a required status
+# check on a pull request. With the pull request out of the loop the guard
+# is one of only two mechanisms standing in front of `main`, so the config
+# forms are now stripped like any other global option (Alexa, 2026-10-28).
+#
+# Still slips past, for want of a better rule: `/usr/bin/git commit` -- a
+# path and not an option, and a rule on every absolute path to every git
+# on the host buys less than it costs -- `sh -c`, `python -c`, a verb built
+# up in a shell variable, and an alias.
 #
 # This guard constrains the MAIN SESSION ONLY, and that is the intent, not
 # an oversight: an execution agent carries agent_id or agent_type and is let
@@ -92,11 +97,14 @@ case "$tool" in
     # below matches the verb right after `git`, so one global option in
     # front of it defeated all of them at once. Strip the global options
     # that move the verb out of first position, then match on the result.
-    # `-c key=val` is deliberately NOT in this list (see the header). A
-    # quoted argument is handled, so `git -C "/a b" push` is read too.
+    # `-c key=val` and `--config-env=key=var` joined the list on
+    # 2026-10-28 (see the header). A quoted argument is handled, so
+    # `git -C "/a b" push` is read too.
     cn=$(printf '%s' "$c" | perl -0777 -pe '
       s{(^|[;&|(]|\s)git((?:\s+(?:
             -C\s+(?:"[^"]*"|\x27[^\x27]*\x27|\S+)
+          | -c\s+(?:"[^"]*"|\x27[^\x27]*\x27|\S+)
+          | --config-env(?:=\S+|\s+(?:"[^"]*"|\x27[^\x27]*\x27|\S+))
           | --git-dir(?:=\S+|\s+(?:"[^"]*"|\x27[^\x27]*\x27|\S+))
           | --work-tree(?:=\S+|\s+(?:"[^"]*"|\x27[^\x27]*\x27|\S+))
           | --exec-path(?:=\S+|\s+(?:"[^"]*"|\x27[^\x27]*\x27|\S+))
