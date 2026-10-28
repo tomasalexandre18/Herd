@@ -96,32 +96,32 @@ nix develop --command cargo fmt --all --check
 
 Gates before a commit: a change that touches any file outside `CLAUDE.md`,
 `README.md`, `docs/`, `.claude/` and `.github/*.md` runs all four Rust gates
-plus `check-docs.sh`. A prose-only change runs `check-docs.sh` and says in its
-report that the Rust gates were **not run** locally and that CI runs them on
-the batch PR. A gate that did not run is reported as not run, never as passed.
+plus `check-docs.sh`. A prose-only change runs `check-docs.sh` and says the
+Rust gates were **not run** locally, covered by the landing's `gate.sh`. A gate
+that did not run is reported as not run, never as passed.
 
 ## Git and main
 
-- One branch per task, in its own worktree, named for the task.
-- Small commits, imperative English subject ≤ 72 chars.
-- **One PR per batch of branches** (Alexa, 2026-10-27): an agent pushes its
-  branch and **opens no PR**. `herd-merger` merges the batch one branch at a
-  time onto one integration branch and opens **one** PR from the template,
-  Evidence per branch. Why, and the refusals: `docs/orchestration/workflow.md`.
-- CI must be green before merge: jobs `check` and `docs`. Never
-  `--no-verify`, never force-push, never a red merge, never `--admin`.
-- **Merging is `herd-merger`'s, by standing authorisation** (Alexa,
-  2026-10-24, ORCH-001: *"non il peux merge par defaut"*): any PR whose CI
-  is green and whose Evidence block is filled, `cut-v*`, `.github/`,
-  `CLAUDE.md` and `.claude/` included. Nobody else merges.
-- **Pushing a tag and publishing a release stay on Alexa's word, one act
-  at a time.** Merging a version PR and publishing its release are two
-  different acts; `herd-release` prepares and never publishes.
+- One branch per task, in its own worktree, named for the task. Small commits,
+  imperative English subject ≤ 72 chars.
+- **One landing per batch** (Alexa, 2026-10-28): **nobody opens a pull
+  request** but `herd-merger`, once, on the orchestrator's instruction, for the
+  one landing this change. An agent pushes and hands off; a landing is one
+  batch, one push, one `--no-ff` merge commit with the record.
+- **Pushing to `main` is `herd-merger`'s, by standing authorisation**
+  (ORCH-001, 2026-10-24, re-granted 2026-10-28): a green `./scripts/gate.sh`
+  for the **gated** sha — the merge's second parent, trees identical — and a
+  filled record, `cut-v*`, `.github/`, `CLAUDE.md` and `.claude/` included;
+  nothing waits for Alexa. Never `--no-verify`, never force-push, never a red
+  landing, never `--admin`.
+- **Pushing a tag and publishing a release stay on Alexa's word, one act at a
+  time** (workflow.md); `herd-release` prepares and never publishes.
 
 ## Shared host rules
 
 Several agents and the consumer's production share this machine.
-- Write only in your own worktree and your own scratchpad subdirectory.
+- Write only in your own worktree and your own scratchpad subdirectory; the two
+  exceptions, with their conditions, are in workflow.md's *Concurrency*.
 - Never `pkill -f`, `killall` or kill by name; kill only PIDs you started.
 - No `cargo` build or test unless the task changes code; one integration at a
   time. More than two heavy agents may run while the first consumer is stopped

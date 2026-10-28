@@ -20,7 +20,7 @@ Say what is outside the mandate and what needs Alexa's word.
 Read what the brief names, in order, then only what the plan needs. Do
 not read `docs/decisions.md` end to end; grep it for the numbers you need.
 
-You may run read-only shell commands (`git log`, `grep`, `gh pr view`).
+You may run read-only shell commands (`git log`, `grep`, `gh run view`).
 You may **write one file**: your handoff and plan at
 `docs/orchestration/history/<date>-<task>.md` in your worktree, from
 `docs/orchestration/templates/handoff.md`. Nothing else is written;

@@ -165,6 +165,68 @@ for f in docs/orchestration/history/*.md; do
   case "$(basename "$f")" in README.md|[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]-*.md) ;; *) note "$f: a handoff is named YYYY-MM-DD-<task>.md";; esac
 done
 
+# herd-merger's handoff carries the landing record: the merge commit message
+# that replaces the pull-request body as the audit trail of a push to `main`
+# (2026-10-28, templates/landing.md). The commit message is not in the tree
+# a gate reads, so the handoff copy is what can be checked here -- its seven
+# sections, and the four header fields filled with real values rather than
+# the template's placeholders. A gate verdict with no sha, or a skip count
+# with no list, is the failure this exists to catch (D27, invariant 5).
+#
+# Cost: deliberately per-file, not whole-corpus. The date in the filename is
+# compared as a string first, so every handoff written under the
+# pull-request method is skipped without being opened, and what is left is
+# read by one awk for the whole set -- one landing per batch. check-docs.sh
+# is run 32 times by check-orchestration.sh against the `docs` job's
+# 5-minute cap (see the note at the top of this file).
+# The constant is a floor, and it moved once: the method landed on
+# 2026-10-28 and a merge handoff of that same date was already on `main`,
+# written under the pull-request method and not rewritable (history is
+# append-only, and 68 handoffs carry the old field names). The first
+# landing under the method is dated 2026-10-29 or later -- it comes after
+# the last pull request, which is what carried this rule -- so that is
+# the floor. Moving it is one line, and the rule is a no-op until a
+# landing is dated on or after it.
+landing_from=2026-10-29
+landings=""
+for f in docs/orchestration/history/*-merge-*.md; do
+  [ -f "$f" ] || continue
+  b=${f##*/}      # not basename: one fork per file, paid 32 times
+  [ "${b%%-merge-*}" \< "$landing_from" ] && continue
+  landings="$landings $f"
+done
+if [ -n "$landings" ]; then
+  bad_landings=$(LC_ALL=C awk '
+    BEGIN {
+      nh = split("What changed and why|Branches in this batch|Evidence|Left out|Decisions allocated|Board rows|CI run", head, "|")
+      hex = "[0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f]"
+      run = "[0-9][0-9][0-9][0-9][0-9][0-9]"
+    }
+    function want(c, s) { if (!c) miss = miss (miss ? ", " : "") s }
+    function flush() {
+      if (file == "") return
+      miss = ""
+      for (i = 1; i <= nh; i++) want(index(seen, "|" i "|"), "section \"## " head[i] "\"")
+      want(batch, "a filled **Batch:** line")
+      want(gate,  "a filled **Gate:** line naming the sha it ran on")
+      want(skips, "a filled **Skips:** line")
+      want(list,  "the skips named (HERD-SKIPPED lines, or \"no skip\")")
+      want(ci,    "a filled **CI run:** line with the run id")
+      if (miss != "") printf "    %s: %s\n", file, miss
+    }
+    FNR == 1 { flush(); seen = ""; batch = gate = skips = list = ci = 0; file = FILENAME }
+    { for (i = 1; i <= nh; i++) if ($0 ~ "^## " head[i] "[ \t]*$") seen = seen "|" i "|" }
+    /HERD-SKIPPED/ || /no skip/ { list = 1 }
+    /\*\*Batch:\*\*/  { if ($0 !~ /</) batch = 1 }
+    /\*\*Gate:\*\*/   { if ($0 !~ /</ && $0 ~ hex) gate = 1 }
+    /\*\*Skips:\*\*/  { if ($0 !~ /</) skips = 1 }
+    /\*\*CI run:\*\*/ { if ($0 !~ /</ && ($0 ~ run || $0 ~ /none/)) ci = 1 }
+    END { flush() }
+  ' $landings)
+  [ -z "$bad_landings" ] || note "a landing on or after $landing_from must carry the filled landing record of docs/orchestration/templates/landing.md:
+$bad_landings"
+fi
+
 # A brief kept under history/ names the agent's own worktree. The guard
 # exempts agents by design (docs/orchestration/permissions.md "Live
 # verification"), so nothing but the brief keeps one out of the
