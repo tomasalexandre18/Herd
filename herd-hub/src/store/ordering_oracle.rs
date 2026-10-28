@@ -35,7 +35,7 @@
 //!
 //! **Nothing that was asserted is asserted less.** The three returns D103
 //! rests on are all on the record side, and all three are still required,
-//! for that call as for the other fifteen: the record's `sync_all` returned
+//! for that call as for the other sixteen: the record's `sync_all` returned
 //! before its `rename` was issued, the `rename` returned before the directory
 //! `fsync` was issued, and the directory `fsync` returned before the **first
 //! byte** of the event line was issued. Step A removed a syscall that
@@ -90,7 +90,7 @@ use herd_proto::{JobOutcome, Step as ProtoStep};
 /// source so that a new writer cannot be added without someone deciding
 /// whether the oracle has to cover it — which is the only way a list written
 /// by hand stays complete.
-const RECORD_WRITE_SITES: usize = 13;
+const RECORD_WRITE_SITES: usize = 14;
 
 /// How many `self.append_event(` call sites `store.rs` holds — the appenders
 /// that **wait for the disk**. Same rule.
@@ -378,7 +378,7 @@ fn carried(path: &str, data: &[u8]) -> herd_proto::JobOutputs {
 /// **The oracle.** Every store call that writes a record, appends an event,
 /// or both, driven once, with the order asserted after each one.
 ///
-/// One test and not fifteen, deliberately: the observation point is a
+/// One test and not seventeen, deliberately: the observation point is a
 /// process-wide recording, the fixture is one job carried through its whole
 /// life, and a call's trace means nothing without the state the calls before
 /// it left. The `what` string names the transition in every failure.
@@ -631,6 +631,24 @@ fn every_transition_fsyncs_the_record_and_its_directory_before_appending_its_eve
         },
     );
 
+    // --- 17. the bytes arrive again (store.rs `readmit_to_the_budget`) ---
+    // The mark step 16 left, cleared: a collection whose bytes are back in
+    // `files/` is the sweeper's again (ORCH-124). Called under its own name,
+    // as `evict` is, because reaching it through a chunk would make the
+    // fixture about the streamed carriage instead. **One record write and no
+    // event line**: the `outputs_removed` line step 16 appended stays true —
+    // the bytes were removed that day — and `JobEventKind` may not grow a
+    // variant without making `events.jsonl` undecodable to an earlier hub.
+    oracle.transition(
+        "readmit_to_the_budget — an evicted collection is countable again",
+        &[Part::Record],
+        || {
+            store
+                .readmit_to_the_budget(&id)
+                .expect("the mark is cleared");
+        },
+    );
+
     drop(watch);
 
     // The record and the history agree at the end, which is the state D103
@@ -663,14 +681,23 @@ fn every_transition_fsyncs_the_record_and_its_directory_before_appending_its_eve
         .expect("the record reads")
         .expect("there is one");
     assert!(record.state.is_terminal());
-    assert!(record.outputs.removed.is_some());
+    // Step 16 took the bytes and step 17 put the collection back into the
+    // budget's accounting, so the live mark is gone while the history still
+    // carries the line that says the bytes went (ORCH-124).
+    assert!(record.outputs.removed.is_none());
+    assert!(
+        events
+            .iter()
+            .any(|event| matches!(&event.what, crate::job::JobEventKind::OutputsRemoved { .. })),
+        "the eviction is not on the history: {events:#?}"
+    );
 }
 
 /// The list above is complete only while `store.rs` has the writers it had
 /// when it was written.
 ///
 /// This is a **tripwire, not a proof**: it counts the call sites in the source
-/// text. A fourteenth `write_record` or a twelfth event appender makes it red,
+/// text. A fifteenth `write_record` or a twelfth event appender makes it red,
 /// and whoever added it then decides whether the oracle has to cover it. It
 /// cannot tell a covered site from an uncovered one, and a site renamed or
 /// reached through a new helper would slip past it — which is why it carries

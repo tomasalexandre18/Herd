@@ -9410,3 +9410,157 @@ so that a figure nobody agreed to does not become a promise by sitting
 silently in a constant. **Alexa may overturn it**; if he does, the entry
 stays and a later one says so, because a number is an identifier and
 decisions.md is append-only (D148).
+
+---
+
+## 2026-10-28 — D185 Bytes landing again re-admit an evicted collection
+
+**What is decided.** The `removed` mark an eviction leaves on a job's record
+is the **live state of its collection**, not a verdict on the job.
+`write_output_chunk` clears it at the rename that puts a whole, verified file
+back into `files/` — before the bytes are counted — and the sweeper may take
+the collection a second time.
+
+**What was broken, proved red first.** `write_output_chunk` never read
+`record.outputs.removed`. Bytes renamed into `files/` after an eviction
+therefore sat under a live mark, and from then on **nothing could ever free
+them**: `sweep_now` measures them (`directory_bytes` of `files/` is non-zero),
+then refuses them because the mark is set, and adds them to `could_not_free`.
+The budget shrinks by that collection for ever, and — worse than the
+shrinking — the sweeper destroys the collections it *can* take in their place.
+The hub also tells its operator something false, in these words: *"nothing
+more may be removed: … belongs to collections that are still arriving or whose
+records will not read"*. The collection is neither.
+
+**The reachable path is a race, and it is not a runner re-sending.** This
+must be written down, because the obvious story is the wrong one.
+`files_may_land` (`herd-hub/src/server.rs`) already refuses a chunk for a
+marked collection, citing D152 and the refill/sweep loop it avoids, and the
+runner side matches it on purpose: `offer_swept_collections` re-offers a
+swept spool at every join and `the_hub_has_said_what_it_is_owed` drops the
+spool on that silence, while `collections_owed` skips a removed collection so
+the hub never asks. So a runner's re-sent bytes do **not** reach
+`write_output_chunk` today. What this closes instead: `files_may_land` reads
+the record **with no lock held**, and `write_output_chunk` reads it again and
+only takes the store lock inside `held_more`. A sweep that evicts between
+that check and the rename leaves a refilled `files/` under a live mark —
+permanently unfreeable before this change. It needs a chunk completing a file
+at the instant a sweep lands on the same job, so it is narrow; on a hub near
+its budget, with a sweep per completing collection, it is not negligible. The
+other writer of output bytes, `record_outputs` (the inline carriage), never
+had the blind spot: it rebuilds `outputs` with `removed: None`.
+
+**Both layers are kept, and that is deliberate** (Alexa, 2026-10-28). The
+server goes on refusing bytes for an evicted collection at the link edge, and
+the store would re-admit them if they ever arrived. This is not an oversight
+and not a half-applied decision: it is defence in depth over a budget whose
+failure mode is silent and permanent. The store is made honest about any
+bytes that reach the disk by whatever route — today the race, tomorrow a
+route nobody has thought of — without changing what a runner is told, which
+is D152's reasoning and would need its own red test on the link path.
+
+**What it is not.** Re-admission writes **no `events.jsonl` line**:
+`JobEventKind` is `#[serde(tag = "event")]` with no `#[serde(other)]` arm, so
+a new variant makes the file undecodable to a hub rolled back (D181, guarded
+by `announced_job_ceiling.rs`). The `outputs_removed` line already on the
+history stays true — the bytes *were* removed that day — and the live state is
+the record's mark. It does not move `updated_at`, so re-admission is not a
+second chance at the retention floor, and it does not go through
+`open_for_writing`, for the reason `note_outputs_fetched` does not: the one
+gate refuses every write to a job that is over, and this is the hub writing
+down what became of the record's own files, not a frame about the job.
+
+**Alternative rejected.** Leaving the mark and teaching the sweeper to delete
+marked-but-non-empty directories. It would free the bytes but keep a record
+that says "removed" over a collection the hub had served, and it puts the
+repair in the sweeper — the one place that runs when the disk is already
+tight — instead of at the write that caused it.
+
+**Not claimed.** This does not explain a hub sitting at 107 GB. The consumer
+confirmed on 2026-10-28 that they have **never** seen the "nothing more may be
+removed" line, which is consistent with the race being narrow and with
+`files_may_land` holding the common path shut. Anyone attributing disk growth
+to this entry should look elsewhere first.
+
+**Reversibility.** High. One private method, one call site before `held_more`,
+and the oracle's step 17; `RECORD_WRITE_SITES` moves 13 → 14.
+
+**On the number.** This entry is D185, allocated at the integration of the
+two-branch product batch, with D186 after it. D143, D154 and D170 stay gaps
+(D148): D170 was held by PR #67, closed unmerged as obsolete, and no PR was
+open at this allocation, so none of the three returns to the pool.
+
+---
+
+## 2026-10-28 — D186 A test declares the job slots its runner needs
+
+**What is decided.** A `real_herd` test whose proof needs a runner to hold a
+**second job while the first is still out there** declares it, with
+`real_herd::ROOM_FOR_A_SECOND_JOB` (`--job-memory-max=512MiB`). A test that
+waits on a machine's capacity must state the capacity it needs.
+
+**Why it is not optional politeness.** The ceiling is
+`(lent − floor) / per-job cap` (`herd_runner::jobs_at_once`), the floor is
+`clamp(lent/5, 1 GiB, 8 GiB)`, and the per-job cap is 2 GiB by default. `lent`
+is **not** `MemTotal`: D119 and D79 read the tightest `memory.max`/
+`memory.high` enclosing the runner's cgroup and subtract what that cgroup
+already holds, once, at startup. **Page cache counts in that figure.** So a
+test that leaves the default announces as many slots as the enclosing slice
+happened to have room for at the instant the runner started.
+
+**Measured, on this workstation, 2026-10-28.** Under `/chatons.slice`,
+`memory.high` 18 GiB, the slice holding 13.31 GiB: the runner announced the
+honest remainder of 4.6 GiB, kept 1 GiB as its floor, and held **one** 2 GiB
+job. Three fixtures silently needed two, and spent the full 30 s `PATIENCE`
+waiting for a job the hub was **right** not to claim —
+`a_result_the_hub_cannot_write_is_kept_until_it_can`,
+`a_metal_job_drains_the_build_slot_first_and_no_build_overlaps_it`,
+`a_drain_first_reservation_survives_a_kill_nine_on_either_side`. The threshold
+is exact: two slots need room ≥ 5 GiB, i.e. the slice holding ≤ 13 GiB of its
+18 GiB. An hour later the slice held 11.75 GiB — room 6.25 GiB, two slots —
+and the same unfixed binaries would have passed. That is the whole of the
+"intermittent" behaviour: **not flaky, and not a product defect.**
+
+**The product did everything right, and said so.** It announced less than the
+machine on purpose (D119, so a slice is not OOM-killed while the hub believes
+it was careful), refused to lend more when `--host-memory` asked it to, queued
+the second job, and printed the reason in both logs — *"on the-real-runner, 1
+job(s) already out there and it said it holds at most 1 at once"* and *"this
+runner holds at most 1 job(s) at once"*. The diagnostic was in the failure
+output all along. The defect was the fixtures': three of them depended on an
+undeclared host property and, when the host did not have it, spent `PATIENCE`
+instead of saying so. No product code is touched by this entry.
+
+**Proved both ways, same tree, same minute.** A 1 800 MiB cap gives 2 slots
+and green in 3 s; 1 900 MiB gives 1 slot and red in 61 s. 512 MiB gives 7
+slots and green in 2.2–2.7 s, and the arithmetic yields at least two slots on
+any host that lends a gigabyte above its floor. The precedent for a declared
+fixture is `a_log_survives_twelve_killed_hubs_whole`, which declares
+`--redial-cap 1` the same way.
+
+**Two hypotheses died on measurement, and are kept** (handoff
+`2026-10-28-real-herd-patience-timeouts.md`, *Risks and findings*): memory
+throttling and an IO stall were both refuted — there was no pressure — and the
+`memory.peak` figure dismissed as "just page cache" turned out to be the
+mechanism, read through the wrong lens: not pressure, but the **input to the
+capacity a runner announces**. Each failing test also reproduces alone, at
+`--test-threads=1 --exact`, so nothing about `libtest` parallelism, cargo's
+binary ordering, `flock`, `free_port` or a lost wakeup is involved. A tested
+and dead hypothesis is worth more than a quiet one; neither is to be edited
+out.
+
+**Scope, stated.** Only the three tests red today declare it. The class stays
+open: any `real_herd` test that comes to need two concurrent jobs inherits the
+same silent dependency. Declaring the cap for all ~30 test binaries was
+weighed and refused for now — some of them assert admission figures
+(`admission.rs`, `announced_job_ceiling.rs`) — and the fallback, a
+`job_cap_unless_given` helper beside `cadence_unless_given`, is written down
+for the day the class is closed. The residual risk is named in the constant's
+doc comment: a 512 MiB cap is an `RLIMIT_AS` fallback on a host without cgroup
+delegation, so a test later added to one of these three that needs real memory
+in a job must raise its own cap.
+
+**Reversibility.** High. One constant and one argument in three call sites.
+
+**On the number.** This entry is D186, allocated at the same integration as
+D185 and after it.

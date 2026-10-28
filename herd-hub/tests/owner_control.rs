@@ -1357,6 +1357,11 @@ async fn a_metal_job_drains_the_build_slot_first_and_no_build_overlaps_it() {
             "--no-detect",
             "--probe-interval",
             "150",
+            // The trial has to reach the drain-first judgement *while the
+            // build holds the slot*, so this machine must hold two jobs at
+            // once. Declared, not inherited from the host: see
+            // [`real_herd::ROOM_FOR_A_SECOND_JOB`].
+            real_herd::ROOM_FOR_A_SECOND_JOB,
         ],
     );
     herd.wait_for_runner().await;
@@ -1527,6 +1532,11 @@ async fn a_drain_first_reservation_survives_a_kill_nine_on_either_side() {
         "--no-detect",
         "--probe-interval",
         "150",
+        // The trial has to reach the drain-first judgement *while the build
+        // holds the slot*, so this machine must hold two jobs at once.
+        // Declared, not inherited from the host: see
+        // [`real_herd::ROOM_FOR_A_SECOND_JOB`].
+        real_herd::ROOM_FOR_A_SECOND_JOB,
     ];
     let trial;
     let held_off;

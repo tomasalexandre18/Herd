@@ -154,7 +154,18 @@ async fn a_result_the_hub_cannot_write_is_kept_until_it_can() {
 
     let herd = Herd::new();
     let mut hub = herd.start_hub("first").await;
-    let mut runner = herd.start_runner();
+    // The sibling submission further down has to be claimed **while this
+    // job's outcome cannot be written**, and a job whose outcome the hub
+    // cannot record is a job the hub still counts as out there — rightly. So
+    // this runner has to hold two at once, which is a figure the test
+    // declares rather than one it hopes the host will lend: see
+    // [`real_herd::ROOM_FOR_A_SECOND_JOB`].
+    let mut runner = herd.start_runner_with(
+        "the-real-runner",
+        "runner",
+        "runner",
+        &[real_herd::ROOM_FOR_A_SECOND_JOB],
+    );
     herd.wait_for_runner().await;
 
     let job = herd.submit("printf 'working\\n'; sleep 1; exit 3").await;
