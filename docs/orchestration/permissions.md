@@ -2,8 +2,12 @@
 
 Claude Code 2.1.303. "Enforced" means the tool call is refused by the
 harness or a hook; "contractual" means only the text forbids it and the
-review of traces catches it. Nothing here weakens a gate: CI, the PR
-template's Evidence, D27, branch protection and D161 are unchanged.
+review of traces catches it. Nothing here weakens a gate, and since
+2026-10-28 it no longer credits this project with a gate it does not
+have: the pull request left the loop by Alexa's word, so
+`scripts/gate.sh` and `scripts/githooks/pre-push` are what stand in
+front of `main`. Branch protection is measured in the next section
+rather than assumed. D27 and D161 are unchanged.
 
 ## Why it is a hook and not a deny rule
 
@@ -21,6 +25,94 @@ The orchestrator runs with `--permission-mode auto`; agents inherit that
 mode whatever their own `permissionMode` says, so the mode is not a lever
 here either.
 
+## What gates `main`, and what protects nothing
+
+Measured on 2026-10-28, not assumed. Branch protection on `main`, from
+`gh api repos/tomasalexandre18/herd/branches/main/protection` (an
+extract of the one JSON line it returns; the full output is in
+`history/2026-10-28-method-permissions-truth.md`):
+
+```json
+"required_status_checks": {"strict": false, "contexts": ["check","docs"]},
+"required_pull_request_reviews": {"required_approving_review_count": 0},
+"enforce_admins": {"enabled": false},
+"allow_force_pushes": {"enabled": false},
+"allow_deletions": {"enabled": false},
+"lock_branch": {"enabled": false}
+```
+
+and the credential that pushes, from
+`gh api repos/tomasalexandre18/herd --jq .permissions`:
+
+```json
+{"admin":true,"maintain":true,"pull":true,"push":true,"triage":true}
+```
+
+`gh api repos/tomasalexandre18/herd/rules/branches/main` returns `[]`:
+there is no ruleset, so classic branch protection is the whole of it.
+
+Read together: **`enforce_admins` is false and we push as a repository
+admin, so not one of those rules binds us.** `allow_force_pushes: false`
+and `allow_deletions: false` buy nothing against our own credential
+while `enforce_admins` stays false, and `required_status_checks` gates a
+merge button nobody presses any more. This was not tested by
+force-pushing `main`: the settings are read, the admin exemption is
+GitHub's documented behaviour, and the experiment is one nobody in this
+project is allowed to run.
+
+What gates `main` is therefore local, and nothing else:
+
+- `scripts/gate.sh` — the one command a landing depends on. Only
+  `gate: GREEN` authorises a push, and a green run leaves a receipt
+  named for the sha it ran on.
+- `scripts/githooks/pre-push` — refuses a push to `main` whose gated
+  commit (the second parent of the `--no-ff` merge being pushed) no green
+  receipt covers, a tip commit carrying no filled landing record, a
+  deletion and a history rewrite. It runs only where `core.hooksPath`
+  points at `scripts/githooks`, and `git push --no-verify` bypasses it
+  entirely. The contract forbids `--no-verify`; the machine does not.
+- One consequence worth stating before somebody meets it: the hook also
+  refuses a landing whose merge **changed the tree** —
+  `git diff <gated> <tip>` not empty — because the receipt would then
+  cover a tree other than the one being pushed. `main` moving under the
+  merge produces exactly that, so *one merger at a time* has stopped
+  being good manners and become load-bearing for this guard. The message
+  reads "the merge changed the tree" and it is a correct refusal, not a
+  false one. The instruction itself lives in
+  `docs/orchestration/workflow.md`.
+- the **landing record** on the tip commit. Its permanence is
+  contractual, not kept by a server: with the pull request gone there is
+  no other record of why a batch landed. The hook checks the record's
+  shape, never its truthfulness.
+
+### `core.hooksPath`: one repository-wide setting, named as an exception
+
+`git -C /mnt/ssd_980/herd-project config core.hooksPath scripts/githooks`
+was run on 2026-10-28 and now sits in
+`/mnt/ssd_980/herd-project/.git/config`. Worktrees added from that
+checkout share that file, so the one command arms all 88 of them: this
+is repository-wide setup, not a duty each worktree repeats. Making it
+per worktree would need `extensions.worktreeConfig`, which is unset and
+not worth setting — one repository-wide value matches how we work, and
+without the extension `--worktree` is refused outright in a repository
+with several working trees (measured, git 2.54.0; with a single working
+tree it silently means `--local`).
+
+Two things the setting does not give us. It **replaces** `.git/hooks`
+rather than adding to it, and the path resolves inside whichever
+worktree runs: in a checkout that does not have `scripts/githooks/` yet
+— the orchestrator's, which sits on `main` — it runs nothing and
+silences `.git/hooks` as well. That is inert rather than harmful only
+because this repository keeps no git hooks of its own (`.git/hooks/`
+held 14 `.sample` files and nothing else when the setting was made); it
+becomes live when the batch carrying `scripts/githooks/` lands. And a
+fresh `git clone` carries no config at all — `.git/config` is not in the
+repository and never will be — so installing the hook is a duty on
+whoever makes a working copy, not a property of the repository.
+`./scripts/githooks/pre-push --check-install` answers for the worktree
+it is run in, and it answers about the *config*: it cannot see whether
+the directory the config names is there.
+
 ## Matrix
 
 | Actor | Action | Wanted | Enforced by | Verified |
@@ -33,17 +125,18 @@ here either.
 | orchestrator | `sed -i`, `perl -i`, redirection or `tee` into a repository path, `cp/mv/rm/touch/mkdir/install` into its checkout | refused | same hook | synthetic |
 | orchestrator | a redirection to a *relative* path while its shell stands in the checkout, or `cd <checkout path> && … > file` | refused | same hook; the target is resolved against `cwd` | synthetic |
 | orchestrator | `Edit`/`Write` on a path that reaches the checkout through `..` (`…/.claude/worktrees/../../docs/x.md`, `/tmp/..<root>/docs/x.md`) | refused | same hook; `.` and `..` are resolved before the path is matched | synthetic |
-| orchestrator | `git -c x commit`, `/usr/bin/git commit`, `sh -c '…'`, `python -c` writing a file, a redirection whose target starts with a shell variable (`> "$F"`) | **not refused** | contractual only: the regex is best effort (the official documentation says Bash rules are not a security boundary) | synthetic (documented bypass) |
+| orchestrator | a global option in front of the verb: `git -C <dir> <verb>`, `--git-dir`, `--work-tree`, `--exec-path`, `--namespace`, `--bare`, `--no-pager`, `-P`, and since 2026-10-28 `-c key=val` and `--config-env=key=var` | refused | same hook; the global options are stripped before the git rules run, so the verb is matched wherever it sits. The two config forms were a documented bypass until 2026-10-28 and were closed when the pull request left the loop (Alexa) | synthetic |
+| orchestrator | `/usr/bin/git commit`, `sh -c '…'`, `python -c` writing a file, a verb built up in a shell variable, an alias, a redirection whose target starts with a shell variable (`> "$F"`) | **not refused** | contractual only: the regex is best effort (the official documentation says Bash rules are not a security boundary). `/usr/bin/git` stays open on purpose: it is a path and not an option, and a rule on every absolute path to every git on the host buys less than it costs | synthetic (documented bypass) |
 | orchestrator | reading, `git log/diff/status`, `gh pr view/checks`, `check-docs.sh`, `git worktree add` | allowed | hook lets it through | synthetic |
 | any agent (`agent_id` present) | everything above | allowed by the hook; bounded by its role file | contractual (role text, brief, diff review by the merger) | — |
 | `herd-planner`, `herd-reviewer` | `Edit`, `NotebookEdit`, `Agent` | removed | frontmatter `disallowedTools` (removes the whole tool) | live V7 |
 | `herd-planner`, `herd-reviewer` | `Write` outside their one handoff file | refused | contractual | — |
 | `herd-step`, `herd-merger` | `Agent` (re-delegation) | removed | frontmatter `disallowedTools` | live V2 |
-| `herd-step` | `main`, PR, tag, release, other worktrees | refused | contractual; branch protection makes a push to `main` fail on GitHub's side | live V2 |
-| `herd-merger` | merge with a red check or an empty Evidence block | refused | branch protection requires green `check` and `docs`; the Evidence part is contractual. A green, evidenced PR is merged under Alexa's standing authorisation (ORCH-001, 2026-10-24) | live V4 |
-| `herd-merger` | push a tag with the version PR | refused | contractual (Alexa's word per release act); `orchestrator-guard.sh` does not apply to agents | live V4 |
+| `herd-step` | a push to `main`, a tag, a release, another agent's worktree | refused | contractual, plus `scripts/githooks/pre-push`, which refuses a push to `main` with no green `scripts/gate.sh` receipt for the sha and no filled landing record. Branch protection does **not** make it fail on GitHub's side: `enforce_admins` is false and the credential is an admin (see above). `--no-verify` bypasses the hook | live V2 |
+| `herd-merger` | land a batch on a red gate, or with an empty landing record | refused | `scripts/gate.sh` (only `gate: GREEN` writes a receipt) and `scripts/githooks/pre-push` (a receipt for the sha pushed, the landing record's four fields and seven sections). The record's *truthfulness* stays contractual: the hook checks its shape. Landing is the merger's under Alexa's standing authorisation (ORCH-001, 2026-10-24) | live V4 |
+| `herd-merger` | push a tag with the version batch | refused | contractual (Alexa's word per release act); `orchestrator-guard.sh` does not apply to agents | live V4 |
 | `herd-release` | `git tag`, tag push, `gh release`, `gh workflow run`, `gh api …dispatches`, docker, systemctl, ssh, sudo | refused | frontmatter hook `release-guard.sh` | synthetic; live V10 |
-| anyone | `--no-verify`, force-push, red merge | refused | branch protection (force-push and deletion blocked; `check` and `docs` required); `--no-verify` contractual | GitHub API read 2026-10-24 |
+| anyone | `--no-verify`, a force-push to `main`, a deletion of `main`, landing on a red gate | refused | **contractual, and locally only.** `scripts/githooks/pre-push` refuses a deletion, a non-fast-forward push and a push with no green receipt — where it is installed. `--no-verify` and `git -c core.hooksPath= push` bypass it. GitHub refuses none of it: `enforce_admins: false` plus an admin credential means `allow_force_pushes: false` and `allow_deletions: false` protect nothing against us | GitHub API read 2026-10-28 (quoted above); hook cases in `check-orchestration.sh` |
 | anyone | the consumer's instance, `/etc/nixos`, containers | refused | contractual (D161); the shared `CLAUDE_CONFIG_DIR` currently *allows* sudo for chatOnS's session — ORCH-030 | — |
 
 ## Disabling and false positives
@@ -92,4 +185,6 @@ PR #70 is still open, no tag was created (checked with `git ls-remote`).
 Limits of these runs: `--allowedTools` granted Bash/Read/Write/Edit without
 prompts, as the orchestrator's `auto` mode would; the Alexa messages in V5
 were simulated; the guard is observed on 2.1.303 only and fails open by
-design.
+design. All of them ran while the pull request was still the landing
+path, so where one of them shows `main` untouched it shows the contract
+being kept, never branch protection enforcing anything.
