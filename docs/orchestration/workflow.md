@@ -9,8 +9,8 @@ owes before it stops. `CLAUDE.md` is the contract; this is the procedure.
 |---|---|---|
 | orchestrator (main session) | receives the goal, reads the board, picks agents, writes briefs, reads evidence, asks Alexa one question at a time, reports in French | edit a repository file, commit, merge, resolve a conflict, tag, release, declare a skip a pass, report an agent's claim unverified |
 | `herd-planner` | analyses a request, lists alternatives and hypotheses to refute, cuts bounded tasks | modify the product, merge, settle an owner decision |
-| `herd-step` | one bounded task on its own branch and worktree, with the gates the task needs, evidence and a handoff; pushes the branch | leave its write paths, push to `main`, touch another agent's worktree, or the running instance |
-| `herd-merger` | integrates a batch of branches, one at a time onto one integration branch: conflicts, the local gate, D-number allocation, board and status update, then the landing record and the merge itself under standing authorisation ORCH-001 — today one PR for the batch and its merge, and once the local lane is in force one `--no-ff` merge commit on `main` and one push | bypass a gate, move `main` on a red check, decide a specification or invariant change, operate Herd |
+| `herd-step` | one bounded task on its own branch and worktree, with the gates the task needs, evidence and a handoff; pushes the branch | open a pull request, leave its write paths, touch `main`, touch another agent's worktree, or the running instance |
+| `herd-merger` | integrates a batch of branches, one at a time onto one integration branch: conflicts, the local gate, D-number allocation, board and status update, then the landing record and **one** `--no-ff` merge commit on `main` with that record as its message, pushed once under standing authorisation ORCH-001 | open a pull request, bypass a gate, push `main` without a green gate for that exact sha, decide a specification or invariant change, operate Herd |
 | `herd-release` | prepares a release: checklist, version, body, evidence; simulation only until Alexa orders a tag | tag, push a tag, publish, deploy, land its own branch |
 | `herd-reviewer` | adversarial review of a plan, a rule change, a permission change or an unresolvable conflict; lists missing evidence and adverse cases | edit anything, replace the owner |
 
@@ -34,13 +34,12 @@ What is technically enforced and what is only written is in
    before the push — and the output quoted in the handoff is that run's:
    a handoff is itself a docs file, so a gate run before it was written
    tested a different tree, and under one landing per batch one ungated
-   handoff reddens the whole batch's run, CI's today and the gate's
-   later, where it blocks every other branch in it. **Then** the branch
-   is pushed. **An agent opens no pull request** (*One landing per
-   batch*): the branch and the handoff are the delivery. Once
-   `scripts/githooks/pre-push` exists, a worktree also gets
+   handoff reddens the whole batch's gate run, where it blocks every
+   other branch in it. **Then** the branch is pushed. **Nobody opens a
+   pull request** (*One landing per batch*): the branch and the handoff
+   are the delivery. A worktree also gets
    `git config core.hooksPath scripts/githooks` when it is created, so
-   that the repository's own hooks apply in it.
+   that `scripts/githooks/pre-push` applies in it.
 5. **Verify.** The orchestrator reads the diff, the gate output and the
    handoff. It reruns a read-only check when a claim matters. It never
    fixes what it finds; it sends it back or opens a new task.
@@ -53,15 +52,15 @@ What is technically enforced and what is only written is in
    resolved in its worktree, `D` numbers allocated once in order
    (`D-NEXT` → next free number, gaps stay), `board.md` and
    `docs/status.md` written once, and the landing record written from
-   `templates/landing.md`. **Today** it then opens **one** pull request
-   for the batch with that record as the body, waits for CI, and merges
-   under ORCH-001 on green `check` and `docs` with the Evidence filled.
-   **Once the local lane is in force** (*What is in force today*) it
-   instead runs `./scripts/gate.sh`, merges `--no-ff` onto `main` in its
-   own worktree with the record as the merge commit message, and pushes
-   `main` once. `main` moves no other way either way. A tag is never
-   part of this step. The rule, what a landing is, what it costs and the
-   three method changes refused with it: *One landing per batch*, below.
+   `templates/landing.md`. It then runs `./scripts/gate.sh` on that
+   branch, merges it `--no-ff` onto `main` in its own worktree with the
+   record as the merge commit message, and pushes `main` **once**:
+   Alexa's standing authorisation (ORCH-001, 2026-10-24, re-granted
+   2026-10-28) covers any landing whose gate is green on the exact sha
+   pushed and whose landing record is filled. `main` moves no other way,
+   and no pull request is opened. A tag is never part of this step. The
+   rule, what a landing is, what it costs, the transition and the three
+   method changes refused with it: *One landing per batch*, below.
 8. **Release.** On Alexa's order, `herd-release` prepares the checklist
    and pushes the `cut-v<version>` branch that bumps the version;
    `herd-merger` lands it, as for any other branch. The tag itself is
@@ -104,41 +103,62 @@ of authors, so a pull request bought review from nobody and cost about
 nine minutes of CI per batch on the critical path (PR run 40562916742,
 8 m 54 s, 2026-10-27).
 
-### What is in force today, and what is proposed
+### Not an option: the obligation, and the transition to it
 
-**In force today, unchanged:** a batch goes through **one pull request**
-and **CI is the gate** — jobs `check` and `docs` green on the pushed
-head, Evidence filled, then the merge under ORCH-001. That is
-`CLAUDE.md`'s *Git and main* and it stays until two things are true:
-the branch protection on `main` is narrowed (*Transition*, below) and
-the question in the next paragraph is answered.
+The objection was raised — a local gate is one machine, and on
+2026-10-28 this one could not produce a green run at all — and Alexa
+answered it. Verbatim, 2026-10-28: *"que l'on soit clair, l'abandon des
+PR et CI Github n'est pas une option, mais une obligation."* So the
+method above **is the rule**, `CLAUDE.md` carries it, and the red suite
+is a problem to solve rather than a reason to wait. What follows is a
+dated transition, not a condition in the contract: when the last step is
+done this subsection goes, and nothing above it changes.
 
-**Proposed, pending ORCH-nnn (decision D-A):** the merge condition
-becomes a green `./scripts/gate.sh` for the exact sha being pushed plus
-a filled landing record, with no pull request anywhere. **Alexa's grant
-is not what is in doubt** — he re-granted ORCH-001 on 2026-10-28 in the
-words quoted above. What is in doubt is **whether a green `gate.sh`
-means anything yet**, and two measurements of 2026-10-28, both made by
-the agent that built the gate, are why:
+**The order, so that nobody improvises it:**
 
-- **A full-workspace run at rest on this workstation came back RED.**
-  Three `real_herd` 30 s timeouts —
-  `a_result_the_hub_cannot_write_is_kept_until_it_can`,
-  `a_drain_first_reservation_survives_a_kill_nine_on_either_side`,
-  `a_metal_job_drains_the_build_slot_first_and_no_build_overlaps_it` —
-  and all three **pass when their targets are run alone** (18 passed and
-  20 passed at lower load). The suite self-inflicts enough contention to
-  break its own 30 s waits, so "green locally" is not yet a property of
-  the tree rather than of the moment.
-- **The gate measures a cgroup slice, not a host**, which is in *What
-  the local merge costs* below with the figures.
+1. **One last pull request carries the whole method change**, so that
+   the method is verified by the thing it replaces before that thing is
+   removed. `herd-merger` assembles it; its body is the landing record,
+   filled from `templates/landing.md` as for any landing. It is the last
+   pull request this project opens, and
+   `.github/pull_request_template.md` is what any pull request still
+   open was written from.
+2. **The branch protection on `main` is narrowed:**
+   `required_pull_request_reviews` and `required_status_checks` dropped,
+   `allow_force_pushes: false` and `allow_deletions: false` **kept**.
+   Alexa has authorised an agent to do it; it is a separate task and it
+   is not in this one. **It is a tidying step and not a safety one:**
+   `enforce_admins` is false and our only push credential is a
+   repository admin, so GitHub does not in fact refuse a direct push to
+   `main` today (*What the local merge costs* has the measurement).
+   Nothing but step 4's own preconditions keeps the order.
+3. **`ci.yml`'s `pull_request:` trigger and
+   `.github/pull_request_template.md` go.** `release.yml` and
+   `release-dev.yml` are **never** deleted: a release needs them (D162),
+   and *What the local merge costs* says what else GitHub keeps doing.
+4. **The first local landing**, which is also the first use of the
+   method on something other than itself. Two things must be true
+   before it, besides the defect below: `scripts/githooks/pre-push` is
+   in the tree, and the worktree that pushes was created with
+   `git config core.hooksPath scripts/githooks`. Without both there is
+   **no mechanism at all** in front of `main` — the branch protection
+   never bound our own credential (*What the local merge costs*) — and
+   the *Unchanged* paragraph above would be promising a guarantee that
+   does not exist.
 
-Everything else in this section — the landing record as the audit
-trail, one landing per batch, the one-to-one chain from batch to push to
-merge commit to post-push run — is adopted and does **not** depend on
-that condition. Where the text below says "the gate", today that is CI
-on the batch's pull request and tomorrow it is `gate.sh`; the
-*Transition* bullet says what has to happen in between.
+**The one thing step 4 waits on, with an owner.** A green `gate.sh` is
+**currently unobtainable on this host**: a full-workspace run at rest
+fails reproducibly — three times out of three — on three `real_herd`
+30 s timeouts,
+`a_result_the_hub_cannot_write_is_kept_until_it_can`,
+`a_drain_first_reservation_survives_a_kill_nine_on_either_side` and
+`a_metal_job_drains_the_build_slot_first_and_no_build_overlaps_it`, each
+of which **passes when its target is run alone**. Memory contention and
+IO contention have both been **refuted by measurement**, so this is a
+**product defect**, not a property of the workstation, and an agent is
+hunting it as of 2026-10-28. The rule does not bend around it and the
+gate is not relaxed to accommodate it: the defect is fixed, and then the
+first landing happens.
 
 ### What a landing is
 
@@ -162,28 +182,53 @@ thing a second machine would ever have said about its own landing.
   attributable to a known merge commit rather than to a blur. It
   resolves the conflicts once, allocates the `D` numbers once in order,
   and writes the board once.
-- **The gate, proposed and pending ORCH-nnn: `./scripts/gate.sh`, green
-  on the exact sha that is pushed.** It runs the steps of the `check`
-  and `docs` CI jobs, in the same order, on this workstation, and leaves
-  a receipt named for the sha; a receipt for another sha is not a gate
-  run for this one. **Today the gate is still CI on the batch's pull
-  request.** What `gate.sh` does not cover is below, in *What the local
-  merge costs*, and it is the reason this one bullet waits.
+- **The gate is `./scripts/gate.sh`, green on the exact sha that is
+  pushed.** It runs the steps of the `check` and `docs` CI jobs, in the
+  same order, on this workstation, and leaves a receipt named for the
+  sha; a receipt for another sha is not a gate run for this one. What it
+  does not cover is below, in *What the local merge costs*, and those
+  are known limitations of the method, not open questions about it.
 - **The landing record is the merge commit message**, filled from
   `docs/orchestration/templates/landing.md`: the batch, each branch with
   its `ORCH-nnn` and its handoff path, the gate verdict, what was left
   out, what was recorded. `git log --merges main` is the audit trail; it
-  needs no network and no GitHub account, and it cannot be rewritten
-  after the fact, because force-push to `main` stays refused
-  server-side. A pull request body could be edited silently, a merge
-  commit message cannot — this is the one part of the change that makes
-  the record stronger rather than weaker.
-- **The verbatim output stays in files in the repository**, as before:
-  each branch's handoff under `docs/orchestration/history/`, and the
-  merger's own `<date>-merge-<batch>.md` carrying the full `gate.sh`
-  output file and the skip list. They land in the same push as the merge
-  commit, so the record and its evidence arrive together and a reader
-  who was not there needs one `git show`.
+  needs no network and no GitHub account. **Its permanence is
+  contractual, not mechanical, and the difference matters**: a pull
+  request body can be edited silently, and a merge commit message can be
+  replaced by a force-push. Nothing on GitHub's side stops us doing
+  that — measured 2026-10-28, and the measurement is in *What the local
+  merge costs* — so what keeps the record is that we forbid rewriting it
+  and that `scripts/githooks/pre-push` refuses a push that would. The
+  record is better than a pull request body because it is attached to
+  the thing it documents and reads with no network, not because a server
+  protects it.
+- **No docs gate can check the record itself, and this will surprise
+  somebody.** `check-docs.sh` and `check-orchestration.sh` can only ever
+  see the record's **copy in the handoff**, never the real merge commit
+  message: `check-orchestration.sh` builds each of its corpora by
+  copying the tracked files **without `.git`**, so no case it runs has a
+  commit to read. A green docs gate therefore says the handoff carries a
+  filled record and says **nothing** about what `git log -1 --format=%B`
+  on `main` actually holds. Only `scripts/githooks/pre-push` is in a
+  position to compare the two, because it runs in a real repository at
+  push time. Until it does, that comparison is a human's.
+- **The handoffs land in the same push as the merge commit**, so the
+  record and the per-branch evidence arrive together and a reader who
+  was not there needs one `git show`: each branch's handoff under
+  `docs/orchestration/history/`, and the merger's own
+  `<date>-merge-<batch>.md`.
+- **The gate's own output cannot land with them, and saying otherwise
+  would be a lie about the order.** The gate must run on the tree that
+  is pushed, so nothing can be added to that tree afterwards — not the
+  gate's output file, not its verdict, not the post-push run id. The
+  merger therefore writes and commits its handoff **before** the gate,
+  with its *Gates* section naming the receipt `gate.sh` will write for
+  that exact sha; the verbatim output goes to the receipt and to the
+  merger's report, and the **next** landing is what carries it into the
+  repository if it is wanted there. Same for the post-push run id: the
+  handoff and the report get it, and the next landing's board edit
+  records it. Two pushes for one batch is the one thing this section
+  forbids, and no bookkeeping is worth it.
 - The batch is **everything ready when the merger starts**, not a fixed
   count. That is the orchestrator's call, recorded here so that it is not
   re-litigated.
@@ -200,33 +245,34 @@ thing a second machine would ever have said about its own landing.
   danger was therefore not a hurried conflict resolution but a board
   merge nobody had to read, and a silent revert with nothing to resolve
   is caught by this check and by nothing else. It takes a minute.
-- **The post-push run is recorded, then read.** `herd-merger` puts its
-  id in its handoff and in the board row **immediately after the push**
-  and does not wait for the verdict — that wait is the nine minutes this
-  change exists to stop paying. It may choose to wait when it judges a
-  landing risky, and it says which it did. The next session start reads
+- **The post-push run is recorded, then read.** Immediately after the
+  push, `herd-merger` puts its id in its **report** to the orchestrator
+  and in its handoff's *Resume point*; the board gets it at the **next**
+  landing, for the reason in the bullet above. It does not wait for the
+  verdict — that wait is the nine minutes this change exists to stop
+  paying — unless it judges a landing risky, and it says which it did.
+  The next session start reads
   `gh run list --workflow ci.yml --branch main --limit 5` after the
-  board and the last handoff, and a `failure` becomes an `ORCH-nnn` row
+  board and the last handoff, and a `failure` becomes a new board row
   before any new work is briefed. No automatic GitHub issue: issues are
   Alexa's.
-- **Transition, and it is not ours to skip.** Two things gate it, in
-  this order. First, GitHub still requires a pull request on `main`
-  (`required_pull_request_reviews`, plus the required contexts `check`
-  and `docs`), so until that branch protection is narrowed — Alexa's
-  act — a push to `main` is refused by the server, not by us. Second,
-  ORCH-nnn: what a green `gate.sh` proves. Until both, the pull request
-  lane above is the one in force, and this change itself lands through
-  it. Any pull request still open when the lane closes is closed naming
-  the landing that replaces it, and its branch stays.
+- **Getting here from where we are** is four dated steps, in order, and
+  nobody improvises them: *Not an option*, below. Any pull request still
+  open when the last of them is done is closed naming the landing that
+  replaces it, and its branch stays.
 
-**Unchanged.** Never `--no-verify` — once the local lane is in force it
-is what bypasses `scripts/githooks/pre-push`, the only mechanism that
-will then stand in front of `main` — never force-push, never a red
-landing, never `--admin`. One integration at a time: a batch **is** one
-integration,
-larger. A tag and a release stay Alexa's word, one act at a time. The
-orchestrator still never merges or pushes, and that one is still
-enforced from outside the text, by `orchestrator-guard.sh`.
+**Unchanged.** Never `--no-verify` — it is what bypasses
+`scripts/githooks/pre-push`, the only mechanism standing in front of
+`main` — never force-push, never a red landing, never `--admin`. One
+integration at a time: a batch **is** one integration, larger. A tag
+and a release stay Alexa's word, one act at a time. The orchestrator
+still never merges or pushes, and that one is **contractual**:
+`orchestrator-guard.sh` denies `git merge` to the main session but was
+probed on 2026-10-28 and lets `git -C <dir> merge` and
+`git -C <dir> push origin main` through, so it is a guard with a known
+hole and not an enforcement. The hole is given to the agent writing the
+push guard; until that lands, nothing outside this sentence stops the
+orchestrator pushing, and the orchestrator does not push.
 
 **The three refusals of 2026-10-27, with their dates.** A refusal of
 Alexa's is history, not a draft: one of these was adopted the next day
@@ -237,9 +283,10 @@ and is marked, not deleted.
   minutes. Working out which tests a change affects costs more than it
   saves at that size, and is sometimes wrong.
 - **Making this workstation's local run the gate. ADOPTED 2026-10-28**
-  (ORCH-120, Alexa's words above) — **adopted in principle and not yet
-  in force**: what a green local run proves is ORCH-nnn, and *What is in
-  force today* says why. The reasoning that refused it on
+  (ORCH-120, Alexa's words above), and reaffirmed the same day as an
+  obligation rather than an option — *Not an option*, below, carries
+  those words and the one defect its first use waits on. The reasoning
+  that refused it on
   2026-10-27 stands below as it was written, with its two factual errors
   marked where they occur, because what changed is the facts it rested
   on and not the judgement:
@@ -257,7 +304,10 @@ and is marked, not deleted.
   The sequence it named arrived: ORCH-069 landed (PR #102) and ORCH-107
   landed (batch 4), which is what put the question on the board as
   ORCH-120 rather than leaving it closed. **The suite is no longer red
-  here for host reasons**, and the skip figures were wrong — **12 here
+  here for host reasons** — which is not the same as green: a
+  full-workspace run at rest was red on 2026-10-28 and that defect is
+  *Not an option*'s one blocker — and the skip figures were wrong —
+  **12 here
   at rest, 14 here under load** (`flood-fifty` and `flood-two-fifty`
   skip themselves above a one-minute load of 8), against **14 on CI**,
   measured (ORCH-116, run 40538722315). The *"15 on CI"* came from run
@@ -281,8 +331,14 @@ and is marked, not deleted.
 
 ## What the local merge costs
 
-Here and not only in a handoff, because every one of these is something
-the method no longer does for us and somebody now has to.
+**These are known limitations of the method we are adopting, not open
+questions about whether to adopt it** — that was settled on 2026-10-28
+(*Not an option*). Each one is something the method no longer does for
+us and somebody now has to, and each is written here rather than in a
+handoff nobody re-reads. Two of them were measured the day the method
+was adopted and corrected a claim the plan had made in our favour; they
+are kept in the corrected form, because a limitation we can name is
+cheaper than one we meet later.
 
 - **The second host leaves the critical path.** A green landing used to
   mean two machines agreed. It will mean one machine agreed and the
@@ -317,8 +373,34 @@ the method no longer does for us and somebody now has to.
   `scripts/githooks/pre-push` is bypassed by `--no-verify` and a written
   contract can be misread. We have no self-hosted remote and therefore
   no server-side hook available, so this loss is structural, not an
-  oversight. What survives server-side is the force-push and deletion
-  protection on `main`, kept deliberately.
+  oversight.
+- **The server-side protection we thought we were keeping does not bind
+  us (measured 2026-10-28).** The branch protection on `main` is real,
+  and `enforce_admins` is **false** while the project's only push
+  credential (`gh auth git-credential`) is a repository admin:
+
+  ```
+  $ gh api repos/:owner/:repo/branches/main/protection
+  "required_status_checks": {"contexts":["check","docs"]},
+  "required_pull_request_reviews": {"required_approving_review_count":0},
+  "enforce_admins": {"enabled": false},
+  "allow_force_pushes": {"enabled": false},
+  "allow_deletions": {"enabled": false}
+  $ gh api user --jq .login
+  tomasalexandre18
+  $ gh api repos/:owner/:repo --jq .permissions
+  {"admin":true,"maintain":true,"pull":true,"push":true,"triage":true}
+  ```
+
+  So `allow_force_pushes: false` and `allow_deletions: false` hold
+  against everyone **except** the account that would do the pushing.
+  Every sentence in this project that said `main`'s history is "refused
+  server-side" was wrong, and they are rewritten rather than quietly
+  dropped. Turning `enforce_admins` on would make them true and is
+  Alexa's act; until then the protection of `main`'s history is the
+  contract plus `scripts/githooks/pre-push`, which is a client-side hook
+  that `--no-verify` bypasses. This is the honest shape of the biggest
+  loss above, not a separate one.
 - **Alexa loses the URL he could open before it landed — by his own
   choice, 2026-10-28.** He was asked whether rule changes (`CLAUDE.md`,
   the invariants, `.claude/`, a release cut) should keep a pull request
@@ -329,13 +411,16 @@ the method no longer does for us and somebody now has to.
   the mitigation is only that the orchestrator names the integration
   branch and the landing record in its report, so that `git show` is one
   command away.
-- **A post-push run on `main` has never once been read.** Run
+- **A post-push run on `main` has never once been read, which is the
+  argument for the reading duties and not against the method.** Run
   40439537929 is the proof: a red `check` on `main` on 2026-10-27, after
   the merge of PR #91, and it appears in neither `board.md` nor
-  `docs/status.md`. We are promoting an unread signal to a safety net.
-  The mitigation is three duties and no mechanism — the merger records
-  the run id, the next session reads the verdict, a failure becomes an
-  `ORCH-nnn` row.
+  `docs/status.md`. It went unread while the pull request gate was in
+  front of it, so removing that gate does not create the problem — it
+  removes the cushion that made ignoring it survivable. The mitigation
+  is three duties and no mechanism, and they are duties precisely
+  because nothing enforces them: the merger records the run id, the next
+  session reads the verdict, a failure becomes an `ORCH-nnn` row.
 - **Review ergonomics.** No diff view, no inline comment, no
   `gh pr checks --watch`. `herd-reviewer` already writes a file and the
   orchestrator already reads `git diff`, so this one falls on Alexa and
@@ -345,7 +430,8 @@ the method no longer does for us and somebody now has to.
   change and stays: the release factory (`release.yml` — the static
   musl binaries, the hub image archive, the two version numbers an
   operator asks for: D162, D168), the hotfix lane (`release-dev.yml`,
-  D172), the force-push and deletion protection on `main`, the push
+  D172), the force-push and deletion protection on `main` (which binds
+  everyone but our own admin credential, above), the push
   credential (`origin` is an `https://` remote whose helper is
   `gh auth git-credential`, so a session with no `gh` login cannot push
   at all), and the only second machine we have.
@@ -372,10 +458,10 @@ was lost.
    `./scripts/bench-preflight.sh` first.
 4. **Fix forward by default.** Revert only when the regression blocks
    other work or a release is pending: `git revert -m 1 <merge-commit>`
-   on a branch, gated locally, landed like any other landing. A revert
-   needs no pull request and never did, and history stays append-only —
-   which is why force-push protection is the one server-side rule we
-   keep.
+   on a branch, gated locally, landed like any other landing — a revert
+   is an ordinary landing and gets no shortcut. History stays
+   append-only because we keep it so and `pre-push` refuses the rest,
+   not because the server refuses it (*What the local merge costs*).
 5. A red `main` **blocks a release**, because D162's artefacts are built
    from it, and does **not** block the next landing unless that landing
    touches the same area. Both halves are written down so that neither
@@ -387,10 +473,11 @@ was lost.
   release (each act singly), GitHub issues, anything on the consumer's
   side. The merge is `herd-merger`'s — Alexa's standing authorisation of
   2026-10-24, verbatim *"non il peux merge par defaut"* (ORCH-001),
-  re-granted 2026-10-28. **In force today:** a CI-green pull request
-  with its Evidence filled. **Proposed, pending ORCH-nnn:** a green
-  `./scripts/gate.sh` for the exact sha plus a filled landing record.
-  Merging or landing a version branch does not publish its release.
+  re-granted 2026-10-28 on the condition that replaced the old one: a
+  green `./scripts/gate.sh` for the exact sha being pushed plus a filled
+  landing record. The old condition — a CI-green pull request with its
+  Evidence filled — is gone with the pull request itself. Landing a
+  version branch does not publish its release.
 - A question for Alexa is one item in the board's *Waiting* section:
   question, recommendation, impact, fallback, date. Work that does not
   depend on it continues. Nobody invents the answer.
@@ -426,23 +513,49 @@ was lost.
 - One `herd-merger` at a time; the board shows which batch it holds. A
   batch is one integration, larger, never several integrations at once.
 - The orchestrator's checkout `/mnt/ssd_980/herd-project` is **stale by
-  construction** — the guard blocks it from fetching — so it is never a
-  source for the current state of `main`: read `origin/main`, in your own
-  worktree or with `git show origin/main:<path>`. Why, and what it cost
-  on 2026-10-27: `templates/brief.md`. It cost again on 2026-10-28: a
-  brief quoted a sentence of `CLAUDE.md` that had not existed since
-  2026-10-27, read from that checkout, which was **217 commits behind
-  `origin/main`** (26 by first parent) and clean. ORCH-031 closed the
-  half where an agent *writes* there; this is the half where the
-  orchestrator *reads* there.
+  construction** — nobody commits there and the guard denies it the
+  `git merge` that would advance it; it is **not** blocked from
+  fetching, which was measured on 2026-10-28 and is a correction to
+  what this bullet used to say — so it is never a source for the current
+  state of `main`: read `origin/main`, in your own worktree or with
+  `git show origin/main:<path>`. Why, and what it cost on 2026-10-27:
+  `templates/brief.md`. It cost again on 2026-10-28: a brief quoted a
+  sentence of `CLAUDE.md` that had not existed since 2026-10-27, read
+  from that checkout, which was **217 commits behind `origin/main`** (26
+  by first parent) and clean. ORCH-031 closed the half where an agent
+  *writes* there; this is the half where the orchestrator *reads* there.
+- **Creating a worktree from that checkout is not a write in the sense
+  of the rule above.** `git worktree add` registers metadata under its
+  `.git/worktrees/` (85 entries on 2026-10-28) and `git fetch` writes
+  `FETCH_HEAD`; every agent's brief asks for both. What is forbidden is
+  changing what that checkout *says*: a commit, an edit, a staged file,
+  a moved branch.
 - **`herd-merger` advances that checkout as the last thing it does**,
-  after its push has succeeded, with `git -C /mnt/ssd_980/herd-project
-  fetch origin` and `merge --ff-only origin/main`. Fast-forward only: a
-  dirty or diverged checkout makes `--ff-only` fail, and then it is
-  reported in the handoff and **left alone** — never `reset --hard`,
-  never `checkout -f`, never `stash`. It is not the merger's to repair,
-  only to advance, and a failure there never fails the landing.
-  **Why the merger and not a hook**, since this is exactly the kind of
+  once `main` has moved. Its safety is in the preconditions, and they
+  are **commands, not prose**, because `--ff-only` does not supply them:
+
+  ```sh
+  d=/mnt/ssd_980/herd-project
+  [ "$(git -C "$d" symbolic-ref --quiet --short HEAD)" = main ] || exit 0
+  [ -z "$(git -C "$d" status --porcelain)" ]                    || exit 0
+  git -C "$d" fetch origin && git -C "$d" merge --ff-only origin/main
+  ```
+
+  Both checks were measured on 2026-10-28 and **both failure modes are
+  real**: a dirty file the incoming commits do not touch is carried
+  straight through by a fast-forward (`Fast-forward`, exit 0, still
+  dirty), and with any branch other than `main` checked out,
+  `git -C "$d" merge --ff-only origin/main` silently fast-forwards
+  **that** branch to `origin/main` while local `main` never moves — so
+  another party's branch pointer is rewritten and a handoff reporting
+  "moved from X to Y" names the wrong ref. `fetch origin main:main` is
+  not a substitute: it refuses while `main` is checked out and moves
+  `main` under a different HEAD when it is not. When either check stops
+  the step, the merger reports it in the handoff and **leaves the
+  checkout alone** — never `reset --hard`, never `checkout -f`, never
+  `stash`. It is not the merger's to repair, only to advance, and a
+  failure there never fails the landing.
+- **Why the merger and not a hook**, since this is exactly the kind of
   thing a later agent will want to improve: a `SubagentStop` hook
   matched on `herd-merger` would work — per-agent hooks are supported
   and this project already uses one, the `PreToolUse` guard in
@@ -450,8 +563,9 @@ was lost.
   **session's own machinery** writes the repository, which is what
   `.claude/hooks/orchestrator-guard.sh` exists to prevent and what
   `CLAUDE.md`'s *Roles* forbids. An agent writing the repository is the
-  normal case and needs no new mechanism and no exception. The
-  privilege stays where the contract already puts it.
+  normal case and needs no new mechanism and no exception. The privilege
+  stays where the contract already puts it, with its conditions beside
+  it in `.claude/agents/herd-merger.md`.
 - Never two agents on the same worktree, scratchpad subdirectory or
   decision entry. When two tasks would touch the same file, the second is
   based on the first's branch.

@@ -42,9 +42,9 @@ with a tag or `--tags`, `gh release create|edit|upload|delete`, any
 consumer's instance (D161). No pull request either: you push
 `cut-v<version>` and hand off, and `herd-merger` integrates it like any
 other branch (*One landing per batch*,
-`docs/orchestration/workflow.md`). Merging or landing a version branch
-is not publishing its release: both stay separate acts, and the tag is
-Alexa's word.
+`docs/orchestration/workflow.md`). Landing a version branch is not
+publishing its release: they stay separate acts, and the tag is Alexa's
+word.
 
 Handoff: `docs/orchestration/history/<date>-release-v<version>.md` from
 the template. Then stop.
