@@ -185,9 +185,9 @@ $ echo $?
 0
 ```
 
-**Two of the seven runs of `check-orchestration.sh` were RED, and they
-are reported red.** Both failures were the same single case, on trees
-whose scripts are byte-identical to `origin/main`:
+**Three of the nine runs of `check-orchestration.sh` were RED, and they
+are reported red.** All three failures were the same single case, on
+trees whose scripts are byte-identical to `origin/main`:
 
 ```
 FAIL  PATH dropped the inherited entries; the guard below needs coreutils
@@ -198,7 +198,7 @@ check-orchestration: 145 passed, 1 failed
 
 **It is not this diff.** `git diff --stat origin/main -- scripts/ ops/
 .claude/hooks/ .claude/settings.json` is empty: this task changed no
-executable file at all, and two of the five green runs were made before
+executable file at all, and two of the six green runs were made before
 any edit of mine.
 
 The case is `scripts/check-orchestration.sh:464`. It sources
@@ -217,17 +217,18 @@ $ printf '%s' "$out" | grep -qF ":$PATH" && echo PRESENT
 PRESENT
 ```
 
-Both red runs happened in shell invocations that also wrote files; all
-five green ones ran the script alone. So the verdict of that case
-depends on how the invoking shell was started, not on the repository.
-All seven outputs are in my scratchpad:
+All three red runs happened in shell invocations that also wrote files;
+all six green ones ran the script alone, including one immediately after
+a red one on the same commit. So the verdict of that case depends on how
+the invoking shell was started, not on the repository. All nine outputs
+are in my scratchpad:
 
 ```
 /mnt/ssd_980/herd/claude/tmp/claude-1002/-mnt-ssd-980-herd-project/3ddf11ac-718a-4231-bc8d-45291a39ef82/scratchpad/method-rules/out/
 ```
 
 No skip: neither script has a skip mechanism and no `HERD-SKIPPED` line
-appears in any of the sixteen outputs.
+appears in any of the outputs.
 
 Whole-script timing of `check-orchestration.sh` on this host: **12 s**
 before my edits, **12-13 s** after. No case was added or removed.
@@ -436,9 +437,10 @@ pending half is the one the board row ORCH-nnn tracks.
    the protection change, because that file is the project's claim about
    what a machine still refuses. *Fallback:* a board row with a date,
    and the file is known-wrong until then.
-4. **A row for the flaky `check-orchestration.sh:464`**, red twice in
-   seven runs on an unchanged tree. *Recommendation:* open it — the case
-   asserts the invoking shell's literal `$PATH` and this script is part
+4. **A row for the flaky `check-orchestration.sh:464`**, red three
+   times in nine runs on an unchanged tree. *Recommendation:* open it —
+   the case asserts the invoking shell's literal `$PATH`, and this
+   script is part
    of the only gate the proposed method gets. *Fallback:* nothing, and
    the next agent spends the time I spent proving it was not its diff.
 5. **Whether ORCH-120's board row is closed by `herd-merger` at
