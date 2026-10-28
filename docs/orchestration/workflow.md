@@ -31,11 +31,18 @@ What is technically enforced and what is only written is in
    from `templates/handoff.md` saved as
    `docs/orchestration/history/<date>-<task>.md` on that branch. **The
    docs gate is the last thing run** — after the handoff is committed,
-   before the push — and the output quoted in the handoff is that run's:
-   a handoff is itself a docs file, so a gate run before it was written
-   tested a different tree, and under one landing per batch one ungated
-   handoff reddens the whole batch's gate run, where it blocks every
-   other branch in it. **Then** the branch is pushed. **Nobody opens a
+   before the push: a handoff is itself a docs file, so a gate run
+   before it was written tested a different tree, and under one landing
+   per batch one ungated handoff reddens the whole batch's gate run,
+   where it blocks every other branch in it. **That last run's output
+   therefore cannot be in the handoff** — the tree it gated is the tree
+   that is pushed, and nothing may be added to it afterwards — so the
+   handoff's *Gates* section **names** that run and where its output
+   went, the verbatim output goes to the agent's report, and the output
+   quoted in the handoff is from the runs made before the commit.
+   `templates/handoff.md` carries the shape, which is the one
+   `.claude/agents/herd-merger.md` step 6 already uses. **Then** the
+   branch is pushed. **Nobody opens a
    pull request** (*One landing per batch*): the branch and the handoff
    are the delivery. An agent sets no git hook of its own:
    `core.hooksPath` is **one repository-wide setting**, not a
@@ -145,16 +152,20 @@ not four because the obvious fourth cannot be done in its own step:**
    Nothing but step 3's own preconditions keeps the order.
 3. **The first local landing**, which is also the first use of the
    method on something other than itself, and which **carries the
-   deletion of `ci.yml`'s `pull_request:` trigger** (see below). **Five
+   deletion of `ci.yml`'s `pull_request:` trigger** (see below). **Six
    things must be true before it**, none of them a pull request, and the
-   fifth is the one that gets forgotten: `scripts/gate.sh` is in the
+   two that get forgotten are the fifth and the sixth:
+   `scripts/gate.sh` is in the
    tree, so that the condition in `CLAUDE.md` can be met at all;
    `docs/orchestration/templates/landing.md` is in the tree, so that the
    record has a shape; `scripts/githooks/pre-push` is in the tree;
    `core.hooksPath` is set on the repository (*Concurrency and host
-   rules*); and **the test fix is on `main`** — branch
+   rules*); **the test fix is on `main`** — branch
    `real-herd-patience-timeouts`, landed in the product batch of
-   2026-10-28. That fifth one is not only about the first landing:
+   2026-10-28; and **this host's expected skip lists are in the tree**,
+   `scripts/expected-skips/local.txt` and
+   `scripts/expected-skips/local-under-load.txt`. That fifth one is not
+   only about the first landing:
    **`gate.sh` runs the full suite**, so until that fix is on `main`
    every `gate.sh` is red and **no landing at all is possible**, this
    one or any later one. The first three are on pushed branches of the
@@ -165,6 +176,20 @@ not four because the obvious fourth cannot be done in its own step:**
    because the branch protection never bound our own credential, and
    the *Unchanged* paragraph above would be promising a guarantee that
    was never created.
+
+   **The sixth is the one that actually blocked everything on the
+   afternoon of 2026-10-28**, and it is not a red gate but no gate:
+   without `scripts/expected-skips/local.txt` the gate **refuses** — no
+   verdict, exit 3, *"produce one with `--bless` after a green suite"* —
+   so there is nothing a landing could rest on. The second file,
+   `local-under-load.txt`, is a **delta over the at-rest list and never a
+   full list**: the two load-gated flood benches and nothing else
+   (`scripts/expected-skips/README.md` documents it that way). The
+   distinction is load-bearing. Blessing a loaded run straight into
+   `local.txt` would put all fourteen names there, and an at-rest run
+   would then be green with a flood bench silently skipped — an
+   assertion nobody checks, reported as a pass, which is the one thing
+   D27 exists to forbid.
 
 **Why the `pull_request:` trigger cannot go in step 1, which is the
 whole reason there are three steps and not four.** `ci.yml` triggers on
@@ -244,6 +269,17 @@ thing a second machine would ever have said about its own landing.
   for this landing. What `gate.sh` does not cover is below, in *What the
   local merge costs*, and those are known limitations of the method, not
   open questions about it.
+- **A green gate does not travel between worktrees**, and *"a green gate
+  for the merge's second parent"* reads like something a branch hands
+  over. It is not. `gate.sh`'s receipt store is **per worktree** —
+  `$HERD_GATE_RECEIPTS`, default `target/herd-gate/`, under a gitignored
+  directory that never leaves the agent's own checkout — so a branch
+  carries no receipt and a gate run in one worktree is invisible to
+  `scripts/githooks/pre-push` running in another. `herd-merger` gates
+  **its own** integration tip, which is what its step 7 says; an agent's
+  own green gate is evidence about its branch and is never the landing's.
+  Nobody copies a receipt in to save a run: the receipt would then name a
+  sha and prove nothing about the tree the merger is pushing.
 - **The landing record is the merge commit message**, filled from
   `docs/orchestration/templates/landing.md`: the batch, each branch with
   its `ORCH-nnn` and its handoff path, the gate verdict, what was left
