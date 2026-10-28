@@ -268,8 +268,33 @@ while read -r local_ref local_sha remote_ref remote_sha; do
   fi
 
   # 2: the tip commit's own message is a filled landing record.
+  # Every read of $msg below is a HERE-STRING, never `printf | reader`.
+  # Under the `pipefail` set at the top of this file that pipe is a race
+  # and not a matter of style: `grep -qxF` exits the moment it matches,
+  # `printf` is then killed by SIGPIPE on the bytes it has left to write,
+  # `pipefail` reports the pipeline as failed, and the section that was
+  # just recognised is recorded as missing -- so this hook refuses a
+  # correct landing and names a section its own diagnostic proves is
+  # there. Two things have to hold, and a landing record of this project
+  # meets both as soon as it passes 4 KiB: the payload must be larger than
+  # the 4 KiB stdio buffer `printf` writes a pipe in, so that it takes
+  # more than one write, and a complete matching line must sit in the
+  # first of those writes, which the `## Section` lines near the top of a
+  # record do. Measured on this host on 2026-10-28, driving this hook with
+  # the ref line on stdin against a correct seven-section record: 6 051
+  # bytes 0/200 at rest and 0/200 at load1 12-16, 62 291 bytes 4/200 at
+  # load1 12-16, 1 045 091 bytes 50/50 at rest, each false refusal naming
+  # only sections lying in the first 4 KiB. A here-string is a temporary
+  # file: no reader can exit early and there is no writer to kill.
+  # `check-orchestration.sh` carries the same rule, and the same mechanism
+  # measured over its own assertions.
+  #
+  # The section loop was the live defect -- it is the one site whose
+  # pipeline status is read. `head -1` and `field_value` discard theirs,
+  # so they were inert; they are here-strings too, so that reading their
+  # status one day cannot bring the defect back.
   msg=$(git log -1 --format=%B "$local_sha") || refuse "cannot read the message of $local_sha."
-  subject=$(printf '%s\n' "$msg" | head -1)
+  subject=$(head -1 <<<"$msg")
   body_lines=$(printf '%s\n' "$msg" | sed '1d' | grep -c '[^[:space:]]' || true)
   if [ -z "${subject//[[:space:]]/}" ]; then
     refuse "the tip commit $local_sha has an empty subject."
@@ -288,11 +313,11 @@ while read -r local_ref local_sha remote_ref remote_sha; do
   fi
   missing=""
   for s in "${sections[@]}"; do
-    printf '%s\n' "$msg" | grep -qxF "## $s" || missing="$missing
+    grep -qxF "## $s" <<<"$msg" || missing="$missing
       missing section: ## $s"
   done
   for f in "${fields[@]}"; do
-    v=$(printf '%s\n' "$msg" | field_value "$f")
+    v=$(field_value "$f" <<<"$msg")
     if [ -z "${v//[[:space:]]/}" ]; then
       missing="$missing
       missing or empty header field: - **$f:**"
