@@ -24,6 +24,29 @@
 #
 # Usage: ./scripts/check-orchestration.sh
 set -uo pipefail
+
+# This script is independent of the stdin it was handed: nothing below reads
+# fd 0, and the redirection makes sure nothing below inherits it either.
+#
+# That is not tidiness. Several captures below run
+# `env -i PATH=... HOME=/wrong/home bash -c ...` to prove a script rebuilds
+# its own environment, and `env -i` strips `__ETC_PROFILE_DONE`. When bash's
+# fd 0 is a *socket*, its isnetconn() check makes it source SYS_BASHRC
+# (/etc/bashrc) although it is not interactive; /etc/bashrc then finds that
+# variable empty, sources /etc/profile and /etc/set-environment, and rebuilds
+# PATH out of the child's own HOME=/wrong/home -- discarding the PATH the
+# case supplied. The assertions then correctly report a PATH and a stub
+# directory that are no longer there, and nothing in the diff is at fault.
+# Measured on this host on 2026-10-28, same tree, same minute: 253 passed /
+# 0 failed with fd 0 on /dev/null, 232 passed / 21 failed with fd 0 on an
+# AF_UNIX socketpair (in-memory; no listening socket, no port, no network).
+#
+# Only a socket arms it: /dev/null, a pipe, a regular file and a closed fd 0
+# are all inert, which is why this went unseen -- the caller chose, and the
+# script had no say. One redirection here covers all 27 captures below and
+# any added later, and it is the convention the product already follows: a
+# runner gives every job Stdio::null() (herd-runner/src/job.rs). ORCH-111.
+exec </dev/null
 root=$(cd "$(dirname "$0")/.." && pwd)
 tmp=$(mktemp -d "${TMPDIR:-/tmp}/herd-orch-check.XXXXXX")
 trap 'rm -rf "$tmp"' EXIT
@@ -1294,6 +1317,54 @@ rm -rf "${pdir:?}" "${prem:?}" "${prec:?}" "${ptrace:?}"
 rm -f "${tmp:?}"/push-good.md "${tmp:?}"/push-oneline.md \
   "${tmp:?}"/push-nosection.md "${tmp:?}"/push-placeholder.md \
   "${tmp:?}"/push-nofield.md "${tmp:?}"/push-longsubject.md
+
+echo "== the gate scripts' own stdin (ORCH-111)"
+# A socket on fd 0 makes bash source SYS_BASHRC non-interactively (its
+# isnetconn() check), and under the `env -i` captures above that rebuilds
+# PATH out of the case's own HOME=/wrong/home, so this script went red for a
+# reason that was never in the diff: 253 passed / 0 failed with fd 0 on
+# /dev/null against 232 passed / 21 failed with fd 0 on an AF_UNIX
+# socketpair, same tree, same minute, measured on 2026-10-28. The fix is one
+# `exec </dev/null` per script, and it needs freezing here because the
+# defect is invisible from a terminal: every fd kind a shell hands out by
+# default is inert, so a run with that line deleted stays green until the
+# day a caller's fd 0 happens to be a socket.
+#
+# Proving the redirection *works* needs a process that can put a socket on
+# fd 0, and this script runs with no toolchain, so that is deliberately not
+# asserted here -- a case that could only ever skip where this runs is not a
+# control. What is asserted is what can be asserted on every host: the line
+# is there, and it comes before the first capture, because a guard placed
+# after the first `env -i` guards nothing.
+guard_first() {
+  # <name> <script> <regex of the first construct that must already be
+  # guarded>: the redirection must appear above that construct.
+  gline=$(grep -n '^exec </dev/null$' "$2" | head -1 | cut -d: -f1)
+  cline=$(grep -nE "$3" "$2" | head -1 | cut -d: -f1)
+  if [ -n "$gline" ] && [ -n "$cline" ] && [ "$gline" -lt "$cline" ]; then
+    ok "$1"
+  else
+    bad "$1" "    exec </dev/null at line ${gline:-none}, first match of
+    /$3/ at line ${cline:-none}"
+  fi
+}
+guard_first \
+  "check-orchestration.sh redirects its stdin before its first capture" \
+  "$root/scripts/check-orchestration.sh" '^[^#]*env -i '
+guard_first "gate.sh redirects its stdin before its first step" \
+  "$root/scripts/gate.sh" '^run_step '
+# pre-push is the one script here that must NOT be guarded: git feeds it the
+# ref list on stdin, and `while read -r ...` over /dev/null iterates zero
+# times. A guarded pre-push would therefore fall straight through to its
+# exit 0 and approve every push to main, refusing nothing and saying nothing.
+if grep -qE '^[[:space:]]*exec[[:space:]]*<[[:space:]]*/dev/null' \
+     "$root/scripts/githooks/pre-push"; then
+  bad "pre-push keeps the stdin git hands it: the ref list is its input" \
+    "    pre-push redirects its own stdin, so its ref-list loop would run
+    zero times and the hook would approve every push to main"
+else
+  ok "pre-push keeps the stdin git hands it: the ref list is its input"
+fi
 echo
 echo "check-orchestration: $pass passed, $fail failed"
 [ "$fail" -eq 0 ]
