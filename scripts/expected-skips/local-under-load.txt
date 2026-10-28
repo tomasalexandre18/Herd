@@ -1,0 +1,22 @@
+# The skips this host additionally cannot make when load1 is above 8.
+# A list and not a count: the gate compares the assertion NAME of each
+# line (the text between the marker and the first colon), and the reason
+# that follows carries a load figure that differs on every run.
+#
+# Measured, not written: ./scripts/gate.sh --bless under deliberate load
+# on 2026-10-28, host=servernixos nproc=12 load1=9.56 at step 0 and 14.91
+# at the end, sha=7403626307a2d3ad621c35656b3742877c12fc4f, suite 257 s,
+# `test suite: PASSED`, 14 HERD-SKIPPED lines. These are the two of those
+# 14 whose names are not in local.txt (12 at rest), so the list grows by
+# exactly the two load-gated flood benches and by nothing else — no
+# cgroup refusal moved, which is what makes the pair readable.
+#
+# Why these two lines were selected from that blessed run rather than
+# written by --bless itself: --bless only ever writes $HERD_GATE_EXPECTED
+# (gate.sh:45, :215-228), so it can write local.txt or a whole-list file,
+# but there is no mode that writes this file. Blessing straight into
+# local.txt from a loaded run would put all 14 there and an at-rest run
+# would then pass with a flood bench silently skipped. The delta is the
+# honest shape, and it is the shape README.md documents.
+HERD-SKIPPED: flood-fifty: the host's one-minute load is Some(14.91), over this bench's ceiling of 8; the host is shared with a production system
+HERD-SKIPPED: flood-two-fifty: the host's one-minute load is Some(14.91), over this bench's ceiling of 8; the host is shared with a production system

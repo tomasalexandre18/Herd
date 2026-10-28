@@ -2,75 +2,78 @@
 
 State now, replaced every session. **What is owed and what Alexa has not
 decided lives in `docs/orchestration/board.md`** (invariant 8). **The first
-consumer operates the running system** (D161, invariant 9): the hub container
-and its volume, the runner units and their data roots, the tokens, the disk,
-the version pins. Ours is what a tag produces.
+consumer operates the running system** (D161, invariant 9): the hub container,
+the runner units, the tokens, the disk, the version pins. Ours is what a tag
+produces.
 
 ## How a change reaches `main`
 
-**No pull request** (**D189**, 2026-10-28): one batch, one `--no-ff` merge
-commit carrying the landing record, one push by `herd-merger`, one post-push
-`ci.yml` run. The condition is a green `./scripts/gate.sh` for the merge's
-**second parent, trees identical**, reading the skip **list** and never the
-count (**D187**); `pre-push` is the only machine in front of `main` (**D188**),
-`enforce_admins` being false against an admin credential. **Still to do:**
-Alexa narrows the branch protection, then the first local landing deletes
-`ci.yml`'s `pull_request:` trigger — the one lane that can. `release.yml` and
-`release-dev.yml` stay (D162, D168, D172).
+**No pull request, and no lane left that could start one** (**D189**). One
+batch, one `--no-ff` merge commit whose message **is** the landing record, one
+push by `herd-merger`, one post-push `ci.yml` run that is then **read**. The
+condition is a green `./scripts/gate.sh` for the merge's **second parent, with
+an identical tree**, plus a filled record. **`ci.yml` lost its
+`pull_request:` trigger at the first local landing, 2026-10-28, and runs only
+on a push to `main`** — the last transition step that was ours. Still pending,
+and nothing waits on it: Alexa narrows the branch protection, a tidying step
+and not a safety one. `release.yml` and `release-dev.yml` stay (D162, D168).
+
+**The gate** (**D190**): steps 0 to 8, the middle six one per command `ci.yml`
+runs. It refuses a dirty tree, ends in one verdict naming its sha, and writes
+a receipt **only on GREEN**, which `pre-push` asks about by
+`--verify-receipt`. It compares the skip **list**, never the count (**D187**):
+twelve names at rest here, plus a two-name **delta** list above a load of 8.
+A `--bless` run writes **no** receipt, and the load is read twice (**D191**).
+`pre-push` is the **only** machine in front of `main` (**D188**) — nothing
+server-side binds our admin credential — `core.hooksPath` is absolute now,
+arming all 85 worktrees (ORCH-131), and `--no-verify` is forbidden by contract
+and not by the machine.
 
 ## Releases, and what is in none
 
-**v0.3.7 is the newest** — `3da48f5`, 2026-10-24: v0.3.6 plus a deep queue
-that no longer writes a non-event per queued job per pass (D171); v0.3.6
-carried the bounded reading (D169). v0.3.4 onward are published (D162); a
-**`v*.*.*-dev*` tag** publishes a pre-release (D172). **`main` is 280 commits
-past v0.3.7** on this batch's head, the workspace version still reads `0.3.7`,
-and nothing merged since the tag has shipped. `PROTOCOL_VERSION` is **2**,
-`RECORD_VERSION` **1**.
+**v0.3.7 is the newest** — `3da48f5`, 2026-10-24 (D171); v0.3.4 onward are
+published (D162) and a **`v*.*.*-dev*` tag** publishes a pre-release (D172).
+**`main` is 309 commits past v0.3.7**, the workspace version still
+reads `0.3.7`, and nothing merged since the tag has shipped.
+`PROTOCOL_VERSION` is **2**, `RECORD_VERSION` **1**.
+
+**Fourteen changes are in no release:** nine defects (**D175**-**D178**,
+**D180**-**D182**, **ORCH-094**, **D185**), three new behaviours (**D184**,
+`SIGTERM` stops the hub in five seconds; **ORCH-092**, a runner sweeps its
+output spool at startup; **D194**, `herd-hub report [STATE_DIR]`, a lock-free
+read of a state root printing `r_file`, the kept-byte deciles and the
+record-against-disk gap) and two cost cuts (**D183 step A**, the `waiting`
+event line unsynced; **ORCH-082**, the store's lock no longer spans a read).
 
 ## What is known about the consumer's machines, and when
 
-Nobody here logs into their hosts (D161); a fact about their machines reaches
-us as a report, and each figure below carries the date it reached us.
+Nobody here logs into their hosts (D161); a fact reaches us as a dated report.
+**Their instance is paused**, so more than two heavy agents may run here.
 
 - **Versions, reported 2026-10-24:** their nightly ran on **0.3.5** (D169),
   then **0.3.6** with a full pass (D171). **Whether v0.3.7 reached them is not
   recorded.**
 - **Disk:** about **90 GB across 1 571 jobs** against D152's 200 GB budget,
-  nothing ever evicted (2026-10-23); **125 runner spools holding 65 GB**, under
-  seven days old (2026-10-26). A runner **sweeps `outputs/` at startup**
-  (ORCH-092), re-offers each, and sets aside — never deletes — what no hub
-  claims (**ORCH-108**). **State root `/mnt/ssd_980`, ext4 on NVMe, 983 GB,
-  ~341 free** (2026-10-27, ORCH-076) — shared with this workstation's builds.
-- **The shipped seven-day output floor cannot be kept at their workload at any
-  budget:** it needs **~750 GB** against a **~451 GB** theoretical and ~250 GB
-  practical ceiling (`disk-policy.md` §2.4); whether the default stays or drops
-  is **ORCH-105**, with Alexa.
-- Herd is their only path: a job it cannot run fails their build; long jobs,
-  KVM and exclusive `rig-cpu` worked on 2026-10-23.
+  nothing ever evicted (2026-10-23); **125 runner spools holding 65 GB** under
+  seven days old (2026-10-26). State root `/mnt/ssd_980`, ext4 on NVMe,
+  **~339 GB free** (2026-10-28, ORCH-076).
+- **The seven-day output floor cannot be kept at their workload at any
+  budget:** ~750 GB needed against a ~451 GB ceiling (**ORCH-105**, Alexa's).
+  **`r_file` is unmeasured on the volume that decides it** (**ORCH-145**).
 
 ## What `main` carries
 
 M1-M11, M15 and M16; protocol version 2; a job may return 1 GiB by default
-(`confine.rs:82`). **A skip count is per host and per load** (D27, ORCH-070,
-ORCH-107): **12** here at rest, **14** under load, **14** on CI — compare the
-**list**, not the number (**D187**); D151's 13 is unreproducible (`05`).
+(`confine.rs:82`). **A skip count is per host and per load** (D27): **12**
+here at rest, **14** under load, **14** on CI — the **list** decides (D187).
 
-**The suite is green here: 839 passed, 0 failed, 12 skipped at rest**, every
-skip a cgroup-delegation refusal; the same tree gave **14** at load 13.62 an
-hour earlier, `flood-fifty` and `flood-two-fifty` being load-gated at a ceiling
-of 8 — the split above, measured twice in a day. **D179** still reports an
-incomplete run's skips as a floor; the 21 at load 19 stays **unexplained**.
-
-**Thirteen changes are in no release:** nine defects (**D175**-**D178**,
-**D180**-**D182**, **ORCH-094**, **D185**), two new behaviours (**D184**,
-`SIGTERM` stops the hub in five seconds, non-zero on overrun; **ORCH-092**, a
-runner sweeps its output spool at startup) and two cost cuts (**D183 step A**,
-the `waiting` event line alone unsynced, 3.10 → 2.10 ms; **ORCH-082**, the
-store's lock no longer spans a record read, eight readers ×8.49 → ×1.71).
-Each is one dated entry in `docs/decisions.md`. `docs/remediation/` holds
-fifteen pieces: the baseline, audits A and B with their review, two
-experiments with theirs, and `06`-`13` (**D183**).
+**The suite is green here at rest: 0 failed, 12 skipped, `test suite:
+PASSED`**, every skip the same cgroup v2 delegation this host does not grant;
+the two extra under load are `flood-fifty` and `flood-two-fifty`, which read
+the load themselves. `check-orchestration.sh` is at **256 passed, 0 failed**.
+**`main` went red once on a post-push run** (`40720983497`, `7eb9585`,
+`announced_job_ceiling.rs:1179`) on content green ten minutes earlier, and was
+deliberately not re-run: **ORCH-119**.
 
 ## What the software still does not do
 
@@ -79,12 +82,9 @@ Each is a board row, which holds its owner and next step.
 1. **The reaper's janitor list is unbuilt** (D134): a failing `up` leaves
    workspaces behind and Herd records only that `down` failed (ORCH-012).
 2. **A requirement reading still weighs nothing** — no memory, no tmpfs
-   (`matcher.rs:421`). Nothing ever deletes a job directory (ORCH-021);
-   **~94 % of a `T` walk is per-record CPU** (ORCH-123, a hypothesis); **what a
-   runner lends is a startup snapshot** never revised as its cgroup empties,
-   and nobody is told (**ORCH-126**).
+   (`matcher.rs:421`); nothing ever deletes a job directory (ORCH-021); what a
+   runner lends is a startup snapshot never revised (**ORCH-126**).
 3. **M11's pack half does not exist**, with no frame on either protocol enum,
    so E-12 and E-17 are undelivered (ORCH-020).
-4. **M17's second machine is prepared, not joined**, **one shared token**
-   serves every requester, and **three tests are known unstable** (D149;
-   ORCH-013, -014, -022).
+4. **M17's second machine is prepared, not joined**, one shared token serves
+   every requester, three tests are known unstable (D149; ORCH-013, -014).

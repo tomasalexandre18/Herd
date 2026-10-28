@@ -3,7 +3,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
-use clap::Parser;
+use clap::{Parser, Subcommand};
 use herd_hub::{
     Authority, Budget, Hub, JobDirStore, JobStore, Policy, Stickiness, Stop, StopSignals,
     AGING_STEP, DEFAULT_LISTEN_ADDR, DRAIN_FIRST_LIMIT, LOST_AFTER, OUTPUT_BUDGET, OUTPUT_FLOOR,
@@ -181,6 +181,49 @@ struct Args {
     /// off: everything is then evictable by the order alone.
     #[arg(long, env = "HERD_OUTPUT_FLOOR", default_value_t = OUTPUT_FLOOR.as_secs_f64())]
     output_floor: f64,
+    /// What this binary does instead of serving. Left out, it serves, which
+    /// is every existing invocation unchanged.
+    #[command(subcommand)]
+    command: Option<Command>,
+}
+
+/// The one thing this binary does that is not serving.
+///
+/// **Why it is a subcommand of the hub and not of `herdctl`** (ORCH-125).
+/// `herdctl` is a requester: everything it does goes over the WebSocket
+/// protocol, and giving it this would mean a new message, which means a
+/// `PROTOCOL_VERSION` bump on a version that is frozen at 2. It is also the
+/// wrong machine — a requester runs anywhere, and this reads a directory
+/// that exists on one host. The hub binary is already in the consumer's
+/// image, so `docker compose exec hub herd-hub report` needs no new image,
+/// no new entrypoint and no port: the operator who runs the hub can run
+/// this against the live root, which is the only way its figures ever reach
+/// this project (D161, invariant 9).
+///
+/// A subcommand rather than a flag on the serving path, because every one
+/// of the options above is about serving and none of them means anything
+/// here. A `--report` flag would have to be documented as ignoring
+/// seventeen others.
+#[derive(Debug, Subcommand)]
+enum Command {
+    /// Print what a state root holds, serve nothing, and exit.
+    ///
+    /// Three figures: the file-level deduplication ratio over the records,
+    /// per-job output size by decile, and what the records claim against
+    /// what the directories measure. It is safe against a running hub — it
+    /// takes no lock, writes nothing, and reads no output or log byte — and
+    /// what it prints is a point-in-time snapshot, which it says itself.
+    Report {
+        /// The state root to read. The same directory the serving hub is
+        /// given, so `HERD_STATE_DIR` alone is enough inside the hub's own
+        /// container.
+        #[arg(
+            env = "HERD_STATE_DIR",
+            default_value = DEFAULT_STATE_DIR,
+            value_name = "STATE_DIR",
+        )]
+        state_dir: PathBuf,
+    },
 }
 
 /// The shared requester token, from the file the operator named (Q8).
@@ -220,6 +263,16 @@ async fn main() -> Result<()> {
     // buffered and acted on the instant the serving loop begins.
     let signals = StopSignals::listen();
     let args = Args::parse();
+    // Before the budget is parsed and long before the state root is opened,
+    // because opening it takes the `flock` on `hub.lock` and sweeps: a report
+    // that did either would be a report nobody may run against the hub that
+    // is serving (ORCH-125).
+    if let Some(Command::Report { state_dir }) = &args.command {
+        let report = herd_hub::StateRootReport::read(state_dir)
+            .with_context(|| format!("reading the state root {}", state_dir.display()))?;
+        print!("{report}");
+        return Ok(());
+    }
     // Read before the state root is opened, because opening it sweeps: a
     // budget that does not parse must stop the hub here, where the message
     // names the figure the operator typed, and not after bytes have gone.
@@ -366,5 +419,37 @@ async fn main() -> Result<()> {
              the queue at this hub's depth takes longer to judge than the bound allows."
         ),
         Stop::ListenerFailed(error) => Err(error),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// clap's own check of the derive, plus the two invocations that have to
+    /// keep meaning what they mean.
+    ///
+    /// The first matters most: adding a subcommand to a binary that had none
+    /// must leave every existing invocation of it alone, because the
+    /// consumer's compose file is one of them.
+    #[test]
+    fn the_command_line_is_well_formed_and_the_serving_hub_is_unchanged() {
+        use clap::CommandFactory;
+        Args::command().debug_assert();
+
+        let serving = Args::parse_from(["herd-hub", "--state-dir", "/srv/herd-state"]);
+        assert!(
+            serving.command.is_none(),
+            "no subcommand is still the serving hub"
+        );
+        assert_eq!(serving.state_dir, PathBuf::from("/srv/herd-state"));
+
+        let reporting = Args::parse_from(["herd-hub", "report", "/srv/herd-state"]);
+        match reporting.command {
+            Some(Command::Report { state_dir }) => {
+                assert_eq!(state_dir, PathBuf::from("/srv/herd-state"));
+            }
+            other => panic!("`report` did not parse as itself: {other:?}"),
+        }
     }
 }

@@ -4,10 +4,28 @@ Saved as `docs/orchestration/history/<YYYY-MM-DD>-<task>.md` on the task's
 branch by the agent that did the work. One file per task; never append to
 another task's file.
 
-The docs gate is the **last thing run** — after this file is committed,
-before the push — and the output under *Gates* is that run's: a handoff
-is itself a docs file, so a gate run before it was written tested a
-different tree.
+The gate is the **last thing run** — after this file is committed, before
+the push — because a handoff is itself a docs file and a gate run made
+before it was written tested a different tree. **So the output of that
+last run cannot be in this file**, and the two sentences this paragraph
+used to carry ("the last thing run" and "the output under *Gates* is
+that run's") could not both hold. The resolution is the one
+`.claude/agents/herd-merger.md` step 6 already uses, and it is the same
+for every agent:
+
+- *Gates* **names** the run that is about to happen on the committed
+  tree — the command, and where its output will be: the log or receipt
+  path for `./scripts/gate.sh`, the output file for
+  `./scripts/check-docs.sh`.
+- The **verbatim output goes to the agent's report** and to that file,
+  not into the tree it has just gated. Nothing is added to the tree
+  afterwards, and a second commit to carry the output would need a
+  second gate run.
+- Output quoted in *Gates* is from the runs made **before** this file
+  was committed — the Rust gates and any earlier docs run, which is most
+  of the evidence — and it says which run each block came from.
+- A red last run is reported red, in the agent's report, and the branch
+  is not pushed.
 
 `herd-merger`'s own handoff, named `<YYYY-MM-DD>-merge-<batch>.md`, carries
 one more thing: the filled landing record of `templates/landing.md`, which
@@ -31,8 +49,10 @@ is the merge commit's message and the audit trail of the push to `main`.
 <each item with its reason; "nothing" if none>
 
 ## Gates
-<verbatim output, or "check-docs.sh: docs ok; Rust gates NOT RUN
-locally (prose only), CI runs them">
+<verbatim output of the runs made before this commit, or "check-docs.sh:
+docs ok; Rust gates NOT RUN locally (prose only), CI runs them">
+<the last run, named and not quoted: the command, and the log or receipt
+path its output goes to; the output itself is in the agent's report>
 <skips, each one named; "no skip" if none>
 
 ## Risks and findings
