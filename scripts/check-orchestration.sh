@@ -1,9 +1,12 @@
 #!/usr/bin/env bash
 # Tests of the organisation's own controls: check-docs.sh must go red on
 # each defect it claims to catch (a control only ever seen green is not
-# known to work), and the two guard hooks must block what they claim and
-# let legitimate inspection through. Runs on a scratch copy; the repository
-# is never modified. No toolchain needed.
+# known to work), the two guard hooks must block what they claim and let
+# legitimate inspection through, and scripts/gate.sh -- the local gate a
+# landing depends on -- must go red on every way a local run can lie. Runs
+# on a scratch copy; the repository is never modified. No toolchain needed:
+# the gate section stubs nix, cargo and the suite, so the gate's own logic
+# is what is under test and not the toolchain.
 #
 # Cost: each expect_red/expect_green runs check-docs.sh over a fresh full
 # copy of the real repository -- 32 whole-corpus runs as this file stands.
@@ -511,6 +514,202 @@ mv "$tmp/creds-aside" "$sandroot/claude/config/.credentials.json"
 grep -qE 'oauth_token|ghp_|github_pat_' "$root/ops/agents/env.sh" "$root/ops/agents/session.sh" \
   && bad "a credential appears in ops/agents (invariant 7)" "" \
   || ok "ops/agents names paths only, never a token (invariant 7)"
+
+echo "== gate.sh: the local gate, red on each way a local run can lie"
+# A gate only ever seen green is not known to work. Every case below runs the
+# real scripts/gate.sh in a scratch repository whose steps are stubs, so the
+# gate's own logic — not the toolchain — is what is under test.
+gatedir="$tmp/gate"
+gate_fresh() {
+  rm -rf "$gatedir" "$tmp/gate-receipts"
+  mkdir -p "$gatedir/scripts/expected-skips" "$gatedir/bin" "$tmp/gate-receipts"
+  cp "$root/scripts/gate.sh" "$gatedir/scripts/gate.sh"
+  for s in check-docs.sh check-orchestration.sh; do
+    printf '#!/usr/bin/env bash\necho "%s stub ok"\nexit "${HERD_STUB_DOCS:-0}"\n' "$s" \
+      > "$gatedir/scripts/$s"
+  done
+  cat > "$gatedir/scripts/report-skips.sh" <<'EOS'
+#!/usr/bin/env bash
+grep -h '^HERD-SKIPPED: ' "$1" | sort -u
+exit 0
+EOS
+  cat > "$gatedir/scripts/test.sh" <<'EOS'
+#!/usr/bin/env bash
+[ -n "${HERD_STUB_SKIPS:-}" ] && cat "$HERD_STUB_SKIPS"
+if [ "${HERD_STUB_SUITE:-pass}" != pass ]; then
+  echo "test suite: FAILED (cargo test exited 101)"; exit 101
+fi
+[ "${HERD_STUB_NOPASS:-0}" = 1 ] || echo "test suite: PASSED"
+exit 0
+EOS
+  # A `nix` that is not nix: `flake check` answers, and `develop --command`
+  # runs what it is given. The gate must reach its steps through it.
+  cat > "$gatedir/bin/nix" <<'EOS'
+#!/usr/bin/env bash
+case "$1" in
+  flake) exit "${HERD_STUB_FLAKE:-0}" ;;
+  develop) shift; [ "${1:-}" = --command ] && shift; exec "$@" ;;
+esac
+exit 0
+EOS
+  cat > "$gatedir/bin/cargo" <<'EOS'
+#!/usr/bin/env bash
+case "$1" in
+  fmt) exit "${HERD_STUB_FMT:-0}" ;;
+  clippy) exit "${HERD_STUB_CLIPPY:-0}" ;;
+esac
+exit 0
+EOS
+  chmod +x "$gatedir/scripts/"*.sh "$gatedir/bin/"*
+  (cd "$gatedir" && git init -q . \
+    && git add -A >/dev/null \
+    && git -c user.name=t -c user.email=t@t commit -qm base) >/dev/null
+  # The skip list the stub suite prints, and the expectation it is compared
+  # with, both live OUTSIDE the repository: a case that edited them inside it
+  # would be testing the dirty-tree refusal by accident.
+  printf 'HERD-SKIPPED: a_needs_cgroup_delegation: no delegated subtree here\nHERD-SKIPPED: b_needs_bfq: no device offers bfq\n' > "$tmp/gate-skips"
+  printf '# expectation\nHERD-SKIPPED: a_needs_cgroup_delegation: no delegated subtree here\nHERD-SKIPPED: b_needs_bfq: no device offers bfq\n' > "$tmp/gate-expected"
+  rm -f "$tmp/gate-expected-load"
+}
+# gate_run <extra env...> -- <gate args...>
+gate_run() {
+  env -i PATH="$gatedir/bin:/usr/bin:/bin:$PATH" HOME="$tmp" \
+    HERD_GATE_RECEIPTS="$tmp/gate-receipts" \
+    HERD_GATE_EXPECTED="$tmp/gate-expected" \
+    HERD_GATE_EXPECTED_UNDER_LOAD="$tmp/gate-expected-load" \
+    HERD_STUB_SKIPS="$tmp/gate-skips" \
+    "$@" bash -c "cd '$gatedir' && ./scripts/gate.sh ${GATE_ARGS:-}" 2>&1
+}
+# gate_case <name> <expected exit> <grep pattern> <env...>
+gate_case() {
+  name=$1; want=$2; pat=$3; shift 3
+  out=$(gate_run "$@"); rc=$?
+  if [ "$rc" -eq "$want" ] && printf '%s' "$out" | grep -qE -- "$pat"; then
+    ok "gate: $name"
+  else
+    bad "gate: $name" "    want exit $want matching /$pat/, got exit $rc:
+$(printf '%s\n' "$out" | tail -12 | sed 's/^/    /')"
+  fi
+}
+
+gate_fresh
+gate_case "a clean tree with the expected skip list is GREEN" 0 '^gate: GREEN sha=[0-9a-f]{40} '
+# The verdict names the sha it is about: an authorisation that does not say
+# which commit it covers is not an authorisation (ORCH-001).
+out=$(gate_run); sha=$(cd "$gatedir" && git rev-parse HEAD)
+printf '%s' "$out" | grep -q "gate: GREEN sha=$sha " \
+  && ok "gate: the GREEN verdict names the exact sha" \
+  || bad "gate: the verdict must name the sha" "$(printf '%s\n' "$out" | tail -4)"
+printf '%s' "$out" | grep -qE 'skips=|steps=0-8:ok' \
+  && ok "gate: the verdict is one line and says the steps all ran" \
+  || bad "gate: verdict shape" "$(printf '%s\n' "$out" | tail -4)"
+# One output file, and the verdict is its last line.
+log=$(printf '%s' "$out" | sed -n 's/^log: //p' | tail -1)
+[ -f "$log" ] && [ "$(tail -2 "$log" | head -1 | cut -c1-11)" = "gate: GREEN" ] \
+  && ok "gate: one log file whose end carries the verdict" \
+  || bad "gate: the log must end in the verdict" "    log=$log"
+# Every ci.yml step is named in the log, mapped to its CI job.
+for s in "step 1: check-docs" "step 2: check-orchestration" "step 3: nix flake check" \
+         "step 4: cargo fmt" "step 5: cargo clippy" "step 6: test suite" "step 7: the skips"; do
+  grep -qF "$s" "$log" || bad "gate: the log does not name '$s'" ""
+done
+grep -qF "step 1: check-docs.sh (ci job: docs)" "$log" \
+  && grep -qF "step 5: cargo clippy (ci job: check)" "$log" \
+  && ok "gate: each step names the ci.yml job it stands for" \
+  || bad "gate: the steps do not map onto ci.yml's jobs" ""
+
+# --- red paths ------------------------------------------------------------
+gate_fresh
+gate_case "a red step makes the gate RED and names it" 1 '^gate: RED .*5:cargo-clippy' \
+  HERD_STUB_CLIPPY=1
+gate_fresh
+gate_case "a red docs step makes the gate RED" 1 '^gate: RED .*1:check-docs' \
+  HERD_STUB_DOCS=1
+gate_fresh
+gate_case "a red suite makes the gate RED" 1 '^gate: RED .*6:test-suite' \
+  HERD_STUB_SUITE=red
+gate_fresh
+echo "an uncommitted line" >> "$gatedir/scripts/test.sh"
+gate_case "a dirty tree is refused before anything runs" 3 'working tree is not clean' 
+gate_fresh
+printf 'HERD-SKIPPED: a_needs_cgroup_delegation: no delegated subtree here\nHERD-SKIPPED: b_needs_bfq: no device offers bfq\nHERD-SKIPPED: c_nobody_expected_this: a new reason\n' > "$tmp/gate-skips"
+gate_case "a skip that is not on the expected list is RED" 1 '7:unexpected-skip'
+out=$(gate_run)
+printf '%s' "$out" | grep -qF '+ c_nobody_expected_this' \
+  && ok "gate: the unexpected skip is named, not counted" \
+  || bad "gate: the unexpected skip must be named" "$(printf '%s\n' "$out" | tail -8)"
+# The same run, with the load-conditional list allowing that skip above the
+# load threshold: the gate is GREEN and says which list it applied. This is
+# how the flood benches skipping themselves above load1=8 stays legible
+# without the gate ever reading a count.
+printf 'HERD-SKIPPED: c_nobody_expected_this: a new reason\n' > "$tmp/gate-expected-load"
+gate_case "the load-conditional list allows a load skip above the threshold" 0 \
+  'load-conditional list' HERD_GATE_LOAD_NOTE=0
+gate_case "and below the threshold the same skip is still RED" 1 '7:unexpected-skip' \
+  HERD_GATE_LOAD_NOTE=1000
+# The count moving on its own is not a signal and must not be one.
+gate_fresh
+printf 'HERD-SKIPPED: a_needs_cgroup_delegation: no delegated subtree here\n' > "$tmp/gate-skips"
+gate_case "an expected skip that did not appear is a note, not a failure" 0 \
+  'an expected skip did not appear'
+out=$(gate_run); printf '%s' "$out" | grep -qE 'gate: GREEN' \
+  && ok "gate: a smaller skip list does not turn the gate red (list, not count)" \
+  || bad "gate: a smaller list must stay green with a note" "$(printf '%s\n' "$out" | tail -6)"
+
+# D27 and D179: a run that did not finish is not a run.
+gate_fresh
+gate_case "a suite that never printed PASSED cannot be reported as one" 1 \
+  '6:test-suite-incomplete' HERD_STUB_NOPASS=1
+gate_fresh
+GATE_ARGS=--bless
+gate_case "--bless on a suite that did not pass is refused" 1 \
+  'bless refused' HERD_STUB_SUITE=red
+gate_fresh
+rm -f "$tmp/gate-expected"
+gate_case "--bless after a passing suite adopts the list and is GREEN" 0 \
+  'wrote 2 lines'
+grep -q '^HERD-SKIPPED: a_needs_cgroup_delegation' "$tmp/gate-expected" \
+  && grep -q '^# host=' "$tmp/gate-expected" \
+  && ok "gate: --bless records the host and the load it measured on" \
+  || bad "gate: the blessed list must say where it came from" ""
+GATE_ARGS=""
+gate_fresh
+rm -f "$tmp/gate-expected"
+gate_case "no expected list for this host: refused, not assumed" 3 \
+  'no expected skip list'
+gate_fresh
+gate_case "a load above the ceiling is refused with a retry" 3 \
+  'above the ceiling' HERD_GATE_LOAD_MAX=-1
+
+# --- the receipt: a gate run on another sha proves nothing ----------------
+gate_fresh
+out=$(gate_run); sha=$(cd "$gatedir" && git rev-parse HEAD)
+[ -f "$tmp/gate-receipts/$sha.receipt" ] \
+  && ok "gate: a GREEN run writes a receipt named for its sha" \
+  || bad "gate: no receipt after a green run" "$(ls "$tmp/gate-receipts")"
+verify() { # <expected exit> <sha> <label>
+  env -i PATH="$gatedir/bin:/usr/bin:/bin:$PATH" HOME="$tmp" \
+    HERD_GATE_RECEIPTS="$tmp/gate-receipts" \
+    bash -c "cd '$gatedir' && ./scripts/gate.sh --verify-receipt '$2'" >/dev/null 2>&1
+  rc=$?
+  [ "$rc" -eq "$1" ] && ok "gate: $3" || bad "gate: $3 (exit $rc, wanted $1)" ""
+}
+verify 0 "$sha" "the receipt for the sha that was gated verifies"
+other=0000000000000000000000000000000000000000
+verify 1 "$other" "a receipt for another sha does not satisfy the gate"
+# A receipt file that names a different sha than its own name is refused too:
+# renaming a green receipt must not launder another commit.
+cp "$tmp/gate-receipts/$sha.receipt" "$tmp/gate-receipts/$other.receipt"
+verify 1 "$other" "a green receipt renamed onto another sha is refused"
+rm -f "$tmp/gate-receipts/$other.receipt"
+# A red run leaves no receipt at all.
+gate_fresh
+gate_run HERD_STUB_CLIPPY=1 >/dev/null
+sha=$(cd "$gatedir" && git rev-parse HEAD)
+[ ! -f "$tmp/gate-receipts/$sha.receipt" ] \
+  && ok "gate: a RED run writes no receipt" \
+  || bad "gate: a red run must not leave a receipt" ""
+rm -rf "$gatedir" "$tmp/gate-receipts" "$tmp/gate-skips" "$tmp/gate-expected" "$tmp/gate-expected-load"
 echo
 echo "check-orchestration: $pass passed, $fail failed"
 [ "$fail" -eq 0 ]
