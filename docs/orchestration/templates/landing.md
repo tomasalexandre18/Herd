@@ -36,8 +36,8 @@ verbatim output lives in the handoff, under its own fences.
 Land batch <n>: <subject, imperative English, ≤ 72 chars>
 
 - **Batch:** <n>, landed <YYYY-MM-DD> by herd-merger
-- **Gate:** green — ./scripts/gate.sh on <sha>, the exact sha pushed;
-  receipt <path>
+- **Gate:** green — ./scripts/gate.sh on <sha>, this commit's second
+  parent, `git diff --quiet <sha> HEAD` clean; receipt <path>
 - **Skips:** <n>, each named under *Evidence* and printed as a skip
   (D27); "no skip" if none
 - **CI run:** <id> — recorded, not waited on
@@ -56,10 +56,17 @@ A single branch is a batch of one.
 
 ## Evidence
 
-The gate's verdict and the sha it was run on. That sha must be the one
-being pushed: a gate run on another tree proves nothing about this one.
-One verdict block per branch, named for it, plus the batch's own run on
-the merged tree. Claiming it passed is not evidence.
+The gate's verdict and the sha it was run on. That sha is this merge
+commit's **second parent**, and its tree must be identical to the merge's
+(`git diff --quiet <gated sha> <merge sha>`): the merge commit's message
+is this record, so its sha cannot exist before the gate runs, and a
+record demanding a gate on "the sha pushed" permits no landing at all
+(measured 2026-10-28; `CLAUDE.md` *Git and main*, `workflow.md` *What a
+landing is*, `.claude/agents/herd-merger.md` steps 7 and 8). An identical
+tree is what makes the receipt bind: a gate run on another tree proves
+nothing about this one. One verdict block per branch, named for it, plus
+the batch's own run on the merged tree. Claiming it passed is not
+evidence.
 
 Every skip is named and shown as a skip, never counted into a pass (D27,
 invariant 5). A count is not a signal, the list is: paste the
