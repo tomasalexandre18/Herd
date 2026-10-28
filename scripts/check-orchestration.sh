@@ -2,11 +2,17 @@
 # Tests of the organisation's own controls: check-docs.sh must go red on
 # each defect it claims to catch (a control only ever seen green is not
 # known to work), the two guard hooks must block what they claim and let
-# legitimate inspection through, and scripts/gate.sh -- the local gate a
-# landing depends on -- must go red on every way a local run can lie. Runs
-# on a scratch copy; the repository is never modified. No toolchain needed:
-# the gate section stubs nix, cargo and the suite, so the gate's own logic
-# is what is under test and not the toolchain.
+# legitimate inspection through, scripts/gate.sh -- the local gate a
+# landing depends on -- must go red on every way a local run can lie, and
+# scripts/githooks/pre-push -- the last machine between an agent and `main`
+# now that no pull request stands in the way -- must refuse every bad push
+# and slow down no good one. Runs on a scratch copy; the repository is never
+# modified. No toolchain needed: the gate section stubs nix, cargo and the
+# suite, and the pre-push section stubs only the receipts, so each script's
+# own logic is what is under test and not the toolchain.
+#
+# The pre-push section drives real `git push` against a local bare remote in
+# $tmp: no network, no credential, nothing outside $tmp is written.
 #
 # Cost: each expect_red/expect_green runs check-docs.sh over a fresh full
 # copy of the real repository -- 32 whole-corpus runs as this file stands.
@@ -710,6 +716,334 @@ sha=$(cd "$gatedir" && git rev-parse HEAD)
   && ok "gate: a RED run writes no receipt" \
   || bad "gate: a red run must not leave a receipt" ""
 rm -rf "$gatedir" "$tmp/gate-receipts" "$tmp/gate-skips" "$tmp/gate-expected" "$tmp/gate-expected-load"
+
+echo "== orchestrator-guard.sh: a global option must not move the verb out of reach"
+# `git -C <dir> merge` and `git -C <dir> push` passed the guard until
+# 2026-10-28, because every git rule in it matched the verb in first
+# position. The idiom is about to be documented in workflow.md and
+# herd-merger.md for driving another worktree, so it is the bypass certain
+# to be used by accident. The two known bypasses asserted above
+# (`git -c a=b commit`, `/usr/bin/git commit`) are deliberate and stay
+# exactly as they are: closing one of those is a decision, not a side
+# effect of this fix.
+OG="$root/.claude/hooks/orchestrator-guard.sh"
+og() { # <expected exit> <command, JSON-escaped>
+  printf '{"tool_name":"Bash","cwd":"%s","tool_input":{"command":"%s"}}' \
+    "$root" "$2" | "$OG" >/dev/null 2>&1; rc=$?
+  [ "$rc" -eq "$1" ] && ok "guard exit $1: $2" \
+    || bad "guard expected $1 got $rc" "    $2"
+}
+og 2 'git -C /x merge origin/main'
+og 2 'git -C /x push origin main'
+og 2 'git -C /x commit -m hi'
+og 2 'git --git-dir=/x/.git --work-tree=/x commit -m hi'
+og 2 'git --git-dir /x/.git push origin main'
+og 2 'git --work-tree=/x merge origin/main'
+og 2 'git -C \"/a b\" push origin main'
+og 2 'cd /tmp && git -C /x push origin main'
+# Measured, and honest about it: `-c key=val` anywhere in the option list
+# still bypasses, because `-c` is the deliberate bypass and stripping it
+# here would close it by the back door. Nobody types this by accident.
+og 0 'git -C /x -c a=b rebase origin/main'
+# The orchestrator reads constantly, and a guard that blocks reading is a
+# guard that gets switched off. Inspection through -C stays free.
+og 0 'git -C /x fetch origin'
+og 0 'git -C /x status --short'
+og 0 'git -C /x log --oneline -5'
+og 0 'git -C /x diff origin/main --stat'
+og 0 'git --no-pager log -1'
+og 0 'git --git-dir=/x/.git log --oneline -3'
+# Unchanged on purpose: the two documented bypasses keep their verdict.
+og 0 'git -c a=b commit -m hi'
+og 0 '/usr/bin/git commit -m hi'
+# The relative-redirection rule resolves its target now, instead of denying
+# every relative target while the shell stands in the checkout. A write that
+# lands in the checkout is still denied; one that lands outside is the
+# orchestrator writing its own notes and was denied twice in one session.
+og 2 'echo x > a.md'
+og 2 'cd docs && echo x > a.md'
+og 2 'echo x > ./docs/status.md'
+og 0 'echo x > ../../notes.md'
+og 0 'echo x > ~/notes.md'
+og 0 'echo x > /tmp/claude-1002/x/notes.md'
+# ... and it still fails CLOSED where the target cannot be judged.
+og 2 'echo x > ~someone/notes.md'
+og 2 'tee -a report.md'
+
+echo "== pre-push: the last machine between an agent and main"
+# With pull requests and required status checks gone (2026-10-28), nothing
+# server-side refuses a bad push to `main`: `enforce_admins` is false and
+# the push credential is a repository admin, so even allow_force_pushes:
+# false does not hold against it. This hook is the only mechanism left.
+# A guard only ever seen passing is not known to work, so every case below
+# drives the REAL hook and the REAL scripts/gate.sh in a scratch repository
+# with a local bare remote. Only the receipts are stubs: the receipt rule
+# lives in gate.sh and the hook must be seen asking it, never
+# re-implementing it.
+pdir="$tmp/push"; prem="$tmp/push-remote.git"; prec="$tmp/push-receipts"
+ptrace="$tmp/push-trace"
+pp_record() { # <file>: the landing record, filled, seven sections
+  cat > "$1" <<'EOR'
+Land batch 9: add the push guard and its cases
+
+- **Batch:** 9, landed 2026-10-28 by herd-merger
+- **Gate:** green — ./scripts/gate.sh on the sha pushed; receipt kept
+- **Skips:** 12, each named under Evidence and printed as a skip (D27)
+- **CI run:** 40600000001 — recorded, not waited on
+
+## What changed and why
+
+Milestone M4. main refuses a push that no gate blessed.
+
+## Branches in this batch
+
+method-push-guard, ORCH-125, docs/orchestration/history/x.md
+
+## Evidence
+
+gate: GREEN steps=0-8:ok, on the sha pushed.
+
+## Left out
+
+The branch protection change, which is a separate act.
+
+## Decisions allocated
+
+D185, the push guard is the last machine before main.
+
+## Board rows
+
+ORCH-125 done.
+
+## CI run
+
+40600000001, recorded, not waited on.
+EOR
+}
+pp_fresh() {
+  rm -rf "${pdir:?}" "${prem:?}" "${prec:?}" "${ptrace:?}"
+  mkdir -p "$pdir/scripts/githooks" "$prec"
+  cp "$root/scripts/gate.sh" "$pdir/scripts/gate.sh"
+  cp "$root/scripts/githooks/pre-push" "$pdir/scripts/githooks/pre-push"
+  chmod +x "$pdir/scripts/gate.sh" "$pdir/scripts/githooks/pre-push"
+  git init -q --bare "$prem" >/dev/null 2>&1
+  (cd "$pdir" && git init -q . \
+    && git config core.hooksPath scripts/githooks \
+    && git config user.name t && git config user.email t@t \
+    && git remote add origin "$prem" \
+    && echo base > file.txt && git add -A \
+    && git commit -qm "base") >/dev/null 2>&1
+}
+# A gate.sh that records what it was asked before delegating to the real
+# one: two properties are then measured rather than believed -- the hook
+# asks about the sha on its stdin, and it does not consult the gate at all
+# for a ref that is not main.
+pp_trace_gate() {
+  mv "$pdir/scripts/gate.sh" "$pdir/scripts/gate-real.sh"
+  { echo '#!/usr/bin/env bash'
+    printf 'printf "%%s\\n" "$*" >> %s\n' "$ptrace"
+    printf 'exec %s/scripts/gate-real.sh "$@"\n' "$pdir"
+  } > "$pdir/scripts/gate.sh"
+  chmod +x "$pdir/scripts/gate.sh"
+}
+pp_receipt() { # <sha the file is named for> [verdict] [sha written inside]
+  printf 'verdict: %s\nsha: %s\nsteps: 0..8 all ok\n' \
+    "${2:-GREEN}" "${3:-$1}" > "$prec/$1.receipt"
+}
+pp_commit() { # <message file>: a new commit, prints its sha
+  (cd "$pdir" && date -u +%s%N > stamp.txt && git add -A \
+    && git commit -q -F "$1" && git rev-parse HEAD) 2>/dev/null
+}
+pp_push() { # <git push args...>: output in $out, exit in $pp_rc
+  out=$(cd "$pdir" && HERD_GATE_RECEIPTS="$prec" git push "$@" 2>&1); pp_rc=$?
+}
+pp_case() { # <name> <expected exit> <grep pattern> <git push args...>
+  name=$1; want=$2; pat=$3; shift 3
+  pp_push "$@"
+  if [ "$pp_rc" -eq "$want" ] && printf '%s' "$out" | grep -qE -- "$pat"; then
+    ok "pre-push: $name"
+  else
+    bad "pre-push: $name" "    want exit $want matching /$pat/, got exit $pp_rc:
+$(printf '%s\n' "$out" | sed 's/^/    /' | head -10)"
+  fi
+}
+
+pp_record "$tmp/push-good.md"
+
+# --- the receipt: rule 1, and it is gate.sh's rule, not the hook's --------
+pp_fresh
+sha=$(pp_commit "$tmp/push-good.md")
+pp_case "main with no receipt at all is refused" 1 \
+  'no green gate receipt for the sha being pushed' origin "HEAD:refs/heads/main"
+pp_receipt 0000000000000000000000000000000000000000
+pp_case "a receipt for another sha does not authorise this one" 1 \
+  'no green gate receipt' origin "HEAD:refs/heads/main"
+pp_receipt "$sha" RED
+pp_case "a RED receipt for this sha is refused" 1 \
+  'is not GREEN' origin "HEAD:refs/heads/main"
+# A green receipt renamed onto this sha: the file's own `sha:` field
+# disagrees with its name, and gate.sh is what notices.
+pp_receipt 0000000000000000000000000000000000000000 GREEN \
+  0000000000000000000000000000000000000000
+cp "$prec/0000000000000000000000000000000000000000.receipt" "$prec/$sha.receipt"
+pp_case "a GREEN receipt renamed onto this sha is refused" 1 \
+  'does not name' origin "HEAD:refs/heads/main"
+
+# --- the landing record: rule 2, the gap nothing else can close -----------
+# check-orchestration.sh copies the corpus without .git, so no docs rule can
+# ever read a commit message. A merger who fills the handoff and pushes a
+# one-line merge commit is stopped here or nowhere.
+pp_fresh
+printf 'Land batch 9: a one-line merge commit\n' > "$tmp/push-oneline.md"
+sha=$(pp_commit "$tmp/push-oneline.md"); pp_receipt "$sha"
+pp_case "a one-line tip message is refused even with a green receipt" 1 \
+  'has a one-line message' origin "HEAD:refs/heads/main"
+pp_fresh
+grep -v '^## Left out$' "$tmp/push-good.md" > "$tmp/push-nosection.md"
+sha=$(pp_commit "$tmp/push-nosection.md"); pp_receipt "$sha"
+pp_case "a tip message missing one required section is refused" 1 \
+  'missing section: ## Left out' origin "HEAD:refs/heads/main"
+pp_fresh
+sed 's/^- \*\*CI run:\*\*.*/- **CI run:** <id> — recorded, not waited on/' \
+  "$tmp/push-good.md" > "$tmp/push-placeholder.md"
+sha=$(pp_commit "$tmp/push-placeholder.md"); pp_receipt "$sha"
+pp_case "a header field still carrying its placeholder is refused" 1 \
+  'CI run:\*\* still carries a placeholder: <id>' origin "HEAD:refs/heads/main"
+pp_fresh
+sed '/^- \*\*Skips:\*\*/d' "$tmp/push-good.md" > "$tmp/push-nofield.md"
+sha=$(pp_commit "$tmp/push-nofield.md"); pp_receipt "$sha"
+pp_case "a missing header field is refused and named" 1 \
+  'missing or empty header field: - \*\*Skips:\*\*' origin "HEAD:refs/heads/main"
+pp_fresh
+sed '1s/.*/Land batch 9: a subject deliberately longer than the seventy-two columns the contract allows/' \
+  "$tmp/push-good.md" > "$tmp/push-longsubject.md"
+sha=$(pp_commit "$tmp/push-longsubject.md"); pp_receipt "$sha"
+pp_case "a subject over 72 characters is refused" 1 \
+  'characters, over 72' origin "HEAD:refs/heads/main"
+
+# --- the green path, and it is the one that proves the rest mean something -
+pp_fresh
+pp_trace_gate
+sha=$(pp_commit "$tmp/push-good.md"); pp_receipt "$sha"
+pp_case "a green receipt for this sha plus a filled record lands" 0 \
+  'pre-push: main <- ' origin "HEAD:refs/heads/main"
+[ "$(git --git-dir="$prem" rev-parse refs/heads/main 2>/dev/null)" = "$sha" ] \
+  && ok "pre-push: the green push reached the remote" \
+  || bad "pre-push: the green push did not reach the remote" ""
+grep -qF -- "--verify-receipt $sha" "$ptrace" \
+  && ok "pre-push: the hook asks the gate about the sha on its stdin" \
+  || bad "pre-push: the hook did not ask about that sha" "    $(cat "$ptrace" 2>/dev/null)"
+
+# The sha on stdin, not HEAD at some other moment: HEAD has a green receipt
+# and a filled record, and the commit below it has neither. Pushing that
+# older commit must be refused, naming it.
+pp_fresh
+pp_trace_gate
+sha=$(pp_commit "$tmp/push-good.md"); pp_receipt "$sha"
+base=$(cd "$pdir" && git rev-parse HEAD~1)
+pp_case "pushing a commit that is not HEAD is judged on that commit" 1 \
+  "no green gate receipt for the sha being pushed \($base\)" \
+  origin "$base:refs/heads/main"
+
+# --- every other ref goes through untouched, and stays cheap --------------
+pp_fresh
+pp_trace_gate
+sha=$(pp_commit "$tmp/push-oneline.md")
+pp_push -q origin "HEAD:refs/heads/method-task-x"
+[ "$pp_rc" -eq 0 ] && [ -z "$out" ] \
+  && ok "pre-push: a task branch with no receipt and a one-line message is silent" \
+  || bad "pre-push: a task branch must pass silently" "    exit $pp_rc: $out"
+[ ! -s "$ptrace" ] \
+  && ok "pre-push: a ref that is not main never consults the gate" \
+  || bad "pre-push: the gate was consulted for a task branch" "    $(cat "$ptrace")"
+pp_push -q --force origin "HEAD:refs/heads/method-task-x"
+[ "$pp_rc" -eq 0 ] \
+  && ok "pre-push: force-pushing a task branch is not this hook's business" \
+  || bad "pre-push: a task branch force-push must pass" "    exit $pp_rc: $out"
+
+# --- rules 3 and 4: a rewrite and a deletion of main, whatever else holds -
+# These are the belt, not the braces. GitHub will not refuse them: with
+# enforce_admins false and an admin push credential, allow_force_pushes:
+# false does not apply to the credential this project pushes with.
+pp_fresh
+sha=$(pp_commit "$tmp/push-good.md"); pp_receipt "$sha"
+pp_push origin "HEAD:refs/heads/main"
+[ "$pp_rc" -eq 0 ] || bad "pre-push: the setup push for the rewrite cases failed" "$out"
+# A divergent history, fully gated and fully recorded: only rule 3 can
+# refuse it, which is the point.
+(cd "$pdir" && git reset -q --hard HEAD~1) >/dev/null 2>&1
+alt=$(pp_commit "$tmp/push-good.md"); pp_receipt "$alt"
+pp_case "a force-push that rewrites main is refused, gate and record notwithstanding" 1 \
+  'not a fast-forward' --force origin "HEAD:refs/heads/main"
+# Without --force the same rewrite never reaches the hook: git declines it
+# during the push negotiation, before pre-push runs. Measured, and recorded
+# as such -- the hook's own refusal above is the one that matters, because
+# it is the one --force would otherwise walk past.
+pp_case "the same rewrite without --force is refused, by git before the hook" 1 \
+  '(non-fast-forward|not a fast-forward)' origin "HEAD:refs/heads/main"
+pp_case "deleting main is refused" 1 \
+  'this push deletes main' origin ":refs/heads/main"
+pp_case "deleting main by --delete is refused too" 1 \
+  'this push deletes main' --delete origin main
+[ -n "$(git --git-dir="$prem" rev-parse --verify -q refs/heads/main)" ] \
+  && ok "pre-push: main still exists on the remote after both refusals" \
+  || bad "pre-push: main was deleted on the remote" ""
+
+# A remote tip this repository has never seen: the hook cannot tell a
+# fast-forward from a rewrite, so it refuses and says to fetch rather than
+# guessing. A second clone that never fetched is how that happens.
+pdir2="$tmp/push-other"
+rm -rf "${pdir2:?}"
+mkdir -p "$pdir2/scripts/githooks"
+cp "$root/scripts/gate.sh" "$pdir2/scripts/gate.sh"
+cp "$root/scripts/githooks/pre-push" "$pdir2/scripts/githooks/pre-push"
+chmod +x "$pdir2/scripts/gate.sh" "$pdir2/scripts/githooks/pre-push"
+(cd "$pdir2" && git init -q . && git config core.hooksPath scripts/githooks \
+  && git config user.name t && git config user.email t@t \
+  && git remote add origin "$prem" && echo other > file.txt && git add -A \
+  && git commit -q -F "$tmp/push-good.md") >/dev/null 2>&1
+osha=$(cd "$pdir2" && git rev-parse HEAD); pp_receipt "$osha"
+out=$(cd "$pdir2" && HERD_GATE_RECEIPTS="$prec" \
+  git push --force origin "HEAD:refs/heads/main" 2>&1); pp_rc=$?
+if [ "$pp_rc" -eq 1 ] \
+   && printf '%s' "$out" | grep -q 'cannot tell a fast-forward'; then
+  ok "pre-push: a remote tip this clone has never seen is refused, not guessed"
+else
+  bad "pre-push: an unknown remote tip must be refused" "    exit $pp_rc:
+$(printf '%s\n' "$out" | sed 's/^/    /' | head -8)"
+fi
+rm -rf "${pdir2:?}"
+
+# --- the guard nobody installs is decoration -----------------------------
+# core.hooksPath is what makes this file run at all, and the hook cannot
+# report its own absence when it is not installed -- nothing runs. What it
+# can do is answer for the worktree it is asked in, which is how a worktree
+# without the setting is detectable.
+pp_fresh
+(cd "$pdir" && ./scripts/githooks/pre-push --check-install >/dev/null 2>&1) \
+  && ok "pre-push: --check-install passes where core.hooksPath points at it" \
+  || bad "pre-push: --check-install must pass in an installed worktree" ""
+(cd "$pdir" && git config --unset core.hooksPath)
+(cd "$pdir" && ./scripts/githooks/pre-push --check-install >/dev/null 2>&1) \
+  && bad "pre-push: --check-install must fail where the hook is not installed" "" \
+  || ok "pre-push: --check-install reports a worktree with no core.hooksPath"
+# And with the setting gone, the hook really is absent: the same push that
+# was refused above now goes through. This is the limit, measured.
+pp_push -q origin "HEAD:refs/heads/main"
+[ "$pp_rc" -eq 0 ] \
+  && ok "pre-push: with core.hooksPath unset the guard does not run (known limit)" \
+  || bad "pre-push: expected the unguarded push to succeed" "    exit $pp_rc: $out"
+# --no-verify is the other limit, and the contract is what forbids it.
+pp_fresh
+sha=$(pp_commit "$tmp/push-oneline.md")
+pp_push -q --no-verify origin "HEAD:refs/heads/main"
+[ "$pp_rc" -eq 0 ] \
+  && ok "pre-push: --no-verify bypasses the hook entirely (known limit)" \
+  || bad "pre-push: --no-verify is expected to bypass the hook" "    exit $pp_rc: $out"
+rm -rf "${pdir:?}" "${prem:?}" "${prec:?}" "${ptrace:?}"
+rm -f "${tmp:?}"/push-good.md "${tmp:?}"/push-oneline.md \
+  "${tmp:?}"/push-nosection.md "${tmp:?}"/push-placeholder.md \
+  "${tmp:?}"/push-nofield.md "${tmp:?}"/push-longsubject.md
 echo
 echo "check-orchestration: $pass passed, $fail failed"
 [ "$fail" -eq 0 ]
