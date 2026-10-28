@@ -96,31 +96,32 @@ nix develop --command cargo fmt --all --check
 
 Gates before a commit: a change that touches any file outside `CLAUDE.md`,
 `README.md`, `docs/`, `.claude/` and `.github/*.md` runs all four Rust gates
-plus `check-docs.sh`. A prose-only change runs `check-docs.sh` and says the
-Rust gates were **not run** locally, covered by the landing's `gate.sh`. A gate
-that did not run is reported as not run, never as passed.
+plus `check-docs.sh`. A prose-only change runs `check-docs.sh` and says in its
+report that the Rust gates were **not run** locally and that CI runs them on
+the batch PR. A gate that did not run is reported as not run, never as passed.
 
 ## Git and main
 
-- One branch per task, in its own worktree, named for the task. Small commits,
-  imperative English subject ≤ 72 chars.
-- **One landing per batch** (Alexa, 2026-10-28): **nobody opens a pull request,
-  ever.** An agent pushes its branch and hands off; a landing is one batch, one
-  push, one `--no-ff` merge commit carrying the landing record. Why, and what
-  it costs: `docs/orchestration/workflow.md`.
-- **Pushing to `main` is `herd-merger`'s, by standing authorisation**
-  (ORCH-001, Alexa 2026-10-24, re-granted 2026-10-28): a green
-  `./scripts/gate.sh` for that exact sha and a filled landing record, `cut-v*`,
-  `.github/`, `CLAUDE.md` and `.claude/` included; nothing waits for Alexa.
-  Never `--no-verify`, never force-push, never a red landing, never `--admin`.
-- **Pushing a tag and publishing a release stay on Alexa's word, one act at a
-  time.** Landing a version branch and publishing its release are two different
-  acts; `herd-release` prepares and never publishes.
+- One branch per task, in its own worktree, named for the task.
+- Small commits, imperative English subject ≤ 72 chars.
+- **One landing per batch** (Alexa, 2026-10-28): the pull request leaves the
+  loop; a landing is one batch, one push, one `--no-ff` merge commit carrying
+  the landing record. **Not in force yet**: `docs/orchestration/workflow.md`.
+- CI must be green before merge: jobs `check` and `docs`. Never
+  `--no-verify`, never force-push, never a red merge, never `--admin`.
+- **Merging is `herd-merger`'s, by standing authorisation** (Alexa,
+  2026-10-24, ORCH-001: *"non il peux merge par defaut"*): any PR whose CI
+  is green and whose Evidence block is filled, `cut-v*`, `.github/`,
+  `CLAUDE.md` and `.claude/` included. Nobody else merges.
+- **Pushing a tag and publishing a release stay on Alexa's word, one act
+  at a time.** Merging a version PR and publishing its release are two
+  different acts; `herd-release` prepares and never publishes.
 
 ## Shared host rules
 
 Several agents and the consumer's production share this machine.
-- Write only in your own worktree and your own scratchpad subdirectory.
+- Write only in your own worktree and your own scratchpad subdirectory;
+  `herd-merger`'s closing fast-forward of the orchestrator's checkout excepted.
 - Never `pkill -f`, `killall` or kill by name; kill only PIDs you started.
 - No `cargo` build or test unless the task changes code; one integration at a
   time. More than two heavy agents may run while the first consumer is stopped
@@ -142,9 +143,8 @@ ask about file layout, naming, crate internals, test style or libraries.
 
 ## Session start, session end
 
-Start: read this file, then `docs/orchestration/board.md`, the latest handoff
-in `docs/orchestration/history/`, and the last `ci.yml` runs on `main`: a
-`failure` is an `ORCH-nnn` row before new work. Resume from the handoff, not
-from a conversation summary. End: the agent that did the last task updates the
-board and writes its handoff; the orchestrator verifies both and reports in
-three or four lines. An open item is never dropped because a session ended.
+Start: read this file, then `docs/orchestration/board.md`, then the latest
+handoff in `docs/orchestration/history/`. Resume from the handoff, not from a
+conversation summary. End: the agent that did the last task updates the board
+and writes its handoff; the orchestrator verifies both and reports in three or
+four lines. An open item is never dropped because a session ended.
