@@ -318,9 +318,11 @@ was lost.
 - Alexa decides: milestone order, invariants, pushing a tag, publishing a
   release (each act singly), GitHub issues, anything on the consumer's
   side. Pushing a landing whose local gate is green on the exact sha
-  and whose landing record is filled is `herd-merger`'s (ORCH-001,
-  re-granted 2026-10-28); landing a version branch does not publish its
-  release.
+  and whose landing record is filled is `herd-merger`'s — Alexa's
+  standing authorisation of 2026-10-24, verbatim *"non il peux merge par
+  defaut"* (ORCH-001), re-granted on those two conditions 2026-10-28.
+  `CLAUDE.md` carries it in short form, and this is where the words are.
+  Landing a version branch does not publish its release.
 - A question for Alexa is one item in the board's *Waiting* section:
   question, recommendation, impact, fallback, date. Work that does not
   depend on it continues. Nobody invents the answer.
