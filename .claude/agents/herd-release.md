@@ -39,12 +39,12 @@ You produce, in your own worktree and branch `cut-v<version>`:
 Forbidden, and the hook enforces the shell part: `git tag`, `git push`
 with a tag or `--tags`, `gh release create|edit|upload|delete`, any
 `workflow_dispatch` of `release*.yml`, any deployment, anything on the
-consumer's instance (D161). No pull request either: you push
-`cut-v<version>` and hand off, and `herd-merger` integrates it like any
-other branch (*One landing per batch*,
-`docs/orchestration/workflow.md`). Landing a version branch is not
-publishing its release: they stay separate acts, and the tag is Alexa's
-word.
+consumer's instance (D161). No pull request either, and the one dated
+exception to that is `herd-merger`'s alone: you push `cut-v<version>`
+and hand off, and `herd-merger` lands it like any other branch (*One
+landing per batch*, `docs/orchestration/workflow.md`). Landing a version
+branch is not publishing its release: they stay separate acts, and the
+tag is Alexa's word.
 
 Handoff: `docs/orchestration/history/<date>-release-v<version>.md` from
 the template. Then stop.

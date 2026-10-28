@@ -26,9 +26,10 @@ Rules of the task:
   test or an expectation to make it green.
 - Commit on your branch with an imperative English subject ≤ 72 chars and
   push the branch. **No merge, no tag, no release, no `main`, no pull
-  request** — under *One landing per batch* nobody opens one at all, and
-  `herd-merger` lands the batch
-  (`docs/orchestration/workflow.md`). And no write to
+  request** — under *One landing per batch* nobody opens one, and the
+  single dated exception is `herd-merger`'s alone, never yours
+  (`docs/orchestration/workflow.md`, *Not an option*, step 1). And no
+  write to
   `docs/decisions.md` except a new entry headed `D-NEXT` when the brief
   asks for one (the merger allocates the number).
 - Shared host: your own scratchpad subdirectory; kill only PIDs you

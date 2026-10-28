@@ -12,9 +12,12 @@ board shows you hold it; when it is integrated or blocked you write your
 handoff and stop. **Nobody opens a pull request, you included, and you
 are the only one who may touch `main`**: you land the batch yourself,
 with one `--no-ff` merge commit and one push (workflow.md, *One landing
-per batch*). While the transition in *Not an option* is unfinished the
-orchestrator will tell you if a landing is to go through the last pull
-request instead; you never decide that yourself.
+per batch*). **The one exception, dated 2026-10-28: the pull request
+that lands the method change itself, which you open** — you are the only
+actor that can, since the guard denies the main session
+`gh pr create` — **and only when the orchestrator instructs it for that
+landing** (workflow.md, *Not an option*, step 1). You never decide that
+yourself, and there is no second one.
 
 Steps, in order, each one evidenced in the handoff:
 
@@ -61,11 +64,17 @@ Steps, in order, each one evidenced in the handoff:
 7. **The gate: one `./scripts/gate.sh` run on a clean tree, and it is
    the last thing that runs before the merge.** It runs the steps of
    CI's `check` and `docs` jobs in the same order and leaves a receipt
-   for that exact sha; a receipt for another sha is not a gate run for
-   the sha you are pushing. A red step blocks the landing, is reported
-   red, and `main` does not move. The verbatim output and the skip
-   **list** — never a skip count (D27, D179) — go to the receipt and to
-   your report, not into the tree you have just gated.
+   for the sha it gated — **the integration tip, which is the second
+   parent of the merge commit you are about to make, not the merge
+   commit itself**: that commit's message is the record, so it does not
+   exist yet and can never have a receipt. What has to hold at step 8
+   is a receipt for `$(git rev-parse <merge-sha>^2)` **and**
+   `git diff --quiet <that sha> <merge-sha>`, an identical tree
+   (workflow.md, *What a landing is*, has the measurement). A red step
+   blocks the landing, is reported red, and `main` does not move. The
+   verbatim output and the skip **list** — never a skip count (D27,
+   D179) — go to the receipt and to your report, not into the tree you
+   have just gated.
 8. **Land it.** Push the integration branch, so that the branch a report
    tells a reader to `git show` exists on the origin. Then merge it onto
    `main` in your own worktree with `git merge --no-ff`, that record as
@@ -74,7 +83,8 @@ Steps, in order, each one evidenced in the handoff:
    and one post-push run (workflow.md, *What a landing is*). That is
    Alexa's standing authorisation (ORCH-001, 2026-10-24, *"non il peux
    merge par defaut"*, re-granted 2026-10-28): a green `gate.sh` for the
-   exact sha you push and a filled landing record, `cut-v*`,
+   **gated** sha — the merge's second parent, trees identical — and a
+   filled landing record, `cut-v*`,
    `.github/`, `CLAUDE.md` and `.claude/` included. A red gate or an
    empty record leaves `main` where it is, and you say so. Landing a
    version branch never includes pushing its tag: that is Alexa's word.
@@ -96,10 +106,19 @@ Steps, in order, each one evidenced in the handoff:
 
     ```sh
     d=/mnt/ssd_980/herd-project
-    [ "$(git -C "$d" symbolic-ref --quiet --short HEAD)" = main ] || exit 0
-    [ -z "$(git -C "$d" status --porcelain)" ]                    || exit 0
-    git -C "$d" fetch origin && git -C "$d" merge --ff-only origin/main
+    [ "$(git -C "$d" symbolic-ref --quiet --short HEAD)" = main ] ||
+      { echo "ff skipped: HEAD is not main"; exit 0; }
+    [ -z "$(git -C "$d" status --porcelain)" ] ||
+      { echo "ff skipped: tree is dirty"; exit 0; }
+    before=$(git -C "$d" rev-parse HEAD)
+    git -C "$d" fetch origin && git -C "$d" merge --ff-only origin/main &&
+      echo "ff: $before -> $(git -C "$d" rev-parse HEAD)"
     ```
+
+    Each refusal **prints why** and each success prints the before and
+    after shas, because all three cases exit 0 and a silent skip is
+    indistinguishable from a success — measured 2026-10-28, which is why
+    the `echo`s are in the block and not left to whoever runs it.
 
     Both checks were measured on 2026-10-28 and both failure modes are
     real: a **dirty** tree does **not** make `--ff-only` fail — a
@@ -115,7 +134,9 @@ Steps, in order, each one evidenced in the handoff:
     moved from and to, or which precondition stopped it. Why this is
     yours and not a hook: workflow.md, *Concurrency and host rules*.
 
-Forbidden: opening a pull request, tags, releases, deployment, anything
+Forbidden: opening a pull request — but the one that lands this change,
+on the orchestrator's instruction (workflow.md, *Not an option*, step
+1) — tags, releases, deployment, anything
 on the consumer's instance (D161), `pkill -f`, more than one compile at
 a time, a second push for one batch, and every change to what the
 orchestrator's checkout *says* except step 10's fast-forward — creating
