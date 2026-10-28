@@ -39,6 +39,37 @@ pub const PATIENCE: Duration = Duration::from_secs(30);
 /// configuration nobody can run.
 pub const HEALTH_EVERY_IN_THESE_TESTS: &str = "0.2";
 
+/// The per-job memory ceiling a test gives its runner when what it proves
+/// needs that runner to hold **a second job while the first is still out
+/// there**.
+///
+/// How many jobs a runner holds at once is not a constant and is not an
+/// option: it is `(what the host lends − its floor) / this ceiling`
+/// (`herd_runner::jobs_at_once`). What the host lends is itself read from the
+/// cgroup the runner stands in — the tightest `memory.max`/`memory.high` up
+/// the chain, less what that cgroup already holds, read once at startup
+/// (D119, D79). So a runner left on the 2 GiB default announces as many
+/// slots as the enclosing slice happened to have room for at the instant it
+/// started, and **page cache counts in `memory.current`**: a build that has
+/// just filled the slice's cache leaves the runner one slot for its whole
+/// life.
+///
+/// A test whose proof needs two jobs at once therefore has to *declare* the
+/// ceiling, exactly as `a_log_survives_twelve_killed_hubs_whole` declares
+/// `--redial-cap`: a fixture, not a weakened assertion. Measured on this
+/// workstation on 2026-10-28, with `/chatons.slice` at `memory.high` 18 GiB
+/// holding 13.3 GiB, so the runner announced 4.6 GiB, kept 1 GiB as its
+/// floor and held **one** 2 GiB job: three tests that need two spent
+/// `PATIENCE` waiting for a job the hub was right not to claim, and said so
+/// in the runner's own words — *"this runner holds at most 1 job(s) at
+/// once"* — 30 s later. At 512 MiB the same three pass in under three
+/// seconds, and the arithmetic gives at least two slots on any host that
+/// lends a gigabyte above its floor.
+///
+/// One argument rather than two, so that a test adds it to an option list it
+/// already has by writing one word.
+pub const ROOM_FOR_A_SECOND_JOB: &str = "--job-memory-max=512MiB";
+
 /// How many hubs of one herd are running, as the herd itself counts them.
 ///
 /// The herd starts the hubs and the herd is handed them back when they die,
