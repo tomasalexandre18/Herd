@@ -9718,3 +9718,305 @@ back, which is his act.
 
 **On the number.** This entry is D189, allocated last of the three at the
 integration of the method batch, after D187 and D188.
+
+---
+
+## 2026-10-28 — D190 The gate as built: steps 0 to 8, one verdict, one receipt
+
+**Context.** D187 decided the gate's *principle* — compare the skip list,
+never the count — on a day when `scripts/gate.sh` could not complete a plain
+run on this workstation at all: `scripts/expected-skips/local.txt` did not
+exist, so the script **refused**, exit 3, with no verdict. A principle no run
+can exercise is not a gate, and `CLAUDE.md`'s push condition named a mechanism
+that could not be met. Three branches of this batch bootstrapped and hardened
+it; this entry records what it actually is.
+
+**Choice.** `./scripts/gate.sh` runs steps 0 to 8 in `ci.yml`'s own order: the
+tree, the sha and the host (0); `check-docs.sh` and `check-orchestration.sh`,
+the `docs` job (1, 2); `nix flake check`, `cargo fmt`, `cargo clippy` and the
+suite, the `check` job (3-6); the skips (7); the verdict and the receipt (8).
+The middle six are one per command `ci.yml` runs, which is what makes a green
+gate an argument about CI and not a different suite. It refuses a dirty tree,
+because a run on a tree that is not what gets pushed proves nothing. Its last
+line is the verdict and names the sha it ran on:
+`gate: GREEN sha=… steps=0-8:ok host=… load1=… skips=…`. **Only a GREEN run
+writes a receipt**, in `$HERD_GATE_RECEIPTS` (`target/herd-gate/` by
+default), and `--verify-receipt SHA` exits 0 only for a GREEN receipt naming
+exactly that sha. That one question is the whole of what
+`scripts/githooks/pre-push` asks (D188): the receipt rule lives in `gate.sh`
+and nowhere else.
+
+**The two host lists, and why there are two.**
+`scripts/expected-skips/local.txt` holds this host's twelve at rest, every one
+of them the same cgroup v2 delegation refusal, blessed from a run that ended
+`test suite: PASSED`. `local-under-load.txt` holds **two** names and is a
+**delta** over it, never a whole list: `flood-fifty` and `flood-two-fifty`,
+which read the host's one-minute load and decline to flood a machine shared
+with a production system. Blessing a loaded run straight into `local.txt`
+would put all fourteen there and leave an at-rest run green with a load-gated
+bench silently skipped — the exact failure the split exists to stop. That is
+why there is no `--bless-under-load`: the second list is produced by pointing
+`HERD_GATE_EXPECTED` elsewhere and committing the two names that are new.
+
+**The receipt store is per worktree**, under a gitignored `target/`, so a
+green gate is **not** something a branch hands over. Whoever pushes gates the
+tree they push, and nobody copies a receipt in to save a run.
+
+**Alternative rejected.** Running only what a change touched — the first
+refusal of 2026-10-27, still refused: the suite is about eight minutes here,
+and working out which tests a change affects costs more than it saves at that
+size and is sometimes wrong.
+
+**Reversibility.** High. One script and one directory of lists; nothing in
+the product reads either.
+
+**On the number.** This entry is D190, first of the five allocated at the
+first local landing, in merge order. D143, D154 and D170 stay gaps (D148).
+
+---
+
+## 2026-10-28 — D191 A blessing is not a gate run, and the load is read twice
+
+**Context.** Two ways `gate.sh` could hand `pre-push` a receipt that proved
+nothing, both measured on 2026-10-28. First, `--bless` adopts *this* run's
+skips as the expectation, so its step 7 green-lights itself — and it then
+wrote a receipt like any other run. One such receipt said
+`verdict: GREEN sha: 7eb9585…` for a tree that did not contain `local.txt` at
+all, on which a plain gate is REFUSED. `--verify-receipt` reads the verdict,
+the sha and nothing else, so `pre-push` would have taken it. Second, the gate
+read the one-minute load once, at step 0, while the flood benches read it
+twice — at the flood's start and again mid-flood — and skip on either
+reading. A gate that began quiet and ended busy therefore went **RED on a
+clean tree for a reason that is not in the diff**, at the cost of a whole
+suite run, and the retry was honest only if the host happened to be quiet.
+Measured: load1 rose 0.32 → 2.36 in one run and 9.56 → 14.91 in another, so
+the end-of-run figure is routinely several points above the start.
+
+**Choice.** A blessing run ends in `gate: BLESSED …`, says *NOT A GATE RUN*,
+names the sha to re-run without `--bless`, and **writes no receipt at all**.
+And the gate reads the load a second time at the top of step 7 — the first
+moment after the suite, where the benches read theirs — applies the
+load-conditional list when **either** reading is over the threshold, and
+names the reading that bit in its verdict: `skips=at-rest`, or
+`skips=under-load(load1-end=14.99>8)`. In the same decision,
+`pre-push --check-install` refuses a **relative** `core.hooksPath` and
+advises the absolute path of the main checkout's hooks directory, because
+nothing could tell the two forms apart before — `git rev-parse --git-path
+hooks` contains `scripts/githooks` either way — and an agent following its
+own tool's error message would have restored ORCH-131 for all 85 worktrees.
+
+**Alternative rejected.** A `blessed: yes` field on the receipt that
+`--verify-receipt` refuses. It leaves an object that exists and must be
+disbelieved, and every reader of the store then has to know the rule. Writing
+nothing needs no rule.
+
+**Known limit.** The second reading is taken after the suite, not mid-flood,
+so a spike that rises and falls entirely inside the suite is still missed.
+Two readings cover the shape measured here — a load that climbs and stays — and
+a third read out of the suite's own output would be exact and is not worth a
+parser. The gate under load is still not a reliable red/green signal; the
+gate at rest is.
+
+**Reversibility.** High. Three places in one script and one `case` in the
+hook.
+
+**On the number.** This entry is D191, allocated after D190 at the first
+local landing, in merge order.
+
+---
+
+## 2026-10-28 — D192 A reader that can exit early never sits downstream
+
+**Context.** In a script that sets `pipefail`, `printf '%s' "$x" | grep -q P`
+is a race and not a matter of style: `grep -q` exits the moment it matches,
+`printf` is killed by SIGPIPE on the bytes it has left, `pipefail` reports
+the pipeline as failed, and the control declares absent the very text it has
+just recognised — printing that text in its own diagnostic three lines below.
+Two conditions are necessary, and both were measured here rather than
+reasoned about: the payload must exceed the 4 KiB stdio buffer `printf`
+writes a pipe in, so that it takes more than one write, and a complete
+matching line must sit in the first of those writes. At load1 13-15, match on
+line 1, 200 runs per size: 945, 1 950, 3 960 and 4 161 bytes gave 0/200;
+4 965 and 7 980 bytes 1/200; 64 kB 14/200; 1 MB 200/200. A here-string gave
+0/200 at every size. It fired twice for real on 2026-10-28, in a gate run and
+in `check-orchestration.sh`'s `envis` case.
+
+**Choice.** Every such read is a **here-string**, which is a temporary file:
+no reader can exit early and there is no writer to kill. All 25 sites in
+`scripts/check-orchestration.sh` were converted, with the nine assertions
+added by the gate hardening already in that shape; the file now contains no
+pipe into `grep` of any kind. `scripts/githooks/pre-push`'s three reads of
+the tip commit's message were converted in the same batch, and the section
+loop there was the one live defect in the repository: a **correct** landing
+record was falsely refused 4 times in 200 at 62 291 bytes under load1 12-16
+and 50 times in 50 at 1 045 091 bytes at rest, each refusal naming only
+sections lying in the first 4 KiB. The rule holds for any script added later.
+
+**What this does not claim.** In `check-orchestration.sh` the largest payload
+any site reads is 3 692 bytes, below the threshold, so **no site there could
+fire on today's tree** and no red turned green: the conversion is
+prophylactic, and the margin is thin — the largest is at 90 % of it. In
+`pre-push` the realistic size is 6 051 bytes, which measured 0/200 both at
+rest and under load, so for today's records that fix is closer to
+prophylactic than to a repair. What makes it worth landing is the failure
+mode: a refusal of a correct landing by the only machine in front of `main`,
+with no retry that distinguishes it from a real defect in the record.
+
+**Still carrying it, deliberately.** `scripts/check-docs.sh:247,249`, two
+sites whose payloads are a handful of lines. And `.claude/hooks/`'s
+`orchestrator-guard.sh` (10 sites) and `release-guard.sh` (4) carry it
+**inertly**, having no `pipefail` — which is load-bearing: adding one there
+would make 14 races at once, and in a guard the direction is **fail-open**, a
+failed pipeline reading as "no match" and *allowing* the write the guard
+exists to deny.
+
+**Alternative rejected.** One helper per `grep` shape. Each of the 25 sites
+has its own flags (`-qE`, `-qxF`, negated, inside an `if`), and a here-string
+took at every one of them with no wrapper and no change to any assertion's
+message: the 141 `ok`/`bad` strings are byte-identical before and after.
+
+**Reversibility.** High, and the risk is a silent relapse rather than a
+breakage: nothing mechanical freezes the shape in `pre-push` yet, only a
+comment. That is an open board row and the next batch's first task.
+
+**On the number.** This entry is D192, allocated after D191 at the first
+local landing, in merge order. It carries two branches' findings —
+`no-sigpipe-assertions` measured the mechanism, `pre-push-no-pipe` fixed the
+one site that could refuse a landing — because they are one rule.
+
+---
+
+## 2026-10-28 — D193 A gate script owns its own fd 0
+
+**Context.** ORCH-111 was read for two days as an intermittent SIGPIPE
+failure of one assertion. It is not that, and the refutation is part of the
+decision: the site reads a single 615-byte line with no trailing newline
+through `grep -qF`, which gives `printf` one write and `grep` no early exit —
+0 false failures in 20 000 runs of the old idiom with its real payload at
+load1 13-15, against a race that needs over 4 KiB (D192). What it actually
+is: a **socket** on the caller's fd 0 makes `bash` source `SYS_BASHRC`
+through its `isnetconn()` check although the shell is not interactive, and on
+the `-c` path only. `check-orchestration.sh` captures through
+`env -i PATH=… HOME=/wrong/home bash -c …`; `env -i` has stripped
+`__ETC_PROFILE_DONE`, so `/etc/bashrc` finds it empty, sources `/etc/profile`
+and `/etc/set-environment`, and rebuilds `PATH` out of the child's own
+`HOME=/wrong/home` — discarding the `PATH` the case supplied. The assertions
+were then **right**: the text really was absent. Same tree, same minute, on
+`6649bd1`: `253 passed, 0 failed` with `/dev/null` on fd 0 against
+`232 passed, 21 failed` with an `AF_UNIX` socketpair. It costs 21 of 253 —
+the PATH case names it, and the 20 `gate:` cases fail because the same
+rebuild drops the stub `bin` directory, so the stubbed `nix` and `cargo` are
+never found. Worse than a red: on a run where the real toolchain answered as
+the stub would, those 20 would have passed while testing nothing.
+
+**Choice.** `scripts/check-orchestration.sh` and `scripts/gate.sh` each carry
+one `exec </dev/null` directly under their `set -uo pipefail`, above the
+first capture, with the mechanism written above it. Neither reads fd 0
+anywhere, so it costs nothing and covers every child they start, present and
+future. `scripts/githooks/pre-push` must **not** have it and must never get
+it: git feeds the hook the ref list on fd 0, and `while read -r …` over
+`/dev/null` iterates zero times, so a guarded hook falls straight through to
+`exit 0` and approves a deletion of `main`, a non-fast-forward, a commit made
+straight on `main`, a push with no receipt. The same holds for the two
+`.claude/hooks` scripts, which read their input there by design. Three
+textual cases freeze all of it, each seen red in a throwaway copy: the guard
+missing from either script, and the guard moved below the first capture, give
+255/1; `exec </dev/null` added to `pre-push` gives 233/23, the 22 extra being
+real pushes the hook stopped refusing.
+
+**Alternative rejected.** `__ETC_PROFILE_DONE=1` or `NOSYSBASHRC=1` through
+every `env -i` — one token per site and all 21 cases fixed. Rejected because
+the first suppresses the symptom while the child still executes
+`/etc/bashrc`, the second is a NixOS-specific knob, and only the redirection
+removes the cause for every present and future capture site. It is also the
+convention the product already follows: a runner gives every job
+`Stdio::null()` (`herd-runner/src/job.rs`).
+
+**What is still not pinned.** What puts a socket on fd 0 in the first place.
+While armed the rebuild is deterministic — 300/300 captures, six calling
+contexts, `232 passed, 21 failed` five runs running — and while not armed the
+script reads `253 passed, 0 failed` every time; the state flipped once with
+no edit to either tree in between. That is the intermittency three agents
+sampled honestly and disagreed about (7 red in 14, 5 in 11, 0 in 5). The fix
+does not depend on knowing: it removes the socket.
+
+**Known limit.** No behavioural case. Arming it needs a process that can put
+a socket on fd 0; `python3` is absent here, `perl` is system-only and `socat`
+is dev-shell only, while `check-orchestration.sh` runs with no toolchain, and
+the CI runner's `/etc/bashrc` has a different shape so the negative control
+would not arm there either. A case that skips on every host where the script
+runs is not a control, and it would be the first skip in a script whose
+contract CI reads as `N passed, 0 failed`. The three textual cases give the
+red-on-removal guard everywhere instead.
+
+**Reversibility.** High. One line in each of two scripts.
+
+**On the number.** This entry is D193, allocated after D192 at the first
+local landing, in merge order.
+
+---
+
+## 2026-10-28 — D194 `herd-hub report` reads a state root without a lock
+
+**Context.** Whether file-level deduplication is worth building depends on a
+figure nobody had: how much of what a hub holds is the same bytes under
+different jobs. The consumer's own requester reported 2.81 over one day of
+what it received, which is not the population that decides — the hub's whole
+volume is. Nobody here logs into their machines (D161, invariant 9), so the
+figure has to come back as text an operator pasted, which means a command
+that runs in their container and prints it.
+
+**Choice.** `herd-hub report [STATE_DIR]` — a subcommand of the hub binary,
+with the arithmetic in `herd-hub/src/report.rs`. The state root is positional,
+defaulting to `$HERD_STATE_DIR` and then to `herd-state`, so
+`docker compose exec hub herd-hub report` needs no new image, no entrypoint
+and no port; `herd-hub` with no subcommand serves exactly as before, which a
+test asserts. It prints three figures: `r_file` twice, over every record the
+root holds and over the collections whose bytes are still claimed, each with
+the four counts it rests on and never as a bare ratio; the per-job kept-byte
+**deciles** by nearest rank, plus the maximum, the total and the top
+decile's share, over **every** record read including those naming no file,
+with **no mean anywhere** (ORCH-070's rule); and the gap between what the
+records claim and what the `files/` directories measure, through the
+sweeper's own `directory_bytes` walk so that the report does not print a gap
+that is partly its own measuring rule.
+
+**It takes no lock.** It never builds a `JobDirStore`, so it takes neither
+the store's mutex nor the `flock(2)` on `hub.lock`; it opens files read-only,
+one at a time, and creates nothing. A test runs it while holding that
+`flock` — the state a live hub leaves the file in — and asserts the root is
+byte-identical afterwards. What that buys is a report an operator can run
+against a serving hub; what it costs is said in the report's own first
+paragraph: each record is read whole or not at all (ORCH-082's `rename`
+publication), but the figures together are not one instant.
+
+**Three states of the real records the obvious formula gets wrong**, each
+decided towards the lower claim: a `KeptFile` with an empty `sha256`, written
+before the field existed, is counted and reported apart and left out of both
+sides of both ratios, because its bytes in the numerator alone would inflate
+`r_file` by exactly the undigested bytes; a digest two records give two
+different lengths is named with both figures and takes the **larger**; and
+`0 / 0` prints "undefined: no record names a digested byte", not 1.00. A
+record this build cannot read is counted and named with its path, never read
+as a job that kept nothing.
+
+**No threshold is printed, and none is decided here.** The brief that asked
+for this tool carried "below 4 we build nothing"; no decision carries that
+figure, and a shipped binary stating an unrecorded policy is a number nobody
+can later change. The tool prints the ratio and its counts. Whether 4 is the
+bar is a question for Alexa with the first real measurement in hand, and it
+is a board row.
+
+**Alternatives rejected.** `herdctl`, where everything crosses the WebSocket
+protocol: it would have meant a new message and a `PROTOCOL_VERSION` bump on
+a version frozen at 2, and it is the wrong machine — a requester runs
+anywhere, this reads one host's directory. And a flag on the serving path,
+where all seventeen serving options are meaningless and `--report` would
+have to be documented as ignoring them. Nothing was added to `herd-proto`.
+
+**Reversibility.** High. One module, one subcommand, six constants widened to
+`pub(crate)` in `store.rs` with no behaviour changed. No `--json`, by
+choice: one output is one thing to keep honest.
+
+**On the number.** This entry is D194, last of the five allocated at the
+first local landing, in merge order.
