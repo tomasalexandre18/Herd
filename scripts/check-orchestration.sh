@@ -675,14 +675,22 @@ printf 'HERD-SKIPPED: a_needs_cgroup_delegation: no delegated subtree here\nHERD
 printf 'HERD-SKIPPED: c_load_gated_bench: the host went busy\n' > "$tmp/gate-expected-load"
 printf '0.10 0.10 0.10 1/1 1\n' > "$tmp/gate-loadavg"
 out=$(gate_run HERD_GATE_LOADAVG="$tmp/gate-loadavg" HERD_STUB_LOAD_AFTER=12.00); rc=$?
-[ "$rc" -eq 0 ] && printf '%s' "$out" | grep -qF 'load1 rose from 0.10 to 12.00' \
+# These assertions read `$out` through a HERE-STRING and not through
+# `printf | grep -q`, which is this file's older idiom, because that idiom
+# false-fails under `set -o pipefail`: `grep -q` exits on its match, printf
+# dies of SIGPIPE on what is left, and the pipeline reports the failure of a
+# text that matched. Measured 2026-10-28 under a one-minute load of 8.7: 2
+# false failures in 4000 with the pipe, 0 in 4000 with the here-string -- and
+# twice for real the same afternoon, once turning a `gate.sh` run RED on a
+# clean tree at step 2. The ~30 older sites are a finding, not fixed here.
+[ "$rc" -eq 0 ] && grep -qF 'load1 rose from 0.10 to 12.00' <<<"$out" \
   && ok "gate: a quiet start and a busy finish still gets the load list" \
   || bad "gate: the second load reading must apply the load list" \
     "    exit $rc:
 $(printf '%s\n' "$out" | tail -12 | sed 's/^/    /')"
 # And the verdict says WHICH reading allowed the extra names: "under load"
 # with no figure beside it leaves a reader guessing.
-printf '%s' "$out" | grep -qE '^gate: GREEN .* skips=under-load\(load1-end=12\.00>8\)$' \
+grep -qE '^gate: GREEN .* skips=under-load\(load1-end=12\.00>8\)$' <<<"$out" \
   && ok "gate: the verdict names the reading that allowed the extra skips" \
   || bad "gate: the verdict must name the triggering reading" \
     "$(printf '%s\n' "$out" | tail -4)"
@@ -695,7 +703,7 @@ gate_case "a quiet run throughout is still RED on that skip" 1 '7:unexpected-ski
 gate_fresh
 printf '0.10 0.10 0.10 1/1 1\n' > "$tmp/gate-loadavg"
 out=$(gate_run HERD_GATE_LOADAVG="$tmp/gate-loadavg")
-printf '%s' "$out" | grep -qE '^gate: GREEN .* skips=at-rest$' \
+grep -qE '^gate: GREEN .* skips=at-rest$' <<<"$out" \
   && ok "gate: an at-rest run says which list it applied too" \
   || bad "gate: the at-rest verdict must say so" "$(printf '%s\n' "$out" | tail -4)"
 # The count moving on its own is not a signal and must not be one.
@@ -739,8 +747,8 @@ bsha=$(cd "$gatedir" && git rev-parse HEAD)
   && ok "gate: --bless writes no receipt, so no push can ever rest on one" \
   || bad "gate: a blessing run must leave no receipt" \
     "    exit $rc, receipts: $(ls "$tmp/gate-receipts" 2>/dev/null | tr '\n' ' ')"
-printf '%s' "$out" | grep -qE '^gate: BLESSED sha=[0-9a-f]{40} ' \
-  && ! printf '%s' "$out" | grep -qE '^gate: GREEN ' \
+grep -qE '^gate: BLESSED sha=[0-9a-f]{40} ' <<<"$out" \
+  && ! grep -qE '^gate: GREEN ' <<<"$out" \
   && ok "gate: a blessing run's verdict reads BLESSED, never GREEN" \
   || bad "gate: a blessing verdict must not read as a gate verdict" \
     "$(printf '%s\n' "$out" | tail -6)"
@@ -1176,17 +1184,17 @@ pp_fresh
 # resolves inside each of them. Both halves are now cases.
 (cd "$pdir" && git config core.hooksPath scripts/githooks)
 out=$(cd "$pdir" && ./scripts/githooks/pre-push --check-install 2>&1); rc=$?
-[ "$rc" -ne 0 ] && printf '%s' "$out" | grep -q 'is RELATIVE' \
+[ "$rc" -ne 0 ] && grep -q 'is RELATIVE' <<<"$out" \
   && ok "pre-push: --check-install refuses a relative core.hooksPath" \
   || bad "pre-push: a relative core.hooksPath must be refused" "    exit $rc: $out"
-printf '%s\n' "$out" | grep -qE '^pre-push: +git config core\.hooksPath /' \
-  && ! printf '%s\n' "$out" | grep -qE 'core\.hooksPath +scripts/githooks$' \
+grep -qE '^pre-push: +git config core\.hooksPath /' <<<"$out" \
+  && ! grep -qE 'core\.hooksPath +scripts/githooks$' <<<"$out" \
   && ok "pre-push: the advice is an absolute path, never the relative form" \
   || bad "pre-push: the advice must name an absolute path" "    $out"
 # And it names the MAIN checkout, not whichever worktree asked: one setting
 # serves every worktree, so advising a path inside a throwaway one is the
 # same defect wearing an absolute spelling.
-printf '%s\n' "$out" | grep -qF "core.hooksPath $pdir/scripts/githooks" \
+grep -qF "core.hooksPath $pdir/scripts/githooks" <<<"$out" \
   && ok "pre-push: the advice names the checkout's own hooks directory" \
   || bad "pre-push: the advice must name the checkout" "    $out"
 (cd "$pdir" && git config core.hooksPath "$pdir/scripts/githooks")
