@@ -544,6 +544,12 @@ exit 0
 EOS
   cat > "$gatedir/scripts/test.sh" <<'EOS'
 #!/usr/bin/env bash
+# The host going busy WHILE the suite runs, which is where it happens: the
+# flood benches read the load again mid-flood, so this is what makes the
+# gate's second reading a case and not a comment.
+if [ -n "${HERD_STUB_LOAD_AFTER:-}" ] && [ -n "${HERD_GATE_LOADAVG:-}" ]; then
+  printf '%s 1.00 1.00 1/1 1\n' "$HERD_STUB_LOAD_AFTER" > "$HERD_GATE_LOADAVG"
+fi
 [ -n "${HERD_STUB_SKIPS:-}" ] && cat "$HERD_STUB_SKIPS"
 if [ "${HERD_STUB_SUITE:-pass}" != pass ]; then
   echo "test suite: FAILED (cargo test exited 101)"; exit 101
@@ -656,6 +662,42 @@ gate_case "the load-conditional list allows a load skip above the threshold" 0 \
   'load-conditional list' HERD_GATE_LOAD_NOTE=0
 gate_case "and below the threshold the same skip is still RED" 1 '7:unexpected-skip' \
   HERD_GATE_LOAD_NOTE=1000
+# ONE reading of the load decides nothing, because the flood benches read it
+# twice: once as the flood starts and once mid-flood, skipping themselves on
+# either. A run that begins quiet and becomes busy -- routine on a host with
+# 85 worktrees -- therefore carries a flood skip that step 0's reading alone
+# would not have allowed, and the gate went red on a clean tree for a reason
+# that was not in the diff. Measured here on 2026-10-28: load1 0.32 -> 2.36
+# in one run and 9.56 -> 14.91 in another. The stub suite raises the figure
+# while it runs, which is exactly where the real one raises it.
+gate_fresh
+printf 'HERD-SKIPPED: a_needs_cgroup_delegation: no delegated subtree here\nHERD-SKIPPED: b_needs_bfq: no device offers bfq\nHERD-SKIPPED: c_load_gated_bench: the host went busy\n' > "$tmp/gate-skips"
+printf 'HERD-SKIPPED: c_load_gated_bench: the host went busy\n' > "$tmp/gate-expected-load"
+printf '0.10 0.10 0.10 1/1 1\n' > "$tmp/gate-loadavg"
+out=$(gate_run HERD_GATE_LOADAVG="$tmp/gate-loadavg" HERD_STUB_LOAD_AFTER=12.00); rc=$?
+[ "$rc" -eq 0 ] && printf '%s' "$out" | grep -qF 'load1 rose from 0.10 to 12.00' \
+  && ok "gate: a quiet start and a busy finish still gets the load list" \
+  || bad "gate: the second load reading must apply the load list" \
+    "    exit $rc:
+$(printf '%s\n' "$out" | tail -12 | sed 's/^/    /')"
+# And the verdict says WHICH reading allowed the extra names: "under load"
+# with no figure beside it leaves a reader guessing.
+printf '%s' "$out" | grep -qE '^gate: GREEN .* skips=under-load\(load1-end=12\.00>8\)$' \
+  && ok "gate: the verdict names the reading that allowed the extra skips" \
+  || bad "gate: the verdict must name the triggering reading" \
+    "$(printf '%s\n' "$out" | tail -4)"
+# The same list, with the load never rising: still RED, so the fix allows a
+# skip because of a measured load and not because two readings exist.
+printf '0.10 0.10 0.10 1/1 1\n' > "$tmp/gate-loadavg"
+gate_case "a quiet run throughout is still RED on that skip" 1 '7:unexpected-skip' \
+  HERD_GATE_LOADAVG="$tmp/gate-loadavg"
+# At rest the verdict says so, in the same field.
+gate_fresh
+printf '0.10 0.10 0.10 1/1 1\n' > "$tmp/gate-loadavg"
+out=$(gate_run HERD_GATE_LOADAVG="$tmp/gate-loadavg")
+printf '%s' "$out" | grep -qE '^gate: GREEN .* skips=at-rest$' \
+  && ok "gate: an at-rest run says which list it applied too" \
+  || bad "gate: the at-rest verdict must say so" "$(printf '%s\n' "$out" | tail -4)"
 # The count moving on its own is not a signal and must not be one.
 gate_fresh
 printf 'HERD-SKIPPED: a_needs_cgroup_delegation: no delegated subtree here\n' > "$tmp/gate-skips"
@@ -675,12 +717,40 @@ gate_case "--bless on a suite that did not pass is refused" 1 \
   'bless refused' HERD_STUB_SUITE=red
 gate_fresh
 rm -f "$tmp/gate-expected"
-gate_case "--bless after a passing suite adopts the list and is GREEN" 0 \
+gate_case "--bless after a passing suite adopts the list and is BLESSED" 0 \
   'wrote 2 lines'
 grep -q '^HERD-SKIPPED: a_needs_cgroup_delegation' "$tmp/gate-expected" \
   && grep -q '^# host=' "$tmp/gate-expected" \
   && ok "gate: --bless records the host and the load it measured on" \
   || bad "gate: the blessed list must say where it came from" ""
+# A blessing run adopted its OWN skips as the expectation, so its step 7
+# green-lit itself and its verdict is not evidence about this sha. It must
+# therefore leave nothing a push guard could read as a gate: pre-push's
+# check 1b asks only for a file named for the sha whose first line says
+# `verdict: GREEN`, and no field in a receipt could tell it more, because
+# `--verify-receipt` reads nothing else. Two such receipts existed on this
+# host on 2026-10-28, one of them GREEN for a tree where a plain gate was
+# REFUSED with exit 3.
+gate_fresh
+rm -f "$tmp/gate-expected"
+out=$(gate_run); rc=$?
+bsha=$(cd "$gatedir" && git rev-parse HEAD)
+[ "$rc" -eq 0 ] && [ ! -f "$tmp/gate-receipts/$bsha.receipt" ] \
+  && ok "gate: --bless writes no receipt, so no push can ever rest on one" \
+  || bad "gate: a blessing run must leave no receipt" \
+    "    exit $rc, receipts: $(ls "$tmp/gate-receipts" 2>/dev/null | tr '\n' ' ')"
+printf '%s' "$out" | grep -qE '^gate: BLESSED sha=[0-9a-f]{40} ' \
+  && ! printf '%s' "$out" | grep -qE '^gate: GREEN ' \
+  && ok "gate: a blessing run's verdict reads BLESSED, never GREEN" \
+  || bad "gate: a blessing verdict must not read as a gate verdict" \
+    "$(printf '%s\n' "$out" | tail -6)"
+# And the question pre-push actually asks, asked of that sha.
+env -i PATH="$gatedir/bin:/usr/bin:/bin:$PATH" HOME="$tmp" \
+  HERD_GATE_RECEIPTS="$tmp/gate-receipts" \
+  bash -c "cd '$gatedir' && ./scripts/gate.sh --verify-receipt '$bsha'" \
+  >/dev/null 2>&1 \
+  && bad "gate: --verify-receipt accepted a sha only a blessing run ran on" "" \
+  || ok "gate: --verify-receipt refuses the sha a blessing run ran on"
 GATE_ARGS=""
 gate_fresh
 rm -f "$tmp/gate-expected"
@@ -849,7 +919,7 @@ pp_fresh() {
   chmod +x "$pdir/scripts/gate.sh" "$pdir/scripts/githooks/pre-push"
   git init -q --bare "$prem" >/dev/null 2>&1
   (cd "$pdir" && git init -q . \
-    && git config core.hooksPath scripts/githooks \
+    && git config core.hooksPath "$pdir/scripts/githooks" \
     && git config user.name t && git config user.email t@t \
     && git remote add origin "$prem" \
     && echo base > file.txt && git add -A \
@@ -1072,7 +1142,7 @@ mkdir -p "$pdir2/scripts/githooks"
 cp "$root/scripts/gate.sh" "$pdir2/scripts/gate.sh"
 cp "$root/scripts/githooks/pre-push" "$pdir2/scripts/githooks/pre-push"
 chmod +x "$pdir2/scripts/gate.sh" "$pdir2/scripts/githooks/pre-push"
-(cd "$pdir2" && git init -q . && git config core.hooksPath scripts/githooks \
+(cd "$pdir2" && git init -q . && git config core.hooksPath "$pdir2/scripts/githooks" \
   && git config user.name t && git config user.email t@t \
   && git remote add origin "$prem" && echo other > file.txt && git add -A \
   && git commit -q -F "$tmp/push-good.md") >/dev/null 2>&1
@@ -1097,6 +1167,29 @@ pp_fresh
 (cd "$pdir" && ./scripts/githooks/pre-push --check-install >/dev/null 2>&1) \
   && ok "pre-push: --check-install passes where core.hooksPath points at it" \
   || bad "pre-push: --check-install must pass in an installed worktree" ""
+# The two forms of the value, which --check-install could not tell apart
+# until this change: `git rev-parse --git-path hooks` contains
+# `scripts/githooks` whether the setting is relative or absolute, so the old
+# check passed the exact value ORCH-131 removed -- and printed that value
+# back in its own `Fix:` line, so an agent following its own tool's error
+# message re-armed every worktree of the repository with a path that
+# resolves inside each of them. Both halves are now cases.
+(cd "$pdir" && git config core.hooksPath scripts/githooks)
+out=$(cd "$pdir" && ./scripts/githooks/pre-push --check-install 2>&1); rc=$?
+[ "$rc" -ne 0 ] && printf '%s' "$out" | grep -q 'is RELATIVE' \
+  && ok "pre-push: --check-install refuses a relative core.hooksPath" \
+  || bad "pre-push: a relative core.hooksPath must be refused" "    exit $rc: $out"
+printf '%s\n' "$out" | grep -qE '^pre-push: +git config core\.hooksPath /' \
+  && ! printf '%s\n' "$out" | grep -qE 'core\.hooksPath +scripts/githooks$' \
+  && ok "pre-push: the advice is an absolute path, never the relative form" \
+  || bad "pre-push: the advice must name an absolute path" "    $out"
+# And it names the MAIN checkout, not whichever worktree asked: one setting
+# serves every worktree, so advising a path inside a throwaway one is the
+# same defect wearing an absolute spelling.
+printf '%s\n' "$out" | grep -qF "core.hooksPath $pdir/scripts/githooks" \
+  && ok "pre-push: the advice names the checkout's own hooks directory" \
+  || bad "pre-push: the advice must name the checkout" "    $out"
+(cd "$pdir" && git config core.hooksPath "$pdir/scripts/githooks")
 (cd "$pdir" && git config --unset core.hooksPath)
 (cd "$pdir" && ./scripts/githooks/pre-push --check-install >/dev/null 2>&1) \
   && bad "pre-push: --check-install must fail where the hook is not installed" "" \
@@ -1116,9 +1209,11 @@ pp_push -q --no-verify origin "HEAD:refs/heads/main"
   || bad "pre-push: --no-verify is expected to bypass the hook" "    exit $pp_rc: $out"
 # --- the setting is repository-wide, and it REPLACES .git/hooks ----------
 # Measured on git 2.54.0, and the reason this is written down: one
-# `git config core.hooksPath scripts/githooks` in a checkout arms that
-# checkout and every worktree added from it, because they share one config
-# file. Making it per worktree instead needs `extensions.worktreeConfig`:
+# `git config core.hooksPath <checkout>/scripts/githooks` in a checkout arms
+# that checkout and every worktree added from it, because they share one
+# config file -- which is why the value must be absolute and why
+# `--check-install` refuses a relative one (ORCH-131, cases above).
+# Making it per worktree instead needs `extensions.worktreeConfig`:
 # without it, `--worktree` is REFUSED in a repository that has more than one
 # working tree (ours has 88) and silently means `--local` in one that has a
 # single working tree -- so it is no way to narrow the setting by accident.
@@ -1132,12 +1227,12 @@ pp_fresh
 sha=$(pp_commit "$tmp/push-good.md")
 # One working tree: `--worktree` is accepted and means `--local`, which is
 # the shared config -- not a narrowing.
-(cd "$pdir" && git config --worktree core.hooksPath scripts/githooks) >/dev/null 2>&1 \
+(cd "$pdir" && git config --worktree core.hooksPath "$pdir/scripts/githooks") >/dev/null 2>&1 \
   && ok "pre-push: with one working tree, --worktree means --local" \
   || bad "pre-push: --worktree was expected to act as --local here" ""
 git -C "$pdir" worktree add -q "$tmp/push-wt2" -b wt2 >/dev/null 2>&1
 # Two working trees, extensions.worktreeConfig unset: refused outright.
-(cd "$pdir" && git config --worktree core.hooksPath scripts/githooks) >/dev/null 2>&1 \
+(cd "$pdir" && git config --worktree core.hooksPath "$pdir/scripts/githooks") >/dev/null 2>&1 \
   && bad "pre-push: --worktree must be refused with several working trees" "" \
   || ok "pre-push: --worktree is refused without extensions.worktreeConfig"
 if (cd "$tmp/push-wt2" && ./scripts/githooks/pre-push --check-install >/dev/null 2>&1); then

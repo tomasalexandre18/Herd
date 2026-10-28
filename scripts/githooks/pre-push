@@ -63,8 +63,14 @@
 #   not bind it. Checks 3 and 4 below are not belt and braces. They are the
 #   belt.
 # * The receipt store is a local directory (`$HERD_GATE_RECEIPTS`, default
-#   `target/herd-gate/`). Anyone who can write a file there can write a
-#   receipt. A receipt is evidence that a gate ran, not proof.
+#   `target/herd-gate/`), and it is **per worktree**: a green gate in one
+#   agent's worktree leaves nothing this hook can find in another's, so
+#   whoever pushes gates the tree they push. Anyone who can write a file
+#   there can write a receipt. A receipt is evidence that a gate ran, not
+#   proof. One thing it cannot be is a `--bless` run's self-blessing: such a
+#   run writes no receipt at all (`gate.sh` step 8), because it adopts its
+#   own skip list as the expectation and this hook reads only the verdict
+#   and the sha.
 # * It reads the message of the **tip** commit only. Commits beneath the tip
 #   are not inspected, by design: the landing record describes the landing.
 # * A `--force` push that happens to be a fast-forward is byte-for-byte
@@ -81,14 +87,22 @@
 #   guard must not refuse a correct push on a wording quibble, because every
 #   false refusal is an argument for `--no-verify`.
 #
-# INSTALLING. One command, in the repository or in any worktree of it:
+# INSTALLING. One command, and the path in it is **absolute**:
 #
-#     git config core.hooksPath scripts/githooks
+#     git config core.hooksPath /path/to/checkout/scripts/githooks
 #
-# The path is relative, so it resolves inside whichever worktree the hook
-# runs in. `git worktree add` worktrees share the config of the checkout they
-# were added from, so setting it once in `/mnt/ssd_980/herd-project` covers
-# every agent worktree created there. A fresh `git clone` carries none of it:
+# `core.hooksPath` is one setting for the whole repository — `git worktree
+# add` worktrees share the config of the checkout they were added from, so
+# setting it once in `/mnt/ssd_980/herd-project` arms every agent worktree
+# created there. A **relative** value is therefore the wrong shape and
+# `--check-install` refuses it: git resolves it against each worktree's own
+# root, so the one setting names a different file in every worktree, and in
+# a worktree whose sha does not carry `scripts/githooks` it names a
+# directory that does not exist — which disables `.git/hooks` too and
+# supplies nothing in its place. That was ORCH-131, on this host, and the
+# advice printed by `--check-install` is the absolute form for exactly that
+# reason: an agent that follows its own tool's error message must not
+# restore the defect repository-wide. A fresh `git clone` carries none of it:
 # `.git/config` is not in the repository and never will be, so the setting is
 # part of creating a working copy and is named in `workflow.md`'s
 # worktree-creation step. `./scripts/githooks/pre-push --check-install`
@@ -147,15 +161,51 @@ columns() {
 if [ "${1:-}" = "--check-install" ]; then
   want=$(git config --get core.hooksPath || true)
   here=$(git rev-parse --git-path hooks 2>/dev/null)
+  # The advice names the MAIN checkout's hooks directory, not this
+  # worktree's: `core.hooksPath` is one repository-wide setting, so a value
+  # inside a throwaway worktree would arm every other worktree with a path
+  # that disappears when that one is removed. `--git-common-dir` is the main
+  # `.git` whatever worktree this runs in.
+  common=$(git rev-parse --git-common-dir 2>/dev/null)
+  case "$common" in
+    "") common="$root/.git" ;;
+    /*) ;;
+    *) common="$root/$common" ;;
+  esac
+  advise=$(cd "$(dirname "$common")" 2>/dev/null && pwd)/scripts/githooks
+  case "$advise" in /scripts/githooks) advise="$root/scripts/githooks" ;; esac
   if [ -z "$want" ]; then
     echo "pre-push: core.hooksPath is NOT set in this worktree; the push guard" >&2
-    echo "pre-push: does not run here. Fix: git config core.hooksPath scripts/githooks" >&2
+    echo "pre-push: does not run here. Fix:" >&2
+    echo "pre-push:   git config core.hooksPath $advise" >&2
     exit 1
   fi
+  # A relative value is refused, and this check is the only thing that can
+  # tell the two forms apart: `--git-path hooks` below contains
+  # `scripts/githooks` either way, so matching on it alone passed the exact
+  # value ORCH-131 removed. One setting serves 85 worktrees; relative means
+  # it resolves against each of their roots, naming a different file in each
+  # and a missing directory in any whose sha predates `scripts/githooks` —
+  # and a `core.hooksPath` that names nothing silences `.git/hooks` as well,
+  # which is strictly worse than leaving it unset (`workflow.md`,
+  # *Concurrency and host rules*).
+  case "$want" in
+    /*) ;;
+    *)
+      echo "pre-push: core.hooksPath=$want is RELATIVE, and the guard it arms is" >&2
+      echo "pre-push: one setting for every worktree of this repository: a relative" >&2
+      echo "pre-push: value resolves against each worktree's own root, so it names a" >&2
+      echo "pre-push: different file in each and nothing at all in a worktree whose" >&2
+      echo "pre-push: sha does not carry scripts/githooks — which disables .git/hooks" >&2
+      echo "pre-push: too (ORCH-131). Fix:" >&2
+      echo "pre-push:   git config core.hooksPath $advise" >&2
+      exit 1 ;;
+  esac
   case "$here" in
     *scripts/githooks*) echo "pre-push: installed — core.hooksPath=$want"; exit 0 ;;
   esac
   echo "pre-push: core.hooksPath=$want does not point at scripts/githooks" >&2
+  echo "pre-push: Fix: git config core.hooksPath $advise" >&2
   exit 1
 fi
 

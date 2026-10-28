@@ -8,7 +8,10 @@
 #   ./scripts/gate.sh                  run the gate
 #   ./scripts/gate.sh --out FILE       write the log there
 #   ./scripts/gate.sh --bless          adopt this run's skip list as the
-#                                      expectation for this host
+#                                      expectation for this host. NOT a
+#                                      gate run: it ends in
+#                                      `gate: BLESSED` and writes no
+#                                      receipt at all.
 #   ./scripts/gate.sh --verify-receipt SHA
 #                                      exit 0 iff a GREEN receipt exists
 #                                      for exactly that sha
@@ -22,14 +25,30 @@
 #    skips 12 at rest and 14 under load, and neither figure means anything on
 #    its own. The names do.
 #
-# 2. A load-dependent run is not a run. Two flood benches skip themselves
-#    above a one-minute load of 8, so the gate reads load1 first, allows the
-#    load-conditional list above that threshold and says so, and refuses to
-#    run at all above a ceiling.
+# 2. A load-dependent run is not a run, and one reading of the load does not
+#    say what a run was. Two flood benches skip themselves above a
+#    one-minute load of 8 and they read the load TWICE — once as the flood
+#    starts and once mid-flood (`herd-hub/tests/fake_hub_flood.rs`) — so the
+#    gate reads it twice too, at step 0 and again after the suite, allows
+#    the load-conditional list when EITHER reading is above the threshold,
+#    names the reading that allowed it in the verdict, and refuses to run at
+#    all above a ceiling. One reading misses the routine case on a shared
+#    host: a run that begins quiet and becomes busy. Measured here on
+#    2026-10-28, 0.32 -> 2.36 in one run and 9.56 -> 14.91 in another, and
+#    the gate was printing the second figure without using it.
 #
 # 3. A gate run on a tree that is not what gets pushed proves nothing. The
 #    gate refuses a dirty tree, and writes a receipt named for the sha it
-#    ran on. `--verify-receipt` is what a pre-push hook asks.
+#    ran on. `--verify-receipt` is what a pre-push hook asks, and it reads
+#    only the verdict and the sha — so a run that cannot stand behind its
+#    own verdict writes NO receipt, rather than a receipt with a caveat in
+#    it. A `--bless` run is exactly that run: it adopts this run's own skips
+#    as the expectation, so its step 7 green-lights itself.
+#
+#    The receipt store is per worktree (`$HERD_GATE_RECEIPTS`, default
+#    `target/herd-gate/`, under a gitignored directory), so a green gate
+#    does NOT travel from one worktree to another. Whoever pushes gates the
+#    tree they push.
 #
 # What it cannot cover, said plainly: a second machine, a pristine checkout,
 # the release path (`.github/workflows/release.yml` builds the artefacts the
@@ -46,6 +65,11 @@ expected=${HERD_GATE_EXPECTED:-$root/scripts/expected-skips/local.txt}
 expected_load=${HERD_GATE_EXPECTED_UNDER_LOAD:-$root/scripts/expected-skips/local-under-load.txt}
 load_note=${HERD_GATE_LOAD_NOTE:-8}
 load_max=${HERD_GATE_LOAD_MAX:-24}
+# A seam, so that "the load rose while the suite ran" is a case a test can
+# run rather than a sentence in a comment: both readings come from here and
+# nothing else in this file reads /proc/loadavg.
+loadavg=${HERD_GATE_LOADAVG:-/proc/loadavg}
+read_load1() { cut -d' ' -f1 "$loadavg" 2>/dev/null || echo 0; }
 
 bless=0
 out=""
@@ -71,7 +95,10 @@ while [ $# -gt 0 ]; do
       echo "gate: GREEN receipt for $sha"
       exit 0
       ;;
-    -h|--help) sed -n '2,33p' "$0"; exit 0 ;;
+    # The header block, counted rather than written down: a literal range
+    # goes stale the first time a line is added above it, and a help text
+    # that prints half a sentence is how nobody reads it twice.
+    -h|--help) sed -n "2,$(($(grep -n '^set -uo pipefail' "$0" | cut -d: -f1) - 1))p" "$0"; exit 0 ;;
     *) echo "gate.sh: unknown argument $1" >&2; exit 2 ;;
   esac
 done
@@ -135,7 +162,7 @@ say "step 0: the tree, the sha and the host"
 host=$(hostname)
 cores=$(nproc 2>/dev/null || echo ?)
 memavail=$(awk '/^MemAvailable:/ {print $2 " kB"}' /proc/meminfo 2>/dev/null)
-load1=$(cut -d' ' -f1 /proc/loadavg 2>/dev/null || echo 0)
+load1=$(read_load1)
 branch=$(git rev-parse --abbrev-ref HEAD 2>/dev/null || echo unknown)
 say "  started:      $started"
 say "  sha:          $sha"
@@ -157,9 +184,18 @@ say "  the working tree is clean: this gate is about $sha and nothing else"
 if awk "BEGIN{exit !($load1 > $load_max)}"; then
   refuse "load1 $load1 is above the ceiling $load_max; retry when the host is quieter"
 fi
+# Which reading put this run under load is part of the verdict: "under load"
+# with no figure beside it leaves a reader guessing why two extra names were
+# allowed, and guessing is what a verdict line exists to stop.
 under_load=0
-if awk "BEGIN{exit !($load1 > $load_note)}"; then
+load_trigger=""
+note_load() { # <label> <value>
   under_load=1
+  [ -z "$load_trigger" ] || load_trigger="$load_trigger,"
+  load_trigger="$load_trigger$1=$2>$load_note"
+}
+if awk "BEGIN{exit !($load1 > $load_note)}"; then
+  note_load load1-start "$load1"
   say "  load1 $load1 is above $load_note: the flood benches skip themselves"
   say "  at this load, so the load-conditional expected list applies."
 fi
@@ -212,6 +248,23 @@ say "  observed skip lines: $(wc -l < "$observed" | tr -d ' ') (the count is"
 say "  not the signal; the list is)"
 say "  observed list:        $observed"
 
+# The load's second reading, taken here because this is the first moment
+# after the suite. The flood benches read the load as the flood starts and
+# again mid-flood, and skip themselves on either, so a run that began quiet
+# and ended busy carries a flood skip that step 0's reading alone would not
+# allow — a red gate on a clean tree, for a reason that is not in the diff.
+# Step 8 prints and records this same figure; the load is not read a third
+# time.
+load1_end=$(read_load1)
+if awk "BEGIN{exit !($load1_end > $load_note)}"; then
+  if [ "$under_load" -eq 0 ]; then
+    say "  load1 rose from $load1 to $load1_end, above $load_note: the flood"
+    say "  benches read the load again mid-flood and skip themselves on that"
+    say "  reading too, so the load-conditional expected list applies."
+  fi
+  note_load load1-end "$load1_end"
+fi
+
 if [ "$bless" -eq 1 ]; then
   if grep -q '^test suite: PASSED$' "$suite"; then
     mkdir -p "$(dirname "$expected")"
@@ -238,9 +291,19 @@ fi
 
 allowed="$receipts/allowed-skips-${sha:0:12}.txt"
 skip_names "$expected" > "$allowed"
-if [ "$under_load" -eq 1 ] && [ -f "$expected_load" ]; then
-  say "  adding the load-conditional list: $expected_load"
-  skip_names "$expected_load" >> "$allowed"
+if [ "$under_load" -eq 1 ]; then
+  if [ -f "$expected_load" ]; then
+    say "  adding the load-conditional list: $expected_load"
+    say "  it is a DELTA over the at-rest list and never a whole list"
+    say "  allowed by: $load_trigger"
+    skip_names "$expected_load" >> "$allowed"
+  else
+    note "this run is under load ($load_trigger) and there is no load-conditional list, so a load-gated skip would be red:"
+    say "    $expected_load"
+  fi
+else
+  say "  the at-rest list applies on its own: load1 $load1 at the start and"
+  say "  $load1_end after the suite, neither above $load_note."
 fi
 sort -o "$allowed" "$allowed"
 seen="$receipts/seen-skips-${sha:0:12}.txt"
@@ -271,17 +334,42 @@ esac
 # --- step 8: one verdict, and a receipt named for the sha -----------------
 rule
 finished=$(date -u +%Y-%m-%dT%H:%M:%SZ)
-load1_end=$(cut -d' ' -f1 /proc/loadavg 2>/dev/null || echo 0)
 say "step 8: the verdict and the receipt"
 say "  started $started, finished $finished"
-say "  load1 $load1 at the start, $load1_end at the end"
+say "  load1 $load1 at the start, $load1_end after the suite"
+if [ "$under_load" -eq 1 ]; then
+  skips_field="skips=under-load($load_trigger)"
+else
+  skips_field="skips=at-rest"
+fi
 if [ -n "$failed" ]; then
   say "  steps that failed:$failed"
   rule
-  say "gate: RED sha=$sha failed=$(echo $failed | tr ' ' ',')"
+  say "gate: RED sha=$sha failed=$(echo $failed | tr ' ' ',') $skips_field"
   say "gate: NOT GREEN — this sha must not be pushed to main."
   say "log: $out"
   exit 1
+fi
+
+# A blessing run stops one step short of a receipt, and that is the whole of
+# the rule. It adopted this run's own skip list as the expectation at step 7,
+# so its step 7 green-lit itself and its verdict is not evidence about this
+# sha. Nothing a receipt could carry would say so where it is read:
+# `--verify-receipt` reads the verdict line, the sha and nothing else, and
+# `pre-push`'s check 1b asks only that — so a receipt from a blessing run
+# would be taken as the gate for a landing's second parent. The alternative
+# considered and rejected was a `blessed: yes` field that `--verify-receipt`
+# refuses: it leaves an object that exists and must be disbelieved, and
+# every reader of the store then has to know the rule. Writing nothing needs
+# no rule.
+if [ "$bless" -eq 1 ]; then
+  rule
+  say "gate: BLESSED sha=$sha steps=0-8:ok host=$host load1=$load1 $skips_field"
+  say "gate: NOT A GATE RUN — a blessing run green-lights its own step 7, so"
+  say "      no receipt was written and this verdict authorises no push."
+  say "      Re-run without --bless to gate $sha."
+  say "log: $out"
+  exit 0
 fi
 
 receipt="$receipts/$sha.receipt"
@@ -308,6 +396,6 @@ if [ -n "$note_lines" ]; then
   printf '%s' "$note_lines" | sed 's/^/    /' | tee -a "$out"
 fi
 rule
-say "gate: GREEN sha=$sha steps=0-8:ok host=$host load1=$load1"
+say "gate: GREEN sha=$sha steps=0-8:ok host=$host load1=$load1 $skips_field"
 say "log: $out"
 exit 0
