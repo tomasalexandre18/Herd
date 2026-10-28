@@ -3,8 +3,9 @@
 - **Item:** ORCH-120 (answered 2026-10-28), with the two stale clauses
   ORCH-120's own row requires in the same edit
 - **Agent:** herd-step
-- **Branch / commit:** `method-rules` / see the log below, based on
-  origin/main `bc83717`
+- **Branch / commit:** `method-rules`, based on origin/main `bc83717`;
+  eight content commits, the last of them `8a6287c`, plus this handoff's
+  own — `git log --oneline origin/main..method-rules` is the list
 - **Landing:** none — this branch is pushed and opens no pull request;
   it is integrated with its batch, and `herd-merger` names the landing
   here
@@ -14,7 +15,8 @@
 
 ## Done
 
-Eight commits, each one idea, on `method-rules`. Write paths respected:
+Eight content commits, each one idea, plus the two that carry this
+handoff. Write paths respected:
 `CLAUDE.md`, `docs/orchestration/workflow.md`, the three agent files,
 and this handoff. Nothing else.
 
