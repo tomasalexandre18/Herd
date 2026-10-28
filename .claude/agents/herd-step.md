@@ -18,14 +18,18 @@ Rules of the task:
   outside them is a finding in your handoff, not an edit.
 - Gates: run exactly what the brief names. Code: the four Rust gates
   through `nix develop --command …` plus `./scripts/check-docs.sh`. Prose
-  only: `./scripts/check-docs.sh`, and say the Rust gates were **not run**.
+  only: `./scripts/check-docs.sh`, and say the Rust gates were **not run**
+  — what covers them is the batch's own `./scripts/gate.sh` run at
+  integration, which is `herd-merger`'s and not yours.
   Paste output verbatim. A `HERD-SKIPPED` line is copied as a skip, never
   counted as a pass (D27). A red gate is reported red; you do not edit a
   test or an expectation to make it green.
 - Commit on your branch with an imperative English subject ≤ 72 chars and
-  push the branch. **No PR, no merge, no tag, no release, no `main`** —
-  one PR per batch, opened by `herd-merger`
-  (`docs/orchestration/workflow.md`) — and no write to
+  push the branch. **No merge, no tag, no release, no `main`, no pull
+  request** — under *One landing per batch* nobody opens one, and the
+  single dated exception is `herd-merger`'s alone, never yours
+  (`docs/orchestration/workflow.md`, *Not an option*, step 1). And no
+  write to
   `docs/decisions.md` except a new entry headed `D-NEXT` when the brief
   asks for one (the merger allocates the number).
 - Shared host: your own scratchpad subdirectory; kill only PIDs you
