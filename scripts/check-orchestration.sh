@@ -24,12 +24,62 @@
 #
 # Usage: ./scripts/check-orchestration.sh
 set -uo pipefail
+
+# This script is independent of the stdin it was handed: nothing below reads
+# fd 0, and the redirection makes sure nothing below inherits it either.
+#
+# That is not tidiness. Several captures below run
+# `env -i PATH=... HOME=/wrong/home bash -c ...` to prove a script rebuilds
+# its own environment, and `env -i` strips `__ETC_PROFILE_DONE`. A
+# `bash -c` whose fd 0 is a *socket* sources SYS_BASHRC (/etc/bashrc)
+# although it is not interactive: bash takes a socket on fd 0 for an
+# rshd/sshd session (isnetconn()), and it looks only on the -c path, so
+# this script's own shell is never the one affected -- it is these
+# children, which inherit fd 0 from here. /etc/bashrc then finds that
+# variable empty, sources /etc/profile and /etc/set-environment, and
+# rebuilds PATH out of the child's own HOME=/wrong/home -- discarding the
+# PATH the case supplied. The assertions then correctly report a PATH and
+# a stub directory that are no longer there, and nothing in the diff is
+# at fault.
+#
+# Measured on this host on 2026-10-28. Whole script, same tree, same
+# minute: 253 passed / 0 failed with fd 0 on /dev/null, 232 passed /
+# 21 failed with fd 0 on an AF_UNIX socketpair (in-memory; no listening
+# socket, no port, no network). One capture in isolation, with the socket
+# on fd 0 either way: without the redirection the child reports
+# __ETC_BASHRC_SOURCED=1 and a PATH rebuilt from /wrong/home; with it,
+# the variable is unset and the supplied PATH arrives intact.
+#
+# Only a socket arms it: /dev/null, a pipe, a regular file and a closed fd 0
+# are all inert, which is why this went unseen -- the caller chose, and the
+# script had no say. One redirection here covers all 27 captures below and
+# any added later, and it is the convention the product already follows: a
+# runner gives every job Stdio::null() (herd-runner/src/job.rs). ORCH-111.
+exec </dev/null
 root=$(cd "$(dirname "$0")/.." && pwd)
 tmp=$(mktemp -d "${TMPDIR:-/tmp}/herd-orch-check.XXXXXX")
 trap 'rm -rf "$tmp"' EXIT
 pass=0; fail=0
 ok()   { pass=$((pass+1)); printf 'ok    %s\n' "$1"; }
 bad()  { fail=$((fail+1)); printf 'FAIL  %s\n%s\n' "$1" "$2"; }
+
+# Every assertion below reads a captured output through a HERE-STRING
+# (`grep -q ... <<<"$out"`) and never by piping `printf` into `grep`. Under
+# the `pipefail` set above that pipe is a race and not a matter of style:
+# `grep -q` exits the moment it matches, `printf` is then killed by SIGPIPE
+# on the bytes it has left to write, and `pipefail` reports the pipeline as
+# failed -- so the assertion declares a text missing that it has just
+# recognised, and prints that very text as its diagnostic. Two things have
+# to hold for it to fire, both measured on this host on 2026-10-28 at
+# load1 13-15, 200 runs per size: the output must be larger than the 4 KiB
+# stdio buffer `printf` writes a pipe in, so that it takes more than one
+# write, and a complete matching line must sit in the first of those
+# writes, so that `grep` can decide before the last one. Payloads of 945,
+# 1950, 3960 and 4161 bytes false-failed 0/200; 4965 and 7980 bytes 1/200;
+# 64 kB 14/200; 1 MB 200/200. The here-string false-failed 0/200 at every
+# size, because it is a temporary file and not a pipe: no reader can exit
+# early and there is no writer to kill. Keep it that way -- an assertion
+# here must not pipe a captured output into `grep`.
 
 # A fresh copy of the files check-docs.sh reads.
 fresh() {
@@ -39,7 +89,7 @@ fresh() {
 # expect_red <name> <grep pattern of the message> : check-docs.sh on $tmp/repo fails and says why
 expect_red() {
   out=$(cd "$tmp/repo" && ./scripts/check-docs.sh 2>&1); rc=$?
-  if [ "$rc" -ne 0 ] && printf '%s' "$out" | grep -qE -- "$2"; then ok "$1"
+  if [ "$rc" -ne 0 ] && grep -qE -- "$2" <<<"$out"; then ok "$1"
   else bad "$1" "    exit=$rc, output:
 $(printf '%s\n' "$out" | sed 's/^/    /' | head -8)"; fi
 }
@@ -146,7 +196,7 @@ expect_red "settings.json invalid" 'not valid JSON'
 echo "== the number is an identifier: the historical gaps stay silent, a new gap is noted, nothing is rewritten"
 fresh; before=$(sha256sum "$tmp/repo/docs/decisions.md")
 out=$(cd "$tmp/repo" && ./scripts/check-docs.sh 2>&1)
-printf '%s' "$out" | grep -qE 'note: D143 ' && bad "D143 is a known gap and must not be noted" "$out" || ok "known gaps D143, D154 not noted"
+grep -qE 'note: D143 ' <<<"$out" && bad "D143 is a known gap and must not be noted" "$out" || ok "known gaps D143, D154 not noted"
 [ "$before" = "$(sha256sum "$tmp/repo/docs/decisions.md")" ] && ok "decisions.md unchanged by the check" || bad "decisions.md was modified by the check" ""
 
 echo "== two branches allocating the same number collide at integration, and the check says so"
@@ -168,7 +218,7 @@ out=$(./scripts/check-docs.sh 2>&1); [ $? -eq 0 ] && ok "branch A allocated D4 a
 git checkout -q b && sed -i 's/— D-NEXT From B/— D4 From B/' docs/decisions.md && git -c user.name=t -c user.email=t@t commit -qam "allocate D4 again"
 # a textual merge of a into b conflicts on the file; this is what resolving it by keeping both entries produces
 printf '# Decisions\n\n## 2026-10-01 — D1 One\n\nBody.\n\n## 2026-10-02 — D2 Two\n\nBody.\n\n## 2026-10-03 — D3 Three\n\nBody.\n\n## 2026-10-04 — D4 From A\n\nBody.\n\n## 2026-10-04 — D4 From B\n\nBody.\n' > docs/decisions.md
-out=$(./scripts/check-docs.sh 2>&1); printf '%s' "$out" | grep -q 'D4' && [ "$(printf '%s' "$out" | grep -c 'number twice')" -ge 1 ] && ok "the collision D4/D4 is rejected with the number named" || bad "collision not rejected" "$out"
+out=$(./scripts/check-docs.sh 2>&1); grep -q 'D4' <<<"$out" && [ "$(grep -c 'number twice' <<<"$out")" -ge 1 ] && ok "the collision D4/D4 is rejected with the number named" || bad "collision not rejected" "$out"
 # the right move: B takes D5, the gap list stays empty
 sed -i 's/— D4 From B/— D5 From B/' docs/decisions.md
 out=$(./scripts/check-docs.sh 2>&1); [ $? -eq 0 ] && ok "B reallocated to D5 passes" || bad "D5 should pass" "$out"
@@ -291,9 +341,9 @@ run_test_sh() {
 verdict() {
   local name=$1 want=$2 must=$3 never=${4:-} why=''
   [ "$rc" -eq "$want" ] || why="    exit=$rc, expected $want"
-  printf '%s' "$out" | grep -qF -- "$must" || why="$why
+  grep -qF -- "$must" <<<"$out" || why="$why
     missing from the report: $must"
-  if [ -n "$never" ] && printf '%s' "$out" | grep -qF -- "$never"; then
+  if [ -n "$never" ] && grep -qF -- "$never" <<<"$out"; then
     why="$why
     said what it must not say: $never"
   fi
@@ -313,7 +363,7 @@ run_test_sh 101 "$S1
 $S2"
 verdict "test.sh: red with skips reports them as a floor" 101 \
   "AT LEAST 2 assertion(s) COULD NOT RUN" "nothing was skipped"
-printf '%s' "$out" | grep -qF -- "$S2" && ok "test.sh: the floor lists the skips it has" \
+grep -qF -- "$S2" <<<"$out" && ok "test.sh: the floor lists the skips it has" \
   || bad "test.sh: the floor must still list the skips" "$out"
 # And the green cases keep their exact, unqualified wording.
 run_test_sh 0 ''
@@ -341,8 +391,8 @@ verdict "test.sh: a narrowed green run says its count may be short" 0 \
   "there may be more"
 # ... and its verdict marker says so too, so that a capture of it cannot be
 # read back as a whole run by report-skips.sh.
-if printf '%s\n' "$out" | grep -qF -- "test suite: PASSED (a part of the suite" \
-  && ! printf '%s\n' "$out" | grep -qxF -- "test suite: PASSED"; then
+if grep -qF -- "test suite: PASSED (a part of the suite" <<<"$out" \
+  && ! grep -qxF -- "test suite: PASSED" <<<"$out"; then
   ok "test.sh: a narrowed run's marker is not a plain PASSED"
 else
   bad "test.sh: a narrowed run must not print the whole-suite marker" \
@@ -427,7 +477,7 @@ dump=$(env -i PATH="$PATH" HOME=/wrong/home CHATONS_ROOT=/x HC=1 \
       printf "%s=%s\n" "$v" "${!v-<unset>}"
     done' _ "$E/env.sh" 2>&1)
 envis() { # <NAME=value> : the sourced environment has exactly this
-  printf '%s\n' "$dump" | grep -qxF "$1" && ok "env.sh: $1" \
+  grep -qxF "$1" <<<"$dump" && ok "env.sh: $1" \
     || bad "env.sh: expected $1" "$(printf '%s\n' "$dump" | sed 's/^/    /')"
 }
 envval() { printf '%s\n' "$dump" | sed -n "s/^$1=//p"; }
@@ -473,7 +523,7 @@ case $path_val in
     ok "PATH puts dtach, the wrappers, the per-user profile and sw/bin in front" ;;
   *) bad "PATH prefix is wrong" "    $path_val" ;;
 esac
-printf '%s' "$path_val" | grep -qF ":$PATH" \
+grep -qF ":$PATH" <<<"$path_val" \
   && ok "PATH keeps what it inherited behind the four" \
   || bad "PATH dropped the inherited entries; the guard below needs coreutils" "    $path_val"
 
@@ -484,7 +534,7 @@ cp "$E/env.sh" "$tmp/env-escape.sh"
 sed -i 's|^export CARGO_HOME=.*|export CARGO_HOME=/var/empty/herd-escaped|' "$tmp/env-escape.sh"
 out=$(env -i PATH="$PATH" HOME=/wrong/home \
   bash -c '. "$1" || exit 7' _ "$tmp/env-escape.sh" 2>&1); rc=$?
-[ "$rc" -eq 7 ] && printf '%s' "$out" | grep -q 'state path outside' \
+[ "$rc" -eq 7 ] && grep -q 'state path outside' <<<"$out" \
   && ok "the guard refuses a state path outside the root" \
   || bad "the guard let a path outside the root through" "    exit=$rc $out"
 
@@ -504,18 +554,18 @@ runsession() { # <GH_CONFIG_DIR>
     bash "$E/session.sh" --version </dev/null 2>&1); rc=$?
 }
 runsession "$tmp/gh-logged-in"
-{ [ "$rc" -eq 0 ] && printf '%s' "$out" | grep -q 'FAKE-CLAUDE-RAN --version' \
-  && ! printf '%s' "$out" | grep -q 'hosts.yml'; } \
+{ [ "$rc" -eq 0 ] && grep -q 'FAKE-CLAUDE-RAN --version' <<<"$out" \
+  && ! grep -q 'hosts.yml' <<<"$out"; } \
   && ok "session.sh starts the session and says nothing when gh is logged in" \
   || bad "session.sh misbehaved with a logged-in gh" "    exit=$rc $out"
 runsession "$tmp/gh-empty"
-{ printf '%s' "$out" | grep -q 'cannot open or merge a pull request' \
-  && printf '%s' "$out" | grep -q 'FAKE-CLAUDE-RAN'; } \
+{ grep -q 'cannot open or merge a pull request' <<<"$out" \
+  && grep -q 'FAKE-CLAUDE-RAN' <<<"$out"; } \
   && ok "session.sh warns, and still starts, when gh has no login" \
   || bad "session.sh did not warn about a gh directory with no hosts.yml" "    exit=$rc $out"
 mv "$sandroot/claude/config/.credentials.json" "$tmp/creds-aside"
 runsession "$tmp/gh-logged-in"
-{ [ "$rc" -eq 1 ] && printf '%s' "$out" | grep -q 'no .credentials.json'; } \
+{ [ "$rc" -eq 1 ] && grep -q 'no .credentials.json' <<<"$out"; } \
   && ok "session.sh refuses without credentials when no terminal can log in" \
   || bad "session.sh should refuse without credentials and no tty" "    exit=$rc $out"
 mv "$tmp/creds-aside" "$sandroot/claude/config/.credentials.json"
@@ -544,6 +594,12 @@ exit 0
 EOS
   cat > "$gatedir/scripts/test.sh" <<'EOS'
 #!/usr/bin/env bash
+# The host going busy WHILE the suite runs, which is where it happens: the
+# flood benches read the load again mid-flood, so this is what makes the
+# gate's second reading a case and not a comment.
+if [ -n "${HERD_STUB_LOAD_AFTER:-}" ] && [ -n "${HERD_GATE_LOADAVG:-}" ]; then
+  printf '%s 1.00 1.00 1/1 1\n' "$HERD_STUB_LOAD_AFTER" > "$HERD_GATE_LOADAVG"
+fi
 [ -n "${HERD_STUB_SKIPS:-}" ] && cat "$HERD_STUB_SKIPS"
 if [ "${HERD_STUB_SUITE:-pass}" != pass ]; then
   echo "test suite: FAILED (cargo test exited 101)"; exit 101
@@ -593,7 +649,7 @@ gate_run() {
 gate_case() {
   name=$1; want=$2; pat=$3; shift 3
   out=$(gate_run "$@"); rc=$?
-  if [ "$rc" -eq "$want" ] && printf '%s' "$out" | grep -qE -- "$pat"; then
+  if [ "$rc" -eq "$want" ] && grep -qE -- "$pat" <<<"$out"; then
     ok "gate: $name"
   else
     bad "gate: $name" "    want exit $want matching /$pat/, got exit $rc:
@@ -606,10 +662,10 @@ gate_case "a clean tree with the expected skip list is GREEN" 0 '^gate: GREEN sh
 # The verdict names the sha it is about: an authorisation that does not say
 # which commit it covers is not an authorisation (ORCH-001).
 out=$(gate_run); sha=$(cd "$gatedir" && git rev-parse HEAD)
-printf '%s' "$out" | grep -q "gate: GREEN sha=$sha " \
+grep -q "gate: GREEN sha=$sha " <<<"$out" \
   && ok "gate: the GREEN verdict names the exact sha" \
   || bad "gate: the verdict must name the sha" "$(printf '%s\n' "$out" | tail -4)"
-printf '%s' "$out" | grep -qE 'skips=|steps=0-8:ok' \
+grep -qE 'skips=|steps=0-8:ok' <<<"$out" \
   && ok "gate: the verdict is one line and says the steps all ran" \
   || bad "gate: verdict shape" "$(printf '%s\n' "$out" | tail -4)"
 # One output file, and the verdict is its last line.
@@ -644,7 +700,7 @@ gate_fresh
 printf 'HERD-SKIPPED: a_needs_cgroup_delegation: no delegated subtree here\nHERD-SKIPPED: b_needs_bfq: no device offers bfq\nHERD-SKIPPED: c_nobody_expected_this: a new reason\n' > "$tmp/gate-skips"
 gate_case "a skip that is not on the expected list is RED" 1 '7:unexpected-skip'
 out=$(gate_run)
-printf '%s' "$out" | grep -qF '+ c_nobody_expected_this' \
+grep -qF '+ c_nobody_expected_this' <<<"$out" \
   && ok "gate: the unexpected skip is named, not counted" \
   || bad "gate: the unexpected skip must be named" "$(printf '%s\n' "$out" | tail -8)"
 # The same run, with the load-conditional list allowing that skip above the
@@ -656,12 +712,51 @@ gate_case "the load-conditional list allows a load skip above the threshold" 0 \
   'load-conditional list' HERD_GATE_LOAD_NOTE=0
 gate_case "and below the threshold the same skip is still RED" 1 '7:unexpected-skip' \
   HERD_GATE_LOAD_NOTE=1000
+# ONE reading of the load decides nothing, because the flood benches read it
+# twice: once as the flood starts and once mid-flood, skipping themselves on
+# either. A run that begins quiet and becomes busy -- routine on a host with
+# 85 worktrees -- therefore carries a flood skip that step 0's reading alone
+# would not have allowed, and the gate went red on a clean tree for a reason
+# that was not in the diff. Measured here on 2026-10-28: load1 0.32 -> 2.36
+# in one run and 9.56 -> 14.91 in another. The stub suite raises the figure
+# while it runs, which is exactly where the real one raises it.
+gate_fresh
+printf 'HERD-SKIPPED: a_needs_cgroup_delegation: no delegated subtree here\nHERD-SKIPPED: b_needs_bfq: no device offers bfq\nHERD-SKIPPED: c_load_gated_bench: the host went busy\n' > "$tmp/gate-skips"
+printf 'HERD-SKIPPED: c_load_gated_bench: the host went busy\n' > "$tmp/gate-expected-load"
+printf '0.10 0.10 0.10 1/1 1\n' > "$tmp/gate-loadavg"
+out=$(gate_run HERD_GATE_LOADAVG="$tmp/gate-loadavg" HERD_STUB_LOAD_AFTER=12.00); rc=$?
+# These assertions read `$out` through a here-string, as every assertion in
+# this file now does: the note above `fresh` says what the pipe they used to
+# be written with gets wrong, and what it was measured at.
+[ "$rc" -eq 0 ] && grep -qF 'load1 rose from 0.10 to 12.00' <<<"$out" \
+  && ok "gate: a quiet start and a busy finish still gets the load list" \
+  || bad "gate: the second load reading must apply the load list" \
+    "    exit $rc:
+$(printf '%s\n' "$out" | tail -12 | sed 's/^/    /')"
+# And the verdict says WHICH reading allowed the extra names: "under load"
+# with no figure beside it leaves a reader guessing.
+grep -qE '^gate: GREEN .* skips=under-load\(load1-end=12\.00>8\)$' <<<"$out" \
+  && ok "gate: the verdict names the reading that allowed the extra skips" \
+  || bad "gate: the verdict must name the triggering reading" \
+    "$(printf '%s\n' "$out" | tail -4)"
+# The same list, with the load never rising: still RED, so the fix allows a
+# skip because of a measured load and not because two readings exist.
+printf '0.10 0.10 0.10 1/1 1\n' > "$tmp/gate-loadavg"
+gate_case "a quiet run throughout is still RED on that skip" 1 '7:unexpected-skip' \
+  HERD_GATE_LOADAVG="$tmp/gate-loadavg"
+# At rest the verdict says so, in the same field.
+gate_fresh
+printf '0.10 0.10 0.10 1/1 1\n' > "$tmp/gate-loadavg"
+out=$(gate_run HERD_GATE_LOADAVG="$tmp/gate-loadavg")
+grep -qE '^gate: GREEN .* skips=at-rest$' <<<"$out" \
+  && ok "gate: an at-rest run says which list it applied too" \
+  || bad "gate: the at-rest verdict must say so" "$(printf '%s\n' "$out" | tail -4)"
 # The count moving on its own is not a signal and must not be one.
 gate_fresh
 printf 'HERD-SKIPPED: a_needs_cgroup_delegation: no delegated subtree here\n' > "$tmp/gate-skips"
 gate_case "an expected skip that did not appear is a note, not a failure" 0 \
   'an expected skip did not appear'
-out=$(gate_run); printf '%s' "$out" | grep -qE 'gate: GREEN' \
+out=$(gate_run); grep -qE 'gate: GREEN' <<<"$out" \
   && ok "gate: a smaller skip list does not turn the gate red (list, not count)" \
   || bad "gate: a smaller list must stay green with a note" "$(printf '%s\n' "$out" | tail -6)"
 
@@ -675,12 +770,40 @@ gate_case "--bless on a suite that did not pass is refused" 1 \
   'bless refused' HERD_STUB_SUITE=red
 gate_fresh
 rm -f "$tmp/gate-expected"
-gate_case "--bless after a passing suite adopts the list and is GREEN" 0 \
+gate_case "--bless after a passing suite adopts the list and is BLESSED" 0 \
   'wrote 2 lines'
 grep -q '^HERD-SKIPPED: a_needs_cgroup_delegation' "$tmp/gate-expected" \
   && grep -q '^# host=' "$tmp/gate-expected" \
   && ok "gate: --bless records the host and the load it measured on" \
   || bad "gate: the blessed list must say where it came from" ""
+# A blessing run adopted its OWN skips as the expectation, so its step 7
+# green-lit itself and its verdict is not evidence about this sha. It must
+# therefore leave nothing a push guard could read as a gate: pre-push's
+# check 1b asks only for a file named for the sha whose first line says
+# `verdict: GREEN`, and no field in a receipt could tell it more, because
+# `--verify-receipt` reads nothing else. Two such receipts existed on this
+# host on 2026-10-28, one of them GREEN for a tree where a plain gate was
+# REFUSED with exit 3.
+gate_fresh
+rm -f "$tmp/gate-expected"
+out=$(gate_run); rc=$?
+bsha=$(cd "$gatedir" && git rev-parse HEAD)
+[ "$rc" -eq 0 ] && [ ! -f "$tmp/gate-receipts/$bsha.receipt" ] \
+  && ok "gate: --bless writes no receipt, so no push can ever rest on one" \
+  || bad "gate: a blessing run must leave no receipt" \
+    "    exit $rc, receipts: $(ls "$tmp/gate-receipts" 2>/dev/null | tr '\n' ' ')"
+grep -qE '^gate: BLESSED sha=[0-9a-f]{40} ' <<<"$out" \
+  && ! grep -qE '^gate: GREEN ' <<<"$out" \
+  && ok "gate: a blessing run's verdict reads BLESSED, never GREEN" \
+  || bad "gate: a blessing verdict must not read as a gate verdict" \
+    "$(printf '%s\n' "$out" | tail -6)"
+# And the question pre-push actually asks, asked of that sha.
+env -i PATH="$gatedir/bin:/usr/bin:/bin:$PATH" HOME="$tmp" \
+  HERD_GATE_RECEIPTS="$tmp/gate-receipts" \
+  bash -c "cd '$gatedir' && ./scripts/gate.sh --verify-receipt '$bsha'" \
+  >/dev/null 2>&1 \
+  && bad "gate: --verify-receipt accepted a sha only a blessing run ran on" "" \
+  || ok "gate: --verify-receipt refuses the sha a blessing run ran on"
 GATE_ARGS=""
 gate_fresh
 rm -f "$tmp/gate-expected"
@@ -849,7 +972,7 @@ pp_fresh() {
   chmod +x "$pdir/scripts/gate.sh" "$pdir/scripts/githooks/pre-push"
   git init -q --bare "$prem" >/dev/null 2>&1
   (cd "$pdir" && git init -q . \
-    && git config core.hooksPath scripts/githooks \
+    && git config core.hooksPath "$pdir/scripts/githooks" \
     && git config user.name t && git config user.email t@t \
     && git remote add origin "$prem" \
     && echo base > file.txt && git add -A \
@@ -908,7 +1031,7 @@ pp_push() { # <git push args...>: output in $out, exit in $pp_rc
 pp_case() { # <name> <expected exit> <grep pattern> <git push args...>
   name=$1; want=$2; pat=$3; shift 3
   pp_push "$@"
-  if [ "$pp_rc" -eq "$want" ] && printf '%s' "$out" | grep -qE -- "$pat"; then
+  if [ "$pp_rc" -eq "$want" ] && grep -qE -- "$pat" <<<"$out"; then
     ok "pre-push: $name"
   else
     bad "pre-push: $name" "    want exit $want matching /$pat/, got exit $pp_rc:
@@ -1072,7 +1195,7 @@ mkdir -p "$pdir2/scripts/githooks"
 cp "$root/scripts/gate.sh" "$pdir2/scripts/gate.sh"
 cp "$root/scripts/githooks/pre-push" "$pdir2/scripts/githooks/pre-push"
 chmod +x "$pdir2/scripts/gate.sh" "$pdir2/scripts/githooks/pre-push"
-(cd "$pdir2" && git init -q . && git config core.hooksPath scripts/githooks \
+(cd "$pdir2" && git init -q . && git config core.hooksPath "$pdir2/scripts/githooks" \
   && git config user.name t && git config user.email t@t \
   && git remote add origin "$prem" && echo other > file.txt && git add -A \
   && git commit -q -F "$tmp/push-good.md") >/dev/null 2>&1
@@ -1080,7 +1203,7 @@ osha=$(cd "$pdir2" && git rev-parse HEAD); pp_receipt "$osha"
 out=$(cd "$pdir2" && HERD_GATE_RECEIPTS="$prec" \
   git push --force origin "HEAD:refs/heads/main" 2>&1); pp_rc=$?
 if [ "$pp_rc" -eq 1 ] \
-   && printf '%s' "$out" | grep -q 'cannot tell a fast-forward'; then
+   && grep -q 'cannot tell a fast-forward' <<<"$out"; then
   ok "pre-push: a remote tip this clone has never seen is refused, not guessed"
 else
   bad "pre-push: an unknown remote tip must be refused" "    exit $pp_rc:
@@ -1097,6 +1220,29 @@ pp_fresh
 (cd "$pdir" && ./scripts/githooks/pre-push --check-install >/dev/null 2>&1) \
   && ok "pre-push: --check-install passes where core.hooksPath points at it" \
   || bad "pre-push: --check-install must pass in an installed worktree" ""
+# The two forms of the value, which --check-install could not tell apart
+# until this change: `git rev-parse --git-path hooks` contains
+# `scripts/githooks` whether the setting is relative or absolute, so the old
+# check passed the exact value ORCH-131 removed -- and printed that value
+# back in its own `Fix:` line, so an agent following its own tool's error
+# message re-armed every worktree of the repository with a path that
+# resolves inside each of them. Both halves are now cases.
+(cd "$pdir" && git config core.hooksPath scripts/githooks)
+out=$(cd "$pdir" && ./scripts/githooks/pre-push --check-install 2>&1); rc=$?
+[ "$rc" -ne 0 ] && grep -q 'is RELATIVE' <<<"$out" \
+  && ok "pre-push: --check-install refuses a relative core.hooksPath" \
+  || bad "pre-push: a relative core.hooksPath must be refused" "    exit $rc: $out"
+grep -qE '^pre-push: +git config core\.hooksPath /' <<<"$out" \
+  && ! grep -qE 'core\.hooksPath +scripts/githooks$' <<<"$out" \
+  && ok "pre-push: the advice is an absolute path, never the relative form" \
+  || bad "pre-push: the advice must name an absolute path" "    $out"
+# And it names the MAIN checkout, not whichever worktree asked: one setting
+# serves every worktree, so advising a path inside a throwaway one is the
+# same defect wearing an absolute spelling.
+grep -qF "core.hooksPath $pdir/scripts/githooks" <<<"$out" \
+  && ok "pre-push: the advice names the checkout's own hooks directory" \
+  || bad "pre-push: the advice must name the checkout" "    $out"
+(cd "$pdir" && git config core.hooksPath "$pdir/scripts/githooks")
 (cd "$pdir" && git config --unset core.hooksPath)
 (cd "$pdir" && ./scripts/githooks/pre-push --check-install >/dev/null 2>&1) \
   && bad "pre-push: --check-install must fail where the hook is not installed" "" \
@@ -1116,9 +1262,11 @@ pp_push -q --no-verify origin "HEAD:refs/heads/main"
   || bad "pre-push: --no-verify is expected to bypass the hook" "    exit $pp_rc: $out"
 # --- the setting is repository-wide, and it REPLACES .git/hooks ----------
 # Measured on git 2.54.0, and the reason this is written down: one
-# `git config core.hooksPath scripts/githooks` in a checkout arms that
-# checkout and every worktree added from it, because they share one config
-# file. Making it per worktree instead needs `extensions.worktreeConfig`:
+# `git config core.hooksPath <checkout>/scripts/githooks` in a checkout arms
+# that checkout and every worktree added from it, because they share one
+# config file -- which is why the value must be absolute and why
+# `--check-install` refuses a relative one (ORCH-131, cases above).
+# Making it per worktree instead needs `extensions.worktreeConfig`:
 # without it, `--worktree` is REFUSED in a repository that has more than one
 # working tree (ours has 88) and silently means `--local` in one that has a
 # single working tree -- so it is no way to narrow the setting by accident.
@@ -1132,12 +1280,12 @@ pp_fresh
 sha=$(pp_commit "$tmp/push-good.md")
 # One working tree: `--worktree` is accepted and means `--local`, which is
 # the shared config -- not a narrowing.
-(cd "$pdir" && git config --worktree core.hooksPath scripts/githooks) >/dev/null 2>&1 \
+(cd "$pdir" && git config --worktree core.hooksPath "$pdir/scripts/githooks") >/dev/null 2>&1 \
   && ok "pre-push: with one working tree, --worktree means --local" \
   || bad "pre-push: --worktree was expected to act as --local here" ""
 git -C "$pdir" worktree add -q "$tmp/push-wt2" -b wt2 >/dev/null 2>&1
 # Two working trees, extensions.worktreeConfig unset: refused outright.
-(cd "$pdir" && git config --worktree core.hooksPath scripts/githooks) >/dev/null 2>&1 \
+(cd "$pdir" && git config --worktree core.hooksPath "$pdir/scripts/githooks") >/dev/null 2>&1 \
   && bad "pre-push: --worktree must be refused with several working trees" "" \
   || ok "pre-push: --worktree is refused without extensions.worktreeConfig"
 if (cd "$tmp/push-wt2" && ./scripts/githooks/pre-push --check-install >/dev/null 2>&1); then
@@ -1155,8 +1303,8 @@ chmod +x "$pdir/.git/hooks/pre-push"
 pp_push -q origin "HEAD:refs/heads/main"
 # Which hook spoke is the whole question here, not which rule it applied:
 # ours prints `pre-push: REFUSED`, the stray prints its own marker.
-if [ "$pp_rc" -ne 0 ] && printf '%s' "$out" | grep -q 'pre-push: REFUSED' \
-   && ! printf '%s' "$out" | grep -q 'stray-git-hooks-pre-push-ran'; then
+if [ "$pp_rc" -ne 0 ] && grep -q 'pre-push: REFUSED' <<<"$out" \
+   && ! grep -q 'stray-git-hooks-pre-push-ran' <<<"$out"; then
   ok "pre-push: with the setting on, this hook runs and .git/hooks does not"
 else
   bad "pre-push: the installed hook must run instead of .git/hooks" \
@@ -1178,6 +1326,54 @@ rm -rf "${pdir:?}" "${prem:?}" "${prec:?}" "${ptrace:?}"
 rm -f "${tmp:?}"/push-good.md "${tmp:?}"/push-oneline.md \
   "${tmp:?}"/push-nosection.md "${tmp:?}"/push-placeholder.md \
   "${tmp:?}"/push-nofield.md "${tmp:?}"/push-longsubject.md
+
+echo "== the gate scripts' own stdin (ORCH-111)"
+# A socket on fd 0 makes bash source SYS_BASHRC non-interactively (its
+# isnetconn() check), and under the `env -i` captures above that rebuilds
+# PATH out of the case's own HOME=/wrong/home, so this script went red for a
+# reason that was never in the diff: 253 passed / 0 failed with fd 0 on
+# /dev/null against 232 passed / 21 failed with fd 0 on an AF_UNIX
+# socketpair, same tree, same minute, measured on 2026-10-28. The fix is one
+# `exec </dev/null` per script, and it needs freezing here because the
+# defect is invisible from a terminal: every fd kind a shell hands out by
+# default is inert, so a run with that line deleted stays green until the
+# day a caller's fd 0 happens to be a socket.
+#
+# Proving the redirection *works* needs a process that can put a socket on
+# fd 0, and this script runs with no toolchain, so that is deliberately not
+# asserted here -- a case that could only ever skip where this runs is not a
+# control. What is asserted is what can be asserted on every host: the line
+# is there, and it comes before the first capture, because a guard placed
+# after the first `env -i` guards nothing.
+guard_first() {
+  # <name> <script> <regex of the first construct that must already be
+  # guarded>: the redirection must appear above that construct.
+  gline=$(grep -n '^exec </dev/null$' "$2" | head -1 | cut -d: -f1)
+  cline=$(grep -nE "$3" "$2" | head -1 | cut -d: -f1)
+  if [ -n "$gline" ] && [ -n "$cline" ] && [ "$gline" -lt "$cline" ]; then
+    ok "$1"
+  else
+    bad "$1" "    exec </dev/null at line ${gline:-none}, first match of
+    /$3/ at line ${cline:-none}"
+  fi
+}
+guard_first \
+  "check-orchestration.sh redirects its stdin before its first capture" \
+  "$root/scripts/check-orchestration.sh" '^[^#]*env -i '
+guard_first "gate.sh redirects its stdin before its first step" \
+  "$root/scripts/gate.sh" '^run_step '
+# pre-push is the one script here that must NOT be guarded: git feeds it the
+# ref list on stdin, and `while read -r ...` over /dev/null iterates zero
+# times. A guarded pre-push would therefore fall straight through to its
+# exit 0 and approve every push to main, refusing nothing and saying nothing.
+if grep -qE '^[[:space:]]*exec[[:space:]]*<[[:space:]]*/dev/null' \
+     "$root/scripts/githooks/pre-push"; then
+  bad "pre-push keeps the stdin git hands it: the ref list is its input" \
+    "    pre-push redirects its own stdin, so its ref-list loop would run
+    zero times and the hook would approve every push to main"
+else
+  ok "pre-push keeps the stdin git hands it: the ref list is its input"
+fi
 echo
 echo "check-orchestration: $pass passed, $fail failed"
 [ "$fail" -eq 0 ]
