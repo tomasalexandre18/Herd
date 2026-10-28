@@ -9,14 +9,20 @@ before the push — and the output under *Gates* is that run's: a handoff
 is itself a docs file, so a gate run before it was written tested a
 different tree.
 
+`herd-merger`'s own handoff, named `<YYYY-MM-DD>-merge-<batch>.md`, carries
+one more thing: the filled landing record of `templates/landing.md`, which
+is the merge commit's message and the audit trail of the push to `main`.
+`check-docs.sh` asserts it is there and filled.
+
 ```markdown
 # <task> — handoff <YYYY-MM-DD>
 
 - **Item:** ORCH-nnn
 - **Agent:** herd-<role>
 - **Branch / commit:** <name> / <sha>, based on origin/main <sha>
-- **PR:** none — an agent pushes its branch and opens none (one PR per
-  batch, `docs/orchestration/workflow.md`); `herd-merger` names it here
+- **Landing:** none — an agent pushes its branch and lands nothing (one
+  landing per batch, `docs/orchestration/workflow.md`); `herd-merger`
+  names the landing here, and fills the record of `templates/landing.md`
 
 ## Done
 <what exists now, as facts a reader can check>
