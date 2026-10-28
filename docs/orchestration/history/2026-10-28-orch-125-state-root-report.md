@@ -182,8 +182,9 @@ the run — exit 0:
 test suite: PASSED
 ```
 
-Skips, from that complete run — **14, not 12**, and they are skips, not
-passes (D27):
+Skips, from that complete run: **14, which is this host at load1
+8.39** — the figure `docs/status.md` already records as "14 under load"
+against "12 here at rest". They are skips, not passes (D27):
 
 ```
  14 assertion(s) COULD NOT RUN on this host and were skipped.
@@ -204,8 +205,12 @@ Twelve are cgroup v2 delegation refusals:
 `no_declared_quota_leaves_cpu_max_at_the_kernel_s_max`,
 `the_runner_says_which_memory_ceiling_it_enforces`.
 
-Two are **not**, and the brief did not expect them — the `flood` bench
-refusing a loaded host:
+The other two are the two load-conditional `flood` benches, which
+decline a host over `LOAD_CEILING = 8.0`
+(`herd-hub/tests/fake_hub_flood.rs:72`) because this host is shared with
+a production system. They are not part of the standing skip reference and
+do not appear on a quiet host, so they are the whole of the difference
+between this run and a run at rest:
 
 ```
 HERD-SKIPPED: flood-fifty: the host's one-minute load is Some(8.39), over this bench's ceiling of 8; the host is shared with a production system
@@ -225,7 +230,12 @@ the same output.
 
 ## Risks and findings
 
-**Where the brief was wrong, in order of how much it matters.**
+**What the brief got wrong, and what I got wrong, in order of how much
+it matters.** Items 1, 3 and 4 are corrections to the brief, which the
+orchestrator has taken. Item 2 is a correction to my own first report of
+this task, kept here rather than deleted because the wrong version was
+reported once and a handoff that quietly dropped it would leave the
+record worse than the mistake did.
 
 1. **`real-herd-patience-timeouts` is not in `origin/main`.** The brief
    says a full run "is now green at rest". It is green only on a tree
@@ -246,13 +256,28 @@ the same output.
    merged in a throwaway worktree, where it is `test suite: PASSED`.
    **Every branch the merger takes from `origin/main` before that one
    lands will be red the same way.**
-2. **The skip count on this host is 14, not 12.** The 12 in the brief
-   comes from a run that stopped early, where `test.sh` honestly prints
-   "AT LEAST 12". A complete green run reports 14, and the two extra are
-   not cgroup refusals but the `flood` bench declining a host whose
-   one-minute load was 8.39 — which my own compile helped cause. So the
-   skip count on this host is load-dependent, and "12, every one a
-   cgroup-delegation refusal" is not a figure to quote back.
+2. **My run skipped 14 because it ran under load, not because 12 was
+   wrong.** This is a correction to what I first reported, and the
+   corrected statement is the one the project already records: a skip
+   count is **per host and per load** (D27, ORCH-070, ORCH-107;
+   `docs/status.md`) — 12 on this host at rest, 14 when load1 passes 8,
+   14 on CI — which is exactly why the gate compares the **list** and
+   never the number (ORCH-120).
+
+   My complete green run reported 14 at load1 8.39. The reference
+   complete green run on `real-herd-patience-timeouts` reported 12 at
+   rest. Both are complete, both exit 0, and both are true: the two
+   extra names are `flood-fifty` and `flood-two-fifty`, the
+   load-conditional benches that decline a host over `LOAD_CEILING =
+   8.0` (`herd-hub/tests/fake_hub_flood.rs:72`) and never appear on a
+   quiet host. My own compile is what put the host over the ceiling. So
+   14 is not a property of this host, and nothing about the brief's 12
+   was a floor or an early exit.
+
+   What does stay from the first version of this note, because it is a
+   separate and correct point: a run that stopped early prints "AT LEAST
+   n" and yields a **floor**, never an expectation (D179). That is worth
+   keeping — it is simply not what separates 12 from 14 here.
 3. **`cargo build -p herdctl` alone does not compile**, on `origin/main`
    and unrelated to this change: `herdctl/src/lib.rs:1216` calls
    `tokio::time::sleep` and a single-package build resolves a tokio
