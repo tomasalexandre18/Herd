@@ -231,7 +231,9 @@ and is marked, not deleted.
   post-push run on `main` is no longer a second opinion behind a
   required check, it is the only thing a second machine ever says about
   a landing, and nothing at all catches GitHub-side drift — an action
-  version, the runner image — between two landings.
+  version, the runner image — between two landings. If a scheduled run
+  is added to `ci.yml`, this clause is updated in the same landing: a
+  refusal of Alexa's is not undone by a workflow file.
 
 ## What the local merge costs
 
