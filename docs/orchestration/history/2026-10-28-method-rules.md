@@ -66,6 +66,10 @@ obligation."*
 9. **Put the new method in force and answer the review.**
 10. **Make the merge condition satisfiable and route the last pull
     request** — the pass-2 review, below.
+11. **Answer the pass-3 review** — the fifth precondition, one copy of
+    the fast-forward block, an absolute hooks path, the full exception
+    in `CLAUDE.md`, a sha behind the green-suite claim, and the
+    correction of my own false lesson.
 
 ### Which sentences changed tense, and why
 
@@ -168,6 +172,51 @@ rewrite had created three new blocking defects.
   `gh pr view`. **That file was not in my write paths** — I edited it on
   the orchestrator's explicit instruction in the same message that sent
   this review, and it is a one-word change.
+
+### The pass-3 review, and the last six changes
+
+Verdict *may land once six things change*; all eight pass-2 items held
+on re-measurement, including the hook agreeing with the N1 wording in
+all five places.
+
+- **P1, blocking, and the same family of defect for the third time.**
+  `gate.sh` runs the **full suite**, so until the test fix is on `main`
+  **every** `gate.sh` is red and no landing at all is possible — not
+  only the first. My step 3 listed four preconditions and omitted that
+  one, three lines below a heading announcing that the blocker was
+  gone: I had listed the files the pass-2 reviewer named, not the one
+  that arrived after him. There is now a **fifth** precondition, *the
+  test fix is on `main`* (branch `real-herd-patience-timeouts`, landed
+  in the product batch of 2026-10-28), written as a state of `main` and
+  not as a branch of this batch, and it says in bold that it is not
+  only about the first landing.
+- **P2: my own lesson was false** — see *Gates*. `pre-push` would not
+  have refused that branch push and must not; the true statement is
+  that `main` gets a machine and a branch push gets the contract alone.
+- **P3:** `workflow.md` kept a **second, silent copy** of the
+  fast-forward block after I fixed the one in the role file — two
+  copies of one procedure with one fixed is how the silent-skip defect
+  comes back. There is now **one copy**, in `herd-merger.md` step 10,
+  and `workflow.md` says so and keeps only the reasoning.
+- **P4:** the hooks-path bullet contradicted itself — it tested the
+  hook in the setting agent's worktree and armed the whole repository,
+  including worktrees whose sha predates the hook, which is the state
+  the same bullet called worse than unset. The path is now **absolute**,
+  so guard and value name the same file from every worktree, and the
+  bullet describes what actually happened rather than prescribing an
+  order already overtaken: the setting was made on 2026-10-28 by the
+  agent that corrected `permissions.md`, after it had established that
+  `/mnt/ssd_980/herd-project/.git/hooks/` holds nothing but `*.sample`,
+  so its cost is nil and it is **inert until the batch lands**.
+- **P5:** `CLAUDE.md`'s copy of the exception was the shortest of the
+  four and dropped *once* and *on the orchestrator's instruction* — the
+  file every session loads carried the most permissive variant. Both
+  are in it now, paid for inside the bullet and the one below it.
+- **P6:** *"the full suite is now green at rest"* is the sentence the
+  whole method rests on and was the last durable claim in the file with
+  nothing behind it. It now carries `ee8dec0`, `test.sh exit=0
+  wall=170s`, 55 `test result:` lines with none FAILED, and the handoff
+  that names the twelve skips one by one.
 
 ### The red suite was a blocker; it is fixed
 
@@ -318,17 +367,28 @@ $ echo $?
 ```
 
 Run after every edit of this task and after this handoff was committed.
-It was green every time **but once**, and that once is worth recording
-because it is the rule this branch writes, applied to the branch itself:
-after the pass-2 commit I ran the gate and pushed in the same breath,
+It was green every time **but once**, and that once is worth recording.
+After the pass-2 commit I ran the gate and pushed in the same breath,
 and the gate came back red on an 80-column line in this file — one line
 over, in the very section that says a gate's output is what you read.
-The push had already gone. The fix is its own commit, `7c639ba`'s
-successor, with the gate green on the tree that is now the head. Under
-the method this branch writes, `pre-push` would have refused that push
-for want of a receipt; nothing refused it here, which is the honest
-measure of what the contract alone is worth. The `D170` line is a gap
-note, not a failure.
+The push had already gone. The fix is `7c639ba`'s successor, with the
+gate green on the tree that is now the head.
+
+**The lesson is not the one an earlier draft of this handoff wrote.** It
+said `pre-push` would have refused that push. It would not, and it must
+not: that was a push of `method-rules`, a task branch, and the hook
+lets every ref other than `main` through untouched without consulting a
+receipt (`scripts/githooks/pre-push`). A hook demanding a receipt on a
+branch push would contradict `CLAUDE.md`'s own gate rule, where a
+prose-only change runs `check-docs.sh` alone and the Rust gates are the
+landing's business. **The true statement is stronger: `main` gets a
+machine, and an agent's branch push gets the contract and nothing
+else — before this hook existed and after it.** The 80-column incident
+is the only measurement that fact has: I ran a gate, I did not read it,
+I pushed, and nothing anywhere stopped me. What caught it was reading
+the output afterwards. That is what the whole method asks of every
+agent on every branch, and it is worth knowing that it is asked and not
+enforced. The `D170` line is a gap note, not a failure.
 
 ```
 $ ./scripts/check-orchestration.sh | tail -2
@@ -471,10 +531,14 @@ added it is updated in the same landing.
 
 ## For `herd-merger` in this landing
 
-Five board edits this branch may not make (invariant 8). The first is
-the one that cannot wait: `CLAUDE.md`'s session start sends every fresh
-session to the board at step 2, where it currently reads a waiting
-decision proposing the opposite of the contract it has just read.
+Five board edits this branch may not make (invariant 8), and the board
+is deliberately **left alone** here: the orchestrator's decision of
+2026-10-28 is that the merger writes `board.md` in the same push as
+`CLAUDE.md`, so no window exists where `main` carries the new contract
+beside the stale row — and the orchestrator greps `ORCH-120` on `main`
+itself before reporting the landing done. The first edit is still the
+one that matters most, because `CLAUDE.md`'s session start sends every
+fresh session to the board at step 2.
 
 1. **Close ORCH-120** — answered 2026-10-28 and reaffirmed as an
    obligation the same day. The row still says `waiting` and still
@@ -606,8 +670,15 @@ the batch order; **N5** the repository-wide hooks path, guarded;
 **N7** the narrowed claim; **N8**, **N9**, **N10**.
 
 Then `herd-merger` assembles the one last pull request of *Not an
-option* step 1 — it is the actor now, on the orchestrator's instruction
-— with this branch and the four it names in the same batch.
+option* step 1 — it is the actor, on the orchestrator's instruction —
+from the batch in dependency order: **`method-rules`,
+`method-local-gate`, `method-landing-record`, `method-push-guard`,
+`method-permissions-truth`**. The fifth precondition is a state of
+`main`, not a member of that batch: the test fix
+(`real-herd-patience-timeouts`, `ee8dec0`) lands in the product batch
+of 2026-10-28, and if it did not, **no `gate.sh` in this batch can be
+green** and the landing waits on it rather than on anything in these
+five branches.
 
 ## Processes
 

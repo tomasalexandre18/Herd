@@ -145,16 +145,22 @@ not four because the obvious fourth cannot be done in its own step:**
    Nothing but step 3's own preconditions keeps the order.
 3. **The first local landing**, which is also the first use of the
    method on something other than itself, and which **carries the
-   deletion of `ci.yml`'s `pull_request:` trigger** (see below). Four
-   things must be true before it, and none of them is a pull request:
-   `scripts/gate.sh` is in the tree, so that the condition in
-   `CLAUDE.md` can be met at all; `docs/orchestration/templates/landing.md`
-   is in the tree, so that the record has a shape;
-   `scripts/githooks/pre-push` is in the tree; and `core.hooksPath` is
-   set once on the repository (*Concurrency and host rules*). The first
-   three are on pushed branches of the same batch as this file and are
-   **not on `main` yet** — this file and they land together or the
-   contract names three things that do not exist. Without the hook and
+   deletion of `ci.yml`'s `pull_request:` trigger** (see below). **Five
+   things must be true before it**, none of them a pull request, and the
+   fifth is the one that gets forgotten: `scripts/gate.sh` is in the
+   tree, so that the condition in `CLAUDE.md` can be met at all;
+   `docs/orchestration/templates/landing.md` is in the tree, so that the
+   record has a shape; `scripts/githooks/pre-push` is in the tree;
+   `core.hooksPath` is set on the repository (*Concurrency and host
+   rules*); and **the test fix is on `main`** — branch
+   `real-herd-patience-timeouts`, landed in the product batch of
+   2026-10-28. That fifth one is not only about the first landing:
+   **`gate.sh` runs the full suite**, so until that fix is on `main`
+   every `gate.sh` is red and **no landing at all is possible**, this
+   one or any later one. The first three are on pushed branches of the
+   same batch as this file and are **not on `main` yet** — this file and
+   they land together or the contract names three things that do not
+   exist. Without the hook and
    the hooks path there is **no mechanism at all** in front of `main`,
    because the branch protection never bound our own credential, and
    the *Unchanged* paragraph above would be promising a guarantee that
@@ -183,10 +189,16 @@ the reason in words all along: the runner announced **one job slot**,
 because D119's cgroup clamp cut the announced room to 4.6 GiB, and each
 of those three fixtures silently needed two concurrent jobs. One
 declared constant in the three tests, `--job-memory-max=512MiB`, fixed
-it (branch `real-herd-patience-timeouts`). **The full suite is now green
-at rest: 0 failed, 12 skips, `test suite: PASSED`.** It is written down
-here because a method whose gate had never once been green would have
-been worth doubting, and now it has been.
+it. **The full suite is now green at rest: 0 failed, 12 skips, `test
+suite: PASSED`** — measured on `ee8dec0`, the head of branch
+`real-herd-patience-timeouts`, `test.sh exit=0 wall=170s`, 55
+`test result:` lines and none of them FAILED, with the twelve skips
+named one by one in
+`history/2026-10-28-real-herd-patience-timeouts.md`. The sha is here
+because this is the sentence the whole method rests on, and it was the
+last durable claim in this file with nothing behind it: a method whose
+gate had never once been green would be worth doubting, and this is the
+run that says it has been.
 
 ### What a landing is
 
@@ -587,35 +599,46 @@ was lost.
   `FETCH_HEAD`; every agent's brief asks for both. What is forbidden is
   changing what that checkout *says*: a commit, an edit, a staged file,
   a moved branch.
-- **`core.hooksPath` is the second named exception, and it is set once
-  for the whole repository — not per worktree.** Measured 2026-10-28 on
-  git 2.54.0: `git -C <worktree> config core.hooksPath scripts/githooks`
-  writes the **shared** config of `/mnt/ssd_980/herd-project`, arming
-  the hook for that checkout and all 85 worktrees at once, and
-  `--worktree` is refused outright because `extensions.worktreeConfig`
-  is unset. So it is **one deliberate act, part of the first landing**
-  (*Not an option*, step 3), by the agent that lands it, and never
-  something an agent sets for itself in passing. It is guarded on the
-  hook being there:
+- **`core.hooksPath` is the second named exception, it is one setting
+  for the whole repository — not per worktree — and it is already set.**
+  Measured 2026-10-28 on git 2.54.0:
+  `git -C <worktree> config core.hooksPath …` writes the **shared**
+  config of `/mnt/ssd_980/herd-project`, arming every worktree at once
+  (85 of them that day), and `--worktree` is refused outright because
+  `extensions.worktreeConfig` is unset. So it is **one deliberate act,
+  not something an agent sets for itself in passing**, and it was done
+  on 2026-10-28 by the agent that corrected `permissions.md`, after it
+  had established that `/mnt/ssd_980/herd-project/.git/hooks/` holds
+  nothing but `*.sample`. That ordering is deliberate and its cost is
+  nil: the setting is **inert until the batch lands**, because it points
+  at a file that arrives with the batch, and it displaces no hook that
+  was doing anything.
+- **The path is absolute, and that is not a style choice.** A relative
+  `core.hooksPath` resolves against each worktree's own root, so a
+  worktree created from a pre-landing sha would resolve it to a
+  directory that does not exist — and pointing `core.hooksPath` at a
+  missing directory **disables `.git/hooks` and supplies nothing in its
+  place**, which is strictly worse than leaving it unset. One absolute
+  path resolves to the same file from every worktree:
 
   ```sh
-  test -x scripts/githooks/pre-push &&
-    git -C /mnt/ssd_980/herd-project config core.hooksPath scripts/githooks
+  test -x /mnt/ssd_980/herd-project/scripts/githooks/pre-push &&
+    git -C /mnt/ssd_980/herd-project config core.hooksPath \
+      /mnt/ssd_980/herd-project/scripts/githooks
   ```
 
-  because pointing `core.hooksPath` at a directory that does not exist
-  **disables `.git/hooks` and supplies nothing in its place** — strictly
-  worse than leaving it unset.
+  The guard and the value then name the same place, which the relative
+  form did not: it tested the hook in the setting agent's own worktree
+  and armed every other one.
 - **`herd-merger` advances that checkout as the last thing it does**,
   once `main` has moved. Its safety is in the preconditions, and they
-  are **commands, not prose**, because `--ff-only` does not supply them:
-
-  ```sh
-  d=/mnt/ssd_980/herd-project
-  [ "$(git -C "$d" symbolic-ref --quiet --short HEAD)" = main ] || exit 0
-  [ -z "$(git -C "$d" status --porcelain)" ]                    || exit 0
-  git -C "$d" fetch origin && git -C "$d" merge --ff-only origin/main
-  ```
+  are **commands, not prose**, because `--ff-only` does not supply them.
+  **The commands live in one place only**, step 10 of
+  `.claude/agents/herd-merger.md`, and are deliberately not copied here:
+  this procedure had two copies on 2026-10-28, one of them was fixed and
+  the other kept printing nothing, which is exactly how a silent-skip
+  defect comes back. What follows is why those checks exist; what to run
+  is in the role file.
 
   Both checks were measured on 2026-10-28 and **both failure modes are
   real**: a dirty file the incoming commits do not touch is carried

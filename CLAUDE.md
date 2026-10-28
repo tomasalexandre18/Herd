@@ -104,16 +104,16 @@ that did not run is reported as not run, never as passed.
 
 - One branch per task, in its own worktree, named for the task. Small commits,
   imperative English subject ≤ 72 chars.
-- **One landing per batch** (Alexa, 2026-10-28): **nobody opens a pull request
-  but the one that lands this change** (workflow.md, *Not an option*). An agent
-  pushes its branch and hands off; a landing is one batch, one push, one
-  `--no-ff` merge commit carrying the landing record.
+- **One landing per batch** (Alexa, 2026-10-28): **nobody opens a pull
+  request** but `herd-merger`, once, on the orchestrator's instruction, for the
+  one landing this change. An agent pushes and hands off; a landing is one
+  batch, one push, one `--no-ff` merge commit with the record.
 - **Pushing to `main` is `herd-merger`'s, by standing authorisation**
   (ORCH-001, 2026-10-24, re-granted 2026-10-28): a green `./scripts/gate.sh`
   for the **gated** sha — the merge's second parent, trees identical — and a
-  filled landing record, `cut-v*`, `.github/`, `CLAUDE.md` and `.claude/`
-  included; nothing waits for Alexa. Never `--no-verify`, never force-push,
-  never a red landing, never `--admin`.
+  filled record, `cut-v*`, `.github/`, `CLAUDE.md` and `.claude/` included;
+  nothing waits for Alexa. Never `--no-verify`, never force-push, never a red
+  landing, never `--admin`.
 - **Pushing a tag and publishing a release stay on Alexa's word, one act at a
   time** (workflow.md); `herd-release` prepares and never publishes.
 
