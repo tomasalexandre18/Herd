@@ -8,12 +8,26 @@
 # — is prose, and prose does not stop a push.
 #
 # On a push whose destination ref is `refs/heads/main` it refuses unless all
-# four hold:
+# five hold:
 #
-#   1. `./scripts/gate.sh --verify-receipt <sha>` passes for the exact sha on
-#      this hook's stdin — not the working tree, not HEAD at some other
-#      moment. The receipt rule itself lives in gate.sh and nowhere else;
+#   1. the tip being pushed is a `--no-ff` merge commit: it has a second
+#      parent. A landing is always a merge of an integration branch onto
+#      `main`, so a direct commit on `main` is exactly what this hook exists
+#      to stop.
+#   1b. `./scripts/gate.sh --verify-receipt <sha>` passes for the **second
+#      parent** of the tip on this hook's stdin — not the tip itself, not
+#      the working tree, not HEAD at some other moment. The tip can never
+#      carry a receipt: the gate runs on the integration tip, and the merge
+#      commit's sha does not exist until afterwards, because its message is
+#      the landing record. Asking about the tip refuses every correct
+#      landing, which is how this hook was first built and what a reviewer
+#      measured. The receipt rule itself lives in gate.sh and nowhere else;
 #      this hook only asks.
+#   1c. the merge changed nothing: `git diff --quiet <second parent> <tip>`
+#      is silent. This is what keeps 1b honest. Without it a merger could
+#      gate one tree and push another, and the receipt would still verify.
+#      It also catches a landing where `main` moved under the merge, so the
+#      merge resolved content no gate ever saw.
 #   2. the tip commit's own message is a filled landing record:
 #      the seven sections and four header fields of
 #      `docs/orchestration/templates/landing.md`, with no header field left
@@ -42,8 +56,12 @@
 #   machine does not. That is a rule kept by a person, not by this file.
 # * It sees nothing after the push. A push from another machine, another
 #   clone, the GitHub web UI or a merge button on github.com never reaches
-#   this code. Only `allow_force_pushes: false` and `allow_deletions: false`
-#   on `main`, which stay on, are enforced server-side.
+#   this code. And nothing server-side backs it up: `main` carries
+#   `allow_force_pushes: false` and `allow_deletions: false`, but also
+#   `enforce_admins: false`, and the credential this project pushes with is
+#   a repository admin — measured 2026-10-28 — so branch protection does
+#   not bind it. Checks 3 and 4 below are not belt and braces. They are the
+#   belt.
 # * The receipt store is a local directory (`$HERD_GATE_RECEIPTS`, default
 #   `target/herd-gate/`). Anyone who can write a file there can write a
 #   receipt. A receipt is evidence that a gate ran, not proof.
@@ -166,16 +184,37 @@ while read -r local_ref local_sha remote_ref remote_sha; do
     fi
   fi
 
-  # 1: a receipt for exactly this sha. The rule lives in gate.sh.
+  # 1: a landing is a --no-ff merge, so the tip has a second parent, and the
+  # second parent is the object the gate ran on.
+  if ! gated=$(git rev-parse -q --verify "$local_sha^2"); then
+    refuse "the tip being pushed ($local_sha) has no second parent, so it is" \
+      "not a --no-ff merge. A landing on main is always a merge of an" \
+      "integration branch: gate that branch, then" \
+      "git merge --no-ff -F <landing record> <branch>. A commit made" \
+      "straight on main is what this hook exists to stop."
+  fi
+
+  # 1b: a receipt for the second parent. The rule lives in gate.sh.
   if [ ! -x "$gate" ]; then
     refuse "scripts/gate.sh is missing or not executable at $gate," \
       "so no receipt can be verified. A push to main without a verified" \
       "gate run is exactly what this hook exists to refuse."
   fi
-  if ! verdict=$("$gate" --verify-receipt "$local_sha" 2>&1); then
-    refuse "no green gate receipt for the sha being pushed ($local_sha)." \
-      "gate.sh said: ${verdict:-nothing}" \
-      "Run ./scripts/gate.sh on this exact commit, then push."
+  if ! verdict=$("$gate" --verify-receipt "$gated" 2>&1); then
+    refuse "no green gate receipt for the gated commit ($gated), the second" \
+      "parent of the tip being pushed. gate.sh said: ${verdict:-nothing}" \
+      "Run ./scripts/gate.sh on the integration branch, then merge it with" \
+      "--no-ff and push. The merge commit itself can never carry a receipt:" \
+      "its sha does not exist until after the gate has run."
+  fi
+
+  # 1c: and the merge changed nothing, or the receipt proves nothing.
+  if ! git diff --quiet "$gated" "$local_sha"; then
+    refuse "the merge changed the tree: $local_sha does not contain what was" \
+      "gated in $gated. git diff $gated $local_sha is not empty, so the" \
+      "receipt covers a different tree than the one being pushed. Either" \
+      "main moved under the merge, or the merge resolved something by hand." \
+      "Re-gate the merged tree on an integration branch and merge again."
   fi
 
   # 2: the tip commit's own message is a filled landing record.
@@ -220,8 +259,10 @@ while read -r local_ref local_sha remote_ref remote_sha; do
       "sha, then push."
   fi
 
-  printf 'pre-push: main <- %s\n' "${local_sha:0:12}"
+  printf 'pre-push: main <- %s (merge of %s)\n' \
+    "${local_sha:0:12}" "${gated:0:12}"
   printf 'pre-push:   %s\n' "$verdict"
+  printf 'pre-push:   the merge changed nothing the gate did not see.\n'
   printf 'pre-push:   landing record: seven sections, four fields, filled.\n'
 done
 

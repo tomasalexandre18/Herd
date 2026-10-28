@@ -832,12 +832,12 @@ pp_fresh() {
     && git config user.name t && git config user.email t@t \
     && git remote add origin "$prem" \
     && echo base > file.txt && git add -A \
-    && git commit -qm "base") >/dev/null 2>&1
+    && git commit -qm "base" && git branch -M main) >/dev/null 2>&1
 }
 # A gate.sh that records what it was asked before delegating to the real
-# one: two properties are then measured rather than believed -- the hook
-# asks about the sha on its stdin, and it does not consult the gate at all
-# for a ref that is not main.
+# one: two properties are then measured rather than believed -- which sha
+# the hook asks about, and that it does not consult the gate at all for a
+# ref that is not main.
 pp_trace_gate() {
   mv "$pdir/scripts/gate.sh" "$pdir/scripts/gate-real.sh"
   { echo '#!/usr/bin/env bash'
@@ -850,9 +850,36 @@ pp_receipt() { # <sha the file is named for> [verdict] [sha written inside]
   printf 'verdict: %s\nsha: %s\nsteps: 0..8 all ok\n' \
     "${2:-GREEN}" "${3:-$1}" > "$prec/$1.receipt"
 }
-pp_commit() { # <message file>: a new commit, prints its sha
+pp_commit() { # <message file>: a new commit straight on main, prints its sha
   (cd "$pdir" && date -u +%s%N > stamp.txt && git add -A \
     && git commit -q -F "$1" && git rev-parse HEAD) 2>/dev/null
+}
+# A real landing, built the way herd-merger builds one: an integration
+# branch carries the work and is gated AS ITSELF, then it is merged onto
+# main with --no-ff and the landing record as the merge message. Prints
+# "<tip> <gated>".
+#
+# This is the shape the first version of this hook got wrong, and the
+# reason the mistake was invisible: the gate runs on the integration tip,
+# so the merge commit's sha does not exist until afterwards and can never
+# carry a receipt. A hook that asks about the tip refuses every correct
+# landing. Hence pp_landing, and hence the cases below that push a receipt
+# for the tip and for the first parent and expect red.
+#
+# With a second argument, main first gains a commit of its own, so the
+# merge's tree is NOT the gated tree -- the only thing that keeps the
+# receipt honest.
+pp_landing() { # <record file> [content of an unmerged commit on main]
+  (cd "$pdir" \
+    && git checkout -q -B integration main \
+    && date -u +%s%N > work.txt && git add -A \
+    && git commit -q -m "do the work" \
+    && git checkout -q main \
+    && { [ -z "${2:-}" ] || { printf '%s\n' "$2" > unmerged.txt \
+         && git add -A && git commit -q -m "a commit the gate never saw"; }; } \
+    && git merge -q --no-ff -F "$1" integration \
+    && printf '%s %s\n' "$(git rev-parse HEAD)" "$(git rev-parse HEAD^2)") \
+    2>/dev/null
 }
 pp_push() { # <git push args...>: output in $out, exit in $pp_rc
   out=$(cd "$pdir" && HERD_GATE_RECEIPTS="$prec" git push "$@" 2>&1); pp_rc=$?
@@ -869,81 +896,105 @@ $(printf '%s\n' "$out" | sed 's/^/    /' | head -10)"
 }
 
 pp_record "$tmp/push-good.md"
+MAIN="HEAD:refs/heads/main"
 
-# --- the receipt: rule 1, and it is gate.sh's rule, not the hook's --------
+# --- a landing is a --no-ff merge, and the gated object is its second parent
 pp_fresh
-sha=$(pp_commit "$tmp/push-good.md")
-pp_case "main with no receipt at all is refused" 1 \
-  'no green gate receipt for the sha being pushed' origin "HEAD:refs/heads/main"
-pp_receipt 0000000000000000000000000000000000000000
-pp_case "a receipt for another sha does not authorise this one" 1 \
-  'no green gate receipt' origin "HEAD:refs/heads/main"
-pp_receipt "$sha" RED
-pp_case "a RED receipt for this sha is refused" 1 \
-  'is not GREEN' origin "HEAD:refs/heads/main"
-# A green receipt renamed onto this sha: the file's own `sha:` field
+sha=$(pp_commit "$tmp/push-good.md"); pp_receipt "$sha"
+pp_case "a tip on main with no second parent is refused" 1 \
+  'has no second parent' origin "$MAIN"
+
+pp_fresh
+land=$(pp_landing "$tmp/push-good.md"); tip=${land%% *}; gsha=${land##* }
+pp_case "a landing with no receipt at all is refused" 1 \
+  "no green gate receipt for the gated commit \($gsha\)" origin "$MAIN"
+# A receipt for the merge commit itself: this is exactly what the first
+# version of this hook asked for, and it must stay red.
+pp_receipt "$tip"
+pp_case "a receipt for the merge commit itself does not authorise it" 1 \
+  'no green gate receipt for the gated commit' origin "$MAIN"
+rm -f "${prec:?}/$tip.receipt"
+first=$(cd "$pdir" && git rev-parse "$tip^1")
+pp_receipt "$first"
+pp_case "a receipt for the first parent does not authorise the landing" 1 \
+  'no green gate receipt for the gated commit' origin "$MAIN"
+rm -f "${prec:?}/$first.receipt"
+pp_receipt "$gsha" RED
+pp_case "a RED receipt for the gated commit is refused" 1 \
+  'is not GREEN' origin "$MAIN"
+# A green receipt renamed onto the gated sha: the file's own `sha:` field
 # disagrees with its name, and gate.sh is what notices.
-pp_receipt 0000000000000000000000000000000000000000 GREEN \
-  0000000000000000000000000000000000000000
-cp "$prec/0000000000000000000000000000000000000000.receipt" "$prec/$sha.receipt"
-pp_case "a GREEN receipt renamed onto this sha is refused" 1 \
-  'does not name' origin "HEAD:refs/heads/main"
+pp_receipt "$gsha" GREEN 0000000000000000000000000000000000000000
+pp_case "a GREEN receipt renamed onto the gated sha is refused" 1 \
+  'does not name' origin "$MAIN"
 
-# --- the landing record: rule 2, the gap nothing else can close -----------
+# The tree is what keeps the receipt honest: a merger must not be able to
+# gate one tree and push another.
+pp_fresh
+land=$(pp_landing "$tmp/push-good.md" "a line no gate ever saw")
+tip=${land%% *}; gsha=${land##* }
+pp_receipt "$gsha"
+pp_case "a merge that changed the tree is refused though the receipt verifies" 1 \
+  'the merge changed the tree' origin "$MAIN"
+
+# --- the landing record: the gap nothing else can close -------------------
 # check-orchestration.sh copies the corpus without .git, so no docs rule can
-# ever read a commit message. A merger who fills the handoff and pushes a
-# one-line merge commit is stopped here or nowhere.
-pp_fresh
+# ever read a commit message. A merger who fills the handoff and merges with
+# a one-line message is stopped here or nowhere. Each case below is a
+# correct landing in every other respect: gated second parent, identical
+# tree, only the record is wrong.
 printf 'Land batch 9: a one-line merge commit\n' > "$tmp/push-oneline.md"
-sha=$(pp_commit "$tmp/push-oneline.md"); pp_receipt "$sha"
-pp_case "a one-line tip message is refused even with a green receipt" 1 \
-  'has a one-line message' origin "HEAD:refs/heads/main"
-pp_fresh
 grep -v '^## Left out$' "$tmp/push-good.md" > "$tmp/push-nosection.md"
-sha=$(pp_commit "$tmp/push-nosection.md"); pp_receipt "$sha"
-pp_case "a tip message missing one required section is refused" 1 \
-  'missing section: ## Left out' origin "HEAD:refs/heads/main"
-pp_fresh
 sed 's/^- \*\*CI run:\*\*.*/- **CI run:** <id> — recorded, not waited on/' \
   "$tmp/push-good.md" > "$tmp/push-placeholder.md"
-sha=$(pp_commit "$tmp/push-placeholder.md"); pp_receipt "$sha"
-pp_case "a header field still carrying its placeholder is refused" 1 \
-  'CI run:\*\* still carries a placeholder: <id>' origin "HEAD:refs/heads/main"
-pp_fresh
 sed '/^- \*\*Skips:\*\*/d' "$tmp/push-good.md" > "$tmp/push-nofield.md"
-sha=$(pp_commit "$tmp/push-nofield.md"); pp_receipt "$sha"
-pp_case "a missing header field is refused and named" 1 \
-  'missing or empty header field: - \*\*Skips:\*\*' origin "HEAD:refs/heads/main"
-pp_fresh
 sed '1s/.*/Land batch 9: a subject deliberately longer than the seventy-two columns the contract allows/' \
   "$tmp/push-good.md" > "$tmp/push-longsubject.md"
-sha=$(pp_commit "$tmp/push-longsubject.md"); pp_receipt "$sha"
-pp_case "a subject over 72 characters is refused" 1 \
-  'characters, over 72' origin "HEAD:refs/heads/main"
+pp_record_case() { # <name> <grep pattern> <record file>
+  pp_fresh
+  land=$(pp_landing "$3"); gsha=${land##* }; pp_receipt "$gsha"
+  pp_case "$1" 1 "$2" origin "$MAIN"
+}
+pp_record_case "a one-line merge message is refused on a correct landing" \
+  'has a one-line message' "$tmp/push-oneline.md"
+pp_record_case "a merge message missing one required section is refused" \
+  'missing section: ## Left out' "$tmp/push-nosection.md"
+pp_record_case "a header field still carrying its placeholder is refused" \
+  'CI run:\*\* still carries a placeholder: <id>' "$tmp/push-placeholder.md"
+pp_record_case "a missing header field is refused and named" \
+  'missing or empty header field: - \*\*Skips:\*\*' "$tmp/push-nofield.md"
+pp_record_case "a subject over 72 characters is refused" \
+  'characters, over 72' "$tmp/push-longsubject.md"
 
 # --- the green path, and it is the one that proves the rest mean something -
 pp_fresh
 pp_trace_gate
-sha=$(pp_commit "$tmp/push-good.md"); pp_receipt "$sha"
-pp_case "a green receipt for this sha plus a filled record lands" 0 \
-  'pre-push: main <- ' origin "HEAD:refs/heads/main"
-[ "$(git --git-dir="$prem" rev-parse refs/heads/main 2>/dev/null)" = "$sha" ] \
-  && ok "pre-push: the green push reached the remote" \
-  || bad "pre-push: the green push did not reach the remote" ""
-grep -qF -- "--verify-receipt $sha" "$ptrace" \
-  && ok "pre-push: the hook asks the gate about the sha on its stdin" \
-  || bad "pre-push: the hook did not ask about that sha" "    $(cat "$ptrace" 2>/dev/null)"
+land=$(pp_landing "$tmp/push-good.md"); tip=${land%% *}; gsha=${land##* }
+pp_receipt "$gsha"
+pp_case "a --no-ff landing, gated second parent, identical tree, filled record" 0 \
+  "pre-push: main <- .* \(merge of ${gsha:0:12}\)" origin "$MAIN"
+[ "$(git --git-dir="$prem" rev-parse refs/heads/main 2>/dev/null)" = "$tip" ] \
+  && ok "pre-push: the landing reached the remote" \
+  || bad "pre-push: the landing did not reach the remote" ""
+grep -qF -- "--verify-receipt $gsha" "$ptrace" \
+  && ! grep -qF -- "--verify-receipt $tip" "$ptrace" \
+  && ok "pre-push: the gate is asked about the second parent, not the tip" \
+  || bad "pre-push: wrong sha asked of the gate" "    $(cat "$ptrace" 2>/dev/null)"
 
-# The sha on stdin, not HEAD at some other moment: HEAD has a green receipt
-# and a filled record, and the commit below it has neither. Pushing that
-# older commit must be refused, naming it.
+# The sha on stdin, not HEAD at some other moment: two landings exist, HEAD
+# is the second, and the FIRST is what gets pushed. The gate must be asked
+# about the first landing's gated commit and not the second's.
 pp_fresh
 pp_trace_gate
-sha=$(pp_commit "$tmp/push-good.md"); pp_receipt "$sha"
-base=$(cd "$pdir" && git rev-parse HEAD~1)
-pp_case "pushing a commit that is not HEAD is judged on that commit" 1 \
-  "no green gate receipt for the sha being pushed \($base\)" \
-  origin "$base:refs/heads/main"
+l1=$(pp_landing "$tmp/push-good.md"); tip1=${l1%% *}; g1=${l1##* }
+l2=$(pp_landing "$tmp/push-good.md"); tip2=${l2%% *}; g2=${l2##* }
+pp_receipt "$g1"; pp_receipt "$g2"
+pp_push origin "$tip1:refs/heads/main"
+[ "$pp_rc" -eq 0 ] && grep -qF -- "--verify-receipt $g1" "$ptrace" \
+  && ! grep -qF -- "--verify-receipt $g2" "$ptrace" \
+  && ok "pre-push: the sha on stdin decides, not HEAD" \
+  || bad "pre-push: HEAD must not decide" "    exit $pp_rc, tip2=$tip2
+    $(cat "$ptrace" 2>/dev/null)"
 
 # --- every other ref goes through untouched, and stays cheap --------------
 pp_fresh
@@ -961,26 +1012,28 @@ pp_push -q --force origin "HEAD:refs/heads/method-task-x"
   && ok "pre-push: force-pushing a task branch is not this hook's business" \
   || bad "pre-push: a task branch force-push must pass" "    exit $pp_rc: $out"
 
-# --- rules 3 and 4: a rewrite and a deletion of main, whatever else holds -
-# These are the belt, not the braces. GitHub will not refuse them: with
-# enforce_admins false and an admin push credential, allow_force_pushes:
-# false does not apply to the credential this project pushes with.
+# --- a rewrite and a deletion of main, whatever else holds ----------------
+# These are the belt, not the braces. GitHub refuses neither: `main` carries
+# allow_force_pushes: false and allow_deletions: false, but also
+# enforce_admins: false, and the credential this project pushes with is a
+# repository admin, so branch protection does not bind it (measured
+# 2026-10-28).
 pp_fresh
-sha=$(pp_commit "$tmp/push-good.md"); pp_receipt "$sha"
-pp_push origin "HEAD:refs/heads/main"
-[ "$pp_rc" -eq 0 ] || bad "pre-push: the setup push for the rewrite cases failed" "$out"
-# A divergent history, fully gated and fully recorded: only rule 3 can
-# refuse it, which is the point.
+land=$(pp_landing "$tmp/push-good.md"); gsha=${land##* }; pp_receipt "$gsha"
+pp_push origin "$MAIN"
+[ "$pp_rc" -eq 0 ] || bad "pre-push: the setup landing failed" "$out"
+# A divergent landing, fully gated, identical tree, filled record: nothing
+# but the fast-forward rule can refuse it, which is the point.
 (cd "$pdir" && git reset -q --hard HEAD~1) >/dev/null 2>&1
-alt=$(pp_commit "$tmp/push-good.md"); pp_receipt "$alt"
+land2=$(pp_landing "$tmp/push-good.md"); gsha2=${land2##* }; pp_receipt "$gsha2"
 pp_case "a force-push that rewrites main is refused, gate and record notwithstanding" 1 \
-  'not a fast-forward' --force origin "HEAD:refs/heads/main"
+  'not a fast-forward' --force origin "$MAIN"
 # Without --force the same rewrite never reaches the hook: git declines it
-# during the push negotiation, before pre-push runs. Measured, and recorded
-# as such -- the hook's own refusal above is the one that matters, because
-# it is the one --force would otherwise walk past.
+# during the push negotiation. Measured, and recorded as such -- the hook's
+# own refusal above is the one that matters, because it is the one --force
+# would otherwise walk past.
 pp_case "the same rewrite without --force is refused, by git before the hook" 1 \
-  '(non-fast-forward|not a fast-forward)' origin "HEAD:refs/heads/main"
+  '(non-fast-forward|not a fast-forward)' origin "$MAIN"
 pp_case "deleting main is refused" 1 \
   'this push deletes main' origin ":refs/heads/main"
 pp_case "deleting main by --delete is refused too" 1 \
