@@ -224,6 +224,54 @@ enum Command {
         )]
         state_dir: PathBuf,
     },
+    /// Print what record retention would remove from a state root, and what
+    /// it would cost. **It removes nothing** (ORCH-146).
+    ///
+    /// Per priority class: how many records are past the span given for that
+    /// class, what they weigh, the oldest and the newest of them, and the
+    /// clock reading every figure was judged against. It is safe against a
+    /// running hub for the same reasons `report` is — no lock, no write, no
+    /// output or log byte read — and it has no deletion path and no flag
+    /// that could be given one. M12's retention engine is a separate thing;
+    /// this is what an operator runs *before* it, because once a record is
+    /// gone nothing in Herd can bring it back.
+    ///
+    /// **Every span is required and none is defaulted.** The spans in
+    /// `docs/plan.md` and `docs/disk-policy.md` are a recorded policy and
+    /// this binary states none of its own: a shipped default here would be a
+    /// number nobody could later change (D194). A span of `0` means that
+    /// class **never expires**, and the output says so in those words.
+    RetentionPreview {
+        /// The state root to read, as `report` takes it.
+        #[arg(
+            env = "HERD_STATE_DIR",
+            default_value = DEFAULT_STATE_DIR,
+            value_name = "STATE_DIR",
+        )]
+        state_dir: PathBuf,
+        /// How long a `merger` record would be kept: `90d`, `36h`, `90m`,
+        /// `30s`, or `0` for never. The unit is required.
+        #[arg(long, required = true, value_name = "SPAN", value_parser = span)]
+        merger: std::time::Duration,
+        /// How long a `step` record would be kept. Same shape.
+        #[arg(long, required = true, value_name = "SPAN", value_parser = span)]
+        step: std::time::Duration,
+        /// How long a `nightly` record would be kept. Same shape.
+        #[arg(long, required = true, value_name = "SPAN", value_parser = span)]
+        nightly: std::time::Duration,
+        /// How long a `producer` record would be kept. Same shape.
+        #[arg(long, required = true, value_name = "SPAN", value_parser = span)]
+        producer: std::time::Duration,
+    },
+}
+
+/// A retention span as the command line gives one, with the unit required.
+///
+/// A thin wrapper so clap reports the refusal itself, naming the value the
+/// operator typed: a span is the one figure here whose mistyping cannot be
+/// recovered from, so it is refused before the state root is even opened.
+fn span(text: &str) -> Result<std::time::Duration, String> {
+    herd_hub::parse_span(text)
 }
 
 /// The shared requester token, from the file the operator named (Q8).
@@ -271,6 +319,32 @@ async fn main() -> Result<()> {
         let report = herd_hub::StateRootReport::read(state_dir)
             .with_context(|| format!("reading the state root {}", state_dir.display()))?;
         print!("{report}");
+        return Ok(());
+    }
+    // Here for the same reason, and with one thing more: it removes nothing,
+    // so the only way it could harm this root is by taking a lock or writing
+    // to it, and it is placed before anything that does either (ORCH-146).
+    if let Some(Command::RetentionPreview {
+        state_dir,
+        merger,
+        step,
+        nightly,
+        producer,
+    }) = &args.command
+    {
+        let spans = herd_hub::Spans::new(*merger, *step, *nightly, *producer);
+        let preview =
+            herd_hub::RetentionPreview::read(state_dir, spans, herd_hub::Timestamp::now())
+                .with_context(|| format!("reading the state root {}", state_dir.display()))?;
+        print!("{preview}");
+        // A refusal is not a success. The figures an operator would have
+        // acted on were deliberately not printed, so the exit status must not
+        // say "here they are": a script that read this as green and went on
+        // to run the engine is exactly the sequence this subcommand exists to
+        // interrupt.
+        if let Some(why) = preview.verdict.refusal() {
+            anyhow::bail!("{why}");
+        }
         return Ok(());
     }
     // Read before the state root is opened, because opening it sweeps: a
@@ -451,5 +525,83 @@ mod tests {
             }
             other => panic!("`report` did not parse as itself: {other:?}"),
         }
+    }
+
+    /// The retention preview's four spans: required, no default, unit
+    /// compulsory (ORCH-146).
+    ///
+    /// The three refusals matter more than the acceptance. A span left out
+    /// must refuse rather than fall back on a figure this binary chose
+    /// (D194), and a span typed without its unit must refuse rather than be
+    /// read as seconds — `--step 14` meaning fourteen seconds would select
+    /// every record on the root, and nothing could bring them back.
+    #[test]
+    fn the_retention_preview_requires_a_span_per_class_with_its_unit() {
+        use std::time::Duration;
+
+        let asked = Args::parse_from([
+            "herd-hub",
+            "retention-preview",
+            "/srv/herd-state",
+            "--merger",
+            "90d",
+            "--step",
+            "14d",
+            "--nightly",
+            "36h",
+            "--producer",
+            "0",
+        ]);
+        match asked.command {
+            Some(Command::RetentionPreview {
+                state_dir,
+                merger,
+                step,
+                nightly,
+                producer,
+            }) => {
+                assert_eq!(state_dir, PathBuf::from("/srv/herd-state"));
+                assert_eq!(merger, Duration::from_secs(90 * 86_400));
+                assert_eq!(step, Duration::from_secs(14 * 86_400));
+                assert_eq!(nightly, Duration::from_secs(129_600));
+                assert_eq!(producer, Duration::ZERO, "0 is never, not now");
+            }
+            other => panic!("`retention-preview` did not parse as itself: {other:?}"),
+        }
+
+        for missing in [
+            vec!["herd-hub", "retention-preview"],
+            vec![
+                "herd-hub",
+                "retention-preview",
+                "--merger",
+                "90d",
+                "--step",
+                "14d",
+                "--nightly",
+                "14d",
+            ],
+        ] {
+            assert!(
+                Args::try_parse_from(missing.clone()).is_err(),
+                "a span left out must refuse, not be defaulted: {missing:?}"
+            );
+        }
+        let no_unit = [
+            "herd-hub",
+            "retention-preview",
+            "--merger",
+            "90d",
+            "--step",
+            "14",
+            "--nightly",
+            "14d",
+            "--producer",
+            "14d",
+        ];
+        assert!(
+            Args::try_parse_from(no_unit).is_err(),
+            "a bare figure carries no unit and must refuse"
+        );
     }
 }
