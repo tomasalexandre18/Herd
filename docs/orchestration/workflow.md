@@ -233,6 +233,86 @@ and is marked, not deleted.
   a landing, and nothing at all catches GitHub-side drift — an action
   version, the runner image — between two landings.
 
+## What the local merge costs
+
+Here and not only in a handoff, because every one of these is something
+the method no longer does for us and somebody now has to.
+
+- **The second host leaves the critical path.** A green landing used to
+  mean two machines agreed. It now means one machine agreed and the
+  other will say so about nine minutes later, to whoever reads it.
+  ORCH-069 is the worked example of the two disagreeing: an assertion
+  written for a 17 GiB machine was red here and green on CI. That class
+  of difference is now found **after** the landing.
+- **A machine's refusal becomes an agent's judgement.** This is the
+  largest of them. `required_status_checks` could not be talked round;
+  `scripts/githooks/pre-push` is bypassed by `--no-verify` and a written
+  contract can be misread. We have no self-hosted remote and therefore
+  no server-side hook available, so this loss is structural, not an
+  oversight. What survives server-side is the force-push and deletion
+  protection on `main`, kept deliberately.
+- **Alexa loses the URL he could open before it landed — by his own
+  choice, 2026-10-28.** He was asked whether rule changes (`CLAUDE.md`,
+  the invariants, `.claude/`, a release cut) should keep a pull request
+  so that he could look before `main` moved, and he answered no.
+  Everything lands locally, the rules included, and he reads `main` when
+  it suits him. **Nothing waits for his review**, and that is a real
+  reduction in oversight, written down as one rather than dressed up:
+  the mitigation is only that the orchestrator names the integration
+  branch and the landing record in its report, so that `git show` is one
+  command away.
+- **A post-push run on `main` has never once been read.** Run
+  40439537929 is the proof: a red `check` on `main` on 2026-10-27, after
+  the merge of PR #91, and it appears in neither `board.md` nor
+  `docs/status.md`. We are promoting an unread signal to a safety net.
+  The mitigation is three duties and no mechanism — the merger records
+  the run id, the next session reads the verdict, a failure becomes an
+  `ORCH-nnn` row.
+- **Review ergonomics.** No diff view, no inline comment, no
+  `gh pr checks --watch`. `herd-reviewer` already writes a file and the
+  orchestrator already reads `git diff`, so this one falls on Alexa and
+  the orchestrator rather than on the agents.
+- **"GitHub is just storage" is not literally true, and acting as if it
+  were would be the expensive mistake.** GitHub leaves the path of a
+  change and stays: the release factory (`release.yml` — the static
+  musl binaries, the hub image archive, the two version numbers an
+  operator asks for: D162, D168), the hotfix lane (`release-dev.yml`,
+  D172), the force-push and deletion protection on `main`, the push
+  credential (`origin` is an `https://` remote whose helper is
+  `gh auth git-credential`, so a session with no `gh` login cannot push
+  at all), and the only second machine we have.
+  `.github/workflows/release*.yml` is not touched by this change and is
+  not to be deleted by a later one.
+- **One batch must be exactly one push**, and the pull request used to
+  make that automatic. It is now a discipline: *What a landing is*.
+
+## When the post-push run on `main` is red
+
+A procedure, because *"we will look into it"* is how run 40439537929
+was lost.
+
+1. `gh run rerun --failed` **first**. One command, no reasoning, and it
+   separates a flake from a regression. 40439537929 was one timing test
+   (`herd-hub/tests/follower_alive.rs:230`) and `main`'s next run was
+   green with no change in between.
+2. If it reproduces, the landings since the last green run are
+   `git log --merges --oneline <last-green-sha>..main` — one merge
+   commit per batch, which is why a landing is one `--no-ff` merge and
+   one push.
+3. Bisect locally over those merge commits, running only the failing
+   target and never the whole suite: one worktree, `git bisect`,
+   `./scripts/bench-preflight.sh` first.
+4. **Fix forward by default.** Revert only when the regression blocks
+   other work or a release is pending: `git revert -m 1 <merge-commit>`
+   on a branch, gated locally, landed like any other landing. A revert
+   needs no pull request and never did, and history stays append-only —
+   which is why force-push protection is the one server-side rule we
+   keep.
+5. A red `main` **blocks a release**, because D162's artefacts are built
+   from it, and does **not** block the next landing unless that landing
+   touches the same area. Both halves are written down so that neither
+   is invented under pressure.
+
 ## Permissions and escalation
 
 - Alexa decides: milestone order, invariants, pushing a tag, publishing a
