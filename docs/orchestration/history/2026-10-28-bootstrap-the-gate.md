@@ -27,7 +27,12 @@ refuses a dirty tree, so one run can never both bless and certify a sha.
 | A | 0.32 | `--bless` at rest; wrote 12 lines to `local.txt` | GREEN |
 | B | 9.56 | `--bless` under load into a scratch file: 14 lines, so the delta is two | GREEN |
 | D | 9.04 | plain run on the committed pair, both lists read | GREEN |
-| E | at rest | plain run on this branch's tip — the certifying run | see *Gates* |
+| E | 1.52 | plain run on `2add9db`, the tip as first committed | GREEN |
+| F | at rest | plain run on the pushed tip, after this file was corrected | see *Gates* |
+
+There is no run C: a plain run on `7403626` was planned between the two
+blessings and dropped once it was clear run E would certify the same
+thing on the tip, which is the sha a reader cares about.
 
 Run A's suite took 240 s and ended `test suite: PASSED`, which is the
 only condition under which `--bless` writes anything (D27): it refuses a
@@ -128,7 +133,7 @@ what item 2 depended on and why it ran second.
 ## Gates
 
 `./scripts/gate.sh` is the gate now and this was its first real use, so
-all four runs are here. The lines below are verbatim, filtered to the
+every run of it is here. The lines below are verbatim, filtered to the
 step verdicts and the skip comparison; `load:` lines come from my own
 load helper and not from the gate. `CARGO_TARGET_DIR` was outside the
 worktree throughout, and `TMPDIR` was left at the session's own
@@ -211,16 +216,40 @@ load: killed spinners 3858215 3858216 3858217 3858218 3858219 3858220 3858221 38
 load: load1 after cleanup 11.70
 ```
 
-**Run E — plain, at rest, on this branch's tip.** It runs after this file
-is committed, because a handoff is itself a docs file and a gate run
-before it was written tested a different tree. Its receipt will be
-`<worktree>/target/herd-gate/<tip sha>.receipt`, and **its verbatim
-verdict is in the report to the orchestrator, not here** — `herd-merger`
-step 6 settles this shape for the same reason. `target/` is gitignored
+**Run E — plain, at rest, on `2add9db`, the tip this handoff was
+first committed as.** The certifying run: nothing was blessed, the
+committed `local.txt` is the expectation, and the suite is the 189 s
+one a warm target directory gives.
+
+```
+step 0: the tree, the sha and the host — ok
+step 1: check-docs.sh (ci job: docs) — ok (0s)
+step 2: check-orchestration.sh (ci job: docs) — ok (18s)
+step 3: nix flake check (ci job: check) — ok (2s)
+step 4: cargo fmt (ci job: check) — ok (1s)
+step 5: cargo clippy (ci job: check) — ok (8s)
+step 6: test suite — ok (189s)
+  observed skip lines: 12 (the count is
+  not the signal; the list is)
+  expected list: /mnt/ssd_980/herd/claude/tmp/claude-1002/-mnt-ssd-980-herd-project/3ddf11ac-718a-4231-bc8d-45291a39ef82/scratchpad/gate/wt/scripts/expected-skips/local.txt
+  the skip list matches the expectation exactly.
+step 7: the skips — ok
+  load1 1.52 at the start, 2.66 at the end
+gate: GREEN sha=2add9db94f99df1dd7e378aca13924c3d4c2e1db steps=0-8:ok host=servernixos load1=1.52
+```
+
+**Run F — plain, at rest, on the tip that is pushed.** Run E found a
+claim in this file wrong (the timings, below), and correcting a
+handoff costs a commit, so the gate ran once more on the corrected
+tip. Its receipt is
+`<worktree>/target/herd-gate/<tip sha>.receipt` and **its verbatim
+verdict is in the report to the orchestrator, not here** — a gate run
+cannot be quoted inside the tree it gated, which is what
+`herd-merger.md` step 6 settles the same way. `target/` is gitignored
 and this worktree is temporary, so that report is the durable copy.
 
 `check-orchestration.sh`: **243 passed, 0 failed** at step 2 of every run
-above. ORCH-111's `:464` case did not fire once in four runs.
+above. ORCH-111's `:464` case did not fire in a single one of them.
 
 ### The skips, each one named (D27)
 
@@ -374,14 +403,17 @@ agent.
   changes nothing about the act — `--ff-only` was always going to work —
   but it is why that checkout's `scripts/` was far too old for a
   relative `core.hooksPath` to resolve, which is item 2's whole premise.
-- **The step timings are optimistic.** At rest I measured docs 1 s,
-  orchestration 18 s, flake 1 s, fmt 2 s, clippy 18 s, suite 240 s;
-  under load, orchestration 35 s and suite 257 s. Budget **~5 minutes
-  per gate run**, not the ~3.5 the brief's figures add up to, and
-  remember a bootstrap needs several.
+- **The step timings are right, for a warm target directory, and I
+  was wrong to doubt them.** Run E reproduced them almost exactly:
+  docs 0 s, orchestration 18 s, flake 2 s, fmt 1 s, clippy 8 s,
+  suite **189 s** — the brief's own figures. What costs more is a
+  cold `CARGO_TARGET_DIR` (run A: clippy 18 s, suite 240 s) and load
+  (run B: orchestration 35 s, suite 257 s). So ~3.5 minutes warm and
+  quiet, ~5 cold or busy — and a bootstrap needs four runs, so budget
+  twenty minutes for the whole of it, not four.
 - **ORCH-139 is right, and its diagnosis is exactly right.** I left
   `TMPDIR` alone (`/mnt/ssd_980/herd/claude/tmp`, 28 characters) and saw
-  no `SUN_LEN` failure in four runs. My worktree path is 122 characters
+  no `SUN_LEN` failure in five runs. My worktree path is 122 characters
   and that was harmless, which confirms the fault is `TMPDIR`
   specifically and not a long path anywhere.
 - **"12 at rest, 14 above load1 8, the two extra being the flood
@@ -422,7 +454,7 @@ All of them my own children, killed by PID and never by name:
 - 11 `nice -n 19` CPU spinners for run B, PIDs 3794139-3794149, all
   reaped — verified with `kill -0`, nothing alive.
 - 9 for run D, PIDs 3858215-3858223, all reaped, verified the same way.
-- Four `gate.sh` runs, each the foreground of its own background shell,
+- Five `gate.sh` runs, each the foreground of its own background shell,
   each exited on its own.
 
 `nice -n 19` rather than a cargo build, deliberately: it raises `load1`,
