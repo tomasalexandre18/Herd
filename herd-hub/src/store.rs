@@ -63,10 +63,10 @@ pub const LAYOUT_VERSION: u32 = 1;
 const INDEX_VERSION: u32 = 1;
 
 const STORE_FILE: &str = "store.json";
-const JOBS_DIR: &str = "jobs";
+pub(crate) const JOBS_DIR: &str = "jobs";
 const INDEX_DIR: &str = "index";
 const INDEX_FILE: &str = "state.json";
-const RECORD_FILE: &str = "job.json";
+pub(crate) const RECORD_FILE: &str = "job.json";
 const EVENTS_FILE: &str = "events.jsonl";
 const LOG_FILE: &str = "log";
 /// How many chunks of a job's `log` the hub has written — which is also the
@@ -80,7 +80,7 @@ const LOG_SEQ_FILE: &str = "log.seq";
 /// The width of that number, in digits: a `u64` never needs more, and a fixed
 /// width is what lets the file be written in place with nothing to truncate.
 const LOG_SEQ_DIGITS: usize = 20;
-const KEPT_FILES_DIR: &str = "files";
+pub(crate) const KEPT_FILES_DIR: &str = "files";
 
 /// Where a streamed collection's part-written files wait, beside `files/` and
 /// never inside it.
@@ -91,7 +91,7 @@ const KEPT_FILES_DIR: &str = "files";
 /// what is in it is whole. So a file becomes visible by being **renamed** into
 /// `files/`, after its digest has been checked, and until then it is in here
 /// where nothing looks for it.
-const OUTPUT_PARTS_DIR: &str = "files.part";
+pub(crate) const OUTPUT_PARTS_DIR: &str = "files.part";
 /// Where a collection the sweeper has taken waits while it is unlinked
 /// (D152).
 ///
@@ -106,7 +106,7 @@ const OUTPUT_PARTS_DIR: &str = "files.part";
 ///
 /// A directory of this name left behind is a hub that stopped mid-eviction.
 /// The next sweep removes it, and the first sweep runs at startup.
-const OUTPUT_GONE_DIR: &str = "files.gone";
+pub(crate) const OUTPUT_GONE_DIR: &str = "files.gone";
 const LOCK_FILE: &str = "hub.lock";
 /// Where the answers of `labels_from` readings are kept, by their (commit,
 /// command, args) key (D74). Derived, like the index: an answer that cannot be
@@ -2989,7 +2989,7 @@ fn write_json<T: Serialize>(path: &Path, value: &T) -> Result<()> {
 /// does not have fills nothing. A directory that is not there is nought
 /// bytes and not an error — most job directories hold no output at all, and
 /// that is the common case this walk has to be cheap for.
-fn directory_bytes(path: &Path) -> u64 {
+pub(crate) fn directory_bytes(path: &Path) -> u64 {
     let Ok(entries) = fs::read_dir(path) else {
         return 0;
     };

@@ -5,6 +5,7 @@ pub mod durable;
 pub mod job;
 pub mod matcher;
 pub mod queue;
+pub mod report;
 pub mod roster;
 pub mod server;
 pub mod store;
@@ -20,6 +21,7 @@ pub use matcher::{
     STICKINESS_LIMIT,
 };
 pub use queue::{Standing, AGING_STEP};
+pub use report::{Accounting, Census, Dedup, DigestConflict, Sizes, StateRootReport, Unread};
 pub use roster::{Admission, Approval, Roster, SharedSecret, ROSTER_VERSION};
 pub use server::{
     hub_version, Authority, Hub, HubHandle, Policy, Restating, RunnerStatus, Stop, StopSignals,
