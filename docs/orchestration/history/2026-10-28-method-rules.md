@@ -317,8 +317,18 @@ $ echo $?
 0
 ```
 
-Run after every edit of this task and after this handoff was committed;
-identical every time. The `D170` line is a gap note, not a failure.
+Run after every edit of this task and after this handoff was committed.
+It was green every time **but once**, and that once is worth recording
+because it is the rule this branch writes, applied to the branch itself:
+after the pass-2 commit I ran the gate and pushed in the same breath,
+and the gate came back red on an 80-column line in this file — one line
+over, in the very section that says a gate's output is what you read.
+The push had already gone. The fix is its own commit, `7c639ba`'s
+successor, with the gate green on the tree that is now the head. Under
+the method this branch writes, `pre-push` would have refused that push
+for want of a receipt; nothing refused it here, which is the honest
+measure of what the contract alone is worth. The `D170` line is a gap
+note, not a failure.
 
 ```
 $ ./scripts/check-orchestration.sh | tail -2
@@ -364,8 +374,8 @@ PRESENT
 Every red run was in a shell invocation that also wrote files; every
 green one ran the script alone, including three made immediately after a
 red one on the same commit. Fourteen runs, seven red, seven green, and
-the split is exactly along that line. So the verdict depends on how the invoking
-shell was started, not on the repository. Outputs:
+the split is exactly along that line. So the verdict depends on how the
+invoking shell was started, not on the repository. Outputs:
 
 ```
 /mnt/ssd_980/herd/claude/tmp/claude-1002/-mnt-ssd-980-herd-project/3ddf11ac-718a-4231-bc8d-45291a39ef82/scratchpad/method-rules/out/
