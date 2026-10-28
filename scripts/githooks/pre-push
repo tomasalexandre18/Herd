@@ -1,0 +1,269 @@
+#!/usr/bin/env bash
+# pre-push — the last machine between an agent and `main`.
+#
+# From 2026-10-28 a landing on `main` is a local merge and a direct push: no
+# pull request, no required status check, nothing on GitHub's side that will
+# refuse a bad one. This hook is the only mechanism left that can refuse.
+# Everything else in the method — the gate, the landing record, the contract
+# — is prose, and prose does not stop a push.
+#
+# On a push whose destination ref is `refs/heads/main` it refuses unless all
+# five hold:
+#
+#   1. the tip being pushed is a `--no-ff` merge commit: it has a second
+#      parent. A landing is always a merge of an integration branch onto
+#      `main`, so a direct commit on `main` is exactly what this hook exists
+#      to stop.
+#   1b. `./scripts/gate.sh --verify-receipt <sha>` passes for the **second
+#      parent** of the tip on this hook's stdin — not the tip itself, not
+#      the working tree, not HEAD at some other moment. The tip can never
+#      carry a receipt: the gate runs on the integration tip, and the merge
+#      commit's sha does not exist until afterwards, because its message is
+#      the landing record. Asking about the tip refuses every correct
+#      landing, which is how this hook was first built and what a reviewer
+#      measured. The receipt rule itself lives in gate.sh and nowhere else;
+#      this hook only asks.
+#   1c. the merge changed nothing: `git diff --quiet <second parent> <tip>`
+#      is silent. This is what keeps 1b honest. Without it a merger could
+#      gate one tree and push another, and the receipt would still verify.
+#      It also catches a landing where `main` moved under the merge, so the
+#      merge resolved content no gate ever saw.
+#   2. the tip commit's own message is a filled landing record:
+#      the seven sections and four header fields of
+#      `docs/orchestration/templates/landing.md`, with no header field left
+#      carrying its `<placeholder>`. This is the one check nothing else can
+#      do: `check-orchestration.sh` copies the corpus without `.git`, so no
+#      docs rule can ever read a commit message. A merger who fills the
+#      handoff and pushes a one-line merge commit is stopped here or nowhere.
+#   3. the push is a fast-forward of what the remote last told git — a
+#      rewrite of `main`'s history is refused.
+#   4. it is not a deletion of `main`.
+#
+# Every other ref goes through untouched, silently and without consulting the
+# gate: pushing a task branch is the normal case and stays free.
+#
+# WHAT THIS HOOK IS NOT — read this before trusting it. A hook believed to be
+# stronger than it is, is worse than no hook.
+#
+# * It only runs where `core.hooksPath` points at it. A worktree or clone
+#   without that setting has no guard at all, and the hook cannot report its
+#   own absence — nothing runs. See INSTALLING below. `pre-push --check-install`
+#   answers for the worktree it is run in, which is how
+#   `check-orchestration.sh` can test for the setting; it cannot answer for a
+#   worktree that never calls it.
+# * `git push --no-verify` bypasses it entirely, and so does
+#   `git -c core.hooksPath= push`. Our contract forbids `--no-verify`; the
+#   machine does not. That is a rule kept by a person, not by this file.
+# * It sees nothing after the push. A push from another machine, another
+#   clone, the GitHub web UI or a merge button on github.com never reaches
+#   this code. And nothing server-side backs it up: `main` carries
+#   `allow_force_pushes: false` and `allow_deletions: false`, but also
+#   `enforce_admins: false`, and the credential this project pushes with is
+#   a repository admin — measured 2026-10-28 — so branch protection does
+#   not bind it. Checks 3 and 4 below are not belt and braces. They are the
+#   belt.
+# * The receipt store is a local directory (`$HERD_GATE_RECEIPTS`, default
+#   `target/herd-gate/`). Anyone who can write a file there can write a
+#   receipt. A receipt is evidence that a gate ran, not proof.
+# * It reads the message of the **tip** commit only. Commits beneath the tip
+#   are not inspected, by design: the landing record describes the landing.
+# * A `--force` push that happens to be a fast-forward is byte-for-byte
+#   indistinguishable from an ordinary push, so check 3 lets it through. What
+#   check 3 catches is the thing a force-push to `main` is for: dropping or
+#   rewriting commits that are already there.
+# * It does not run the gate. If no gate was ever run, there is no receipt
+#   and the push is refused; it will not run one for you, because a gate run
+#   takes minutes and a hook that runs one would be bypassed on the first
+#   hurry.
+# * It checks the landing record's shape, never its truthfulness. It cannot
+#   tell a real run id from an invented one. It deliberately does not require
+#   the `Land batch <n>:` subject prefix either: a guard that is the only
+#   guard must not refuse a correct push on a wording quibble, because every
+#   false refusal is an argument for `--no-verify`.
+#
+# INSTALLING. One command, in the repository or in any worktree of it:
+#
+#     git config core.hooksPath scripts/githooks
+#
+# The path is relative, so it resolves inside whichever worktree the hook
+# runs in. `git worktree add` worktrees share the config of the checkout they
+# were added from, so setting it once in `/mnt/ssd_980/herd-project` covers
+# every agent worktree created there. A fresh `git clone` carries none of it:
+# `.git/config` is not in the repository and never will be, so the setting is
+# part of creating a working copy and is named in `workflow.md`'s
+# worktree-creation step. `./scripts/githooks/pre-push --check-install`
+# reports whether the current worktree has it.
+set -uo pipefail
+
+main_ref=refs/heads/main
+root=$(git rev-parse --show-toplevel 2>/dev/null) || exit 0
+gate="$root/scripts/gate.sh"
+
+# The seven sections and four header fields of
+# docs/orchestration/templates/landing.md. Kept here rather than parsed out
+# of the template: a hook must work on a clone whose checked-out tree does
+# not contain the template, and must not change its verdict because a
+# working-tree file was edited after the gate ran.
+sections=(
+  "What changed and why"
+  "Branches in this batch"
+  "Evidence"
+  "Left out"
+  "Decisions allocated"
+  "Board rows"
+  "CI run"
+)
+fields=(Batch Gate Skips "CI run")
+
+refuse() {
+  printf 'pre-push: REFUSED push to %s\n' "$main_ref" >&2
+  printf 'pre-push:   %s\n' "$@" >&2
+  printf 'pre-push: nothing was pushed. See scripts/githooks/pre-push.\n' >&2
+  exit 1
+}
+
+all_zero() { case "$1" in ""|*[!0]*) return 1 ;; *) return 0 ;; esac; }
+
+# The value of one header field: the text after `**<field>:**`, plus the
+# indented continuation lines that belong to it.
+field_value() {
+  awk -v f="$1" '
+    index($0, "- **" f ":**") == 1 {
+      sub(/^- \*\*[^*]*\*\*[ \t]*/, ""); grab = 1; print; next
+    }
+    grab && /^[ \t]+[^ \t]/ { print; next }
+    grab { exit }
+  '
+}
+
+# Characters, not bytes: awk implementations disagree on `length` for UTF-8,
+# so count bytes under LC_ALL=C and subtract the UTF-8 continuation bytes,
+# exactly as check-docs.sh does. The LC_ALL=C is load-bearing: gawk 5.4
+# rejects the byte range /[\200-\277]/ outright in a UTF-8 locale.
+columns() {
+  LC_ALL=C awk '{ print length($0) - gsub(/[\200-\277]/, "", $0) }'
+}
+
+if [ "${1:-}" = "--check-install" ]; then
+  want=$(git config --get core.hooksPath || true)
+  here=$(git rev-parse --git-path hooks 2>/dev/null)
+  if [ -z "$want" ]; then
+    echo "pre-push: core.hooksPath is NOT set in this worktree; the push guard" >&2
+    echo "pre-push: does not run here. Fix: git config core.hooksPath scripts/githooks" >&2
+    exit 1
+  fi
+  case "$here" in
+    *scripts/githooks*) echo "pre-push: installed — core.hooksPath=$want"; exit 0 ;;
+  esac
+  echo "pre-push: core.hooksPath=$want does not point at scripts/githooks" >&2
+  exit 1
+fi
+
+# Git feeds one line per ref being pushed. Every refusal exits straight
+# away, so reaching the end of the loop means every line was acceptable and
+# the only exit code left is 0.
+while read -r local_ref local_sha remote_ref remote_sha; do
+  [ "$remote_ref" = "$main_ref" ] || continue
+
+  # 4 and 3 first: a deletion and a rewrite are refused whatever else holds.
+  if all_zero "$local_sha" || [ "$local_ref" = "(delete)" ]; then
+    refuse "this push deletes main." \
+      "main is append-only. Undo a bad landing with a revert that lands:" \
+      "git revert -m 1 <merge-commit>, gated, pushed like any other landing."
+  fi
+  if ! all_zero "$remote_sha"; then
+    if ! git cat-file -e "$remote_sha^{commit}" 2>/dev/null; then
+      refuse "the remote says main is at $remote_sha, which this repository" \
+        "does not have, so this hook cannot tell a fast-forward from a" \
+        "rewrite. Fetch, then push again."
+    fi
+    if ! git merge-base --is-ancestor "$remote_sha" "$local_sha"; then
+      refuse "this push is not a fast-forward: $remote_sha, which the remote" \
+        "has on main, is not an ancestor of $local_sha. That rewrites" \
+        "main's history. Merge instead, or revert."
+    fi
+  fi
+
+  # 1: a landing is a --no-ff merge, so the tip has a second parent, and the
+  # second parent is the object the gate ran on.
+  if ! gated=$(git rev-parse -q --verify "$local_sha^2"); then
+    refuse "the tip being pushed ($local_sha) has no second parent, so it is" \
+      "not a --no-ff merge. A landing on main is always a merge of an" \
+      "integration branch: gate that branch, then" \
+      "git merge --no-ff -F <landing record> <branch>. A commit made" \
+      "straight on main is what this hook exists to stop."
+  fi
+
+  # 1b: a receipt for the second parent. The rule lives in gate.sh.
+  if [ ! -x "$gate" ]; then
+    refuse "scripts/gate.sh is missing or not executable at $gate," \
+      "so no receipt can be verified. A push to main without a verified" \
+      "gate run is exactly what this hook exists to refuse."
+  fi
+  if ! verdict=$("$gate" --verify-receipt "$gated" 2>&1); then
+    refuse "no green gate receipt for the gated commit ($gated), the second" \
+      "parent of the tip being pushed. gate.sh said: ${verdict:-nothing}" \
+      "Run ./scripts/gate.sh on the integration branch, then merge it with" \
+      "--no-ff and push. The merge commit itself can never carry a receipt:" \
+      "its sha does not exist until after the gate has run."
+  fi
+
+  # 1c: and the merge changed nothing, or the receipt proves nothing.
+  if ! git diff --quiet "$gated" "$local_sha"; then
+    refuse "the merge changed the tree: $local_sha does not contain what was" \
+      "gated in $gated. git diff $gated $local_sha is not empty, so the" \
+      "receipt covers a different tree than the one being pushed. Either" \
+      "main moved under the merge, or the merge resolved something by hand." \
+      "Re-gate the merged tree on an integration branch and merge again."
+  fi
+
+  # 2: the tip commit's own message is a filled landing record.
+  msg=$(git log -1 --format=%B "$local_sha") || refuse "cannot read the message of $local_sha."
+  subject=$(printf '%s\n' "$msg" | head -1)
+  body_lines=$(printf '%s\n' "$msg" | sed '1d' | grep -c '[^[:space:]]' || true)
+  if [ -z "${subject//[[:space:]]/}" ]; then
+    refuse "the tip commit $local_sha has an empty subject."
+  fi
+  if [ "$body_lines" -eq 0 ]; then
+    refuse "the tip commit $local_sha has a one-line message." \
+      "A landing on main carries the landing record as its commit message:" \
+      "docs/orchestration/templates/landing.md, seven sections, four header" \
+      "fields. A filled handoff does not substitute: nothing but this hook" \
+      "ever reads a commit message."
+  fi
+  cols=$(printf '%s' "$subject" | columns)
+  if [ "${cols:-0}" -gt 72 ]; then
+    refuse "the subject of $local_sha is $cols characters, over 72:" \
+      "$subject"
+  fi
+  missing=""
+  for s in "${sections[@]}"; do
+    printf '%s\n' "$msg" | grep -qxF "## $s" || missing="$missing
+      missing section: ## $s"
+  done
+  for f in "${fields[@]}"; do
+    v=$(printf '%s\n' "$msg" | field_value "$f")
+    if [ -z "${v//[[:space:]]/}" ]; then
+      missing="$missing
+      missing or empty header field: - **$f:**"
+      continue
+    fi
+    ph=$(printf '%s\n' "$v" | grep -oE '<[^<>]+>' | tr '\n' ' ')
+    [ -z "$ph" ] || missing="$missing
+      header field - **$f:** still carries a placeholder: $ph"
+  done
+  if [ -n "$missing" ]; then
+    refuse "the message of $local_sha is not a filled landing record:$missing" \
+      "" "Template: docs/orchestration/templates/landing.md. Write the record," \
+      "re-merge with git merge --no-ff -F <file>, re-run the gate on the new" \
+      "sha, then push."
+  fi
+
+  printf 'pre-push: main <- %s (merge of %s)\n' \
+    "${local_sha:0:12}" "${gated:0:12}"
+  printf 'pre-push:   %s\n' "$verdict"
+  printf 'pre-push:   the merge changed nothing the gate did not see.\n'
+  printf 'pre-push:   landing record: seven sections, four fields, filled.\n'
+done
+
+exit 0

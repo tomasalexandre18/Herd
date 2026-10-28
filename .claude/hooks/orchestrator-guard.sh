@@ -6,10 +6,31 @@
 # agent_type (both observed on 2.1.303, see docs/orchestration/permissions.md).
 #
 # Best effort, documented as such in docs/orchestration/permissions.md:
-# a shell rule is a regex, so `git -c x commit`, `/usr/bin/git commit`,
-# `sh -c`, `python -c` and a redirection through a shell variable slip past
-# it. The contract and the review of traces remain the real protection; this
-# hook catches the ordinary slip, not the determined one.
+# a shell rule is a regex, and it catches the ordinary slip, not the
+# determined one. The contract and the review of traces remain the real
+# protection.
+#
+# Recognised since 2026-10-28: git invoked with global options in front of
+# the subcommand. `git -C <dir> merge`, `git --git-dir=<d> --work-tree=<d>
+# commit` and the same shape with `--exec-path`, `--namespace`, `--bare`,
+# `--no-pager` or `-P` all used to slip past every git rule here, because
+# each rule matched the verb in first position only. `git -C <dir>` is about
+# to be the documented idiom for driving another worktree, so it was the one
+# bypass certain to be used by accident rather than on purpose.
+#
+# Still slips past, by decision or for want of a better rule:
+# `git -c key=val commit` -- a deliberate, asserted bypass (the "known
+# bypasses" section of scripts/check-orchestration.sh and
+# docs/orchestration/permissions.md); closing it is a decision of its own,
+# not a side effect of this one -- `/usr/bin/git commit`, `sh -c`,
+# `python -c`, a verb built up in a shell variable, and an alias.
+#
+# This guard constrains the MAIN SESSION ONLY, and that is the intent, not
+# an oversight: an execution agent carries agent_id or agent_type and is let
+# through below before any rule runs, because committing, merging and
+# pushing are its job. Nothing here protects the repository against an
+# agent. What refuses an agent's bad push to `main` is
+# scripts/githooks/pre-push, and only where core.hooksPath points at it.
 #
 # Fails OPEN: unparseable input or a missing perl lets the call through,
 # so the hook can never immobilise a session. Disable without editing
@@ -67,11 +88,28 @@ case "$tool" in
   Bash)
     [ -z "$command" ] && exit 0
     c=$command
-    if printf '%s' "$c" | grep -qE '(^|[;&|(]|\s)git\s+(commit|merge|rebase|cherry-pick|revert|am|apply|tag)(\s|$)'; then
+    # `git -C <dir> merge` has to be read as `git merge`: every git rule
+    # below matches the verb right after `git`, so one global option in
+    # front of it defeated all of them at once. Strip the global options
+    # that move the verb out of first position, then match on the result.
+    # `-c key=val` is deliberately NOT in this list (see the header). A
+    # quoted argument is handled, so `git -C "/a b" push` is read too.
+    cn=$(printf '%s' "$c" | perl -0777 -pe '
+      s{(^|[;&|(]|\s)git((?:\s+(?:
+            -C\s+(?:"[^"]*"|\x27[^\x27]*\x27|\S+)
+          | --git-dir(?:=\S+|\s+(?:"[^"]*"|\x27[^\x27]*\x27|\S+))
+          | --work-tree(?:=\S+|\s+(?:"[^"]*"|\x27[^\x27]*\x27|\S+))
+          | --exec-path(?:=\S+|\s+(?:"[^"]*"|\x27[^\x27]*\x27|\S+))
+          | --namespace(?:=\S+|\s+\S+)
+          | --bare | --no-pager | --no-replace-objects
+          | --literal-pathspecs | -P
+        ))+)\s+}{$1git }gx' 2>/dev/null) || cn=$c
+    [ -n "$cn" ] || cn=$c
+    if printf '%s' "$cn" | grep -qE '(^|[;&|(]|\s)git\s+(commit|merge|rebase|cherry-pick|revert|am|apply|tag)(\s|$)'; then
       deny "git write verb in: $c"; fi
-    if printf '%s' "$c" | grep -qE '(^|[;&|(]|\s)git\s+(reset|checkout|switch|restore|stash|clean)(\s|$)'; then
+    if printf '%s' "$cn" | grep -qE '(^|[;&|(]|\s)git\s+(reset|checkout|switch|restore|stash|clean)(\s|$)'; then
       deny "git verb that rewrites a checkout in: $c"; fi
-    if printf '%s' "$c" | grep -qE '(^|[;&|(]|\s)git\s+push(\s|$)'; then
+    if printf '%s' "$cn" | grep -qE '(^|[;&|(]|\s)git\s+push(\s|$)'; then
       deny "git push in: $c"; fi
     if printf '%s' "$c" | grep -qE '(^|[;&|(]|\s)gh\s+(pr\s+(merge|create|edit|close)|release|workflow\s+run)(\s|$)'; then
       deny "gh write verb in: $c"; fi
@@ -82,16 +120,50 @@ case "$tool" in
     # A relative redirection lands wherever the shell stands: inside the
     # checkout, that is a repository write. A target that starts with $ or
     # with a quoted variable cannot be judged here and passes (documented).
+    #
+    # Narrowed 2026-10-28: the coarse rule denied `echo x > ../../notes.md`
+    # and `echo x > ~/notes.md` -- targets plainly OUTSIDE the checkout --
+    # whenever the shell happened to stand inside it, which it usually does,
+    # and a guard that refuses the orchestrator its own notes is a guard
+    # somebody switches off. So each target is now resolved against cwd and
+    # only one that lands in the checkout is denied. It still fails CLOSED:
+    # no extractable target, a `~user` form or an unresolvable $variable all
+    # keep the old verdict, deny.
     case "${cwd:-}" in
       "$root"|"$root"/*)
         if printf '%s' "$c" | grep -qE '(>>?|tee(\s+-a)?)\s*"?[^/&$[:space:]"({-]'; then
-          deny "redirection to a relative path while in the checkout: $c"; fi ;;
+          where=$(perl -e '
+            my ($cmd, $cwd, $r, $home) = @ARGV;
+            my @t;
+            while ($cmd =~ m{(?:>>?|\btee(?:\s+-a)?)\s*(?:"([^"]+)"|\x27([^\x27]+)\x27|([^\s"\x27&|;()<>]+))}g) {
+              push @t, defined $1 ? $1 : defined $2 ? $2 : $3;
+            }
+            print("unknown"), exit unless @t;
+            for my $p (@t) {
+              if ($p =~ m{^~}) {
+                print("unknown"), exit unless $p =~ m{^~(/|$)} && length $home;
+                $p =~ s{^~}{$home};
+              }
+              $p = "$cwd/$p" unless $p =~ m{^/};
+              my @o; for (split m{/}, $p) { next if $_ eq q{} || $_ eq q{.};
+                $_ eq q{..} ? pop @o : push @o, $_; }
+              my $abs = "/" . join "/", @o;
+              next if index($abs, "$r/.claude/worktrees/") == 0;
+              print("inside"), exit if $abs eq $r || index($abs, "$r/") == 0;
+            }
+            print "outside";' "$c" "$cwd" "$root" "${HOME:-}" 2>/dev/null)
+          [ "$where" = outside ] \
+            || deny "redirection to a relative path while in the checkout: $c"
+        fi ;;
+      *)
+        # `cd <somewhere in the checkout> && <write>`: the redirection target
+        # is relative, so the rule above does not see it when cwd is outside.
+        # Only when cwd is outside: inside, the resolving rule above has
+        # already judged the same command, and the two must not disagree.
+        if printf '%s' "$c" | grep -qE "(^|[;&|(]|\s)cd\s+\"?(\./)?($root|docs|scripts|herd-[a-z]+|herdctl|deploy|nix|[.]github|[.]claude)(/|\"|\s|$)" \
+           && printf '%s' "$c" | grep -qE '(>>?|tee(\s+-a)?)\s*"?[^/&$[:space:]"({-]'; then
+          deny "cd into the checkout followed by a write in: $c"; fi ;;
     esac
-    # `cd <somewhere in the checkout> && <write>`: the redirection target is
-    # relative, so the rule above does not see it when cwd is outside.
-    if printf '%s' "$c" | grep -qE "(^|[;&|(]|\s)cd\s+\"?(\./)?($root|docs|scripts|herd-[a-z]+|herdctl|deploy|nix|[.]github|[.]claude)(/|\"|\s|$)" \
-       && printf '%s' "$c" | grep -qE '(>>?|tee(\s+-a)?)\s*"?[^/&$[:space:]"({-]'; then
-      deny "cd into the checkout followed by a write in: $c"; fi
     case "$c" in *"$root"/*) 
       if printf '%s' "$c" | grep -qE "(>>?|tee(\s+-a)?|cp|mv|rm|touch|mkdir|install)\s+[^;&|]*$root/" && ! printf '%s' "$c" | grep -q "$root/.claude/worktrees/"; then
         deny "write into the orchestrator's checkout in: $c"; fi ;;
