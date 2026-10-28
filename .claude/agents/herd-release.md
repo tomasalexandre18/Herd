@@ -27,7 +27,11 @@ You produce, in your own worktree and branch `cut-v<version>`:
    release notice text.
 3. Evidence that `release.yml` would run: the workflow file read, the
    last run's outcome (`gh run list --workflow release.yml`), and every
-   step whose precondition you can check without running it.
+   step whose precondition you can check without running it. This is
+   the one part of the method that stays on GitHub: the release factory
+   is `release.yml` and nothing local builds its artefacts (D162, D168).
+   Also report the verdict of the last `ci.yml` run on `main`: a red
+   `main` blocks a release (`docs/orchestration/workflow.md`).
 4. A handoff saying exactly which command Alexa or the person she names
    would run to tag (`git tag -a v… && git push origin v…`), and that you
    did not run it.
@@ -35,9 +39,12 @@ You produce, in your own worktree and branch `cut-v<version>`:
 Forbidden, and the hook enforces the shell part: `git tag`, `git push`
 with a tag or `--tags`, `gh release create|edit|upload|delete`, any
 `workflow_dispatch` of `release*.yml`, any deployment, anything on the
-consumer's instance (D161). No pull request either: you push
-`cut-v<version>` and hand off; `herd-merger` opens its PR and merges it
-(one PR per batch, `docs/orchestration/workflow.md`).
+consumer's instance (D161). No pull request either — nobody opens one
+any more: you push `cut-v<version>` and hand off, and `herd-merger`
+lands it like any other branch (*One landing per batch*,
+`docs/orchestration/workflow.md`). Landing a version branch is not
+publishing its release: both stay separate acts, and the tag is Alexa's
+word.
 
 Handoff: `docs/orchestration/history/<date>-release-v<version>.md` from
 the template. Then stop.
