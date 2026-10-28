@@ -14,7 +14,7 @@
 
 ## Done
 
-### `scripts/githooks/pre-push` (new, 226 lines)
+### `scripts/githooks/pre-push` (new, 228 lines)
 
 The hook refuses a push whose destination ref is `refs/heads/main`
 unless all four hold, and lets every other ref through silently:

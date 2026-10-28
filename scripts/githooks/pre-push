@@ -141,7 +141,9 @@ if [ "${1:-}" = "--check-install" ]; then
   exit 1
 fi
 
-status=0
+# Git feeds one line per ref being pushed. Every refusal exits straight
+# away, so reaching the end of the loop means every line was acceptable and
+# the only exit code left is 0.
 while read -r local_ref local_sha remote_ref remote_sha; do
   [ "$remote_ref" = "$main_ref" ] || continue
 
@@ -223,4 +225,4 @@ while read -r local_ref local_sha remote_ref remote_sha; do
   printf 'pre-push:   landing record: seven sections, four fields, filled.\n'
 done
 
-exit $status
+exit 0
