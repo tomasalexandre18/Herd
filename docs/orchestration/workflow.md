@@ -9,9 +9,9 @@ owes before it stops. `CLAUDE.md` is the contract; this is the procedure.
 |---|---|---|
 | orchestrator (main session) | receives the goal, reads the board, picks agents, writes briefs, reads evidence, asks Alexa one question at a time, reports in French | edit a repository file, commit, merge, resolve a conflict, tag, release, declare a skip a pass, report an agent's claim unverified |
 | `herd-planner` | analyses a request, lists alternatives and hypotheses to refute, cuts bounded tasks | modify the product, merge, settle an owner decision |
-| `herd-step` | one bounded task on its own branch and worktree, with the gates the task needs, evidence and a handoff; pushes the branch | open a pull request, leave its write paths, touch `main`, another agent's worktree, or the running instance |
-| `herd-merger` | integrates a batch of branches, one at a time onto one integration branch: conflicts, gates, D-number allocation, board and status update, **one** PR for the batch, and the merge itself (standing authorisation ORCH-001) | bypass a gate, decide a specification or invariant change, operate Herd |
-| `herd-release` | prepares a release: checklist, version, body, evidence; simulation only until Alexa orders a tag | tag, push a tag, publish, deploy, open its own PR |
+| `herd-step` | one bounded task on its own branch and worktree, with the gates the task needs, evidence and a handoff; pushes the branch | leave its write paths, push to `main`, touch another agent's worktree, or the running instance |
+| `herd-merger` | integrates a batch of branches, one at a time onto one integration branch: conflicts, the local gate, D-number allocation, board and status update, then **one** `--no-ff` merge commit on `main` carrying the landing record, pushed under standing authorisation ORCH-001 | bypass a gate, push `main` without a green gate for that exact sha, decide a specification or invariant change, operate Herd |
+| `herd-release` | prepares a release: checklist, version, body, evidence; simulation only until Alexa orders a tag | tag, push a tag, publish, deploy, land its own branch |
 | `herd-reviewer` | adversarial review of a plan, a rule change, a permission change or an unresolvable conflict; lists missing evidence and adverse cases | edit anything, replace the owner |
 
 What is technically enforced and what is only written is in
@@ -33,58 +33,123 @@ What is technically enforced and what is only written is in
    docs gate is the last thing run** — after the handoff is committed,
    before the push — and the output quoted in the handoff is that run's:
    a handoff is itself a docs file, so a gate run before it was written
-   tested a different tree, and under one PR per batch one ungated
-   handoff reddens the whole batch's PR, where it blocks every other
-   branch in it. **Then** the branch is pushed. It **opens no pull
-   request**: the branch and the handoff are the delivery.
+   tested a different tree, and under one landing per batch one ungated
+   handoff reddens the batch's own gate run, where it blocks every
+   other branch in it. **Then** the branch is pushed. **No pull request
+   is opened, by anyone** (*One landing per batch*): the branch and the
+   handoff are the delivery. A worktree gets `git config core.hooksPath
+   scripts/githooks` when it is created, so that the repository's own
+   `scripts/githooks/pre-push` applies in it.
 5. **Verify.** The orchestrator reads the diff, the gate output and the
    handoff. It reruns a read-only check when a claim matters. It never
    fixes what it finds; it sends it back or opens a new task.
 6. **Review when it is a rule.** A change to `CLAUDE.md`, agents,
    permissions, hooks, `check-docs.sh` or an invariant gets a
    `herd-reviewer` pass before integration; a micro-edit does not.
-7. **Integrate.** `herd-merger` takes a **batch** of finished branches —
-   everything ready when it starts — and merges them **one at a time**
-   onto one integration branch off `origin/main`: conflicts resolved in
-   its worktree, `D` numbers allocated once in order (`D-NEXT` → next
-   free number, gaps stay), the gates the diff needs, `board.md` and
-   `docs/status.md` written once. It then opens **one** PR for the batch
-   from `.github/pull_request_template.md`, with **each branch's own
-   evidence separately** in the Evidence block, waits for CI, and merges:
-   Alexa's standing authorisation (ORCH-001, 2026-10-24) covers every PR
-   whose CI is green and whose Evidence block is filled. `main` moves no
-   other way. A tag is never part of this step. The rule, and the three
-   method changes refused with it: *One PR per batch of branches*, below.
+7. **Integrate and land.** `herd-merger` takes a **batch** of finished
+   branches — everything ready when it starts — and merges them **one at
+   a time** onto one integration branch off `origin/main`: conflicts
+   resolved in its worktree, `D` numbers allocated once in order
+   (`D-NEXT` → next free number, gaps stay), `board.md` and
+   `docs/status.md` written once. It then runs `./scripts/gate.sh` on
+   that branch, merges it `--no-ff` onto `main` in its own worktree with
+   the landing record as the merge commit message, and pushes `main`
+   **once**: Alexa's standing authorisation (ORCH-001, 2026-10-24,
+   re-granted 2026-10-28) covers any landing whose gate is green on the
+   exact sha pushed and whose landing record is filled. `main` moves no
+   other way, and no pull request is opened. A tag is never part of this
+   step. The rule, what a landing is, what it costs and the three method
+   changes refused with it: *One landing per batch*, below.
 8. **Release.** On Alexa's order, `herd-release` prepares the checklist
    and pushes the `cut-v<version>` branch that bumps the version;
-   `herd-merger` opens its PR, as for any other branch. The tag itself is
+   `herd-merger` lands it, as for any other branch. The tag itself is
    pushed by whoever Alexa names in that order. Nothing in this project
    deploys.
 
-## One PR per batch of branches
+## One landing per batch
+
+The rule of 2026-10-27 and the rule of 2026-10-28, in that order,
+because the second grew out of the first. Until 2026-10-28 this section
+was titled *One PR per batch of branches*; board rows and handoffs
+written before that date point at the old name.
 
 Alexa, 2026-10-27, verbatim: *"pour le moment on applique uniquement le
 une PR = plusieur lot, le reste non"* — answering a proposal modelled on
-how the first consumer works. One part of that proposal is adopted; three
-are refused. The refusals are written down here with their reason so that
-nobody re-adopts them by drift.
+how the first consumer works. One part of that proposal was adopted;
+three were refused, and the refusals are written down below with their
+reason so that nobody re-adopts them by drift. One of the three was
+adopted the next day, which is why each keeps its date.
 
-**Adopted: one pull request per batch of several steps.**
+Alexa, 2026-10-28, verbatim: *"en gros je verais juste la supresions des
+pr et sortir de l'env Github, comme chatOnS il font tout les test en
+local et c'est merger en local et pousser, sa part du principe que il y
+a pas de colaboratif distant ce qui est le cas, seulement vous sur le
+project, sa evite les longue CI en boucle, un agent peux tester en local
+et le merge aussi avant d'envoyer vers main, Github est juste un centre
+de stokage, c'est une revisite de la facons de travailler (regles aussi
+les problemme des 2000 minute de run)"*
+
+That is the answer to **ORCH-120**, dated 2026-10-28. It is given
+against the recommendation written in that row (*"not yet — keep CI as
+the gate"*) and it is wider than the row's fallback, which would have
+kept CI and changed only what the merger reads. It also answers a
+question ORCH-120 never asked: the pull request itself goes.
+
+**The pull request goes away.** Nobody opens one — not an agent, not
+`herd-merger`, not for a rule change, not for a release cut. There is no
+remote collaborator: Alexa and this project's agents are the whole set
+of authors, so a pull request bought review from nobody and cost about
+nine minutes of CI per batch on the critical path (PR run 40562916742,
+8 m 54 s, 2026-10-27).
+
+### What a landing is
+
+**One batch, one push, one `--no-ff` merge commit whose message is the
+landing record, one post-push run of `ci.yml` on `main`.** That chain is
+one-to-one on purpose, and it is the whole of what keeps a failure
+attributable: the run that goes red names a sha, the sha is a merge
+commit, the merge commit names the batch and each of its branches. Break
+the chain — two pushes for one batch, or a fast-forward with no merge
+commit — and a red run points at a blur with nothing to bisect over.
+That is not hypothetical: `ci.yml`'s concurrency group cancels an
+in-progress run on `main` when a second push arrives, and **six runs on
+`main` were cancelled in the five days to 2026-10-28**, three of them
+within seven seconds of each other. Each cancelled run was the only
+thing a second machine would ever have said about its own landing.
 
 - One branch per task is unchanged. An agent finishes by **pushing its
-  branch and handing off; it does not open a pull request.**
-- `herd-merger` takes a **batch** of finished branches and merges them
-  **one at a time** onto a single integration branch — one at a time so
-  that a later red CI is attributable to a known merge commit rather than
-  to a blur. It resolves the conflicts once, allocates the `D` numbers
-  once in order, writes the board once, and opens **one** pull request
-  for the batch.
+  branch and handing off.**
+- `herd-merger` merges the batch **one at a time** onto a single
+  integration branch — one at a time so that a later red run is
+  attributable to a known merge commit rather than to a blur. It
+  resolves the conflicts once, allocates the `D` numbers once in order,
+  and writes the board once.
+- **The gate is `./scripts/gate.sh`, green on the exact sha that is
+  pushed.** It runs the steps of the `check` and `docs` CI jobs, in the
+  same order, on this workstation, and leaves a receipt named for the
+  sha; a receipt for another sha is not a gate run for this one. What it
+  does not cover is below, in *What the local merge costs*.
+- **The landing record is the merge commit message**, filled from
+  `docs/orchestration/templates/landing.md`: the batch, each branch with
+  its `ORCH-nnn` and its handoff path, the gate verdict, what was left
+  out, what was recorded. `git log --merges main` is the audit trail; it
+  needs no network and no GitHub account, and it cannot be rewritten
+  after the fact, because force-push to `main` stays refused
+  server-side. A pull request body could be edited silently, a merge
+  commit message cannot — this is the one part of the change that makes
+  the record stronger rather than weaker.
+- **The verbatim output stays in files in the repository**, as before:
+  each branch's handoff under `docs/orchestration/history/`, and the
+  merger's own `<date>-merge-<batch>.md` carrying the full `gate.sh`
+  output file and the skip list. They land in the same push as the merge
+  commit, so the record and its evidence arrive together and a reader
+  who was not there needs one `git show`.
 - The batch is **everything ready when the merger starts**, not a fixed
   count. That is the orchestrator's call, recorded here so that it is not
   re-litigated.
-- The batch PR's Evidence block carries **each branch's own evidence
-  separately**. A batch is not permission for one blurred summary: a
-  reader must still see what each change proved on its own.
+- Each branch's evidence stays **its own**, in the record as in the
+  handoffs. A batch is not permission for one blurred summary: a reader
+  must still see what each change proved on its own.
 - **The merged board is read line by line, not only for conflicts.**
   Required of `herd-merger`: once the batch is merged, take the exact
   line each branch wrote into `board.md` and require it **verbatim** in
@@ -95,13 +160,31 @@ nobody re-adopts them by drift.
   danger was therefore not a hurried conflict resolution but a board
   merge nobody had to read, and a silent revert with nothing to resolve
   is caught by this check and by nothing else. It takes a minute.
-- Superseded single PRs, if any were already open, are closed naming the
-  batch PR; their branches stay.
+- **The post-push run is recorded, then read.** `herd-merger` puts its
+  id in its handoff and in the board row **immediately after the push**
+  and does not wait for the verdict — that wait is the nine minutes this
+  change exists to stop paying. It may choose to wait when it judges a
+  landing risky, and it says which it did. The next session start reads
+  `gh run list --workflow ci.yml --branch main --limit 5` after the
+  board and the last handoff, and a `failure` becomes an `ORCH-nnn` row
+  before any new work is briefed. No automatic GitHub issue: issues are
+  Alexa's.
+- **Transition, and it is not ours to skip.** GitHub still requires a
+  pull request on `main` today (`required_pull_request_reviews`, plus
+  the required contexts `check` and `docs`), so until that branch
+  protection is narrowed — Alexa's act, and the first step of this
+  change — a push to `main` is refused by the server, not by us. The
+  change itself therefore lands through one last pull request. Any pull
+  request still open when it does is closed naming the landing that
+  replaces it, and its branch stays.
 
-**Unchanged.** CI is the gate: jobs `check` and `docs` green on the
-pushed head, Evidence filled, then the merge under ORCH-001. Never
-`--no-verify`, never force-push, never a red merge, never `--admin`. One
-integration at a time: a batch **is** one integration, larger.
+**Unchanged.** Never `--no-verify` — it is what bypasses
+`scripts/githooks/pre-push`, which is now the only mechanism standing in
+front of `main` — never force-push, never a red landing, never
+`--admin`. One integration at a time: a batch **is** one integration,
+larger. A tag and a release stay Alexa's word, one act at a time. The
+orchestrator still never merges or pushes, and that one is still
+enforced from outside the text, by `orchestrator-guard.sh`.
 
 **Refused, for now.**
 
@@ -125,8 +208,10 @@ integration at a time: a batch **is** one integration, larger.
 
 - Alexa decides: milestone order, invariants, pushing a tag, publishing a
   release (each act singly), GitHub issues, anything on the consumer's
-  side. Merging a CI-green PR with filled Evidence is `herd-merger`'s
-  (ORCH-001); merging a version PR does not publish its release.
+  side. Pushing a landing whose local gate is green on the exact sha
+  and whose landing record is filled is `herd-merger`'s (ORCH-001,
+  re-granted 2026-10-28); landing a version branch does not publish its
+  release.
 - A question for Alexa is one item in the board's *Waiting* section:
   question, recommendation, impact, fallback, date. Work that does not
   depend on it continues. Nobody invents the answer.
