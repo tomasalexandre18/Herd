@@ -9564,3 +9564,157 @@ in a job must raise its own cap.
 
 **On the number.** This entry is D186, allocated at the same integration as
 D185 and after it.
+
+---
+
+## 2026-10-28 — D187 The local gate reads the skip list, never the count
+
+**Context.** With the pull request going (D189), the merge condition becomes a
+run on this host rather than a run on GitHub. A host figure is not a universal
+one: this workstation reported **12** skips at rest on three runs of
+2026-10-28, GitHub Actions **14** on green run 40564336703, and a red CI run
+printed "AT LEAST 15" because it had not finished. The same host also reports
+**14** under load, because `flood-fifty` and `flood-two-fifty` skip themselves
+above a one-minute load of 8. A count is therefore per host *and* per load,
+and a condition written over it is a condition that drifts.
+
+**Choice.** `scripts/gate.sh` runs every step of `ci.yml` in order and ends in
+one verdict naming the sha it ran on; only `gate: GREEN` authorises a push to
+`main`. It compares the run's skips against a committed list for the host and
+is red on any assertion name that is not on it, and **silent on how many there
+are**. A count cannot carry D27; the list can. The lists live in
+`scripts/expected-skips/`, not under `docs/`, because `check-docs.sh`
+width-checks `docs/*.md` at 79 columns and a skip line is far longer. A list
+is produced only by `--bless` from a run ending `test suite: PASSED`; a run
+that did not finish yields a floor and never an expectation.
+
+**Alternative rejected.** Asserting a number, which is what every report in
+this project did until it was measured on two hosts and two loads. The
+fallback — keep CI as the required check and have the merger read the list —
+is what ORCH-120's own recommendation proposed and what D189 went past.
+
+**Known limit, stated.** The gate measures a **cgroup slice**, not a host:
+4.9 GiB announced rather than 31.1 GiB, because `/chatons.slice`'s
+`memory.high` is 18 GiB and already held 13 GiB, so two agents in different
+slices do not run the same suite.
+
+**Reversibility.** High. One script and one directory; nothing in the product
+depends on either.
+
+**On the number.** This entry is D187, allocated at the integration of the
+five-branch method batch, with D188 and D189 after it, in merge order. D143,
+D154 and D170 stay gaps (D148): no pull request was open at this allocation
+(`gh pr list` empty, 2026-10-28), so none of the three returns to the pool.
+
+---
+
+## 2026-10-28 — D188 The push guard is the last machine before main
+
+**Context.** With pull requests and required status checks gone (D189), and
+with `enforce_admins: false` against an admin push credential, **nothing on
+GitHub's side refuses a bad push to `main`** — not a force-push, not a
+deletion, not a landing on a red gate. The branch protection never bound our
+own credential; it was read from the API on 2026-10-28.
+
+**Choice.** `scripts/githooks/pre-push` is the mechanism. A landing is a
+`--no-ff` merge of a gated integration branch onto `main`, so the hook refuses
+a tip with no second parent, a second parent with no GREEN `gate.sh` receipt,
+a merge whose tree differs from the gated tree, a tip whose message is not a
+filled landing record, a rewrite and a deletion. It asks
+`gate.sh --verify-receipt` rather than re-implementing the receipt rule.
+Asking about the **tip** instead of the second parent refuses every correct
+landing — that is how the hook was first built, and it was measured. Every
+other ref goes through untouched and without consulting the gate: pushing a
+task branch is the normal case and stays free, which is the same rule as
+`CLAUDE.md`'s, where a prose-only change runs `check-docs.sh` alone.
+
+**Limits, in the file and asserted in `check-orchestration.sh`.** It runs only
+where `core.hooksPath` points at `scripts/githooks`, and `--no-verify`
+bypasses it; `git -c core.hooksPath= push` bypasses it too, and that spelling
+is now refused by the orchestrator guard. The landing-record check lives here
+rather than in `check-docs.sh` because `check-orchestration.sh` copies the
+corpus without `.git`, so no docs rule can read a commit message.
+
+**Alternative rejected.** Turning `enforce_admins` on, which would make the
+protection mechanical again. It is a GitHub account setting and outward-facing,
+so it is Alexa's; it stays an open question and the hook does not wait on it.
+
+**Reversibility.** High. One file and one `git config` line.
+
+**On the number.** This entry is D188, allocated after D187 and before D189 at
+the same integration, in merge order.
+
+---
+
+## 2026-10-28 — D189 The pull request leaves the loop: one landing per batch
+
+**Decision (Alexa, 2026-10-28).** First: *"en gros je verais juste la
+supresions des pr et sortir de l'env Github … un agent peux tester en local et
+le merge aussi avant d'envoyer vers main, Github est juste un centre de
+stokage … (regles aussi les problemme des 2000 minute de run)"*. Then, when
+the orchestrator put the objection that a local gate is one machine and that
+this one could not produce a green run: *"que l'on soit clair, l'abandon des
+PR et CI Github n'est pas une option, mais une obligation."*
+
+**What is decided.** The pull request leaves the loop. A landing is one batch,
+one push, one `--no-ff` merge commit whose message is the landing record, one
+post-push run of `ci.yml` on `main` — one-to-one, because that chain is what
+keeps a red run attributable. Six runs on `main` were `cancelled` in the five
+days before, three within seven seconds of each other. There is no remote
+collaborator: Alexa and this project's agents are the whole set of authors, so
+a pull request bought review from nobody and cost about nine minutes of CI per
+batch on the critical path (PR run 40562916742, 8 m 54 s, 2026-10-27).
+
+**ORCH-001 re-granted, not reinterpreted.** Both halves of the 2026-10-24
+condition — CI green, Evidence block filled — go with the pull request.
+`herd-merger` alone pushes `main`, on a green `./scripts/gate.sh` for the sha
+it gated — **the merge's second parent, with an identical tree** — because the
+merge commit's message is the record and so its sha cannot exist before the
+gate. Written as "the exact sha that is pushed", as it was until this was
+measured, **no landing is ever permitted**. Pushing a tag and publishing a
+release are unchanged: Alexa's word, one act at a time.
+
+**What it answers.** ORCH-120, against the recommendation written in that row
+(*"not yet — keep CI as the gate"*) and wider than its fallback. The refusal
+of 2026-10-27 made itself reconsiderable once ORCH-069 and ORCH-107 were
+fixed; both landed, so this is that sequence arriving.
+
+**Nothing waits for a review.** Asked whether rule changes (`CLAUDE.md`, the
+invariants, `.claude/`, a release cut) should keep a pull request so he could
+look before they land, Alexa answered no: everything lands locally, rules
+included, and he reads `main` when it suits him. A reduction in oversight,
+recorded as one.
+
+**Known limitations, measured the same day and not reasons to wait.** Neither
+host runs the twelve confinement assertions behind invariant 2 — all twelve
+skips here are the same cgroup-delegation refusal, and this host runs **two**
+assertions CI cannot, which is the whole of the 12-against-14 difference. The
+gate measures a cgroup slice and not a host (D187). And `main`'s history is
+protected **contractually**, not server-side: `enforce_admins` is false and
+our only push credential is a repository admin, so the branch protection does
+not bind the account that pushes (D188).
+
+**What this does not decide.** The branch protection change, the `ci.yml`
+triggers, `gate.sh`'s contents, the `pre-push` hook, whether a nightly run is
+adopted, and whether `enforce_admins` is turned on. `release.yml` and
+`release-dev.yml` are untouched and are **never** deleted: GitHub remains the
+release factory (D162, D168), the hotfix lane (D172) and our only second
+machine.
+
+**The transition.** Three dated steps in `workflow.md`, *Not an option*: one
+last pull request, opened by `herd-merger` on the orchestrator's instruction,
+carrying the method change and the deletion of
+`.github/pull_request_template.md`; the branch protection narrowed, which is
+Alexa's; then the first local landing, which is the only lane that can delete
+`ci.yml`'s `pull_request:` trigger, since a pull request removing that trigger
+can never produce the two contexts it requires. The red suite that looked like
+a blocker was a **test** defect — three fixtures needing two job slots while
+the runner announced one — fixed the same day as D186, and the suite is green
+at rest on `ee8dec0`.
+
+**Reversibility.** High on our side, low on Alexa's: the text is a landing
+away, but re-requiring a pull request means putting the branch protection
+back, which is his act.
+
+**On the number.** This entry is D189, allocated last of the three at the
+integration of the method batch, after D187 and D188.
