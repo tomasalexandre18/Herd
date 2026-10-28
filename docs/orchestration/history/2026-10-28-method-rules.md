@@ -5,14 +5,19 @@
   row requires in the same edit
 - **Agent:** herd-step
 - **Branch / commit:** `method-rules`, based on origin/main `bc83717`;
-  nine content commits, the last of them `360ee04`, plus the ones that
+  ten content commits, the last of them `abfe6a1`, plus the ones that
   carry this handoff — `git log --oneline origin/main..method-rules`
-- **Landing:** none — this branch opens no pull request. The orchestrator
-  assembles the one last pull request that carries the whole method
-  change (*Not an option*, step 1); `herd-merger` names the landing here
+- **Landing:** none — this branch opens no pull request. **`herd-merger`
+  opens the one last pull request** that carries the method change, on
+  the orchestrator's instruction (*Not an option*, step 1), and names
+  the landing here. It **must land in the same batch** as
+  `method-local-gate` (`scripts/gate.sh`), `method-landing-record`
+  (`templates/landing.md`), the `pre-push` branch and
+  `method-permissions-truth`: the contract this branch writes names all
+  four, and three of them are not on `main`
 - **Task:** T2 of the local-merge method (plan of 2026-10-28 by
-  `herd-planner`), plus three mid-task course corrections and one
-  adversarial review, all answered below. Prose only.
+  `herd-planner`), plus three mid-task course corrections and **two**
+  adversarial review passes, all answered below. Prose only.
 
 ## Done
 
@@ -25,7 +30,8 @@ The method is **in force**, in `CLAUDE.md` and in the role files:
 nobody opens a pull request, a landing is one batch, one push, one
 `--no-ff` merge commit carrying the landing record, one post-push run of
 `ci.yml` on `main`, and `herd-merger` alone pushes `main` on a green
-`./scripts/gate.sh` for that exact sha plus a filled landing record.
+`./scripts/gate.sh` for the **gated** sha — the merge's second parent,
+trees identical — plus a filled landing record.
 Alexa, 2026-10-28, verbatim and quoted in `workflow.md`: *"que l'on soit
 clair, l'abandon des PR et CI Github n'est pas une option, mais une
 obligation."*
@@ -58,6 +64,8 @@ obligation."*
 8. **Give `herd-merger` a closing fast-forward of the orchestrator's
    checkout.**
 9. **Put the new method in force and answer the review.**
+10. **Make the merge condition satisfiable and route the last pull
+    request** — the pass-2 review, below.
 
 ### Which sentences changed tense, and why
 
@@ -68,9 +76,9 @@ Alexa's reaffirmation. Every sentence that moved, both ways:
 
 | Place | 7 made it | 9 made it |
 |---|---|---|
-| `CLAUDE.md` *Git and main* | origin/main's rule, plus a bullet saying what is *not in force yet* | the rule in force: no pull request ever, `gate.sh` for the exact sha, filled record, ORCH-001 re-granted |
+| `CLAUDE.md` *Git and main* | origin/main's rule, plus a bullet saying what is *not in force yet* | the rule in force: no pull request but the one that lands this change, `gate.sh` for the gated sha, filled record, ORCH-001 re-granted |
 | `workflow.md` subsection after the quote | *What is in force today, and what is proposed* | *Not an option: the obligation, and the transition to it* |
-| the gate bullet | *"proposed and pending ORCH-nnn … today the gate is still CI"* | *"The gate is `./scripts/gate.sh`, green on the exact sha"* |
+| the gate bullet | *"proposed and pending ORCH-nnn … today the gate is still CI"* | *"The gate is `./scripts/gate.sh`, green on the sha it gated"* (commit 10 corrected "the exact sha that is pushed", which no landing could satisfy) |
 | *Transition* | two blockers, the second being what a green gate proves | four dated steps plus the one defect step 4 waits on |
 | loop step 7 | both lanes, today's first | one lane |
 | *Permissions and escalation* | in force / proposed, separately | one condition, the old one named as gone |
@@ -88,21 +96,107 @@ the pull request gate was in front of it, so removing that gate does not
 create the problem, it removes the cushion that made ignoring it
 survivable.
 
-### The red suite is a blocker with an owner, not a condition
+### The pass-2 review, defect by defect
 
-`workflow.md`, *Not an option*: a green `gate.sh` is **currently
-unobtainable on this host** — a full-workspace run at rest fails
-reproducibly, three times of three, on three `real_herd` 30 s timeouts
+The seven pass-1 answers were re-measured and all held. The one-lane
+rewrite had created three new blocking defects.
+
+- **N1, and it was the worst: the merge condition was unsatisfiable.**
+  Five places required a green gate for *the exact sha that is pushed*.
+  The gate runs on the integration tip; the `--no-ff` merge commit is
+  created after it and is what gets pushed, and its message **is** the
+  record, so it cannot exist before the gate. Measured: gated
+  `31bb327f…`, pushed `d791dfbc…`, same tree, different sha. Written to
+  the letter, **no landing was ever permitted** — and `pre-push` is
+  being built against this text. All five now say the condition is a
+  receipt for **the merge's second parent** plus an **identical tree**,
+  and *What a landing is* carries the check itself
+  (`git rev-parse "$local_sha^2"`, `git diff --quiet`) so the hook has
+  something exact to implement.
+- **N2: the one last pull request had no actor.** It was forbidden in
+  four places and permitted in one, and my own previous handoff named
+  the orchestrator — the one actor that cannot, since
+  `orchestrator-guard.sh` denies it `gh pr create` (exit 2, measured).
+  **`herd-merger` opens it**, on the orchestrator's instruction, for
+  that landing only, dated 2026-10-28, and the same clause now appears
+  in all four prohibitions: `CLAUDE.md`'s *One landing per batch*
+  bullet, `workflow.md`'s *The pull request goes away*, the role table,
+  and `herd-merger.md`'s *Forbidden*. `herd-step` and `herd-release` say
+  the exception is the merger's alone and never theirs.
+- **N3: transition step 3 could not land in the order it was written.**
+  `ci.yml` triggers on `pull_request:` and `push: main`, so a pull
+  request deleting its own `pull_request:` trigger produces no `check`
+  and no `docs` and can never satisfy the required contexts; and the
+  step was numbered **before** the first local landing, so following
+  1→2→3 moved `main` with no pull request, no hook and no receipt rule.
+  The transition is now **three steps**: step 1's pull request carries
+  the template deletion only, and the trigger deletion is the content of
+  the first local landing, the only lane that can do it. A paragraph
+  after step 3 says why there are three and not four.
+- **N4:** step 3's preconditions now list `scripts/gate.sh`,
+  `docs/orchestration/templates/landing.md` and
+  `scripts/githooks/pre-push`, and say in the text that they are on
+  pushed branches of this batch and **not on `main`** — this file and
+  they land together, or the contract names three things that do not
+  exist.
+- **N5:** the per-worktree hooks-path line is gone from the loop's step
+  4. `core.hooksPath` is written as **one repository-wide setting** and
+  the second named exception to *write only in your own worktree*, set
+  as part of the first landing and **guarded on the hook file existing**
+  — measured: `git -C <worktree> config` lands in the shared config of
+  `/mnt/ssd_980/herd-project` and arms all 85 worktrees at once,
+  `--worktree` is refused because `extensions.worktreeConfig` is unset,
+  and pointing `core.hooksPath` at a missing directory disables
+  `.git/hooks` and supplies nothing. `CLAUDE.md`'s bullet now says
+  *"the two exceptions, with their conditions, are in workflow.md"*
+  rather than naming one.
+- **N7:** the claim that every "refused server-side" sentence **is**
+  rewritten is narrowed to the three files this branch owns, and says
+  plainly that `permissions.md:46` still contradicts them, that it is
+  corrected on `method-permissions-truth`, and that the two land in the
+  same batch — until both are on `main` the project states two
+  different things about the same protection.
+- **N8:** the fast-forward block prints why it skipped and the before
+  and after shas; all three cases exit 0, so a silent skip was
+  indistinguishable from a success.
+- **N9:** the loop's step 7 now says the merger's handoff is **committed
+  before the gate**, which is the whole of its ORCH-121 answer and was
+  only in the role file.
+- **N10:** the "stale by construction" bullet now carries the `git -C`
+  caveat and points at *Unchanged* for the hole; and
+  `.claude/agents/herd-planner.md:23` gives `gh run view` instead of
+  `gh pr view`. **That file was not in my write paths** — I edited it on
+  the orchestrator's explicit instruction in the same message that sent
+  this review, and it is a one-word change.
+
+### The red suite was a blocker; it is fixed
+
+Until the morning of 2026-10-28 a green `gate.sh` was unobtainable on
+this host: a full-workspace run at rest failed reproducibly, three times
+of three, on three `real_herd` 30 s timeouts
 (`a_result_the_hub_cannot_write_is_kept_until_it_can`,
 `a_drain_first_reservation_survives_a_kill_nine_on_either_side`,
 `a_metal_job_drains_the_build_slot_first_and_no_build_overlaps_it`),
-each of which passes when its target is run alone. Memory and IO
-contention are both **refuted by measurement**, so it is a product
-defect and an agent is hunting it. Written as a dated transition step:
-the rule does not bend around it, the gate is not relaxed for it, the
-defect is fixed and then the first landing happens. When the last
-transition step is done, that subsection goes and nothing above it
-changes.
+each of which passed when its target was run alone. I wrote it into
+`workflow.md` as a dated transition blocker with an owner.
+
+**It was then found and fixed the same day, and it was a test defect,
+not a product one.** The runner announced **one job slot**, because
+D119's cgroup clamp cut the announced room to 4.6 GiB, and each of those
+three fixtures silently needed two concurrent jobs; the hub had been
+printing the reason in words all along. One declared constant in the
+three tests, `--job-memory-max=512MiB`, on branch
+`real-herd-patience-timeouts`. **The full suite is now green at rest: 0
+failed, 12 skips, `test suite: PASSED`.** So `workflow.md` no longer
+carries a blocker: it carries the defect, named with its three test
+names and its cause, and says the first landing does not wait on it.
+A blocker that no longer exists is worse than no text at all, and the
+sentence that said *"an agent is hunting it"* was the kind of owner a
+next session cannot find.
+
+The fix wants its **own board row**, which `herd-merger` allocates; the
+product-defect row the first review asked for is **not** needed, because
+there was no product defect.
 
 ### The review's blocking defects, each answered
 
@@ -234,8 +328,9 @@ $ echo $?
 0
 ```
 
-**Five of the eleven runs of `check-orchestration.sh` were RED, and they
-are reported red.** All five were the same single case, on trees whose
+**Seven of the fourteen runs of `check-orchestration.sh` were RED, and
+they are reported red.** All seven were the same single case, on trees
+whose
 executable files are byte-identical to `origin/main`:
 
 ```
@@ -266,9 +361,10 @@ $ printf '%s' "$out" | grep -qF ":$PATH" && echo PRESENT
 PRESENT
 ```
 
-All five red runs were in shell invocations that also wrote files; all
-six green ones ran the script alone, including two made immediately
-after a red one on the same commit. So the verdict depends on how the invoking
+Every red run was in a shell invocation that also wrote files; every
+green one ran the script alone, including three made immediately after a
+red one on the same commit. Fourteen runs, seven red, seven green, and
+the split is exactly along that line. So the verdict depends on how the invoking
 shell was started, not on the repository. Outputs:
 
 ```
@@ -325,17 +421,18 @@ comparison is a human's.
    `herd-merger`'s"* — and that is deliberate: they are the rule the
    method replaces, not content lost.
 
-**Three references point at files not yet on `main`:**
-`scripts/gate.sh` (on `method-local-gate`, head `58dd6f3`),
-`templates/landing.md` (on `method-landing-record`) and
-`scripts/githooks/pre-push` (being written now). The first two exist and
-are named as existing. `pre-push` is named as existing too, on the
-orchestrator's word that its task has started — **and it is the one
-thing the safety argument leans on**, so the transition's step 4 makes
-it an explicit precondition of the first landing, together with the
-worktree's `core.hooksPath`. Without both there is no mechanism at all
-in front of `main`, since the branch protection never bound our own
-credential.
+**This branch cannot land alone.** The contract it writes names four
+things that are not on `main`: `scripts/gate.sh`
+(`method-local-gate`, head `58dd6f3`), `templates/landing.md`
+(`method-landing-record`), `scripts/githooks/pre-push` (being written),
+and the corrected `permissions.md` (`method-permissions-truth`). All
+four are named in the present indicative, which is correct under the
+single lane and makes the batch order load-bearing rather than
+cosmetic: the transition's step 3 lists the first three as explicit
+preconditions of the first landing, together with the repository-wide
+`core.hooksPath`. Without the hook and that setting there is no
+mechanism at all in front of `main`, since the branch protection never
+bound our own credential.
 
 **One contradiction I could not remove.** The third refusal still says a
 nightly full pass is not adopted, true today, while another task adds a
@@ -364,23 +461,31 @@ added it is updated in the same landing.
 
 ## For `herd-merger` in this landing
 
-Four board edits this branch may not make (invariant 8):
+Five board edits this branch may not make (invariant 8). The first is
+the one that cannot wait: `CLAUDE.md`'s session start sends every fresh
+session to the board at step 2, where it currently reads a waiting
+decision proposing the opposite of the contract it has just read.
 
-1. **ORCH-120 answered 2026-10-28** and reaffirmed as an obligation the
-   same day; the row still says `waiting` and still carries the
-   recommendation the decision went against.
-2. **`docs/orchestration/permissions.md` needs an owner.** Lines 5 and
-   42-46 are true today and false the moment the protection is narrowed
-   — one GitHub click — and line 46 is already weakened by
-   `enforce_admins: false` independently of this branch. The row must
-   exist before the click.
-3. **Append to ORCH-111** the sample from this task: 5 red in 11 runs,
+1. **Close ORCH-120** — answered 2026-10-28 and reaffirmed as an
+   obligation the same day. The row still says `waiting` and still
+   carries the recommendation the decision went against.
+2. **A row for the test defect that was fixed**, naming the three
+   `real_herd` test names, the three-of-three measurement, the cause
+   (one announced job slot against fixtures needing two) and the fix
+   (`--job-memory-max=512MiB`, branch
+   `real-herd-patience-timeouts`), with the suite green at rest.
+3. **Append to ORCH-111** the sample from this task: 7 red in 14 runs,
    same case, with the mechanism in *Gates* above. **Not a new row** —
    that would duplicate it and break invariant 8's one-list rule, which
-   is what my previous handoff got wrong.
+   is what an earlier version of this handoff got wrong.
 4. **A row for `CLAUDE.md` being at both ceilings**, 150 lines and 79
    columns, so that the next change to it is not briefed as if it had
    room.
+5. **`permissions.md`** no longer needs an owner from this landing — it
+   has one, `method-permissions-truth`, in this batch. What it needs is
+   the row that records the two landing **together**, because between
+   them the project would state two different things about the same
+   protection.
 
 ## Decision to record (proposed, for `herd-merger` to allocate)
 
@@ -406,8 +511,12 @@ One entry, not two: the hold that justified splitting it was reversed.
 > **ORCH-001 re-granted, not reinterpreted.** Both halves of the
 > 2026-10-24 condition — CI green, Evidence block filled — are gone with
 > the pull request. `herd-merger` alone pushes `main`, on a green
-> `./scripts/gate.sh` for the exact sha being pushed plus a filled
-> landing record. Pushing a tag and publishing a release are unchanged:
+> `./scripts/gate.sh` for the sha it gated — **the merge's second
+> parent, with an identical tree**, because the merge commit's message
+> is the record and so its sha cannot exist before the gate; written as
+> "the exact sha that is pushed", as it was until this was measured, no
+> landing is ever permitted. Pushing a tag and publishing a release are
+> unchanged:
 > Alexa's word, one act at a time.
 >
 > **What it answers.** ORCH-120, against the recommendation in that row
@@ -440,12 +549,16 @@ One entry, not two: the hold that justified splitting it was reversed.
 > deleted: GitHub remains the release factory (D162, D168), the hotfix
 > lane (D172) and our only second machine.
 >
-> **The transition, and the one defect it waits on.** Four dated steps
-> in `workflow.md`, *Not an option*; the first landing waits on a
-> product defect — a full-workspace run at rest fails reproducibly on
-> three `real_herd` 30 s timeouts that pass when run alone, with memory
-> and IO contention refuted by measurement — which an agent is hunting.
-> The rule does not bend around it.
+> **The transition.** Three dated steps in `workflow.md`, *Not an
+> option*: one last pull request, opened by `herd-merger` on the
+> orchestrator's instruction, carrying the method change and the
+> template deletion; the branch protection narrowed; then the first
+> local landing, which is the only lane that can delete `ci.yml`'s
+> `pull_request:` trigger, since a pull request removing that trigger
+> can never produce the contexts it requires. The red suite that looked
+> like a blocker was a **test** defect — three fixtures needing two job
+> slots while the runner announced one — fixed the same day, and the
+> suite is green at rest.
 >
 > **Reversibility.** High on our side, low on Alexa's: the text is a
 > landing away, but re-requiring a pull request means putting the branch
@@ -469,12 +582,22 @@ One entry, not two: the hold that justified splitting it was reversed.
 
 ## Resume point
 
-`herd-reviewer` on this branch again, since the first review's verdict
-was *must change* and all seven defects were answered on it rather than
-on a new branch. The review's own minimum list is the checklist: D1's
-three sentences, D2's preconditions, D3's step order, D5's revert, D6's
-two restorations, D7's bound. Then the orchestrator assembles the one
-last pull request of *Not an option* step 1.
+`herd-reviewer`, third pass on this branch: both earlier verdicts were
+*must change* and every defect of both was answered on this same branch
+rather than on a new one, so the two review files are the checklist.
+Pass 2's minimum list in order: **N1** the condition names the merge's
+second parent and an identical tree in all five places — `CLAUDE.md`'s
+*Pushing to `main`* bullet, `workflow.md`'s loop step 7, its gate
+bullet, its *Permissions* bullet and `herd-merger.md` steps 7 and 8;
+**N2** the identical exception clause in all four prohibitions, with
+`herd-merger` as the actor; **N3** three transition steps with the
+trigger deletion inside the first landing; **N4** the preconditions and
+the batch order; **N5** the repository-wide hooks path, guarded;
+**N7** the narrowed claim; **N8**, **N9**, **N10**.
+
+Then `herd-merger` assembles the one last pull request of *Not an
+option* step 1 — it is the actor now, on the orchestrator's instruction
+— with this branch and the four it names in the same batch.
 
 ## Processes
 
