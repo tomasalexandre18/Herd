@@ -677,6 +677,51 @@ impl JobDirStore {
         Ok(Some(bytes))
     }
 
+    /// Clear the mark an eviction left, because a whole file of this
+    /// collection is back in `files/` (ORCH-124).
+    ///
+    /// **The mark is the live state of a collection and not a verdict on the
+    /// job.** The sweeper refuses a marked collection and counts its bytes
+    /// as `could_not_free`, which is right while `files/` is empty and wrong
+    /// the moment it is not: bytes that are on the disk and that nothing can
+    /// ever free are a budget that shrinks by one collection at every pass,
+    /// and the collections the sweeper *can* take are destroyed in their
+    /// place. So the write wins and the collection goes back into the
+    /// accounting — it can be evicted a second time, which is a loss of
+    /// nothing, where refusing the write loses output without telling the
+    /// requester.
+    ///
+    /// **`updated_at` is not touched**, so the collection keeps the age the
+    /// floor and the eviction order judge it by: re-admitting is not a
+    /// second chance at the floor.
+    ///
+    /// **Not through `open_for_writing`**, for the reason
+    /// [`JobStore::note_outputs_fetched`] is not: the one gate refuses every
+    /// write to a job that is over, and this is not a frame about the job —
+    /// it is the hub writing down what became of the record's own files. The
+    /// state, the outcome, the metrics and the manifest are untouched.
+    ///
+    /// **No `events.jsonl` line.** `JobEventKind` is `#[serde(tag =
+    /// "event")]` with no `#[serde(other)]` arm, so a new variant would make
+    /// the file undecodable to a hub rolled back — and the `outputs_removed`
+    /// line already on the history stays true: the bytes *were* removed that
+    /// day. What they are now is a question for the record, which is where
+    /// the mark lives.
+    ///
+    /// Called with no lock held, and takes its own, because the caller goes
+    /// on to [`Self::held_more`], which takes it too.
+    fn readmit_to_the_budget(&self, id: &JobId) -> Result<()> {
+        let _live = self.lock()?;
+        let Some(mut record) = self.read_record(id)? else {
+            return Ok(());
+        };
+        if record.outputs.removed.is_none() {
+            return Ok(());
+        }
+        record.outputs.removed = None;
+        self.write_record(&record)
+    }
+
     /// One sweep, with the one-at-a-time flag already taken.
     ///
     /// ## What it walks, and when
@@ -2098,6 +2143,12 @@ impl JobStore for JobDirStore {
             durable::sync_dir(parent).map_err(|error| failed("syncing", parent, &error))?;
         }
         let landed = self.collection_state(id, &record);
+        // A whole file is in `files/` again, so a collection the sweeper had
+        // taken is the sweeper's to take again: the mark goes before the
+        // bytes are counted, or the sweep below would meet a marked
+        // collection whose directory is not empty and report the bytes as
+        // unfreeable for ever (ORCH-124).
+        self.readmit_to_the_budget(id)?;
         // **Counted at the rename and not at the chunk**, so the running
         // total and the sweeper's own walk measure the same thing: whole,
         // verified files in `files/`. Part-written bytes are a transfer in
@@ -6021,6 +6072,104 @@ mod tests {
             swept.could_not_free, 8,
             "the figure is reported rather than hidden, because an operator looking at a \
              volume that will not come down has to be able to see why: {swept:?}"
+        );
+    }
+
+    /// Bytes that arrive again after an eviction are **re-admitted to the
+    /// budget**, and the sweeper may take them a second time.
+    ///
+    /// The mark an eviction leaves is the live state of a collection, not a
+    /// permanent verdict on the job: a runner whose acknowledgement never
+    /// arrived redials with the spool still in hand and sends the collection
+    /// again, and `files/` refills. A mark left behind would make those
+    /// bytes unfreeable for ever — measured by every walk, refused by
+    /// `evict`, reported as `could_not_free` — so the budget would shrink by
+    /// one collection at every pass, and the collections the sweeper *can*
+    /// take would be destroyed in their place. Refusing the write instead
+    /// would lose output without telling the requester, so the write wins
+    /// and the collection goes back into the accounting.
+    #[test]
+    fn bytes_written_after_an_eviction_are_swept_again() {
+        // A budget smaller than one collection, which is the shortest path
+        // to an eviction: the collection that triggers a sweep is the last
+        // candidate of its rank, so it is taken the moment it is whole.
+        let (dir, store) = store_holding(512, std::time::Duration::ZERO);
+        let data = vec![b'x'; 1024];
+        let files: &[(&str, &[u8])] = &[("files/results.json", &data)];
+        let job = a_job(&store);
+        store
+            .record_outputs(&job.id, &announced(files))
+            .expect("the manifest lands");
+        store
+            .record_state(
+                &job.id,
+                JobState::Finished {
+                    outcome: JobOutcome::Exited { code: 0 },
+                },
+            )
+            .expect("finished");
+
+        store
+            .write_output_chunk(&job.id, "files/results.json", 0, &data)
+            .expect("the collection arrives");
+        assert!(
+            !bytes_are_there(&dir, &job.id),
+            "a collection bigger than the whole budget is taken as soon as it is whole"
+        );
+        assert!(
+            store
+                .job(&job.id)
+                .expect("reads")
+                .expect("record")
+                .outputs
+                .removed
+                .is_some(),
+            "and the record says the bytes went"
+        );
+
+        // The runner never saw the acknowledgement, so it sends the whole
+        // collection again.
+        store
+            .write_output_chunk(&job.id, "files/results.json", 0, &data)
+            .expect("the collection arrives a second time");
+
+        let swept = store.sweep_outputs().expect("sweeps");
+        assert!(
+            !bytes_are_there(&dir, &job.id),
+            "bytes written after an eviction are the sweeper's again: left marked, they \
+             would sit on the disk for ever with nothing able to free them"
+        );
+        assert_eq!(
+            swept.could_not_free, 0,
+            "and nothing is reported as unfreeable: {swept:?}"
+        );
+        assert_eq!(
+            swept.held, 0,
+            "so the hub is honestly back inside its budget: {swept:?}"
+        );
+        let record = store.job(&job.id).expect("reads").expect("record");
+        assert!(
+            record.outputs.removed.is_some(),
+            "the second eviction leaves its own mark: {record:?}"
+        );
+        assert_eq!(
+            record.outputs.files.len(),
+            1,
+            "with the manifest still naming every file, as it did the first time"
+        );
+        // Twice taken, twice on the job's own history, which is where an
+        // irreversible deletion belongs a week later (D151).
+        let events = store
+            .job_events(&job.id)
+            .expect("reads")
+            .expect("the job has a history");
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(event.what, JobEventKind::OutputsRemoved { .. }))
+                .count(),
+            2,
+            "a reader of this record sees both evictions: {events:?}"
         );
     }
 
