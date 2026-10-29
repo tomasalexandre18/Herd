@@ -61,8 +61,26 @@ n=$(wc -l < docs/status.md)
 # already swallows the rest of its file, before and after this change, so
 # the column-1 anchor was never what protected against that. All 92 files
 # are balanced today; an END check for an unbalanced fence is ORCH-122.
+#
+# The list below covers `deploy/` as of 2026-10-30, and that is new. It
+# used to stop at `docs/`, while `deploy/release-notes/<version>.md` is
+# prose this project publishes: `release.yml` reads it to build the
+# release page. Both notes files already sat at 72 columns because their
+# authors wrote them that way, so a notes file pasted as one 4000-column
+# line would have passed every gate -- a rule that reads as if it covers
+# the project's prose and does not. Extending it cost nothing: all five
+# markdown files under `deploy/` pass the fence- and table-aware count
+# unchanged, `deploy/README.md` and `deploy/release-notice.md` included,
+# whose long lines are all inside fences or tables. The globs are
+# deliberately `.md` only and deliberately named one directory at a time:
+# `docker-compose.yml`, `env.example`, `herd-runner.service`,
+# `nixos-herd-runner.nix`, the two files under `deploy/reverse-proxy/` and
+# `wsl2-check.sh` are not prose and have no business being width-checked,
+# and `deploy/*/*.md` would have pulled in whatever the next
+# subdirectory turns out to hold.
 for f in CLAUDE.md README.md docs/*.md docs/orchestration/*.md \
-         docs/orchestration/*/*.md; do
+         docs/orchestration/*/*.md deploy/*.md \
+         deploy/release-notes/*.md; do
   [ -f "$f" ] || continue
   long=$(LC_ALL=C awk '
     /^[[:space:]]*```/ {
