@@ -194,11 +194,12 @@ fn fetch_reporting(ran: Option<&str>) -> StepRun {
 /// an operator's entire state root, and a handshake refuses every runner that
 /// has not been restarted.
 ///
-/// **`PROTOCOL_VERSION` has since moved, and not for `ran_commit`.** D199
-/// moved it 2 → 3 for M11's pack half, so the literal below is 3 and this
-/// increment's claim is untouched. The pin stays a **literal** on purpose:
-/// against the constant it would be a tautology, and what it is here to catch
-/// is an *accidental* move.
+/// **Both numbers have since moved, and neither for `ran_commit`.** D199
+/// moved `PROTOCOL_VERSION` 2 → 3 with M11's pack frames and `RECORD_VERSION`
+/// 1 → 2 with the hub's pack registry and `LAYOUT_VERSION`, so the literals
+/// below are 3 and 2 and this increment's claim is untouched. The pins stay
+/// **literals** on purpose: against the constants they would be tautologies,
+/// and what they are here to catch is an *accidental* move.
 #[test]
 fn neither_version_number_moves() {
     assert_eq!(
@@ -207,9 +208,9 @@ fn neither_version_number_moves() {
          nothing"
     );
     assert_eq!(
-        RECORD_VERSION, 1,
-        "every existing state root still reads; D199 moves this to 2 with the hub's own pack \
-         registry, and not for this field"
+        RECORD_VERSION, 2,
+        "2 is D199's move, made with the hub's own pack registry and with LAYOUT_VERSION in the \
+         same commit; this field is additive and moved nothing"
     );
 }
 

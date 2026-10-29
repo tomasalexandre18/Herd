@@ -61,7 +61,14 @@ fn job_dir(root: &Path, name: &str, record: Option<serde_json::Value>, kept: &[(
 /// A record naming no output at all, which is what most jobs are.
 fn silent(id: &str) -> serde_json::Value {
     serde_json::json!({
-        "record_version": 1,
+        // The version this build reads, not the literal 1 this fixture was
+        // written with. The test's whole subject is a record the report CAN
+        // read: pinned to 1 it became an **unread** record the moment D199
+        // moved the constant to 2, and the fixture would have started
+        // testing the opposite of its own name without a word. Written
+        // against the constant it means "readable here" for ever, which is
+        // what it always meant.
+        "record_version": herd_hub::RECORD_VERSION,
         "id": id,
         "command": ["true"],
         "state": { "type": "finished", "outcome": { "type": "exited", "code": 0 } },
@@ -159,8 +166,15 @@ fn fixture(root: &Path) {
 
     // A record from a layout this build does not read. Named, counted, and
     // left out of every figure — never read as a job that kept nothing.
+    //
+    // **One past this build, computed and not written down.** The literal 2
+    // this was is the version the build now reads, so at D199 it silently
+    // became a perfectly readable record and this case stopped existing —
+    // the mirror of the defect in `silent` above, and the more dangerous of
+    // the two because the census would simply have counted eleven records
+    // read and said nothing.
     let mut eleven = silent("j0000000011");
-    eleven["record_version"] = serde_json::json!(2);
+    eleven["record_version"] = serde_json::json!(herd_hub::RECORD_VERSION + 1);
     job_dir(root, "j0000000011", Some(eleven), &[]);
 
     // A directory claimed for a job whose first record has not landed. A
@@ -307,7 +321,15 @@ fn every_figure_of_the_report_is_this_fixture_to_the_byte() {
     // number would be a figure nobody noticed going missing.
     report.at = Timestamp::at_unix_seconds(PINNED);
     let rendered = report.to_string();
-    let expected = EXPECTED.replace("{ROOT}", &root.display().to_string());
+    // The two version numbers in it follow the constants for the reason the
+    // fixtures above do: written down, they would have gone stale at D199 in
+    // a block of text 200 lines long, and the only thing that is actually
+    // being asserted about them is that the unread record is one past what
+    // this build reads.
+    let expected = EXPECTED
+        .replace("{ROOT}", &root.display().to_string())
+        .replace("{UNREAD}", &(herd_hub::RECORD_VERSION + 1).to_string())
+        .replace("{READS}", &herd_hub::RECORD_VERSION.to_string());
     assert_eq!(rendered, expected);
 
     // It disturbed nothing: not one byte of this root changed, and the lock
@@ -751,7 +773,7 @@ records
   records read                       10
   directories with no record yet     1
   records this build could not read  1
-    jobs/j0000000011/job.json: it carries record version 2, and this build reads version 1
+    jobs/j0000000011/job.json: it carries record version {UNREAD}, and this build reads version {READS}
 
 1. file-level deduplication (r_file)
 

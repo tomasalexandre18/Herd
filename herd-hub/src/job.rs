@@ -31,25 +31,92 @@ pub use herd_proto::JobMetrics;
 /// error comes out of recovery, the hub refuses to start on that state root
 /// rather than read it.
 ///
-/// **1 is the first deployed record format, and it is frozen here** (D73). It
-/// reached 6 while nothing was deployed — M6's priority, M7's placement
-/// reason, M8's memory and tmpfs, M9's deadline and requeue code, M10's
-/// declaration and executor steps — and every one of those breaks was real,
-/// on records that only ever existed in a test directory. M16 sets the number
-/// back to 1, and from M16 on it is not a development counter.
+/// **1 was the first deployed record format** (D73). It reached 6 while
+/// nothing was deployed — M6's priority, M7's placement reason, M8's memory
+/// and tmpfs, M9's deadline and requeue code, M10's declaration and executor
+/// steps — and every one of those breaks was real, on records that only ever
+/// existed in a test directory. M16 set the number back to 1, and from M16 on
+/// it stopped being a development counter. `v0.4.0` and `v0.4.1` shipped at 1.
 ///
-/// **What moving it now costs.** A record is written once and read much later
+/// **2 is D199's move, and it is spent on M11's pack half.** `job.json` gains
+/// [`JobRecord::packs_in`] and [`JobRecord::packs_out`], and the state root
+/// gains the `packs/` directory the hub's registry lives in
+/// ([`crate::registry`]) — which is why [`crate::LAYOUT_VERSION`] moves to 2
+/// in the same commit, and why that is not optional. The two checks do not
+/// behave alike: the layout's is in `JobDirStore::open_with` and refuses the
+/// **root**, while this one is in `read_stored` and sets **one record** aside
+/// (D218). So a build that moved this number alone would start, bind its port
+/// and serve an empty queue off a root where every job was quarantined by
+/// name — loud, but not a refusal, and runnable for a while before anybody
+/// understood. Moving both together is what puts the refusal at the door
+/// instead of inside the house. `herd-hub/tests/version_move_at_the_door.rs`
+/// asserts both halves of that, including the one that would have been true
+/// of the half-move.
+///
+/// **What moving it costs.** A record is written once and read much later
 /// (E-53, E-54), so the two sides of a bump are one hub at two different
-/// times: a hub at version 2 will not read what the version 1 hub wrote, and a
-/// rollback to version 1 will not read what version 2 wrote. What stops being
+/// times: a hub at version 2 does not read what the version 1 hub wrote, and a
+/// rollback to version 1 does not read what version 2 wrote. What stops being
 /// readable is the operator's whole state root — every queued job, every
 /// verdict the consumer has not collected yet — and the hub says so by not
 /// starting, never by guessing. So a bump is a compatibility statement: it
 /// needs Alexa's approval, and it ships with either a migration or an explicit
-/// instruction for the operator. Only a field that is `#[serde(default)]`
-/// *and* means, when absent, exactly what its default says is additive enough
-/// to leave the number alone.
-pub const RECORD_VERSION: u32 = 1;
+/// instruction for the operator. There is no migration, so it ships with the
+/// instruction: `docs/operating.md`, *"The instruction, in order"*, which
+/// [`record_version_mismatch_reason`] and the layout's own refusal both point
+/// at by name. Only a field that is `#[serde(default)]` *and* means, when
+/// absent, exactly what its default says is additive enough to leave the
+/// number alone — and the two new fields above are in fact of that kind, so
+/// what this move buys is **not** their carriage but the refusal arriving at
+/// the door with the layout's.
+pub const RECORD_VERSION: u32 = 2;
+
+/// The one sentence a reader gets for a record of another version.
+///
+/// **One sentence in one place**, because it is said at four sites — reading a
+/// `job.json`, reading a line of `events.jsonl`, [`crate::report`] and
+/// [`crate::retention`] — and a refusal worded four ways is four refusals an
+/// operator has to learn to recognise. It lives here, beside the constant it
+/// is about, for the reason `herd_proto::version_mismatch_reason` lives beside
+/// `PROTOCOL_VERSION`.
+///
+/// `found` is an `Option` and that is the substance, not the signature: the
+/// version probes read the field with a `serde` default, so a `job.json` with
+/// **no** `record_version` key at all used to come back as `0` and be reported
+/// as *"it carries record version 0"* — a sentence describing an absent field
+/// as a field that says zero, and the sentence an operator pastes into a
+/// question. Absent is said to be absent.
+///
+/// What it has to carry, and why each clause is in it:
+///
+/// - **both figures**, so a reader knows which way round it is;
+/// - **what is unreadable**: this record, and — if the whole root reads this
+///   way — every queued job and every uncollected verdict in it;
+/// - **that the rollback is refused too**. The check is equality, not a floor,
+///   so going back is as refused as coming forward. An operator who reads
+///   only "this build is newer" tries the old image next, and that does not
+///   work either;
+/// - **where the instruction is**, in order, since the words already exist in
+///   `docs/operating.md` and nobody inside a container will go looking for
+///   them unassisted.
+pub fn record_version_mismatch_reason(path: &std::path::Path, found: Option<u32>) -> String {
+    let says = match found {
+        Some(found) => format!("has record version {found}"),
+        None => "carries no record version at all".to_owned(),
+    };
+    format!(
+        "{} {says}, and this hub reads version {RECORD_VERSION}. It is set aside: this hub will \
+         not dispatch it, will not rewrite it and will not repair it, so whatever it was for has \
+         to be asked for again. There is no migration in either direction — the check is equality \
+         and not a floor, so rolling this hub back to the version that wrote it does not read \
+         what version {RECORD_VERSION} has written since. If every record in this root reads this \
+         way then the root itself is from another release, and every queued job and every \
+         uncollected verdict in it is unreadable to this build: do not convert it and do not \
+         delete it, take the `herd-hub report --state-dir` reading off it with the old release's \
+         binary first, and follow docs/operating.md, \"The instruction, in order\"",
+        path.display()
+    )
+}
 
 /// A moment, as the record files carry it: RFC 3339 in UTC, to the
 /// nanosecond. A string a human and the consumer can both read, so that a
@@ -953,6 +1020,47 @@ pub struct JobRecord {
     /// not even gain a *name*, only contents it was already shaped for.
     #[serde(default, skip_serializing_if = "OutputSummary::is_silent")]
     pub outputs: OutputSummary,
+    /// The packs this job's `needs` resolved to, by the key that names them
+    /// under `{in}` (E-12).
+    ///
+    /// Written when the job is assigned, because that is when the hub resolves
+    /// a `(commit, key)` to an id, and never changed afterwards: what a job
+    /// consumed is part of what it was, and a re-run on another commit is
+    /// another job. A requeue onto another machine (E-21) resolves again and
+    /// rewrites this, exactly as it re-derives the `-j`.
+    ///
+    /// The **id** and not the manifest: the manifest's bytes live once, in
+    /// `packs/manifests/<id>/manifest.tsv`, and the id is the sha256 of
+    /// exactly those bytes. Putting a manifest here would put a second copy of
+    /// a pack's identity in a file that is rewritten on every transition.
+    ///
+    /// `#[serde(default)]`, and absent means exactly what the default says:
+    /// **this job consumed no pack.** At record version 2 that is
+    /// unambiguous — the version in front of the file already says the hub
+    /// that wrote it knew about packs — which is the condition this constant's
+    /// own doc sets for a field to be additive. The field is therefore not
+    /// what [`RECORD_VERSION`] moved for; see that doc for what was.
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub packs_in: std::collections::BTreeMap<String, herd_proto::pack::PackId>,
+    /// The packs this job produced, by its declaration's `leaves` key
+    /// (E-12, E-17).
+    ///
+    /// Written when a runner's post-fsync registration frame is accepted, so a
+    /// key appears here only once the pack exists somewhere whole. A job that
+    /// declared `leaves` and whose key is absent here is a job whose pack was
+    /// refused or never registered, which is a visible state and not a
+    /// silence — and the reason is in `events.jsonl`.
+    ///
+    /// **This is where a pack's provenance lives**, together with
+    /// `herd-hub report`: no pack field goes on the verdict document, because
+    /// `VERDICT_FORMAT_VERSION` and `OUTPUT_FORMAT_VERSION` are frozen as whole
+    /// literal text in `herdctl/tests/frozen_verdict.rs` and
+    /// `herd-proto/tests/frozen_formats.rs`, and a field there would move a
+    /// fourth public version D199 never authorised.
+    ///
+    /// `#[serde(default)]`, for the reason [`JobRecord::packs_in`] is.
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub packs_out: std::collections::BTreeMap<String, herd_proto::pack::PackId>,
 }
 
 /// What a job left behind, as `job.json` says it.
@@ -1385,6 +1493,8 @@ impl JobRecord {
             attempts: Vec::new(),
             metrics: JobMetrics::default(),
             outputs: OutputSummary::default(),
+            packs_in: Default::default(),
+            packs_out: Default::default(),
         }
     }
 
@@ -2475,15 +2585,19 @@ mod a_ceiling_refusal_on_the_record {
     /// absent meaning exactly what the default says, and therefore additive.
     ///
     /// **Two assertions, and the second is about the protocol and not about
-    /// the record.** `PROTOCOL_VERSION` moved 2 → 3 at D199, for M11's pack
-    /// half; the record version has not moved and moves to 2 in the same
-    /// batch, with the hub's own pack registry. Both stay **literals**: an
+    /// the record.** Both numbers have since moved at D199, for M11's pack
+    /// half and not for this field: `PROTOCOL_VERSION` 2 → 3 with the pack
+    /// frames, `RECORD_VERSION` 1 → 2 with the hub's pack registry and
+    /// `LAYOUT_VERSION`. The claim this test makes is the one it always made —
+    /// *nothing about an announced job ceiling moved either number* — and the
+    /// literals are what makes it a claim. Both stay **literals**: an
     /// assertion written against the constant it is pinning catches nothing.
     #[test]
     fn the_record_version_does_not_move() {
         assert_eq!(
-            RECORD_VERSION, 1,
-            "the field is additive; D199 moves this to 2 with the pack registry"
+            RECORD_VERSION, 2,
+            "2 is D199's move for the hub's pack registry and the `packs/` directory beside it; \
+             this field is additive and moved nothing"
         );
         assert_eq!(
             herd_proto::PROTOCOL_VERSION,
