@@ -41,9 +41,12 @@
 //! A job may declare that it *leaves* an artefact — `leaves = { pack =
 //! "packs" }`, a pack of a few hundred MiB for a later job of the same commit
 //! (M11). That path is **not in the list above and must never join it**: it
-//! is taken into the runner's pack store and removed from `{out}` before the
+//! is taken into the runner's pack store and out of `{out}` before the
 //! walk below reads the directory ([`crate::packstore::leave_packs`]), so
-//! there is nothing there to exclude.
+//! there is nothing there to exclude. A pack that could not be read goes out
+//! of `{out}` too and is **kept** under the store's `refused/`, named with
+//! its figures on [`JobOutputs::skipped`]: nothing on this path destroys an
+//! operator's bytes.
 //!
 //! The difference matters because of what the failure looks like. A fifth
 //! exclusion is a rule a later edit can quietly drop, and what it would drop
@@ -208,7 +211,18 @@ pub(crate) fn collect(
     // This is the whole of the ordering guarantee and there is exactly one
     // place to get it wrong: [`collect_record`] below has no other caller and
     // takes `{out}` only after this has returned.
-    let (packs, said) = crate::packstore::leave_packs(out_dir, root, leaves);
+    //
+    // A pack that could not be ingested is **kept** rather than removed, and
+    // the name it is kept under is this attempt's: `spool_at`'s own file name
+    // is `<job>-<attempt>` ([`spool_path`]), which is what the sweep and the
+    // janitor already spell for one attempt's bytes. Taken from there rather
+    // than from a job id and an attempt number of this function's own, so
+    // that name has one speller in the runner and not two.
+    let attempt = spool_at
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("unnamed-attempt");
+    let (packs, said) = crate::packstore::leave_packs(out_dir, root, attempt, leaves);
     collect_record(out_dir, root, cap, spool_at, said).with(packs)
 }
 
@@ -813,6 +827,7 @@ mod tests {
             temp.path(),
             1 << 20,
             &temp.path().join("outputs/j1-1"),
+            &BTreeMap::new(),
         );
         assert!(collected.outputs.is_silent(), "{:?}", collected.outputs);
         assert!(collected.spool.is_none(), "nothing to spool");
@@ -1085,16 +1100,21 @@ mod tests {
     }
 
     /// A declared path that is not a pack at all is not collected as the
-    /// job's output either, and the loss is said with its figures.
+    /// job's output either — **and its bytes are kept**, not removed.
     ///
-    /// The alternative — leaving it where it is — is what the pack's own
-    /// bytes would then do to the record: one unreadable pack would put the
-    /// whole collection over the cap and `results.json` would not come back.
+    /// Both halves are the decision. It leaves `{out}` because of what it
+    /// would otherwise do to the record: one unreadable pack would put the
+    /// whole collection over the cap and `results.json` would not come back,
+    /// one failure becoming two with the second one silent. It is **kept**
+    /// because Herd does not destroy an operator's bytes — the sweep keeps a
+    /// spool no hub will claim, the hub keeps a record it cannot read — and
+    /// the sentence says where they are and whose the removal is.
     #[test]
-    fn a_declared_path_that_is_not_a_pack_is_still_not_collected_as_output() {
+    fn a_declared_path_that_is_not_a_pack_is_kept_and_not_collected_as_output() {
         let out = Out::new("outputs-pack-not-a-pack");
         out.write("results.json", br#"{"ok":true}"#);
-        out.write("packs/some/tree/file.txt", &vec![b'x'; 4096]);
+        let stray = vec![b'x'; 4096];
+        out.write("packs/some/tree/file.txt", &stray);
         let leaves = BTreeMap::from([("pack".to_owned(), "packs".to_owned())]);
         let collected = out.leaving(1 << 20, &leaves).outputs;
         assert_eq!(
@@ -1111,7 +1131,29 @@ mod tests {
             said.contains("manifest.tsv") && said.contains("4096 bytes"),
             "the refusal says what was wrong with it and what was lost: {said}"
         );
-        assert!(!out.out().join("packs").exists());
+        assert!(
+            !out.out().join("packs").exists(),
+            "and it is out of {{out}}"
+        );
+
+        // Where it is, byte for byte, under the name this attempt's spool
+        // would have had: nothing was destroyed to keep the record readable.
+        let kept = out
+            .root()
+            .join(crate::packstore::PACKS_DIR)
+            .join(crate::packstore::REFUSED_DIR)
+            .join("j1-1")
+            .join("packs");
+        assert_eq!(
+            fs::read(kept.join("some/tree/file.txt")).expect("the bytes are still on this disk"),
+            stray,
+            "a pack Herd cannot read is set aside and kept, exactly as the job left it"
+        );
+        assert!(
+            said.contains(&kept.display().to_string())
+                && said.contains("removing it is yours to do"),
+            "and the sentence names the path and says whose the removal is: {said}"
+        );
     }
 
     /// A job that declares nothing is collected exactly as it always was,

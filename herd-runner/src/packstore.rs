@@ -35,6 +35,10 @@
 //! <data root>/packs/objects/<sha256>           every pack's bytes, once per content
 //! <data root>/packs/manifests/<id>/manifest.tsv  the bytes, verbatim
 //! <data root>/packs/manifests/<id>/pack.meta     when the pack had one
+//! <data root>/packs/refused/<job>-<attempt>/<declared path>
+//!                                             a declared pack Herd could not
+//!                                             read, kept exactly as the job
+//!                                             left it
 //! ```
 //!
 //! Objects are shared across packs — two packs of two commits that differ in
@@ -60,7 +64,21 @@
 //!    through [`herd_proto::PackManifest::objects_needed`], which filters,
 //!    and the fixtures carry a `d` row and an `l` row so the filter is proven
 //!    and not assumed.
-//! 3. **A pack is complete or absent** (E-17). Objects are placed under a
+//! 3. **Herd does not destroy an operator's bytes.** A declared pack this
+//!    runner cannot ingest leaves `{out}` — it is not the record's business
+//!    either way, and ~400 MiB of unreadable pack left where it is would put
+//!    the whole collection over the job's output cap so that `results.json`
+//!    does not come back for it — but it is **set aside and kept**, under
+//!    `refused/` above, with the reason and its figures said on the record
+//!    and on stderr. Nothing in this runner ever removes it: not a timer, not
+//!    [`crate::sweep`], not [`crate::reclaim`]'s reaper, not a start. The
+//!    same shape the sweep already takes with a spool no hub will ask for
+//!    (`.unclaimed`) and the hub with a record it cannot read, for the same
+//!    reason: removing hundreds of megabytes is a decision with an owner, and
+//!    the owner is the person whose disk it is. And the same **terminal**
+//!    rule, so the state does not flip every boot — bytes under `refused/`
+//!    are never ingested, never laid out and never looked at again.
+//! 4. **A pack is complete or absent** (E-17). Objects are placed under a
 //!    staging name, fsynced and renamed, so a partial object is never visible
 //!    under its final name — a later completeness check would count it, and a
 //!    pack missing those bytes would read as whole. The manifest is written
@@ -102,6 +120,24 @@ const OBJECTS_DIR: &str = "objects";
 
 /// Where one directory per pack id holds that pack's manifest and meta.
 const MANIFESTS_DIR: &str = "manifests";
+
+/// Where a declared pack this runner could not ingest is kept.
+///
+/// Beside `objects/` and `manifests/`, and named for **what it is** rather
+/// than for when it happened or for what is to become of it. Those two hold
+/// the store proper — content a runner can hand to a job — and this is the
+/// third thing a declared pack can turn out to be: bytes Herd holds and
+/// cannot read. `refused` is the word this module already uses in every
+/// sentence that says so (`is refused by name`, `a short object is
+/// refused`), so an operator who reads one of those lines and then looks at
+/// the disk finds the same word on it; `rejected`, `quarantine`, `bad` and
+/// `orphans` would each have been a second vocabulary for one fact, and
+/// `pending` or `retry` would promise something no code here does.
+///
+/// It is created **on demand** and never by [`PackStore::open`], for the
+/// reason `packs/` itself is: an empty directory on every runner's disk is a
+/// feature announcing itself before it exists.
+pub const REFUSED_DIR: &str = "refused";
 
 /// The file whose bytes *are* the pack's identity.
 pub const MANIFEST_FILE: &str = "manifest.tsv";
@@ -219,6 +255,31 @@ impl PackStore {
     /// Where one directory per pack id holds its manifest.
     pub fn manifests_dir(&self) -> PathBuf {
         self.path.join(MANIFESTS_DIR)
+    }
+
+    /// Where a declared pack this runner could not read is kept, whether or
+    /// not anything is in there (see [`REFUSED_DIR`]).
+    ///
+    /// **Nothing in this store ever reads below it.** It is not a second
+    /// place to look for an object and not a queue: `objects_dir` and
+    /// `manifests_dir` are the store, and this is the one thing in `packs/`
+    /// whose only reader is a human.
+    pub fn refused_dir(&self) -> PathBuf {
+        self.path.join(REFUSED_DIR)
+    }
+
+    /// Where the pack one attempt declared at `relative` is kept when it
+    /// could not be ingested.
+    ///
+    /// `attempt` is the `<job>-<attempt>` name the spool and the sweep
+    /// already spell, and `relative` is the declared path under `{out}` —
+    /// already through [`herd_proto::check_relative`] by the time this is
+    /// called, so it is normal components only and cannot climb anywhere.
+    /// Keeping the declared path inside means the kept tree reads like the
+    /// `{out}` it came from, and that two artefacts one job declared at two
+    /// paths cannot land on each other.
+    pub fn refused_at(&self, attempt: &str, relative: &str) -> PathBuf {
+        self.refused_dir().join(attempt).join(relative)
     }
 
     /// This pack's manifest directory, whether or not it exists.
@@ -593,17 +654,29 @@ impl PackStore {
 /// the pack is left at (`leaves = { pack = "packs" }`). Keys are taken in
 /// order, so two runs of one job report in one order.
 ///
-/// **A declared pack path leaves `{out}` whether or not it could be stored**,
-/// and the second case is named rather than silent. The reason is the record:
-/// a pack Herd could not ingest, left in place, is 400 MiB of ordinary output
-/// over the job's output cap, and the whole collection — `results.json`
-/// included — would be refused for it. A declared pack is outside the record
-/// by declaration, so it is outside the record in both outcomes, and what the
-/// runner lost is said with figures on the job's own report and on the
-/// machine's stderr.
+/// **A declared pack path leaves `{out}` whether or not it could be stored,
+/// and in neither case is it destroyed.** Why it leaves is the record: a pack
+/// Herd could not ingest, left in place, is 400 MiB of ordinary output over
+/// the job's output cap, and the whole collection — `results.json` included —
+/// would be refused for it, which is one failure becoming two with the second
+/// one silent. A declared pack is outside the record by declaration, so it is
+/// outside the record in both outcomes.
+///
+/// Where it goes is [`REFUSED_DIR`]: **set aside and kept**, with the reason
+/// and the figures on the job's own report and on the machine's stderr, and
+/// nothing in this runner ever removes it. Herd does not destroy an
+/// operator's bytes — the sweep keeps a spool no hub will claim, the hub
+/// keeps a record it cannot read, and a fourth path that quietly deleted
+/// hundreds of megabytes would be the only place in Herd that does. How long
+/// it is kept is not a question this has an answer to: indefinitely, and
+/// removing it is the operator's.
+///
+/// `attempt` is the `<job>-<attempt>` name that keeps one job's refused packs
+/// apart from another's.
 pub(crate) fn leave_packs(
     out_dir: &Path,
     data_root: &Path,
+    attempt: &str,
     leaves: &BTreeMap<String, String>,
 ) -> (Vec<LeftPack>, Vec<String>) {
     let mut left = Vec::new();
@@ -694,29 +767,61 @@ pub(crate) fn leave_packs(
                 }
             }
             Err(why) => {
-                let fate = match fs::remove_dir_all(&at) {
-                    Ok(()) => format!(
-                        "Its {} are gone with it, because a declared artefact is never collected \
-                         as the job's output: left where it is, one pack this runner cannot keep \
-                         would put the whole record over its output cap",
-                        measured_bytes(weight)
-                    ),
-                    Err(error) => format!(
-                        "Its {} could not be taken out of the output directory either \
-                         ({error}), so the record below carries the pack's own files, which is \
-                         not what a record is for",
-                        measured_bytes(weight)
-                    ),
-                };
                 said.push(format!(
                     "this job declared that it leaves {key:?} at {relative:?} and that is not a \
-                     pack this runner can keep: {why}. {fate}"
+                     pack this runner can keep: {why}. {}",
+                    set_aside(&store, attempt, relative, &at, weight)
                 ));
             }
         }
     }
     said.sort();
     (left, said)
+}
+
+/// Move a declared pack this runner could not read out of `{out}` and
+/// **keep** it, and say so in the register [`crate::sweep::set_aside`]
+/// already uses for a spool no hub will ever claim.
+///
+/// One `rename` inside the data root, so ~400 MiB costs a directory entry and
+/// not a copy — the same reason the spool lives under the data root. Nothing
+/// is removed on any path through here, including the path where the rename
+/// fails: a pack that cannot be moved aside stays exactly where the job left
+/// it, and the sentence says that too, because the record below will then
+/// carry the pack's own files and somebody will ask why.
+///
+/// `weight` is measured before the move, which is the only time it can be.
+fn set_aside(store: &PackStore, attempt: &str, relative: &str, at: &Path, weight: u64) -> String {
+    let kept = store.refused_at(attempt, relative);
+    let lost = |error: String| {
+        format!(
+            "Its {} could NOT be moved aside ({error}), so they are still in {} and the record \
+             below therefore carries the pack's own files, which is not what a record is for",
+            measured_bytes(weight),
+            at.display()
+        )
+    };
+    if let Some(parent) = kept.parent() {
+        if let Err(error) = fs::create_dir_all(parent) {
+            return lost(format!("{} cannot be created: {error}", parent.display()));
+        }
+    }
+    // Never onto something already there: a rename onto a non-empty directory
+    // fails, which is the outcome wanted — the bytes of whatever is under
+    // that name are not this attempt's to replace.
+    match fs::rename(at, &kept) {
+        Ok(()) => format!(
+            "Its {} are kept as {}: a declared artefact is never collected as the job's output, \
+             so it is out of the output directory — left where it is, one pack this runner \
+             cannot read would put the whole record over its output cap — and it is kept there \
+             for as long as it is on this disk. Nothing in this runner reads it, offers it or \
+             gives it to a job again, nothing here will ever remove it, and removing it is \
+             yours to do",
+            measured_bytes(weight),
+            kept.display()
+        ),
+        Err(error) => lost(error.to_string()),
+    }
 }
 
 /// The declared keys, for a sentence about all of them at once.
@@ -1414,6 +1519,195 @@ mod tests {
         assert!(
             why.contains("holds 1 of pack") && why.contains("short 1"),
             "the refusal carries the figures: {why}"
+        );
+    }
+
+    /// **A declared pack this runner cannot read is set aside and kept**, and
+    /// the sentence names the path, the figures and whose the removal is.
+    ///
+    /// The decision this asserts: `{out}` is left, because a pack Herd cannot
+    /// read would otherwise be collected as the job's output and put the
+    /// whole record over its cap — but the bytes are *kept*, because Herd
+    /// does not destroy an operator's bytes. Red if a later edit goes back to
+    /// removing them, which is the edit this test exists for.
+    #[test]
+    fn a_pack_that_cannot_be_read_is_kept_rather_than_removed() {
+        let temp = TempDir::new("pack-set-aside-kept");
+        let out = temp.path().join("jobs/j17-2/out");
+        // A declared path with no `manifest.tsv` in it: not a pack, and the
+        // bytes are a build's and not Herd's to throw away.
+        let bytes = vec![b'q'; 7777];
+        let file = out.join("packs/some/tree/stray.bin");
+        fs::create_dir_all(file.parent().expect("a parent")).expect("the directories");
+        fs::write(&file, &bytes).expect("the stray file");
+        let leaves = BTreeMap::from([("pack".to_owned(), "packs".to_owned())]);
+
+        let (left, said) = leave_packs(&out, temp.path(), "j17-2", &leaves);
+
+        assert!(left.is_empty(), "nothing was stored: {left:?}");
+        assert!(
+            !out.join("packs").exists(),
+            "it is out of {{out}}, so the record below cannot be refused for it"
+        );
+        let kept = temp
+            .path()
+            .join(PACKS_DIR)
+            .join(REFUSED_DIR)
+            .join("j17-2")
+            .join("packs");
+        assert_eq!(
+            fs::read(kept.join("some/tree/stray.bin")).expect("the bytes are still on this disk"),
+            bytes,
+            "kept exactly as the job left it, down to the declared path it was at"
+        );
+        let line = said.join(" | ");
+        for part in [
+            "7777 bytes",
+            "are kept as",
+            &kept.display().to_string(),
+            "Nothing in this runner reads it",
+            "removing it is yours to do",
+        ] {
+            assert!(
+                line.contains(part),
+                "the sentence must say {part:?} — the figures, where they are, and that the \
+                 removal is the operator's: {line}"
+            );
+        }
+        assert!(
+            !line.contains("are gone"),
+            "and it must not say the bytes are gone, because they are not: {line}"
+        );
+    }
+
+    /// **The terminal rule: a set-aside pack is never picked up again**, so
+    /// the state does not flip every boot.
+    ///
+    /// Composed the way [`crate::sweep`]'s own regression test is, over the
+    /// runner's two real startup entry points rather than a stand-in for
+    /// them, because that is the defect shape this guards against: the
+    /// reaper and the sweep each had a green test of their own and neither
+    /// ran the startup sequence, and v0.4.0 shipped a sweep that deleted what
+    /// it existed to re-adopt (ORCH-164). The question here is the same one
+    /// asked of a `.unclaimed` spool — does a start take these bytes away,
+    /// and does it offer them to anything? — and the answer must be no twice.
+    #[test]
+    fn a_start_neither_removes_a_set_aside_pack_nor_picks_it_up() {
+        let _reaping = crate::testing::one_reaper_at_a_time();
+        let temp = TempDir::new("pack-set-aside-start");
+        // A refused pack on the disk before anything starts, as the job above
+        // leaves one.
+        let kept = temp
+            .path()
+            .join(PACKS_DIR)
+            .join(REFUSED_DIR)
+            .join("j0000000031-1")
+            .join("packs");
+        let manifest = write_pack(&kept, &[("bin/tool", b"the bytes a build made")], None);
+        // ...with its manifest cut short, which is what made it unreadable:
+        // the pack is not a pack, and nothing may come to read it as one.
+        fs::write(kept.join(MANIFEST_FILE), &manifest[..20]).expect("a truncated manifest");
+
+        // Startup, step one: the confinement, which reaps a past life.
+        let confined = crate::confine::Confined::prepare(
+            crate::confine::Confinement::with_data_root(temp.path()),
+        )
+        .expect("a throwaway data root confines");
+        let reaped = confined.report().join("\n");
+
+        // Startup, step two: the sweep, on the same data root.
+        let session = crate::Session::new();
+        let swept = session.pick_up_collections(confined.root()).join("\n");
+
+        assert_eq!(
+            fs::read(
+                kept.join(OBJECTS_DIR)
+                    .join(herd_proto::sha256_hex(b"the bytes a build made"))
+            )
+            .expect("the kept bytes survive a start"),
+            b"the bytes a build made",
+            "a start removes nothing under {}: it is the operator's to remove and nobody \
+             else's. The reaper said: {reaped}",
+            temp.path().join(PACKS_DIR).join(REFUSED_DIR).display()
+        );
+        // And neither start path has anything to say about it: it is
+        // terminal, the way a `.unclaimed` spool is, so it is not offered, not
+        // resumed and not counted. Asserted on the path rather than on the
+        // word, because this machine's own cgroups and stray processes are a
+        // shared host's business and no part of this claim.
+        let area = temp
+            .path()
+            .join(PACKS_DIR)
+            .join(REFUSED_DIR)
+            .display()
+            .to_string();
+        assert!(
+            !reaped.contains(&area) && !swept.contains(&area),
+            "nothing on the startup path names {area}. reaper: {reaped} / sweep: {swept}"
+        );
+        // And the store proper does not see it either: this is not a second
+        // place an object is looked for.
+        let store = PackStore::open(temp.path()).expect("a store on the same root");
+        assert_eq!(
+            names_in(&store.objects_dir()),
+            Vec::<String>::new(),
+            "a refused pack's objects are not the store's objects"
+        );
+    }
+
+    /// **Nothing in this runner removes what it set aside** — asserted over
+    /// the source, which is the only way to assert about code that does not
+    /// exist yet.
+    ///
+    /// Two clauses. No line anywhere in this crate both removes something and
+    /// names the refused area; and the refused area is named in exactly one
+    /// module, so there is one place to read and no second opinion about who
+    /// owns those bytes. The detector is run against a known-bad line first,
+    /// because a check that passes by never firing proves nothing.
+    #[test]
+    fn no_source_in_this_runner_removes_a_set_aside_pack() {
+        let removes_a_refused_path = |line: &str| {
+            let removal = ["remove_dir_all(", "remove_file(", "remove_dir("]
+                .iter()
+                .any(|call| line.contains(call));
+            removal && (line.contains("refused") || line.contains("REFUSED"))
+        };
+        assert!(
+            removes_a_refused_path("            fs::remove_dir_all(store.refused_dir())?;"),
+            "the detector must fire on a line that really does take one away, or its silence \
+             below means nothing"
+        );
+
+        let mut names_it: Vec<String> = Vec::new();
+        for (path, text) in crate::testing::source_files() {
+            // The code only: the fixtures below make and drop their own
+            // temporary directories, and a test is not shipped behaviour.
+            let code = match text.split_once("#[cfg(test)]") {
+                Some((code, _)) => code.to_owned(),
+                None => text,
+            };
+            for line in code.lines() {
+                assert!(
+                    !removes_a_refused_path(line),
+                    "{}: a pack Herd set aside is kept until its owner removes it, and this \
+                     line takes one away: {line}",
+                    path.display()
+                );
+            }
+            if code.contains("REFUSED_DIR") || code.contains("refused_at(") {
+                names_it.push(
+                    path.file_name()
+                        .expect("a file name")
+                        .to_string_lossy()
+                        .into_owned(),
+                );
+            }
+        }
+        names_it.sort();
+        assert_eq!(
+            names_it,
+            ["packstore.rs"],
+            "the refused area has one owner in the runner's code"
         );
     }
 
