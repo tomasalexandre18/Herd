@@ -661,49 +661,51 @@ mod tests {
         assert_eq!(parse_name("j7--1"), Some((JobId::new("j7-"), 1)));
     }
 
-    /// **The startup reaper deletes every spool before this sweep can see
-    /// one.** Reproduces the composition defect behind `j0000001561`
-    /// (ORCH-163).
+    /// **The startup reaper and this sweep, composed, in the order
+    /// `run_until` composes them.** The regression behind the first
+    /// consumer's blocked upgrade (ORCH-164).
     ///
-    /// Both halves are correct alone and both have a green test of their own:
-    /// `reclaim::tests::the_reaper_reclaims_an_output_spool_a_previous_life_left_behind`
-    /// asserts the spool is gone, and
+    /// Both halves were correct alone and both had a green test of their own:
+    /// `reclaim::tests` asserted the reaper removed a spool, and
     /// `a_spool_a_previous_runner_left_is_picked_up_with_its_files` above
-    /// asserts it is picked up. Neither runs the startup sequence, so nothing
-    /// noticed that they walk the same directory and that the reaper goes
-    /// first.
+    /// asserts it is picked up. Neither ran the startup sequence, so nothing
+    /// noticed that they walked the same directory and that the reaper went
+    /// first — `remove_dir_all` on every entry under `outputs/` with no guard
+    /// at all, twenty-eight lines before `pick_up_collections` read the same
+    /// directory and found it empty. v0.4.0 shipped the sweep dead on
+    /// arrival.
     ///
-    /// `run_until` calls `Confined::prepare` (`lib.rs:2633`), which calls
-    /// `reclaim_a_past_life` (`confine.rs:502`), which `remove_dir_all`s
-    /// every entry under `outputs/` (`reclaim.rs:449-468`) with no guard at
-    /// all. Twenty-nine lines later it calls `pick_up_collections`
-    /// (`lib.rs:2662`) — this sweep — on a directory that is now empty.
-    ///
-    /// This asserts the behaviour the sweep was built for, so it is **red**
-    /// while the defect stands. `#[ignore]`d so the workspace suite reports
-    /// it as what it is — a skip, never a pass (D27, invariant 5) — rather
-    /// than going red for a defect nobody has yet been asked to fix.
+    /// So this test calls the runner's **own** two startup entry points and
+    /// re-implements neither: `Confined::prepare` (`lib.rs:2634`), which is
+    /// what calls `reclaim_a_past_life`, and `Session::pick_up_collections`
+    /// (`lib.rs:2662`), which is this sweep. A test that stood in for either
+    /// would reproduce nothing, which is exactly how the defect got out.
     #[test]
-    #[ignore = "reproduces ORCH-163; run it on purpose. Red until the reaper stops deleting what the sweep re-adopts"]
     fn the_reaper_does_not_delete_a_spool_this_sweep_would_have_resumed() {
         let _reaping = crate::testing::one_reaper_at_a_time();
-        let (temp, root) = a_root("sweep-vs-reaper");
-        let spool = a_spool(
-            &root,
-            "j0000001561-2",
-            &[(
-                "packs/e49deee1/objects/one.pack",
-                b"the bytes a requester is owed",
-            )],
-        );
+        let temp = TempDir::new("sweep-vs-reaper");
+        // A spool on the disk before anything starts, as a runner that
+        // streamed a collection and was then `SIGKILL`ed leaves one.
+        let spool = temp
+            .path()
+            .join(crate::outputs::SPOOL_DIR)
+            .join("j0000001561-2");
+        let file = spool.join("packs/e49deee1/objects/one.pack");
+        fs::create_dir_all(file.parent().expect("a parent")).expect("the spool directories");
+        fs::write(&file, b"the bytes a requester is owed").expect("the spooled file");
 
-        // Exactly what `Confined::prepare` does, in the order it does it.
-        let ceiling = crate::cgroup::Ceiling::detect(
-            crate::confine::Confinement::with_data_root(temp.path()).job_limits(),
-            None,
-        );
-        let reaped = crate::reclaim::reclaim_a_past_life(&root, &ceiling);
-        let (swept, said) = pick_up(&root);
+        // Startup, step one: the confinement, which reaps a past life.
+        let confined = crate::confine::Confined::prepare(
+            crate::confine::Confinement::with_data_root(temp.path()),
+        )
+        .expect("a throwaway data root confines");
+        // What the reaper said, read off the startup report the runner really
+        // prints rather than off a return value only a test looks at.
+        let reaped: Vec<String> = confined
+            .report()
+            .into_iter()
+            .filter(|line| line.starts_with("reaped at startup:"))
+            .collect();
 
         assert!(
             spool.exists(),
@@ -712,10 +714,42 @@ mod tests {
             spool.display()
         );
         assert_eq!(
-            swept.len(),
-            1,
+            fs::read(&file).expect("the spooled bytes survive the reaper"),
+            b"the bytes a requester is owed",
+            "a spool is the one copy of a requester's evidence until the hub \
+             acknowledges it (D19)"
+        );
+        // And it does not *claim* to have reclaimed it either: the sentence
+        // that explained the deletion was itself false — "no runner can offer
+        // a spool it did not make" — and the sweep below is the runner that
+        // does. Asserted on the spool rather than on the report being empty,
+        // because this host's own cgroups and stray processes are a shared
+        // machine's business and no part of this claim.
+        assert!(
+            !reaped
+                .iter()
+                .any(|line| line.contains("j0000001561") || line.contains("of output left in")),
+            "the reaper has no business under outputs/ and nothing to say about it: \
+             {reaped:?}"
+        );
+
+        // Startup, step two: the sweep, on the same data root the confinement
+        // opened — and then the offer, so that what survived is shown reaching
+        // the hub's own resumption path and not merely sitting on a disk.
+        confined
+            .root()
+            .remember_hub_state_root("s-the-one-that-made-these-ids")
+            .expect("the data root records a state root");
+        let session = crate::Session::new();
+        let said = session.pick_up_collections(confined.root()).join("\n");
+        assert!(said.is_empty(), "nothing to complain about: {said}");
+        let offered = session
+            .settle_against_state_root(confined.root(), "s-the-one-that-made-these-ids")
+            .join("\n");
+        assert!(
+            offered.contains("picked up the collection") && offered.contains("j0000001561"),
             "a collection the hub is still owed must survive the startup that is \
-             supposed to offer it again. Reaper: {reaped:?}; sweep: {said:?}"
+             supposed to offer it again: {offered}"
         );
     }
 }
