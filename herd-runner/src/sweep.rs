@@ -62,6 +62,33 @@
 //! finish is **not** registered: a manifest missing half its files would read
 //! as a collection the hub holds in full, which is the one mistake here that
 //! loses bytes.
+//!
+//! ## A refusal names the path and the error
+//!
+//! That refusal is right, and on its own it is unactionable. The first
+//! consumer's upgrade to v0.4.1 refused 50 spools with it, on a machine
+//! **nobody in this project may log into** (invariant 9, D161), and the
+//! sentence named no file and no error — so its owner could not tell a mode
+//! they can change from a file that was truncated from a disk that is going,
+//! which are three different afternoons. The same run proved how much rides
+//! on these lines: all 75 collections the sweep did offer were already held
+//! whole by the hub, 37.6 GiB agreeing on both sides, so a sweep's own
+//! sentences are the only window an operator has onto tens of gigabytes of
+//! decisions.
+//!
+//! So [`walk`] **keeps** the first path it could not read and the error the
+//! kernel gave for it ([`NotWhole`]), and the refusal carries both beside
+//! what it already said. Kept, not looked for again: this is the startup
+//! path, and re-walking 37 GiB of spools to find out why the first walk
+//! stopped would be a worse defect than the one it explains. One line per
+//! spool whatever is wrong with it, with the rest counted — a spool whose
+//! every directory is shut is not fifty lines.
+//!
+//! What the walk does **not** do is read a file. One `lstat` per entry is the
+//! bound, so a regular file nobody can open is still a whole collection as
+//! far as this is concerned, and the thing that stops a walk is a *directory*
+//! it may not read or traverse — which is exactly the consumer's hypothesis,
+//! a pack tree a build job left owned by another user.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -298,14 +325,15 @@ fn one(path: &Path, budget: &mut usize) -> Found {
             path.display()
         ));
     };
-    let (files, bytes, whole) = walk(path, budget);
-    if !whole {
+    let (files, bytes, not_whole) = walk(path, budget);
+    if let Some(not_whole) = not_whole {
         return Found::Said(format!(
             "{} could not be read all the way through, so what this runner can see of it is \
              not the whole collection; it is NOT offered, because a part of a manifest \
              offered as the whole of one reads to the hub as a collection it already holds. \
-             It is left exactly as it is",
-            path.display()
+             It is left exactly as it is. {}",
+            path.display(),
+            not_whole.sentence()
         ));
     }
     if files.is_empty() {
@@ -346,30 +374,37 @@ fn parse_name(name: &str) -> Option<(JobId, u32)> {
 /// record cannot hold left out — because those were left out of the manifest
 /// too, and a file the hub was never promised is one it refuses by name.
 ///
-/// Returns whether the walk finished. It does not if the budget runs out or a
-/// directory will not read, and then nothing of this spool may be trusted as
-/// a whole collection.
-fn walk(spool: &Path, budget: &mut usize) -> (Vec<SpooledFile>, u64, bool) {
+/// Returns why the walk did not finish, if it did not: the budget ran out or
+/// something would not read, and then nothing of this spool may be trusted as
+/// a whole collection. [`None`] is a whole one.
+fn walk(spool: &Path, budget: &mut usize) -> (Vec<SpooledFile>, u64, Option<NotWhole>) {
     let mut files: Vec<SpooledFile> = Vec::new();
     let mut bytes = 0u64;
-    let mut whole = true;
+    let mut stopped = NotWhole::default();
     let mut pending = vec![(spool.to_path_buf(), String::new())];
     while let Some((directory, prefix)) = pending.pop() {
         let entries = match fs::read_dir(&directory) {
             Ok(entries) => entries,
-            Err(_) => {
-                whole = false;
+            Err(error) => {
+                stopped.could_not_read(directory, &error);
                 continue;
             }
         };
         for entry in entries {
             if *budget == 0 {
-                return (files, bytes, false);
+                stopped.bound = true;
+                return (files, bytes, Some(stopped));
             }
             *budget -= 1;
-            let Ok(entry) = entry else {
-                whole = false;
-                continue;
+            let entry = match entry {
+                Ok(entry) => entry,
+                // No path of its own to give: `readdir` failed part way
+                // through, so the directory being read is the whole of what
+                // is known about where.
+                Err(error) => {
+                    stopped.could_not_read(directory.clone(), &error);
+                    continue;
+                }
             };
             let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
                 continue;
@@ -379,9 +414,12 @@ fn walk(spool: &Path, budget: &mut usize) -> (Vec<SpooledFile>, u64, bool) {
             } else {
                 format!("{prefix}/{name}")
             };
-            let Ok(metadata) = fs::symlink_metadata(entry.path()) else {
-                whole = false;
-                continue;
+            let metadata = match fs::symlink_metadata(entry.path()) {
+                Ok(metadata) => metadata,
+                Err(error) => {
+                    stopped.could_not_read(entry.path(), &error);
+                    continue;
+                }
             };
             let kind = metadata.file_type();
             if kind.is_symlink() {
@@ -405,7 +443,115 @@ fn walk(spool: &Path, budget: &mut usize) -> (Vec<SpooledFile>, u64, bool) {
         }
     }
     files.sort_by(|a, b| a.path.cmp(&b.path));
-    (files, bytes, whole)
+    (files, bytes, stopped.if_any())
+}
+
+/// Why [`walk`] cannot say it saw the whole of a spool — with the path and
+/// the error that say so.
+///
+/// Both halves are what the refusal was missing. The first consumer read 50
+/// of those refusals and could act on none of them, because the two things
+/// the walk knew at that moment — *which* path, and *what* the kernel said
+/// about it — were thrown away one line before the sentence was written.
+#[derive(Debug, Default)]
+struct NotWhole {
+    /// The sweep's entry bound ran out inside this spool, so the rest of it
+    /// was never looked at. Nothing here is a fault of the disk, and the next
+    /// start looks again.
+    bound: bool,
+    /// The first path under the spool that would not read, if one would not.
+    unreadable: Option<Unreadable>,
+}
+
+/// One path the walk could not read, kept for the refusal to name.
+#[derive(Debug)]
+struct Unreadable {
+    /// The path itself. The one field that is not prose.
+    path: PathBuf,
+    /// The error the kernel gave, verbatim — `Permission denied (os error
+    /// 13)`, and not one word of this project's own about it. The errno *is*
+    /// the diagnosis: `EACCES` is a mode or an owner somebody can change,
+    /// `EIO` is a disk, `ENOENT` is a tree that moved under the walk, and a
+    /// sentence that summarised them into "could not be read" is how all
+    /// three became one unanswerable report.
+    why: String,
+    /// How many further paths under the same spool would not read either.
+    /// Counted and not kept: a spool whose every directory is shut is worth
+    /// one line and a number, not fifty lines.
+    and_more: usize,
+}
+
+impl NotWhole {
+    /// Keep one unreadable path and count the rest.
+    ///
+    /// The one kept is the first in **path order**, not the first the
+    /// filesystem happened to hand over: `readdir` order is not stable
+    /// between two starts over the same disk, and a refusal that named a
+    /// different file at each start is one nobody can compare with the last
+    /// one. The same reason [`pick_up`] sorts the names it sweeps.
+    fn could_not_read(&mut self, path: PathBuf, error: &std::io::Error) {
+        let why = error.to_string();
+        match &mut self.unreadable {
+            None => {
+                self.unreadable = Some(Unreadable {
+                    path,
+                    why,
+                    and_more: 0,
+                })
+            }
+            Some(first) => {
+                first.and_more += 1;
+                if path < first.path {
+                    first.path = path;
+                    first.why = why;
+                }
+            }
+        }
+    }
+
+    /// [`None`] when the walk did get through after all.
+    fn if_any(self) -> Option<Self> {
+        (self.bound || self.unreadable.is_some()).then_some(self)
+    }
+
+    /// What to tell the person on that host: the path, the error in the
+    /// kernel's own words, and one sentence on what to do about it.
+    ///
+    /// [`crate::janitor`]'s shape, for [`crate::janitor`]'s audience — the
+    /// owner of a machine this project never logs into, who needs a path, a
+    /// figure and an action, and for whom a line with none of the three is
+    /// the one line nobody can act on.
+    fn sentence(&self) -> String {
+        let mut said = Vec::new();
+        if let Some(first) = &self.unreadable {
+            let and_more = if first.and_more > 0 {
+                format!(
+                    ", and {} further path(s) under it would not read either",
+                    first.and_more
+                )
+            } else {
+                String::new()
+            };
+            said.push(format!(
+                "The first path it could not read is {}: {}{and_more}. do: make that path \
+                 readable to the user this runner runs as — a job that left its output \
+                 owned by another user is what this usually is. This sweep reads and never \
+                 repairs: it has changed no mode, no owner and no name here, and the next \
+                 start offers the whole collection as soon as the path reads",
+                first.path.display(),
+                first.why
+            ));
+        }
+        if self.bound {
+            said.push(format!(
+                "The sweep's bound of {MOST_ENTRIES_SWEPT} entries ran out inside it, so the \
+                 rest of it was never looked at and no path in it is at fault. do: nothing — \
+                 the next start looks again, and every collection the hub acknowledges \
+                 shortens the walk"
+            ));
+        }
+        said.join(" ")
+    }
 }
 
 /// Move a spool out of the way under a name that says why, keeping every
@@ -544,9 +690,14 @@ mod tests {
     /// A directory under a spool that will not read: what the walk can see is
     /// **not** the collection, and a part of a manifest offered as the whole
     /// of one would read to the hub as a collection it already holds.
+    ///
+    /// And — the first consumer's 50 refusals, which named neither — the
+    /// refusal names **that path** and **that errno**. Built with a mode the
+    /// test removes itself, because an output tree owned by another user is
+    /// the consumer's own hypothesis for what their 50 are.
     #[test]
     #[cfg(unix)]
-    fn a_spool_that_will_not_read_through_is_not_offered() {
+    fn a_spool_that_will_not_read_through_is_not_offered_and_says_which_path() {
         use std::os::unix::fs::PermissionsExt;
         let (_temp, root) = a_root("sweep-unreadable");
         let path = a_spool(
@@ -560,10 +711,12 @@ mod tests {
         let put_back = fs::set_permissions(path.join("shut"), fs::Permissions::from_mode(0o700));
         if crate::privilege::effective_uid() == Some(0) {
             crate::testing::skipped(
-                "a_spool_that_will_not_read_through_is_not_offered",
+                "a_spool_that_will_not_read_through_is_not_offered_and_says_which_path",
                 "this test runs as root, and root reads a directory moded 0o000: a \
                  capable host would have proved that a spool the walk cannot finish is \
-                 never offered as a whole collection",
+                 never offered as a whole collection, and that the refusal names the \
+                 path and the errno. The sentence itself is still proved without a \
+                 mode by a_refusal_names_the_errno_in_the_kernels_own_words",
             );
             return;
         }
@@ -571,7 +724,168 @@ mod tests {
         assert!(swept.is_empty(), "{said:?}");
         let said = said.join("\n");
         assert!(said.contains("not the whole collection"), "{said}");
+        // The two figures the operator could not get out of v0.4.1: which
+        // path, and what the kernel said about it.
+        assert!(
+            said.contains(&path.join("shut").display().to_string()),
+            "the refusal must name the path it could not read: {said}"
+        );
+        assert!(
+            said.contains("Permission denied"),
+            "the refusal must carry the errno's own words, which are what tell a mode \
+             apart from a failing disk: {said}"
+        );
+        assert!(
+            said.contains("do: make that path readable"),
+            "a line with no action in it is one nobody acts on: {said}"
+        );
+        // One path named, no second one invented.
+        assert!(
+            !said.contains("further path(s)"),
+            "there was only one unreadable path here: {said}"
+        );
+        // The refusal still refuses, and the bytes are still exactly as they
+        // were: this walk reads, it never repairs.
         assert!(path.exists(), "nothing here deletes: {said}");
+        assert_eq!(
+            fs::read(path.join("open.txt")).expect("the readable file is untouched"),
+            b"here"
+        );
+        assert_eq!(
+            fs::symlink_metadata(path.join("shut"))
+                .expect("the shut directory is still there")
+                .permissions()
+                .mode()
+                & 0o777,
+            0o700,
+            "only this test's own `put_back` may have changed that mode; the sweep \
+             chmods nothing"
+        );
+    }
+
+    /// Several unreadable paths under one spool: the **first in path order**
+    /// is named, the rest are counted, and the spool is one line and not
+    /// fifty. A startup report is not a place to print a tree.
+    #[test]
+    #[cfg(unix)]
+    fn several_unreadable_paths_name_the_first_and_count_the_rest() {
+        use std::os::unix::fs::PermissionsExt;
+        let (_temp, root) = a_root("sweep-unreadable-many");
+        let path = a_spool(
+            &root,
+            "j0000000014-1",
+            &[
+                ("a-shut/inner.txt", b"no"),
+                ("b-shut/inner.txt", b"no"),
+                ("c-shut/inner.txt", b"no"),
+                ("open.txt", b"yes"),
+            ],
+        );
+        let shut = ["a-shut", "b-shut", "c-shut"];
+        for name in shut {
+            fs::set_permissions(path.join(name), fs::Permissions::from_mode(0o000))
+                .expect("the fixture shuts it");
+        }
+        let (swept, said) = pick_up(&root);
+        let put_back: Vec<_> = shut
+            .iter()
+            .map(|name| fs::set_permissions(path.join(name), fs::Permissions::from_mode(0o700)))
+            .collect();
+        if crate::privilege::effective_uid() == Some(0) {
+            crate::testing::skipped(
+                "several_unreadable_paths_name_the_first_and_count_the_rest",
+                "this test runs as root, and root reads a directory moded 0o000: a \
+                 capable host would have proved that one spool with three unreadable \
+                 directories is one line naming the first and counting two more",
+            );
+            return;
+        }
+        for outcome in put_back {
+            outcome.expect("the fixture puts it back");
+        }
+        assert!(swept.is_empty(), "{said:?}");
+        // One line for this spool, whatever is wrong inside it.
+        let about: Vec<&String> = said
+            .iter()
+            .filter(|line| line.contains("j0000000014-1"))
+            .collect();
+        assert_eq!(about.len(), 1, "one spool is one line: {said:?}");
+        let said = about[0];
+        assert!(
+            said.contains(&path.join("a-shut").display().to_string()),
+            "the first in path order is the one named: {said}"
+        );
+        assert!(
+            said.contains("and 2 further path(s)"),
+            "the others are counted, so the line says the problem is bigger than the \
+             path it names: {said}"
+        );
+        assert!(
+            !said.contains("c-shut"),
+            "counted, not listed — fifty lines for one spool is how a startup report \
+             stops being read: {said}"
+        );
+    }
+
+    /// The sentence itself, without a mode: an errno this host can produce at
+    /// any uid, including root. This is what keeps the claim "the refusal
+    /// carries the path and the error" proved on a host where the two tests
+    /// above can only skip.
+    #[test]
+    fn a_refusal_names_the_errno_in_the_kernels_own_words() {
+        let temp = TempDir::new("sweep-errno-words");
+        let missing = temp.path().join("a-path-that-is-not-there");
+        let error = fs::read_dir(&missing).expect_err("nothing is there to read");
+        let mut stopped = NotWhole::default();
+        stopped.could_not_read(missing.clone(), &error);
+        let said = stopped.sentence();
+        assert!(said.contains(&missing.display().to_string()), "{said}");
+        assert!(
+            said.contains("No such file or directory") && said.contains("os error 2"),
+            "the kernel's own words and its number, not a summary of them: {said}"
+        );
+        assert!(said.contains("do: "), "{said}");
+
+        // A second one does not replace the first unless it sorts before it,
+        // because a refusal an owner cannot compare with yesterday's is one
+        // they cannot follow.
+        let later = temp.path().join("z-later");
+        stopped.could_not_read(later, &error);
+        let earlier = temp.path().join("A-earlier");
+        stopped.could_not_read(earlier.clone(), &error);
+        let said = stopped.sentence();
+        assert!(said.contains(&earlier.display().to_string()), "{said}");
+        assert!(said.contains("and 2 further path(s)"), "{said}");
+    }
+
+    /// The other half of the same change, and the one that must not move: a
+    /// spool that reads through is still offered, with no reason attached to
+    /// anything. Adding a reason to a refusal must not change **who** is
+    /// refused.
+    #[test]
+    fn a_spool_that_reads_through_is_still_offered_with_nothing_said() {
+        let (_temp, root) = a_root("sweep-still-offered");
+        let path = a_spool(
+            &root,
+            "j0000000015-3",
+            &[("results.json", b"{}"), ("packs/one.pack", b"bytes")],
+        );
+        let mut budget = MOST_ENTRIES_SWEPT;
+        let (files, bytes, not_whole) = walk(&path, &mut budget);
+        assert!(
+            not_whole.is_none(),
+            "a spool nothing is wrong with has no reason to give: {not_whole:?}"
+        );
+        assert_eq!(files.len(), 2, "{files:?}");
+        assert_eq!(bytes, 7);
+        let (swept, said) = pick_up(&root);
+        assert_eq!(swept.len(), 1, "{said:?}");
+        assert!(said.is_empty(), "nothing to complain about: {said:?}");
+        let offered = swept[0].offered();
+        assert!(
+            offered.contains("it is offered to the hub again"),
+            "{offered}"
+        );
     }
 
     /// A spool already set aside is never picked up again: that is what makes
@@ -623,15 +937,26 @@ mod tests {
             "j0000000019-1",
             &[("a.txt", b"a"), ("b.txt", b"b"), ("c.txt", b"c")],
         );
-        let (files, _, whole) = walk(&path, &mut budget);
-        assert!(!whole, "a walk that ran out of budget is not a whole one");
+        let (files, _, not_whole) = walk(&path, &mut budget);
+        let not_whole = not_whole.expect("a walk that ran out of budget is not a whole one");
+        assert!(not_whole.bound);
+        assert!(
+            not_whole.unreadable.is_none(),
+            "the bound is not a fault of any path, and must not accuse one: {not_whole:?}"
+        );
         assert!(files.len() < 3, "{files:?}");
         assert_eq!(budget, 0);
-        // And the spool is not offered on the strength of what it saw.
+        // And the spool is not offered on the strength of what it saw — with
+        // the bound named as the reason, so that an owner does not go looking
+        // for a broken disk that is not there.
         let mut budget = 2usize;
+        let Found::Said(said) = one(&path, &mut budget) else {
+            panic!("a spool the walk did not finish must never be offered");
+        };
+        assert!(said.contains("whole"), "{said}");
         assert!(
-            matches!(one(&path, &mut budget), Found::Said(said) if said.contains("whole")),
-            "a spool the walk did not finish must never be offered"
+            said.contains(&MOST_ENTRIES_SWEPT.to_string()) && said.contains("no path in it"),
+            "the bound must say it was the bound: {said}"
         );
     }
 
