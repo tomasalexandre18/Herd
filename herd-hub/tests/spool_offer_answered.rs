@@ -400,13 +400,14 @@ const SWEPT: usize = herd_runner::FILES_IN_FLIGHT + 4;
 /// that is no longer there. 37.6 GiB on the first consumer's runner, with the
 /// hub holding every byte of it.
 ///
-/// `#[ignore]`d with its reason, so the suite prints it as a skip and never as
-/// a pass (D27): the defect is real and nobody has been asked to fix it yet,
-/// and a red gate for it would stop every other landing. The fix is a task of
-/// its own, and it is the task that removes this attribute.
-#[ignore = "spool-offer-repro: reproduces the unfixed startup-offer defect; \
-            RED until the barrier waits for the answer to its own offer. \
-            Run it on purpose with --ignored"]
+/// It was `#[ignore]`d with its reason while the defect stood, so the suite
+/// printed it as a skip and never as a pass (D27). **The fix removed the
+/// attribute, and from here this is the regression test for the rule it
+/// established**: a swept collection may be set aside only on a silence the
+/// hub has already had the chance to break — its whole offer on the link, and
+/// a health report queued after that offer's last chunk answered — so a hub
+/// that holds the collection whole now always gets to say so before the
+/// runner can condemn it.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn every_swept_spool_the_hub_acknowledges_is_deleted_and_none_set_aside() {
     let herd = Herd::new();

@@ -8,8 +8,8 @@
 
 use std::sync::Arc;
 
-use herd_hub::{JobDirStore, JobState, JobStore, Mint};
-use herd_proto::{JobOutcome, LogStream};
+use herd_hub::{JobDirStore, JobState, JobStore, Mint, StateRootReport, RECORD_VERSION};
+use herd_proto::{JobId, JobOutcome, LogStream};
 use herd_runner::Session;
 
 mod support;
@@ -864,4 +864,407 @@ async fn a_torn_record_is_set_aside_and_the_hub_still_binds_its_port() {
         "the torn record was rewritten"
     );
     link.abort();
+}
+
+// ---------------------------------------------------------------------------
+// The quarantine, one shape of damage at a time (V10, D218, ORCH-183)
+// ---------------------------------------------------------------------------
+//
+// The test above proves the sentence an operator cares about — the hub binds
+// its port and the healthy jobs run — on one shape of damage, a record cut
+// mid-write. These five hold the rest of the shapes, and they are here rather
+// than in `crash_points.rs` for one reason: every case in that file is
+// `#[ignore]`d, so the 308-state census that asserts `0 refuse the whole
+// state root` never runs under `./scripts/test.sh`. The strongest evidence
+// for the fix was outside the gate. This is it inside the gate.
+//
+// **Every fixture is a record the store's own writer wrote, then damaged.**
+// Never a hand-written string that looks torn: a string the test invented
+// proves the reader agrees with the test, and nothing about what `create_job`
+// puts on the disk.
+//
+// **And every one is armed first.** Each test opens the *intact* root and
+// asserts `quarantined()` is empty before it damages anything. A detector
+// that cannot be shown to be silent on a sound root cannot be trusted when it
+// is silent on a damaged one — three detectors in this project reported a
+// false zero in one day for exactly that reason.
+
+/// Enough of a `job.json` to read its version: the same shape `store.rs`
+/// probes with, restated here so a test can prove *which* of the store's
+/// three parses rejected a fixture.
+#[derive(serde::Deserialize)]
+struct VersionProbe {
+    #[serde(default)]
+    record_version: u32,
+}
+
+/// Mint `whats.len()` real jobs on a fresh root and give back their ids.
+///
+/// The store is dropped before this returns, so the `flock(2)` on `hub.lock`
+/// is free and the caller can reopen the root.
+fn mint_on(root: &std::path::Path, whats: &[&str]) -> Vec<JobId> {
+    let store = JobDirStore::open(root).expect("the state root opens");
+    whats
+        .iter()
+        .map(|what| {
+            store
+                .create_job(herd_hub::NewJob::new(shell(&format!("printf '{what}\\n'"))))
+                .expect("minted")
+                .id
+        })
+        .collect()
+}
+
+/// The arming check, as its own named step: an intact root quarantines
+/// nothing.
+///
+/// Called before each fixture is damaged. If this ever passed trivially — a
+/// `quarantined()` that returned an empty list whatever was on the disk — the
+/// five assertions below would be worthless, and they would still be green.
+fn armed(root: &std::path::Path) {
+    let store = JobDirStore::open(root).expect("the intact state root opens");
+    let quarantined = store.quarantined().expect("the quarantine lists");
+    assert!(
+        quarantined.is_empty(),
+        "the arming check: an intact root this store wrote itself must quarantine \
+         nothing, or the assertions below prove nothing. Got {quarantined:?}"
+    );
+}
+
+/// Open the root and give back its quarantine list, oldest first.
+fn quarantine_on(root: &std::path::Path) -> Vec<(JobId, String)> {
+    let store = JobDirStore::open(root).expect("the damaged state root still opens");
+    store.quarantined().expect("the quarantine lists")
+}
+
+/// Bytes a record never holds: a `job.json` overwritten mid-record with
+/// something that is not UTF-8 at all.
+///
+/// This is the shape a partially-rewritten block leaves, and it fails
+/// *before* any parse: `fs::read_to_string` will not hand back the bytes. The
+/// hub treats that like every other unreadable record — one job's problem, not
+/// the root's.
+#[test]
+fn a_record_overwritten_with_non_utf8_bytes_quarantines_only_itself() {
+    let state = tempfile::tempdir().expect("a temporary state directory");
+    let ids = mint_on(state.path(), &["the healthy one", "the damaged one"]);
+    armed(state.path());
+
+    let path = job_dir(state.path(), &ids[1]).join("job.json");
+    let mut bytes = std::fs::read(&path).expect("the record reads");
+    // Mid-record, not at the front: the opening brace and the version field
+    // survive, which is what a torn block really looks like.
+    let at = bytes.len() / 2;
+    bytes[at..at + 4].copy_from_slice(&[0xf0, 0x9f, 0xff, 0xfe]);
+    std::fs::write(&path, &bytes).expect("the record is overwritten");
+
+    let quarantined = quarantine_on(state.path());
+    assert_eq!(quarantined.len(), 1, "{quarantined:?}");
+    assert_eq!(quarantined[0].0, ids[1]);
+    assert!(
+        quarantined[0].1.contains(&path.display().to_string()),
+        "the quarantine names the file an operator has to look at: {}",
+        quarantined[0].1
+    );
+    assert_eq!(
+        std::fs::read(&path).expect("the record is still there"),
+        bytes,
+        "a record nobody can read is not Herd's to rewrite"
+    );
+}
+
+/// Valid JSON, a version this build reads, and a field the record requires
+/// **gone** — and the one place `report` and the hub disagree.
+///
+/// The hub parses the whole `RecordFile`, so a missing `state` is a record it
+/// cannot read and it quarantines. `report` parses `RecordOutputs`, which
+/// needs `record_version` and `outputs` and lets serde ignore everything
+/// else, so the **same bytes** are counted in `census.read` as a record it
+/// read. `report` is the *laxer* reader of the two and says nothing about it:
+/// a clean `report` is evidence about damaged bytes, not a promise that every
+/// record the hub opens is one it can use.
+///
+/// Pinned here because it is the kind of divergence that is invisible until
+/// somebody acts on the wrong one of the two numbers.
+#[test]
+fn a_record_missing_a_required_field_is_quarantined_and_report_counts_it_read() {
+    let state = tempfile::tempdir().expect("a temporary state directory");
+    let ids = mint_on(state.path(), &["the only one"]);
+    armed(state.path());
+
+    let path = job_dir(state.path(), &ids[0]).join("job.json");
+    let text = std::fs::read_to_string(&path).expect("the record reads");
+    let mut value: serde_json::Value = serde_json::from_str(&text).expect("the record is json");
+    assert!(
+        value
+            .as_object_mut()
+            .expect("a record is an object")
+            .remove("state")
+            .is_some(),
+        "the fixture must really remove a field the record had"
+    );
+    let damaged = serde_json::to_string(&value).expect("the fixture serialises");
+    std::fs::write(&path, &damaged).expect("the record is rewritten without `state`");
+
+    // **The second arming check.** The fixture must still get *past* the
+    // version probe, or this test would be proving the version arm fires and
+    // calling it the third parse. The probe is the store's first of three
+    // reads of the same text.
+    let probe: VersionProbe = serde_json::from_str(&damaged).expect(
+        "the fixture still parses as the version probe: if it did not, the quarantine \
+         below would be the version arm and not the record parse",
+    );
+    assert_eq!(
+        probe.record_version, RECORD_VERSION,
+        "the fixture carries this build's own record version, so the version arm \
+         cannot be what sets it aside"
+    );
+
+    let quarantined = quarantine_on(state.path());
+    assert_eq!(quarantined.len(), 1, "{quarantined:?}");
+    assert_eq!(quarantined[0].0, ids[0]);
+    let why = &quarantined[0].1;
+    assert!(
+        why.contains("not a record this hub can read"),
+        "the third parse is what rejected it: {why}"
+    );
+    assert!(
+        !why.contains("record version"),
+        "the version arm must not be what fired: {why}"
+    );
+    assert!(
+        why.contains("state"),
+        "the sentence names the field that is missing: {why}"
+    );
+
+    // And the divergence itself, on the very same bytes.
+    let report = StateRootReport::read(state.path()).expect("the report reads the root");
+    assert_eq!(
+        report.census.read, 1,
+        "`report` counts this record as read while the hub quarantines it: \
+         `RecordOutputs` needs only `record_version` and `outputs`, both \
+         `#[serde(default)]`, so `report` is the laxer reader of the two. {:?}",
+        report.census
+    );
+    assert!(
+        report.census.unread.is_empty(),
+        "`report` says nothing at all about it: {:?}",
+        report.census.unread
+    );
+}
+
+/// `job.json` is not a file any more: a directory stands where the record
+/// was.
+///
+/// Not a crash shape — it is what a restore, a mount or a hand-repair can
+/// leave — and the hub must treat it as one job's problem like any other.
+/// `read_to_string` on a directory is `EISDIR`, which is the "could not get
+/// the bytes at all" arm rather than a parse failure.
+#[test]
+fn a_record_replaced_by_a_directory_quarantines_only_that_job() {
+    let state = tempfile::tempdir().expect("a temporary state directory");
+    let ids = mint_on(state.path(), &["the healthy one", "the replaced one"]);
+    armed(state.path());
+
+    let path = job_dir(state.path(), &ids[1]).join("job.json");
+    std::fs::remove_file(&path).expect("the record is removed");
+    std::fs::create_dir(&path).expect("a directory stands in its place");
+
+    let quarantined = quarantine_on(state.path());
+    assert_eq!(quarantined.len(), 1, "{quarantined:?}");
+    assert_eq!(quarantined[0].0, ids[1]);
+    assert!(
+        quarantined[0].1.contains("could not be read"),
+        "the bytes were never got, which is its own arm: {}",
+        quarantined[0].1
+    );
+    assert!(
+        path.is_dir(),
+        "the hub repaired nothing: what it found is what is still there"
+    );
+}
+
+/// A record the filesystem will not hand back: mode `0o000`.
+///
+/// The shape the first consumer is most likely to meet, because it needs no
+/// crash at all — a restore under the wrong owner, or an `fchmod` from
+/// somebody's repair script. It is `EACCES` at the read, so the hub sets the
+/// job aside carrying the errno and serves the rest of the root.
+///
+/// **Skipped loudly as root** (D27). Root reads a file moded `0o000`, so on a
+/// root-run suite the record would parse, nothing would be quarantined, and
+/// the assertion would be a false zero dressed as a pass.
+#[test]
+#[cfg(unix)]
+fn a_record_the_filesystem_will_not_hand_back_quarantines_only_that_job() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let state = tempfile::tempdir().expect("a temporary state directory");
+    let ids = mint_on(state.path(), &["the healthy one", "the shut one"]);
+    armed(state.path());
+
+    let path = job_dir(state.path(), &ids[1]).join("job.json");
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o000))
+        .expect("the fixture shuts the record");
+    if rustix::process::geteuid().is_root() {
+        let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600));
+        herd_runner::testing::skipped(
+            "a_record_the_filesystem_will_not_hand_back_quarantines_only_that_job",
+            "this test runs as root, and root reads a file moded 0o000: the record \
+             would parse, nothing would be quarantined, and a green assertion here \
+             would be a false zero. An unprivileged host would have proved that a \
+             record whose bytes the filesystem refuses is set aside with its errno \
+             while the rest of the root is served. The same sentence is proved \
+             without a mode by \
+             a_record_replaced_by_a_directory_quarantines_only_that_job",
+        );
+        return;
+    }
+
+    let quarantined = quarantine_on(state.path());
+    // Put the mode back before any assertion can panic out of the test, so
+    // the temporary directory is still removable.
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))
+        .expect("the fixture opens it again");
+
+    assert_eq!(quarantined.len(), 1, "{quarantined:?}");
+    assert_eq!(quarantined[0].0, ids[1]);
+    assert!(
+        quarantined[0].1.contains("could not be read"),
+        "the quarantine carries what the kernel said: {}",
+        quarantined[0].1
+    );
+    assert!(
+        quarantined[0].1.contains(&path.display().to_string()),
+        "and the path it said it about: {}",
+        quarantined[0].1
+    );
+}
+
+/// Tear the **last** record on a root, leaving the damage on the highest id,
+/// and give it back: mint three, tear `j0000000003`, reopen, `create_job`.
+fn torn_highest_of_three(root: &std::path::Path) -> (Vec<JobId>, Vec<u8>) {
+    let ids = mint_on(root, &["the first", "the second", "the last"]);
+    assert_eq!(ids[2].as_str(), "j0000000003", "the fixture's own premise");
+    armed(root);
+    let path = job_dir(root, &ids[2]).join("job.json");
+    let whole = std::fs::read(&path).expect("the record reads");
+    let cut = whole[..whole.len() * 2 / 3].to_vec();
+    std::fs::write(&path, &cut).expect("the record is torn");
+    (ids, cut)
+}
+
+/// **The one that matters for later.** A torn record holding the highest id
+/// does not cost that id to the next job — on a root with a high-water mark
+/// *and* on a root without one.
+///
+/// `recover` takes the next id from the higher of two things: `store.json`'s
+/// `ids_minted` mark, and the highest **directory name** in `jobs/`.
+/// `sequence_of` reads the name and never the record, so a quarantined
+/// record's id stays spent only while its directory keeps its name.
+///
+/// **Two arms, because only one of them is load-bearing, and it is the one a
+/// modern root hides.** On a root this build wrote, the mark alone would hold
+/// the line even if the directory vanished. On a root written *before* the
+/// mark existed — `store.rs`'s own words for that set are "every root in
+/// existence", the first consumer's included — the directories are the whole
+/// truth, and there the directory name is the only thing standing between the
+/// next job and an id another job already has.
+///
+/// So this is the test that goes red the day somebody decides a set-aside
+/// record should be moved or renamed — `j0000000003.bad`, or into a
+/// `quarantine/` folder. The second arm is the one that catches it.
+#[test]
+fn a_torn_record_holding_the_highest_id_does_not_cost_that_id() {
+    // ---- Arm one: a root this build wrote, mark and directories agreeing.
+    let state = tempfile::tempdir().expect("a temporary state directory");
+    let (ids, cut) = torn_highest_of_three(state.path());
+    let path = job_dir(state.path(), &ids[2]).join("job.json");
+
+    let store = JobDirStore::open(state.path()).expect("the state root opens");
+    let quarantined = store.quarantined().expect("the quarantine lists");
+    assert_eq!(
+        quarantined.len(),
+        1,
+        "the torn record is on the quarantine list under its own id. An empty list \
+         here means recovery never saw the directory at all — which is what a \
+         RENAMED quarantine directory looks like, because `sequence_of` reads the \
+         name and `j0000000003.bad` is not a name it knows. Read arm two's message \
+         for what that costs. Got {quarantined:?}"
+    );
+    assert_eq!(quarantined[0].0, ids[2]);
+
+    let next = store
+        .create_job(herd_hub::NewJob::new(shell("printf 'after the damage\\n'")))
+        .expect("the hub still mints on a root holding a quarantined record")
+        .id;
+    assert_eq!(
+        next.as_str(),
+        "j0000000004",
+        "a quarantined record must not give its id back"
+    );
+    assert!(
+        job_dir(state.path(), &ids[2]).is_dir(),
+        "the quarantined record's directory is still named {}",
+        ids[2]
+    );
+    assert_eq!(
+        std::fs::read(&path).expect("the torn record is still there"),
+        cut,
+        "the torn record was rewritten"
+    );
+    drop(store);
+
+    // ---- Arm two, and this is the assertion with something behind it: a
+    // root with no high-water mark, where `jobs/` is the only record of what
+    // has been handed out.
+    let legacy = tempfile::tempdir().expect("a second temporary state directory");
+    let (ids, _) = torn_highest_of_three(legacy.path());
+    let store_file = legacy.path().join("store.json");
+    let text = std::fs::read_to_string(&store_file).expect("store.json reads");
+    let mut value: serde_json::Value = serde_json::from_str(&text).expect("store.json is json");
+    assert!(
+        value
+            .as_object_mut()
+            .expect("store.json is an object")
+            .remove("ids_minted")
+            .is_some(),
+        "the fixture must really remove the mark, or this arm is arm one again"
+    );
+    std::fs::write(
+        &store_file,
+        serde_json::to_string(&value).expect("the fixture serialises"),
+    )
+    .expect("store.json is rewritten without its mark");
+
+    let store = JobDirStore::open(legacy.path()).expect("a root with no mark opens");
+    let quarantined = store.quarantined().expect("the quarantine lists");
+    assert_eq!(
+        quarantined.len(),
+        1,
+        "the torn record is still the one set aside. An empty list is a renamed \
+         quarantine directory: see the id assertion below for the price. Got \
+         {quarantined:?}"
+    );
+    let next = store
+        .create_job(herd_hub::NewJob::new(shell("printf 'after the damage\\n'")))
+        .expect("the hub still mints")
+        .id;
+    assert_eq!(
+        next.as_str(),
+        "j0000000004",
+        "On a root with no high-water mark the DIRECTORY NAME is the only thing \
+         that says j0000000003 was ever handed out: `sequence_of` reads the name, \
+         never the record. If this line is red because the new id is j0000000003, \
+         something now renames or moves a quarantined record's directory. That \
+         drops the directory out of the id sequence, and on this root — every \
+         root written before `ids_minted`, the first consumer's included — one id \
+         is then handed to two jobs, one of them a job whose record is still \
+         sitting in jobs/j0000000003."
+    );
+    assert!(
+        job_dir(legacy.path(), &ids[2]).is_dir(),
+        "and the directory that carries that id is still named {}",
+        ids[2]
+    );
 }
