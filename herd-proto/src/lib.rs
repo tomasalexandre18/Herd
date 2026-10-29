@@ -2339,6 +2339,14 @@ pub struct AbsentFile {
 /// after the closing parenthesis would break a reader anchored on it. Inside,
 /// it is part of the free text the `why` already is, and
 /// `^ran on: (\S+) \((.*)\)$` is satisfied exactly (D109).
+///
+/// **Frozen by a test, not by this paragraph.**
+/// `herd-proto/tests/frozen_formats.rs` asserts this number and the whole
+/// literal line it rides inside, so that a space, a word or a separator
+/// cannot move without a red gate. Read that file's `WHEN_THIS_FIRES` before
+/// repairing anything it reports: a frozen format whose expectation is edited
+/// to match new output, with this number left where it was, tells every
+/// consumer's parser it is reading a format it is not.
 pub const OUTPUT_FORMAT_VERSION: u32 = 1;
 
 /// The version of the machine-readable verdict `herdctl --verdict-to` writes
@@ -2361,6 +2369,14 @@ pub const OUTPUT_FORMAT_VERSION: u32 = 1;
 /// field does not: every reader of JSON already ignores what it was not
 /// looking for, and a document that gains a field still answers every
 /// question it answered before.
+///
+/// **Frozen by a test, not by this paragraph.**
+/// `herdctl/tests/frozen_verdict.rs` asserts the whole document as literal
+/// text — key order, indentation, the `null`s and the final newline — for a
+/// job that passed, a job a cap stopped, and a run that got no verdict at
+/// all. Read that file's `WHEN_THIS_FIRES` before repairing anything it
+/// reports: an added field is an expectation updated there on purpose with
+/// this number left alone, and anything else is a bump in the same commit.
 pub const VERDICT_FORMAT_VERSION: u32 = 1;
 
 /// E-02's first line: where this job ran, and why there.
@@ -2370,6 +2386,10 @@ pub const VERDICT_FORMAT_VERSION: u32 = 1;
 /// what invariant 4 exists to prevent. Printed on the requester's **stdout**,
 /// ahead of the job's first byte, and never written into the record's log —
 /// that log is the bytes the job's process wrote and nothing else (D18).
+///
+/// The text is frozen in `herd-proto/tests/frozen_formats.rs`: the runner's
+/// name and the hub's reason are its only variable parts, and every byte
+/// around them is the format a consumer's reader is anchored on.
 pub fn ran_on_line(runner: &str, why: &str) -> String {
     format!("ran on: {runner} ({why}; herd output format {OUTPUT_FORMAT_VERSION})")
 }
