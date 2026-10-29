@@ -396,6 +396,12 @@ impl LiveJobs {
 /// else will ever collect them, so the next runner does, at startup, before
 /// it joins a hub. Returns one line per thing reclaimed, for the startup
 /// report — silence here is as bad as a silent fallback.
+///
+/// **Processes, workspaces and cgroups, and nothing else.** `outputs/` is not
+/// reclaimed and must not be: a spool there is the only copy of a result
+/// until the hub acknowledges it (D19), and something *does* collect it now —
+/// [`crate::sweep::pick_up`], on the same startup, a few lines later. The
+/// comment in the body says what that cost when this reaper also walked it.
 pub fn reclaim_a_past_life(root: &DataRoot, ceiling: &Ceiling) -> Vec<String> {
     let mut said = Vec::new();
 
@@ -429,44 +435,30 @@ pub fn reclaim_a_past_life(root: &DataRoot, ceiling: &Ceiling) -> Vec<String> {
         }
     }
 
-    // The spools under `outputs/`, for the same reason and with one more.
+    // **`outputs/` is deliberately not reclaimed here.** It is the one
+    // directory under the data root this reaper leaves alone, and the reason
+    // is the whole of D19: a spool is the **only copy** of a requester's
+    // evidence until the hub has said it holds every file of it
+    // (`Session::files_acknowledged`). `outputs/` sits outside `jobs/` for
+    // exactly that reason (`crate::root::DataRoot::outputs_dir`).
     //
-    // A collection too big to ride its verdict is moved out of the workspace
-    // into `<data root>/outputs/<job>-<attempt>/` and kept there until the
-    // hub says it holds every byte (D19, D148). That hold lives in **this
-    // process's memory**: the only place a spool is ever registered is at the
-    // end of the job that produced it (`Session::end_job`), and nothing
-    // anywhere reads `outputs/` back. So a runner that was `SIGKILL`ed leaves
-    // bytes that no later runner can ever offer and no acknowledgement can
-    // ever free — the hub asking for them is answered "this runner holds no
-    // collection for it" — and until now nothing removed them either. On the
-    // first consumer's own machine that is a directory that only grows, which
-    // is the plainest breach of invariant 2 there is.
+    // For one release this arm did reclaim it, on the premise that "no runner
+    // can offer a spool it did not make, so these bytes could never have
+    // reached the hub". That premise was true when it was written and is
+    // false now: `Session::pick_up_collections` (`crate::sweep::pick_up`)
+    // runs twenty-eight lines after this reaper in `run_until` and exists
+    // precisely so a spool a previous life left **is** offered to the hub
+    // again. The two walked the same directory, this one went first, and the
+    // sweep read what it had just emptied — a sweep dead on arrival in the
+    // release that shipped it.
     //
-    // Named with the figure, like every other thing reclaimed here, because
-    // these are somebody's build outputs and a line saying how much went is
-    // the only trace left of them.
-    let spools = root.path().join(crate::outputs::SPOOL_DIR);
-    if let Ok(entries) = fs::read_dir(&spools) {
-        for entry in entries.flatten() {
-            let path = entry.path();
-            let weight = crate::root::measure_tree(&path, root.path())
-                .map(crate::size::show_bytes)
-                .unwrap_or_else(|_| "an unmeasurable number of".to_owned());
-            match reclaim_directory(&path, root.path()) {
-                Ok(()) => said.push(format!(
-                    "reclaimed {weight} of output left in {} by a previous life: no runner \
-                     can offer a spool it did not make, so these bytes could never have \
-                     reached the hub",
-                    path.display()
-                )),
-                Err(error) => said.push(format!(
-                    "COULD NOT reclaim the leftover output spool {}: {error}",
-                    path.display()
-                )),
-            }
-        }
-    }
+    // So the sweep owns `outputs/` alone, and every byte in there has one
+    // disposition: offered and acknowledged, in which case the ordinary
+    // acknowledgement path removes it; or offered and met with silence, in
+    // which case it is renamed `.unclaimed`, named with its figure, and never
+    // offered again (`Session::the_hub_has_said_what_it_is_owed`). Nothing in
+    // the startup path deletes a spool the hub has not spoken about, and this
+    // reaper no longer has an opinion about that directory.
 
     // The cgroups, whose names carry the pid of the runner that made them.
     if let Some(base) = ceiling.base() {
@@ -599,16 +591,23 @@ mod tests {
         assert_eq!(pid_in(first.as_str()), Some(std::process::id()));
     }
 
-    /// **The leak invariant 2 cared about most, closed.** A collection too
-    /// big to ride its verdict is moved to `<data root>/outputs/<job>-<n>/`
-    /// and removed only on the hub's acknowledgement
-    /// (`herd-runner/src/lib.rs`, `files_acknowledged`). A runner that was
-    /// `SIGKILL`ed never gets that acknowledgement, and the next runner
-    /// cannot offer the bytes either — the only place a spool is registered
-    /// is the end of the job that produced it — so before this they stayed on
-    /// the consumer's disk for ever.
+    /// **The reaper leaves `outputs/` entirely alone, and that is the
+    /// assertion.** A collection too big to ride its verdict is moved to
+    /// `<data root>/outputs/<job>-<n>/` and removed only on the hub's
+    /// acknowledgement (`herd-runner/src/lib.rs`, `files_acknowledged`), so a
+    /// spool is the one copy of a requester's evidence until the hub says it
+    /// holds every file (D19).
+    ///
+    /// This test used to assert the opposite — that the reaper removed the
+    /// spool — on the premise that no later runner could offer it. The sweep
+    /// that `Session::pick_up_collections` runs on the same startup made that
+    /// premise false (`crate::sweep`), and the two shipped in one release
+    /// walking the same directory with this one going first. The sweep's own
+    /// `the_reaper_does_not_delete_a_spool_this_sweep_would_have_resumed`
+    /// asserts the composition; this asserts the half that is the reaper's:
+    /// it does not touch the directory, and it does not claim to.
     #[test]
-    fn the_reaper_reclaims_an_output_spool_a_previous_life_left_behind() {
+    fn the_reaper_leaves_an_output_spool_for_the_startup_sweep() {
         let _reaping = crate::testing::one_reaper_at_a_time();
         let temp = crate::testing::TempDir::new("reclaim-spool");
         let root = DataRoot::open(temp.path()).expect("a throwaway data root");
@@ -623,12 +622,20 @@ mod tests {
         let said = reclaim_a_past_life(&root, &ceiling);
 
         assert!(
-            !spool.exists(),
-            "a spool no runner can ever offer must not outlive the runner that made it"
+            spool.exists(),
+            "a spool is the only copy of a result until the hub acknowledges it (D19), \
+             and the sweep that offers it again runs after this: {said:?}"
+        );
+        assert_eq!(
+            fs::read(spool.join("results.json"))
+                .expect("the spooled bytes are still there")
+                .len(),
+            4096
         );
         assert!(
-            said.iter().any(|line| line.contains("j0000000001-1")),
-            "and what went has to be named, with the figure: {said:?}"
+            !said.iter().any(|line| line.contains("j0000000001-1")),
+            "and the reaper says nothing about a directory it does not touch; the sweep \
+             reports it, with its figure: {said:?}"
         );
     }
 

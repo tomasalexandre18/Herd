@@ -497,8 +497,10 @@ impl Confined {
         // somebody changing a scheduler by hand.
         let io_weight_reach = crate::blockio::io_weight_reach(root.path());
         // Before the first job and before the hub: a runner that was killed
-        // left processes, cgroups, workspaces and output spools nothing else
-        // will collect.
+        // left processes, cgroups and workspaces nothing else will collect.
+        // Not its output spools — those are the only copy of a result until
+        // the hub acknowledges them (D19) and `Session::pick_up_collections`
+        // offers them again a few lines after this returns.
         let reclaimed = reclaim_a_past_life(&root, &ceiling);
         Ok(Self {
             root,
