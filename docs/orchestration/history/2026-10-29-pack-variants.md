@@ -187,6 +187,72 @@ text does not end the line, which the whole framing rests on and which
 `a_refusal_carrying_a_newline_is_still_one_line` asserts against a `why` of
 three lines.
 
+### The digest column is validated where the entry is parsed
+
+`entry_of_row` parsed the size and refused an unknown kind letter and carried
+**column 1 exactly as written**, so a row whose digest read
+`../../../escaped` produced a `ManifestEntry` naming a path outside
+`objects/`. It is now checked at the one place an entry comes into existence:
+
+```rust
+pub fn check_object_digest(value: &str) -> Result<(), String>
+```
+
+**Exactly 64 lowercase hex characters.** Public, so the readers that already
+check this — the runner's store today, the hub's registry and the fetch
+endpoint tomorrow — delegate instead of keeping a second, third and fourth
+copy; three copies is how two of them come to disagree. **Uppercase is refused
+and not lowercased**, said in the refusal itself: a content-addressed store
+that accepted both spellings could hold one object's bytes twice under two
+names, with nothing to say which the manifest meant.
+
+**Proved by removing it.** With the `check_object_digest(columns[0])` line
+deleted, the traversal fixture parses:
+
+```
+panicked at herd-proto/src/pack.rs:1615:18:
+that is not a digest Herd may build a path out of:
+PackManifest { id: "53afeb0c…", bytes: 72, rows: 1, files: 1 }
+```
+
+— a manifest with one `kind f` row whose object name is `../../../escaped`.
+The line was restored and the 84 unit tests are green.
+
+Five refusing fixtures and a silent one, in
+`a_digest_column_that_is_not_a_digest_is_refused_by_name`: the traversal,
+`abc`, 65 characters, 64 uppercase, 64 non-hex — each asserted to name the row
+number and what was wrong with the value — and **`"1".repeat(64)` parses,
+along with the module's own four-row `d`/`l` fixture**, so the check is not
+simply refusing everything.
+
+### What I found about the other columns
+
+**`path` was not inert by construction, only by habit, so it is checked too.**
+[`ManifestEntry::path`]'s doc already carried the rule as prose — *"not a path
+Herd ever joins onto anything"* — which is the same N-places failure in its
+smallest form. Column 6 is relative to the pack's own root by the format's own
+definition, so `check_entry_path` refuses an empty path, an absolute one, a
+NUL, and any `..` component that climbs out, each with a fixture. A `..` that
+does **not** climb out is not refused (`a/../b` names `b`), and `x..y` and
+`..z` parse: a check that refused those would refuse good packs.
+
+**`link_target` is deliberately NOT checked, and that is the finding.** Herd
+never follows a link and never lays a tree out, so nothing resolves it — but a
+build output's symlink may legitimately point at an absolute path outside the
+pack (`/nix/store/abc-tool/bin/tool`), and refusing that would refuse a good
+pack to defend against a resolution nothing performs. It is therefore inert
+**by usage and not by construction**, which the type's doc now says in those
+words, with the one rule a reader still owes: anybody who ever resolves one
+owes it its own check. Asserted by
+`a_link_target_outside_the_pack_is_carried_and_not_refused`, which also
+asserts that such a row names no object at all.
+
+`size` is a parsed `u64`; `kind` is one of three letters and an unknown letter
+is already a refusal; `mode` is text that is never applied; `role` is carried
+and printed and never matched. The type's doc now says all four rest on
+nothing being done with them, because that is worth knowing before you are the
+one who does something with them.
+
 ## Not done, and why
 
 - **No handler, no caller, no behaviour anywhere.** Instructed, and said in
@@ -199,6 +265,14 @@ three lines.
   frame inventory, `docs/plan.md` and `docs/coverage.md` are not this step's,
   and the drafted decision entry is in the agent's report rather than in
   `docs/decisions.md` (only `herd-merger` appends there).
+- **The runner's own `object_name` guard is left in place**, deliberately: it
+  is in a file this branch does not own and its author kept it on purpose. It
+  is now redundant — `ManifestEntry` cannot exist with a digest of any other
+  shape — and it can become a thin delegation to
+  `herd_proto::pack::check_object_digest` as a follow-up. This branch does not
+  touch it, and nothing on this branch calls `PackManifest::parse` outside
+  `herd-proto` (`rg PackManifest::parse` finds no caller elsewhere), so the
+  guard breaks nobody's fixture here.
 - **`herdctl` still sends `needs: []` and `leaves: {}` on every submission.**
   Carrying ORCH-148's declaration fields onto the wire is the `herdctl`-only
   step the board already names; this branch adds the fields and wires nothing.
@@ -222,7 +296,7 @@ $ nix develop --command cargo build --workspace
 exit 0
 
 $ nix develop --command cargo test -p herd-proto
-  lib             80 passed; 0 failed; 0 ignored
+  lib             84 passed; 0 failed; 0 ignored
   frozen_formats   4 passed; 0 failed; 0 ignored
   pack_frames     41 passed; 0 failed; 0 ignored
   round_trip      32 passed; 0 failed; 0 ignored
@@ -427,6 +501,15 @@ budget case has no check anywhere and belongs to whoever reads the figures
    measured cost (eight asks across one reboot of the consumer's fleet,
    ORCH-163) and the one whose hub side is a single `stop asking` edge.
 
+4. **Whether the digest rule should also bind the hub's registry and the fetch
+   endpoint by type rather than by call.** `check_object_digest` is a function
+   they must remember to call; a `Digest` newtype whose only constructor runs
+   the check would make it impossible to forget, as `PackId` does for the
+   pack's own id. Recommendation: not tonight — it changes
+   `ManifestEntry::sha256`'s type and every reader of it, and the field is
+   already unforgeable at the one place entries are built. Fallback: do it
+   when the second reader appears, which is S6.
+
 ### Drafted decision entry
 
 ```markdown
@@ -496,6 +579,21 @@ and a header still arriving is `Incomplete` and **not** a refusal, because a
 reader that closed the link on a chunk boundary would close a healthy one.
 No new numbers: the bounds are `PACK_ENDPOINT_READ_BYTES` and
 `PACK_CHUNK_BYTES`.
+
+**A manifest row is untrusted input, and the digest column is checked where
+the row is parsed.** A `manifest.tsv` comes out of the consumer's own tooling,
+and column 1 is the name Herd joins onto `objects/` — so a row reading
+`../../../escaped` named a path outside the store. It must be **exactly 64
+lowercase hex characters**, refused by name at the one place a
+`ManifestEntry` comes into existence, so the registry, the fetch endpoint and
+the runner's store inherit the rule instead of writing it three times: three
+copies is how two of them come to disagree. **Uppercase is refused and not
+lowercased**, because a content-addressed store that took both spellings could
+hold one object's bytes twice under two names. The path column is checked to
+be what the format says it is — relative to the pack's own root — and the link
+target is deliberately **not**: Herd never resolves one, and a build output's
+symlink may legitimately leave the pack, so refusing it would refuse a good
+pack to defend against something nothing does.
 
 `RECORD_VERSION` and `LAYOUT_VERSION` do **not** move here, and neither do
 `VERDICT_FORMAT_VERSION` or `OUTPUT_FORMAT_VERSION`: no pack information went

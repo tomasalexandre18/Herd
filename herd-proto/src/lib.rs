@@ -42,7 +42,7 @@ pub use outputs::{
     PER_FILE_OVERHEAD,
 };
 pub use pack::{
-    check_peer_protocol_version, decode_peer_header, encode_peer_header,
+    check_object_digest, check_peer_protocol_version, decode_peer_header, encode_peer_header,
     peer_version_mismatch_reason, take_peer_body, AskPack, AskTransferCapability, AssignedPack,
     ExpectTransfer, FetchCapability, FetchPath, Holder, ManifestEntry, ManifestKind, PackHolders,
     PackId, PackManifest, PackRefused, PackRegistered, PackState, PackTransferred, PackUnavailable,
