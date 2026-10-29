@@ -2,6 +2,13 @@
 //! directory, **built by construction**, and what `JobDirStore::open` does
 //! with each one.
 //!
+//! **V10 changed what it does with 176 of the 308.** A `job.json` this hub
+//! cannot read used to refuse the whole state root — the hub exited before it
+//! bound its port, so a container restarted into the same wall — and now
+//! quarantines that one job: named with its path, out of the queue, record
+//! untouched, every healthy job on the root still served. The enumeration
+//! below is unchanged by it; the expectations are not.
+//!
 //! ## Why by construction and not by crashing
 //!
 //! Killing a hub produces *one* of the states below, chosen by the kernel's
@@ -215,7 +222,7 @@ enum Record {
     Absent,
     /// Readable JSON, a `record_version` this hub does not read. Not a crash
     /// state; enumerated because it is the one *other* way `read_stored`
-    /// returns `Err`, and it shares the refusal.
+    /// used to return `Err`, and it shares the quarantine that replaced it.
     WrongVersion,
 }
 
@@ -284,7 +291,8 @@ impl fmt::Display for Case {
 #[derive(Debug, PartialEq, Eq)]
 enum Verdict {
     /// `JobDirStore::open` returned `Err`: **the whole state root is
-    /// refused**, every other job on it with it.
+    /// refused**, every other job on it with it. Since V10 no state in this
+    /// enumeration produces it, and the census asserts that count is zero.
     Refused(String),
     /// It opened. The job is in `unfinished_jobs()` with this reason, or it
     /// is not there at all (`None`), or it is quarantined.
@@ -462,8 +470,16 @@ fn events_expected(shape: Events) -> Option<usize> {
     }
 }
 
-/// Whether `JobDirStore::open` should refuse the whole state root.
-fn open_refused(record: Record) -> bool {
+/// Whether `JobDirStore::open` should set this record aside rather than act
+/// on it (D52, V10).
+///
+/// **No record shape refuses the state root any more**, which is V10: this
+/// used to be `open_refused`, and these same four shapes were the ones that
+/// stopped the hub before it bound its port. The hub now opens on every one
+/// of the 308 states, and the four damaged shapes are quarantined: named with
+/// their path, out of the queue, on the quarantine list, in
+/// `index/state.json`, record untouched.
+fn quarantines(record: Record) -> bool {
     matches!(
         record,
         Record::Torn | Record::Empty | Record::Nulled | Record::WrongVersion
@@ -539,6 +555,7 @@ fn every_crash_point_a_waiting_write_can_leave() {
     println!("{}", "-".repeat(84));
 
     let mut refusals = 0usize;
+    let mut set_aside = 0usize;
     let mut vanished = 0usize;
     let mut ahead = 0usize;
     let mut temporaries_left = 0usize;
@@ -546,16 +563,14 @@ fn every_crash_point_a_waiting_write_can_leave() {
     for case in &cases {
         let verdict = run(*case);
         match &verdict {
+            // Counted and tabulated rather than asserted on the spot, so
+            // that a refusal shows up in the table beside the states that
+            // opened instead of stopping the run at the first one. The count
+            // is asserted to be zero below: since V10, nothing in this
+            // enumeration refuses a whole state root.
             Verdict::Refused(why) => {
                 refusals += 1;
-                assert!(
-                    open_refused(case.record),
-                    "{case} refused the whole state root and was not expected to: {why}"
-                );
-                assert!(
-                    why.contains(RECORD_FILE),
-                    "a refusal names the file it could not read: {why}"
-                );
+                println!("{case}: REFUSED the whole state root: {why}");
                 println!(
                     "{:<14} {:<16} {:<13} {:<16} {:>7} {:>5} {:>7}",
                     format!("{:?}", case.record),
@@ -574,14 +589,11 @@ fn every_crash_point_a_waiting_write_can_leave() {
                 temporary_left,
                 held_bytes,
             } => {
-                assert!(
-                    !open_refused(case.record),
-                    "{case} opened and was expected to be refused"
-                );
-                assert!(
-                    !quarantined,
-                    "{case}: D52's quarantine is for labels only and must not \
-                     claim a crash state (store.rs:1150-1157)"
+                assert_eq!(
+                    *quarantined,
+                    quarantines(case.record),
+                    "{case}: a record this hub cannot read is set aside, and a \
+                     record it can read is not (V10)"
                 );
 
                 // The record axis, on its own.
@@ -603,7 +615,16 @@ fn every_crash_point_a_waiting_write_can_leave() {
                         );
                         vanished += 1;
                     }
-                    other => unreachable!("{other:?} does not open"),
+                    // The four shapes V10 is about. The hub opens, the job is
+                    // out of the queue, and it is on the quarantine list
+                    // under its own name instead of taking the root down.
+                    Record::Torn | Record::Empty | Record::Nulled | Record::WrongVersion => {
+                        assert!(
+                            queued_with.is_none(),
+                            "{case}: a record nobody can read is not dispatched"
+                        );
+                        set_aside += 1;
+                    }
                 }
 
                 // The events axis, on its own — and it really is independent:
@@ -672,24 +693,30 @@ fn every_crash_point_a_waiting_write_can_leave() {
 
     println!("\n{} states built", cases.len());
     println!("  {refusals} refuse the whole state root at `JobDirStore::open`");
+    println!("  {set_aside} open with the damaged record quarantined by name (V10)");
     println!("  {vanished} open with the job silently gone from the queue");
     println!("  {ahead} leave `events.jsonl` AHEAD of `job.json` (D103's one rule)");
-    println!("  {temporaries_left} leave a stale temporary that nothing removes");
-    println!("  0 are quarantined (D52 covers labels only, store.rs:1150-1157)\n");
+    println!("  {temporaries_left} leave a stale temporary that nothing removes\n");
 
-    // 4 of the 7 record shapes refuse, in every combination of the other two
-    // axes: 4 x 11 x 4.
+    // **Zero, and that is V10.** Four of the seven record shapes used to
+    // refuse the whole state root in every combination of the other two
+    // axes — 176 of the 308 states, each one a hub that would not start.
     assert_eq!(
-        refusals,
+        refusals, 0,
+        "no damaged record refuses a whole state root any more"
+    );
+    // Those same 4 x 11 x 4 states now quarantine one job instead.
+    assert_eq!(
+        set_aside,
         4 * 11 * 4,
-        "the refusal is a property of the record alone"
+        "the quarantine is a property of the record alone"
     );
     assert_eq!(vanished, 11 * 4, "so is the vanishing");
     assert_eq!(ahead, 4, "one event shape runs ahead of the older record");
     assert_eq!(
         temporaries_left,
-        3 * 11 * 3,
-        "three shapes of temporary, three records that open"
+        3 * 11 * 7,
+        "three shapes of temporary, and every record shape opens since V10"
     );
 }
 
@@ -697,19 +724,21 @@ fn every_crash_point_a_waiting_write_can_leave() {
 // The findings, each on its own, so a reader can run one
 // ---------------------------------------------------------------------------
 
-/// **The headline.** A `job.json` this hub cannot parse does not quarantine
-/// one job: it refuses the whole state root, and the hub does not start.
+/// **The headline, and what V10 changed about it.** A `job.json` this hub
+/// cannot read quarantines that one job: the hub opens, and the record is
+/// named with its path, kept out of the queue and left exactly as it was.
 ///
-/// The chain, at `2ca6dc7`: `store.rs:1141-1142` (the `?` on
-/// `serde_json::from_str`) → `store.rs:899` (`self.read_stored(&id)?` in
-/// `recover`) → `store.rs:436` (`store.recover()?` in `open_with`).
-///
-/// It is not avoidable by the index, either. `usable_index` reads every
-/// record the index leaves out, and an unreadable one there sets the index
-/// aside (`store.rs:1052-1054`) so that `recover` reads it again and refuses.
+/// It used to refuse the whole state root. The chain, at `2ca6dc7`:
+/// `store.rs:1339-1340` (the `?` on `serde_json::from_str`) →
+/// `store.rs:1097` (`self.read_stored(&id)?` in `recover`) →
+/// `store.rs:481` (`store.recover()?` in `open_with`) → `main.rs:358`
+/// (`main()`'s `?`), which is seventy-six lines before `Hub::bind_with` at
+/// `main.rs:434`. The port never opened, so a container restarted into the
+/// same wall for ever, and the quarantine shape used here already existed
+/// three lines away at `store.rs:1351-1354` for a rejected label set.
 #[test]
 #[ignore = "ORCH-080's enumeration; run with --ignored"]
-fn a_torn_record_refuses_the_whole_state_root() {
+fn a_record_this_hub_cannot_read_quarantines_one_job_and_the_hub_starts() {
     for shape in [
         Record::Torn,
         Record::Empty,
@@ -722,22 +751,36 @@ fn a_torn_record_refuses_the_whole_state_root() {
             temporary: Temporary::None,
         });
         match verdict {
-            Verdict::Refused(why) => {
-                println!("{shape:?}: the hub will not start — {why}");
-                assert!(why.contains(RECORD_FILE));
+            Verdict::Opened {
+                quarantined,
+                queued_with,
+                ..
+            } => {
+                assert!(quarantined, "{shape:?} is set aside by name");
+                assert!(
+                    queued_with.is_none(),
+                    "{shape:?} is out of the queue, not dispatched"
+                );
+                println!("{shape:?}: the hub starts, and that one job is quarantined");
             }
-            other => panic!("{shape:?} was expected to refuse, got {}", other.headline()),
+            Verdict::Refused(why) => {
+                panic!("{shape:?} must no longer refuse the whole state root: {why}")
+            }
         }
     }
 }
 
-/// A second job on the same root goes down with the first. This is the
-/// operational fact: the blast radius of one unreadable record is the whole
-/// hub, and the consumer runs it in docker compose and cannot log into
-/// anything of ours (invariant 9, D161).
+/// **The blast radius of one unreadable record is that record.** Before V10 a
+/// second and a third job on the same root went down with the first: the
+/// operational fact, on a hub the consumer runs in docker compose and cannot
+/// log into anything of ours (invariant 9, D161).
+///
+/// So this case is the one the fix is measured by — three jobs, the middle
+/// record torn, and the two healthy ones must still be in the queue with the
+/// torn one named beside them.
 #[test]
 #[ignore = "ORCH-080's enumeration; run with --ignored"]
-fn one_torn_record_takes_every_other_job_with_it() {
+fn one_torn_record_costs_neither_of_the_two_healthy_jobs_beside_it() {
     let dir = tempfile::tempdir().expect("a temporary state root");
     let store = JobDirStore::open(dir.path()).expect("a fresh state root opens");
     let mut ids = Vec::new();
@@ -765,9 +808,30 @@ fn one_torn_record_takes_every_other_job_with_it() {
     let whole = read(&victim);
     fs::write(&victim, &whole[..whole.len() / 2]).expect("torn");
 
-    let error = JobDirStore::open(dir.path()).expect_err("the hub refuses the root");
-    println!("three jobs, one torn record: {error}");
-    assert!(error.to_string().contains(ids[1].as_str()));
+    let store = JobDirStore::open(dir.path()).expect("the hub starts on this root");
+    let queue: Vec<String> = store
+        .unfinished_jobs()
+        .expect("the queue lists")
+        .into_iter()
+        .map(|record| record.id.to_string())
+        .collect();
+    assert_eq!(
+        queue,
+        vec![ids[0].to_string(), ids[2].to_string()],
+        "both healthy jobs are still queued"
+    );
+    let quarantined = store.quarantined().expect("the quarantine lists");
+    assert_eq!(quarantined.len(), 1, "{quarantined:?}");
+    assert_eq!(quarantined[0].0, ids[1]);
+    assert!(
+        quarantined[0].1.contains(RECORD_FILE),
+        "the reason names the file: {}",
+        quarantined[0].1
+    );
+    println!(
+        "three jobs, one torn record: {} quarantined, {} and {} still queued",
+        ids[1], ids[0], ids[2]
+    );
 }
 
 /// **Step B's hazard, named.** The rename is lost and the event is not: the
