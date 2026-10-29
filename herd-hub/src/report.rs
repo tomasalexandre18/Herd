@@ -60,6 +60,12 @@ use crate::job::{OutputSummary, Timestamp, RECORD_VERSION};
 use crate::store::{
     directory_bytes, JOBS_DIR, KEPT_FILES_DIR, OUTPUT_GONE_DIR, OUTPUT_PARTS_DIR, RECORD_FILE,
 };
+// The measured-bytes rule, folded into `herd-proto` beside the rule for a
+// figure a human typed (ORCH-186). Every byte figure this report prints is
+// one somebody measured or one a record claims, never one an operator typed,
+// so `show_bytes` appears nowhere below: exactness first and never instead,
+// because every number here is evidence somebody will do arithmetic on.
+use herd_proto::size::measured_bytes;
 
 /// How many offenders of one kind the report names before it stops listing
 /// and says how many more there are. Ten, because the list exists to be
@@ -78,8 +84,15 @@ const NAMED_AT_MOST: usize = 10;
 /// manifest is and the report cannot drift from the record.
 #[derive(Debug, Deserialize)]
 struct RecordOutputs {
+    /// `None` when the key is not in the JSON at all, which is **not** the
+    /// same fact as a record that says version `0` and must not be reported
+    /// as one. A `u32` with `#[serde(default)]` read an absent field as
+    /// zero, and the refusal then said *"it carries record version 0"* —
+    /// describing a field that is missing as a field with a value in it.
+    /// `job.rs` draws the same line on `at_its_ceiling`: never read as zero,
+    /// because zero is a thing a record can mean.
     #[serde(default)]
-    record_version: u32,
+    record_version: Option<u32>,
     #[serde(default)]
     outputs: OutputSummary,
 }
@@ -399,14 +412,24 @@ impl StateRootReport {
                     continue;
                 }
             };
-            if parsed.record_version != RECORD_VERSION {
+            if parsed.record_version != Some(RECORD_VERSION) {
                 report.census.unread.push(Unread {
                     path: format!("{JOBS_DIR}/{name}/{RECORD_FILE}"),
-                    why: format!(
-                        "it carries record version {}, and this build reads version \
-                         {RECORD_VERSION}",
-                        parsed.record_version
-                    ),
+                    why: match parsed.record_version {
+                        Some(version) => format!(
+                            "it carries record version {version}, and this build reads \
+                             version {RECORD_VERSION}"
+                        ),
+                        // Said as absent, because that is a different fact
+                        // about the file and sends an operator somewhere
+                        // else: a version this build does not read is a
+                        // record from another layout, and no version at all
+                        // is a file that is probably not one of ours.
+                        None => format!(
+                            "it carries no record version at all, and this build reads \
+                             version {RECORD_VERSION}"
+                        ),
+                    },
                 });
                 continue;
             }
@@ -593,29 +616,6 @@ fn rank(n: usize, k: u32) -> usize {
     (rank.max(1) as usize).min(n as usize)
 }
 
-/// A byte count as this report prints one: the exact figure always, and an
-/// approximation beside it once the exact figure stops being readable.
-///
-/// Exactness first and never instead: every number here is evidence somebody
-/// will do arithmetic on, and a rounded one is how a figure gets quoted back
-/// as the figure it was not.
-fn bytes_said(bytes: u64) -> String {
-    const KIB: u64 = 1 << 10;
-    const MIB: u64 = 1 << 20;
-    const GIB: u64 = 1 << 30;
-    if bytes < KIB {
-        return format!("{bytes} bytes");
-    }
-    let (scale, unit) = if bytes >= GIB {
-        (GIB, "GiB")
-    } else if bytes >= MIB {
-        (MIB, "MiB")
-    } else {
-        (KIB, "KiB")
-    };
-    format!("{bytes} bytes ({:.2} {unit})", bytes as f64 / scale as f64)
-}
-
 /// A ratio, or the sentence that says there was nothing to divide.
 fn ratio_said(ratio: Option<f64>) -> String {
     match ratio {
@@ -683,10 +683,53 @@ impl fmt::Display for StateRootReport {
         for unread in self.census.unread.iter().take(NAMED_AT_MOST) {
             writeln!(f, "    {}: {}", unread.path, unread.why)?;
         }
-        if let Some(more) = self.census.unread.len().checked_sub(NAMED_AT_MOST) {
-            if more > 0 {
-                writeln!(f, "    and {more} more")?;
-            }
+        // The fraction beside the names rather than a bare `and N more`.
+        // Ten names on a root of 1571 unreadable records is ten names out of
+        // 1571, and an operator who cannot see that cannot tell whether the
+        // list is the whole defect or a sample of it. The bound itself stays
+        // at [`NAMED_AT_MOST`] -- a list of 1571 paths is a number, which
+        // the count already is -- so the line says where the rest are
+        // instead of printing them.
+        if self.census.unread.len() > NAMED_AT_MOST {
+            writeln!(
+                f,
+                "    ^ these are the first {NAMED_AT_MOST} of {}, in job-id order. The rest are",
+                self.census.unread.len()
+            )?;
+            writeln!(
+                f,
+                "      later in `ls {JOBS_DIR}/` than the last name above; this report names"
+            )?;
+            writeln!(f, "      no more of them and no other file lists them.")?;
+        }
+        // Every record unread, which until now printed no banner at all:
+        // `records read 0`, up to ten names, and then sections 1 to 3 in
+        // full -- deduplication ratios, distinct digest counts and budget
+        // arithmetic, every one of them over zero records. That reads as an
+        // answer rather than as a refusal, which is the worse failure of the
+        // two, so it gets the shape the unreadable `jobs/` directory above
+        // already has.
+        //
+        // **It stays a report and does not become a refusal.** No exit code,
+        // no early return, and the sections below still print: `report`
+        // exists to be runnable on a state root a hub will not open, two
+        // published release pages say so, and an operator reaches for it
+        // precisely when the records cannot be read. A command that refused
+        // here would refuse in the one case it was built for. So this prints
+        // a banner and `herd-hub report` still exits 0.
+        if self.census.read == 0 && !self.census.unread.is_empty() {
+            writeln!(
+                f,
+                "  NOT ONE RECORD COULD BE PARSED BY THIS BUILD, so every figure below is"
+            )?;
+            writeln!(
+                f,
+                "  about no records at all and about nothing else: the jobs directory was"
+            )?;
+            writeln!(
+                f,
+                "  read, the records are there, and not one of them became a figure."
+            )?;
         }
         writeln!(f)?;
 
@@ -720,7 +763,7 @@ impl fmt::Display for StateRootReport {
             f,
             "  files whose record carries no digest  {} ({})",
             self.undigested_files,
-            bytes_said(self.undigested_bytes)
+            measured_bytes(self.undigested_bytes)
         )?;
         writeln!(
             f,
@@ -800,25 +843,25 @@ impl fmt::Display for StateRootReport {
                 f,
                 "  decile {}                   {}",
                 index + 1,
-                bytes_said(*decile)
+                measured_bytes(*decile)
             )?;
         }
         writeln!(
             f,
             "  maximum                    {}",
-            bytes_said(self.sizes.max)
+            measured_bytes(self.sizes.max)
         )?;
         writeln!(
             f,
             "  over the whole population  {}",
-            bytes_said(self.sizes.bytes)
+            measured_bytes(self.sizes.bytes)
         )?;
         match self.sizes.top_decile_share() {
             Some(share) => writeln!(
                 f,
                 "  the largest {} record(s)    {}, {:.2}% of that",
                 self.sizes.top_decile_jobs,
-                bytes_said(self.sizes.top_decile_bytes),
+                measured_bytes(self.sizes.top_decile_bytes),
                 share * 100.0
             )?,
             None => writeln!(
@@ -851,18 +894,18 @@ impl fmt::Display for StateRootReport {
             f,
             "  records still claiming their bytes  {} job(s), {}",
             accounting.claiming_jobs,
-            bytes_said(accounting.claimed_bytes)
+            measured_bytes(accounting.claimed_bytes)
         )?;
         writeln!(
             f,
             "  records whose bytes were removed    {} job(s), {}",
             accounting.removed_jobs,
-            bytes_said(accounting.removed_bytes)
+            measured_bytes(accounting.removed_bytes)
         )?;
         writeln!(
             f,
             "  every files/ directory measures     {}",
-            bytes_said(accounting.measured_bytes)
+            measured_bytes(accounting.measured_bytes)
         )?;
         let (order, gap) = accounting.gap();
         match order {
@@ -873,12 +916,12 @@ impl fmt::Display for StateRootReport {
             std::cmp::Ordering::Greater => writeln!(
                 f,
                 "  THE RECORDS CLAIM {} MORE THAN THE DIRECTORIES MEASURE",
-                bytes_said(gap)
+                measured_bytes(gap)
             )?,
             std::cmp::Ordering::Less => writeln!(
                 f,
                 "  THE DIRECTORIES MEASURE {} MORE THAN THE RECORDS CLAIM",
-                bytes_said(gap)
+                measured_bytes(gap)
             )?,
         }
         writeln!(
@@ -929,9 +972,9 @@ impl fmt::Display for StateRootReport {
                     f,
                     "    {JOBS_DIR}/{}: claims {}, files/ measures {}, short by {}",
                     short.job,
-                    bytes_said(short.claimed),
-                    bytes_said(short.measured),
-                    bytes_said(short.shortfall())
+                    measured_bytes(short.claimed),
+                    measured_bytes(short.measured),
+                    measured_bytes(short.shortfall())
                 )?;
             }
             if let Some(more) = accounting
@@ -950,7 +993,7 @@ impl fmt::Display for StateRootReport {
             accounting.removed_but_present.len()
         )?;
         for (name, bytes) in accounting.removed_but_present.iter().take(NAMED_AT_MOST) {
-            writeln!(f, "    {JOBS_DIR}/{name}: {}", bytes_said(*bytes))?;
+            writeln!(f, "    {JOBS_DIR}/{name}: {}", measured_bytes(*bytes))?;
         }
         if let Some(more) = accounting
             .removed_but_present
@@ -965,7 +1008,7 @@ impl fmt::Display for StateRootReport {
             f,
             "  {OUTPUT_PARTS_DIR}/ unfinished collection   {} job(s), {}",
             accounting.parts_dirs,
-            bytes_said(accounting.parts_bytes)
+            measured_bytes(accounting.parts_bytes)
         )?;
         if !accounting.parts_jobs.is_empty() {
             writeln!(
@@ -981,7 +1024,7 @@ impl fmt::Display for StateRootReport {
                 "    into it right now, or it may be what one that died left behind."
             )?;
             for (name, bytes) in accounting.parts_jobs.iter().take(NAMED_AT_MOST) {
-                writeln!(f, "    {JOBS_DIR}/{name}: {}", bytes_said(*bytes))?;
+                writeln!(f, "    {JOBS_DIR}/{name}: {}", measured_bytes(*bytes))?;
             }
             if let Some(more) = accounting.parts_jobs.len().checked_sub(NAMED_AT_MOST) {
                 if more > 0 {
@@ -993,7 +1036,7 @@ impl fmt::Display for StateRootReport {
             f,
             "  {OUTPUT_GONE_DIR}/ a sweep left behind     {} job(s), {}",
             accounting.gone_dirs,
-            bytes_said(accounting.gone_bytes)
+            measured_bytes(accounting.gone_bytes)
         )?;
         Ok(())
     }
@@ -1001,12 +1044,16 @@ impl fmt::Display for StateRootReport {
 
 fn write_dedup(f: &mut fmt::Formatter<'_>, dedup: &Dedup) -> fmt::Result {
     writeln!(f, "    files with a digest    {}", dedup.files)?;
-    writeln!(f, "    bytes they name        {}", bytes_said(dedup.bytes))?;
+    writeln!(
+        f,
+        "    bytes they name        {}",
+        measured_bytes(dedup.bytes)
+    )?;
     writeln!(f, "    distinct sha256        {}", dedup.digests)?;
     writeln!(
         f,
         "    bytes over distinct    {}",
-        bytes_said(dedup.distinct_bytes)
+        measured_bytes(dedup.distinct_bytes)
     )?;
     writeln!(
         f,
@@ -1014,4 +1061,282 @@ fn write_dedup(f: &mut fmt::Formatter<'_>, dedup: &Dedup) -> fmt::Result {
         ratio_said(dedup.ratio())
     )?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::Path;
+
+    /// The moment the rendered text is pinned to, so an assertion is about
+    /// the figures and not about when it ran: 2026-10-28T00:00:00Z.
+    const PINNED: i64 = 1_793_145_600;
+
+    /// A record naming no output at all, which is what most jobs are.
+    ///
+    /// **Its version is [`RECORD_VERSION`] and not a literal `1`.** A
+    /// hand-written fixture that spells the version out becomes an *unread*
+    /// record the day the constant moves, and a test whose whole intent is
+    /// "a record this build reads" would then silently assert the opposite.
+    fn readable(id: &str) -> serde_json::Value {
+        serde_json::json!({
+            "record_version": RECORD_VERSION,
+            "id": id,
+            "command": ["true"],
+            "state": { "type": "finished", "outcome": { "type": "exited", "code": 0 } },
+        })
+    }
+
+    /// The same record, from a layout this build does not read — whichever
+    /// version this build is.
+    fn from_another_layout(id: &str) -> serde_json::Value {
+        let mut record = readable(id);
+        record["record_version"] = serde_json::json!(RECORD_VERSION + 1);
+        record
+    }
+
+    /// Write one job directory: its `job.json`, and nothing else.
+    fn job_dir(root: &Path, name: &str, record: Option<serde_json::Value>) {
+        let dir = root.join(JOBS_DIR).join(name);
+        fs::create_dir_all(&dir).expect("the job directory is made");
+        if let Some(record) = record {
+            fs::write(
+                dir.join(RECORD_FILE),
+                serde_json::to_vec_pretty(&record).expect("the record serialises"),
+            )
+            .expect("the record is written");
+        }
+    }
+
+    fn rendered(root: &Path) -> String {
+        let mut report = StateRootReport::read(root).expect("a report, never a refusal");
+        report.at = Timestamp::at_unix_seconds(PINNED);
+        report.to_string()
+    }
+
+    /// **Every record unread, which the report used to print as an answer.**
+    ///
+    /// Before this, such a root printed `records read 0`, up to ten names
+    /// with their reasons, and then sections 1 to 3 in full: deduplication
+    /// ratios, distinct digest counts and budget arithmetic, every figure of
+    /// it over zero records, with no banner saying so. It exits 0, so it
+    /// read as an answer rather than as the refusal it is.
+    ///
+    /// Two things are asserted together here and the second is not a
+    /// detail: the banner fires, **and this is still a report**. `read`
+    /// returns `Ok`, every section still prints, and the zeros are still
+    /// there to be read. `herd-hub report` exists to be runnable on a state
+    /// root a hub will not open, which is exactly when records cannot be
+    /// read; a version of it that refused here would refuse in the one case
+    /// it was built for.
+    #[test]
+    fn a_root_where_no_record_could_be_read_says_so_and_is_still_a_report() {
+        let dir = tempfile::tempdir().expect("a temporary directory");
+        let root = dir.path();
+        for n in 1..=3u64 {
+            let name = format!("j{n:0>10}");
+            job_dir(root, &name, Some(from_another_layout(&name)));
+        }
+
+        let report = StateRootReport::read(root).expect("a report, never a refusal");
+        assert_eq!(report.census.directories, 3);
+        assert_eq!(report.census.read, 0, "not one record became a figure");
+        assert_eq!(report.census.unread.len(), 3);
+
+        let text = rendered(root);
+        assert!(
+            text.contains(
+                "  NOT ONE RECORD COULD BE PARSED BY THIS BUILD, so every figure below is\n  \
+                 about no records at all and about nothing else: the jobs directory was\n  \
+                 read, the records are there, and not one of them became a figure.\n"
+            ),
+            "the all-unread banner is missing:\n{text}"
+        );
+
+        // And it is still a report: the sections print and their figures are
+        // zeros an operator can read beside the reason they are zeros.
+        assert!(
+            text.contains("1. file-level deduplication (r_file)\n"),
+            "{text}"
+        );
+        assert!(
+            text.contains("2. per-job output size, by decile\n"),
+            "{text}"
+        );
+        assert!(
+            text.contains("3. the records against the directories\n"),
+            "{text}"
+        );
+        assert!(
+            text.contains("  population                 0 records\n"),
+            "the sections still print, over nothing:\n{text}"
+        );
+        assert_eq!(
+            report.ever.files, 0,
+            "no figure came out of an unread record"
+        );
+        assert_eq!(report.accounting.claimed_bytes, 0);
+    }
+
+    /// The banner is about *that* case and fires on nothing else.
+    ///
+    /// A root whose records are simply not there yet is a state and not a
+    /// fault. Without this, a condition that drifted to `read == 0` alone
+    /// would start shouting at every fresh state root.
+    #[test]
+    fn a_root_with_no_records_yet_is_not_a_root_whose_records_failed() {
+        let dir = tempfile::tempdir().expect("a temporary directory");
+        let root = dir.path();
+        job_dir(root, "j0000000001", None);
+        job_dir(root, "j0000000002", None);
+
+        let report = StateRootReport::read(root).expect("the report reads this root");
+        assert_eq!(report.census.read, 0);
+        assert_eq!(report.census.without_record, 2);
+        assert!(report.census.unread.is_empty());
+        let text = rendered(root);
+        assert!(
+            !text.contains("NOT ONE RECORD COULD BE PARSED"),
+            "two directories waiting for their first record are not a failure:\n{text}"
+        );
+    }
+
+    /// And a root it read prints no banner at all, which is the control for
+    /// the two above.
+    #[test]
+    fn a_root_this_build_reads_carries_no_banner() {
+        let dir = tempfile::tempdir().expect("a temporary directory");
+        let root = dir.path();
+        job_dir(root, "j0000000001", Some(readable("j0000000001")));
+
+        let report = StateRootReport::read(root).expect("the report reads this root");
+        assert_eq!(report.census.read, 1);
+        assert!(report.census.unread.is_empty());
+        let text = rendered(root);
+        assert!(!text.contains("NOT ONE RECORD COULD BE PARSED"), "{text}");
+        assert!(!text.contains("COULD NOT BE READ"), "{text}");
+        assert!(
+            text.contains("  records read                       1\n"),
+            "{text}"
+        );
+    }
+
+    /// A record with **no** `record_version` key is called absent, not zero.
+    ///
+    /// `#[serde(default)]` on a `u32` read a missing field as `0`, and the
+    /// line then said *"it carries record version 0"* — a sentence about a
+    /// field with a value in it, printed about a file that has no such
+    /// field. The two send an operator to different places: a version this
+    /// build does not read is a record from another layout, and no version
+    /// at all is a file that is probably not one of ours.
+    #[test]
+    fn a_record_with_no_version_field_is_named_absent_and_never_as_version_zero() {
+        let dir = tempfile::tempdir().expect("a temporary directory");
+        let root = dir.path();
+
+        // The field removed, not set to zero.
+        let mut no_version = readable("j0000000001");
+        no_version
+            .as_object_mut()
+            .expect("the record is an object")
+            .remove("record_version");
+        assert!(no_version.get("record_version").is_none());
+        job_dir(root, "j0000000001", Some(no_version));
+        // A record this build does read, so this test is about the wording
+        // and not about the banner above.
+        job_dir(root, "j0000000002", Some(readable("j0000000002")));
+        // And one that really says zero, which must still read as a version
+        // somebody wrote: zero is a thing a record can say.
+        let mut zero = readable("j0000000003");
+        zero["record_version"] = serde_json::json!(0);
+        job_dir(root, "j0000000003", Some(zero));
+
+        let report = StateRootReport::read(root).expect("the report reads this root");
+        assert_eq!(report.census.read, 1);
+        assert_eq!(report.census.unread.len(), 2);
+        assert_eq!(
+            report.census.unread[0].why,
+            format!(
+                "it carries no record version at all, and this build reads version \
+                 {RECORD_VERSION}"
+            ),
+            "an absent field is said to be absent"
+        );
+        assert!(
+            !report.census.unread[0].why.contains("version 0"),
+            "the one sentence this must never print again: {}",
+            report.census.unread[0].why
+        );
+        assert_eq!(
+            report.census.unread[1].why,
+            format!(
+                "it carries record version 0, and this build reads version \
+                 {RECORD_VERSION}"
+            ),
+        );
+        assert!(
+            rendered(root)
+                .contains("jobs/j0000000001/job.json: it carries no record version at all"),
+            "{}",
+            rendered(root)
+        );
+    }
+
+    /// Ten names out of thirteen is said to be ten of thirteen.
+    ///
+    /// The bound is not raised: a list of 1571 paths is a number, which the
+    /// count on the line above already is. What was missing was the fraction
+    /// — an operator reading ten names could not tell whether the list was
+    /// the whole defect or a sample of it — and where the rest are.
+    #[test]
+    fn the_unread_list_says_what_fraction_of_the_pile_it_names() {
+        let dir = tempfile::tempdir().expect("a temporary directory");
+        let root = dir.path();
+        for n in 1..=13u64 {
+            let name = format!("j{n:0>10}");
+            job_dir(root, &name, Some(from_another_layout(&name)));
+        }
+        // One readable record, so the all-unread banner is not what is being
+        // read here.
+        job_dir(root, "j0000000014", Some(readable("j0000000014")));
+
+        let report = StateRootReport::read(root).expect("the report reads this root");
+        assert_eq!(report.census.read, 1);
+        assert_eq!(report.census.unread.len(), 13);
+
+        let text = rendered(root);
+        assert!(
+            text.contains("  records this build could not read  13\n"),
+            "the count is the whole thirteen:\n{text}"
+        );
+        // `NAMED_AT_MOST` is 10. Written out here rather than interpolated,
+        // so that changing it fails this test and somebody has to say the
+        // list got longer on purpose.
+        assert!(
+            text.contains(
+                "    ^ these are the first 10 of 13, in job-id order. The rest are\n      \
+                 later in `ls jobs/` than the last name above; this report names\n      \
+                 no more of them and no other file lists them.\n"
+            ),
+            "the fraction, and where the rest are:\n{text}"
+        );
+        assert!(
+            !text.contains("\n    and 3 more\n"),
+            "a bare count with no fraction is what this replaced:\n{text}"
+        );
+        for nth in 1..=10 {
+            assert!(
+                text.contains(&format!(
+                    "jobs/j{nth:0>10}/{RECORD_FILE}: it carries record version"
+                )),
+                "the first ten in job-id order are named:\n{text}"
+            );
+        }
+        for nth in 11..=13 {
+            assert!(
+                !text.contains(&format!("jobs/j{nth:0>10}/{RECORD_FILE}")),
+                "the eleventh onwards are counted, not named:\n{text}"
+            );
+        }
+    }
 }
