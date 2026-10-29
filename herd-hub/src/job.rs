@@ -2469,14 +2469,27 @@ mod a_ceiling_refusal_on_the_record {
         }
     }
 
-    /// **Neither version number moves.** Asserted here as well as in
-    /// `herd-hub/tests/announced_job_ceiling.rs`, because this is the file
-    /// whose rule the new field has to satisfy: `#[serde(default)]`, absent
-    /// meaning exactly what the default says, and therefore additive.
+    /// **Neither version number moves for the field.** Asserted here as well
+    /// as in `herd-hub/tests/announced_job_ceiling.rs`, because this is the
+    /// file whose rule the new field has to satisfy: `#[serde(default)]`,
+    /// absent meaning exactly what the default says, and therefore additive.
+    ///
+    /// **Two assertions, and the second is about the protocol and not about
+    /// the record.** `PROTOCOL_VERSION` moved 2 → 3 at D199, for M11's pack
+    /// half; the record version has not moved and moves to 2 in the same
+    /// batch, with the hub's own pack registry. Both stay **literals**: an
+    /// assertion written against the constant it is pinning catches nothing.
     #[test]
     fn the_record_version_does_not_move() {
-        assert_eq!(RECORD_VERSION, 1);
-        assert_eq!(herd_proto::PROTOCOL_VERSION, 2);
+        assert_eq!(
+            RECORD_VERSION, 1,
+            "the field is additive; D199 moves this to 2 with the pack registry"
+        );
+        assert_eq!(
+            herd_proto::PROTOCOL_VERSION,
+            3,
+            "3 is D199's bump for M11's pack half, and not for this field"
+        );
     }
 
     /// A record written by a hub **with** the field is read by one without

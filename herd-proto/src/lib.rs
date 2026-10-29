@@ -21,6 +21,7 @@ use serde::{de::DeserializeOwned, Deserialize, Serialize};
 pub mod capability;
 pub mod declaration;
 pub mod outputs;
+pub mod pack;
 pub mod placement;
 pub mod size;
 
@@ -39,6 +40,14 @@ pub use outputs::{
     check_relative, JobOutputs, OutputFile, FRAME_CEILING, INLINE_OUTPUT_MAX, OUTPUT_CHUNK_BYTES,
     PER_FILE_OVERHEAD,
 };
+pub use pack::{
+    peer_version_mismatch_reason, AskPack, AskTransferCapability, AssignedPack, ExpectTransfer,
+    FetchCapability, FetchPath, Holder, ManifestEntry, ManifestKind, PackHolders, PackId,
+    PackManifest, PackRefused, PackRegistered, PackState, PackTransferred, PackUnavailable,
+    PacksHeld, PeerRefusal, PeerReply, PeerRequest, PinPacks, ReadPacksAgain, RegisterPack,
+    TransferCapability, TransferDirection, CHATONS_PACK_FORMAT, MANIFEST_MAX_BYTES,
+    PACK_CAPABILITY_LIFETIME, PACK_CHUNK_BYTES, PACK_ENDPOINT_READ_BYTES,
+};
 pub use placement::{
     default_memory_floor_mib, parallelism_tokens, size_mib, with_parallelism, HostSize,
     Parallelism, PARALLELISM_TOKEN,
@@ -50,23 +59,40 @@ pub use size::{parse_bytes, show_bytes};
 /// not announce exactly this number is refused by name
 /// ([`version_mismatch_reason`]), whatever else it got right.
 ///
-/// **1 was the first deployed protocol and 2 is the first bump since the
-/// freeze** (D73, D148). The development numbers 2 to 8 each existed for a
-/// real format break, but every one of those breaks was made on a protocol
-/// nothing spoke outside this repository; carrying eight compatibility eras
-/// into a deployment would have described a history no peer ever lived. M16
-/// set the number back to 1, and from M16 on it is not a development counter —
-/// so **this 2 is a compatibility statement, approved by Alexa on
-/// 2026-10-16**: M11 needs frames for a job's streamed outputs and for the
-/// content registry, both of them new variants, and D124 and D128 between
-/// them make a new variant on either enum breaking whatever serde would
-/// tolerate.
+/// **1 was the first deployed protocol, 2 was the first bump since the
+/// freeze, and this 3 is the second and the last one planned** (D73, D148,
+/// D199). The development numbers 2 to 8 each existed for a real format
+/// break, but every one of those breaks was made on a protocol nothing spoke
+/// outside this repository; carrying eight compatibility eras into a
+/// deployment would have described a history no peer ever lived. M16 set the
+/// number back to 1, and from M16 on it is not a development counter — each
+/// move is a compatibility statement with Alexa's approval behind it.
 ///
-/// **And this is the bump that makes the next one cheaper, by exactly one
-/// enum arm.** Both frame enums now carry a `#[serde(other)]` catch-all, so a
-/// frame whose `type` a build has never heard of **decodes** instead of
-/// failing to. What each peer then does with it is deliberately different,
-/// and the difference is the whole value:
+/// **What 2 bought**: M11's record half — the frames for a job's streamed
+/// outputs and for the end of its collection (approved 2026-10-16).
+///
+/// **What 3 buys**: M11's **pack half**, and M12's pack-side surface riding
+/// with it. M11's own claim that version 2 was *"paid once for both halves"*
+/// is false and D205 corrected it: version 2 went on the record half alone,
+/// and the pack half — the frames by which a runner announces what it holds,
+/// registers a pack after its fsync, asks for one, and is authorised to move
+/// it to or from a peer (D10, D11, D200, D209) — was never numbered. It is
+/// numbered here, with M12's keeper and budget fields in the same move,
+/// because E-14 and E-16 are `must` expectations inside v1.0.0 (D205) and a
+/// second bump for them would be a fleet going quiet twice.
+///
+/// The types those frames carry live in [`pack`], including the peer wire
+/// between two runners: that leg never touches the hub (D10) and still
+/// belongs here (invariant 4). It gets **no number of its own** — both ends
+/// are joined to the same hub at this version — and
+/// [`pack::PeerRequest::protocol_version`] exists only so a mismatch is
+/// refused by name.
+///
+/// **And 2 is the bump that made this one cheaper, by exactly one enum arm.**
+/// Both frame enums carry a `#[serde(other)]` catch-all, so a frame whose
+/// `type` a build has never heard of **decodes** instead of failing to. What
+/// each peer then does with it is deliberately different, and the difference
+/// is the whole value:
 ///
 /// * a **runner** logs it and ignores it, because a frame it does not know is
 ///   work it is not needed for. Before this, the decode error killed the link
@@ -81,37 +107,44 @@ pub use size::{parse_bytes, show_bytes};
 ///   request it cannot read is work that will never be done, and silence
 ///   would leave the peer waiting for it.
 ///
-/// None of that makes a `FromHub` variant that can reach a requester free.
-/// The rule from D124 and D128 still stands for anything a requester sees;
-/// what has changed is that it no longer stands for the runner.
+/// **What moving it costs.** The handshake tests equality, not a floor: the
+/// day this becomes 3, every runner and every `herdctl` still built against 2
+/// is refused at the handshake and stays refused until its host is rebuilt —
+/// a fleet going quiet machine by machine, and requesters that cannot submit,
+/// out of one constant. Hub and peers move **together**, and the order they
+/// are moved in is decided before it lands. The sentence a refused peer reads
+/// says all of that ([`version_mismatch_reason`]), because the peer's
+/// operator is the person who can act on it and this doc comment is not where
+/// she is looking.
 ///
-/// **What moving it now costs.** The handshake tests equality, not a floor:
-/// the day this becomes 2, every runner and every `herdctl` still built
-/// against 1 is refused at the handshake and stays refused until its host is
-/// rebuilt — a fleet going quiet machine by machine, and requesters that
-/// cannot submit, out of one constant. So a bump is a compatibility statement:
-/// it needs Alexa's approval, and the order in which the hub and its peers are
-/// moved is decided before it lands.
+/// **What is NOT foreclosed, which is worth saying because it was once
+/// believed to be.** D204's stability promise constrains the **feature
+/// surface**, not this constant: it says the triple of D199 must move
+/// *before* v1.0.0, not that it may never move after. So the shapes that were
+/// additive before this bump are additive after it, and three of them are:
 ///
-/// **What still has to move it.** "Additive" is not the same as "an older peer
-/// survives it", and serde only half closes the gap. A frame whose `type` an
-/// older build has never heard of now decodes — into the catch-all described
-/// below — so it is an *ignorable* message rather than a read error. That is
-/// enough for a runner and **not** enough for a requester: `herdctl` refuses
-/// the frame on purpose, ending the run it was following with no verdict for
-/// a job that may well have passed, which is the shape of D117 and is the
-/// right behaviour (D124). So **adding a [`FromHub`] variant that can reach a
-/// requester is still a breaking change and still moves this number**,
-/// whatever serde would tolerate on the wire. A variant only a runner ever
-/// sees no longer is. A new *field* on an existing variant may leave the
-/// number alone, and only when it is `#[serde(default)]` *and* means, when
-/// absent, exactly what its default says.
+/// * a new `#[serde(default)]` field on an existing variant, when its absence
+///   means exactly what its default says (the precedent is `JobMetrics`'
+///   `pressure`, D73);
+/// * a new [`FromHub`] variant **only a runner ever sees** — the catch-all
+///   above is precisely what makes it free;
+/// * a new `#[serde(default)]` field in a record on disk.
+///
+/// **What still has to move it**, and therefore what had to be exhaustive
+/// here:
+///
+/// * a new [`ToHub`] variant. An older hub answers [`FromHub::Refused`] and
+///   drops the link, so there is no shrug available in that direction at all;
+/// * a new [`FromHub`] variant a **requester** can see: `herdctl` ends the
+///   run it was following, with no verdict for a job that may well have
+///   passed, which is the shape of D117 and is the right behaviour (D124);
+/// * removing a field, or re-meaning one, anywhere.
 ///
 /// The gap between two *builds* speaking the same protocol is a separate
 /// question with a separate answer ([`version_gap`], E-51): a minor gap is
 /// served with a note, a major one refused. This number only says whether two
 /// peers can read each other's frames at all.
-pub const PROTOCOL_VERSION: u32 = 2;
+pub const PROTOCOL_VERSION: u32 = 3;
 
 /// How often a runner says it is alive and what it is doing (E-40).
 ///
@@ -1896,6 +1929,19 @@ pub enum FromHub {
         /// stderr. The hub says it too.
         ///
         /// `None` is the ordinary case: the two builds agree.
+        ///
+        /// **`#[serde(default)]`, and the attribute is the whole of why this
+        /// field is safe.** It was the only `Option` on either frame enum
+        /// without it, which made a `Welcome` carrying no `version_note` key
+        /// a serde **missing-field error** rather than the
+        /// [`FromHub::Unknown`] the catch-all would have given it. That error
+        /// is outside everything the bump to 2 bought: it kills the link, the
+        /// runner redials, and it reads the same undecodable frame again —
+        /// D128's loop exactly, on the one frame where it matters most,
+        /// because `Welcome` is the frame a runner cannot get past. A
+        /// one-attribute fix, and the field it protects is the next one
+        /// anybody adds here.
+        #[serde(default)]
         version_note: Option<String>,
     },
     /// The hub declines to go on, and says why. Always the last frame.
@@ -2482,10 +2528,32 @@ pub fn workspace_refused_reason(limit: u64, detail: &str) -> String {
 
 /// The wording of a version refusal, so that every peer reads one sentence and
 /// a test can rely on it. Names both versions, as the handshake must.
+///
+/// **And says what the two numbers cost, because the person reading it is the
+/// one who can act on it.** [`PROTOCOL_VERSION`]'s own doc comment carries all
+/// of this — what is lost, that the test is equality and not a floor, that a
+/// fleet goes quiet machine by machine — and a doc comment is not where a
+/// runner's owner is looking when her machine has stopped taking work. She is
+/// looking at her runner's stderr, which is this sentence. So it has to say
+/// three things a pair of numbers does not:
+///
+/// * this peer **cannot work at all** until its host is rebuilt — it is not
+///   degraded, not slower, not missing a feature;
+/// * the same is true of every other peer on the old number, one at a time as
+///   each dials, so a fleet goes quiet machine by machine rather than all at
+///   once;
+/// * the check is **equality**, so hub and peers move **together** and
+///   either direction works: upgrade the peer, or roll the hub back. A peer
+///   newer than its hub is refused exactly as an older one is.
 pub fn version_mismatch_reason(announced: u32) -> String {
     format!(
         "protocol version mismatch: the hub speaks version {PROTOCOL_VERSION}, \
-         the peer announced version {announced}"
+         the peer announced version {announced}. This peer cannot work at all until its host is \
+         rebuilt — it will take no job and submit none, and every other peer still on version \
+         {announced} is refused the same way as it dials, so a fleet goes quiet machine by \
+         machine. The check is equality and not a floor, so the hub and its peers have to move \
+         together: rebuild this peer at version {PROTOCOL_VERSION}, or roll the hub back to \
+         version {announced}, but a peer and a hub on two different numbers never speak"
     )
 }
 

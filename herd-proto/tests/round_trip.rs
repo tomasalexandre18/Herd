@@ -1489,26 +1489,53 @@ fn a_wait_that_predates_wants_files_is_read_as_wanting_them() {
 
 /// `jobs_at_once` is additive in **both** directions, which is what the rule
 /// at `docs/decisions.md:7293` and `herd-hub/src/job.rs:44-51` actually ask
-/// for and what lets D181 ship without moving [`PROTOCOL_VERSION`].
+/// for: the field moved no version of its own.
 ///
 /// A field is additive only when a peer that does not know it and a peer that
 /// does can each read what the other wrote, **and** when what is missing
 /// means exactly what its default says. Both halves are asserted here,
 /// because only one of them is about serde:
 ///
-/// * **A hello from a peer built before the field** — the frame `main`
-///   produces today, written out literally rather than generated, so that a
-///   later edit to the struct cannot quietly change what "older" means —
-///   decodes with `jobs_at_once: None`. That is "it did not say", and §1 of
-///   the doc comment on the field is that this is never read as unlimited,
-///   never as zero and never as a figure derived from `host`.
+/// * **A hello from a peer built before the field** — written out literally
+///   rather than generated, so that a later edit to the struct cannot quietly
+///   change what "older" means — decodes with `jobs_at_once: None`. That is
+///   "it did not say", and §1 of the doc comment on the field is that this is
+///   never read as unlimited, never as zero and never as a figure derived
+///   from `host`.
 /// * **A hello from a peer built after it** is read by a deserialiser that
 ///   has never heard of the field. Modelled by a struct of exactly the fields
 ///   the older `Hello` had: serde ignores what it does not know, so the older
 ///   hub reads every figure it used to read and is merely one fact poorer.
+///
+/// ## What this test says about [`PROTOCOL_VERSION`], and what it does not
+///
+/// It used to be called *"without moving the version"* and its fixture was
+/// labelled *"the frame as `main` emits it"*. **Both became false at D199**,
+/// which moved the constant 2 → 3 for M11's pack half — and neither went red,
+/// because `herd-proto` validates no version and the last assertion compares
+/// the constant against a frame this test built *from* the constant. A green
+/// test whose claim is false is worse than a red one, so the claim is stated
+/// properly here instead:
+///
+/// * the literal fixture is a hello from a peer built **before the field**,
+///   which was also before the bump, so it announces 2. **That is a frame the
+///   hub now refuses at the handshake** ([`herd_proto::version_mismatch_reason`]),
+///   and this test asserts nothing about whether it would be admitted — only
+///   that serde reads every field of it, which is what additiveness means and
+///   is a separate question from admission. The test says so out loud below;
+/// * the additiveness claim is then made again at **this build's** version,
+///   where it is not entangled with the bump at all: a hello announcing
+///   [`PROTOCOL_VERSION`] and carrying no `jobs_at_once` key decodes as
+///   `None` exactly the same way.
 #[test]
 fn a_hello_carries_its_job_ceiling_in_both_directions_without_moving_the_version() {
-    // ---- Older peer → today's code. The frame as `main` emits it.
+    // ---- Older peer → today's code.
+    //
+    // A peer built before the field, and therefore before D199's bump: it
+    // announces protocol 2, which the hub refuses at the handshake today.
+    // Nothing here is about admission — only about serde reading every field
+    // of a frame an older build wrote, which is the whole of what "additive"
+    // claims.
     let from_before = r#"{"type":"hello","protocol_version":2,"peer_version":"0.3.7",
         "role":"runner","name":"wsl-pc","instance":"run-4242",
         "host":{"memory_mib":17408,"threads":20,"memory_floor_mib":3481},
@@ -1531,6 +1558,40 @@ fn a_hello_carries_its_job_ceiling_in_both_directions_without_moving_the_version
     // change that moved another figure would not be additive.
     assert_eq!(host.memory_mib, Some(17408));
     assert_eq!(preference, 10);
+
+    // Said out loud rather than left as the reader's inference: that fixture
+    // is **not** a frame this hub admits. It decodes, which is what this test
+    // is about, and it would be refused at the handshake, which this test
+    // does not test. The two are different questions and the old name of this
+    // test ran them together.
+    let ToHub::Hello {
+        protocol_version, ..
+    } = from_frame::<ToHub>(from_before).expect("decodes")
+    else {
+        panic!("that frame is a hello");
+    };
+    assert_ne!(
+        protocol_version, PROTOCOL_VERSION,
+        "the fixture is a pre-bump peer on purpose; if it ever announces this build's version \
+         the fixture has stopped standing in for an older one"
+    );
+
+    // ---- And the same claim at this build's own version, where it is not
+    // entangled with D199's bump: no `jobs_at_once` key still means "did not
+    // say", whatever the number in the handshake is.
+    let today = format!(
+        r#"{{"type":"hello","protocol_version":{PROTOCOL_VERSION},"peer_version":"0.4.1",
+        "role":"runner","name":"wsl-pc","switch":{{"position":"on"}}}}"#
+    );
+    let ToHub::Hello { jobs_at_once, .. } =
+        from_frame::<ToHub>(&today).expect("a hello at this version decodes")
+    else {
+        panic!("that frame is a hello");
+    };
+    assert_eq!(
+        jobs_at_once, None,
+        "the field's default is what it is at every protocol version, and that is the claim"
+    );
 
     // ---- Today's peer → an older deserialiser.
     let with_ceiling = to_frame(&ToHub::Hello {
@@ -1572,6 +1633,10 @@ fn a_hello_carries_its_job_ceiling_in_both_directions_without_moving_the_version
     }
     let older: HelloAsAnOlderHubReadsIt =
         serde_json::from_str(&with_ceiling).expect("an older hub reads a newer runner's hello");
+    // Not a version check: `with_ceiling` was built *from* the constant, so
+    // this says serde carried the field across and nothing about what any
+    // version is. The version check is the hub's, on equality, at the
+    // handshake.
     assert_eq!(older.protocol_version, PROTOCOL_VERSION);
     assert_eq!(older.peer_version, "0.3.8");
     assert_eq!(older.name.as_deref(), Some("wsl-pc"));
