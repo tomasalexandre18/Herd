@@ -11121,3 +11121,252 @@ leave nobody able to say what had been lost.
 `herd-hub/tests/durability.rs`;
 `history/2026-10-29-v10-quarantine.md`; **D52**; ORCH-106, ORCH-161,
 ORCH-183.
+
+---
+
+## 2026-10-29 — D219 The RECORD_VERSION arm quarantines too, not refuses
+
+**Context.** D218 put a record the hub cannot read on D52's quarantine
+path, and its *Choice* includes a record "of a record version this build
+does not read". Two documents had published the opposite promise and
+neither was corrected with it:
+`docs/remediation/13-crash-point-enumeration.md` §5 point 1 argued the
+version arm "should probably stay an error", and `docs/operating.md` — the
+page shipped to the first consumer's operator, who nobody here may reach
+(D161, invariant 9) — told them the mismatch "stays a hard error, because
+damage and a wrong binary are different failures". D218 recorded the
+choice and not the reversal.
+
+**Choice.** The reversal stands, and is recorded here rather than left in
+a superseded dossier. **The downgrade guard is `LAYOUT_VERSION`**, read
+once out of `store.json` in `open_with`, which still refuses a whole root
+by name. The per-record `RECORD_VERSION` arm quarantines, per record.
+
+**What this costs, and it is not nothing.** A build whose `RECORD_VERSION`
+differs from the root's while its `LAYOUT_VERSION` matches now **starts
+and serves an empty queue**: every record is quarantined, each named with
+its path, with the count on the line that says the hub is listening. That
+is loud but it is not a refusal, and **D199 names v1.0.0 as the release
+that moves these numbers**. Either v1.0.0 moves `LAYOUT_VERSION` with
+`RECORD_VERSION` — which the four-step procedure in `docs/operating.md`
+already assumes — or that release needs a guard of its own. That choice is
+ORCH-204, opened by this landing.
+
+**Alternative rejected.** Returning the version arm to a hard error. It
+would put back the defect D218 removed for the one record shape an
+operator is least able to diagnose, and `LAYOUT_VERSION` already carries
+the format contract at the only granularity where refusing is right: the
+whole root.
+
+**Evidence.** `herd-hub/src/store.rs` (`open_with`'s layout check against
+`read_stored`'s version arm); `herd-hub/tests/durability.rs`;
+`docs/operating.md` §*When a version refusal names two figures* and
+§*A torn `job.json`…*; `docs/remediation/13-crash-point-enumeration.md`
+amendment; **D218**, **D52**, **D199**; ORCH-183, ORCH-203, ORCH-204;
+`history/2026-10-29-operator-truth-quarantine.md`.
+
+---
+
+## 2026-10-29 — D220 A runner does not hold reclaimable cache against its room
+
+**Context.** `herd-runner/src/room.rs` subtracted the enclosing cgroup's
+`memory.current` whole, and `memory.current` counts page cache, so a
+runner on a machine that had merely read files announced a fraction of its
+room — 3224 MiB under an 18 GiB ceiling on this project's host while
+`MemAvailable` said 22.3 GiB — and broke E-22's promise of `MemTotal`
+unless the owner says otherwise.
+
+**Choice.** The charge is subtracted less its reclaimable file pages, and
+the reclaimable figure is **`inactive_file` less `shmem`**, not `file`:
+`inactive_file` is what the kernel drops first, `active_file` may be in
+use and stays charged, and `shmem` is swap-backed rather than droppable
+while still sitting on the file LRUs — and a runner's workspaces live on a
+tmpfs (D79). The figure is a **floor** on the room, never an estimate of
+it, because erring towards less room is the only direction invariant 2
+allows. `scripts/bench-preflight.sh` carries the same arithmetic, as its
+own comment requires.
+
+**What it does not prove.** `inactive_file` is a floor and a moving one:
+under real pressure the kernel ages `active_file` down and reclaims it
+too, so a runner on a host with a hot, mostly-active cache still
+under-announces. That is the direction invariant 2 requires. Settling it
+would need a real reclaim run, not more arithmetic. And the real-cgroup
+half of this arithmetic,
+`a_tighter_enclosing_memory_max_lowers_the_room_that_is_announced`, is one
+of this host's twelve delegation skips, so the rule is proved against
+fixtures plus two reads of this host and never against a cgroup Herd made
+itself.
+
+**Alternative rejected.** Subtracting `file` whole, which would have
+counted `active_file` as free and announced room the host would not in
+fact yield — an over-announcement, which is the one direction invariant 2
+forbids.
+
+**Evidence.** `herd-runner/src/room.rs`; `scripts/bench-preflight.sh`;
+E-22, invariant 2, **D79**; two readings on this host, 2026-10-29
+22:44:53 CET — old script 3054 MiB and REFUSED, new script 10181 MiB and
+"ok, safe to start", same `memory.stat`;
+`history/2026-10-29-room-honest.md`; ORCH-198.
+
+---
+
+## 2026-10-29 — D221 A swept spool is judged on an answer, never on a silence
+
+**Context.** 37.6 GiB of spools were set aside on this project's first
+consumer, and the cause was not the silence D211 and D19 describe. The hub
+had in fact answered — *"has every file of its collection"*, 244 times for
+75 collections — and the runner discarded the answer, then condemned the
+collection for a silence that had never happened (ORCH-192). D19's rule
+that a result the hub cannot persist is never destroyed, and D211's rule
+that removal stays on the hub's sentence, were both being applied to a
+sentence the runner had thrown away.
+
+**Choice.** A swept collection may be set aside **only on a silence the
+hub has already had the chance to break**: its whole offer is on the link,
+a health report queued after the last chunk of that offer has been
+answered, and no frame naming the collection arrived in between. The
+barrier is exactly
+
+```
+files.swept && !files.heard && files.offered_at.is_some_and(|at| at < recorded)
+```
+
+where `recorded` is `inner.reports_recorded` read in the same `with(…)`
+that incremented it, so nothing can be queued between the count and the
+judgement, and `<` not `<=` because `offered_at` is the number of reports
+*already queued* when the offer finished. `FilesOut::probed: bool` becomes
+`offered_at: Option<u64>`, and one private free function,
+`queue_a_health_report(&mut Inner) -> bool`, is the only place that builds,
+queues and counts a report — taking `&mut Inner` precisely so that whatever
+queued the frame is what counted it.
+
+**This narrows D19 and D211 rather than reversing either.** Both said a
+spool is removed only on the hub's sentence and never on the runner's
+guess; neither said what counts as the hub having had its chance to pass
+sentence. This entry supplies that, and it is strictly harder to condemn a
+collection than before. No version number moves, no frame and no record
+shape changes.
+
+**Alternative rejected.** ORCH-194's `JobFilesRefused` frame, which is
+behind D199's version move and would not remove the need for this rule: a
+runner still has to know when a silence is a silence.
+
+**Residue.** The sweep's module doc and `spools_resumed.rs`'s doc comment
+are still wrong about silence and about a re-offer being refused. The
+re-offer costs about **two** chunks per collection rather than one
+(ORCH-205).
+
+**Evidence.** `herd-runner/src/lib.rs`;
+`herd-hub/tests/spool_offer_answered.rs`, the reproduction off `#[ignore]`
+and asserting the fix; **D19**, **D211**, **D199**; ORCH-192, ORCH-194,
+ORCH-205; `history/2026-10-29-spool-offer-fix.md`,
+`history/2026-10-29-spool-offer-repro.md`.
+
+---
+
+## 2026-10-29 — D222 The mesh-address rule, and both invariant-3 guards
+
+**Context.** D11 (Alexa, 2026-10-12) amended invariant 3 so a runner may
+listen on a private mesh interface to serve content to peers, under three
+conditions, the first of which is a startup condition: a configuration
+that would bind a public or default interface is refused at startup, the
+way a bad data root is (E-45). Nothing enforced it, because nothing
+listened; `herd-runner/tests/confinement.rs` instead asserted that the
+runner binds nothing at all, in two guards whose own comments said they
+would change when the fetch endpoint arrived.
+
+**Choice.** `--mesh-listen ADDR` is refused at startup, naming the address
+and the reason, for a wildcard (`0.0.0.0`, `::`), for an address of the
+default-route interface, and for a globally routable address. It is
+accepted for loopback and for a private, CGNAT (`100.64/10`), link-local
+or unique-local address not on the default-route interface.
+`--mesh-advertise` defaults to the listen address, carries the same class
+rule and no routing check, and is refused with no `--mesh-listen`. Where
+the host's routing cannot be read at all, everything but loopback is
+refused rather than guessed at.
+
+Both guards are replaced, and the second gets **stronger**:
+`every_listening_socket_of_the_runner_is_its_mesh_address` asserts that
+every listening socket of the real process is the configured mesh address
+and that there is at most one, after first proving the walk can find a
+socket planted on purpose;
+`no_module_of_the_runner_can_bind_a_socket` permits `TcpListener` in
+exactly one named module — `herd-runner/src/mesh.rs`, which owns
+`mesh::MeshListener` — and keeps `UdpSocket`, `UnixListener` and
+`UnixDatagram` forbidden everywhere, that module included. One named
+module is a tighter statement than "nowhere" plus an exception nobody
+wrote down.
+
+**Two consequences, accepted rather than worked around.** A single-NIC
+flat-LAN machine has no permitted serving address and is therefore
+outbound-only — the cost of *"never behind a port forwarded on someone's
+box"*, and why D10 keeps a path that needs no listener. And loopback is
+permitted deliberately: it is reachable from nothing off the machine, and
+the two-runner end-to-end that makes the pack half done (invariant 5) runs
+two runners on one workstation.
+
+**Alternative rejected.** An explicit allowlist in the configuration plus
+a refusal when nothing is declared. Strictly more conservative, and the
+fallback if the default-route reading had proved undecidable — it did not,
+on Linux, so the allowlist would have been configuration surface that
+bought nothing (invariant 1). The conservative half is kept where it is
+needed: an unreadable host refuses everything but loopback.
+
+**Not a weakening of invariant 3, and no Alexa question.** The invariant
+as written already permits exactly this — *"It may listen on a private
+mesh interface to serve content to peers (D10, D11) — bound to that
+interface only, never on a default or public one"* — D11 approved it on
+2026-10-12, and `docs/joining.md` states the property publicly (D209).
+Checked against the invariant's own text at integration, not taken on the
+branch's word.
+
+**Residue.** The guard's name,
+`no_module_of_the_runner_can_bind_a_socket`, now outlives its sentence: it
+permits one named module. The name is kept because three prose citations
+reference it, and the rename belongs to whoever next edits that test
+(ORCH-208).
+
+**Evidence.** **D10**, **D11**, **D200**, **D209**; invariant 3;
+`herd-runner/src/mesh.rs`; `herd-runner/src/main.rs`;
+`herd-runner/tests/confinement.rs`; `docs/runner-confinement.md`;
+`history/2026-10-29-mesh-rule.md`.
+
+---
+
+## 2026-10-29 — D223 A pack is gone from {out} before the record walk
+
+**Context.** ORCH-153. `docs/plan.md` had a build job write its pack to
+`{out}/packs/<id>`, and `herd-runner/src/outputs.rs` collects
+**everything** under `{out}` that is a regular file, with four exclusions
+and none of them a pack. A build job writing there would stream ~400 MiB
+in ~560 files runner → hub → requester as record evidence, against the
+hub's 200 GB output budget: the exact byte path D10 removed and D152 then
+has to sweep. `plan.md` named two candidate shapes and left the path
+**unspecified**, "to be settled before any pack code is briefed" — while
+the pack steps were already being built against the answer.
+
+**Choice (Alexa's orchestrator, 2026-10-29).** A pack is **gone from
+`{out}` before the record walk runs**, not excluded by a fifth entry in an
+exclusion list. The two candidates were not equal and this picks the one
+`plan.md` itself said D10's byte-path argument implies: a fifth exclusion
+in `outputs.rs` can be undone by a later edit to that list, and the
+version a later edit cannot silently break is the one where there is
+nothing under `{out}` to exclude by the time the walk looks. A pack that is
+not there cannot be collected by a walk that forgets about it.
+
+**Why it is recorded here and not left as a row.** It constrains every
+pack step that is already building, which is the shape of a rule rather
+than of open work, and a document that calls a thing undecided while
+branches implement it is the exact failure `plan.md`'s correction existed
+to fix. `docs/plan.md`'s pack-path paragraph is amended in the same
+landing to state the decision instead of the open question; the two
+candidates and the reasoning stay, because the rejected one is why the
+chosen one holds.
+
+**Alternative rejected.** The fifth exclusion in `outputs.rs`. Cheaper to
+write, and silently reversible by any later edit to that list — a defect
+whose reappearance would look like a tidy-up.
+
+**Evidence.** `docs/plan.md` §*A pack is read by a job*;
+`herd-runner/src/outputs.rs`; **D10**, **D152**; ORCH-153;
+`history/2026-10-29-plan-truth.md`.

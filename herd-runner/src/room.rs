@@ -24,12 +24,44 @@
 //! below `memory.max` is a real bound and is treated as one. Taking the lower
 //! of the two is the only figure that is true whichever one is set.
 //!
+//! **What is subtracted is not the whole charge.** `memory.current` counts
+//! reclaimable page cache, and a machine that has merely *read* files carries
+//! gigabytes of it. Subtracting that whole figure made a runner on an idle
+//! host announce almost nothing — 3224 MiB under an 18 GiB `memory.high` on
+//! this project's host at 22:17 on 2026-10-29, while `MemAvailable` said
+//! 22.3 GiB — and the sentence [`Enclosure::why`] prints about itself was
+//! then false. E-22 is a merged `must`: the figure is `MemTotal` unless the
+//! owner says otherwise, so announcing a tenth of the room because the page
+//! cache is warm breaks a promise the product makes.
+//!
+//! **How much it is worth moves by the hour, and that is worth knowing before
+//! anyone quotes one figure.** Three readings of the same host that evening,
+//! room before this change and after: 3224 then about 11600 MiB at 22:17;
+//! 9548 then 12107 at 22:35, when only 2.5 of its 7.8 GiB of cache was
+//! inactive; 3054 then 10181 at 22:44. What does not move is the direction
+//! and the floor under it — keeping `active_file` charged costs several GiB
+//! at every one of those readings, and it is kept on purpose, because a
+//! figure that is never generous is the whole point.
+//!
+//! So the charge is read **less the reclaimable file pages**, and the
+//! reclaimable figure is `inactive_file` from `memory.stat`, not `file`.
+//! `inactive_file` is the conservative knob of the two: those are the pages
+//! the kernel drops first, while `active_file` has been touched more than
+//! once and may be in use, so **`active_file` stays counted as charged** even
+//! though the kernel would reclaim it too under enough pressure. The figure
+//! is therefore a floor on the room, not an estimate of it, and erring
+//! towards less room is the only direction invariant 2 allows. `shmem` comes
+//! off the reclaimable figure for the same reason: tmpfs and `shm` pages sit
+//! on the file LRUs and are counted in `inactive_file`, but they are
+//! swap-backed and cannot be dropped — and a runner's own workspaces live on
+//! a tmpfs (D79), so on a runner host this is not a hypothetical.
+//!
 //! What is **not** read here is `MemAvailable`, which the first consumer
 //! asked for. The hub's arithmetic subtracts the floor (E-29) and what the
 //! jobs it believes are running have reserved; a second figure that moves
 //! between the judgement and the claim would be the overcommit E-32 forbids.
-//! `memory.current` is subtracted once, at startup, for the same reason the
-//! tmpfs figure is a capacity and not what is free this second (D79).
+//! The charge is subtracted once, at startup, for the same reason the tmpfs
+//! figure is a capacity and not what is free this second (D79).
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -51,18 +83,33 @@ pub struct Enclosure {
     pub knob: &'static str,
     /// The ceiling itself, in bytes.
     pub ceiling_bytes: u64,
-    /// What that cgroup had already charged when this was read.
+    /// What `memory.current` reported when this was read: the whole charge,
+    /// reclaimable page cache included.
     pub charged_bytes: u64,
+    /// The part of that charge the kernel will drop rather than fail an
+    /// allocation: `inactive_file` less `shmem`, from `memory.stat`. Zero
+    /// when `memory.stat` could not be read, and zero when `memory.current`
+    /// could not be read either — a charge that was *assumed* to be the whole
+    /// ceiling must not then be given room back.
+    pub reclaimable_bytes: u64,
 }
 
 impl Enclosure {
+    /// The part of the charge that will still be there when a job asks for
+    /// memory: everything `memory.current` counts, less the page cache the
+    /// kernel drops first. See the module doc for why `inactive_file` and not
+    /// `file` — `active_file` is deliberately still counted as held.
+    pub fn held_bytes(&self) -> u64 {
+        self.charged_bytes.saturating_sub(self.reclaimable_bytes)
+    }
+
     /// The room left under the ceiling, in MiB.
     ///
     /// Saturating: a cgroup already over its `memory.high` is a cgroup with
     /// no room, which is a figure, and the floor refusal in `main` is what
     /// turns "no room" into a runner that says so instead of starting.
     pub fn room_mib(&self) -> u64 {
-        self.ceiling_bytes.saturating_sub(self.charged_bytes) / (1 << 20)
+        self.ceiling_bytes.saturating_sub(self.held_bytes()) / (1 << 20)
     }
 
     /// The startup line, which has to name the cgroup, the knob and both
@@ -70,13 +117,14 @@ impl Enclosure {
     /// this machine announced less than it has.
     pub fn why(&self) -> String {
         format!(
-            "{} is enclosed by {} {} on {}, which already holds {}, so the room here is {} \
-             and not what /proc/meminfo reports",
+            "{} is enclosed by {} {} on {}, which already holds {} of which {} is reclaimable \
+             page cache, so the room here is {} and not what /proc/meminfo reports",
             SELF_CGROUP,
             self.knob,
             herd_proto::size_mib(self.ceiling_bytes / (1 << 20)),
             self.cgroup,
             herd_proto::size_mib(self.charged_bytes / (1 << 20)),
+            herd_proto::size_mib(self.reclaimable_bytes / (1 << 20)),
             herd_proto::size_mib(self.room_mib())
         )
     }
@@ -131,17 +179,53 @@ fn ceiling_at(directory: &Path, cgroup: &Path) -> Option<Enclosure> {
         }
     }
     let (knob, ceiling_bytes) = lowest?;
+    // A cgroup with a ceiling always has `memory.current`; an unreadable one
+    // is read as nothing charged, which announces *more* room than there is —
+    // so it is read as the ceiling being fully charged instead. Erring
+    // towards less room is the only direction invariant 2 allows.
+    let charged = charged_in(&directory.join("memory.current"));
     Some(Enclosure {
         cgroup: cgroup.display().to_string(),
         knob,
         ceiling_bytes,
-        // A cgroup with a ceiling always has `memory.current`; an unreadable
-        // one is read as nothing charged, which announces *more* room than
-        // there is — so it is read as the ceiling being fully charged
-        // instead. Erring towards less room is the only direction invariant 2
-        // allows.
-        charged_bytes: charged_in(&directory.join("memory.current")).unwrap_or(ceiling_bytes),
+        charged_bytes: charged.unwrap_or(ceiling_bytes),
+        // And nothing is given back against a charge that was assumed: an
+        // unreadable `memory.current` means the figure above is a worst case
+        // rather than a reading, and subtracting cache from a worst case
+        // would make it a guess in the generous direction.
+        reclaimable_bytes: match charged {
+            Some(_) => reclaimable_in(&directory.join("memory.stat")),
+            None => 0,
+        },
     })
+}
+
+/// The reclaimable page cache a cgroup holds: `inactive_file` less `shmem`,
+/// both from `memory.stat`, and `0` for anything that will not read.
+///
+/// Why those two fields and not `file`: see the module doc. Briefly —
+/// `inactive_file` is what the kernel drops first and `active_file` may still
+/// be in use, so counting only the inactive half makes this a floor on the
+/// room; and `shmem` is swap-backed rather than droppable while still being
+/// counted on the file LRUs, so it comes back off.
+///
+/// A missing field reads as `0`, which charges the runner for cache it may
+/// not really be holding — the safe direction. A kernel that stops publishing
+/// `inactive_file` therefore returns Herd to the figure it announced before
+/// this change, which is pessimistic rather than wrong.
+fn reclaimable_in(path: &Path) -> u64 {
+    let Ok(text) = fs::read_to_string(path) else {
+        return 0;
+    };
+    let field = |name: &str| -> u64 {
+        text.lines()
+            .find_map(|line| {
+                let (key, value) = line.split_once(' ')?;
+                (key == name).then(|| value.trim().parse::<u64>().ok())?
+            })
+            .unwrap_or(0)
+    };
+    field("inactive_file").saturating_sub(field("shmem"))
 }
 
 /// The figure in a `memory.max` or `memory.high`, or `None` for `max` — the
@@ -338,6 +422,12 @@ mod tests {
     /// read as fully charged. Announcing the whole ceiling there would
     /// announce room that may not exist, and invariant 2 only lets this err
     /// towards less.
+    ///
+    /// And the cache reading does **not** soften that worst case, which is
+    /// why this fixture carries a `memory.stat` full of reclaimable pages: a
+    /// charge that was assumed rather than read has no cache in it to give
+    /// back, and subtracting one from the other would turn the safe guess
+    /// into a generous one.
     #[test]
     fn an_unreadable_charge_is_read_as_no_room_left() {
         let mount = TempDir::new("room-nocurrent");
@@ -345,11 +435,213 @@ mod tests {
             mount.path(),
             &[
                 ("", &[]),
-                ("herd.slice", &[("memory.max", &(1u64 << 30).to_string())]),
+                (
+                    "herd.slice",
+                    &[
+                        ("memory.max", &(1u64 << 30).to_string()),
+                        ("memory.stat", &stat(&[("inactive_file", 1u64 << 30)])),
+                    ],
+                ),
             ],
         );
         let found = enclosing(mount.path(), "/herd.slice").expect("the ceiling reads");
+        assert_eq!(found.charged_bytes, 1 << 30, "assumed fully charged");
+        assert_eq!(found.reclaimable_bytes, 0, "nothing is given back");
         assert_eq!(found.room_mib(), 0);
+    }
+
+    /// A `memory.stat` with the fields this module reads, written the way the
+    /// kernel writes them: one `name value` line each, among others it does
+    /// not read, because picking the right line out of a real file is half
+    /// of what [`reclaimable_in`] does.
+    fn stat(fields: &[(&str, u64)]) -> String {
+        let mut text = String::from("slab_reclaimable 123456\npgfault 7\n");
+        for (name, value) in fields {
+            text.push_str(&format!("{name} {value}\n"));
+        }
+        // A field whose name merely starts with one this module reads: the
+        // kernel publishes `file_dirty` and `inactive_file` is not it.
+        text.push_str("file_dirty 4096\nanon_thp 0\n");
+        text
+    }
+
+    /// **The good direction** (2026-10-29). A host that has merely read files
+    /// carries gigabytes of page cache in `memory.current`, and subtracting
+    /// that charge whole made a runner on an idle machine announce almost
+    /// nothing. The reclaimable half comes off, so the room lands within
+    /// about 2 GiB of the ceiling instead of a tenth of it.
+    ///
+    /// The figures are this project's host, rounded: an 18 GiB `memory.high`
+    /// on `/chatons.slice`, 16 GiB charged, half a gigabyte of it anonymous
+    /// and the rest cache. `active_file` is deliberately **not** reclaimed
+    /// here — 1 GiB of it stays charged alongside the 0.5 GiB of `anon`,
+    /// which is where the remaining 2 GiB of the gap comes from.
+    #[test]
+    fn reclaimable_page_cache_is_not_held_against_the_room() {
+        let mount = TempDir::new("room-cache-warm");
+        let ceiling = 18 * (1u64 << 30);
+        tree(
+            mount.path(),
+            &[
+                ("", &[]),
+                (
+                    "chatons.slice",
+                    &[
+                        ("memory.high", &ceiling.to_string()),
+                        ("memory.current", &(16 * (1u64 << 30)).to_string()),
+                        (
+                            "memory.stat",
+                            &stat(&[
+                                ("anon", (1u64 << 30) / 2),
+                                ("file", 15 * (1u64 << 30)),
+                                ("inactive_file", 14 * (1u64 << 30)),
+                                ("active_file", 1u64 << 30),
+                                ("shmem", 0),
+                            ]),
+                        ),
+                    ],
+                ),
+            ],
+        );
+        let found = enclosing(mount.path(), "/chatons.slice").expect("a ceiling is there");
+        assert_eq!(found.charged_bytes, 16 * (1u64 << 30));
+        assert_eq!(found.reclaimable_bytes, 14 * (1u64 << 30));
+        assert_eq!(
+            found.held_bytes(),
+            2 * (1u64 << 30),
+            "anon plus active_file"
+        );
+        assert_eq!(found.room_mib(), 16 * 1024);
+        assert!(
+            ceiling / (1 << 20) - found.room_mib() <= 2 * 1024,
+            "the room must land within 2 GiB of the ceiling, not a tenth of \
+             it: {} MiB under a {} MiB ceiling",
+            found.room_mib(),
+            ceiling / (1 << 20)
+        );
+        // And the sentence the runner prints about itself has to be true, so
+        // it names the reclaimable part rather than the whole charge.
+        let why = found.why();
+        assert!(why.contains("14 GiB is reclaimable page cache"), "{why}");
+        assert!(why.contains("16 GiB") && why.contains("18 GiB"), "{why}");
+    }
+
+    /// **The known-bad direction, and the point of the pair.** The same
+    /// ceiling and the same 16 GiB charged, but every byte of it anonymous:
+    /// nothing is reclaimable, so the room stays at 2 GiB. A change that had
+    /// simply stopped subtracting the charge would announce 18 GiB here and
+    /// hand the hub room that does not exist, which is the failure invariant
+    /// 2 forbids — and it would pass the test above unnoticed.
+    #[test]
+    fn an_anonymous_charge_is_still_held_against_the_room() {
+        let mount = TempDir::new("room-cache-cold");
+        tree(
+            mount.path(),
+            &[
+                ("", &[]),
+                (
+                    "chatons.slice",
+                    &[
+                        ("memory.high", &(18 * (1u64 << 30)).to_string()),
+                        ("memory.current", &(16 * (1u64 << 30)).to_string()),
+                        (
+                            "memory.stat",
+                            &stat(&[
+                                ("anon", 16 * (1u64 << 30)),
+                                ("file", 0),
+                                ("inactive_file", 0),
+                                ("active_file", 0),
+                                ("shmem", 0),
+                            ]),
+                        ),
+                    ],
+                ),
+            ],
+        );
+        let found = enclosing(mount.path(), "/chatons.slice").expect("a ceiling is there");
+        assert_eq!(found.reclaimable_bytes, 0);
+        assert_eq!(
+            found.room_mib(),
+            2 * 1024,
+            "16 GiB of anonymous memory is 16 GiB that will not go away"
+        );
+    }
+
+    /// `shmem` sits on the file LRUs and is counted inside `inactive_file`,
+    /// but tmpfs and `shm` pages are swap-backed: the kernel cannot drop
+    /// them. So they come back off the reclaimable figure, and a slice whose
+    /// whole inactive cache is a tmpfs has the room it had before — which
+    /// matters here because a runner's own job workspaces live on one (D79).
+    #[test]
+    fn swap_backed_cache_is_not_counted_as_reclaimable() {
+        let mount = TempDir::new("room-shmem");
+        tree(
+            mount.path(),
+            &[
+                ("", &[]),
+                (
+                    "herd.slice",
+                    &[
+                        ("memory.max", &(18 * (1u64 << 30)).to_string()),
+                        ("memory.current", &(16 * (1u64 << 30)).to_string()),
+                        (
+                            "memory.stat",
+                            &stat(&[
+                                ("inactive_file", 8 * (1u64 << 30)),
+                                ("shmem", 8 * (1u64 << 30)),
+                            ]),
+                        ),
+                    ],
+                ),
+            ],
+        );
+        let found = enclosing(mount.path(), "/herd.slice").expect("a ceiling is there");
+        assert_eq!(found.reclaimable_bytes, 0, "all of it is tmpfs");
+        assert_eq!(found.room_mib(), 2 * 1024);
+    }
+
+    /// A cgroup with no `memory.stat` at all, which is every fixture written
+    /// before this and any kernel that stops publishing the field: nothing is
+    /// reclaimed and the figure is the one Herd announced before this change.
+    /// Pessimistic, not wrong, and never the other way round.
+    #[test]
+    fn an_unreadable_memory_stat_reclaims_nothing() {
+        let mount = TempDir::new("room-nostat");
+        tree(
+            mount.path(),
+            &[
+                ("", &[]),
+                (
+                    "herd.slice",
+                    &[
+                        ("memory.max", &(8 * (1u64 << 30)).to_string()),
+                        ("memory.current", &(1u64 << 30).to_string()),
+                    ],
+                ),
+            ],
+        );
+        let found = enclosing(mount.path(), "/herd.slice").expect("a ceiling is there");
+        assert_eq!(found.reclaimable_bytes, 0);
+        assert_eq!(found.room_mib(), 7 * 1024);
+        // And a `memory.stat` that reads but says nothing this module needs.
+        let bare = TempDir::new("room-barestat");
+        tree(
+            bare.path(),
+            &[
+                ("", &[]),
+                (
+                    "herd.slice",
+                    &[
+                        ("memory.max", &(8 * (1u64 << 30)).to_string()),
+                        ("memory.current", &(1u64 << 30).to_string()),
+                        ("memory.stat", "pgfault 7\nnot_a_number x\n"),
+                    ],
+                ),
+            ],
+        );
+        let found = enclosing(bare.path(), "/herd.slice").expect("a ceiling is there");
+        assert_eq!(found.reclaimable_bytes, 0);
+        assert_eq!(found.room_mib(), 7 * 1024);
     }
 
     #[test]
@@ -375,6 +667,7 @@ mod tests {
             knob: "memory.max",
             ceiling_bytes: ceiling_gib * (1 << 30),
             charged_bytes: charged_gib * (1 << 30),
+            reclaimable_bytes: 0,
         }
     }
 

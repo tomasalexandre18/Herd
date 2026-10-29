@@ -781,14 +781,35 @@ struct FilesOut {
     /// "the hub never mentioned it", which is the whole terminal rule: see
     /// [`Session::the_hub_has_said_what_it_is_owed`].
     heard: bool,
-    /// Whether a chunk of it has been put on the link since this runner
-    /// started.
+    /// How many health reports this connection had **already queued** at the
+    /// moment this collection's whole offer was on the link, if it ever was.
     ///
-    /// The terminal rule is about an *offer* nobody answered, so it may not
-    /// run on a collection that was never offered: a health report can
-    /// overtake a pump that has not had the link's window yet, and a spool
-    /// set aside on that race would be one the hub was about to take.
-    probed: bool,
+    /// The terminal rule is about an *offer the hub did not answer*, so it
+    /// needs two things a boolean cannot carry: that the offer is finished,
+    /// and *when* it finished, measured in the one clock that proves anything
+    /// here — the hub's own answers to this runner's health reports.
+    ///
+    /// `None` is "the hub has not been given its chance yet", and it is
+    /// precisely the state 37.6 GiB of the first consumer's results were
+    /// condemned in: a pump still waiting for a permit from a window of eight
+    /// against seventy-five collections, while the first `HealthRecorded` was
+    /// read as proof the hub had already said everything it would say.
+    ///
+    /// Read only by [`Session::the_hub_has_said_what_it_is_owed`], and
+    /// written only in the critical section that concluded the offer — never
+    /// in a later one, or the reading would be about a different instant from
+    /// the queue it is compared against. See [`Inner::reports_sent`].
+    offered_at: Option<u64>,
+    /// Whether that offer ended because a file of it would not read, rather
+    /// than because there was nothing left to send.
+    ///
+    /// The same fact to the barrier — nobody will ever acknowledge this
+    /// collection — and a different sentence to a reader, so the barrier says
+    /// which. Without this arm a file that will not read would never finish
+    /// its offer, and the spool would be offered again on every connection
+    /// for ever: a rename traded for an unbounded re-offer, which is the leak
+    /// [`crate::sweep`]'s terminal rule exists to prevent.
+    offer_cut_short: bool,
 }
 
 impl FilesOut {
@@ -823,7 +844,8 @@ impl FilesOut {
             touched: vec![false; count],
             swept,
             heard: false,
-            probed: false,
+            offered_at: None,
+            offer_cut_short: false,
         }
     }
 
@@ -854,11 +876,11 @@ impl FilesOut {
     /// other part of the runner contends on would make a streaming job
     /// contend with its own health report.
     fn next(&mut self) -> Option<ChunkPlan> {
-        // Decided here because this runs under the lock for every chunk
-        // anyway: a collection that has a chunk to send is one that is about
-        // to be offered, and the terminal rule may only judge an offer the
-        // hub had the chance to answer.
-        self.probed = true;
+        // Nothing about the terminal rule is decided here any more, and that
+        // is the fix. "A chunk is about to be offered" was read as "the offer
+        // has been made", which is the other end of the transfer: what the
+        // rule needs is the moment there is nothing left to send, and only
+        // this method's caller can see that — [`FilesOut::offered_at`].
         for index in 0..self.manifest.len() {
             let entry = &self.manifest[index];
             if entry.len == 0 {
@@ -938,6 +960,42 @@ struct Inner {
     /// A new link starts with a full window and the hub says where to resume
     /// from ([`herd_proto::FromHub::JobFilesHeld`]).
     files_credit: Option<Arc<Semaphore>>,
+    /// How many health reports have been **queued on the link that is up
+    /// now**, and how many of them the hub has answered.
+    ///
+    /// **A round trip the protocol already affords, read as proof.** Every
+    /// [`herd_proto::ToHub::Health`] is answered by exactly one
+    /// [`herd_proto::FromHub::HealthRecorded`], unconditionally, at the end
+    /// of the hub's handler for it, and the hub handles one frame of one
+    /// connection at a time in order. So the *n*-th answer proves the hub has
+    /// read and handled every frame this runner queued before the *n*-th
+    /// report — which is the only thing that can turn a silence into
+    /// evidence. No new frame, no clock, no protocol version move.
+    ///
+    /// **The invariant that keeps the pair honest, and the one a later change
+    /// will break:** `reports_sent` is only ever incremented in the same
+    /// `with(…)` critical section that queued the frame it counts —
+    /// [`queue_a_health_report`] is the only place that does either, which is
+    /// why all three senders of a report go through it — and
+    /// [`FilesOut::offered_at`] is only ever a reading of it taken in the
+    /// section that concluded an offer. Counted in a section of its own, a
+    /// report queued *before* an offer's last chunk could be counted as one
+    /// queued after it, and this fix would become a narrower version of the
+    /// defect it closes.
+    ///
+    /// Per **connection**, like the link and the window beside them, and both
+    /// zeroed in [`Session::attach`]: a counter carried across a redial is a
+    /// counter about a link that is gone.
+    reports_sent: u64,
+    reports_recorded: u64,
+    /// What [`Session::the_hub_has_said_what_it_is_owed`] has set aside on
+    /// this connection, by job and attempt, with the spool it was holding.
+    ///
+    /// Kept so that a sentence can **name** it, and for nothing else: no code
+    /// deletes anything on the strength of this note. A set-aside spool is
+    /// never picked up again, and a deletion driven by an in-memory record of
+    /// one would re-open that rule from the inside.
+    set_aside_here: Vec<(JobId, u32, PathBuf)>,
     /// Every attempt this runner has in hand, by job **and** attempt
     /// ([`InHand`]).
     jobs: HashMap<InHand, JobInHand>,
@@ -1016,6 +1074,9 @@ impl Default for Inner {
             instance: mint_an_instance_id(),
             link: None,
             files_credit: None,
+            reports_sent: 0,
+            reports_recorded: 0,
+            set_aside_here: Vec::new(),
             files_stall_after: FILES_STALL_AFTER,
             jobs: HashMap::new(),
             collections: HashMap::new(),
@@ -1256,13 +1317,7 @@ impl Session {
             // E-33's ten seconds is a promise about the hub stopping to hand
             // work to this machine, and a report fifteen seconds away would
             // spend all of it.
-            let health = ToHub::Health {
-                jobs: running_jobs(inner),
-                draining: inner.draining,
-                load_milli: crate::metrics::host_load_milli(),
-                switch: inner.switch.clone(),
-            };
-            send_on(&inner.link, health);
+            queue_a_health_report(inner);
             Some(said)
         })
     }
@@ -1631,9 +1686,27 @@ impl Session {
                         }
                     }
                 };
-                let Some(plan) = session
-                    .with(|inner| inner.collections.get_mut(&job_id).and_then(FilesOut::next))
-                else {
+                let next = session.with(|inner| {
+                    // Read before the entry is borrowed, and used in this
+                    // same critical section: the number of reports already
+                    // queued at the instant this offer is concluded is the
+                    // whole of the barrier's evidence, and a reading taken
+                    // anywhere else would be about another instant
+                    // ([`Inner::reports_sent`]).
+                    let reports_sent = inner.reports_sent;
+                    let files = inner.collections.get_mut(&job_id)?;
+                    match files.next() {
+                        Some(plan) => Some(plan),
+                        None => {
+                            // Nothing left to send: every chunk this
+                            // collection will ever put on this link is on
+                            // it. *Now* the hub can be given its turn.
+                            files.offered_at = Some(reports_sent);
+                            None
+                        }
+                    }
+                });
+                let Some(plan) = next else {
                     return;
                 };
                 match read_at(&plan.file, plan.offset, plan.take) {
@@ -1664,6 +1737,21 @@ impl Session {
                              the file and this runner no longer has it.",
                             plan.file.display()
                         );
+                        // And the offer ends here, so it counts as ended. A
+                        // cursor that can never be exhausted would otherwise
+                        // leave this collection unjudgeable for ever and the
+                        // spool would be offered again on every connection:
+                        // the same leak with more network, which is what the
+                        // terminal rule exists to prevent. The barrier says
+                        // which of the two endings it was
+                        // ([`FilesOut::offer_cut_short`]).
+                        session.with(|inner| {
+                            let reports_sent = inner.reports_sent;
+                            if let Some(files) = inner.collections.get_mut(&job_id) {
+                                files.offered_at = Some(reports_sent);
+                                files.offer_cut_short = true;
+                            }
+                        });
                         return;
                     }
                 }
@@ -1705,13 +1793,81 @@ impl Session {
     }
 
     /// The hub holds the whole collection: the spool may go.
-    fn files_acknowledged(&self, job_id: &JobId, attempt: u32) {
-        let spool = self.with(|inner| match inner.collections.get(job_id) {
+    ///
+    /// Returns the sentence this acknowledgement is worth when it frees
+    /// nothing, for the caller to print — the shape
+    /// [`Session::settle_against_state_root`] already uses, and here for the
+    /// same reason: a sentence a test can only read by capturing this crate's
+    /// stderr is a sentence that quietly stops being printed.
+    ///
+    /// **The silent no-op is gone, and the line that replaces it is a
+    /// sentinel.** This is the step at which 37.6 GiB was lost without a
+    /// word: the barrier had already taken the map entry, the hub's
+    /// acknowledgement landed on nothing, and `_ => None` said so to nobody.
+    /// With the barrier sound, an Ack arriving for a collection the barrier
+    /// already took is **unreachable** — the hub sends it before the
+    /// `HealthRecorded` that could condemn the collection, and this runner
+    /// handles the two inline and in order — so **if it is ever printed
+    /// beside an `.unclaimed` line for the same job id, the barrier is wrong
+    /// again**.
+    fn files_acknowledged(&self, job_id: &JobId, attempt: u32) -> Option<String> {
+        enum Freed {
+            /// The collection this frame is about, taken out of the map.
+            Spool(Option<PathBuf>),
+            /// A collection for another attempt of the same job, left alone.
+            AnotherAttempt(u32),
+            /// No collection for this job at all, with the directory the
+            /// barrier set aside on this connection if that is where it went.
+            NoCollection(Option<PathBuf>),
+        }
+        let freed = self.with(|inner| match inner.collections.get(job_id) {
             Some(files) if files.attempt == attempt => {
-                inner.collections.remove(job_id).map(|files| files.spool)
+                Freed::Spool(inner.collections.remove(job_id).map(|files| files.spool))
             }
-            _ => None,
+            // An acknowledgement of one attempt is not a sentence about
+            // another's bytes: nothing is removed and, deliberately, `heard`
+            // is not set either — a frame about another attempt says nothing
+            // about whether anybody wants this spool.
+            Some(files) => Freed::AnotherAttempt(files.attempt),
+            None => Freed::NoCollection(
+                inner
+                    .set_aside_here
+                    .iter()
+                    .find(|(of, which, _)| of == job_id && *which == attempt)
+                    .map(|(_, _, aside)| aside.clone()),
+            ),
         });
+        let spool = match freed {
+            Freed::Spool(spool) => spool,
+            Freed::AnotherAttempt(held) => {
+                return Some(format!(
+                    "the hub says it has every file of {job_id} (attempt {attempt}) and this \
+                     runner holds attempt {held} of it, so nothing is removed: an \
+                     acknowledgement of one attempt is not a sentence about another's bytes"
+                ));
+            }
+            Freed::NoCollection(aside) => {
+                return Some(format!(
+                    "the hub says it has every file of {job_id} (attempt {attempt}) and this \
+                     runner holds no collection for it, so this acknowledgement frees \
+                     nothing. The bytes are safe on the hub.{}",
+                    match aside {
+                        // The unreachable case above, said as loudly as it
+                        // can be said: named, and still not deleted.
+                        Some(aside) => format!(
+                            " This runner set aside its own copy on this very connection, as \
+                             {}, BEFORE this acknowledgement arrived: that is a defect in \
+                             the barrier, the bytes are intact, and nothing here will touch \
+                             them.",
+                            aside.display()
+                        ),
+                        None => " If a spool of it is still on this disk it is this runner's \
+                                 own copy, and nothing here will remove it."
+                            .to_owned(),
+                    }
+                ));
+            }
+        };
         // Only now, after the hub has said every file is on its disk: a spool
         // removed before the acknowledgement would be the one copy of a
         // result destroyed by the mechanism that exists to keep it (D19).
@@ -1730,6 +1886,7 @@ impl Session {
                 );
             }
         }
+        None
     }
 
     /// Offer every swept collection on the link that has just come up.
@@ -1748,7 +1905,7 @@ impl Session {
     ///
     /// Called once the link is attached, which is why it is not part of
     /// settling: nothing can be offered on a connection that has no outbox
-    /// yet. `heard` and `probed` are a *connection's* record of what was
+    /// yet. `heard` and `offered_at` are a *connection's* record of what was
     /// asked and answered, so they start again here.
     pub fn offer_swept_collections(&self) {
         let offering: Vec<JobId> = self.with(|inner| {
@@ -1758,7 +1915,8 @@ impl Session {
                 .filter(|(_, files)| files.swept)
                 .map(|(job_id, files)| {
                     files.heard = false;
-                    files.probed = false;
+                    files.offered_at = None;
+                    files.offer_cut_short = false;
                     job_id.clone()
                 })
                 .collect()
@@ -1768,67 +1926,124 @@ impl Session {
         }
     }
 
-    /// The hub has now told this runner everything it is still owed, so
-    /// whatever it did not mention it is not waiting for.
+    /// The hub has answered a health report, so whatever it has not mentioned
+    /// by now it is not waiting for — **for every collection whose whole
+    /// offer was on the link before that report was queued, and for no
+    /// other**.
     ///
-    /// **Where the barrier comes from.** A hub sends one
-    /// [`herd_proto::FromHub::JobFilesHeld`] per outstanding collection the
-    /// moment a runner joins, before it reads a single frame from the
-    /// connection, and it answers every health report with
-    /// [`herd_proto::FromHub::HealthRecorded`]. Frames on one link are
-    /// ordered, so the first answer to a report is proof that the whole owed
-    /// list has already arrived. No new frame, and no clock.
+    /// **The rule.** A swept collection may be set aside only on a silence
+    /// the hub has already had the chance to break: its whole offer is on the
+    /// link, a health report queued after the last chunk of that offer has
+    /// been answered, and no frame naming the collection arrived in between.
     ///
-    /// Only a **swept** collection that was actually offered on this
-    /// connection is judged on it. One this runner produced was announced by
-    /// a verdict a moment ago and the hub may not have got to it yet; one
-    /// never offered was never asked about.
+    /// **Why that answer is proof, with no new frame and no clock.** Every
+    /// [`herd_proto::ToHub::Health`] is answered by exactly one
+    /// [`herd_proto::FromHub::HealthRecorded`], unconditionally, at the end
+    /// of the hub's handler for it; the hub handles one frame of one
+    /// connection at a time, in order; and this runner handles
+    /// [`herd_proto::FromHub::JobFilesAck`] and `HealthRecorded` inline in
+    /// one sequential loop. So the *n*-th answer proves the hub read and
+    /// handled every frame queued before the *n*-th report — and an
+    /// acknowledgement the hub sent in answer to the offer has already
+    /// removed the map entry by the time this runs. See
+    /// [`Inner::reports_sent`] and [`FilesOut::offered_at`].
     ///
-    /// What reaches here is therefore narrow, and that is deliberate. A hub
-    /// that already holds the collection answers the offer with
-    /// `JobFilesAck` and the spool goes on the ordinary path; a hub that is
-    /// owed it asks for it. Silence is the third case only: the record is
-    /// gone, the attempt was superseded, the job's collection was evicted, or
-    /// the files are offered by a machine the record does not name — every
-    /// branch of `files_may_land` that refuses without a frame. Nothing will
-    /// ever acknowledge those, and a spool offered on every connection for
-    /// ever is the same leak with more network.
+    /// **Strictly after, which is why the comparison is `<`.**
+    /// `offered_at` is the number of reports *already queued* when the offer
+    /// finished, and any of those may have gone out before its last chunk.
+    /// Report `offered_at + 1` is the first one queued strictly after it, so
+    /// `reports_recorded > offered_at` is the first reading that proves the
+    /// hub read the whole offer. The price is at most one health cadence
+    /// before a genuinely unclaimed spool is renamed — paid once per start,
+    /// never by a byte and never by a deletion.
+    ///
+    /// **What was wrong before, and what it cost.** This read the *first*
+    /// `HealthRecorded` as proof the hub had said everything. That is sound
+    /// for the unprompted `JobFilesHeld` list, which a hub sends before it
+    /// reads a frame, and it is no proof at all about the answer to an offer
+    /// the runner had not finished making: with a window of eight
+    /// ([`FILES_IN_FLIGHT`]) against seventy-five swept collections, most
+    /// pumps had not had a permit yet, and the hub's acknowledgement then
+    /// landed on a map entry this method had already taken. 37.6 GiB of the
+    /// first consumer's results, with the hub holding every byte of it whole.
+    ///
+    /// Only a **swept** collection is judged, and only one whose offer is
+    /// concluded. One this runner produced was announced by a verdict a
+    /// moment ago and the hub may not have got to it yet; one whose offer is
+    /// still waiting for room in the window has not been made yet, and it is
+    /// judged at a later round trip instead — this runs on **every** answer,
+    /// not only the first.
     ///
     /// Set aside rather than removed, and the asymmetry is the point.
     /// Acknowledgement is a sentence from the hub and the spool goes on it
     /// ([`Session::files_acknowledged`]); this is *silence*, and a hub whose
-    /// record scan failed is silent in exactly the same way about every
-    /// runner it has. So the bytes are kept under a name that says nobody
-    /// claimed them, the line carries the figure, and what to do with the
-    /// disk stays a decision a human makes with that line in front of them.
+    /// one global record scan failed is silent in exactly the same way about
+    /// every runner it has. So the bytes are kept under a name that says
+    /// nobody claimed them, the line carries the figures, and what to do with
+    /// the disk stays a decision a human makes with that line in front of
+    /// them. The line says only what this runner checked: an operator who
+    /// believes a spool was set aside wrongly renames it back to
+    /// `{job}-{attempt}` and restarts, and the hub's own answer decides it.
     fn the_hub_has_said_what_it_is_owed(&self) {
-        let unclaimed: Vec<(JobId, u32, PathBuf)> = self.with(|inner| {
+        let unclaimed: Vec<Condemned> = self.with(|inner| {
+            // Counted here, in the critical section that then judges on it,
+            // so that nothing can be queued between the count and the
+            // judgement ([`Inner::reports_sent`]).
+            inner.reports_recorded += 1;
+            let recorded = inner.reports_recorded;
             let orphans: Vec<JobId> = inner
                 .collections
                 .iter()
-                .filter(|(_, files)| files.swept && files.probed && !files.heard)
+                .filter(|(_, files)| {
+                    files.swept && !files.heard && files.offered_at.is_some_and(|at| at < recorded)
+                })
                 .map(|(job_id, _)| job_id.clone())
                 .collect();
             orphans
                 .into_iter()
                 .filter_map(|job_id| {
+                    let files = inner.collections.remove(&job_id)?;
+                    // Noted under the same lock that took the entry, so the
+                    // sentinel in `files_acknowledged` can name what this
+                    // took if the unreachable ever happens. A note, not a
+                    // handle: nothing deletes anything on the strength of it.
                     inner
-                        .collections
-                        .remove(&job_id)
-                        .map(|files| (job_id, files.attempt, files.spool))
+                        .set_aside_here
+                        .push((job_id.clone(), files.attempt, files.spool.clone()));
+                    Some(Condemned {
+                        job_id,
+                        attempt: files.attempt,
+                        files: files.manifest.len(),
+                        bytes: files.manifest.iter().map(|file| file.len).sum(),
+                        cut_short: files.offer_cut_short,
+                        spool: files.spool,
+                    })
                 })
                 .collect()
         });
-        for (job_id, attempt, spool) in unclaimed {
-            eprintln!(
-                "herd-runner: the collection this runner holds for {job_id} (attempt \
-                 {attempt}) was offered to the hub and the hub has neither asked for it \
-                 nor acknowledged it: its record is gone, the attempt was superseded, its \
-                 collection was evicted there, or this machine is not the one that record \
-                 names. Nothing will ever acknowledge it, so it is NOT offered again. {}",
-                sweep::set_aside(&spool, sweep::UNCLAIMED)
-            );
+        for condemned in unclaimed {
+            eprintln!("herd-runner: {}", condemned.say());
         }
+    }
+
+    /// What this connection has recorded about one collection: whether the
+    /// hub has mentioned it, when its offer was concluded, and whether that
+    /// offer ended on a file that would not read.
+    ///
+    /// For the tests of the rule above, and for two things they cannot do
+    /// without it. It is the **precondition** of the barrier — "the whole
+    /// offer is on the link" — so a test that waits for it waits for exactly
+    /// what production waits for, instead of sleeping; and it is how a test
+    /// asserts that a frame about another attempt did **not** set `heard`,
+    /// which is otherwise only visible as the absence of an effect.
+    #[cfg(test)]
+    fn what_this_link_knows(&self, job_id: &JobId) -> Option<(bool, Option<u64>, bool)> {
+        self.with(|inner| {
+            inner
+                .collections
+                .get(job_id)
+                .map(|files| (files.heard, files.offered_at, files.offer_cut_short))
+        })
     }
 
     /// Give an attempt back without a verdict, and let the job go.
@@ -2157,6 +2372,12 @@ impl Session {
             inner.link = Some(outbox);
             inner.files_credit = Some(credit);
             inner.files_stall_after = stall_after;
+            // Zeroed for the reason the window beside them is rebuilt rather
+            // than carried over: both counters are about round trips on
+            // *this* link, and a report queued on the one that broke is one
+            // no answer will ever arrive for.
+            inner.reports_sent = 0;
+            inner.reports_recorded = 0;
             let held: Vec<InHand> = inner.jobs.keys().cloned().collect();
             for which in held {
                 let Some(job) = inner.jobs.get(&which) else {
@@ -2210,19 +2431,22 @@ impl Session {
             if let Some(credit) = inner.files_credit.take() {
                 credit.close();
             }
+            // The note is a connection's, like everything else here: the next
+            // link offers what is still held and judges it again from zero.
+            inner.set_aside_here.clear();
         });
     }
 
-    /// What this runner is doing, as a health report says it (E-40).
-    fn health(&self) -> ToHub {
-        self.with(|inner| ToHub::Health {
-            jobs: running_jobs(inner),
-            draining: inner.draining,
-            switch: inner.switch.clone(),
-            // Measured now, on every report, because it is a fact about the
-            // moment (E-32). The hub records it and gates nothing on it.
-            load_milli: crate::metrics::host_load_milli(),
-        })
+    /// Say what this runner is doing, once, and whether there was a hub to
+    /// say it to (E-40).
+    ///
+    /// One call rather than `send(health())`, which was two lock
+    /// acquisitions: between them a pump could queue a chunk, and a report
+    /// counted in a third acquisition could then be counted as one queued
+    /// after an offer it in fact went out before. See
+    /// [`queue_a_health_report`].
+    fn send_health(&self) -> bool {
+        self.with(queue_a_health_report)
     }
 
     /// Refuse new work from now on, and tell every job it is over.
@@ -2241,14 +2465,9 @@ impl Session {
                 }
             }
             // So that the hub stops handing out work to a runner on its way
-            // out at once, rather than at the next report.
-            let health = ToHub::Health {
-                jobs: running_jobs(inner),
-                draining: true,
-                load_milli: crate::metrics::host_load_milli(),
-                switch: inner.switch.clone(),
-            };
-            send_on(&inner.link, health);
+            // out at once, rather than at the next report. `draining` is
+            // already true above, so the frame this builds carries it.
+            queue_a_health_report(inner);
             ending
         })
     }
@@ -2592,6 +2811,97 @@ fn send_on(link: &Option<Outbox>, message: ToHub) -> bool {
         Some(outbox) => outbox.send(message).is_ok(),
         None => false,
     }
+}
+
+/// A swept collection the barrier has taken, and the figures its line
+/// carries.
+///
+/// Built inside the lock and said outside it, like [`ChunkPlan`]: the
+/// sentence is a `format!` over a manifest and the mutex every other part of
+/// the runner contends on is not the place for it.
+struct Condemned {
+    job_id: JobId,
+    attempt: u32,
+    spool: PathBuf,
+    /// How many files, and how many bytes, the manifest named — what ORCH-167
+    /// asks every set-aside line to carry, so that an operator reading the
+    /// line knows what the disk is holding.
+    files: usize,
+    bytes: u64,
+    /// Whether the offer ended on a file that would not read
+    /// ([`FilesOut::offer_cut_short`]).
+    cut_short: bool,
+}
+
+impl Condemned {
+    /// What the runner says about it, and **nothing it did not check**.
+    ///
+    /// The sentence this replaces named four causes — a record that is gone,
+    /// a superseded attempt, an eviction there, another machine's name on the
+    /// record — and all four were false in every reproduced run, while the
+    /// hub had acknowledged the collection in the same second. So neither of
+    /// these names a cause: the runner reports the measurement it made, says
+    /// the reason is the hub's to give, and sets the bytes aside.
+    fn say(&self) -> String {
+        let Self {
+            job_id,
+            attempt,
+            files,
+            ..
+        } = self;
+        let size = crate::size::show_bytes(self.bytes);
+        let aside = sweep::set_aside(&self.spool, sweep::UNCLAIMED);
+        if self.cut_short {
+            return format!(
+                "the collection this runner holds for {job_id} (attempt {attempt}) could \
+                 NOT be offered in full — the line above names the file and the error — and \
+                 the hub has neither asked for it nor acknowledged it. Its manifest named \
+                 {files} file(s), {size}. Nothing here will acknowledge it, so it is NOT \
+                 offered again. {aside}"
+            );
+        }
+        format!(
+            "the collection this runner holds for {job_id} (attempt {attempt}) was offered \
+             to this hub in full — {files} file(s), {size} — and the hub then answered a \
+             health report queued after that offer's last chunk without ever naming it: it \
+             has neither asked for it nor acknowledged it. Why is the hub's to say and this \
+             runner cannot see it; the hub's own log is where the reason is. Nothing here \
+             will acknowledge it, so it is NOT offered again. {aside}"
+        )
+    }
+}
+
+/// Queue a health report on the link that is up, and count it — **the only
+/// place that does either** (E-40).
+///
+/// Three callers need a report sent: the cadence
+/// ([`Session::send_health`]), a drain beginning, and an owner's switch
+/// moving. All three go through here and none of them builds the frame
+/// itself, because the frame and the count must not be able to drift apart:
+/// [`Inner::reports_sent`] is what [`FilesOut::offered_at`] is measured in,
+/// so a report counted without being queued, or queued in one critical
+/// section and counted in another, would make the barrier conclude the hub
+/// had been given a turn it never had. That is the defect this whole
+/// mechanism replaces, written one layer lower down.
+///
+/// Takes `&mut Inner` rather than the session for exactly that reason: it can
+/// only be called from inside a `with(…)`, and whatever queued the frame is
+/// what counted it. Returns whether there was a link, like
+/// [`Session::send`].
+fn queue_a_health_report(inner: &mut Inner) -> bool {
+    let health = ToHub::Health {
+        jobs: running_jobs(inner),
+        draining: inner.draining,
+        switch: inner.switch.clone(),
+        // Measured now, on every report, because it is a fact about the
+        // moment (E-32). The hub records it and gates nothing on it.
+        load_milli: crate::metrics::host_load_milli(),
+    };
+    if !send_on(&inner.link, health) {
+        return false;
+    }
+    inner.reports_sent += 1;
+    true
 }
 
 /// Join the hub and keep serving it, until the owner asks this runner to stop.
@@ -3323,7 +3633,7 @@ async fn report_health(session: Session, every: Duration) {
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     loop {
         ticker.tick().await;
-        if !session.send(session.health()) {
+        if !session.send_health() {
             return;
         }
     }
@@ -3397,7 +3707,13 @@ async fn serve_hub(
                 held,
             } => session.files_held(&job_id, attempt, &held),
             FromHub::JobFilesAck { job_id, attempt } => {
-                session.files_acknowledged(&job_id, attempt)
+                // Printed here rather than inside, so that a test can assert
+                // the sentence through production's own path: see
+                // [`Session::files_acknowledged`], whose silence this
+                // replaces, and which is a sentinel now.
+                if let Some(said) = session.files_acknowledged(&job_id, attempt) {
+                    eprintln!("herd-runner: {said}");
+                }
             }
             FromHub::LogAck {
                 job_id,
@@ -3432,12 +3748,13 @@ async fn serve_hub(
             } => {
                 session.drop_stale(&job_id, attempt, &reason);
             }
-            // The link is alive — and, the first time on a connection, proof
-            // that the hub has already said which collections it is owed: it
-            // sends them unprompted the moment a runner joins, before it
-            // reads anything, and frames on one link are ordered. A spool
-            // found on the disk that the hub has not mentioned by now is one
-            // nothing will ever acknowledge.
+            // The link is alive — and proof about every frame this runner
+            // queued before the report this answers, because the hub answers
+            // each report exactly once at the end of its handler and handles
+            // one frame at a time. That is what makes a silence about a
+            // swept collection evidence rather than a guess, and it is
+            // counted and judged on every answer, not only the first:
+            // [`Session::the_hub_has_said_what_it_is_owed`].
             FromHub::HealthRecorded {} => session.the_hub_has_said_what_it_is_owed(),
             // The orchestrator's half of E-33, arriving through the hub. It is
             // written down **and then** applied, so that the two ways of
@@ -4326,7 +4643,11 @@ mod tests {
             }
             // The hub has it all, so the pump finds nothing more to send and
             // ends — which is the moment the permit used to disappear.
-            session.files_acknowledged(&job_id, 1);
+            assert_eq!(
+                session.files_acknowledged(&job_id, 1),
+                None,
+                "this acknowledgement freed a collection, so there is nothing to say"
+            );
             let deadline = Instant::now() + Duration::from_secs(5);
             while credit.available_permits() < FILES_IN_FLIGHT {
                 assert!(
@@ -4486,7 +4807,11 @@ mod tests {
             spool.exists(),
             "the spool stays until the hub says it has it"
         );
-        session.files_acknowledged(&job_id, 3);
+        assert_eq!(
+            session.files_acknowledged(&job_id, 3),
+            None,
+            "this acknowledgement freed a collection, so there is nothing to say"
+        );
         assert!(
             !spool.exists(),
             "the existing acknowledgement path removes the spool: that is the whole design"
@@ -4496,6 +4821,29 @@ mod tests {
     /// A spool for a job the hub no longer knows — cancelled, written off, or
     /// a record that is gone — reaches a **terminal** state rather than being
     /// offered on every connection for ever. Its bytes are kept.
+    ///
+    /// **Rewritten when the barrier was fixed, and only its stimulus.** Every
+    /// outcome assertion below is the one this test has always made: the
+    /// collection is no longer held, the spool is gone from its own name, the
+    /// bytes are readable under `.unclaimed`, and a later start does not pick
+    /// it up again. Nothing about what *silence* means changed.
+    ///
+    /// What changed is how the silence is produced: the hand-made
+    /// `the_hub_has_said_what_it_is_owed()` of the old version is now a
+    /// no-op by itself, so the test drains the offer off the link, queues a
+    /// health report through the session's own path, and delivers the hub's
+    /// answer to *that* report. The test is stronger for it — it used to
+    /// prove the barrier condemns **when called**, and now proves it
+    /// condemns **when the hub has demonstrably had its turn and said
+    /// nothing**.
+    ///
+    /// The assertion a rewrite like this could have smuggled away is "a
+    /// silence with no proof behind it keeps the spool", and it is back as
+    /// its own test with its own fixture:
+    /// [`a_swept_spool_is_not_set_aside_before_the_hub_has_answered_the_offer`].
+    /// The pair is what a reviewer checks — *silence with proof ⇒ set
+    /// aside*, *silence without proof ⇒ keep* — and neither passes on the
+    /// other's implementation.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_swept_spool_no_hub_asks_for_is_set_aside_and_never_offered_again() {
         let job_id = JobId::new("j0000002855");
@@ -4528,8 +4876,30 @@ mod tests {
             }
             tokio::task::yield_now().await;
         }
-        // The answer to the first health report: the barrier that says the
-        // hub has already told this runner everything it is owed.
+        // And the *whole* offer is on the link — the pump found nothing more
+        // to send — which is the barrier's own first precondition and the
+        // thing the old version of this test asserted nothing about.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let offered_at = loop {
+            if let Some((_, Some(at), _)) = session.what_this_link_knows(&job_id) {
+                break at;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "the offer was never concluded, so the barrier may not judge it"
+            );
+            tokio::task::yield_now().await;
+        };
+        assert_eq!(
+            offered_at, 0,
+            "no health report had been queued when the offer finished"
+        );
+        // The production sequence, in place of a hand-made instant: a report
+        // queued **after** that last chunk, and the hub's answer to it. That
+        // answer is the proof — one `HealthRecorded` per `Health`, at the end
+        // of the hub's handler, frames in order — that the hub read the whole
+        // offer and said nothing about this collection.
+        assert!(session.send_health(), "there is a link to report on");
         session.the_hub_has_said_what_it_is_owed();
         assert_eq!(
             session.held_collections(),
@@ -4660,5 +5030,404 @@ mod tests {
         // Neither one was touched.
         assert!(spool.exists());
         assert!(live.exists());
+    }
+
+    /// **The other half of the pair** (see
+    /// [`a_swept_spool_no_hub_asks_for_is_set_aside_and_never_offered_again`]):
+    /// a silence with no proof behind it keeps the spool.
+    ///
+    /// RED before the fix, because the old barrier condemned on the first
+    /// `HealthRecorded` whatever had or had not been offered by then. The
+    /// fixture is the order production actually runs in, and the order that
+    /// cost the first consumer 37.6 GiB: the report is queued **before** the
+    /// offer's last chunk — `offer_swept_collections` only spawns the pumps,
+    /// and `report_health`'s interval fires its first tick at once — so the
+    /// answer to it proves only that the hub read the frames that were
+    /// already there. The window starts shut so that this order is the
+    /// test's and not the scheduler's.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_swept_spool_is_not_set_aside_before_the_hub_has_answered_the_offer() {
+        let job_id = JobId::new("j0000002856");
+        let (_temp, root, spool) = a_root_holding_a_spool("sweep-unanswered", &job_id, 1);
+        let session = Session::new();
+        let credit = Arc::new(Semaphore::new(0));
+        let (outbox, _inbox) = mpsc::unbounded_channel();
+        // A stall bound no part of this test waits out: the pump below sits
+        // on a shut window on purpose and has nothing to complain about.
+        session.attach(outbox, Arc::clone(&credit), Duration::from_secs(30));
+        session.pick_up_collections(&root);
+        session.settle_against_state_root(&root, "s-the-one-that-made-these-ids");
+        assert_eq!(session.held_collections(), 1);
+
+        session.offer_swept_collections();
+        // Queued while every pump is still waiting for room, which is what
+        // makes its answer no evidence about the offer.
+        assert!(session.send_health(), "there is a link to report on");
+        credit.add_permits(FILES_IN_FLIGHT);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let offered_at = loop {
+            if let Some((_, Some(at), _)) = session.what_this_link_knows(&job_id) {
+                break at;
+            }
+            assert!(Instant::now() < deadline, "the offer was never concluded");
+            tokio::task::yield_now().await;
+        };
+        assert_eq!(
+            offered_at, 1,
+            "one report was already queued when the offer finished, so only the *second* \
+             answer could prove anything"
+        );
+
+        // The hub answers the report it had already been sent. That is the
+        // frame the old barrier condemned on.
+        session.the_hub_has_said_what_it_is_owed();
+        assert_eq!(
+            session.held_collections(),
+            1,
+            "an answer to a report queued before the offer finished proves nothing about \
+             the offer: the hub may be about to acknowledge it, which is exactly what it \
+             was doing when 37.6 GiB was set aside"
+        );
+        assert!(spool.exists(), "{}", spool.display());
+        assert!(!root
+            .outputs_dir()
+            .join(format!("{job_id}-1.{}", sweep::UNCLAIMED))
+            .exists());
+    }
+
+    /// **The in-crate twin of `spool_offer_answered.rs`, with no sockets:**
+    /// more collections than the link's window, every one of them
+    /// acknowledged by the hub *after* it has answered a health report, and
+    /// not one of them set aside.
+    ///
+    /// RED before the fix: the barrier took every collection that had put a
+    /// chunk on the link, the acknowledgements then landed on map entries
+    /// that were no longer there, and the spools stayed on the disk under
+    /// `.unclaimed` — the whole defect, in the order the frames really
+    /// arrive in. The swept count exceeds [`FILES_IN_FLIGHT`] by
+    /// construction, because that is what makes the offers conclude at
+    /// different times.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn every_offered_collection_the_hub_acknowledges_survives_the_first_health_answer() {
+        const SWEPT: usize = FILES_IN_FLIGHT + 4;
+        let (_temp, root, spools) = a_root_holding_spools(
+            "sweep-acknowledged-late",
+            SWEPT,
+            herd_proto::OUTPUT_CHUNK_BYTES as usize + 7,
+        );
+        let session = Session::new();
+        let credit = Arc::new(Semaphore::new(0));
+        let (outbox, mut inbox) = mpsc::unbounded_channel();
+        session.attach(outbox, Arc::clone(&credit), Duration::from_secs(30));
+        session.pick_up_collections(&root);
+        session.settle_against_state_root(&root, "s-the-one-that-made-these-ids");
+        assert_eq!(session.held_collections(), SWEPT);
+
+        session.offer_swept_collections();
+        assert!(session.send_health(), "there is a link to report on");
+        credit.add_permits(FILES_IN_FLIGHT);
+        // Every offer finishes, which takes returning permits as
+        // `write_frames` does: more collections than permits, so they finish
+        // at different times and in no particular order.
+        let deadline = Instant::now() + Duration::from_secs(30);
+        loop {
+            while let Ok(message) = inbox.try_recv() {
+                if matches!(message, ToHub::JobFileChunk { .. }) {
+                    credit.add_permits(1);
+                }
+            }
+            if spools.iter().all(|(job_id, _)| {
+                matches!(session.what_this_link_knows(job_id), Some((_, Some(_), _)))
+            }) {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "not every offer was concluded, so this test would be measuring the window"
+            );
+            tokio::task::yield_now().await;
+        }
+
+        // The hub's answer to the report that was queued before any of those
+        // offers finished. Not one of them may be judged on it.
+        session.the_hub_has_said_what_it_is_owed();
+        assert_eq!(
+            session.held_collections(),
+            SWEPT,
+            "every one of these offers finished after that report was queued, so its answer \
+             is no evidence about any of them"
+        );
+
+        // And now the hub says what it was always going to say, in a
+        // different order from the offer, and every spool goes — through the
+        // one path D19 authorises to remove one.
+        for (job_id, spool) in spools.iter().rev() {
+            assert_eq!(
+                session.files_acknowledged(job_id, 1),
+                None,
+                "the collection was still held, so the acknowledgement freed it and has \
+                 nothing to say"
+            );
+            assert!(
+                !spool.exists(),
+                "{} survived its own acknowledgement",
+                spool.display()
+            );
+        }
+        assert_eq!(session.held_collections(), 0);
+        for (job_id, _) in &spools {
+            let aside = root
+                .outputs_dir()
+                .join(format!("{job_id}-1.{}", sweep::UNCLAIMED));
+            assert!(
+                !aside.exists(),
+                "a collection the hub acknowledged was set aside anyway: {}",
+                aside.display()
+            );
+        }
+    }
+
+    /// A collection whose offer is still waiting for room in the window is
+    /// **never** judged, however many round trips go by.
+    ///
+    /// This is the property that makes the fix a fix rather than a narrower
+    /// window: the barrier's evidence is about one collection's own offer, so
+    /// a collection that has not made one is not covered by anybody else's
+    /// round trip. RED before the fix, where the one pump that got the single
+    /// permit set `probed` and was condemned at the first answer.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_collection_still_waiting_for_room_is_never_judged() {
+        let (_temp, root, spools) = a_root_holding_spools("sweep-no-room", 2, 27);
+        let session = Session::new();
+        // One permit, and nothing ever gives it back: `write_frames` is what
+        // returns a permit and there is none here, so the first chunk of the
+        // first pump shuts the window for good.
+        let credit = Arc::new(Semaphore::new(1));
+        let (outbox, mut inbox) = mpsc::unbounded_channel();
+        session.attach(outbox, Arc::clone(&credit), Duration::from_secs(30));
+        session.pick_up_collections(&root);
+        session.settle_against_state_root(&root, "s-the-one-that-made-these-ids");
+        assert_eq!(session.held_collections(), 2);
+        session.offer_swept_collections();
+
+        // One chunk reaches the link and the window is shut behind it.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut chunks = 0;
+        while chunks == 0 {
+            assert!(Instant::now() < deadline, "no chunk of either collection");
+            while let Ok(message) = inbox.try_recv() {
+                if matches!(message, ToHub::JobFileChunk { .. }) {
+                    chunks += 1;
+                }
+            }
+            tokio::task::yield_now().await;
+        }
+
+        // Two full round trips with the hub, and neither collection has an
+        // offer to be judged on.
+        for _ in 0..2 {
+            assert!(session.send_health(), "there is a link to report on");
+            session.the_hub_has_said_what_it_is_owed();
+        }
+        assert_eq!(
+            session.held_collections(),
+            2,
+            "a collection whose offer is still waiting for room was never offered, so no \
+             answer of the hub's says anything about it"
+        );
+        for (job_id, spool) in &spools {
+            assert!(spool.exists(), "{}", spool.display());
+            assert!(!root
+                .outputs_dir()
+                .join(format!("{job_id}-1.{}", sweep::UNCLAIMED))
+                .exists());
+        }
+    }
+
+    /// An acknowledgement that frees nothing **says so**, and says which of
+    /// the two it was. This is the step at which 37.6 GiB was lost in
+    /// silence.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_acknowledgement_for_a_collection_this_runner_does_not_hold_is_said_out_loud() {
+        // (a) Nothing held for that job at all.
+        let session = Session::new();
+        let stranger = JobId::new("j0000002900");
+        let said = session
+            .files_acknowledged(&stranger, 1)
+            .expect("an acknowledgement that frees nothing is not silent");
+        assert!(
+            said.contains("every file of j0000002900 (attempt 1)"),
+            "{said}"
+        );
+        assert!(said.contains("holds no collection for it"), "{said}");
+        assert!(said.contains("The bytes are safe on the hub"), "{said}");
+        assert!(said.contains("nothing here will remove it"), "{said}");
+
+        // (b) A collection held for another attempt of the same job.
+        let job_id = JobId::new("j0000002901");
+        let (_temp, root, spool) = a_root_holding_a_spool("ack-other-attempt", &job_id, 2);
+        let session = Session::new();
+        let credit = Arc::new(Semaphore::new(FILES_IN_FLIGHT));
+        let (outbox, _inbox) = mpsc::unbounded_channel();
+        session.attach(outbox, credit, Duration::from_millis(50));
+        session.pick_up_collections(&root);
+        session.settle_against_state_root(&root, "s-the-one-that-made-these-ids");
+        assert_eq!(session.held_collections(), 1);
+        let said = session
+            .files_acknowledged(&job_id, 1)
+            .expect("an acknowledgement of another attempt is not silent either");
+        assert!(said.contains("holds attempt 2 of it"), "{said}");
+        assert!(said.contains("nothing is removed"), "{said}");
+        assert_eq!(session.held_collections(), 1, "and nothing was removed");
+        assert!(spool.exists(), "{}", spool.display());
+        assert_eq!(
+            session.what_this_link_knows(&job_id),
+            Some((false, None, false)),
+            "a frame about another attempt is not a statement about this spool, so it must \
+             not count as the hub having mentioned it"
+        );
+    }
+
+    /// A file that will not read **ends** the offer, so the collection
+    /// reaches the terminal state instead of being offered again on every
+    /// connection for ever.
+    ///
+    /// The one arm the new rule would otherwise leak: "the cursor is
+    /// exhausted" never becomes true for a spool whose file is gone, and a
+    /// rename traded for an unbounded re-offer is the leak
+    /// [`crate::sweep`]'s terminal rule exists to prevent. The fixture is the
+    /// shape that was actually measured on the first consumer's disk — the
+    /// file simply is not there — and not a `chmod`, which a root-ish test
+    /// environment ignores.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_file_that_will_not_read_ends_the_offer_and_says_so() {
+        let job_id = JobId::new("j0000002902");
+        let (_temp, root, spool) = a_root_holding_a_spool("sweep-unreadable", &job_id, 1);
+        let session = Session::new();
+        let credit = Arc::new(Semaphore::new(FILES_IN_FLIGHT));
+        let (outbox, _inbox) = mpsc::unbounded_channel();
+        session.attach(outbox, credit, Duration::from_secs(30));
+        session.pick_up_collections(&root);
+        session.settle_against_state_root(&root, "s-the-one-that-made-these-ids");
+        // After the manifest was read and before a chunk of it is: a disk
+        // fault, or an operator, or the `cp -al` of somebody else's backup.
+        std::fs::remove_file(spool.join("results.json")).expect("the file goes away");
+
+        session.offer_swept_collections();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            if let Some((_, Some(at), cut_short)) = session.what_this_link_knows(&job_id) {
+                assert_eq!(at, 0, "no report had been queued yet");
+                assert!(
+                    cut_short,
+                    "the offer ended on a read that failed, and the sentence has to say so"
+                );
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "a read that fails must still end the offer, or this spool is offered for \
+                 ever"
+            );
+            tokio::task::yield_now().await;
+        }
+        assert!(session.send_health(), "there is a link to report on");
+        session.the_hub_has_said_what_it_is_owed();
+        assert_eq!(
+            session.held_collections(),
+            0,
+            "nothing will ever acknowledge a collection this runner cannot send"
+        );
+        assert!(!spool.exists());
+        assert!(root
+            .outputs_dir()
+            .join(format!("{job_id}-1.{}", sweep::UNCLAIMED))
+            .exists());
+        let (swept, _) = sweep::pick_up(&root);
+        assert!(swept.is_empty(), "and it is not offered again");
+    }
+
+    /// A collection the hub asks for **while** its offer is in flight is
+    /// never condemned, though two pumps are then running it.
+    ///
+    /// Pins the reason no in-flight counter is needed: `files_held` sets
+    /// `heard` under the lock *before* it spawns its pump, so a collection
+    /// with a second pump is already out of the barrier's reach. A later
+    /// change to who may spawn a pump fails here rather than in production.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_collection_the_hub_asks_for_mid_offer_is_never_condemned_though_two_pumps_run_it() {
+        let job_id = JobId::new("j0000002903");
+        let (_temp, root, spool) = a_root_holding_a_spool("sweep-two-pumps", &job_id, 1);
+        let session = Session::new();
+        let credit = Arc::new(Semaphore::new(0));
+        let (outbox, mut inbox) = mpsc::unbounded_channel();
+        session.attach(outbox, Arc::clone(&credit), Duration::from_secs(30));
+        session.pick_up_collections(&root);
+        session.settle_against_state_root(&root, "s-the-one-that-made-these-ids");
+
+        session.offer_swept_collections();
+        // Mid-offer, because the window has not opened yet: the hub asks for
+        // the collection, which marks it and starts a second pump on it.
+        session.files_held(&job_id, 1, &[]);
+        credit.add_permits(FILES_IN_FLIGHT);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            while let Ok(message) = inbox.try_recv() {
+                if matches!(message, ToHub::JobFileChunk { .. }) {
+                    credit.add_permits(1);
+                }
+            }
+            if let Some((heard, Some(_), _)) = session.what_this_link_knows(&job_id) {
+                assert!(heard, "the hub asked for it, which is the whole question");
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "neither pump concluded the offer"
+            );
+            tokio::task::yield_now().await;
+        }
+        for _ in 0..2 {
+            assert!(session.send_health(), "there is a link to report on");
+            session.the_hub_has_said_what_it_is_owed();
+        }
+        assert_eq!(
+            session.held_collections(),
+            1,
+            "the hub is waiting for these bytes, and two pumps on one collection does not \
+             make it an orphan"
+        );
+        assert!(spool.exists(), "{}", spool.display());
+    }
+
+    /// A data root holding `how_many` spools of one file each, for the tests
+    /// whose whole point is **more collections than the link's window**:
+    /// below that count the single pump is answered before anything else
+    /// happens, which is a true measurement of the one state the race cannot
+    /// be lost in.
+    fn a_root_holding_spools(
+        name: &str,
+        how_many: usize,
+        each: usize,
+    ) -> (
+        crate::testing::TempDir,
+        root::DataRoot,
+        Vec<(JobId, PathBuf)>,
+    ) {
+        let temp = crate::testing::TempDir::new(name);
+        let root = root::DataRoot::open(temp.path()).expect("a throwaway data root");
+        let spools = (0..how_many)
+            .map(|which| {
+                let job_id = JobId::new(format!("j00000030{which:02}"));
+                let spool = root.outputs_dir().join(format!("{job_id}-1"));
+                std::fs::create_dir_all(&spool).expect("the spool directory");
+                std::fs::write(spool.join("results.json"), vec![b'a'; each])
+                    .expect("the spooled file");
+                (job_id, spool)
+            })
+            .collect();
+        root.remember_hub_state_root("s-the-one-that-made-these-ids")
+            .expect("the data root records a state root");
+        (temp, root, spools)
     }
 }
