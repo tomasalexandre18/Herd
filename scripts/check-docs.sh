@@ -114,7 +114,12 @@ $next"
 dups=$(grep -oE '^## [0-9-]+ — D[0-9]+' "$dec" | sed 's/.*— D//' | sort -n | uniq -d)
 [ -z "$dups" ] || note "$dec uses a decision number twice (a number is an identifier, D148; append with the next free one, never renumber):
 $(printf '    D%s\n' $dups)"
-known_gaps="143 154"
+# D143 and D154 were raced for by parallel branches and never taken.
+# D170 was held by PR #67, which was closed unmerged as obsolete, so the
+# number is spent and the gap is permanent (decisions.md, D148: a number
+# is an identifier, gaps stay). Listing it here accepts the gap; it does
+# not renumber anything. A note nobody can clear is a note nobody reads.
+known_gaps="143 154 170"
 max=$(grep -oE '^## [0-9-]+ — D[0-9]+' "$dec" | sed 's/.*— D//' | sort -n | tail -1)
 if [ -n "$max" ]; then
   gaps=$(seq 1 "$max" | grep -vxF -f <(grep -oE '^## [0-9-]+ — D[0-9]+' "$dec" | sed 's/.*— D//') | tr '\n' ' ')
