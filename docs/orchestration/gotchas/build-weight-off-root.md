@@ -17,9 +17,12 @@
   the suite or benches.
   1. **Before:** run `./scripts/bench-preflight.sh`. It checks free
      space on the filesystem that will hold `target/`, the 1-minute
-     load against the core count, and memory headroom, and exits
+     load against the core count, host memory headroom, and — since
+     2026-10-29 — the room left in the cgroup the phase will actually
+     run in, read the way `herd-runner/src/room.rs` reads it. It exits
      non-zero with the sentence saying what to do. A refusal is not
-     advice.
+     advice; a reading it could not take is printed as unavailable and
+     refuses nothing.
   2. **Build output goes to Herd's own volume, one directory per
      task**, and is deleted when the task ends:
 
