@@ -48,8 +48,9 @@
 
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::net::SocketAddr;
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, bail, Context, Result};
@@ -63,7 +64,7 @@ use herd_proto::{
 };
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::mpsc::{self, UnboundedReceiver, UnboundedSender};
-use tokio::sync::watch;
+use tokio::sync::{watch, Notify};
 use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::WebSocketStream;
 
@@ -73,6 +74,7 @@ use crate::job::{
 };
 use crate::matcher::{self, Placement, Seat, Stickiness};
 use crate::queue;
+use crate::status::{self, Status};
 
 /// Loopback by default: the hub is reached through the reverse proxy, which
 /// terminates TLS; the hub itself only ever speaks plain `ws://` (D4).
@@ -625,8 +627,34 @@ impl Hub {
                 peers: Mutex::new(Peers::default()),
                 dispatching: Mutex::new(()),
                 stopping: AtomicBool::new(false),
+                status_root: OnceLock::new(),
+                status_changed: Notify::new(),
+                status_published: Mutex::new(None),
             }),
         })
+    }
+
+    /// Publish the status document into this state root while serving
+    /// (E-35, E-40).
+    ///
+    /// The binary always calls this with the root it was given; a hub that
+    /// is not told writes no document, which is the in-process hub most
+    /// tests build and which has no root of its own to speak of.
+    ///
+    /// **A path rather than a question asked of the store.** The
+    /// [`JobStore`] trait says nothing about directories on purpose, and the
+    /// one other thing in the hub that reads the state root as a directory —
+    /// [`crate::StateRootReport`] — takes a `&Path` for the same reason: a
+    /// writer told where to write is easier to be sure of than one that
+    /// infers it from something whose job is records.
+    ///
+    /// Called before [`Hub::serve`], and said once: a second call is
+    /// ignored, because a hub that could be pointed at a different root
+    /// halfway through serving would be a hub with two answers about where
+    /// its own state is.
+    pub fn publishing_status_to(self, root: impl Into<PathBuf>) -> Self {
+        let _already_said = self.state.status_root.set(root.into());
+        self
     }
 
     /// The address actually bound.
@@ -647,7 +675,7 @@ impl Hub {
     }
 
     /// Serve until the listener fails. Dropping the returned future releases
-    /// the port and ends the hub's own four housekeeping tasks.
+    /// the port and ends the hub's own five housekeeping tasks.
     ///
     /// No signal is listened for here: an in-process hub shares its process
     /// with its test, and a library that installed a `SIGTERM` handler on
@@ -693,7 +721,7 @@ impl Hub {
         // Held in a guard rather than aborted at the end, **because the end
         // is not always reached**: a caller that drops this future — every
         // end-to-end test does, by aborting the task it runs in — would
-        // otherwise leave four tasks alive, each holding an `Arc<State>` and
+        // otherwise leave five tasks alive, each holding an `Arc<State>` and
         // through it the store's `flock` on the state root. A hub that is
         // gone would go on holding its state root against the next one, which
         // M8 turned from a theoretical leak into a real test flake: a state
@@ -703,6 +731,7 @@ impl Hub {
             tokio::spawn(keep_trying_to_write_results(Arc::clone(&self.state))),
             tokio::spawn(let_the_queue_age(Arc::clone(&self.state))),
             tokio::spawn(say_again_why_jobs_wait(Arc::clone(&self.state))),
+            tokio::spawn(keep_the_status_document_current(Arc::clone(&self.state))),
         ]);
         let serving = async {
             loop {
@@ -773,6 +802,15 @@ impl Hub {
                 after: STOP_WITHIN,
             },
         };
+        // **The last word, written here and not left to the publisher.**
+        // `_housekeeping` is dropped on the way out of this function, which
+        // aborts the publishing task — so a document saying this hub was
+        // stopping would be a race against that abort. Written straight,
+        // once, it is deterministic: the document an operator finds on a
+        // volume whose hub is gone says so, in the hub's own last
+        // publication, instead of looking like a fleet that simply went
+        // quiet (see `HubNow::stopping`).
+        publish_the_status(&self.state);
         Ok(stop)
     }
 }
@@ -1104,6 +1142,37 @@ struct State {
     /// Monotonic on purpose: nothing un-stops a hub, so a second `SIGTERM`
     /// finds the flag already set and changes nothing (ORCH-081).
     stopping: AtomicBool,
+    /// Where to publish the status document, when this hub publishes one
+    /// (E-35).
+    ///
+    /// Set once, by [`Hub::publishing_status_to`], before serving begins;
+    /// unset on a hub nobody asked for a document, which is the in-process
+    /// one most tests build. It is a path handed in rather than a question
+    /// asked of the [`JobStore`] for the reason
+    /// [`crate::StateRootReport::read`] takes one: a writer told where to
+    /// write is easier to be sure of than one that infers it, and the store
+    /// trait says nothing about directories on purpose.
+    status_root: OnceLock<PathBuf>,
+    /// Rung whenever something the status document says may have changed.
+    ///
+    /// **The only thing that ever wakes the publisher.** There is no clock:
+    /// a hub where nothing happens publishes nothing, which is what makes
+    /// the document a record of changes rather than a sample. It is rung
+    /// from [`State::with_peers`], which is the one door to every live fact
+    /// about the fleet, so it is not possible to move a runner, a health
+    /// age, a switch or a held job without ringing it. Over-ringing is free
+    /// and deliberate: the publisher compares what it built against what it
+    /// last wrote and writes nothing when they say the same thing
+    /// ([`Status::same_but_for_the_clock`]), so a wake that turns out to be
+    /// about nothing costs one build and no write.
+    status_changed: Notify,
+    /// The last document this hub published, so an unchanged one is not
+    /// written again.
+    ///
+    /// This is what lets [`State::status_changed`] be rung carelessly: the
+    /// comparison, not the trigger, is what decides whether the disk is
+    /// touched. `None` until the first publication.
+    status_published: Mutex<Option<Status>>,
 }
 
 /// What a runner announced about itself in its handshake, past its name.
@@ -1233,6 +1302,25 @@ struct ConnectedRunner {
     kick: watch::Sender<bool>,
     joined_at: Instant,
     last_health: Instant,
+    /// The same moment on the wall clock, for the status document (E-35,
+    /// E-40).
+    ///
+    /// **A second representation of one fact, and the duplication is the
+    /// point.** `last_health` above is an [`Instant`], which is what a
+    /// timeout must be judged on — it cannot step backwards, so a host whose
+    /// clock jumps cannot make the hub declare a healthy runner lost. But an
+    /// `Instant` has no meaning outside this process, so a document that
+    /// carried an *age* derived from it would be stale the moment it was
+    /// written, and one that carried `now - elapsed` would flip by a second
+    /// whenever the two clocks rounded differently — which would be a write
+    /// on a fleet where nothing happened. So the wall-clock moment is taken
+    /// once, where the report lands, and never recomputed: it changes when a
+    /// runner speaks and at no other time, which is exactly what keeps the
+    /// document off a timer.
+    ///
+    /// Nothing judges a timeout on it, and nothing may: that is
+    /// `last_health`'s job.
+    last_health_at: Timestamp,
     reports_seen: u64,
     draining: bool,
     /// Where its owner's switch stands (E-33), as this runner last said.
@@ -1530,7 +1618,36 @@ impl Peers {
 }
 
 impl State {
+    /// The hub's live view of its peers, with the status publisher told that
+    /// it may have moved.
+    ///
+    /// **The one door, and that is what makes E-35 hold.** Every fact the
+    /// status document reports about the fleet — who is connected, what each
+    /// one lends, where its switch stands, how long since it last spoke,
+    /// what it says it is holding — is reached through here, so ringing the
+    /// bell on the way out means no change to any of them can be published
+    /// late. The alternative, a ring at each of the sites that mutate a
+    /// runner, is a list that the next milestone adds to and forgets.
+    ///
+    /// It rings on a read as well, because the closure takes `&mut Peers`
+    /// and this function cannot tell the two apart. That is deliberately not
+    /// worth fixing: a ring that turns out to be about nothing costs the
+    /// publisher one build and no write at all
+    /// ([`Status::same_but_for_the_clock`]), and the publisher reaches the
+    /// lock through [`State::peers_now`] so it can never wake itself.
     fn with_peers<T>(&self, f: impl FnOnce(&mut Peers) -> T) -> T {
+        let answer = self.peers_now(f);
+        self.status_changed.notify_one();
+        answer
+    }
+
+    /// The same lock, and no bell.
+    ///
+    /// For the status publisher itself, which would otherwise wake itself
+    /// for ever, and for nothing else: a caller that wants the publisher not
+    /// to hear about its change is a caller publishing a document that is
+    /// quietly wrong.
+    fn peers_now<T>(&self, f: impl FnOnce(&mut Peers) -> T) -> T {
         let mut peers = self
             .peers
             .lock()
@@ -1630,6 +1747,7 @@ impl State {
                     kick,
                     joined_at: now,
                     last_health: now,
+                    last_health_at: Timestamp::now(),
                     reports_seen: 0,
                     draining: false,
                     switch: announced.switch.clone(),
@@ -1722,6 +1840,147 @@ impl State {
                     }
                 })
                 .collect()
+        })
+    }
+
+    /// What the fleet is doing, as the status document says it (E-35, E-40).
+    ///
+    /// **Two sources and no overlap between their locks.** The records are
+    /// read first and the peers second, each released before the other is
+    /// taken: the hub's own lock order is `dispatching` before `peers`
+    /// (see [`State::dispatching`]), and a gatherer that held `peers` while
+    /// it walked the store would be a third order nobody had reasoned
+    /// about. The cost is that the two halves are a few microseconds apart,
+    /// which the document already admits to in general — it carries the
+    /// moment it was built, and nothing in it is claimed to be one instant
+    /// (the same trade [`crate::StateRootReport`] makes, for the same
+    /// reason).
+    ///
+    /// **Which source answers which question.** The queue and the jobs that
+    /// are out come off the **records**, because that is the hub's one
+    /// authority on what is where (D79): a count held in memory is a count
+    /// that can leak, and a restarted hub rebuilds the truth by looking.
+    /// What a machine *is* — its build, its offer, its switch, its health
+    /// age — comes off the connection, because a machine that is not here
+    /// has no offer and a redial brings its own.
+    ///
+    /// An error, not an empty document, when the records cannot be read: a
+    /// publication claiming an empty queue because a directory would not
+    /// open is exactly the zero-standing-in-for-ignorance this document
+    /// refuses everywhere else.
+    fn status_now(&self) -> crate::job::Result<Status> {
+        let unfinished = self.store.unfinished_jobs()?;
+        let approved = self.store.approved_runners()?;
+        let budget = self.store.output_budget();
+        let hub = status::HubNow {
+            version: hub_version().to_owned(),
+            state_root_id: self.store.state_root_id().to_owned(),
+            protocol_version: PROTOCOL_VERSION,
+            record_version: crate::job::RECORD_VERSION,
+            health_every_ms: self.policy.health_every.as_millis() as u64,
+            lost_after_ms: self.policy.lost_after.as_millis() as u64,
+            output_budget_bytes: budget.bytes,
+            stopping: self.stopping(),
+        };
+        let mut running = Vec::new();
+        let mut queued = Vec::new();
+        for record in unfinished {
+            let labels: Vec<String> = record.labels.iter().map(str::to_owned).collect();
+            // The jobs that are out are the ones with an attempt under way,
+            // and the state's own word for where each one stands is used
+            // rather than a word invented here: `assigned`, `running` and
+            // `interrupted` are three different things for an operator and
+            // flattening them would hide the third, which is the one worth
+            // acting on.
+            match (&record.state, record.attempts.last()) {
+                (JobState::Queued, _) | (_, None) => queued.push(status::QueuedNow {
+                    id: record.id.clone(),
+                    priority: record.priority,
+                    labels,
+                    submitted_at: record.submitted_at,
+                    waiting_for: record.waiting_for.clone(),
+                    attempts_so_far: record.attempts.len() as u32,
+                }),
+                (state, Some(attempt)) => running.push(status::RunningNow {
+                    id: record.id.clone(),
+                    state: state.name().to_owned(),
+                    runner: attempt.runner.clone(),
+                    attempt: attempt.number,
+                    priority: record.priority,
+                    labels,
+                    started_at: attempt.started_at,
+                    why_here: attempt.why.clone(),
+                }),
+            }
+        }
+        // The one sort that is not already given: `unfinished_jobs` answers
+        // oldest first over the whole queue, so splitting it in two leaves
+        // each half ordered by id anyway — this says so rather than relying
+        // on it, because two publications of the same facts have to be the
+        // same bytes for the writer to be able to skip a write.
+        running.sort_by(|left, right| left.id.cmp(&right.id));
+        queued.sort_by(|left, right| left.id.cmp(&right.id));
+
+        let runners = self.peers_now(|peers| {
+            peers
+                .runners
+                .values()
+                .map(|runner| {
+                    let suspended: BTreeMap<String, String> =
+                        runner.capacity.suspended().into_iter().collect();
+                    let capabilities = runner
+                        .capacity
+                        .offer()
+                        .entries()
+                        .iter()
+                        .map(|entry| status::CapabilityNow {
+                            label: entry.name().to_owned(),
+                            kind: entry.capability.kind.name().to_owned(),
+                            slots: entry.capability.kind.holders_allowed(),
+                            origins: entry.origins,
+                            suspended: suspended.get(entry.name()).cloned(),
+                        })
+                        .collect();
+                    status::RunnerNow {
+                        name: runner.name.clone(),
+                        version: Some(runner.version.clone()),
+                        instance: runner.instance.clone(),
+                        switch: runner.switch.clone(),
+                        draining: runner.draining,
+                        preference: runner.preference,
+                        last_health_at: runner.last_health_at,
+                        health_reports_seen: runner.reports_seen,
+                        load_milli: runner.load_milli,
+                        lends: status::Lends {
+                            memory_mib: runner.host.memory_mib,
+                            memory_floor_mib: runner.host.memory_floor_mib,
+                            threads: runner.host.threads,
+                            tmpfs_mib: runner.host.tmpfs_mib,
+                            jobs_at_once: runner.jobs_at_once,
+                            capabilities,
+                        },
+                        holding: runner.jobs.iter().map(|job| job.job_id.clone()).collect(),
+                    }
+                })
+                .collect::<Vec<_>>()
+        });
+        let here: HashSet<&str> = runners.iter().map(|runner| runner.name.as_str()).collect();
+        let away = approved
+            .into_iter()
+            .filter(|approval| !here.contains(approval.name.as_str()))
+            .map(|approval| status::AwayNow {
+                name: approval.name,
+                approved_at: Timestamp::at_unix_seconds(approval.approved_unix_s as i64),
+            })
+            .collect();
+        Ok(Status {
+            status_version: status::STATUS_VERSION,
+            as_of: Timestamp::now(),
+            hub,
+            runners,
+            away,
+            running,
+            queued,
         })
     }
 
@@ -1953,6 +2212,7 @@ impl State {
                 .find(|runner| runner.outbox.same_channel(outbox))
             {
                 runner.last_health = Instant::now();
+                runner.last_health_at = Timestamp::now();
                 runner.reports_seen += 1;
                 runner.draining = draining;
                 runner.jobs = jobs;
@@ -3871,6 +4131,121 @@ async fn say_again_why_jobs_wait(state: Arc<State>) {
             }
         }
     }
+}
+
+/// Keep the status document in step with the fleet (E-35, E-40).
+///
+/// **Woken by changes, never by a clock.** It sleeps on
+/// [`State::status_changed`], which [`State::with_peers`] rings — so a hub
+/// where nothing is happening does nothing at all, for ever, and the
+/// document's own `as_of` stops moving with it. That is the property the
+/// milestone asks for: *refreshed on change*, not sampled.
+///
+/// Three things keep it cheap enough to leave on that trigger.
+///
+/// 1. **Nothing is written when nothing changed.** The built document is
+///    compared against the last one published, everything but the clock
+///    ([`Status::same_but_for_the_clock`]), and an identical one is dropped.
+///    `with_peers` is also the hub's one *read* door, so most wakes are
+///    about nothing — and cost one build and no `fsync`.
+/// 2. **One notification, however many changes.** A [`Notify`] holds a
+///    single permit, so a dispatch pass that touches the fleet forty times
+///    wakes this loop once more, not forty times.
+/// 3. **A floor between two builds** ([`status::AT_MOST_EVERY`]). This is
+///    not a refresh interval and does not make the document a sample: it
+///    bounds how often a *burst* can be written down, and a change that
+///    lands during the floor is published the instant it lifts. Fifty
+///    milliseconds, which is three hundred times shorter than the health
+///    cadence E-40 asks for.
+///
+/// A hub nobody gave a root to ([`Hub::publishing_status_to`]) writes
+/// nothing and this loop ends at once, which is the in-process hub most
+/// tests build.
+async fn keep_the_status_document_current(state: Arc<State>) {
+    if state.status_root.get().is_none() {
+        return;
+    }
+    // Once before the first wake, so a hub that has just come up answers
+    // the question straight away — including the case that matters most to
+    // an operator reading this file after an outage: a hub that inherited a
+    // queue and has no runner yet.
+    publish_the_status(&state);
+    loop {
+        state.status_changed.notified().await;
+        tokio::time::sleep(status::AT_MOST_EVERY).await;
+        publish_the_status(&state);
+    }
+}
+
+/// Build the document and write it, unless it would say what the last one
+/// said.
+///
+/// Separate from the loop so that the stop path can take its last word
+/// deterministically rather than racing the loop's abort, and so that a test
+/// of the writing has something to call.
+///
+/// **A failure is said once and never papered over.** A document that could
+/// not be built — the records would not read — is not published at all: an
+/// empty queue because a directory would not open is the one lie this
+/// document must never tell. A document that could not be *written* leaves
+/// the previous one in place, which is honest for the same reason: its
+/// `as_of` says how old it is.
+fn publish_the_status(state: &State) {
+    let Some(root) = state.status_root.get() else {
+        return;
+    };
+    let status = match state.status_now() {
+        Ok(status) => status,
+        Err(error) => {
+            eprintln!(
+                "herd-hub: the status document was not published, because this \
+                 hub could not read its own records: {error}. The previous \
+                 document stays as it was; it says when it was published."
+            );
+            return;
+        }
+    };
+    {
+        let published = state
+            .status_published
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if published
+            .as_ref()
+            .is_some_and(|before| before.same_but_for_the_clock(&status))
+        {
+            return;
+        }
+    }
+    // Pretty, and that is a decision rather than a default. This file is
+    // read by a human with `cat` as often as by a renderer with a parser —
+    // which is the whole of why it is a document and not a frame — and a
+    // one-line JSON of a fleet is a file nobody reads twice. It is bounded
+    // by the fleet and the queue, not by any job's output, so there is no
+    // size for the whitespace to matter against.
+    let bytes = match serde_json::to_vec_pretty(&status) {
+        Ok(bytes) => bytes,
+        Err(error) => {
+            eprintln!("herd-hub: the status document would not serialise: {error}");
+            return;
+        }
+    };
+    // Through `durable`, like every other write in the hub (D8): a reader
+    // sees the whole of one publication or the whole of the previous one,
+    // never half of either, which is what makes `Status::read` safe to run
+    // in a loop against a serving hub.
+    if let Err(error) = crate::durable::write_file(&status::status_path(root), &bytes) {
+        eprintln!(
+            "herd-hub: the status document {} could not be written: {error}",
+            status::status_path(root).display()
+        );
+        return;
+    }
+    let mut published = state
+        .status_published
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    *published = Some(status);
 }
 
 /// Record why a queued job is not starting, and tell whoever is waiting for
@@ -7946,6 +8321,9 @@ mod tests {
             peers: Mutex::new(Peers::default()),
             dispatching: Mutex::new(()),
             stopping: AtomicBool::new(false),
+            status_root: OnceLock::new(),
+            status_changed: Notify::new(),
+            status_published: Mutex::new(None),
         });
         let (outbox, _inbox) = mpsc::unbounded_channel();
         let (kick, _kicked) = watch::channel(false);
@@ -8168,6 +8546,9 @@ mod tests {
             peers: Mutex::new(Peers::default()),
             dispatching: Mutex::new(()),
             stopping: AtomicBool::new(false),
+            status_root: OnceLock::new(),
+            status_changed: Notify::new(),
+            status_published: Mutex::new(None),
         });
 
         // The first pass writes a waiting line on every record: 400 records,
@@ -8247,6 +8628,9 @@ mod tests {
             peers: Mutex::new(Peers::default()),
             dispatching: Mutex::new(()),
             stopping: AtomicBool::new(false),
+            status_root: OnceLock::new(),
+            status_changed: Notify::new(),
+            status_published: Mutex::new(None),
         });
 
         // The first judgement of a job is news and is written: a job nobody
@@ -8349,6 +8733,9 @@ mod tests {
             peers: Mutex::new(Peers::default()),
             dispatching: Mutex::new(()),
             stopping: AtomicBool::new(false),
+            status_root: OnceLock::new(),
+            status_changed: Notify::new(),
+            status_published: Mutex::new(None),
         });
         // Outside the measurement: the pass that judges every job for the
         // first time writes a line for each, and is allowed to.
@@ -8582,6 +8969,9 @@ mod tests {
             peers: Mutex::new(Peers::default()),
             dispatching: Mutex::new(()),
             stopping: AtomicBool::new(false),
+            status_root: OnceLock::new(),
+            status_changed: Notify::new(),
+            status_published: Mutex::new(None),
         };
         let (outbox, mut inbox) = mpsc::unbounded_channel();
         // A job this hub has no record of is exactly what a written-off
@@ -8808,6 +9198,9 @@ mod tests {
             peers: Mutex::new(Peers::default()),
             dispatching: Mutex::new(()),
             stopping: AtomicBool::new(false),
+            status_root: OnceLock::new(),
+            status_changed: Notify::new(),
+            status_published: Mutex::new(None),
         });
         let (outbox, _inbox) = mpsc::unbounded_channel();
         let (kick, _kicked) = watch::channel(false);
@@ -8912,6 +9305,9 @@ mod tests {
             peers: Mutex::new(Peers::default()),
             dispatching: Mutex::new(()),
             stopping: AtomicBool::new(false),
+            status_root: OnceLock::new(),
+            status_changed: Notify::new(),
+            status_published: Mutex::new(None),
         })
     }
 

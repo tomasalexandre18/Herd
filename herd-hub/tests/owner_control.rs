@@ -229,6 +229,19 @@ async fn until_the_state_root_is_quiet(herd: &Herd) -> Vec<(String, Vec<u8>)> {
     }
 }
 
+/// The names of the runners a status document says are connected (E-35).
+///
+/// Names alone, because that is what the dry-run comparison is about: what
+/// each machine *says about itself* — its health age above all — moves by
+/// itself and says nothing about a `would-run`.
+fn names_in(status: &herd_hub::Status) -> Vec<String> {
+    status
+        .runners
+        .iter()
+        .map(|runner| runner.name.clone())
+        .collect()
+}
+
 /// Submit until a job waits **for this reason**, and come back with the
 /// sentence its record carries.
 ///
@@ -816,6 +829,21 @@ async fn a_dry_run_changes_nothing_and_says_what_the_real_pass_would_say() {
     .await;
 
     let before = until_the_state_root_is_quiet(&herd).await;
+    // E-07 over the one file `state_bytes` leaves out: the hub's own status
+    // document (E-35).
+    //
+    // It is excluded from the snapshot because a serving hub republishes it
+    // on every health report — five times a second here — so its *bytes*
+    // say nothing about this dry run. What it says about the fleet does, and
+    // nothing about that may move: a `would-run` mints no job, so the queue
+    // must be the same queue; it takes no slot and no reservation, so the
+    // running jobs must be the same jobs; and it connects nothing, so the
+    // runners must be the same runners. The health age and the report count
+    // are the two fields deliberately left out of this comparison, because
+    // they are what a healthy runner changes by itself.
+    let status_before = herd_hub::Status::read(herd.state.path())
+        .expect("the status document reads")
+        .expect("a serving hub has published one");
     let said = herd
         .herdctl(&[
             "would-run",
@@ -833,6 +861,23 @@ async fn a_dry_run_changes_nothing_and_says_what_the_real_pass_would_say() {
         String::from_utf8_lossy(&said.stderr)
     );
     let after = herd.state_bytes();
+    let status_after = herd_hub::Status::read(herd.state.path())
+        .expect("the status document reads")
+        .expect("a serving hub has published one");
+    assert_eq!(
+        status_before.queued, status_after.queued,
+        "a dry run mints nothing, so the queue in the status document is \
+         unchanged (E-07, E-35)"
+    );
+    assert_eq!(
+        status_before.running, status_after.running,
+        "a dry run takes no slot, so what is running is unchanged (E-07, E-35)"
+    );
+    assert_eq!(
+        names_in(&status_before),
+        names_in(&status_after),
+        "a dry run connects nothing, so the fleet is unchanged (E-07, E-35)"
+    );
     assert_eq!(
         before.len(),
         after.len(),
