@@ -2,13 +2,25 @@
 
 Reworked 2026-10-12 from the chatOnS requirement sheet (issue #1, expectations
 E-01..E-55 — 44 must, 9 should, 2 could; mapping in `docs/coverage.md`). M0 is
-done; everything after it is replaced. Each milestone is one session on one
-branch, ending with `cargo test --workspace` green and `docs/status.md`
+done; everything after it is replaced. A milestone is one or more branches,
+landed in a batch with one `--no-ff` merge commit (D189), each branch ending
+with `nix develop --command ./scripts/test.sh` green and `docs/status.md`
 replaced. Done means a passing automated test; where acceptance needs real
 hardware or a chatOnS deliverable, the automated stand-in is named and the
 rest is a manual check or a gated item closed in M18. Vocabulary per CLAUDE.md
 (the sheet's "client" is our runner); chatOnS reaches Herd only as declared
 commands, labels and figures — strings and numbers, never meanings.
+
+**Corrected against the tree on 2026-10-29** (ORCH-152). Four statements
+in this document changed what gets built and were wrong: M14's hub-side
+bare repository (D207), M12's three-term placement order, M15d's empty
+justification, and M11's pack written under `{out}` (ORCH-153). Each is
+now marked where a reader meets it, with the wrong claim quoted rather
+than quietly deleted, so nobody carries it forward from a stale copy.
+Where this document and the code disagree about what exists, the code is
+what is true; `docs/coverage.md` holds each expectation's state and the
+counted must figure. This correction is **not** the roadmap to v1.0.0,
+which is still owed (ORCH-155).
 
 ## Milestones
 
@@ -209,11 +221,24 @@ interface and is refused at startup if it would bind a default or public one
 (D11). A pack is complete or absent: the manifest is registered only once
 every blob is held and fsynced (E-17, E-13, E-12). The real shape, now
 known: `<id>/manifest.tsv`, `<id>/pack.meta`, `<id>/objects/<sha256>`, `<id>`
-the sha256 of the manifest. Herd keeps a build job's `{out}/packs/<id>` by
-(commit, id) and hands it to the same commit's test-pack jobs as `{in}/pack`;
-measured by them, ~400 MiB in ~560 files, verified in under 2 s. E-13's
-content-addressed storage is then simply storing objects by their sha256
-name, which is what their pack already is.
+the sha256 of the manifest. Herd keeps a build job's pack by (commit, id)
+and hands it to the same commit's test-pack jobs as `{in}/pack`; measured by
+them, ~400 MiB in ~560 files, verified in under 2 s.
+
+**A pack must not be written under `{out}`, and this paragraph used to say
+it was** (ORCH-153). `herd-runner/src/outputs.rs` collects **everything**
+under `{out}` that is a regular file, with four exclusions and none of them
+a pack, so a build job writing `{out}/packs/<id>` would stream ~400 MiB
+runner → hub → requester as record evidence, against the hub's 200 GB
+output budget: the exact byte path D10 removed and D152 then has to sweep.
+**The shape must be settled before any pack code is briefed**, and the two
+candidates are not equal. A fifth exclusion in `outputs.rs` can be undone
+by a later edit to that list; writing packs **outside `{out}` entirely**
+cannot, and the second is what D10's byte-path argument implies. Until it
+is settled the pack's path here is **unspecified**, not `{out}/packs/<id>`.
+
+E-13's content-addressed storage is then simply storing objects by their
+sha256 name, which is what their pack already is.
 
 **A record is read by a requester, and travels through the hub.** A job's
 log, its `results.json` and its per-scenario screenshots are evidence about
@@ -235,12 +260,18 @@ no resumption state — the bytes are on the hub's disk, so `herdctl wait <id>
 --outputs-to <dir>` is simply run again and skips what it already has at the
 right hash.
 
-**This is where the protocol break is spent, and it is spent once** (D148).
+**This is where the record half's protocol break is spent** (D148).
 Streaming files needs new variants on both enums, which D124 and D128 make
 breaking whatever serde tolerates, so `PROTOCOL_VERSION` moves to **2**,
-approved by Alexa on 2026-10-16. The registry's own frames above ride the
-same break, and so does a catch-all arm so an unknown frame no longer means
-"does not decode at all" (D128's recorded defect). The arm reads three ways,
+approved by Alexa on 2026-10-16. **It is not spent once for both halves,
+and the sentence that said so was never true (D205):** version 2 went on
+the record half alone, the pack frames below are numbered on neither
+protocol enum today, and they are part of why `PROTOCOL_VERSION` moves to
+**3** before v1.0.0 (D199). Anyone sizing the pack work on the belief that
+the protocol cost was already paid is sizing it short. The registry's own
+frames above ride the same break, and so does a catch-all arm so an unknown
+frame no longer means "does not decode at all" (D128's recorded defect).
+The arm reads three ways,
 one per direction, and the difference is the point: a **runner** logs and
 ignores what it cannot read, because a frame it does not know is work it is
 not needed for; a **requester** still refuses the run, because one that
@@ -272,9 +303,14 @@ only has an argument for. chatOnS's `0 crates compiled` acceptance closes in
 M18.
 Certain to overflow one session. The split is **at the record/pack line**,
 record first: it is what the consumer is blocked on today, and it is where
-the protocol break lands. Both halves' frames are nevertheless designed and
-numbered **together**, in one move to version 2, because a break is paid by
-the deployment and must not be paid twice.
+the record half's protocol break lands. **The intention was to design and
+number both halves' frames together in one move to version 2; that is not
+what happened.** The record half shipped at version 2 with no pack frame
+beside it, so the pack half pays its own break — `PROTOCOL_VERSION` 2 → 3,
+with `RECORD_VERSION` and `LAYOUT_VERSION` 1 → 2 in the same window (D199).
+That is a second break paid by the deployment, which this paragraph set out
+to avoid; it is affordable only because the consumer resets their volume at
+v1.0.0 (D199) and for no other reason.
 
 ### M12 — Custody, budgets, GC, retention, locality (`m12-custody-gc`)
 **This milestone shrinks twice.** First by the consumer's own words — "you
@@ -341,8 +377,21 @@ stay on the record for as long as the record does, so a requester asking for
 something already gone is told how many files there were, how big, and when
 and why they went — never an empty directory and never a short one.
 
-Placement preference among available eligible runners: keys already held,
-then most free memory, reference last (E-23); E-19 still governs waiting.
+Placement preference among available eligible runners. **What ships today is
+not the three-term order this line used to state.** `herd-hub/src/matcher.rs`
+takes the maximum of one operator-declared integer, `preference`, and breaks
+ties by runner name so the same fleet makes the same choice twice; there is
+**no free-memory term in it at all**, and no `reference` ordering either.
+What M12 adds is cache locality (E-23) as a **further term on top of that
+integer** and not a second mechanism: keys already held preferred among
+runners of equal declared preference, reference last. **Free memory has no
+home anywhere** — not in the matcher, and not in M12's own *done when*
+below, which asks only that placement prefer the key holder and pick
+reference last. So the deleted three-term order disagreed with this very
+milestone as well as with the code. Whether free memory ever becomes an
+ordering term is undecided and must not be assumed from this document;
+memory is an **admission** (M8), which is a different question from an
+ordering. E-19 still governs waiting.
 Scheduling and running the consumer's `produce` command on a `build` runner,
 and moving its pack (M11), stay here.
 **Done when** a pack whose only non-keeper holder goes offline is still
@@ -354,34 +403,81 @@ scheduled and run on a `build` runner and its pack moves like any other; and
 placement prefers the runner already holding the key, picking reference last.
 
 ### M13 — Status and events (`m13-status-events`)
+**Partly landed 2026-10-29 in batch 8.** E-35 is merged and E-37 is partly
+built — four of its listed transitions are emitted, two of its five
+items are not. The milestone as a whole is not done.
+
 One status document, JSON with a format version (Q7), carrying the queue,
 runners, running jobs and leases with the fields E-35 lists, refreshed on
-change, plus one text screen (E-35); M3's health ages surfaced (E-40). Events
-pushed to a configured URL or command — exactly E-37's list, never per step
-job by default (E-37).
-**Done when** an e2e snapshot validates against the schema and drives a
-fixture renderer with no other source, and a simulated day of step jobs emits
-exactly the expected events and zero per-step ones.
+change, plus one text screen (E-35); M3's health ages surfaced (E-40). **As
+built (D215):** `status.json` in the state root beside the records, with its
+own `STATUS_VERSION`, published on a ring from `State::with_peers` and never
+on a clock, and `herd-hub status` as the one text screen over it. Reading it
+takes no lock, and a serving hub rewrites it about five times a second, so
+it is not state a test may checksum. Events pushed to a configured URL or
+command — exactly E-37's list, never per step job by default (E-37). **As
+built (D216):** four of the five listed things have a transition in today's
+hub and are emitted to one sink, a URL or a command string, with no filter,
+template or per-event switch. The two that are not: a detached job's end
+needs the submitter's asking carried on `NewJob`, `ToHub::SubmitJob` and
+`job.json`; the nightly's verdict needs M14's nightly to exist and then
+needs no event of its own.
+**Done when** the status document and its screen carry E-35's fields and
+drive a fixture renderer from the document and nothing else, and a simulated
+day of step jobs emits exactly the expected events and zero per-step ones.
+**A separate JSON Schema was the old wording of this and does not exist**:
+the typed document is the schema, and a document of another
+`STATUS_VERSION` is refused by name with both figures. What is still owed
+here is E-37's two and the use-against-budget figure M12 points at this
+milestone for, which stays `herd-hub report`'s because it is a walk of the
+volume.
 
 ### M14 — Scheduled jobs and the hook path (`m14-scheduled-jobs`)
-Hub-config schedule entries: at a local time, if a named ref of the bare
-repository moved since the last run, submit a declared command with labels,
-priority, deadline (E-41) — that one predicate, nothing richer (Q13, invariant
-1). Exclusivity from label kinds, deadline from M9. Their nightly is now
-concrete: 03:00 local, daily, only if main moved, main's tip read at start,
-5 h cap, `nightly` exclusive against everything on that runner, a 05:00
-start deadline past which it is skipped with the reason as an event. The
+**Corrected 2026-10-29 by D207, and partly landed the same day.** This
+milestone said, from 2026-10-15 until that correction, that the **hub**
+kept a bare repository and read a ref to decide when to submit. That was
+wrong on the record and not merely stale: D106 settled that the hub never
+holds a repository and never runs git, and a hub that clones a repository
+to decide when to build is the generic-CI surface invariant 1 refuses —
+it would also put a credential for someone else's repository inside the
+hub. **The predicate is the requester's.**
+
+As built (D207, D217): `herdctl if-moved` submits a declared command when
+a named ref has moved since the last run it recorded, under a lock so two
+overlapping timers cannot both submit, and refuses rather than guess when
+its state file is missing, unreadable or from another version. **The timer
+is the consumer's own**, as E-42's hook is; `docs/scheduling.md` says what
+we ship and what they write. The hub accepts the submission, matches it
+against declared capabilities and priority (invariant 6), and nothing
+about a scheduler changes that. Exclusivity from label kinds, deadline
+from M9. Their nightly is concrete: 03:00 local, daily, only if main
+moved, 5 h cap, `nightly` exclusive against everything on that runner, a
+05:00 start deadline past which the job is cancelled and reported. **One
+deviation, and no hub work closes it (D217):** a pass that submitted
+nothing is `herdctl`'s own stderr line and never an event, because the hub
+never heard of the job; the skip E-41 *can* have as an event is the other
+one, a pass submitted with `--deadline` that nothing started by 05:00,
+which the hub cancels as `cancelled (deadline)`, exit 125 (E-09, D40). The
 push-hook path is a documented detached `herdctl` submission; the hook
 itself is the consumer's (E-42), submitting `produce` with a `dedup_key`
 of `produce:<commit>` and a `coalesce` key of `produce:main`: a queued
 `produce` of an older main is superseded, never a running one (D75).
-**Done when** a simulated clock fires at 03:00 only when the ref moved; the
-job carries its deadline and its exclusive label keeps everything else off
-that runner until it ends, a 03:30 job waiting or going elsewhere; a clock
-past 05:00 with no run yet skips it with the reason as an event; a scripted
-bare-repo hook lands a lowest-priority job in e2e; a second hook push before
-the first `produce` starts supersedes the queued one, exiting 125 and naming
-the superseding job, while a `produce` already running is never discarded.
+**Done when** `herdctl if-moved` submits exactly once for a ref that moved
+and nothing for one that did not, saying which on its own stderr, and two
+concurrent runs racing one state file do not both submit (**landed**: E-41,
+`herdctl/tests/if_moved.rs`); the job carries its deadline and its exclusive
+label keeps everything else off that runner until it ends, a 03:30 job
+waiting or going elsewhere; a job submitted with a 05:00 deadline that
+nothing started by then ends `cancelled (deadline)` with the reason naming
+what it was waiting for; a scripted hook of the consumer's lands a
+lowest-priority job in e2e; a second hook push before the first `produce`
+starts supersedes the queued one, exiting 125 and naming the superseding
+job, while a `produce` already running is never discarded. **No simulated
+hub clock and no bare repository appear in any of these**: there is no hub
+clock to simulate and the hub holds no repository to read (D106, D207).
+What is left of this milestone is E-42's coalesce path — `coalesce` is
+parsed by `herdctl`'s declaration today and nothing in the hub or the
+protocol supersedes a queued job on it.
 
 ### M15 — Auth and versions (`m15-auth-versions`)
 Per-runner token minted by one operator action (`herdctl runner approve`),
@@ -407,8 +503,17 @@ understand the instruction is told to update rather than refused.
 no shell opened on its host; a B that exits on start, a B that never
 handshakes and a B whose digest does not match each come back as A with the
 reason readable on the hub; and no swap ever interrupts a running job.
-The server's native runner is updated by Nix (E-47), so this milestone
-serves the non-Nix hosts.
+**The justification this milestone used to carry is empty, and it is the
+open question about M15d rather than a detail.** It read: the server's
+native runner is updated by Nix (E-47), so M15d serves the non-Nix hosts.
+There are no non-Nix hosts in the planned fleet. The only other machine is
+the owner's PC, and M17's own recipe installs Nix inside WSL2 — "a login
+shell for Nix" is the first thing on its list. So M15d serves no host the
+plan names. It may still be wanted on its own terms (D66 calls it the
+owner's operating requirement and not a chatOnS expectation, and it
+carries no E), but **that case has to be made from the operating
+requirement, not from a class of hosts that does not exist.** M15d is
+outside v1.0.0's must set either way, since it carries no must.
 
 ### M16 — The hub deployed, the server's runner native (`m16-deploy-hub`)
 Flake builds the hub image; docker compose beside the consumer's dashboard;
@@ -431,13 +536,22 @@ network runs on the server's native runner over `wss://` and returns its log
 and exit code (automated against the deployed pair); a hub restart under
 docker compose re-asserts M2's no-loss test on the real volume; a reboot of
 the server brings the runner back with no hand; the no-Docker-socket test
-passes with the runner's user removed from `docker`. This milestone also
-sets `PROTOCOL_VERSION` and `RECORD_VERSION` back to 1 and freezes them: the
-first deployed protocol is version 1 (D73). Frozen means a bump is a
-compatibility statement needing Alexa's word, not that neither moves again —
-M11 is the first to spend one, `PROTOCOL_VERSION` to 2 (D148), while
-`RECORD_VERSION` stays at 1 because every field it adds is defaulted and a
-record already on the live state root reads unchanged.
+passes with the runner's user removed from `docker`. This milestone set
+`PROTOCOL_VERSION` and `RECORD_VERSION` back to 1 and froze them: the first
+deployed protocol is version 1 (D73). Frozen means a bump is a compatibility
+statement needing Alexa's word, not that neither moves again. M11's record
+half spent the first, `PROTOCOL_VERSION` to **2** (D148). **All three then
+move before v1.0.0** (D199, Alexa, 2026-10-29): `PROTOCOL_VERSION` 2 → 3,
+`RECORD_VERSION` 1 → 2, `LAYOUT_VERSION` 1 → 2. There is **no migration
+path anywhere in `JobDirStore::open`**, so the last two destroy an
+operator's state root as a working root; that price is accepted only
+because the consumer resets their volume at v1.0.0. **One binding ordering
+constraint:** the ordinary release before v1.0.0 ships at layout 1 and
+record 1, no part of the triple in it — a layout-2 hub refuses to open
+their existing root, and `report.rs` pushes a version-mismatched record
+onto `census.unread` and continues, so a record-2 build on a version-1
+root exits cleanly with every job unread, which looks like an answer
+rather than a refusal.
 
 ### M17 — The owner's PC joins (`m17-pc-runner`)
 The second machine, and the one with the hard conditions. Runner on WSL2: a
@@ -468,15 +582,25 @@ side; blocks nothing of ours.
 
 The scheduler spine, **M1 → M2 → M5 → M6 → M7 → M8 → M9**, is merged.
 
-**The path to a deployed hub is now M10 → M15 → M16, then M15d → M17**
+**The path to a deployed hub was M10 → M15 → M16, then M15d → M17**
 (reordered 2026-10-15, D109: the owner's build server keeps being
 OOM-killed by work Herd is not yet there to bound, so deployment outranks
-breadth).
+breadth). **M10, M15 and M16 are merged**, so the hub is deployed and the
+server's runner is native. What is left of that path has changed shape:
+**M17 is outside v1.0.0 by Alexa's decision (D206)**, with E-49 and E-50
+declared unmet by choice, and M15d's own justification is empty (see
+M15d). So nothing of the original tail is on the way to the stable
+release; what is on the way is M11's pack half, which D205 puts inside
+v1.0.0, plus M12, M13's remainder and M14's remainder.
 
 Deferred to after M16, each with its cost written down in D109: M11 and M12
 (artefacts — so a build and its test must run on one machine), M13 (status
 and events — the consumer keeps its own status files, which E-53 permits),
 M14 (the scheduled job and the hook — the consumer's cron keeps them).
+**M13 and M14 came off that list in part on 2026-10-29**: E-35 is merged,
+E-37 is partly built and E-41's requester-side predicate is merged
+(D215, D216, D217). M11's record half had already landed, so what remains
+deferred is M11's pack half, M12 whole, and one must each in M13 and M14.
 Still genuinely deferrable for good: E-38, E-39, E-55.
 
 - M1 → M2: the store persists the lifecycle M1 creates; anything built before
@@ -519,9 +643,15 @@ server can test from, and the owner's rule denies it `kvm`.
 
 One branch per milestone; parallel milestones meeting in herd-proto or the
 hub's module tree conflict, so the spine owns herd-proto and a parallel track
-gets its message additions agreed before its branch opens. CLAUDE.md allows
-one sub-agent at a time, with Alexa's agreement — at most one track beside the
-spine.
+gets its message additions agreed before its branch opens. **The one-track
+rule this line used to quote is not in CLAUDE.md and has been withdrawn.**
+It read: CLAUDE.md allows one sub-agent at a time, with Alexa's agreement,
+so at most one track beside the spine. CLAUDE.md contains no such rule
+today; what it has is a shared-host bound — more than two heavy agents may
+run while the first consumer is stopped (Alexa, 2026-10-27), bounded by
+load, free memory and free disk, with one compile at a time per agent. So
+parallelism is limited by the host and by the conflict surface below, not
+by a count in CLAUDE.md.
 
 - **Track R — runner** (M4, then M10): herd-runner plus a fixture consumer
   repo. Depends on M1 (M10 also on M4, Q5, Q7); must not touch the hub's
@@ -544,7 +674,7 @@ spine.
 | Q2 | The data path | **Herd is never in the byte path (D10).** The hub registers manifests and who holds what, and issues scoped fetch capabilities; runners move blobs directly. A runner advertises a fetch endpoint and binds it to one configured mesh interface only, never a default or public one (D11). Same host: hardlink/reflink, zero network. A runner with no mesh is outbound-only: it pushes to and pulls from a keeper and never serves. | M11, M12 |
 | Q3 | Resource algebra shape | One Capability type {name, kind: exclusive / counted(n) / shared, excludes, busy-probe}; memory and tmpfs are numeric admissions, not labels; a lease is counted(1) with an external probe. | M5 |
 | Q4 | Content addressing | Per file, not per archive. It buys three things at once: inter-pack dedup (E-13), GC pinning (E-16), and "fetch the diff" for free — a peer fetches only the hashes it lacks, so no delta protocol and no rsync is ever needed. | M11 |
-| Q5 | Warm caches | Herd grows no cache engine of its own, but must actively *carry* one: (a) the artefact store is generic, so the consumer may publish cache diffs through it as ordinary packs — per-file addressing (Q4) means a 57-700 MB diff costs only its missing blobs; (b) the declaration contract has a first-class **prepare step** with declared cache keys and a recorded duration; (c) a runner reports which keys it holds, and placement prefers a holder (E-23). Herd never knows what a cache *is*. | M10, M11, M12 |
+| Q5 | Warm caches | Herd grows no cache engine of its own, but must actively *carry* one: (a) the artefact store is generic, so the consumer may publish cache diffs through it as ordinary packs — per-file addressing (Q4) means a 57-700 MB diff costs only its missing blobs; (b) ~~the declaration contract has a first-class prepare step with declared cache keys and a recorded duration~~ — **dropped**, see M12: the consumer's own words are "you move packs; our executor owns warm caches", so the cache-specific prepare step is replaced by D77's generic per-executor-step timestamps, which time their `up` step without Herd knowing it is a cache; (c) a runner reports which keys it holds, and placement prefers a holder (E-23), which is M12 and unbuilt. Herd never knows what a cache *is*. | M10, M11, M12 |
 | Q6 | WSL memory ceiling | All job processes in one cgroup v2 subtree with MemoryMax (WSL2 ships systemd); documented fallback; verified on the real PC in M17. | M4 |
 | Q7 | Public format versioning | `ran on:` line, status JSON and event payloads each carry a format version; v1 freezes at M16. | M10, M13 |
 | Q8 | Authentication | Per-runner token minted at approval, hashed at the hub; no mTLS (the proxy terminates TLS); one shared requester token to start. | M15 |
@@ -585,8 +715,9 @@ spine.
   first consumer — few build machines, and a cold build is over 30 minutes —
   so "Herd does not manage it" must not become "Herd ignores it". Herd grows
   no cache engine (that would shape it around one consumer), but the generic
-  artefact store, the declared prepare step and key-aware placement must be
-  good enough to carry theirs. See D9.
+  artefact store, D77's per-step timestamps (**which replaced the declared
+  prepare step** — see M12 and Q5) and key-aware placement must be good
+  enough to carry theirs. See D9.
 - **Timing vocabulary.** Invariant 2's ≤ 5 s stop, E-06's 10 s job kill,
   E-33's 10 s switch and E-27's 15 min metal drain are four different things;
   M9 specifies all four.
@@ -600,8 +731,10 @@ spine.
 - **Gated on chatOnS** (fixture tests stand in until M18): E-02, E-11, E-12,
   E-14, E-38, E-41, E-42, E-53, E-54 — each needs a chatOnS deliverable named
   in `docs/coverage.md`.
-- **Size honesty.** The sheet carries 44 musts (recounted; not 38) across 15
-  must-bearing milestones — not a handful of sessions, and pretending
+- **Size honesty.** The sheet carries 44 musts (recounted; not 38) across
+  **16** must-bearing milestones, M2 to M17 — counted from
+  `docs/coverage.md`'s own *Musts per milestone* table, which lists
+  sixteen rows; this line said 15 — not a handful of sessions, and pretending
   otherwise is how work gets walked back.
 
 ## Order rationale
