@@ -208,9 +208,13 @@ which is the evidence that the test exercises the real startup order and
 not a copy of it.
 
 **The last run**, on the committed tree including this file:
-`./scripts/gate.sh`, bare. Its receipt is the one `gate.sh` writes for the
-sha it ran on, under `.gate-receipts/`; its verbatim output, the verdict
-line and the named skip list are in the agent's report.
+`./scripts/gate.sh --out <log>`, bare. `gate.sh` writes, under the
+worktree's own `target/herd-gate/`, a receipt named for the sha it ran on,
+the suite's output and the observed skip list; those three and the log are
+kept outside the build tree, in this agent's scratchpad under
+`receipts/`, since `target/` goes once the branch is pushed. The verbatim
+output, the verdict line and the twelve skip names are in the agent's
+report.
 
 **Skips — the host's twelve, each a `HERD-SKIPPED` line from
 `scripts/test.sh`, none of them a pass (D27, invariant 5), and none of
