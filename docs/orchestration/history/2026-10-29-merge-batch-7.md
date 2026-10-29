@@ -248,9 +248,20 @@ the single `gate.sh` run below, which runs them in `ci.yml`'s order.
 thing before the merge.** Not inside `nix develop`: nesting `TMPDIR` panics
 `herd-runner/tests/confinement.rs:2529` on `SUN_LEN` (ORCH-139).
 
-The sha it gates is **this handoff commit** — the integration tip, which is
-the **second parent** of the merge commit, not the merge commit itself,
+The sha it gates is **the last handoff commit** — the integration tip, which
+is the **second parent** of the merge commit, not the merge commit itself,
 whose message is the landing record and which therefore cannot exist yet.
+
+**The gate ran twice, and only the second run counts.** The first was GREEN
+on `e0bee97`, the tip when this handoff was first closed. The orchestrator
+then reviewed the permission diff and required two additions — the scope
+judgement and the `claude-md-direction` collision, both above — so the tree
+changed and that receipt stopped describing it. A receipt for a tree that is
+not the tree being pushed is not evidence about the push
+(`scripts/githooks/pre-push`, check 1c), so the gate was re-run on the new
+tip rather than reusing a green verdict about a superseded tree. Both runs
+and their shas are in the merger's report; the receipt that binds this
+landing is the second one's.
 What has to hold at the landing is a GREEN receipt for
 `git rev-parse <merge sha>^2` **and** `git diff --quiet` between that sha
 and the merge commit: an identical tree is what makes the receipt bind.
@@ -448,20 +459,20 @@ already be fixed at the branch before the next batch reads this.
 
 Written now, at step 5, because it **is** the message of the `--no-ff` merge
 commit of step 8. This copy and that message are the same text. The gated
-sha appears in it as "`1e6c7b5` plus the merge-handoff commit, which is this
-commit's second parent": exact and self-resolving — `git rev-parse <merge
-sha>^2` — and not writable as 40 hex here, for the reason given under
-*Gates*.
+sha appears in it as "`1e6c7b5` plus the two merge-handoff commits, the
+second of which is this commit's second parent": exact and self-resolving —
+`git rev-parse <merge sha>^2` — and not writable as 40 hex here, for the
+reason given under *Gates*.
 
 Land batch 7: cut v0.4.1 and make the tag the integrator's
 
 - **Batch:** 7, one branch, landed 2026-10-29 by herd-merger. One push, one
   --no-ff merge commit carrying this record, one post-push ci.yml run, and
   then one annotated tag as a separate and later act (D212).
-- **Gate:** green -- ./scripts/gate.sh on `1e6c7b5` plus the merge-handoff
-  commit, which is this commit's second parent and the last change to the
-  tree; trees identical, `git diff --quiet` between that sha and this one
-  clean. Run
+- **Gate:** green -- ./scripts/gate.sh on `1e6c7b5` plus the two
+  merge-handoff commits, the second of which is this commit's second parent
+  and the last change to the tree; trees identical, `git diff --quiet`
+  between that sha and this one clean. Run
   BARE, not inside nix develop: nesting TMPDIR panics confinement.rs:2529
   on SUN_LEN (ORCH-139). The receipt is named for that sha under
   target/herd-gate/ in the merger's own worktree, per worktree, never
