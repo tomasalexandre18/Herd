@@ -367,6 +367,83 @@ landing — see *Board rows*.
    delta applied only on the refusing bench's own figure (D196) and were not
    applied here. A count would have said nothing (D27, D179).
 
+## The scope of this landing, and the judgement the merger took
+
+**The brief named three files to correct. This landing corrects five, plus
+one board row. That was the merger's own judgement, it was reviewed before
+the landing, and it is written here so that it reads as a judgement and not
+as a drift.**
+
+The brief named `docs/orchestration/permissions.md:137`,
+`docs/orchestration/workflow.md` ("in two places") and
+`.claude/agents/herd-release.md`. Measured, the reserving sentence was in
+more places than that:
+
+- **`workflow.md` had six stale places, not two** — the role table in both
+  the `herd-merger` and `herd-release` rows, step 7, step 8, *One landing
+  per batch* → *Unchanged*, and *Permissions and escalation* in two
+  paragraphs. That is a measurement, not an expansion of the task.
+- **`CLAUDE.md`** said "Pushing a tag and publishing a release stay on
+  Alexa's word" in *Git and main* and listed tags under *When to ask
+  Alexa*. It is the contract every session loads first.
+- **`.claude/agents/herd-merger.md`** said "Landing a version branch never
+  includes pushing its tag: that is Alexa's word" and listed "tags" as
+  forbidden. **Leaving it would have left the integrator's own charter
+  forbidding the act Alexa had just granted it** — the worse outcome, and
+  the reason the judgement was taken rather than deferred.
+- **The board's ORCH-001 row** said the tag was "kept distinct, not covered
+  by it". It records a decision of 2026-10-24, so it was **amended** with
+  the supersession and its date rather than rewritten.
+
+**Narrowed in the same breath as widened.** `herd-merger.md`'s forbidden
+list loses "tags" and **gains** "writing a release's own notes (D210)", and
+`permissions.md` keeps a refusal rather than losing one: a tag inside the
+batch's own push, or on a commit whose workspace version the tag does not
+name, stays refused. A permission that loses its boundary when it is granted
+is a worse permission.
+
+**What was deliberately left wrong, because it is not a live rule.**
+`herd-release`'s hook and forbidden list are untouched — Alexa moved who
+holds the tag, not whether that agent may have it. `docs/decisions.md` and
+everything under `docs/orchestration/history/` are append-only records of
+past acts; `remediation-report.md` is a dated report. D210's sentence
+placing the tag "in the same class" as the notes stands verbatim, and D212
+says which sentence it displaces.
+
+**The board id was measured and the brief's figure was wrong.** The brief
+said the first free id was ORCH-171. `origin/main` tops out at ORCH-167,
+but `orch168-split` holds 168-170 and **`orch170-policy` holds 168-175** —
+inside `docs/disk-policy.md`'s own table, not in `board.md`, which is why a
+board-only scan misses them. The first free id is **176**. A scan for the
+next free `ORCH-nnn` has to read every tracked file on every pushed branch.
+
+## A known collision for the next batch
+
+**`claude-md-direction` rewrites exactly the region of `CLAUDE.md` this
+landing edited, and it is now wrong.** It was written before Alexa answered,
+so it still says the tag act is reserved — in its own words:
+
+```
+- **No compatibility question gates a tag**: the consumer resets at v1.0.0,
+  so a version is cut when it is useful, not when he is asked. The act stays
+  reserved: `workflow.md`, `permissions.md`, `.claude/agents/herd-release.md`.
+```
+
+It names the three files this landing corrected. Its diff against
+`origin/main` is 64 insertions and 64 deletions in `CLAUDE.md`, and it
+removes both lines this landing replaced: the *Git and main* tag bullet and
+the whole *When to ask Alexa* section.
+
+**It will conflict, and the resolution is not a merge-tool choice.** D212 is
+the later fact and the branch predates it, so whoever integrates
+`claude-md-direction` keeps **this landing's** wording for the tag act and
+re-applies that branch's other changes around it. **Do not resolve it by
+taking either side whole**: the branch's remaining content is wanted and
+only its tag sentence is stale. Found by the orchestrator while this landing
+was under review — the merger could not have seen it, since the branch was
+held out of this batch — and reported to that branch's author, so it may
+already be fixed at the branch before the next batch reads this.
+
 ## The landing record
 
 Written now, at step 5, because it **is** the message of the `--no-ff` merge
