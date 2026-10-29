@@ -47,6 +47,7 @@ pub mod janitor;
 pub mod job;
 pub mod metrics;
 mod outputs;
+pub mod packstore;
 pub mod privilege;
 pub mod reclaim;
 pub mod room;
