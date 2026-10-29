@@ -4,32 +4,57 @@
   follow-up `pack-proto`'s *Decisions needed* 1 named), plus the general
   `ToHub` fact frame of the bump review's §3 and the peer leg's framing
 - **Agent:** herd-step
-- **Branch / commit:** `pack-variants` / see the agent's report, based on
-  `pack-proto` `adbc204` with `origin/main` `1a8c1ae` (batch 9) and
-  `origin/spool-offer-fix` `fdf928c` merged in
+- **Branch / commit:** `pack-variants` / see the agent's report
+
 - **Landing:** none — an agent pushes its branch and lands nothing (one
   landing per batch, `docs/orchestration/workflow.md`); `herd-merger` names
   the landing here and fills the record of `templates/landing.md`
-- **Pairing, which the batch depends on:** this branch and `pack-proto` are
-  **one change in two commits**. `pack-proto` moved `PROTOCOL_VERSION` to 3
-  and its doc comment says 3 carries the pack frames; the frames are here.
-  **If one lands without the other, that doc comment is false and the bump
-  bought nothing.**
+- **THESE TWO BRANCHES MUST LAND IN THE SAME BATCH.** `pack-variants` and
+  `pack-proto` are **one change in two branches**, and this line is in the
+  tree rather than only in a report because the merger reads the tree and
+  nothing else. `pack-proto` moved `PROTOCOL_VERSION` 2 → 3 and its doc
+  comment says 3 carries the pack half's frames; **the frames are here.**
+  Land `pack-proto` without this branch and that documentation is false and
+  the bump bought nothing — a fleet goes quiet for a frame set that is not
+  there. Land this branch without `pack-proto` and it does not compile: the
+  constant, the payload structs and `pack.rs` itself are that branch's.
+  They are one landing or neither.
+- **Based on:** `pack-proto` `adbc204`, with `origin/main` merged **twice** —
+  `1a8c1ae` (batch 9) and `5f73c18` (batch 10, which carries D220, the fix
+  for what this handoff first reported as finding 0) — and
+  `origin/spool-offer-fix` `fdf928c`. Four merges, no conflict in any.
 
 ## Done
 
-### The two merges, both clean
+### The four merges, all clean
 
 ```
-$ git merge origin/main                 # batch 9
+$ git merge origin/main                 # 1a8c1ae, batch 9
 Merge made by the 'ort' strategy.   13 files changed, 2711 insertions(+), 79 deletions(-)
-$ git merge origin/spool-offer-fix
+$ git merge origin/spool-offer-fix      # fdf928c
 Merge made by the 'ort' strategy.    3 files changed, 1111 insertions(+), 106 deletions(-)
+$ git merge origin/main                 # 5f73c18, batch 10, carrying D220
+Merge made by the 'ort' strategy.   32 files changed, 6048 insertions(+), 292 deletions(-)
 ```
 
-No conflict in either, and the 967 lines of `herd-runner/src/lib.rs` that
-carry the 37.6 GiB spool fix are untouched by this branch except for the four
-places the compiler forced (below).
+No conflict in any of them, and the 967 lines of `herd-runner/src/lib.rs`
+that carry the 37.6 GiB spool fix are untouched by this branch except for the
+four places the compiler forced (below). Batch 10's merge brought
+`herd-runner/src/mesh.rs` and D220's rewritten `room.rs` in beside them; the
+only line of mine anywhere near the mesh work is `mesh_endpoint: None` in the
+runner's own `Hello`, which S4 will fill.
+
+### The authoritative surface list — and §4 is wrong in three places
+
+**Diff against this, not against the plan's §4.** Three of §4's counts are
+wrong, and a reader who trusted them would conclude something is missing:
+
+| §4 says | What is actually here | Why §4 is wrong |
+|---|---|---|
+| 13 payloads | **14 variants** | plus `ToHub::JobFact`, which §4 never had |
+| 6 `FromHub` + a field row | **7 `FromHub` variants** | `PinPacks` is listed in §4's *fields* table and is a **variant** |
+| "seven fields" on seven messages | **nine field names on five message types** | the `Health` row carries three fields, and `PinPacks` is counted as a field |
+| `message_kind`, one exhaustive match | **three** | `herd-runner/src/lib.rs` and `herdctl/src/lib.rs` each have one on `FromHub`, found only by the compiler |
 
 ### Fourteen new variants, not thirteen
 
@@ -279,7 +304,8 @@ one who does something with them.
 
 ## Gates
 
-**Runs made before this file was committed**, on this tree, with
+**Runs made before this file was committed, on the merged tree** (batch 10
+included, so these figures are about the tree the third gate run gates), with
 `CARGO_TARGET_DIR=/mnt/ssd_980/herd/build/pack-variants`:
 
 ```
@@ -287,12 +313,12 @@ $ nix develop --command cargo fmt --all --check
 (no output)   exit 0
 
 $ nix develop --command cargo clippy --workspace --all-targets -- -D warnings
-    Checking herd-proto … herd-runner … herd-hub … herdctl
-    Finished `dev` profile [unoptimized + debuginfo] target(s) in 7.23s
+    Checking herd-proto … herd-runner … herdctl … herd-hub
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 19.04s
 exit 0
 
 $ nix develop --command cargo build --workspace
-    Finished `dev` profile [unoptimized + debuginfo] target(s) in 26.48s
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 57.50s
 exit 0
 
 $ nix develop --command cargo test -p herd-proto
@@ -304,10 +330,11 @@ $ nix develop --command cargo test -p herd-proto
 exit 0
 
 $ ./scripts/check-docs.sh
-note: D170 is a gap in docs/decisions.md (held by an open PR, or lost); gaps stay (D148)
 docs ok
 exit 0
 ```
+
+The full workspace suite was run once on the **pre-merge** tree and passed:
 
 ```
 $ nix develop --command ./scripts/test.sh
@@ -316,6 +343,10 @@ $ nix develop --command ./scripts/test.sh
   test suite: PASSED
 exit 0
 ```
+
+It is **not** re-run separately on the merged tree: the gate's step 6 is that
+same command, three other agents want a suite tonight, and running it twice
+would be the one thing the host rules ask me not to do.
 
 ### The first gate was RED, and on a true statement about the host
 
@@ -386,14 +417,29 @@ Which tests those are is a race, which is why the two runs failed in different
 files; the cause is one. **The branch is therefore not pushed**: push only on
 your own green gate, and this gate is not green.
 
-**The last run, named and not quoted** (a handoff is a docs file, so the run
+### The third run, after the merge that carries D220
+
+Two reds were enough to stop rolling the dice, and the thing that changed is
+not the dice: `origin/main` moved to `5f73c18` and batch 10 landed **D220**,
+which is finding 0 word for word. The fourth merge brings it in, and the
+unmodified preflight then reads honestly on the same host that had been
+refusing:
+
+```
+slice room:  13648 MiB under memory.high on /chatons.slice, floor 8192 MiB (8 GiB)
+             charge 12948 MiB, of which 8164 MiB is reclaimable page cache and not held
+bench-preflight: ok, safe to start.     exit 0
+```
+
+**The last runs, named and not quoted** (a handoff is a docs file, so the run
 that gates the tree with this file in it cannot quote itself):
-`./scripts/check-docs.sh` on the tree with this file committed, to
-`<scratchpad>/pack-variants/docs-final.log`, verbatim in the agent's report.
-**No third gate run was made.** Two were enough to establish the cause, and a
-third would have been re-rolling a dice whose outcome is about the host's page
-cache and not about this tree — which is the one thing a gate must not be
-asked to do.
+`./scripts/check-docs.sh` and bare `./scripts/gate.sh` on the tree with this
+file committed, after **two consecutive clears of the unmodified preflight**
+and with no override anywhere. Output goes to
+`<scratchpad>/pack-variants/docs-final.log` and
+`<scratchpad>/pack-variants/gate3.log`, and verbatim into the agent's report.
+**If it reds on anything that is not the memory reading, it is reported red
+and the branch is not pushed** — there is no fourth run.
 
 **Skips:** none from any run above — `cargo test -p herd-proto` reported
 `0 ignored` on all four binaries. The suite's and the gate's skips are in the
@@ -423,27 +469,44 @@ that could redden a `check-orchestration` case asserting what a refusal says;
 step 2 was ok in 73 s. Nothing under `/sys/fs/cgroup` was written. No cache
 was dropped.
 
-**And the lift was wrong.** The reasoning above — that the refusal was about
-reclaimable page cache and would not recover on a timer — was correct about
-the *cause* and wrong about the *consequence*. The floor is 8192 MiB because
-the `real_herd` tests make a runner lend 2048 MiB and then assert figures
-about it, and that runner reads the enclosing `memory.high` honestly (D119).
-At 1.4 GiB of room it announced 1.4 GiB, said so in a sentence naming the
-slice, and nine tests refused rather than asserting a figure that was the
-cgroup's and not theirs. The preflight's own words for this are *"the run
-would go red on a true statement about the host"*, and that is exactly what
-happened. An `anon` figure in the hundreds of MiB says the charge is
-reclaimable; it does not say the suite can run, because what the suite needs
-is **room under `memory.high`**, which page cache occupies just as anonymous
-memory does. The second gate run therefore waited for the unmodified gate.
+**The lift was wrong, and the reason is not the one I first wrote down.**
+
+My first account of it said: the reasoning about `anon` *"was right about the
+cause and wrong about the consequence — what the suite needs is room under
+`memory.high`, which page cache occupies just as anonymous memory does."*
+**That is true of the two shas that were gated and false of `main`.** D220
+(finding 0) nets reclaimable cache out of both the runner's announcement and
+the preflight's own figure, so on the merged tree a small `anon` **does** mean
+room. The honest version: the reasoning was right and the code that read it
+was behind — which is exactly why it was still wrong to lift the floor. The
+gate runs against the code in the tree, not against the reading I believed was
+the better one, and overriding a refusal in order to act on my own arithmetic
+instead of the build's is the whole of the mistake.
+
+What it cost, concretely: the two `real_herd` reds. Those tests make a runner
+lend 2048 MiB and then assert figures about it, and the runner read its
+enclosing `memory.high` the pre-D220 way (D119). At 1.4 GiB of room it
+announced 1.4 GiB, said so in a sentence naming the slice, and the tests
+refused rather than assert a figure that was the cgroup's and not theirs. The
+preflight's own words for that are *"the run would go red on a true statement
+about the host"*.
+
+**The rule to carry forward is unchanged and its reason is better: treat the
+preflight as a gate and lift nothing — because after D220 a refusal is likely
+to be real.** The third gate run below waited for two consecutive clears of
+the unmodified gate and took no override anywhere.
 
 ## Risks and findings
 
 Ordered by what a later version cannot repair.
 
-**0. THE PRODUCT FINDING, and it is why the gate is red: a runner inside a
-`memory.high` cgroup counts reclaimable page cache as memory the jobs are
-holding, and so refuses to start.**
+**0. RESOLVED BY THE MERGE, and kept here because the two red gates above are
+unintelligible without it: a runner inside a `memory.high` cgroup used to
+count reclaimable page cache as memory the jobs are holding, and so refused to
+start.** It was a real defect, it was **already fixed on `main` while this
+branch was being written** — batch 10's `room-honest`, **D220** — and the
+fourth merge above carries the fix. Everything below is the diagnosis as it
+stood on the two gated shas; D220's own text is the answer to it.
 
 `herd-runner/src/room.rs:63` is
 
@@ -489,14 +552,30 @@ MiB, is refused by its own floor, and its owner reads a sentence about memory
 she has plenty of. The startup line is honest about *what it read*; what it
 read is the wrong figure.
 
-**Not touched**: `herd-runner/src/room.rs` is on this brief's do-not-touch
-list by name. The fix is one subtraction and a test, and it is not mine.
+**Not touched, and it did not need to be.** `herd-runner/src/room.rs` is on
+this brief's do-not-touch list by name, and the right fix had already landed:
+**D220** (`docs/decisions.md:11170`, *"A runner does not hold reclaimable
+cache against its room"*) subtracts the charge **less its reclaimable file
+pages**, and chooses the conservative figure on purpose — **`inactive_file`
+less `shmem`**, not `file`: `active_file` has been touched more than once and
+stays counted as held, and `shmem` is netted out because tmpfs pages sit on
+the file LRUs but are swap-backed and a runner's workspaces live on a tmpfs
+(D79). So the figure is a **floor on the room and never an estimate of it**,
+which is the only direction invariant 2 allows.
+`scripts/bench-preflight.sh` carries the same arithmetic.
 
-**It is also the whole of why both gate runs are red**, so for this branch it
-is a blocker and not only a finding. Three remedies, in the test's own words
-and in increasing order of what they cost somebody else: run the suite outside
-the slice, raise the slice's `memory.high`, or correct the reading. The third
-is the one that also helps the consumer.
+Measured on the merged tree, unmodified, no override in the environment:
+
+```
+slice room:  13648 MiB under memory.high on /chatons.slice, floor 8192 MiB (8 GiB)
+             charge 12948 MiB, of which 8164 MiB is reclaimable page cache and not held
+bench-preflight: ok, safe to start.
+exit 0
+```
+
+The same instant read the old way — `high - current` — is 5484 MiB, which is a
+refusal. **That difference is the whole of why the first two gates were red
+and the third was not.**
 
 **1. `PackUnavailable` was kept separate from `JobFact`, and the argument
 cuts both ways.** It is a pack-shaped instance of exactly that frame, and
@@ -571,34 +650,34 @@ to its id, is a readable frame today. The manifest case is already covered by
 budget case has no check anywhere and belongs to whoever reads the figures
 (S6/M12), not to `herd-proto`.
 
-## Decisions needed
+## Decisions needed — all five answered, none open
 
-1. **Whether `PackUnavailable` survives now that `JobFact` exists.**
-   Recommendation: keep both, on finding 1's argument — typed fields the hub
-   looks up are not a sentence. Fallback: absorb it, accept that a hub reading
-   one has to parse `detail` for the `(commit, key)`, and save one `ToHub`
-   variant. It must be settled **inside this batch**: removing a `ToHub`
-   variant afterwards is a fourth protocol version.
-2. **Whether `FactReason`'s six codes are the right six**, which is the one
-   part of part two that is a judgement rather than a transcription. Each is
-   mapped to its silence above. Recommendation: land them; `Other` means a
-   seventh costs nothing and a wrong name costs a rename, not a version.
-   Fallback: cut to four by merging S1 with S2 and S6 with S7, at the price of
-   a hub that cannot tell *"stop asking me"* from *"a requester has been
-   promised something nobody will send"*.
-3. **Who wires the first silence, and which one.** Recommendation: S1, in the
-   step that next owns `herd-runner/src/lib.rs` — it is the one with a
-   measured cost (eight asks across one reboot of the consumer's fleet,
-   ORCH-163) and the one whose hub side is a single `stop asking` edge.
+Answered by the orchestrator, 2026-10-30, and recorded here because the next
+reader of this branch needs the ruling and not the question.
 
-4. **Whether the digest rule should also bind the hub's registry and the fetch
-   endpoint by type rather than by call.** `check_object_digest` is a function
-   they must remember to call; a `Digest` newtype whose only constructor runs
-   the check would make it impossible to forget, as `PackId` does for the
-   pack's own id. Recommendation: not tonight — it changes
-   `ManifestEntry::sha256`'s type and every reader of it, and the field is
-   already unforgeable at the one place entries are built. Fallback: do it
-   when the second reader appears, which is S6.
+1. **`PackUnavailable` survives beside `JobFact`. Keep both.** Decided on this
+   handoff's own argument: its `pack`, `commit` and `key` are read **by the
+   hub**, which is keyed on `(commit, key)` and on the pack's id, so inside
+   `JobFact` they would have to live in `detail` and the hub would be parsing
+   its way out of a sentence — which is what invariant 4 exists to prevent.
+   One extra `ToHub` variant bought now is cheaper than a hub that reads
+   prose.
+2. **The six reason codes land as they are.** And the brief's premise that the
+   reason set was the expensive half is **withdrawn**: `FactReason::Other`
+   carries an unknown code verbatim, so an older hub reads the whole frame,
+   logs the detail, names the code and acts on nothing. **Only the variant is
+   one-shot.** That is now the rule for every future frame on this enum, and
+   it is in the decision entry below in those terms.
+3. **S1 is wired first**, by the next step that owns `herd-runner/src/lib.rs`
+   — it has the measured cost (ORCH-163's eight asks across one reboot of the
+   consumer's fleet) and a hub side that is a single "stop asking" edge.
+4. **No `Digest` newtype tonight.** It would change `ManifestEntry::sha256`'s
+   type and every reader of it, and the second reader is the hub's registry
+   (S6), which is the right moment to pay for it. The field is already
+   unforgeable at the one place entries are built.
+5. **Nothing else was needed for green.** The `room.rs` work of finding 0 was
+   already done and landed as D220; this branch needed the **merge**, not a
+   fix. See *Gates*.
 
 ### Drafted decision entry
 
@@ -641,13 +720,24 @@ there is no id the hub ever minted. `coverage.md` records that deviation as
 *"not closeable by hub work"*; it is closeable by protocol work, and this is
 the shape of it.
 
-**The reason set is not the one-shot half, against the expectation that it
-was.** An unknown code decodes into `FactReason::Other` carrying the code
-itself, so an older hub reads the whole frame, logs the sentence, names the
-code and acts on nothing — the shrug `ToHub::Unknown` is, one level down. Only
-the **variant** is one-shot. `PackUnavailable` stays its own frame beside it:
-its `pack`, `commit` and `key` are looked up by the hub's registry, and a hub
-parsing them back out of a sentence is what invariant 4 exists to prevent.
+**On a frame of this shape, only the variant is one-shot — not its reason
+set.** This was believed the other way round, and it is worth stating as a
+rule because it changes what any future frame on `ToHub` has to carry. A
+reason code this build has not been taught decodes into `FactReason::Other`
+carrying the code itself, so an older hub reads the **whole** frame, writes
+the `detail` where a person will see it, names the code in that line, and acts
+on nothing — which is the shrug `ToHub::Unknown` already is, one level down.
+So a seventh reason costs nothing, an eighth costs nothing, and the only thing
+that had to be got right tonight is that the **variant** exists. The
+corollary, for the next frame: spend the design effort on the variant and on
+which fields are typed, and none of it on enumerating a value set
+exhaustively.
+
+**`PackUnavailable` stays its own frame beside it.** Its `pack`, `commit` and
+`key` are looked up by the hub's registry — keyed on `(commit, key)` and on
+the pack's id — and a hub parsing them back out of a sentence is what
+invariant 4 exists to prevent. One extra variant is cheaper than a hub that
+reads prose.
 
 **The peer leg is one line of JSON and then the bytes.** The control plane has
 no choice about base64 — D4 makes a frame one WebSocket text frame and D18
@@ -679,89 +769,76 @@ lowercase hex characters**, refused by name at the one place a
 the runner's store inherit the rule instead of writing it three times: three
 copies is how two of them come to disagree. **Uppercase is refused and not
 lowercased**, because a content-addressed store that took both spellings could
-hold one object's bytes twice under two names. The path column is checked to
-be what the format says it is — relative to the pack's own root — and the link
-target is deliberately **not**: Herd never resolves one, and a build output's
-symlink may legitimately leave the pack, so refusing it would refuse a good
-pack to defend against something nothing does.
+hold one object's bytes twice under two names.
+
+**The path column was inert by habit and not by construction, and that is the
+same defect in miniature.** Its rule lived in its own doc comment — *"not a
+path Herd ever joins onto anything"* — which is a rule in one place and
+enforced in none, so it is now checked to be what the format says it is:
+relative to the pack's own root, not empty, no NUL, and no `..` that climbs
+out. **The link target is deliberately NOT checked**, and the reason belongs
+in the record so that nobody tightens it later without it: Herd never resolves
+one, and a build output's symlink may legitimately point at `/nix/store/…`
+outside the pack, so refusing it would refuse a good pack to defend against a
+resolution nothing performs. It is inert by usage, the type says so, and
+anybody who ever resolves one owes it their own check.
 
 `RECORD_VERSION` and `LAYOUT_VERSION` do **not** move here, and neither do
 `VERDICT_FORMAT_VERSION` or `OUTPUT_FORMAT_VERSION`: no pack information went
 on the verdict document.
 ```
 
-5. **How this branch gets a green gate, which is the one thing blocking it.**
-   The tree is green on all four Rust gates and on a complete
-   `./scripts/test.sh` (1006 passed, `test suite: PASSED`); the batch gate is
-   red twice on finding 0. Recommendation: fix `room.rs`'s cgroup reading as
-   its own small step — it is a subtraction and a test, it is the consumer's
-   defect as much as this host's, and it makes the gate runnable here.
-   Fallback, if that is not tonight's: raise `/chatons.slice`'s `memory.high`,
-   or run the gate outside the slice; both are the host's owner's to do and
-   neither is mine. **This branch must not be pushed on a red gate**, so
-   whoever takes one of those remedies re-runs `./scripts/gate.sh` on
-   `a76da25` unchanged and pushes on its green.
-
 ## Resume point
 
-**The branch is committed and NOT pushed**, because the gate is red (finding
-0). Five commits, nothing uncommitted; this file is the fifth, so the sha
-below is the branch tip and not one of the gated ones:
+The branch's own code has not changed since `a76da25`; everything after it is
+this file and the merge of batch 10. The gated shas, in order, were `b63cec3`
+(RED, finding 0), `a76da25` (RED, finding 0) and the tip of this branch (the
+run named above).
 
 ```sh
 cd <scratchpad>/pack-variants/wt      # branch pack-variants
-git log --oneline -5
-#   this file                 Record the second gate's red and the reading
-#   a76da25                   Refuse a manifest digest that is not 64 hex
-#   e2053b3                   Record the first gate's red and the host
-#   b63cec3                   Add pack-variants' handoff
-#   ebbfdd8                   Fold the pack frames onto the enums
+git log --oneline -8
 ```
 
-The two gated shas were `b63cec3` (first run) and `a76da25` (second). The code
-has not changed since `a76da25`; the two commits after it are this file.
+**S2 (the runner's pack store) and S6 (the hub's registry)** have their whole
+wire surface on the real enums now: construct
+`ToHub::RegisterPack(pack::RegisterPack { … })`, match
+`FromHub::PackRegistered(_)`, and delegate every digest check to
+`herd_proto::pack::check_object_digest` instead of writing a second copy.
 
-To finish it, with nothing to re-decide: take one of finding 0's three
-remedies, then
+**S5 (the fetch endpoint) and S9 (the fetch client)** have the framing:
+`check_peer_protocol_version` first, then `encode_peer_header` on the serving
+side and `decode_peer_header` + `take_peer_body` on the fetching side. Every
+refusal is already named and already has a case that fires it, and
+`PeerHeaderRead::Incomplete` is the one answer that is **not** a refusal.
 
-```sh
-export CARGO_TARGET_DIR=/mnt/ssd_980/herd/build/pack-variants   # deleted; it rebuilds
-./scripts/bench-preflight.sh          # wait for two clears, unmodified
-./scripts/gate.sh                     # bare, never inside nix develop
-git push -u origin pack-variants      # on GREEN only
-```
+**S7** adds handler arms beside `message_kind`'s seven names. **S4** fills
+`Hello`'s `mesh_endpoint`, which is `None` on this build and is the
+outbound-only runner.
 
-Next, in any order, all of them now unblocked:
+**The first silence** is S1, by decision 3: a caller for `ToHub::JobFact` with
+`FactReason::JobFilesNotHeld` where `files_held`'s `other` arm prints today
+(`herd-runner/src/lib.rs:1690-1700`), and a hub arm that stops re-asking.
 
-- **S2** (the runner's pack store) and **S6** (the hub's registry) have their
-  whole wire surface on the real enums: construct
-  `ToHub::RegisterPack(pack::RegisterPack { … })` and match
-  `FromHub::PackRegistered(_)`.
-- **S5** (the fetch endpoint) and **S9** (the fetch client) have the framing:
-  `encode_peer_header` on the serving side, `decode_peer_header` +
-  `take_peer_body` on the fetching side, `check_peer_protocol_version` first,
-  and every refusal already named and tested.
-- **S7** (wire the pack frames into the hub's connection loop) adds handler
-  arms beside `message_kind`'s seven names.
-- **The first silence**: a caller for `ToHub::JobFact` and a hub arm that
-  reads it.
+**One follow-up this branch deliberately left alone:** the runner's own
+`object_name` guard is now redundant and can become a thin delegation to
+`check_object_digest`. It is in a file this branch does not own.
 
 ## Processes
 
-Six background shells, all started and ended by this agent: two until-loops
+Seven background shells, all started and ended by this agent: two until-loops
 waiting for the unmodified preflight to clear (`bn2xniqwm`, stopped with
 `TaskStop` once the figures said the slice-room refusal was page cache —
 stopped too early, see *Gates*; and `buikndgug`, which waited for the two
-consecutive clears and got them), the full suite (`bl5nqishv`, PASSED), the
-first gate (`b43mxk1j0`, RED), the second gate (`bw8i22rnv`, RED) and one
-monitor on the gate's verdict line (`bqacxf11n`). No
+consecutive clears and got them), the full suite (`bl5nqishv`, PASSED), three
+gate runs (`b43mxk1j0` RED, `bw8i22rnv` RED, and the third named in the
+report) and one monitor on the gate's verdict line (`bqacxf11n`). No
 `pkill`, no `killall`, no kill by name, no PID of any other agent touched.
 Nothing of `/etc/nixos`, `/srv`, the consumer's data or the chatOnS project;
 nothing written under `/sys/fs/cgroup`; no cache dropped.
 
 `CARGO_TARGET_DIR=/mnt/ssd_980/herd/build/pack-variants`, outside the
-worktree, 13 GB, **deleted** with
+worktree, deleted once after the second red — which cost the third run a full
+rebuild — and **deleted again** with
 `rm -rf /mnt/ssd_980/herd/build/pack-variants`
-at the end of the task (gotcha `build-weight-off-root`) although the branch
-was not pushed — a re-gate rebuilds it, which costs a few minutes and returns
-13 GB of page cache to the very slice finding 0 is about.
+at the end of the task (gotcha `build-weight-off-root`).
