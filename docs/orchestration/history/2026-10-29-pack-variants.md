@@ -352,15 +352,48 @@ The gate's own log and the suite's output:
 `<scratchpad>/pack-variants/gate-stdout.txt`, and
 `target/herd-gate/test-output-b63cec3ecbab.txt`.
 
-**The last runs, named and not quoted** (a handoff is a docs file, so the run
+### The second gate was RED too, and the host was at rest for it
+
+```
+gate: RED sha=a76da253014ca2580c50329ab0904c80b76c6e99 failed=6:test-suite
+      skips=at-rest
+gate: NOT GREEN — this sha must not be pushed to main.
+```
+
+Run only after **two consecutive clears of the unmodified
+`bench-preflight.sh` twenty seconds apart** — 9741 MiB and 9934 MiB of slice
+room, load 4.40 of a 9.00 ceiling, no override anywhere in the environment.
+Steps 0–5 and 7 ok again, and this time the skip list was the **at-rest** one
+exactly: no bench had to be excused. `load1` 4.05 at the start, 5.12 after the
+suite — the host was quiet from end to end.
+
+Step 6 failed in 263 s with **two** tests (not the nine of the first run, and
+a different file: `herd-hub --test stopping`), and the runner's own words say
+why:
+
+```
+herd-runner: announcing 3 MiB of memory rather than 31.1 GiB, because
+/proc/self/cgroup is enclosed by memory.high 18 GiB on /chatons.slice, which
+already holds 17.9 GiB, so the room here is 3 MiB and not what /proc/meminfo
+reports
+Error: --host-memory-floor is 1024 MiB and this host lends 3 MiB, so nothing
+could ever be admitted here.
+```
+
+So the gate's suite **fills the slice to its own ceiling as it runs**, and
+every `real_herd` test whose runner starts after that point refuses to start.
+Which tests those are is a race, which is why the two runs failed in different
+files; the cause is one. **The branch is therefore not pushed**: push only on
+your own green gate, and this gate is not green.
+
+**The last run, named and not quoted** (a handoff is a docs file, so the run
 that gates the tree with this file in it cannot quote itself):
-`./scripts/check-docs.sh` and bare `./scripts/gate.sh` on the tree with this
-file committed — the **second** gate run, made only after the unmodified
-`bench-preflight.sh` cleared, which is what the first one should have waited
-for. Output goes to `<scratchpad>/pack-variants/docs-final.log` and
-`<scratchpad>/pack-variants/gate2.log`, and verbatim into the agent's report.
-**If that run is red too, the branch is not pushed and the red is the
-report's first line.**
+`./scripts/check-docs.sh` on the tree with this file committed, to
+`<scratchpad>/pack-variants/docs-final.log`, verbatim in the agent's report.
+**No third gate run was made.** Two were enough to establish the cause, and a
+third would have been re-rolling a dice whose outcome is about the host's page
+cache and not about this tree — which is the one thing a gate must not be
+asked to do.
 
 **Skips:** none from any run above — `cargo test -p herd-proto` reported
 `0 ignored` on all four binaries. The suite's and the gate's skips are in the
@@ -407,6 +440,63 @@ memory does. The second gate run therefore waited for the unmodified gate.
 ## Risks and findings
 
 Ordered by what a later version cannot repair.
+
+**0. THE PRODUCT FINDING, and it is why the gate is red: a runner inside a
+`memory.high` cgroup counts reclaimable page cache as memory the jobs are
+holding, and so refuses to start.**
+
+`herd-runner/src/room.rs:63` is
+
+```rust
+self.ceiling_bytes.saturating_sub(self.charged_bytes) / (1 << 20)
+```
+
+where `charged_bytes` is `memory.current` (`:143`). **`memory.current`
+includes the cgroup's page cache**, which is not memory any job holds and
+which the kernel reclaims the instant anything asks for it. So on any cgroup
+that has done file IO — every cgroup after a while, and certainly a build
+host — the figure collapses towards zero, and the floor refusal in `main`
+turns that into a runner that will not start at all:
+
+> `--host-memory-floor is 1024 MiB and this host lends 3 MiB, so nothing
+> could ever be admitted here.`
+
+Measured on this host, the two readings side by side at one instant:
+
+```
+room.rs reads    high - current                    = 5722 MiB
+cache taken off  high - (current - inactive_file)  = 7644 MiB
+```
+
+and at the worst moment of the gate's own suite `current` was 17.9 GiB of an
+18 GiB `memory.high`, with **`anon` 536 MiB and `file` 12637 MiB** — so the 3
+MiB the runner announced was about page cache and nothing else, while the
+machine had 23 GiB available.
+
+**The module knows the question and answers it for the host, not for the
+cgroup.** `room.rs:27-29` deliberately refuses `MemAvailable` — *"a second
+figure that moves between the judgement and the claim would be the overcommit
+E-32 forbids"* — and that argument is about the **host's** free memory. But
+`MemAvailable` is exactly the kernel's "free plus what is reclaimable", and
+the cgroup path then uses the one figure that has no such correction. The
+asymmetry is the defect: the host reading accounts for reclaimable cache and
+the cgroup reading does not.
+
+**Consequence for the consumer, which is why this is first.** D161 says they
+run every instance, in docker compose — which is cgroups with limits. A runner
+in a container whose `memory.high` is reached by page cache announces a few
+MiB, is refused by its own floor, and its owner reads a sentence about memory
+she has plenty of. The startup line is honest about *what it read*; what it
+read is the wrong figure.
+
+**Not touched**: `herd-runner/src/room.rs` is on this brief's do-not-touch
+list by name. The fix is one subtraction and a test, and it is not mine.
+
+**It is also the whole of why both gate runs are red**, so for this branch it
+is a blocker and not only a finding. Three remedies, in the test's own words
+and in increasing order of what they cost somebody else: run the suite outside
+the slice, raise the slice's `memory.high`, or correct the reading. The third
+is the one that also helps the consumer.
 
 **1. `PackUnavailable` was kept separate from `JobFact`, and the argument
 cuts both ways.** It is a pack-shaped instance of exactly that frame, and
@@ -600,11 +690,45 @@ pack to defend against something nothing does.
 on the verdict document.
 ```
 
+5. **How this branch gets a green gate, which is the one thing blocking it.**
+   The tree is green on all four Rust gates and on a complete
+   `./scripts/test.sh` (1006 passed, `test suite: PASSED`); the batch gate is
+   red twice on finding 0. Recommendation: fix `room.rs`'s cgroup reading as
+   its own small step — it is a subtraction and a test, it is the consumer's
+   defect as much as this host's, and it makes the gate runnable here.
+   Fallback, if that is not tonight's: raise `/chatons.slice`'s `memory.high`,
+   or run the gate outside the slice; both are the host's owner's to do and
+   neither is mine. **This branch must not be pushed on a red gate**, so
+   whoever takes one of those remedies re-runs `./scripts/gate.sh` on
+   `a76da25` unchanged and pushes on its green.
+
 ## Resume point
+
+**The branch is committed and NOT pushed**, because the gate is red (finding
+0). Five commits, nothing uncommitted; this file is the fifth, so the sha
+below is the branch tip and not one of the gated ones:
 
 ```sh
 cd <scratchpad>/pack-variants/wt      # branch pack-variants
-git log --oneline -3
+git log --oneline -5
+#   this file                 Record the second gate's red and the reading
+#   a76da25                   Refuse a manifest digest that is not 64 hex
+#   e2053b3                   Record the first gate's red and the host
+#   b63cec3                   Add pack-variants' handoff
+#   ebbfdd8                   Fold the pack frames onto the enums
+```
+
+The two gated shas were `b63cec3` (first run) and `a76da25` (second). The code
+has not changed since `a76da25`; the two commits after it are this file.
+
+To finish it, with nothing to re-decide: take one of finding 0's three
+remedies, then
+
+```sh
+export CARGO_TARGET_DIR=/mnt/ssd_980/herd/build/pack-variants   # deleted; it rebuilds
+./scripts/bench-preflight.sh          # wait for two clears, unmodified
+./scripts/gate.sh                     # bare, never inside nix develop
+git push -u origin pack-variants      # on GREEN only
 ```
 
 Next, in any order, all of them now unblocked:
@@ -624,18 +748,20 @@ Next, in any order, all of them now unblocked:
 
 ## Processes
 
-Four background shells, all started and ended by this agent: the until-loop
+Six background shells, all started and ended by this agent: two until-loops
 waiting for the unmodified preflight to clear (`bn2xniqwm`, stopped with
 `TaskStop` once the figures said the slice-room refusal was page cache —
-stopped too early, see *Gates*), the full suite (`bl5nqishv`, ran to
-completion), the first gate (`b43mxk1j0`, RED) and the second (named in the
-report). No
+stopped too early, see *Gates*; and `buikndgug`, which waited for the two
+consecutive clears and got them), the full suite (`bl5nqishv`, PASSED), the
+first gate (`b43mxk1j0`, RED), the second gate (`bw8i22rnv`, RED) and one
+monitor on the gate's verdict line (`bqacxf11n`). No
 `pkill`, no `killall`, no kill by name, no PID of any other agent touched.
 Nothing of `/etc/nixos`, `/srv`, the consumer's data or the chatOnS project;
 nothing written under `/sys/fs/cgroup`; no cache dropped.
 
 `CARGO_TARGET_DIR=/mnt/ssd_980/herd/build/pack-variants`, outside the
-worktree, 13 GB, deleted with `rm -rf /mnt/ssd_980/herd/build/pack-variants`
-once the branch was pushed — and, if the branch was **not** pushed, deleted
-all the same and named in the report as the thing a re-gate has to rebuild
-(gotcha `build-weight-off-root`).
+worktree, 13 GB, **deleted** with
+`rm -rf /mnt/ssd_980/herd/build/pack-variants`
+at the end of the task (gotcha `build-weight-off-root`) although the branch
+was not pushed — a re-gate rebuilds it, which costs a few minutes and returns
+13 GB of page cache to the very slice finding 0 is about.
