@@ -31,6 +31,15 @@
 //! Adding a field therefore does not move
 //! [`herd_proto::VERDICT_FORMAT_VERSION`]; removing one, or changing what one
 //! means, does.
+//!
+//! **And none of that was enforced by anything until `tests/frozen_verdict.rs`.**
+//! The paragraphs above are a promise; that file is the machine behind it. It
+//! asserts three of these documents as whole literal text — every key, in
+//! order, with its indentation, its `null`s and the final newline — so that a
+//! renamed field, a reordered one, a compact printer or a lost newline is a
+//! red gate rather than a surprise in somebody's wrapper. The unit tests
+//! below stay as they are: they say *why* each field reads as it does, which
+//! golden text cannot.
 
 use std::path::Path;
 
