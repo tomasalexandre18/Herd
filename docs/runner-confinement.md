@@ -24,6 +24,8 @@ variable, in the style of `--hub` / `HERD_HUB_URL`.
 | `--job-nice` | `HERD_JOB_NICE` | `10` | CPU niceness floor for a job |
 | `--cgroup-root` | `HERD_CGROUP_ROOT` | the runner's own cgroup | Delegated cgroup v2 directory to hang job cgroups under. Must contain this runner |
 | `--privileged-helper` | `HERD_PRIVILEGED_HELPERS` | empty | Absolute path of a command allowed to need privilege; repeat the flag, or separate with `:` |
+| `--mesh-listen` | `HERD_MESH_LISTEN` | **absent** | The one address this runner may serve a job's artefacts from. Absent means it serves nothing and listens on nothing. Refused at startup by name for a wildcard, a default-route address or a globally routable one |
+| `--mesh-advertise` | `HERD_MESH_ADVERTISE` | the listen address | What peers are told to dial. Same class rule, no routing check |
 
 Sizes accept a plain number of bytes or a suffix: `B`, `KiB`, `MiB`, `GiB`,
 `TiB`, and the decimal `kB`, `MB`, `GB`, `TB`. A value that does not parse is
@@ -186,10 +188,111 @@ itself. How that is done depends on what the host gives:
   `nohup` and a `setsid` are all still found — and `setsid` is precisely what
   a process-group kill cannot reach.
 
-**No inbound socket.** A runner binds nothing in M4, asserted two ways: the
-real binary is inspected through `/proc` while running a job, and a test reads
-the crate's sources for anything that could bind. The mesh-bound fetch
-endpoint of D10 and D11 arrives in M11.
+**No inbound socket, except one named mesh address.** See *The mesh-address
+rule* below: a runner binds nothing unless `--mesh-listen` names a private
+mesh address, and what it may name is refused at startup rather than
+discovered by a peer.
+
+## The mesh-address rule (invariant 3, D10, D11)
+
+Invariant 3 reads: *a runner opens the control connection to the hub and needs
+nothing inbound to work. It may listen on a **private mesh interface** to
+serve content to peers (D10, D11) — bound to that interface only, never on a
+default or public one, and never behind a port forwarded on someone's box.*
+D11 (Alexa, 2026-10-12) is where that exception was approved, and its first
+condition is a **startup** condition: a configuration that would bind a public
+or default interface is refused at startup, the way a bad data root is (E-45).
+
+`--mesh-listen ADDR` is **refused at startup, naming the address and the
+reason**, when it is
+
+- a **wildcard** — `0.0.0.0`, `::`: it binds the default-route interface along
+  with every other one, which is the whole thing D11 forbids;
+- an address of the **default-route interface**: that is the interface this
+  host reaches the internet through, and so the interface a port forwarded on
+  a router would land on;
+- **globally routable**: an address the public internet can address is not a
+  private mesh, whatever the firewall in front of it happens to say today.
+
+It is **accepted** for **loopback**, and for a **private** (RFC 1918),
+**carrier-grade-NAT** (`100.64/10`, which is what a tailnet hands out),
+**link-local** or **unique-local** address that is *not* on the default-route
+interface. An `::ffff:` IPv4-mapped address is judged as the IPv4 address
+inside it, so writing it that way is not a way round the rule.
+
+`--mesh-advertise ADDR` is what peers are told and defaults to the listen
+address. It carries the same class rule — a wildcard or a globally routable
+address is refused — but no routing check: it is the address a *peer* dials,
+and this host's route table says nothing about that. Given with no
+`--mesh-listen`, it is refused: an address peers are told to dial with nothing
+listening on it is a promise this runner cannot keep.
+
+Without a port, the kernel picks one and the advertised endpoint carries what
+it got. The owner's switch still decides whether anything is served at all:
+`off` serves nothing, not just claims nothing (E-33, D11's third condition),
+and that gate is `Runner::serves_content` — read once, there, and not restated
+by the mesh rule.
+
+### Two consequences, stated rather than discovered
+
+**A single-NIC flat-LAN machine has no permitted serving address, and is
+therefore outbound-only.** Its one address is on the default-route interface,
+so every form of `--mesh-listen` it could write is refused. That is not a
+defect and it is not a gap to close by relaxing the rule: it is what *"never
+behind a port forwarded on someone's box"* costs, and it is why D10 keeps a
+path that needs no listener at all. An operator who wants that machine to
+serve joins it to a mesh — a tailnet, a WireGuard network — and names the
+address the mesh gave it.
+
+**Loopback is permitted deliberately.** It is neither a default-route address
+nor a globally routable one, so the rule admits it on its own terms; the
+implementation returns on it before the host's routing is consulted, so no
+host shape can take it away. Two reasons it must stay admitted: a loopback
+endpoint is reachable by nothing off the machine, which is the strictest
+reading of invariant 3 there is; and the two-runner end-to-end that makes the
+pack half *done* (invariant 5) runs two runners on one workstation, where
+loopback is the only mesh there is.
+
+### Where the rule cannot be decided, it refuses
+
+The default-route reading needs this host's routing table and this host's own
+interface addresses — `/proc/net/route`, `/proc/net/ipv6_route` and
+`getifaddrs`. Where neither can be read, the answer is **not** "permit and
+hope": anything but loopback is refused, naming the reason. An operator on
+such a host gets an outbound-only runner, which is a state D10 already has a
+path for.
+
+### What is built, and what is not
+
+The rule and both of its guards are built. **No socket is bound yet**: the one
+socket type a runner may ever hold is `mesh::MeshListener`, named in
+`herd-runner/src/mesh.rs` and nowhere else in the crate, and the fetch
+endpoint that binds through it is the next step. The two guards below are what
+keep that true.
+
+### The two guards
+
+- **`every_listening_socket_of_the_runner_is_its_mesh_address`** walks the
+  real binary's descriptors through `/proc` while it is running a job, and
+  asserts that every socket it holds in `TCP_LISTEN` is the mesh address its
+  configuration named and that there is at most one. The walk is first made to
+  find a socket planted on purpose, because an empty result from a walk that
+  can find nothing is evidence of nothing. With no mesh address the permitted
+  set is empty and the assertion is the one this file used to describe.
+- **`no_module_of_the_runner_can_bind_a_socket`** reads the crate's sources:
+  `TcpListener` is permitted in **exactly one** file, named in the test, and
+  asserted to really be named there; `UdpSocket`, `UnixListener` and
+  `UnixDatagram` stay forbidden **everywhere**, that file included. One named
+  module is a tighter statement than "nowhere" plus an exception nobody wrote
+  down — moving the listener to a second module is a red suite rather than a
+  reviewer's good memory. The matching is first made to fire on a line known
+  to be bad.
+- Each refusal is asserted by a case that fires, not by reading the code: the
+  wildcard and the globally routable one against the real binary's exit and
+  its stderr, and all of them — wildcard, default-route, globally routable,
+  multicast, reserved, an unreadable host, a `%zone` scope id — against fixed
+  host fixtures in `mesh.rs`'s own tests, plus one that refuses **this**
+  host's own default-route address and skips out loud on a host that has none.
 
 ## A runner's own death
 
