@@ -31,24 +31,24 @@ no migration path, so the last two destroy an existing root: ORCH-156.
 
 ## Releases, and what is in none
 
-**v0.4.0 is published**: tag `2631286` → `171c780`, 2026-10-29 13:50:10Z,
-`prerelease: false`, now *Latest*, five assets (**D162**); `release.yml`
-`40885270441` green in **all 22 steps**, Arch and Alpine smokes included.
-The published hub carries **`report`** and **`retention-preview`**, which
-v0.3.7's has not; **interoperability was run both ways** and the three
-version numbers are **unmoved** (ORCH-156): 2, 1, 1. So **the fifteen
-changes that were in no release are now in one**, nine of them defects, and
-retention ships **active** behind that preview (**D201**). **Its body went
-out without the human half and Alexa pasted it himself** (**D210**;
-ORCH-162 would make it a gate). **Their `report` reading is takeable now**
-(ORCH-145).
+**v0.4.1 is published and tagged**, and **`herd-merger` pushed that tag** —
+the first one the integrator has posted (**D212**, 2026-10-29: the tag is
+the integrator's, on the landing's own two conditions). It carries one
+subject, **D211**: v0.4.0's startup reaper deleted the output spools its own
+startup sweep exists to re-adopt, twenty-eight lines apart on one startup,
+so that half was dead on arrival. Both halves had a green test; neither ran
+that startup. **This is the release the first consumer waits for** — their
+runner is held at 0.3.6 because ~396 MiB of a job's evidence sits in such a
+spool (ORCH-164). **Its body again went out without the human half**, and
+that paste is Alexa's own act (**D210**; ORCH-162 retires the need).
 
-**And v0.4.0 shipped a regression, fixed on `main` and in no release**
-(**D211**): its startup reaper deleted the output spools its own startup
-sweep exists to re-adopt, twenty-eight lines apart on one startup, so that
-half was dead on arrival. **The first consumer's runner is held at 0.3.6**
-until a release carries the fix, or the upgrade deletes the bytes they wait
-for (ORCH-164). Both halves had a green test; neither ran that startup.
+**v0.4.0 before it**: 2026-10-29 13:50:10Z, `prerelease: false`, five assets
+(**D162**), `release.yml` green in all 22 steps. Its hub carries **`report`**
+and **`retention-preview`**, which v0.3.7's has not; **interoperability was
+run both ways** and the three version numbers are **unmoved** (ORCH-156): 2,
+1, 1. So **the fifteen changes that were in no release are now in one**, nine
+of them defects, retention ships **active** behind that preview (**D201**),
+and **their `report` reading is takeable now** (ORCH-145).
 
 ## What is known about the consumer's machines, and when
 
@@ -72,8 +72,8 @@ M1-M11, M15 and M16; a job may return 1 GiB by default (`confine.rs:82`).
 **A skip count is per host and per load** (D27): **12** here at rest, **14**
 under load — the **list** decides (D187). The suite is green here at rest,
 every skip the same cgroup v2 delegation this host does not grant.
-`check-orchestration.sh` is at **269 passed**. **Three green post-push runs
-on `main`**, `40896526152` (`10ff31d`) the newest, ending three reds fixed
+`check-orchestration.sh` is at **269 passed**. **Four green post-push runs
+on `main`**, `40908071577` (`cd0f1b7`) the newest, ending three reds fixed
 by **D195** then **D208** (ORCH-119).
 
 ## What the software still does not do

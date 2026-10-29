@@ -10,8 +10,8 @@ owes before it stops. `CLAUDE.md` is the contract; this is the procedure.
 | orchestrator (main session) | receives the goal, reads the board, picks agents, writes briefs, reads evidence, asks Alexa one question at a time, reports in French | edit a repository file, commit, merge, resolve a conflict, tag, release, declare a skip a pass, report an agent's claim unverified |
 | `herd-planner` | analyses a request, lists alternatives and hypotheses to refute, cuts bounded tasks | modify the product, merge, settle an owner decision |
 | `herd-step` | one bounded task on its own branch and worktree, with the gates the task needs, evidence and a handoff; pushes the branch | open a pull request, leave its write paths, touch `main`, touch another agent's worktree, or the running instance |
-| `herd-merger` | integrates a batch of branches, one at a time onto one integration branch: conflicts, the local gate, D-number allocation, board and status update, then the landing record and **one** `--no-ff` merge commit on `main` with that record as its message, pushed once under standing authorisation ORCH-001 | open a pull request — but the one that lands this change, on the orchestrator's instruction (*Not an option*, step 1) — bypass a gate, push `main` without a green gate for the merge's second parent, decide a specification or invariant change, operate Herd |
-| `herd-release` | prepares a release: checklist, version, body, evidence; simulation only until Alexa orders a tag | tag, push a tag, publish, deploy, land its own branch |
+| `herd-merger` | integrates a batch of branches, one at a time onto one integration branch: conflicts, the local gate, D-number allocation, board and status update, then the landing record and **one** `--no-ff` merge commit on `main` with that record as its message, pushed once under standing authorisation ORCH-001, then pushes that release's annotated tag (D212) | open a pull request — but the one that lands this change, on the orchestrator's instruction (*Not an option*, step 1) — bypass a gate, push `main` without a green gate for the merge's second parent, decide a specification or invariant change, operate Herd |
+| `herd-release` | prepares a release: checklist, version, body, evidence; simulation only until Alexa orders a release | tag, push a tag, publish, deploy, land its own branch |
 | `herd-reviewer` | adversarial review of a plan, a rule change, a permission change or an unresolvable conflict; lists missing evidence and adverse cases | edit anything, replace the owner |
 
 What is technically enforced and what is only written is in
@@ -68,21 +68,25 @@ What is technically enforced and what is only written is in
    2026-10-24, re-granted 2026-10-28) covers any landing whose gate is
    green on **the sha that was gated — the merge's second parent, with
    an identical tree** — and whose landing record is filled. `main`
-   moves no other way, and no pull request is opened. A tag is never
-   part of this step. The rule, what a landing is, what it costs, the
-   transition and the three method changes refused with it: *One landing
-   per batch*, below.
+   moves no other way, and no pull request is opened. A tag is not part
+   of this step: it is its own act, after the push, and step 8 holds it.
+   The rule, what a landing is, what it costs, the transition and the
+   three method changes refused with it: *One landing per batch*, below.
 8. **Release.** On Alexa's order, `herd-release` prepares the checklist
    and pushes the `cut-v<version>` branch that bumps the version;
-   `herd-merger` lands it, as for any other branch. The tag itself is
-   pushed by whoever Alexa names in that order. Nothing in this project
-   deploys. **A release's own notes are Alexa's act too, and a brief
-   says so from the start** (**D210**, 2026-10-29): `release.yml` never
-   reads the prepared human half, and once a release is public neither an
-   execution agent nor the orchestrator can put it there — two
-   permission walls, neither a defect, measured at v0.4.0. Until the
-   notes ship in the tree (ORCH-162) the paste belongs in the same order
-   as the tag.
+   `herd-merger` lands it, as for any other branch, and **then pushes
+   the annotated tag itself** (Alexa, 2026-10-29, **D212**). The
+   integrator holds the tag on the conditions it already lands under — a
+   green gate for the gated sha, a filled record — and tags the landing
+   commit by name, the only commit `release.yml`'s version check accepts.
+   One named owner, in place of an act nobody held. Nothing in this
+   project deploys. **A release's own notes stay Alexa's own act, and a
+   brief says so from the start** (**D210**, 2026-10-29): `release.yml`
+   never reads the prepared human half, and once a release is public
+   neither an execution agent nor the orchestrator can put it there —
+   two permission walls, neither a defect, measured at v0.4.0. Until the
+   notes ship in the tree (ORCH-162) the paste is Alexa's own, named in
+   the same order as the tag.
 
 ## One landing per batch
 
@@ -362,8 +366,10 @@ thing a second machine would ever have said about its own landing.
 **Unchanged.** Never `--no-verify` — it is what bypasses
 `scripts/githooks/pre-push`, the only mechanism standing in front of
 `main` — never force-push, never a red landing, never `--admin`. One
-integration at a time: a batch **is** one integration, larger. A tag
-and a release stay Alexa's word, one act at a time. The orchestrator
+integration at a time: a batch **is** one integration, larger. The tag
+is the integrator's since 2026-10-29 (**D212**), one act after the push
+and never inside it; a release's own notes stay Alexa's (D210). The
+orchestrator
 still never merges or pushes, and that one is **contractual**:
 `orchestrator-guard.sh` denies `git merge` to the main session but was
 probed on 2026-10-28 and lets `git -C <dir> merge` and
@@ -577,16 +583,18 @@ was lost.
 
 ## Permissions and escalation
 
-- Alexa decides: milestone order, invariants, pushing a tag, publishing a
-  release (each act singly), GitHub issues, anything on the consumer's
-  side. The merge is `herd-merger`'s — Alexa's standing authorisation of
+- Alexa decides: milestone order, invariants, ordering a release, its own
+  notes (D210), GitHub issues, anything on the consumer's side. The merge
+  is `herd-merger`'s — Alexa's standing authorisation of
   2026-10-24, verbatim *"non il peux merge par defaut"* (ORCH-001),
   re-granted 2026-10-28 on the condition that replaced the old one: a
   green `./scripts/gate.sh` for the **gated** sha — the merge's second
   parent, trees identical (*What a landing is*) — plus a filled
   landing record. The old condition — a CI-green pull request with its
-  Evidence filled — is gone with the pull request itself. Landing a
-  version branch does not publish its release.
+  Evidence filled — is gone with the pull request itself. **The tag is
+  the integrator's too since 2026-10-29** (**D212**), on those same two
+  conditions and as a separate act after the push. What landing a version
+  branch still does not do is write the release's own notes (D210).
 - A question for Alexa is one item in the board's *Waiting* section:
   question, recommendation, impact, fallback, date. Work that does not
   depend on it continues. Nobody invents the answer.

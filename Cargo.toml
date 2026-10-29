@@ -3,7 +3,7 @@ members = ["herd-proto", "herd-hub", "herd-runner", "herdctl"]
 resolver = "2"
 
 [workspace.package]
-version = "0.4.0"
+version = "0.4.1"
 edition = "2021"
 publish = false
 # Q10, decided 2026-10-16: Apache-2.0 (D141). The verbatim text is in

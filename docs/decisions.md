@@ -10778,3 +10778,76 @@ and `:2662`; `herd-runner/src/root.rs:197-203`; `b250358`;
 done, and it is the better fix. H.*, which named re-adopting the spool as
 the better fix and said nobody had asked for it — two days before somebody
 built it; **D19**, **D148**, **D180**; ORCH-164.
+
+## 2026-10-29 — D212 The integrator pushes the tag, on the landing's conditions
+
+**Context — an act nobody held.** Until today a tag sat in a gap. `CLAUDE.md`
+*Git and main*, `workflow.md` step 8 and *Permissions and escalation*,
+`docs/orchestration/permissions.md` and `.claude/agents/herd-release.md` all
+reserved it with the same phrase — "Alexa's word, one act at a time" — while
+naming no actor who could carry it out. `herd-release` is refused `git tag`
+and a tag push by its own frontmatter hook (`.claude/hooks/release-guard.sh`,
+measured live as V10); the orchestrator is refused `git tag` and `git push`
+by `orchestrator-guard.sh` (V11); and `herd-merger`'s row in
+`permissions.md` refused it "with the version batch" on the strength of a
+sentence that today's answer removes. So each release needed Alexa to run two
+commands by hand, and v0.4.0 is what that cost: the tag went up on his word
+and the body went out incomplete, because the human steps around a release
+were distributed across people rather than owned by one.
+
+**The question asked, and the answer.** One question went to Alexa on
+2026-10-29: *who posts a tag and publishes a version?* He chose **the
+integrator, under the same conditions it already lands under**. One named
+owner in place of an act nobody held.
+
+**Rule (2026-10-29).** `herd-merger` pushes a release's annotated tag. The
+conditions are the landing's own and no others: a green `./scripts/gate.sh`
+for the **gated** sha — the merge's second parent, trees identical — and a
+filled landing record. Nothing waits for Alexa, exactly as ORCH-001 made the
+merge not wait. Three constraints come with it, and each has a mechanism
+behind it rather than only a sentence:
+
+1. **The tag is a separate, later act, never folded into the batch's push.**
+   One landing is one batch, one push, one `--no-ff` merge commit and one
+   post-push run (`workflow.md`, *What a landing is*). A tag pushed in the
+   same act would make a red run unattributable, which is the whole reason
+   that rule exists.
+2. **The tag names the landing commit, by name.** `release.yml` reads the
+   version through the flake (`nix eval --raw .#static.version`) and fails
+   the run when the tag is not `v$version` or a pre-release of it — step
+   *the version and the target*. A tag pushed before the version bump lands
+   therefore cannot publish, which is why the order is landing, then tag,
+   and never the reverse.
+3. **A release's own notes are untouched by this and stay Alexa's own act**
+   (**D210**). D210 placed the paste "in the same class as pushing the tag";
+   that cross-reference is what this entry supersedes, and only that. The two
+   permission walls D210 names are not weakened, and nothing here asks them
+   to be: `release.yml` still reads no prepared file, so until **ORCH-162**
+   ships the notes in the tree the paste remains a human step named in the
+   same order as the tag.
+
+**What stays Alexa's.** Ordering a release at all, its own notes, milestone
+order, the invariants, GitHub issues and anything on the consumer's side.
+What moved is the mechanical half of a release — the tag — and not the
+decision to cut one.
+
+**Why this is a decision and not a board row.** It is a permission change
+Alexa took today, recorded rather than proposed, and it constrains every
+future release brief and three role files. The rows it leaves open are
+separate: **ORCH-162** (notes in the tree) and **ORCH-164**, which closes on
+the paste and not on this landing.
+
+**Retirement condition.** None foreseen. If a future release act is given to
+a different agent, that is a new entry and not an edit of this one.
+
+**Evidence.** Alexa, 2026-10-29, in answer to one question relayed by the
+orchestrator; corrected in this landing in `CLAUDE.md` *Git and main* and
+*When to ask Alexa*, `docs/orchestration/workflow.md` (the role table, step
+7, step 8, *One landing per batch* *Unchanged*, and *Permissions and
+escalation*), `docs/orchestration/permissions.md` (the `herd-merger` tag row
+replaced by one allowance and one narrower refusal),
+`.claude/agents/herd-release.md` and `.claude/agents/herd-merger.md`;
+`.github/workflows/release.yml` step *the version and the target*;
+`history/2026-10-29-release-v0.4.1.md`; `history/2026-10-29-tag-v0.4.0.md`,
+which is what this entry prevents recurring; **D210**, **D162**, **D172**;
+ORCH-001, ORCH-162, ORCH-164, ORCH-176.
