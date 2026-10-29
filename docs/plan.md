@@ -304,21 +304,38 @@ gone.
 
 **Retention, answering the question the consumer will actually ask** — *how
 long do I have to fetch yesterday's failing screenshots?* Two numbers,
-because there are two kinds of thing (D148). The record proper — `job.json`,
-`events.jsonl`, the log, the inline files — keeps retention by priority
-class, 14/90 days, configurable (closes E-15), **and that half is still
-here**. The other half, a job's **large files** against their own budget on
-the hub's volume, **shipped in M11** rather than waiting: a sweeper with no
-budget is a disk-full outage with a delay fuse, so streaming could not be
-released without it (D152). `--output-budget` is 200 GB with a seven-day
-`--output-floor`, both printed at startup; the 200 GB is Alexa's, chosen on
-2026-10-16 without a measurement and written down as such (D148). What M12
-still owes on that side is the use-against-budget figure in M13's status
+because there are two kinds of thing (D148), and **since 2026-10-29 the
+space the numbers guard is what decides, not the calendar**
+(`docs/disk-policy.md` §0). The record proper — `job.json`,
+`events.jsonl`, the log, the inline files — carries its priority class's
+span, 14/90 days, configurable (closes E-15), **and that half is still
+here**: what changed is that a span is now the **maximum age** a record may
+reach rather than when it is deleted. The trigger is free space on the
+filesystem the state root sits on, with the span as the backstop that acts
+when nothing is under pressure; the output floor doubles as the guard that
+keeps space pressure off a fresh record. **Deduplication ships on by
+default** — every file in a job's `files/` a hard link to a
+content-addressed blob — because that is where the room is: four fifths of
+what the first consumer's records name are second and later copies, so
+deduplication divides the arrival rate rather than recovering anything
+already written. The other half, a job's **large files** against their own
+budget on the hub's volume, **shipped in M11** rather than waiting: a
+sweeper with no budget is a disk-full outage with a delay fuse, so
+streaming could not be released without it (D152). `--output-budget` is
+200 GB with a seven-day `--output-floor`, both printed at startup; the
+200 GB is Alexa's, chosen on 2026-10-16 without a measurement and written
+down as such (D148), and the budget governs the **collected files only** —
+a record's own bytes are the filesystem's business, which is why the free
+space guard and not the budget is what can ever remove one. What M12 still
+owes on that side is the use-against-budget figure in M13's status
 document, which needs M13. The eviction order is not oldest-first: outside
 the floor before inside it, then a job that passed before one that did not,
 then a collection already fetched before one nobody has opened, with age
 only as the tie-break (D152). Evicting inside the floor is a named line and
-an event, never a silent trim.
+an event, never a silent trim. And **nothing is kept without a bound**:
+what can no longer serve is removed after a stated delay, saying so, or
+moved to a configurable archive path on another disk — never destroyed
+immediately and never destroyed silently.
 And the **manifest outlives the bytes**: each file's path, length and sha256
 stay on the record for as long as the record does, so a requester asking for
 something already gone is told how many files there were, how big, and when
