@@ -59,9 +59,14 @@ exec </dev/null
 root=$(cd "$(dirname "$0")/.." && pwd)
 tmp=$(mktemp -d "${TMPDIR:-/tmp}/herd-orch-check.XXXXXX")
 trap 'rm -rf "$tmp"' EXIT
-pass=0; fail=0
+pass=0; fail=0; skips=0
 ok()   { pass=$((pass+1)); printf 'ok    %s\n' "$1"; }
 bad()  { fail=$((fail+1)); printf 'FAIL  %s\n%s\n' "$1" "$2"; }
+# A case this host cannot make is printed as SKIP and counted apart: the
+# same rule the Rust suite lives under (D27, invariant 5). It is never
+# counted as a pass, and the summary names it only when there is one, so
+# the usual line stays the usual line.
+skipped() { skips=$((skips+1)); printf 'SKIP  %s: %s\n' "$1" "$2"; }
 
 # Every assertion below reads a captured output through a HERE-STRING
 # (`grep -q ... <<<"$out"`) and never by piping `printf` into `grep`. Under
@@ -843,6 +848,75 @@ grep -qF '+ c_nobody_expected_this' <<<"$out" \
   && ok "gate: the unexpected skip is named, not counted" \
   || bad "gate: the unexpected skip must be named" "$(printf '%s\n' "$out" | tail -8)"
 
+
+# --- the hash is a hash: pinned collation (ORCH-202) ---------------------
+# The defect this proves gone. `skip-list-sha256` was `sort "$seen" |
+# sha256sum`, and `sort` takes its order from the environment, so two
+# correct gate runs on ONE tree in two locales printed TWO figures over one
+# list. Measured on servernixos over the identical twelve at-rest names:
+# en_US.UTF-8 gave 0fbdadca... and LC_ALL=C gave 2911f1e8..., diverging on
+# exactly one pair — `a_tighter_enclosing_memory_max_...` against
+# `an_allocation_past_the_ceiling_...` — because UTF-8 collation ignores the
+# underscore and C does not. A run from a stripped environment printed the C
+# one. `0fbdadca...` had travelled through roughly seventeen receipts as if
+# it identified a list.
+#
+# The probe pair below has the same shape: `a_zzz...` sorts BEFORE
+# `an_aaa...` under C and AFTER it under a UTF-8 collation.
+gate_fresh
+printf 'HERD-SKIPPED: a_zzz_needs_a_delegated_subtree: none here\nHERD-SKIPPED: an_aaa_needs_bfq: no device offers bfq\n' > "$tmp/gate-skips"
+cp "$tmp/gate-skips" "$tmp/gate-expected"
+printf 'HERD-IGNORED: c_zzz_a_bench: a bench; run it on purpose\nHERD-IGNORED: cn_aaa_a_bench: a bench; run it on purpose\n' > "$tmp/gate-ignored"
+cp "$tmp/gate-ignored" "$tmp/gate-expected-ignored"
+# The figure the gate must print: the BYTE order, computed here without any
+# locale at all, so this assertion cannot drift with the environment either.
+want_skip_c=$(printf 'a_zzz_needs_a_delegated_subtree\nan_aaa_needs_bfq\n' | LC_ALL=C sort | sha256sum | cut -d' ' -f1)
+want_ign_c=$(printf 'c_zzz_a_bench\ncn_aaa_a_bench\n' | LC_ALL=C sort | sha256sum | cut -d' ' -f1)
+# gate_sha256s <locale> -- the two figures from one gate run under it
+gate_sha256s() {
+  gate_run LC_ALL="$1" LANG="$1" >/dev/null 2>&1
+  s=$(cd "$gatedir" && git rev-parse HEAD)
+  grep -hE '^(skip|ignore)-list-sha256:' "$tmp/gate-receipts/$s.receipt" 2>/dev/null
+}
+under_c=$(gate_sha256s C)
+{ grep -qxF "skip-list-sha256: $want_skip_c" <<<"$under_c" \
+  && grep -qxF "ignore-list-sha256: $want_ign_c" <<<"$under_c"; } \
+  && ok "gate: both hashes are over the byte order, not the locale's order" \
+  || bad "gate: the hashes are not the byte-ordered ones" "    wanted
+    skip-list-sha256: $want_skip_c
+    ignore-list-sha256: $want_ign_c
+    got
+$(printf '%s\n' "$under_c" | sed 's/^/    /')"
+# And the assertion that matters: a DIFFERENT collation, the SAME figures.
+# Only a locale whose collation really disagrees with C proves anything, so
+# one is looked for rather than assumed; if the host has none, this is a
+# skip and not a pass (D27).
+alt=""
+for L in en_US.UTF-8 en_US.utf8 fr_FR.UTF-8 de_DE.UTF-8; do
+  [ "$(printf 'a_zzz\nan_aaa\n' | LC_ALL="$L" sort 2>/dev/null | tr '\n' ' ')" = "an_aaa a_zzz " ] \
+    && { alt=$L; break; }
+done
+if [ -z "$alt" ]; then
+  skipped "gate: two locales, one figure" \
+"this host offers no locale whose collation disagrees with C for the probe \
+pair, so the cross-locale half could not be exercised. The byte-order \
+assertion above did run. A host with en_US.UTF-8 proves the rest"
+else
+  under_alt=$(gate_sha256s "$alt")
+  if [ "$under_c" = "$under_alt" ] && [ -n "$under_c" ]; then
+    ok "gate: two locales ($alt vs C), one figure for each list"
+  else
+    bad "gate: the hash still moves with the locale" "    under C:
+$(printf '%s\n' "$under_c" | sed 's/^/      /')
+    under $alt:
+$(printf '%s\n' "$under_alt" | sed 's/^/      /')"
+  fi
+  # The probe pair must really disagree, or the case above proves nothing.
+  [ "$(printf 'a_zzz\nan_aaa\n' | LC_ALL=C sort | tr '\n' ' ')" \
+    != "$(printf 'a_zzz\nan_aaa\n' | LC_ALL="$alt" sort | tr '\n' ' ')" ] \
+    && ok "gate: the probe pair does collate differently, so that was a test" \
+    || bad "gate: the probe pair collates the same either way" "    it proves nothing"
+fi
 # --- the compile-time half of step 7: #[ignore] (ORCH-202) ---------------
 # Driven here for the same reason as everything above: a detector only ever
 # seen silent is not known to fire. The hole it closes was measured in batch
@@ -1950,5 +2024,10 @@ else
   ok "pre-push keeps the stdin git hands it: the ref list is its input"
 fi
 echo
-echo "check-orchestration: $pass passed, $fail failed"
+if [ "$skips" -eq 0 ]; then
+  echo "check-orchestration: $pass passed, $fail failed"
+else
+  echo "check-orchestration: $pass passed, $fail failed, $skips skipped"
+  echo "a skipped case is NOT a passed one (D27): see the SKIP lines above"
+fi
 [ "$fail" -eq 0 ]

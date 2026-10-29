@@ -2,15 +2,25 @@
 # not a count. A property of the tree and not of the host, so this file is
 # the same on every machine (ORCH-202).
 #
-# First list of its kind, so it was not produced by --bless. It was written
-# at ORCH-202 from a real `./scripts/test.sh` run on servernixos that
-# PASSED -- 942 passed, 0 failed, 39 ignored, 2026-10-30T00:05Z -- because a
-# list from a run that did not pass is not an expectation (D27), which is
-# exactly why --bless refuses one. It holds the 39 HERD-IGNORED lines that
-# run printed, in the form --bless writes, and --bless maintains it from
-# here on. The 39 names were also counted independently out of the source
-# (39 `#[ignore]` attributes in 9 files, ripgrep 15.2.0): the two lists are
+# Written at ORCH-202, not by --bless, because it is the first of its kind.
+# Its 39 lines came from a `./scripts/test.sh` run that PASSED -- 942
+# passed, 0 failed, 39 ignored, 2026-10-30T00:05Z, on the branch's base
+# 1a8c1ae -- because a list from a run that did not pass is not an
+# expectation (D27), which is exactly why --bless refuses one. The 39 names
+# were also counted independently out of the source and the two lists were
 # identical.
+#
+# It then lost ONE line, and that is this file's first worked example.
+# Batch 10 fixed the startup-offer defect (D219, `spool-offer-fix`) and took
+# `#[ignore]` off
+# `every_swept_spool_the_hub_acknowledges_is_deleted_and_none_set_aside`.
+# That test is now CHECKED, so its name leaves this file: 39 -> 38, one
+# visible deleted line. Before ORCH-202 the same transition moved nothing at
+# all and left no trace anywhere -- which is the hole this file exists to
+# close. Had the line been left here, the gate would have printed it under
+# "an expected #[ignore] did not appear" rather than passing in silence.
+# Verified against the merged tree: 38 attributes in 8 files (ripgrep
+# 15.2.0), identical to the 38 names below. --bless maintains it from here.
 #
 # The marker carries the KIND: HERD-IGNORED is a compile-time skip
 # (#[ignore], nobody is checking it until someone acts), HERD-SKIPPED a
@@ -19,21 +29,23 @@
 # visible change and never a wash. The gate compares the assertion NAME;
 # the reason is kept for the reader, and a line without one is refused
 # rather than listed.
+#
+# Order is byte order: every sort feeding a hash or a comparison in gate.sh
+# runs under LC_ALL=C, because collation is part of a hash (ORCH-202).
 HERD-IGNORED: a_collection_owed_is_not_an_open_job: a bench; run it on purpose
 HERD-IGNORED: a_link_cut_while_the_runner_is_full_loses_no_job_at_the_deployed_sixty_seconds: 171 s of wall clock, measured: the deployed 60 s threshold, a 65 s outage and 90 s jobs
-HERD-IGNORED: an_event_ahead_of_the_record_is_neither_seen_nor_repaired: ORCH-080's enumeration; run with --ignored
-HERD-IGNORED: an_interrupted_mint_loses_the_job_quietly: ORCH-080's enumeration; run with --ignored
-HERD-IGNORED: an_unknown_field_survives_a_read_and_not_a_write: a bench; run it on purpose
 HERD-IGNORED: a_record_renamed_with_no_event_appended_is_permitted_and_silent: ORCH-080's enumeration; run with --ignored
 HERD-IGNORED: a_record_this_hub_cannot_read_quarantines_one_job_and_the_hub_starts: ORCH-080's enumeration; run with --ignored
 HERD-IGNORED: a_temporary_in_files_is_held_output_for_ever: ORCH-080's enumeration; run with --ignored
 HERD-IGNORED: a_whole_line_that_is_not_json_refuses_the_query_and_not_the_hub: ORCH-080's enumeration; run with --ignored
 HERD-IGNORED: a_whole_pass_of_waiting_writes: a bench; run it on purpose
+HERD-IGNORED: an_event_ahead_of_the_record_is_neither_seen_nor_repaired: ORCH-080's enumeration; run with --ignored
+HERD-IGNORED: an_interrupted_mint_loses_the_job_quietly: ORCH-080's enumeration; run with --ignored
+HERD-IGNORED: an_unknown_field_survives_a_read_and_not_a_write: a bench; run it on purpose
 HERD-IGNORED: d_against_the_worst_turn: an experiment, not an assertion: run it on purpose
 HERD-IGNORED: each_post_alone: a bench; run it on purpose
 HERD-IGNORED: each_sync_priced_alone: a bench; run it on purpose
 HERD-IGNORED: every_crash_point_a_waiting_write_can_leave: ORCH-080's enumeration; run with --ignored
-HERD-IGNORED: every_swept_spool_the_hub_acknowledges_is_deleted_and_none_set_aside: spool-offer-repro: reproduces the unfixed startup-offer defect; RED until the barrier waits for the answer to its own offer. Run it on purpose with --ignored
 HERD-IGNORED: how_often_a_live_hub_walks_the_disk: an experiment, not an assertion: run it on purpose
 HERD-IGNORED: lock_wait_under_contention: a bench; run it on purpose
 HERD-IGNORED: n_and_t_against_one_pass: an experiment, not an assertion: run it on purpose

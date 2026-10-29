@@ -190,13 +190,42 @@ run_step() {
   return "$rc"
 }
 
+# Collation is part of a hash, and `sort` takes its order from the
+# environment (ORCH-202). Measured on this host over the IDENTICAL twelve
+# at-rest names: en_US.UTF-8 gives
+# 0fbdadcaf14aac20eb9875f41aa74b11349d7aee9df39d3dc93be5b714ba66f9 and
+# LC_ALL=C gives
+# 2911f1e8cdbaaaa3005e5318bda0f46016cc359b6aefec879b771c65e16a3c0e. They
+# diverge on exactly one pair: `a_tighter_enclosing_memory_max_...` against
+# `an_allocation_past_the_ceiling_...` and `an_io_weight_...`, because UTF-8
+# collation ignores the underscore and C does not. So two correct gate runs
+# on one tree, in two locales, printed two figures over one list — and a run
+# from a stripped environment (`env -i`, as a hook or a service gives)
+# printed the C one. A figure that changes with the environment is not a
+# hash. `0fbdadca...` had travelled through roughly seventeen receipts as if
+# it identified a list.
+#
+# So every sort and every comparison that feeds a hash or a verdict runs
+# under LC_ALL=C, through these two, and both lists use them so that the two
+# receipt fields stay comparable with each other.
+#
+# Deliberately NOT `export LC_ALL=C`: this script runs check-docs.sh and
+# check-orchestration.sh as children. check-docs.sh exports its own locale
+# and would be unharmed, but check-orchestration.sh sets none, and an
+# environment variable the gate exports into its own children is exactly how
+# a gate's own checks get reddened from outside (the same shape as the
+# HERD_PREFLIGHT lesson). check-docs.sh's second idiom — the locale on the
+# one command that needs it — is the one followed here.
+csort() { LC_ALL=C sort "$@"; }
+ccomm() { LC_ALL=C comm "$@"; }
+
 # A skip's identity is its assertion name: the text between the marker and
 # the first colon. The reason that follows it carries a temporary path and a
 # pid on every run, so it is kept in the expected list for the reader and is
 # deliberately not what the gate compares.
 skip_names() {
   grep -h '^HERD-SKIPPED: ' "$1" 2>/dev/null \
-    | sed 's/^HERD-SKIPPED: //' | sed 's/:.*$//' | sort
+    | sed 's/^HERD-SKIPPED: //' | sed 's/:.*$//' | csort
 }
 
 # The same rule for the other kind, and a separate function so that the two
@@ -210,7 +239,7 @@ skip_names() {
 # HERD-IGNORED-UNEXPLAINED, and the gate below is red on it.
 ignore_names() {
   grep -h '^HERD-IGNORED: ' "$1" 2>/dev/null \
-    | sed 's/^HERD-IGNORED: //' | sed 's/:.*$//' | sort
+    | sed 's/^HERD-IGNORED: //' | sed 's/:.*$//' | csort
 }
 
 refuse() {
@@ -317,7 +346,7 @@ say "  (a) runtime, HERD-SKIPPED: this host could not check it"
 skips_rc=$?
 [ "$skips_rc" -eq 0 ] || failed="$failed 7:report-skips"
 observed="$receipts/skips-${sha:0:12}.txt"
-grep -h '^HERD-SKIPPED: ' "$suite" 2>/dev/null | sort -u > "$observed"
+grep -h '^HERD-SKIPPED: ' "$suite" 2>/dev/null | csort -u > "$observed"
 say "  observed skip lines: $(wc -l < "$observed" | tr -d ' ') (the count is"
 say "  not the signal; the list is)"
 say "  observed list:        $observed"
@@ -328,9 +357,9 @@ say "  observed list:        $observed"
 # same reason it re-derives the skips: the receipt must be about what this
 # run printed.
 observed_ignored="$receipts/ignored-${sha:0:12}.txt"
-grep -h '^HERD-IGNORED: ' "$suite" 2>/dev/null | sort -u > "$observed_ignored"
+grep -h '^HERD-IGNORED: ' "$suite" 2>/dev/null | csort -u > "$observed_ignored"
 observed_unexplained="$receipts/ignored-unexplained-${sha:0:12}.txt"
-grep -h '^HERD-IGNORED-UNEXPLAINED: ' "$suite" 2>/dev/null | sort -u > "$observed_unexplained"
+grep -h '^HERD-IGNORED-UNEXPLAINED: ' "$suite" 2>/dev/null | csort -u > "$observed_unexplained"
 
 # The load's second reading, taken here because this is the first moment
 # after the suite. It is printed, carried in the verdict and written into
@@ -399,7 +428,7 @@ if [ ! -f "$expected" ]; then
 fi
 
 allowed="$receipts/allowed-skips-${sha:0:12}.txt"
-skip_names "$expected" | sort -u > "$allowed"
+skip_names "$expected" | csort -u > "$allowed"
 seen="$receipts/seen-skips-${sha:0:12}.txt"
 skip_names "$observed" > "$seen"
 say "  expected list: $expected"
@@ -411,12 +440,12 @@ say "  expected list: $expected"
 load_delta="$receipts/load-delta-${sha:0:12}.txt"
 : > "$load_delta"
 if [ -f "$expected_load" ]; then
-  skip_names "$expected_load" | sort -u > "$load_delta"
+  skip_names "$expected_load" | csort -u > "$load_delta"
   say "  load-conditional delta list: $expected_load"
   say "  a DELTA over the at-rest list and never a whole list; its"
   say "  $(wc -l < "$load_delta" | tr -d ' ') name(s) are the only ones a bench's own reading can excuse"
-  declined=$(comm -12 "$load_delta" "$seen")
-  ran=$(comm -23 "$load_delta" "$seen")
+  declined=$(ccomm -12 "$load_delta" "$seen")
+  ran=$(ccomm -23 "$load_delta" "$seen")
   if [ -n "$ran" ]; then
     say "  load-gated benches that RAN, and whose assertions were made:"
     printf '%s\n' "$ran" | sed 's/^/    ran      /' | tee -a "$out"
@@ -463,8 +492,8 @@ load_excuse() {
     }'
 }
 
-unexpected=$(comm -13 "$allowed" "$seen")
-absent=$(comm -23 "$allowed" "$seen")
+unexpected=$(ccomm -13 "$allowed" "$seen")
+absent=$(ccomm -23 "$allowed" "$seen")
 
 # Every name that is not on the at-rest list is asked twice: is it a name
 # the delta list may excuse at all, and does its own line give the load
@@ -582,13 +611,13 @@ else
     refuse "no expected #[ignore] list at $expected_ignored; produce one with --bless after a green suite"
   fi
 
-  ignore_names "$expected_ignored" | sort -u > "$allowed_ignored"
+  ignore_names "$expected_ignored" | csort -u > "$allowed_ignored"
   ignore_names "$observed_ignored" > "$seen_ignored"
   say "      observed #[ignore] lines: $(wc -l < "$observed_ignored" | tr -d ' ') (the count is not the"
   say "      signal; the list is)        $observed_ignored"
   say "      expected list:              $expected_ignored"
-  unexpected_ignored=$(comm -13 "$allowed_ignored" "$seen_ignored")
-  absent_ignored=$(comm -23 "$allowed_ignored" "$seen_ignored")
+  unexpected_ignored=$(ccomm -13 "$allowed_ignored" "$seen_ignored")
+  absent_ignored=$(ccomm -23 "$allowed_ignored" "$seen_ignored")
 fi
 if [ -n "$unexpected_ignored" ]; then
   say "      #[ignore]S THAT ARE NOT ON THE EXPECTED LIST — the gate is red on"
@@ -684,13 +713,13 @@ receipt="$receipts/$sha.receipt"
   echo "expected-skips: $expected"
   echo "load-excused-skips: ${excused:-none}"
   echo "skips-observed: $(wc -l < "$observed" | tr -d ' ')"
-  echo "skip-list-sha256: $(sort "$seen" | sha256sum | cut -d' ' -f1)"
+  echo "skip-list-sha256: $(csort "$seen" | sha256sum | cut -d' ' -f1)"
   # The compile-time half, in its own fields. skip-list-sha256 above is
   # untouched and still over the HERD-SKIPPED names alone, so a figure
   # quoted by an older receipt still compares (ORCH-202).
   echo "expected-ignored: $expected_ignored"
   echo "ignored-observed: $(wc -l < "$observed_ignored" | tr -d ' ')"
-  echo "ignore-list-sha256: $(sort "$seen_ignored" | sha256sum | cut -d' ' -f1)"
+  echo "ignore-list-sha256: $(csort "$seen_ignored" | sha256sum | cut -d' ' -f1)"
   echo "steps: 0..8 all ok"
 } > "$receipt"
 say "  receipt: $receipt"
