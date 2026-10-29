@@ -43,6 +43,23 @@
 //! 4. A record that is not over, and a quarantined record, can never be
 //!    shown as expired: the first is the reaper's (ORCH-012, D134) and the
 //!    second has no end time this build may trust (D52).
+//!
+//! **Three populations, three owners, and never one number** (ORCH-168).
+//! What a job directory weighs is not one quantity: the **collected files**
+//! under `files/`, `files.part/` and `files.gone/` are the output budget's
+//! (D148, D152) and a sweep frees them without touching the record; the
+//! **record** — `job.json`, `events.jsonl`, `log.seq` — and the **log** are
+//! nobody's, and the only thing in Herd that frees one of their bytes is
+//! removing the record. Nothing on the hub bounds a log at all: the only cap
+//! on it is the *runner's* `--job-log-cap`, 64 MiB by default, and
+//! `append_log` writes what arrives. So a record is not kilobytes merely
+//! because its `job.json` is, and the argument the output budget makes about
+//! itself (`herd-hub/src/main.rs`, *"a record is kilobytes and a log has a
+//! cap of its own"*) is about the budget's own scope and not about this
+//! figure. A preview printing one undifferentiated total could not size a
+//! policy against any of the three, which is why [`Weight`] prints each with
+//! its count, on both sides of every span. A log this build could not
+//! measure is [`LogWeight::Unknown`] and is **named**, never nought.
 
 use std::collections::BTreeMap;
 use std::fmt;
@@ -65,6 +82,12 @@ use herd_proto::{LabelSet, Priority};
 /// exists to be acted on, and one naming four thousand ids is a number, which
 /// the count already is.
 const NAMED_AT_MOST: usize = 10;
+
+/// How wide a label in [`write_weight`] is padded to, so that its figure
+/// lands in the same column as the figures of the lines around it: the
+/// per-class block is indented six and the root block four, and both put
+/// their value where every other figure of this output puts it.
+const LABEL_WIDTH: usize = 23;
 
 /// The span each priority class is kept for, as one invocation was given it.
 ///
@@ -254,6 +277,159 @@ pub struct Scanned {
     pub unread: Vec<Unread>,
 }
 
+/// What a job's log weighs, or why this build cannot say.
+///
+/// **The log is the population nothing bounds.** The hub appends what
+/// arrives and caps nothing; the only cap is the runner's `--job-log-cap`,
+/// 64 MiB a job by default, on somebody else's machine. So a log is a figure
+/// worth printing in its own right, and one that could not be read is worth
+/// printing as unread: a log counted as empty because it could not be
+/// measured is a record whose removal frees more than the preview promised,
+/// which is the direction a sizing figure must never err in.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LogWeight {
+    /// The `log` file, by `metadata().len()`.
+    Measured(u64),
+    /// This build could not measure it, with the reason. **Unknown, and
+    /// never nought bytes.**
+    Unknown(String),
+    /// There is no `log` **and** no `log.seq`, which is the counter the hub
+    /// writes the moment a job is assigned. So nothing ever wrote a log byte
+    /// for this record — a job cancelled while queued ends here — and nought
+    /// is a measurement rather than a gap. A variant of its own and not
+    /// `Measured(0)`, so that the two cannot be added up by accident.
+    NeverWritten,
+}
+
+impl LogWeight {
+    /// The bytes, when there are bytes to be had. `None` is unmeasured, and
+    /// nothing that sums may read it as nought.
+    pub fn bytes(&self) -> Option<u64> {
+        match self {
+            LogWeight::Measured(bytes) => Some(*bytes),
+            LogWeight::Unknown(_) => None,
+            LogWeight::NeverWritten => Some(0),
+        }
+    }
+}
+
+/// What one job directory weighs, in the three populations that own a state
+/// root's bytes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Weighed {
+    /// `files/`, `files.part/` and `files.gone/`: what the collection
+    /// weighs. The output budget already governs these (D148, D152), and a
+    /// sweep frees them without touching the record.
+    pub collected_bytes: u64,
+    /// How many files that is, at every depth. Beside the bytes because a
+    /// byte figure with no count behind it cannot be checked, and because
+    /// "names no file at all" is the first consumer's common case.
+    pub collected_files: usize,
+    /// Everything beside the log that is not a collected file: `job.json`,
+    /// `events.jsonl`, `log.seq`, and any directory a later milestone adds,
+    /// which lands here on purpose — no other mechanism can free it, so
+    /// counting it here over-states what only a record removal can take and
+    /// never under-states it.
+    pub record_bytes: u64,
+    /// The log, which nothing on the hub bounds.
+    pub log: LogWeight,
+}
+
+impl Weighed {
+    /// Every byte of this directory this build measured. `None` when the log
+    /// could not be measured: `collected + record` is then a total of two of
+    /// the three populations, and printing it under the name of all three is
+    /// the mistake [`LogWeight::Unknown`] exists to prevent.
+    pub fn measured_bytes(&self) -> Option<u64> {
+        let log = self.log.bytes()?;
+        Some(
+            self.collected_bytes
+                .saturating_add(self.record_bytes)
+                .saturating_add(log),
+        )
+    }
+}
+
+/// What one side of a span weighs: the three populations, each with its
+/// count.
+///
+/// One per class per side, and one more summed over the whole root
+/// ([`RetentionPreview::past`], [`RetentionPreview::inside`]). Every record
+/// on this side is accounted for exactly once in the log figures:
+/// `logs + logs_unknown.len() + without_log == records`, which is asserted
+/// rather than described.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Weight {
+    /// Records on this side of the span.
+    pub records: usize,
+    /// What their collections weigh, and how many files that is.
+    pub collected_bytes: u64,
+    pub collected_files: usize,
+    /// Of `records`, the ones naming no collected file at all. **The common
+    /// case and not the edge**: 41 % of the first consumer's records name no
+    /// file, and for every one of them the whole of what removing it frees
+    /// is its record and its log.
+    pub without_collected_file: usize,
+    /// What the records themselves weigh: `job.json`, `events.jsonl`,
+    /// `log.seq`.
+    pub record_bytes: u64,
+    /// The logs this build measured, and what they weigh.
+    pub log_bytes: u64,
+    pub logs: usize,
+    /// The logs it could not measure, each named with its reason. Never
+    /// folded into `log_bytes` as nought.
+    pub logs_unknown: Vec<(String, String)>,
+    /// Records with neither a log nor a `log.seq`: nothing ever wrote one,
+    /// which is a measurement and not a gap.
+    pub without_log: usize,
+}
+
+impl Weight {
+    /// Add one record's three figures.
+    fn add(&mut self, id: &str, weighed: &Weighed) {
+        self.records += 1;
+        self.collected_bytes = self.collected_bytes.saturating_add(weighed.collected_bytes);
+        self.collected_files += weighed.collected_files;
+        if weighed.collected_files == 0 {
+            self.without_collected_file += 1;
+        }
+        self.record_bytes = self.record_bytes.saturating_add(weighed.record_bytes);
+        match &weighed.log {
+            LogWeight::Measured(bytes) => {
+                self.logs += 1;
+                self.log_bytes = self.log_bytes.saturating_add(*bytes);
+            }
+            LogWeight::Unknown(why) => self.logs_unknown.push((id.to_owned(), why.clone())),
+            LogWeight::NeverWritten => self.without_log += 1,
+        }
+    }
+
+    /// Another side's or another class's figures, added in.
+    fn absorb(&mut self, other: &Weight) {
+        self.records += other.records;
+        self.collected_bytes = self.collected_bytes.saturating_add(other.collected_bytes);
+        self.collected_files += other.collected_files;
+        self.without_collected_file += other.without_collected_file;
+        self.record_bytes = self.record_bytes.saturating_add(other.record_bytes);
+        self.log_bytes = self.log_bytes.saturating_add(other.log_bytes);
+        self.logs += other.logs;
+        self.logs_unknown.extend(other.logs_unknown.iter().cloned());
+        self.without_log += other.without_log;
+    }
+
+    /// Every byte measured on this side, over the three populations.
+    ///
+    /// A record whose log could not be measured contributes its collected
+    /// and record bytes and no log byte, so this is a **floor** whenever
+    /// `logs_unknown` is not empty — which is why the two are printed
+    /// together and never apart.
+    pub fn measured_bytes(&self) -> u64 {
+        self.collected_bytes
+            .saturating_add(self.record_bytes)
+            .saturating_add(self.log_bytes)
+    }
+}
+
 /// One record the preview has something to say about.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Seen {
@@ -261,25 +437,11 @@ pub struct Seen {
     pub id: String,
     pub class: Priority,
     pub ended_at: Timestamp,
-    /// What the whole job directory measures: `job.json`, `events.jsonl`,
-    /// the log and every inline file. **What removing this record would
-    /// free**, which is the only figure the question "what would it cost
-    /// me?" can mean.
-    pub bytes: u64,
-    /// Of that, what is under `files/`, `files.part/` and `files.gone/` —
-    /// the output bytes, which the budget already governs (D148, D152).
-    /// Broken out because retention removes them in the same act and the
-    /// budget may not, so an operator comparing the two mechanisms needs
-    /// them apart.
-    pub output_bytes: u64,
-}
-
-impl Seen {
-    /// What is not an output byte: the record, the events and the log. The
-    /// evidence retention is actually about.
-    pub fn record_bytes(&self) -> u64 {
-        self.bytes.saturating_sub(self.output_bytes)
-    }
+    /// **What removing this record would free**, split into the three
+    /// populations that own it. The only figure the question "what would it
+    /// cost me?" can mean, and three figures because three different things
+    /// can free it — or, for two of them, nothing can.
+    pub weighed: Weighed,
 }
 
 /// What one class would lose.
@@ -294,12 +456,10 @@ pub struct ClassPreview {
     pub judged: usize,
     /// Of the judged, the ones past the span, oldest first.
     pub expired: Vec<Seen>,
-    /// What they weigh, in all and in output bytes.
-    pub expired_bytes: u64,
-    pub expired_output_bytes: u64,
+    /// What those weigh. `past.records` is `expired.len()`.
+    pub past: Weight,
     /// Of the judged, the ones inside the span, and what they weigh.
-    pub inside: usize,
-    pub inside_bytes: u64,
+    pub inside: Weight,
     /// The soonest a record of this class that is inside its span would
     /// expire, and which one. `None` when none is inside.
     pub next_to_expire: Option<(String, Timestamp, Duration)>,
@@ -630,15 +790,11 @@ impl RetentionPreview {
                     // below read a class that can never be emptied as one
                     // that was.
                     class.judged += 1;
-                    class.inside += 1;
-                    let (bytes, _) = weigh(&dir);
-                    class.inside_bytes = class.inside_bytes.saturating_add(bytes);
+                    class.inside.add(name, &weigh(&dir));
                 }
                 Selection::Inside { left } => {
                     class.judged += 1;
-                    class.inside += 1;
-                    let (bytes, _) = weigh(&dir);
-                    class.inside_bytes = class.inside_bytes.saturating_add(bytes);
+                    class.inside.add(name, &weigh(&dir));
                     let sooner = match inside_soonest.get(&rank) {
                         Some((_, _, known)) => left < *known,
                         None => true,
@@ -649,16 +805,13 @@ impl RetentionPreview {
                 }
                 Selection::Expired { .. } => {
                     class.judged += 1;
-                    let (bytes, output_bytes) = weigh(&dir);
-                    class.expired_bytes = class.expired_bytes.saturating_add(bytes);
-                    class.expired_output_bytes =
-                        class.expired_output_bytes.saturating_add(output_bytes);
+                    let weighed = weigh(&dir);
+                    class.past.add(name, &weighed);
                     class.expired.push(Seen {
                         id: name.clone(),
                         class: parsed.priority,
                         ended_at: parsed.updated_at,
-                        bytes,
-                        output_bytes,
+                        weighed,
                     });
                 }
             }
@@ -707,18 +860,26 @@ impl RetentionPreview {
             .sum()
     }
 
-    /// What removing every expired record would free, over every class.
-    pub fn expired_bytes(&self) -> u64 {
-        self.classes
-            .values()
-            .fold(0u64, |sum, class| sum.saturating_add(class.expired_bytes))
+    /// What removing every expired record would free, over every class and
+    /// split into the three populations.
+    pub fn past(&self) -> Weight {
+        let mut total = Weight::default();
+        for class in self.classes.values() {
+            total.absorb(&class.past);
+        }
+        total
     }
 
-    /// Of that, the output bytes.
-    pub fn expired_output_bytes(&self) -> u64 {
-        self.classes.values().fold(0u64, |sum, class| {
-            sum.saturating_add(class.expired_output_bytes)
-        })
+    /// And what the records inside their spans weigh, the same way. Printed
+    /// beside the other side on purpose: under the direction this figure is
+    /// wanted for, a span is a guard rather than a trigger, so what is
+    /// *kept* is as much a sizing figure as what would go.
+    pub fn inside(&self) -> Weight {
+        let mut total = Weight::default();
+        for class in self.classes.values() {
+            total.absorb(&class.inside);
+        }
+        total
     }
 
     /// The two refusals, in the order that matters: a clock the records
@@ -767,28 +928,128 @@ impl RetentionPreview {
     }
 }
 
-/// What a job directory weighs, in all and in output bytes.
+/// The log and the hub's own counter for it, by the names a job directory
+/// carries them under.
 ///
-/// Both by `metadata().len()` and never by contents: `directory_bytes` is the
-/// sweeper's own walk, used on purpose, so a figure this preview prints and a
-/// figure the sweeper prints about the same bytes are the same figure.
+/// **Written again here rather than imported.** They are private to
+/// [`crate::store`], and `store.rs` is another task's exclusively, so this
+/// module may not widen them. The duplication is held by a test rather than
+/// by a comment: `the_preview_reads_what_the_store_itself_wrote` appends a
+/// real log line through the store's own writer and asserts the figure, so a
+/// rename in `store.rs` fails there instead of printing nought for every log
+/// on an operator's root.
+const LOG_FILE: &str = "log";
+const LOG_SEQ_FILE: &str = "log.seq";
+
+/// What a job directory weighs, in the three populations retention removes
+/// in one act.
 ///
-/// The whole directory, because the whole directory is what retention
-/// removes: `job.json`, `events.jsonl`, the log, `log.seq` and the inline
-/// files. The output bytes are broken out because the budget governs those
-/// and may never remove the record (`docs/disk-policy.md` §3.3), so an
-/// operator weighing the two mechanisms needs them apart.
-fn weigh(dir: &Path) -> (u64, u64) {
-    let total = directory_bytes(dir);
-    let outputs = [KEPT_FILES_DIR, OUTPUT_PARTS_DIR, OUTPUT_GONE_DIR]
-        .iter()
-        .fold(0u64, |sum, name| {
-            sum.saturating_add(directory_bytes(&dir.join(name)))
-        });
-    // Clamped rather than asserted: a subdirectory a later milestone adds
-    // lands in the remainder, which is the harmless side, and a preview must
-    // not panic on a root it was merely asked to read.
-    (total, outputs.min(total))
+/// Measured **positively**, population by population, and not by subtracting
+/// one from a total: a figure the log could not supply must leave the log's
+/// place empty rather than silently move its bytes into the record's.
+///
+/// By `metadata().len()` and never by contents, and by `directory_bytes` for
+/// the subdirectories: that is the sweeper's own walk, used on purpose, so a
+/// figure this preview prints and a figure the sweeper prints about the same
+/// bytes are the same figure.
+///
+/// The log is the one file measured or named: it is the population nothing
+/// bounds, and the only one where a missing figure changes what an operator
+/// would decide. Every other length falls back to nought the way
+/// `directory_bytes` does, because an unreadable `job.json` is already
+/// counted and named by the walk above.
+fn weigh(dir: &Path) -> Weighed {
+    let entries = match fs::read_dir(dir) {
+        Ok(entries) => entries,
+        Err(error) => {
+            return Weighed {
+                collected_bytes: 0,
+                collected_files: 0,
+                record_bytes: 0,
+                log: LogWeight::Unknown(format!(
+                    "the job directory itself could not be read, so none of its three \
+                     populations was measured: {error}"
+                )),
+            }
+        }
+    };
+    let mut collected_bytes = 0u64;
+    let mut collected_files = 0usize;
+    let mut record_bytes = 0u64;
+    let mut log: Option<LogWeight> = None;
+    let mut counter_is_there = false;
+    for entry in entries.flatten() {
+        let Ok(kind) = entry.file_type() else {
+            continue;
+        };
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if kind.is_dir() {
+            let path = entry.path();
+            if [KEPT_FILES_DIR, OUTPUT_PARTS_DIR, OUTPUT_GONE_DIR].contains(&name.as_str()) {
+                collected_bytes = collected_bytes.saturating_add(directory_bytes(&path));
+                collected_files += files_in(&path);
+            } else {
+                record_bytes = record_bytes.saturating_add(directory_bytes(&path));
+            }
+            continue;
+        }
+        if !kind.is_file() {
+            continue;
+        }
+        if name == LOG_FILE {
+            log = Some(match entry.metadata() {
+                Ok(at) => LogWeight::Measured(at.len()),
+                Err(error) => LogWeight::Unknown(format!(
+                    "{LOG_FILE} is there and its length could not be read: {error}"
+                )),
+            });
+            continue;
+        }
+        if name == LOG_SEQ_FILE {
+            counter_is_there = true;
+        }
+        record_bytes =
+            record_bytes.saturating_add(entry.metadata().map(|at| at.len()).unwrap_or(0));
+    }
+    let log = match log {
+        Some(log) => log,
+        // The counter is this hub's own record that a log was being
+        // written, so a log missing from beside it is a figure that is
+        // unknown rather than nought. Without the counter the job never
+        // reached an attempt, and then nought is a measurement.
+        None if counter_is_there => LogWeight::Unknown(format!(
+            "there is no {LOG_FILE}, and the {LOG_SEQ_FILE} beside it is this hub's own \
+             record that a log was being counted, so its bytes are unknown and not nought"
+        )),
+        None => LogWeight::NeverWritten,
+    };
+    Weighed {
+        collected_bytes,
+        collected_files,
+        record_bytes,
+        log,
+    }
+}
+
+/// How many files a directory holds, at every depth.
+///
+/// Beside `directory_bytes`'s sum and in the same shape, because a byte
+/// figure with no count behind it cannot be checked by hand — and because
+/// "names no collected file at all" is the first consumer's common case and
+/// a count is the only way to see it.
+fn files_in(path: &Path) -> usize {
+    let Ok(entries) = fs::read_dir(path) else {
+        return 0;
+    };
+    let mut files = 0;
+    for entry in entries.flatten() {
+        match entry.file_type() {
+            Ok(kind) if kind.is_dir() => files += files_in(&entry.path()),
+            Ok(kind) if kind.is_file() => files += 1,
+            _ => {}
+        }
+    }
+    files
 }
 
 /// A byte count as this preview prints one: the exact figure always, and an
@@ -1094,6 +1355,40 @@ impl RetentionPreview {
     fn write_classes(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         writeln!(f, "what retention would remove, by class")?;
         writeln!(f)?;
+        writeln!(
+            f,
+            "  THREE POPULATIONS, THREE OWNERS, kept apart below because sizing a policy"
+        )?;
+        writeln!(
+            f,
+            "  against their sum is sizing it against nothing. The collected files are the"
+        )?;
+        writeln!(
+            f,
+            "  output budget's (D148, D152): a sweep frees them and leaves the record. The"
+        )?;
+        writeln!(
+            f,
+            "  record and its log are nobody's -- the only thing in Herd that frees one of"
+        )?;
+        writeln!(
+            f,
+            "  their bytes is removing the record -- and nothing on this hub bounds a log"
+        )?;
+        writeln!(
+            f,
+            "  at all: the only cap is the runner's --job-log-cap, 64 MiB a job by default,"
+        )?;
+        writeln!(
+            f,
+            "  on the runner's own machine. A record is not kilobytes because its job.json"
+        )?;
+        writeln!(
+            f,
+            "  is. A log this build could not measure is printed UNKNOWN and named, never"
+        )?;
+        writeln!(f, "  as nought.")?;
+        writeln!(f)?;
         for class in Priority::ALL {
             let Some(figures) = self.classes.get(&class.rank()) else {
                 continue;
@@ -1116,25 +1411,7 @@ impl RetentionPreview {
                 "    past the span            {} record(s)",
                 figures.expired.len()
             )?;
-            writeln!(
-                f,
-                "      what they weigh        {}",
-                said_bytes(figures.expired_bytes)
-            )?;
-            writeln!(
-                f,
-                "        of which output      {}",
-                said_bytes(figures.expired_output_bytes)
-            )?;
-            writeln!(
-                f,
-                "        the records          {}",
-                said_bytes(
-                    figures
-                        .expired_bytes
-                        .saturating_sub(figures.expired_output_bytes)
-                )
-            )?;
+            write_weight(f, &figures.past, "      ")?;
             match figures.oldest_and_newest() {
                 Some((oldest, newest)) => {
                     writeln!(f, "      oldest                 {oldest}")?;
@@ -1152,19 +1429,19 @@ impl RetentionPreview {
             for seen in figures.expired.iter().take(NAMED_AT_MOST) {
                 writeln!(
                     f,
-                    "      {JOBS_DIR}/{} {} ended {}",
+                    "      {JOBS_DIR}/{}  {}  ended {}",
                     seen.id,
-                    said_bytes(seen.bytes),
+                    said_three(&seen.weighed),
                     seen.ended_at
                 )?;
             }
             and_more(f, figures.expired.len(), "      ")?;
             writeln!(
                 f,
-                "    inside the span          {} record(s), {}",
-                figures.inside,
-                said_bytes(figures.inside_bytes)
+                "    inside the span          {} record(s)",
+                figures.inside.records
             )?;
+            write_weight(f, &figures.inside, "      ")?;
             match &figures.next_to_expire {
                 Some((id, at, left)) => writeln!(
                     f,
@@ -1196,30 +1473,90 @@ impl RetentionPreview {
              expires)",
             self.judged()
         )?;
-        writeln!(
-            f,
-            "  what that would free     {}",
-            said_bytes(self.expired_bytes())
-        )?;
-        writeln!(
-            f,
-            "    of which output        {}",
-            said_bytes(self.expired_output_bytes())
-        )?;
-        writeln!(
-            f,
-            "    the records            {}",
-            said_bytes(
-                self.expired_bytes()
-                    .saturating_sub(self.expired_output_bytes())
-            )
-        )?;
+        writeln!(f, "  what that would free, over the whole root")?;
+        write_weight(f, &self.past(), "    ")?;
+        writeln!(f, "  what it would keep, over the whole root")?;
+        write_weight(f, &self.inside(), "    ")?;
         writeln!(
             f,
             "  Nothing above was removed, and this subcommand cannot remove it."
         )?;
         Ok(())
     }
+}
+
+/// One side of a span, population by population.
+///
+/// **Three figures and three counts, never one number.** A sweep can free
+/// the first; nothing in Herd can free the other two but removing the
+/// record, and nothing anywhere bounds the third. The unknown logs are
+/// printed immediately under the measured ones so that the measured figure
+/// is never read as a total when it is a floor.
+fn write_weight(f: &mut fmt::Formatter<'_>, weight: &Weight, indent: &str) -> fmt::Result {
+    let width = LABEL_WIDTH;
+    writeln!(
+        f,
+        "{indent}{:<width$}{} in {} file(s)",
+        "collected files",
+        said_bytes(weight.collected_bytes),
+        weight.collected_files
+    )?;
+    writeln!(
+        f,
+        "{indent}{:<width$}{} record(s)",
+        "  naming no file", weight.without_collected_file
+    )?;
+    writeln!(
+        f,
+        "{indent}{:<width$}{} in {} record(s)",
+        "the records",
+        said_bytes(weight.record_bytes),
+        weight.records
+    )?;
+    writeln!(
+        f,
+        "{indent}{:<width$}{} in {} log(s)",
+        "the logs",
+        said_bytes(weight.log_bytes),
+        weight.logs
+    )?;
+    writeln!(
+        f,
+        "{indent}{:<width$}{} log(s): UNKNOWN, never nought",
+        "  could not be read",
+        weight.logs_unknown.len()
+    )?;
+    let named = format!("{indent}    ");
+    for (id, why) in weight.logs_unknown.iter().take(NAMED_AT_MOST) {
+        writeln!(f, "{named}{JOBS_DIR}/{id}: {why}")?;
+    }
+    and_more(f, weight.logs_unknown.len(), &named)?;
+    writeln!(
+        f,
+        "{indent}{:<width$}{} record(s)",
+        "  no log ever written", weight.without_log
+    )?;
+    writeln!(
+        f,
+        "{indent}{:<width$}{}",
+        "measured in all",
+        said_bytes(weight.measured_bytes())
+    )?;
+    Ok(())
+}
+
+/// One record's three populations, on the line that names it.
+fn said_three(weighed: &Weighed) -> String {
+    format!(
+        "files {}, record {}, log {}",
+        said_bytes(weighed.collected_bytes),
+        said_bytes(weighed.record_bytes),
+        match &weighed.log {
+            LogWeight::Measured(bytes) => said_bytes(*bytes),
+            LogWeight::Unknown(_) => "UNKNOWN".to_owned(),
+            LogWeight::NeverWritten => "none written".to_owned(),
+        }
+    )
 }
 
 /// "and N more", at the indentation of the list it follows, when a list was
@@ -1318,6 +1655,122 @@ mod tests {
             Selection::Inside { left: 14 * DAY },
             "the age saturates at nought, so the whole span is left"
         );
+    }
+
+    /// The three populations, measured positively, off a directory whose
+    /// every length is one this test chose.
+    #[test]
+    fn a_job_directory_weighs_three_populations_and_not_one_number() {
+        let dir = tempfile::tempdir().expect("a temporary directory");
+        let at = dir.path();
+        fs::write(at.join(RECORD_FILE), vec![b'r'; 100]).expect("a record");
+        fs::write(at.join("events.jsonl"), vec![b'e'; 30]).expect("some events");
+        fs::write(at.join(LOG_SEQ_FILE), vec![b'0'; 41]).expect("the counter");
+        fs::write(at.join(LOG_FILE), vec![b'l'; 7_000]).expect("a log");
+        fs::create_dir_all(at.join(KEPT_FILES_DIR).join("deep")).expect("a collection");
+        fs::write(at.join(KEPT_FILES_DIR).join("one.bin"), vec![b'1'; 5]).expect("a file");
+        fs::write(
+            at.join(KEPT_FILES_DIR).join("deep").join("two.bin"),
+            vec![b'2'; 6],
+        )
+        .expect("a nested file");
+        fs::create_dir_all(at.join(OUTPUT_PARTS_DIR)).expect("a part");
+        fs::write(at.join(OUTPUT_PARTS_DIR).join("half.bin"), vec![b'h'; 9])
+            .expect("an arriving file");
+
+        let weighed = weigh(at);
+        assert_eq!(weighed.collected_bytes, 20, "5 + 6 + 9");
+        assert_eq!(weighed.collected_files, 3, "at every depth");
+        assert_eq!(weighed.record_bytes, 171, "100 + 30 + 41, and not the log");
+        assert_eq!(weighed.log, LogWeight::Measured(7_000));
+        assert_eq!(weighed.measured_bytes(), Some(7_191));
+    }
+
+    /// A missing log is never nought. Which of the two kinds of absence it
+    /// is comes from the hub's own counter beside it.
+    #[test]
+    fn a_log_that_cannot_be_measured_is_unknown_and_never_nought() {
+        let dir = tempfile::tempdir().expect("a temporary directory");
+        // A job that was assigned -- `begin_attempt` writes `log.seq` --
+        // whose log is not there. Its bytes are unknown.
+        let assigned = dir.path().join("assigned");
+        fs::create_dir_all(&assigned).expect("a job directory");
+        fs::write(assigned.join(RECORD_FILE), vec![b'r'; 512]).expect("a record");
+        fs::write(assigned.join(LOG_SEQ_FILE), vec![b'0'; 41]).expect("the counter");
+        let weighed = weigh(&assigned);
+        match &weighed.log {
+            LogWeight::Unknown(why) => assert!(
+                why.contains("unknown and not nought"),
+                "the reason says so: {why}"
+            ),
+            other => panic!("a log with a counter and no file is unknown, not {other:?}"),
+        }
+        assert_eq!(
+            weighed.log.bytes(),
+            None,
+            "nothing that sums may read it as nought"
+        );
+        assert_eq!(weighed.measured_bytes(), None, "and nor may the total");
+        assert_eq!(weighed.record_bytes, 553, "512 + 41, measured either way");
+
+        // A job that never ran: no log and no counter either. Nought is a
+        // measurement here, and a variant of its own so the two cannot be
+        // added up by accident.
+        let never = dir.path().join("never");
+        fs::create_dir_all(&never).expect("a job directory");
+        fs::write(never.join(RECORD_FILE), vec![b'r'; 512]).expect("a record");
+        let weighed = weigh(&never);
+        assert_eq!(weighed.log, LogWeight::NeverWritten);
+        assert_eq!(weighed.log.bytes(), Some(0));
+        assert_eq!(weighed.measured_bytes(), Some(512));
+    }
+
+    /// Every record on one side is in exactly one of the three log figures,
+    /// so an operator can check the counts against the record count.
+    #[test]
+    fn every_record_lands_in_exactly_one_log_figure() {
+        let mut weight = Weight::default();
+        weight.add(
+            "measured",
+            &Weighed {
+                collected_bytes: 8,
+                collected_files: 2,
+                record_bytes: 100,
+                log: LogWeight::Measured(64 << 20),
+            },
+        );
+        weight.add(
+            "unknown",
+            &Weighed {
+                collected_bytes: 0,
+                collected_files: 0,
+                record_bytes: 100,
+                log: LogWeight::Unknown("it is not there".to_owned()),
+            },
+        );
+        weight.add(
+            "never",
+            &Weighed {
+                collected_bytes: 0,
+                collected_files: 0,
+                record_bytes: 100,
+                log: LogWeight::NeverWritten,
+            },
+        );
+        assert_eq!(weight.records, 3);
+        assert_eq!(
+            weight.logs + weight.logs_unknown.len() + weight.without_log,
+            weight.records,
+            "every record is in exactly one of the three"
+        );
+        assert_eq!(
+            weight.without_collected_file, 2,
+            "the common case, and counted"
+        );
+        assert_eq!(weight.collected_files, 2);
+        assert_eq!(weight.log_bytes, 64 << 20, "the unknown one adds nothing");
+        assert_eq!(weight.measured_bytes(), 8 + 300 + (64 << 20));
+        assert_eq!(weight.logs_unknown[0].0, "unknown", "and it is named");
     }
 
     #[test]

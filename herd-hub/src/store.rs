@@ -14,7 +14,8 @@
 //!                           and how many bytes they are
 //!       files/              room for what a job keeps (M11's artefacts)
 //!   index/
-//!     state.json            derived: which jobs are not over yet
+//!     state.json            derived: which jobs are not over yet, and which
+//!                           ones this hub set aside and will not act on
 //!   readings/
 //!     answers.json          derived: what every `labels_from` reading
 //!                           answered, by (commit, command, args) (D74)
@@ -186,9 +187,19 @@ struct Live {
     /// reading of its own. That is why an unreadable file here does not stop
     /// the hub starting, where an unreadable record does.
     readings: BTreeMap<String, Requirements>,
-    /// The jobs this hub has read and will not act on, with why (D52). Filled
-    /// at recovery and never added to afterwards: what quarantines a record is
-    /// a judgement about rules that do not change while the hub runs.
+    /// The jobs this hub will not act on, with why (D52, V10). Written
+    /// through to `index/state.json`, so it outlives the process that decided
+    /// it.
+    ///
+    /// Filled at recovery, which is where all but one of them are decided:
+    /// what quarantines a record is either a judgement about rules that do
+    /// not change while the hub runs, or a record this hub cannot read at
+    /// all. The one exception is a record that stops reading **after**
+    /// recovery — never by this hub's hand, which publishes `job.json` by
+    /// `rename` after an `fsync`, but an operator or a failing disk can — and
+    /// [`JobDirStore::set_aside_now`] adds that one here the first time the
+    /// queue walk meets it, rather than letting it fall quietly out of the
+    /// queue until the next start.
     quarantined: BTreeMap<JobId, String>,
     /// Roughly how many bytes of whole collections this hub holds (D152).
     ///
@@ -261,6 +272,36 @@ struct IndexFile {
     index_version: u32,
     jobs_accounted: u64,
     pending: Vec<JobId>,
+    /// Every job this hub set aside, with why: the durable half of the
+    /// quarantine (D52, V10).
+    ///
+    /// **Written so that a quarantine outlives the process that decided it.**
+    /// A job set aside is a job nothing will dispatch, and a thing nobody can
+    /// act on must not be a thing nobody can see either: this is the list an
+    /// operator reads off the disk after the hub has printed it and the
+    /// terminal has scrolled it away. It is rewritten at every start and
+    /// after every change, so it says what *this* hub set aside and never
+    /// what some older one did.
+    ///
+    /// **Evidence, never the decision.** The record is what quarantines a
+    /// job, re-read at every start, which is the only way a record that is
+    /// repaired — or rules that are loosened again — can ever let a job out.
+    /// An entry here that the records no longer agree with is overwritten by
+    /// the start that disagrees, which is why nothing reads this back to
+    /// decide anything.
+    ///
+    /// `#[serde(default)]` so that an index written before this field reads
+    /// as a hub that set nothing aside, which is what every such root means.
+    #[serde(default)]
+    quarantined: Vec<QuarantinedJob>,
+}
+
+/// One entry of [`IndexFile::quarantined`]: the job, and the sentence that
+/// says why this hub will not act on it.
+#[derive(Debug, Serialize, Deserialize)]
+struct QuarantinedJob {
+    id: JobId,
+    why: String,
 }
 
 /// `readings/answers.json`: what every reading this store has kept answered,
@@ -313,17 +354,21 @@ struct DurableLabels {
 
 /// What `job.json` turned out to be.
 ///
-/// Three outcomes rather than two, because "readable, and not something this
-/// hub may act on" is its own answer (D52): it is neither a missing record nor
-/// a reason to fail.
+/// Three outcomes rather than two, because "not something this hub may act
+/// on" is its own answer (D52, V10): it is neither a missing record nor a
+/// reason to fail.
 enum Stored {
     /// No `job.json` in the directory at all.
     Missing,
     /// A record this hub reads and acts on.
     Read(Box<JobRecord>),
-    /// A record this hub reads and refuses to act on, with why. Named,
-    /// visible, skipped — never dispatched, never failed, never silently
-    /// repaired.
+    /// A record this hub will not act on, with why. Either it read the record
+    /// and today's rules reject what the job asks for (D52), or it could not
+    /// read the record at all (V10): torn, empty, NUL-filled, carrying a
+    /// version this build does not read, or bytes the filesystem would not
+    /// hand back. Named, visible, skipped — never dispatched, never failed,
+    /// never silently repaired, and never a reason to refuse the whole state
+    /// root.
     Quarantined(String),
 }
 
@@ -501,14 +546,16 @@ impl JobDirStore {
         &self.state_root_id
     }
 
-    /// The jobs this hub read and will not act on, with why, oldest first
-    /// (D52).
+    /// The jobs this hub will not act on, with why, oldest first (D52, V10).
     ///
-    /// Empty on every ordinary state root. A job is here when its record is
-    /// readable and what it asked for is something today's rules reject — a
-    /// job minted before the rules were tightened. It is skipped, not failed
-    /// and not repaired, and this is how it stays visible: the hub names each
-    /// one as it starts, and whoever asks the store gets the same list.
+    /// Empty on every ordinary state root. A job is here for one of two
+    /// reasons: its record is readable and what it asked for is something
+    /// today's rules reject — a job minted before the rules were tightened —
+    /// or its record cannot be read at all (V10). Either way it is skipped,
+    /// not failed and not repaired, and this is how it stays visible: the hub
+    /// names each one with its record's path as it starts, counts them on the
+    /// line that says it is listening, writes them to `index/state.json`, and
+    /// whoever asks the store gets the same list.
     pub fn quarantined(&self) -> Result<Vec<(JobId, String)>> {
         Ok(self
             .lock()?
@@ -1131,8 +1178,9 @@ impl JobDirStore {
                 Stored::Quarantined(why) => {
                     eprintln!(
                         "herd-hub: {id} is QUARANTINED and will not be \
-                         dispatched: {why}. Its record is untouched; the hub \
-                         is running"
+                         dispatched: {why}. Its record at {} is untouched; \
+                         the hub is running",
+                        self.job_dir(&id).join(RECORD_FILE).display()
                     );
                     quarantined.insert(id, why);
                 }
@@ -1247,8 +1295,10 @@ impl JobDirStore {
                 // No record at all is a mint that never finished, which the
                 // full read reports on its own.
                 Ok(_) => {}
-                // A record this hub cannot read is not a record it may call
-                // terminal. Rebuilding reads it again and refuses out loud.
+                // Not a record this hub may call terminal. A `job.json` that
+                // will not parse is `Stored::Quarantined` above since V10, so
+                // what is left here is the store failing underneath — a
+                // poisoned lock — and the full read is what names it.
                 Err(error) => return rebuild(format!("{id} cannot be read: {error}")),
             }
         }
@@ -1260,8 +1310,52 @@ impl JobDirStore {
             index_version: INDEX_VERSION,
             jobs_accounted: live.jobs_accounted,
             pending: live.pending.iter().copied().map(id_of).collect(),
+            // The quarantine goes down beside the queue, in the one file this
+            // store already rewrites after every change: a job nothing will
+            // dispatch is on the disk as such, and not only in a line of
+            // stderr that has scrolled away (V10).
+            quarantined: live
+                .quarantined
+                .iter()
+                .map(|(id, why)| QuarantinedJob {
+                    id: id.clone(),
+                    why: why.clone(),
+                })
+                .collect(),
         };
         write_json(&self.index_path(), &index)
+    }
+
+    /// Say, once, that a job this hub meant to dispatch cannot be acted on
+    /// after all (V10).
+    ///
+    /// Recovery decides every other quarantine and names every one it finds.
+    /// This covers the one case recovery cannot: a record that stops reading
+    /// **while the hub runs**. Not by this hub's hand — `job.json` is
+    /// published by `rename` after an `fsync`, so a reader gets the whole old
+    /// record or the whole new one — but an operator editing a file or a disk
+    /// going bad can do it. Such a job is in `pending`, and the queue walk in
+    /// `unfinished_jobs` would otherwise skip it in silence for as long as
+    /// this hub runs:
+    /// out of the queue, never dispatched, counted nowhere, which is the same
+    /// defect wearing a different face.
+    ///
+    /// **Said once, not once per pass.** The queue is walked on every
+    /// dispatch pass, and a line per pass would be D151's per-frame-line
+    /// defect in a new place. The entry is what makes it once: already there,
+    /// already said.
+    fn set_aside_now(&self, id: &JobId, why: &str) -> Result<()> {
+        let mut live = self.lock()?;
+        if live.quarantined.contains_key(id) {
+            return Ok(());
+        }
+        live.quarantined.insert(id.clone(), why.to_owned());
+        eprintln!(
+            "herd-hub: {id} is QUARANTINED and will not be dispatched: {why}. Its \
+             record at {} is untouched; the hub is running",
+            self.job_dir(id).join(RECORD_FILE).display()
+        );
+        self.write_index(&live)
     }
 
     fn lock(&self) -> Result<std::sync::MutexGuard<'_, Live>> {
@@ -1331,22 +1425,62 @@ impl JobDirStore {
     /// Validation stays strict where a requester is listening — at
     /// submission, through [`LabelSet`] — and that is the only place it can
     /// do any good.
+    ///
+    /// **A record this hub cannot read at all takes the same path, and that
+    /// is V10.** It used to be an `Err` three lines above the quarantine, and
+    /// an `Err` here travels up through three `?`s — `recover`, `open_with`,
+    /// `main` — and stops the hub **before `Hub::bind_with`**, so the port
+    /// never opens. One `job.json` left torn, empty or NUL-filled by a power
+    /// cut, or carrying a version this build does not read, or whose bytes
+    /// the filesystem will not hand back, therefore held every healthy job on
+    /// that root hostage, and a container restarted straight back into the
+    /// same wall. There is nothing an operator can do about that from outside
+    /// the container, which is where the first consumer stands (invariant 9,
+    /// D161).
+    ///
+    /// The precedent for the other answer was already in the tree:
+    /// [`crate::retention`]'s reader puts a record it cannot read on an
+    /// "unread" list and goes on to report every figure about the rest. So an
+    /// unreadable record is set aside exactly like a rejected one — named
+    /// with its path at every start, counted, written to `index/state.json`,
+    /// kept out of the queue, never dispatched, never rewritten, never
+    /// repaired. Nothing here guesses at what the bytes were meant to say:
+    /// that is the operator's to decide, and the record is left for them.
+    ///
+    /// **What still refuses the whole state root** is a root this hub cannot
+    /// *enumerate* — `jobs/` unlistable, `store.json` unreadable, the lock
+    /// unheld — because that is not one damaged record among healthy ones,
+    /// and a hub that cannot tell what is on the disk must not serve from it.
     fn read_stored(&self, id: &JobId) -> Result<Stored> {
         let path = self.job_dir(id).join(RECORD_FILE);
-        let Some(text) = read_optional(&path)? else {
-            return Ok(Stored::Missing);
+        let text = match fs::read_to_string(&path) {
+            Ok(text) => text,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Stored::Missing),
+            // Not a judgement about the job: this hub could not get the bytes
+            // at all. It is still one job's problem and not the root's, so it
+            // is set aside carrying the error that caused it.
+            Err(error) => {
+                return Ok(Stored::Quarantined(format!(
+                    "{} could not be read: {error}",
+                    path.display()
+                )))
+            }
         };
-        let probe: VersionProbe =
-            serde_json::from_str(&text).map_err(|error| failed("reading", &path, &error))?;
+        let probe: VersionProbe = match serde_json::from_str(&text) {
+            Ok(probe) => probe,
+            Err(error) => return Ok(unreadable(&path, &error)),
+        };
         if probe.record_version != RECORD_VERSION {
-            return Err(StoreError::new(format!(
+            return Ok(Stored::Quarantined(format!(
                 "{} has record version {}, and this hub reads version {RECORD_VERSION}",
                 path.display(),
                 probe.record_version
             )));
         }
-        let durable: DurableLabels =
-            serde_json::from_str(&text).map_err(|error| failed("reading", &path, &error))?;
+        let durable: DurableLabels = match serde_json::from_str(&text) {
+            Ok(durable) => durable,
+            Err(error) => return Ok(unreadable(&path, &error)),
+        };
         if let Err(why) = LabelSet::new(durable.labels.clone()) {
             return Ok(Stored::Quarantined(format!(
                 "its labels {:?} are not labels this hub accepts: {why}",
@@ -1354,10 +1488,13 @@ impl JobDirStore {
             )));
         }
         // The labels just passed the very check `LabelSet` makes when it
-        // deserialises, so reading the whole record cannot fail on them.
-        let file: RecordFile =
-            serde_json::from_str(&text).map_err(|error| failed("reading", &path, &error))?;
-        Ok(Stored::Read(Box::new(file.record)))
+        // deserialises, so reading the whole record cannot fail on them. It
+        // can still fail on anything else the record's shape requires, and
+        // that is a record this hub cannot read like any other.
+        match serde_json::from_str::<RecordFile>(&text) {
+            Ok(file) => Ok(Stored::Read(Box::new(file.record))),
+            Err(error) => Ok(unreadable(&path, &error)),
+        }
     }
 
     /// The record, for a caller that is about to act on it.
@@ -2642,10 +2779,17 @@ impl JobStore for JobDirStore {
             // quarantined job is not in it: recovery keeps it out of
             // `pending`, and reading one here would be a hub that cannot even
             // list its queue (D52).
-            if let Stored::Read(record) = self.read_stored(&id_of(sequence))? {
-                if !record.state.is_terminal() {
-                    records.push(*record);
+            let id = id_of(sequence);
+            match self.read_stored(&id)? {
+                Stored::Read(record) => {
+                    if !record.state.is_terminal() {
+                        records.push(*record);
+                    }
                 }
+                // A record that was readable at recovery and is not now. It
+                // leaves the queue, and it leaves it **out loud** (V10).
+                Stored::Quarantined(why) => self.set_aside_now(&id, &why)?,
+                Stored::Missing => {}
             }
         }
         Ok(records)
@@ -3102,6 +3246,19 @@ fn digest_of(path: &Path) -> std::io::Result<String> {
 
 fn failed(what: &str, path: &Path, error: &dyn std::fmt::Display) -> StoreError {
     StoreError::new(format!("{what} {} failed: {error}", path.display()))
+}
+
+/// A `job.json` this hub could not parse, as the quarantine it is (V10).
+///
+/// One sentence for all three parses of the same text, so that every way one
+/// record can fail to read is reported the same way and names the same file.
+/// It is deliberately not a [`StoreError`]: an error here would reach
+/// `main()` and stop the hub binding its port, which is the whole defect.
+fn unreadable(path: &Path, error: &dyn std::fmt::Display) -> Stored {
+    Stored::Quarantined(format!(
+        "{} is not a record this hub can read: {error}",
+        path.display()
+    ))
 }
 
 fn failed_line(what: &str, path: &Path, line: usize, error: &dyn std::fmt::Display) -> StoreError {
@@ -4156,6 +4313,170 @@ mod tests {
                 .to_string()
                 .contains(&format!("reads version {RECORD_VERSION}")),
             "both figures, so a reader knows which way round it is: {error}"
+        );
+        // Refused for that one job, and for nothing else: the root opens
+        // again with it set aside by name (V10). A version this build does
+        // not read is a record this build cannot act on, which is one job's
+        // problem; it was a dead hub until V10.
+        drop(store);
+        let store = JobDirStore::open(dir.path()).expect("the root opens with it set aside");
+        let quarantined = store.quarantined().expect("the quarantine lists");
+        assert_eq!(quarantined.len(), 1, "{quarantined:?}");
+        assert_eq!(quarantined[0].0, job.id);
+        assert!(
+            quarantined[0]
+                .1
+                .contains(&format!("record version {newer}")),
+            "{}",
+            quarantined[0].1
+        );
+    }
+
+    /// V10: the live defect. One `job.json` a power cut tore in half used to
+    /// make `JobDirStore::open` fail, which in `main()` happens seventy-six
+    /// lines before `Hub::bind_with` — so the hub exited before binding its
+    /// port, the container restarted into the same wall, and every healthy
+    /// job on the root was held hostage by one damaged one. The consumer runs
+    /// the hub and cannot repair anything of ours (invariant 9, D161).
+    ///
+    /// Each of the four shapes a damaged record comes in, one at a time, with
+    /// two healthy jobs beside it that must survive: the whole point is that
+    /// the blast radius of one unreadable record is that record.
+    #[test]
+    fn one_damaged_record_is_set_aside_and_every_healthy_job_survives() {
+        for (what, bytes) in [
+            ("torn", None),
+            ("empty", Some(Vec::new())),
+            ("NUL-filled", Some(vec![0u8; 64])),
+            ("not json at all", Some(b"} not a record {".to_vec())),
+        ] {
+            let dir = tempfile::tempdir().expect("a temporary directory");
+            let ids = {
+                let store = JobDirStore::open(dir.path()).expect("the state root opens");
+                let ids: Vec<JobId> = (0..3).map(|i| mint(&store, &format!("job-{i}"))).collect();
+                ids
+            };
+            // The middle one only, so a loss on either side of it shows.
+            let victim = dir
+                .path()
+                .join(JOBS_DIR)
+                .join(ids[1].as_str())
+                .join(RECORD_FILE);
+            let damaged = match bytes {
+                Some(bytes) => bytes,
+                None => {
+                    let whole = read(&victim).into_bytes();
+                    whole[..whole.len() * 2 / 3].to_vec()
+                }
+            };
+            fs::write(&victim, &damaged).expect("the record is damaged");
+
+            let store = JobDirStore::open(dir.path())
+                .unwrap_or_else(|e| panic!("a {what} record must not stop the hub: {e}"));
+
+            // Named, with the path of the file nobody can read.
+            let quarantined = store.quarantined().expect("the quarantine lists");
+            assert_eq!(quarantined.len(), 1, "{what}: {quarantined:?}");
+            assert_eq!(quarantined[0].0, ids[1], "{what}");
+            assert!(
+                quarantined[0].1.contains(&victim.display().to_string()),
+                "{what}: the reason names the file: {}",
+                quarantined[0].1
+            );
+
+            // And neither healthy job is lost: both are in the queue, in
+            // order, with the damaged one simply not in it.
+            let queue: Vec<JobId> = store
+                .unfinished_jobs()
+                .expect("the queue reads")
+                .into_iter()
+                .map(|record| record.id)
+                .collect();
+            assert_eq!(
+                queue,
+                vec![ids[0].clone(), ids[2].clone()],
+                "{what}: one damaged record cost two healthy jobs"
+            );
+
+            // A requester asking about it is told what happened to it, which
+            // is not "no such job".
+            let said = store
+                .job(&ids[1])
+                .expect_err("the hub will not act on it")
+                .to_string();
+            assert!(said.contains(ids[1].as_str()), "{what}: {said}");
+            assert!(said.contains("quarantined"), "{what}: {said}");
+
+            // The record is left exactly as it was found. A record nobody can
+            // read is not Herd's to guess at.
+            assert_eq!(
+                fs::read(&victim).expect("the record is still there"),
+                damaged,
+                "{what}: the damaged record was rewritten"
+            );
+
+            // Durable: the quarantine is on the disk, not only in a line of
+            // stderr, and the next start walks into no wall.
+            let index: serde_json::Value =
+                serde_json::from_str(&read(&dir.path().join(INDEX_DIR).join(INDEX_FILE)))
+                    .expect("the index is json");
+            assert_eq!(
+                index["quarantined"],
+                serde_json::json!([{ "id": ids[1].as_str(), "why": quarantined[0].1 }]),
+                "{what}: the index names what this hub set aside"
+            );
+            drop(store);
+            let again = JobDirStore::open(dir.path()).expect("and it starts again");
+            assert_eq!(
+                again.quarantined().expect("the quarantine lists"),
+                quarantined,
+                "{what}: a restart reaches the same answer"
+            );
+            assert_eq!(
+                again.unfinished_jobs().expect("the queue reads").len(),
+                2,
+                "{what}: and loses neither healthy job on the way"
+            );
+        }
+    }
+
+    /// The other half of V10, and the one recovery cannot answer: a record
+    /// that stops reading **after** the hub has started. It leaves the queue,
+    /// and it leaves it out loud — on the quarantine list, in the index, and
+    /// on stderr once rather than once per dispatch pass.
+    #[test]
+    fn a_record_that_stops_reading_while_the_hub_runs_is_not_dropped_in_silence() {
+        let (dir, store) = store();
+        let healthy = mint(&store, "healthy");
+        let damaged = mint(&store, "damaged");
+        assert_eq!(
+            store.unfinished_jobs().expect("the queue reads").len(),
+            2,
+            "both are queued to begin with"
+        );
+        let path = dir
+            .path()
+            .join(JOBS_DIR)
+            .join(damaged.as_str())
+            .join(RECORD_FILE);
+        fs::write(&path, b"torn by something that is not this hub").expect("damaged");
+
+        let queue: Vec<JobId> = store
+            .unfinished_jobs()
+            .expect("the queue still reads")
+            .into_iter()
+            .map(|record| record.id)
+            .collect();
+        assert_eq!(queue, vec![healthy], "the healthy job is still dispatched");
+        let quarantined = store.quarantined().expect("the quarantine lists");
+        assert_eq!(quarantined.len(), 1, "{quarantined:?}");
+        assert_eq!(quarantined[0].0, damaged, "and it is named, not dropped");
+        // Said once: the second walk adds nothing, because the entry is
+        // already there.
+        let _ = store.unfinished_jobs().expect("the queue reads again");
+        assert_eq!(
+            store.quarantined().expect("the quarantine lists"),
+            quarantined
         );
     }
 

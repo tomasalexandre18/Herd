@@ -194,6 +194,18 @@ impl DataRoot {
         self.path.join(HELD)
     }
 
+    /// The one file naming what a job left on this host that this runner
+    /// could NOT take away ([`crate::janitor`], D134).
+    ///
+    /// Outside `jobs/` for a reason the reaper makes plain: the reaper clears
+    /// everything under `jobs/`, and a record of what the reaper could not do
+    /// may not live anywhere the reaper can erase it. A file and not a log
+    /// line because the question it answers — "what is still on my disk?" —
+    /// is asked after the restart that scrolled the log away.
+    pub fn left_behind_path(&self) -> PathBuf {
+        self.path.join(crate::janitor::FILE)
+    }
+
     /// Where one directory per unacknowledged collection waits for the hub
     /// ([`crate::outputs::spool_path`]), and what the startup sweep reads
     /// ([`crate::sweep::pick_up`]).

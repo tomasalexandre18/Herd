@@ -495,6 +495,25 @@ impl Commands {
         })
     }
 
+    /// What one command declares about wanting to be submitted without
+    /// anybody asking, or `None` when it declares no schedule (E-41).
+    ///
+    /// Read without a commit, which is why it is not part of
+    /// [`Commands::resolve`]: the predicate has to know **which ref** to
+    /// look at before it knows which commit there is to resolve, and a
+    /// schedule's three strings hold no `{commit}` and no `{args}` to fill
+    /// (see [`Schedule`]).
+    ///
+    /// An unknown name refuses exactly as `resolve` refuses it, with the
+    /// same sentence: a person who mistyped a command must not get two
+    /// different answers depending on which door they came through.
+    pub fn schedule_of(&self, named: &str) -> Result<Option<&Schedule>> {
+        let Some(command) = self.commands.get(named) else {
+            bail!("{}", self.no_such_command(named));
+        };
+        Ok(command.schedule.as_ref())
+    }
+
     /// One sentence for a name the file does not declare, listing the names it
     /// does — sorted, because that is the list a person who mistyped one
     /// reads.

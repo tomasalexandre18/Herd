@@ -58,7 +58,13 @@ made before its `up` step runs and empty until M11 fills them: `in` and `out`,
 which are what its hooks receive as `{in}` and `{out}` (D107). An ad-hoc job
 gets the first three and nothing else. `held-results/` holds a verdict
 the hub never acknowledged — deliberately outside `jobs/`, so the startup
-reaper cannot clear it (D34, and "A runner's own death" below).
+reaper cannot clear it (D34, and "A runner's own death" below). `outputs/`
+holds an unacknowledged collection, outside `jobs/` for the same reason
+(D19, D211). And `left-behind` is one text file naming what a job left on
+this host that the runner could **not** take away, outside `jobs/` for a
+sharper version of that reason: a record of what the reaper could not do
+may not live where the reaper can erase it (D134, "What the runner could
+not reclaim" below).
 
 **One runner per data root.** A runner takes an exclusive lock on
 `<root>/.herd-runner.lock` and refuses to start if another runner holds it,
@@ -226,6 +232,62 @@ runner started through a wrapper, under another argv0, or as a test binary is
 never mistaken for a dead one. The cost is pid reuse — a leftover can then
 survive one more life. A leftover that lingers is a nuisance; a live job
 killed by a stranger is a lost build.
+
+## What the runner could not reclaim (D134)
+
+Every path above says what Herd *took away*. The half that a machine's
+owner has to act on is the other one: what Herd tried to take away and
+was refused — a workspace deposited under another ownership, a tree on a
+mount that went read-only, a directory replaced by a file. Nothing in
+Herd will ever collect those, and until this they existed only as a line
+on a runner's stderr: printed by the start that follows the death that
+caused them, and printed again at every start after that.
+
+So `<root>/left-behind` is one text file, and **every entry in it names a
+path and a figure**. What is in it is an instruction and not a report: a
+line with no figure in it is one nobody can act on, because an owner
+cannot tell a directory worth clearing from one that is not. An entry
+carries the path, what it held when it was first seen, whose job it was,
+the error the runner got verbatim, what to do, and what not doing it
+costs in bytes.
+
+Four properties, and each one is the answer to a way a list like this
+goes bad.
+
+- **It is strictly what Herd could not do.** An entry is written only
+  where a reclaim has already failed, and the writer asks the disk once
+  more before writing: a path that is no longer there is never written
+  down. If Herd can clean it, Herd cleans it and says nothing here.
+- **It shrinks.** At every start, an entry whose path is no longer on
+  the disk comes off the list, and the startup report says how many did.
+  A list that only grows is a list nobody opens. A thing met again keeps
+  its first entry — one thing is one entry, however many starts meet it,
+  and the timestamp stays the moment it was first seen.
+- **It never names a spool or a held result.** Those are the only copy
+  of a requester's evidence and of a verdict (D19, D34, D211); they are
+  not garbage, they have owners of their own, and this list is read by
+  somebody who deletes what it names. The refusal is in the writer, not
+  in the manners of its callers, and the module removes, renames and
+  chmods nothing at all.
+- **It is never on the critical path.** A file that cannot be written
+  costs one line on stderr. No job and no verdict depends on it: a
+  janitor's notebook is not worth one byte of a job's outcome.
+
+Bounded at both ends, because this runs when a job ends and at startup:
+the measurement stops after a fixed number of directory entries and
+reports its figure as a floor when it did, the list stops at a fixed
+number of entries and says what it could not add, and the
+reconciliation at startup is one `lstat` per entry and no walk.
+
+What this does **not** do, said plainly, because D134 chose it
+deliberately: Herd does not run the consumer's `down` for a job it
+reaped. That would put arbitrary consumer code on a runner's startup
+path, which has promises to keep, and it needs a declaration that lives
+on the hub's record. Herd names the mess; the consumer owns the cleanup.
+State a job made **outside** its workspace is still there between a
+death and a janitor's pass — anything that must not outlive a job
+belongs inside the workspace, which Herd does reclaim, whatever the job
+did to it.
 
 ## The memory ceiling, and its fallback (E-30, Q6)
 
