@@ -34,10 +34,52 @@ case of the harness and named. **H** — a hypothesis. **I** — unknown.
 
 ---
 
+## Amendment, 2026-10-29 (ORCH-183)
+
+**§5's proposal was taken, and this document's headline finding is no longer
+the tree's behaviour.** V10 / **D218** made a `job.json` the hub cannot read a
+**quarantine** rather than a refusal of the whole state root. Everything below
+stands as what was measured at `2ca6dc7` and is **not** rewritten; what each
+superseded passage says is now marked where it stands. The three places to
+know about:
+
+1. **§0 point 1 and §4.2** state the refusal as current. It was fixed on
+   2026-10-29 and is current only for **v0.4.1 and every release below it**.
+2. **§3's census changed with the code it asserts**, which is the point of the
+   change and not a weakening of the test. The same 308 states are still
+   built. The harness prints, and asserts, these totals today:
+
+   ```
+   308 states built
+     0 refuse the whole state root at `JobDirStore::open`
+     176 open with the damaged record quarantined by name (V10)
+     44 open with the job silently gone from the queue
+     4 leave `events.jsonl` AHEAD of `job.json` (D103's one rule)
+     231 leave a stale temporary that nothing removes
+   ```
+
+   Two numbers moved for one reason: `176` was `0` quarantined and `176`
+   refusing, and the stale temporaries went `99` → `231` because every record
+   shape now opens, so three shapes of temporary are reached across seven
+   record shapes rather than three.
+
+3. **§5 point 1 was not followed.** It argued the `RECORD_VERSION` mismatch
+   arm should probably stay an error. What shipped quarantines that arm too.
+   D218 records the choice; it does not record that this caveat was reversed,
+   and `docs/operating.md` carried the same promise to the first consumer's
+   operator until this amendment's date.
+
+The cases this document names by their `2ca6dc7` names were renamed with the
+fix; §0 point 1 gives both.
+
+---
+
 ## 0. The three answers, in one page
 
 **1. A `job.json` the hub cannot parse does not quarantine one job: it stops
-the hub.** `JobDirStore::open_with` → `store.recover()?` (`store.rs:436`) →
+the hub.** *(Superseded 2026-10-29 by V10 / D218 — it quarantines one job and
+the hub starts. True of v0.4.1 and every release below it. See the amendment
+above.)* `JobDirStore::open_with` → `store.recover()?` (`store.rs:436`) →
 `self.read_stored(&id)?` (`store.rs:899`) → the `?` on
 `serde_json::from_str::<VersionProbe>` (`store.rs:1141-1142`). The error
 leaves `main.rs:224` and the process exits before it binds a port. D52's
@@ -49,6 +91,12 @@ takes the whole state root with it (F, cases
 `one_torn_record_takes_every_other_job_with_it`). **This is a behaviour we
 have, not one we want**; §5 proposes the change and §6 says why it is not
 made here.
+
+*Those two cases were renamed when the change was made. They are
+`a_record_this_hub_cannot_read_quarantines_one_job_and_the_hub_starts` and
+`one_torn_record_costs_neither_of_the_two_healthy_jobs_beside_it` in
+`herd-hub/tests/crash_points.rs` today, and they now assert the opposite
+outcome. A reader grepping the old names will find nothing.*
 
 **2. The ordering hazard is `B`'s, and it is real but narrow.** Of the 308
 states built, **4** leave `events.jsonl` *ahead* of `job.json` — the one
@@ -194,7 +242,7 @@ returning `Err` and the hub not starting.
   quarantined, one line on stderr (`store.rs:925-928`). Its `events.jsonl` is
   still there and still readable, naming a job the hub no longer has.
 
-Totals, printed by the harness:
+Totals, printed by the harness **at `2ca6dc7`**:
 
 ```
 308 states built
@@ -204,6 +252,10 @@ Totals, printed by the harness:
   99 leave a stale temporary that nothing removes
   0 are quarantined (D52 covers labels only, store.rs:1150-1157)
 ```
+
+*Superseded 2026-10-29 (V10 / D218): the first number is now `0`, `176` are
+quarantined by name, and the stale temporaries are `231`. The amendment at the
+top of this document carries the census the harness asserts today.*
 
 ---
 
@@ -240,7 +292,13 @@ harness does not build that state today, because today it cannot occur; a
 branch that drops the sync unconditionally should add it.
 
 ### 4.2 A torn record refuses the whole state root — **C**'s hazard, and an
-operational fact today
+operational fact at `2ca6dc7`
+
+*Superseded 2026-10-29 by V10 / D218: a record the hub cannot read is
+quarantined and the hub starts. This section reads as written, because it is
+what was measured and it is what every release up to and including v0.4.1
+does. The answer to its own question — "Is it what we want?", **No** — was
+acted on.*
 
 **What we have.** Four of the seven record shapes refuse. The error names the
 file and the fault:
@@ -408,6 +466,13 @@ What it changes that needs a decision:
    quietly running past a state root a newer Herd wrote is the downgrade
    hazard `00-baseline.md §4` names. A parse failure is damage; a version
    mismatch is the wrong binary.
+
+   *Not followed, 2026-10-29. V10 / D218 put the version arm on the quarantine
+   path with the damaged ones. The downgrade guard that remains is
+   `LAYOUT_VERSION`, read once out of `store.json`, which still refuses the
+   root. A build whose `RECORD_VERSION` alone differs from the root's now
+   starts and serves an empty queue with every job quarantined by name. D218
+   does not record this reversal; the question is live again.*
 2. **"The hub starts and is missing jobs" is a different failure than "the hub
    does not start"**, and it is quieter. It must not be quiet: the count at
    `main.rs:234` and the per-start line are the mitigation, and whether they
@@ -471,10 +536,16 @@ each, so a reader can run one.
 1. `recover` reads `job.json` only; `events.jsonl` has two sites in
    `store.rs`, the append at `:1285` and `job_events` at `:2312`.
 2. The refusal chain is `store.rs:1141-1142` → `:899` → `:436` →
-   `main.rs:224`, and it leaves `main`.
+   `main.rs:224`, and it leaves `main`. *(Superseded 2026-10-29: that chain is
+   gone — the first link returns `Ok(Stored::Quarantined(…))`.)*
 3. D52's quarantine is `store.rs:1150-1157` and covers labels only.
+   *(Superseded 2026-10-29: it covers a record the hub cannot read at all,
+   including a record version it does not read — D218.)*
 4. `usable_index` cannot route around a torn record (`store.rs:1052-1054`).
 5. Four of the seven record shapes refuse; 176 of the 308 states do.
+   *(Superseded 2026-10-29: **no** record shape refuses; those same 176 states
+   quarantine one record each, and 231 rather than 99 leave a stale
+   temporary.)*
 6. 44 states open with the job gone and no quarantine entry.
 7. 4 states leave `events.jsonl` ahead of `job.json`; none is reachable today.
 8. 99 states leave a stale temporary; all 99 still have it after open.
