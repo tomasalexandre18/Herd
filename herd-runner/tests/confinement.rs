@@ -2527,6 +2527,12 @@ impl ShortDir {
         let leaf = format!("herd-{label}-{}-{unique}", std::process::id());
         let ambient = std::env::temp_dir();
         let runtime = std::env::var_os("XDG_RUNTIME_DIR").map(PathBuf::from);
+        // What a base may spend: `sun_path` less the '/' before the bound
+        // name, the name itself, and its terminating NUL. Written as the
+        // base's room rather than as a sum against the ceiling, because
+        // `x + 1 <= y` is `clippy::int_plus_one` and the subtraction says
+        // the same thing in the fixture's own terms.
+        let room_for_a_base = SUN_PATH_BYTES - LONGEST_BOUND_NAME - 2;
         let mut chosen = ambient.join(leaf.as_str());
         for base in runtime
             .iter()
@@ -2534,9 +2540,7 @@ impl ShortDir {
             .chain([Path::new("/tmp"), ambient.as_path()])
         {
             let candidate = base.join(leaf.as_str());
-            // The '/' before the bound name and the NUL after it are both
-            // part of what has to fit in `sun_path`.
-            let fits = candidate.as_os_str().len() + 1 + LONGEST_BOUND_NAME + 1 <= SUN_PATH_BYTES;
+            let fits = candidate.as_os_str().len() <= room_for_a_base;
             if fits && base.is_dir() && this_user_can_write(base) {
                 chosen = candidate;
                 break;
