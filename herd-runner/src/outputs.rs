@@ -85,7 +85,7 @@ use std::path::{Path, PathBuf};
 use herd_proto::{JobOutputs, OutputFile, PER_FILE_OVERHEAD};
 
 use crate::root::read_dir_restoring;
-use crate::size::show_bytes;
+use crate::size::{measured_bytes, show_bytes};
 
 /// One file found under `{out}`, before its bytes are read.
 struct Found {
@@ -240,17 +240,10 @@ pub(crate) fn collect(out_dir: &Path, root: &Path, cap: u64, spool_at: &Path) ->
         },
         // The bytes could not be put somewhere that outlives the workspace,
         // so they are about to be destroyed by the reclaim and there is no
-        // honest way to announce them. Named with the figures, in the shape
-        // the cap refusal uses, because "nothing came back" needs a reason
-        // beside it either way.
+        // honest way to announce them. Named with the figures, because
+        // "nothing came back" needs a reason beside it either way.
         Err(error) => Collected::verdict_only(JobOutputs::refusing(
-            format!(
-                "this job's output is not in its record: {} in {} file(s) had to be moved \
-                 out of the workspace before it was reclaimed, and that failed: {error}. \
-                 Nothing was truncated and nothing came back.",
-                show_bytes(weight),
-                found.len()
-            ),
+            not_spooled(weight, found.len(), &error),
             skipped,
         )),
     }
@@ -337,6 +330,14 @@ fn spool_into(out_dir: &Path, spool_at: &Path) -> std::io::Result<()> {
 /// far over it is rather than only that it is over. It also says where the
 /// large case belongs, because "it does not fit" with no second sentence
 /// reads as "Herd cannot do this".
+///
+/// **The two figures are said by two formatters, and that is deliberate.**
+/// The cap is what someone typed after `--job-output-cap`, and it reads back
+/// in the family they typed it in or they cannot tell the runner took the
+/// number they meant. The weight is what this runner measured, and
+/// [`crate::size::measured_bytes`] prints it exactly, because a measured
+/// figure whose unit depends on what it happens to divide by is how
+/// `535691 kB` came to be one line in seventy-five.
 pub(crate) fn over_the_cap(cap: u64, weight: u64, count: usize) -> String {
     format!(
         "this job's output is not in its record: {} in {count} file(s), and this runner's \
@@ -344,8 +345,28 @@ pub(crate) fn over_the_cap(cap: u64, weight: u64, count: usize) -> String {
          reads like the truth — so no file came back at all. Raise --job-output-cap on the \
          machine, up to its disk budget, if a job of this size is meant to hand its output \
          back.",
-        show_bytes(weight),
+        measured_bytes(weight),
         show_bytes(cap)
+    )
+}
+
+/// The sentence a collection that could not be moved out of the workspace is
+/// refused with.
+///
+/// **Its own function so the line can be pinned.** Staging a failing rename
+/// in a test means arranging the filesystem to refuse one, and the sentence a
+/// reader sees would then be checked only through whatever errno that
+/// arrangement produced. The figures are the part somebody downstream reads,
+/// so they are asserted directly.
+///
+/// The weight is a measurement — this runner walked those files — so it is
+/// said as one, exactly, with the approximation beside it.
+pub(crate) fn not_spooled(weight: u64, count: usize, error: &std::io::Error) -> String {
+    format!(
+        "this job's output is not in its record: {} in {count} file(s) had to be moved \
+         out of the workspace before it was reclaimed, and that failed: {error}. Nothing \
+         was truncated and nothing came back.",
+        measured_bytes(weight)
     )
 }
 
@@ -741,6 +762,85 @@ mod tests {
                 .collect::<Vec<_>>(),
             ["files/results.json"],
             "a job cannot chmod its way out of its own record: {collected:?}"
+        );
+    }
+
+    /// The refusal a reader of a verdict actually reads, pinned as text.
+    ///
+    /// **Two figures, two formatters, and that is the point of this test.**
+    /// The cap was typed after `--job-output-cap` and reads back in the
+    /// family it was typed in; the weight was measured by this runner's own
+    /// walk and reads as an exact count with an approximation beside it.
+    /// 535691000 is the first consumer's figure, the one that printed as
+    /// `535691 kB` because it happens to divide by 1000 and by nothing
+    /// larger.
+    ///
+    /// This is a literal expectation and not a round trip on purpose: a test
+    /// that re-derived this line from the formatters would stay green through
+    /// exactly the change that breaks whoever parses our output. **If it goes
+    /// red, do not paste the new line over the expectation** — that repair is
+    /// always wrong here, because the expectation is the contract.
+    #[test]
+    fn the_cap_refusal_says_a_typed_cap_in_its_family_and_a_measured_weight_in_bytes() {
+        assert_eq!(
+            over_the_cap(200_000_000_000, 535_691_000, 75),
+            "this job's output is not in its record: 535691000 bytes (510.87 MiB) in 75 \
+             file(s), and this runner's output cap is 200 GB. Nothing was truncated — a \
+             cut-down results file that still parses reads like the truth — so no file came \
+             back at all. Raise --job-output-cap on the machine, up to its disk budget, if \
+             a job of this size is meant to hand its output back.",
+            "the weight is measured and stays in bytes; the cap is typed and stays in the \
+             family it was typed in. Do not paste new output over this expectation."
+        );
+    }
+
+    /// The class the defect belongs to, at this call site: a cap and a weight
+    /// that both divide exactly by 1000. Only the typed one may take a
+    /// decimal unit.
+    #[test]
+    fn a_weight_that_divides_by_a_thousand_keeps_its_bytes_in_the_cap_refusal() {
+        let refusal = over_the_cap(64 << 20, 2_000, 1);
+        assert!(
+            refusal.contains("2000 bytes (1.95 KiB)"),
+            "a measured weight is exact whatever it divides by: {refusal}"
+        );
+        assert!(
+            refusal.contains("output cap is 64 MiB"),
+            "and the typed cap is unchanged: {refusal}"
+        );
+        for weight in [1_000u64, 1_000_000, 535_691_000, 1_000_000_000] {
+            let refusal = over_the_cap(2_000_000_000_000, weight, 3);
+            assert!(
+                refusal.contains(&format!("record: {weight} bytes")),
+                "the exact count comes first, always: {refusal}"
+            );
+            assert!(
+                !refusal.contains(&format!("{} kB", weight / 1_000)),
+                "and never the decimal unit the figure happens to divide by: {refusal}"
+            );
+        }
+    }
+
+    /// And the sentence for bytes that could not be moved out of the
+    /// workspace, which carries the same measured figure.
+    ///
+    /// Literal, for the same reason as above. **Do not paste new output over
+    /// it.**
+    #[test]
+    fn the_unspooled_refusal_says_its_measured_weight_in_bytes() {
+        let error = std::io::Error::other("the data root went away");
+        assert_eq!(
+            not_spooled(535_691_000, 75, &error),
+            "this job's output is not in its record: 535691000 bytes (510.87 MiB) in 75 \
+             file(s) had to be moved out of the workspace before it was reclaimed, and \
+             that failed: the data root went away. Nothing was truncated and nothing came \
+             back.",
+            "nobody typed this weight, so it is said exactly. Do not paste new output over \
+             this expectation."
+        );
+        assert!(
+            !not_spooled(2_000, 1, &error).contains("2 kB"),
+            "nor at any other size that divides by a thousand"
         );
     }
 }
