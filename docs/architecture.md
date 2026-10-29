@@ -341,7 +341,7 @@ floor.
 | Number | Value | Where it lives | What a mismatch does |
 |---|---|---|---|
 | `PROTOCOL_VERSION` | **2** | `herd-proto`, in `Hello` and `Welcome` | the hub refuses the peer by name, whatever else it got right. A bump is a fleet-wide synchronised restart |
-| build version (`version_gap`) | workspace `0.4.0` | `Hello::peer_version`, `Welcome::hub_version` | a major gap refuses; a minor gap is served with a note; an unreadable string is served with a note (E-51) |
+| build version (`version_gap`) | workspace `0.4.1` | `Hello::peer_version`, `Welcome::hub_version` | a major gap refuses; a minor gap is served with a note; an unreadable string is served with a note (E-51) |
 | `RECORD_VERSION` | **1** | `herd-hub/src/job.rs`; sits in front of `job.json` **and every line of `events.jsonl`** | the file is not read at all: the store errors naming the path and both numbers, and because that comes out of recovery the hub **refuses to start** on that state root |
 | `LAYOUT_VERSION`, `INDEX_VERSION`, `READINGS_VERSION`, `ROSTER_VERSION` | **1** each | `store.json`, `index/state.json`, `readings/answers.json`, `runners.json` | the file is refused rather than read as if it were this version; the roster's one decides who may connect |
 | `OUTPUT_FORMAT_VERSION` | **1** | the `ran on: …` line a requester's stdout is framed with | nothing refuses; it is how a consumer's parser knows which framing it got (Q7) |
