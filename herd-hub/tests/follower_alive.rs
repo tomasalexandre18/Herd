@@ -89,6 +89,11 @@ fn quiet_until(gate: &Path) -> String {
 /// breaths in one millisecond followed by twenty minutes of nothing, which is
 /// the bug. What a proxy's idle timeout measures is the gap, so that is what
 /// is measured here.
+///
+/// Every figure below is a gap compared against [`BREATH`], the cadence this
+/// test gave the hub. **No figure here is compared against another measured
+/// duration**, and the window they are taken over is the one the gate holds
+/// shut rather than one the scheduler decides.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_quiet_running_job_keeps_its_follower_hearing_from_the_hub() {
     let herd = Herd::new();
@@ -152,6 +157,23 @@ async fn a_quiet_running_job_keeps_its_follower_hearing_from_the_hub() {
         );
         heard.push((Instant::now(), frame));
     }
+    // **Where the quiet stretch ends**, and the one line this test was
+    // missing.
+    //
+    // Everything pushed after this index is the job *finishing*: the `sh`
+    // loop waking up to find the gate, the word it prints, the verdict
+    // crossing two links. That stretch is paced by nothing — no cadence
+    // governs it and no figure in this test is about it — and it was inside
+    // both of the measurements below, which is where this test's
+    // instability lived. On a loaded host the tail alone exceeds any bound a
+    // cadence of [`BREATH`] can justify, and a ninth breath landing in it
+    // made the frame count wrong as well: measured here, 2 of 20 runs red at
+    // the count on two pinned cores under eight spinners, 0 of 20 at rest.
+    //
+    // The silence this test is about is the one the gate holds shut. So that
+    // is the window, and it is a window the test *decides* rather than one
+    // it measures.
+    let during_the_silence = heard.len();
 
     // Let it finish, and take the verdict off the same connection.
     std::fs::write(&gate, "go").expect("the gate opens");
@@ -191,7 +213,12 @@ async fn a_quiet_running_job_keeps_its_follower_hearing_from_the_hub() {
     );
 
     // Two: the breaths are spread over the quiet stretch rather than bunched.
-    let breathed_at: Vec<Instant> = heard
+    //
+    // Over the quiet stretch and not over everything heard: the count is a
+    // check on the window above, and it was the window that was wrong. A
+    // breath arriving while the job finishes is the hub doing its job, not a
+    // ninth breath in a stretch that wanted eight.
+    let breathed_at: Vec<Instant> = heard[..during_the_silence]
         .iter()
         .filter(|(_, frame)| matches!(frame, FromHub::StillThere { .. }))
         .map(|(at, _)| *at)
@@ -213,7 +240,11 @@ async fn a_quiet_running_job_keeps_its_follower_hearing_from_the_hub() {
     // Three, and this is the one the bug would fail: **no long silence**.
     // Without the liveness frame this connection carries nothing at all from
     // the placement to the verdict, which is a gap as long as the build.
-    let longest = heard
+    //
+    // Over the quiet stretch, for the reason given at `during_the_silence`:
+    // the gap between the gate opening and the verdict is not a silence this
+    // test has anything to say about.
+    let longest = heard[..during_the_silence]
         .windows(2)
         .map(|pair| pair[1].0 - pair[0].0)
         .max()
@@ -227,10 +258,40 @@ async fn a_quiet_running_job_keeps_its_follower_hearing_from_the_hub() {
         "the follower heard nothing for {longest:?} while its job was running; a quiet link \
          must carry a frame every {BREATH:?} and never go {allowed:?} without one.\n{heard:?}"
     );
+    // Four: and the burst, caught on the gaps themselves rather than by a
+    // ratio.
+    //
+    // `assert!(longest < spread / 2)` stood here, and it is the shape this
+    // project keeps paying for: a bound on one measured duration taken from
+    // another measured duration. It was not a statement about the hub at
+    // all. It passed or failed on how long the *tail* above happened to be,
+    // and its real content — seven breaths in one millisecond followed by
+    // one late frame must not pass — is not about a gap being too long but
+    // about a gap being too **short**. So that is what is asserted, on the
+    // gaps between breaths, against the cadence the hub was given.
+    //
+    // **The typical gap and not the shortest one**, and that distinction is
+    // measured rather than cautious. The hub's ticker catches up after a
+    // tick it missed, so a frame held up by contention *shortens* the gap
+    // after it: across 40 runs of this test on two pinned cores under eight
+    // spinners the shortest gap of a run was 151–156 ms in 39 of them and
+    // **145.7 ms** in one, against a cadence the hub fires at 154 ms and a
+    // floor of 133 ms. A bound on the minimum would therefore be a bound
+    // contention can reach, which is the mistake this whole change is about.
+    // The median of seven moves only if four of them do, and four bursts in
+    // a row is not a scheduler.
+    let mut gaps: Vec<Duration> = breathed_at
+        .windows(2)
+        .map(|pair| pair[1] - pair[0])
+        .collect();
+    gaps.sort();
+    let typical = gaps[gaps.len() / 2];
+    let floor = BREATH * 2 / 3;
     assert!(
-        longest < spread / 2,
-        "the longest silence ({longest:?}) is most of the run ({spread:?}), so the follower \
-         was effectively silent after all.\n{heard:?}"
+        typical >= floor,
+        "the typical gap between two liveness frames was {typical:?}, which is a burst and \
+         not a cadence of {BREATH:?}: it must be at least {floor:?}. The seven gaps were \
+         {gaps:?}, spread over {spread:?}.\n{heard:?}"
     );
 
     // And the answer itself is the job's own, which is what the 125 was
