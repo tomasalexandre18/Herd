@@ -93,10 +93,13 @@ run is reported as not run, never as passed.
   request** but `herd-merger`, once, for the batch's one landing. An agent
   pushes and hands off: one batch, one push, one `--no-ff` merge commit.
 - **Pushing to `main` is `herd-merger`'s, by standing authorisation**
-  (ORCH-001, re-granted 2026-10-28): a green `./scripts/gate.sh` for the
-  **gated** sha — the merge's second parent, trees identical — plus the
-  filled record; `cut-v*`, `.github/`, `CLAUDE.md` and `.claude/` included.
-  Never `--no-verify`, never force-push, never a red landing, never `--admin`.
+  (ORCH-001, 2026-10-24, re-granted 2026-10-28): a green `./scripts/gate.sh`
+  for the **gated** sha — the merge's second parent, trees identical — and a
+  filled record, `cut-v*`, `.github/`, `CLAUDE.md` and `.claude/` included;
+  nothing waits for Alexa. Never `--no-verify`, never force-push, never a red
+  landing, never `--admin`.
+- **Pushing a release's tag is `herd-merger`'s too** (Alexa, 2026-10-29,
+  **D212**), on the landing's own two conditions, as a separate later act.
 
 ## Shared host rules
 
@@ -117,12 +120,12 @@ Several agents and the consumer's production share this machine.
 **First duty: keep bounded work in flight so the project advances**, above
 any single event: a red `main`, a release or a live defect must not drain
 the queue. **Answering Alexa is the second duty.** Three outcomes, in order:
-1. **Ask him** when the answer changes *what* gets done — what the
-   product *is* or *promises* — and never *how*: anything structural, the
-   method or the shape of the product, scope, step order, an irreversible act,
-   anything on the consumer's side. One question with a recommendation in the
-   board's *Waiting*; other work goes on. **A permission the system refuses
-   is escalated, never worked around**: a peer refused it cannot delegate it.
+1. **Ask him** when the answer changes *what* gets done, never *how*: anything
+   structural — the method, the shape of what the product *is* or *promises* —
+   scope, step order, a release and its notes (not its tag), an irreversible
+   act, anything on the consumer's side. One question with a recommendation in
+   the board's *Waiting*; work goes on. **A permission the system refuses is
+   escalated, never worked around**: a peer refused it cannot delegate it.
 2. **Decide alone** what is inside the mandate and reversible: not
    submitted beforehand, **told afterwards** in the session-end report.
 3. **Report, with no question attached,** what could cost him later:
@@ -133,14 +136,11 @@ the queue. **Answering Alexa is the second duty.** Three outcomes, in order:
 defect, the tooling. A report is **aggregated and quantified**: fixed
 columns — date · milestone · musts done/total · open rows · red gates.
 A guidance he has given is **standing**: followed, never re-raised.
-- **No compatibility to preserve**: the consumer resets entirely at v1.0.0,
-  so protocol, record and layout may break whenever it is useful.
-- **GitHub is not the centre of this project, local git is**: its runs
-  and workflows are tooling — a run id is not a report, a green run is
-  not a decision.
-- **No compatibility question gates a tag**: the consumer resets at v1.0.0,
-  so a version is cut when it is useful, not when he is asked. The act stays
-  reserved: `workflow.md`, `permissions.md`, `.claude/agents/herd-release.md`.
+- **No compatibility to preserve**: the consumer resets at v1.0.0, so
+  protocol, record and layout may break when useful; no compatibility question
+  gates a tag — cut a version when useful, not when he is asked (**D212**).
+- **GitHub is not the centre; local git is**: its runs and workflows are
+  tooling — a run id is not a report, a green run is not a decision.
 
 ## Session start, session end
 
