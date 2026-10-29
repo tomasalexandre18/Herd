@@ -76,7 +76,13 @@ What is technically enforced and what is only written is in
    and pushes the `cut-v<version>` branch that bumps the version;
    `herd-merger` lands it, as for any other branch. The tag itself is
    pushed by whoever Alexa names in that order. Nothing in this project
-   deploys.
+   deploys. **A release's own notes are Alexa's act too, and a brief
+   says so from the start** (**D210**, 2026-10-29): `release.yml` never
+   reads the prepared human half, and once a release is public neither an
+   execution agent nor the orchestrator can put it there — two
+   permission walls, neither a defect, measured at v0.4.0. Until the
+   notes ship in the tree (ORCH-162) the paste belongs in the same order
+   as the tag.
 
 ## One landing per batch
 

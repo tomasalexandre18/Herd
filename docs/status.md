@@ -34,20 +34,21 @@ path, so the last two destroy an existing root: ORCH-156's ordering.
 
 ## Releases, and what is in none
 
-**v0.4.0 is cut, gated and landed, and is not released: its tag is Alexa's
-own separate act and is unpushed**, so **v0.3.7 is still the newest
-published** — `3da48f5`, 2026-10-24 (D171); v0.3.4 onward are published
-(D162), a **`v*.*.*-dev*` tag** publishes a pre-release (D172). `main` is
-**334 commits and 84 merges** past v0.3.7 and the workspace version reads
-**`0.4.0`**; `PROTOCOL_VERSION` is **2**, `RECORD_VERSION` **1**,
-`LAYOUT_VERSION` **1**, all three unmoved deliberately (ORCH-156).
-**Fifteen changes are in no published release:** nine defects
-(**D175**-**D178**, **D180**-**D182**, **ORCH-094**, **D185**), four new
-behaviours (**D184**, `SIGTERM` in five seconds; **ORCH-092**, a spool sweep;
-**D194**, `herd-hub report`; **D197**, `herd-hub retention-preview`, which
-removes nothing and refuses a pass that would empty the root) and two cost
-cuts (**D183 step A**, **ORCH-082**). Retention will ship **active**, merger
-90 days and the rest 14, behind that preview and its refusals (**D201**).
+**v0.4.0 is published**: tag `2631286` → `171c780`, 2026-10-29 13:50:10Z,
+`prerelease: false`, now *Latest*, five assets (**D162**); `release.yml`
+`40885270441` green in **all 22 steps**, Arch and Alpine smokes included.
+The published hub carries **`report`** and **`retention-preview`**, which
+v0.3.7's has not, and **interoperability was built and run both ways**:
+v0.3.7 wrote a four-job root with no `ids_minted` — the consumer's own
+shape — and v0.4.0's `report` read all four; then a v0.3.7 hub reopened a
+v0.4.0 root and served. The three numbers are **unmoved** (ORCH-156): 2, 1,
+1. So **the fifteen changes that were in no release are now in one** — nine
+defects (**D175**-**D178**, **D180**-**D182**, **ORCH-094**, **D185**), four
+behaviours (**D184**, **ORCH-092**, **D194**, **D197**) and two cost cuts
+(**D183 step A**, **ORCH-082**); retention ships **active** behind that
+preview (**D201**). **Its body went out without the human half and Alexa
+pasted it himself** (**D210**; ORCH-162 would make it a gate). **Their
+`report` reading is takeable now** (ORCH-145).
 
 ## What is known about the consumer's machines, and when
 
@@ -71,10 +72,9 @@ M1-M11, M15 and M16; a job may return 1 GiB by default (`confine.rs:82`).
 **A skip count is per host and per load** (D27): **12** here at rest, **14**
 under load — the **list** decides (D187). The suite is green here at rest,
 every skip the same cgroup v2 delegation this host does not grant.
-`check-orchestration.sh` is at **269 passed**. **`main`'s streak of three red
-post-push runs is broken:** `40870735400` (`6036d24`) is `success`, after
-`40720983497`, `40762764493` and `40857453150` on `announced_job_ceiling.rs`,
-fixed by **D195** then **D208** — the premise is built, not timed (ORCH-119).
+`check-orchestration.sh` is at **269 passed**. **Two green post-push runs on
+`main`:** `40882112506` (`171c780`) after `40870735400` (`6036d24`), ending
+three reds fixed by **D195** then **D208** (ORCH-119).
 
 ## What the software still does not do
 
