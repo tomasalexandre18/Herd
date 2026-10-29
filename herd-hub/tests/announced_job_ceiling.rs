@@ -1176,12 +1176,62 @@ async fn a_job_refused_past_the_bound_ends_and_names_it() {
         end["runners"][0]["name"], "capped-runner",
         "and every machine that said it was full, by name: {end}"
     );
-    assert_eq!(
-        end["runners"][0]["holding"], CEILING,
-        "with the figure that machine itself gave — the count it was holding, which is the \
-         ceiling it announced, that being why it refused: {end}"
-    );
     let said = end["reason"].as_str().expect("a sentence for a person");
+    // **The figure that machine itself gave, read against the refusal it
+    // gave it for** — and not against [`CEILING`] flat, because this outage
+    // produces either of the **two** refusals that are about a runner's own
+    // count, and only one of them is a machine at its ceiling (ORCH-119).
+    //
+    // `herd_runner::take_job` sets `at_its_ceiling` from two branches, and
+    // they are different facts about the same healthy machine:
+    //
+    // - `NotTaken::AtItsCeiling`: the runner is holding as many jobs as it
+    //   announced, so `holding == CEILING`. Its sentence carries
+    //   [`THE_RUNNERS_CEILING_SENTENCE`].
+    // - `NotTaken::StillRunningThisJob`: the hub has sent it a second
+    //   attempt of a job it is **still running** (D182, one machine runs one
+    //   job once). `take_job` answers `AtItsCeiling` first whenever
+    //   `running >= most_at_once`, so this branch is reachable only *below*
+    //   the ceiling and `holding < CEILING` always — 1, at a ceiling of 2.
+    //   It carries a sentence of its own and not the ceiling's.
+    //
+    // Which of the two this outage produces is decided by the clock and
+    // nothing else: the jobs sleep [`SLEEP_ACROSS_THE_OUTAGE`] and their
+    // second attempts arrive about [`THE_OUTAGE`] plus a redial later, so a
+    // host busy enough to let one of the two originals finish first turns
+    // the one refusal into the other. Measured on this workstation of 12
+    // cores: green 35 of 35 unconstrained and 20 of 20 pinned to two idle
+    // CPUs, then 4 failures in 20 on two CPUs under four spinners and 13 in
+    // 20 under eight — every one of them `holding` 1 with the second
+    // branch's sentence, which is what three red CI runs on a two-core
+    // `ubuntu-latest` were.
+    //
+    // So the figure is asserted against the record's own sentence rather
+    // than against the one regime a faster host happens to reach: a field
+    // beside a reason has to agree with it (D166), and *that* holds in both
+    // branches. Asserting [`CEILING`] asserted the host.
+    let holding = end["runners"][0]["holding"]
+        .as_u64()
+        .and_then(|holding| usize::try_from(holding).ok())
+        .expect("the figure the machine gave, as a number a program reads");
+    if said.contains(THE_RUNNERS_CEILING_SENTENCE) {
+        assert_eq!(
+            holding, CEILING,
+            "it refused for the ceiling it announced, so the figure it gave is that ceiling: \
+             {end}"
+        );
+    } else {
+        assert!(
+            (1..CEILING).contains(&holding),
+            "it refused for a count of its own that was not its ceiling, so the figure it gave \
+             is at least one — a machine holding nothing would have taken the job — and under \
+             the {CEILING} it announced, or the ceiling branch would have answered first: {end}"
+        );
+        assert!(
+            said.contains(&format!("It is holding {holding} job(s)")),
+            "and the field has to say what the sentence beside it says (D166): {end}"
+        );
+    }
     assert!(
         said.contains("1 time(s) of the 1 allowed"),
         "the sentence has to carry both figures, or it is a job told it is over and not why: \

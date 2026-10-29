@@ -594,13 +594,16 @@ exit 0
 EOS
   cat > "$gatedir/scripts/test.sh" <<'EOS'
 #!/usr/bin/env bash
-# The host going busy WHILE the suite runs, which is where it happens: the
-# flood benches read the load again mid-flood, so this is what makes the
-# gate's second reading a case and not a comment.
+# The host going busy WHILE the suite runs, which is where it happens, and
+# then going quiet again before the suite ends -- the burst that begins AND
+# ends inside the suite, which no reading the gate takes itself can see.
 if [ -n "${HERD_STUB_LOAD_AFTER:-}" ] && [ -n "${HERD_GATE_LOADAVG:-}" ]; then
   printf '%s 1.00 1.00 1/1 1\n' "$HERD_STUB_LOAD_AFTER" > "$HERD_GATE_LOADAVG"
 fi
 [ -n "${HERD_STUB_SKIPS:-}" ] && cat "$HERD_STUB_SKIPS"
+if [ -n "${HERD_STUB_LOAD_RESTORE:-}" ] && [ -n "${HERD_GATE_LOADAVG:-}" ]; then
+  printf '%s 1.00 1.00 1/1 1\n' "$HERD_STUB_LOAD_RESTORE" > "$HERD_GATE_LOADAVG"
+fi
 if [ "${HERD_STUB_SUITE:-pass}" != pass ]; then
   echo "test suite: FAILED (cargo test exited 101)"; exit 101
 fi
@@ -703,54 +706,218 @@ out=$(gate_run)
 grep -qF '+ c_nobody_expected_this' <<<"$out" \
   && ok "gate: the unexpected skip is named, not counted" \
   || bad "gate: the unexpected skip must be named" "$(printf '%s\n' "$out" | tail -8)"
-# The same run, with the load-conditional list allowing that skip above the
-# load threshold: the gate is GREEN and says which list it applied. This is
-# how the flood benches skipping themselves above load1=8 stays legible
-# without the gate ever reading a count.
-printf 'HERD-SKIPPED: c_nobody_expected_this: a new reason\n' > "$tmp/gate-expected-load"
-gate_case "the load-conditional list allows a load skip above the threshold" 0 \
-  'load-conditional list' HERD_GATE_LOAD_NOTE=0
-gate_case "and below the threshold the same skip is still RED" 1 '7:unexpected-skip' \
-  HERD_GATE_LOAD_NOTE=1000
-# ONE reading of the load decides nothing, because the flood benches read it
-# twice: once as the flood starts and once mid-flood, skipping themselves on
-# either. A run that begins quiet and becomes busy -- routine on a host with
-# 85 worktrees -- therefore carries a flood skip that step 0's reading alone
-# would not have allowed, and the gate went red on a clean tree for a reason
-# that was not in the diff. Measured here on 2026-10-28: load1 0.32 -> 2.36
-# in one run and 9.56 -> 14.91 in another. The stub suite raises the figure
-# while it runs, which is exactly where the real one raises it.
+# --- which expected list applies, and what decides it --------------------
+#
+# The rule being driven here, because it changed on 2026-10-29 and a rule
+# change nobody can see run is a rule nobody can review. OLD: the gate
+# sampled /proc/loadavg at step 0 and again after the suite, and allowed
+# the whole load-conditional delta when EITHER figure was over the
+# threshold. NEW: the delta is applied PER SKIP, and only when the skip's
+# NAME is on the delta list AND its own reason names this bench's load
+# ceiling with a figure above that ceiling and above $HERD_GATE_LOAD_NOTE.
+# The gate's own two readings are information in the verdict and decide
+# nothing.
+#
+# What the old rule could not catch, and what it got wrong both ways:
+#  - a burst that begins AND ends inside the suite is invisible to both of
+#    the gate's samples, so two correct flood skips were called unexpected
+#    and a clean tree went RED at the cost of a whole suite run. Measured
+#    twice on 2026-10-29: host 1.68 -> 8.54 -> 11.60 -> 10.12 -> 3.30, the
+#    benches read 10.12, the gate sampled 1.70 and 3.30.
+#  - and in the other direction, a busy host excused EVERY delta name
+#    whatever its reason, so a flood bench that skipped because it could
+#    not bind a port was GREEN. That is an assertion nobody checked,
+#    reported as expected, which is the one thing D27 forbids.
+#
+# The two skip lines below are the two the benches really print, at the
+# flood's start and mid-flood (herd-hub/tests/fake_hub_flood.rs). The gate
+# now reads a figure out of them, so a case that invented its own wording
+# would be testing nothing the benches say.
+flood_start_line() { # <name> <figure> <ceiling>
+  printf "HERD-SKIPPED: %s: the host's one-minute load is Some(%s), over this bench's ceiling of %s; the host is shared with a production system\n" "$1" "$2" "$3"
+}
+flood_mid_line() { # <name> <figure> <ceiling>
+  printf "HERD-SKIPPED: %s: the host's one-minute load reached %s mid-flood, over this bench's ceiling of %s, so the flood was cut short before it had read every abandonment; the figures it did have are printed above and are not asserted on. The host is shared with a production system\n" "$1" "$2" "$3"
+}
+# at_rest_skips writes the two at-rest names; every case below adds to it.
+at_rest_skips() {
+  printf 'HERD-SKIPPED: a_needs_cgroup_delegation: no delegated subtree here\nHERD-SKIPPED: b_needs_bfq: no device offers bfq\n' > "$tmp/gate-skips"
+}
+# quiet_host writes a loadavg file the gate reads as quiet at step 0 and
+# again after the suite; HERD_STUB_LOAD_AFTER/RESTORE burst between them.
+quiet_host() { printf '0.10 0.10 0.10 1/1 1\n' > "$tmp/gate-loadavg"; }
+busy_host()  { printf '12.00 1.00 1.00 1/1 1\n' > "$tmp/gate-loadavg"; }
+delta_two() {
+  { flood_start_line flood-fifty 14.91 8; flood_mid_line flood-two-fifty 14.91 8; } \
+    > "$tmp/gate-expected-load"
+}
+
+# 1. The burst that begins and ends inside the suite. Both of the gate's own
+#    readings are quiet; the benches read 10.67 and 10.12 and declined.
 gate_fresh
-printf 'HERD-SKIPPED: a_needs_cgroup_delegation: no delegated subtree here\nHERD-SKIPPED: b_needs_bfq: no device offers bfq\nHERD-SKIPPED: c_load_gated_bench: the host went busy\n' > "$tmp/gate-skips"
-printf 'HERD-SKIPPED: c_load_gated_bench: the host went busy\n' > "$tmp/gate-expected-load"
-printf '0.10 0.10 0.10 1/1 1\n' > "$tmp/gate-loadavg"
-out=$(gate_run HERD_GATE_LOADAVG="$tmp/gate-loadavg" HERD_STUB_LOAD_AFTER=12.00); rc=$?
+delta_two
+at_rest_skips
+flood_start_line flood-fifty 10.67 8 >> "$tmp/gate-skips"
+flood_mid_line flood-two-fifty 10.12 8 >> "$tmp/gate-skips"
+quiet_host
+out=$(gate_run HERD_GATE_LOADAVG="$tmp/gate-loadavg" \
+  HERD_STUB_LOAD_AFTER=11.60 HERD_STUB_LOAD_RESTORE=0.10); rc=$?
 # These assertions read `$out` through a here-string, as every assertion in
 # this file now does: the note above `fresh` says what the pipe they used to
 # be written with gets wrong, and what it was measured at.
-[ "$rc" -eq 0 ] && grep -qF 'load1 rose from 0.10 to 12.00' <<<"$out" \
-  && ok "gate: a quiet start and a busy finish still gets the load list" \
-  || bad "gate: the second load reading must apply the load list" \
+[ "$rc" -eq 0 ] \
+  && ok "gate: a burst that begins and ends inside the suite is GREEN" \
+  || bad "gate: the refusing bench's own reading must excuse its skip" \
     "    exit $rc:
-$(printf '%s\n' "$out" | tail -12 | sed 's/^/    /')"
-# And the verdict says WHICH reading allowed the extra names: "under load"
-# with no figure beside it leaves a reader guessing.
-grep -qE '^gate: GREEN .* skips=under-load\(load1-end=12\.00>8\)$' <<<"$out" \
-  && ok "gate: the verdict names the reading that allowed the extra skips" \
-  || bad "gate: the verdict must name the triggering reading" \
+$(printf '%s\n' "$out" | tail -14 | sed 's/^/    /')"
+# And the verdict says which reading justified the list and where it came
+# from: the bench, the figure IT read, the ceiling ITS line named.
+grep -qE '^gate: GREEN .* skips=under-load\(flood-fifty=10\.67>8,flood-two-fifty=10\.12>8\)$' <<<"$out" \
+  && ok "gate: the verdict names the bench, its figure and its own ceiling" \
+  || bad "gate: the verdict must name the reading that justified the list" \
     "$(printf '%s\n' "$out" | tail -4)"
-# The same list, with the load never rising: still RED, so the fix allows a
-# skip because of a measured load and not because two readings exist.
-printf '0.10 0.10 0.10 1/1 1\n' > "$tmp/gate-loadavg"
-gate_case "a quiet run throughout is still RED on that skip" 1 '7:unexpected-skip' \
-  HERD_GATE_LOADAVG="$tmp/gate-loadavg"
-# At rest the verdict says so, in the same field.
+# The proof that this is the new rule and not the old one: neither figure
+# the gate took itself was ever above the threshold.
+grep -qF 'load1 0.10 at the start, 0.10 after the suite' <<<"$out" \
+  && ok "gate: and it was green with both of its OWN readings quiet" \
+  || bad "gate: the two host readings must have been quiet here" \
+    "$(printf '%s\n' "$out" | grep -F 'at the start' | sed 's/^/    /')"
+# The figure must clear the gate's own threshold too, not only the ceiling
+# the line happens to name.
+gate_case "a figure under the gate's own threshold excuses nothing" 1 \
+  '7:unexpected-skip' HERD_GATE_LOADAVG="$tmp/gate-loadavg" \
+  HERD_GATE_LOAD_NOTE=1000
+
+# 2. The mid-flood phrasing on its own, since it is a second sentence and
+#    not the same one.
 gate_fresh
-printf '0.10 0.10 0.10 1/1 1\n' > "$tmp/gate-loadavg"
+delta_two
+at_rest_skips
+flood_mid_line flood-two-fifty 9.04 8 >> "$tmp/gate-skips"
+quiet_host
+gate_case "the mid-flood wording is read as evidence too" 0 \
+  'skips=under-load\(flood-two-fifty=9\.04>8\)' HERD_GATE_LOADAVG="$tmp/gate-loadavg"
+
+# 3. Doubly scoped, part one: BY NAME. A perfect load refusal under a name
+#    the delta list does not carry is still RED.
+gate_fresh
+delta_two
+at_rest_skips
+flood_start_line c_nobody_expected_this 10.67 8 >> "$tmp/gate-skips"
+quiet_host
+gate_case "a load refusal under a name the delta list lacks is RED" 1 \
+  '7:unexpected-skip' HERD_GATE_LOADAVG="$tmp/gate-loadavg"
+out=$(gate_run HERD_GATE_LOADAVG="$tmp/gate-loadavg")
+grep -qF '+ c_nobody_expected_this' <<<"$out" \
+  && ok "gate: that name is named in the red block, not counted" \
+  || bad "gate: the unexpected name must be named" "$(printf '%s\n' "$out" | tail -8)"
+
+# 4. Doubly scoped, part two: BY REASON. A delta name that skipped for
+#    something that is not the load ceiling is RED -- on a quiet host and,
+#    the case the old rule got wrong, on a busy one.
+gate_fresh
+delta_two
+at_rest_skips
+printf 'HERD-SKIPPED: flood-fifty: the fake hub could not bind a port on this host\n' >> "$tmp/gate-skips"
+quiet_host
+gate_case "a delta name skipping for another reason is RED" 1 \
+  '7:unexpected-skip' HERD_GATE_LOADAVG="$tmp/gate-loadavg"
+out=$(gate_run HERD_GATE_LOADAVG="$tmp/gate-loadavg")
+grep -qF 'could not bind a port on this host' <<<"$out" \
+  && ok "gate: the line it could not excuse is quoted, so a reader can see" \
+  || bad "gate: the unexcusable skip line must be quoted" \
+    "$(printf '%s\n' "$out" | tail -10)"
+busy_host
+gate_case "and RED on a busy host, where two readings called it GREEN" 1 \
+  '7:unexpected-skip' HERD_GATE_LOADAVG="$tmp/gate-loadavg"
+
+# 5. A contradiction inside the bench: load claimed with a figure UNDER the
+#    ceiling the same line names, and load claimed with no figure at all.
+#    Both are defects in the bench and the gate is where they show.
+gate_fresh
+delta_two
+at_rest_skips
+flood_start_line flood-fifty 3.30 8 >> "$tmp/gate-skips"
+quiet_host
+gate_case "load claimed with a figure under the ceiling it names is RED" 1 \
+  '7:unexpected-skip' HERD_GATE_LOADAVG="$tmp/gate-loadavg"
+gate_fresh
+delta_two
+at_rest_skips
+flood_mid_line flood-two-fifty 7.99 8 >> "$tmp/gate-skips"
+quiet_host
+gate_case "the same contradiction in the mid-flood wording is RED" 1 \
+  '7:unexpected-skip' HERD_GATE_LOADAVG="$tmp/gate-loadavg"
+gate_fresh
+delta_two
+at_rest_skips
+printf "HERD-SKIPPED: flood-fifty: the host's one-minute load is too high for this bench\n" >> "$tmp/gate-skips"
+quiet_host
+gate_case "a skip that merely claims load, with no figure, is RED" 1 \
+  '7:unexpected-skip' HERD_GATE_LOADAVG="$tmp/gate-loadavg"
+
+# 5b. The ceiling a line NAMES is what its figure is compared against, and
+#     not only the gate's own threshold -- the two are both 8 today, so a
+#     case where they differ is the only one that can tell them apart. A
+#     bench whose line names a ceiling of 20 and a figure of 10.50 has a
+#     figure over $HERD_GATE_LOAD_NOTE and under its own ceiling: that is a
+#     contradiction in the bench and it is RED.
+gate_fresh
+delta_two
+at_rest_skips
+flood_start_line flood-fifty 10.50 20 >> "$tmp/gate-skips"
+quiet_host
+gate_case "over the gate's threshold, under the line's own ceiling: RED" 1 \
+  '7:unexpected-skip' HERD_GATE_LOADAVG="$tmp/gate-loadavg"
+#     The same line with the figure above that same named ceiling IS
+#     excused, so the case above is about the comparison and not about the
+#     unusual wording.
+gate_fresh
+delta_two
+at_rest_skips
+flood_start_line flood-fifty 20.50 20 >> "$tmp/gate-skips"
+quiet_host
+gate_case "and above that same named ceiling the skip is excused" 0 \
+  'skips=under-load\(flood-fifty=20\.50>20\)' HERD_GATE_LOADAVG="$tmp/gate-loadavg"
+
+# 6. No delta list at all: a bench that declined for load is RED and the
+#    gate says the file it would have needed.
+gate_fresh
+at_rest_skips
+flood_start_line flood-fifty 10.67 8 >> "$tmp/gate-skips"
+quiet_host
+gate_case "with no delta list, a load refusal is RED and says which file" 1 \
+  'no load-conditional delta list' HERD_GATE_LOADAVG="$tmp/gate-loadavg"
+
+# 7. An honest run at rest: the at-rest list applies, the verdict says so,
+#    and the load-gated benches are reported as having RUN -- a bench that
+#    ran and one that was excused must never read the same.
+gate_fresh
+delta_two
+at_rest_skips
+quiet_host
 out=$(gate_run HERD_GATE_LOADAVG="$tmp/gate-loadavg")
 grep -qE '^gate: GREEN .* skips=at-rest$' <<<"$out" \
   && ok "gate: an at-rest run says which list it applied too" \
   || bad "gate: the at-rest verdict must say so" "$(printf '%s\n' "$out" | tail -4)"
+grep -qE '^    ran      flood-fifty$' <<<"$out" \
+  && grep -qE '^    ran      flood-two-fifty$' <<<"$out" \
+  && ok "gate: at rest the load-gated benches are reported as having run" \
+  || bad "gate: a bench that ran must be said to have run" \
+    "$(printf '%s\n' "$out" | grep -E 'ran|declined' | sed 's/^/    /')"
+
+# 8. A busy host where no bench declined. The at-rest list applies, and the
+#    verdict carries the host's figures so the line still answers "why this
+#    list" without anyone opening the log.
+gate_fresh
+delta_two
+at_rest_skips
+busy_host
+out=$(gate_run HERD_GATE_LOADAVG="$tmp/gate-loadavg")
+grep -qE '^gate: GREEN .* skips=at-rest\(host-busy:load1-start=12\.00>8,load1-end=12\.00>8,no-bench-declined-for-load\)$' <<<"$out" \
+  && ok "gate: a busy host with no bench declining gets the at-rest list" \
+  || bad "gate: the busy-host-at-rest verdict must say both" \
+    "$(printf '%s\n' "$out" | tail -4)"
 # The count moving on its own is not a signal and must not be one.
 gate_fresh
 printf 'HERD-SKIPPED: a_needs_cgroup_delegation: no delegated subtree here\n' > "$tmp/gate-skips"

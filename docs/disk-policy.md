@@ -6,14 +6,18 @@ one measurement that would change it is their distribution of output size
 per job per day"* — and it sizes M12's record retention against the same
 figures.
 
-**Three voices, kept apart on every line.** `[C]` is **code**, with a file
+**Five voices, kept apart on every line.** `[C]` is **code**, with a file
 and a line, and it is the only voice that is checkable here. `[R]` is
 **reported** by the first consumer or by Alexa's breakdown of their
 figures: theirs, not ours, and **unverified by this project** — nobody
 here has looked at their machines and nobody will (invariant 9, D161).
 `[D]` is **derived**, and every derived number names the inputs it came
 from. `[P]` is a **proposal**: mine, with its reasoning, decided by nobody
-yet.
+yet. `[M]` is **measured by this project on this workstation**, against a
+fixture store this project built and never against anything of the
+consumer's; a measured figure names the run that produced it. `[M]` was
+added on 2026-10-28 by ORCH-104, which replaced two `[D]` figures in §2.5
+and §3.4 with measurements; the four voices above it are unchanged.
 
 The reader this is written for arrives from `docs/plan.md` M12 or from
 `docs/coverage.md` E-15. It is a topic document beside
@@ -231,13 +235,17 @@ R4]`:
   directory ever created** `[C5, C13]`. The hub spends the night deleting
   last night's evidence to make room for tonight's, one collection at a
   time, with a walk between each.
-* **What that walk costs.** D152 measured it on this host at 100 000
-  directories: 1.15–1.96 s for the sweep's walk and 0.87–1.31 s for the
-  record-reading profile. Scaled linearly — *derived, not measured* — the
-  walk is **40–65 ms at 3334 directories** and **0.4–0.65 s at ten times
-  that** `[D]`. A hundred walks a night is 4–6.5 s today and 40–65 s at
-  ten times, in bursts, against a hub whose host already has IO as its
-  sore point (D136).
+* **What that walk costs — measured, 2026-10-28 (ORCH-104).** The sweep's
+  own walk is the cheap one, because under budget it reads no record at
+  all `[C5]`: **13.8 ms warm and 19.8 ms cold at 3334 directories**, and
+  **137 ms warm and 205 ms cold at 33 340** `[M]`. A hundred of them a
+  night is **1.4 s today and 14 s at ten times**, in bursts, against a
+  hub whose host already has IO as its sore point (D136). That is
+  *cheaper* than the 4–6.5 s this bullet derived, and the reason is that
+  the derivation scaled the wrong one of D152's two figures: the sweep
+  under budget does one `stat` and one `opendir` per directory, not a
+  record read. The expensive walk is the record-reading one, and §3.4
+  carries it.
 * **And it produces ~100 identical alarms a night.** The inside-the-floor
   warning fires on every sweep that took something in-floor `[C9]`; only
   the over-budget-nothing-to-free line has the once-per-episode
@@ -501,8 +509,53 @@ A naive retention pass is a **fifth**, and it is the expensive kind: the
 sweep under budget reads no records at all `[C5]`, while retention must
 read every record to learn its priority and its end time — the
 `collections_owed` profile, measured by D152 at 0.87–1.31 s per 100 000
-records on this host. Scaled linearly, *derived and not measured*: **30–
-45 ms at 3334 records**, **0.3–0.45 s at 33 340** `[D]`.
+records on this host. This document first scaled that figure linearly and
+printed **30–45 ms at 3334 records** and **0.3–0.45 s at 33 340** `[D]`.
+
+**Those two figures were measured on 2026-10-28 (ORCH-104) and the warm
+ones are about twice what was derived, while the cold ones are seven to
+eleven times it.** The walk is linear — that part of H6 holds — and the
+derivation's error is not its scaling but its cache and its corpus:
+`[M]`
+
+| directories | sweep walk warm | sweep walk cold | record walk warm | record walk cold | record walk, per dir warm |
+|---:|---:|---:|---:|---:|---:|
+| 1 000 | 3.65 ms | 5.77 ms | 19.4 ms | 87.0 ms | 19.4 µs |
+| 3 334 | 13.8 ms | 19.8 ms | **65.6 ms** | **292 ms** | 19.7 µs |
+| 10 000 | 39.6 ms | 59.5 ms | 190 ms | 873 ms | 19.0 µs |
+| 33 340 | 137 ms | 205 ms | **639 ms** | **3.29 s** | 19.2 µs |
+| 100 000 | 620 ms | 1.74 s | 1.99 s | 15.2 s | 19.9 µs |
+
+Release build, `collections_owed` through the public trait, median of
+five warm runs, one cold run per cell; the 100 000 row was taken at a
+1-minute load of 8–11 and the rest at 2.9–4.8. **Cold** means every
+record `fsync`ed and then `posix_fadvise(DONTNEED)`ed, which drops the
+page cache and not the dentry cache — a hub restarted onto an old state
+root is colder still, so the cold column is a floor and not a ceiling.
+Method and the full tables: `herd-hub/tests/walk_cost.rs` and
+`docs/orchestration/history/2026-10-28-orch-104-walk-cost.md`.
+
+**Three things that table says, and only the first was expected** `[M]`:
+
+1. **Linear, flatly so.** The per-directory warm cost is 19.4, 19.7,
+   19.0, 19.2 and 19.9 µs from 1 000 to 100 000 directories. Nothing
+   bends over two orders of magnitude, so **H6's scaling claim is
+   confirmed** and a retention pass can be sized by multiplication.
+2. **The cold cache is the whole risk, and it is a factor of 4.4 to 7.6.**
+   Nobody had measured a cold walk. The startup pass §3.4 proposes runs
+   on exactly the cold cache this column measures: **3.3 s at 33 340**,
+   not 0.45 s.
+3. **The cost is concentrated, so the mean is not the record.** One
+   record in ten in this fixture carries a 240-file manifest, as the
+   consumer's own output distribution is deciles 1–8 at 0.0 MB with the
+   top tenth carrying 95 % of the bytes. Deciles 1–8 of the per-record
+   warm cost are 6.5–8.1 µs, decile 9 is 31.9 µs and the maximum is
+   215 µs: the **top tenth of records carries about two thirds of the
+   walk**, and the mean, 19.2 µs, is 2.9× the median. The mean is still
+   the right multiplier for a total — a total *is* `N` × mean — but it
+   describes no record, and a corpus of uniformly small records
+   understates the walk by about 1.8×, which is most of the gap between
+   the derived figures and these.
 
 And there is a **sixth** behind it, which nothing has named: `usable_index`
 trusts the index only while `index.jobs_accounted` equals the number of
@@ -510,6 +563,20 @@ job directories `[C15]`. A pass that removes directories without updating
 that count forces a **full index rebuild — every record read — at the
 next startup**. Retention must update the index in the same act, or the
 trust check must stop being a raw count.
+
+**And id order is also about half the cold cost per record, which is a
+second reason for the proposal below and was not known when it was
+written** `[M]`. Every walk in the store reads the names
+`durable::names_in` hands back, which is ext4's directory-hash order:
+at 33 340 directories **zero** of 33 341 names sit where sorted id order
+would put them. Reading the same records in id order costs **0.50× at
+3 334 and 0.41× at 33 340** on a cold cache — measured in both sequences,
+1.83× and 2.01× with the orders reversed — and **nothing at all warm**
+(0.99× and 1.02×), which is the control that says the effect is the disk
+and not the loop. So a full cold pass at 33 340 is ~3.3 s in the order
+the store walks today and **~1.7 s in id order**: a larger saving than
+collapsing `read_stored`'s three parses buys warm (ORCH-123), on the
+pass that delays a hub coming up.
 
 **How to add retention without a fifth O(T) walk** `[P]`: job ids are
 sequence-ordered and `sequence_of` already filters them
@@ -526,8 +593,24 @@ thing that can put a hub over its output budget is a collection
 arriving"*. The rule underneath is *trigger on the thing that can change
 the answer*; for retention that thing **is** the passage of time. **Once
 a day, plus once at startup**, matching the sweep's startup run `[C11]`.
-At 30–45 ms a day that is free, and even at 0.45 s it is half of one of
-ORCH-021's 200 ms polls.
+
+**Can a daily full pass be afforded? Yes, by a wide margin, and the
+startup pass is the one to watch** `[M]`. At the first consumer's 3334
+directories a full record walk is **65.6 ms warm and 292 ms cold**, once
+a day: that is free, and the cold figure is the one that counts because
+a daily pass on a hub that has been quiet reads a cache nobody has
+warmed. At ten times their count — 33 340, about ten months of their
+own id rate `[R6]` — it is **639 ms warm and 3.3 s cold**. A once-a-day
+3.3 s unlocked read is still affordable; it is **not** affordable as
+anything that runs per event, and the number to compare it against is
+not 200 ms but *how long a hub may be slow at startup*. Where it stops
+being affordable, said as a rule rather than a date: a full cold pass
+costs about **100 µs per directory** on this host `[M]`, so it crosses
+10 s at ~100 000 directories and a minute at ~600 000. **At 100 000 the
+startup pass alone is 15.2 s of a hub not yet serving** — which is why
+§3.4's early-stopping id-ordered pass is the right shape for the daily
+one and why the startup full pass needs a bound of its own, not because
+the daily cost is high.
 
 ### 3.5 What must never be deleted, under any rule
 
@@ -604,7 +687,7 @@ mark says that one root never hands the same `j…` out twice.
 | H3 | The volume currently holds about one nightly pass | The same listing plus directory dates | No, same read |
 | H4 | The breakdown's "older than seven days" is directory mtime, while the hub's floor is `record.updated_at` `[C7]`. Any record rewrite — a first fetch, an eviction — bumps the directory's mtime, so `find -mtime +7` **undercounts** what the hub calls old, and the 12 GB `[R4]` is a **lower bound** on the out-of-floor pool | Comparing the two figures. Nothing prints the hub's own figure today, which is one more reason for M13's status document | Partly: the fix is ours, the comparison is theirs |
 | H5 | The arrival process is one burst a night, so a daily mean misdescribes it (§2.1) | The consumer's own words `[R7]`; refuted if the pass actually spreads its output across the day | No |
-| H6 | D152's walk timings scale linearly from 100 000 directories down to 3334 and up to 33 340 (§2.5, §3.4) | A measurement at the real directory count. D152 itself calls its figure *"one host, one filesystem, warm cache"* | **Yes**, and nobody has done it: a fixture store is cheap to build |
+| H6 | D152's walk timings scale linearly from 100 000 directories down to 3334 and up to 33 340 (§2.5, §3.4) | A measurement at the real directory count. D152 itself calls its figure *"one host, one filesystem, warm cache"* | **Settled 2026-10-28, ORCH-104, and it splits in two.** The *scaling* is **confirmed**: the warm record walk is 19.4/19.7/19.0/19.2/19.9 µs per directory at 1 000/3 334/10 000/33 340/100 000, flat over two orders of magnitude `[M]`. The *figures it was used to derive* are **refuted**: §3.4's 30–45 ms and 0.3–0.45 s are about half the measured warm cost and a seventh to an eleventh of the measured cold cost, because the derivation inherited D152's warm cache and its uniformly tiny records. §2.5's sweep figure was wrong the other way — too high, because it scaled the record-reading profile onto a walk that reads no records. Both are now `[M]` in the table at §3.4 |
 | H7 | "In-floor eviction every night" assumes the nightly returns at this size with the budget at 200 GB | The nightly is off `[R7]`, so nothing will show until it returns | No, and this is why the warning of §2.7 matters more than the prediction |
 | H8 | `statvfs` on the state root measures the filesystem Herd shares (§2.6) | True here: the hub volume is a directory on the same ext4 `[R5]`. A separate mount, an overlay or a quota would measure something else — and the guard would then be measuring the right thing for *that* deployment anyway | Yes, by test |
 | H9 | A `herd_herd-state` docker volume maps to a plain directory under `/mnt/ssd_980/docker/volumes` | `[R5]` says so. If it were a separate device the whole of §2.6 still holds, with different numbers | No |
@@ -693,7 +776,7 @@ and keep the order.
 | ORCH-101 | The startup line stops promising a record *"for ever"* (`main.rs:288-297`); `docs/plan.md` M12 and `docs/coverage.md` E-15 point at `docs/disk-policy.md` | `docs/disk-policy.md` §3.2 | herd-step | owed | Prose plus one `println!`; must land with ORCH-098, never before | ORCH-098 | `herd-hub/src/main.rs:288-297` |
 | ORCH-102 | The server hands the retention pass a set of protected ids — jobs being followed, fetches in flight — so the store stays ignorant of sessions | `docs/disk-policy.md` §3.5 | herd-step | owed | One task at the server/store seam | ORCH-098 | `docs/disk-policy.md` §3.5 |
 | ORCH-103 | Relay to Alexa: ask the consumer for one per-directory size listing of the hub volume's `jobs/`, with dates. It settles H1, H2 and H3; it needs root on their host; nobody in this project runs it (D161) | `docs/disk-policy.md` §1.3, §4 | Alexa | waiting | Ask, one question, with the two commands of §1.3 | Alexa | `docs/disk-policy.md` §1.3 |
-| ORCH-104 | Measure the sweep walk at a realistic directory count (3334 and 33 340), refuting or confirming H6's linear scaling of D152's 100 000-directory figures | `docs/disk-policy.md` §4 H6 | herd-step | open | A fixture store and a timing, no product change; the only hypothesis here we can settle ourselves | — | D152's measurement block |
+| ORCH-104 | Measure the sweep walk at a realistic directory count (3334 and 33 340), refuting or confirming H6's linear scaling of D152's 100 000-directory figures | `docs/disk-policy.md` §4 H6 | herd-step | done | **Done 2026-10-28 on `orch-104-walk-cost`. Linearity confirmed, the figures refuted, and no product file touched.** Five populations — 1 000, 3 334, 10 000, 33 340, 100 000 — cold and warm, release and debug, in `herd-hub/tests/walk_cost.rs` (all cases `#[ignore]`d). The warm record walk is flat at ~19 µs a directory over two orders of magnitude; §3.4's derived 30–45 ms / 0.3–0.45 s become **65.6 ms / 639 ms warm** and **292 ms / 3.29 s cold**; §2.5's sweep figure was too high, not too low. **ORCH-123 confirmed and sharpened:** per-record work is **98.6 %** of the warm walk, not 94 %, and the three `serde_json` parses are **81 %** of the per-record cost in a **release** build, not only in debug — but collapsing them into one parse buys only **23 %** of the walk, so the row's lever is real and about a quarter the size its framing suggests. Cold, the attribution inverts: the disk is 72–76 % and the parses 24–28 %. **A fourth finding nobody was looking for:** every walk in the store reads in ext4 directory-hash order, and sorting the names into id order first costs **0.41–0.50× cold** and nothing warm, so a full cold pass at 33 340 is ~1.7 s instead of ~3.3 s. Three new rows proposed in the handoff | — | `herd-hub/tests/walk_cost.rs`; §3.4's table; `history/2026-10-28-orch-104-walk-cost.md` |
 
 ### File ownership and order
 

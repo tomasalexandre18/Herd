@@ -10020,3 +10020,509 @@ choice: one output is one thing to keep honest.
 
 **On the number.** This entry is D194, last of the five allocated at the
 first local landing, in merge order.
+
+## 2026-10-29 — D195 A runner's own count is not always its ceiling
+
+**Context.** `herd-hub/tests/announced_job_ceiling.rs:1179` asserted that the
+`holding` figure of a `refused_as_full` outcome equals `CEILING`. It went red
+on CI three times, latest run `40762764493` at `09229db`, always with
+`holding` 1 against a ceiling of 2. The cause is not a flake in the hub:
+`herd_runner::take_job` has **two** refusals that set that one field, and they
+are different facts. `NotTaken::AtItsCeiling` fires when `running >=
+most_at_once`, so it reports exactly the ceiling.
+`NotTaken::StillRunningThisJob`
+— D182, one machine runs one job once — is reachable **only below** the
+ceiling, because the ceiling arm returns first; by construction it reports a
+figure under it. The assertion pinned one arm and the test sat on a clock, so
+whichever arm answered decided whether CI was green.
+
+**Reproduced, as a rate at each condition** (ORCH-119): on two pinned CPUs,
+4 failures in 20 under four spinners and **13 in 20** under eight, against
+**0 in 35** unconstrained — and 10 of 10 red at a different assertion (1156)
+with the outage shortened to 4 s on an idle 12-core host, which brackets the
+same window from the other side. The host is incidental; the window is not.
+
+**Choice, and it is the test that changes.** The figure is asserted against
+the record's **own sentence** rather than against `CEILING`: a field beside a
+reason has to agree with it (D166), which holds in both arms, and the ceiling
+arm is still held to `== CEILING` exactly. That is a stronger oracle, not a
+weaker one — under the formerly-red condition the second arm occurred in 13
+of 20 runs and the assertion accepted and checked it, 0 failures in 20. No
+product file, no `RECORD_VERSION` and no `PROTOCOL_VERSION` moves here.
+
+**What is deliberately left open, because it is a product change and not a
+test's.** A `StillRunningThisJob` refusal is still recorded as
+`JobOutcome::RefusedAsFull`, whose sentence says the job was handed back *"by
+machines that were already as full as the ceiling they announced"* and advises
+*"Add capacity"* — of a machine holding **1 of 2**. The record contradicts
+itself in one sentence and the advice is wrong: the thing to act on is that
+the hub sent a second attempt of a job the machine was still running. Three
+doc comments state the same claim the code does not keep
+(`HowItEnded::TheRunnerWasAtItsCeiling::holding`, `Attempt::at_its_ceiling`,
+`herd_proto::RunnerThatWasFull::holding`), and the file's own
+`ceiling_refusals()` oracle cannot see that arm at all, so "attempts spent
+for the runner's ceiling = 0" is proved over a subset of the refusals that
+spend it. All three go to ORCH-126, which is about the same disagreement
+between what a hub thinks of a machine and what the machine says.
+
+**Evidence.** `history/2026-10-28-orch-119-announced-ceiling.md`; ORCH-119;
+CI runs `40720983497` and `40762764493`; D182, D166.
+
+## 2026-10-29 — D196 The gate reads the load off the bench that refused
+
+**Context.** `gate.sh` step 7 chose between `scripts/expected-skips/local.txt`
+and `local-under-load.txt` by sampling `/proc/loadavg` at step 0 and again
+after the suite, applying the whole two-name delta when **either** figure was
+over `HERD_GATE_LOAD_NOTE` (8) — the second reading being D191's own
+addition. Both samples miss the case that actually happens on this host: a
+load burst that begins **and ends inside the suite**. Measured twice on
+2026-10-29 by two agents, on branches that cannot move a bench's reading: the
+host went 1.68 → 8.54 → 11.60 → 10.12 → 3.30, the flood benches read 10.12 as
+they ran and correctly declined, the gate sampled 1.70 and 3.30, applied the
+at-rest list and called two correct skips unexpected. Each false red costs a
+whole suite run, 190-240 s, on a clean tree — and invites blessing a flood
+name into `local.txt`, which would leave an assertion nobody checks reported
+as expected.
+
+**And the old rule was wrong in the other direction, which nobody had
+noticed.** A busy host excused **every** delta name whatever the skip's
+reason. A `flood-fifty` that skipped because the fake hub could not bind a
+port read **GREEN** on any busy host: an assertion nobody checked, reported
+as expected. That is invariant 5 broken inside the gate itself. Driven for
+real against the same inputs: `BASE … gate: GREEN … skips=under-load(…)`
+where `FIX … gate: RED … failed=7:unexpected-skip`.
+
+**Choice.** The delta is applied **per skip**, out of the refusing bench's own
+`HERD-SKIPPED` line — the figure that bench read, at the moment it read it, is
+the only evidence about why that skip exists. The excuse is **doubly scoped**,
+and both scopes must hold:
+
+- **by name** — the skip's assertion name is on `local-under-load.txt`
+  (today exactly `flood-fifty` and `flood-two-fifty`); and
+- **by reason** — that skip's own line names this bench's load ceiling and
+  gives a figure **above that named ceiling and above `HERD_GATE_LOAD_NOTE`**.
+
+Anything else is RED: a delta name that skipped for another reason, one that
+claimed load with a figure under the ceiling it names, one that claimed load
+with no figure at all. Each of those is a defect in the bench, and the gate is
+where it shows. The new rule is strictly narrower in what it excuses and
+strictly wider in what it refuses.
+
+**D187 is untouched.** The comparison is still the **list** and never the
+count; the excuse is a per-name exception inside that comparison, not a count
+allowance. The gate still reads the host at step 0 and after the suite and
+still refuses to run above `HERD_GATE_LOAD_MAX`; those two figures are now
+**information** — in the log, the verdict and the receipt — and decide
+nothing. The verdict says which reading justified the list and where it came
+from: `skips=under-load(flood-fifty=10.67>8,flood-two-fifty=10.12>8)`,
+`skips=at-rest`, or `skips=at-rest(host-busy:…,no-bench-declined-for-load)`.
+
+**The coupling this buys, stated as a cost.** The gate now depends on the
+**wording** of a skip line: if a flood bench ever declines for load without
+printing the figure and the ceiling, the gate goes RED on a correct skip. That
+is deliberate — a bench that stops giving evidence must stop being excused —
+and it is mitigated in the tree rather than hoped about: both phrasings are
+reproduced verbatim in `check-orchestration.sh`, so such an edit breaks a 20 s
+case instead of a 240 s suite.
+
+**Alternative rejected.** A third reading, taken mid-suite. It is the same
+mistake one sample further on: three instants the gate chose still cannot see
+a burst between them, and each extra sample makes the verdict harder to read
+while making the rule no sounder. The witness is the bench; ask it.
+
+**Evidence.** `history/2026-10-29-gate-load-from-the-bench.md`;
+`scripts/gate.sh`; `check-orchestration.sh` 256 → **269** passed, nineteen new
+cases driving the rule and six that encoded the old one removed, 8 of the 19
+red against the base gate and four mutations of the new one each caught; five
+real gate runs on this host with a real burst, three of them on the
+formerly-red path and step 7 ok in all three. D191, D187, D27.
+
+## 2026-10-29 — D197 A retention pass that would empty the state root refuses
+
+**Context.** M12's record retention removes a requester's evidence on a timer,
+and nothing in Herd can undo that removal: once the hub acknowledges a
+collection the runner's spool goes through that acknowledgement, so the record
+is the only copy. `Timestamp::since` saturates backwards only
+(`herd-hub/src/job.rs:76`), so a clock stepped **backwards** makes every
+record read as younger than it is — safe — and a clock stepped **forward**
+makes every record read as expired. The second is the one that destroys a
+root.
+
+**What was refuted.** The planner's proposed guard was *"refuse when `now` is
+earlier than the newest record's `updated_at`"*. That catches the backward
+step and lets the forward step straight through, because a clock that stepped
+forward is ahead of every record on the root. Worse, **a monotone forward step
+is not detectable from a state root at all**: a year-old newest record is
+exactly what a broken clock and a hub idle for a year both look like
+(`docs/disk-policy.md` §3.6 says the idle case is real), and nothing on the
+disk distinguishes them.
+
+**Choice.** Refuse the consequence the two share, with two verdicts and no
+threshold of Herd's own:
+
+1. **The clock is behind the root's own newest record.** This hub wrote that
+   record with this clock, so the clock has moved backwards; an age measured
+   against it saturates and every figure means nothing. The pass does not run.
+2. **Every record that can expire is past its span**, so a pass would leave no
+   record behind. The pass does not run. The only figure in this test is the
+   span the operator typed — no number is enshrined (D194) — and the
+   population is *records that can expire*, not *records judged*, because one
+   class whose span is `0` would otherwise mask a clock that had stepped
+   forward under all the others.
+
+A refusal prints the clock reading, the spans and the census and **no list of
+what would go**, and exits non-zero: a refusal that still printed "everything
+is expired" would be the output it exists to prevent.
+
+**And a span of `0` means never expire**, said in those words, which is
+deliberately **not** `--output-floor 0`'s reading. The two settings are not
+symmetric because their failures are not: the floor's zero loses bytes a
+budget was going to take anyway, and this zero would lose the records. A span
+left unset, a shell variable that expanded to nothing, or a `0` typed while
+reaching for `90` must keep the evidence, not destroy it. Every span is also a
+**required argument with a compulsory unit**: `--step 14` read as fourteen
+seconds would select every record on the root. That is D194's precedent
+applied — a shipped binary states no policy, so the four class spans are four
+required arguments rather than a built-in class map, which also lets the tool
+be run against any answer to ORCH-098.
+
+**What the preview is, and what it is not.** `herd-hub retention-preview
+[STATE_DIR] --merger --step --nightly --producer` is a lock-free subcommand
+beside `report`, decided and printed before the state root is opened (D194's
+reason: opening it takes the `flock` and sweeps). It **removes nothing and has
+no flag that could be given a deletion path**. It exposes
+`retention::select`, the selection function the engine will call, so that
+"what the preview said would go" and "what the engine takes" cannot become two
+different sentences. Two further premises were checked rather than assumed:
+`updated_at` is a stable end time and not a last-touch clock — byte-identical
+across a fetch, a resend of a file the hub already holds whole, and an output
+eviction — so a span is a span and not an LRU and D152's sign is not inverted;
+and a job that is not over (the reaper's, ORCH-012, D134) or a quarantined
+record (D52) is never shown as expired, asserted at a span of one second per
+class.
+
+**Cost, said plainly.** A hub that really has been idle longer than its
+shortest span is refused too. For the preview that costs nothing. For the
+engine it is one explicit instruction naming the count it authorises — never a
+`--force` a script can carry by accident.
+
+**Evidence.** `history/2026-10-28-orch-146-retention-preview.md`; ORCH-146;
+`herd-hub/src/retention.rs`, `herd-hub/tests/retention_preview.rs`, 14 new
+assertions; **`store.rs` untouched**, `RECORD_VERSION` 1 and
+`PROTOCOL_VERSION` 2 unchanged by it. D194, D152, D52, D134.
+
+## 2026-10-29 — D198 The record walk's measured cost replaces the derived
+
+**Context.** `docs/disk-policy.md` §3.4 sized M12's retention passes off
+figures derived by scaling D152's record-reading profile. ORCH-104 measured
+both walks instead, at the consumer's own 3 334 directories and at ten times
+that, release build, with the cold column taken on a cache dropped as far as
+a shared host allows. **The plan was wrong in both directions**, and one thing
+it never had a figure for at all.
+
+**What the measurement says.**
+
+- **The full record walk:** 65.6 ms warm / 292 ms cold at 3 334 directories,
+  639 ms warm / **3.29 s** cold at 33 340, and 1.99 s warm / 15.2 s cold at
+  100 000 — that last row the only one taken under load and marked as such.
+  Cold had **never been measured**; it is 4.4× to 7.6× the warm figure, and it
+  is the figure that delays a hub coming up.
+- **The narrow sweep pass was overstated by three.** §2.5 derived "40-65 ms at
+  3 334" and "4-6.5 s for a hundred walks a night"; measured it is **13.8 ms
+  warm / 19.8 ms cold**, and a hundred of them is **1.4 s**. The derivation
+  had scaled a record-reading profile onto a pass that reads no record at all.
+- **ORCH-123 is confirmed and cut to a quarter.** Per-record work is 98.6 % of
+  the warm walk and the three `serde_json` parses are 81 % of that, so about
+  80 % of the warm walk — but collapsing three parses into one buys **23 %**,
+  not 80 %, because the expensive parse is the one that cannot be removed.
+  Anyone sizing that work off "80 % of the walk is the parses" is out by 3.5×.
+- **And the attribution inverts cold:** `open`+`read` is 71-76 % and the
+  parses 24-28 %. The two passes M12 proposes sit on opposite sides of that
+  line — a daily pass on a busy hub is CPU-bound, a startup pass is
+  disk-bound — so **a fix justified by the warm number and measured against
+  the cold one will look like it failed**.
+- **The order the store reads in costs a factor of two, cold.** Every walk
+  goes through `durable::names_in`, which returns ext4's directory-hash order;
+  **zero of 33 341** names occupy the same position as in id order. Cold, id
+  order costs **0.50×** at 3 334 and **0.41×** at 33 340, confirmed by running
+  the pair in both sequences and controlled by a warm pair where the
+  difference is nil. A full cold pass at 33 340 goes from ~3.3 s to ~1.7 s for
+  one `sort()` — a larger saving than ORCH-123's parse fix buys warm, on the
+  pass that actually delays startup.
+
+**Choice.** `docs/disk-policy.md` carries the measured figures, marked `[M]`,
+in place of the derived ones, and M12's engine is sized against them: the
+daily pass against 65.6 ms warm / 292 ms cold at the consumer's population,
+and the **startup** pass treated as the expensive one with a bound of its own.
+The warm walk is load-insensitive between load 3 and load 10 on this host
+(two phases that share no code, 0.7 % and 3.5 % apart), so no warm figure
+needs re-taking; the cold figures are the opposite, and the 100 000-directory
+cold cell is marked as needing a re-run at rest before anyone quotes it.
+Nothing here changes what is built or anything outward-facing — it replaces
+two derived figures with measured ones and settles a hypothesis this project
+could settle itself.
+
+**Cost, said plainly.** `/proc/sys/vm/drop_caches` was not used: it needs root
+and the first consumer's production shares this host. Dentry and inode caches
+are therefore warm in every "cold" figure, so the cold column is a **floor**
+and the true startup cost is above it by an unmeasured amount.
+
+**Evidence.** `history/2026-10-28-orch-104-walk-cost.md` §1, §2, §3b, §4;
+`herd-hub/tests/walk_cost.rs`; `docs/disk-policy.md` §3.4. No product file was
+touched. D152, D136, D79; ORCH-123, ORCH-098, ORCH-021.
+
+## 2026-10-29 — D199 All three versions move before v1.0.0
+
+**Context.** `PROTOCOL_VERSION` is 2, `RECORD_VERSION` 1 and `LAYOUT_VERSION`
+1. M11's pack half needs frames neither protocol enum has; the record and the
+layout both need shapes the current ones cannot express. There is **no
+migration path anywhere in `JobDirStore::open`**: a build at a higher record
+or layout version does not convert an existing state root, so moving either
+one destroys an operator's root as a working root.
+
+**Choice, Alexa, 2026-10-29.** All three move before v1.0.0:
+`PROTOCOL_VERSION` 2 → **3**, `RECORD_VERSION` 1 → **2**, `LAYOUT_VERSION`
+1 → **2**. He was shown that the last two destroy an operator's state root and
+that no migration path exists, and took it: the consumer keeps their volume
+only until v1.0.0, at which they reset entirely, so **a fleet restarting from
+zero makes the price nil**. This is the decision that lets M11's pack half,
+the record changes and the layout changes each be designed for what they need
+instead of for what version 1 can hold.
+
+**One ordering constraint, and it is binding.** The **ordinary release before
+v1.0.0 ships at layout 1 and record 1** — no part of this triple goes in it.
+Two measured reasons, and both are worse than a refusal would be:
+
+1. A **layout-2** hub refuses to open their existing root, so
+   `docker compose exec hub herd-hub report` has nothing to exec into — and
+   that reading is the one thing still owed on ORCH-145, which they have said
+   they will run before they reset.
+2. `report.rs:344-353` pushes a version-mismatched record onto
+   `census.unread` and **continues**. So a **record-2** build on a version-1
+   root exits cleanly with `read = 0` and every job unread: it looks like an
+   answer rather than a refusal, which is the worse of the two failures.
+
+This constraint is a board row of its own so that no brief can take the
+version work early, and it is the reason the ordinary release is being put to
+Alexa as its own act.
+
+**Evidence.** Alexa, 2026-10-29, relayed by the orchestrator;
+`herd-hub/src/report.rs:344-353`; `JobDirStore::open`; ORCH-145; D194.
+
+## 2026-10-29 — D200 Pack bytes travel in clear on the operator's private mesh
+
+**Context.** D10 and D11 put pack content on a private mesh interface between
+peers rather than through the hub, which is what keeps a 400 MiB artefact off
+the hub's byte path. What that leaves open is who protects those bytes in
+flight. Herd builds and requires no network (invariant 3), and TLS inside Herd
+would mean a PKI inside Herd, which invariant 1 refuses.
+
+**Choice, Alexa, 2026-10-29: accepted as it stands.** **Herd provides
+authorisation; the operator provides confidentiality.** Authorisation is an
+ephemeral capability the hub pushes to the holder over that holder's own
+already-authenticated control link — so the capability never crosses an
+unauthenticated channel, and a peer that was never given one cannot ask for
+the bytes. Confidentiality is the mesh's: the operator's private interface is
+where these bytes live, and Herd adds no second layer over it. **No PKI, no
+TLS inside Herd.**
+
+**Named residue, which is the point of recording this rather than assuming
+it.** Two things are true and accepted: the **bytes are readable** by anything
+already on that mesh interface, and the **capability is replayable within its
+lifetime** by anything that sees it. Both are bounded by the operator's own
+network, which is the same trust boundary invariant 3 already rests on — a
+runner needs nothing inbound from outside it.
+
+**Evidence.** Alexa, 2026-10-29, relayed by the orchestrator; D10, D11;
+invariants 1 and 3. The prose that states this where an operator will read it
+lands separately, on `joining-mesh-residue` (`docs/joining.md`).
+
+## 2026-10-29 — D201 Retention ships active, merger 90 days and the rest 14
+
+**Context.** ORCH-098 asked for the class map and whether retention ships on
+or off. The figures behind the question are in `docs/disk-policy.md`: the
+consumer's volume holds ~90 GB across 1 571 jobs against D152's 200 GB budget
+with nothing ever evicted, and nightly joining merger at 90 days would make
+retention close to a no-op at their workload.
+
+**Choice, Alexa, 2026-10-29.** The class map is **merger 90 days, every other
+class 14** — the map as written, not the fallback. And retention **ships
+active by default**, which is the part that needed saying out loud, because it
+means a shipped Herd removes an operator's records without being asked to.
+What makes that safe enough to ship on is the guard it ships behind, all of
+which is already decided and partly built:
+
+- `herd-hub retention-preview`, which removes nothing, so an operator can see
+  what a pass would take and what it would cost before any pass runs (D197);
+- the two threshold-free refusals of D197 — a clock behind the root's own
+  newest record, and a pass that would leave no record behind;
+- `0` means **never**, said in those words, so an unset span or a `0` typed
+  while reaching for `90` keeps the evidence instead of destroying it.
+
+**Cost, said plainly.** Active by default means the first consumer's volume
+starts expiring records on a timer as soon as they run a build that carries
+the engine. At their measured rate that is the intended effect and not a
+surprise — see D202 and the eviction row — but it is a removal nothing in Herd
+can undo, and the preview is the only thing between an operator and it.
+
+**Evidence.** Alexa, 2026-10-29, relayed by the orchestrator; ORCH-098;
+`docs/disk-policy.md` §3.1, §3.3, §3.4, §6 C; D197, D152.
+
+## 2026-10-29 — D202 The output floor stays, the hub stops promising it
+
+**Context.** ORCH-105, Decision A. The shipped seven-day output floor is
+**unsatisfiable at the first consumer's workload on the disk they have**: it
+needs ~750 GB against a ~451 GB theoretical and ~250 GB practical ceiling, at
+any budget. Three ways out were put: keep the default and say so, drop the
+default, or tell the consumer to set about two days.
+
+**Choice, Alexa, 2026-10-29: (i) and (iii) together.** The shipped seven-day
+floor **stays** — the default is project-agnostic and no single fleet's disk
+sets it. What changes is what the hub **claims**: it stops promising a floor it
+has been shown it cannot keep. And the consumer gets a **concrete figure for
+their own configuration** rather than a default to argue with. A promise the
+software cannot keep is worse than a number an operator has to set, which is
+the same reason D194 refuses to print a threshold.
+
+**Evidence.** Alexa, 2026-10-29, relayed by the orchestrator; ORCH-105;
+`docs/disk-policy.md` §2.4, §2.5, §6 A; D152, D194.
+
+## 2026-10-29 — D203 GitHub is storage; branch protection is not pursued
+
+**Context.** D189 removed pull requests and the GitHub CI gate; D188 recorded
+that `pre-push` is the last machine in front of `main`. What stayed on the list
+after that was "Alexa narrows the branch protection", carried as a tidying
+step. The first local landing measured what that protection is actually worth
+against the credential this project pushes with. GitHub printed, and then let
+the push through:
+
+```text
+Bypassed rule violations … Changes must be made through a pull request …
+2 of 2 required status checks are expected
+```
+
+**Choice, Alexa, 2026-10-29.** Branch protection and `enforce_admins` are
+**deliberately not pursued**, and this is recorded as the **accepted final
+state, not a gap**. A rule an admin credential bypasses while printing that it
+bypassed it protects nothing; keeping it on the list as pending work would
+mean pretending `main` has a server-side guard that the evidence says it does
+not have. **GitHub is storage.** What guards `main` is `./scripts/gate.sh`,
+the `pre-push` hook, and the contract — one batch, one `--no-ff` merge, one
+push, never `--admin`, never `--no-verify`, never a force-push.
+
+**Cost, said plainly.** Nothing server-side stops a mistake by whoever holds
+this credential. That was already true before this entry; what changes is that
+it is now written down as a property of the method instead of as an item
+somebody might one day close.
+
+**Evidence.** Alexa, 2026-10-29, relayed by the orchestrator; the first local
+landing's own push output, 2026-10-28; D187, D188, D189, D190;
+`docs/orchestration/workflow.md` *Not an option*.
+
+## 2026-10-29 — D204 "Stable" means v1.0.0
+
+**Context.** `docs/plan.md` has never defined stability; "stable" has been used
+in briefs and in the consumer exchange with no agreed referent, which makes
+every question of the form "is this stable yet?" unanswerable.
+
+**Choice, Alexa, 2026-10-29, and it is the first time the project defines it.**
+**Stable means v1.0.0**, in three parts, in this order: **the majority of the
+features implemented**, then **support**, then **a development period
+constrained on features**. So stability is not a quality bar bolted onto an
+arbitrary tag — it is a commitment about what happens *after* the tag: the
+feature surface stops moving, and what is promised is kept.
+
+**What it binds.** Everything scoped in or out of v1.0.0 is scoped in or out of
+the stability promise, which is why D205 and D206 are each their own entry and
+each carries its cost. The version triple of D199 moves **before** that line,
+because a stability promise taken at protocol 2 and record 1 would be a
+promise to keep shapes this project already knows it needs to break.
+
+**Evidence.** Alexa, 2026-10-29, relayed by the orchestrator; `docs/plan.md`
+(which says nothing about it); D199, D205, D206.
+
+## 2026-10-29 — D205 M11's pack half is inside v1.0.0, which makes it 44 of 44
+
+**Context.** M11 has two halves: the record half, which landed and paid the
+`RECORD_VERSION` 2 break on its own, and the **pack half**, which does not
+exist — no frame on either protocol enum, so E-12 and E-17 are undelivered
+(ORCH-020). Whether it was inside the first stable release had never been
+settled.
+
+**Choice, Alexa, 2026-10-29: inside.** The pack half is **in v1.0.0**, which
+makes v1.0.0 **44 of 44** of the first consumer's musts. There is no must left
+outside the stable release.
+
+**Two corrections that come with it**, both of which were load-bearing and
+both wrong:
+
+1. **ORCH-020's premise.** Its row says the pack half is "cut by D161". It is
+   not. D161 blocks verification **on the consumer's machines**; the
+   done-when here is a **two-runner end-to-end** test, and that runs on this
+   workstation through `herd-hub/tests/real_herd/mod.rs`. Nothing about D161
+   stands in the way of building or proving it.
+2. **M11's own claim that the version-2 break was "paid once for both
+   halves"** is false. Version 2 went on the **record half alone**. The pack
+   half's frames are part of why `PROTOCOL_VERSION` moves to 3 (D199), and
+   anyone who sized the pack work believing the protocol cost was already
+   paid was reading a sentence that was never true.
+
+**Evidence.** Alexa, 2026-10-29, relayed by the orchestrator; ORCH-020; E-12,
+E-17; `docs/coverage.md`; `herd-hub/tests/real_herd/mod.rs`; D161, D199, D204.
+
+## 2026-10-29 — D206 M17 is outside v1.0.0, E-49 and E-50 unmet by choice
+
+**Context.** M17 is the second-machine work: a WSL2 runner on Windows. It is
+**prepared, not joined** — one shared token serves every requester and three
+tests are known unstable (D149). E-49 and E-50 are the two expectations it
+carries.
+
+**Choice, Alexa, 2026-10-29: outside v1.0.0.** M17 does not ship in the first
+stable release, and **E-49 and E-50 are declared unmet by choice** rather than
+left looking owed.
+
+**The cost, stated rather than discovered later.** Because D204 makes v1.0.0
+the stability promise, declaring M17 out means **the stability promise covers
+a platform the software has never run on**. That is the price of the decision
+and it is accepted with it: a Windows runner is not what v1.0.0 is promising,
+and saying so plainly is better than a promise nobody has tested. It is also
+the reason E-49 and E-50 are marked *unmet by choice* and not *unplaced* —
+`check-docs.sh` would accept either, and a reader must not have to guess which
+one it is.
+
+**Evidence.** Alexa, 2026-10-29, relayed by the orchestrator; D149; E-49,
+E-50; `docs/coverage.md`; ORCH-013, ORCH-014; D204.
+
+## 2026-10-29 — D207 E-41's scheduler keeps D106, the predicate moves out
+
+**Context.** E-41 wants jobs submitted when something changed — a ref moved.
+D106 settled that the hub never holds a repository and never runs git.
+`docs/plan.md`'s M14 says the opposite, and has since **2026-10-15**: it has
+the hub keeping a bare repository to decide when to submit. Two documents, one
+of them the plan, have contradicted each other on this for two weeks.
+
+**Choice, Alexa, 2026-10-29: D106 stands, and `plan.md` is the one that is
+wrong.** The predicate moves to the **requester's** side: `herdctl` decides
+that a ref moved and submits. **The hub never holds a repository and never
+runs git** — it accepts a job, matches it against declared capabilities and
+priority (invariant 6), and nothing about a scheduler changes that. A hub that
+clones a repository to decide when to build is the generic-CI surface
+invariant 1 refuses, and it would put a credential for someone else's
+repository inside the hub.
+
+**What this makes true of `plan.md`.** M14 is now wrong **on the record**, not
+merely stale, and it is one of four places where `plan.md` disagrees with the
+code in a way that changes what gets built. The others, each its own board
+row: M12's three-term placement order, where the shipped
+`matcher.rs:1201-1239` is max-preference-then-name with **no free-memory term
+at all**; M15d, whose only justification is empty; and the pack-collection
+collision, where `plan.md` has a build job write its pack to `{out}/packs/`
+while `herd-runner/src/outputs.rs:12-40` collects everything under `{out}`
+that is a regular file, with four exclusions and none of them a pack — so a
+400 MiB pack would stream runner → hub → requester as record evidence against
+the hub's 200 GB budget, which is the exact byte path D10 removed. That last
+one must be written down before any pack code is briefed.
+
+**Evidence.** Alexa, 2026-10-29, relayed by the orchestrator; D106; E-41;
+`docs/plan.md` M14 (2026-10-15); invariants 1 and 6; D10;
+`herd-runner/src/outputs.rs:12-40`; `herd-hub/src/matcher.rs:1201-1239`.
