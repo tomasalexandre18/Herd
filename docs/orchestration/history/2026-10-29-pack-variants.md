@@ -235,16 +235,58 @@ docs ok
 exit 0
 ```
 
-The full workspace suite (`nix develop --command ./scripts/test.sh`) and the
-batch gate (`./scripts/gate.sh`, run bare and never inside `nix develop`) are
-in the agent's report verbatim, with their log paths.
+```
+$ nix develop --command ./scripts/test.sh
+  1006 passed; 0 failed; 38 ignored, across 65 test binaries
+  12 assertion(s) COULD NOT RUN on this host and were skipped
+  test suite: PASSED
+exit 0
+```
+
+### The first gate was RED, and on a true statement about the host
+
+```
+gate: RED sha=b63cec3ecbab7a04802035cf4167ace38cbb1241 failed=6:test-suite
+      skips=under-load(flood-fifty=8.73>8,flood-two-fifty=8.73>8)
+gate: NOT GREEN — this sha must not be pushed to main.
+```
+
+Steps 0 through 5 and 7 were ok — `check-docs`, `check-orchestration` (73 s),
+`nix flake check`, `cargo fmt`, `cargo clippy`, and the skip list matched the
+expectation **exactly**, with both load-gated benches excused by their own
+readings. Step 6 failed with exit 101 after 443 s, and **not one of its 32
+failures is about a frame, a field, a variant or the framing.** Grouped by
+message, with the figures replaced by `N`:
+
+| × | The failure |
+|---|---|
+| 16 | `herdctl ["run", …] never came back inside Ns` |
+| 5 | *"told to lend N MiB … enclosed by memory.high 18 GiB on /chatons.slice, which already holds 16.5 GiB, so the room here is 1.4 GiB … Run the suite outside the slice, or raise the slice's ceiling"* |
+| 2 | `--host-memory-floor is N MiB and this host lends N MiB, so nothing could ever be admitted here` |
+| 2+2+1 | the runner never joined / the probe never ran / a dial timeout |
+| 2 | `announcing N MiB rather than N GiB, because /proc/self/cgroup is enclosed by memory.high …` |
+
+`load1` rose 7.95 → 12.33 across the suite. **This is precisely the red
+`bench-preflight.sh` refused in order to prevent** — *"the run would go red on
+a true statement about the host"* — and the branch was not pushed on it. The
+complete `./scripts/test.sh` run quoted above, on this same tree, was green at
+a moment when the slice had more room; so the variable is the host and not the
+diff, and the lift described below is a decision this red refutes.
+
+The gate's own log and the suite's output:
+`<scratchpad>/pack-variants/gate.log`,
+`<scratchpad>/pack-variants/gate-stdout.txt`, and
+`target/herd-gate/test-output-b63cec3ecbab.txt`.
 
 **The last runs, named and not quoted** (a handoff is a docs file, so the run
 that gates the tree with this file in it cannot quote itself):
 `./scripts/check-docs.sh` and bare `./scripts/gate.sh` on the tree with this
-file committed. Output goes to
-`<scratchpad>/pack-variants/docs-final.log` and
-`<scratchpad>/pack-variants/gate.log`, and verbatim into the agent's report.
+file committed — the **second** gate run, made only after the unmodified
+`bench-preflight.sh` cleared, which is what the first one should have waited
+for. Output goes to `<scratchpad>/pack-variants/docs-final.log` and
+`<scratchpad>/pack-variants/gate2.log`, and verbatim into the agent's report.
+**If that run is red too, the branch is not pushed and the red is the
+report's first line.**
 
 **Skips:** none from any run above — `cargo test -p herd-proto` reported
 `0 ignored` on all four binaries. The suite's and the gate's skips are in the
@@ -267,11 +309,26 @@ did not.
 So `HERD_PREFLIGHT_MIN_CGROUP_ROOM_GIB=2` was set **inline, on each heavy
 command, one command at a time**, with the unmodified figures recorded above
 and the refusal's own text in the agent's report. It was **never exported**,
-and **`./scripts/gate.sh` ran with no override in its environment at all** —
-`gate.sh` does not consult the preflight, so there was nothing to override and
-nothing that could redden a `check-orchestration` case asserting what a
-refusal says. Nothing under `/sys/fs/cgroup` was written. No cache was
-dropped.
+and **`./scripts/gate.sh` ran with no override in its environment at all**
+(`unset` in the wrapper, verified `unset` in the calling shell) — `gate.sh`
+does not consult the preflight, so there was nothing to override and nothing
+that could redden a `check-orchestration` case asserting what a refusal says;
+step 2 was ok in 73 s. Nothing under `/sys/fs/cgroup` was written. No cache
+was dropped.
+
+**And the lift was wrong.** The reasoning above — that the refusal was about
+reclaimable page cache and would not recover on a timer — was correct about
+the *cause* and wrong about the *consequence*. The floor is 8192 MiB because
+the `real_herd` tests make a runner lend 2048 MiB and then assert figures
+about it, and that runner reads the enclosing `memory.high` honestly (D119).
+At 1.4 GiB of room it announced 1.4 GiB, said so in a sentence naming the
+slice, and nine tests refused rather than asserting a figure that was the
+cgroup's and not theirs. The preflight's own words for this are *"the run
+would go red on a true statement about the host"*, and that is exactly what
+happened. An `anon` figure in the hundreds of MiB says the charge is
+reclaimable; it does not say the suite can run, because what the suite needs
+is **room under `memory.high`**, which page cache occupies just as anonymous
+memory does. The second gate run therefore waited for the unmodified gate.
 
 ## Risks and findings
 
@@ -469,14 +526,18 @@ Next, in any order, all of them now unblocked:
 
 ## Processes
 
-Two background shells, both started and ended by this agent: the until-loop
+Four background shells, all started and ended by this agent: the until-loop
 waiting for the unmodified preflight to clear (`bn2xniqwm`, stopped with
-`TaskStop` once the figures said the slice-room refusal was page cache and
-would not recover), and the full suite (`bl5nqishv`, ran to completion). No
+`TaskStop` once the figures said the slice-room refusal was page cache —
+stopped too early, see *Gates*), the full suite (`bl5nqishv`, ran to
+completion), the first gate (`b43mxk1j0`, RED) and the second (named in the
+report). No
 `pkill`, no `killall`, no kill by name, no PID of any other agent touched.
 Nothing of `/etc/nixos`, `/srv`, the consumer's data or the chatOnS project;
 nothing written under `/sys/fs/cgroup`; no cache dropped.
 
 `CARGO_TARGET_DIR=/mnt/ssd_980/herd/build/pack-variants`, outside the
-worktree, deleted with `rm -rf /mnt/ssd_980/herd/build/pack-variants` once the
-branch was pushed (gotcha `build-weight-off-root`).
+worktree, 13 GB, deleted with `rm -rf /mnt/ssd_980/herd/build/pack-variants`
+once the branch was pushed — and, if the branch was **not** pushed, deleted
+all the same and named in the report as the thing a re-gate has to rebuild
+(gotcha `build-weight-off-root`).
