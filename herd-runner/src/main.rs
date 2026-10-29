@@ -93,18 +93,22 @@ struct Args {
     /// How much declared output one job may have carried into its record:
     /// everything it leaves under `{out}`, with its relative paths.
     ///
-    /// 32 MiB by default, which is also the most this can be — the figure is
-    /// what fits one control frame and decodes inside the cadence a quiet
-    /// link lives by, so the flag only ever lowers it. A higher value is
-    /// refused at startup with both figures rather than producing a frame
-    /// nobody can read.
+    /// 1 GiB by default, and the flag **raises** it as well as lowers it.
+    /// Output too large for one control frame is streamed rather than inlined
+    /// (`herd_proto::INLINE_OUTPUT_MAX`, 32 MiB), so there is no longer a
+    /// frame-shaped ceiling for this figure to be.
+    ///
+    /// What bounds it instead is `--job-disk-budget`: a job writes `{out}`
+    /// inside its workspace, and the workspace stops at that budget first, so
+    /// a cap above it could never bind. Such a cap is **clamped** to the
+    /// budget at startup, with both figures printed, rather than refused — an
+    /// unreachable cap says more than it can do, which is no reason for a
+    /// working runner to stop starting.
     ///
     /// Over the cap **no file comes back** and the job's record says so with
     /// both figures: a cap on an output is not a truncation of it, and a
-    /// cut-down results file that still parses reads like the truth. Output
-    /// of a few hundred megabytes is over this on purpose and belongs on the
-    /// direct runner-to-runner transfer (M11), never relayed through the hub.
-    /// `0` returns a verdict and nothing else.
+    /// cut-down results file that still parses reads like the truth. `0`
+    /// returns a verdict and nothing else.
     #[arg(long, env = "HERD_JOB_OUTPUT_CAP", value_name = "SIZE")]
     job_output_cap: Option<String>,
     /// How much one job's workspace may hold before the runner stops it.

@@ -33,12 +33,27 @@
 # reads the room in the cgroup this script is *actually* standing in.
 #
 # It follows herd-runner/src/room.rs step for step — the same walk, the same
-# choice of knob, the same reading of an unreadable memory.current — because
-# two readings of one figure that disagree would be worse than one that is
-# absent. Where nothing encloses this process there is nothing to read: the
-# check says the reading was unavailable and clears. An unmeasured thing is
-# reported as unmeasured, never as a refusal; refusing on an unreadable file
-# would stop every build on every machine with no slice.
+# choice of knob, the same subtraction of reclaimable page cache, the same
+# reading of an unreadable memory.current — because two readings of one figure
+# that disagree would be worse than one that is absent. Where nothing encloses
+# this process there is nothing to read: the check says the reading was
+# unavailable and clears. An unmeasured thing is reported as unmeasured, never
+# as a refusal; refusing on an unreadable file would stop every build on every
+# machine with no slice.
+#
+# The subtraction was added on 2026-10-29 with room.rs's own: memory.current
+# counts reclaimable page cache, so this check read 3224 MiB of room at 22:17
+# that evening on an idle host whose MemAvailable said 22.3 GiB, and would
+# have refused every heavy phase on it at the floor of 8 GiB below.
+# inactive_file less shmem comes off the charge; active_file does not. Both
+# readings moved together, as the paragraph above requires.
+#
+# What it is worth moves by the hour. Measured with this script, old reading
+# then new: 9548 then 12107 MiB at 22:35, when only 2.5 of the host's 7.8 GiB
+# of cache was inactive; 3054 then 10181 MiB at 22:44, the two scripts run
+# back to back on an idle host whose MemAvailable said 23.1 GiB — where the
+# old arithmetic refused the phase at the 8 GiB floor and the new one cleared
+# it. Quote the range, not one of the three.
 #
 # It reads the host and exits non-zero with one sentence saying what to do.
 # It changes nothing, starts nothing and needs no toolchain.
@@ -162,14 +177,21 @@ avail_kib_of() { df -k --output=avail -- "$1" 2>/dev/null | awk 'NR==2 {print $1
 
 # --- Reading the cgroup, the way herd-runner/src/room.rs reads it ----------
 #
-# The three functions below are that module's `own_cgroup`, `limit_in` and
-# `enclosing` in shell, and nothing here is a second opinion: the knob is the
-# lower of memory.max and memory.high, because they fail differently but say
-# the same thing about how much memory can be held here; the tightest ceiling
-# anywhere up the chain wins, because a bound three levels up still binds;
-# memory.current is subtracted once; and a cgroup whose ceiling reads while
-# its memory.current does not is read as fully charged, erring towards less
-# room, which is the only direction invariant 2 allows.
+# The four functions below are that module's `own_cgroup`, `limit_in`,
+# `reclaimable_in` and `enclosing` in shell, and nothing here is a second
+# opinion: the knob is the lower of memory.max and memory.high, because they
+# fail differently but say the same thing about how much memory can be held
+# here; the tightest ceiling anywhere up the chain wins, because a bound three
+# levels up still binds; the charge is subtracted once, less the reclaimable
+# page cache inside it, because memory.current counts cache the kernel drops
+# on demand and holding a warm cache against the room announced almost
+# nothing on an idle machine; the reclaimable figure is inactive_file less
+# shmem — active_file may be in use and shmem is swap-backed rather than
+# droppable, so neither is given back, which makes the result a floor on the
+# room rather than an estimate of it; and a cgroup whose ceiling reads while
+# its memory.current does not is read as fully charged with nothing reclaimed
+# against that assumption, erring towards less room, which is the only
+# direction invariant 2 allows.
 
 # This process's cgroup, out of the `0::` line and no other: a host still
 # showing cgroup v1 controllers writes one line per hierarchy and none of
@@ -199,13 +221,33 @@ numeric_in() {
   printf '%s\n' "$text"
 }
 
+# The reclaimable page cache one cgroup holds, in bytes, out of its
+# memory.stat: inactive_file less shmem, and 0 for anything that will not
+# read. room.rs's `reclaimable_in`, field for field. A missing field reads as
+# 0, which charges this host for cache it may not be holding — the safe
+# direction, and the figure this check used before the subtraction existed.
+reclaimable_in() {
+  local file=$1 inactive=0 shmem=0 name value
+  [ -r "$file" ] || { printf '0\n'; return 0; }
+  while read -r name value; do
+    case "$name" in
+      inactive_file) inactive=$value ;;
+      shmem) shmem=$value ;;
+      *) continue ;;
+    esac
+  done < "$file"
+  case "$inactive$shmem" in *[!0-9]*) printf '0\n'; return 0 ;; esac
+  printf '%s\n' "$(( inactive > shmem ? inactive - shmem : 0 ))"
+}
+
 # The tightest ceiling on the way from the root of $CGROUP_MOUNT down to
-# <cgroup>, as `<ceiling bytes> <charged bytes> <knob> <cgroup>`. Non-zero,
-# and nothing printed, when no level up the chain carries one — which is the
-# bare machine, and must cost nothing there.
+# <cgroup>, as `<ceiling bytes> <charged bytes> <reclaimable bytes> <knob>
+# <cgroup>`. Non-zero, and nothing printed, when no level up the chain carries
+# one — which is the bare machine, and must cost nothing there.
 cgroup_enclosure() {
   local rest=${1#/} part path dir level=0 knob value low lowknob
-  local best_ceiling="" best_charged="" best_knob="" best_cgroup=""
+  local best_ceiling="" best_charged="" best_reclaimable="" best_knob=""
+  local best_cgroup=""
   local -a names=()
   while [ -n "$rest" ]; do
     part=${rest%%/*}
@@ -228,12 +270,19 @@ cgroup_enclosure() {
     done
     if [ -n "$low" ] && { [ -z "$best_ceiling" ] || [ "$low" -lt "$best_ceiling" ]; }; then
       best_ceiling=$low; best_knob=$lowknob; best_cgroup=${path:-/}
-      best_charged=$(numeric_in "$dir/memory.current") || best_charged=$low
+      if best_charged=$(numeric_in "$dir/memory.current"); then
+        best_reclaimable=$(reclaimable_in "$dir/memory.stat")
+      else
+        # Fully charged, and nothing given back against an assumption: see
+        # the paragraph above and room.rs's `ceiling_at`.
+        best_charged=$low; best_reclaimable=0
+      fi
     fi
     level=$((level + 1))
   done
   [ -n "$best_ceiling" ] || return 1
-  printf '%s %s %s %s\n' "$best_ceiling" "$best_charged" "$best_knob" "$best_cgroup"
+  printf '%s %s %s %s %s\n' "$best_ceiling" "$best_charged" "$best_reclaimable" \
+    "$best_knob" "$best_cgroup"
 }
 
 # --- 1. Room on the filesystem that will hold target/ ----------------------
@@ -321,10 +370,14 @@ elif ! enclosure=$(cgroup_enclosure "$own"); then
   say "slice room:  nothing from $own up to the root of $CGROUP_MOUNT carries \
 a memory.high or a memory.max, reading unavailable"
 else
-  read -r ceiling_bytes charged_bytes knob enclosing_cgroup <<<"$enclosure"
-  room_mib=$(( (ceiling_bytes > charged_bytes ? ceiling_bytes - charged_bytes : 0) / 1048576 ))
+  read -r ceiling_bytes charged_bytes reclaimable_bytes knob enclosing_cgroup \
+    <<<"$enclosure"
+  held_bytes=$(( charged_bytes > reclaimable_bytes ? charged_bytes - reclaimable_bytes : 0 ))
+  room_mib=$(( (ceiling_bytes > held_bytes ? ceiling_bytes - held_bytes : 0) / 1048576 ))
   say "slice room:  ${room_mib} MiB under $knob on $enclosing_cgroup, floor \
 ${cgroup_floor_mib} MiB (${MIN_CGROUP_ROOM_GIB} GiB)"
+  say "             charge $((charged_bytes / 1048576)) MiB, of which \
+$((reclaimable_bytes / 1048576)) MiB is reclaimable page cache and not held"
   if [ "$room_mib" -lt "$cgroup_floor_mib" ]; then
     refuse "only ${room_mib} MiB of memory left under $knob on \
 $enclosing_cgroup, floor is ${cgroup_floor_mib} MiB: a runner started here \
