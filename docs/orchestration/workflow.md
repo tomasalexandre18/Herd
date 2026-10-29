@@ -363,9 +363,7 @@ thing a second machine would ever have said about its own landing.
 `scripts/githooks/pre-push`, the only mechanism standing in front of
 `main` — never force-push, never a red landing, never `--admin`. One
 integration at a time: a batch **is** one integration, larger. A tag
-and a release **no longer wait on Alexa's word** (2026-10-29, *"pour le
-tag on sens fou tout vas etre reset"*); CLAUDE.md's *Direction, and what
-reaches Alexa* supersedes the sentence that reserved them. The orchestrator
+and a release stay Alexa's word, one act at a time. The orchestrator
 still never merges or pushes, and that one is **contractual**:
 `orchestrator-guard.sh` denies `git merge` to the main session but was
 probed on 2026-10-28 and lets `git -C <dir> merge` and
@@ -579,11 +577,9 @@ was lost.
 
 ## Permissions and escalation
 
-- Alexa decides: milestone order, invariants, GitHub issues, anything on
-  the consumer's side; **a tag and a release are no longer his word**
-  (2026-10-29) — CLAUDE.md's *Direction, and what reaches Alexa* carries
-  the test and supersedes the sentence that reserved each act singly.
-  The merge is `herd-merger`'s — Alexa's standing authorisation of
+- Alexa decides: milestone order, invariants, pushing a tag, publishing a
+  release (each act singly), GitHub issues, anything on the consumer's
+  side. The merge is `herd-merger`'s — Alexa's standing authorisation of
   2026-10-24, verbatim *"non il peux merge par defaut"* (ORCH-001),
   re-granted 2026-10-28 on the condition that replaced the old one: a
   green `./scripts/gate.sh` for the **gated** sha — the merge's second
