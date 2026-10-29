@@ -18,7 +18,7 @@ than that. They are evidence, not prose.
 | file | what it is |
 |---|---|
 | `local.txt` | the list this workstation skips at rest. Produced by `./scripts/gate.sh --bless` from a run whose last line was `test suite: PASSED`; the header records the host and the load1 it measured on. |
-| `local-under-load.txt` | the skips additionally allowed when load1 is above `HERD_GATE_LOAD_NOTE` (8). The two flood benches skip themselves above that load, so under load the list grows by exactly those two and the gate stays green without ever reading a count. |
+| `local-under-load.txt` | the **two names** a flood bench's own refusal can excuse, and nothing else. The gate does not apply this file because the host looks busy: it applies it **per skip**, when a skip's name is on this list *and* that skip's own reason names this bench's load ceiling with a figure above both that ceiling and `HERD_GATE_LOAD_NOTE` (8). A name on this list that skipped for any other reason, or claimed load with a figure under the ceiling, is **red** — a defect in the bench, and the gate is where it shows. |
 | `ci.txt` | what `ubuntu-latest` skipped on green run 40564336703, for comparison. The gate does not read it on this host; `HERD_GATE_EXPECTED` can point at it on a host shaped like that one. |
 
 The gate compares the assertion **name** of each line: the text between
