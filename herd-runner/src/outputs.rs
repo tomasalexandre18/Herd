@@ -36,6 +36,23 @@
 //! A hard link is a regular file and is collected; two names for one inode
 //! come back as two files, which is what the directory says they are.
 //!
+//! ## And a fifth thing that is **not** an exclusion (ORCH-153)
+//!
+//! A job may declare that it *leaves* an artefact — `leaves = { pack =
+//! "packs" }`, a pack of a few hundred MiB for a later job of the same commit
+//! (M11). That path is **not in the list above and must never join it**: it
+//! is taken into the runner's pack store and removed from `{out}` before the
+//! walk below reads the directory ([`crate::packstore::leave_packs`]), so
+//! there is nothing there to exclude.
+//!
+//! The difference matters because of what the failure looks like. A fifth
+//! exclusion is a rule a later edit can quietly drop, and what it would drop
+//! is 400 MiB of pack collected as the job's output evidence and streamed
+//! runner → hub → requester as if it were a result — with the record half
+//! doing exactly its job, no error anywhere, and very likely the whole
+//! collection refused over the output cap so that `results.json` does not
+//! come back either. An absence cannot be dropped by an edit to a list.
+//!
 //! ## What a job killed mid-write leaves behind
 //!
 //! A half-written `results.json`, and it is collected as it stands. That is
@@ -79,6 +96,7 @@
 //! file still being written by a background child of a job the runner is
 //! killing has not.
 
+use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -112,6 +130,14 @@ pub(crate) struct Collected {
     /// all — in each of those cases the verdict is the whole of the delivery
     /// and there is nothing for a spool to hold.
     pub spool: Option<PathBuf>,
+    /// The packs this job declared it leaves, now in this runner's pack
+    /// store and **gone from `{out}`** (ORCH-153).
+    ///
+    /// Handed back rather than acted on here: registering a pack with the hub
+    /// is a frame, and the frame belongs to the step that owns the runner's
+    /// connection loop. Empty for every job that declares no `leaves`, which
+    /// is every job today.
+    pub packs: Vec<crate::packstore::LeftPack>,
 }
 
 impl Collected {
@@ -119,12 +145,20 @@ impl Collected {
         Self {
             outputs,
             spool: None,
+            packs: Vec::new(),
         }
     }
 
     /// Nothing collected and nothing to collect: an abandoned attempt.
     pub(crate) fn nothing() -> Self {
         Self::verdict_only(JobOutputs::default())
+    }
+
+    /// The same collection with the packs that left `{out}` before it was
+    /// walked.
+    fn with(mut self, packs: Vec<crate::packstore::LeftPack>) -> Self {
+        self.packs = packs;
+        self
     }
 }
 
@@ -155,13 +189,56 @@ pub(crate) const SPOOL_DIR: &str = "outputs";
 /// verdict. It must be on the same filesystem as `out_dir` — both are under
 /// the runner's data root — because the move is a **rename**: see
 /// [`spool_into`].
-pub(crate) fn collect(out_dir: &Path, root: &Path, cap: u64, spool_at: &Path) -> Collected {
+pub(crate) fn collect(
+    out_dir: &Path,
+    root: &Path,
+    cap: u64,
+    spool_at: &Path,
+    leaves: &BTreeMap<String, String>,
+) -> Collected {
+    // **ORCH-153, and it is one line here on purpose.** Every pack this job
+    // declared is taken into the runner's store and removed from `{out}`
+    // *before* anything below reads that directory, so the collection cannot
+    // see it: not excluded from the walk by a fifth rule beside the four in
+    // this module's own doc, but gone. An exclusion list is a thing a later
+    // edit silently breaks, and what it would break is a ~400 MiB pack being
+    // collected as the job's output evidence and streamed runner → hub →
+    // requester as if it were a result. An absence cannot break that way.
+    //
+    // This is the whole of the ordering guarantee and there is exactly one
+    // place to get it wrong: [`collect_record`] below has no other caller and
+    // takes `{out}` only after this has returned.
+    let (packs, said) = crate::packstore::leave_packs(out_dir, root, leaves);
+    collect_record(out_dir, root, cap, spool_at, said).with(packs)
+}
+
+/// The record half, unchanged: what is under `{out}` once the packs are out
+/// of it.
+///
+/// `said` is what the extraction above has to report — a declared artefact
+/// that was not there, one that is not a pack, one that could not be kept —
+/// and it rides [`JobOutputs::skipped`] beside the walk's own lines, because
+/// a declared artefact Herd did not keep is a fact about the job and not a
+/// silence (D23).
+fn collect_record(
+    out_dir: &Path,
+    root: &Path,
+    cap: u64,
+    spool_at: &Path,
+    mut said: Vec<String>,
+) -> Collected {
     if !out_dir.exists() {
         // An ad-hoc job: no declared command, so no `{out}` was ever made.
-        // Nothing to say, and nothing on the wire.
-        return Collected::verdict_only(JobOutputs::default());
+        // Nothing to say but whatever the declaration already owed.
+        said.sort();
+        return Collected::verdict_only(JobOutputs {
+            skipped: said,
+            ..JobOutputs::default()
+        });
     }
     let (found, mut skipped) = walk(out_dir, root);
+    skipped.extend(said);
+    skipped.sort();
     if cap == 0 {
         if found.is_empty() && skipped.is_empty() {
             return Collected::verdict_only(JobOutputs::default());
@@ -237,6 +314,9 @@ pub(crate) fn collect(out_dir: &Path, root: &Path, cap: u64, spool_at: &Path) ->
                 streamed: true,
             },
             spool: Some(spool_at.to_path_buf()),
+            // Filled by `collect` above, which is the only caller and the
+            // only place the packs exist.
+            packs: Vec::new(),
         },
         // The bytes could not be put somewhere that outlives the workspace,
         // so they are about to be destroyed by the reclaim and there is no
@@ -279,7 +359,11 @@ fn inline(found: Vec<Found>, mut skipped: Vec<String>) -> JobOutputs {
 /// from `stat` and a digest taken from a read are two statements about a file
 /// that may have changed in between, and the manifest has to carry two that
 /// agree.
-fn hash_file(path: &Path) -> std::io::Result<(u64, String)> {
+///
+/// `pub(crate)` for [`crate::packstore`]: a pack store hashes every object as
+/// it places it, and two spellings of "read this file once and hash it" is
+/// how two parts of one runner come to disagree about a digest.
+pub(crate) fn hash_file(path: &Path) -> std::io::Result<(u64, String)> {
     use std::io::Read;
 
     let mut file = fs::File::open(path)?;
@@ -505,7 +589,14 @@ mod tests {
         /// The whole result, spool and all, for the tests that are about the
         /// carriage rather than about what was walked.
         fn collected(&self, cap: u64) -> Collected {
-            collect(&self.out(), &self.root(), cap, &self.spool())
+            self.leaving(cap, &BTreeMap::new())
+        }
+
+        /// The whole result for a job that declared it **leaves** something:
+        /// the `leaves` map as the requester wrote it, key → path under
+        /// `{out}`.
+        fn leaving(&self, cap: u64, leaves: &BTreeMap<String, String>) -> Collected {
+            collect(&self.out(), &self.root(), cap, &self.spool(), leaves)
         }
 
         fn spool(&self) -> PathBuf {
@@ -841,6 +932,211 @@ mod tests {
         assert!(
             !not_spooled(2_000, 1, &error).contains("2 kB"),
             "nor at any other size that divides by a thousand"
+        );
+    }
+
+    // --------------------------------------- the pack leaves {out} (ORCH-153)
+
+    /// A pack directory in the first consumer's own three-part shape, under
+    /// `{out}` at `relative`, with a `kind d` row and a `kind l` row.
+    ///
+    /// Returns the manifest's bytes — the pack's identity — and the number of
+    /// bytes of objects in it, which is what the record would have carried
+    /// had the pack stayed where it was.
+    fn write_a_pack(out: &Out, relative: &str, objects: &[&[u8]]) -> (Vec<u8>, u64) {
+        let at = out.out().join(relative);
+        fs::create_dir_all(at.join("objects")).expect("a pack directory");
+        let mut text = format!("{}\n# profile debug\n", herd_proto::CHATONS_PACK_FORMAT);
+        let mut bytes = 0u64;
+        for (number, content) in objects.iter().enumerate() {
+            let sha = herd_proto::sha256_hex(content);
+            text.push_str(&format!(
+                "{sha}\t{}\t0644\tf\tartefact\tbin/tool-{number}\n",
+                content.len()
+            ));
+            fs::write(at.join("objects").join(&sha), content).expect("an object");
+            bytes += content.len() as u64;
+        }
+        // The two rows that are not files: a completeness check over every
+        // sha256 would call this good pack incomplete, which is why the
+        // fixture has them.
+        text.push_str(&format!("{}\t0\t0755\td\tartefact\tbin\n", "2".repeat(64)));
+        text.push_str(&format!(
+            "{}\t0\t0777\tl\tartefact\tbin/tool-latest\tbin/tool-0\n",
+            "3".repeat(64)
+        ));
+        let manifest = text.into_bytes();
+        fs::write(at.join("manifest.tsv"), &manifest).expect("a manifest");
+        fs::write(at.join("pack.meta"), b"commit = deadbeef\n").expect("a meta");
+        (manifest, bytes)
+    }
+
+    /// **The test this branch is for.** A job that declares it leaves a pack
+    /// has no pack path anywhere on its record, and the record's byte figure
+    /// is the record's own files and not the pack's.
+    ///
+    /// Red in four separate ways if [`collect`]'s one call to
+    /// [`crate::packstore::leave_packs`] is removed: a `packs/…` path appears
+    /// on the manifest, the collection's weight carries the pack's bytes, the
+    /// whole collection is refused over the cap — so `results.json` does not
+    /// come back at all — and `{out}/packs` is still on the disk when the
+    /// workspace is about to be reclaimed. The failure it guards against is
+    /// silent and expensive: ~400 MiB of pack streamed runner → hub →
+    /// requester as if it were a result.
+    #[test]
+    fn the_declared_pack_is_gone_from_out_before_the_record_walk() {
+        let out = Out::new("outputs-pack-gone");
+        out.write("results.json", br#"{"ok":true}"#);
+        let first = vec![b'a'; 256 << 10];
+        let second = vec![b'b'; 128 << 10];
+        let (manifest, pack_bytes) = write_a_pack(&out, "packs", &[&first, &second]);
+        // A cap between the record's own bytes and the pack's: with the pack
+        // in the walk this collection is refused whole, which is the
+        // expensive half of the failure.
+        let cap = 64 << 10;
+        let leaves = BTreeMap::from([("pack".to_owned(), "packs".to_owned())]);
+
+        let collected = out.leaving(cap, &leaves);
+        assert_eq!(
+            collected.outputs.refused, None,
+            "the record is the job's own files, and they are well under the cap: {:?}",
+            collected.outputs
+        );
+        assert_eq!(
+            collected
+                .outputs
+                .files
+                .iter()
+                .map(|file| file.path.as_str())
+                .collect::<Vec<_>>(),
+            ["results.json"],
+            "no path of the pack is on the record's manifest"
+        );
+        assert!(
+            !collected
+                .outputs
+                .files
+                .iter()
+                .any(|file| file.path.starts_with("packs")),
+            "and said the other way round, by name, because this is the assertion a later \
+             edit would break"
+        );
+        let weight: u64 = collected
+            .outputs
+            .files
+            .iter()
+            .map(|file| file.bytes().len() as u64 + file.path.len() as u64 + PER_FILE_OVERHEAD)
+            .sum();
+        assert!(
+            weight < pack_bytes,
+            "the collection's byte figure excludes the pack's {pack_bytes}: {weight}"
+        );
+        assert!(
+            !out.out().join("packs").exists(),
+            "and the pack is gone from {{out}} — not excluded from the walk, gone, which is \
+             the difference a later edit cannot undo by editing a list"
+        );
+
+        // Where it went: the store, under the data root, whole.
+        let pack = collected.packs.first().expect("one pack was taken out");
+        assert_eq!(pack.key, "pack");
+        assert_eq!(pack.at, "packs");
+        assert_eq!(
+            pack.held.manifest.id(),
+            &herd_proto::PackId::of_manifest_bytes(&manifest),
+            "the id is the sha256 of the manifest's own bytes"
+        );
+        assert_eq!(pack.held.objects, 2);
+        assert_eq!(pack.held.objects_added, 2);
+        assert_eq!(
+            pack.held.bytes_copied, 0,
+            "{{out}} and the store are under one data root, so no byte was copied"
+        );
+        let store = crate::packstore::PackStore::open(&out.root()).expect("the store");
+        assert!(
+            store
+                .holds_whole(&pack.held.manifest)
+                .expect("the question is answerable"),
+            "and the store holds the whole of it"
+        );
+    }
+
+    /// A declared artefact the job did not leave is **named**, never a
+    /// silence (D23), and the record is otherwise exactly what it was.
+    #[test]
+    fn a_declared_pack_that_was_never_left_is_named_in_the_record() {
+        let out = Out::new("outputs-pack-absent");
+        out.write("results.json", br#"{"ok":true}"#);
+        let leaves = BTreeMap::from([("pack".to_owned(), "packs".to_owned())]);
+        let collected = out.leaving(1 << 20, &leaves).outputs;
+        assert_eq!(
+            collected
+                .files
+                .iter()
+                .map(|file| file.path.as_str())
+                .collect::<Vec<_>>(),
+            ["results.json"]
+        );
+        let said = collected.skipped.join(" | ");
+        assert!(
+            said.contains("\"pack\"") && said.contains("left nothing there"),
+            "a declared artefact that is not there is a fact about the job: {said}"
+        );
+    }
+
+    /// A declared path that is not a pack at all is not collected as the
+    /// job's output either, and the loss is said with its figures.
+    ///
+    /// The alternative — leaving it where it is — is what the pack's own
+    /// bytes would then do to the record: one unreadable pack would put the
+    /// whole collection over the cap and `results.json` would not come back.
+    #[test]
+    fn a_declared_path_that_is_not_a_pack_is_still_not_collected_as_output() {
+        let out = Out::new("outputs-pack-not-a-pack");
+        out.write("results.json", br#"{"ok":true}"#);
+        out.write("packs/some/tree/file.txt", &vec![b'x'; 4096]);
+        let leaves = BTreeMap::from([("pack".to_owned(), "packs".to_owned())]);
+        let collected = out.leaving(1 << 20, &leaves).outputs;
+        assert_eq!(
+            collected
+                .files
+                .iter()
+                .map(|file| file.path.as_str())
+                .collect::<Vec<_>>(),
+            ["results.json"],
+            "a declared artefact is never the record's business, readable or not"
+        );
+        let said = collected.skipped.join(" | ");
+        assert!(
+            said.contains("manifest.tsv") && said.contains("4096 bytes"),
+            "the refusal says what was wrong with it and what was lost: {said}"
+        );
+        assert!(!out.out().join("packs").exists());
+    }
+
+    /// A job that declares nothing is collected exactly as it always was,
+    /// and **no pack store is created** on the machine for it.
+    ///
+    /// The whole record half's behaviour is unchanged for every job Herd runs
+    /// today, which is every job: `leaves` is empty, so nothing above runs.
+    #[test]
+    fn a_job_that_declares_nothing_is_collected_as_it_always_was_and_makes_no_store() {
+        let out = Out::new("outputs-pack-none");
+        out.write("files/results.json", br#"{"ok":true}"#);
+        let collected = out.collected(1 << 20);
+        assert_eq!(
+            collected
+                .outputs
+                .files
+                .iter()
+                .map(|file| file.path.as_str())
+                .collect::<Vec<_>>(),
+            ["files/results.json"]
+        );
+        assert!(collected.packs.is_empty());
+        assert!(
+            !out.root().join(crate::packstore::PACKS_DIR).exists(),
+            "a runner that has never been given a pack has no pack store directory"
         );
     }
 }
