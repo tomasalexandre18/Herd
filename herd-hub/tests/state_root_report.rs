@@ -17,9 +17,10 @@
 //!    on its own it would only prove the report agrees with the test. The
 //!    last test drives the store's own writer and reports on what *it* left.
 //! 4. **That it names the jobs behind figure 3 and not only their sum**
-//!    (ORCH-166) — the middle state a defect leaves, the bound on how many
-//!    it names, that a sound root prints no empty list, and that each of
-//!    those runs leaves the root byte-identical too.
+//!    (ORCH-166) — the middle state a defect leaves; that the ten it names
+//!    out of a longer pile are the ten **largest** and not the ten lowest
+//!    ids; the tie-break under that; that a sound root prints no empty
+//!    list; and that each of those runs leaves the root byte-identical too.
 
 use std::fs;
 use std::path::Path;
@@ -401,33 +402,61 @@ fn a_job_claiming_more_than_its_files_holds_is_named_with_both_figures() {
     assert_eq!(listing(root), before, "the report writes nothing");
 }
 
-/// The bound holds: `NAMED_AT_MOST` jobs named, the rest counted.
+/// The bound holds — `NAMED_AT_MOST` named, the rest counted — and the ten
+/// that fit are the ten **largest**, not the ten lowest ids.
 ///
-/// The same rule the unread and conflict lists already follow, and the
-/// reason there is no flag to widen it: a list exists to be acted on, and
-/// one naming every job is a number, which the count already is.
+/// Those two are one test on purpose. The bound alone is the rule the unread
+/// and conflict lists already follow, and the reason there is no flag to
+/// widen it: a list exists to be acted on, and one naming every job is a
+/// number, which the count already is. But a *truncated* list in job order
+/// would name an arbitrary ten and leave the operator re-sorting by hand,
+/// which is the shell loop this list exists to stop. So the fixture here
+/// gives every job a different shortfall, **ascending with its id**: under
+/// the old job order the three left out would have been the three worst, and
+/// this test would fail.
 #[test]
-fn the_shortfall_list_names_the_first_ten_and_counts_the_rest() {
+fn the_shortfall_list_names_the_ten_largest_and_counts_the_rest() {
     let dir = tempfile::tempdir().expect("a temporary directory");
     let root = dir.path();
 
-    // One digest, one claimed length: thirteen jobs in the middle state and
-    // not one digest conflict, so only the bound is under test.
-    let aa = digest("aa");
-    for n in 1..=13 {
+    // Thirteen jobs in the middle state. Each claims 1000 * n and holds one
+    // byte, so job n is short by 1000 * n - 1 and the shortfalls rise with
+    // the id. A digest of its own per job, because one digest given two
+    // claimed lengths is a conflict and this test is not about those.
+    for n in 1..=13u64 {
         let name = format!("j{n:0>10}");
         job_dir(
             root,
             &name,
-            Some(claiming(&name, 1_000, &aa)),
-            &[("a.bin", b"one")],
+            Some(claiming(&name, 1_000 * n, &digest(&format!("{n:02}")))),
+            &[("a.bin", b"x")],
         );
     }
 
     let before = listing(root);
     let mut report = StateRootReport::read(root).expect("the report reads this root");
-    assert_eq!(report.accounting.claiming_more_than_held.len(), 13);
+    let held = &report.accounting.claiming_more_than_held;
+    assert_eq!(held.len(), 13);
     assert!(report.conflicts.is_empty());
+
+    // The value is ordered, not just the text: largest first, and every
+    // shortfall is the subtraction it claims to be.
+    for (index, short) in held.iter().enumerate() {
+        let nth = 13 - index as u64;
+        assert_eq!(
+            short.job,
+            format!("j{nth:0>10}"),
+            "position {index} of the list"
+        );
+        assert_eq!(short.claimed, 1_000 * nth);
+        assert_eq!(short.measured, 1);
+        assert_eq!(short.shortfall(), 1_000 * nth - 1);
+    }
+    assert!(
+        held.windows(2)
+            .all(|pair| pair[0].shortfall() >= pair[1].shortfall()),
+        "the list never rises"
+    );
 
     report.at = Timestamp::at_unix_seconds(PINNED);
     let rendered = report.to_string();
@@ -438,20 +467,87 @@ fn the_shortfall_list_names_the_first_ten_and_counts_the_rest() {
     // `NAMED_AT_MOST` is 10 in `report.rs`. Written out here rather than
     // imported, so that raising it there fails this test and somebody has to
     // say the list got longer on purpose.
-    for n in 1..=10 {
-        let name = format!("jobs/j{n:0>10}: claims ");
-        assert!(rendered.contains(&name), "{name} is named:\n{rendered}");
+    for nth in 4..=13 {
+        let name = format!("jobs/j{nth:0>10}: claims ");
+        assert!(
+            rendered.contains(&name),
+            "{name} is one of the ten largest and must be named:\n{rendered}"
+        );
     }
-    for n in 11..=13 {
-        let name = format!("jobs/j{n:0>10}: claims ");
+    for nth in 1..=3 {
+        let name = format!("jobs/j{nth:0>10}: claims ");
         assert!(
             !rendered.contains(&name),
-            "{name} is past the bound and must not be named:\n{rendered}"
+            "{name} is one of the three smallest and must not be:\n{rendered}"
         );
     }
     assert!(
         rendered.contains("\n    and 3 more\n"),
         "the three past the bound are counted:\n{rendered}"
+    );
+    // And in that order in the text, which is what an operator reads.
+    let first = rendered
+        .find("jobs/j0000000013: claims ")
+        .expect("the worst is in the text");
+    let last = rendered
+        .find("jobs/j0000000004: claims ")
+        .expect("the tenth-worst is in the text");
+    assert!(
+        first < last,
+        "the worst offender is printed before the tenth:\n{rendered}"
+    );
+
+    assert_eq!(listing(root), before, "the report writes nothing");
+}
+
+/// Two jobs equally short are named in job order.
+///
+/// The tie-break is what keeps the rendered text a function of its inputs
+/// once the primary key stops being unique, and the whole-text assertion
+/// above depends on there being one.
+#[test]
+fn jobs_equally_short_fall_back_to_job_order() {
+    let dir = tempfile::tempdir().expect("a temporary directory");
+    let root = dir.path();
+
+    // Two at 400 short and one at 900. The two ties are written in the
+    // awkward order on purpose: `bb` before `aa` by digest, and the larger
+    // id first, so neither insertion order nor the digest map can be what
+    // the assertion below is reading.
+    job_dir(
+        root,
+        "j0000000009",
+        Some(claiming("j0000000009", 500, &digest("bb"))),
+        &[("a.bin", &[b'y'; 100])],
+    );
+    job_dir(
+        root,
+        "j0000000002",
+        Some(claiming("j0000000002", 500, &digest("aa"))),
+        &[("a.bin", &[b'y'; 100])],
+    );
+    job_dir(
+        root,
+        "j0000000005",
+        Some(claiming("j0000000005", 1_000, &digest("cc"))),
+        &[("a.bin", &[b'y'; 100])],
+    );
+
+    let before = listing(root);
+    let report = StateRootReport::read(root).expect("the report reads this root");
+    assert_eq!(
+        report
+            .accounting
+            .claiming_more_than_held
+            .iter()
+            .map(|short| (short.job.as_str(), short.shortfall()))
+            .collect::<Vec<_>>(),
+        vec![
+            ("j0000000005", 900),
+            ("j0000000002", 400),
+            ("j0000000009", 400),
+        ],
+        "largest first, and the two equal ones in job order"
     );
 
     assert_eq!(listing(root), before, "the report writes nothing");
@@ -725,8 +821,9 @@ records
     jobs/j0000000010
   claiming more than files/ holds     1 job(s)
     Bytes were claimed and some of them are there: neither extreme the
-    lists either side of this one name. Both figures are on each line,
-    so the shortfall can be checked rather than trusted.
+    lists either side of this one name. Largest shortfall first, so the
+    names that fit are the ones that matter, and both figures are on
+    each line, so the shortfall can be checked rather than trusted.
     jobs/j0000000008: claims 2000600 bytes (1.91 MiB), files/ measures 7 bytes, short by 2000593 bytes (1.91 MiB)
   bytes removed, files/ still holds   1 job(s)
     jobs/j0000000009: 11 bytes

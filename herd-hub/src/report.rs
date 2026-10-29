@@ -228,8 +228,20 @@ pub struct Accounting {
     /// project has seen sat in neither: a job whose `files/` measured 143 MB
     /// against a record claiming 559 MB. The gap total named it as a number
     /// and nothing named it as a job, so the operator found it with a shell
-    /// loop over a figure this loop had already computed. That is the whole
+    /// loop over a figure this list had already computed. That is the whole
     /// reason this field exists.
+    ///
+    /// **Largest shortfall first, ties by job name — and that order is
+    /// deliberately not the order of its neighbours.** Every other list in
+    /// this report is in the walk's sorted job order, because every other
+    /// list is an all-or-nothing state where the order carries nothing. This
+    /// one is a *magnitude*, and only [`NAMED_AT_MOST`] of it is printed: in
+    /// job order the names that fit would be the ten lowest ids, which is
+    /// arbitrary with respect to the question being asked, and an operator
+    /// would have to re-sort by hand — the very thing (a shell loop over
+    /// figures the report already had) this list exists to stop. Do not
+    /// "fix" it back to job order. The tie-break keeps the text a function
+    /// of its inputs, so the whole-text assertion holds.
     pub claiming_more_than_held: Vec<ClaimShortfall>,
     /// Jobs whose record says the bytes went and whose `files/` still
     /// measures some, with what it measures.
@@ -493,6 +505,21 @@ impl StateRootReport {
             .values()
             .fold(0u64, |sum, bytes| sum.saturating_add(*bytes));
         report.conflicts = conflicts.into_values().collect();
+        // Largest shortfall first, ties by job name. The only list here not
+        // in the walk's job order, and the reason is on the field: it is a
+        // magnitude that gets truncated, so the names that fit have to be
+        // the ones that matter. `sort_by` and not `sort_unstable_by`:
+        // nothing here is hot, and the comparison is total anyway, so the
+        // order is a function of the inputs either way.
+        report
+            .accounting
+            .claiming_more_than_held
+            .sort_by(|left, right| {
+                right
+                    .shortfall()
+                    .cmp(&left.shortfall())
+                    .then_with(|| left.job.cmp(&right.job))
+            });
         report.sizes = summarise(per_job, naming_nothing);
         Ok(report)
     }
@@ -883,11 +910,15 @@ impl fmt::Display for StateRootReport {
             )?;
             writeln!(
                 f,
-                "    lists either side of this one name. Both figures are on each line,"
+                "    lists either side of this one name. Largest shortfall first, so the"
             )?;
             writeln!(
                 f,
-                "    so the shortfall can be checked rather than trusted."
+                "    names that fit are the ones that matter, and both figures are on"
+            )?;
+            writeln!(
+                f,
+                "    each line, so the shortfall can be checked rather than trusted."
             )?;
             for short in accounting
                 .claiming_more_than_held
