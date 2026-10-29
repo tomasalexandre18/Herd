@@ -19,7 +19,11 @@
 //!    by more than an order of magnitude.
 //! 3. [`Accounting`] — what the records say this root holds against what the
 //!    directories measure. That difference is where an accounting defect
-//!    shows up, and no other figure here would show it.
+//!    shows up, and no other figure here would show it. It is printed as a
+//!    total **and** as the jobs behind it, because a total is not something
+//!    an operator can act on: the one real defect this project has seen was
+//!    found by running a shell loop over a figure this report had already
+//!    computed per job and printed only the sum of (ORCH-166).
 //!
 //! **What it is allowed to touch.** The records, and the *lengths* of the
 //! files under each job's `files/`, `files.part/` and `files.gone/`. No
@@ -170,6 +174,32 @@ impl Sizes {
     }
 }
 
+/// One job whose record claims more bytes than its `files/` holds, with
+/// both figures, so the line can be acted on without a second command.
+///
+/// Three fields and not two: the shortfall is `claimed - measured`, and
+/// printing it beside its two terms is what lets a reader check the figure
+/// rather than trust it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ClaimShortfall {
+    /// The job directory's name, relative to `jobs/`.
+    pub job: String,
+    /// What the record's manifest names.
+    pub claimed: u64,
+    /// What `files/` measures, by file length. Never nought: a job measuring
+    /// nought is the extreme [`Accounting::claimed_but_absent`] already
+    /// names, and naming it twice would double-count the same defect.
+    pub measured: u64,
+}
+
+impl ClaimShortfall {
+    /// `claimed - measured`: the bytes the record names and the directory
+    /// does not have.
+    pub fn shortfall(&self) -> u64 {
+        self.claimed.saturating_sub(self.measured)
+    }
+}
+
 /// The records against the disk: figure 3.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Accounting {
@@ -187,14 +217,30 @@ pub struct Accounting {
     pub measured_bytes: u64,
     /// Jobs whose record claims bytes and whose `files/` measures nought.
     pub claimed_but_absent: Vec<String>,
+    /// Jobs whose record claims **more** than their `files/` measures, while
+    /// that directory still measures something: the name, the claim and the
+    /// measurement.
+    ///
+    /// **The middle of the range, and the state a defect actually leaves.**
+    /// The two lists either side of this one catch the extremes — nothing
+    /// where bytes were claimed, and bytes where nothing was claimed — and
+    /// between 2026-10-28 and today the one real accounting defect this
+    /// project has seen sat in neither: a job whose `files/` measured 143 MB
+    /// against a record claiming 559 MB. The gap total named it as a number
+    /// and nothing named it as a job, so the operator found it with a shell
+    /// loop over a figure this loop had already computed. That is the whole
+    /// reason this field exists.
+    pub claiming_more_than_held: Vec<ClaimShortfall>,
     /// Jobs whose record says the bytes went and whose `files/` still
     /// measures some, with what it measures.
     pub removed_but_present: Vec<(String, u64)>,
-    /// `files.part/` directories — a collection still arriving, which is
-    /// real disk and deliberately outside the output budget — and what they
-    /// measure.
+    /// `files.part/` directories — a collection that started and did not
+    /// finish, which is real disk and deliberately outside the output budget
+    /// — how many, what they measure, and **which jobs**.
     pub parts_dirs: usize,
     pub parts_bytes: u64,
+    /// Those directories by job, with what each measures.
+    pub parts_jobs: Vec<(String, u64)>,
     /// `files.gone/` directories — a sweep that was killed between the
     /// rename and the unlink (D152) — and what they measure. Non-zero is
     /// disk the next sweep will free, not disk anything accounts for.
@@ -392,6 +438,18 @@ impl StateRootReport {
                         report.accounting.claimed_bytes.saturating_add(job_bytes);
                     if job_bytes > 0 && measured == 0 {
                         report.accounting.claimed_but_absent.push(name.clone());
+                    } else if job_bytes > measured {
+                        // `measured > 0` holds here: the arm above took the
+                        // zero case. The middle of the range, which is where
+                        // a real accounting defect sits.
+                        report
+                            .accounting
+                            .claiming_more_than_held
+                            .push(ClaimShortfall {
+                                job: name.clone(),
+                                claimed: job_bytes,
+                                measured,
+                            });
                     }
                 }
             } else {
@@ -407,11 +465,14 @@ impl StateRootReport {
             }
             let parts = dir.join(OUTPUT_PARTS_DIR);
             if parts.is_dir() {
+                let parts_bytes = directory_bytes(&parts);
                 report.accounting.parts_dirs += 1;
-                report.accounting.parts_bytes = report
+                report.accounting.parts_bytes =
+                    report.accounting.parts_bytes.saturating_add(parts_bytes);
+                report
                     .accounting
-                    .parts_bytes
-                    .saturating_add(directory_bytes(&parts));
+                    .parts_jobs
+                    .push((name.clone(), parts_bytes));
             }
             let gone = dir.join(OUTPUT_GONE_DIR);
             if gone.is_dir() {
@@ -812,6 +873,48 @@ impl fmt::Display for StateRootReport {
         }
         writeln!(
             f,
+            "  claiming more than files/ holds     {} job(s)",
+            accounting.claiming_more_than_held.len()
+        )?;
+        if !accounting.claiming_more_than_held.is_empty() {
+            writeln!(
+                f,
+                "    Bytes were claimed and some of them are there: neither extreme the"
+            )?;
+            writeln!(
+                f,
+                "    lists either side of this one name. Both figures are on each line,"
+            )?;
+            writeln!(
+                f,
+                "    so the shortfall can be checked rather than trusted."
+            )?;
+            for short in accounting
+                .claiming_more_than_held
+                .iter()
+                .take(NAMED_AT_MOST)
+            {
+                writeln!(
+                    f,
+                    "    {JOBS_DIR}/{}: claims {}, files/ measures {}, short by {}",
+                    short.job,
+                    bytes_said(short.claimed),
+                    bytes_said(short.measured),
+                    bytes_said(short.shortfall())
+                )?;
+            }
+            if let Some(more) = accounting
+                .claiming_more_than_held
+                .len()
+                .checked_sub(NAMED_AT_MOST)
+            {
+                if more > 0 {
+                    writeln!(f, "    and {more} more")?;
+                }
+            }
+        }
+        writeln!(
+            f,
             "  bytes removed, files/ still holds   {} job(s)",
             accounting.removed_but_present.len()
         )?;
@@ -829,10 +932,32 @@ impl fmt::Display for StateRootReport {
         }
         writeln!(
             f,
-            "  {OUTPUT_PARTS_DIR}/ still arriving          {} job(s), {}",
+            "  {OUTPUT_PARTS_DIR}/ unfinished collection   {} job(s), {}",
             accounting.parts_dirs,
             bytes_said(accounting.parts_bytes)
         )?;
+        if !accounting.parts_jobs.is_empty() {
+            writeln!(
+                f,
+                "    A collection that started and did not finish. This report cannot"
+            )?;
+            writeln!(
+                f,
+                "    tell whether anything is still coming: a runner may be streaming"
+            )?;
+            writeln!(
+                f,
+                "    into it right now, or it may be what one that died left behind."
+            )?;
+            for (name, bytes) in accounting.parts_jobs.iter().take(NAMED_AT_MOST) {
+                writeln!(f, "    {JOBS_DIR}/{name}: {}", bytes_said(*bytes))?;
+            }
+            if let Some(more) = accounting.parts_jobs.len().checked_sub(NAMED_AT_MOST) {
+                if more > 0 {
+                    writeln!(f, "    and {more} more")?;
+                }
+            }
+        }
         writeln!(
             f,
             "  {OUTPUT_GONE_DIR}/ a sweep left behind     {} job(s), {}",

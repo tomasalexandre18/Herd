@@ -16,12 +16,16 @@
 //! 3. **That it reads real records.** The fixture above is hand-written, so
 //!    on its own it would only prove the report agrees with the test. The
 //!    last test drives the store's own writer and reports on what *it* left.
+//! 4. **That it names the jobs behind figure 3 and not only their sum**
+//!    (ORCH-166) — the middle state a defect leaves, the bound on how many
+//!    it names, that a sound root prints no empty list, and that each of
+//!    those runs leaves the root byte-identical too.
 
 use std::fs;
 use std::path::Path;
 
 use herd_hub::job::JobStore;
-use herd_hub::{JobDirStore, Mint, NewJob, StateRootReport, Timestamp};
+use herd_hub::{ClaimShortfall, JobDirStore, Mint, NewJob, StateRootReport, Timestamp};
 use herd_proto::{LabelSet, Priority};
 
 /// The moment the rendered text is pinned to, so that the assertion is about
@@ -255,12 +259,35 @@ fn every_figure_of_the_report_is_this_fixture_to_the_byte() {
         (std::cmp::Ordering::Greater, 6_501_359)
     );
     assert_eq!(report.accounting.claimed_but_absent, vec!["j0000000010"]);
+    // The middle state, which neither list either side of it catches:
+    // j0000000008's manifest names 2000600 bytes and its `files/` holds seven
+    // of them (ORCH-166).
+    assert_eq!(
+        report.accounting.claiming_more_than_held,
+        vec![ClaimShortfall {
+            job: "j0000000008".to_owned(),
+            claimed: 2_000_600,
+            measured: 7,
+        }]
+    );
+    let shortfall = &report.accounting.claiming_more_than_held[0];
+    assert_eq!(
+        shortfall.shortfall(),
+        shortfall.claimed - shortfall.measured,
+        "the shortfall is that subtraction and nothing else"
+    );
+    assert_eq!(shortfall.shortfall(), 2_000_593);
     assert_eq!(
         report.accounting.removed_but_present,
         vec![("j0000000009".to_owned(), 11)]
     );
     assert_eq!(report.accounting.parts_dirs, 1);
     assert_eq!(report.accounting.parts_bytes, 3);
+    assert_eq!(
+        report.accounting.parts_jobs,
+        vec![("j0000000006".to_owned(), 3)],
+        "an unfinished collection is named, not only counted"
+    );
     assert_eq!(report.accounting.gone_dirs, 1);
     assert_eq!(report.accounting.gone_bytes, 5);
 
@@ -286,6 +313,249 @@ fn every_figure_of_the_report_is_this_fixture_to_the_byte() {
     // a hub holds was held throughout.
     assert_eq!(listing(root), before, "the report writes nothing");
     drop(held);
+}
+
+/// A record claiming one file of `bytes` under `sha256`, and nothing else.
+fn claiming(id: &str, bytes: u64, sha256: &str) -> serde_json::Value {
+    let mut record = silent(id);
+    record["outputs"] = serde_json::json!({ "files": [kept("files/a.bin", bytes, sha256)] });
+    record
+}
+
+/// The defect state, named (ORCH-166).
+///
+/// Not a repeat of the fixture above: that one asserts the whole text, this
+/// one asserts the *condition*, with the two neighbours of the middle state
+/// in the same root so that the three lists are seen sorting a job each.
+/// Before this, a job here was in no list at all and the operator was left
+/// with a total.
+#[test]
+fn a_job_claiming_more_than_its_files_holds_is_named_with_both_figures() {
+    let dir = tempfile::tempdir().expect("a temporary directory");
+    let root = dir.path();
+
+    // The middle: 1000 claimed, 400 of them there.
+    job_dir(
+        root,
+        "j0000000001",
+        Some(claiming("j0000000001", 1_000, &digest("aa"))),
+        &[("a.bin", &[b'x'; 400])],
+    );
+    // One extreme: claimed, and `files/` measures nought.
+    job_dir(
+        root,
+        "j0000000002",
+        Some(claiming("j0000000002", 1_000, &digest("bb"))),
+        &[],
+    );
+    // Sound: the claim and the measurement agree to the byte.
+    job_dir(
+        root,
+        "j0000000003",
+        Some(claiming("j0000000003", 500, &digest("cc"))),
+        &[("a.bin", &[b'y'; 500])],
+    );
+
+    let before = listing(root);
+    let mut report = StateRootReport::read(root).expect("the report reads this root");
+
+    assert_eq!(
+        report.accounting.claiming_more_than_held,
+        vec![ClaimShortfall {
+            job: "j0000000001".to_owned(),
+            claimed: 1_000,
+            measured: 400,
+        }],
+        "the middle state is one job, and the two neighbours are not in it"
+    );
+    assert_eq!(report.accounting.claimed_but_absent, vec!["j0000000002"]);
+    // The figures check by arithmetic, both inside the value and against the
+    // totals: 1000 + 1000 + 500 claimed, 400 + 500 measured.
+    let shortfall = &report.accounting.claiming_more_than_held[0];
+    assert_eq!(shortfall.shortfall(), 600);
+    assert_eq!(
+        shortfall.shortfall(),
+        shortfall.claimed - shortfall.measured
+    );
+    assert_eq!(report.accounting.claimed_bytes, 2_500);
+    assert_eq!(report.accounting.measured_bytes, 900);
+    assert_eq!(
+        report.accounting.gap(),
+        (std::cmp::Ordering::Greater, 1_600)
+    );
+
+    report.at = Timestamp::at_unix_seconds(PINNED);
+    let rendered = report.to_string();
+    assert!(
+        rendered.contains("  claiming more than files/ holds     1 job(s)\n"),
+        "the count line is there:\n{rendered}"
+    );
+    assert!(
+        rendered.contains(
+            "    jobs/j0000000001: claims 1000 bytes, files/ measures 400 bytes, \
+             short by 600 bytes\n"
+        ),
+        "the job is named with its claim, its measurement and the shortfall:\n{rendered}"
+    );
+
+    assert_eq!(listing(root), before, "the report writes nothing");
+}
+
+/// The bound holds: `NAMED_AT_MOST` jobs named, the rest counted.
+///
+/// The same rule the unread and conflict lists already follow, and the
+/// reason there is no flag to widen it: a list exists to be acted on, and
+/// one naming every job is a number, which the count already is.
+#[test]
+fn the_shortfall_list_names_the_first_ten_and_counts_the_rest() {
+    let dir = tempfile::tempdir().expect("a temporary directory");
+    let root = dir.path();
+
+    // One digest, one claimed length: thirteen jobs in the middle state and
+    // not one digest conflict, so only the bound is under test.
+    let aa = digest("aa");
+    for n in 1..=13 {
+        let name = format!("j{n:0>10}");
+        job_dir(
+            root,
+            &name,
+            Some(claiming(&name, 1_000, &aa)),
+            &[("a.bin", b"one")],
+        );
+    }
+
+    let before = listing(root);
+    let mut report = StateRootReport::read(root).expect("the report reads this root");
+    assert_eq!(report.accounting.claiming_more_than_held.len(), 13);
+    assert!(report.conflicts.is_empty());
+
+    report.at = Timestamp::at_unix_seconds(PINNED);
+    let rendered = report.to_string();
+    assert!(
+        rendered.contains("  claiming more than files/ holds     13 job(s)\n"),
+        "the count is the whole thirteen:\n{rendered}"
+    );
+    // `NAMED_AT_MOST` is 10 in `report.rs`. Written out here rather than
+    // imported, so that raising it there fails this test and somebody has to
+    // say the list got longer on purpose.
+    for n in 1..=10 {
+        let name = format!("jobs/j{n:0>10}: claims ");
+        assert!(rendered.contains(&name), "{name} is named:\n{rendered}");
+    }
+    for n in 11..=13 {
+        let name = format!("jobs/j{n:0>10}: claims ");
+        assert!(
+            !rendered.contains(&name),
+            "{name} is past the bound and must not be named:\n{rendered}"
+        );
+    }
+    assert!(
+        rendered.contains("\n    and 3 more\n"),
+        "the three past the bound are counted:\n{rendered}"
+    );
+
+    assert_eq!(listing(root), before, "the report writes nothing");
+}
+
+/// A root with neither a shortfall nor an unfinished collection prints the
+/// two count lines at nought and not one line of a list under them.
+///
+/// The cheapest way for a report to become unreadable is a section that is
+/// there whether or not it has anything in it.
+#[test]
+fn a_sound_root_prints_no_empty_list() {
+    let dir = tempfile::tempdir().expect("a temporary directory");
+    let root = dir.path();
+
+    job_dir(
+        root,
+        "j0000000001",
+        Some(claiming("j0000000001", 500, &digest("aa"))),
+        &[("a.bin", &[b'y'; 500])],
+    );
+    job_dir(root, "j0000000002", Some(silent("j0000000002")), &[]);
+
+    let before = listing(root);
+    let mut report = StateRootReport::read(root).expect("the report reads this root");
+    assert!(report.accounting.claiming_more_than_held.is_empty());
+    assert!(report.accounting.parts_jobs.is_empty());
+    assert_eq!(report.accounting.parts_dirs, 0);
+    assert_eq!(
+        report.accounting.gap(),
+        (std::cmp::Ordering::Equal, 0),
+        "a sound accounting is the two figures agreeing to the byte"
+    );
+
+    report.at = Timestamp::at_unix_seconds(PINNED);
+    let rendered = report.to_string();
+    assert!(
+        rendered.contains("  claiming more than files/ holds     0 job(s)\n"),
+        "the count line is always printed, even at nought:\n{rendered}"
+    );
+    assert!(
+        rendered.contains("  files.part/ unfinished collection   0 job(s), 0 bytes\n"),
+        "and so is the unfinished-collection line:\n{rendered}"
+    );
+    assert!(
+        !rendered.contains("Bytes were claimed and some of them are there"),
+        "no shortfall, so no paragraph about shortfalls:\n{rendered}"
+    );
+    assert!(
+        !rendered.contains("A collection that started and did not finish"),
+        "no files.part/, so no paragraph about one:\n{rendered}"
+    );
+    assert!(
+        !rendered.contains("    jobs/"),
+        "no list has a line under it:\n{rendered}"
+    );
+
+    assert_eq!(listing(root), before, "the report writes nothing");
+}
+
+/// `files.part/` says what it is, and names the job (ORCH-166).
+///
+/// The old wording was "still arriving", which on the first consumer's hub
+/// was false: the directory had sat untouched for six days through a reboot.
+/// A report that asserts something it cannot know is worse than one that
+/// says less, and this was the line that would have pointed straight at the
+/// problem.
+#[test]
+fn an_unfinished_collection_is_named_and_claims_nothing_about_arrival() {
+    let dir = tempfile::tempdir().expect("a temporary directory");
+    let root = dir.path();
+
+    job_dir(root, "j0000000001", Some(silent("j0000000001")), &[]);
+    job_dir(root, "j0000000002", Some(silent("j0000000002")), &[]);
+    fs::create_dir_all(root.join("jobs/j0000000002/files.part")).expect("made");
+    fs::write(
+        root.join("jobs/j0000000002/files.part/half.bin"),
+        b"halfway",
+    )
+    .expect("written");
+
+    let before = listing(root);
+    let mut report = StateRootReport::read(root).expect("the report reads this root");
+    assert_eq!(
+        report.accounting.parts_jobs,
+        vec![("j0000000002".to_owned(), 7)]
+    );
+
+    report.at = Timestamp::at_unix_seconds(PINNED);
+    let rendered = report.to_string();
+    assert!(
+        rendered.contains("  files.part/ unfinished collection   1 job(s), 7 bytes\n"),
+        "{rendered}"
+    );
+    assert!(
+        rendered.contains("    jobs/j0000000002: 7 bytes\n"),
+        "the job is named, not only counted:\n{rendered}"
+    );
+    assert!(
+        !rendered.contains("still arriving"),
+        "the report no longer claims the bytes are on their way:\n{rendered}"
+    );
+
+    assert_eq!(listing(root), before, "the report writes nothing");
 }
 
 #[test]
@@ -453,8 +723,17 @@ records
   THE RECORDS CLAIM 6501359 bytes (6.20 MiB) MORE THAN THE DIRECTORIES MEASURE
   claiming bytes, files/ measures 0   1 job(s)
     jobs/j0000000010
+  claiming more than files/ holds     1 job(s)
+    Bytes were claimed and some of them are there: neither extreme the
+    lists either side of this one name. Both figures are on each line,
+    so the shortfall can be checked rather than trusted.
+    jobs/j0000000008: claims 2000600 bytes (1.91 MiB), files/ measures 7 bytes, short by 2000593 bytes (1.91 MiB)
   bytes removed, files/ still holds   1 job(s)
     jobs/j0000000009: 11 bytes
-  files.part/ still arriving          1 job(s), 3 bytes
+  files.part/ unfinished collection   1 job(s), 3 bytes
+    A collection that started and did not finish. This report cannot
+    tell whether anything is still coming: a runner may be streaming
+    into it right now, or it may be what one that died left behind.
+    jobs/j0000000006: 3 bytes
   files.gone/ a sweep left behind     1 job(s), 5 bytes
 ";

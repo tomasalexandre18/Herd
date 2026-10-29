@@ -22,7 +22,9 @@ pub use matcher::{
     STICKINESS_LIMIT,
 };
 pub use queue::{Standing, AGING_STEP};
-pub use report::{Accounting, Census, Dedup, DigestConflict, Sizes, StateRootReport, Unread};
+pub use report::{
+    Accounting, Census, ClaimShortfall, Dedup, DigestConflict, Sizes, StateRootReport, Unread,
+};
 pub use retention::{
     parse_span, select, ClassPreview, Judged, NotOurs, RetentionPreview, Scanned, Seen, Selection,
     Spans, Verdict,
