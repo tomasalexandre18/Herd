@@ -648,6 +648,12 @@ const HEALTH_EVERY_HERE: Duration = Duration::from_secs(1);
 /// comes back — which is the whole premise, since the defect is the runner
 /// holding jobs the hub has already written off — and short enough that the
 /// run is seconds.
+///
+/// Used by [`no_job_is_lost_to_an_outage`] alone, whose oracle is "no job
+/// dead, no job without a verdict" and reads the same whichever refusal the
+/// redial produces. The test that *does* depend on which refusal it was
+/// holds its jobs open instead and has no figure here to get wrong
+/// (ORCH-119).
 const SLEEP_ACROSS_THE_OUTAGE: u64 = 6;
 
 /// How long this one test may take. Its own figure rather than [`PATIENCE`]:
@@ -978,23 +984,26 @@ async fn no_job_is_lost_to_an_outage(label: &'static str, outage: AnOutage) {
     // Waited for, never slept over: the cut has to land on a machine that is
     // really full, and a sleep that ended early would cut a link with nothing
     // on it.
+    //
+    // And waited for on the **runner's** word, not the hub's (ORCH-119):
+    // `Assigned` says the hub sent an assignment, `Running` says the runner
+    // reported it started — which it does from inside the same lock that
+    // counts its ceiling. The difference is not theoretical: the hub's
+    // second dispatch and this loop's exit were measured one millisecond
+    // apart, and a cut inside that window takes the assignment with it and
+    // leaves the machine holding less than it announced.
     let deadline = Instant::now() + PATIENCE;
     loop {
-        let out_there = submitted
+        let in_hand = submitted
             .iter()
-            .filter(|id| {
-                matches!(
-                    harness.state_of(id),
-                    herd_hub::JobState::Assigned | herd_hub::JobState::Running
-                )
-            })
+            .filter(|id| matches!(harness.state_of(id), herd_hub::JobState::Running))
             .count();
-        if out_there == CEILING {
+        if in_hand == CEILING {
             break;
         }
         assert!(
             Instant::now() < deadline,
-            "only {out_there} of {CEILING} jobs reached the runner, so the link would be cut \
+            "only {in_hand} of {CEILING} jobs reached the runner, so the link would be cut \
              on a machine that was not at its ceiling"
         );
         tokio::time::sleep(Duration::from_millis(20)).await;
@@ -1065,6 +1074,48 @@ async fn no_job_is_lost_to_an_outage(label: &'static str, outage: AnOutage) {
     drop(harness);
 }
 
+/// A job that holds its place on the runner until the test lets it go.
+///
+/// For the test below, whose premise is a machine **still holding** its
+/// originals at the instant the hub hands it a second attempt of them. A
+/// `sleep` cannot keep that premise: it makes the premise a duration, and
+/// whether the duration outlasts an outage, a watchdog, a redial and a
+/// dispatch pass is then decided by whatever else the host is doing.
+/// `admission.rs` argues the same thing for a reservation that has to still
+/// be held while something else is judged against it, and holds it the same
+/// way.
+///
+/// It prints nothing: one frame fewer about the written-off attempt at the
+/// redial, since the hub answers anything about one with
+/// `FromHub::StaleAttempt` and the runner then **stops** that attempt
+/// (E-21). That is the one thing this construction cannot hold off, and it
+/// does not have to: the second attempt is dispatched on the hello, ahead of
+/// any answer the hub gives to a frame of the runner's, and the stop is a
+/// round trip and a process teardown behind it. One redial, measured on an
+/// idle host, from the hub's own lines: the two dispatches at +8 ms and
+/// +15 ms after the runner joined, the stale answer at +16 ms, the stop
+/// signalled at +17 ms — and both refusals, computed after that, still read
+/// the count as [`CEILING`], because a job that has been told to stop is
+/// still a job the runner is holding until its processes are gone.
+fn a_job_that_holds_its_place(
+    pen: &DataRootDir,
+    which: usize,
+) -> (std::path::PathBuf, Vec<String>) {
+    let release = pen.path().join(format!("release-{which}"));
+    (
+        release.clone(),
+        support::shell(&format!(
+            "until [ -e {} ]; do sleep 0.05; done",
+            release.display()
+        )),
+    )
+}
+
+/// Let one of those jobs finish.
+fn let_the_held_job_finish(release: &std::path::Path) {
+    std::fs::write(release, b"go").expect("the test releases the job it was holding");
+}
+
 /// **The exemption is bounded, and the bound says so on the record**
 /// (D182).
 ///
@@ -1080,6 +1131,26 @@ async fn no_job_is_lost_to_an_outage(label: &'static str, outage: AnOutage) {
 /// the behaviour, and the number is a setting precisely so that a test does
 /// not have to. The same outage as above, and the one refusal it produces is
 /// the whole budget.
+///
+/// **The premise is built, not timed** (ORCH-119). What this test needs is a
+/// machine that is still holding its originals when the hub hands it their
+/// second attempts; it needs no particular number of seconds anywhere. Two
+/// things make that a construction:
+///
+/// - the jobs are held open ([`a_job_that_holds_its_place`]) and released
+///   when the test chooses, instead of sleeping for longer than the test
+///   expects to need;
+/// - the link is cut once the **runner** has said it is running them, not
+///   once the hub has said it has handed them out. `JobState::Running` is
+///   written only on `ToHub::JobStarted`, which a runner sends from inside
+///   `take_job`'s lock; `JobState::Assigned` means only that the hub sent a
+///   frame. Cutting on `Assigned` cut the link, measurably, within a
+///   millisecond of the hub's second dispatch — often before the runner had
+///   read it — and an assignment lost in the cut left the machine holding
+///   one original or none. Holding fewer than [`CEILING`] is what produced
+///   both of this assertion's CI reds: one original left `NotTaken::
+///   StillRunningThisJob` instead of the ceiling's refusal, and none left
+///   nothing refused at all.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_job_refused_past_the_bound_ends_and_names_it() {
     let (harness, link, _data_root, running) = a_capped_runner_behind_a_cuttable_link(
@@ -1094,34 +1165,40 @@ async fn a_job_refused_past_the_bound_ends_and_names_it() {
     let requester = harness.requester();
     let state_dir = harness.state_dir().to_owned();
 
+    // Exactly as many jobs as the machine holds, each one held open until
+    // this test lets it go, so that "the runner is still holding its
+    // originals" is a fact about the jobs and not a bet on how long the rest
+    // of the sequence takes.
+    let holding_pen = DataRootDir::new("link-cut-bound-holds");
+    let mut releases = Vec::new();
     let mut submitted = Vec::new();
     for n in 0..CEILING {
+        let (release, command) = a_job_that_holds_its_place(&holding_pen, n);
+        releases.push(release);
         submitted.push(
-            support::submit_job(
-                &requester,
-                support::shell(&format!(
-                    "echo at the bound {n}; sleep {SLEEP_ACROSS_THE_OUTAGE}"
-                )),
-            )
-            .await
-            .expect("the hub accepts the submission"),
+            support::submit_job(&requester, command)
+                .await
+                .expect("the hub accepts the submission"),
         );
     }
+    // Waited for **on the runner's own word**: `Running` is written when the
+    // runner reports the attempt started, which it does from inside the lock
+    // that counted its ceiling, so a machine in that state is holding the
+    // job. `Assigned` would be the hub's word for a frame it has sent.
     let deadline = Instant::now() + PATIENCE;
     loop {
-        let out_there = submitted
+        let in_hand = submitted
             .iter()
-            .filter(|id| {
-                matches!(
-                    harness.state_of(id),
-                    herd_hub::JobState::Assigned | herd_hub::JobState::Running
-                )
-            })
+            .filter(|id| matches!(harness.state_of(id), herd_hub::JobState::Running))
             .count();
-        if out_there == CEILING {
+        if in_hand == CEILING {
             break;
         }
-        assert!(Instant::now() < deadline, "the runner never filled up");
+        assert!(
+            Instant::now() < deadline,
+            "{in_hand} of {CEILING} jobs are running on the runner, so the link would be cut \
+             on a machine that is not holding what the bound is about"
+        );
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
 
@@ -1136,6 +1213,15 @@ async fn a_job_refused_past_the_bound_ends_and_names_it() {
     {
         assert!(Instant::now() < deadline, "the jobs never ended at all");
         tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    // Every job has its answer, so the processes that were holding the place
+    // may go. E-21 has already stopped them — the hub answers a frame about
+    // a written-off attempt with `StaleAttempt` and the runner ends that
+    // attempt rather than finishing it — so this releases what the runner
+    // has usually ended already, and leaves nothing of this test behind on
+    // the day that changes.
+    for release in &releases {
+        let_the_held_job_finish(release);
     }
 
     // At least one of them met the bound, and **what it is recorded as** is
