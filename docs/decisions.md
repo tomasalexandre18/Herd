@@ -11370,3 +11370,283 @@ whose reappearance would look like a tidy-up.
 **Evidence.** `docs/plan.md` §*A pack is read by a job*;
 `herd-runner/src/outputs.rs`; **D10**, **D152**; ORCH-153;
 `history/2026-10-29-plan-truth.md`.
+
+---
+
+## 2026-10-29 — D224 A byte figure is formatted by who produced it
+
+**Context.** ORCH-186 landed the measured-bytes rule in batch 9 and left
+the fold owed: the rule had **three identical bodies** — one in
+`herd-runner/src/size.rs`, one in `herd-hub/src/report.rs`, one in
+`herd-hub/src/retention.rs` — and a rule with three copies is a rule that
+drifts on the next edit to any one of them. Beside it sat a second,
+different rule, `show_bytes`, whose job is the opposite one.
+
+**Choice.** **A byte figure is formatted by who produced it, not by what
+it divides by, and the two rules live in one file.**
+`herd_proto::size::show_bytes` is for a figure a human **typed** and
+returns it in the unit family they typed it in (D148, D152);
+`herd_proto::size::measured_bytes` is for a figure Herd **measured** and
+prints the exact count always, with a binary approximation beside it and
+never instead of it. A new byte figure picks its formatter by answering
+one question — did a human type this, or did we measure it? — and never by
+how the number happens to divide. The measured rule had three identical
+bodies (ORCH-186); it now has one, beside the typed one, and the
+asymmetry between them is documented where both are. Erasing the
+difference is a red test, not a tidy.
+
+**Alternative rejected.** Leaving the three bodies and adding a comment
+to each. That is the shape the defect arrived in: `j0000000740` printed
+`535691 kB` where seventy-four sibling jobs printed bytes, because one
+site used the typed rule for a measured figure. A comment does not stop
+the fourth copy.
+
+**Evidence.** `herd-proto/src/size.rs` (`show_bytes`, `measured_bytes`,
+and the tests that pin the asymmetry); `herd-hub/src/report.rs`;
+`herd-hub/src/retention.rs`; `herd-runner/src/size.rs`; **D148**,
+**D152**; ORCH-186; `history/2026-10-29-measured-fold.md`, whose
+*Decisions needed* drafted this entry — the wording is its author's, and
+only the bullet was restructured into this file's header form.
+
+---
+
+## 2026-10-29 — D225 A failed record scan says nothing, then answers each offer
+
+**Context.** ORCH-197. `ask_for_the_files_still_owed`
+(`herd-hub/src/server.rs`) runs once per runner dial, before the hub
+reads a frame from that connection, and its whole answer came from
+`JobStore::collections_owed`. On that function's error it returned having
+sent nothing. `collections_owed` is **one `readdir`** and the listing is
+its only error path, so `EACCES` on a tree whose mode changed, `ENOTDIR`,
+`EIO` or `ENFILE` reached it as a whole-directory failure. Nothing is
+cached: the scan is recomputed per dial, so the failure was neither
+sticky nor per-runner — one directory, re-read identically for every
+connection.
+
+**Why that silence was a false sentence.** The owed list is *N*
+unprompted `JobFilesHeld` and nothing else, and the runner reads the
+absence of them against a barrier keyed on the answer to a health report
+(`herd-runner/src/sweep.rs`, `Session::the_hub_has_said_what_it_is_owed`).
+So silence **plus** `HealthRecorded` is a complete sentence on this wire:
+*"this hub holds nothing of yours."* Returning early said it to every
+runner at once, every runner read a genuine silence, and every one of them
+correctly set its spools aside. One unlistable directory, the whole fleet.
+
+**Choice.** A hub that cannot read its records **claims nothing**, and
+then answers **one collection at a time**. The scan returns `OwedAtJoin`:
+`Said`, the join list is complete and a collection the hub did not name is
+one it is not waiting for — byte for byte the old behaviour; or
+`CannotTell`, where nothing is asserted about any collection and each one
+the runner **offers** is answered from that job's own record, deriving the
+one answer with `JobStore::collection_owed` (D79's *one definition, asked
+two ways*) and sending the `JobFilesHeld` the join list would have
+carried, once per collection per connection. A collection the hub already
+holds in full is still not claimed as owed, because `collection_owed`
+answering `None` is a fact read off that job's record and not a guess.
+
+**Considered and refused: withholding `HealthRecorded`.** It is the
+obvious *say nothing rather than lie*, and the code refutes it.
+`herd-runner`'s `HUB_SILENCE_LIMIT` is 60 s against the comment *"the hub
+answers every health report, so four unanswered reports is a dead link"*,
+and `HealthRecorded` is the only frame an idle runner ever gets. A hub
+that went quiet there would be dropped by its whole fleet in a redial
+loop — a worse failure than the one being fixed, and fleet-wide in the
+same way. The answer to a health report still goes out; a failed
+`readdir` is not a failed `open`, and the collection lands and is
+acknowledged while the listing is broken, which is the point: bytes
+recovered rather than renamed `.unclaimed`.
+
+**No frame and no runner change.** `JobFilesHeld` is the frame the runner
+already resumes on and it may arrive at any time; ordering does the rest,
+and the barrier is keyed on `HealthRecorded` both in its old form and in
+`spool-offer-fix`'s new one. `PROTOCOL_VERSION` is unmoved.
+
+**Evidence.** `herd-hub/src/server.rs` (`OwedAtJoin`,
+`answer_this_offer`); `herd-hub/tests/owed_scan_fails.rs`, three tests
+over a real socket whose fixture is the listing itself — the jobs
+directory left at mode `0o111`, so a real `readdir` fails `EACCES` while
+`open("jobs/<id>/job.json")` still succeeds, both halves asserted and the
+mode restored by a `Drop` guard; two of the three measured **red** at
+`1a8c1ae` with the test file copied in and no product change (*"it said
+[]"* — the defect verbatim), the third green there as the control.
+**D79**, **D27**; ORCH-197; `history/2026-10-29-orch-197-record-scan.md`.
+**This entry's wording is `herd-merger`'s, not the author's:** that
+handoff deferred its drafted entry to *"the agent's report"*, which the
+merger cannot read, so the text above was composed from the handoff's own
+*Done* section — the same failure, and the same repair, as D221 one day
+earlier. It should be re-read by whoever can check it against the intent.
+
+---
+
+## 2026-10-30 — D226 A drafted decision lives in the handoff, not in a report
+
+**Context.** A `herd-step` drafts a `docs/decisions.md` entry and
+`herd-merger` places it, because the merger is that file's only writer
+(invariant 8). On 2026-10-29 `spool-offer-fix` put its drafted entry in
+its hand-back report to the orchestrator and wrote in its committed
+handoff only that the entry was *"deferred to the agent's report"*. The
+merger never receives those reports: it reads the branch. So D221 was
+**composed from that handoff's own *Done* section**, which
+`history/2026-10-29-merge-batch-10.md` states plainly, flagging the
+entry to re-read. The orchestrator re-read it and it was faithful.
+Nothing in the method had made it so.
+
+**Choice.** A drafted `docs/decisions.md` entry and a drafted
+`board.md` row go in the **committed handoff, in full** — the whole
+text the merger will paste, headed `D-NEXT` for a decision since the
+merger allocates the number and gaps stay (D148). Not a pointer, not
+*"see the agent's report"*, not a summary. The reason is stated with the
+rule, in one sentence, because a rule whose reason is missing is one
+somebody reinvents: **the orchestrator's conversation is not an artefact
+the merger can read, so anything the merger must act on has to be in a
+file on the branch.** Written in `templates/handoff.md`, as a prose
+block and as a new `## Drafted for herd-merger` section, and in
+`workflow.md` step 4, which is the only other place that describes what
+a handoff owes.
+
+**Not a new duty, a located one.** Nothing here asks an agent to draft
+more than it drafted before. The entry was always owed; this says where
+it is written down. The agent's report keeps the drafted text too — a
+report is for the orchestrator and loses nothing by repeating it.
+
+**Left to a deliberate change.** `.claude/agents/herd-step.md` says
+only that an agent may write a `D-NEXT` entry when the brief asks, and
+never where a draft goes; an agent reading the role file alone can still
+put it in its report and break no written rule. Agent files are role
+definitions and change on their own decision, not folded into a task
+(the orchestrator's instruction, 2026-10-30). One sentence, when it is
+decided. The row is **ORCH-211**.
+
+**Measured against itself, at this landing.** The rule was tested by the
+batch that carries it, and it is not yet holding. `stale-comments`, which
+wrote the rule, followed it: its handoff has the
+`## Drafted for herd-merger` section with the entry and its board rows in
+full. `measured-fold` drafted its entry in full under *Decisions needed*,
+which is the pre-rule shape and cost nothing. **`orch-197-record-scan`
+repeated the exact defect in the same batch** — *"the entry is drafted in
+the agent's report for the merger to place"* — so D225 above is again the
+merger's wording and not its author's. Two of four handoffs in one batch,
+one day after D221. That is the evidence for ORCH-211: the rule is in the
+template and in `workflow.md`, and the role file an agent reads is still
+silent.
+
+**Evidence.** `docs/orchestration/templates/handoff.md`;
+`docs/orchestration/workflow.md` step 4 of *The loop*; **D148**,
+**D221**; `history/2026-10-29-merge-batch-10.md`;
+`history/2026-10-30-stale-comments.md`, whose
+*Drafted for `herd-merger`* section is this entry verbatim; ORCH-211.
+
+---
+
+## 2026-10-30 — D227 The skip-list hash is pinned to byte order
+
+**Context.** `gate.sh` prints `skip-list-sha256` as
+`sort "$seen" | sha256sum`, and `sort`'s collation comes from the
+environment, which the gate sets nowhere. Over this host's **identical**
+twelve at-rest skip names the figure is therefore two figures:
+
+| collation | `skip-list-sha256` |
+|---|---|
+| `en_US.UTF-8`, what receipts carried | `0fbdadcaf14aac20eb9875f41aa74b11349d7aee9df39d3dc93be5b714ba66f9` |
+| `LC_ALL=C`, what a stripped environment prints | `2911f1e8cdbaaaa3005e5318bda0f46016cc359b6aefec879b771c65e16a3c0e` |
+
+They diverge on exactly one pair: where
+`a_tighter_enclosing_memory_max_lowers_the_room_that_is_announced` sorts
+against `an_allocation_past_the_ceiling_kills_the_job_and_only_the_job`
+and `an_io_weight_that_cannot_bite_is_said_out_loud`. UTF-8 collation
+ignores the underscore; C does not. So two **correct** gate runs on one
+tree print different figures over one list, and a run from a stripped
+environment prints the second. D187 made the list, never the count, the
+thing that decides; a hash over that list which moves with the ambient
+locale is a figure that cannot do the job the list was given.
+
+**Choice (Alexa's orchestrator, 2026-10-30).** **Pin it to byte order.**
+Every sort and comparison in `gate.sh` that feeds a hash or a verdict
+runs under `LC_ALL=C`, on the command that needs it — **not**
+`export LC_ALL=C`, because `gate.sh` runs `check-docs.sh` and
+`check-orchestration.sh` as children and a variable a gate exports into
+its own children is exactly how a gate's checks get reddened from
+outside. `check-docs.sh`'s existing idiom, the locale on the one command,
+is the one followed.
+
+**The figure moves once, and this is where to look it up.** Anyone
+meeting `0fbdadca…` in a receipt from before the pin should read it here:
+it is the same twelve names, in the other order, and **not** a changed
+list. Reading it as a skip-list mismatch is the misdiagnosis this entry
+exists to prevent.
+
+**Not implemented by this landing.** The implementation is ORCH-202, on
+`orch202-ignored-skips`, which is not in batch 11; this landing changed
+nothing about `gate.sh` and its own receipt carries the **pre-pin**
+figure. The decision is recorded ahead of its code on purpose, in D223's
+shape: a figure two correct runs disagree about is a defect whose next
+sighting would otherwise be diagnosed from scratch.
+
+**Evidence.** `scripts/gate.sh` `skip-list-sha256`;
+`scripts/expected-skips/local.txt`, `local-under-load.txt`; **D27**,
+**D187**, **D223**; ORCH-202;
+`history/2026-10-30-orch202-ignored-skips.md` *Risks and findings* 8 and
+§3, which carries the two-locale proof and the three regression cases;
+`history/2026-10-30-merge-batch-11.md`, whose receipt is a pre-pin one.
+
+---
+
+## 2026-10-29 — D228 V3's obvious fix is withdrawn, and the rest is Alexa's
+
+**Context.** ORCH-022 / V3, `herd-hub/tests/slots.rs`
+`a_runner_killed_mid_job_gives_its_slot_back` — **not** the
+`follower_alive` test, which is V4 and was fixed in batch 9. The cause
+is in the product and is now located exactly: the watchdog **deletes a
+runner from its peers map before asking that runner what it holds**, so
+D169's word-over-clock rule is void in precisely the case D169 was
+written for — a runner descheduled briefly under load, whose word would
+have been `StillRunningIt`.
+
+**Choice.** The obvious fix — ask before dropping — is **implemented,
+measured and not shipped**. An agent wrote the reorder, proved it
+red-before and green-after with a deterministic unit test, then ran V3's
+own acceptance regime and got **5 of 5 red, unchanged**, and withdrew the
+change rather than ship something that reads like a fix and moves no
+acceptance figure. The patch is kept **out of the tree** at
+
+```
+…/3ddf11ac-718a-4231-bc8d-45291a39ef82/scratchpad/
+orch022-ask-before-dropping.patch
+```
+
+273 lines, against `server.rs` at `3d44312`, with its unit test in it.
+
+**Why it does not work, which is the part worth keeping.** The drop and
+the write-off are **100 ms apart, one watchdog tick**, so asking first
+only moves the clock's decision to the next pass. And V3's assertion is
+not about the attempt at all: it asserts at `slots.rs:293` that the queue
+reason carries *"build has 1 slot(s) and 1 are taken"*, and what it
+actually gets is *"it is waiting because no runner is connected to this
+hub"* — the link was dropped, so the fleet reads **empty** rather than
+busy. A fix aimed at the attempt cannot move an assertion that fails on
+the link's absence.
+
+**What is not decided here, and is not the orchestrator's to decide.**
+**May a runner silent for `lost_after` keep its link?** Both readings
+have a price. Giving the link its own bound — `lost_after * 2`, which
+must stay above `lost_after / 2` so `register_runner`'s displacement of a
+quiet incumbent still comes first — makes V3 holdable, **but E-21
+promises that a runner nothing has been heard from for about 60 s is
+lost and its jobs attempted once more, and this doubles that to about two
+minutes for a machine genuinely off.** The opposite reading is that a
+machine silent for `lost_after` *is* lost, the product is doing
+deliberately what the test complains of, and **the test is what should
+move**. That is a published promise, so it is Alexa's: **ORCH-022 is in
+the board's *Waiting*** with both readings, and neither is adopted by
+this entry. The orchestrator's recommendation is recorded in that row and
+is not a decision.
+
+**Evidence.** `herd-hub/src/server.rs` `one_watchdog_pass`,
+`what_a_runner_says`; `herd-hub/tests/slots.rs:205`, the assertion at
+`:292-295`; **D169**;
+E-21 in `docs/coverage.md`; ORCH-022;
+`history/2026-10-29-orch022-v3.md` (the cause, quoted from `1a8c1ae`),
+`history/2026-10-29-orch-197-record-scan.md` *Risks and findings* 1 and
+*Decisions needed* (the implementation, the 5-of-5-red measurement and
+the withdrawal), `history/2026-10-29-v3v4-rates.md` (the rate tables and
+the kept probe at `V3_STARVE=2200`).
