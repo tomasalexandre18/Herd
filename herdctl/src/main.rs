@@ -390,6 +390,117 @@ enum Action {
         #[arg(trailing_var_arg = true, num_args = 0..)]
         command: Vec<String>,
     },
+    /// Submit a declared command **if a named ref has moved** since the last
+    /// run, and say so when it has not (E-41).
+    ///
+    /// The whole of what Herd ships of a scheduled pass: one predicate and
+    /// one submission. **This is not a scheduler and will not become one.**
+    /// What time of day the question gets asked is a timer in the consumer's
+    /// own tree — a `systemd` timer, a cron line, whatever they already
+    /// run — exactly as E-42's push hook is theirs. `docs/scheduling.md`
+    /// says what we ship and what they write.
+    ///
+    /// It lives here, on the requester's side, because the hub holds no
+    /// repository and runs no git (D106, D207): the ref is read where the
+    /// repository already is, by the same code that reads the commit any
+    /// submission carries.
+    ///
+    /// **"Since the last run" is a file**, `--state`, in your own tree. The
+    /// ref is read once and that one sha is three things: what the predicate
+    /// compared, what the job builds, and what the file records. Every way
+    /// the file can be wrong — missing, unreadable, from another format
+    /// version, kept for another ref, kept for another command — is a
+    /// refusal naming the file, because the alternative is a nightly that
+    /// fires on an empty directory. Start one with `--init`, which records
+    /// where the ref stands now and submits nothing.
+    ///
+    /// **Two runs that overlap cannot both submit.** The whole of
+    /// read-decide-submit-record happens under an exclusive lock on
+    /// `<state>.lock`, and a second run submits nothing and says so on
+    /// stderr. The lock goes when the process goes, however it goes, so
+    /// there is nothing stale to clear.
+    ///
+    /// **The skip is this command's own line and not an event.** E-41 asks
+    /// for a skipped pass to be reported as an event; a run that submits
+    /// nothing leaves the hub with nothing to emit, because it never heard
+    /// of the job. So `herdctl: not-moved:` on stderr is the whole of the
+    /// report. The skip that *is* an event is the other one: a pass
+    /// submitted with `--deadline` that no machine had started by then,
+    /// which the hub cancels and reports (E-09).
+    ///
+    /// Three lines on stderr, and a wrapper reads the prefix and never the
+    /// wording:
+    ///
+    ///     herdctl: moved: ...        a job was submitted; its id is on stdout
+    ///     herdctl: not-moved: ...    the ref is where the last run left it
+    ///     herdctl: another-run: ...  a run of this pass is already going
+    ///
+    /// All three exit 0: a night with nothing to build is not a failure, and
+    /// a timer unit must not go red on one.
+    ///
+    /// **It submits and leaves**, as `submit` does, and never follows the
+    /// job: a timer must not hold a process for the five hours of a
+    /// nightly, and the job runs and is recorded whether anyone is
+    /// following it or not. `herdctl wait <id>` picks it up afterwards.
+    ///
+    /// The deadline and the level travel as they do for any submission:
+    /// `--deadline 05:00+02:00` or `--deadline +2h` (E-09), and the level
+    /// the declaration fixes or `--priority` asks for (E-18), including the
+    /// exclusive label the declaration gives the command. The declaration's
+    /// own `schedule.at` and `schedule.deadline` are **not** read: they are
+    /// times of day, and turning one into an instant needs a day and a time
+    /// zone that the file does not name — that is the timer's business.
+    /// `schedule.if_moved` **is** read, as the default for `--ref`, because
+    /// a ref's name is complete in itself.
+    #[command(name = "if-moved")]
+    IfMoved {
+        /// The command this checkout declares, by name (E-11).
+        ///
+        /// A declared command and nothing else: a pass that runs unattended
+        /// is one whose line, labels, figures and level are written down in
+        /// the consumer's own tree, not typed into a timer unit.
+        #[arg(long = "command", value_name = "NAME")]
+        declared_command: String,
+        /// The ref whose having moved is the condition, in full:
+        /// `refs/remotes/origin/main`.
+        ///
+        /// Left out, the ref the declaration names in
+        /// `[commands.<name>.schedule]`'s `if_moved`. A ref that does not
+        /// exist is refused by name — it has not moved — and a commit hash
+        /// is refused for what it is, because a hash can never move.
+        #[arg(long = "ref", value_name = "REF")]
+        watched: Option<String>,
+        /// The file that records the last run, in your own tree.
+        ///
+        /// One file per ref and per command: it carries both, and a file
+        /// handed to a run asking about another of either is refused rather
+        /// than read as a ref that moved. A lock file lives beside it as
+        /// `<FILE>.lock`.
+        #[arg(long, value_name = "FILE")]
+        state: std::path::PathBuf,
+        /// Start the state file where the ref stands now, and submit
+        /// nothing.
+        ///
+        /// How the first run happens: there is no "no file yet, so it must
+        /// have moved". A file that is already there is refused rather than
+        /// replaced, because replacing it is how last night gets forgotten.
+        #[arg(long, conflicts_with_all = ["deadline", "after", "requeue_exit_code"])]
+        init: bool,
+        /// Which checkout to read the declaration and the ref in. The
+        /// working directory by default.
+        #[arg(long, value_name = "PATH")]
+        checkout: Option<std::path::PathBuf>,
+        /// Which of the four levels this job is weighed at (E-18):
+        /// merger, step, nightly or producer, highest first. A command that
+        /// fixes its own level overrules it.
+        #[arg(long, default_value = DEFAULT_PRIORITY, value_name = "LEVEL")]
+        priority: Priority,
+        #[command(flatten)]
+        asking: Asking,
+        /// The arguments the declared line's `{args}` stands for.
+        #[arg(trailing_var_arg = true, num_args = 0..)]
+        command: Vec<String>,
+    },
     /// Say where a job **would** run, and run nothing (E-07).
     ///
     /// The eligible runners with the labels each of them answers for, what is
@@ -901,6 +1012,125 @@ async fn run(args: Args, known: &Cell<WhatExists>) -> Result<Done> {
             println!("{job_id}");
             Ok(Done::Said)
         }
+        Action::IfMoved {
+            declared_command,
+            watched,
+            state,
+            init,
+            checkout,
+            priority,
+            asking,
+            command,
+        } => {
+            // This command can leave a job behind, so the question "does one
+            // exist?" is live from its **first** refusal onwards and not
+            // only from the submission: a timer that was told "your state
+            // file is missing" has to know, in the one documented line,
+            // that nothing was submitted and that running again is safe
+            // (`JOB_ID_PREFIX`). `--init` is the exception — it submits
+            // nothing by construction, so the question does not arise.
+            if !init {
+                learn(known, WhatExists::Nothing);
+            }
+            let from = match checkout.clone() {
+                Some(path) => path,
+                None => std::env::current_dir()
+                    .context("finding the checkout to read the declaration in")?,
+            };
+            let at = herdctl::checkout::Checkout::found_from(&from)?;
+            // Read here for the ref the declaration names, and read again by
+            // `submitting` for the command itself. Two reads of one small
+            // file, deliberately: the alternative is a second way of
+            // resolving a declared command, and one of the two would drift.
+            let commands = herdctl::declaration::Commands::read_in(at.root())?;
+            let watching = watching_for(&commands, &declared_command, watched, state)?;
+            if init {
+                let tip = herdctl::moved::begin(&at, &watching)?;
+                eprintln!(
+                    "herdctl: {} starts at {}, where {} stands now; nothing was submitted. \
+                     The first pass runs the next time it moves",
+                    watching.state.display(),
+                    tip.hash,
+                    watching.watched
+                );
+                return Ok(Done::Said);
+            }
+            match herdctl::moved::decide(&at, &watching)? {
+                herdctl::moved::Decision::AnotherRun { lock } => {
+                    eprintln!(
+                        "{}a run of this pass already holds {}, so nothing was submitted: two \
+                         timers that overlap would otherwise be two nightlies. Nothing is \
+                         said here about what that run decided — it holds the state file and \
+                         records what it does",
+                        herdctl::moved::ANOTHER_RUN_PREFIX,
+                        lock.display()
+                    );
+                    Ok(Done::Said)
+                }
+                herdctl::moved::Decision::Unmoved { commit, since } => {
+                    eprintln!(
+                        "{}{} is still at {commit}, where {} recorded it at {since}: nothing \
+                         was submitted. The hub never heard of this pass, so this line is the \
+                         whole of the report and there is no event for it (E-41)",
+                        herdctl::moved::NOT_MOVED_PREFIX,
+                        watching.watched,
+                        watching.state.display()
+                    );
+                    Ok(Done::Said)
+                }
+                herdctl::moved::Decision::Moved { held, was, tip } => {
+                    eprintln!(
+                        "{}{} moved from {was} to {}, so one {} is submitted",
+                        herdctl::moved::MOVED_PREFIX,
+                        watching.watched,
+                        tip.hash,
+                        watching.command
+                    );
+                    let job = submitting(
+                        Declaring {
+                            declared_command: Some(declared_command),
+                            // The sha the predicate read, never the ref
+                            // again: one read, so the commit the job carries
+                            // is the commit the predicate compared and the
+                            // commit the file records, whatever the ref does
+                            // in the half-second between them.
+                            commit: tip.hash.clone(),
+                            checkout,
+                        },
+                        Vec::new(),
+                        priority,
+                        None,
+                        None,
+                        None,
+                        asking,
+                        command,
+                    )?;
+                    eprintln!("herdctl: {}", submitting_at(job.priority));
+                    let job_id = herdctl::submit_job_saying(
+                        &config,
+                        job.command,
+                        job.labels,
+                        job.priority,
+                        job.declared,
+                        |said| say_it(known, said),
+                    )
+                    .await?;
+                    // The id on stdout before the file is written, so that a
+                    // wrapper has it even if the write below fails.
+                    println!("{job_id}");
+                    herdctl::moved::record(&held, &watching, &tip.hash, Some(&job_id.to_string()))
+                        .with_context(|| {
+                            format!(
+                                "job {job_id} was submitted and {} could not be written: the \
+                                 next run of this pass will read the commit before it and \
+                                 submit the same pass again, so fix the path before then",
+                                watching.state.display()
+                            )
+                        })?;
+                    Ok(Done::Said)
+                }
+            }
+        }
         Action::WouldRun {
             labels,
             priority,
@@ -1078,6 +1308,43 @@ fn submitting_at(priority: Priority) -> String {
     } else {
         format!("submitting at priority {priority}")
     }
+}
+
+/// Which ref a scheduled pass watches, and the file it is compared against
+/// (E-41).
+///
+/// The ref comes from `--ref` or, failing that, from what the declaration
+/// says under `[commands.<name>.schedule]`'s `if_moved` — the one field of a
+/// schedule that is complete in itself. A pass with no ref at all is refused
+/// here, before the state file is opened, because "watch nothing" is not a
+/// condition anybody can read.
+///
+/// An unknown command name is refused by `schedule_of` with the same
+/// sentence `--command` is refused by anywhere else, and it is refused
+/// **first**: a mistyped name must not come back as a complaint about a
+/// state file.
+fn watching_for(
+    commands: &herdctl::declaration::Commands,
+    named: &str,
+    watched: Option<String>,
+    state: std::path::PathBuf,
+) -> Result<herdctl::moved::Watching> {
+    let declared = commands
+        .schedule_of(named)?
+        .and_then(|schedule| schedule.if_moved.clone());
+    let Some(watched) = watched.or(declared) else {
+        bail!(
+            "nothing says which ref `{named}` watches: give `--ref <REF>`, or declare \
+             `if_moved` under [commands.{named}.schedule] in {}. A pass that watches no ref \
+             is not one that runs every night — it is one nobody can say when it runs",
+            commands.path().display()
+        );
+    };
+    Ok(herdctl::moved::Watching {
+        state,
+        watched,
+        command: named.to_owned(),
+    })
 }
 
 /// One submission, however it was named: a command line typed after `--`, or
