@@ -187,7 +187,7 @@ struct Args {
     command: Option<Command>,
 }
 
-/// The one thing this binary does that is not serving.
+/// What this binary does that is not serving.
 ///
 /// **Why it is a subcommand of the hub and not of `herdctl`** (ORCH-125).
 /// `herdctl` is a requester: everything it does goes over the WebSocket
@@ -263,6 +263,33 @@ enum Command {
         #[arg(long, required = true, value_name = "SPAN", value_parser = span)]
         producer: std::time::Duration,
     },
+    /// Print what the fleet is doing, out of the status document the serving
+    /// hub publishes (E-35, E-40).
+    ///
+    /// The runners connected and what each one lends, what is running where,
+    /// what is queued and what each queued job is waiting for, with the
+    /// health ages and the hub's own version. It is **a render of
+    /// `status.json` and of nothing else**: a screen with a second source
+    /// would be a second answer to the same question, and the first time the
+    /// two disagreed nobody would know which to believe.
+    ///
+    /// Safe against a running hub for the reasons `report` is, and more
+    /// simply: one read-only open of one file, no lock, no write, no walk.
+    /// A figure the hub does not know prints as `unknown`, never as zero.
+    ///
+    /// **Exit 1 when no hub has published a document in this root**, with
+    /// the path named. An absent document is a question that was not
+    /// answered, and a script reading exit 0 as "here is the fleet" while
+    /// getting nothing is the failure this refuses to be.
+    Status {
+        /// The state root to read, as `report` takes it.
+        #[arg(
+            env = "HERD_STATE_DIR",
+            default_value = DEFAULT_STATE_DIR,
+            value_name = "STATE_DIR",
+        )]
+        state_dir: PathBuf,
+    },
 }
 
 /// A retention span as the command line gives one, with the unit required.
@@ -319,6 +346,38 @@ async fn main() -> Result<()> {
         let report = herd_hub::StateRootReport::read(state_dir)
             .with_context(|| format!("reading the state root {}", state_dir.display()))?;
         print!("{report}");
+        return Ok(());
+    }
+    // Before the lock and the sweep for the same reason `report` is, and it
+    // needs even less of the root than `report` does: one file, read-only
+    // (ORCH-125's reasoning, E-35's surface).
+    if let Some(Command::Status { state_dir }) = &args.command {
+        let Some(status) = herd_hub::Status::read(state_dir)
+            .with_context(|| format!("reading the state root {}", state_dir.display()))?
+        else {
+            anyhow::bail!(
+                "no hub has published a status document in {}: there is no {} \
+                 there. Either no hub has served this root since the document \
+                 existed, or the hub serving it is older than the document. \
+                 This is not an empty fleet and is not reported as one.",
+                state_dir.display(),
+                herd_hub::STATUS_FILE,
+            );
+        };
+        print!("{status}");
+        // The age, measured here and against this reader's own clock rather
+        // than taken from the document, because the one mistake a reader of
+        // this screen can make is to read a dead hub's last word as live.
+        // The document carries the moment; this says how long ago that was,
+        // and the two together are what make an operator look at the hub
+        // instead of at the fleet.
+        let read_at = herd_hub::Timestamp::now();
+        println!(
+            "read at {read_at}: this document was published {:?} earlier. \
+             Nothing here is live — it is what the hub last wrote, and a hub \
+             publishes only when something changes.",
+            read_at.since(status.as_of),
+        );
         return Ok(());
     }
     // Here for the same reason, and with one thing more: it removes nothing,
@@ -431,7 +490,12 @@ async fn main() -> Result<()> {
     );
     // A timing that cannot mean what it says is refused here, before the port
     // is bound and before any runner can join (E-21, E-40).
-    let hub = Hub::bind_with(args.listen, Arc::new(store), policy, authority).await?;
+    let hub = Hub::bind_with(args.listen, Arc::new(store), policy, authority)
+        .await?
+        // E-35: the fleet's state goes beside the records, refreshed whenever
+        // it changes, so that nobody has to read a log to know what the hub
+        // is doing. `herd-hub status` prints it; a renderer parses it.
+        .publishing_status_to(args.state_dir.clone());
     println!(
         "herd-hub {} listening on ws://{}, state in {} ({state_root_id}), \
          {unfinished} job(s) not over, {} quarantined, a runner reporting every {:?} is \
@@ -524,6 +588,14 @@ mod tests {
                 assert_eq!(state_dir, PathBuf::from("/srv/herd-state"));
             }
             other => panic!("`report` did not parse as itself: {other:?}"),
+        }
+
+        let asking = Args::parse_from(["herd-hub", "status", "/srv/herd-state"]);
+        match asking.command {
+            Some(Command::Status { state_dir }) => {
+                assert_eq!(state_dir, PathBuf::from("/srv/herd-state"));
+            }
+            other => panic!("`status` did not parse as itself: {other:?}"),
         }
     }
 

@@ -1275,7 +1275,8 @@ the gap is recorded.
 | **The Docker Hub push**, the pull-back by digest and the GitHub release. All three are written and ordered; none has ever run, for want of an account, a repository variable and a scoped token | §11.2 | D153; `status.md` "Next action" |
 | **M11's pack half.** There are **no registry frames** on either enum, no content-addressed store under a data root, no mesh-bound fetch endpoint, no same-host hardlink or reflink path, no keeper, no scoped fetch capability. `{in}` is made and left empty | §1 and §10 | D10, D11; `docs/plan.md` M11; `herd-runner/src/lib.rs` says the endpoint "arrives in M11" |
 | **A per-requester authentication ceiling.** One shared requester token, so any requester holding it may ask for `merger` | §11.1 | `status.md` "not done" 4 |
-| **M13's status document** (E-35, E-37), **M14's scheduled jobs and push hook** (E-41, E-42), **M15d's self-update**, **M18's acceptance** | not drawn — nothing of them exists to draw | `docs/plan.md` |
+| **M13's events** (E-37), **M14's scheduled jobs and push hook** (E-41, E-42), **M15d's self-update**, **M18's acceptance** | not drawn — nothing of them exists to draw | `docs/plan.md` |
+| **M13's status document is built and is not M13.** `status.json` in the state root, published on change, with `herd-hub status` to render it (E-35, E-40). What is still missing from M13 is E-37's events, above, and the use-against-budget figure D152 left to this milestone: the budget is on the document, what is used against it is a walk of the volume and stays `herd-hub report`'s | §8 — one more file the hub writes under D8's discipline, read by nobody it serves | `docs/plan.md` M13; `herd-hub/src/status.rs` |
 
 Three things that are built and are **weaker than the picture might
 suggest**, which a reviewer should not read as gaps:
