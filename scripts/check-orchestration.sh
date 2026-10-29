@@ -1543,6 +1543,182 @@ rm -f "${tmp:?}"/push-good.md "${tmp:?}"/push-oneline.md \
   "${tmp:?}"/push-nosection.md "${tmp:?}"/push-placeholder.md \
   "${tmp:?}"/push-nofield.md "${tmp:?}"/push-longsubject.md
 
+echo "== bench-preflight.sh reads the room in the cgroup it is standing in"
+# Why this section exists. On 2026-10-29 five agents each lost a twelve-core
+# suite run to a preflight that had cleared them, and three branches sat red:
+# /proc/loadavg and MemAvailable read fine while the slice the suite runs in
+# (/chatons.slice, memory.high 18 GiB) had 661 MiB left, and the real-binary
+# tests need a runner that can lend 2 GiB. The runner announced the slice's
+# remaining room, correctly, and the tests failed on a true statement about
+# the host. The preflight now reads that room too, and every case below is
+# one way that reading can be wrong in a way nobody would see from a
+# terminal: this host has a slice, so a run here exercises exactly one of
+# these shapes and never the others.
+#
+# The reading follows herd-runner/src/room.rs, and the four cases that
+# mirror its own tests — the tightest ceiling up the chain, memory.high
+# under memory.max, an unreadable memory.current, nothing enclosing at all —
+# are here so the two readings cannot drift apart silently.
+pf=$tmp/preflight
+# pf_level <path under the mount, "" for the root> <knob=value>...
+pf_level() {
+  d=$pf/cg$1; shift
+  mkdir -p "$d"
+  for kv in "$@"; do printf '%s\n' "${kv#*=}" > "$d/${kv%%=*}"; done
+}
+pf_fresh() { rm -rf "$pf"; mkdir -p "$pf/cg" "$pf/target"; }
+# pf_run <contents of the fake /proc/self/cgroup> <env...>
+#
+# Checks 1, 2 and 3 are neutralised by their own environment variables so
+# that only the cgroup reading can decide the verdict; the three cases that
+# assert those checks still work put their own figures back.
+pf_run() {
+  printf '%s\n' "$1" > "$pf/self-cgroup"; shift
+  env HERD_PREFLIGHT_CGROUP_MOUNT="$pf/cg" \
+      HERD_PREFLIGHT_SELF_CGROUP="$pf/self-cgroup" \
+      HERD_PREFLIGHT_MIN_FREE_GIB=0 \
+      HERD_PREFLIGHT_MAX_LOAD_PER_CORE=10000 \
+      HERD_PREFLIGHT_MIN_AVAIL_MEM_GIB=0 \
+      HERD_BUILD_ROOT="$pf/no-build-root" \
+      "$@" "$root/scripts/bench-preflight.sh" --target-dir "$pf/target" 2>&1
+}
+# pf_case <name> <expected exit> <regex> <self-cgroup> <env...>
+pf_case() {
+  name=$1; want=$2; pat=$3; self=$4; shift 4
+  out=$(pf_run "$self" "$@"); rc=$?
+  if [ "$rc" -eq "$want" ] && grep -qE -- "$pat" <<<"$out"; then
+    ok "preflight: $name"
+  else
+    bad "preflight: $name" "    want exit $want matching /$pat/, got exit $rc:
+$(printf '%s\n' "$out" | sed 's/^/    /' | head -10)"
+  fi
+}
+gib=1073741824
+mib=1048576
+
+# The incident itself: 18 GiB of memory.high on the slice, 661 MiB left.
+pf_fresh
+pf_level "" memory.current=0
+pf_level /chatons.slice memory.max=max \
+  "memory.high=$((18 * gib))" "memory.current=$((18 * gib - 661 * mib))"
+pf_level /chatons.slice/agent.scope memory.max=max memory.current=1155182592
+pf_case "a slice with 661 MiB left refuses the run" 1 \
+  'only 661 MiB of memory left under memory.high on /chatons.slice' \
+  '0::/chatons.slice/agent.scope'
+# A refusal with no number in it is one nobody can act on: the figure, the
+# floor and the cgroup, or it is not a refusal anyone can answer.
+out=$(pf_run '0::/chatons.slice/agent.scope')
+if grep -qE '661 MiB' <<<"$out" && grep -qE 'floor is 8192 MiB' <<<"$out" &&
+   grep -qE '/chatons.slice' <<<"$out"; then
+  ok "preflight: the refusal names the figure, the floor and the cgroup"
+else
+  bad "preflight: a refusal must name all three" "$(printf '%s\n' "$out" | sed 's/^/    /' | tail -6)"
+fi
+
+# The same slice with room: the check clears and prints what it read.
+pf_fresh
+pf_level /chatons.slice "memory.high=$((18 * gib))" "memory.current=$((2 * gib))"
+pf_case "the same slice with 16 GiB left clears" 0 \
+  'slice room: +16384 MiB under memory.high on /chatons.slice' \
+  '0::/chatons.slice/agent.scope'
+# And says, on the way out, that it read an instant: two phases cleared at a
+# quiet moment on 2026-10-29 reached load 29 mid-suite, and this script is
+# the start of a run and not a watchdog.
+pf_case "a cleared run says its figures are of this instant only" 0 \
+  'of this instant only' '0::/chatons.slice/agent.scope'
+
+# room.rs: the tightest ceiling anywhere up the chain wins. The scope's own
+# 16 GiB is not the bound; the slice two levels up is.
+pf_fresh
+pf_level /outer.slice "memory.max=$((8 * gib))" "memory.current=$((8 * gib - 512 * mib))"
+pf_level /outer.slice/inner.slice "memory.max=$((16 * gib))" memory.current=0
+pf_case "the tightest ceiling up the chain is the one that binds" 1 \
+  'only 512 MiB of memory left under memory.max on /outer.slice' \
+  '0::/outer.slice/inner.slice'
+
+# room.rs: a memory.high under the memory.max is the real bound — past it the
+# kernel throttles and reclaims, which a job meets as a time cap.
+pf_fresh
+pf_level /h.slice "memory.max=$((18 * gib))" "memory.high=$((4 * gib))" \
+  "memory.current=$((4 * gib - 512 * mib))"
+pf_case "a memory.high below the memory.max is the ceiling" 1 \
+  'under memory.high on /h.slice' '0::/h.slice'
+
+# room.rs: a ceiling that reads while memory.current does not is read as
+# fully charged. Erring towards less room is the only direction invariant 2
+# allows, and a preflight that assumed an empty slice would clear every run.
+pf_fresh
+pf_level /nocurrent.slice "memory.max=$((8 * gib))"
+pf_case "an unreadable memory.current is read as no room left" 1 \
+  'only 0 MiB of memory left under memory.max on /nocurrent.slice' \
+  '0::/nocurrent.slice'
+
+# The bare machine, and the case that must never refuse: nothing up the
+# chain carries a ceiling, so there is no figure. An unmeasured thing is
+# reported as unmeasured; refusing here would stop every build on every host
+# with no slice.
+pf_fresh
+pf_level /user.slice memory.max=max memory.high=max memory.current=1864634368
+pf_level /user.slice/session-1.scope memory.max=max memory.current=17
+pf_case "no cgroup memory limit at all clears and says so" 0 \
+  'reading unavailable' '0::/user.slice/session-1.scope'
+# A host still showing cgroup v1 controllers only: no 0:: line, so no v2
+# path and nothing to read.
+pf_fresh
+pf_level /chatons.slice "memory.high=$((18 * gib))" "memory.current=$((18 * gib))"
+pf_case "a host with no cgroup v2 line clears and says so" 0 \
+  'no cgroup v2 line' '8:memory:/system.slice/x'
+# And an unreadable /proc/self/cgroup is not a refusal either, although the
+# very same tree refuses when the file can be read.
+out=$(env HERD_PREFLIGHT_CGROUP_MOUNT="$pf/cg" \
+  HERD_PREFLIGHT_SELF_CGROUP="$pf/no-such-file" \
+  HERD_PREFLIGHT_MIN_FREE_GIB=0 HERD_PREFLIGHT_MAX_LOAD_PER_CORE=10000 \
+  HERD_PREFLIGHT_MIN_AVAIL_MEM_GIB=0 HERD_BUILD_ROOT="$pf/no-build-root" \
+  "$root/scripts/bench-preflight.sh" --target-dir "$pf/target" 2>&1); pf_rc=$?
+if [ "$pf_rc" -eq 0 ] && grep -qE 'reading unavailable' <<<"$out"; then
+  ok "preflight: an unreadable /proc/self/cgroup clears, it never refuses"
+else
+  bad "preflight: an unreadable cgroup file must not refuse" \
+    "    exit $pf_rc: $(printf '%s\n' "$out" | sed 's/^/    /' | tail -4)"
+fi
+
+# The floor is one host's measurement, so it is the environment's to move —
+# and a value that is not a number is a usage error, never a guard that
+# quietly clears everything.
+pf_fresh
+pf_level /chatons.slice "memory.high=$((18 * gib))" "memory.current=$((18 * gib - 661 * mib))"
+pf_case "the floor moves with HERD_PREFLIGHT_MIN_CGROUP_ROOM_GIB" 0 \
+  'floor 512 MiB \(0.5 GiB\)' '0::/chatons.slice' \
+  HERD_PREFLIGHT_MIN_CGROUP_ROOM_GIB=0.5
+pf_case "a floor that is not a number is a usage error, not a cleared run" 2 \
+  'must be a number of GiB, not lots' '0::/chatons.slice' \
+  HERD_PREFLIGHT_MIN_CGROUP_ROOM_GIB=lots
+
+# The three checks that were there before: a reading was added, none was
+# replaced, and each still refuses on its own.
+pf_fresh
+pf_level /chatons.slice "memory.high=$((18 * gib))" "memory.current=$((2 * gib))"
+pf_case "the load check still refuses on its own" 1 \
+  'is at or above' '0::/chatons.slice' HERD_PREFLIGHT_MAX_LOAD_PER_CORE=0
+pf_case "the MemAvailable check still refuses on its own" 1 \
+  'of memory available, floor is 999999' '0::/chatons.slice' \
+  HERD_PREFLIGHT_MIN_AVAIL_MEM_GIB=999999
+pf_case "the free-space check still refuses on its own" 1 \
+  'GiB free on .*, need 999999' '0::/chatons.slice' \
+  HERD_PREFLIGHT_MIN_FREE_GIB=999999
+
+# --help prints the header, and the header grew: a literal line range here
+# is how a help text comes to print half a sentence.
+out=$("$root/scripts/bench-preflight.sh" --help 2>&1)
+if grep -qF 'Why it reads the cgroup too' <<<"$out" &&
+   grep -qF 'Exit:  0 safe to start' <<<"$out"; then
+  ok "preflight: --help prints the whole header, including its last line"
+else
+  bad "preflight: --help must print the whole header" \
+    "$(printf '%s\n' "$out" | sed 's/^/    /' | tail -4)"
+fi
+rm -rf "${pf:?}"
+
 echo "== the gate scripts' own stdin (ORCH-111)"
 # A socket on fd 0 makes bash source SYS_BASHRC non-interactively (its
 # isnetconn() check), and under the `env -i` captures above that rebuilds

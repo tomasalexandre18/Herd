@@ -241,6 +241,92 @@ impl Checkout {
         }
         Ok(())
     }
+
+    /// The commit a **ref** stands at: the one read E-41's predicate is
+    /// built on (D207, [`crate::moved`]).
+    ///
+    /// Separate from [`Checkout::resolve`], and deliberately narrower than
+    /// it in one way and wider in another:
+    ///
+    /// * it insists on a **ref**. A hash resolves perfectly well and is
+    ///   refused anyway, because a hash names one commit for ever: a
+    ///   predicate asking "has it moved?" about one would answer "it moved"
+    ///   on its first run and "it did not" on every run after, for ever,
+    ///   and nobody would be told why. A ref that does not exist is refused
+    ///   by name for the same reason — a ref that is not there has not
+    ///   moved, and must never be read as having moved;
+    /// * it says nothing about the tree or about any remote. It is a read
+    ///   of where a ref points, not a submission. E-08's two refusals still
+    ///   happen, on the way out: the hash this gives is handed back through
+    ///   [`Checkout::resolve`] by the submission itself, so a dirty tree or
+    ///   an unpushed commit is refused there, once, by the code that
+    ///   already does it.
+    pub fn tip_of_ref(&self, named: &str) -> Result<Commit> {
+        let full = self.full_name_of_ref(named)?;
+        let commit = self.commit_named(&full)?;
+        Ok(Commit {
+            hash: commit.hash,
+            // The full name, not what was typed: `main` and
+            // `refs/heads/main` are the same ref, and a state file that
+            // recorded one of the two spellings would read as a different
+            // ref the day somebody typed the other.
+            named: full,
+        })
+    }
+
+    /// The full name of a ref — `refs/remotes/origin/main` — or a refusal
+    /// saying what the name is instead.
+    fn full_name_of_ref(&self, named: &str) -> Result<String> {
+        let said = run_git(
+            &self.root,
+            &[
+                "rev-parse",
+                "--symbolic-full-name",
+                "--end-of-options",
+                named,
+            ],
+        )?;
+        // The **last** non-empty line, and this is not fussiness: in
+        // `--symbolic-full-name` mode `git rev-parse` echoes every argument
+        // it has no ref for, `--end-of-options` included, so the output of a
+        // name that resolves perfectly well is two lines with the marker
+        // first (measured on git 2.54.0: `--end-of-options\nrefs/heads/x`).
+        // Trimming the whole output and testing its start reads the marker
+        // and refuses every ref there is. The marker itself stays, because
+        // without it a ref whose name begins with a dash would be read as an
+        // option.
+        let full = said
+            .out
+            .lines()
+            .map(str::trim)
+            .rfind(|line| !line.is_empty())
+            .unwrap_or_default()
+            .to_owned();
+        if said.worked() && full.starts_with("refs/") {
+            return Ok(full);
+        }
+        let root = self.root.display();
+        // A name git resolves and has no ref for is a hash, or something
+        // peeled from one. It is refused for what it is rather than for
+        // being unknown, because the two call for opposite corrections.
+        let object = run_git(
+            &self.root,
+            &["rev-parse", "--verify", "--end-of-options", named],
+        )?;
+        if object.worked() {
+            bail!(
+                "'{named}' names an object in {root} and not a ref that can move: a predicate \
+                 watching a ref needs a ref — name a branch or a remote-tracking ref, like \
+                 refs/remotes/origin/main"
+            );
+        }
+        bail!(
+            "'{named}' is not a ref {root} holds ({}): a ref that does not exist has not \
+             moved, so nothing was submitted. Fetch it, or name the ref you watch in full, \
+             like refs/remotes/origin/main",
+            said.complaint()
+        )
+    }
 }
 
 /// Exactly forty lowercase hex characters, and nothing else.

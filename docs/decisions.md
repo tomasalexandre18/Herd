@@ -10778,3 +10778,346 @@ and `:2662`; `herd-runner/src/root.rs:197-203`; `b250358`;
 done, and it is the better fix. H.*, which named re-adopting the spool as
 the better fix and said nobody had asked for it — two days before somebody
 built it; **D19**, **D148**, **D180**; ORCH-164.
+
+## 2026-10-29 — D212 The integrator pushes the tag, on the landing's conditions
+
+**Context — an act nobody held.** Until today a tag sat in a gap. `CLAUDE.md`
+*Git and main*, `workflow.md` step 8 and *Permissions and escalation*,
+`docs/orchestration/permissions.md` and `.claude/agents/herd-release.md` all
+reserved it with the same phrase — "Alexa's word, one act at a time" — while
+naming no actor who could carry it out. `herd-release` is refused `git tag`
+and a tag push by its own frontmatter hook (`.claude/hooks/release-guard.sh`,
+measured live as V10); the orchestrator is refused `git tag` and `git push`
+by `orchestrator-guard.sh` (V11); and `herd-merger`'s row in
+`permissions.md` refused it "with the version batch" on the strength of a
+sentence that today's answer removes. So each release needed Alexa to run two
+commands by hand, and v0.4.0 is what that cost: the tag went up on his word
+and the body went out incomplete, because the human steps around a release
+were distributed across people rather than owned by one.
+
+**The question asked, and the answer.** One question went to Alexa on
+2026-10-29: *who posts a tag and publishes a version?* He chose **the
+integrator, under the same conditions it already lands under**. One named
+owner in place of an act nobody held.
+
+**Rule (2026-10-29).** `herd-merger` pushes a release's annotated tag. The
+conditions are the landing's own and no others: a green `./scripts/gate.sh`
+for the **gated** sha — the merge's second parent, trees identical — and a
+filled landing record. Nothing waits for Alexa, exactly as ORCH-001 made the
+merge not wait. Three constraints come with it, and each has a mechanism
+behind it rather than only a sentence:
+
+1. **The tag is a separate, later act, never folded into the batch's push.**
+   One landing is one batch, one push, one `--no-ff` merge commit and one
+   post-push run (`workflow.md`, *What a landing is*). A tag pushed in the
+   same act would make a red run unattributable, which is the whole reason
+   that rule exists.
+2. **The tag names the landing commit, by name.** `release.yml` reads the
+   version through the flake (`nix eval --raw .#static.version`) and fails
+   the run when the tag is not `v$version` or a pre-release of it — step
+   *the version and the target*. A tag pushed before the version bump lands
+   therefore cannot publish, which is why the order is landing, then tag,
+   and never the reverse.
+3. **A release's own notes are untouched by this and stay Alexa's own act**
+   (**D210**). D210 placed the paste "in the same class as pushing the tag";
+   that cross-reference is what this entry supersedes, and only that. The two
+   permission walls D210 names are not weakened, and nothing here asks them
+   to be: `release.yml` still reads no prepared file, so until **ORCH-162**
+   ships the notes in the tree the paste remains a human step named in the
+   same order as the tag.
+
+**What stays Alexa's.** Ordering a release at all, its own notes, milestone
+order, the invariants, GitHub issues and anything on the consumer's side.
+What moved is the mechanical half of a release — the tag — and not the
+decision to cut one.
+
+**Why this is a decision and not a board row.** It is a permission change
+Alexa took today, recorded rather than proposed, and it constrains every
+future release brief and three role files. The rows it leaves open are
+separate: **ORCH-162** (notes in the tree) and **ORCH-164**, which closes on
+the paste and not on this landing.
+
+**Retirement condition.** None foreseen. If a future release act is given to
+a different agent, that is a new entry and not an edit of this one.
+
+**Evidence.** Alexa, 2026-10-29, in answer to one question relayed by the
+orchestrator; corrected in this landing in `CLAUDE.md` *Git and main* and
+*When to ask Alexa*, `docs/orchestration/workflow.md` (the role table, step
+7, step 8, *One landing per batch* *Unchanged*, and *Permissions and
+escalation*), `docs/orchestration/permissions.md` (the `herd-merger` tag row
+replaced by one allowance and one narrower refusal),
+`.claude/agents/herd-release.md` and `.claude/agents/herd-merger.md`;
+`.github/workflows/release.yml` step *the version and the target*;
+`history/2026-10-29-release-v0.4.1.md`; `history/2026-10-29-tag-v0.4.0.md`,
+which is what this entry prevents recurring; **D210**, **D162**, **D172**;
+ORCH-001, ORCH-162, ORCH-164, ORCH-176.
+
+---
+
+## 2026-10-29 — D213 Space before age: the spans become a maximum
+
+Alexa, 2026-10-29, re-cutting the hub's disk policy for space before age.
+This entry **amends D201 and edits nothing of it**.
+
+**Context.** The trigger for removing a record was read as a calendar. It
+cannot be one: the output budget governs the **collected files only**, by
+its own argument documentation (`herd-hub/src/main.rs:149-151`), so it
+cannot see a record byte or a log byte by definition. A policy decided by
+age on a volume whose pressure is space will either delete what is still
+wanted or keep what there is no room for.
+
+**Choice.** Free space on the filesystem the state root sits on decides
+when a record is removed, never the output budget; `--output-floor`
+becomes the record guard as well as the byte floor. **D201's two numbers
+are unchanged — merger 90 days, every other class 14, active by default —
+and become the maximum age a record may reach rather than when it is
+deleted.** And nothing is kept without a bound: what can no longer serve
+is removed after a stated delay, saying so, or moved to a configurable
+archive path on another disk. Never immediately, never silently, never
+for the sake of keeping. Whatever is held — a transitional state, an
+archive path — appears in a report with its size, counts toward the space
+calculation, and signals an overflow. The precedent is the 65 GB of
+runner spools that no tool reported on 2026-10-27.
+
+**What this entry does not decide, and why it is written this way.**
+`docs/disk-policy.md` §6 E — **deduplication on by default** — and §6 F —
+**the delay before something that can no longer serve is removed, and the
+archive path** — are **open questions to Alexa**, by the branch's own
+handoff. The integrator declined to record either as directed: a shipped
+default is irreversible on the consumer's volume, and a decision entry is
+where this project states what Alexa said, not what it expects him to
+say. The figure deduplication would be decided on is measured and stands
+either way: the first consumer's reading of 2026-10-29 gives `r_file` =
+**5.04** against the never-recorded threshold of **4**. It does **not**
+free ~85 GB — 84.94 GiB are second-and-later copies, but linking applies
+to new arrivals, so day one frees zero. What changes is the rate, 7.57 to
+1.50 GiB/day of distinct bytes, and headroom to a 200 GB budget from 10.7
+to 53.8 days. Those figures go to Alexa with the day-one-zero cost in the
+same breath (ORCH-199).
+
+**Alternative rejected.** Keeping the calendar as the trigger and leaving
+the budget to mean what its documentation says it means, which is the
+state the consumer's volume is in now: two budgets over one disk and
+nothing reconciling them.
+
+**Evidence.** `docs/disk-policy.md` §0, §2.4 retired, §2.9 new, §3.3
+inverted; `docs/plan.md` M12; `docs/coverage.md` E-13, E-15, E-16;
+`history/2026-10-29-orch-170-disk-policy-space-first.md`; **D201**,
+**D194**, **D202**; ORCH-170, ORCH-199.
+
+---
+
+## 2026-10-29 — D214 Alexa directs; the orchestrator keeps work in flight
+
+Alexa, 2026-10-29, verbatim: *"tu est orchestrateur ton but est de filé du
+bouleau pour que le projet avance, tu est plus haut que un évènement alors
+il y a que ca qui compte"*, *"ton deuxiemme role et de me repondre"*,
+*"mon but est d'etre directeur du project, tu est manageur, je donne la
+direction … tout les choix tenique ne passe pas par moi"*, *"tout ce qui
+est vraiment structurant pour le project dois quand meme me remonter,
+mais pas tout"*, *"une guidance dois etre suivie"*, *"quand je dis pas de
+preservation de compatibilité et c'est la seul chose que tu me parle
+c'est chiant, Github c'est la meme histoire"*, *"je veux des feuille de
+route chiffré et pouvoir comparer les avancement"*.
+
+**Choice.** The orchestrator's **first duty is to keep bounded work in
+flight so the project advances**; it stands above any single event, and a
+red `main`, a release or a live defect must not drain the queue.
+**Answering Alexa is the second duty.** The triage has three outcomes, in
+order:
+
+1. **Ask him** when the answer changes *what* gets done, never *how*:
+   anything structural — the method, the shape of what the product is or
+   promises — scope, step order, a release and its own notes, an
+   irreversible act, anything on the consumer's side. One question with a
+   recommendation in the board's *Waiting*; work goes on. **A permission
+   the system refuses is escalated, never worked around**, by a peer too.
+2. **Decide alone** what is inside the mandate and reversible: not
+   submitted beforehand, told afterwards in the session-end report.
+3. **Report, with no question attached,** what could cost him later — a
+   trap that would destroy something, a threshold being approached, a
+   structural decision arriving from elsewhere — early enough to matter.
+
+**How is never his:** not a technical choice, an implementation, an API,
+a defect, the tooling. A report is aggregated and quantified: one dated
+line, columns date · milestone · musts done/total · open rows · red
+gates. **A guidance already given is standing** and is not re-raised: no
+compatibility to preserve (the consumer resets at v1.0.0) and no
+compatibility question gates a tag; GitHub is tooling and not the centre
+of this project — a run id is not a report, a green run is not a
+decision.
+
+**Scope.** This supersedes the *When to ask Alexa* section of `CLAUDE.md`,
+which it replaces, and nothing else. **The tag's actor is D212's**, not
+this entry's. **D210 stands**: a published release's notes are Alexa's own
+act, not because a release waits on his word but because two permission
+walls refuse that write to every agent and to the orchestrator, and
+neither is to be weakened; it retires when ORCH-162 ships the notes in
+the tree.
+
+**What left `CLAUDE.md` with the old section, and where it went.** The
+word **"issues"** has no line left at 150/150 and is not in the new
+section. It is redundant rather than retired: a ticket that changes scope
+is already caught by *anything structural*, and one on the consumer's
+repository by *anything on the consumer's side*. The rule itself lives in
+`docs/orchestration/workflow.md` (orchestrator's judgement, 2026-10-29,
+ORCH-191).
+
+**Alternative rejected.** Keeping the old enumeration and spending the
+line on "issues", which would have left the first duty unstated — and the
+first duty is the half Alexa said was missing.
+
+**Evidence.** `CLAUDE.md` *Direction, and what reaches Alexa*;
+`history/2026-10-29-claude-md-direction.md`; **D212**, **D210**;
+ORCH-189, ORCH-190, ORCH-191.
+
+---
+
+## 2026-10-29 — D215 The fleet's state is a document, not a frame
+
+**Context.** `docs/plan.md` reasoned that E-35's machine-readable status
+should be a protocol frame a requester asks for. Under Alexa's direction
+of 2026-10-29 the shape was reconsidered: what an operator and a renderer
+need is the state of the fleet **at rest**, readable with no connection,
+no token and no protocol version in hand.
+
+**Choice.** `status.json` in the state root, beside the records, with its
+own `STATUS_VERSION` (Q7), and `herd-hub status` as the one text screen
+over it. **Published on change and never on a clock**: the only thing
+that wakes the publisher is a ring from `State::with_peers`, the one door
+to every live fact about the fleet, so a quiet hub publishes nothing and
+the document is a record of changes rather than a sample. Over-ringing is
+free: the publisher compares what it built against what it last wrote and
+writes nothing when they say the same thing. Reading it takes no lock.
+
+**Alternative rejected.** The frame the plan named. It would make the
+fleet's state unreadable without a live connection, put a second
+versioned surface on the protocol, and give the operator nothing to read
+when the hub is the thing that is wrong.
+
+**Consequence recorded for the next reader.** A serving hub rewrites
+`status.json` about five times a second, so it is **not** state a test may
+checksum: `herd-hub/tests/real_herd/mod.rs`'s `state_bytes` excludes it,
+and the exclusion is compensated by an added assertion rather than by
+loosening an existing one.
+
+**Evidence.** `herd-hub/src/status.rs`; `herd-hub/tests/status.rs`;
+`herd-hub/tests/real_herd/mod.rs`; `docs/architecture.md`;
+`history/2026-10-29-v18-status.md`; E-35, E-40, Q7; ORCH-180.
+
+---
+
+## 2026-10-29 — D216 The events sink: payload, transport, owner's side
+
+**Context.** E-37 asks that events be routable to ntfy. Its list was
+nowhere in this repository until 2026-10-29; issue #1 names five things
+and no more, with the acceptance criterion *"a day's ntfy count does not
+grow with the number of step jobs"*. Three choices in building it are
+architecture and not detail, so they are recorded rather than left in a
+module header.
+
+**Choice, in three parts.**
+
+1. **The event payload carries its own version.** It is a surface a
+   consumer parses, so it is versioned like the others (Q7) and moves
+   without touching `PROTOCOL_VERSION`.
+2. **`http://`-only, with a command string as the escape hatch.** One
+   setting, a URL or a command; no filter, no template, no per-event
+   switch — invariant 1 refuses the beginnings of a notification policy
+   language. The hub's image keeps its "no shell, nothing to exec"
+   property: a consumer who needs TLS or a signature runs ntfy in the
+   compose network and points the hub at it.
+3. **`asked_for` is remembered, so "the owner's side" means something.**
+   An owner switch is announced only when the switch moved from the
+   owner's side and not because the hub asked for it; without that memory
+   the event fires on the hub's own request and is noise.
+
+**What is not built, and why it is not a gap in the record.** Two of
+E-37's five have no transition in today's hub: a detached job's end needs
+the submitter's asking carried on `NewJob`, `ToHub::SubmitJob` and
+`job.json`, which is the record's owner's work; the nightly's verdict
+needs M14 to exist and then needs no event of its own, because a
+scheduled job is a submission nobody is following. `docs/coverage.md`
+E-37 says so and the row stays open.
+
+**Never on a path anything waits for.** Every call site is one
+`self.notify.say(...)`, not `async`, unable to block; a sink that has
+stopped answering cannot add a second to the hub's bounded stop, because
+`Housekeeping` aborts its task and never joins it.
+
+**Alternative rejected.** A shell and a CA bundle in the hub's image,
+which buys arbitrary transports and costs the property the image was
+built around.
+
+**Evidence.** `herd-hub/src/notify.rs`; `herd-hub/tests/events.rs`;
+`docs/coverage.md` E-37; `history/2026-10-29-v20-events.md`; **D27**;
+ORCH-181.
+
+---
+
+## 2026-10-29 — D217 E-41's no-submission skip is the requester's line
+
+**Context.** E-41 asks that a skipped nightly be reported as an event.
+`herdctl if-moved` submits a declared command only when a named ref has
+moved since the last run it recorded; a run that submits nothing leaves
+the hub nothing to emit an event about, because the hub's events are
+about jobs it knows.
+
+**Choice.** The skip that submitted nothing is **`herdctl`'s own stderr
+line**, not a hub event. The half of E-41 that *is* an event is the
+deadline skip, which is a job the hub holds and already ends `cancelled
+(deadline)` with exit 125 (E-09, D40). The timer stays the consumer's
+(D106, D207).
+
+**Why this is recorded and not merely noted.** It is a visible departure
+from a numbered consumer expectation. Today it lives only in
+`docs/coverage.md`'s E-41 note and `docs/scheduling.md`; the next person
+to read E-41 as a promise should find the departure in `decisions.md`.
+
+**Alternative rejected.** Giving the requester a path to make the hub emit
+an event about a job that does not exist. It would put a notification API
+on the submission path and make "an event is about a job" false, which is
+what keeps the acceptance criterion — a day's count that does not grow
+with step jobs — provable at all.
+
+**Evidence.** `herdctl/src/moved.rs`; `herdctl/tests/if_moved.rs`;
+`docs/scheduling.md`; `docs/coverage.md` E-41; `herdctl if-moved --help`;
+**D106**, **D207**, **D40**; ORCH-182.
+
+---
+
+## 2026-10-29 — D218 An unreadable record is quarantined, not a refused root
+
+**Context.** A `job.json` the hub could not read made `JobDirStore::open`
+fail, which stops `main()` seventy-six lines before `Hub::bind_with`: one
+damaged record held every healthy job on the state root hostage, and a
+container restarted into the same wall. It was live on the first
+consumer's machine and unrepairable from outside their container (D161,
+invariant 9).
+
+**Choice.** The quarantine path **D52** already gave a record whose labels
+today's rules reject now covers a record the hub cannot read at all: torn,
+empty, NUL-filled, of a record version this build does not read, or whose
+bytes the filesystem will not return. Such a record is **named with its
+path at every start, counted, written to `index/state.json`, kept out of
+the queue and never rewritten**. What still refuses a whole state root is
+a root the hub cannot *enumerate*. No format version moves.
+
+**The expectations that changed were the defect.** ORCH-080's 308-state
+crash-point census said `176 refuse the whole state root`; it now says
+`0`. That census was asserting the behaviour this entry removes, so the
+rewrite is the point of the change and not a weakening of its test — the
+same 308 states are still enumerated, and `herd-hub/tests/durability.rs`
+gains the assertions for the quarantine path itself.
+
+**Alternative rejected.** Repairing or rewriting the damaged record, which
+would destroy the one copy of whatever a requester's evidence was, and
+leave nobody able to say what had been lost.
+
+**Residue.** `docs/remediation/13-crash-point-enumeration.md` §4.2 and
+`README.md:42` still state the old refusal (ORCH-183).
+
+**Evidence.** `herd-hub/src/store.rs`; `herd-hub/tests/crash_points.rs`;
+`herd-hub/tests/durability.rs`;
+`history/2026-10-29-v10-quarantine.md`; **D52**; ORCH-106, ORCH-161,
+ORCH-183.

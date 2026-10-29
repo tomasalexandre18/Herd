@@ -1126,10 +1126,27 @@ impl Herd {
     }
 
     /// Every byte of this hub's state root, as a sorted list of paths and
-    /// contents (E-07).
+    /// contents (E-07) — **except the hub's own status document**.
     ///
     /// What a dry run must not change. Paths **and** bytes, because "nothing
     /// was written" has two halves: no file appeared and no file moved.
+    ///
+    /// **Why `status.json` is left out** (E-35, E-40, M13). A serving hub
+    /// publishes what the fleet is doing whenever it changes, and one of the
+    /// things that document carries is when each runner was last heard from
+    /// — so with a runner connected it moves on every health report, which
+    /// in these tests is five times a second. A snapshot that included it
+    /// would never be twice the same: `until_the_state_root_is_quiet` would
+    /// never return, and a before/after comparison would be measuring the
+    /// health cadence rather than the thing it is about.
+    ///
+    /// **An exclusion and not an exemption.** The document is still held to
+    /// E-07, by name, where that matters: the dry-run test in
+    /// `owner_control.rs` asserts that a `would-run` leaves the document's
+    /// runners, its running jobs and its queue exactly as they were, which
+    /// is E-07's claim about this file with the health age taken out of it.
+    /// What the document says about everything else is
+    /// `herd-hub/tests/status.rs`.
     pub fn state_bytes(&self) -> Vec<(String, Vec<u8>)> {
         fn walk(at: &Path, under: &Path, into: &mut Vec<(String, Vec<u8>)>) {
             let mut entries: Vec<PathBuf> = std::fs::read_dir(at)
@@ -1148,7 +1165,7 @@ impl Herd {
                 if entry.is_dir() {
                     into.push((format!("{shown}/"), Vec::new()));
                     walk(&entry, under, into);
-                } else {
+                } else if shown != herd_hub::STATUS_FILE {
                     into.push((shown, std::fs::read(&entry).unwrap_or_default()));
                 }
             }

@@ -341,7 +341,7 @@ floor.
 | Number | Value | Where it lives | What a mismatch does |
 |---|---|---|---|
 | `PROTOCOL_VERSION` | **2** | `herd-proto`, in `Hello` and `Welcome` | the hub refuses the peer by name, whatever else it got right. A bump is a fleet-wide synchronised restart |
-| build version (`version_gap`) | workspace `0.4.0` | `Hello::peer_version`, `Welcome::hub_version` | a major gap refuses; a minor gap is served with a note; an unreadable string is served with a note (E-51) |
+| build version (`version_gap`) | workspace `0.4.1` | `Hello::peer_version`, `Welcome::hub_version` | a major gap refuses; a minor gap is served with a note; an unreadable string is served with a note (E-51) |
 | `RECORD_VERSION` | **1** | `herd-hub/src/job.rs`; sits in front of `job.json` **and every line of `events.jsonl`** | the file is not read at all: the store errors naming the path and both numbers, and because that comes out of recovery the hub **refuses to start** on that state root |
 | `LAYOUT_VERSION`, `INDEX_VERSION`, `READINGS_VERSION`, `ROSTER_VERSION` | **1** each | `store.json`, `index/state.json`, `readings/answers.json`, `runners.json` | the file is refused rather than read as if it were this version; the roster's one decides who may connect |
 | `OUTPUT_FORMAT_VERSION` | **1** | the `ran on: …` line a requester's stdout is framed with | nothing refuses; it is how a consumer's parser knows which framing it got (Q7) |
@@ -1275,7 +1275,8 @@ the gap is recorded.
 | **The Docker Hub push**, the pull-back by digest and the GitHub release. All three are written and ordered; none has ever run, for want of an account, a repository variable and a scoped token | §11.2 | D153; `status.md` "Next action" |
 | **M11's pack half.** There are **no registry frames** on either enum, no content-addressed store under a data root, no mesh-bound fetch endpoint, no same-host hardlink or reflink path, no keeper, no scoped fetch capability. `{in}` is made and left empty | §1 and §10 | D10, D11; `docs/plan.md` M11; `herd-runner/src/lib.rs` says the endpoint "arrives in M11" |
 | **A per-requester authentication ceiling.** One shared requester token, so any requester holding it may ask for `merger` | §11.1 | `status.md` "not done" 4 |
-| **M13's status document** (E-35, E-37), **M14's scheduled jobs and push hook** (E-41, E-42), **M15d's self-update**, **M18's acceptance** | not drawn — nothing of them exists to draw | `docs/plan.md` |
+| **M13's events** (E-37), **M14's scheduled jobs and push hook** (E-41, E-42), **M15d's self-update**, **M18's acceptance** | not drawn — nothing of them exists to draw | `docs/plan.md` |
+| **M13's status document is built and is not M13.** `status.json` in the state root, published on change, with `herd-hub status` to render it (E-35, E-40). What is still missing from M13 is E-37's events, above, and the use-against-budget figure D152 left to this milestone: the budget is on the document, what is used against it is a walk of the volume and stays `herd-hub report`'s | §8 — one more file the hub writes under D8's discipline, read by nobody it serves | `docs/plan.md` M13; `herd-hub/src/status.rs` |
 
 Three things that are built and are **weaker than the picture might
 suggest**, which a reviewer should not read as gaps:

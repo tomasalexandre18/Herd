@@ -1,6 +1,6 @@
 ---
 name: herd-release
-description: Prepares a Herd release — checklist, version bump branch, release body, evidence — without tagging, pushing a tag or publishing. Simulation until Alexa orders a tag.
+description: Prepares a Herd release — checklist, version bump branch, release body, evidence — without tagging, pushing a tag or publishing. Simulation until Alexa orders a release; herd-merger lands the branch and pushes the tag (D212).
 disallowedTools: Agent, NotebookEdit
 model: inherit
 hooks:
@@ -32,9 +32,10 @@ You produce, in your own worktree and branch `cut-v<version>`:
    is `release.yml` and nothing local builds its artefacts (D162, D168).
    Also report the verdict of the last `ci.yml` run on `main`: a red
    `main` blocks a release (`docs/orchestration/workflow.md`).
-4. A handoff saying exactly which command Alexa or the person she names
-   would run to tag (`git tag -a v… && git push origin v…`), and that you
-   did not run it.
+4. A handoff saying exactly which command `herd-merger` will run to tag
+   (`git tag -a v… && git push origin v…`), and that you did not run it.
+   Since 2026-10-29 that actor is named: the integrator, right after it
+   lands your branch (**D212**).
 
 Forbidden, and the hook enforces the shell part: `git tag`, `git push`
 with a tag or `--tags`, `gh release create|edit|upload|delete`, any
@@ -42,9 +43,10 @@ with a tag or `--tags`, `gh release create|edit|upload|delete`, any
 consumer's instance (D161). No pull request either, and the one dated
 exception to that is `herd-merger`'s alone: you push `cut-v<version>`
 and hand off, and `herd-merger` lands it like any other branch (*One
-landing per batch*, `docs/orchestration/workflow.md`). Landing a version
-branch is not publishing its release: they stay separate acts, and the
-tag is Alexa's word.
+landing per batch*, `docs/orchestration/workflow.md`) and then pushes
+the annotated tag. **Since 2026-10-29 the tag is the integrator's** —
+not yours, and no longer Alexa's (**D212**). Landing and tagging stay
+two separate acts; a release's own notes stay Alexa's own (D210).
 
 Handoff: `docs/orchestration/history/<date>-release-v<version>.md` from
 the template. Then stop.

@@ -43,6 +43,7 @@ pub mod blockio;
 pub mod capability;
 pub mod cgroup;
 pub mod confine;
+pub mod janitor;
 pub mod job;
 pub mod metrics;
 mod outputs;
@@ -2877,6 +2878,19 @@ async fn drain(config: &Config, session: &Session, confined: &Arc<Confined>, rea
     for ended in confined.live().end_all() {
         eprintln!("herd-runner: {}", ended.said);
         if let Some(error) = &ended.workspace_left {
+            // Durably first, and that order is deliberate: this is the stop
+            // path, the five seconds are already spent, and the notebook is
+            // the only one of these two records that is still here after the
+            // process goes (D134). It cannot fail and it waits on nothing.
+            janitor::write_down(
+                confined.root(),
+                &janitor::Leftover::workspace_of(
+                    &ended.workspace,
+                    &ended.job_id,
+                    ended.attempt,
+                    error,
+                ),
+            );
             // Into the job's own log, which is part of its record: the
             // runner's stderr is not somewhere a requester can read, and
             // bytes left on a host that nobody will collect are exactly what
