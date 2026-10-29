@@ -1517,24 +1517,67 @@ fn a_tighter_enclosing_memory_max_lowers_the_room_that_is_announced() {
     );
 }
 
-// ------------------------------------------------- no inbound socket ----
+// ------------------------------------------- the one inbound socket ----
 
 /// Invariant 3, asserted against the running process rather than against a
-/// promise: the real runner binary, joined to a hub and running a job, holds
-/// no socket in the listening state.
+/// promise: **every** listening socket the real runner binary holds is the
+/// mesh address its configuration named, and there is **at most one**.
 ///
-/// The mesh-bound fetch endpoint of D10 and D11 arrives in M11; when it does,
-/// this test becomes "no socket on a default or public interface" and keeps
-/// its shape.
+/// This is the shape the old assertion said it would take. It used to read
+/// "the runner holds no socket in the listening state", with its own note
+/// that *"the mesh-bound fetch endpoint of D10 and D11 arrives in M11; when
+/// it does, this test becomes 'no socket on a default or public interface'
+/// and keeps its shape"*. It now says something stricter than that note
+/// promised: not merely "not a public interface" but **that one address and
+/// no other**, counted, so a second listener anywhere in the process is a
+/// failure even when it is bound somewhere respectable.
+///
+/// Three properties in one walk, and the middle one is the new part:
+///
+/// 1. with **no** mesh address configured the permitted set is empty, so the
+///    assertion is exactly the old one, letter for letter;
+/// 2. with one configured, the permitted set is that one address — and
+///    `herd-runner` today still binds nothing, so the set this walk finds is
+///    empty either way. What the configured runner proves is the other half
+///    of the rule: the address was **accepted** at startup (loopback, on
+///    purpose — see `mesh.rs`) and the process joined the hub rather than
+///    refusing to start;
+/// 3. the walk is first made to find a socket planted on purpose, because an
+///    empty result from a walk that can find nothing is not evidence of
+///    anything.
+///
+/// The refusals themselves — a wildcard, an address of the default-route
+/// interface, a globally routable one — are asserted in `mesh.rs`'s own unit
+/// tests against fixed host fixtures and against this host's real routing,
+/// and the two that need no host at all are asserted below against the real
+/// binary.
 #[tokio::test]
-async fn the_runner_binds_no_listening_socket() {
+async fn every_listening_socket_of_the_runner_is_its_mesh_address() {
+    const TEST: &str = "every_listening_socket_of_the_runner_is_its_mesh_address";
     if !cfg!(target_os = "linux") {
         skipped(
-            "the_runner_binds_no_listening_socket",
+            TEST,
             "this host is not Linux, so /proc/net/tcp cannot be read",
         );
         return;
     }
+    // The detector, before the claim: a listener bound by this test, found by
+    // the same walk that is about to report the runner's. A zero is not a
+    // result until the walk is known to be able to see something.
+    let planted = std::net::TcpListener::bind("127.0.0.1:0").expect("the fixture binds a socket");
+    let mesh: std::net::SocketAddr = planted
+        .local_addr()
+        .expect("a bound listener has an address");
+    let found = listening_sockets_of(std::process::id());
+    assert!(
+        found.iter().any(|held| same_socket(*held, mesh)),
+        "the walk missed the listener this test bound at {mesh}, so an empty result for the \
+         runner would have proved nothing: {found:?}"
+    );
+    // And the address the runner is now given is the one this test just let
+    // go of: free, loopback, and nothing else on this host answers there.
+    drop(planted);
+
     let data_root = TempDir::new("no-listener");
     let state = TempDir::new("no-listener-state");
     let store = Arc::new(JobDirStore::open(state.path()).expect("the state root opens"));
@@ -1564,6 +1607,14 @@ async fn the_runner_binds_no_listening_socket() {
         .env("HERD_TOKEN", token)
         .arg("--data-root")
         .arg(data_root.path())
+        // Configured with a mesh address, which is the part of this test that
+        // is new: a runner that would not be allowed to serve anything would
+        // prove the old assertion and not this one. Loopback, because it is
+        // the only address the rule permits on a workstation with one network
+        // card, and because its acceptance is a deliberate clause of the rule
+        // rather than an accident of it (`mesh.rs`).
+        .arg("--mesh-listen")
+        .arg(mesh.to_string())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
         .kill_on_drop(true)
@@ -1622,10 +1673,31 @@ async fn the_runner_binds_no_listening_socket() {
     }
 
     let listening = listening_sockets_of(pid);
+    // Every one of them is the configured mesh address…
+    for held in &listening {
+        assert!(
+            same_socket(*held, mesh),
+            "the runner is listening on {held}, which is not the mesh address {mesh} its \
+             configuration named: invariant 3 permits one private mesh address and nothing \
+             else, never a default or public interface (D11). All of them: {listening:?}"
+        );
+    }
+    // …and there is at most one, so a second listener is a failure even when
+    // it is bound somewhere the rule would have permitted.
+    assert!(
+        listening.len() <= 1,
+        "the runner holds {} listening sockets ({listening:?}); invariant 3 permits one, on \
+         the single configured mesh address",
+        listening.len()
+    );
+    // Which today means none at all: the rule is built and the endpoint is
+    // not, so this runner serves nothing. Stated as its own assertion so that
+    // the step which binds the endpoint has to come here and change one line
+    // rather than silently satisfy a weaker claim.
     assert!(
         listening.is_empty(),
-        "the runner is listening on {listening:?}; invariant 3 says it dials out \
-         and binds nothing (the mesh endpoint of D10/D11 arrives in M11)"
+        "this version of herd-runner holds the mesh rule and no fetch endpoint, so it should \
+         still be listening on nothing: {listening:?}"
     );
 
     std::fs::write(&release, b"checked").expect("the job is let go");
@@ -1634,15 +1706,156 @@ async fn the_runner_binds_no_listening_socket() {
     serving.abort();
 }
 
+/// Start the real binary with one `--mesh-listen` value and give back what it
+/// said and whether it lived.
+///
+/// Nothing is bound and no hub is needed: the mesh address is judged before
+/// the dial, exactly as a bad data root is (E-45, D11), so a refusal is this
+/// process exiting non-zero with the reason on its stderr.
+fn startup_with_mesh_listen(label: &str, address: &str) -> (bool, String) {
+    let data_root = TempDir::new(label);
+    let out = std::process::Command::new(env!("CARGO_BIN_EXE_herd-runner"))
+        // A hub that is not there. Reached only if the address was accepted,
+        // which is not what these cases are about.
+        .arg("--hub")
+        .arg("ws://127.0.0.1:1")
+        .arg("--name")
+        .arg(label)
+        .arg("--data-root")
+        .arg(data_root.path())
+        .arg("--mesh-listen")
+        .arg(address)
+        // A dial this process never waits for: the refusal happens before it.
+        .arg("--give-up-after")
+        .arg("0")
+        .output()
+        .expect("the real runner binary runs");
+    let said = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    (out.status.success(), said)
+}
+
+/// D11's first condition against the real binary: a wildcard is refused at
+/// startup, by name, before anything is dialled.
+///
+/// A wildcard is the one value that would satisfy a naive reading of "bind
+/// the mesh address" and break invariant 3 completely: `0.0.0.0` binds the
+/// default-route interface along with every other one, which is exactly the
+/// interface a port forwarded on a router lands on.
+#[test]
+fn a_wildcard_mesh_address_refuses_the_runners_startup() {
+    for address in ["0.0.0.0:9440", "[::]:9440"] {
+        let (lived, said) = startup_with_mesh_listen("mesh-wildcard", address);
+        assert!(!lived, "{address} was accepted: {said}");
+        assert!(said.contains("--mesh-listen"), "{address}: {said}");
+        assert!(said.contains("wildcard"), "{address}: {said}");
+        assert!(said.contains("invariant 3"), "{address}: {said}");
+    }
+}
+
+/// And the third: a globally routable address is refused at startup, by name.
+/// Host-independent on purpose — `8.8.8.8` is public wherever this runs, and
+/// no interface of this machine has to hold it for the rule to refuse it.
+#[test]
+fn a_globally_routable_mesh_address_refuses_the_runners_startup() {
+    let (lived, said) = startup_with_mesh_listen("mesh-public", "8.8.8.8:9440");
+    assert!(!lived, "a public address was accepted: {said}");
+    assert!(said.contains("--mesh-listen"), "{said}");
+    assert!(said.contains("globally routable"), "{said}");
+    // The second half of a refusal an operator can act on: what to do about
+    // it. D10 keeps a path for a machine that serves nothing.
+    assert!(said.contains("outbound-only"), "{said}");
+}
+
+/// An advertised address with nothing listening on it is a promise this
+/// runner cannot keep, so it is refused rather than ignored.
+#[test]
+fn an_advertised_mesh_address_without_a_listen_address_refuses_the_startup() {
+    let data_root = TempDir::new("mesh-advertise-alone");
+    let out = std::process::Command::new(env!("CARGO_BIN_EXE_herd-runner"))
+        .arg("--hub")
+        .arg("ws://127.0.0.1:1")
+        .arg("--name")
+        .arg("mesh-advertise-alone")
+        .arg("--data-root")
+        .arg(data_root.path())
+        .arg("--mesh-advertise")
+        .arg("10.9.0.3:9440")
+        .arg("--give-up-after")
+        .arg("0")
+        .output()
+        .expect("the real runner binary runs");
+    let said = String::from_utf8_lossy(&out.stderr).into_owned();
+    assert!(!out.status.success(), "it was accepted: {said}");
+    assert!(said.contains("--mesh-advertise"), "{said}");
+    assert!(said.contains("--mesh-listen"), "{said}");
+}
+
+/// The module that may name the one listener type invariant 3 permits. One
+/// file, by name, and the test below is where the name lives.
+const MAY_NAME_A_LISTENER: &str = "mesh.rs";
+
 /// The same promise read off the code, so that it holds on every host and not
-/// only where `/proc` can be walked: no module of the runner reaches for
-/// anything that binds.
+/// only where `/proc` can be walked: one named module of the runner may reach
+/// for the one listener type D11 permits, and no other module may reach for
+/// anything that binds at all.
+///
+/// **This guard is stronger than the one it replaces, not weaker.** It used
+/// to forbid `TcpListener`, `UdpSocket`, `UnixListener` and `UnixDatagram`
+/// everywhere in the crate. That was a true statement about a runner with no
+/// fetch endpoint, and the moment one is built it becomes a statement nobody
+/// can keep — and the usual way it stops being kept is an `#[allow]`, a
+/// renamed import or a path spelled `net::TcpListener` so the substring no
+/// longer matches. What replaces it is:
+///
+/// - `TcpListener` is permitted in **exactly one** file, named here, and
+///   asserted to really be named there — so the permit cannot rot into a
+///   name nobody uses while the real listener grows somewhere else;
+/// - `UdpSocket`, `UnixListener` and `UnixDatagram` stay forbidden
+///   **everywhere**, that one file included: a runner's peer path is one TCP
+///   endpoint on one mesh address, and nothing in Herd has any business
+///   opening a datagram socket or a Unix socket;
+/// - every other file of the crate is forbidden all four, as before.
+///
+/// "One named module" is a tighter statement than "nowhere" plus an exception
+/// nobody wrote down, which is what the first step of the pack half would
+/// otherwise have created: the exception is now a file name in a test, and
+/// moving the listener to a second module is a red suite rather than a
+/// reviewer's good memory.
 #[test]
 fn no_module_of_the_runner_can_bind_a_socket() {
-    let forbidden = ["TcpListener", "UdpSocket", "UnixListener", "UnixDatagram"];
+    // Forbidden everywhere, the permitted module included.
+    let forbidden = ["UdpSocket", "UnixListener", "UnixDatagram"];
+    // Forbidden everywhere but the one module named above.
+    let permitted_once = "TcpListener";
+    // The detector, before the claim: the same matching the walk uses, made
+    // to fire on a line that is known to be bad. A source walk that matched
+    // nothing would pass this test on a crate that bound a socket in every
+    // module.
+    assert_eq!(
+        names_in(
+            code_of("    let socket = tokio::net::UdpSocket::bind(addr).await?;"),
+            &forbidden
+        ),
+        vec!["UdpSocket"],
+        "the matching this test is built on does not fire on a line that binds"
+    );
+    assert!(
+        names_in(
+            code_of("    // UdpSocket is what this module must never reach for"),
+            &forbidden
+        )
+        .is_empty(),
+        "a name inside a comment is not a module reaching for it"
+    );
+
     let sources = herd_runner::testing::source_files();
     assert!(sources.len() > 5, "the walk found {} files", sources.len());
     let mut checked = 0usize;
+    let mut named_the_listener: Vec<String> = Vec::new();
     for (path, text) in sources {
         // This file is the test of the rule, so it is allowed to name what it
         // forbids; nothing else in the crate is.
@@ -1652,21 +1865,70 @@ fn no_module_of_the_runner_can_bind_a_socket() {
         {
             continue;
         }
+        let may_name_a_listener = path
+            .file_name()
+            .is_some_and(|name| name == MAY_NAME_A_LISTENER);
         checked += 1;
         for (number, line) in text.lines().enumerate() {
-            let code = line.split("//").next().unwrap_or("");
-            for name in forbidden {
+            let code = code_of(line);
+            let reached_for = names_in(code, &forbidden);
+            assert!(
+                reached_for.is_empty(),
+                "{}:{} names {reached_for:?}: a runner dials out, and the one socket it may \
+                 ever bind is a TCP endpoint on its mesh address (invariant 3, D11): {line}",
+                path.display(),
+                number + 1
+            );
+            if code.contains(permitted_once) {
                 assert!(
-                    !code.contains(name),
-                    "{}:{} names {name}: a runner dials out and binds nothing \
-                     (invariant 3): {line}",
+                    may_name_a_listener,
+                    "{}:{} names {permitted_once}: the one module of this crate that may is \
+                     {MAY_NAME_A_LISTENER}, which owns the mesh-address rule and the single \
+                     endpoint invariant 3 permits (D11). Bind through \
+                     `mesh::MeshListener` from there rather than reaching for the type \
+                     here: {line}",
                     path.display(),
                     number + 1
                 );
+                named_the_listener.push(path.display().to_string());
             }
         }
     }
     assert!(checked > 4, "only {checked} files were checked");
+    // The permit is a door with a name on it, so the name must lead
+    // somewhere: a `MAY_NAME_A_LISTENER` nothing matches would quietly become
+    // "forbidden everywhere" again, and the next listener would go in
+    // whichever file was convenient.
+    assert!(
+        !named_the_listener.is_empty(),
+        "no file of this crate names {permitted_once}, so the permit for \
+         {MAY_NAME_A_LISTENER} points at nothing. Either that module owns the one listener \
+         invariant 3 permits, or this test's permit should be removed"
+    );
+    assert!(
+        named_the_listener
+            .iter()
+            .all(|path| path.ends_with(MAY_NAME_A_LISTENER)),
+        "{permitted_once} is named outside {MAY_NAME_A_LISTENER}: {named_the_listener:?}"
+    );
+}
+
+/// What is left of a source line once its trailing comment is cut off, which
+/// is the only part that can reach for a type. A doc comment or a whole-line
+/// comment leaves nothing.
+fn code_of(line: &str) -> &str {
+    line.split("//").next().unwrap_or("")
+}
+
+/// Which of `names` the code on this line reaches for. Separated out, with
+/// `code_of`, so that the matching the guard above rests on can itself be
+/// made to fire on a line known to be bad and to stay silent on a comment.
+fn names_in<'a>(code: &str, names: &[&'a str]) -> Vec<&'a str> {
+    names
+        .iter()
+        .copied()
+        .filter(|name| code.contains(name))
+        .collect()
 }
 
 // ---------------------------------------------- no Docker socket (D78) ----
@@ -2178,8 +2440,9 @@ fn is_a_live_sleep(pid: u32) -> bool {
         .unwrap_or(false)
 }
 
-/// Every local address a process holds a listening socket on.
-fn listening_sockets_of(pid: u32) -> Vec<String> {
+/// Every local address a process holds a listening socket on, parsed, so that
+/// a caller can compare one against the address a configuration named.
+fn listening_sockets_of(pid: u32) -> Vec<std::net::SocketAddr> {
     let mut inodes = HashSet::new();
     let Ok(entries) = std::fs::read_dir(format!("/proc/{pid}/fd")) else {
         panic!("the runner's descriptors cannot be read; the test asserts nothing");
@@ -2206,11 +2469,63 @@ fn listening_sockets_of(pid: u32) -> Vec<String> {
             // local_address is field 1, st is field 3, inode is field 9.
             // State 0A is TCP_LISTEN.
             if fields.len() > 9 && fields[3] == "0A" && inodes.contains(fields[9]) {
-                listening.push(format!("{table} {}", fields[1]));
+                let address = proc_net_address(fields[1]).unwrap_or_else(|| {
+                    panic!(
+                        "{table} printed a local address this test cannot read: {}",
+                        fields[1]
+                    )
+                });
+                listening.push(address);
             }
         }
     }
     listening
+}
+
+/// The `local_address` column of `/proc/net/tcp` and `/proc/net/tcp6`, which
+/// is not a printed address but the kernel's own bytes in hex.
+///
+/// Eight hex digits for IPv4 and thirty-two for IPv6, each four-byte group in
+/// the host's byte order, then a colon and the port in hex. `0100007F:1F90`
+/// is `127.0.0.1:8080`, and reading it as `1.0.0.127` is the mistake this
+/// function exists to make once rather than at every call site.
+fn proc_net_address(field: &str) -> Option<std::net::SocketAddr> {
+    let (host, port) = field.split_once(':')?;
+    let port = u16::from_str_radix(port, 16).ok()?;
+    let word = |group: &[u8]| u32::from_str_radix(std::str::from_utf8(group).ok()?, 16).ok();
+    match host.len() {
+        8 => {
+            let raw = word(host.as_bytes())?;
+            let address = std::net::Ipv4Addr::from(raw.to_le_bytes());
+            Some(std::net::SocketAddr::new(address.into(), port))
+        }
+        32 => {
+            let mut octets = [0u8; 16];
+            for (index, group) in host.as_bytes().chunks(8).enumerate() {
+                octets[index * 4..index * 4 + 4].copy_from_slice(&word(group)?.to_le_bytes());
+            }
+            let address = std::net::Ipv6Addr::from(octets);
+            Some(std::net::SocketAddr::new(address.into(), port))
+        }
+        _ => None,
+    }
+}
+
+/// Whether two sockets are the same endpoint, `::ffff:` and all.
+///
+/// A listener on `127.0.0.1` can be reported in `/proc/net/tcp6` as
+/// `::ffff:127.0.0.1` when the socket was opened on a dual-stack descriptor,
+/// and a comparison that read those as two different addresses would have
+/// reported a permitted listener as a forbidden one.
+fn same_socket(held: std::net::SocketAddr, against: std::net::SocketAddr) -> bool {
+    let plain = |address: std::net::SocketAddr| match address.ip() {
+        std::net::IpAddr::V6(inner) => match inner.to_ipv4_mapped() {
+            Some(mapped) => std::net::SocketAddr::new(mapped.into(), address.port()),
+            None => address,
+        },
+        std::net::IpAddr::V4(_) => address,
+    };
+    plain(held) == plain(against)
 }
 
 /// Every path a descriptor must never resolve to: the container-runtime
