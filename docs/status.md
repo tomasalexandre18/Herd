@@ -20,10 +20,10 @@ and not a safety one. `release.yml` and `release-dev.yml` stay (D162, D168).
 
 **The gate** (**D190**): steps 0 to 8, the middle six one per command `ci.yml`
 runs. It refuses a dirty tree, ends in one verdict naming its sha, and writes
-a receipt **only on GREEN**, which `pre-push` asks about by
-`--verify-receipt`. It compares the skip **list**, never the count (**D187**):
-twelve names at rest here, plus a two-name **delta** list above a load of 8.
-A `--bless` run writes **no** receipt, and the load is read twice (**D191**).
+a receipt **only on GREEN**, which `pre-push --verify-receipt` asks for. The
+skip **list** decides, never the count (**D187**): twelve at rest, plus a
+two-name **delta** applied per skip from the refusing bench's own load figure,
+never the gate's host readings (**D-NEXT**); `--bless` writes none (**D191**).
 `pre-push` is the **only** machine in front of `main` (**D188**) — nothing
 server-side binds our admin credential — `core.hooksPath` is absolute now,
 arming all 85 worktrees (ORCH-131), and `--no-verify` is forbidden by contract

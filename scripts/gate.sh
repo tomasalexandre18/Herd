@@ -25,17 +25,32 @@
 #    skips 12 at rest and 14 under load, and neither figure means anything on
 #    its own. The names do.
 #
-# 2. A load-dependent run is not a run, and one reading of the load does not
-#    say what a run was. Two flood benches skip themselves above a
-#    one-minute load of 8 and they read the load TWICE — once as the flood
-#    starts and once mid-flood (`herd-hub/tests/fake_hub_flood.rs`) — so the
-#    gate reads it twice too, at step 0 and again after the suite, allows
-#    the load-conditional list when EITHER reading is above the threshold,
-#    names the reading that allowed it in the verdict, and refuses to run at
-#    all above a ceiling. One reading misses the routine case on a shared
-#    host: a run that begins quiet and becomes busy. Measured here on
-#    2026-10-28, 0.32 -> 2.36 in one run and 9.56 -> 14.91 in another, and
-#    the gate was printing the second figure without using it.
+# 2. A load-dependent run is not a run, and the host's load at an instant
+#    the GATE chose is not evidence about a skip. Two flood benches skip
+#    themselves above a one-minute load of 8, and each prints the figure it
+#    read at the moment it read it (`herd-hub/tests/fake_hub_flood.rs`). So
+#    the load-conditional list is applied PER SKIP, out of the refusing
+#    bench's own line, and never out of a reading the gate took itself. A
+#    skip is excused only when BOTH hold: its NAME is on the
+#    load-conditional delta list, and its REASON names this bench's load
+#    ceiling with a figure above that ceiling and above this gate's own
+#    threshold. Everything else stays red, including a name on the delta
+#    list that skipped for some other reason, and one that claimed load
+#    with a figure UNDER the ceiling — each of those is a defect in the
+#    bench, and the gate is where it shows. The gate still reads the host
+#    twice, at step 0 and after the suite, and still refuses to run at all
+#    above a ceiling; those two figures are now INFORMATION, in the verdict
+#    and in the receipt, and they decide nothing.
+#
+#    Why: two samples by the gate miss a burst that begins AND ends inside
+#    the suite, which is the routine case on this host. Measured twice on
+#    2026-10-29 on branches that cannot move a bench's reading — the host
+#    went 1.68 -> 8.54 -> 11.60 -> 10.12 -> 3.30, the benches read 10.12 as
+#    they ran and correctly declined, the gate sampled 1.70 and 3.30, and
+#    called those two correct skips unexpected. Two whole suite runs lost to
+#    a reason that was not in the diff. The reading that matters is the one
+#    the bench actually made, at the moment it made it; nothing else is
+#    evidence about why that skip exists.
 #
 # 3. A gate run on a tree that is not what gets pushed proves nothing. The
 #    gate refuses a dirty tree, and writes a receipt named for the sha it
@@ -200,20 +215,22 @@ say "  the working tree is clean: this gate is about $sha and nothing else"
 if awk "BEGIN{exit !($load1 > $load_max)}"; then
   refuse "load1 $load1 is above the ceiling $load_max; retry when the host is quieter"
 fi
-# Which reading put this run under load is part of the verdict: "under load"
-# with no figure beside it leaves a reader guessing why two extra names were
-# allowed, and guessing is what a verdict line exists to stop.
-under_load=0
-load_trigger=""
-note_load() { # <label> <value>
-  under_load=1
-  [ -z "$load_trigger" ] || load_trigger="$load_trigger,"
-  load_trigger="$load_trigger$1=$2>$load_note"
+# The host's own two readings, kept because a reader wants to know the gate
+# ran on a busy host and the receipt should record it. They no longer decide
+# which expected list applies: step 7 asks the bench that refused.
+host_busy=0
+host_trigger=""
+note_host_load() { # <label> <value>
+  host_busy=1
+  [ -z "$host_trigger" ] || host_trigger="$host_trigger,"
+  host_trigger="$host_trigger$1=$2>$load_note"
 }
 if awk "BEGIN{exit !($load1 > $load_note)}"; then
-  note_load load1-start "$load1"
-  say "  load1 $load1 is above $load_note: the flood benches skip themselves"
-  say "  at this load, so the load-conditional expected list applies."
+  note_host_load load1-start "$load1"
+  say "  load1 $load1 is above $load_note: the flood benches may skip"
+  say "  themselves at this load. Whether the load-conditional list applies"
+  say "  is decided at step 7, out of the skip line of whichever bench"
+  say "  refused, and not out of this figure."
 fi
 say "step 0: the tree, the sha and the host — ok"
 
@@ -265,20 +282,19 @@ say "  not the signal; the list is)"
 say "  observed list:        $observed"
 
 # The load's second reading, taken here because this is the first moment
-# after the suite. The flood benches read the load as the flood starts and
-# again mid-flood, and skip themselves on either, so a run that began quiet
-# and ended busy carries a flood skip that step 0's reading alone would not
-# allow — a red gate on a clean tree, for a reason that is not in the diff.
-# Step 8 prints and records this same figure; the load is not read a third
-# time.
+# after the suite. It is printed, carried in the verdict and written into
+# the receipt, and it decides nothing: a burst that began and ended inside
+# the suite has decayed away by now, and the benches that declined because
+# of it are the only witnesses left. Step 8 prints and records this same
+# figure; the load is not read a third time.
 load1_end=$(read_load1)
 if awk "BEGIN{exit !($load1_end > $load_note)}"; then
-  if [ "$under_load" -eq 0 ]; then
-    say "  load1 rose from $load1 to $load1_end, above $load_note: the flood"
-    say "  benches read the load again mid-flood and skip themselves on that"
-    say "  reading too, so the load-conditional expected list applies."
+  if [ "$host_busy" -eq 0 ]; then
+    say "  load1 rose from $load1 to $load1_end, above $load_note. The figure"
+    say "  is information: which list applies is decided below, by name and"
+    say "  by reason, out of the skip lines themselves."
   fi
-  note_load load1-end "$load1_end"
+  note_host_load load1-end "$load1_end"
 fi
 
 if [ "$bless" -eq 1 ]; then
@@ -306,34 +322,138 @@ if [ ! -f "$expected" ]; then
 fi
 
 allowed="$receipts/allowed-skips-${sha:0:12}.txt"
-skip_names "$expected" > "$allowed"
-if [ "$under_load" -eq 1 ]; then
-  if [ -f "$expected_load" ]; then
-    say "  adding the load-conditional list: $expected_load"
-    say "  it is a DELTA over the at-rest list and never a whole list"
-    say "  allowed by: $load_trigger"
-    skip_names "$expected_load" >> "$allowed"
-  else
-    note "this run is under load ($load_trigger) and there is no load-conditional list, so a load-gated skip would be red:"
-    say "    $expected_load"
-  fi
-else
-  say "  the at-rest list applies on its own: load1 $load1 at the start and"
-  say "  $load1_end after the suite, neither above $load_note."
-fi
-sort -o "$allowed" "$allowed"
+skip_names "$expected" | sort -u > "$allowed"
 seen="$receipts/seen-skips-${sha:0:12}.txt"
 skip_names "$observed" > "$seen"
-
 say "  expected list: $expected"
+
+# The load-conditional list is a DELTA over the at-rest list and never a
+# whole list, and it is read here for its NAMES only: those are the only
+# names the excuse below may ever reach. Any other unexpected name is red,
+# whatever its reason claims.
+load_delta="$receipts/load-delta-${sha:0:12}.txt"
+: > "$load_delta"
+if [ -f "$expected_load" ]; then
+  skip_names "$expected_load" | sort -u > "$load_delta"
+  say "  load-conditional delta list: $expected_load"
+  say "  a DELTA over the at-rest list and never a whole list; its"
+  say "  $(wc -l < "$load_delta" | tr -d ' ') name(s) are the only ones a bench's own reading can excuse"
+  declined=$(comm -12 "$load_delta" "$seen")
+  ran=$(comm -23 "$load_delta" "$seen")
+  if [ -n "$ran" ]; then
+    say "  load-gated benches that RAN, and whose assertions were made:"
+    printf '%s\n' "$ran" | sed 's/^/    ran      /' | tee -a "$out"
+  fi
+  if [ -n "$declined" ]; then
+    say "  load-gated benches that DECLINED, and must now say why:"
+    printf '%s\n' "$declined" | sed 's/^/    declined /' | tee -a "$out"
+  fi
+else
+  say "  there is no load-conditional delta list, so a bench that declined"
+  say "  for load would be red: $expected_load"
+fi
+
+# load_excuse <skip line>
+# The refusing bench's own words, or nothing. The reason has to name the
+# host's one-minute load AND this bench's ceiling, and the figure it gives
+# has to be above that ceiling and above this gate's $load_note. The two
+# phrasings are the two the bench prints — at the flood's start and
+# mid-flood (herd-hub/tests/fake_hub_flood.rs). Prints "<figure> <ceiling>"
+# and exits 0 when the line carries that evidence. A reason that merely
+# claims load, or claims it with a figure under the ceiling, is a
+# contradiction inside the bench: exit 1, and the gate stays red on it.
+load_excuse() {
+  printf '%s\n' "$1" | awk -v note="$load_note" '
+    {
+      i = index($0, ":"); if (i == 0) exit 1
+      rest = substr($0, i + 1)            # past "HERD-SKIPPED"
+      j = index(rest, ":"); if (j == 0) exit 1
+      reason = substr(rest, j + 1)        # past the assertion name
+      if (match(reason, /over this bench.s ceiling of [0-9]+(\.[0-9]+)?/) == 0) exit 1
+      ceiling = substr(reason, RSTART, RLENGTH); sub(/^.*ceiling of /, "", ceiling)
+      if (match(reason, /one-minute load is Some\([0-9]+(\.[0-9]+)?\)/) > 0) {
+        figure = substr(reason, RSTART, RLENGTH)
+        sub(/^.*Some\(/, "", figure); sub(/\)$/, "", figure)
+      } else if (match(reason, /one-minute load reached [0-9]+(\.[0-9]+)?/) > 0) {
+        figure = substr(reason, RSTART, RLENGTH); sub(/^.*reached /, "", figure)
+      } else {
+        exit 1
+      }
+      if (figure + 0 <= ceiling + 0) exit 1
+      if (figure + 0 <= note + 0) exit 1
+      print figure " " ceiling
+      exit 0
+    }'
+}
+
 unexpected=$(comm -13 "$allowed" "$seen")
 absent=$(comm -23 "$allowed" "$seen")
+
+# Every name that is not on the at-rest list is asked twice: is it a name
+# the delta list may excuse at all, and does its own line give the load
+# ceiling as the reason with a figure above it. Both, or red.
+excused=""
+unexpected_left=""
 if [ -n "$unexpected" ]; then
+  say "  each skip that is not on the at-rest list, asked by name and then by"
+  say "  reason whether the load-conditional delta excuses it:"
+  while IFS= read -r name; do
+    [ -n "$name" ] || continue
+    if ! grep -qxF -- "$name" "$load_delta"; then
+      unexpected_left="$unexpected_left$name"$'\n'
+      say "    red      $name: not on the at-rest list, and not a name the"
+      say "             load-conditional delta list may ever excuse"
+      continue
+    fi
+    lines=$(grep -F "HERD-SKIPPED: $name:" "$observed")
+    figures=""
+    carries=1
+    if [ -z "$lines" ]; then
+      carries=0
+    else
+      while IFS= read -r line; do
+        [ -n "$line" ] || continue
+        if evidence=$(load_excuse "$line"); then
+          read -r figure ceiling <<EOFEV
+$evidence
+EOFEV
+          [ -z "$figures" ] || figures="$figures+"
+          figures="$figures$figure>$ceiling"
+        else
+          carries=0
+          break
+        fi
+      done <<EOFLINES
+$lines
+EOFLINES
+    fi
+    if [ "$carries" -eq 1 ]; then
+      [ -z "$excused" ] || excused="$excused,"
+      excused="$excused$name=$figures"
+      say "    excused  $name: the bench itself read $figures, the ceiling"
+      say "             being the one its own skip line names, and declined"
+    else
+      unexpected_left="$unexpected_left$name"$'\n'
+      say "    red      $name: on the delta list, but its own line does not"
+      say "             give the load ceiling as the reason with a figure"
+      say "             above it, so nothing says why it went unchecked:"
+      if [ -z "$lines" ]; then
+        say "             (no skip line of its own to read a reason out of)"
+      else
+        printf '%s\n' "$lines" | sed 's/^/             /' | tee -a "$out"
+      fi
+    fi
+  done <<EOFNAMES
+$unexpected
+EOFNAMES
+fi
+if [ -n "$unexpected_left" ]; then
   say "  SKIPS THAT ARE NOT ON THE EXPECTED LIST — the gate is red on these,"
   say "  because an assertion nobody expected to be skipped was not checked:"
-  printf '%s\n' "$unexpected" | sed 's/^/    + /' | tee -a "$out"
+  printf '%s' "$unexpected_left" | sed 's/^/    + /' | tee -a "$out"
   failed="$failed 7:unexpected-skip"
 fi
+unexpected=$unexpected_left
 if [ -n "$absent" ]; then
   note "an expected skip did not appear; the host may have gained a capability, or a test was renamed or removed:"
   printf '%s\n' "$absent" | sed 's/^/    - /' | tee -a "$out"
@@ -353,8 +473,15 @@ finished=$(date -u +%Y-%m-%dT%H:%M:%SZ)
 say "step 8: the verdict and the receipt"
 say "  started $started, finished $finished"
 say "  load1 $load1 at the start, $load1_end after the suite"
-if [ "$under_load" -eq 1 ]; then
-  skips_field="skips=under-load($load_trigger)"
+# Which list applied, and what justified it. An excuse names the bench, the
+# figure IT read and the ceiling ITS own line gave, because that is the
+# reading the decision rests on. A busy host where no bench declined gets
+# the at-rest list and says so with its figures beside it, so the one line
+# still answers "why this list" on its own.
+if [ -n "$excused" ]; then
+  skips_field="skips=under-load($excused)"
+elif [ "$host_busy" -eq 1 ]; then
+  skips_field="skips=at-rest(host-busy:$host_trigger,no-bench-declined-for-load)"
 else
   skips_field="skips=at-rest"
 fi
@@ -402,6 +529,7 @@ receipt="$receipts/$sha.receipt"
   echo "log: $out"
   echo "suite-output: $suite"
   echo "expected-skips: $expected"
+  echo "load-excused-skips: ${excused:-none}"
   echo "skips-observed: $(wc -l < "$observed" | tr -d ' ')"
   echo "skip-list-sha256: $(sort "$seen" | sha256sum | cut -d' ' -f1)"
   echo "steps: 0..8 all ok"
@@ -412,6 +540,6 @@ if [ -n "$note_lines" ]; then
   printf '%s' "$note_lines" | sed 's/^/    /' | tee -a "$out"
 fi
 rule
-say "gate: GREEN sha=$sha steps=0-8:ok host=$host load1=$load1 $skips_field"
+say "gate: GREEN sha=$sha steps=0-8:ok host=$host load1=$load1 load1-end=$load1_end $skips_field"
 say "log: $out"
 exit 0
