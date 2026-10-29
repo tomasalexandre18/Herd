@@ -406,25 +406,78 @@ colour. D27, D187, invariant 5, ORCH-202.
 
 ## Resume point
 
-The branch is pushed and carries everything above. Next, in order:
+**The branch is NOT pushed: the last gate run went RED, and it went red on
+the host and not on this change.** `./scripts/gate.sh` on `d018610`,
+2026-10-29T23:02:00Z, 9 m 26 s:
 
-1. `herd-merger` takes `orch202-ignored-skips` into the batch, allocates
-   the `D-NEXT` above and closes ORCH-202 on the board — noting that the
-   row's own proposed shape (fold the ignores into `HERD_SKIP_LOG` as
-   `HERD-SKIPPED`) was **not** taken, and why (*Risks* 2).
-2. The owed measurement, on a quiet host (preflight must pass on load):
-   `cargo test -p herd-hub --test crash_points -- --ignored`, under
-   `nix develop --command`
-3. Decision 1 above, before some run in a stripped environment prints
+```
+step 0..5 — ok      (check-docs 2s, check-orchestration 84s, nix flake
+                     check 2s, cargo fmt 2s, cargo clippy 11s)
+step 6: test suite — FAILED (exit 101, 465s)   901 passed, 41 failed
+step 7: the skips, both kinds — ok             12 matched, 39 matched
+gate: RED sha=d0186103c09945ecbd51081f2bcdb829b7ce96f0 failed=6:test-suite
+```
+
+All 41 failures are one cause, and it is a true statement about the host:
+
+```
+Error: --host-memory-floor is 1024 MiB and this host lends 462 MiB, so
+nothing could ever be admitted here.
+```
+
+The runner measured 462 MiB of lendable memory because `/chatons.slice`
+had filled to within ~460 MiB of its 18 GiB `memory.high` while the gate's
+own earlier steps ran. **`bench-preflight.sh` refused this run twice and
+was right both times, and I overrode its cgroup floor both times.** Its
+message says exactly what happened — *"the suite grows about 4 GiB more in
+the same cgroup as it runs. The run would go red on a true statement about
+the host"* — and my reason for overriding it (that `anon` was only
+~800 MiB against ~11 GiB of reclaimable `inactive_file`) was **wrong in a
+way worth writing down**: the product's own D119 measurement reads the
+same stock figure preflight reads, so whatever preflight predicts is
+exactly what the runner will measure. A small `anon` does not help,
+because nothing in the product looks at `anon`. The 8 GiB floor is not
+over-caution; it is the suite's own headroom.
+
+So the precondition for the retry is **preflight passing on its own
+terms**, with no override:
+
+1. Wait until `./scripts/bench-preflight.sh` is `ok` unaided — it needs
+   8 GiB of room under `memory.high` on `/chatons.slice`, and load under
+   9. Right now the slice holds 15.1 GiB, so there is 3.3 GiB.
+2. Then, from this worktree and never from the shared checkout, with
+   `CARGO_TARGET_DIR=/mnt/ssd_980/herd/build/orch202` (left in place and
+   warm, deliberately — see *Processes*):
+   `./scripts/gate.sh`
+3. On `gate: GREEN`, push `orch202-ignored-skips`. Nothing else is owed:
+   the four Rust gates, both docs checks and step 7 are green on this
+   content, and the suite itself passed **942 passed, 0 failed, 39
+   ignored** at 2026-10-30T00:05Z on `6876fae`, whose only difference from
+   the gated tip is this handoff file.
+4. Then `herd-merger` takes the branch into the batch, allocates the
+   `D-NEXT` above and closes ORCH-202 — noting that the row's own proposed
+   shape (fold the ignores into `HERD_SKIP_LOG` as `HERD-SKIPPED`) was
+   **not** taken, and why (*Risks* 2).
+5. Still owed, on a quiet host: the enumeration's runtime,
+   `cargo test -p herd-hub --test crash_points -- --ignored` under
+   `nix develop --command`.
+6. Decision 1 above, before some run in a stripped environment prints
    `2911f1e8…` and somebody reads it as a changed skip list.
 
 ## Processes
 
-- The suite, twice, and `cargo fmt`/`build`/`clippy`, each as a child of
-  this agent's own shell, started and reaped by it; the final
-  `./scripts/gate.sh` likewise. No PID of any other agent, and no PID of
-  the consumer's production, was signalled. The consumer's `herd-hub`
-  (3006543) and `herd-runner` (3021002) were seen in `ps` while judging
-  host load and **left alone**; nothing was killed by name or pattern.
-- Build tree: `/mnt/ssd_980/herd/build/orch202`, deleted after the push —
-  path and confirmation in the agent's report.
+- The suite (three times: twice standalone, once inside the gate), `cargo
+  fmt`, `cargo build`, `cargo clippy`, `check-docs.sh`,
+  `check-orchestration.sh` and `./scripts/gate.sh` — each a child of this
+  agent's own shell, started and reaped by it. **No PID of any other agent
+  and none of the consumer's production was signalled.** The consumer's
+  `herd-hub` (3006543) and `herd-runner` (3021002) were read out of `ps`
+  while judging host load and **left alone**; nothing was killed by name
+  or by pattern, and nothing under `/sys/fs/cgroup` was written.
+- Build tree `/mnt/ssd_980/herd/build/orch202`: **kept, on purpose.** The
+  branch is not pushed, so workflow.md's "delete your own `target/` once
+  your branch is pushed" has not come due, and a warm tree is what makes
+  the retry above cost 9 minutes instead of a cold rebuild — which would
+  itself put ~8.5 GiB of fresh page cache into the very cgroup whose
+  fullness caused the red. Whoever gets the green push runs
+  `rm -rf /mnt/ssd_980/herd/build/orch202`.
