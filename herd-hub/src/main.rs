@@ -143,6 +143,37 @@ struct Args {
     /// waiting behind it. Zero is refused.
     #[arg(long, env = "HERD_READINGS_AT_ONCE", default_value_t = READINGS_AT_ONCE)]
     readings_at_once: u32,
+    /// Where this hub sends the four things E-37 asks to hear about: a URL
+    /// or a command string. Left out, it sends nothing.
+    ///
+    /// **The whole of the configuration surface**, on purpose (invariant 1).
+    /// There is no filter, no per-event switch, no template and no second
+    /// destination: the hub ships the payload and the list, and the topic,
+    /// the title and the routing are the consumer's. The events are a
+    /// runner joining, a runner lost, an owner's own switch moving, and a
+    /// job lost twice — never one per step job, per log line or per
+    /// progress chunk, which is what E-37 asks for in so many words and
+    /// what keeps a notification worth reading.
+    ///
+    /// `http://host[:port]/path` is one `POST` per event, the payload as
+    /// the body and the title as a `Title:` header, which is what ntfy
+    /// reads. Anything else is a command run by `sh -c` with the payload on
+    /// its standard input — `curl -s -T - -H "Title: herd"
+    /// https://ntfy.sh/our-topic` is an https sink in one line, and `https`
+    /// as a URL here is refused by name because this hub carries no TLS
+    /// client of its own (D14).
+    ///
+    /// **In the hub's own container image the command form has no shell to
+    /// run in** (`nix/hub-image.nix` ships no shell on purpose), so a
+    /// containerised hub uses the URL form: an ntfy in the same compose
+    /// network is `http://ntfy/our-topic`, which needs neither a shell nor
+    /// TLS. The command form is for a hub run as a plain binary.
+    ///
+    /// Nothing waits for it: a sink that hangs delays no verdict and costs
+    /// this hub none of its stop budget, and an event that cannot be
+    /// delivered is said out loud once, with the reason, and never retried.
+    #[arg(long, env = "HERD_NOTIFY_SINK", value_name = "URL|COMMAND")]
+    notify_sink: Option<String>,
     /// How much of this hub's volume a job's output files may hold, in all
     /// (D148, D152). `200GB`, `64MiB`, or a plain number of bytes.
     ///
@@ -414,6 +445,16 @@ async fn main() -> Result<()> {
             .map_err(|why| anyhow::anyhow!("--output-budget: {why}"))?,
         floor: seconds(args.output_floor),
     };
+    // Here for the same reason, and it is the stronger half of it: a sink
+    // nobody can send to has to be found by the operator who typed it, not by
+    // the absence of a notification three weeks later (E-37) — and a startup
+    // that refuses it before the state root is opened has taken no `flock`
+    // and swept nothing, so a mistyped scheme costs an operator a message and
+    // not a sweep.
+    let sink = match &args.notify_sink {
+        Some(spec) => Some(herd_hub::Sink::parse(spec).map_err(|why| anyhow::anyhow!(why))?),
+        None => None,
+    };
     let store = JobDirStore::open_with(&args.state_dir, budget).with_context(|| {
         format!(
             "the hub's state directory {} is not usable",
@@ -488,9 +529,25 @@ async fn main() -> Result<()> {
         herd_proto::show_bytes(budget.bytes),
         herd_hub::in_days(budget.floor),
     );
+    match &sink {
+        Some(sink) => println!(
+            "herd-hub: events go to {} (--notify-sink). Four things are said and nothing \
+             else: a runner joining, a runner lost, an owner's own switch moving, and a job \
+             lost twice. Never one per step job, so a day of green steps is a day of \
+             silence. Nothing waits for this sink: a sink that hangs delays no verdict and \
+             costs this hub none of its stop budget, and a delivery that fails is said here \
+             once, with the reason, and never retried.",
+            sink.described()
+        ),
+        None => println!(
+            "herd-hub: no event sink is configured, so this hub tells nobody anything \
+             (--notify-sink URL|COMMAND, HERD_NOTIFY_SINK). Everything it knows is still on \
+             its disk and in every stream it is following."
+        ),
+    }
     // A timing that cannot mean what it says is refused here, before the port
     // is bound and before any runner can join (E-21, E-40).
-    let hub = Hub::bind_with(args.listen, Arc::new(store), policy, authority)
+    let hub = Hub::bind_with_sink(args.listen, Arc::new(store), policy, authority, sink)
         .await?
         // E-35: the fleet's state goes beside the records, refreshed whenever
         // it changes, so that nobody has to read a log to know what the hub
