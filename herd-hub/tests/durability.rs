@@ -770,3 +770,98 @@ async fn a_record_whose_labels_the_rules_reject_is_quarantined_not_fatal() {
     assert_eq!(log_of(state.path(), &rejected), "");
     link.abort();
 }
+
+/// V10: one `job.json` a power cut tore in half must not stop the hub from
+/// **binding its port**.
+///
+/// This was live on the first consumer's machine and nobody there could
+/// repair it. An unreadable record was an `Err` out of `read_stored`, and
+/// that `Err` travelled up through `recover`, `open_with` and `main` — which
+/// reaches `Hub::bind_with` seventy-six lines later. So the hub exited before
+/// the port ever opened, the container restarted straight back into the same
+/// wall, and every healthy job on that root was held hostage by one damaged
+/// one. Herd is shipped, not operated (invariant 9, D161): from outside the
+/// container there is nothing an operator can do about it.
+///
+/// So the damaged record is set aside exactly as a record the label rules
+/// reject already was, and this test asserts the three things that follow:
+/// the hub binds and serves, the healthy jobs on either side of the damaged
+/// one both run, and a requester asking about the damaged one is told what
+/// happened to it.
+#[tokio::test]
+async fn a_torn_record_is_set_aside_and_the_hub_still_binds_its_port() {
+    let state = tempfile::tempdir().expect("a temporary state directory");
+    let (first, torn, last) = {
+        let store = JobDirStore::open(state.path()).expect("the state root opens");
+        let mut minted = Vec::new();
+        for what in ["the first", "the torn one", "the last"] {
+            minted.push(
+                store
+                    .create_job(herd_hub::NewJob::new(shell(&format!("printf '{what}\\n'"))))
+                    .expect("minted")
+                    .id,
+            );
+        }
+        (minted[0].clone(), minted[1].clone(), minted[2].clone())
+    };
+
+    // The middle record, cut where a power cut would have left it. Only the
+    // middle one, so a loss on either side of it shows.
+    let path = job_dir(state.path(), &torn).join("job.json");
+    let whole = std::fs::read(&path).expect("the record reads");
+    let cut = whole.len() * 2 / 3;
+    std::fs::write(&path, &whole[..cut]).expect("the record is torn");
+
+    let token = support::approve_on_disk(state.path(), "durable-runner");
+    // **The assertion the defect was about.** `HubProcess::start` opens the
+    // state root and then binds a port, in that order, as `main()` does.
+    // Before V10 it never reached the bind.
+    let hub = HubProcess::start(state.path());
+    assert_ne!(
+        hub.addr.port(),
+        0,
+        "the hub bound a port it can be reached on"
+    );
+
+    let (data_root, confined) = support::prepared_runner("torn-record-runner");
+    let link = tokio::spawn({
+        let config = runner_config(&hub.hub_url, &token, &data_root);
+        let confined = Arc::clone(&confined);
+        async move { herd_runner::serve_once(config, Session::new(), confined).await }
+    });
+    hub.wait_for_runner().await;
+
+    // Both healthy jobs run: the damaged one cost neither of them.
+    let state_dir = state.path().to_path_buf();
+    let (one, other) = (first.clone(), last.clone());
+    wait_until("the two healthy jobs run and end", || {
+        file_state_of(&state_dir, &one) == "finished"
+            && file_state_of(&state_dir, &other) == "finished"
+    })
+    .await;
+    assert_eq!(log_of(state.path(), &first), "the first\n");
+    assert_eq!(log_of(state.path(), &last), "the last\n");
+
+    // A requester asking about the damaged one gets a sentence saying what
+    // happened to it, which is the one thing "no such job" could never say:
+    // the job is on the disk, and the hub is refusing to act on it.
+    let said = herdctl::cancel_job(&hub.requester(), torn.clone())
+        .await
+        .expect_err("the hub will not cancel a job it will not act on")
+        .to_string();
+    assert!(said.contains(torn.as_str()), "{said}");
+    assert!(said.contains("quarantined"), "{said}");
+    assert!(
+        !said.contains("no such job"),
+        "a job whose record is on the disk is never 'no such job': {said}"
+    );
+
+    // And the damaged bytes are exactly as they were found: a record nobody
+    // can read is not Herd's to guess at or to tidy away.
+    assert_eq!(
+        std::fs::read(&path).expect("the record is still there"),
+        whole[..cut].to_vec(),
+        "the torn record was rewritten"
+    );
+    link.abort();
+}

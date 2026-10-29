@@ -77,7 +77,7 @@ use crate::confine::{
 };
 use crate::metrics::{host_load_milli, process_rss_bytes};
 use crate::reclaim::{kill_by_marker, JobTag};
-use crate::root::{Unmeasurable, Workspace};
+use crate::root::{DataRoot, Unmeasurable, Workspace};
 use crate::step::{self, Stage};
 use crate::{CancelToken, Ending, NotTaken, Session};
 
@@ -199,7 +199,7 @@ pub async fn execute(
             // `{in}` and `{out}` exist before `up` runs, under this job's own
             // directory and therefore inside the one data root (D107, E-45).
             if let Err(reason) = workspace.open_exchange() {
-                reclaim_or_say(&workspace, &job_id, attempt, &session);
+                reclaim_or_say(confined.root(), &workspace, &job_id, attempt, &session);
                 report_could_not_start(&job_id, attempt, &session, reason);
                 return;
             }
@@ -217,7 +217,7 @@ pub async fn execute(
             ) {
                 Ok(stages) => stages,
                 Err(refusal) => {
-                    reclaim_or_say(&workspace, &job_id, attempt, &session);
+                    reclaim_or_say(confined.root(), &workspace, &job_id, attempt, &session);
                     session.abandon(&job_id, attempt, &refusal);
                     return;
                 }
@@ -225,7 +225,7 @@ pub async fn execute(
         }
     };
     if stages.is_empty() {
-        reclaim_or_say(&workspace, &job_id, attempt, &session);
+        reclaim_or_say(confined.root(), &workspace, &job_id, attempt, &session);
         report_could_not_start(
             &job_id,
             attempt,
@@ -598,7 +598,7 @@ pub async fn execute(
     // exactly what a runner must not do to its host — so it is said in the
     // job's own record and not only in the runner's log.
     drop(cgroup);
-    reclaim_or_say(&workspace, &job_id, attempt, &session);
+    reclaim_or_say(confined.root(), &workspace, &job_id, attempt, &session);
 
     // What the hub is told, and the one place the three ways of ending part.
     //
@@ -1213,7 +1213,21 @@ fn kill_everything_of(cgroup: Option<&JobCgroup>, pids: &[u32], tag: &JobTag, jo
 /// The runner owns every inode under there, so this failing means something
 /// stranger than a mode — and whatever it is, the requester reading the job's
 /// log must be able to see that this host now carries bytes nobody collected.
-fn reclaim_or_say(workspace: &Workspace, job_id: &JobId, attempt: u32, session: &Session) {
+///
+/// **Three readers, and the third is the one who can act.** The runner's
+/// stderr is for whoever is watching this process; the job's log is for the
+/// requester, who can see it but cannot reach the disk; and the notebook
+/// ([`crate::janitor`]) is for the person on this host, who is the only one
+/// of the three who can remove what is still there. A job whose *setup*
+/// failed on a workspace it was refused (D166) comes through here like any
+/// other, which is why that case leaves an entry without a path of its own.
+fn reclaim_or_say(
+    root: &DataRoot,
+    workspace: &Workspace,
+    job_id: &JobId,
+    attempt: u32,
+    session: &Session,
+) {
     let Err(error) = workspace.reclaim() else {
         return;
     };
@@ -1223,6 +1237,13 @@ fn reclaim_or_say(workspace: &Workspace, job_id: &JobId, attempt: u32, session: 
         workspace.base_dir().display()
     );
     eprintln!("{}", said.trim_end());
+    // Durably, where a restart cannot take it away and where it is named with
+    // its figure. Nothing is returned and nothing can fail: a notebook that
+    // cannot be written costs this job nothing (D134).
+    crate::janitor::write_down(
+        root,
+        &crate::janitor::Leftover::workspace_of(workspace.base_dir(), job_id, attempt, &error),
+    );
     // Into the job's log, which is part of its record: the runner's own
     // stderr is not somewhere a requester can read. Numbered from the job's
     // own counter like any other chunk — a number of its own invention would
@@ -1742,5 +1763,90 @@ mod tests {
         assert!(ran.nothing_ended_it());
         ran.ending = Some(Ending::Cancelled("a requester asked".to_owned()));
         assert!(!ran.nothing_ended_it());
+    }
+
+    /// A job whose **setup** failed is the case the first consumer is blocked
+    /// on: nothing of theirs ran, and what Herd made for it is still on the
+    /// host. Every ending a job can have — a setup failure, a refusal, a cap,
+    /// a clean exit — leaves through [`reclaim_or_say`], so this proves the
+    /// wiring once at the function all four arms call.
+    ///
+    /// The workspace is wrecked the way `root.rs` and the drain's own test
+    /// wreck one: the base directory is replaced by a **file**, so
+    /// `remove_dir_all` fails with `ENOTDIR` and no mode can fix it. That is
+    /// the one unreclaimable workspace an unprivileged test can make, and the
+    /// 4 096 bytes it holds are the figure the entry has to carry.
+    #[test]
+    fn a_workspace_a_job_left_behind_reaches_the_notebook_with_its_figure() {
+        let temp = crate::testing::TempDir::new("janitor-from-a-job");
+        let root = DataRoot::open(temp.path()).expect("a throwaway data root opens");
+        let job_id = JobId::new("j0000000030");
+        let workspace = root.open_workspace(&job_id).expect("a workspace is made");
+        std::fs::remove_dir_all(workspace.base_dir()).expect("the fixture clears it");
+        std::fs::write(workspace.base_dir(), vec![b'w'; 4_096]).expect("the fixture wrecks it");
+
+        let session = Session::new();
+        let _cancel = session
+            .take_job(&job_id, 1, 4)
+            .expect("a fresh session is not draining and is not full");
+        reclaim_or_say(&root, &workspace, &job_id, 1, &session);
+
+        let notebook =
+            std::fs::read_to_string(root.left_behind_path()).expect("the notebook is written");
+        assert!(
+            notebook.contains(&format!("left-behind: {}", workspace.base_dir().display())),
+            "the path the owner has to go to: {notebook}"
+        );
+        assert!(
+            notebook.contains(&format!(
+                "holds: {} in 1 file(s)",
+                crate::size::show_bytes(4_096)
+            )),
+            "and what it weighs, or the owner cannot tell it from an empty one: {notebook}"
+        );
+        assert!(
+            notebook.contains("left-by: job j0000000030, attempt 1"),
+            "and whose job it was: {notebook}"
+        );
+        // The requester's half of the same fact, unchanged by any of this.
+        assert!(
+            session
+                .held_output_of(&job_id, 1)
+                .contains("could not be reclaimed"),
+            "the job's own record still carries it too"
+        );
+        let _ = std::fs::remove_file(workspace.base_dir());
+    }
+
+    /// A janitor's notebook is not on the critical path. With the notebook's
+    /// path occupied by a directory no `write` can replace, the job's record
+    /// still reaches the session — which is the frame the hub is sent — and
+    /// nothing in the reclaim path returns an error for it.
+    #[test]
+    fn a_notebook_that_cannot_be_written_never_costs_a_job_its_record() {
+        let temp = crate::testing::TempDir::new("janitor-unwritable-from-a-job");
+        let root = DataRoot::open(temp.path()).expect("a throwaway data root opens");
+        std::fs::create_dir_all(root.left_behind_path()).expect("the fixture blocks the path");
+        let job_id = JobId::new("j0000000031");
+        let workspace = root.open_workspace(&job_id).expect("a workspace is made");
+        std::fs::remove_dir_all(workspace.base_dir()).expect("the fixture clears it");
+        std::fs::write(workspace.base_dir(), b"not a directory").expect("the fixture wrecks it");
+
+        let session = Session::new();
+        let _cancel = session
+            .take_job(&job_id, 1, 4)
+            .expect("a fresh session is not draining and is not full");
+        reclaim_or_say(&root, &workspace, &job_id, 1, &session);
+
+        let record = session.held_output_of(&job_id, 1);
+        assert!(
+            record.contains("could not be reclaimed") && record.contains("left on this host"),
+            "a notebook nobody can write must not cost a job its record: {record:?}"
+        );
+        assert!(
+            root.left_behind_path().is_dir(),
+            "and nothing removed or renamed what was in the way"
+        );
+        let _ = std::fs::remove_file(workspace.base_dir());
     }
 }

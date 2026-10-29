@@ -37,6 +37,13 @@ tokio-tungstenite = { workspace = true, features = ["rustls-tls-webpki-roots"] }
 # Not used by name: it is here to choose rustls' crypto provider, which
 # nothing else in the graph chooses. See the workspace manifest.
 rustls.workspace = true
+# One timestamp, in the notebook of what a job left on this host that this
+# runner could not take away (`janitor.rs`, D134). RFC 3339, which is what the
+# hub's records and `herdctl`'s output already print — a date a person reads
+# beside a path and a figure, and the workspace's own pinned version of the
+# crate that already formats it, so there is one spelling of a timestamp in
+# the fleet and not two.
+time.workspace = true
 
 [target.'cfg(unix)'.dependencies]
 libc.workspace = true

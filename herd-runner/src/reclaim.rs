@@ -427,10 +427,23 @@ pub fn reclaim_a_past_life(root: &DataRoot, ceiling: &Ceiling) -> Vec<String> {
                     "reclaimed the workspace {} left by a previous life",
                     path.display()
                 )),
-                Err(error) => said.push(format!(
-                    "COULD NOT reclaim the leftover workspace {}: {error}",
-                    path.display()
-                )),
+                Err(error) => {
+                    // Durably as well as on stderr. This reaper runs *because*
+                    // the last runner was killed, so its own report is printed
+                    // after the journal that would have explained it is behind
+                    // the owner — and a workspace that will not go now will not
+                    // go at the next start either. The notebook is where that
+                    // becomes a path with a figure beside it instead of a line
+                    // scrolling past once a boot (D134).
+                    crate::janitor::write_down(
+                        root,
+                        &crate::janitor::Leftover::workspace_of_a_past_life(&path, &error),
+                    );
+                    said.push(format!(
+                        "COULD NOT reclaim the leftover workspace {}: {error}",
+                        path.display()
+                    ));
+                }
             }
         }
     }

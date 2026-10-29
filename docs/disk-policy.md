@@ -25,6 +25,250 @@ The reader this is written for arrives from `docs/plan.md` M12 or from
 decisions in §6 are taken, they become numbered entries in
 `docs/decisions.md` and this file keeps the arithmetic behind them.
 
+**§0 is the contract and it was re-cut on 2026-10-29** (ORCH-170), when
+Alexa moved this subject from a calendar to space and turned
+deduplication on by default. §1 to §7 are the arithmetic behind it and the
+record of how it was reached: where a section was written against the old
+direction, it says so and points back at §0. Two of its findings are
+retired by that move and are marked retired where they stand rather than
+deleted, because the arithmetic that produced them is the arithmetic
+somebody will redo.
+
+---
+
+## 0. The direction of 2026-10-29: space before age
+
+Alexa re-cut this document's subject on 2026-10-29. **Deduplication is on
+by default, and what is deleted is decided by space rather than by a
+calendar.** Everything below §1 was written against a calendar, and §3.3
+stated the reverse of the new rule; this section is the contract, and the
+sections it corrects say so where they stood.
+
+**Read this section before §1.** The rest of the document is the arithmetic
+behind it and the record of how it was reached — including, deliberately,
+two findings this direction retires. A finding that is retired is marked
+where it stands rather than deleted, because the arithmetic that produced it
+is still the arithmetic someone will redo.
+
+**Every figure about the first consumer's volume in this section is their
+reading of 2026-10-29, relayed to us and carried forward** — rows R10 to
+R20 of §1.2. It is a reading of their past, not a measurement of the
+future, and nobody in this project has looked at their machines or will
+(invariant 9, D161).
+
+### 0.1 The direction, in four sentences
+
+1. **Deduplication is where the space is.** It destroys nothing: one
+   `link(2)` per arriving file, and the 5.04 ratio read on the consumer's
+   own volume says four fifths of their collected bytes are second and
+   later copies `[R12]`.
+2. **Space decides, not a timer.** The trigger is bytes held against a
+   ceiling, and free space on the filesystem behind it. A span is a guard,
+   never the reason something goes.
+3. **Age is demoted, not deleted.** D201's class map — merger 90 days,
+   every other class 14, active by default — survives **unchanged as a
+   maximum age**: the oldest a record is ever allowed to get, not when it
+   is deleted. What loses its primacy is the timer, not the numbers. The
+   easy mistake is to read "space before age" as "no age"; it is not.
+4. **Keep only what still serves — and nothing is kept without a bound.**
+   Free space is a burst cache, so bytes that serve nothing cost
+   throughput and not merely room. What can no longer serve is removed
+   after a stated delay, or moved to an archive path on another disk if
+   the operator gives one. Setting something aside under a name that says
+   so is a **transitional state**, never an end state.
+
+### 0.2 Which mechanism owns which bytes
+
+**One table a reader can act on.** Four populations, four owners, and
+the shares are measured rather than assumed. The share column is of the
+state root as the consumer read it on 2026-10-29 `[R14, R16]`.
+
+| | Population | Share | Bounded by | Triggered by | Guarded by | What an operator sees |
+|---|---|---|---|---|---|---|
+| P1 | **Collected files** — every job's `files/`, whole and verified | **105.57 GiB, 99.68 %** `[R14, D]` | `--output-budget B` `[C, main.rs:146-167]` | A collection arriving, never a clock `[C, store.rs:530-549]` | `--output-floor`, then D152's four keys `[C, store.rs:686-732]` | One line per sweep, with both figures; a named line and an event when the floor is breached `[C, store.rs:797-841]` |
+| P2 | **The record** — `job.json`, `events.jsonl`, `log`, `log.seq` | **≈ 346 MiB, 0.32 %** `[R16, D]` | **Nothing, today** | **Nothing, today.** Under this direction: free space on the filesystem, with the maximum age as a backstop | `--output-floor` as the record guard, plus §3.5's never-delete list | Nothing today; a tombstone's sentence once records are removable (§3.2) |
+| P3 | **The log inside a record** | **173.8 MiB in all** `[R16]` | Only the runner's `--job-log-cap`, **per attempt**, default 64 MiB `[C, confine.rs:50]`; the hub appends what arrives with no cap of its own `[C, store.rs:2469-2509]` | — | — | Nothing. A hub-side cap does not exist |
+| P4 | **Bytes in flight** — `files.part/` | not read | Outside `B` **by design**, because evicting a transfer in flight would destroy the thing the hub is being given `[C, main.rs:152-156]`; D152 | — | — | An orphan part file is unreachable and unbudgeted: ORCH-165 |
+
+Two readings of that table, and only the first is comfortable.
+
+- **Almost the whole space question is P1.** Records and logs together are
+  **0.32 %** of the state root `[R14, R16, D]`. So deduplication and the
+  free-space trigger are the two mechanisms that matter for space, and
+  **record deletion is a correctness and a privacy instrument rather than
+  a space instrument.** Nothing below should be read as saying records
+  threaten this disk. They do not.
+- **The mechanism gap is nonetheless real, and it is about authority
+  rather than about magnitude.** `--output-budget` governs the collected
+  files **only** and says so in its own argument documentation — *"The
+  output files only, not the state root: a record is kilobytes and a log
+  has a cap of its own"* `[C, herd-hub/src/main.rs:149-151]`. So it
+  cannot see a record byte or a log byte **by definition**, however many
+  there turn out to be, and only removing a record ever frees a log byte.
+  The quantity that can see all four populations at once is **free space
+  on the filesystem**. That is why the space trigger for records is the
+  free-space guard and never the output budget, and it would be the right
+  shape at a hundredth of these figures or a hundred times them.
+
+### 0.3 The log: measured small, unbounded on the hub, and not urgent
+
+The hub's log file is the one population nothing in Herd bounds. The only
+cap is the **runner's** `--job-log-cap`, default 64 MiB
+`[C, herd-runner/src/confine.rs:50]`, and it is a cap **per attempt**: the
+hub appends a second attempt's output onto the first attempt's log
+`[C, herd-hub/src/store.rs:2283-2300]` and `ATTEMPTS_ALLOWED` is 2
+`[C, herd-hub/src/server.rs:194]`, so the hub-side ceiling for one job is
+two caps rather than one. Nothing on the hub refuses a byte past that.
+
+**And in practice it is 173.8 MiB over 3 334 jobs** `[R16]`. The
+argument documentation's *"a record is kilobytes"* is vindicated by
+measurement: ≈ 104 KiB a job, all four record files together `[R16]`.
+
+> **A hub-side log cap is therefore a guard worth having and not a
+> priority** `[P]`. What is true and worth one line: it is absent, and one
+> chatty job can legitimately bring 64 MiB — twice that over two attempts.
+> What is **not** true: that logs threaten this disk.
+
+This paragraph replaces a derivation that was briefed as alarming and was
+not a measurement: 3 334 records × the runner's 64 MiB cap ≈ **208 GiB of
+possible log**. It is arithmetic on a cap, it was marked derived by the
+planner who wrote it, and the measurement is about six hundred times
+smaller. **It is not a risk figure and it is not repeated as one.**
+
+### 0.4 What deduplication does and does not do, and one figure corrected
+
+**The correction first, because it was said out loud and is wrong as
+stated.** Deduplication was described on 2026-10-29 as freeing *"about
+85 GB"* on the consumer's volume. **That is wrong.** The 5.04 ratio means
+84.94 GiB of what their records name are second-and-later copies
+`[R12, D]` — but deduplication by hard link applies to **new arrivals**, and
+the bytes already on their disk are already written. **On day one it frees
+zero.**
+
+What it changes is the **rate**, and that is the figure to quote:
+
+| Figure | Before dedup | After dedup | Voice |
+|---|---|---|---|
+| Named arrival, over their 14 days | **7.57 GiB/day** | — | `[D, from R12]` |
+| Distinct arrival, same 14 days | — | **1.50 GiB/day** | `[D, from R12]` |
+| Headroom to a 200 GB budget, at 105.57 GiB held | 80.69 GiB | 80.69 GiB | `[D]` |
+| **Days of that headroom** | **10.7** | **53.8** | `[D]` |
+
+So: **five times the headroom in days, and zero bytes recovered on the
+first day.** The 84.94 GiB is a measurement of their past. It becomes real
+on their current volume only through an optional, operator-run compaction
+that re-reads and re-verifies what is already there — not in this
+direction's scope, and named in §5 so nobody discovers it.
+
+**Every figure in this section is the consumer's reading of 2026-10-29,
+carried forward** — not a measurement of the future and not ours. The
+ratio could be higher over a longer window or lower over today's mix: it
+is read over 14 days that include the pre-streaming era, when a job
+directory was kilobytes. A second reading is what settles it, and nobody
+in this project runs either (invariant 9, D161).
+
+### 0.5 Free space is a burst cache, not a margin to reach and then fill
+
+**The state root is not on a dedicated disk.** It is a Docker volume
+sharing one **916 GB filesystem** with the consumer's whole project, their
+runner's own spool and other volumes: **64 % used, 319 GB free** on
+2026-10-29 `[R11]`. The hub is one tenant among several.
+
+**That is the same filesystem as R5 and very nearly the same reading, in
+different units** `[D]`. R5 gave 983 GB capacity and 344 GB free on
+2026-10-27; 983 GB is 915.5 GiB and 344 GB is 320.4 GiB, and `df`'s own
+`Use%` is used over used-plus-available rather than over capacity, which
+turns R5's 589-of-983 into 63 % and not 60 %. So the two readings agree,
+**free space has not materially moved in those two days**, and the figures
+below are in the GiB the 2026-10-29 reading is in. Two readings of one
+quantity that differ only in their units are worth reconciling out loud in
+a document that now carries both.
+
+Two consequences, and the second is the one that reframes the policy.
+
+1. **A threshold expressed as a proportion of a hub-private budget is the
+   wrong shape.** The hub's budget can sit half empty while the filesystem
+   fills because of something that is not Herd's. The trigger that can see
+   that is **free space on the filesystem**, which is §2.6's
+   `--volume-free-floor R` from `statvfs` — already recommended there, and
+   now a prerequisite rather than a neighbour.
+2. **Free space is what absorbs a spike of activity.** More free space is
+   more room for a burst, so holding bytes that serve nothing costs
+   **throughput**, not merely room. **The 15 %-free figure is a floor, not
+   a target**: the policy's ideal is *keep only what still serves*, not
+   *climb to the floor and sit on it*.
+
+**The figure is the operator's and it already exists.** Alexa's standing
+rule for that disk is **alert above 85 % used**, so the floor on their
+filesystem is **15 % free ≈ 137 GiB** `[D, from R18]`. That is not a new
+decision and it is not ours to invent. It also says §2.6's proposed
+default is wrong for this disk: `max(20 GB, 5 % of the volume)` would be
+≈ 46 GB there, **about a third of the operator's own figure** `[D]`.
+
+What that leaves on their disk today, with both ceilings named `[D]`:
+
+| Ceiling | Headroom now | At 7.57 GiB/day | At 1.50 GiB/day |
+|---|---|---|---|
+| The output budget, `B` = 200 GB | **80.69 GiB** | 10.7 days | **53.8 days** |
+| Free space, floor 15 % of 916 GB | **181.6 GiB** | 24.0 days | **121 days** |
+
+**So the budget binds first on their disk today, and the free-space guard
+is what survives a neighbour growing** `[D]`. Both rows assume Herd is the
+only thing moving on that filesystem, which this section's first sentence
+says it is not: the free-space row is an upper bound on time, not a
+forecast.
+
+### 0.6 Keep only what still serves: nothing is kept without a bound
+
+**The principle, in the form that survives.** We do not destroy a
+requester's evidence immediately and we **never** destroy it silently.
+That is not the same as keeping it: **keeping for the sake of keeping is
+refused** (Alexa, 2026-10-29, relayed in French and rendered here in the
+English this document is written in). So:
+
+> **What can no longer serve is removed after a stated delay, saying so,
+> or moved to a configurable archive path on another disk if the operator
+> gives one.** Set aside under a name that says so is a **transitional
+> state** until that delay expires, never an end state. `[P]`
+
+**Two settings, named, with no default invented here** `[P]`:
+
+| Setting | What it bounds | Whose figure |
+|---|---|---|
+| The **delay** before something that can no longer serve is removed | How long a transitional state may last — the window in which an operator can still change their mind | **Alexa's.** Not invented in this document |
+| The **archive path** | Where bytes go instead of being removed, on a filesystem that is not this one | **Alexa's.** Unset means removal after the delay |
+
+Both are deliberately unfilled. A shipped binary stating an unrecorded
+policy is a number nobody can later change, which is D194's rule and
+`herd-hub report`'s own; the consumer's orchestrator declined to invent
+these two and so does this document.
+
+**The worked example, because the distinction is only concrete in one.**
+The consumer is keeping one damaged job and its interrupted spool right
+now, at this project's request `[R19]`: they are the evidence of a defect
+still being fixed. **They still serve.** The same bytes a week after the fix
+ships serve nothing at all. **Same bytes, opposite answer** — and the rule
+that tells the two apart is *does this still serve*, not *how old is it*.
+That is the whole of "space before age" in one case, and it is also why
+the age spans survive as a backstop: nothing in the hub can read "still
+serves", so the age is what bounds the answer when nobody says.
+
+### 0.7 What an operator must be able to see, and why it is a requirement
+
+On 2026-10-27 the consumer found **65 GB of accumulated runner spools that
+no tool reported** `[R20]`. That is the precedent, and it makes three
+properties requirements rather than preferences `[P]`:
+
+1. **Whatever is kept appears in a report with its size** — including
+   anything in a transitional state and anything under the archive path.
+2. **It counts toward the space calculation.** A byte that is held but not
+   counted is the 65 GB again.
+3. **An overflow is signalled.** Not merely recorded: said, once per
+   episode, in the unit the operator thinks in (§2.7).
+
+A hub that sets bytes aside and does not report them has reproduced the
+defect this requirement was earned on.
+
 ---
 
 ## 1. The inputs
@@ -44,7 +288,7 @@ decisions in §6 are taken, they become numbered entries in
 | C9 | One line per sweep; the **inside-the-floor** warning fires on every sweep that took something in-floor | `herd-hub/src/store.rs:797-818` |
 | C10 | The **over-budget-and-nothing-to-free** line is said once per episode and cleared when a sweep comes back inside | `herd-hub/src/store.rs:820-841` |
 | C11 | Opening the state root **sweeps**, so a budget change takes effect at the next hub start, before a job runs | `herd-hub/src/main.rs:215-224` |
-| C12 | The startup line names the budget and the floor, and promises *"A record keeps every path, size and digest for ever: only the bytes are ever removed"* | `herd-hub/src/main.rs:283-297` |
+| C12 | The startup line names the budget and the floor, and promises *"A record keeps every path, size and digest for ever: only the bytes are ever removed"* | `herd-hub/src/main.rs:428` |
 | C13 | **Nothing in the tree removes a job directory, ever.** Every walk is therefore O(all jobs ever submitted) | `docs/remediation/03c-contradictory-review.md:384-386` |
 | C14 | `next_sequence` is re-derived at every open from the **highest surviving job directory name**, and nothing persists it | `herd-hub/src/store.rs:879`; `IndexFile` at `:229-233` |
 | C15 | `usable_index` trusts the index only while `index.jobs_accounted` equals the number of job directories; otherwise it rebuilds by reading every record | `herd-hub/src/store.rs:1003-1008`, `:884-893` |
@@ -67,6 +311,17 @@ Unverified by this project. Figures as relayed.
 | R7 | The real shape: *"a few dozen step and merger jobs a day, plus one nightly full pass of ~214 groups, which carries most of the output volume"*. The nightly is **off right now** and chatOnS is paused, so today's rate is near zero | the consumer, 2026-10-27 |
 | R8 | The per-job sizes and the runner's spool listing **cannot be read**: the runner's data root is `drwx------ herd:herd`, the read needs `sudo`, their operator permissions do not cover it, and they declined to work around it | the consumer, 2026-10-27 |
 | R9 | A runner's `outputs/`: 65 GB in 125 spools, all under seven days | Alexa's breakdown; **ORCH-092's**, not this document's |
+| R10 | **The reading of 2026-10-29, and it is the one §0 is built on.** Taken on their real root with `herd-hub report` and a read-only `du -sk`, by the operator, on their own machine. R10 to R19 are all of it | the consumer, 2026-10-29 |
+| R11 | The state root is a Docker volume on **one 916 GB filesystem**, shared with the consumer's whole project, their runner's own spool and other volumes: **64 % used, 319 GB free**. It is **not** a dedicated disk. Same filesystem as R5, in GiB (§0.5) | the consumer, 2026-10-29 |
+| R12 | Bytes the records name over files carrying a digest: **105.96 GiB**. Over distinct `sha256`: **21.02 GiB**. Ratio `r_file` = **5.04** | `herd-hub report`, 2026-10-29 |
+| R13 | **110 653** files carry a digest, over **9 272** distinct digests | `herd-hub report`, 2026-10-29 |
+| R14 | Every job's `files/` together: **105.57 GiB**, over **3 334** records — of which **1 377**, 41.3 %, name no file at all | `herd-hub report`, 2026-10-29 |
+| R15 | Per-record output size: decile 9 is **39.82 MiB** and the largest **333** records carry **98.12 %** of the bytes | `herd-hub report`, 2026-10-29 |
+| R16 | Everything under `jobs/<id>/` except `files/` and `files.part/`, by `du -sk` — disk blocks, not exact lengths: `log` **173.8 MiB**, `events.jsonl` **119.2 MiB**, `job.json` **40.1 MiB**, `log.seq` **13.0 MiB**. **≈ 346 MiB in all, ≈ 104 KiB a job** | the consumer, read-only on their real root, 2026-10-29 ~16:30Z |
+| R17 | Outside `jobs/`: **176 KiB** of readings, **8 KiB** of index, 4 KiB each for the rest | the consumer, 2026-10-29 |
+| R18 | Alexa's standing rule for that filesystem: **alert above 85 % used**. It is an existing rule, not a new decision, and it is the free-space floor of §0.5 | Alexa, 2026-10-29 |
+| R19 | One damaged job and its interrupted spool are being kept **right now**, at this project's request, as the evidence of a defect still being fixed. §0.6's worked example | the consumer, 2026-10-29 |
+| R20 | The 65 GB of R9 **were reported by no tool**: they were found by looking. That is the precedent behind §0.7's three visibility requirements | the consumer, 2026-10-27 |
 
 One figure in this table is not theirs and is ours: the orchestrator ran
 `df` on this host minutes after R5 and got `/dev/nvme0n1p1`, ext4,
@@ -77,22 +332,39 @@ developed; it establishes that the hub's state root is this machine's
 answers ORCH-076 yes. It is not a reading of the consumer's job
 directories and nothing below treats it as one.
 
-### 1.3 What nobody can read today, and who could
+### 1.3 What could not be read on 2026-10-27, and what was read on 2026-10-29
 
-Everything in §2 and §3 turns on one quantity: **how many bytes one
-nightly pass leaves on the hub**. It is one read away —
+**Most of this is now answered, by the operator, read-only, on their own
+machine.** What §2 and §3 turned on was one quantity — **how many bytes
+one nightly pass leaves on the hub** — and the shape of the distribution
+behind it. The reading of 2026-10-29 `[R10 to R20]` gives the
+root-wide totals, the dedup ratio, the per-record deciles and the record
+side to the kilobyte. It did **not** need root and it did not need a
+`du` of every job directory: `herd-hub report` reads the records the hub
+already owns, and the `du -sk` that completed it covers only the four
+record files.
 
-```sh
-du -s --block-size=1M /path/to/herd_herd-state/_data/jobs/* | sort -n
-ls -ld --time-style=long-iso /path/to/herd_herd-state/_data/jobs/*
-```
+What is still unread, and it is now a smaller list:
 
-— and that read needs root on the host that runs the hub. The consumer
-cannot run it and correctly declined to work around the permission
-(R8). **Nobody in this project runs it either**, including from this
-shell and including on the paths named in R5: Herd is shipped, not
-operated, and a fact about that machine reaches us as a report (invariant
-9, D161). The ask goes to Alexa, who can relay it; it is ORCH-103 below.
+* **A per-directory listing of `jobs/` with dates**, which would say
+  whether the 105.57 GiB is one nightly pass or several (H1, H3). The
+  deciles of R15 bear on it and do not settle it.
+* **The runner's spool listing**, still `drwx------ herd:herd` and still
+  needing `sudo` `[R8]`. Unchanged, and still ORCH-092's rather than
+  this document's.
+* **A second reading of `herd-hub report`, days apart.** Every rate in
+  this document is a stock wearing a rate's clothes: one reading
+  measures their history, two measure the process. This is the single
+  most valuable figure still missing and it costs one command on their
+  side.
+
+**Nobody in this project runs any of them**, including from this shell
+and including on the paths named in R5: Herd is shipped, not operated,
+and a fact about that machine reaches us as a report (invariant 9, D161).
+**ORCH-103 — the `du` of every job directory — should close**: it needed
+root, they declined and were right to, and the reading of 2026-10-29
+supersedes most of what it wanted. What replaces it is the second
+`report` reading, which is a different and cheaper ask.
 
 ---
 
@@ -186,32 +458,66 @@ what it depends on:
 * **The floor 200 GB can actually keep here:** 200 ÷ N ≈ **1.9 days**
   `[D]`. About two nightly passes.
 
-### 2.4 The finding: the seven-day floor is unsatisfiable here
+### 2.4 The finding of 2026-10-27, and how deduplication retires it
 
-750 GB is needed; 451 GB is the theoretical maximum and ~250 GB the
-practical one. **At the first consumer's workload, on the disk they have,
-the seven-day floor cannot be kept at any budget — not by raising the
-budget, not by buying back space from the neighbours.** `[D]`
+**This was the heart of this document and it no longer holds.** It is kept
+here in full, with the retirement after it, because the identity it rests
+on is sound and is what kills it.
 
-This is a larger finding than "200 GB is the wrong default", and it is
-the heart of this document, so here is exactly what would refute it:
+**As written on 2026-10-27.** 750 GB is needed; 451 GB is the theoretical
+maximum and ~250 GB the practical one. *At the first consumer's workload,
+on the disk they have, the seven-day floor cannot be kept at any
+budget — not by raising the budget, not by buying back space from the
+neighbours* `[D]`. What would refute it: the floor becomes satisfiable if
+`N ≤ 451 / 7 ≈ 64 GB` in theory, or `N ≤ 250 / 7 ≈ 36 GB` in practice,
+and the evidence put `N` at 95–116 GB — 1.5× over the theoretical bar and
+3× over the practical one.
 
-> The floor becomes satisfiable if `N ≤ 451 / 7 ≈ 64 GB` in theory, or
-> `N ≤ 250 / 7 ≈ 36 GB` in practice. The evidence puts `N` at 95–116 GB:
-> **1.5× over the theoretical bar and 3× over the practical one.** The
-> finding dies if a per-directory listing (§1.3) shows the 107 GB is
-> three or more passes rather than one, or if ~540 MB is the largest
-> directory rather than a typical one.
+> **Retired on 2026-10-29, by deduplication rather than by a
+> measurement.** `[D]` §2.3's identity `budget >= F x A` survives
+> untouched and is exactly what retires the finding: **deduplication
+> divides `A`**, the bytes arriving per day, by the ratio read on their
+> own volume.
 
-A 3× margin against two readings of one unverified breakdown is strong
-enough to plan from and not strong enough to ship a default from. §6
-keeps those two apart.
+Two readings of it, both from R12 and both arithmetic on their figures:
 
-The other way to satisfy it is on the consumer's side and not ours: a
-seven-day floor fits a 200 GB budget if a pass leaves 200 ÷ 7 = 28.6 GB,
-i.e. about 134 MB a group instead of 540 MB `[D]` — a four-fold
-reduction in what the nightly ships. That is their decision about their
-test suite, relayed as a figure, never as an instruction (D161).
+* **On the rate.** Their distinct arrival is 1.50 GiB/day `[D, R12]`, so a
+  seven-day floor needs `7 x 1.50 = 10.5 GiB` against a 200 GB
+  (186.26 GiB) budget `[D]` — **about eighteen times the margin needed**.
+* **On this section's own per-pass reading.** With `N` at 95–116 GB named,
+  the distinct bytes of one pass are `N / 5.04` = **18.9 to 23.0 GB**
+  `[D]`, so seven passes is **132 to 161 GB** against 200 GB: satisfiable
+  with **19 % to 34 % of the budget still free** `[D]`. Thin at the upper
+  end, and no longer impossible.
+
+> **So the seven-day floor becomes keepable at the first consumer's
+> workload, by deduplication rather than by a measurement or a bigger
+> disk** `[D]`. That is the strongest single argument for doing
+> deduplication first, and it vindicates **D202** three days after it was
+> taken: the floor Alexa kept becomes a promise the hub can make.
+
+**What would bring the finding back.** A prospective ratio materially
+below 5.04 — the figure is read over 14 days that include the
+pre-streaming era, when a job directory was kilobytes, so it could move
+either way. That is H10, and it is settled by a **second** reading rather
+than a better one (§1.3).
+
+**One thing the reading of 2026-10-29 says about the old inputs, and it
+narrows rather than settles.** R3's *"~540 MB each for the recent ones"*
+is the premise of Route B, and R15 says per-record output is deciles 1 to
+8 at nothing, decile 9 at 39.82 MiB, and the largest **333** records
+carrying **98.12 %** of the bytes — a top-decile mean of about **311 MiB**
+`[D, from R14 and R15]`. So ~540 MB describes the top decile at most and
+not a typical directory, and 214 groups at that top-decile mean would be
+**≈ 67 GiB a pass** `[D]` rather than 95 to 116 GB. That assumes a nightly
+pass *is* the top 214 records, which nothing shows; it does **not** settle
+H1 or H3, and the per-directory listing with dates is still what would.
+
+The other way to satisfy the floor is on the consumer's side and not ours,
+and it is unchanged: a seven-day floor fits a 200 GB budget if a pass
+leaves 200 / 7 = 28.6 GB of **distinct** bytes `[D]`. On R12's ratio their
+current pass already does. That is their decision about their test suite,
+relayed as a figure, never as an instruction (D161).
 
 ### 2.5 What happens at the crossing, concretely
 
@@ -329,6 +635,35 @@ own rule carried forward: a chosen number must not wear a derived
 number's clothes, because whoever reasons from it next reasons from the
 clothes.
 
+**Amended 2026-10-29 (§0.5): the recommendation stands, two of its figures
+do not, and `R` is promoted.**
+
+* **`R` is no longer a neighbour of record removal; it is its
+  prerequisite.** The space trigger for records is `R` and never `B`,
+  because `B` governs the collected files only by its own documentation
+  `[C, main.rs:149-151]` and cannot see a record or a log byte (§0.2).
+  One operator-set number answering for three populations is the thing
+  that argument refuses in writing.
+* **`R`'s default is wrong for the first consumer's disk, and the figure
+  is not ours.** `max(20 GB, 5 % of the volume)` is ≈ 46 GB on their
+  916 GB filesystem `[D, R11]`, while Alexa's standing rule for that
+  filesystem is **alert above 85 % used**, which is **15 % free ≈ 137 GiB**
+  `[D, R18]` — about three times the proposed default. The rule already
+  exists, so the figure is the operator's and this document does not
+  invent it. What the default is *for* is a disk nobody has told Herd
+  about; it must not quietly contradict an operator who has.
+* **The floor is a floor and not a target.** Free space is what absorbs a
+  burst, so a hub that climbs to `R` and sits there has spent the
+  consumer's throughput, not just their room. Nothing in the mechanism
+  makes the hub climb — the sweeper only ever removes — but the *policy*
+  must say which of the two it is aiming at, and it aims at **keep only
+  what still serves** (§0.6).
+* **`B`'s own default is unchanged and still defensible.**
+  `min(200 GB, 25 % of the measured volume)` is `min(200, 229) = 200 GB`
+  on 916 GB `[D, R11]`, so Alexa's figure survives where it is
+  defensible, exactly as this section said on a slightly different
+  capacity.
+
 ### 2.7 Warn on the approach, not at the breach
 
 Today there is **no signal at all while the volume climbs**. The per-sweep
@@ -351,6 +686,25 @@ figures it would have fired on the **first** night, with a week of
 warning. And the inside-the-floor line should come under the same
 once-per-episode flag as the over-budget line `[C9, C10]`, so a night of
 evictions is one piece of news rather than a hundred.
+
+**Amended 2026-10-29 (§0.7): this section's alarm is now a requirement
+rather than a recommendation, and it gains two more.** The precedent is
+R20 — 65 GB of accumulated runner spools that no tool reported, found by
+looking. So, for whatever the hub holds, including anything in a
+transitional state and anything under an archive path (§3.3.2):
+
+1. **It appears in a report with its size.** `herd-hub report` is where
+   that lands on the record side; the sweep line is where it lands per
+   episode.
+2. **It counts toward the space calculation.** A byte that is held but
+   not counted is R20 again, with Herd's name on it.
+3. **An overflow is signalled**, once per episode, in the unit the
+   operator thinks in — which is this section's own alarm, and the reason
+   it is not optional.
+
+And the warning must now watch **two** quantities rather than one: `B`
+against what arrived, as above, and **free space against `R`**, because a
+neighbour filling the filesystem is invisible to the first (§0.5).
 
 ### 2.8 What an operator can do today, with no release, and the trap
 
@@ -381,15 +735,98 @@ rescue the floor.
 the record reads and the four-key sort all exist `[C5, C6]`; the dry run
 is the same code stopping before `evict`. ORCH-097.
 
+### 2.9 Deduplication: the denominator, and what it does not touch
+
+§0.4 gives the honest figures. This section gives the shape, because the
+figures are only defensible if the mechanism is the small one.
+
+> **`objects/<sha256>` beside `jobs/` in the state root; every file in a
+> job's `files/` is a hard link to it.** No format, no compressor, no
+> chunker, no dependency, no secret, **no new record field and no new
+> state of a record** — the file *is* present, merely shared. `[P]`
+
+Four properties of the existing code are what make it safe, and all four
+are read from the tree rather than assumed:
+
+* **Herd never writes through a name in `files/`.**
+  `durable::write_file_with` writes a temporary, `fsync`s it and renames
+  `[C, durable.rs:247-274]`; the streamed path appends into `files.part/`
+  and renames `[C, store.rs:2136-2143]`. **So a shared inode can never be
+  modified under its other claimants.** The whole design rests on this
+  and it already holds.
+* **The digest is verified before the file becomes visible**
+  `[C, store.rs:2114-2140]`, and the inline path refuses bytes that
+  disagree with the manifest `[C, store.rs:1968-1976]`. One exception,
+  and it is a rule rather than a caveat: the comparison is guarded by a
+  non-empty digest, so **a blob with no verified digest is never shared**.
+* **The reference count is the link count, not a ledger.** A blob whose
+  `st_nlink` is back to 1 is garbage. Nothing is counted; it is measured —
+  the same argument `collection_is_whole` already makes for itself,
+  that a tally kept beside the files could disagree with them
+  `[C, store.rs:554]`.
+* **Hard links are transparent to every reader, including an older
+  binary**, and `recover` enumerates `jobs/` and nothing else. So
+  `objects/` **must not move `LAYOUT_VERSION`**, which is 1
+  `[C, store.rs:59]`: a version move has no migration path and refuses to
+  open an operator's existing root (ORCH-156), while a downgrade onto a
+  shared root costs a **leak** of orphan blobs that the next upgraded
+  start collects. A leak that self-heals beats a refusal that does not.
+
+**What it does not touch**, each named so it is not discovered later:
+
+| | Not touched | Why |
+|---|---|---|
+| D1 | The 105.57 GiB already on their volume | **New arrivals only.** The existing bytes are never rewritten, and §0.4 says so in the figure. Recovering them is an optional, operator-run compaction: §5 |
+| D2 | What a record says | No new field, no new state, `RECORD_VERSION` unchanged. A pre-deduplication record reads identically |
+| D3 | `files.part/` | Part files are neither whole nor verified, so they are never linked. ORCH-165 stays exactly the size it is |
+| D4 | A filesystem without hard links | One `link()` probe at startup, a degrade to a plain write, **said once**, and never a failed transfer |
+| D5 | Files carrying no digest | They can never be shared: a byte with no digest can neither be matched against another nor be called distinct from it. `herd-hub report` leaves them out of both sides of the ratio and **counts them separately** as `undigested_files` and `undigested_bytes` `[C, report.rs:249-253]`; the reading of 2026-10-29 did not relay those two figures, so their size here is unknown |
+
+**Two consequences to state rather than let someone discover** `[P]`:
+
+* **Two records naming identical content can be in different output
+  states.** A record marked `outputs.removed` may be looking at content
+  still on the disk under another job's `files/`. The hub does not serve
+  it: removed means removed for that record. No fourth state is created.
+* **Eviction becomes two figures where it was one** — *"unlinked 338 MiB,
+  freed 12 MiB"* — and a sweeper that evicts a record at a time can walk
+  its whole candidate list, destroy evidence and free nothing. **So it
+  evicts by blob**, unlinking a blob from every record that claims it, and
+  a shared blob is as protected as its **most protected** claimant under
+  D152's four keys. The visible corollary: a green job's bytes can go with
+  a red one's, and both sentences say so.
+
 ---
 
-## 3. Half two — sizing M12's record retention
+---
+
+## 3. Half two — record retention, demoted to a guard
 
 Nothing in the tree deletes a record today, ever `[C13, C18]`. 3334
 records is small; unbounded is unbounded, and §2 showed that every walk
 in the hub is O(all jobs ever submitted) because of it. Retention is not
 only about disk: it is the only thing that can ever make those walks
 shrink.
+
+**And after the reading of 2026-10-29 it is barely about disk at all.**
+The whole record side of their root is **≈ 346 MiB**, 0.32 % of the state
+root `[R16, D]`. So:
+
+> **Record removal is a correctness and a privacy instrument, and a bound
+> on the walks. It is not a space instrument at these figures.** `[D]`
+
+That is the sentence to carry out of this half. It does not make retention
+less necessary — unbounded is still unbounded, 1 377 records that name no
+file at all `[R14]` are never removed by any space rule because removing
+them frees nothing measurable, and space pressure cannot bound a count —
+but it does mean **nothing in §3 should be read as protecting this disk**.
+§0.2's two populations have two owners for a reason of authority, not of
+magnitude.
+
+What this half still owes, and all three survive the re-cut: the class
+map's two numbers as a **maximum age** (§3.1), the answer a requester gets
+for a record that is gone (§3.2), and the never-delete list (§3.5). What
+it loses is the **timer's primacy** (§3.3).
 
 ### 3.1 What a priority class is, and where 14/90 is read from
 
@@ -415,6 +852,37 @@ these figures the class that carries nearly all the volume is
 gets 90. That is the right way round by evidence value and the wrong way
 round by bytes, and somebody will assume the big one is the protected
 one.
+
+**Amended 2026-10-29 (§0.1): the two numbers survive and their meaning
+changes.** Alexa took this map as D201 — merger 90 days, every other class
+14, active by default — and then moved its basis. What survives, said
+precisely, because D201 is append-only and its numbers are still the only
+ones we have:
+
+* **The two numbers are unchanged.** 90 and 14. They stop being *when a
+  record is deleted* and become **the oldest a record is ever allowed to
+  get**: a maximum age, the backstop of §3.3's ladder.
+* **"Ships active by default" survives**, and now means two things rather
+  than one: the space ladder is on, and the backstop is on.
+* **The three guards D201 named survive verbatim** — the preview that
+  removes nothing, D197's two threshold-free refusals, and `0` meaning
+  never.
+* **What is demoted is the trigger.** A shipped Herd still removes an
+  operator's records without being asked to, but **the timer is no longer
+  the first thing that decides**.
+* **D201's context figures are superseded**, not its choice. It cites
+  *"~90 GB across 1 571 jobs"*; the reading of 2026-10-29 says 3 334
+  records and 105.57 GiB of collected files `[R14]`. The new figures make
+  a bound more necessary, not less, so nothing in the choice turns on it.
+* **Four required spans with no default is still the right shape** — more
+  so, because they are now a *guard*, and a guard a shipped binary
+  invented would be worse than one an operator typed (D194).
+
+The consequence this section already named survives the demotion and is
+worth re-reading with it: the class carrying nearly all the volume is
+**nightly** at 14 days, while **merger**, which is small, gets 90. Right
+by evidence value, wrong by bytes, and somebody will assume the big one is
+the protected one.
 
 ### 3.2 The manifest outlives the bytes — and now the record expires
 
@@ -459,36 +927,125 @@ and digest would be a retention that kept the record. **The per-file
 detail is exactly what retention costs; the count, the size, the outcome
 and the reason are what it must keep.** `[P]`
 
+**Amended 2026-10-29: the manifest's promise is unchanged, and it acquires
+a second job.** Nothing in the new direction touches what a record *says*.
+*"A record keeps every path, size and digest for ever: only the bytes are
+ever removed"* `[C, main.rs:428]` holds until a record is removed, which
+is where that sentence has to change anyway (ORCH-101). What changes is
+what a removal **frees**, not what a record promises, and D148's and
+D152's rule — the manifest outlives the bytes — survives untouched.
+
+The second job it acquires comes from deduplication (§2.9): because every
+`KeptFile` carries its `sha256`, **the manifest is the reference list that
+makes a shared blob collectable**. That is why sharing inodes does not
+weaken the promise: it is the promise that makes sharing safe to undo.
+
+**One line number to carry forward.** The startup sentence is at
+`herd-hub/src/main.rs:428`. `[C12]`, this section and ORCH-101's row all
+cited `:283-297` or `:288-297` until 2026-10-29; that citation was stale
+by about 130 lines and is corrected in all three places.
+
 ### 3.3 Where the two mechanisms meet, and which wins
 
-Two mechanisms over one directory tree: the output budget evicts **bytes
-under pressure**, retention expires **records on time**. In one sentence:
+**This section stated the reverse of the rule and is inverted here.** As
+written on 2026-10-27 it said: *"Retention is about records and
+**outranks** the budget, which is about bytes. The budget may never
+remove a record; retention always removes the bytes in the same act."*
+The first sentence is wrong under the direction of 2026-10-29. The
+second half of the second sentence is right and survives for a reason
+that has nothing to do with precedence (the hazard below).
 
-> **Retention is about records and outranks the budget, which is about
-> bytes. The budget may never remove a record; retention always removes
-> the bytes in the same act.** `[P]`
+> **The budget and the free-space guard outrank. Space decides, and age
+> is the guard that bounds the answer when nothing is under pressure.**
+> `[P]`
+>
+> **Why**, in one line each: the budget is a fact about a disk and the
+> span is a promise about time, and 2026-10-29 put the fact first; the
+> span cannot see a byte, so it can never be the thing that answers
+> *"this volume is filling"*; and `--output-budget` governs the collected
+> files only, by its own documentation, so **it is not even eligible** to
+> be the mechanism that removes a record `[C, main.rs:149-151]`.
+
+### 3.3.1 The ladder
+
+One trigger per rung. Each rung is either already shipped, already
+approved by Alexa, or named as new. **No rung below is a new knob.**
+
+| | Rung | Trigger | What it takes | Already exists? |
+|---|---|---|---|---|
+| 1 | Collected bytes outside the floor | `held > B` | `files/`, in D152's four keys | **Shipped** `[C, store.rs:686-732]` |
+| 2 | Collected bytes **inside** the floor, said once per episode | `held > B` and rung 1 exhausted | same | **Shipped** `[C9]`, and D202 has re-affirmed the promise it breaks |
+| 3 | Collected bytes, whatever the budget says | `free < R` | same | ORCH-095, Alexa's yes, unbuilt |
+| 4 | **Whole records** — tombstone, bytes, directory — oldest outside the floor first | `free < R` and rung 3 exhausted | `job.json`, `events.jsonl`, `log`, `log.seq`, the directory | new |
+| 5 | Nothing. Say so once per episode, with both figures | `free < R` and rung 4 exhausted | — | the discipline at `[C10]` |
+| — | **The backstop**, in parallel and secondary: a record past its class's maximum age goes whether or not anything is under pressure | a clock, once a day and once at startup | as rung 4 | new; this is D201's class map, demoted (§3.1) |
+
+**The two numbers that bound rung 4 both already exist** `[P]`:
+
+> **`--output-floor` becomes the record guard as well as the byte floor.**
+> No record is ever removed by *space pressure* while it is inside the
+> floor. **The retention spans become the maximum age.** Space pressure
+> may act anywhere between the two; the backstop acts at the far end.
+
+That is the whole of "age is a guard, not the trigger", in two numbers
+Alexa has already set. It also gives **ORCH-100**'s startup refusal a
+sharper form rather than removing it: refuse a configuration whose
+**shortest span is below the floor**, naming both figures, because then
+there is no window in which space pressure may act and the two numbers
+contradict each other. Same shape as before, better reason.
+
+**Rung 4 never breaks its guard, and that is the one asymmetry with the
+bytes.** Rung 2 breaches the floor loudly because the budget is a fact
+about a disk, and the manifest survives — the requester is told what was
+there. **A record removal destroys the manifest**, and a tombstone is a
+sentence, not evidence. So a deficit that survives rung 4 is **reported,
+never forced** `[P]`.
+
+### 3.3.2 What happens to what can no longer serve
+
+§0.6 is the rule and this is where it lands in the mechanism. A record
+rung 4 or the backstop selects is not simply unlinked:
+
+1. If an **archive path** is configured, the record moves there and the
+   job directory goes. The archive is on another filesystem by the whole
+   point of it, so the move is a copy and an unlink, not a `rename`, and
+   it must be reported (§0.7) and counted.
+2. If none is configured, the record enters a **transitional state** under
+   a name that says so, and is removed when the **delay** expires. The
+   transitional bytes are still Herd's: they appear in the report with
+   their size, they count toward the space calculation, and an overflow
+   is signalled.
+3. Either way the **tombstone is written first** and survives both, so
+   the requester's question has an answer whatever happened to the bytes
+   (§3.2).
+
+**Both figures — the delay and the archive path — are Alexa's and are not
+invented here** (§0.6). Unset archive path means removal after the delay;
+what the delay defaults to is a decision, not a derivation.
+
+### 3.3.3 What the two mechanisms must share rather than duplicate
 
 They can contradict each other in exactly one configuration: a record
-past its retention whose bytes are still inside the output floor. With
-retention ≥ 14 days and a 7-day floor it cannot arise; with
-`--output-floor 30d --record-retention 14d` it does, and then one
-mechanism says keep and the other says go. **Refuse that configuration at
-startup, naming both figures** `[P]` — the style `herd-hub/src/main.rs`
-already uses, where a budget that does not parse stops the hub before any
-byte has moved `[C11]` and *"a timing that cannot mean what it says is
-refused here, before the port is bound"*.
+past its maximum age whose bytes are still inside the output floor. With
+a span at or above 14 days and a seven-day floor it cannot arise; with
+`--output-floor 30d` and a 14-day span it does, and then one mechanism
+says keep and the other says go. **Refuse that configuration at startup,
+naming both figures** `[P]` — the style `herd-hub/src/main.rs` already
+uses, where a budget that does not parse stops the hub before any byte
+has moved `[C11]` and *"a timing that cannot mean what it says is refused
+here, before the port is bound"*.
 
-The hazard that makes the ordering non-negotiable: a `files/` whose
-`job.json` is gone is permanently `could_not_free` `[C16]`, so the
-running total drifts up, never comes down, and the sweeper can never
-reach the budget again. Therefore **bytes first, record last, in one
-act**: the reverse order leaves exactly that orphan if the hub dies in
-the middle.
-
-Two more things they must share rather than duplicate `[P]`:
+**The hazard that makes the removal order non-negotiable, and it is
+untouched by the inversion.** A `files/` whose `job.json` is gone is
+permanently `could_not_free` `[C16]`, so the running total drifts up,
+never comes down, and the sweeper can never reach the budget again.
+Therefore **bytes first, record last, in one act**: the reverse order
+leaves exactly that orphan if the hub dies in the middle. This is why the
+old section's second sentence survives its first one — it was never a
+statement about precedence.
 
 * **One writer, one guard.** The sweeper has a one-at-a-time flag; the
-  retention pass takes the **same** one, not a second. D8's one-writer
+  record pass takes the **same** one, not a second. D8's one-writer
   discipline, and D152's reason for refusing a timer was precisely that a
   second writer waking on a quiet hub is the wrong shape.
 * **One removal discipline.** Rename to make it invisible, write, unlink
@@ -612,6 +1169,24 @@ startup pass alone is 15.2 s of a hub not yet serving** — which is why
 one and why the startup full pass needs a bound of its own, not because
 the daily cost is high.
 
+**Amended 2026-10-29: every figure in this section survives, and what it
+sizes is now the backstop.** The walk is still linear, the cold cache is
+still the whole risk, the cost is still concentrated in the top decile,
+and the sixth walk behind it — `usable_index`'s raw count `[C15]` — is
+still a correctness requirement on any pass that removes a directory.
+What changes is only the name of the thing being sized: this is **the
+backstop's** daily and startup pass (§3.3.1), not the primary mechanism.
+
+Two consequences of the demotion, and the second is a small gift:
+
+* **The startup pass still needs its own bound** — 292 ms cold at their
+  3 334 directories and **3.29 s at 33 340** `[M]`, which is a hub not yet
+  serving. Unchanged, and it is ORCH-157's.
+* **A space-triggered pass does not need a walk of its own.** Rung 4 fires
+  when `free < R`, which is already a sweep trigger, and it selects from
+  the candidates the sweep's own walk has already read. The fifth walk is
+  the backstop's alone, once a day; the space path adds none.
+
 ### 3.5 What must never be deleted, under any rule
 
 * **A queued, assigned or running job.** `record.state.is_terminal()` is
@@ -691,6 +1266,24 @@ mark says that one root never hands the same `j…` out twice.
 | H7 | "In-floor eviction every night" assumes the nightly returns at this size with the budget at 200 GB | The nightly is off `[R7]`, so nothing will show until it returns | No, and this is why the warning of §2.7 matters more than the prediction |
 | H8 | `statvfs` on the state root measures the filesystem Herd shares (§2.6) | True here: the hub volume is a directory on the same ext4 `[R5]`. A separate mount, an overlay or a quota would measure something else — and the guard would then be measuring the right thing for *that* deployment anyway | Yes, by test |
 | H9 | A `herd_herd-state` docker volume maps to a plain directory under `/mnt/ssd_980/docker/volumes` | `[R5]` says so. If it were a separate device the whole of §2.6 still holds, with different numbers | No |
+| H10 | `r_file` holds **prospectively** at about 5, so §0.4's rate and §2.4's retirement hold going forward | **Their figure, read forward** `[R12]`. A second `herd-hub report` reading, days apart. Their 5.04 is over 14 days that include the pre-streaming era, when a job directory was kilobytes, so the ratio over today's mix could be higher (a longer window accumulates copies) or lower. **This is the one hypothesis the whole of §0.4 and §2.4 rests on** | Yes, by one command on their side — §1.3's remaining ask |
+| H11 | Nothing on the hub bounds a log: the only cap is the runner's `--job-log-cap`, default 64 MiB and **per attempt**, and the hub appends what arrives | **Read from the code at `cd0f1b7`, 2026-10-29** `[C, confine.rs:50; store.rs:2469-2509, :2283-2300; server.rs:194; main.rs:149-151]`. Refuted by a hub-side cap, and there is none. **Verified rather than inherited**, because it is what reorganises §0.2 | Settled |
+| H12 | Records and logs stay a negligible share of the state root, so record removal is not a space instrument | **Measured by them**, 0.32 % on 2026-10-29 `[R16, D]`. Refuted by a workload whose logs are large: a chatty job can legitimately bring 64 MiB, twice that over two attempts, so a fleet of chatty jobs moves this. It is a statement about their workload, not about Herd | Yes, by a second reading — and it is the figure that would reopen §0.3 |
+| H13 | The state root's filesystem supports hard links, so §2.9 works there | ext4 `[R5, R11]`. An overlay, a cross-device bind or a filesystem without links refuses, and the answer is a `link()` probe at startup with a plain-write fallback said once (§2.9 D4). **The hypothesis does not have to hold for the design to ship**, which is the point of the probe | Yes, by test, on any host |
+| H14 | `st_nlink` is a sufficient reference count: no ledger beside the disk | **Inferred.** Refuted by a blob that must survive at `nlink == 1`, or by a sequence where the count is read non-atomically against a concurrent `link`. The second is real and is answered by taking the store's existing mutex for the `stat` plus `unlink` and for the `link`; both are O(1) metadata calls, and the failure if it is got wrong is a **missed deduplication**, never a lost byte | Yes, by test |
+| H15 | Space pressure cannot bound the **record count**, because 41.3 % of records hold no collected bytes `[R14]` | It would die if those records were large in log bytes. **R16 says they are not**: ≈ 104 KiB a job over the whole population. So space pressure provably cannot bound the count here, and the backstop is the only thing that can — **strengthened, not refuted** | Settled by R16 |
+
+**Amended 2026-10-29.** H1, H2 and H3 are **narrowed and not settled**:
+R15's deciles say ~540 MB describes the top decile at most, and 214
+groups at the top-decile mean would be ≈ 67 GiB a pass rather than 95 to
+116 GB `[D, §2.4]` — but that assumes a nightly pass *is* the top 214
+records, which nothing shows. The per-directory listing with dates is
+still what would settle all three, and it is still theirs to run or not
+(§1.3). H8 is **confirmed** by R11: the state root is a Docker volume on
+one shared filesystem, so `statvfs` on it measures what the free-space
+guard needs to see. H9's own id is taken by the docker-volume question,
+so the ratio's hypothesis below is **H10** and not, as a scratchpad draft
+had it, a second H9.
 
 ---
 
@@ -715,44 +1308,120 @@ mark says that one root never hands the same `j…` out twice.
 * **`docs/remediation/`** is a closed dossier about something else and
   nothing here belongs in it.
 
+**Added 2026-10-29, each named so it is not discovered later:**
+
+* **The compaction pass.** The only way the 84.94 GiB already on their
+  volume is ever recovered (§0.4). It re-reads and re-verifies ~105 GiB
+  offline and it is an operator-run act on their machine (D161). Its own
+  row, its own decision, after deduplication has shipped and been seen to
+  work.
+* **The archive path's own disk** (§0.6). Its capacity, its filesystem and
+  its own bound are the operator's. Herd writes there if told to, reports
+  what it put there, and makes no promise about the volume underneath. A
+  second `--volume-free-floor` for a second filesystem is **not**
+  proposed here and would need its own argument.
+* **Pack deduplication.** A pack is addressed by its content and
+  deduplicated by construction; the 5.04 of R12 is job evidence. The two
+  are not folded together and §2.9 does not touch packs.
+* **The hub as a pack cache** — deferred, Alexa's, not reopened here.
+* **ORCH-108** — whether a runner may ever delete an unclaimed spool —
+  is still Alexa's, and it is load-bearing for `R`'s startup sentence:
+  part of Herd's reserve is spent protecting the disk from Herd.
+* **ORCH-165** (an orphan `files.part/` is unreachable, unbudgeted
+  garbage) and **ORCH-166** (`report` names the extremes and misses the
+  middle) are neighbours. §2.9 must not grow either of them.
+* **A hub-side log cap** (§0.3). A guard worth having, sized by nobody,
+  and explicitly **not urgent** at R16's figures.
+
+
 ---
 
 ## 6. Decisions for Alexa
 
 One at a time, each with a recommendation and a fallback. None of these
 is the orchestrator's to take: each changes *what* is built or is
-outward-facing.
+outward-facing. **Re-cut 2026-10-29**: A, C and D are answered or
+retired and are kept with their answers; E and F are the open ones.
 
-**A. The seven-day floor cannot be kept at the first consumer's workload
-on their disk (§2.4).** Do we (i) keep the shipped default at seven days
-and make the hub say what it can actually keep, (ii) lower the shipped
-default, or (iii) tell the consumer to set about two days?
-**Recommendation: (i) and (iii) together** — the default stays
-project-agnostic, the hub stops promising what it has been shown it
-cannot keep, and the consumer gets a concrete figure for their own
-configuration. **Fallback:** (ii) at three days, which is honest on more
-disks and gratuitously short on small fleets.
+**A. The seven-day floor. Answered by D202, and the question that
+prompted it is retired.** This document asked on 2026-10-27 whether to
+keep the shipped seven-day default when it could not be kept at the
+consumer's workload. Alexa kept the floor (D202, 2026-10-27), and
+§2.4 now retires the premise: with deduplication the floor is keepable
+there, with eighteen times the margin on the rate reading `[D]`. **What
+survives of the question** is the honest-sentence half: a hub on a disk
+where the floor *cannot* be kept must say so rather than keep promising
+it. That is a build task, not a decision. **No part of this retires
+`--output-floor`**, and the 2026-10-28 scratchpad proposal to replace it
+with a byte figure is dead on arrival.
 
-**B. A second disk knob, `--volume-free-floor` (§2.6).** This is
-invariant 1 territory: is a second number the beginning of a policy
-language? **Recommendation: yes, add it.** One number bounds what Herd
-*takes*, the other what Herd *leaves*; a shared volume needs both, and
-R5 says this volume is shared. It is a bound, not a policy: no job can
-be named in it and no job is more important than another under it.
-**Fallback:** no new flag — derive the reserve from the budget alone and
-accept that a neighbour can fill the disk under a hub that is inside its
-budget and sweeping nothing.
+**B. A second disk knob, `--volume-free-floor` (§2.6). Recommendation:
+yes, and it is now a prerequisite rather than a neighbour.** One number
+bounds what Herd *takes*, the other what Herd *leaves*; the state root
+shares a filesystem with the consumer's whole project `[R11]`, so a
+shared volume needs both. It is a bound, not a policy: no job can be
+named in it and no job is more important than another under it. **And
+its figure for that disk already exists** — Alexa's standing rule is
+alert above 85 % used `[R18]`, so `R` there is 15 % free ≈ 137 GiB
+`[D]`, about three times what §2.6 proposed as a default. **Fallback:**
+no new flag, and accept that a neighbour can fill the disk under a hub
+that is inside its budget and sweeping nothing. That fallback is worse
+after 2026-10-29 than before it, because the free-space guard is also
+the only trigger that can ever see a record byte (§0.2).
 
 **C. The retention class map: merger 90 days, every other level 14
-(§3.1).** **Recommendation: as written.** **Fallback:** nightly joins
-merger at 90, which on these figures is nearly the whole volume and
-makes retention close to a no-op.
+(§3.1). Taken as D201, and demoted on 2026-10-29.** The two numbers are
+unchanged and now mean **maximum age** rather than deletion time. Nothing
+is asked here again; §3.1 records exactly what survives.
 
-**D. One read, on the consumer's side, that would settle H1, H2 and H3
-(§1.3).** A per-directory size listing of the hub volume's `jobs/`. It
-needs root on their host; the consumer declined to work around their
-permissions and was right to; **nobody in this project runs it** (D161).
-This is a relay, not a decision: Alexa asks or does not.
+**D. One read on the consumer's side (§1.3). Superseded.** The reading of
+2026-10-29 answers most of what it wanted, read-only and without root.
+**ORCH-103 should close.** What replaces it is a cheaper and more
+valuable ask, and it is **E** below.
+
+**E. Deduplication on by default (§0.4, §2.9), with the threshold it
+cleared.** `herd-hub report` deliberately prints no threshold (D194), and
+the shape proposed and never recorded was *build file-level
+deduplication only if `r_file >= 4`*. Their reading says **5.04**
+`[R12]`. **Recommendation: yes, and record it with the threshold it
+cleared**, so the figure stops being a guess: 5.04 against 4, on their
+own volume, read by a shipped binary. **The cost, said plainly:** the
+saving on their existing 105.57 GiB is **zero on day one** and arrives as
+a rate (§0.4); an older binary meeting a shared root leaks orphan blobs
+until an upgraded one collects them; a filesystem without hard links
+degrades silently to today's behaviour, said once at startup. **Fallback:**
+ship the linking off behind a flag for one release and turn it on at the
+next — which costs a knob, a second code path and a release, and buys a
+reversibility that removing `objects/` after a plain-write fallback
+already gives.
+
+**F. The two figures of §0.6, and they are the only numbers this document
+deliberately leaves blank.** The **delay** before something that can no
+longer serve is removed, and the **archive path**. Both are Alexa's: a
+shipped binary stating an unrecorded policy is a number nobody can later
+change (D194). **Recommendation: ask for the delay and treat the archive
+path as optional** — unset means removal after the delay, which is the
+behaviour that needs no second disk. **Fallback:** no delay and no
+archive, which means removal in the same act as the selection, and the
+principle of §0.6 — never immediately, never silently — then holds only
+in its second half.
+
+**G. One relay, and it is one ask (§1.3).** A **second** `herd-hub
+report` run, days after the first, pasted whole, and one
+`herd-hub retention-preview` run with the spans of D201. Two stocks days
+apart are a rate; one stock is a history, and every rate in this document
+is a stock wearing a rate's clothes. It settles **H10**, on which §0.4
+and §2.4 both rest. Nobody in this project runs either (invariant 9,
+D161). This is a relay, not a decision: Alexa asks or does not.
+
+**Two records for `herd-merger` to write, and they are not questions.**
+The direction is already Alexa's; what is missing is the entry. (i) **The
+spans are demoted** — D201's two numbers become a maximum age plus a
+guard, with `--output-floor` as the record guard, and the trigger becomes
+space. An entry that amends D201 without editing it; `docs/decisions.md`
+is append-only. (ii) **The budget keeps its documented scope** — `B`
+governs the collected files, `R` governs the filesystem, and record
+removal is `R`'s because a log is outside `B` by design.
 
 ---
 
@@ -773,30 +1442,89 @@ and keep the order.
 | ORCH-098 | M12 record retention, the engine: two classes (merger 90 / all others 14, configurable), a daily clock plus a startup pass, id-ordered walk stopping after K consecutive in-window records, the sweeper's one-at-a-time guard shared, `index.jobs_accounted` updated in the same act, bytes removed before the record | `docs/plan.md` M12; E-15; `docs/disk-policy.md` §3 | herd-step | waiting | Alexa decides §6 C; then one task, and it is the largest here | ORCH-094, decision §6 C | `docs/disk-policy.md` §3.1, §3.3, §3.4 |
 | ORCH-099 | M12 tombstones: append-only monthly shards carrying id, priority, outcome, `ended_at`, `removed_at`, file count and total bytes; `herdctl` answers for a removed record with that sentence instead of "no such job" | `docs/disk-policy.md` §3.2 | herd-step | owed | One task over the store and `herdctl`, after the engine | ORCH-098 | `docs/disk-policy.md` §3.2 |
 | ORCH-100 | Refuse at startup a configuration where `--output-floor` exceeds the shortest record retention, naming both figures | `docs/disk-policy.md` §3.3 | herd-step | owed | Small task in `main.rs`, with the other startup refusals | ORCH-098 | `herd-hub/src/main.rs:215-224` |
-| ORCH-101 | The startup line stops promising a record *"for ever"* (`main.rs:288-297`); `docs/plan.md` M12 and `docs/coverage.md` E-15 point at `docs/disk-policy.md` | `docs/disk-policy.md` §3.2 | herd-step | owed | Prose plus one `println!`; must land with ORCH-098, never before | ORCH-098 | `herd-hub/src/main.rs:288-297` |
+| ORCH-101 | The startup line stops promising a record *"for ever"* (`main.rs:428`); `docs/plan.md` M12 and `docs/coverage.md` E-15 point at `docs/disk-policy.md` | `docs/disk-policy.md` §3.2 | herd-step | owed | Prose plus one `println!`; must land with ORCH-098, never before | ORCH-098 | `herd-hub/src/main.rs:428` |
 | ORCH-102 | The server hands the retention pass a set of protected ids — jobs being followed, fetches in flight — so the store stays ignorant of sessions | `docs/disk-policy.md` §3.5 | herd-step | owed | One task at the server/store seam | ORCH-098 | `docs/disk-policy.md` §3.5 |
 | ORCH-103 | Relay to Alexa: ask the consumer for one per-directory size listing of the hub volume's `jobs/`, with dates. It settles H1, H2 and H3; it needs root on their host; nobody in this project runs it (D161) | `docs/disk-policy.md` §1.3, §4 | Alexa | waiting | Ask, one question, with the two commands of §1.3 | Alexa | `docs/disk-policy.md` §1.3 |
 | ORCH-104 | Measure the sweep walk at a realistic directory count (3334 and 33 340), refuting or confirming H6's linear scaling of D152's 100 000-directory figures | `docs/disk-policy.md` §4 H6 | herd-step | done | **Done 2026-10-28 on `orch-104-walk-cost`. Linearity confirmed, the figures refuted, and no product file touched.** Five populations — 1 000, 3 334, 10 000, 33 340, 100 000 — cold and warm, release and debug, in `herd-hub/tests/walk_cost.rs` (all cases `#[ignore]`d). The warm record walk is flat at ~19 µs a directory over two orders of magnitude; §3.4's derived 30–45 ms / 0.3–0.45 s become **65.6 ms / 639 ms warm** and **292 ms / 3.29 s cold**; §2.5's sweep figure was too high, not too low. **ORCH-123 confirmed and sharpened:** per-record work is **98.6 %** of the warm walk, not 94 %, and the three `serde_json` parses are **81 %** of the per-record cost in a **release** build, not only in debug — but collapsing them into one parse buys only **23 %** of the walk, so the row's lever is real and about a quarter the size its framing suggests. Cold, the attribution inverts: the disk is 72–76 % and the parses 24–28 %. **A fourth finding nobody was looking for:** every walk in the store reads in ext4 directory-hash order, and sorting the names into id order first costs **0.41–0.50× cold** and nothing warm, so a full cold pass at 33 340 is ~1.7 s instead of ~3.3 s. Three new rows proposed in the handoff | — | `herd-hub/tests/walk_cost.rs`; §3.4's table; `history/2026-10-28-orch-104-walk-cost.md` |
 
+### 7.1 Re-cut 2026-10-29: the rows this direction adds and changes
+
+**Written here, not in `docs/orchestration/board.md`: `herd-merger` owns
+that file and merges rows in one branch at a time.** Ids after ORCH-167,
+the board's highest at `cd0f1b7`; if one collides at rebase, renumber
+from the first free id and keep the order.
+
+| ID | Item | Owner | State | Depends on | Must not touch |
+|---|---|---|---|---|---|
+| ORCH-168 | **The figure the hub can report itself.** `retention-preview` splits record bytes from output bytes on **both** sides of every span and prints one root-wide total of each. `Seen::record_bytes()` already exists `[C, retention.rs:277-283]`. R16 now gives the figure; this makes the hub give it, which is §0.7's first requirement | herd-step | open | — | `report.rs` (ORCH-166), `store.rs`, any writer |
+| ORCH-169 | **The relay of §6 G**: a second `herd-hub report` reading days after the first, plus one `retention-preview` run. It settles H10 | Alexa | waiting | ORCH-168, so the preview they run carries the split | — |
+| ORCH-170 | **This document.** §0 written, §2.4 retired, §3.3 inverted, `docs/plan.md` M12 and `docs/coverage.md` E-15/E-16 re-pointed | herd-step | done | — | `decisions.md`, `board.md`, code |
+| ORCH-171 | **Deduplication by hard link** (§2.9): `objects/<sha256>`, both write paths linking, a `link()` probe with a plain-write fallback said once, blob collection by `st_nlink` inside the removal act, a bounded `objects/` sweep at startup, the eviction sentence carrying **unlinked** and **freed**, `LAYOUT_VERSION` unchanged at 1 | herd-step | waiting | Decision §6 E; ORCH-170 for the words | `herd-proto`, `herdctl`, `server.rs`, `job.rs` |
+| ORCH-172 | **The budget starts meaning disk bytes**: `directory_bytes`/`held` count a shared blob once, the sweeper measures progress in bytes actually freed, **eviction by blob** with a blob as protected as its most protected claimant, and **no candidate destroyed that frees nothing** | herd-step | owed | ORCH-171 | `herd-proto`, the record's fields |
+| ORCH-095 | *(existing, Alexa's yes)* The free-space guard. **Promoted**: it is now the prerequisite of record removal, not a neighbour, and its figure for their disk is R18's 15 % | herd-step | waiting | Decision §6 B; ORCH-172 | retention, records |
+| ORCH-173 | **Record removal under space pressure** — rung 4 (§3.3.1). One act, tombstone then bytes then directory, taking the sweeper's existing one-at-a-time guard, updating `index.jobs_accounted` in the same act, reusing `retention::select` for the guard test and D197's refusals, and taking a protected-id set from its first line of code. Restates ORCH-098's space half and folds ORCH-102 | herd-step | owed | ORCH-095 | `herd-proto`, `matcher.rs`, `queue.rs`, `herdctl` |
+| ORCH-174 | **The backstop, demoted** (§3.1, §3.3.1): once a day and once at startup, id-ordered, stopping after K consecutive in-window records, calling ORCH-173's removal act, with the startup pass carrying its own bound. Restates ORCH-098's calendar half and **consumes ORCH-157** | herd-step | owed | ORCH-173 | `herd-proto`, the budget |
+| ORCH-175 | **Nothing is kept without a bound** (§0.6, §3.3.2, §0.7): the transitional state and its delay, the optional archive path, and the three visibility requirements — reported with its size, counted toward the space calculation, overflow signalled | herd-step | waiting | Decision §6 F; ORCH-173 | the tombstone's format (ORCH-099) |
+
+**Changes to rows that already exist**, and none of them is written here:
+
+* **ORCH-103** (the `du` of every job directory) **should close**:
+  superseded by the reading of 2026-10-29 (§1.3).
+* **ORCH-145** (will the operator run `report`) **should close**:
+  answered — they did, and R12 to R17 are the answer.
+* **ORCH-097** (the budget dry run) survives **re-pointed**: it is a
+  second question for `retention-preview` rather than a second
+  subcommand. One tool, one walk, two questions, no new CLI surface.
+* **ORCH-098** splits into ORCH-173 (space) and ORCH-174 (backstop), with
+  ORCH-102 folded into ORCH-173 — it cannot be a follow-up, because a
+  pass that cannot be told what is in flight removes a directory under a
+  working fetch.
+* **ORCH-099, ORCH-100, ORCH-101** all survive. ORCH-100's refusal gets
+  the sharper form of §3.3.1; ORCH-101's citation is corrected to
+  `main.rs:428` (§3.2).
+* **ORCH-157** (the startup pass needs its own bound) survives and is
+  **consumed by ORCH-174**.
+* **ORCH-158** (sort `names_in` into id order, 0.41 to 0.50x cold `[M]`)
+  is independent of all of it, is one `sort()`, and halves the cold cost
+  of exactly the startup pass ORCH-174 has to bound. It should ride in
+  the same batch as ORCH-174 or earlier.
+
 ### File ownership and order
 
-Four of these rows touch `herd-hub/src/store.rs`, so they cannot share a
-worktree or run at once. The order below is the dependency order and also
-the conflict order:
+**Re-cut 2026-10-29.** `herd-hub/src/store.rs` is the critical path:
+ORCH-171, ORCH-172, ORCH-095, ORCH-173, ORCH-174 and ORCH-175 all rewrite
+it, **no two may share a worktree or run at once**, and the order below is
+both the dependency order and the conflict order. ORCH-087 ("the keeper")
+rewrites the same file and must not start beside any of them.
 
-1. **ORCH-094** — `store.rs` (`recover`, `StoreFile`), `main.rs` none.
-   Must land before anything can remove a record.
+```
+any time   ORCH-170  docs, no code file -- the contract, and it comes first
+any time   ORCH-168  retention.rs and its test only; then ORCH-169 relays
+           -- store.rs, strictly serial, one worktree each --
+wave 1     ORCH-171  objects/ + links + collection + probe
+wave 2     ORCH-172  the budget means disk bytes; eviction by blob
+wave 3     ORCH-095  statvfs, R, the effective ceiling
+wave 4     ORCH-173  rung 4: records under pressure (+ the protected set)
+wave 5     ORCH-174  the backstop (daily + startup, id-ordered, bounded)
+wave 6     ORCH-175  the transitional state and the archive path
+wave 7     ORCH-099 (server.rs, herdctl)  ||  ORCH-100 + ORCH-101 (main.rs)
+```
+
+**The order of 2026-10-27, kept because the four rows in it are done or
+still open on their own terms:**
+
+1. **ORCH-094** — `store.rs` (`recover`, `StoreFile`). Must land before
+   anything can remove a record. **Done**, PR #97.
 2. **ORCH-095** — `main.rs` (the arguments and the startup line),
    `job.rs` (`Budget`, the defaults), `store.rs` (`held_more`, the
-   ceiling). Blocked on decision §6 B.
+   ceiling). Blocked on decision §6 B, and now in wave 3 above.
 3. **ORCH-096** — `store.rs` only (`Live`, `say_what_the_sweep_did`).
-   After ORCH-095, because it warns against the effective ceiling.
-4. **ORCH-098** — `store.rs`, heavily, plus `job.rs` and `main.rs` for
-   the two flags. The largest task here; it should not be cut smaller,
-   because the pass, the guard, the index update and the removal order
-   are one correctness argument.
-5. **ORCH-099, ORCH-100, ORCH-101, ORCH-102** — each small, each after
-   ORCH-098, and ORCH-101 must never land before it.
-6. **ORCH-097** and **ORCH-104** are independent of the rest:
-   ORCH-104 touches no product file at all and can run at any time,
-   including first.
+   After ORCH-095, because it warns against the effective ceiling, and
+   it now watches two quantities rather than one (§2.7).
+4. **ORCH-097** and **ORCH-104** are independent of the rest:
+   ORCH-104 touches no product file at all and is **done**; ORCH-097 is
+   re-pointed into `retention-preview` (§7.1).
+
+**Host bound, unchanged:** ~8.5 GB per build tree on `/mnt/ssd_980`,
+which is the consumer's production disk too. At most two heavy agents,
+and each `target/` deleted once its branch is pushed.

@@ -24,7 +24,10 @@ serde_json.workspace = true
 # the hub's state. Easy to swap, shapes nothing.
 sha2.workspace = true
 time.workspace = true
-tokio = { workspace = true, features = ["rt-multi-thread", "macros", "net", "signal", "sync", "time"] }
+# `process` and `io-util` are M13's event sink (E-37): a command sink is a
+# child process the hub writes a payload into, and a URL sink is one POST
+# written onto a TcpStream. Nothing else in the hub needs either.
+tokio = { workspace = true, features = ["io-util", "macros", "net", "process", "rt-multi-thread", "signal", "sync", "time"] }
 tokio-tungstenite.workspace = true
 
 [dev-dependencies]
