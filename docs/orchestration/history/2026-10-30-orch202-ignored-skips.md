@@ -404,80 +404,184 @@ pipes cargo's stdout through `tee`, so a direct run loses libtest's
 colour. D27, D187, invariant 5, ORCH-202.
 ```
 
+
+## Addendum, after merging `origin/main` (batch 10)
+
+Everything above was written on `1a8c1ae`. The orchestrator pointed out that
+`main` had moved to `5f73c18` and that two of batch 10's branches change
+what this task concluded. It merged clean (no conflicts, including in
+`scripts/check-orchestration.sh`, which both batch 10 and this task edited).
+**Three conclusions above are now wrong or incomplete, and here is each.**
+
+### 1. The red gate was a defect already fixed, not the host
+
+My own finding 10 named `room_mib()` counting reclaimable page cache as
+occupied. **That is D220** (`room-honest`, `7c75525`), landed in batch 10
+about two hours before I measured it. The charge is now read *less* its
+reclaimable file pages — `inactive_file` less `shmem`, because
+`inactive_file` is what the kernel drops first and `active_file` may be in
+use — in **both** `herd-runner/src/room.rs` and `scripts/bench-preflight.sh`,
+field for field. So the figure the suite's own guard reads changes, and the
+41 failures should simply not occur here.
+
+**And my conclusion that I was wrong to override preflight needs
+correcting.** My reasoning was *"the product's own measurement reads the
+same stock figure preflight reads, so a small `anon` buys nothing"*. That
+was **true of my base** — on `1a8c1ae` both read the raw charge, so no
+override could help, and the override was indeed useless. It is **not true
+of `main`**, where both net out reclaimable cache. What I had actually found
+was the right defect; it had been fixed on a branch I could not see. What
+was wrong was only the inference that overriding was therefore safe.
+
+Measured on the merged tree, with **nothing overridden**:
+
+```
+load (1m):   2.42 on 12 cores, ceiling 9.00
+slice room:  13173 MiB under memory.high on /chatons.slice, floor 8192 MiB (8 GiB)
+bench-preflight: ok, safe to start.
+```
+
+The retry precondition stands unchanged and for a better reason: preflight
+clears **unaided**, and nothing should be overridden again.
+
+### 2. The census is 38, and the transition is now a worked example
+
+Batch 10's **D219** (`spool-offer-fix`, `c00d47e`) fixed the startup-offer
+defect and took `#[ignore]` off
+`every_swept_spool_the_hub_acknowledges_is_deleted_and_none_set_aside`.
+That test is **checked** now. So, by `rg` over the merged tree, **38
+attributes in 8 files** — `spool_offer_answered.rs` is gone from the census
+— and `ignored.txt` goes 39 → 38: one deleted line, verified identical to
+the merged tree's source census.
+
+**So rank 1 of my ranking is resolved**, by the fix and not by deleting an
+attribute, which is exactly what I said should happen. The ranking becomes
+**11 of 38** assertions nobody makes — the ten of `crash_points.rs` and the
+one of `announced_job_ceiling.rs` — and 27 measurements that assert
+nothing.
+
+**This is condition 4's real worked example, and it is legible in both
+directions**, which is more than I claimed above:
+
+| direction | what the gate does |
+|---|---|
+| the fix lands, the name is left in `ignored.txt` | **note**, naming the test: *"an expected `#[ignore]` did not appear: the test is checked again… take the name off"*. Green, because coverage was gained. Committed case: *gate: a test taken off `#[ignore]` is named in a note* |
+| the `#[ignore]` comes back, the name is gone from `ignored.txt` | **RED**, `failed=7:unexpected-ignore`, naming `every_swept_spool_…`. Demonstrated by running the merged gate's step 7 over the pre-fix suite output against the 38-entry file |
+
+Before ORCH-202 that transition moved nothing in either direction and left
+no trace anywhere.
+
+### 3. The locale finding is decided: pinned
+
+The orchestrator decided it. **Every** sort and comparison in `gate.sh` that
+feeds a hash or a verdict now runs under `LC_ALL=C`, through two helpers
+`csort`/`ccomm` — all 15 sites, **both** lists, so the two receipt fields
+stay comparable with each other.
+
+**Not `export LC_ALL=C`**, deliberately: `gate.sh` runs `check-docs.sh` and
+`check-orchestration.sh` as children. `check-docs.sh` exports its own locale
+and would be unharmed, but `check-orchestration.sh` sets none — and a
+variable the gate exports into its own children is exactly how a gate's
+checks get reddened from outside. `check-docs.sh`'s second idiom, the locale
+on the one command that needs it, is the one followed.
+
+**The figure moves, once, and here is the pair.** Over this host's
+**identical** twelve at-rest names:
+
+```
+en_US.UTF-8 (what receipts carried): 0fbdadcaf14aac20eb9875f41aa74b11349d7aee9df39d3dc93be5b714ba66f9
+LC_ALL=C    (what they carry now):   2911f1e8cdbaaaa3005e5318bda0f46016cc359b6aefec879b771c65e16a3c0e
+```
+
+They diverge on exactly one pair:
+`a_tighter_enclosing_memory_max_lowers_the_room_that_is_announced` against
+`an_allocation_past_the_ceiling_kills_the_job_and_only_the_job` and
+`an_io_weight_that_cannot_bite_is_said_out_loud`. UTF-8 collation ignores
+the underscore; C does not. **Anyone meeting `0fbdadca…` in a receipt from
+before this landing should read it here**: it is the same twelve names, in
+the other order.
+
+**And the pinning is proved, not asserted.** Three cases, all green:
+
+```
+ok  gate: both hashes are over the byte order, not the locale's order
+ok  gate: two locales (en_US.UTF-8 vs C), one figure for each list
+ok  gate: the probe pair does collate differently, so that was a test
+```
+
+The third exists because the second proves nothing if the probe pair happens
+to collate alike. And run against the **un-pinned** `gate.sh` (`6876fae`),
+the same two-locale comparison fails on both lists — which is what makes
+these cases a regression guard rather than a number that was changed:
+
+```
+unpinned  LC_ALL=C             skip 46e3871a861ccd11 | ignore 1f07f15000414fbb
+unpinned  LC_ALL=en_US.UTF-8   skip eeba04ada41130e5 | ignore 1a3bf9ee99e26bf5   <- both move
+pinned    LC_ALL=C             skip 46e3871a861ccd11 | ignore 1f07f15000414fbb
+pinned    LC_ALL=en_US.UTF-8   skip 46e3871a861ccd11 | ignore 1f07f15000414fbb   <- one figure
+```
+
+A host offering no collation that disagrees with C cannot exercise the
+cross-locale case, so `check-orchestration.sh` gained an honest **`SKIP`**
+path: it prints `SKIP <name>: <why>`, counts it apart, and the summary says
+*"a skipped case is NOT a passed one (D27)"* when there is one. The usual
+line is unchanged when there are none, which is the case on this host.
+
+### Gates re-run after the merge
+
+```
+$ ./scripts/check-orchestration.sh
+check-orchestration: 324 passed, 0 failed        (35.7s, 0 skipped)
+```
+
+The 285 figure in *Gates* above is `1a8c1ae`'s and no longer the baseline:
+batch 10 added cases of its own, so the comparison to make is against
+`main`'s current figure plus this task's **33** (15 on `test.sh`, 15 on
+`gate.sh`, 3 on the locale).
+
+**The four Rust gates and `./scripts/gate.sh` must be re-run on the merged
+tip** — the quoted runs above are from `6876fae`, before the merge brought
+in `mesh.rs` (1045 lines), `room.rs` and the rest. That is the resume point.
+
 ## Resume point
 
-**The branch is NOT pushed: the last gate run went RED, and it went red on
-the host and not on this change.** `./scripts/gate.sh` on `d018610`,
-2026-10-29T23:02:00Z, 9 m 26 s:
+**The branch is NOT pushed. The gate must be re-run on the merged tip**,
+`origin/main` having moved to `5f73c18` after my base. The earlier red
+(`d018610`, `failed=6:test-suite`, 41 failures) was **D220's defect, fixed
+in batch 10 two hours before I measured it** — see the addendum — so it
+should not recur on the merged tree. Step 7, this change's own, was green on
+that run and on every run since.
 
-```
-step 0..5 — ok      (check-docs 2s, check-orchestration 84s, nix flake
-                     check 2s, cargo fmt 2s, cargo clippy 11s)
-step 6: test suite — FAILED (exit 101, 465s)   901 passed, 41 failed
-step 7: the skips, both kinds — ok             12 matched, 39 matched
-gate: RED sha=d0186103c09945ecbd51081f2bcdb829b7ce96f0 failed=6:test-suite
-```
-
-All 41 failures are one cause, and it is a true statement about the host:
-
-```
-Error: --host-memory-floor is 1024 MiB and this host lends 462 MiB, so
-nothing could ever be admitted here.
-```
-
-The runner measured 462 MiB of lendable memory because `/chatons.slice`
-had filled to within ~460 MiB of its 18 GiB `memory.high` while the gate's
-own earlier steps ran. **`bench-preflight.sh` refused this run twice and
-was right both times, and I overrode its cgroup floor both times.** Its
-message says exactly what happened — *"the suite grows about 4 GiB more in
-the same cgroup as it runs. The run would go red on a true statement about
-the host"* — and my reason for overriding it (that `anon` was only
-~800 MiB against ~11 GiB of reclaimable `inactive_file`) was **wrong in a
-way worth writing down**: the product's own D119 measurement reads the
-same stock figure preflight reads, so whatever preflight predicts is
-exactly what the runner will measure. A small `anon` does not help,
-because nothing in the product looks at `anon`. The 8 GiB floor is not
-over-caution; it is the suite's own headroom.
-
-So the precondition for the retry is **preflight passing on its own
-terms**, with no override:
-
-1. Wait until `./scripts/bench-preflight.sh` is `ok` unaided — it needs
-   8 GiB of room under `memory.high` on `/chatons.slice`, and load under
-   9. Right now the slice holds 15.1 GiB, so there is 3.3 GiB.
-2. Then, from this worktree and never from the shared checkout, with
-   `CARGO_TARGET_DIR=/mnt/ssd_980/herd/build/orch202` (left in place and
-   warm, deliberately — see *Processes*):
-   `./scripts/gate.sh`
-3. On `gate: GREEN`, push `orch202-ignored-skips`. Nothing else is owed:
-   the four Rust gates, both docs checks and step 7 are green on this
-   content, and the suite itself passed **942 passed, 0 failed, 39
-   ignored** at 2026-10-30T00:05Z on `6876fae`, whose only difference from
-   the gated tip is this handoff file.
-4. Then `herd-merger` takes the branch into the batch, allocates the
-   `D-NEXT` above and closes ORCH-202 — noting that the row's own proposed
-   shape (fold the ignores into `HERD_SKIP_LOG` as `HERD-SKIPPED`) was
-   **not** taken, and why (*Risks* 2).
+1. `./scripts/bench-preflight.sh` must be `ok` **unaided**. It was, on the
+   merged tree: load 2.42, slice room 13173 MiB against the 8192 floor.
+   **Override nothing.**
+2. From this worktree, never the shared checkout, with
+   `CARGO_TARGET_DIR=/mnt/ssd_980/herd/build/orch202`: the four Rust gates,
+   then bare `./scripts/gate.sh`. The runs quoted under *Gates* predate the
+   merge and no longer stand for this tree.
+3. On `gate: GREEN`, push `orch202-ignored-skips`, then
+   `rm -rf /mnt/ssd_980/herd/build/orch202`.
+4. `herd-merger` takes the branch, allocates the `D-NEXT` above, and closes
+   ORCH-202 — recording that the row's own proposed shape (fold the ignores
+   into `HERD_SKIP_LOG` as `HERD-SKIPPED`) was **declined**, and why
+   (*Risks* 2). The landing record states that this host's
+   `skip-list-sha256` moves once, `0fbdadca… → 2911f1e8…`, over the same
+   twelve names in byte order instead of UTF-8 collation order.
 5. Still owed, on a quiet host: the enumeration's runtime,
    `cargo test -p herd-hub --test crash_points -- --ignored` under
-   `nix develop --command`.
-6. Decision 1 above, before some run in a stripped environment prints
-   `2911f1e8…` and somebody reads it as a changed skip list.
+   `nix develop --command`. Not taken at load 10, and not taken since.
 
 ## Processes
 
-- The suite (three times: twice standalone, once inside the gate), `cargo
-  fmt`, `cargo build`, `cargo clippy`, `check-docs.sh`,
-  `check-orchestration.sh` and `./scripts/gate.sh` — each a child of this
-  agent's own shell, started and reaped by it. **No PID of any other agent
-  and none of the consumer's production was signalled.** The consumer's
-  `herd-hub` (3006543) and `herd-runner` (3021002) were read out of `ps`
-  while judging host load and **left alone**; nothing was killed by name
-  or by pattern, and nothing under `/sys/fs/cgroup` was written.
+- The suite ×3, `cargo fmt`/`build`/`clippy`, `check-docs.sh`,
+  `check-orchestration.sh` ×3, `./scripts/gate.sh` ×1, two short background
+  watchers, and the two shell-only harnesses under the scratchpad — each a
+  child of this agent's own shell, started and reaped by it. **No PID of
+  another agent and none of the consumer's production was signalled**;
+  nothing was killed by name or by pattern. The consumer's `herd-hub`
+  (3006543) and `herd-runner` (3021002) were read out of `ps` while judging
+  host load and left alone. `/sys/fs/cgroup` was read, never written.
 - Build tree `/mnt/ssd_980/herd/build/orch202`: **kept, on purpose.** The
-  branch is not pushed, so workflow.md's "delete your own `target/` once
-  your branch is pushed" has not come due, and a warm tree is what makes
-  the retry above cost 9 minutes instead of a cold rebuild — which would
-  itself put ~8.5 GiB of fresh page cache into the very cgroup whose
-  fullness caused the red. Whoever gets the green push runs
-  `rm -rf /mnt/ssd_980/herd/build/orch202`.
+  branch is not pushed, so workflow.md's "delete once pushed" has not come
+  due, and a warm tree is what keeps the re-gate cheap. Whoever gets the
+  green push deletes it.
