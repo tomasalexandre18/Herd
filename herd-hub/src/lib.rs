@@ -4,6 +4,7 @@ pub mod capability;
 pub mod durable;
 pub mod job;
 pub mod matcher;
+pub mod notify;
 pub mod queue;
 pub mod report;
 pub mod retention;
@@ -21,6 +22,7 @@ pub use matcher::{
     Parent, Placement, Placing, Seat, Stickiness, DRAIN_FIRST_LIMIT, READINGS_AT_ONCE,
     STICKINESS_LIMIT,
 };
+pub use notify::{Event, Notifier, Sink, DELIVER_WITHIN, EVENTS_QUEUED, EVENT_FORMAT_VERSION};
 pub use queue::{Standing, AGING_STEP};
 pub use report::{Accounting, Census, Dedup, DigestConflict, Sizes, StateRootReport, Unread};
 pub use retention::{

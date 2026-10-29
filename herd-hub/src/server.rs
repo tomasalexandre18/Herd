@@ -72,6 +72,7 @@ use crate::job::{
     HowItEnded, JobRecord, JobState, JobStore, LogWrite, NewJob, Raise, Submission, Timestamp,
 };
 use crate::matcher::{self, Placement, Seat, Stickiness};
+use crate::notify::{Deliveries, Event, Notifier, Sink as EventSink};
 use crate::queue;
 
 /// Loopback by default: the hub is reached through the reverse proxy, which
@@ -569,6 +570,15 @@ pub struct Authority {
 pub struct Hub {
     listener: TcpListener,
     state: Arc<State>,
+    /// The one task that touches the event sink, taken by `serve` and put in
+    /// the hub's `Housekeeping` (E-37, M13).
+    ///
+    /// Held here rather than spawned at bind time so that a hub which is
+    /// bound and never served starts no task, and so that the task dies with
+    /// the serving future like every other: `Housekeeping` **aborts** what it
+    /// holds and never joins it, which is what keeps a blocked sink out of
+    /// the stop budget.
+    deliveries: Option<Deliveries>,
 }
 
 impl Hub {
@@ -600,6 +610,25 @@ impl Hub {
         policy: Policy,
         authority: Authority,
     ) -> Result<Self> {
+        Self::bind_with_sink(addr, store, policy, authority, None).await
+    }
+
+    /// The same, with the one place this hub says the four things E-37 asks
+    /// to hear about (M13).
+    ///
+    /// `None` is a hub that tells nobody anything, which is the default and
+    /// what every other entry point here gives: an operator who configured no
+    /// sink gets no event, no task and no notification code on any path. The
+    /// sink itself is read and refused at startup by
+    /// [`crate::notify::Sink::parse`], so what arrives here is a sink this
+    /// hub can send to.
+    pub async fn bind_with_sink(
+        addr: SocketAddr,
+        store: Arc<dyn JobStore>,
+        policy: Policy,
+        authority: Authority,
+        sink: Option<EventSink>,
+    ) -> Result<Self> {
         // Before the port, because a hub that cannot keep its promises about
         // a live runner must not be reachable by one. Here rather than in the
         // binary's option parsing so that there is no way to build a hub on
@@ -612,8 +641,16 @@ impl Hub {
         let listener = TcpListener::bind(addr)
             .await
             .with_context(|| format!("binding {addr}"))?;
+        let (notify, deliveries) = match sink {
+            Some(sink) => {
+                let (notify, deliveries) = Notifier::to(sink);
+                (notify, Some(deliveries))
+            }
+            None => (Notifier::silent(), None),
+        };
         Ok(Self {
             listener,
+            deliveries,
             state: Arc::new(State {
                 store,
                 policy,
@@ -625,6 +662,7 @@ impl Hub {
                 peers: Mutex::new(Peers::default()),
                 dispatching: Mutex::new(()),
                 stopping: AtomicBool::new(false),
+                notify,
             }),
         })
     }
@@ -689,7 +727,7 @@ impl Hub {
     /// drives and the hub the consumer runs cannot drift in what they do
     /// while they are up. `None` is a hub nothing can ask to stop, which is
     /// the in-process one.
-    async fn serve_until(self, signals: Option<StopSignals>) -> Result<Stop> {
+    async fn serve_until(mut self, signals: Option<StopSignals>) -> Result<Stop> {
         // Held in a guard rather than aborted at the end, **because the end
         // is not always reached**: a caller that drops this future — every
         // end-to-end test does, by aborting the task it runs in — would
@@ -698,12 +736,22 @@ impl Hub {
         // gone would go on holding its state root against the next one, which
         // M8 turned from a theoretical leak into a real test flake: a state
         // root reported "already in use" by a hub nothing was running.
-        let _housekeeping = Housekeeping(vec![
+        let mut housekeeping = vec![
             tokio::spawn(watch_for_a_lost_runner(Arc::clone(&self.state))),
             tokio::spawn(keep_trying_to_write_results(Arc::clone(&self.state))),
             tokio::spawn(let_the_queue_age(Arc::clone(&self.state))),
             tokio::spawn(say_again_why_jobs_wait(Arc::clone(&self.state))),
-        ]);
+        ];
+        // The fifth, and the only one that waits for anything outside this
+        // machine (E-37). It is in here with the other four for the reason
+        // the comment above gives — a dropped future must not leave it
+        // alive — and it matters twice over here: `Housekeeping` aborts and
+        // never joins, so a sink that has stopped answering cannot add a
+        // second to this hub's bounded stop.
+        if let Some(deliveries) = self.deliveries.take() {
+            housekeeping.push(tokio::spawn(deliveries.run()));
+        }
+        let _housekeeping = Housekeeping(housekeeping);
         let serving = async {
             loop {
                 let (stream, peer) = self.listener.accept().await.context("accepting")?;
@@ -1104,6 +1152,13 @@ struct State {
     /// Monotonic on purpose: nothing un-stops a hub, so a second `SIGTERM`
     /// finds the flag already set and changes nothing (ORCH-081).
     stopping: AtomicBool,
+    /// Where the four things E-37 asks to hear about are said (M13).
+    ///
+    /// Silent unless the operator configured a sink, and never on a path a
+    /// verdict, a record or a stop waits for: see [`crate::notify`]'s three
+    /// properties. Every call site is one `self.notify.say(...)`, which is
+    /// not `async` and cannot block.
+    notify: Notifier,
 }
 
 /// What a runner announced about itself in its handshake, past its name.
@@ -1259,6 +1314,24 @@ struct ConnectedRunner {
     /// [`set_a_switch`] before it asks, so that a stale acknowledgement of the
     /// same position can never answer a new question.
     applied: watch::Sender<Option<Acknowledged>>,
+    /// The position this hub last **asked** this runner for and has not yet
+    /// seen come back (E-37).
+    ///
+    /// It exists for one question, and only E-37 asks it: *was this change
+    /// the owner's own?* A position the hub asked for is recorded on
+    /// `ToHub::SwitchApplied`, and the comment there says the earlier of the
+    /// two wins — but which is earlier is a race, and it is not an unlikely
+    /// one: the runner applies the position and sends its acknowledgement
+    /// while its own health reporter is on a clock of its own, so a report
+    /// carrying the new position can reach the hub first. Measured, 60 ms
+    /// after a join, with a 0.2 s cadence. Reading "it came on a health
+    /// report" as "the owner did it" therefore attributed an orchestrator's
+    /// own `herdctl switch` to the machine's owner about as often as not.
+    ///
+    /// So the hub remembers what it asked for and forgets it the moment that
+    /// same position comes back by either path. Nothing else reads it: it
+    /// changes no placement, no record and no answer to `herdctl`.
+    asked_for: Option<herd_proto::Switch>,
     jobs: Vec<RunningJob>,
 }
 
@@ -1638,6 +1711,9 @@ impl State {
                     // empty on purpose: an acknowledgement is about one
                     // process, and the process may be a different one.
                     applied: watch::channel(None).0,
+                    // Nothing has been asked of this connection yet, for the
+                    // same reason: a redial is a different process.
+                    asked_for: None,
                     jobs: Vec::new(),
                 },
             );
@@ -1884,10 +1960,41 @@ impl State {
         self.with_peers(|peers| {
             if let Some(runner) = peers
                 .runners
-                .values()
+                .values_mut()
                 .find(|runner| runner.outbox.same_channel(outbox))
             {
+                // The ask is answered, so it is forgotten: a position the
+                // owner sets by hand *afterwards* — the same position, even —
+                // is her own doing and must be said out loud (E-37).
+                runner.asked_for = None;
                 runner.applied.send_replace(Some(acknowledged));
+            }
+        })
+    }
+
+    /// Whether this exact position is one this hub asked that runner for, and
+    /// forget it either way (E-37).
+    ///
+    /// Asked once, before the position is recorded, by the one call site that
+    /// has to tell the owner's hand from an agent's: see
+    /// [`ConnectedRunner::asked_for`]. It is a one-shot — a second report of
+    /// the same position is not a second answer to the same ask — so a
+    /// position the owner really does set by hand later is never swallowed by
+    /// an ask from an hour ago.
+    fn the_hub_asked_for_this_switch(&self, outbox: &Outbox, switch: &herd_proto::Switch) -> bool {
+        self.with_peers(|peers| {
+            let Some(runner) = peers
+                .runners
+                .values_mut()
+                .find(|runner| runner.outbox.same_channel(outbox))
+            else {
+                return false;
+            };
+            if runner.asked_for.as_ref() == Some(switch) {
+                runner.asked_for = None;
+                true
+            } else {
+                false
             }
         })
     }
@@ -2834,6 +2941,26 @@ async fn serve_peer(state: Arc<State>, stream: TcpStream) -> Result<()> {
     outcome
 }
 
+/// E-37's switch event, built where the position is still in hand.
+///
+/// A function so that the position's three words are written once: the event
+/// carries `on`, `off` or `drain` in a field of its own, and the owner's
+/// reason in another, rather than one sentence a consumer's router would have
+/// to parse. E-33 requires the reason for `off` and for `drain`; `on` carries
+/// none, and the event says so in the one word a reader needs.
+fn owner_switch(name: &str, switch: &herd_proto::Switch) -> Event {
+    let word = match switch {
+        herd_proto::Switch::On => "on",
+        herd_proto::Switch::Off { .. } => "off",
+        herd_proto::Switch::Drain { .. } => "drain",
+    };
+    Event::owner_switch(
+        name,
+        word,
+        switch.reason().unwrap_or("no reason is given for on"),
+    )
+}
+
 async fn serve_runner(
     state: &State,
     name: &str,
@@ -2843,6 +2970,10 @@ async fn serve_runner(
     announced: Announced,
 ) -> Result<()> {
     let (host, preference) = (announced.host, announced.preference);
+    // Which build it is, kept before the handshake's facts are handed to the
+    // registry: E-37's "a client ... joined" is worth nothing to a reader who
+    // cannot tell which version of the runner came back.
+    let its_version = announced.version.clone();
     // What it offers, said out loud with every capability's origin: a denial
     // nobody can see is a denial nobody can trust (E-24).
     for line in announced.capacity.report() {
@@ -2878,6 +3009,11 @@ async fn serve_runner(
         }
     }
     println!("herd-hub: runner {name} has joined");
+    // One of E-37's five, and the first half of "a client lost or joined".
+    // After the admission and not before it: a runner asked to stand by has
+    // not joined anything, and a notification saying it had would be a
+    // notification about the opposite of what happened.
+    state.notify.say(Event::runner_joined(name, &its_version));
     // Before anything else is asked of this connection: the collections this
     // hub is still owed bytes for (D148).
     //
@@ -2902,6 +3038,15 @@ async fn serve_runner(
              not back within {:?} (E-21)",
             state.policy.lost_after
         );
+        // E-37's "a client lost", on the ordinary path: the link closed, which
+        // is what a runner stopping, a drained runner leaving and a machine
+        // being switched off all look like from here. The other path is the
+        // watchdog's, for a link that is still open and has gone quiet
+        // ([`one_watchdog_pass`]); a runner can leave by only one of the two,
+        // because whichever notices it first takes it out of the registry.
+        state
+            .notify
+            .say(Event::runner_lost(&gone, "its link to this hub closed"));
         // A job that was sticking to this runner is no longer sticking to it:
         // it was waiting for a machine that is now not *available*, which is
         // exactly when E-19 lets it move. One pass, now, so that the job
@@ -4089,8 +4234,19 @@ async fn relay_from_runner(
                 // are claimable elsewhere now, not at the next thing that
                 // happens to wake the hub (D80). That is where E-33's ten
                 // seconds is actually spent.
+                // E-37's "an owner switch changed from the owner's side",
+                // and **only** from her side: a position this hub asked for
+                // is recorded on `SwitchApplied` below, which arrives first
+                // (D99), so a position that first reaches the hub here is one
+                // nobody here asked for. See [`Event::OwnerSwitch`] for the
+                // one window the two cannot be told apart in.
+                let position = owner_switch(name, &switch);
+                let the_hub_asked = state.the_hub_asked_for_this_switch(outbox, &switch);
                 if let Some(said) = state.record_switch(outbox, switch) {
                     println!("herd-hub: {said}");
+                    if !the_hub_asked {
+                        state.notify.say(position);
+                    }
                     dispatch_queued_jobs(state)?;
                 }
                 // The answer is what tells the runner this link is alive: a
@@ -5609,6 +5765,14 @@ fn one_watchdog_pass(state: &State) {
             "herd-hub: dropping the connection to runner {name}: nothing has come back \
              on it for {quiet_for:?}"
         );
+        // E-37's "a client lost", on the path that matters most to the owner:
+        // the socket is still open and the machine behind it has stopped
+        // answering, which is the shape of a host that was switched off,
+        // suspended, or lost its network.
+        state.notify.say(Event::runner_lost(
+            &name,
+            &format!("nothing has come back on its link for {quiet_for:?} (E-21)"),
+        ));
     }
 
     let in_the_air = attempts_in_the_air(state);
@@ -5971,6 +6135,16 @@ fn give_the_job_another_go(
         );
     } else {
         eprintln!("herd-hub: {job_id} is lost: {reason}");
+        // E-37's "a job lost twice", and nothing else: this branch is
+        // E-21's second loss, with the record already written above. The
+        // other branch is D182's different ending, where nothing failed and
+        // no machine went anywhere, so it is not this event. A job that ends
+        // with a verdict — any exit code at all — is not one either: it has a
+        // requester, and a step job's ordinary end is exactly what E-37 says
+        // must never be an event.
+        state
+            .notify
+            .say(Event::job_lost(&job_id.to_string(), reason));
     }
     let kept = read_the_outputs(state, job_id);
     let commit = the_commit_it_ran(state, job_id);
@@ -6563,10 +6737,14 @@ fn judge_one(state: &State, new: NewJob) -> Result<Vec<String>> {
 async fn set_a_switch(state: &State, runner: &str, switch: herd_proto::Switch) -> (String, bool) {
     let why = format!("set through this hub to {}", switch.sentence());
     let asked = state.with_peers(|peers| {
-        peers.runners.get(runner).map(|connected| {
+        peers.runners.get_mut(runner).map(|connected| {
             // Cleared before the ask, so that an acknowledgement of this same
             // position from an earlier `herdctl switch` cannot answer this one.
             connected.applied.send_replace(None);
+            // And remembered, so that whichever of the acknowledgement and
+            // the next health report arrives first, this position is not read
+            // as the owner's own doing (E-37).
+            connected.asked_for = Some(switch.clone());
             let acknowledgements = connected.applied.subscribe();
             let _ = connected.outbox.send(FromHub::SetSwitch {
                 switch: switch.clone(),
@@ -7946,6 +8124,7 @@ mod tests {
             peers: Mutex::new(Peers::default()),
             dispatching: Mutex::new(()),
             stopping: AtomicBool::new(false),
+            notify: Notifier::silent(),
         });
         let (outbox, _inbox) = mpsc::unbounded_channel();
         let (kick, _kicked) = watch::channel(false);
@@ -8168,6 +8347,7 @@ mod tests {
             peers: Mutex::new(Peers::default()),
             dispatching: Mutex::new(()),
             stopping: AtomicBool::new(false),
+            notify: Notifier::silent(),
         });
 
         // The first pass writes a waiting line on every record: 400 records,
@@ -8247,6 +8427,7 @@ mod tests {
             peers: Mutex::new(Peers::default()),
             dispatching: Mutex::new(()),
             stopping: AtomicBool::new(false),
+            notify: Notifier::silent(),
         });
 
         // The first judgement of a job is news and is written: a job nobody
@@ -8349,6 +8530,7 @@ mod tests {
             peers: Mutex::new(Peers::default()),
             dispatching: Mutex::new(()),
             stopping: AtomicBool::new(false),
+            notify: Notifier::silent(),
         });
         // Outside the measurement: the pass that judges every job for the
         // first time writes a line for each, and is allowed to.
@@ -8582,6 +8764,7 @@ mod tests {
             peers: Mutex::new(Peers::default()),
             dispatching: Mutex::new(()),
             stopping: AtomicBool::new(false),
+            notify: Notifier::silent(),
         };
         let (outbox, mut inbox) = mpsc::unbounded_channel();
         // A job this hub has no record of is exactly what a written-off
@@ -8808,6 +8991,7 @@ mod tests {
             peers: Mutex::new(Peers::default()),
             dispatching: Mutex::new(()),
             stopping: AtomicBool::new(false),
+            notify: Notifier::silent(),
         });
         let (outbox, _inbox) = mpsc::unbounded_channel();
         let (kick, _kicked) = watch::channel(false);
@@ -8912,6 +9096,7 @@ mod tests {
             peers: Mutex::new(Peers::default()),
             dispatching: Mutex::new(()),
             stopping: AtomicBool::new(false),
+            notify: Notifier::silent(),
         })
     }
 
