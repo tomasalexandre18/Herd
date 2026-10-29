@@ -10683,3 +10683,98 @@ human step before the tag was pushed; `.github/workflows/release.yml`;
 (40 353 against 40 352 bytes), and the generated half still sha256
 `87cb889775e8d347064ae4e476670c72fb1f2ad6d5ea68ae3cc4d92c072a82d0`;
 ORCH-106, ORCH-161, ORCH-162; D132, D162, D172.
+
+## 2026-10-29 — D211 The startup reaper leaves outputs/ to the sweep
+
+**Context — a half that was dead on arrival in the release that introduced
+it.** D180 (2026-10-25) gave the startup reaper `<data root>/outputs/` on
+an explicit premise: after a `SIGKILL` "the bytes can never be offered
+again, no acknowledgement can ever free them, and nothing removed them",
+so the spools were unbounded disk growth and nothing but growth. D180's
+own *Reversibility* paragraph calls that half "the one irreversible half"
+and says "a revert simply stops the sweep".
+
+**Two days later `b250358` (2026-10-27) built the runner that can offer
+exactly such a spool.** `Session::pick_up_collections` re-adopts a spool
+left on disk and waits for the hub to say whether anyone is still owed the
+bytes. It runs on the same startup, **twenty-eight lines after the
+reaper** — `Confined::prepare` at `herd-runner/src/lib.rs:2634`,
+`pick_up_collections` at `:2662` — over the same directory. `v0.4.0`
+shipped both halves, so the half that recovers a requester's evidence read
+a directory the reaper had just emptied. The feature was dead on arrival
+in the release that introduced it, and the consumer is holding a runner at
+0.3.6 because upgrading would delete the bytes they are waiting for.
+
+**The premise's own refutation shipped in the same commit, and that is the
+sharp part.** `DataRoot::outputs_dir` (`herd-runner/src/root.rs:197-203`)
+says `outputs/` sits outside `jobs/` "for the same reason" as
+`held-results/`: "the startup reaper clears a workspace, and a collection
+the hub has not acknowledged is the only copy of a result (D19)". That
+doc comment was written by `b250358` itself — not earlier, measured with
+`git log -S` over `root.rs`, which names that one commit — so v0.4.0
+carried the rule and its violation twenty-eight lines apart. The proposed
+text for this entry said the tree "already said" it before v0.4.0; it did
+not, and the weaker fact is the true one.
+
+**Choice.** The startup reaper owns **processes, workspaces and cgroups,
+and nothing else**. `outputs/` is the sweep's alone. Removal of a spool
+stays on the hub's sentence (`Session::files_acknowledged`, D19); when the
+hub stays silent, the bytes are set aside under a name that says so, named
+with their size at every start, and the disk is left to a human. No
+version number moves: this is a bug fix inside `herd-runner`, no frame and
+no record shape changes.
+
+**Alternatives rejected on the merits, both of them plausible.**
+
+1. **Ordering the two stages** — sweep first, reap second. It deletes
+   precisely the bytes the sweep carefully declined to touch: an
+   unfinished walk, an unreadable subdirectory, a spool already set aside.
+   The sweep's restraint is the feature, and reaping after it converts
+   every one of its deliberate refusals into a deletion.
+2. **A narrow name guard** in the reaper — spare only what
+   `parse_name` recognises. It deletes the `.unclaimed` and
+   `.foreign-state-root` set, which is exactly the set the sweep promises
+   an operator is theirs to look at.
+
+**This partly reverses D180.** D180's first three numbered items — the
+ceiling, the count read inside the lock, `AttemptAbandoned` as the only
+refusal — are untouched and stand. What is reversed is the unnumbered
+paragraph at its end, "the startup reaper now reclaims `<data root>/
+outputs/`", which D180 itself flagged as its one irreversible half. A
+decision that named its own risk is being read back against it.
+
+**The lesson, and it belongs on the record because the tests were green.**
+Both halves had a passing test and **neither test ran the startup
+sequence**. `herd-hub/tests/spools_resumed.rs` drives a fake runner over a
+raw socket and never calls `Confined::prepare`; the reaper's own test
+reclaimed a spool it had placed itself. Two green tests, one dead feature.
+The fix's test calls the runner's **own** two entry points —
+`Confined::prepare` and `Session::pick_up_collections` — and
+re-implements neither, after the first reproduction was found to have
+copied the startup order rather than called it. A stand-in for the startup
+path is how this shipped.
+
+**Reversibility.** High. The fix removes a deletion; reverting it restores
+one. No format, no frame, no record version moved, and nothing on disk is
+written differently. What is **not** reversible is anything v0.4.0 already
+deleted on a runner that has been restarted, which is why the upgrade
+advice changed and the consumer was told to wait.
+
+**On the number.** This entry is D211, allocated at this landing above
+D210, the highest on `origin/main` `10ff31d` and on every branch not yet
+landed — measured over all remote branches, none of which carries an
+allocated number above D210; three old branches hold a `D-NEXT`
+placeholder, which reserves nothing. D143, D154 and D170 stay gaps (D148,
+invariant 8). It is the only decision batch 6 carries.
+
+**Evidence.** `history/2026-10-29-collect-gap.md` §2, the diagnosis;
+`history/2026-10-29-reaper-sweep.md`, the fix;
+`herd-runner/src/reclaim.rs` (no reference to `SPOOL_DIR` remains);
+`herd-runner/src/sweep.rs`
+`the_reaper_does_not_delete_a_spool_this_sweep_would_have_resumed`, a
+plain `#[test]` and no longer `#[ignore]`d; `herd-runner/src/lib.rs:2634`
+and `:2662`; `herd-runner/src/root.rs:197-203`; `b250358`;
+`docs/remediation/09-runner-self-limits.md` *What is deliberately not
+done, and it is the better fix. H.*, which named re-adopting the spool as
+the better fix and said nobody had asked for it — two days before somebody
+built it; **D19**, **D148**, **D180**; ORCH-164.
