@@ -27,6 +27,28 @@ for every agent:
 - A red last run is reported red, in the agent's report, and the branch
   is not pushed.
 
+A drafted `docs/decisions.md` entry and a drafted `board.md` row go in
+**this file, in full**: the whole text the merger will paste, headed
+`D-NEXT` for a decision, since the merger allocates the number and gaps
+stay (D148, invariant 8). Not a pointer, not *"see the agent's
+report"*, not a summary of what the entry would say. **The reason is
+that the merger reads the tree and nothing else**: the orchestrator's
+conversation and an agent's hand-back report are not artefacts
+`herd-merger` can read, so anything the merger must act on has to be in
+a file on the branch.
+
+Measured once, on 2026-10-29: `spool-offer-fix`'s handoff deferred its
+drafted entry to *"the agent's report"*, so `herd-merger` had to
+compose D221 out of that handoff's *Done* section, and said in
+`history/2026-10-29-merge-batch-10.md` that the wording was not its
+author's. The reconstruction turned out faithful. Nothing in the method
+had made it so.
+
+This template said nothing close before. Its one decision-shaped
+section was *Decisions needed*, which is for a question somebody else
+must answer, not for an entry already written; that section is
+unchanged, and *Drafted for `herd-merger`* now stands beside it.
+
 `herd-merger`'s own handoff, named `<YYYY-MM-DD>-merge-<batch>.md`, carries
 one more thing: the filled landing record of `templates/landing.md`, which
 is the merge commit's message and the audit trail of the push to `main`.
@@ -57,6 +79,12 @@ path its output goes to; the output itself is in the agent's report>
 
 ## Risks and findings
 <what could be wrong, what contradicts the brief, with evidence>
+
+## Drafted for `herd-merger`
+<the full `docs/decisions.md` entry this task drafts, headed `D-NEXT`,
+and the full text of every `board.md` row it proposes — verbatim, never
+a pointer to the agent's report and never a summary, because the merger
+reads the tree and nothing else; "none" if the brief asked for neither>
 
 ## Decisions needed
 <question — recommendation — fallback; or "none">
