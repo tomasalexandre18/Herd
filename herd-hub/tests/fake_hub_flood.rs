@@ -219,6 +219,7 @@ impl FakeHub {
             hub_version: herd_runner::runner_version().to_owned(),
             state_root: "fake-hub-state-root".to_owned(),
             version_note: None,
+            keeper_for: Vec::new(),
         };
         socket
             .send(Message::text(to_frame(&welcome).expect("encodes")))
@@ -246,6 +247,8 @@ async fn assign(socket: &mut Socket, how_many: usize) {
             ],
             declaration: None,
             timeout_s: Some(TIMEOUT_SECONDS),
+            packs_in: Vec::new(),
+            packs_out: std::collections::BTreeMap::new(),
         };
         socket
             .send(Message::text(to_frame(&frame).expect("encodes")))

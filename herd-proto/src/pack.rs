@@ -23,6 +23,29 @@
 //! carries the number so a mismatch is refused **by name** rather than read
 //! as a malformed request, and that is all it is for. One version, not two.
 //!
+//! ## How the peer leg is framed, and why it is not JSON all the way down
+//!
+//! **One line of JSON ended by `\n`, then exactly as many raw bytes as the
+//! line said** ([`encode_peer_header`], [`decode_peer_header`],
+//! [`take_peer_body`]).
+//!
+//! The control plane has no choice: D4 makes one message one WebSocket
+//! **text** frame and D18 keeps a job's output byte-exact inside it, so a
+//! payload there is base64 and pays 33% for it. That cost is right where it
+//! is paid — a log chunk is kilobytes — and wrong here, because this is the
+//! one leg that moves hundreds of megabytes and it touches no hub, carries
+//! no mixed traffic and needs no text frame. The consumer's measured pack is
+//! 401.6 MiB; base64'd inside JSON it would be about 535 MiB, and the third
+//! would buy nothing at all.
+//!
+//! A length-prefixed binary framing would save the same third and cost the
+//! property that a person can read one line of this stream with `head -1`
+//! and know what is on it. So the header stays JSON and the body stops
+//! being: the length lives **in the header that precedes the bytes**, which
+//! [`PeerBody`] makes a property of the header's type rather than a rule
+//! somebody has to remember, and every way the two can disagree is refused
+//! by its own name ([`PeerFramingRefusal`]).
+//!
 //! ## The three parts of a pack, and the one that does not travel far
 //!
 //! ```text
@@ -81,7 +104,7 @@ use std::collections::BTreeMap;
 use std::fmt;
 use std::time::Duration;
 
-use serde::{Deserialize, Serialize};
+use serde::{de::DeserializeOwned, Deserialize, Serialize};
 
 /// The first line of a manifest Herd will read: `# chatons pack 1`.
 ///
@@ -643,17 +666,43 @@ pub struct PeerRequest {
     pub offset: u64,
 }
 
-/// One reply on the peer wire: these bytes of that object.
+/// The header of one reply on the peer wire: *these bytes of that object
+/// follow*.
+///
+/// **The bytes are not in here, and that is the whole point.** An earlier
+/// shape carried them as a `data: Vec<u8>` field, base64 inside the JSON, as
+/// every payload on the *control* plane does — and on the control plane
+/// base64 is forced, because D4 makes a frame one WebSocket **text** frame
+/// and D18 keeps a job's output byte-exact inside it. Nothing forces JSON on
+/// this leg. It touches no hub, carries no mixed traffic, and is the one leg
+/// that moves hundreds of megabytes: the consumer's measured 401.6 MiB pack
+/// would travel as about 535 MiB base64'd, a third of it paid for nothing.
+///
+/// So the framing is [`encode_peer_header`]'s: one line of JSON terminated
+/// by `\n`, then exactly [`PeerReply::length`] raw bytes. Debuggable by eye,
+/// no new dependency, and the length is in the header that precedes the
+/// bytes rather than in a prefix nobody can read.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PeerReply {
     pub object: String,
     pub offset: u64,
+    /// **How many raw bytes follow this header line**, at most
+    /// [`PACK_CHUNK_BYTES`].
+    ///
+    /// This is the field the framing reads, and it is the chunk's length and
+    /// not the object's: a reader that took it for the object's whole size
+    /// would wait for bytes the sender never promised. The object's size is
+    /// [`PeerReply::object_length`], beside it.
+    pub length: u64,
     /// The object's whole length, so a fetcher knows when it is done without
     /// consulting the manifest a second time.
-    pub length: u64,
-    /// At most [`PACK_CHUNK_BYTES`].
-    #[serde(with = "crate::bytes_as_base64")]
-    pub data: Vec<u8>,
+    ///
+    /// Carried although `length` is now the chunk's, because the fact it
+    /// states is not derivable from one reply: a fetcher resuming at an
+    /// offset would otherwise have to read the manifest again to learn when
+    /// to stop. `offset + length` past this figure is a header disagreeing
+    /// with itself, and [`decode_peer_header`] refuses it by name.
+    pub object_length: u64,
 }
 
 /// Why a peer served nothing, in a sentence.
@@ -664,6 +713,293 @@ pub struct PeerReply {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PeerRefusal {
     pub why: String,
+}
+
+// ---------------------------------------------------------------------------
+// The peer leg's framing: one JSON line, then the bytes
+// ---------------------------------------------------------------------------
+
+/// How many raw bytes follow a peer header on the wire.
+///
+/// A property of the header's **type**, so that the length a reader waits for
+/// can only ever come out of the header it just read. That is the whole
+/// invariant of this framing — the length is in the header that precedes the
+/// bytes — and making it a trait is how it is held rather than remembered: a
+/// header type that carried a body and did not say so would not compile
+/// through [`encode_peer_header`].
+pub trait PeerBody {
+    /// How many raw bytes follow this header line. Zero for everything but a
+    /// [`PeerReply`].
+    fn body_bytes(&self) -> u64;
+
+    /// Whatever this header says that contradicts itself, knowable before a
+    /// byte of body is read.
+    ///
+    /// Checked by [`decode_peer_header`], so a header that cannot be true is
+    /// refused by name instead of putting a reader into a wait it will never
+    /// come out of. Nothing by default.
+    fn self_disagreement(&self) -> Option<PeerFramingRefusal> {
+        None
+    }
+}
+
+impl PeerBody for PeerRequest {
+    fn body_bytes(&self) -> u64 {
+        0
+    }
+}
+
+impl PeerBody for PeerRefusal {
+    fn body_bytes(&self) -> u64 {
+        0
+    }
+}
+
+impl PeerBody for PeerReply {
+    fn body_bytes(&self) -> u64 {
+        self.length
+    }
+
+    fn self_disagreement(&self) -> Option<PeerFramingRefusal> {
+        // An overflowing `offset + length` is a disagreement and not an
+        // absence of one: a `None` here would let the one header nobody can
+        // make sense of through.
+        let past_the_end = match self.offset.checked_add(self.length) {
+            Some(end) => end > self.object_length,
+            None => true,
+        };
+        past_the_end.then_some(PeerFramingRefusal::BodyPastTheObject {
+            offset: self.offset,
+            length: self.length,
+            object_length: self.object_length,
+        })
+    }
+}
+
+/// Why a peer frame was refused, each case by its own name.
+///
+/// Named rather than stringly, for D150's reason twice over: the party that
+/// knows why is the one that has to speak, and a fetcher that got a sentence
+/// it cannot match on could log the refusal and still not know whether to
+/// retry, ask the hub for another holder, or stop. [`fmt::Display`] is the
+/// sentence a person reads; the variant is what the code reads.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PeerFramingRefusal {
+    /// A header line that did not end inside one read of the endpoint's
+    /// buffer, on the way in or on the way out.
+    HeaderPastTheReadBuffer { bytes: usize },
+    /// A header line that is not a peer header.
+    HeaderUnreadable { error: String },
+    /// A header promising more body than one reply may carry.
+    BodyPastTheChunk { promised: u64 },
+    /// A header whose chunk falls past the end of the object it names — a
+    /// header disagreeing with itself.
+    BodyPastTheObject {
+        offset: u64,
+        length: u64,
+        object_length: u64,
+    },
+    /// Fewer body bytes arrived than the header promised.
+    BodyTruncated { promised: u64, arrived: usize },
+    /// A peer announcing a protocol version that is not this one's.
+    ProtocolVersion { announced: u32 },
+}
+
+impl fmt::Display for PeerFramingRefusal {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::HeaderPastTheReadBuffer { bytes } => write!(
+                f,
+                "pack transfer refused: {bytes} bytes of header arrived with no newline among \
+                 them, and a peer header is one line of JSON ended by one newline. The bound is \
+                 the endpoint's own read buffer ({PACK_ENDPOINT_READ_BYTES} bytes), so a header \
+                 that does not fit one read is not a header this peer wrote: nothing was served \
+                 and this connection is closed"
+            ),
+            Self::HeaderUnreadable { error } => write!(
+                f,
+                "pack transfer refused: that line is not a peer header: {error}. The peer wire is \
+                 one line of JSON then exactly as many raw bytes as the line said, so a line this \
+                 peer cannot read means the two ends have lost count of the stream and nothing \
+                 later on it can be trusted: this connection is closed"
+            ),
+            Self::BodyPastTheChunk { promised } => write!(
+                f,
+                "pack transfer refused: that header promises {promised} bytes of body and one \
+                 reply carries at most {PACK_CHUNK_BYTES}. A reader that honoured it would hold \
+                 more of one object in memory than this peer ever agreed to serve, which is \
+                 invariant 2's cap read from the other side"
+            ),
+            Self::BodyPastTheObject {
+                offset,
+                length,
+                object_length,
+            } => {
+                write!(
+                f,
+                "pack transfer refused: that header offers {length} bytes at offset {offset} of \
+                 an object {object_length} bytes long, which ends {} bytes past it. The header \
+                 disagrees with itself, so one of the two peers is reading a different object \
+                 under the same sha256 — and that is a refusal and not a short read",
+                offset.saturating_add(*length).saturating_sub(*object_length)
+            )
+            }
+            Self::BodyTruncated { promised, arrived } => write!(
+                f,
+                "pack transfer refused: that header promised {promised} bytes of body and \
+                 {arrived} arrived before the stream ended. A short body is never a short object \
+                 — an object is its sha256 — so what arrived is discarded rather than written, \
+                 and the fetch resumes at the offset the last whole chunk ended at"
+            ),
+            Self::ProtocolVersion { announced } => {
+                f.write_str(&peer_version_mismatch_reason(*announced))
+            }
+        }
+    }
+}
+
+/// One header read off a peer stream, and where its body begins.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PeerHeader<H> {
+    pub header: H,
+    /// How many raw bytes of body follow, starting at `body_at`.
+    pub body_bytes: u64,
+    /// Where the body starts in the buffer this header was read from: one
+    /// past the newline that ended the line.
+    pub body_at: usize,
+}
+
+/// What [`decode_peer_header`] made of a buffer.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PeerHeaderRead<H> {
+    /// The line has not arrived in full yet: read more and call again.
+    ///
+    /// **Not a refusal**, and the distinction is the one that matters on a
+    /// stream: a reader that treated a half-arrived line as a bad one would
+    /// close a healthy connection every time a chunk boundary fell inside a
+    /// header. It becomes
+    /// [`PeerFramingRefusal::HeaderPastTheReadBuffer`] only once there is
+    /// more unterminated header than one read of the endpoint's buffer.
+    Incomplete,
+    /// A whole header, and the length of the body behind it.
+    Read(PeerHeader<H>),
+}
+
+/// Encode one peer header as the single line that precedes its body.
+///
+/// Returns the line — **newline included** — and the number of raw bytes the
+/// caller then writes after it, which is the number the line itself carries.
+/// A caller that writes a different number of bytes than it was handed here
+/// has desynchronised the stream, and the reader refuses the next header by
+/// name rather than mistaking the surplus for one.
+///
+/// JSON escapes a newline inside a string as `\n`, so a reason, a path or a
+/// sha256 can carry one without ending the line: proven by
+/// `a_refusal_carrying_a_newline_is_still_one_line`, because the whole
+/// framing rests on it.
+pub fn encode_peer_header<H: Serialize + PeerBody>(
+    header: &H,
+) -> Result<(Vec<u8>, u64), PeerFramingRefusal> {
+    let body_bytes = header.body_bytes();
+    if body_bytes > PACK_CHUNK_BYTES {
+        return Err(PeerFramingRefusal::BodyPastTheChunk {
+            promised: body_bytes,
+        });
+    }
+    if let Some(disagreement) = header.self_disagreement() {
+        return Err(disagreement);
+    }
+    let mut line =
+        serde_json::to_vec(header).map_err(|error| PeerFramingRefusal::HeaderUnreadable {
+            error: error.to_string(),
+        })?;
+    if line.len() as u64 >= PACK_ENDPOINT_READ_BYTES {
+        return Err(PeerFramingRefusal::HeaderPastTheReadBuffer { bytes: line.len() });
+    }
+    line.push(b'\n');
+    Ok((line, body_bytes))
+}
+
+/// Read one peer header off `buffer`, and say how many raw bytes to read
+/// after it.
+///
+/// `buffer` is whatever has arrived; the header is the bytes up to the first
+/// newline. Reads nothing and does no I/O — the caller owns the socket, this
+/// owns the contract (invariant 4).
+pub fn decode_peer_header<H: DeserializeOwned + PeerBody>(
+    buffer: &[u8],
+) -> Result<PeerHeaderRead<H>, PeerFramingRefusal> {
+    let line = match buffer.iter().position(|byte| *byte == b'\n') {
+        Some(end) => &buffer[..end],
+        None => {
+            if buffer.len() as u64 >= PACK_ENDPOINT_READ_BYTES {
+                return Err(PeerFramingRefusal::HeaderPastTheReadBuffer {
+                    bytes: buffer.len(),
+                });
+            }
+            return Ok(PeerHeaderRead::Incomplete);
+        }
+    };
+    if line.len() as u64 >= PACK_ENDPOINT_READ_BYTES {
+        return Err(PeerFramingRefusal::HeaderPastTheReadBuffer { bytes: line.len() });
+    }
+    let header: H =
+        serde_json::from_slice(line).map_err(|error| PeerFramingRefusal::HeaderUnreadable {
+            error: error.to_string(),
+        })?;
+    let body_bytes = header.body_bytes();
+    if body_bytes > PACK_CHUNK_BYTES {
+        return Err(PeerFramingRefusal::BodyPastTheChunk {
+            promised: body_bytes,
+        });
+    }
+    if let Some(disagreement) = header.self_disagreement() {
+        return Err(disagreement);
+    }
+    Ok(PeerHeaderRead::Read(PeerHeader {
+        header,
+        body_bytes,
+        body_at: line.len() + 1,
+    }))
+}
+
+/// Split the body a header promised off the bytes that followed it, and
+/// return what is left over.
+///
+/// The leftover is the next header's first bytes, and returning it is what
+/// keeps a length that disagrees with what arrived from being read as one: a
+/// sender that wrote more bytes than its header promised leaves the surplus
+/// here, and the next [`decode_peer_header`] refuses it as
+/// [`PeerFramingRefusal::HeaderUnreadable`] rather than quietly writing it
+/// into an object.
+pub fn take_peer_body(
+    after_header: &[u8],
+    body_bytes: u64,
+) -> Result<(&[u8], &[u8]), PeerFramingRefusal> {
+    let wanted = usize::try_from(body_bytes).map_err(|_| PeerFramingRefusal::BodyPastTheChunk {
+        promised: body_bytes,
+    })?;
+    if after_header.len() < wanted {
+        return Err(PeerFramingRefusal::BodyTruncated {
+            promised: body_bytes,
+            arrived: after_header.len(),
+        });
+    }
+    Ok(after_header.split_at(wanted))
+}
+
+/// Refuse a peer that announced a protocol version that is not this one's.
+///
+/// The peer wire has no version of its own (see the module doc), so the one
+/// number is checked here and the sentence is
+/// [`peer_version_mismatch_reason`]'s — written once, for invariant 4's
+/// reason.
+pub fn check_peer_protocol_version(announced: u32) -> Result<(), PeerFramingRefusal> {
+    if announced == crate::PROTOCOL_VERSION {
+        Ok(())
+    } else {
+        Err(PeerFramingRefusal::ProtocolVersion { announced })
+    }
 }
 
 /// What a runner holds, announced after [`crate::FromHub::Welcome`] and

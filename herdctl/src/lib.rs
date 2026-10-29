@@ -387,6 +387,8 @@ impl Declared {
             declaration: self.declaration,
             labels_from: self.labels_from,
             timeout_s: self.timeout_s,
+            needs: Vec::new(),
+            leaves: std::collections::BTreeMap::new(),
         }
     }
 }
@@ -1435,6 +1437,9 @@ async fn join(config: &Config) -> Result<Socket> {
             health_every_ms: None,
             // A requester offers nothing: capacity is a runner's word.
             capabilities: CapabilityOffer::empty(),
+            // And no mesh endpoint: pack content moves runner to runner
+            // (D10), so a requester has nothing to serve and never would.
+            mesh_endpoint: None,
         },
     )
     .await
@@ -1638,6 +1643,17 @@ fn message_kind(message: &FromHub) -> &'static str {
         FromHub::ApprovedRunners { .. } => "approved_runners",
         FromHub::SetSwitch { .. } => "set_switch",
         FromHub::ReadProbesAgain { .. } => "read_probes_again",
+        // The pack half's seven, numbered at protocol 3 and handled by
+        // nobody yet. Named here because this function's whole job is saying
+        // what arrived, and a frame falling to `Unknown`'s sentence would
+        // claim this build has never heard of a frame it defines.
+        FromHub::PackHolders(_) => "pack_holders",
+        FromHub::TransferCapability(_) => "transfer_capability",
+        FromHub::ExpectTransfer(_) => "expect_transfer",
+        FromHub::PackRegistered(_) => "pack_registered",
+        FromHub::PackRefused(_) => "pack_refused",
+        FromHub::ReadPacksAgain(_) => "read_packs_again",
+        FromHub::PinPacks(_) => "pin_packs",
     }
 }
 
