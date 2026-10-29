@@ -327,6 +327,14 @@ pub struct Confined {
     live: LiveJobs,
     /// What the startup reaper found of a previous life, for the report.
     reclaimed: Vec<String>,
+    /// What the notebook of things this runner could NOT reclaim still names,
+    /// and what came off it because somebody cleared it ([`crate::janitor`]).
+    ///
+    /// Beside `reclaimed` and never inside it: one is the reaper saying what
+    /// it took away, the other is a list of what is still on this host, and a
+    /// report that ran the two sentences together would read as the second
+    /// having been dealt with too.
+    left_behind: Vec<String>,
     /// Whether the `io.weight` a job carries reaches the device that job
     /// works on, and why either way. A bound that is written and ignored
     /// must be said out loud, not assumed — and so must one that does bite,
@@ -502,6 +510,11 @@ impl Confined {
         // the hub acknowledges them (D19) and `Session::pick_up_collections`
         // offers them again a few lines after this returns.
         let reclaimed = reclaim_a_past_life(&root, &ceiling);
+        // After the reaper, because the reaper is what puts things on this
+        // list, and a reconciliation that ran first would have reported as
+        // still-here a workspace this start had just managed to remove. One
+        // `lstat` per entry and no walk: this is the startup path.
+        let left_behind = crate::janitor::reconcile(&root);
         Ok(Self {
             root,
             ceiling,
@@ -509,6 +522,7 @@ impl Confined {
             confinement,
             live: LiveJobs::default(),
             reclaimed,
+            left_behind,
             io_weight_reach,
         })
     }
@@ -698,6 +712,13 @@ impl Confined {
         }
         for reclaimed in &self.reclaimed {
             lines.push(format!("reaped at startup: {reclaimed}"));
+        }
+        // Last, and in its own voice. Everything above is what this runner
+        // will and will not do; this is what is on the machine's disk right
+        // now that no runner will ever take away, and the owner is the only
+        // reader who can do anything about it.
+        for left in &self.left_behind {
+            lines.push(format!("left behind: {left}"));
         }
         lines
     }
