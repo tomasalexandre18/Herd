@@ -29,17 +29,19 @@ features. **M11's pack half is inside it**, making v1.0.0 **44 of 44** of the
 consumer's musts (**D205**); **M17 is outside it**, E-49 and E-50 unmet by
 choice, so the promise covers a platform the software has never run on
 (**D206**). **All three versions move before it** — `PROTOCOL_VERSION` 2 → 3,
-`RECORD_VERSION` 1 → 2, `LAYOUT_VERSION` 1 → 2 (**D199**); `JobDirStore::open`
-has no migration path, so the last two destroy an existing root, which is why
-**the ordinary release ships at layout 1 and record 1** (ORCH-156).
+`RECORD_VERSION` 1 → 2, `LAYOUT_VERSION` 1 → 2 (**D199**) — with no migration
+path, so the last two destroy an existing root: ORCH-156's ordering.
 
 ## Releases, and what is in none
 
-**v0.3.7 is the newest** — `3da48f5`, 2026-10-24 (D171); v0.3.4 onward are
-published (D162), a **`v*.*.*-dev*` tag** publishes a pre-release (D172).
-**`main` is 322 commits past v0.3.7** and the workspace version still reads
-`0.3.7`. `PROTOCOL_VERSION` is **2**, `RECORD_VERSION` **1**,
-`LAYOUT_VERSION` **1**. **Fifteen changes are in no release:** nine defects
+**v0.4.0 is cut, gated and landed, and is not released: its tag is Alexa's
+own separate act and is unpushed**, so **v0.3.7 is still the newest
+published** — `3da48f5`, 2026-10-24 (D171); v0.3.4 onward are published
+(D162), a **`v*.*.*-dev*` tag** publishes a pre-release (D172). `main` is
+**334 commits and 84 merges** past v0.3.7 and the workspace version reads
+**`0.4.0`**; `PROTOCOL_VERSION` is **2**, `RECORD_VERSION` **1**,
+`LAYOUT_VERSION` **1**, all three unmoved deliberately (ORCH-156).
+**Fifteen changes are in no published release:** nine defects
 (**D175**-**D178**, **D180**-**D182**, **ORCH-094**, **D185**), four new
 behaviours (**D184**, `SIGTERM` in five seconds; **ORCH-092**, a spool sweep;
 **D194**, `herd-hub report`; **D197**, `herd-hub retention-preview`, which
@@ -69,12 +71,10 @@ M1-M11, M15 and M16; a job may return 1 GiB by default (`confine.rs:82`).
 **A skip count is per host and per load** (D27): **12** here at rest, **14**
 under load — the **list** decides (D187). The suite is green here at rest,
 every skip the same cgroup v2 delegation this host does not grant.
-`check-orchestration.sh` is at **269 passed**. **`main` went red on three
-consecutive post-push runs**: `40720983497` (`7eb9585`) and `40762764493`
-(`09229db`) at `announced_job_ceiling.rs:1179`, fixed by **D195**, then
-`40857453150` (`b73d38c`) at **1156**, the next assertion out on the same
-quantity, fixed here by **D208** — the premise is built, not timed
-(ORCH-119). Whether `main` is green is this landing's own post-push run.
+`check-orchestration.sh` is at **269 passed**. **`main`'s streak of three red
+post-push runs is broken:** `40870735400` (`6036d24`) is `success`, after
+`40720983497`, `40762764493` and `40857453150` on `announced_job_ceiling.rs`,
+fixed by **D195** then **D208** — the premise is built, not timed (ORCH-119).
 
 ## What the software still does not do
 
