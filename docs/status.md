@@ -87,4 +87,4 @@ and an `#[ignore]` in neither (ORCH-202).
 3. **Five declaration fields are parsed, validated and discarded**
    (**ORCH-148**). **`plan.md` and `coverage.md` are corrected against the
    tree** (ORCH-152), but **three "Gated on chatOnS" lists still disagree**
-   (ORCH-206) and the v1.0.0 roadmap is owed (ORCH-155).
+   (ORCH-206) and `docs/road-to-v1.md` counts the road (ORCH-155).
