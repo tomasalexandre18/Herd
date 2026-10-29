@@ -114,8 +114,8 @@ that did not run is reported as not run, never as passed.
   filled record, `cut-v*`, `.github/`, `CLAUDE.md` and `.claude/` included;
   nothing waits for Alexa. Never `--no-verify`, never force-push, never a red
   landing, never `--admin`.
-- **Pushing a tag and publishing a release stay on Alexa's word, one act at a
-  time** (workflow.md); `herd-release` prepares and never publishes.
+- **Pushing a release's tag is `herd-merger`'s too** (Alexa, 2026-10-29,
+  **D212**), on the landing's own two conditions, as a separate later act.
 
 ## Shared host rules
 
@@ -135,10 +135,10 @@ Several agents and the consumer's production share this machine.
 ## When to ask Alexa
 
 Only about things that change **what** gets built or are irreversible: an
-ambiguous requirement, a conflict with an invariant, milestone order,
-merging to `main` (see above), tags, releases, issues, anything on the
-consumer's side. One question at a time, with a recommendation; record it
-in the board's *Waiting* section and continue independent work. Do not
+ambiguous requirement, a conflict with an invariant, milestone order, a
+release and its own notes (not its tag: see above), issues, anything on
+the consumer's side. One question at a time, with a recommendation; record
+it in the board's *Waiting* section and continue independent work. Do not
 ask about file layout, naming, crate internals, test style or libraries.
 
 ## Session start, session end

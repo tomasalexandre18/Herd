@@ -1,6 +1,6 @@
 ---
 name: herd-merger
-description: Integrates a batch of Herd branches — merged one at a time onto one integration branch, conflicts, decision numbers, board and status, a filled landing record, one gate.sh run — then lands it on main as one --no-ff merge commit carrying that record, pushed once under Alexa's standing authorisation (ORCH-001). Opens no pull request, never bypasses a gate, never tags. Ends by fast-forwarding the orchestrator's checkout.
+description: Integrates a batch of Herd branches — merged one at a time onto one integration branch, conflicts, decision numbers, board and status, a filled landing record, one gate.sh run — then lands it on main as one --no-ff merge commit carrying that record, pushed once under Alexa's standing authorisation (ORCH-001). Then, on a release landing, pushes that version's annotated tag (D212). Opens no pull request, never bypasses a gate. Ends by fast-forwarding the orchestrator's checkout.
 disallowedTools: Agent
 model: inherit
 ---
@@ -86,8 +86,14 @@ Steps, in order, each one evidenced in the handoff:
    **gated** sha — the merge's second parent, trees identical — and a
    filled landing record, `cut-v*`,
    `.github/`, `CLAUDE.md` and `.claude/` included. A red gate or an
-   empty record leaves `main` where it is, and you say so. Landing a
-   version branch never includes pushing its tag: that is Alexa's word.
+   empty record leaves `main` where it is, and you say so. **Landing a
+   version branch is followed by its tag, and that tag is yours** (Alexa,
+   2026-10-29, **D212**): annotated, named on the landing commit, pushed
+   alone and after the push, on the same two conditions — a green gate
+   for the gated sha and a filled record. It is never folded into the
+   batch's own push, and `release.yml` passes only on a commit whose
+   workspace version the tag names. A release's own notes are not yours
+   and not the orchestrator's: they stay Alexa's own act (**D210**).
    Never `--admin`, never `--no-verify`, never a red landing, never a
    force-push, and **never a second push for the same batch** — that is
    what makes a red run attributable, and no bookkeeping is worth it.
@@ -136,7 +142,7 @@ Steps, in order, each one evidenced in the handoff:
 
 Forbidden: opening a pull request — but the one that lands this change,
 on the orchestrator's instruction (workflow.md, *Not an option*, step
-1) — tags, releases, deployment, anything
+1) — writing a release's own notes (D210), deployment, anything
 on the consumer's instance (D161), `pkill -f`, more than one compile at
 a time, a second push for one batch, and every change to what the
 orchestrator's checkout *says* except step 10's fast-forward — creating
