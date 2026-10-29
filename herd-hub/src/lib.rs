@@ -6,6 +6,7 @@ pub mod job;
 pub mod matcher;
 pub mod queue;
 pub mod report;
+pub mod retention;
 pub mod roster;
 pub mod server;
 pub mod store;
@@ -22,6 +23,10 @@ pub use matcher::{
 };
 pub use queue::{Standing, AGING_STEP};
 pub use report::{Accounting, Census, Dedup, DigestConflict, Sizes, StateRootReport, Unread};
+pub use retention::{
+    parse_span, select, ClassPreview, Judged, NotOurs, RetentionPreview, Scanned, Seen, Selection,
+    Spans, Verdict,
+};
 pub use roster::{Admission, Approval, Roster, SharedSecret, ROSTER_VERSION};
 pub use server::{
     hub_version, Authority, Hub, HubHandle, Policy, Restating, RunnerStatus, Stop, StopSignals,
