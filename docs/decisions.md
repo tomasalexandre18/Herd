@@ -10526,3 +10526,105 @@ one must be written down before any pack code is briefed.
 **Evidence.** Alexa, 2026-10-29, relayed by the orchestrator; D106; E-41;
 `docs/plan.md` M14 (2026-10-15); invariants 1 and 6; D10;
 `herd-runner/src/outputs.rs:12-40`; `herd-hub/src/matcher.rs:1201-1239`.
+
+## 2026-10-29 — D208 A bound test's premise is built, and the runner's word
+
+**Context.** `announced_job_ceiling.rs` asserts what a hub records when a
+machine is full. Its premise — *this runner is holding CEILING jobs* — was
+established by waiting for `JobState::Assigned | JobState::Running` and then
+cutting the link. `Assigned` is written when the **hub sends**
+`FromHub::AssignJob`; `Running` is written only on `ToHub::JobStarted`, which
+the runner sends from inside the lock that counts its own ceiling
+(`herd-hub/src/server.rs:4144`). So the test cut the wire on a frame the hub
+had *sent* — measured at **one millisecond** after the second dispatch — and
+an assignment the runner had not yet read went down with the link. `main`
+went red on three consecutive post-push runs over this, the last of them
+`40857453150` at `b73d38c`, assertion 1156.
+
+**Choice, and it governs the next such test and not only this one.** **The
+premise of a bound test is built, not timed, and the oracle for "this machine
+is full" is the runner's own word.**
+
+1. **Build the premise; never time it.** A job that must still be running
+   when a later step happens is held open on a **release file** the test
+   writes when it is ready (`admission.rs`'s shape), never on a `sleep`. A
+   `sleep` makes the premise a duration, and every test that does it then
+   races its own steps against that duration — on whatever machine happens to
+   run it.
+2. **Wait on the word of whoever owns the fact.** Occupancy is the runner's
+   fact: it is `JobState::Running`, written from inside the lock that counts
+   the ceiling. `JobState::Assigned` says only that a frame was **sent**, so
+   it is never evidence that a machine is holding anything. Any test that
+   waits on `Assigned` and then **cuts a link, kills a hub, or asserts
+   occupancy** is making the hub's bookkeeping stand for the runner's.
+3. **The converse, so this is not read as a ban on `Assigned`.** Where the
+   quantity under test *is* the hub's own view — a peak of attempts in the
+   air, a dispatch count — the hub's word is the right word.
+   `announced_job_ceiling.rs:240` is that case and keeps
+   `Assigned` or `Running` deliberately: nothing cuts a link after it.
+4. **Remove the regime; do not widen the timeout.** The fallback of widening
+   `THE_OUTAGE` or `SLEEP_ACROSS_THE_OUTAGE` was available and was refused.
+   Nothing in the bound test reads a duration for its premise any more.
+
+**What is left, stated as a bounded race and not as an impossibility.** The
+regime is no longer produced by **scheduling on the dispatch path**, which is
+what made the outcome a matter of luck on whatever machine ran it. It is not
+unreachable by construction: E-21 stops the written-off originals at the
+redial (`herd-runner/src/lib.rs:2051`), so one ordering remains — the second
+attempt must reach `take_job` before the stopped originals' processes are
+actually gone. It is structurally favourable, a `tokio::spawn` against a
+round trip plus a signal and a `/proc` sweep, and it was **never lost in 35
+measured runs** of the fixed test, 20 of them on two pinned CPUs under eight
+spinners. No test figure moves it. Saying "impossible" here would send the
+next reader looking in the wrong place the day it goes red.
+
+**Alternative rejected.** Teaching the oracle to tolerate the regime — accept
+"nothing was refused" as a pass. Refused: that assertion exists to catch
+exactly that, and regime 3 driven on purpose is still red 5 of 5 with CI's
+own message, which is the right answer.
+
+**Evidence.** `history/2026-10-29-orch-119-clockless-oracle.md`;
+`herd-hub/tests/announced_job_ceiling.rs`; `herd-hub/src/server.rs:4144`;
+`herd-runner/src/lib.rs:2051`; D181, D182, D195; E-21; invariant 5, D27;
+CI runs `40720983497`, `40762764493`, `40857453150`; ORCH-119, ORCH-160.
+
+## 2026-10-29 — D209 Pack transfer: we authorise, the operator encrypts
+
+**Context.** M11 moves a job's declared artefacts runner to runner over the
+machine owners' private mesh (D10, D11). Before any pack frame was numbered,
+Alexa decided what that transfer protects, so the property would be a stated
+one rather than something a reader infers from code.
+
+**Choice (Alexa, 2026-10-29).** Herd provides **authorisation, not
+confidentiality**.
+
+1. The right to fetch a pack is an **ephemeral capability**: a random bearer
+   token the hub mints and pushes to the holder over the holder's own
+   already-authenticated control link — expect this token, for this pack,
+   from this peer, for N minutes. There is no key to distribute, no PKI, and
+   nothing secret in the repository (invariant 7). A fetch with no valid
+   capability is refused.
+2. **Confidentiality is the operator's**, supplied by the private mesh the
+   runners are already on. Herd adds **no TLS of its own**, because TLS
+   implies trust distribution — who signs, who verifies, how a key reaches a
+   machine, what happens when it expires — a whole subsystem to answer
+   "someone is already on your private network", and invariant 1 refuses
+   that surface.
+
+**The residue, taken knowingly.** On a mesh that does not encrypt, pack bytes
+travel **in clear**, and the capability is **replayable by anyone who can
+read it, for as long as it lives**. That is the cost of the choice and Alexa
+accepted it with that sentence in front of him.
+
+**Consequence.** `docs/joining.md` carries the operator-facing form in "What
+protects a pack between runners, and what does not", written before any pack
+code exists; invariant 3 is cited there, not restated. M11 owes the
+capability's issue, its lifetime and its refusal path — and the `FromHub`
+variant that carries it, which is numbered on neither protocol enum today —
+and owes the correction of that document's "nothing on your machine listens"
+bullet when the fetch endpoint lands (ORCH-159).
+
+**Evidence.** Alexa, 2026-10-29, relayed by the orchestrator;
+`history/2026-10-29-joining-mesh-residue.md`; `docs/joining.md`; D10, D11;
+`docs/plan.md` M11; `docs/architecture.md` line 1276; invariants 1, 3 and 7;
+ORCH-159.

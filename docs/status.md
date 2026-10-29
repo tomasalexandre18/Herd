@@ -63,18 +63,18 @@ Nobody here logs into their hosts (D161); a fact reaches us as a dated report.
   volume until v1.0.0, then reset. Also **125 spools holding 65 GB**.
 - **The seven-day output floor stays and the hub stops promising it**
   (**D202**). **`r_file` is still unmeasured** (ORCH-145), which is why
-  ORCH-156 ordering matters to them.
-  (**D202**). **`r_file` is still unmeasured** (ORCH-145), which is why the
-  ordering constraint of ORCH-156 matters to them.
+  ORCH-156's ordering constraint matters to them.
 
 M1-M11, M15 and M16; a job may return 1 GiB by default (`confine.rs:82`).
 **A skip count is per host and per load** (D27): **12** here at rest, **14**
 under load — the **list** decides (D187). The suite is green here at rest,
 every skip the same cgroup v2 delegation this host does not grant.
-`check-orchestration.sh` is at **269 passed**. **`main` has been red on its
-post-push runs since `7eb9585`**, always `announced_job_ceiling.rs:1179`; the
-fix lands in this batch (**D195**, ORCH-119), and whether `main` is green
-again is this landing's own post-push run, read at the next session start.
+`check-orchestration.sh` is at **269 passed**. **`main` went red on three
+consecutive post-push runs**: `40720983497` (`7eb9585`) and `40762764493`
+(`09229db`) at `announced_job_ceiling.rs:1179`, fixed by **D195**, then
+`40857453150` (`b73d38c`) at **1156**, the next assertion out on the same
+quantity, fixed here by **D208** — the premise is built, not timed
+(ORCH-119). Whether `main` is green is this landing's own post-push run.
 
 ## What the software still does not do
 
