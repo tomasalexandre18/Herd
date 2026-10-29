@@ -906,3 +906,79 @@ invariant 3:
 
 Whichever you pick, the scheme is spelled out at the call site and never
 inferred (D14), so `--hub` says which of these you are doing.
+
+## What protects a pack between runners, and what does not
+
+**None of this is built yet, and the order is deliberate.** A job's
+declared artefacts are meant to move runner to runner across your mesh,
+with the hub as registry and authority and never in the byte path (D10,
+D11) — and none of it exists. No pack frame is numbered on either
+protocol enum, no fetch endpoint binds anything, and the word `keeper`
+appears nowhere in the binaries you installed at step 1. If you go
+looking in `herd-runner` for a transfer to inspect, you will find none;
+M11 builds it (`docs/plan.md`). What follows is the property the design
+is being built to have, written down before the first frame was numbered
+(Alexa, 2026-10-29), so you can judge your mesh now instead of after the
+transfers start.
+
+**Herd gives authorisation. It does not give confidentiality.** Those
+are two promises, and only the first one is ours:
+
+| What | Who provides it | What it means |
+| --- | --- | --- |
+| Authorisation | Herd | only a runner the hub told to fetch this pack can fetch it |
+| Confidentiality | you, through your mesh | whether the bytes are unreadable on the way |
+
+**The right to fetch a pack is an ephemeral capability.** When a runner
+needs a pack, the hub mints a random bearer token and pushes it to the
+runner that holds the pack, over that holder's own control link — the
+one it already authenticated with the token of step 5. The message says:
+expect this token, for this pack, from this peer, for the next few
+minutes. The fetching runner presents the token, and the holder serves
+those bytes and nothing else. A fetch carrying no valid capability is
+refused.
+
+There is nothing in that for you to distribute and nothing to renew on a
+calendar: no key, no certificate, no CA, no PKI. Nothing secret lives in
+Herd's repository either (invariant 7), and the only secret on your
+machine is still the approval token you placed at step 5.
+
+**What the capability buys, which is not nothing:** a machine the hub
+never authorised cannot fetch a pack, even when it can reach the serving
+runner's address and knows exactly what to ask for. It holds no token,
+and no one will serve it one.
+
+**Herd adds no TLS of its own, on purpose.** TLS on the peer path does
+not stop at wrapping a socket. It asks who signs, who verifies, how a
+key reaches each machine, and what happens the day one expires — a whole
+trust-distribution subsystem, built to answer "someone is already inside
+your private network". Herd stays specialized and grows no such surface
+(invariant 1). The mesh you already run answers that question better,
+because you chose it, you operate it, and it is already what protects
+everything else those machines say to each other.
+
+**So, the residue, stated here rather than left for you to infer from
+the code later.** If your mesh does not encrypt what crosses it, then
+whoever can read the mesh can do two things:
+
+- **read pack bytes in clear.** A pack is your build and test
+  artefacts; treat them as readable by anyone who can read the mesh.
+- **reuse a capability for as long as it lives.** It is a bearer token,
+  so it proves nothing about who presents it. Someone who reads one off
+  the wire can present it as their own until it expires — minutes, not
+  hours, but not zero either.
+
+That is the honest cost of the choice, and it leaves you one question:
+**is your mesh good enough to carry your artefacts in clear?** For a
+tailnet, a WireGuard network, or anything else that encrypts peer to
+peer, yes. For a flat LAN, a shared VLAN, or a mesh somebody else
+operates, no — and then the thing to fix is the mesh, not a Herd flag,
+because there will not be one.
+
+**None of this opens a port.** The rule is the one at the top of this
+document, under **What you never need**, and a pack path does not bend
+it: the fetch endpoint, once it is built, binds the single mesh
+interface you name in the configuration and is refused at startup if it
+would bind a default or a public one, control is still the runner
+dialling out, and nothing of this ever sits behind a port forwarded on a
+router (invariant 3, D11).
