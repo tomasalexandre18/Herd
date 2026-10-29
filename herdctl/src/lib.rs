@@ -7,6 +7,7 @@
 
 pub mod checkout;
 pub mod declaration;
+pub mod moved;
 pub mod verdict;
 
 use anyhow::{anyhow, bail, Context, Result};
