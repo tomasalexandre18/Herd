@@ -2482,6 +2482,83 @@ fn this_user_can_write(_path: &Path) -> bool {
     false
 }
 
+/// The whole of `sun_path` in a `sockaddr_un`, its terminating NUL included:
+/// 108 bytes on Linux, and nothing about it is negotiable. `bind(2)` fails
+/// with `ENAMETOOLONG` on a path one byte over it — a failure about where a
+/// fixture put its socket, never about the runner.
+#[cfg(unix)]
+const SUN_PATH_BYTES: usize = 108;
+
+/// The room `ShortDir` keeps inside `SUN_PATH_BYTES` for the name of
+/// whatever is bound in it, so that a base can be judged short enough before
+/// any particular socket is named.
+#[cfg(unix)]
+const LONGEST_BOUND_NAME: usize = 24;
+
+/// A directory short enough to bind a Unix domain socket in, chosen by this
+/// fixture rather than inherited from the environment, and removed on drop.
+///
+/// Why not `TempDir`: it lives under `std::env::temp_dir()`, and every agent
+/// in this project runs with a scratchpad `TMPDIR` of about 131 bytes, onto
+/// which `nix develop` nests a prefix of its own. A socket bound there
+/// overruns `sun_path` and the test goes red for a reason that has nothing to
+/// do with confinement. Measured on 2026-10-29: a **28**-byte `TMPDIR` inside
+/// a nested `nix develop` became 62, and that was already enough to tip the
+/// total over — so the trigger is the total length of the bound path, and a
+/// short `TMPDIR` is no protection.
+///
+/// So the fixture takes that total out of the environment's hands: it binds
+/// under the first base it finds that is short enough, is a directory, and
+/// this user can write to — the per-user runtime directory, then `/tmp` — and
+/// falls back to the ambient temporary directory only where there is none. In
+/// that last case the assertion at the bind site says so with the figure,
+/// instead of leaving `bind(2)` to fail and look like a defect.
+#[cfg(unix)]
+struct ShortDir {
+    path: PathBuf,
+}
+
+#[cfg(unix)]
+impl ShortDir {
+    /// A fresh directory named after `label`, unique per process and call.
+    fn new(label: &str) -> Self {
+        static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        let unique = NEXT.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let leaf = format!("herd-{label}-{}-{unique}", std::process::id());
+        let ambient = std::env::temp_dir();
+        let runtime = std::env::var_os("XDG_RUNTIME_DIR").map(PathBuf::from);
+        let mut chosen = ambient.join(leaf.as_str());
+        for base in runtime
+            .iter()
+            .map(PathBuf::as_path)
+            .chain([Path::new("/tmp"), ambient.as_path()])
+        {
+            let candidate = base.join(leaf.as_str());
+            // The '/' before the bound name and the NUL after it are both
+            // part of what has to fit in `sun_path`.
+            let fits = candidate.as_os_str().len() + 1 + LONGEST_BOUND_NAME + 1 <= SUN_PATH_BYTES;
+            if fits && base.is_dir() && this_user_can_write(base) {
+                chosen = candidate;
+                break;
+            }
+        }
+        let _ = std::fs::remove_dir_all(&chosen);
+        std::fs::create_dir_all(&chosen).expect("the fixture's short directory is creatable");
+        Self { path: chosen }
+    }
+
+    fn path(&self) -> &Path {
+        &self.path
+    }
+}
+
+#[cfg(unix)]
+impl Drop for ShortDir {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.path);
+    }
+}
+
 /// The walk run against descriptors this test plants on purpose, so that an
 /// empty result about the runner is a fact about the runner rather than about
 /// a walk that could never find anything.
@@ -2523,7 +2600,21 @@ fn the_walk_finds_a_planted_descriptor(test: &str) {
         "the walk reports a descriptor that is closed: {after:?}"
     );
 
-    let planted = temp.path().join("planted.sock");
+    // This one is *bound*, so its path has to fit in `sun_path`: it goes in a
+    // directory of the fixture's own rather than in `temp`, which inherits
+    // whatever `TMPDIR` the suite was launched with.
+    let short = ShortDir::new("planted-socket");
+    let planted = short.path().join("planted.sock");
+    assert!(
+        planted.as_os_str().len() < SUN_PATH_BYTES,
+        "the fixture is about to bind a path of {} bytes, and `sun_path` holds \
+         {SUN_PATH_BYTES} including its terminating NUL: bind(2) would fail with \
+         ENAMETOOLONG, and this test would be red about where its own socket went \
+         rather than about the runner. Every short base this fixture knows was \
+         refused or too long, so it fell back to the ambient temporary directory: {}",
+        planted.as_os_str().len(),
+        planted.display()
+    );
     let watched = both_names_of(std::iter::once(planted.clone()));
     let listener =
         std::os::unix::net::UnixListener::bind(&planted).expect("the fixture binds a socket");
