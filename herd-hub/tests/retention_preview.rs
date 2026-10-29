@@ -32,13 +32,25 @@
 //! 7. **That it reads real records.** The fixture is hand-written, so on its
 //!    own it would only prove the preview agrees with the test. Two tests
 //!    drive the store's own writer and preview what *it* left.
+//! 8. **The three populations, apart** (ORCH-168). A state root holds three
+//!    populations with three different owners — the collected files, the
+//!    records and the logs — and the fixture gives each of them a different,
+//!    arithmetically checkable size, on both sides of every span. Four
+//!    things are held here that one undifferentiated figure could not hold:
+//!    a record naming **no** collected file still reports its own bytes and
+//!    its log (41 % of the first consumer's records name no file, so this is
+//!    the common case); a **64 MiB** log — the runner's own default cap, and
+//!    nothing on the hub bounds it at all — reports as 64 MiB rather than as
+//!    "kilobytes"; a log this build could not measure is **UNKNOWN and
+//!    named**, never nought; and a log nothing ever wrote is a measurement
+//!    of its own and not the same thing as an unmeasured one.
 
 use std::fs;
 use std::path::Path;
 use std::time::Duration;
 
 use herd_hub::job::JobStore;
-use herd_hub::retention::{self, Judged, Selection, Spans, Verdict};
+use herd_hub::retention::{self, Judged, LogWeight, Selection, Spans, Verdict, Weight};
 use herd_hub::{Budget, JobDirStore, JobState, Mint, NewJob, RetentionPreview, Timestamp};
 use herd_proto::{JobOutcome, LabelSet, Priority};
 
@@ -56,6 +68,23 @@ const DAY: i64 = 86_400;
 /// reader cannot do in their head is a fixture whose figures only the test
 /// knows.
 const RECORD_BYTES: usize = 512;
+
+/// Every `log.seq` of the fixture, which is the length the store's own
+/// writer gives one: two twenty-digit figures and a newline
+/// (`LOG_SEQ_DIGITS`). It is part of the **record** population, not the log:
+/// it is the hub's counter for the log and goes with the record.
+const LOG_SEQ_BYTES: usize = 42;
+
+/// A record plus its counter, which is what a job that was ever assigned
+/// weighs in the record population.
+const RECORD_AND_COUNTER: u64 = (RECORD_BYTES + LOG_SEQ_BYTES) as u64;
+
+/// The runner's own default `--job-log-cap`, and the figure that makes the
+/// point: **nothing on the hub bounds a log**, so one record can weigh this
+/// much on its own. Written sparse, so the fixture costs no disk and every
+/// figure still comes from `metadata().len()`, which is what the preview
+/// reads.
+const BIG_LOG: u64 = 64 << 20;
 
 fn span(days: i64) -> Duration {
     Duration::from_secs((days * DAY) as u64)
@@ -102,6 +131,24 @@ fn job_dir(
     }
 }
 
+/// The counter the store writes the moment a job is assigned, at the length
+/// it writes it. Its presence beside a missing `log` is what tells an
+/// absent log from an unmeasurable one.
+fn log_counter(root: &Path, name: &str) {
+    let dir = root.join("jobs").join(name);
+    fs::write(dir.join("log.seq"), vec![b'0'; LOG_SEQ_BYTES]).expect("the counter is written");
+}
+
+/// A log of exactly this many bytes, sparse: `set_len` gives the file the
+/// length `metadata()` reports without writing a byte, so a 64 MiB log in
+/// the fixture costs no disk and the figure the preview reads is still the
+/// figure it would read on an operator's root.
+fn log_of(root: &Path, name: &str, bytes: u64) {
+    let dir = root.join("jobs").join(name);
+    let log = fs::File::create(dir.join("log")).expect("the log is made");
+    log.set_len(bytes).expect("the log is given its length");
+}
+
 /// A record carrying only what retention judges it by, plus the two fields
 /// every reader of a `job.json` expects to find.
 fn record(
@@ -134,6 +181,13 @@ fn running() -> serde_json::Value {
 ///
 /// The names are in the hub's own zero-padded shape, because the preview
 /// prints them and an operator pastes them into an `ls`.
+///
+/// **Every one of the three populations has a different size in here, and
+/// each of the log's three readings appears on both sides of a span:**
+/// measured, UNKNOWN, and never written. The record population is
+/// `RECORD_BYTES` plus `LOG_SEQ_BYTES` for a job that was ever assigned and
+/// `RECORD_BYTES` alone for one that was not, so every record figure the
+/// preview prints is 512 or 554 times a count.
 fn fixture(root: &Path) {
     // merger, span 90d. One 10 days past it, one one day short of it.
     job_dir(
@@ -147,6 +201,8 @@ fn fixture(root: &Path) {
         )),
         &[("files", "a.bin", &[b'a'; 10])],
     );
+    log_counter(root, "j0000000001");
+    log_of(root, "j0000000001", 300);
     job_dir(
         root,
         "j0000000002",
@@ -158,6 +214,10 @@ fn fixture(root: &Path) {
         )),
         &[],
     );
+    // No `log` and no `log.seq`: this job never reached an attempt, so
+    // nothing ever wrote a log byte for it. Nought is a measurement here and
+    // the preview says so in its own line.
+    //
     // step, span 14d. Two past it — one of them with a `files.gone/` a killed
     // sweep left behind (D152) — one with a collection still arriving, and
     // one a day old, which is the newest record on this root and therefore
@@ -176,6 +236,11 @@ fn fixture(root: &Path) {
             ("files.gone", "old.bin", b"fifth"),
         ],
     );
+    // Its counter is there and its log is not, which is the one shape that
+    // means **unknown**: this hub's own record says a log was being counted,
+    // so the bytes removing this record would free cannot be measured and
+    // are never printed as nought.
+    log_counter(root, "j0000000003");
     job_dir(
         root,
         "j0000000004",
@@ -187,6 +252,12 @@ fn fixture(root: &Path) {
         )),
         &[("files.part", "half.bin", b"arrived")],
     );
+    // Seven bytes of collection and a 64 MiB log. **The figure this whole
+    // split exists for**: the output budget would see seven bytes here, and
+    // what removing the record frees is sixty-four megabytes of log that
+    // nothing on the hub bounds.
+    log_counter(root, "j0000000004");
+    log_of(root, "j0000000004", BIG_LOG);
     job_dir(
         root,
         "j0000000005",
@@ -198,6 +269,12 @@ fn fixture(root: &Path) {
         )),
         &[],
     );
+    // Names no collected file at all and still weighs: its record, its
+    // counter and 1234 bytes of log. The first consumer's common case — 41 %
+    // of their records name no file — and it is on the **inside** of its
+    // span, so the kept side carries it too.
+    log_counter(root, "j0000000005");
+    log_of(root, "j0000000005", 1234);
     // nightly, span 14d: the class that carries the volume. One well past the
     // span with a kilobyte of output, and one that is **not over** — a hub
     // killed mid-attempt, which is the reaper's and never retention's
@@ -213,6 +290,8 @@ fn fixture(root: &Path) {
         )),
         &[("files", "log.txt", &[b'n'; 1000])],
     );
+    log_counter(root, "j0000000006");
+    log_of(root, "j0000000006", 2000);
     job_dir(
         root,
         "j0000000007",
@@ -251,10 +330,16 @@ fn fixture(root: &Path) {
     job_dir(root, "j0000000011", None, &[]);
 }
 
-/// Every file under `root`, by path and length, so that "it wrote nothing" is
-/// an assertion and not a claim.
-fn listing(root: &Path) -> Vec<(String, u64)> {
-    fn walk(at: &Path, base: &Path, into: &mut Vec<(String, u64)>) {
+/// Every file under `root`, by path, length **and modification time**, so
+/// that "it wrote nothing" is an assertion and not a claim.
+///
+/// The modification time is here because a length is not a proof: a write
+/// that replaced a byte without changing the count would pass a
+/// length-only comparison. Reading a file never moves its `mtime`, so a
+/// listing that is equal in all three is a root nothing wrote to — which is
+/// the one claim this whole subcommand rests on.
+fn listing(root: &Path) -> Vec<(String, u64, std::time::SystemTime)> {
+    fn walk(at: &Path, base: &Path, into: &mut Vec<(String, u64, std::time::SystemTime)>) {
         let Ok(entries) = fs::read_dir(at) else {
             return;
         };
@@ -264,13 +349,13 @@ fn listing(root: &Path) -> Vec<(String, u64)> {
             if kind.is_dir() {
                 walk(&path, base, into);
             } else {
-                let length = entry.metadata().expect("metadata").len();
+                let at = entry.metadata().expect("metadata");
                 let name = path
                     .strip_prefix(base)
                     .expect("under the root")
                     .to_string_lossy()
                     .into_owned();
-                into.push((name, length));
+                into.push((name, at.len(), at.modified().expect("a modified time")));
             }
         }
     }
@@ -337,16 +422,42 @@ fn every_figure_of_the_preview_is_this_fixture_to_the_byte() {
     assert_eq!(merger.not_over, 0);
     assert_eq!(merger.judged, 2);
     assert_eq!(expired_ids(&preview, Priority::Merger), vec!["j0000000001"]);
-    assert_eq!(merger.expired_bytes, 522, "512 of record and 10 of output");
-    assert_eq!(merger.expired_output_bytes, 10);
-    assert_eq!(merger.expired[0].record_bytes(), 512);
+    // The three populations, apart: ten bytes a sweep could free on its own,
+    // 554 of record and counter, and 300 bytes of log that nothing but
+    // removing the record frees.
+    assert_eq!(merger.past.collected_bytes, 10);
+    assert_eq!(merger.past.collected_files, 1);
+    assert_eq!(merger.past.without_collected_file, 0);
+    assert_eq!(merger.past.record_bytes, RECORD_AND_COUNTER, "512 + 42");
+    assert_eq!(merger.past.logs, 1);
+    assert_eq!(merger.past.log_bytes, 300);
+    assert!(merger.past.logs_unknown.is_empty());
+    assert_eq!(merger.past.without_log, 0);
+    assert_eq!(merger.past.measured_bytes(), 864, "10 + 554 + 300");
+    assert_eq!(
+        merger.expired[0].weighed.measured_bytes(),
+        Some(864),
+        "and the one record it is"
+    );
+    assert_eq!(merger.expired[0].weighed.log, LogWeight::Measured(300));
     assert_eq!(
         merger.oldest_and_newest(),
         Some((days_ago(100), days_ago(100))),
         "one record, so it is both"
     );
-    assert_eq!(merger.inside, 1);
-    assert_eq!(merger.inside_bytes, 512);
+    assert_eq!(merger.inside.records, 1);
+    assert_eq!(merger.inside.collected_bytes, 0);
+    assert_eq!(merger.inside.without_collected_file, 1);
+    assert_eq!(
+        merger.inside.record_bytes, RECORD_BYTES as u64,
+        "j0000000002 never reached an attempt, so it has no log.seq either"
+    );
+    assert_eq!(merger.inside.logs, 0);
+    assert_eq!(
+        merger.inside.without_log, 1,
+        "and nothing ever wrote it a log byte: a measurement, not a gap"
+    );
+    assert_eq!(merger.inside.measured_bytes(), 512);
     assert_eq!(
         merger.next_to_expire,
         Some(("j0000000002".to_owned(), days_ago(89), span(1))),
@@ -363,13 +474,47 @@ fn every_figure_of_the_preview_is_this_fixture_to_the_byte() {
         "oldest first, by the end time and not by the id"
     );
     assert_eq!(
-        step.expired_bytes, 1136,
-        "two records of 512, 100 of output, 5 left by a killed sweep and 7 still arriving"
+        step.past.collected_bytes, 112,
+        "100 of collection, 5 left by a killed sweep and 7 still arriving"
     );
-    assert_eq!(step.expired_output_bytes, 112, "100 + 5 + 7");
+    assert_eq!(step.past.collected_files, 3);
+    assert_eq!(step.past.without_collected_file, 0);
+    assert_eq!(step.past.record_bytes, 2 * RECORD_AND_COUNTER, "1108");
+    assert_eq!(
+        step.past.logs, 1,
+        "j0000000004's; j0000000003's could not be measured and is not counted as one"
+    );
+    assert_eq!(
+        step.past.log_bytes, BIG_LOG,
+        "the runner's own default cap, in one record, against 112 bytes of collection"
+    );
+    assert_eq!(step.past.logs_unknown.len(), 1);
+    assert_eq!(step.past.logs_unknown[0].0, "j0000000003");
+    assert!(
+        step.past.logs_unknown[0]
+            .1
+            .contains("unknown and not nought"),
+        "and the reason is named: {}",
+        step.past.logs_unknown[0].1
+    );
+    assert_eq!(step.past.without_log, 0);
+    assert_eq!(
+        step.past.measured_bytes(),
+        112 + 1108 + BIG_LOG,
+        "a floor and not a total, because one log of the two could not be measured"
+    );
     assert_eq!(step.oldest_and_newest(), Some((days_ago(30), days_ago(20))));
-    assert_eq!(step.inside, 1);
-    assert_eq!(step.inside_bytes, 512);
+    assert_eq!(step.inside.records, 1);
+    assert_eq!(step.inside.collected_bytes, 0);
+    assert_eq!(step.inside.collected_files, 0);
+    assert_eq!(
+        step.inside.without_collected_file, 1,
+        "j0000000005 names no file at all and still weighs"
+    );
+    assert_eq!(step.inside.record_bytes, RECORD_AND_COUNTER);
+    assert_eq!(step.inside.logs, 1);
+    assert_eq!(step.inside.log_bytes, 1234);
+    assert_eq!(step.inside.measured_bytes(), 554 + 1234, "and no file byte");
     assert_eq!(
         step.next_to_expire,
         Some(("j0000000005".to_owned(), days_ago(1), span(13))),
@@ -387,10 +532,17 @@ fn every_figure_of_the_preview_is_this_fixture_to_the_byte() {
         expired_ids(&preview, Priority::Nightly),
         vec!["j0000000006"]
     );
-    assert_eq!(nightly.expired_bytes, 1512);
-    assert_eq!(nightly.expired_output_bytes, 1000);
-    assert_eq!(nightly.inside, 0);
-    assert_eq!(nightly.inside_bytes, 0);
+    assert_eq!(nightly.past.collected_bytes, 1000);
+    assert_eq!(nightly.past.collected_files, 1);
+    assert_eq!(nightly.past.record_bytes, RECORD_AND_COUNTER);
+    assert_eq!(nightly.past.logs, 1);
+    assert_eq!(nightly.past.log_bytes, 2000);
+    assert_eq!(nightly.past.measured_bytes(), 3554, "1000 + 554 + 2000");
+    assert_eq!(
+        nightly.inside,
+        Weight::default(),
+        "nothing of this class is inside its span, in any population"
+    );
     assert_eq!(nightly.next_to_expire, None);
 
     // producer, span 0: a record five hundred days old, and nothing of this
@@ -402,12 +554,16 @@ fn every_figure_of_the_preview_is_this_fixture_to_the_byte() {
         producer.expired.is_empty(),
         "a span of 0 means never, not now"
     );
-    assert_eq!(producer.expired_bytes, 0);
-    assert_eq!(producer.inside, 1);
-    assert_eq!(producer.inside_bytes, 515);
+    assert_eq!(producer.past, Weight::default());
+    assert_eq!(producer.inside.records, 1);
+    assert_eq!(producer.inside.collected_bytes, 3);
+    assert_eq!(producer.inside.collected_files, 1);
+    assert_eq!(producer.inside.record_bytes, RECORD_BYTES as u64);
+    assert_eq!(producer.inside.without_log, 1);
+    assert_eq!(producer.inside.measured_bytes(), 515, "3 + 512");
     assert_eq!(producer.next_to_expire, None);
 
-    // And the totals.
+    // And the totals, over the whole root, on both sides of every span.
     assert_eq!(preview.expired(), 4);
     assert_eq!(preview.judged(), 7);
     assert_eq!(
@@ -415,8 +571,54 @@ fn every_figure_of_the_preview_is_this_fixture_to_the_byte() {
         6,
         "the producer's record can never expire, so it is not in this population"
     );
-    assert_eq!(preview.expired_bytes(), 3170, "522 + 1136 + 1512");
-    assert_eq!(preview.expired_output_bytes(), 1122, "10 + 112 + 1000");
+    let past = preview.past();
+    assert_eq!(past.records, 4);
+    assert_eq!(past.collected_bytes, 1122, "10 + 112 + 1000");
+    assert_eq!(past.collected_files, 5, "1 + 3 + 1");
+    assert_eq!(past.without_collected_file, 0);
+    assert_eq!(
+        past.record_bytes,
+        4 * RECORD_AND_COUNTER,
+        "2216: four records that each reached an attempt"
+    );
+    assert_eq!(past.logs, 3);
+    assert_eq!(past.log_bytes, 300 + BIG_LOG + 2000);
+    assert_eq!(past.logs_unknown.len(), 1);
+    assert_eq!(past.without_log, 0);
+    assert_eq!(
+        past.measured_bytes(),
+        1122 + 2216 + 300 + BIG_LOG + 2000,
+        "67114502, of which 1122 bytes are all the output budget can ever see"
+    );
+    assert_eq!(
+        past.logs + past.logs_unknown.len() + past.without_log,
+        past.records,
+        "every record past its span is in exactly one of the three log figures"
+    );
+
+    let inside = preview.inside();
+    assert_eq!(inside.records, 3);
+    assert_eq!(inside.collected_bytes, 3);
+    assert_eq!(inside.collected_files, 1);
+    assert_eq!(
+        inside.without_collected_file, 2,
+        "j0000000002 and j0000000005 name no file at all"
+    );
+    assert_eq!(
+        inside.record_bytes,
+        2 * RECORD_BYTES as u64 + RECORD_AND_COUNTER,
+        "1578: two records with no counter and one with"
+    );
+    assert_eq!(inside.logs, 1);
+    assert_eq!(inside.log_bytes, 1234);
+    assert!(inside.logs_unknown.is_empty());
+    assert_eq!(inside.without_log, 2);
+    assert_eq!(inside.measured_bytes(), 3 + 1578 + 1234, "2815");
+    assert_eq!(
+        inside.logs + inside.logs_unknown.len() + inside.without_log,
+        inside.records,
+        "and so is every record inside its span"
+    );
 
     // And the whole of the text, because these figures only reach an operator
     // as text: a line that silently stopped printing a number would be a
@@ -809,6 +1011,15 @@ fn the_preview_reads_what_the_store_itself_wrote() {
     store
         .begin_attempt(&over.id, "test-runner", "the only runner", None)
         .expect("an attempt is recorded");
+    // A real log, through the store's own writer. **This is what holds the
+    // two file names the preview has to write out again** — `log` and
+    // `log.seq` are private to `store.rs` and this task may not widen them,
+    // so a rename there has to fail here rather than print nought for every
+    // log on an operator's root.
+    const LOG_LINE: &[u8] = b"a line of this job's output\n";
+    store
+        .append_log(&over.id, herd_proto::LogStream::Stdout, 0, LOG_LINE)
+        .expect("the log line is appended");
     store
         .record_outputs(
             &over.id,
@@ -887,7 +1098,7 @@ fn the_preview_reads_what_the_store_itself_wrote() {
         "the merger record survives the pass, so it would not empty this root"
     );
     assert_eq!(
-        class(&preview, Priority::Merger).inside,
+        class(&preview, Priority::Merger).inside.records,
         1,
         "{} is a merger and has ninety days",
         safe.id
@@ -901,18 +1112,40 @@ fn the_preview_reads_what_the_store_itself_wrote() {
         vec![over.id.as_str()]
     );
     // What removing that record would free: its own directory, measured the
-    // way the sweeper measures one.
-    let on_disk: u64 = before
-        .iter()
-        .filter(|(path, _)| path.starts_with(&format!("jobs/{}/", over.id)))
-        .map(|(_, length)| *length)
-        .sum();
+    // way the sweeper measures one, and split the three ways the operator
+    // needs it. Every figure is read off the listing rather than typed, so
+    // the three add up to the directory and nothing is double-counted.
+    let under = |what: &str| -> u64 {
+        before
+            .iter()
+            .filter(|(path, _, _)| path.starts_with(&format!("jobs/{}/{what}", over.id)))
+            .map(|(_, length, _)| *length)
+            .sum()
+    };
+    let on_disk = under("");
+    let weighed = &nightly.expired[0].weighed;
     assert_eq!(
-        nightly.expired_bytes, on_disk,
+        weighed.measured_bytes(),
+        Some(on_disk),
         "the whole job directory, which is what retention removes"
     );
-    assert_eq!(nightly.expired[0].output_bytes, 4, "files/out.bin");
-    assert_eq!(nightly.expired[0].record_bytes(), on_disk - 4);
+    assert_eq!(weighed.collected_bytes, 4, "files/out.bin");
+    assert_eq!(weighed.collected_files, 1);
+    assert_eq!(
+        weighed.log,
+        LogWeight::Measured(LOG_LINE.len() as u64),
+        "the log the store's own writer appended, under the name store.rs gives it"
+    );
+    assert_eq!(weighed.record_bytes, on_disk - 4 - LOG_LINE.len() as u64);
+    assert_eq!(
+        weighed.record_bytes,
+        under("job.json") + under("events.jsonl") + under("log.seq"),
+        "the record population is the record, the events and the counter"
+    );
+    assert_eq!(nightly.past.logs, 1);
+    assert_eq!(nightly.past.log_bytes, LOG_LINE.len() as u64);
+    assert!(nightly.past.logs_unknown.is_empty());
+    assert_eq!(nightly.past.without_log, 0);
     assert_eq!(nightly.expired[0].ended_at, ended);
 
     // And the selection the engine will call agrees, on the record the store
@@ -933,6 +1166,167 @@ fn the_preview_reads_what_the_store_itself_wrote() {
         "and the preview wrote nothing to a root a store has open"
     );
     drop(store);
+}
+
+/// **A record that names no collected file still reports its own bytes and
+/// its log**, which is the common case and not the edge: 41 % of the first
+/// consumer's records name no file at all, and a figure that could only see
+/// `files/` would read every one of them as nought.
+#[test]
+fn a_record_naming_no_collected_file_still_weighs_its_record_and_its_log() {
+    let dir = tempfile::tempdir().expect("a temporary directory");
+    let root = dir.path();
+    // One record, past its span, with no `files/` at all and a log of 4096
+    // bytes. Nothing the output budget governs; 4650 bytes that only
+    // removing the record frees.
+    job_dir(
+        root,
+        "j0000000001",
+        Some(record(
+            "j0000000001",
+            Priority::Step,
+            finished(),
+            days_ago(30),
+        )),
+        &[],
+    );
+    log_counter(root, "j0000000001");
+    log_of(root, "j0000000001", 4096);
+    // A second record, inside its span, so that the pass would not empty the
+    // root and the figures are printed rather than withheld.
+    job_dir(
+        root,
+        "j0000000002",
+        Some(record(
+            "j0000000002",
+            Priority::Merger,
+            finished(),
+            days_ago(1),
+        )),
+        &[],
+    );
+    let before = listing(root);
+
+    let preview = RetentionPreview::read(root, spans(), Timestamp::at_unix_seconds(PINNED))
+        .expect("the preview reads this root");
+    assert_eq!(preview.verdict, Verdict::Readable);
+    let past = preview.past();
+    assert_eq!(past.records, 1);
+    assert_eq!(past.collected_bytes, 0, "it names no file");
+    assert_eq!(past.collected_files, 0);
+    assert_eq!(past.without_collected_file, 1, "and that is counted");
+    assert_eq!(past.record_bytes, RECORD_AND_COUNTER, "554");
+    assert_eq!(past.logs, 1);
+    assert_eq!(past.log_bytes, 4096);
+    assert_eq!(
+        past.measured_bytes(),
+        4650,
+        "554 + 4096, every byte of it outside anything the budget can see"
+    );
+
+    let rendered = preview.to_string();
+    assert!(
+        rendered.contains("collected files        0 bytes in 0 file(s)"),
+        "the collection is nought and says so: {rendered}"
+    );
+    assert!(
+        rendered.contains("naming no file       1 record(s)"),
+        "and the record is counted as naming none: {rendered}"
+    );
+    assert!(
+        rendered.contains("the logs               4096 bytes (4.00 KiB) in 1 log(s)"),
+        "while its log is a real figure: {rendered}"
+    );
+    assert_eq!(listing(root), before, "and it removed nothing");
+}
+
+/// **A log that is large reports as large.** The runner's `--job-log-cap`
+/// defaults to 64 MiB and the hub appends whatever arrives with no cap of
+/// its own, so one record can weigh far more than the "kilobytes" the output
+/// budget's own argument assumes of a record. A preview that implied
+/// otherwise is the thing ORCH-168 fixes.
+#[test]
+fn a_log_the_size_of_the_runners_cap_reports_as_megabytes() {
+    let dir = tempfile::tempdir().expect("a temporary directory");
+    let root = dir.path();
+    fixture(root);
+    let before = listing(root);
+
+    let preview = RetentionPreview::read(root, spans(), Timestamp::at_unix_seconds(PINNED))
+        .expect("the preview reads this root");
+    let step = class(&preview, Priority::Step);
+    assert_eq!(step.past.log_bytes, BIG_LOG);
+    assert_eq!(
+        step.past.collected_bytes, 112,
+        "and the collection beside it is 112 bytes: the two figures differ by 600 000 times"
+    );
+
+    let rendered = preview.to_string();
+    assert!(
+        rendered.contains("the logs               67108864 bytes (64.00 MiB) in 1 log(s)"),
+        "the exact figure and the approximation beside it: {rendered}"
+    );
+    assert!(
+        rendered.contains("log 67108864 bytes (64.00 MiB)"),
+        "and on the line that names the record it belongs to: {rendered}"
+    );
+    assert!(
+        rendered.contains("--job-log-cap"),
+        "and the output says where the only cap on it lives: {rendered}"
+    );
+    assert_eq!(listing(root), before, "and it removed nothing");
+}
+
+/// **A log this build could not measure is UNKNOWN and named, never nought.**
+/// An unmeasured thing is printed as unmeasured in this project (D27's rule,
+/// applied to a figure rather than to a test), and here it matters twice
+/// over: a log read as empty is a record whose removal would free more than
+/// the preview promised, which is the direction a sizing figure must never
+/// err in.
+#[test]
+fn a_log_that_could_not_be_measured_is_named_and_never_counted_as_nought() {
+    let dir = tempfile::tempdir().expect("a temporary directory");
+    let root = dir.path();
+    fixture(root);
+    let before = listing(root);
+
+    let preview = RetentionPreview::read(root, spans(), Timestamp::at_unix_seconds(PINNED))
+        .expect("the preview reads this root");
+    let step = class(&preview, Priority::Step);
+    assert_eq!(step.past.logs_unknown.len(), 1);
+    assert_eq!(step.past.logs_unknown[0].0, "j0000000003");
+    assert_eq!(
+        step.past.logs, 1,
+        "the unknown one is not counted among the measured"
+    );
+    assert_eq!(
+        step.expired[0].weighed.measured_bytes(),
+        None,
+        "and nor is the record's own total a total any more"
+    );
+    assert_eq!(
+        step.expired[0].weighed.record_bytes, RECORD_AND_COUNTER,
+        "while the two populations that were measured still are"
+    );
+
+    let rendered = preview.to_string();
+    assert!(
+        rendered.contains("could not be read    1 log(s): UNKNOWN, never nought"),
+        "the count is printed as unknown: {rendered}"
+    );
+    assert!(
+        rendered.contains("jobs/j0000000003: there is no log"),
+        "and the record is named with its reason: {rendered}"
+    );
+    assert!(
+        rendered.contains("jobs/j0000000003  files 105 bytes, record 554 bytes, log UNKNOWN"),
+        "and the line that names it does not print a figure it does not have: {rendered}"
+    );
+    assert!(
+        rendered.contains("no log ever written  0 record(s)"),
+        "which is not the same thing as a log nothing ever wrote: {rendered}"
+    );
+    assert_eq!(listing(root), before, "and it removed nothing");
 }
 
 /// The preview's text, with the only thing that varies left as `{ROOT}`.
@@ -974,19 +1368,40 @@ records
 
 what retention would remove, by class
 
+  THREE POPULATIONS, THREE OWNERS, kept apart below because sizing a policy
+  against their sum is sizing it against nothing. The collected files are the
+  output budget's (D148, D152): a sweep frees them and leaves the record. The
+  record and its log are nobody's -- the only thing in Herd that frees one of
+  their bytes is removing the record -- and nothing on this hub bounds a log
+  at all: the only cap is the runner's --job-log-cap, 64 MiB a job by default,
+  on the runner's own machine. A record is not kilobytes because its job.json
+  is. A log this build could not measure is printed UNKNOWN and named, never
+  as nought.
+
   merger
     span                     90 day(s) (7776000 s)
     records of this class    2
       not over, so not ours  0 (the reaper's, ORCH-012 and D134)
       judged                 2
     past the span            1 record(s)
-      what they weigh        522 bytes
-        of which output      10 bytes
-        the records          512 bytes
+      collected files        10 bytes in 1 file(s)
+        naming no file       0 record(s)
+      the records            554 bytes in 1 record(s)
+      the logs               300 bytes in 1 log(s)
+        could not be read    0 log(s): UNKNOWN, never nought
+        no log ever written  0 record(s)
+      measured in all        864 bytes
       oldest                 2026-07-20T00:00:00Z
       newest                 2026-07-20T00:00:00Z
-      jobs/j0000000001 522 bytes ended 2026-07-20T00:00:00Z
-    inside the span          1 record(s), 512 bytes
+      jobs/j0000000001  files 10 bytes, record 554 bytes, log 300 bytes  ended 2026-07-20T00:00:00Z
+    inside the span          1 record(s)
+      collected files        0 bytes in 0 file(s)
+        naming no file       1 record(s)
+      the records            512 bytes in 1 record(s)
+      the logs               0 bytes in 0 log(s)
+        could not be read    0 log(s): UNKNOWN, never nought
+        no log ever written  1 record(s)
+      measured in all        512 bytes
       next to expire         jobs/j0000000002, ended 2026-07-31T00:00:00Z, 1 day(s) (86400 s) left
 
   step
@@ -995,14 +1410,26 @@ what retention would remove, by class
       not over, so not ours  0 (the reaper's, ORCH-012 and D134)
       judged                 3
     past the span            2 record(s)
-      what they weigh        1136 bytes (1.11 KiB)
-        of which output      112 bytes
-        the records          1024 bytes (1.00 KiB)
+      collected files        112 bytes in 3 file(s)
+        naming no file       0 record(s)
+      the records            1108 bytes (1.08 KiB) in 2 record(s)
+      the logs               67108864 bytes (64.00 MiB) in 1 log(s)
+        could not be read    1 log(s): UNKNOWN, never nought
+          jobs/j0000000003: there is no log, and the log.seq beside it is this hub's own record that a log was being counted, so its bytes are unknown and not nought
+        no log ever written  0 record(s)
+      measured in all        67110084 bytes (64.00 MiB)
       oldest                 2026-09-28T00:00:00Z
       newest                 2026-10-08T00:00:00Z
-      jobs/j0000000003 617 bytes ended 2026-09-28T00:00:00Z
-      jobs/j0000000004 519 bytes ended 2026-10-08T00:00:00Z
-    inside the span          1 record(s), 512 bytes
+      jobs/j0000000003  files 105 bytes, record 554 bytes, log UNKNOWN  ended 2026-09-28T00:00:00Z
+      jobs/j0000000004  files 7 bytes, record 554 bytes, log 67108864 bytes (64.00 MiB)  ended 2026-10-08T00:00:00Z
+    inside the span          1 record(s)
+      collected files        0 bytes in 0 file(s)
+        naming no file       1 record(s)
+      the records            554 bytes in 1 record(s)
+      the logs               1234 bytes (1.21 KiB) in 1 log(s)
+        could not be read    0 log(s): UNKNOWN, never nought
+        no log ever written  0 record(s)
+      measured in all        1788 bytes (1.75 KiB)
       next to expire         jobs/j0000000005, ended 2026-10-27T00:00:00Z, 13 day(s) (1123200 s) left
 
   nightly
@@ -1011,13 +1438,24 @@ what retention would remove, by class
       not over, so not ours  1 (the reaper's, ORCH-012 and D134)
       judged                 1
     past the span            1 record(s)
-      what they weigh        1512 bytes (1.48 KiB)
-        of which output      1000 bytes
-        the records          512 bytes
+      collected files        1000 bytes in 1 file(s)
+        naming no file       0 record(s)
+      the records            554 bytes in 1 record(s)
+      the logs               2000 bytes (1.95 KiB) in 1 log(s)
+        could not be read    0 log(s): UNKNOWN, never nought
+        no log ever written  0 record(s)
+      measured in all        3554 bytes (3.47 KiB)
       oldest                 2026-08-29T00:00:00Z
       newest                 2026-08-29T00:00:00Z
-      jobs/j0000000006 1512 bytes (1.48 KiB) ended 2026-08-29T00:00:00Z
-    inside the span          0 record(s), 0 bytes
+      jobs/j0000000006  files 1000 bytes, record 554 bytes, log 2000 bytes (1.95 KiB)  ended 2026-08-29T00:00:00Z
+    inside the span          0 record(s)
+      collected files        0 bytes in 0 file(s)
+        naming no file       0 record(s)
+      the records            0 bytes in 0 record(s)
+      the logs               0 bytes in 0 log(s)
+        could not be read    0 log(s): UNKNOWN, never nought
+        no log ever written  0 record(s)
+      measured in all        0 bytes
       next to expire         none: no record of this class is inside its span
 
   producer
@@ -1026,18 +1464,43 @@ what retention would remove, by class
       not over, so not ours  0 (the reaper's, ORCH-012 and D134)
       judged                 1
     past the span            0 record(s)
-      what they weigh        0 bytes
-        of which output      0 bytes
-        the records          0 bytes
+      collected files        0 bytes in 0 file(s)
+        naming no file       0 record(s)
+      the records            0 bytes in 0 record(s)
+      the logs               0 bytes in 0 log(s)
+        could not be read    0 log(s): UNKNOWN, never nought
+        no log ever written  0 record(s)
+      measured in all        0 bytes
       oldest                 none: no record of this class is past its span
       newest                 none
-    inside the span          1 record(s), 515 bytes
+    inside the span          1 record(s)
+      collected files        3 bytes in 1 file(s)
+        naming no file       0 record(s)
+      the records            512 bytes in 1 record(s)
+      the logs               0 bytes in 0 log(s)
+        could not be read    0 log(s): UNKNOWN, never nought
+        no log ever written  1 record(s)
+      measured in all        515 bytes
       next to expire         never: this class's span is 0
 
   in all                   4 of the 6 record(s) that can expire are past their span
     records judged         7 (a class whose span is 0 is judged and never expires)
-  what that would free     3170 bytes (3.10 KiB)
-    of which output        1122 bytes (1.10 KiB)
-    the records            2048 bytes (2.00 KiB)
+  what that would free, over the whole root
+    collected files        1122 bytes (1.10 KiB) in 5 file(s)
+      naming no file       0 record(s)
+    the records            2216 bytes (2.16 KiB) in 4 record(s)
+    the logs               67111164 bytes (64.00 MiB) in 3 log(s)
+      could not be read    1 log(s): UNKNOWN, never nought
+        jobs/j0000000003: there is no log, and the log.seq beside it is this hub's own record that a log was being counted, so its bytes are unknown and not nought
+      no log ever written  0 record(s)
+    measured in all        67114502 bytes (64.01 MiB)
+  what it would keep, over the whole root
+    collected files        3 bytes in 1 file(s)
+      naming no file       2 record(s)
+    the records            1578 bytes (1.54 KiB) in 3 record(s)
+    the logs               1234 bytes (1.21 KiB) in 1 log(s)
+      could not be read    0 log(s): UNKNOWN, never nought
+      no log ever written  2 record(s)
+    measured in all        2815 bytes (2.75 KiB)
   Nothing above was removed, and this subcommand cannot remove it.
 ";
