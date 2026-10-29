@@ -324,6 +324,9 @@ cat > "$tmp/bin/cargo" <<'FAKE'
 #!/usr/bin/env bash
 printf '%s\n' "$@" > "$FAKE_CARGO_ARGV"
 [ -n "${FAKE_CARGO_SKIPS:-}" ] && printf '%s\n' "$FAKE_CARGO_SKIPS" >> "$HERD_SKIP_LOG"
+# libtest prints a compile-time skip on STDOUT, in these exact words, and
+# only a `cargo test` run does (ORCH-202).
+[ "${1:-}" = test ] && [ -n "${FAKE_CARGO_IGNORED:-}" ] && printf '%s\n' "$FAKE_CARGO_IGNORED"
 exit "${FAKE_CARGO_STATUS:-0}"
 FAKE
 chmod +x "$tmp/bin/cargo"
@@ -335,7 +338,8 @@ S2='HERD-SKIPPED: io_max_is_written: the workspace is on ZFS'
 run_test_sh() {
   local st=$1 sk=$2; shift 2
   out=$(cd "$tmp/repo" && PATH="$tmp/bin:$PATH" FAKE_CARGO_STATUS="$st" \
-    FAKE_CARGO_SKIPS="$sk" ./scripts/test.sh "$@" 2>&1); rc=$?
+    FAKE_CARGO_SKIPS="$sk" FAKE_CARGO_IGNORED="${IGN:-}" \
+    ./scripts/test.sh "$@" 2>&1); rc=$?
 }
 # verdict <name> <expected exit> <must appear> [<must not appear>]
 verdict() {
@@ -409,6 +413,76 @@ run_test_sh 0 '' --no-fail-fast
   && ok "test.sh: the caller's own --no-fail-fast is not doubled" \
   || bad "test.sh: --no-fail-fast doubled, cargo would refuse" "    $(tr '\n' ' ' < "$FAKE_CARGO_ARGV")"
 
+
+echo "== a compile-time skip is seen too: #[ignore] (ORCH-202, D27)"
+# The hole this closes. A skip a test writes while running reaches
+# $HERD_SKIP_LOG; a test carrying #[ignore] never runs, writes nothing, and
+# was invisible to the whole skip accounting. Measured in batch 9: a new
+# #[ignore]d test, printed by cargo as `ignored, ...`, left the twelve-name
+# skip list and its sha256 untouched.
+#
+# The lines below are libtest's own, verbatim, as cargo printed them for a
+# throwaway crate on 2026-10-29 — one #[ignore = "..."], one bare #[ignore],
+# and one whose REASON contains the marker, to trap a parser that takes the
+# last match instead of the first.
+I1='test needs_a_delegated_cgroup ... ignored, nobody checks this until a host has one'
+I2='test nobody_said_why_this_is_off ... ignored'
+I3='test the_reason_carries_the_marker ... ignored, see also test foo ... ignored, which is also off'
+IGN="$I1" run_test_sh 0 ''
+verdict "test.sh: an #[ignore] with a reason is listed, with its reason" 0 \
+  "HERD-IGNORED: needs_a_delegated_cgroup: nobody checks this until a host has one"
+verdict "test.sh: an #[ignore] is reported as nobody checking it" 0 \
+  "nobody is checking this"
+# Condition 3: the two kinds must not be merged. A tree with only an
+# #[ignore] must still say that NO assertion was skipped for a host reason.
+verdict "test.sh: an #[ignore] is not counted as a runtime skip" 0 \
+  "Every assertion ran on this host: nothing was skipped."
+grep -qF -- "HERD-SKIPPED: needs_a_delegated_cgroup" <<<"$out" \
+  && bad "test.sh: an #[ignore] must never be printed as a HERD-SKIPPED" "$out" \
+  || ok "test.sh: the two kinds carry different markers"
+# Condition 2: no reason is a refusal, under a marker no expectation matches.
+IGN="$I2" run_test_sh 0 ''
+verdict "test.sh: a bare #[ignore] is refused, not silently listed" 0 \
+  "HERD-IGNORED-UNEXPLAINED: nobody_said_why_this_is_off"
+verdict "test.sh: the refusal says what is wrong with it" 0 \
+  "carry #[ignore] WITH NO REASON"
+grep -qF -- "HERD-IGNORED: nobody_said_why_this_is_off" <<<"$out" \
+  && bad "test.sh: a reasonless #[ignore] must not reach the listable marker" "$out" \
+  || ok "test.sh: a reasonless #[ignore] gets only the refusal marker"
+# A reason that contains the marker is still a reason, and the NAME is the
+# text before the FIRST marker.
+IGN="$I3" run_test_sh 0 ''
+verdict "test.sh: a reason containing the marker does not shift the name" 0 \
+  "HERD-IGNORED: the_reason_carries_the_marker: see also test foo ... ignored, which is also off"
+# Both kinds at once, each in its own block, each with its own count.
+IGN="$I1
+$I2" run_test_sh 0 "$S1
+$S2"
+verdict "test.sh: both kinds in one run, the runtime ones counted alone" 0 \
+  " 2 assertion(s) COULD NOT RUN on this host and were skipped."
+verdict "test.sh: both kinds in one run, the compile-time ones counted alone" 0 \
+  " 1 assertion(s) DID NOT RUN AT ALL: they carry #[ignore]."
+# The census marker, so that a captured run says whether its list is whole.
+IGN="$I1" run_test_sh 0 ''
+verdict "test.sh: a finished run prints a complete ignored census" 0 \
+  "ignored census: COMPLETE (1 ignored, 0 without a reason)"
+IGN="$I1" run_test_sh 101 ''
+verdict "test.sh: an unfinished run's census is a floor, not a count" 101 \
+  "ignored census: INCOMPLETE"
+IGN="$I1" run_test_sh 0 '' -p herd-proto
+verdict "test.sh: a narrowed run's census is not a whole-tree census" 0 \
+  "ignored census: INCOMPLETE"
+# Nothing ignored is still said plainly, and never as a skip. The empty
+# assignment is explicit: whether a prefix assignment to a shell function
+# outlives the call is a bash version question, and a case must not depend
+# on the answer.
+IGN= run_test_sh 0 ''
+grep -qF -- "DID NOT RUN AT ALL" <<<"$out" \
+  && bad "test.sh: a tree with no #[ignore] must print no #[ignore] block" "$out" \
+  || ok "test.sh: no #[ignore] in the run, no #[ignore] block"
+verdict "test.sh: a run with no #[ignore] says so in its census" 0 \
+  "ignored census: COMPLETE (0 ignored, 0 without a reason)"
+IGN=
 # report-skips.sh reads a captured run in CI, where it runs with if: always()
 # and so also sees red ones. It decides on the marker test.sh prints last.
 # run_report <file contents>
@@ -601,13 +675,19 @@ if [ -n "${HERD_STUB_LOAD_AFTER:-}" ] && [ -n "${HERD_GATE_LOADAVG:-}" ]; then
   printf '%s 1.00 1.00 1/1 1\n' "$HERD_STUB_LOAD_AFTER" > "$HERD_GATE_LOADAVG"
 fi
 [ -n "${HERD_STUB_SKIPS:-}" ] && cat "$HERD_STUB_SKIPS"
+# The compile-time half (ORCH-202): the real test.sh turns cargo's own
+# `ignored` lines into these, and prints a census marker so that a captured
+# run says whether its list is whole.
+[ -n "${HERD_STUB_IGNORED:-}" ] && cat "$HERD_STUB_IGNORED"
 if [ -n "${HERD_STUB_LOAD_RESTORE:-}" ] && [ -n "${HERD_GATE_LOADAVG:-}" ]; then
   printf '%s 1.00 1.00 1/1 1\n' "$HERD_STUB_LOAD_RESTORE" > "$HERD_GATE_LOADAVG"
 fi
 if [ "${HERD_STUB_SUITE:-pass}" != pass ]; then
-  echo "test suite: FAILED (cargo test exited 101)"; exit 101
+  echo "test suite: FAILED (cargo test exited 101)"
+  echo "ignored census: INCOMPLETE"; exit 101
 fi
 [ "${HERD_STUB_NOPASS:-0}" = 1 ] || echo "test suite: PASSED"
+[ "${HERD_STUB_NOCENSUS:-0}" = 1 ] || echo "ignored census: COMPLETE"
 exit 0
 EOS
   # A `nix` that is not nix: `flake check` answers, and `develop --command`
@@ -637,6 +717,11 @@ EOS
   # would be testing the dirty-tree refusal by accident.
   printf 'HERD-SKIPPED: a_needs_cgroup_delegation: no delegated subtree here\nHERD-SKIPPED: b_needs_bfq: no device offers bfq\n' > "$tmp/gate-skips"
   printf '# expectation\nHERD-SKIPPED: a_needs_cgroup_delegation: no delegated subtree here\nHERD-SKIPPED: b_needs_bfq: no device offers bfq\n' > "$tmp/gate-expected"
+  # The compile-time skips the stub suite prints, and their expectation
+  # (ORCH-202). Outside the repository, like the two above: a case that
+  # edited them inside it would be testing the dirty-tree refusal.
+  printf 'HERD-IGNORED: c_an_enumeration_run_on_purpose: a bench; run it on purpose\nHERD-IGNORED: d_reproduces_an_unfixed_defect: RED until the barrier waits for its own offer\n' > "$tmp/gate-ignored"
+  printf '# expectation\nHERD-IGNORED: c_an_enumeration_run_on_purpose: a bench; run it on purpose\nHERD-IGNORED: d_reproduces_an_unfixed_defect: RED until the barrier waits for its own offer\n' > "$tmp/gate-expected-ignored"
   rm -f "$tmp/gate-expected-load"
 }
 # gate_run <extra env...> -- <gate args...>
@@ -645,7 +730,9 @@ gate_run() {
     HERD_GATE_RECEIPTS="$tmp/gate-receipts" \
     HERD_GATE_EXPECTED="$tmp/gate-expected" \
     HERD_GATE_EXPECTED_UNDER_LOAD="$tmp/gate-expected-load" \
+    HERD_GATE_EXPECTED_IGNORED="$tmp/gate-expected-ignored" \
     HERD_STUB_SKIPS="$tmp/gate-skips" \
+    HERD_STUB_IGNORED="$tmp/gate-ignored" \
     "$@" bash -c "cd '$gatedir' && ./scripts/gate.sh ${GATE_ARGS:-}" 2>&1
 }
 # gate_case <name> <expected exit> <grep pattern> <env...>
@@ -706,6 +793,102 @@ out=$(gate_run)
 grep -qF '+ c_nobody_expected_this' <<<"$out" \
   && ok "gate: the unexpected skip is named, not counted" \
   || bad "gate: the unexpected skip must be named" "$(printf '%s\n' "$out" | tail -8)"
+
+# --- the compile-time half of step 7: #[ignore] (ORCH-202) ---------------
+# Driven here for the same reason as everything above: a detector only ever
+# seen silent is not known to fire. The hole it closes was measured in batch
+# 9 — a new #[ignore]d test left the twelve-name skip list and its sha256
+# untouched, so the strongest evidence for a defect lived entirely outside
+# the gate.
+gate_fresh
+out=$(gate_run)
+grep -q 'the #\[ignore\] list matches the expectation exactly' <<<"$out" \
+  && grep -q '(b) compile-time, #\[ignore\]' <<<"$out" \
+  && ok "gate: the matching #[ignore] list is reported as its own half" \
+  || bad "gate: step 7 must have a compile-time half" "$(printf '%s\n' "$out" | tail -12)"
+# Condition 1: by name, never by count. A THIRD #[ignore] nobody expected is
+# red even though the two expected ones are still there.
+gate_fresh
+printf 'HERD-IGNORED: c_an_enumeration_run_on_purpose: a bench; run it on purpose\nHERD-IGNORED: d_reproduces_an_unfixed_defect: RED until the barrier waits for its own offer\nHERD-IGNORED: e_nobody_expected_this_to_be_off: a reason nobody has read\n' > "$tmp/gate-ignored"
+gate_case "an #[ignore] that is not on the expected list is RED" 1 '7:unexpected-ignore'
+out=$(gate_run)
+grep -qF '+ e_nobody_expected_this_to_be_off' <<<"$out" \
+  && grep -qF 'a reason nobody has read' <<<"$out" \
+  && ok "gate: the unexpected #[ignore] is named, with its reason" \
+  || bad "gate: the unexpected #[ignore] must be named" "$(printf '%s\n' "$out" | tail -10)"
+# Condition 3: the two kinds are not interchangeable. An unexpected
+# #[ignore] must not be excused by a skip expectation that happens to carry
+# the same name, nor the other way round.
+gate_fresh
+printf 'HERD-IGNORED: a_needs_cgroup_delegation: ignored under a name the SKIP list expects\n' > "$tmp/gate-ignored"
+gate_case "a name on the skip list does not excuse the same name ignored" 1 \
+  '7:unexpected-ignore'
+gate_fresh
+printf 'HERD-SKIPPED: c_an_enumeration_run_on_purpose: skipped under a name the IGNORE list expects\n' > "$tmp/gate-skips"
+gate_case "a name on the #[ignore] list does not excuse the same name skipped" 1 \
+  '7:unexpected-skip'
+# Condition 2: a reason is not optional, and no expectation file can make a
+# reasonless #[ignore] acceptable — not even one that lists it.
+gate_fresh
+printf 'HERD-IGNORED-UNEXPLAINED: f_nobody_said_why\n' >> "$tmp/gate-ignored"
+printf 'HERD-IGNORED-UNEXPLAINED: f_nobody_said_why\n' >> "$tmp/gate-expected-ignored"
+gate_case "an #[ignore] with no reason is RED even if the list holds it" 1 \
+  '7:unexplained-ignore'
+out=$(gate_run)
+grep -qF '+ f_nobody_said_why' <<<"$out" \
+  && ok "gate: the reasonless #[ignore] is named" \
+  || bad "gate: the reasonless #[ignore] must be named" "$(printf '%s\n' "$out" | tail -10)"
+# An #[ignore] that went away is a note, not a failure: the assertion is
+# checked again, which is never a loss of coverage. It is still said out
+# loud, so that the next transition stays visible.
+gate_fresh
+printf 'HERD-IGNORED: c_an_enumeration_run_on_purpose: a bench; run it on purpose\n' > "$tmp/gate-ignored"
+gate_case "an #[ignore] that is gone is a note, not a failure" 0 \
+  '^gate: GREEN'
+out=$(gate_run)
+grep -qF -- '- d_reproduces_an_unfixed_defect' <<<"$out" \
+  && ok "gate: a test taken off #[ignore] is named in a note" \
+  || bad "gate: the vanished #[ignore] must be named" "$(printf '%s\n' "$out" | tail -10)"
+# Missing the expectation file is a refusal, never an assumption: deleting
+# it must not silently turn the whole half off.
+gate_fresh
+rm -f "$tmp/gate-expected-ignored"
+gate_case "no expected #[ignore] list: refused, not assumed" 3 \
+  'no expected #\[ignore\] list at'
+# A suite that printed no complete census cannot have its list believed.
+gate_fresh
+gate_case "a suite with no complete ignored census is not a list" 1 \
+  '7:ignored-census-incomplete' HERD_STUB_NOCENSUS=1
+# Condition 6: the receipt's two figures are separate, and skip-list-sha256
+# is still over the HERD-SKIPPED names ALONE — so a figure an older receipt
+# quoted still compares.
+gate_fresh
+out=$(gate_run); sha=$(cd "$gatedir" && git rev-parse HEAD)
+r="$tmp/gate-receipts/$sha.receipt"
+want_skips=$(printf 'a_needs_cgroup_delegation\nb_needs_bfq\n' | sha256sum | cut -d' ' -f1)
+want_ign=$(printf 'c_an_enumeration_run_on_purpose\nd_reproduces_an_unfixed_defect\n' | sha256sum | cut -d' ' -f1)
+{ grep -qxF "skip-list-sha256: $want_skips" "$r" \
+  && grep -qxF "ignore-list-sha256: $want_ign" "$r"; } \
+  && ok "gate: the receipt carries the two lists' sha256 separately" \
+  || bad "gate: the receipt's two sha256 fields" "    wanted skip=$want_skips ignore=$want_ign
+$(grep -E 'sha256|observed' "$r" | sed 's/^/    /')"
+# --bless adopts both halves, and refuses the compile-time one outright when
+# an #[ignore] carries no reason: an expectation may not hold a name whose
+# line cannot say why it is unchecked.
+gate_fresh
+rm -f "$tmp/gate-expected-ignored"
+GATE_ARGS=--bless
+gate_case "--bless adopts the #[ignore] list too" 0 "lines to $tmp/gate-expected-ignored"
+{ grep -q '^HERD-IGNORED: c_an_enumeration_run_on_purpose' "$tmp/gate-expected-ignored" \
+  && grep -q 'HERD-IGNORED is a compile-time skip' "$tmp/gate-expected-ignored"; } \
+  && ok "gate: the blessed #[ignore] list says which kind its entries are" \
+  || bad "gate: the blessed list must carry the kind" "$(cat "$tmp/gate-expected-ignored" 2>&1 | head -6)"
+gate_fresh
+rm -f "$tmp/gate-expected-ignored"
+printf 'HERD-IGNORED-UNEXPLAINED: f_nobody_said_why\n' >> "$tmp/gate-ignored"
+gate_case "--bless refuses to adopt an #[ignore] with no reason" 1 \
+  '7:bless-an-unexplained-ignore'
+GATE_ARGS=""
 # --- which expected list applies, and what decides it --------------------
 #
 # The rule being driven here, because it changed on 2026-10-29 and a rule
