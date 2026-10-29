@@ -69,7 +69,7 @@ use std::path::{Path, PathBuf};
 use herd_proto::JobId;
 
 use crate::root::DataRoot;
-use crate::size::show_bytes;
+use crate::size::measured_bytes;
 
 /// What a spool no hub will ever ask for is renamed to.
 pub(crate) const UNCLAIMED: &str = "unclaimed";
@@ -148,7 +148,7 @@ impl Swept {
              never acknowledged, and it is offered to the hub again",
             self.job_id,
             self.attempt,
-            show_bytes(self.bytes),
+            measured_bytes(self.bytes),
             self.files.len(),
             self.path.display()
         )
@@ -163,7 +163,7 @@ impl Swept {
              hub's state root ({why}); no hub can record it now, so it is NOT offered. {}",
             self.job_id,
             self.attempt,
-            show_bytes(self.bytes),
+            measured_bytes(self.bytes),
             self.files.len(),
             set_aside(&self.path, FOREIGN)
         )
@@ -750,6 +750,102 @@ mod tests {
             offered.contains("picked up the collection") && offered.contains("j0000001561"),
             "a collection the hub is still owed must survive the startup that is \
              supposed to offer it again: {offered}"
+        );
+    }
+
+    /// A spool as the sweep hands one to the lines below, with the figures
+    /// chosen rather than walked.
+    fn a_swept(path: PathBuf, bytes: u64) -> Swept {
+        Swept {
+            path,
+            job_id: JobId::new("j0000000007"),
+            attempt: 2,
+            files: vec![
+                SpooledFile {
+                    path: "files/results.json".to_owned(),
+                    len: 535_690_000,
+                },
+                SpooledFile {
+                    path: "files/log.txt".to_owned(),
+                    len: 1_000,
+                },
+            ],
+            bytes,
+        }
+    }
+
+    /// **The line the first consumer read, pinned as text.**
+    ///
+    /// 535691000 is their own figure: one offer line in seventy-five said
+    /// `535691 kB` where the other seventy-four said bytes, because that one
+    /// total happens to be an exact multiple of 1000 and of nothing larger.
+    /// The number was right and the unit moved, which is worse than either.
+    ///
+    /// The expectation is spelled out and is **not** a round trip through the
+    /// formatter. A round trip would stay green through the one change that
+    /// matters here — the writer and the reader moving together — which is
+    /// precisely what breaks somebody parsing this line. **If this goes red,
+    /// do not paste the new line over the expectation:** that is the repair
+    /// that is always wrong, because the expectation is the bug report.
+    #[test]
+    fn the_offer_line_says_a_measured_weight_in_bytes_not_in_a_round_kb() {
+        let swept = a_swept(
+            PathBuf::from("/var/lib/herd/outputs/j0000000007-2"),
+            535_691_000,
+        );
+        assert_eq!(
+            swept.offered(),
+            "picked up the collection of j0000000007 (attempt 2, 535691000 bytes \
+             (510.87 MiB) in 2 file(s)) from /var/lib/herd/outputs/j0000000007-2: it was \
+             never acknowledged, and it is offered to the hub again",
+            "nobody typed this weight, so it is said exactly. Do not paste new output over \
+             this expectation."
+        );
+    }
+
+    /// The whole class, not the one case: every figure here divides exactly
+    /// by 1000, which is what used to pull the line into `kB`.
+    #[test]
+    fn no_measured_weight_changes_unit_because_it_divides_by_a_thousand() {
+        for (bytes, said) in [
+            (1_000u64, "1000 bytes"),
+            (2_000, "2000 bytes (1.95 KiB)"),
+            (1_000_000, "1000000 bytes (976.56 KiB)"),
+            (535_691_000, "535691000 bytes (510.87 MiB)"),
+            (1_000_000_000, "1000000000 bytes (953.67 MiB)"),
+        ] {
+            let offered =
+                a_swept(PathBuf::from("/var/lib/herd/outputs/j0000000007-2"), bytes).offered();
+            assert!(
+                offered.contains(&format!("attempt 2, {said} in 2 file(s)")),
+                "a measured weight is exact whatever it divides by: {offered}"
+            );
+            assert!(
+                !offered.contains(&format!("{} kB", bytes / 1_000)),
+                "and never takes the decimal unit it happens to divide by: {offered}"
+            );
+        }
+    }
+
+    /// The other line that carries a measured weight: bytes produced for a
+    /// hub state root that is gone. Pinned as text for the same reason, the
+    /// one interpolation being the throwaway directory this test made.
+    #[test]
+    fn the_foreign_state_root_line_says_a_measured_weight_in_bytes() {
+        let (_temp, root) = a_root("sweep-foreign-measured");
+        let path = a_spool(&root, "j0000000007-2", &[("files/log.txt", b"a few bytes")]);
+        let swept = a_swept(path.clone(), 535_691_000);
+        assert_eq!(
+            swept.for_a_foreign_state_root("its state root is 0f0f"),
+            format!(
+                "the collection of j0000000007 (attempt 2, 535691000 bytes (510.87 MiB) in \
+                 2 file(s)) was produced for another hub's state root (its state root is \
+                 0f0f); no hub can record it now, so it is NOT offered. Its bytes are kept \
+                 as {}.foreign-state-root",
+                path.display()
+            ),
+            "nobody typed this weight either. Do not paste new output over this \
+             expectation."
         );
     }
 }
