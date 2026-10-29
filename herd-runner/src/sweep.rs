@@ -660,4 +660,62 @@ mod tests {
         // no name `spool_path` can produce that this reads as another job.
         assert_eq!(parse_name("j7--1"), Some((JobId::new("j7-"), 1)));
     }
+
+    /// **The startup reaper deletes every spool before this sweep can see
+    /// one.** Reproduces the composition defect behind `j0000001561`
+    /// (ORCH-163).
+    ///
+    /// Both halves are correct alone and both have a green test of their own:
+    /// `reclaim::tests::the_reaper_reclaims_an_output_spool_a_previous_life_left_behind`
+    /// asserts the spool is gone, and
+    /// `a_spool_a_previous_runner_left_is_picked_up_with_its_files` above
+    /// asserts it is picked up. Neither runs the startup sequence, so nothing
+    /// noticed that they walk the same directory and that the reaper goes
+    /// first.
+    ///
+    /// `run_until` calls `Confined::prepare` (`lib.rs:2633`), which calls
+    /// `reclaim_a_past_life` (`confine.rs:502`), which `remove_dir_all`s
+    /// every entry under `outputs/` (`reclaim.rs:449-468`) with no guard at
+    /// all. Twenty-nine lines later it calls `pick_up_collections`
+    /// (`lib.rs:2662`) — this sweep — on a directory that is now empty.
+    ///
+    /// This asserts the behaviour the sweep was built for, so it is **red**
+    /// while the defect stands. `#[ignore]`d so the workspace suite reports
+    /// it as what it is — a skip, never a pass (D27, invariant 5) — rather
+    /// than going red for a defect nobody has yet been asked to fix.
+    #[test]
+    #[ignore = "reproduces ORCH-163; run it on purpose. Red until the reaper stops deleting what the sweep re-adopts"]
+    fn the_reaper_does_not_delete_a_spool_this_sweep_would_have_resumed() {
+        let _reaping = crate::testing::one_reaper_at_a_time();
+        let (temp, root) = a_root("sweep-vs-reaper");
+        let spool = a_spool(
+            &root,
+            "j0000001561-2",
+            &[(
+                "packs/e49deee1/objects/one.pack",
+                b"the bytes a requester is owed",
+            )],
+        );
+
+        // Exactly what `Confined::prepare` does, in the order it does it.
+        let ceiling = crate::cgroup::Ceiling::detect(
+            crate::confine::Confinement::with_data_root(temp.path()).job_limits(),
+            None,
+        );
+        let reaped = crate::reclaim::reclaim_a_past_life(&root, &ceiling);
+        let (swept, said) = pick_up(&root);
+
+        assert!(
+            spool.exists(),
+            "the reaper removed {}, so the sweep that exists to re-adopt it reads an \
+             empty directory. The reaper said: {reaped:?}",
+            spool.display()
+        );
+        assert_eq!(
+            swept.len(),
+            1,
+            "a collection the hub is still owed must survive the startup that is \
+             supposed to offer it again. Reaper: {reaped:?}; sweep: {said:?}"
+        );
+    }
 }
