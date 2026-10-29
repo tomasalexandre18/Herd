@@ -231,11 +231,11 @@ under `{out}` that is a regular file, with four exclusions and none of them
 a pack, so a build job writing `{out}/packs/<id>` would stream ~400 MiB
 runner → hub → requester as record evidence, against the hub's 200 GB
 output budget: the exact byte path D10 removed and D152 then has to sweep.
-**The shape must be settled before any pack code is briefed**, and the two
-candidates are not equal. A fifth exclusion in `outputs.rs` can be undone
-by a later edit to that list; writing packs **outside `{out}` entirely**
-cannot, and the second is what D10's byte-path argument implies. Until it
-is settled the pack's path here is **unspecified**, not `{out}/packs/<id>`.
+**The shape is settled: D223** (2026-10-29). The two candidates were not
+equal. A fifth exclusion in `outputs.rs` can be undone by a later edit to
+that list; a pack that is **gone from `{out}` before the record walk runs**
+cannot, and the second is what D10's byte-path argument implies. So that is
+the rule, and the pack's path here is **never `{out}/packs/<id>`**.
 
 E-13's content-addressed storage is then simply storing objects by their
 sha256 name, which is what their pack already is.
