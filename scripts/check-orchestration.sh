@@ -15,9 +15,9 @@
 # $tmp: no network, no credential, nothing outside $tmp is written.
 #
 # Cost: each expect_red/expect_green runs check-docs.sh over a fresh full
-# copy of the real repository -- 32 whole-corpus runs as this file stands.
+# copy of the real repository -- 38 whole-corpus runs as this file stands.
 # That multiplier is the constraint on anyone adding an all-docs rule to
-# check-docs.sh: a rule linear in the corpus is paid 32 times here, and the
+# check-docs.sh: a rule linear in the corpus is paid 38 times here, and the
 # `docs` CI job is capped at 5 minutes. Adding a case here costs one more
 # run of every rule. The fixtures are deliberately not trimmed: a control
 # measured on a toy corpus is not known to work on the real one.
@@ -81,10 +81,16 @@ bad()  { fail=$((fail+1)); printf 'FAIL  %s\n%s\n' "$1" "$2"; }
 # early and there is no writer to kill. Keep it that way -- an assertion
 # here must not pipe a captured output into `grep`.
 
-# A fresh copy of the files check-docs.sh reads.
+# A fresh copy of the files check-docs.sh reads. The last three arrived with
+# the release-notes rule (ORCH-162): it reads the workspace version out of
+# Cargo.toml, wants the notes file beside it, and asserts that release.yml
+# really puts that file on the page. Named file by file rather than as whole
+# directories, because this copy is made 38 times below and `deploy` and
+# `.github` hold a megabyte between them that no check here reads.
 fresh() {
   rm -rf "$tmp/repo"; mkdir -p "$tmp/repo"
-  (cd "$root" && cp -r --parents CLAUDE.md README.md docs scripts .claude/agents .claude/hooks .claude/settings.json "$tmp/repo")
+  (cd "$root" && cp -r --parents CLAUDE.md README.md docs scripts .claude/agents .claude/hooks .claude/settings.json \
+      Cargo.toml deploy/release-notes .github/workflows/release.yml "$tmp/repo")
 }
 # expect_red <name> <grep pattern of the message> : check-docs.sh on $tmp/repo fails and says why
 expect_red() {
@@ -193,6 +199,45 @@ expect_red "hook not executable" 'not executable'
 fresh; printf '{ not json' > "$tmp/repo/.claude/settings.json"
 expect_red "settings.json invalid" 'not valid JSON'
 
+# A release's notes, the version's own file (ORCH-162). Five cases, and each
+# one is a way v0.4.0's page could happen again:
+#
+#  - the notes for the workspace's version are simply not there -- a version
+#    bump that forgot them, which is the whole reason the rule exists;
+#  - they are there and blank, which publishes an empty half and would
+#    satisfy any rule that only tested for a path;
+#  - the workflow stops reading the directory, so the file is written, kept,
+#    reviewed, and reaches nobody;
+#  - the workflow's *second* assembly drops the piece. That `cat` replaces
+#    the body the first one published, so this is the one defect here that
+#    looks green in a release's own log: the notes go up, and a few minutes
+#    later the image step takes them down again;
+#  - the workflow is made to fail on an absent notes file. That must stay
+#    impossible: the body is never allowed to cost a tag its binaries (D162),
+#    and a rehearsal with an empty tag input has no notes of its own.
+#
+# The notes file is removed by removing the directory rather than by naming
+# `0.4.0.md`: the version belongs to Cargo.toml, and a case that spells it
+# out here would have to be edited at every bump and would be testing its own
+# copy of the parse.
+fresh; rm -rf "$tmp/repo/deploy/release-notes"
+expect_red "no notes file for the workspace version" 'deploy/release-notes/.*does not exist'
+fresh; for f in "$tmp/repo"/deploy/release-notes/*.md; do : > "$f"; done
+expect_red "a blank notes file" 'deploy/release-notes/.*is empty'
+fresh; sed -i 's#deploy/release-notes/#deploy/release-note/#g' "$tmp/repo/.github/workflows/release.yml"
+expect_red "release.yml no longer reads the notes directory" 'never reads deploy/release-notes/'
+fresh; sed -i 's/body-image\.md body-notes\.md/body-image.md/' "$tmp/repo/.github/workflows/release.yml"
+expect_red "the second assembly drops the notes" 'without the notes between the generated half'
+fresh; sed -i '/^ *: > body-notes\.md$/d' "$tmp/repo/.github/workflows/release.yml"
+expect_red "an absent notes file made fatal" 'truncate body-notes.md to empty'
+# And the other direction, in one case because it is one property: nothing is
+# required of a version that has already shipped. An old release keeps its
+# notes in the tree -- that history is the point -- and an old file that is
+# blank is not this rule's business either, since no page is waiting on it.
+fresh; printf 'The notes of a release that has shipped.\n' > "$tmp/repo/deploy/release-notes/0.1.0.md"
+: > "$tmp/repo/deploy/release-notes/0.0.1.md"
+expect_green "notes for versions that are not the workspace's, one of them blank"
+
 echo "== the number is an identifier: the historical gaps stay silent, a new gap is noted, nothing is rewritten"
 fresh; before=$(sha256sum "$tmp/repo/docs/decisions.md")
 out=$(cd "$tmp/repo" && ./scripts/check-docs.sh 2>&1)
@@ -205,7 +250,11 @@ echo "== two branches allocating the same number collide at integration, and the
 # Without -e, a failed cd would leave every relative path below pointing at the
 # real repository, so each step that decides where we are is fatal.
 mkdir -p "$tmp/corpus" && cd "$tmp/corpus" || { echo "FATAL: cannot enter $tmp/corpus; touching nothing" >&2; exit 1; }
-git init -q . && cp -r "$root/scripts" . && mkdir -p docs/orchestration/history .claude/agents .claude/hooks && cp "$root/CLAUDE.md" "$root/README.md" . && cp -r "$root/docs/orchestration" docs/ && cp "$root/.claude/agents/"*.md .claude/agents/ && cp "$root/.claude/hooks/"*.sh .claude/hooks/ && cp "$root/.claude/settings.json" .claude/ && cp "$root/docs/coverage.md" "$root/docs/status.md" docs/ \
+# The last three copies are what the release-notes rule reads (ORCH-162);
+# without them this fixture goes red for a reason that has nothing to do with
+# decision numbers, which is what it did while that rule was being written.
+git init -q . && cp -r "$root/scripts" . && mkdir -p docs/orchestration/history .claude/agents .claude/hooks .github/workflows deploy && cp "$root/CLAUDE.md" "$root/README.md" . && cp -r "$root/docs/orchestration" docs/ && cp "$root/.claude/agents/"*.md .claude/agents/ && cp "$root/.claude/hooks/"*.sh .claude/hooks/ && cp "$root/.claude/settings.json" .claude/ && cp "$root/docs/coverage.md" "$root/docs/status.md" docs/ \
+  && cp "$root/Cargo.toml" . && cp -r "$root/deploy/release-notes" deploy/ && cp "$root/.github/workflows/release.yml" .github/workflows/ \
   || { echo "FATAL: corpus setup failed" >&2; exit 1; }
 printf '# Decisions\n\n## 2026-10-01 — D1 One\n\nBody.\n\n## 2026-10-02 — D2 Two\n\nBody.\n\n## 2026-10-03 — D3 Three\n\nBody.\n' > docs/decisions.md
 git add -A >/dev/null && git -c user.name=t -c user.email=t@t commit -qm base
