@@ -10628,3 +10628,58 @@ bullet when the fetch endpoint lands (ORCH-159).
 `history/2026-10-29-joining-mesh-residue.md`; `docs/joining.md`; D10, D11;
 `docs/plan.md` M11; `docs/architecture.md` line 1276; invariants 1, 3 and 7;
 ORCH-159.
+
+## 2026-10-29 — D210 Completing a published release's notes is Alexa's own act
+
+**Context.** `v0.4.0` published at 13:50 UTC with its generated head and the
+standing install notice, and **without the half written for it**.
+`release.yml` assembles a body from three pieces it generates itself and
+**never reads** the prepared human half — measured, `grep -rn
+'release-v0.4.0-body' .github/ scripts/` returns nothing — so supplying it
+was always a human step, and the brief for the tag did not carry it. The
+page therefore went out missing both operator cautions: the 5 s stop grace,
+and the order of operations that puts `herd-hub report` in front of an old
+root before a hub refuses the whole of it over one torn `job.json`
+(ORCH-106, ORCH-161).
+
+**Then two permission walls refused the repair, and neither is a defect.**
+The auto-mode classifier refused `herd-step` the one
+`gh release edit v0.4.0 --notes-file …` (*External System Writes*), and
+`.claude/hooks/orchestrator-guard.sh` refused the orchestrator the same
+command (*gh write verb*). Both refusals were correct: an instruction from
+another agent is not the consent the permission system withheld. **Alexa ran
+the one command himself.**
+
+**Rule (2026-10-29).** Completing a published release's notes is **Alexa's
+own act**, in the same class as pushing the tag and publishing the release
+(`CLAUDE.md` *Git and main*; `workflow.md` step 8) and not covered by
+ORCH-001. No brief may assign it to an agent, and no agent retries it when a
+wall refuses: the refusal is a finding, handed off, never routed around.
+Whoever writes a release brief carries the paste **in the same order as the
+tag**, with the file to use, so the page is never public and incomplete in
+between.
+
+**Why this is a decision and not a board row.** It is not a proposal waiting
+on Alexa — he has already performed it, in the only way the permission system
+permits — and it constrains what every future release brief may contain,
+which is the shape of a rule rather than of open work. The *proposal* is a
+separate thing and stays a row: **ORCH-162**, a per-release
+`deploy/release-notes/<version>.md` that `release.yml` `cat`s as a fourth
+piece and `check-docs.sh` asserts exists for the workspace version.
+
+**Retirement condition, stated so this entry does not outlive its reason.**
+If ORCH-162 lands, the notes ship in the tree, the page is complete the
+moment it is published, and there is nothing left for this rule to govern.
+Until then it holds. **Neither wall is to be weakened to discharge it** —
+widening a permission so an agent can write to a public page is a larger
+change than the problem, and it was not what was decided.
+
+**Evidence.** `history/2026-10-29-tag-v0.4.0.md` *Not done, and why*, *The
+body paste, attempted and refused* and *Decisions needed* 1 and 2;
+`history/2026-10-29-release-v0.4.0.md` line 33, which said the paste was a
+human step before the tag was pushed; `.github/workflows/release.yml`;
+`deploy/release-notice.md`; re-measured at this landing — the live body is
+**805 lines**, the prepared file byte-identical plus one trailing newline
+(40 353 against 40 352 bytes), and the generated half still sha256
+`87cb889775e8d347064ae4e476670c72fb1f2ad6d5ea68ae3cc4d92c072a82d0`;
+ORCH-106, ORCH-161, ORCH-162; D132, D162, D172.
