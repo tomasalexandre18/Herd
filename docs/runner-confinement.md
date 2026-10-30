@@ -486,26 +486,99 @@ M4.
 real kernel, the real binaries and a real hub — and then prints every
 assertion this host could not make.
 
-Two assertions need cgroup v2 delegation, which a GitHub Actions runner and a
-plain login session do not have: the *named* memory outcome, and the cgroup
-branch of the startup report. On such a host they are **skipped with their
-reason** rather than failed or quietly passed. A skip prints a
-`HERD-SKIPPED:` line and appends it to `$HERD_SKIP_LOG`, because `cargo test`
-hides the stdout of a passing test — so `cargo test --workspace` alone would
-show a green run with no hint that part of it did not run.
-`scripts/test.sh` prints the log; `scripts/report-skips.sh` turns each line
-into a warning on the CI run and into its summary. A green check is not the
-same claim on every host, and that difference is meant to be visible from the
-terminal and on the pull request.
+**Twelve** assertions need cgroup v2 delegation on this workstation, which
+a GitHub Actions runner and a plain login session do not have. This
+sentence said **two** — the *named* memory outcome and the cgroup branch
+of the startup report — until 2026-10-30: it counted the first two
+written and nothing obliged it to follow the ten added after it
+(ORCH-241's class). The twelve are named in
+`scripts/expected-skips/local.txt`, which is the list and the only thing
+worth quoting, because a count means nothing across hosts (ORCH-070).
+Two of the twelve need a **block device** under the job's directory as
+well as delegation, so a delegated host whose data root is ZFS still
+cannot make them; `/mnt/ssd_980` here is one, which is why twelve is
+reachable on this machine at all. On a host that cannot make them they
+are **skipped with their reason** rather than failed or quietly passed. A
+skip prints a `HERD-SKIPPED:` line and appends it to `$HERD_SKIP_LOG`,
+because `cargo test` hides the stdout of a passing test — so
+`cargo test --workspace` alone would show a green run with no hint that
+part of it did not run. `scripts/test.sh` prints the log;
+`scripts/report-skips.sh` turns each line into a warning on the CI run
+and into its summary. A green check is not the same claim on every host,
+and that difference is meant to be visible from the terminal and on the
+pull request.
 
-To make every assertion on a machine whose login session is not delegated,
-run the test binary inside a delegated scope:
+### Making those twelve: the invocation is the finding
+
+Measured on 2026-10-30, one session, one host, the same binaries, in each
+case counting how many of the twelve assertions were *made*:
+
+| invocation | made |
+|---|---|
+| no scope — the condition every gate run has used so far | 0 of 12 |
+| `systemd-run --user --scope -p Delegate=yes <a wrapper script>` | 0 of 12 |
+| the test binary as the scope's **only** process, 12 threads | 10 of 12 |
+| scope, leaf pre-warmed, then `exec` the binary, 12 threads | 12 of 12 |
+| scope, the binary at `--test-threads 1` | 12 of 12 |
+
+**Two failures, two reasons, one count.** With no scope the refusal is
+`Permission denied (os error 13)` on creating a cgroup under the runner's
+own. Under a wrapper it is `EBUSY (os error 16)` on the *first controller
+write*, because the wrapper shell process sits directly in the scope and
+cgroup v2 forbids a cgroup from holding processes once a controller is
+enabled for its children. Both print twelve skips, so a measurement that
+records only the count cannot tell the two apart — and the second one
+looks exactly like delegation not working.
+
+**Two of the twelve are unit tests** and live in the `herd_runner` lib
+test binary, not in `confinement`:
+
+- `a_ceiling_this_host_can_carry_is_proved_and_reported_with_its_device`
+- `a_declared_ceiling_changes_what_the_inert_weight_line_says`
+
+`--list` gives ten names in `confinement` and these two in
+`herd_runner`, with no overlap, so an in-scope run of `confinement`
+alone caps at ten whatever else is right. The recipe below was
+`confinement` only until 2026-10-30 and could never have reached twelve.
 
 ```sh
-cargo test --workspace --no-run
-systemd-run --user --scope -p Delegate=yes \
-  target/debug/deps/confinement-<hash> --nocapture
+nix develop --command cargo test --workspace --no-run
+# Both binaries, each as its scope's only process. --test-threads 1 is
+# the simple cure for the EBUSY above; pre-warming the leaf and exec-ing
+# the binary also reaches twelve and keeps the threads.
+systemd-run --user --scope -p Delegate=yes -p MemoryMax=12G \
+  target/debug/deps/confinement-<hash> --test-threads 1 --nocapture
+systemd-run --user --scope -p Delegate=yes -p MemoryMax=12G \
+  target/debug/deps/herd_runner-<hash> --test-threads 1 --nocapture
 ```
+
+**`-p MemoryMax=…` is not optional on a shared host.** An uncapped
+delegated user scope escapes every enclosing ceiling this host has, and
+`scripts/bench-preflight.sh`'s check 4 then reads nothing and clears:
+`docs/orchestration/gotchas/a-delegated-scope-blinds-the-preflight.md`
+has the readings and the rule.
+
+**Pass the binary as a file, not as a shell expansion.** `systemd-run`
+expands `${…}` in the command line it is given, so a shell parameter
+expansion is eaten before the program sees it; put anything that needs a
+shell in a script and pass that script's path — remembering that the
+script's own shell process is then the thing that causes the `EBUSY`
+above.
+
+### What twelve in-scope assertions are worth, exactly
+
+The net gain is **+11, not +12**. One assertion stops being checkable
+rather than starting to pass: `a_fallback_is_shouted_not_mentioned`
+cannot be made on a host that no longer falls back, and it skips with
+its own reason — `herd-runner/src/confine.rs:1061` already writes that
+skip, so this is the design working, not a defect. So an in-scope
+expectation list is **not `local.txt` minus twelve**: it loses twelve
+names and gains that one. And
+`pressure_refuses_nothing_and_delays_nothing`
+(`herd-runner/tests/confinement.rs:3082`) appeared in **one of three**
+in-scope runs — condition-dependent, and unrelated to delegation. Both
+facts are needed before any in-scope list is blessed, or the list will
+be unstable for reasons nobody wrote down.
 
 Everything else — the disk budget against a job that hides its files, the log
 cap against a job that exits at once, the reclaim of a workspace a job locked
