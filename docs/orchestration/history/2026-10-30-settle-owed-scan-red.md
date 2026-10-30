@@ -455,8 +455,11 @@ Started and ended by me, all by a PID I held myself:
   read and never touched.
 
 Build tree: `/mnt/ssd_980/herd/build/settle-owed-scan-red`, **debug
-profile with tests, `du -sh` 12G** — a final figure, measured after the
-last build, and `du`'s own rounding is the only error in it. Deleted
+profile with tests, `du -sh` 17G** — the figure measured at deletion,
+which is the final one; `du`'s own rounding is the only error in it. It
+read 12G after the first build and 17G after the incremental rebuild of
+the fix, and quoting the first of those as the final size is the mistake
+this sentence exists to avoid. Deleted
 once the branch was pushed; the exact command and its result are in the
 agent's report. **Evidence was moved out of it first**: the gated
 binary is kept as
