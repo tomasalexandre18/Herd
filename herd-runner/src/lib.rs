@@ -1119,6 +1119,27 @@ struct Inner {
     /// path, and the report reads what it left here. `None` until then,
     /// which the report sends as "did not say" and never as nought.
     pack_store: Option<packstore::PackStore>,
+    /// Which `leaves` key families the hub has asked this runner to **keep**
+    /// as a keeper, and how many of each (M12, E-16).
+    ///
+    /// **Here, on the session, because custody outlives a connection while
+    /// the eviction that honours it does not.** It arrives twice over: in
+    /// [`FromHub::Welcome`]'s `keeper_for` on every dial — a standing
+    /// arrangement, which is why `herd-proto` put it on the one frame a
+    /// runner cannot get past — and in [`herd_proto::pack::PinPacks`] while
+    /// a link is up. Held here, it is in force **before** that connection's
+    /// own eviction pass runs, which closes the window the protocol's own
+    /// doc names: "a runner that learned it from a later frame would have a
+    /// window in which it could evict the very pack it is keeping".
+    ///
+    /// `None` is "the hub has pinned nothing here", which is every runner a
+    /// hub of this build talks to: `herd-hub/src/server.rs` still sends
+    /// `keeper_for: Vec::new()` and sends no `PinPacks` at all, which is
+    /// M12's keeper policy and not this file's. It is **never** an empty
+    /// `PinPacks`: a pinned set of no keys and a hub that named no keeper are
+    /// the same custody, and one spelling of it is one fewer thing for an
+    /// eviction to read wrong.
+    pins: Option<herd_proto::pack::PinPacks>,
 }
 
 impl Default for Inner {
@@ -1140,8 +1161,23 @@ impl Default for Inner {
             said_stale: VecDeque::new(),
             switch: herd_proto::Switch::On,
             pack_store: None,
+            pins: None,
         }
     }
+}
+
+/// The key families of a custody arrangement, as one phrase of a sentence.
+///
+/// Quoted and comma-separated, in the order the hub sent them, and **all of
+/// them**: a line that said "3 keys" would tell the owner of the machine
+/// that something is pinned here without telling her what, and what is
+/// pinned is the one thing her pack budget cannot take away.
+fn said_keys(keys: &[String]) -> String {
+    if keys.is_empty() {
+        return "no key at all".to_owned();
+    }
+    let said: Vec<String> = keys.iter().map(|key| format!("{key:?}")).collect();
+    format!("key(s) {}", said.join(", "))
 }
 
 /// What a pump says when the link's window has not opened for it (D158).
@@ -1410,6 +1446,201 @@ impl Session {
         } else {
             format!("this runner holds {count} pack(s), announced in {cut_into} frame(s)")
         }
+    }
+
+    /// Take the custody the hub's welcome declared: which key families this
+    /// runner is a **keeper** for (`FromHub::Welcome.keeper_for`, M12, E-16).
+    ///
+    /// **The welcome is authoritative, and that is why an empty list clears
+    /// what a previous connection pinned.** A hub fills `keeper_for` from its
+    /// own policy at every dial and sends [`herd_proto::pack::PinPacks`] when
+    /// that policy changes while the link is up, so the welcome is the whole
+    /// truth about custody at the moment this connection begins. A runner
+    /// that kept yesterday's custody after a hub that no longer names it
+    /// would pin packs nobody asked it to keep, for ever, with nothing able
+    /// to retract them — a hub that forgot would never send the frame that
+    /// could. `herd-proto` says the same thing from the other side: "a runner
+    /// reading an empty list is a runner with no custody".
+    ///
+    /// The count is this runner's own [`packstore::KEEP_PER_KEY`], because
+    /// the welcome carries keys and no figure. A `PinPacks` is what refines
+    /// it, and it is the frame that has a figure to refine it with.
+    ///
+    /// Answers the one line to say about it, or nothing at all for the
+    /// ordinary runner that is a keeper for nothing and was not one before.
+    pub(crate) fn keeps_for(&self, keeper_for: Vec<String>) -> Option<String> {
+        let pins = (!keeper_for.is_empty()).then(|| herd_proto::pack::PinPacks {
+            keys: keeper_for,
+            keep_per_key: packstore::KEEP_PER_KEY,
+        });
+        let was = self.with(|inner| std::mem::replace(&mut inner.pins, pins.clone()));
+        match (pins, was) {
+            (Some(pins), _) => Some(format!(
+                "this hub makes this runner a keeper for {}: the newest {} pack(s) of each are \
+                 never taken away by this runner's own pack budget, however far over it this \
+                 store is",
+                said_keys(&pins.keys),
+                pins.keep_per_key
+            )),
+            (None, Some(was)) => Some(format!(
+                "this hub names no keeper here any more: the {} key(s) this runner was keeping \
+                 are no longer pinned, and its pack budget may now take them like any other \
+                 pack. It was keeping {}",
+                was.keys.len(),
+                said_keys(&was.keys)
+            )),
+            // Every runner a hub of this build talks to: no custody now and
+            // none before, which is not news and is said at startup anyway
+            // by the budget's own line.
+            (None, None) => None,
+        }
+    }
+
+    /// Apply a [`herd_proto::pack::PinPacks`], and say so **once**.
+    ///
+    /// The frame that changes custody while a link is up. It **replaces**
+    /// what is in force rather than adding to it, for the reason
+    /// `ToHub::PacksHeld` replaces rather than appends: a frame that only
+    /// ever added could never retract, and the hub would have no way to stop
+    /// a runner keeping a key family its policy has dropped.
+    ///
+    /// One line and not one per key, and a frame that changes nothing says
+    /// that it changed nothing: an operator reading her machine's stderr has
+    /// to be able to tell a hub whose policy moved from a hub repeating
+    /// itself.
+    ///
+    /// **It does not sweep.** The pass that spends the budget runs with
+    /// whatever is in force ([`Session::sweep_packs_to_budget`]), and this
+    /// frame arriving can only mean one of two things: more is pinned, which
+    /// needs no pass because pinning never frees anything; or less is, which
+    /// leaves this store holding what it was already holding a moment ago
+    /// until the next pass. Neither is worth an eviction inside the frame
+    /// loop, where the store's one lock may be held by a fetch's ingest.
+    pub(crate) fn pin_packs(&self, pins: herd_proto::pack::PinPacks) -> String {
+        let was = self.with(|inner| {
+            let was = inner.pins.clone();
+            inner.pins = (!pins.keys.is_empty()).then(|| pins.clone());
+            was
+        });
+        if was.as_ref() == Some(&pins) {
+            return format!(
+                "the hub pins {} on this runner again, with the newest {} of each kept: nothing \
+                 about what this runner keeps has changed",
+                said_keys(&pins.keys),
+                pins.keep_per_key
+            );
+        }
+        let before = match &was {
+            Some(was) => said_keys(&was.keys),
+            None => "nothing".to_owned(),
+        };
+        if pins.keys.is_empty() {
+            return format!(
+                "the hub pins no key on this runner any more: it was keeping {before}, and its \
+                 pack budget may now take those packs like any other"
+            );
+        }
+        format!(
+            "the hub pins {} on this runner, with the newest {} pack(s) of each kept, where it \
+             was keeping {before}: none of them is taken away by this runner's own pack budget",
+            said_keys(&pins.keys),
+            pins.keep_per_key
+        )
+    }
+
+    /// What this runner's custody is, as an eviction has to read it.
+    ///
+    /// **`referenced` is empty and that is a measurement of this build, not
+    /// an oversight**: what a queued or running job references is the layout
+    /// step's knowledge and the layout step does not put it in this session
+    /// yet ([`packstore::Claims::referenced`] carries the same statement from
+    /// the other side). Nothing is lost by it today that the filesystem does
+    /// not keep: a pack already laid out for a job is **hard links** into
+    /// `objects/`, so unlinking the store's own name for those bytes leaves
+    /// the job's copy whole.
+    fn pack_claims(&self) -> packstore::Claims {
+        packstore::Claims {
+            pins: self.with(|inner| inner.pins.clone()),
+            ..packstore::Claims::default()
+        }
+    }
+
+    /// Spend this runner's pack budget: take whole packs away until the store
+    /// is inside it, honouring what the hub has pinned here (M12, E-16).
+    ///
+    /// **The one caller of [`packstore::PackStore::evict_to_budget`] in this
+    /// crate, and the reason it is here rather than beside an ingest.** The
+    /// pass may not run without the custody set, or it would evict the very
+    /// packs a keeper exists to hold; the custody set lives on the session;
+    /// and the session is reachable from this file and from no other place
+    /// that ingests a pack. `packstore::leave_packs` and `fetch` both ingest
+    /// without a session in hand, so a pass called from either would run with
+    /// `pins: None` — which is worse than no pass at all.
+    ///
+    /// It **also** finishes an eviction a kill stopped in the middle, before
+    /// any budget is read, which is why it runs even for a store nobody
+    /// bounded: finishing a removal that was already decided is not spending
+    /// a budget.
+    ///
+    /// Answers the lines to say, rather than printing, like
+    /// [`Session::announce_packs_held`] beside it — and answers **none** for
+    /// the ordinary runner with no budget and nothing half-removed, whose
+    /// startup line has already said that nothing bounds its store.
+    pub(crate) fn sweep_packs_to_budget(&self, data_root: &Path) -> Vec<String> {
+        let claims = self.pack_claims();
+        let store = match self.pack_store(data_root) {
+            Ok(store) => store,
+            Err(why) => {
+                return vec![format!(
+                    "this runner's pack store is NOT swept against its budget and whatever it \
+                     holds, it holds: {why}"
+                )]
+            }
+        };
+        let swept = match store.evict_to_budget(&claims) {
+            Ok(swept) => swept,
+            Err(why) => {
+                return vec![format!(
+                    "this runner's pack store is NOT swept against its budget and whatever it \
+                     holds, it holds: {why}"
+                )]
+            }
+        };
+        let moved = swept.packs_removed > 0 || swept.objects_removed > 0;
+        let Some(budget) = swept.budget else {
+            if !moved {
+                return Vec::new();
+            }
+            let mut lines = vec![format!(
+                "this runner's pack store had {} pack(s) half taken away when something \
+                 stopped it, and this pass has finished them: {} object(s) gone and {} freed. \
+                 It holds {} and nothing bounds it",
+                swept.packs_removed,
+                swept.objects_removed,
+                crate::size::measured_bytes(swept.bytes_freed),
+                crate::size::measured_bytes(swept.bytes_after)
+            )];
+            lines.extend(swept.said);
+            return lines;
+        };
+        let mut lines = vec![format!(
+            "this runner's pack store held {} and holds {} of the {} it may hold \
+             ({}): {} pack(s) and {} object(s) taken away, freeing {}{}",
+            crate::size::measured_bytes(swept.bytes_before),
+            crate::size::measured_bytes(swept.bytes_after),
+            crate::size::show_bytes(budget),
+            packstore::PACK_BUDGET_FLAG,
+            swept.packs_removed,
+            swept.objects_removed,
+            crate::size::measured_bytes(swept.bytes_freed),
+            if swept.within_budget {
+                ""
+            } else {
+                ", and it is still over its budget"
+            }
+        )];
+        lines.extend(swept.said);
+        lines
     }
 
     /// How many results are waiting to be acknowledged.
@@ -3843,8 +4074,17 @@ pub async fn serve_once(config: Config, session: Session, confined: Arc<Confined
         Some(FromHub::Welcome {
             state_root,
             version_note,
+            keeper_for,
             ..
         }) => {
+            // What this runner keeps for the fleet, taken **before the link
+            // is attached and before anything sweeps this store**: the
+            // eviction pass below reads it, and a pass that ran first would
+            // be free to take away the very packs this welcome is asking
+            // this runner to hold (M12, E-16).
+            if let Some(line) = session.keeps_for(keeper_for) {
+                eprintln!("herd-runner: {line}");
+            }
             // What the hub has to say about the gap between its build and
             // this one (E-51). On this machine's stderr, because the person
             // who can move this runner to another version is the person
@@ -3895,6 +4135,37 @@ pub async fn serve_once(config: Config, session: Session, confined: Arc<Confined
     session.offer_swept_collections();
     // And what every probe says, before this connection can be dispatched on.
     session.announce_capabilities();
+    // And before it says what it holds: what its own budget takes away, with
+    // this connection's custody in force (M12, E-16).
+    //
+    // **The pass runs here, and the order with the announcement is the whole
+    // of why.** An announcement that went first would leave the hub holding
+    // this runner as a holder of packs this pass is about to take away, and
+    // the frame set has no retraction but a later, whole announcement: the
+    // hub would offer a holder that cannot serve, which is the one outcome
+    // the eviction's own order exists to avoid (ORCH-240). Swept first, the
+    // announcement that follows is the truth about the disk as it is now.
+    //
+    // Off the reactor, like every other walk of this disk (`job.rs`'s
+    // `workspace.measure()`): the pass reads every manifest, unlinks
+    // objects, and takes the store's one lock — which a fetch belonging to a
+    // job of the *previous* connection may be holding, because a job does
+    // not end when a link does.
+    {
+        let sweeping = session.clone();
+        let root = confined.root().path().to_path_buf();
+        match tokio::task::spawn_blocking(move || sweeping.sweep_packs_to_budget(&root)).await {
+            Ok(lines) => {
+                for line in lines {
+                    eprintln!("herd-runner: {line}");
+                }
+            }
+            Err(error) => eprintln!(
+                "herd-runner: this runner's pack store is NOT swept against its budget and \
+                 whatever it holds, it holds: the pass did not finish: {error}"
+            ),
+        }
+    }
     // And what this runner holds, unprompted (D231 decision 5). After the
     // capabilities rather than before them for no reason beyond ordering:
     // both are facts about this runner that the hub cannot work out for
@@ -4110,6 +4381,15 @@ async fn serve_hub(
             // said.
             FromHub::ExpectTransfer(expect) => {
                 eprintln!("herd-runner: {}", session.granted().pushed_by_hub(&expect));
+            }
+            // Custody changing while the link is up (M12, E-16). The welcome
+            // is where it ordinarily arrives — a standing arrangement, in
+            // force before this connection's own eviction pass — and this
+            // frame is the hub's way of moving it without waiting for a
+            // redial. Applied and said once; what it does not do, and why,
+            // is on [`Session::pin_packs`].
+            FromHub::PinPacks(pins) => {
+                eprintln!("herd-runner: {}", session.pin_packs(pins));
             }
             FromHub::Refused { reason } => return Err(Refusal(reason).into()),
             FromHub::StandBy {
@@ -6017,6 +6297,256 @@ mod tests {
             (Some(announced.bytes), u32::try_from(announced.packs).ok()),
             "the report's figures and the announcement's store agree, which is asserted \
              here rather than assumed"
+        );
+    }
+
+    /// The one key family these custody tests file every planted pack under.
+    const A_KEY_FAMILY: &str = "pack";
+
+    /// Three packs of **one length**, which is what makes the count these
+    /// tests assert independent of the order a pass takes them in.
+    ///
+    /// The eviction order is by age, and a file's mtime on Linux is taken
+    /// from a coarse clock whose granularity is a scheduler tick: three
+    /// packs planted in one loop can be filed in the same instant, and the
+    /// id then breaks the tie. With three equal packs it does not matter
+    /// which — any two of them cover the overrun and no one of them does —
+    /// so the assertion is about the budget and not about a clock. Which
+    /// pack goes is `packstore`'s own measurement, where the fixture can
+    /// plant the mtimes it needs.
+    const CUSTODY_LENGTHS: [usize; 3] = [1_000, 1_000, 1_000];
+
+    /// The budget the custody tests give that store: 3 000 bytes in three
+    /// packs against 1 500, so one pack has to stay and two have to go,
+    /// whichever two.
+    const A_BUDGET_THE_PLANTED_STORE_IS_OVER: u64 = 1_500;
+
+    /// Plant [`CUSTODY_LENGTHS`]'s three packs, file every one of them under
+    /// one key family, and give the store a budget it is over.
+    ///
+    /// The key goes down through [`packstore::PackStore::remember_key`] and
+    /// not by writing `pack.key` here, because what an eviction reads is
+    /// what `leave_packs` wrote: a fixture that spelled that file itself
+    /// would pass while the two disagreed.
+    fn a_keyed_store_over_its_budget(data_root: &Path) -> u64 {
+        let (bytes, packs) = plant_a_pack_store(data_root, &CUSTODY_LENGTHS);
+        assert!(
+            bytes > A_BUDGET_THE_PLANTED_STORE_IS_OVER,
+            "the premise of these tests is a store over its budget, and it holds {bytes}"
+        );
+        let store = packstore::PackStore::open(data_root).expect("the store opens");
+        for id in store.held_packs().expect("the store lists what it holds") {
+            store
+                .remember_key(&id, A_KEY_FAMILY)
+                .expect("the key family goes down beside the manifest");
+        }
+        // `main.rs`'s own call: it sets the budget and it is the only thing
+        // that measures the store.
+        let line = packstore::take_budget(data_root, Some(A_BUDGET_THE_PLANTED_STORE_IS_OVER));
+        assert!(
+            line.contains(&format!("in {packs} pack(s)")),
+            "the fixture is the size it claims: {line}"
+        );
+        packs
+    }
+
+    /// What this store holds now, read off the disk and not off a figure.
+    fn packs_left_in(data_root: &Path) -> usize {
+        packstore::PackStore::open(data_root)
+            .expect("the store opens")
+            .held_packs()
+            .expect("the store lists what it holds")
+            .len()
+    }
+
+    /// **A keeper keeps, under a budget that would otherwise take it, a pack
+    /// an unpinned runner loses** (M12, E-16).
+    ///
+    /// The milestone's own clause, asserted here at the seam this task
+    /// built — welcome → [`Session::keeps_for`] → [`Session::pack_claims`] →
+    /// the pass — and against the real binaries as processes in
+    /// `herd-hub/tests/pack_custody.rs`. Both, because they prove different
+    /// things: that file proves a runner started on a disk honours its hub,
+    /// and this one proves which of this session's fields the pass reads.
+    #[test]
+    fn a_keeper_keeps_what_an_unpinned_runner_s_budget_takes() {
+        // One: no custody, which is every runner a hub of this build
+        // welcomes.
+        let plain = testing::TempDir::new("pack-custody-unpinned");
+        let packs = a_keyed_store_over_its_budget(plain.path()) as usize;
+        let root = root::DataRoot::open(plain.path()).expect("a throwaway data root");
+        let unpinned = Session::new();
+        assert!(
+            unpinned.keeps_for(Vec::new()).is_none(),
+            "a runner the hub names no keeper for has nothing to say about custody"
+        );
+        let said = unpinned.sweep_packs_to_budget(root.path()).join("\n");
+        let left = packs_left_in(root.path());
+        assert!(
+            left < packs,
+            "a store over its budget with nothing pinned loses packs. It said:\n{said}"
+        );
+        assert_eq!(
+            left, 1,
+            "and it loses exactly two of the three, which is what coming under \
+             {A_BUDGET_THE_PLANTED_STORE_IS_OVER} bytes costs. It said:\n{said}"
+        );
+
+        // Two: the same disk, the same budget, and a hub that names this
+        // runner a keeper for the family all three packs are filed under.
+        let keeper_at = testing::TempDir::new("pack-custody-keeper");
+        assert_eq!(
+            a_keyed_store_over_its_budget(keeper_at.path()) as usize,
+            packs,
+            "the two fixtures are the same store, or the comparison is not one"
+        );
+        let keeper_root = root::DataRoot::open(keeper_at.path()).expect("a data root");
+        let keeper = Session::new();
+        let custody = keeper
+            .keeps_for(vec![A_KEY_FAMILY.to_owned()])
+            .expect("a keeper says what it keeps");
+        assert!(
+            custody.contains(A_KEY_FAMILY),
+            "and says which family, because that is what its budget cannot take: {custody}"
+        );
+        let said = keeper.sweep_packs_to_budget(keeper_root.path()).join("\n");
+        assert_eq!(
+            packs_left_in(keeper_root.path()),
+            packs,
+            "a keeper keeps every pack of a pinned family, however far over its budget the \
+             store is. It said:\n{said}"
+        );
+        assert!(
+            said.contains("pinned here as a keeper's"),
+            "and says that it could not come under its budget and why, rather than staying \
+             over it in silence. It said:\n{said}"
+        );
+    }
+
+    /// **Custody is taken from every welcome, and an empty one clears it.**
+    ///
+    /// The "kept across a redial" half of the clause. The session outlives a
+    /// connection, so what is asserted is that a second welcome leaves the
+    /// set in force — in force *before* that connection's pass, which is the
+    /// order `serve_once` keeps — and that a hub which names no keeper here
+    /// any more really takes it away. An empty `keeper_for` is the whole
+    /// truth about custody and not a silence: a runner that kept yesterday's
+    /// arrangement could never be told to stop.
+    #[test]
+    fn custody_is_taken_from_every_welcome_and_an_empty_one_clears_it() {
+        let session = Session::new();
+        let pinned = Some(herd_proto::pack::PinPacks {
+            keys: vec![A_KEY_FAMILY.to_owned()],
+            keep_per_key: packstore::KEEP_PER_KEY,
+        });
+        let first = session
+            .keeps_for(vec![A_KEY_FAMILY.to_owned()])
+            .expect("a keeper says so");
+        assert_eq!(
+            session.pack_claims().pins, pinned,
+            "the welcome's keys, at this runner's own default count: {first}"
+        );
+        // The redial: one session, a second welcome.
+        let again = session
+            .keeps_for(vec![A_KEY_FAMILY.to_owned()])
+            .expect("said on every connection, because it is true on every connection");
+        assert_eq!(again, first, "one arrangement, one sentence");
+        assert_eq!(
+            session.pack_claims().pins, pinned,
+            "and the set is in force again before anything on this connection sweeps"
+        );
+        let withdrawn = session
+            .keeps_for(Vec::new())
+            .expect("custody being taken away is said, because it changes what a budget may do");
+        assert!(
+            withdrawn.contains("no keeper here any more"),
+            "{withdrawn}"
+        );
+        assert_eq!(
+            session.pack_claims().pins, None,
+            "an empty keeper_for is no custody and not a custody of no keys"
+        );
+        assert!(
+            session.keeps_for(Vec::new()).is_none(),
+            "and the ordinary runner, welcomed again, still says nothing about custody"
+        );
+    }
+
+    /// **A `PinPacks` arriving after the welcome replaces the set, and says
+    /// so once.**
+    #[test]
+    fn a_pin_packs_frame_replaces_the_set_and_says_so_once() {
+        let session = Session::new();
+        session
+            .keeps_for(vec![A_KEY_FAMILY.to_owned()])
+            .expect("the welcome made this runner a keeper");
+        let moved = herd_proto::pack::PinPacks {
+            keys: vec!["reference".to_owned()],
+            keep_per_key: 2,
+        };
+        let said = session.pin_packs(moved.clone());
+        assert!(
+            said.contains("\"reference\"")
+                && said.contains(A_KEY_FAMILY)
+                && said.contains("newest 2 pack(s)"),
+            "one line, naming what is kept now, how many of each, and what was kept before: \
+             {said}"
+        );
+        assert_eq!(
+            session.pack_claims().pins,
+            Some(moved.clone()),
+            "the frame replaces the welcome's set rather than adding to it, so a hub can \
+             retract a family as well as add one"
+        );
+        let again = session.pin_packs(moved);
+        assert!(
+            again.contains("nothing about what this runner keeps has changed"),
+            "a hub repeating itself is said as a repetition, so an operator can tell it \
+             from a policy that moved: {again}"
+        );
+        let none = session.pin_packs(herd_proto::pack::PinPacks {
+            keys: Vec::new(),
+            keep_per_key: packstore::KEEP_PER_KEY,
+        });
+        assert!(none.contains("pins no key on this runner any more"), "{none}");
+        assert_eq!(
+            session.pack_claims().pins, None,
+            "a frame of no keys is custody withdrawn, and never a custody of nothing that \
+             an eviction has to read"
+        );
+    }
+
+    /// **A store nothing bounds is a store nothing sweeps, and the pass says
+    /// nothing about it.**
+    ///
+    /// Two things at once, and the second is why the first is asserted here
+    /// rather than in `packstore`: a pass that printed a line on every
+    /// connection of every runner that has no `--pack-budget` would be new
+    /// noise on every machine in the fleet, saying what the startup line
+    /// already said.
+    #[test]
+    fn a_store_nothing_bounds_is_swept_and_says_nothing() {
+        let temp = testing::TempDir::new("pack-custody-no-budget");
+        let (bytes, packs) = plant_a_pack_store(temp.path(), &PLANTED_LENGTHS);
+        let _line = packstore::take_budget(temp.path(), None);
+        let root = root::DataRoot::open(temp.path()).expect("a throwaway data root");
+        let session = Session::new();
+        assert!(
+            session.sweep_packs_to_budget(root.path()).is_empty(),
+            "nothing to say about a store nobody bounded and nothing half-removed"
+        );
+        assert_eq!(
+            packs_left_in(root.path()),
+            packs as usize,
+            "and nothing taken away: absent is nobody said, never nought"
+        );
+        assert_eq!(
+            packstore::PackStore::open(root.path())
+                .expect("the store opens")
+                .usage()
+                .bytes,
+            bytes,
+            "down to the byte"
         );
     }
 }
