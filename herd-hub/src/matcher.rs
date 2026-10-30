@@ -330,11 +330,38 @@ pub struct Placing {
     pub drain_first_limit: Option<Duration>,
     /// How many requirement readings one runner may run at once (D169).
     pub readings_at_once: Option<u32>,
+    /// How many of the packs this job's `needs` resolve to each connected
+    /// runner already holds, by runner name (E-23).
+    ///
+    /// **Empty for every job that needs nothing**, which is every job Herd
+    /// runs today: nothing fills `needs` unless a declaration asks. The term
+    /// below is then zero on every seat, so the order is the order it was
+    /// before this field existed — asserted, byte for byte, by
+    /// `a_job_with_no_needs_places_byte_identically_to_before_e23`.
+    ///
+    /// Looked up outside the claim step by whoever has the registry, for the
+    /// reason [`Parent`] is: this is a pure function of a record and a fleet,
+    /// and a holding it read for itself would make it a function of a disk.
+    ///
+    /// **Never a requester's word** (invariant 6). A requester names the keys
+    /// its job consumes; who holds the pack a key resolves to is what runners
+    /// announced to this hub, and the hub alone turns it into a preference.
+    pub holds_what_it_needs: BTreeMap<String, usize>,
 }
 
 impl Placing {
     fn drain_first_limit(&self) -> Duration {
         self.drain_first_limit.unwrap_or(DRAIN_FIRST_LIMIT)
+    }
+
+    /// How many of this job's needed packs that runner already holds (E-23).
+    ///
+    /// Absent is zero and means "it holds none of them", which is the same
+    /// answer a runner that holds none gives: there is nothing to tell apart
+    /// here, because a runner that is not in the map and a runner that holds
+    /// nothing of this job's are the same machine to this job.
+    fn holds(&self, runner: &str) -> usize {
+        self.holds_what_it_needs.get(runner).copied().unwrap_or(0)
     }
 
     /// Never zero: a cap of zero is a reading that is never placed, and every
@@ -1222,9 +1249,17 @@ pub fn place(
     };
 
     // Among the most preferred eligible runners, one that is free now takes
-    // it. Ties go by name, so that the same fleet makes the same choice
-    // twice: a placement nobody can predict is a placement nobody can
-    // explain.
+    // it. Then, at equal preference, the machine that already holds more of
+    // what this job needs (E-23). Then the name, so that the same fleet makes
+    // the same choice twice: a placement nobody can predict is a placement
+    // nobody can explain.
+    //
+    // **Three terms on one order, and not a second mechanism.** The
+    // preference is the declared integer and stays the first word: a holder
+    // never beats a machine the fleet said it prefers, which is why `best`
+    // above is computed without consulting a holding at all. And the locality
+    // term is zero on every seat of a job that needs nothing, so the name
+    // below decides exactly what it decided before.
     let free = |only_at_best: bool| {
         let mut free: Vec<usize> = (0..seats.len())
             .filter(|at| matches!(verdicts[*at], Verdict::Now(_)))
@@ -1234,9 +1269,32 @@ pub fn place(
             seats[*right]
                 .preference
                 .cmp(&seats[*left].preference)
+                .then_with(|| {
+                    placing
+                        .holds(&seats[*right].name)
+                        .cmp(&placing.holds(&seats[*left].name))
+                })
                 .then_with(|| seats[*left].name.cmp(&seats[*right].name))
         });
         free
+    };
+    // Which equally preferred machines this job was preferred *to* for
+    // holding what it needs, in the order `free` put them. Empty whenever the
+    // term decided nothing — which is always, for a job that needs nothing —
+    // so the sentence below never claims a reason it did not have.
+    let passed_over = |chosen: usize, among: &[usize]| -> Vec<String> {
+        let held = placing.holds(&seats[chosen].name);
+        if held == 0 {
+            return Vec::new();
+        }
+        among
+            .iter()
+            .copied()
+            .filter(|at| *at != chosen)
+            .filter(|at| seats[*at].preference == seats[chosen].preference)
+            .filter(|at| placing.holds(&seats[*at].name) < held)
+            .map(|at| seats[at].name.clone())
+            .collect()
     };
     let fitted_at = |at: usize| match &verdicts[at] {
         Verdict::Now(fitted) => *fitted,
@@ -1247,14 +1305,18 @@ pub fn place(
             tmpfs_mib: 0,
         },
     };
-    if let Some(at) = free(true).first().copied() {
+    let at_best = free(true);
+    if let Some(at) = at_best.first().copied() {
+        let fitted = fitted_at(at);
+        let locality = locality_sentence(record, &seats[at], placing, &passed_over(at, &at_best));
         return claim(
             record,
             &mut seats[at],
-            fitted_at(at),
+            fitted,
             eligible,
             None,
             placing,
+            locality,
         );
     }
 
@@ -1284,13 +1346,17 @@ pub fn place(
                 roughly(waited),
                 roughly(stickiness.limit)
             );
+            let fitted = fitted_at(at);
+            let locality =
+                locality_sentence(record, &seats[at], placing, &passed_over(at, &elsewhere));
             return claim(
                 record,
                 &mut seats[at],
-                fitted_at(at),
+                fitted,
                 eligible,
                 Some(moved),
                 placing,
+                locality,
             );
         }
     }
@@ -1360,6 +1426,62 @@ fn reasons(verdicts: &[Verdict], of: impl Fn(&Verdict) -> Option<String>) -> Str
         .join("; and ")
 }
 /// Take the labels for this job on this runner and build E-36's line.
+/// What this machine already holds of what this job needs, and whether
+/// holding it is what chose the machine (E-23, E-36).
+///
+/// `None` for a job that needs nothing, which is the whole of the frozen
+/// behaviour: the clause is not shortened for those jobs, it is absent, so
+/// the claim's sentence is the same bytes it was before this existed.
+///
+/// `passed_over` is the equally preferred machines that could have taken this
+/// job now and hold fewer of its packs. It is empty whenever the term decided
+/// nothing, and the sentence then says what the machine holds without
+/// claiming that is why it was chosen — an operator who reads "it was
+/// preferred for holding this" on a one-machine fleet learns something false
+/// about his own hub.
+fn locality_sentence(
+    record: &JobRecord,
+    seat: &Seat,
+    placing: &Placing,
+    passed_over: &[String],
+) -> Option<String> {
+    if record.needs.is_empty() {
+        return None;
+    }
+    let needed = record.needs.len();
+    let keys = record.needs.join(", ");
+    let held = placing.holds(&seat.name);
+    // One pack is the ordinary case of a job that consumes anything at all,
+    // and `1 of the 1 pack(s)` is what an operator would have had to read.
+    let one = needed == 1;
+    let mut said = match (held, one) {
+        (0, true) => format!("it does not hold the pack it needs ({keys}) and fetches it"),
+        (0, _) => format!("it holds none of the {needed} packs it needs ({keys}) and fetches them"),
+        (_, true) => format!("it already holds the pack it needs ({keys}), so none is fetched"),
+        _ => format!(
+            "it already holds {held} of the {needed} packs it needs ({keys}), so that much is \
+             not fetched"
+        ),
+    };
+    // Whether holding it is what *chose* this machine. `passed_over` is empty
+    // whenever it is not, and the clause then states the fleet's position
+    // instead of claiming a reason: every equally preferred machine that
+    // could take this job now holds exactly as much, which is why the name
+    // decided (and, for a one-machine fleet, there was nothing to decide).
+    if passed_over.is_empty() {
+        said.push_str(
+            "; no runner of its preference that could take this job now holds more (E-23)",
+        );
+    } else {
+        said.push_str(&format!(
+            "; holding {} is why it was preferred to {} at the same preference (E-23)",
+            if one { "it" } else { "them" },
+            passed_over.join(", ")
+        ));
+    }
+    Some(said)
+}
+
 fn claim(
     record: &JobRecord,
     seat: &mut Seat,
@@ -1367,6 +1489,7 @@ fn claim(
     eligible: usize,
     moved: Option<String>,
     placing: &Placing,
+    locality: Option<String>,
 ) -> Placement {
     let Fitted {
         derived,
@@ -1406,6 +1529,12 @@ fn claim(
             n => format!("the most preferred of {n} eligible runners"),
         }
     ));
+    // And what it already holds of what this job needs, when the job needs
+    // anything at all (E-23). `None` for every job that needs nothing, so the
+    // sentence of today's placements is the sentence it was.
+    if let Some(locality) = locality {
+        why.push_str(&format!("; {locality}"));
+    }
     if let Some(moved) = moved {
         why.push_str(&format!("; {moved}"));
     }
@@ -2450,6 +2579,7 @@ mod tests {
             1,
             None,
             &Placing::default(),
+            None,
         ));
         assert!(
             why.contains("could not be given its labels"),
@@ -3833,6 +3963,7 @@ mod tests {
                 parent: Parent::None,
                 drain_first_limit: Some(DRAIN_FIRST_LIMIT),
                 readings_at_once: None,
+                holds_what_it_needs: Default::default(),
             },
         ));
         assert!(why.contains("quiet host"), "{why}");
@@ -4464,4 +4595,147 @@ f4 claim spare-pc | ["/bin/sh", "-c", "true"] | None | claimed by spare-pc: labe
 f5 claim wsl-pc | ["/bin/sh", "-c", "true"] | None | claimed by wsl-pc: labels rig-cpu; rig-cpu is shared; admitted 0 MiB of memory, 14 GiB free of 14 GiB after it (17 GiB lent, 3 GiB kept as its own floor); it reserves no tmpfs; load 0.42 there, recorded and not a gate (E-32); preference 10, the only eligible runner
 f6 claim build-host | ["/bin/sh", "-c", "true"] | None | claimed by build-host: labels kvm; kvm is shared; admitted 0 MiB of memory, 25 GiB free of 25 GiB after it (31 GiB lent, 6 GiB kept as its own floor); it reserves no tmpfs; load 0.42 there, recorded and not a gate (E-32); preference 0, the only eligible runner
 "#;
+
+    /// The same record, consuming packs by key.
+    ///
+    /// The keys are the requester's own words, which is all a requester ever
+    /// says about a machine here: who holds the pack a key resolves to
+    /// arrives through [`Placing`], from what runners announced to the hub
+    /// (invariant 6).
+    fn needing(id: &str, keys: &[&str], want: &[&str]) -> JobRecord {
+        let mut record = queued(id, want);
+        record.needs = keys.iter().map(|key| (*key).to_owned()).collect();
+        record
+    }
+
+    /// What the hub's registry answered about this job's keys: how many of
+    /// them each runner already holds.
+    fn holding(held: &[(&str, usize)]) -> Placing {
+        Placing {
+            holds_what_it_needs: held
+                .iter()
+                .map(|(runner, count)| ((*runner).to_owned(), *count))
+                .collect(),
+            ..Placing::default()
+        }
+    }
+
+    /// Two seats of equal preference, one of them holding the key: the job
+    /// goes to the holder, and the line an operator reads says locality is
+    /// why (E-23, E-36).
+    ///
+    /// The control comes first and matters as much: with nothing holding the
+    /// pack, the name is still the only term, and `spare-pc` takes it. So the
+    /// second half moves a placement *against* the whole of the order there
+    /// was before, which is the only way to know the term did anything.
+    #[test]
+    fn at_equal_preference_the_holder_takes_it_and_the_line_says_why() {
+        let mut fleet = vec![her_pc(), a_spare_pc()];
+        let (runner, why) = placed(place(
+            &needing("j1", &["kernel"], &["build"]),
+            &mut fleet,
+            now(),
+            Stickiness::default(),
+            &Placing::default(),
+        ));
+        assert_eq!(
+            runner, "spare-pc",
+            "with nobody holding it, the name is the only term left: {why}"
+        );
+        assert!(
+            why.contains("it does not hold the pack it needs (kernel) and fetches it"),
+            "{why}"
+        );
+
+        let mut fleet = vec![her_pc(), a_spare_pc()];
+        let (runner, why) = placed(place(
+            &needing("j1", &["kernel"], &["build"]),
+            &mut fleet,
+            now(),
+            Stickiness::default(),
+            &holding(&[("wsl-pc", 1)]),
+        ));
+        assert_eq!(
+            runner, "wsl-pc",
+            "the machine holding the pack takes it against the name: {why}"
+        );
+        assert!(
+            why.contains("it already holds the pack it needs (kernel), so none is fetched"),
+            "{why}"
+        );
+        assert!(
+            why.contains(
+                "holding it is why it was preferred to spare-pc at the same preference (E-23)"
+            ),
+            "{why}"
+        );
+    }
+
+    /// A higher declared `preference` still wins over a holder (E-19 first,
+    /// E-23 second).
+    ///
+    /// The locality term is a tie-break *inside* one preference and never a
+    /// way around it: the fleet's own declared order is what decides which
+    /// machines are even compared, and a job will fetch a pack onto the
+    /// machine its owners prefer rather than run on a lesser one that has it.
+    #[test]
+    fn a_higher_declared_preference_still_wins_over_a_holder() {
+        let mut fleet = vec![their_server(), her_pc()];
+        let (runner, why) = placed(place(
+            &needing("j1", &["kernel"], &["build"]),
+            &mut fleet,
+            now(),
+            Stickiness::default(),
+            &holding(&[("build-host", 1)]),
+        ));
+        assert_eq!(
+            runner, "wsl-pc",
+            "preference 10 is preferred to a holder at preference 0: {why}"
+        );
+        assert!(why.contains("preference 10"), "{why}");
+        // And the sentence does not pretend it holds anything, which is the
+        // other half of the same honesty: this job fetches its pack.
+        assert!(
+            why.contains("it does not hold the pack it needs (kernel)"),
+            "{why}"
+        );
+    }
+
+    /// The term is a count and not a flag: holding two of three keys beats
+    /// holding one of them.
+    ///
+    /// One further term on the order, which is why this needs no second
+    /// mechanism — no weight, no per-key rule, no second sort pass. The
+    /// figures in the sentence are the two counts an operator would want.
+    #[test]
+    fn more_of_what_it_needs_wins_at_equal_preference() {
+        let keys = &["kernel", "rootfs", "firmware"][..];
+        let mut fleet = vec![her_pc(), a_spare_pc()];
+        let (runner, why) = placed(place(
+            &needing("j1", keys, &["build"]),
+            &mut fleet,
+            now(),
+            Stickiness::default(),
+            &holding(&[("wsl-pc", 1), ("spare-pc", 2)]),
+        ));
+        assert_eq!(runner, "spare-pc", "{why}");
+        assert!(
+            why.contains("it already holds 2 of the 3 packs it needs (kernel, rootfs, firmware)"),
+            "{why}"
+        );
+
+        let mut fleet = vec![her_pc(), a_spare_pc()];
+        let (runner, why) = placed(place(
+            &needing("j1", keys, &["build"]),
+            &mut fleet,
+            now(),
+            Stickiness::default(),
+            &holding(&[("wsl-pc", 3), ("spare-pc", 2)]),
+        ));
+        assert_eq!(runner, "wsl-pc", "{why}");
+        assert!(
+            why.contains("it already holds 3 of the 3 packs it needs"),
+            "{why}"
+        );
+    }
 }

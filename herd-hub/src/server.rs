@@ -3581,6 +3581,7 @@ fn dispatch_a_pass(state: &State) -> Result<()> {
             parent: parent_of(state, record, &unfinished),
             drain_first_limit: Some(state.policy.drain_first_limit),
             readings_at_once: Some(state.policy.readings_at_once),
+            holds_what_it_needs: holders_of_what_it_needs(state, record),
         };
         // The whole claim decision, for this job, against the fleet as this
         // pass found it — and `seats` is carried *through* the loop, so a job
@@ -4744,6 +4745,54 @@ fn packs_for(
         }
     }
     Ok(resolved)
+}
+
+/// How many of the packs this job's `needs` resolve to each connected runner
+/// already holds, for the claim step's locality term (E-23).
+///
+/// **The ordinary case consults nothing.** A job with no `needs` — which is
+/// every job Herd runs today — returns an empty map before a lock is taken or
+/// a registry is asked for, so a hub whose store keeps no registry at all
+/// walks its queue exactly as it did. That is what makes this safe to call
+/// once per queued job per pass, which is what it is.
+///
+/// **It reads no manifest.** Locality is a question about names: which pack a
+/// `(commit, key)` is, and who announced holding it. `pack_for` and
+/// `holders_of` both answer out of the registry's own maps, with no byte off
+/// the disk. [`packs_for`] still reads the manifests, and still only for the
+/// one job that is being dispatched.
+///
+/// **Every unknown is silence, never a refusal and never a wait.** A key that
+/// resolves to nothing, a job with no commit, a `(commit, key)` with two ids,
+/// a registry that cannot read its own disk: each of those is a fact
+/// [`packs_for`] says out loud at the dispatch, with the key and the commit in
+/// the sentence (D13). Said a second time here it would only be a tie-break
+/// refusing a job that nothing else refused — so what this answers for such a
+/// key is "nobody holds it", which is true and which changes no placement.
+///
+/// **No requester's word reaches it** (invariant 6). The job names the keys it
+/// consumes; the holdings are what runners announced to this hub, and turning
+/// them into a preference is the hub's own act.
+fn holders_of_what_it_needs(state: &State, record: &JobRecord) -> BTreeMap<String, usize> {
+    let mut held: BTreeMap<String, usize> = BTreeMap::new();
+    if record.needs.is_empty() {
+        return held;
+    }
+    let Some(declaration) = &record.declaration else {
+        return held;
+    };
+    let Some(registry) = state.store.packs() else {
+        return held;
+    };
+    for key in &record.needs {
+        let Ok(Some(pack)) = registry.pack_for(&declaration.commit, key) else {
+            continue;
+        };
+        for holder in registry.holders_of(&pack) {
+            *held.entry(holder.runner).or_default() += 1;
+        }
+    }
+    held
 }
 
 /// Hand one job to the runner, recording the attempt before the frame goes
@@ -7911,6 +7960,7 @@ fn judge_one(state: &State, new: NewJob) -> Result<Vec<String>> {
             parent: parent_of(state, record, &unfinished),
             drain_first_limit: Some(state.policy.drain_first_limit),
             readings_at_once: Some(state.policy.readings_at_once),
+            holds_what_it_needs: holders_of_what_it_needs(state, record),
         };
         if record.id == hypothetical.id {
             let eligible = matcher::eligible(record, &seats, now, &placing);
@@ -10785,6 +10835,123 @@ mod tests {
         assert!(
             held_frames(&mut inbox).is_empty(),
             "the record names the machine that owes it, and it is not this one"
+        );
+    }
+
+    /// E-23's input, read off the hub's own registry and off nothing else.
+    ///
+    /// `matcher.rs` holds the tests of what the locality *term* does with
+    /// this map. What only a state root can say is where the map comes from,
+    /// and this is that seam: a pack registered for a `(commit, key)`, two
+    /// runners that announced holding it, and the count each one gets.
+    ///
+    /// The three silences are asserted beside it, because each is a placement
+    /// that must not move: a job that needs nothing, a job with no commit to
+    /// resolve against, and a key nothing is registered for. None of them is
+    /// a refusal here — `packs_for` says all three out loud at the dispatch,
+    /// with the key and the commit in the sentence (D13).
+    #[test]
+    fn what_each_runner_holds_of_a_job_s_needs_comes_off_the_registry() {
+        const COMMIT: &str = "cb5a2e8b4f1d9c7a3e05b8d6f2a1c4e79b0d3f68";
+        let dir = tempfile::tempdir().expect("a temporary state directory");
+        let store = Arc::new(JobDirStore::open(dir.path()).expect("the state root opens"));
+        let registry = store.packs();
+
+        // Two keys, two different packs: different bytes, so different ids,
+        // which is the identity rule and not a convenience here.
+        let mut ids = Vec::new();
+        for (key, size) in [("kernel", 4096), ("rootfs", 8192)] {
+            let manifest = format!(
+                "# chatons pack 1\n{}\t{size}\t0644\tf\t{key}\t{key}/thing\n",
+                "1".repeat(64)
+            )
+            .into_bytes();
+            let announced = herd_proto::pack::PackId::of_manifest_bytes(&manifest);
+            let answer = registry
+                .register(crate::registry::Registration {
+                    commit: COMMIT.to_owned(),
+                    key: key.to_owned(),
+                    announced: announced.clone(),
+                    manifest,
+                    meta: None,
+                    runner: "tower".to_owned(),
+                    job: "j0000000001".to_owned(),
+                    attempt: 1,
+                    at: Timestamp::at_unix_seconds(1_793_145_600),
+                })
+                .expect("the registry writes");
+            assert!(answer.refusal().is_none(), "{answer:?}");
+            ids.push(announced);
+        }
+
+        // What the fleet announced: one machine holds both packs, one holds
+        // the first, one holds nothing and is in the fleet all the same.
+        registry.announced("tower", None, ids.clone(), false);
+        registry.announced("attic", None, vec![ids[0].clone()], false);
+        registry.announced("cellar", None, Vec::new(), false);
+
+        let state = a_state_over(store.clone() as Arc<dyn JobStore>);
+        let declared = |what: &str, needs: Vec<String>, commit: Option<&str>| {
+            // A different line per call: this store deduplicates a submission
+            // against the work already queued (E-18), which is right and is
+            // not what this test is about.
+            let mut record = store
+                .create_job(NewJob::new(vec!["true".to_owned(), what.to_owned()]))
+                .expect("the job is minted");
+            record.needs = needs;
+            record.declaration = commit.map(|commit| herd_proto::Declaration {
+                command: "a-declared-command".to_owned(),
+                commit: commit.to_owned(),
+                args: Vec::new(),
+                executor: herd_proto::Executor::default(),
+            });
+            record
+        };
+
+        let held = holders_of_what_it_needs(
+            &state,
+            &declared(
+                "both",
+                vec!["kernel".to_owned(), "rootfs".to_owned()],
+                Some(COMMIT),
+            ),
+        );
+        assert_eq!(
+            held,
+            BTreeMap::from([("tower".to_owned(), 2), ("attic".to_owned(), 1)]),
+            "the count is per runner and per key, and a runner that holds \
+             none of them is absent rather than zero"
+        );
+
+        // A key nothing is registered for contributes nothing, and does not
+        // take the key beside it down with it.
+        let held = holders_of_what_it_needs(
+            &state,
+            &declared(
+                "one-unknown",
+                vec!["kernel".to_owned(), "nothing-leaves-this".to_owned()],
+                Some(COMMIT),
+            ),
+        );
+        assert_eq!(
+            held,
+            BTreeMap::from([("tower".to_owned(), 1), ("attic".to_owned(), 1)])
+        );
+
+        // And the two silences. A job that needs nothing is the one that
+        // matters: it is every job Herd runs today.
+        assert!(
+            holders_of_what_it_needs(&state, &declared("no-needs", Vec::new(), Some(COMMIT)))
+                .is_empty()
+        );
+        assert!(
+            holders_of_what_it_needs(
+                &state,
+                &declared("no-commit", vec!["kernel".to_owned()], None)
+            )
+            .is_empty(),
+            "a pack is registered for a (commit, key), so a job with no \
+             declaration has nothing to resolve against"
         );
     }
 }
