@@ -60,7 +60,8 @@ use herd_proto::{
     a_frame_about_a_job_that_is_over_reason, foreign_state_root_reason, from_frame,
     not_this_runner_s_attempt_reason, runner_twin_reason, to_frame, unreadable_handshake_reason,
     version_mismatch_reason, CapabilityState, FromHub, Holdings, HostSize, JobId, JobMetrics,
-    JobOutcome, Priority, Role, RunningJob, ToHub, HEALTH_EVERY, PROTOCOL_VERSION,
+    JobOutcome, Priority, Role, RunningJob, ToHub, HEALTH_EVERY, PACK_CAPABILITY_LIFETIME,
+    PROTOCOL_VERSION,
 };
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::mpsc::{self, UnboundedReceiver, UnboundedSender};
@@ -5841,28 +5842,210 @@ async fn relay_from_runner(
                 ));
             }
 
-            // **Not this step's.** A capability is minted by the hub and
-            // pushed to the holder over the holder's own link (D209), and
-            // that half is unwritten. Refused by name and **non-terminally**,
-            // which is the whole difference from the arm below: a runner that
-            // asks for something this build does not mint is told so and
-            // keeps its link and its other jobs.
+            // **The hub's half of a transfer** (D209, E-12). The runner that
+            // needs objects asks; this mints a token, tells the **holder** to
+            // expect it over the holder's own already authenticated link, and
+            // answers the asker with the holder's mesh address.
+            //
+            // Three things it is not, each of them a rule rather than a
+            // shortcut not taken:
+            //
+            // * **the hub is not the byte path** (D10). Nothing of the pack
+            //   passes through here: what is minted is an authorisation, and
+            //   the objects go runner to runner on the fleet's own mesh;
+            // * **it widens no address.** The endpoint handed out is the one
+            //   the holder advertised in its handshake, which is an address
+            //   on a private mesh interface and nothing else (invariant 3,
+            //   D10, D11). This arm chooses no address and opens no port;
+            // * **a refusal here is about one pack** and is `PackRefused` and
+            //   never `FromHub::Refused` (D13): a transfer this hub will not
+            //   authorise costs the asking runner neither its link nor its
+            //   other jobs. None of these paths turns a job's wait into a
+            //   refusal — a job whose pack has no holder is held at the
+            //   dispatch and never reaches this frame (D261).
             ToHub::AskTransferCapability(asked) => {
-                let why = format!(
-                    "this hub does not mint a transfer capability for pack {} yet: the frame is \
-                     numbered at protocol {PROTOCOL_VERSION} and the hub's half of D209 — \
-                     minting the token and pushing ExpectTransfer to the holder over the \
-                     holder's own link — is not written. Fetch the objects from a holder this \
-                     hub named in PackHolders, or say PackUnavailable so the job's wait has a \
-                     reason on it",
-                    asked.pack
-                );
-                journal(&format!("herd-hub: {why}"));
-                let _ = outbox.send(FromHub::PackRefused(herd_proto::PackRefused {
-                    job_id: asked.job_id,
-                    pack: Some(asked.pack),
-                    why,
+                let job_id = asked.job_id.clone();
+                let pack = asked.pack.clone();
+                let refuse = |why: String| {
+                    journal(&format!("herd-hub: {why}"));
+                    let _ = outbox.send(FromHub::PackRefused(herd_proto::PackRefused {
+                        job_id: job_id.clone(),
+                        pack: Some(pack.clone()),
+                        why,
+                    }));
+                };
+                // The asking runner's entitlement first, before anything is
+                // read about the pack: a capability is a credential, and a
+                // runner asking for one against a job that is not its own
+                // must be told no without this hub even having looked up who
+                // holds what. The same window a fetch is read in, and for the
+                // same reason it cannot be `is_current`'s.
+                if let Err(why) = a_pack_may_be_fetched(state, name, &asked.job_id) {
+                    refuse(why);
+                    continue;
+                }
+                // **The push direction is the other step's** (ORCH-220, plan
+                // S10). A `Push` is what an *outbound-only* asker needs — a
+                // runner that listens on nothing, so a holder has to dial
+                // *it* — and nothing in this build dials a fetcher. Named,
+                // because the asker can do something with the name: it is
+                // the difference between "ask again" and "this fleet cannot
+                // move this pack to this machine".
+                if matches!(asked.direction, herd_proto::TransferDirection::Push) {
+                    refuse(format!(
+                        "this hub authorises a fetch and not a push, so pack {} will not be \
+                         pushed to {name}: the push path is for a runner that listens on \
+                         nothing at all and it is the step after this one. A runner that can \
+                         be dialled asks for a fetch instead",
+                        asked.pack
+                    ));
+                    continue;
+                }
+                // `peer: None` is the same case said the other way round —
+                // "name me somebody who can dial me" — and it is refused by
+                // the same sentence rather than by a silence, because the
+                // whole of D150's lesson is that the party that knows why has
+                // to speak.
+                let Some(peer) = asked.peer.clone() else {
+                    refuse(format!(
+                        "{name} asked this hub to name a holder of pack {} that could dial it, \
+                         which is the push path and the step after this one. Name the holder to \
+                         fetch from — this hub listed them in PackHolders and on the assignment \
+                         — or say PackUnavailable so the job's wait has a reason on it",
+                        asked.pack
+                    ));
+                    continue;
+                };
+                if peer == name {
+                    refuse(format!(
+                        "{name} asked for a capability against itself for pack {}: a runner that \
+                         holds a pack lays it out of its own store and dials nobody, and one \
+                         that does not hold it is not a holder this hub can authorise",
+                        asked.pack
+                    ));
+                    continue;
+                }
+                let registry = match a_pack_registry(state) {
+                    Ok(registry) => registry,
+                    Err(why) => {
+                        refuse(why);
+                        continue;
+                    }
+                };
+                // **The hub is the registry and the authority** (D10): the
+                // scope of a capability is read off what this hub records,
+                // never off what the asker said. An asker that named a
+                // machine holding nothing gets no token for it.
+                let holders = registry.holders_of(&asked.pack);
+                let Some(holder) = holders.iter().find(|holder| holder.runner == peer) else {
+                    refuse(format!(
+                        "{peer} does not hold pack {} as far as this hub knows, so there is \
+                         nothing here to authorise {name} to fetch from it. {} runner(s) hold \
+                         it; holdings are volatile and re-announced on every welcome, so a \
+                         holder this hub named a moment ago may have gone",
+                        asked.pack,
+                        holders.len()
+                    ));
+                    continue;
+                };
+                // An **outbound-only holder**: it holds the pack and listens
+                // on nothing, because its host has no address invariant 3
+                // permits it to serve from. Not a defect and not a degraded
+                // holder — it is the case the push path exists for, and this
+                // hub says which of the two it is rather than handing out a
+                // capability with no address in it.
+                let Some(endpoint) = holder.endpoint.clone() else {
+                    refuse(format!(
+                        "{peer} holds pack {} and is outbound-only — it advertised no mesh \
+                         address, because its host has none invariant 3 permits it to serve \
+                         content from — so it cannot be dialled and this hub mints no \
+                         capability against an address it does not have. The bytes have to be \
+                         pushed by it instead, which is the step after this one",
+                        asked.pack
+                    ));
+                    continue;
+                };
+                // The holder has to be **connected**, because `ExpectTransfer`
+                // goes over the holder's own link and that is the only thing
+                // that makes the token mean anything: a capability the holder
+                // was never told about is one its endpoint refuses by name as
+                // `NotPushedByHub`. So a holder this hub cannot reach is a
+                // refusal here and not a token the asker would spend a dial
+                // discovering is worthless.
+                let Some(to_the_holder) = state.outbox_of(&peer) else {
+                    refuse(format!(
+                        "{peer} holds pack {} and is not connected to this hub, so it cannot be \
+                         told to expect a transfer and a token minted for it would be refused \
+                         at its endpoint. A transfer's authority reaches the holder over the \
+                         holder's own link and by no other route (D209)",
+                        asked.pack
+                    ));
+                    continue;
+                };
+                let token = match mint_a_transfer_token() {
+                    Ok(token) => token,
+                    Err(why) => {
+                        refuse(why);
+                        continue;
+                    }
+                };
+                let expires_unix_s = match hub_clock_unix_s() {
+                    Some(now) => now + PACK_CAPABILITY_LIFETIME.as_secs() as i64,
+                    None => {
+                        refuse(format!(
+                            "this hub's clock is before the Unix epoch, so it can put no expiry \
+                             on a capability for pack {}. A capability with no expiry it can \
+                             compute is not one this hub mints: short-lived is the whole of \
+                             what makes a bearer token on the mesh bearable (D200)",
+                            asked.pack
+                        ));
+                        continue;
+                    }
+                };
+                // **The holder is told first, and the asker second.** The two
+                // frames go to two different connections, so this is the one
+                // ordering the hub controls: queued this way, the token is on
+                // its way to the holder before the asker has been given
+                // anything to dial with. The other order would race the
+                // asker's dial against the holder's knowledge of the token
+                // and lose it as `NotPushedByHub` — a transfer refused for a
+                // reason that is nobody's fault.
+                let _ = to_the_holder.send(FromHub::ExpectTransfer(herd_proto::ExpectTransfer {
+                    pack: asked.pack.clone(),
+                    peer: name.to_owned(),
+                    token: token.clone(),
+                    expires_unix_s,
+                    direction: asked.direction,
+                    objects: asked.objects.clone(),
                 }));
+                // The journal carries the scope and **not the token** (D200,
+                // invariant 7): a capability is a bearer secret, and a hub's
+                // journal is read, shipped and pasted. Every figure an
+                // operator needs to follow a transfer is here; the one thing
+                // that would let a reader perform it is not.
+                journal(&format!(
+                    "herd-hub: {name} may fetch {} of pack {} from {peer} at {endpoint} until \
+                     {expires_unix_s}; {peer} has been told to expect it over its own link. \
+                     The token is not written down anywhere, here included",
+                    if asked.objects.is_empty() {
+                        "the whole".to_owned()
+                    } else {
+                        format!("{} object(s)", asked.objects.len())
+                    },
+                    asked.pack
+                ));
+                let _ = outbox.send(FromHub::TransferCapability(
+                    herd_proto::TransferCapability {
+                        job_id: asked.job_id,
+                        pack: asked.pack,
+                        peer,
+                        endpoint,
+                        token,
+                        expires_unix_s,
+                        direction: asked.direction,
+                        objects: asked.objects,
+                    },
+                ));
             }
 
             other => {
@@ -6399,6 +6582,78 @@ fn files_may_land(
         ));
     }
     Ok(())
+}
+
+/// How many random bytes a transfer capability's token carries.
+///
+/// 32, the figure an approved runner's token carries, and for the same
+/// reason: it is a credential nobody types from memory, so there is no
+/// argument for being cheap about bytes. What it guards is smaller — one
+/// pack, one peer, one direction, five minutes — and that is the scope and
+/// not a licence to make the secret weaker.
+const TRANSFER_TOKEN_BYTES: usize = 32;
+
+/// What every transfer token begins with, so that one found in a log, a core
+/// file or a terminal is recognisable for what it is.
+///
+/// The twin of the roster's prefix on a runner's token, and deliberately a
+/// *different* word: the two are credentials of different lifetimes against
+/// different things, and a reader who finds one should be able to tell which
+/// of them they are holding.
+const TRANSFER_TOKEN_PREFIX: &str = "herd-pack-";
+
+/// Mint one transfer capability's token: the kernel's random bytes, hex, with
+/// the prefix that names what it is.
+///
+/// **The roster's scheme and not a second one** — 32 bytes from
+/// `getrandom`, hex, a prefix, and no fallback to the clock — and a call of
+/// its own rather than a call *into* `roster`, because the roster's
+/// sentences are about a machine an operator approved and would be a lie
+/// here. The scheme is shared; the explanation is the caller's.
+///
+/// A host that will not give random bytes mints nothing. A token this hub
+/// made up out of its clock would be one anybody who knows when a job
+/// started could make up too, and the whole of what a bearer capability
+/// buys is that it cannot be guessed (D200).
+fn mint_a_transfer_token() -> std::result::Result<String, String> {
+    let mut bytes = [0u8; TRANSFER_TOKEN_BYTES];
+    let mut filled = 0;
+    while filled < TRANSFER_TOKEN_BYTES {
+        match rustix::rand::getrandom(&mut bytes[filled..], rustix::rand::GetRandomFlags::empty()) {
+            Ok(0) | Err(_) => {
+                return Err(
+                    "this host gave this hub no random bytes, so it minted no transfer \
+                     capability: a token made up from a clock is one an attacker can make up \
+                     too, and this hub refuses a transfer rather than authorising it with a \
+                     guessable secret (D200, invariant 7)"
+                        .to_owned(),
+                )
+            }
+            Ok(some) => filled += some,
+        }
+    }
+    use std::fmt::Write;
+    let mut token = String::with_capacity(TRANSFER_TOKEN_PREFIX.len() + TRANSFER_TOKEN_BYTES * 2);
+    token.push_str(TRANSFER_TOKEN_PREFIX);
+    for byte in bytes {
+        let _ = write!(token, "{byte:02x}");
+    }
+    Ok(token)
+}
+
+/// This hub's clock in whole seconds since the Unix epoch, or `None` on a
+/// clock set before it.
+///
+/// `None` and not a zero, which is what the roster's own reading of the same
+/// clock returns: a zero is a sound *approval time* and a disastrous
+/// *expiry*, because a capability is compared against this number by a
+/// machine that is not this one. A hub that cannot say when a capability
+/// stops being usable does not mint it.
+fn hub_clock_unix_s() -> Option<i64> {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()
+        .and_then(|since| i64::try_from(since.as_secs()).ok())
 }
 
 /// This hub's pack registry, or the one sentence that says it has none.
