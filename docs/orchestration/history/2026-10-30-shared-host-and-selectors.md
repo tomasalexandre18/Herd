@@ -359,20 +359,20 @@ ceiling (`scripts/check-docs.sh`), a full re-wrap of the file frees one
 line, and that line was spent correcting the per-tree disk figure in the
 same branch. **Ruled 2026-10-30 by the orchestrator (ORCH-249): the rule
 goes to `docs/orchestration/workflow.md` *Concurrency and host rules*,
-which has no ceiling and which `CLAUDE.md:108` already points at for this
-section's exceptions, and the ceiling is not raised** — a limit that
-exists to force this very discipline would be spent to buy the lesson,
-and invariants have been silently compressed to fit it once already
-(ORCH-002, 2026-10-24). `CLAUDE.md:109` is unchanged word for word. That
-section is now where the rule and its detector are written down, and this
-entry is why.
+which has no ceiling and which `CLAUDE.md:106`-`:107` already points at
+for this section's exceptions, and the ceiling is not raised** — a limit
+that exists to force this very discipline would be spent to buy the
+lesson, and invariants have been silently compressed to fit it once
+already (ORCH-002, 2026-10-24). `CLAUDE.md:108` is unchanged word for
+word. That section is now where the rule and its detector are written
+down, and this entry is why.
 ```
 
 ## Decisions needed
 
 1. **Answered 2026-10-30 by the orchestrator, in the brief of the branch
    `host-ownership-rule`: the rule goes to `workflow.md`, the ceiling is
-   not touched, and `CLAUDE.md:109` is not reworded.** Whether one short
+   not touched, and `CLAUDE.md:108` is not reworded.** Whether one short
    clause is later added to `CLAUDE.md` is a second ruling and his;
    `host-ownership-rule` was asked to propose one and proposes none, with
    its reason in ORCH-249. The question as it was asked, kept for the
@@ -384,10 +384,10 @@ entry is why.
    and a ceiling is what should move when the contract genuinely grows.
    *Fallback, which is what was ruled:* put the rule in
    `docs/orchestration/workflow.md`'s *Concurrency and host rules*, which
-   has no ceiling and which `CLAUDE.md:108` already points at for this
-   section's exceptions — one hop further from the file every agent reads
-   first. The three payments are sized in **ORCH-249**; this was a method
-   ruling and inside the orchestrator's mandate, not Alexa's.
+   has no ceiling and which `CLAUDE.md:106`-`:107` already points at for
+   this section's exceptions — one hop further from the file every agent
+   reads first. The three payments are sized in **ORCH-249**; this was a
+   method ruling and inside the orchestrator's mandate, not Alexa's.
 2. **Does ORCH-247 go to Alexa's *Waiting*, or stay a planner's row?** —
    *Recommendation:* file it as it stands, `open` and `herd-planner`,
    until the shape is sized, and take it to Alexa only as the one question
@@ -447,11 +447,11 @@ to force exactly the discipline this rule is about would be spent to buy
 the lesson — and this project has already had invariants silently
 compressed to fit that limit once (ORCH-002, invariants 3 and 6,
 2026-10-24, restored afterwards). `workflow.md` has no ceiling and
-`CLAUDE.md:108` already points at it for this section's exceptions, so the
-detail now lives where the detail already lived. Verified after the edits:
-`CLAUDE.md` is **150 lines**, `git diff` against `51b47eb` shows it and
-`scripts/` untouched, and the kill-by-name line at `CLAUDE.md:109` is
-byte-identical.
+`CLAUDE.md:106`-`:107` already points at it for this section's
+exceptions, so the detail now lives where the detail already lived.
+Verified after the edits: `CLAUDE.md` is **150 lines**, `git diff` against
+`51b47eb` shows it and `scripts/` untouched, and the kill-by-name line at
+`CLAUDE.md:108` is byte-identical.
 
 The rule sits immediately after the existing `pkill -f` bullet and is two
 bullets. The first says ownership, not age, decides what may be
@@ -547,7 +547,7 @@ with the writing attributed to this branch.
 - **No clause was added to `CLAUDE.md`, and none is proposed.** The brief
   asked for the exact text and its column count if the step judged one
   would change whether an agent looks further. It does not: the bullet at
-  `CLAUDE.md:107`-`:108` already sends the reader to `workflow.md`'s
+  `CLAUDE.md:106`-`:107` already sends the reader to `workflow.md`'s
   *Concurrency* for this section's detail, so the sentence that would do
   that work is already in the file, and a fourth clause on killing would
   compete with the pointer rather than add to it. The arithmetic has not
@@ -634,11 +634,29 @@ run.
    `~12–14 GB` band rests on seven, of which only two are in the tree.
    Both files say which, so neither number can be quoted later with more
    confidence than it has.
-6. **No contradiction between the brief and the tree was found.** The ten
-   figures and both line numbers the brief gave were checked against the
-   files and all held: `workflow.md:623` and `disk-policy.md:1535` were
-   where the brief said, `CLAUDE.md:112`-`:113` already named the
-   profile, and `CLAUDE.md` was at exactly 150 lines.
+6. **One contradiction between the brief and the tree, and it is the same
+   family as ORCH-250: every `CLAUDE.md:108` and `CLAUDE.md:109` citation
+   on this branch was off by one, the brief's included.** The brief, the
+   drafted `D-NEXT`, ORCH-249's *Item* cell and this handoff's own parent
+   sections all named `CLAUDE.md:109` for the kill-by-name rule and
+   `CLAUDE.md:108` for the bullet pointing at `workflow.md`. Those are the
+   numbers on **`origin/main`**. The parent branch's re-wrap of the
+   *No `cargo`* bullet freed one line above them, so on this branch — and
+   therefore after the landing — the kill rule is at **`:108`**, the
+   pointer at **`:106`-`:107`**, and the section at **`:103`**-**`:116`**.
+   Thirteen citations were corrected, eight in this file and five in
+   `board.md`, each read off `CLAUDE.md` rather than carried forward; the
+   disk figure at `CLAUDE.md:112`-`:113`, which the brief also gave, was
+   already right. What is deliberately **not** corrected: ORCH-250's
+   *Item* cell still names `workflow.md:623` and `disk-policy.md:1535`,
+   because that is where the defect was and the row has to go on saying
+   so, while its *Next action* cell carries the post-fix numbers. A line
+   number in prose is a figure with no provenance — the same lesson as
+   ORCH-250, in the file this project edits most often.
+7. **The rest of the brief held.** The ten other figures and both sibling
+   line numbers were checked against the files: `workflow.md:623` and
+   `disk-policy.md:1535` were where the brief said, `CLAUDE.md:112`-`:113`
+   already named the profile, and `CLAUDE.md` was at exactly 150 lines.
 
 ### Drafted for `herd-merger`
 
@@ -669,14 +687,14 @@ seven-word state vocabulary were checked after the edit.
    pointing at the new `workflow.md` section by name?** — This is the
    second ruling the orchestrator reserved, and this step proposes no
    text, so the question is whether he wants one at all. *Recommendation:*
-   **no clause.** `CLAUDE.md:107`-`:108` already points at
-   `workflow.md`'s *Concurrency* for this section's detail, the file is at
-   exactly its 150 lines, and a clause would need a payment whose cheapest
-   form is deleting a rule somebody is held to. *Fallback:* if the pointer
-   is judged too weak, the cheapest honest payment is the one line a full
-   79-column re-wrap of the file frees, which this batch has already
-   spent — so the fallback is really the ceiling, and that is the thing
-   the ruling above declined to touch.
+   **no clause.** `CLAUDE.md:106`-`:107` already points at `workflow.md`'s
+   *Concurrency* for this section's detail, the file is at exactly its 150
+   lines, and a clause would need a payment whose cheapest form is deleting
+   a rule somebody is held to. *Fallback:* if the pointer is judged too
+   weak, the cheapest honest payment is the one line a full 79-column
+   re-wrap of the file frees, which this batch has already spent — so the
+   fallback is really the ceiling, and that is the thing the ruling above
+   declined to touch.
 2. **Who owns `scripts/find-job-procs.sh`?** — *Recommendation:* brief it
    with the next task that already owes the four Rust gates, as a tail
    item: the script is the six lines now in `workflow.md`, plus a
