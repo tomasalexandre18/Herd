@@ -93,7 +93,7 @@ from here should quote the counted one above and name the open question.
 ## Gated on chatOnS
 
 **This is the one list, and it has seven rows.** `docs/plan.md` and the
-M18 line below name it rather than restate its members, after three
+M18 line below name it rather than restate its members, after four
 hand-kept copies disagreed about them (ORCH-206). Each member below names
 the deliverable it waits on and quotes the words in its own row above
 that gate it, so a reader checks the list against the rows instead of
@@ -113,9 +113,11 @@ which is which.
 - **E-14** — their replication: *"gated on their replication (M18)"*.
 - **E-20** — their executor and the status document: *"needs their
   executor and the status document (M13, gated M18)"*. **Neither older
-  summary carried this row** and its own note does; `docs/plan.md`'s M18
-  paragraph still names six items of work and not this one, which is the
-  part of ORCH-206 that is a question about M18's scope.
+  summary carried this row** and its own note does, so `docs/plan.md`'s
+  M18 paragraph now names it too: **this list is derived from the rows,
+  and the milestone follows them** (the orchestrator, 2026-10-30,
+  ORCH-206). A note that gains a `gated M18` marker gains a place here
+  and in M18, and never the other way round.
 - **E-41** — their nightly command: *"gated: their nightly command, live
   at M18"*, with the one deviation its row records.
 - **E-42** — their push hook: its row says *"the hook is theirs"*, and
@@ -131,22 +133,26 @@ choice, D206) wait on somebody walking a machine, not on anything of the
 consumer's. A sentence may hold them beside the gated rows only when it
 says "gated **or** real-hardware", as the closing line of this file does.
 
-**Three rows an older list claimed and the rows do not support. Left out,
-and each said here rather than dropped quietly** (ORCH-206; the first and
-the third need a decision and not a reading):
+**A second group: gated on them, and with no milestone that closes it.**
+These two wait on a chatOnS deliverable like the seven above, but no
+milestone closes the wait, so no fixture test "stands in until M18" for
+them and they are not M18's to walk. The criterion is in this heading on
+purpose: a reader who finds the dependency here, with the reason it is
+not in the list above, does not re-add it — and re-adding is how four
+copies of that list came to exist (the orchestrator, 2026-10-30,
+ORCH-206, preferring this to leaving the two out unexplained).
 
-- **E-38 (should)** — the dependency is real and written under *Not
-  covered by any milestone* below: the load-vs-real failure split needs
-  their results.json. But the row names no milestone and is deferred
-  *past* M18, so "stands in until M18" is false of it. Whether a row with
-  no milestone can be M18-gated is not settled here.
-- **E-53 (should)** — nothing in its row, and none of the five
-  deliverables named at the top of this file, needs anything of theirs:
-  it is `merged`, *"plain files by Q1"* and D103. **An unsupported
-  member**, and leaving it out is a reading, not a judgement.
-- **E-54 (could)** — its row does name something of theirs, *"the judge
-  is their tool"*, but the row is `planned` and names no closing
-  milestone, so what it waits on is not only their acceptance.
+- **E-38 (should)** — their results.json, for the load-vs-real failure
+  split; written out under *Not covered by any milestone* below. The row
+  names no milestone and is deferred *past* M18.
+- **E-54 (could)** — their judge: *"the judge is their tool"*. The row
+  is `planned` and names no closing milestone.
+
+**One row an older list claimed that nothing supports.** E-53 (should):
+nothing in its row, and none of the five deliverables named at the top
+of this file, needs anything of theirs — it is `merged`, *"plain files
+by Q1"* and D103. **Left out**, and said here rather than dropped
+quietly; leaving it out was a reading, not a judgement.
 
 ## State of play (2026-10-29)
 
