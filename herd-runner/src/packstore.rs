@@ -112,7 +112,7 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use herd_proto::pack::check_object_digest;
+use herd_proto::pack::{check_object_digest, PacksHeld};
 use herd_proto::{PackId, PackManifest, MANIFEST_MAX_BYTES};
 
 use crate::size::measured_bytes;
@@ -162,6 +162,25 @@ pub const MANIFEST_FILE: &str = "manifest.tsv";
 /// The pack's provenance, which is **not** part of its id: a pack with no
 /// `pack.meta` is an ordinary pack.
 pub const META_FILE: &str = "pack.meta";
+
+/// How many pack ids ride one [`herd_proto::ToHub::PacksHeld`] frame.
+///
+/// **Chosen against a frame ceiling that is measured and not guessed**: the
+/// hub refuses a frame over `MAX_FRAME_BYTES`, which is `1 << 20`
+/// (`herd-hub/src/server.rs:167`, read 2026-10-30). A [`PackId`] is 64 hex
+/// characters, so one id costs 67 bytes of JSON array — two quotes and a
+/// comma — and 512 of them is about 34 KiB, some thirty times under that
+/// ceiling with the rest of the frame's envelope nowhere near the difference.
+///
+/// It is **deliberately far below** what would fit, and the two questions are
+/// not the same one: what a hub can read is a ceiling, while this is what
+/// decides whether the `more: true` path is walked by a store of a few
+/// hundred packs or only by one of fifteen thousand — and a path nothing in
+/// the field ever walks is a path that is not really there. The test fixture
+/// holds `PACKS_HELD_PER_FRAME + 4` for the same reason `FILES_IN_FLIGHT + 4`
+/// is the figure elsewhere: a fixture at or below the window measures the
+/// wrong state.
+pub const PACKS_HELD_PER_FRAME: usize = 512;
 
 /// What an object or a manifest directory is called while it is being made.
 ///
@@ -363,6 +382,65 @@ impl PackStore {
     /// Whether this store holds every object of that pack.
     pub fn holds_whole(&self, manifest: &PackManifest) -> Result<bool, String> {
         Ok(self.missing(manifest)?.is_empty())
+    }
+
+    /// Every pack this store holds, by id, in the order the names sort.
+    ///
+    /// **This is what a runner announces** ([`herd_proto::pack::PacksHeld`]),
+    /// and it is deliberately the cheapest reading of the store that is still
+    /// true: one `read_dir` of `manifests/` and one `stat` per entry. A
+    /// directory counts when its name is a sha256 of the shape
+    /// `check_object_digest` accepts and it holds a [`MANIFEST_FILE`] —
+    /// which is [`PackStore::holds`]'s own rule, and the manifest is written
+    /// last, so its presence is the store's statement that a complete copy
+    /// landed.
+    ///
+    /// **The name is taken as a name and never re-hashed**, exactly as
+    /// [`PackId::as_announced`] says an announced id is. Re-hashing would
+    /// read every manifest on every announcement — a pack of 557 files
+    /// carries on the order of 100 KiB of manifest (the consumer's issue #16,
+    /// measured 2026-10-13: 401.6 MiB in 557 files), so a store of a few
+    /// hundred packs would be tens of megabytes read each time a job ends.
+    /// The consequence is named rather than hidden: a manifest directory
+    /// whose name does not hash to its own bytes is announced as held, and
+    /// [`PackStore::manifest_of`] is what refuses it by name — which every
+    /// path that would serve or lay out that pack already goes through.
+    ///
+    /// The hex check is also what keeps a half-made ingest out of an
+    /// announcement: a staging name begins with a dot and holds a `-`, so it
+    /// can never be read as a 64-hex id.
+    ///
+    /// An unreadable `manifests/` is an **error and never an empty list**: an
+    /// empty announcement is the retraction "I hold none", and it would be a
+    /// false one here.
+    pub fn held_packs(&self) -> Result<Vec<PackId>, String> {
+        let directory = self.manifests_dir();
+        let entries = fs::read_dir(&directory).map_err(|error| {
+            format!(
+                "what this runner holds cannot be read: {} will not open: {error}",
+                directory.display()
+            )
+        })?;
+        let mut held = Vec::new();
+        for entry in entries {
+            let entry = entry.map_err(|error| {
+                format!(
+                    "what this runner holds cannot be read: {} will not list: {error}",
+                    directory.display()
+                )
+            })?;
+            let name = entry.file_name();
+            let Some(name) = name.to_str() else { continue };
+            if check_object_digest(name).is_err() {
+                continue;
+            }
+            let id = PackId::as_announced(name.to_owned());
+            if self.holds(&id) {
+                held.push(id);
+            }
+        }
+        held.sort_by(|left, right| left.as_str().cmp(right.as_str()));
+        Ok(held)
     }
 
     /// Put a pack directory into the store.
@@ -1010,6 +1088,42 @@ fn link_or_copy(from: &Path, to: &Path) -> io::Result<Carriage> {
 fn object_name(sha256: &str) -> Result<&str, String> {
     check_object_digest(sha256)?;
     Ok(sha256)
+}
+
+/// Cut what a runner holds into the frames that announce it.
+///
+/// **One frame is always returned, and an empty list is not nothing.** A
+/// runner that holds no pack announces one frame with an empty `packs` and
+/// `more: false`, which is the frame set's only retraction: the hub replaces
+/// its whole view of this runner with that emptiness and forgets every
+/// holding it had. No announcement at all says nothing, and the two must not
+/// be confused — a runner that has dropped everything it held and said
+/// nothing leaves a hub offering holders that are not there.
+///
+/// Every frame but the last carries `more: true`, so the hub accumulates and
+/// applies nothing until the last one arrives. The chunking is cut at
+/// [`PACKS_HELD_PER_FRAME`], whose doc carries the measurement it is cut
+/// against.
+pub fn announcement_frames(held: Vec<PackId>) -> Vec<PacksHeld> {
+    if held.is_empty() {
+        return vec![PacksHeld {
+            packs: Vec::new(),
+            more: false,
+        }];
+    }
+    let mut frames: Vec<PacksHeld> = held
+        .chunks(PACKS_HELD_PER_FRAME)
+        .map(|chunk| PacksHeld {
+            packs: chunk.to_vec(),
+            more: true,
+        })
+        .collect();
+    // The last frame is what applies the announcement, and there is always
+    // one: `chunks` over a non-empty slice yields at least one chunk.
+    if let Some(last) = frames.last_mut() {
+        last.more = false;
+    }
+    frames
 }
 
 /// A unique name under `directory` for something being made.
@@ -1952,6 +2066,172 @@ mod tests {
                 .holds_whole(&held.manifest)
                 .expect("the question is answerable"),
             "whole, so `pack.meta` beside a manifest is an ordinary pack and not a stray"
+        );
+    }
+
+    /// What a runner announces is every pack the store **holds**, and the
+    /// three things in `manifests/` that are not one are left out by name.
+    ///
+    /// Two packs are really ingested, so the ids are the store's own and not
+    /// a test's invention. Beside them, planted deliberately: a 64-hex
+    /// directory with **no manifest**, which is an ingest that placed its
+    /// objects and died before the manifest was written (the module's rule 1)
+    /// and is therefore a pack that is absent rather than half-present; a
+    /// staging name, which is what a *running* ingest looks like; and a name
+    /// that is not a digest at all. An announcement that carried any of the
+    /// three would tell the hub this runner holds a pack it cannot serve.
+    #[test]
+    fn what_a_runner_announces_is_every_pack_it_holds_and_nothing_half_made() {
+        let temp = TempDir::new("pack-announce");
+        let store = PackStore::open(temp.path()).expect("a store");
+
+        let first_at = temp.path().join("first");
+        let first = write_pack(&first_at, &[("bin/one", b"the first pack")], None);
+        let second_at = temp.path().join("second");
+        let second = write_pack(&second_at, &[("bin/two", b"the second pack")], None);
+        store.ingest(&first_at).expect("the first pack ingests");
+        store.ingest(&second_at).expect("the second pack ingests");
+        let first = PackId::of_manifest_bytes(&first);
+        let second = PackId::of_manifest_bytes(&second);
+
+        // An ingest that never wrote its manifest: hex-named, and not a pack.
+        let objects_only = "a".repeat(64);
+        fs::create_dir_all(store.manifests_dir().join(&objects_only)).expect("the planted name");
+        // An ingest that is happening right now.
+        fs::create_dir_all(staging_path(&store.manifests_dir())).expect("a staging name");
+        // And something nobody can read as a digest.
+        fs::create_dir_all(store.manifests_dir().join("not-a-digest")).expect("the odd name");
+
+        let announced = store.held_packs().expect("the store is readable");
+        let mut expected = vec![first, second];
+        expected.sort_by(|left, right| left.as_str().cmp(right.as_str()));
+        assert_eq!(
+            announced, expected,
+            "the two packs that are whole, in the order the names sort, and not one of the three \
+             that are not packs"
+        );
+    }
+
+    /// A store that will not be read is an **error**, never an empty
+    /// announcement.
+    ///
+    /// The distinction is the whole of why the walk answers a `Result`: an
+    /// empty announcement is the frame set's only retraction, so a
+    /// `read_dir` that failed would tell the hub to forget every holding this
+    /// runner really has — a false statement built out of a filesystem error.
+    #[test]
+    fn a_store_that_will_not_be_read_is_an_error_and_not_an_empty_announcement() {
+        let temp = TempDir::new("pack-announce-unreadable");
+        let store = PackStore::open(temp.path()).expect("a store");
+        let pack_at = temp.path().join("pack");
+        write_pack(
+            &pack_at,
+            &[("bin/one", b"a pack that is really held")],
+            None,
+        );
+        store.ingest(&pack_at).expect("the pack ingests");
+        assert_eq!(
+            store
+                .held_packs()
+                .expect("readable while it is there")
+                .len(),
+            1,
+            "one pack is held, which is what makes the next line a measurement"
+        );
+
+        fs::remove_dir_all(store.manifests_dir()).expect("the directory goes");
+        let why = store
+            .held_packs()
+            .expect_err("an unreadable store is not an empty one");
+        assert!(
+            why.contains("what this runner holds cannot be read"),
+            "the error says what could not be read rather than answering nothing: {why}"
+        );
+    }
+
+    /// A holding too large for one frame is cut, and **only the last frame
+    /// applies**.
+    ///
+    /// The fixture holds `PACKS_HELD_PER_FRAME + 4` ids, four over the
+    /// window, for the reason `FILES_IN_FLIGHT + 4` is the figure elsewhere:
+    /// a fixture at or below the window is green while measuring nothing,
+    /// because it never cuts. Four over forces exactly two frames, so the
+    /// `more: true` path is walked and the remainder is not a whole window
+    /// either.
+    ///
+    /// The byte figure is measured through the **production encoder**
+    /// (`herd_proto::to_frame`, which is what the runner's link writes) and
+    /// compared against the hub's own ceiling, `MAX_FRAME_BYTES = 1 << 20`
+    /// (`herd-hub/src/server.rs:167`). A chunk size that fit the array and
+    /// not the frame would be a runner whose every announcement the hub
+    /// refuses.
+    #[test]
+    fn a_holding_too_large_for_one_frame_is_cut_and_only_the_last_frame_applies() {
+        let held: Vec<PackId> = (0..PACKS_HELD_PER_FRAME + 4)
+            .map(|which| PackId::of_manifest_bytes(format!("pack {which}").as_bytes()))
+            .collect();
+
+        let frames = announcement_frames(held.clone());
+        assert_eq!(frames.len(), 2, "cut into two, so the cutting is exercised");
+        assert_eq!(frames[0].packs.len(), PACKS_HELD_PER_FRAME);
+        assert!(
+            frames[0].more,
+            "the first frame accumulates and applies nothing"
+        );
+        assert_eq!(frames[1].packs.len(), 4);
+        assert!(
+            !frames[1].more,
+            "the last frame is what replaces the hub's view"
+        );
+        let announced: Vec<PackId> = frames
+            .iter()
+            .flat_map(|frame| frame.packs.clone())
+            .collect();
+        assert_eq!(
+            announced, held,
+            "every id rides exactly one frame, in the order it was held"
+        );
+
+        // The hub's ceiling, measured against the encoder the link uses.
+        const MAX_FRAME_BYTES: usize = 1 << 20;
+        let widest = frames
+            .iter()
+            .map(|frame| {
+                herd_proto::to_frame(&herd_proto::ToHub::PacksHeld(frame.clone()))
+                    .expect("the frame encodes")
+                    .len()
+            })
+            .max()
+            .expect("there are frames");
+        assert!(
+            widest < MAX_FRAME_BYTES,
+            "the widest frame is {widest} bytes, which the hub would refuse over \
+             {MAX_FRAME_BYTES}"
+        );
+
+        // And exactly at the window: one frame, and it is the one that
+        // applies. The off-by-one the other way round would send an empty
+        // second frame, which a hub reads as a retraction of what the first
+        // one just said.
+        let exactly = announcement_frames(held[..PACKS_HELD_PER_FRAME].to_vec());
+        assert_eq!(exactly.len(), 1, "a full window is still one frame");
+        assert!(!exactly[0].more, "and it applies");
+    }
+
+    /// A runner that holds nothing announces **one empty frame that applies**,
+    /// and that is not the same as announcing nothing.
+    ///
+    /// It is the only retraction the frame set has. No announcement says
+    /// nothing, and a hub told nothing goes on offering a holder that has
+    /// dropped everything it had.
+    #[test]
+    fn a_runner_that_holds_nothing_announces_one_empty_frame_that_applies() {
+        let frames = announcement_frames(Vec::new());
+        assert_eq!(frames.len(), 1, "nothing to say is still said");
+        assert!(frames[0].packs.is_empty());
+        assert!(
+            !frames[0].more,
+            "and it applies, or the hub would accumulate an emptiness for ever"
         );
     }
 }
