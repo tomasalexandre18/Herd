@@ -5,7 +5,7 @@ use std::sync::Arc;
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use herd_hub::{
-    Authority, Budget, Hub, JobDirStore, JobStore, Policy, Stickiness, Stop, StopSignals,
+    Authority, Budget, Hub, JobDirStore, JobStore, Keepers, Policy, Stickiness, Stop, StopSignals,
     AGING_STEP, DEFAULT_LISTEN_ADDR, DRAIN_FIRST_LIMIT, LOST_AFTER, OUTPUT_BUDGET, OUTPUT_FLOOR,
     READINGS_AT_ONCE, READING_CAP, REQUEUE_BUDGET, STICKINESS_LIMIT, STOP_WITHIN, WAIT_RESTATEMENT,
 };
@@ -239,6 +239,62 @@ struct Args {
     /// a loud one.
     #[arg(long, env = "HERD_VOLUME_FREE_FLOOR", value_name = "SIZE")]
     volume_free_floor: Option<String>,
+    /// The runner that keeps every `leaves` key family no other runner is
+    /// named for: this hub's **default keeper** (D10, M12, E-16).
+    ///
+    /// A keeper is asked to keep the newest five packs of each key family it
+    /// keeps past the point its own `--pack-budget` would take them, so that
+    /// a pack outlives the machine that built it and survives that machine
+    /// being switched off.
+    ///
+    /// **D10 says the server's runner is the default keeper, and this is how
+    /// that sentence is written down.** This hub cannot find that runner by
+    /// itself: it knows a runner by the name the runner announced, and the
+    /// handshake's `host` carries memory, threads and tmpfs — nothing a hub
+    /// could compare with its own machine. So the deployment names it here,
+    /// once, and the name must be the one that runner is approved under.
+    ///
+    /// **There is no default, and that is the decision** (D194's rule).
+    /// Left out, this hub names no keeper, asks no runner to pin anything,
+    /// and every pack on every runner is evictable by that runner's own
+    /// budget alone — this hub's behaviour before this flag existed, byte
+    /// for byte. A name chosen here by Herd would be a name applied to
+    /// somebody else's fleet.
+    ///
+    /// **What it bounds is nothing.** The hub asks; the runner's own budget
+    /// and gc decide what can really be kept, and a keeper that cannot come
+    /// under its budget says so on the machine whose disk it is. A hub that
+    /// enforced a figure against someone else's disk would be enforcing a
+    /// bound its owner never agreed to.
+    #[arg(long, env = "HERD_KEEPER", value_name = "RUNNER")]
+    keeper: Option<String>,
+    /// One `leaves` key family and the runner that keeps it, as
+    /// `KEY=RUNNER`. Repeatable, and comma-separated in the environment
+    /// variable.
+    ///
+    /// **A named family is MOVED off the default keeper, not added to it.**
+    /// Naming a family here takes it out of `--keeper`'s share, so an
+    /// operator whose server's disk is filling with one key family can put
+    /// that family on another machine. Give the same family twice to have
+    /// two runners keep it, which is D10's "one or more keepers", and name
+    /// the default keeper again here to have it keep a family beside
+    /// somebody else.
+    ///
+    /// A family named here is pinned whether or not this hub has a pack
+    /// registered under it yet: it is what the operator asked for, and a
+    /// keeper that had to wait for the first pack would be a keeper that
+    /// missed it. `--keeper`'s own share is the other way round, because
+    /// *every family nobody else keeps* has no spelling until this hub knows
+    /// which families exist — it is filled from the families this hub has a
+    /// pack registered under, and a family whose first pack arrives while a
+    /// keeper is connected reaches it on the wire.
+    #[arg(
+        long = "keeper-for",
+        env = "HERD_KEEPER_FOR",
+        value_name = "KEY=RUNNER",
+        value_delimiter = ','
+    )]
+    keeper_for: Vec<String>,
     /// What this binary does instead of serving. Left out, it serves, which
     /// is every existing invocation unchanged.
     #[command(subcommand)]
@@ -485,6 +541,12 @@ async fn main() -> Result<()> {
             None => None,
         },
     };
+    // Who keeps which packs (D10, M12). Read here for the reason the budget
+    // above is: a `--keeper-for` that does not parse must stop this hub
+    // before the state root is opened, where the message names what the
+    // operator typed — and opening the root sweeps.
+    let keepers = Keepers::parse(args.keeper.as_deref(), &args.keeper_for)
+        .map_err(|why| anyhow::anyhow!(why))?;
     // Here for the same reason, and it is the stronger half of it: a sink
     // nobody can send to has to be found by the operator who typed it, not by
     // the absence of a notification three weeks later (E-37) — and a startup
@@ -596,6 +658,11 @@ async fn main() -> Result<()> {
             args.state_dir.display(),
         );
     }
+    // Custody, printed like every other setting (D148) and printed in both
+    // states: the failure this line exists to prevent is an operator
+    // believing a pack is kept somewhere when no runner was ever told to
+    // keep it.
+    println!("{}", keepers.said());
     match &sink {
         Some(sink) => println!(
             "herd-hub: events go to {} (--notify-sink). Five things are said and nothing \
@@ -621,7 +688,12 @@ async fn main() -> Result<()> {
         // E-35: the fleet's state goes beside the records, refreshed whenever
         // it changes, so that nobody has to read a log to know what the hub
         // is doing. `herd-hub status` prints it; a renderer parses it.
-        .publishing_status_to(args.state_dir.clone());
+        .publishing_status_to(args.state_dir.clone())
+        // D10's custody, before a single connection is accepted: a welcome
+        // that went out while this was still empty would tell a keeper it
+        // keeps nothing, and nothing would ever correct it — the frame that
+        // could is only sent when the policy *changes*.
+        .naming_keepers(keepers);
     println!(
         "herd-hub {} listening on ws://{}, state in {} ({state_root_id}), \
          {unfinished} job(s) not over, {} quarantined, a runner reporting every {:?} is \
@@ -893,6 +965,17 @@ mod tests {
                 ),
                 "--output-floor's promise",
             ),
+            (
+                format!(
+                    "newest {} packs",
+                    // Fully qualified, and that is not a style choice: the
+                    // constant is read by this test alone, so an import at
+                    // the top of the file would be an unused one in the
+                    // binary's own build and `-D warnings` would refuse it.
+                    a_number_in_words(herd_hub::KEEPER_KEEP_PER_KEY.into())
+                ),
+                "--keeper's custody figure",
+            ),
         ] {
             assert!(
                 help.to_lowercase().contains(&figure.to_lowercase()),
@@ -906,6 +989,78 @@ mod tests {
                  --- the rendered long help, with its whitespace flattened:\n{help}"
             );
         }
+    }
+
+    /// **The keeper policy as the command line gives it** (D10, M12, E-16).
+    ///
+    /// The refusals matter more than the acceptance, and for the reason the
+    /// retention spans' do: every one of these mistakes is otherwise
+    /// *silent*. A `--keeper-for` without its `=` would name a key family
+    /// nothing is ever filed under, and the operator would read a startup
+    /// line that looked exactly right while nothing was pinned anywhere.
+    ///
+    /// The last case is the one that has to hold for ever: a hub given
+    /// neither flag names nobody, which is this binary's behaviour before
+    /// the flags existed.
+    #[test]
+    fn the_keeper_policy_is_read_off_the_command_line_or_refused_by_name() {
+        let named = Args::parse_from([
+            "herd-hub",
+            "--keeper",
+            "server-runner",
+            "--keeper-for",
+            "reference=pc-runner",
+        ]);
+        assert_eq!(named.keeper.as_deref(), Some("server-runner"));
+        assert_eq!(named.keeper_for, vec!["reference=pc-runner".to_owned()]);
+        let keepers = Keepers::parse(named.keeper.as_deref(), &named.keeper_for)
+            .expect("a default keeper and one named family parse");
+        assert!(
+            !keepers.names_nobody(),
+            "a hub given both flags names somebody"
+        );
+        let said = keepers.said();
+        for owed in [
+            "server-runner is the default keeper",
+            "reference is kept by pc-runner",
+            "MOVED off the default keeper",
+        ] {
+            assert!(
+                said.contains(owed),
+                "the startup line has to say {owed:?}, and it says:\n{said}"
+            );
+        }
+
+        for (typed, wrong) in [
+            (vec!["reference".to_owned()], "has no `=` in it"),
+            (vec!["=pc-runner".to_owned()], "leaves the key family empty"),
+            (
+                vec!["reference=".to_owned()],
+                "leaves the runner's name empty",
+            ),
+        ] {
+            match Keepers::parse(None, &typed) {
+                Err(why) => assert!(
+                    why.contains(wrong),
+                    "{typed:?} must be refused with {wrong:?}, and it said: {why}"
+                ),
+                Ok(_) => panic!("{typed:?} is not a KEY=RUNNER and must be refused"),
+            }
+        }
+        assert!(
+            Keepers::parse(Some("  "), &[]).is_err(),
+            "--keeper with an empty name is a mistake and not a hub that names nobody"
+        );
+
+        let silent = Args::parse_from(["herd-hub"]);
+        assert!(silent.keeper.is_none() && silent.keeper_for.is_empty());
+        assert!(
+            Keepers::parse(silent.keeper.as_deref(), &silent.keeper_for)
+                .expect("neither flag parses")
+                .names_nobody(),
+            "a hub given neither flag names NO keeper: no welcome carries keeper_for and no \
+             PinPacks is ever sent, which is this binary's behaviour before the flags existed"
+        );
     }
 
     /// The long help, rendered from the real `Args` and flattened to one

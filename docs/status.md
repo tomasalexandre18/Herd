@@ -61,7 +61,7 @@ a registry on `(commit, key)`; the runner holds a content-addressed store
 hard-linking a pack into a job; a peer serves and fetches on the one socket
 invariant 3 permits, **reporting which path** (**D223**, **D233**, **D240**,
 **D241**). **A dry run answers for the dispatch too** (**D261**, E-07); **the
-runner honours the hub's custody, but no hub names a keeper yet** (**D262**).
+runner honours custody, and the hub names keepers only if asked** (**D266**).
 
 **The runner has a mesh-address rule and binds nothing by default** (**D222**);
 **every `--help` figure reads back through its own constant** (**D245**); **an

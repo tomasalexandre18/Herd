@@ -36,9 +36,9 @@ pub use retention::{
 };
 pub use roster::{Admission, Approval, Roster, SharedSecret, ROSTER_VERSION};
 pub use server::{
-    hub_version, Authority, Hub, HubHandle, Policy, Restating, RunnerStatus, Stop, StopSignals,
-    ATTEMPTS_ALLOWED, DEFAULT_LISTEN_ADDR, FRAME_CEILING_BYTES, LOST_AFTER, MAX_FRAME_BYTES,
-    READING_CAP, REQUEUE_BUDGET, STOP_WITHIN, WAIT_RESTATEMENT,
+    hub_version, Authority, Hub, HubHandle, Keepers, Policy, Restating, RunnerStatus, Stop,
+    StopSignals, ATTEMPTS_ALLOWED, DEFAULT_LISTEN_ADDR, FRAME_CEILING_BYTES, KEEPER_KEEP_PER_KEY,
+    LOST_AFTER, MAX_FRAME_BYTES, READING_CAP, REQUEUE_BUDGET, STOP_WITHIN, WAIT_RESTATEMENT,
 };
 pub use status::{
     status_path, AwayNow, CapabilityNow, HubNow, Lends, QueuedNow, RunnerNow, RunningNow, Status,
