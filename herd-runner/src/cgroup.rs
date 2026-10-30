@@ -1030,7 +1030,7 @@ impl Kernel<'static> {
             proc_root: Path::new(PROC),
             me: std::process::id() as i32,
             write: |path, value| fs::write(path, value),
-            mkdir: fs::create_dir,
+            mkdir: |path| fs::create_dir(path),
         }
     }
 }
@@ -1792,7 +1792,7 @@ mod tests {
             proc_root,
             me: std::process::id() as i32,
             write,
-            mkdir: fs::create_dir,
+            mkdir: |path| fs::create_dir(path),
         }
     }
 
@@ -2327,7 +2327,10 @@ mod tests {
         // is the one thing no real kernel does — so the list is missing
         // rather than empty.
         let why = ceiling
-            .prove_io_max_through(&an_io_ceiling(), fake_io_kernel(fs::create_dir))
+            .prove_io_max_through(
+                &an_io_ceiling(),
+                fake_io_kernel(|path| fs::create_dir(path)),
+            )
             .expect_err("an unreadable controller list proves nothing");
         assert!(
             why.contains("cgroup.controllers") && why.contains("cannot be read"),
