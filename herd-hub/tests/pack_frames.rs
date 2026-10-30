@@ -1128,30 +1128,31 @@ async fn a_job_needing_a_pack_no_runner_holds_waits_by_name_and_is_not_assigned(
         "and nobody's link is closed over it (D13): {seen:?}"
     );
 
-    // And the next dispatch pass places it: the **same** job, no
+    // **And the announcement itself places it** — the same job, no
     // resubmission and no requeue, which is what makes this a wait rather
     // than an ending.
     //
-    // **An announcement is not itself a dispatch trigger**, and this test
-    // says so rather than hiding it. `ToHub::PacksHeld` records the holding
-    // and starts no pass, and a health report starts one only when it ended a
-    // ceiling correction (D182) — so on a quiet hub what places this job is
-    // `let_the_queue_age`, within a minute. A minute is longer than this
-    // suite's patience, so the pass is provoked here by the one event that
-    // reliably starts one, a submission, and the figure above is the real
-    // bound an operator would see. It is a row for the board, not a defect
-    // this test may paper over.
+    // **One frame and nothing else, which is the assertion.** An
+    // announcement that changes what this hub knows judges the queue at
+    // once: nothing here submits a second job, sends a health report or
+    // waits on a clock between the frame and the assignment, so the frame is
+    // the only thing that could have caused it. That is worth asserting this
+    // precisely because the alternative was measured: before the hub judged
+    // the queue here, `ToHub::PacksHeld` woke no pass and a health report
+    // woke one only when it had ended a ceiling correction (D182), so what
+    // placed this job was `let_the_queue_age` — up to a minute of a machine
+    // standing idle holding the very bytes the job was waiting for, and
+    // longer than this suite's patience.
+    //
+    // Sent with `say` rather than through the `announces` helper, because
+    // that helper reads every frame up to the answer to its own health
+    // report and the assignment this provokes is one of those frames.
     runner
         .say(ToHub::PacksHeld(PacksHeld {
             packs: vec![the_pack()],
             more: false,
         }))
         .await;
-    let _provokes_a_pass = support::submit_job(&harness.requester(), shell("true"))
-        .await
-        .expect("a second job is minted");
-    // Oldest first, so the job that was waiting is placed before the one
-    // that woke the pass.
     let (packs_in, _) = assignment_for(&mut runner, &job_id).await;
     assert_eq!(
         packs_in.len(),

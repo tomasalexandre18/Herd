@@ -5671,12 +5671,13 @@ async fn relay_from_runner(
                     // had this line say it held 4 (ORCH-239, measured
                     // through two real processes). An operator has no other
                     // observation of holdings than this sentence.
-                    let count = registry.announced(
+                    let said = registry.announced(
                         name,
                         state.mesh_endpoint_of(name),
                         announcement.packs,
                         more,
                     );
+                    let count = said.held;
                     if more {
                         journal(&format!(
                             "herd-hub: runner {name} is announcing its packs, {count} so far \
@@ -5695,6 +5696,21 @@ async fn relay_from_runner(
                             "herd-hub: runner {name} holds {count} pack(s), which replaces \
                              what this hub had for it"
                         ));
+                    }
+                    // And if that moved what this hub knows, the queue is
+                    // judged **now**. Nothing else would: an announcement is
+                    // not an event the dispatch pass is woken by, and a
+                    // health report wakes one only when it ended a ceiling
+                    // correction (D182) — so a job held back because the pack
+                    // it needs has no holder (clause 2) would wait for
+                    // whatever happened to wake the hub next. On a quiet fleet
+                    // that is `let_the_queue_age`, up to a minute of a machine
+                    // standing idle holding the very bytes the job is waiting
+                    // for. The same shape as the health report's and the
+                    // switch's, and **only on news**: a runner restating what
+                    // this hub already had walks no queue.
+                    if said.changed {
+                        dispatch_queued_jobs(state)?;
                     }
                 }
                 Err(why) => journal(&format!(

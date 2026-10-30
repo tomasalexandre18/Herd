@@ -887,22 +887,40 @@ impl PackRegistry {
     /// it held **4**, because 4 is the length of the last frame
     /// (ORCH-239). That sentence is an operator's only observation of
     /// holdings, so the figure it prints comes from here.
+    /// **And it says whether the applied set actually moved**
+    /// ([`Announcement::changed`]), because a job can be waiting on exactly
+    /// this: a pack with no holder is a job that waits (clause 2), and the one
+    /// event that ends that wait is a runner saying it holds the pack. The
+    /// caller judges the queue when, and only when, this says there is news —
+    /// the shape `State::record_health` and `State::record_switch` already
+    /// use, and for the same reason: a pass on every frame would walk the
+    /// queue for a runner restating what the hub already knew.
     pub fn announced(
         &self,
         runner: &str,
         endpoint: Option<String>,
         packs: Vec<PackId>,
         more: bool,
-    ) -> usize {
+    ) -> Announcement {
         let mut live = self.locked();
         let holding = live.holdings.entry(runner.to_owned()).or_default();
         holding.endpoint = endpoint;
         holding.arriving.extend(packs);
         if more {
-            return holding.arriving.len();
+            // Nothing is applied until the announcement ends, so there is no
+            // news yet however many frames have arrived.
+            return Announcement {
+                held: holding.arriving.len(),
+                changed: false,
+            };
         }
-        holding.held = std::mem::take(&mut holding.arriving);
-        holding.held.len()
+        let applied = std::mem::take(&mut holding.arriving);
+        let changed = applied != holding.held;
+        holding.held = applied;
+        Announcement {
+            held: holding.held.len(),
+            changed,
+        }
     }
 
     /// Forget everything a runner announced, because its link is gone.
@@ -974,6 +992,28 @@ pub enum Resolved {
     Nothing,
     /// This hub will not answer for that key, and here is the sentence why.
     Refused(String),
+}
+
+/// What one announcement did, as [`PackRegistry::announced`] applied it.
+///
+/// Two fields because the caller needs two different things from one act
+/// under one lock: a figure to say out loud, and whether anything moved.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Announcement {
+    /// How many packs this runner now stands at: the applied set once `more`
+    /// is false, and what has arrived so far while it is true.
+    ///
+    /// **Read under the lock that just wrote it**, which is the whole reason
+    /// it is a return value and not a second call (ORCH-239).
+    pub held: usize,
+    /// Whether the applied set is different from what this hub held for this
+    /// runner a moment ago.
+    ///
+    /// **False while `more` is true**, because nothing is applied until an
+    /// announcement ends. False too for a runner restating what the hub
+    /// already had, which is the common case and the one a dispatch pass
+    /// would be wasted on.
+    pub changed: bool,
 }
 
 /// Who holds a pack, or **which of the two ways nobody does**.
@@ -1545,7 +1585,19 @@ mod tests {
 
         // One runner says it holds none. **A measurement**, and the figure in
         // the state is what makes it one.
-        registry.announced("attic", None, Vec::new(), false);
+        //
+        // It is also the first of the four `changed` cases, and the one a
+        // reader would guess wrongly: a runner this hub had never heard from
+        // saying "I hold none" is **not news for the queue**. The hub learns
+        // something — this fleet has now spoken — but no pack became
+        // placeable, so no dispatch pass is owed.
+        let said = registry.announced("attic", None, Vec::new(), false);
+        assert_eq!(said.held, 0);
+        assert!(
+            !said.changed,
+            "an empty first announcement moves no holding, so the queue is \
+             not judged for it"
+        );
         assert_eq!(
             registry.custody_of(&pack),
             Custody::NoHolder {
@@ -1558,8 +1610,23 @@ mod tests {
         assert_eq!(now.unheld.len(), 1);
 
         // A holder, and the list is empty: it holds what is wrong, not what
-        // there is.
-        registry.announced("tower", None, vec![pack.clone()], false);
+        // there is. **This one is news** — it is the event that ends the wait
+        // of every job needing this pack, and the hub judges its queue on it.
+        let said = registry.announced("tower", None, vec![pack.clone()], false);
+        assert_eq!(said.held, 1);
+        assert!(
+            said.changed,
+            "a pack that gained a holder is news: it is what lets a waiting \
+             job start"
+        );
+        // And a runner restating what the hub already had is not news, which
+        // is what keeps a pass off every frame.
+        let again = registry.announced("tower", None, vec![pack.clone()], false);
+        assert_eq!(again.held, 1);
+        assert!(
+            !again.changed,
+            "the same set announced twice walks no queue the second time"
+        );
         assert_eq!(
             registry.custody_of(&pack).name(),
             "held",
@@ -1584,14 +1651,24 @@ mod tests {
         // from the first frame, so it has *said*, while its applied set is
         // still the previous one — which this registry replaces only when
         // `more` is false.
-        registry.announced("tower", None, Vec::new(), true);
+        let mid = registry.announced("tower", None, Vec::new(), true);
+        assert!(
+            !mid.changed,
+            "nothing is applied while more is true, so there is no news yet \
+             however many frames have arrived"
+        );
         assert_eq!(
             registry.custody_of(&pack).name(),
             "held",
             "nothing is applied until the announcement ends, so the hub still \
              names the holder it was told about"
         );
-        registry.announced("tower", None, Vec::new(), false);
+        let ended = registry.announced("tower", None, Vec::new(), false);
+        assert!(
+            ended.changed,
+            "and a pack that lost its last holder is news too: the job that \
+             needs it has to be told it is waiting"
+        );
         assert_eq!(
             registry.custody_of(&pack),
             Custody::NoHolder {
@@ -1653,17 +1730,23 @@ mod tests {
             })
             .collect();
         assert_eq!(
-            registry.announced("tower", None, packs[0..3].to_vec(), true),
+            registry
+                .announced("tower", None, packs[0..3].to_vec(), true)
+                .held,
             3,
             "the first frame of three has three packs arriving"
         );
         assert_eq!(
-            registry.announced("tower", None, packs[3..5].to_vec(), true),
+            registry
+                .announced("tower", None, packs[3..5].to_vec(), true)
+                .held,
             5,
             "the second frame answers what has arrived so far, not its own two"
         );
         assert_eq!(
-            registry.announced("tower", None, packs[5..6].to_vec(), false),
+            registry
+                .announced("tower", None, packs[5..6].to_vec(), false)
+                .held,
             6,
             "and the frame that applies answers the whole set, not its own one"
         );
