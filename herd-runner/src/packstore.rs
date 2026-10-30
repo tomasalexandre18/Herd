@@ -73,11 +73,16 @@
 //! objects, manifest first, so no instant exists in which this runner
 //! announces a pack it cannot serve (ORCH-240).
 //!
-//! **Nothing in this crate calls it yet**, and that is deliberate rather
-//! than unfinished: a pass run with an empty claim set on a runner that is in
-//! fact running a job would take a pack out from under it, and what a running
-//! job references is knowledge the layout step has not put in this runner
-//! yet. The gc is here, tested, and waiting for its caller.
+//! **Its one caller is [`crate::Session::sweep_packs_to_budget`]**, which
+//! runs it once per connection, before the announcement of what this runner
+//! holds and after the welcome that says what this runner keeps. That is the
+//! only place in the crate with the hub's custody in hand, and a pass run
+//! without it — beside an ingest in [`leave_packs`], or in `fetch.rs` — would
+//! run with `pins: None` and evict the very packs a keeper exists to hold.
+//! What it still does not have is [`Claims::referenced`]: what a queued or
+//! running job references is knowledge the layout step has not put in this
+//! runner yet, and until it has, that clause is proven against a claim set a
+//! test writes rather than against a real job.
 //!
 //! ## Three rules this module exists to get right
 //!
@@ -506,9 +511,11 @@ pub fn take_budget(data_root: &Path, budget: Option<u64>) -> String {
 /// the hub has pinned on this runner, so both are asked for rather than
 /// guessed, and a caller that passes [`Claims::default`] is saying "nothing
 /// is claimed". That is the honest reading of a store nobody has told
-/// anything about — and it is also why [`PackStore::evict_to_budget`] has no
-/// caller in this crate yet: a pass run with an empty claim set on a runner
-/// that is in fact running a job would take the pack out from under it.
+/// anything about, and it is why this type is what the one caller in this
+/// crate builds rather than what the pass guesses:
+/// [`crate::Session::sweep_packs_to_budget`] fills `pins` from the hub's own
+/// welcome and `referenced` from nothing, because nothing in this build
+/// knows it yet.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Claims {
     /// Packs a queued or running job on this runner references. **Never
@@ -520,14 +527,25 @@ pub struct Claims {
     /// (ORCH-220). Said rather than implied, and a row is owed for re-proving
     /// this clause against a real job rather than against a claim set a test
     /// wrote.
+    ///
+    /// What the empty set costs today is bounded by the filesystem and not by
+    /// this type: a pack already laid out for a job is **hard links** into
+    /// `objects/` ([`PackStore::lay_out`]), so a pass that unlinks the
+    /// store's own name for those bytes leaves the job's copy whole. What it
+    /// can still cost is a pack taken away between the completeness check and
+    /// the layout of a job that was about to be handed it — a re-fetch, said
+    /// by name, and never a job handed half a pack.
     pub referenced: BTreeSet<PackId>,
     /// The keeper's pins, as the hub sends them ([`PinPacks`]): which key
     /// families this runner keeps for the fleet, and how many of each. The
     /// newest `keep_per_key` of every named key are **never** evicted.
     ///
-    /// `None` is "the hub has pinned nothing here", which is every runner
-    /// today: reading the frame and keeping it across a redial is P4's and
-    /// `lib.rs`'s, not this module's.
+    /// `None` is "the hub has pinned nothing here", which is still every
+    /// runner a hub of this build talks to: reading `Welcome.keeper_for` and
+    /// [`PinPacks`] and keeping the set across a redial is `lib.rs`'s
+    /// ([`crate::Session::keeps_for`], [`crate::Session::pin_packs`]), and
+    /// what makes a hub *name* a keeper is M12's keeper policy, which is the
+    /// hub's and is not written yet.
     pub pins: Option<PinPacks>,
     /// How many packs of each key family the retention rule keeps while it
     /// can — [`KEEP_PER_KEY`] unless the caller says otherwise.
