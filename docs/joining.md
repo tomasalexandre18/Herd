@@ -850,6 +850,18 @@ herd-runner: stopped
 A verdict the hub has not acknowledged by then is written under the data
 root and delivered on the next start (D34). Stopping loses nothing.
 
+**Timed once, on 2026-10-30, and only the easy half.** Until that day
+the five seconds was asserted and never measured against a running
+runner. On our own queue runner (v0.4.1, one host, one version),
+`kill -TERM` by PID to process exit was **0.212 s** — a 24× margin.
+That runner was **idle**, and its own first line above says so:
+`0 job(s) to end`. So what is measured is the stop path with nothing
+to drain. **The case the bound exists for is still untimed**: a runner
+asked to stop while a job is running has to end that job, take its
+verdict and write it down, and no figure in this project covers that
+yet. Read 0.212 s as the floor of the stop path, not as the answer for
+a runner draining a three-hour build.
+
 ## When it does not work
 
 | What you see | What it is |
