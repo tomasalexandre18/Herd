@@ -1469,7 +1469,7 @@ impl Session {
     /// Answers the one line to say about it, or nothing at all for the
     /// ordinary runner that is a keeper for nothing and was not one before.
     pub(crate) fn keeps_for(&self, keeper_for: Vec<String>) -> Option<String> {
-        let pins = (!keeper_for.is_empty()).then(|| herd_proto::pack::PinPacks {
+        let pins = (!keeper_for.is_empty()).then_some(herd_proto::pack::PinPacks {
             keys: keeper_for,
             keep_per_key: packstore::KEEP_PER_KEY,
         });
@@ -6443,7 +6443,8 @@ mod tests {
             .keeps_for(vec![A_KEY_FAMILY.to_owned()])
             .expect("a keeper says so");
         assert_eq!(
-            session.pack_claims().pins, pinned,
+            session.pack_claims().pins,
+            pinned,
             "the welcome's keys, at this runner's own default count: {first}"
         );
         // The redial: one session, a second welcome.
@@ -6452,18 +6453,17 @@ mod tests {
             .expect("said on every connection, because it is true on every connection");
         assert_eq!(again, first, "one arrangement, one sentence");
         assert_eq!(
-            session.pack_claims().pins, pinned,
+            session.pack_claims().pins,
+            pinned,
             "and the set is in force again before anything on this connection sweeps"
         );
         let withdrawn = session
             .keeps_for(Vec::new())
             .expect("custody being taken away is said, because it changes what a budget may do");
-        assert!(
-            withdrawn.contains("no keeper here any more"),
-            "{withdrawn}"
-        );
+        assert!(withdrawn.contains("no keeper here any more"), "{withdrawn}");
         assert_eq!(
-            session.pack_claims().pins, None,
+            session.pack_claims().pins,
+            None,
             "an empty keeper_for is no custody and not a custody of no keys"
         );
         assert!(
@@ -6508,9 +6508,13 @@ mod tests {
             keys: Vec::new(),
             keep_per_key: packstore::KEEP_PER_KEY,
         });
-        assert!(none.contains("pins no key on this runner any more"), "{none}");
+        assert!(
+            none.contains("pins no key on this runner any more"),
+            "{none}"
+        );
         assert_eq!(
-            session.pack_claims().pins, None,
+            session.pack_claims().pins,
+            None,
             "a frame of no keys is custody withdrawn, and never a custody of nothing that \
              an eviction has to read"
         );
