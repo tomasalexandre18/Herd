@@ -18,7 +18,7 @@ deciding, never the count** (**D187**, **D236**).
 **v0.4.1 is published and tagged by `herd-merger`** (**D212**); it carries
 **D211**, so their runner can leave 0.3.6. **Nothing released since.** Notes
 are a file in the tree (ORCH-162); **writing and publishing stay Alexa's**
-(**D210**).
+(**D210**). The next tag is v1.0.0 (ORCH-217).
 
 **Stable means v1.0.0** (**D204**) and **it ships 42 of 44 musts** (**D248**).
 **M11's pack half is inside it; M17's two musts the consumer has released us
@@ -28,8 +28,7 @@ E-49, on their own condition that **both are named in the notes as not met**.
 ORCH-210 is closed; **D206 is overtaken, not reversed**. **All three
 versions have moved** — `PROTOCOL_VERSION` **3**, `RECORD_VERSION` **2**,
 `LAYOUT_VERSION` **2** — with no migration path, the last two destroying a
-root. **D199's constraint on the ordinary release is moot** (**D243**) and
-**ORCH-156 is closed as caduque**: the next tag is v1.0.0 (ORCH-217).
+root. **D199 is moot** (**D243**) and **ORCH-156 is caduque**.
 
 ## What is known about the consumer's machines, and when
 
@@ -76,9 +75,10 @@ and **skips per host** (D27): **12** runtime, **14** loaded, **38** ignored.
 ## What the software still does not do
 
 1. **Nothing ever deletes a job directory** (ORCH-012, -021), a reading weighs
-   no memory (**ORCH-126**), *reaped* is unbuilt (**D134**), and **`packs/`
-   has no retention or sweep** (ORCH-215): the runner takes a budget, **evicts
-   nothing**, and the deployed unit names none (ORCH-251, -252).
+   no memory (**ORCH-126**), *reaped* is unbuilt (**D134**), and the **hub's**
+   `packs/` has no retention (ORCH-215). The runner evicts packs under its
+   budget and **nothing calls that gc** (ORCH-240, -253); no one is told the
+   figures (ORCH-251) and the deployed unit names none (ORCH-252).
 2. **The pack half reaches a job, and no pack reaches a disk.** **The runner
    lays no pack out under `{in}` and registers none from `{out}`** — it hands
    the job back with every key named (ORCH-220). `ToHub::JobFact` and six
