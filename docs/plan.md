@@ -403,9 +403,11 @@ scheduled and run on a `build` runner and its pack moves like any other; and
 placement prefers the runner already holding the key, picking reference last.
 
 ### M13 — Status and events (`m13-status-events`)
-**Partly landed 2026-10-29 in batch 8.** E-35 is merged and E-37 is partly
-built — four of its listed transitions are emitted, two of its five
-items are not. The milestone as a whole is not done.
+**Partly landed 2026-10-29 in batch 8, and E-37's fifth item built on
+`detached-end-event`, 2026-10-30.** E-35 is merged and E-37 is partly
+built — four of its listed transitions landed in batch 8, the fifth is on
+that branch, and the last of the five needs M14 and no event of its own.
+The milestone as a whole is not done.
 
 One status document, JSON with a format version (Q7), carrying the queue,
 runners, running jobs and leases with the fields E-35 lists, refreshed on
@@ -418,19 +420,28 @@ it is not state a test may checksum. Events pushed to a configured URL or
 command — exactly E-37's list, never per step job by default (E-37). **As
 built (D216):** four of the five listed things have a transition in today's
 hub and are emitted to one sink, a URL or a command string, with no filter,
-template or per-event switch. The two that are not: a detached job's end
-needs the submitter's asking carried on `NewJob`, `ToHub::SubmitJob` and
-`job.json`; the nightly's verdict needs M14's nightly to exist and then
-needs no event of its own.
+template or per-event switch. **The fifth is built on `detached-end-event`,
+2026-10-30:** the submitter's asking travels as `announce_end` on
+`ToHub::SubmitJob`, through `NewJob`, onto `job.json`, and is read back at
+every door a record reaches a terminal state through; `herdctl submit
+--announce-end` asks for it and `herdctl run` is offered no such flag, which
+is what makes *"detached"* true. Neither `PROTOCOL_VERSION` nor
+`RECORD_VERSION` moved: both fields are absent when nobody asked, asserted
+on the written bytes. **What is left of E-37 is the nightly's verdict, and
+it is this same event rather than a new one**: a scheduled pass is
+`herdctl if-moved` submitting on the consumer's own timer, so what it waits
+on is M14's nightly existing and the asking being passed through on that
+submission — one line in `herdctl`, not hub work.
 **Done when** the status document and its screen carry E-35's fields and
 drive a fixture renderer from the document and nothing else, and a simulated
 day of step jobs emits exactly the expected events and zero per-step ones.
 **A separate JSON Schema was the old wording of this and does not exist**:
 the typed document is the schema, and a document of another
 `STATUS_VERSION` is refused by name with both figures. What is still owed
-here is E-37's two and the use-against-budget figure M12 points at this
-milestone for, which stays `herd-hub report`'s because it is a walk of the
-volume.
+here is the use-against-budget figure M12 points at this milestone for,
+which stays `herd-hub report`'s because it is a walk of the volume. E-37's
+own remainder is **not** owed here: the nightly's verdict is M14's, and no
+further M13 work closes it.
 
 ### M14 — Scheduled jobs and the hook path (`m14-scheduled-jobs`)
 **Corrected 2026-10-29 by D207, and partly landed the same day.** This
@@ -457,7 +468,11 @@ deviation, and no hub work closes it (D217):** a pass that submitted
 nothing is `herdctl`'s own stderr line and never an event, because the hub
 never heard of the job; the skip E-41 *can* have as an event is the other
 one, a pass submitted with `--deadline` that nothing started by 05:00,
-which the hub cancels as `cancelled (deadline)`, exit 125 (E-09, D40). The
+which the hub cancels as `cancelled (deadline)`, exit 125 (E-09, D40).
+**E-37's last item lands here and not in M13**: *the nightly's verdict* is
+the `job_ended` event built on `detached-end-event` 2026-10-30, so what it
+needs is `if-moved` asking for it on the submission it makes — the hub side
+exists and announces every ending, the 05:00 cancellation included. The
 push-hook path is a documented detached `herdctl` submission; the hook
 itself is the consumer's (E-42), submitting `produce` with a `dedup_key`
 of `produce:<commit>` and a `coalesce` key of `produce:main`: a queued

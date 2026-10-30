@@ -1484,6 +1484,42 @@ pub enum ToHub {
         /// same [`Asked`] and has no files to want.
         #[serde(default = "wants_files_unless_told")]
         wants_files: bool,
+        /// Whether this submitter is **asking for this job's end to be
+        /// announced** to whatever the hub's event sink is (E-37).
+        ///
+        /// A request made at submission time about an announcement at the
+        /// end, and never a statement that anything was announced: the hub
+        /// writes it onto the job's `job.json` and reads it back when the
+        /// job reaches a terminal state. What happens with
+        /// it then is the operator's — the hub with no sink configured says
+        /// nothing at all, and a submitter cannot tell from here whether
+        /// there is one.
+        ///
+        /// **`false` is the default and the absence, and that is E-37's own
+        /// requirement**, not a convenience: *"never per step job by
+        /// default"*, with the acceptance criterion *"a day's ntfy count does
+        /// not grow with the number of step jobs"*. A fleet whose submitters
+        /// say nothing is a fleet that emits nothing, so the one way to get
+        /// an end announced is to have asked for it here.
+        ///
+        /// **Beside `asked` and not inside it**, for the second half of
+        /// `wants_files`'s reason: [`ToHub::DryRun`] carries the same
+        /// [`Asked`] and has no end to announce. Unlike `wants_files` it is
+        /// *not* a fact about this follower — it goes on the record and
+        /// outlives the connection — which is why it is on this frame alone
+        /// and not on [`ToHub::WaitForJob`]: a requester attaching to a job
+        /// by its id is already being told how it ends, and only the
+        /// submission can say what the submitter asked for.
+        ///
+        /// `#[serde(default, skip_serializing_if = …)]`, which is the whole
+        /// of why this field left [`PROTOCOL_VERSION`] where it was: a
+        /// submission that does not ask encodes to exactly the bytes it
+        /// encoded to before this field existed, and one from a peer that
+        /// never heard of it decodes with the field at `false` — which is
+        /// what such a peer meant. `herd-proto/tests/round_trip.rs` asserts
+        /// both halves.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        announce_end: bool,
     },
     /// Requester asks where a job **would** run, and for nothing to happen
     /// (E-07).

@@ -467,6 +467,14 @@ pub struct NewJob {
     /// The artefacts this submission says it will leave, key → path under
     /// `{out}` (M11); see [`JobRecord::leaves`].
     pub leaves: std::collections::BTreeMap<String, String>,
+    /// Whether the submitter asked for this job's end to be announced
+    /// (E-37); see [`JobRecord::announce_end`].
+    ///
+    /// `false` for every constructor here, which is E-37's *"never per step
+    /// job by default"*: the hub's own mints — a reading (D74), a requeue —
+    /// ask for nothing, and the one way this is `true` is a submission that
+    /// said so on the wire.
+    pub announce_end: bool,
 }
 
 impl NewJob {
@@ -505,6 +513,7 @@ impl NewJob {
             reading_for: None,
             needs: Vec::new(),
             leaves: std::collections::BTreeMap::new(),
+            announce_end: false,
         }
     }
 
@@ -584,6 +593,18 @@ impl NewJob {
     pub fn with_admission(mut self, memory_mib: Option<u64>, tmpfs_mib: Option<u64>) -> Self {
         self.memory_mib = memory_mib;
         self.tmpfs_mib = tmpfs_mib;
+        self
+    }
+
+    /// The same, as a submitter who asked for this job's end to be announced
+    /// (E-37).
+    ///
+    /// A request, carried from the submission onto the record and read back
+    /// when the job ends. Nothing else in the hub ever sets it: a job the
+    /// hub minted for itself is a job nobody is waiting on an announcement
+    /// for.
+    pub fn announcing_its_end(mut self, asked: bool) -> Self {
+        self.announce_end = asked;
         self
     }
 
@@ -1126,6 +1147,43 @@ pub struct JobRecord {
     /// `#[serde(default)]`, for the reason [`JobRecord::packs_in`] is.
     #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
     pub packs_out: std::collections::BTreeMap<String, herd_proto::pack::PackId>,
+    /// Whether this job's **submitter asked for its end to be announced**
+    /// (E-37).
+    ///
+    /// **A request and never a result.** It says what was asked for at
+    /// submission time; it says nothing at all about whether an announcement
+    /// was made, could be made, or reached anybody. A hub with no
+    /// `--notify-sink` configured writes this field exactly as a hub with one
+    /// does and announces nothing, because the sink is the operator's setting
+    /// and this is the requester's question. Whether a particular event left
+    /// the machine is the hub's own stderr's business, not the record's: an
+    /// event is news, sent once and never retried
+    /// ([`crate::notify`]), so a record claiming delivery would be a record
+    /// claiming something nobody checked.
+    ///
+    /// Written at birth and never changed, like [`JobRecord::labels`]: what a
+    /// submitter asked for is part of what the job was. A requeue (D76) and a
+    /// second attempt (E-21) re-run the same record and so carry the same
+    /// asking; a second identical submission that *joins* this job (E-05) does
+    /// not change it, which is the honest answer — one execution has one end,
+    /// and E-05's joiner is told how it went on its own connection.
+    ///
+    /// **It is read exactly once per job**, at the job's terminal transition,
+    /// and only by a hub that has a sink: see `say_how_it_ended` in
+    /// `crate::server`. So the acceptance criterion holds by construction —
+    /// a day of step jobs nobody asked about is a day of no reads and no
+    /// events.
+    ///
+    /// `#[serde(default)]`, and absent means exactly what the default says:
+    /// **nobody asked**. That is true of every record written before this
+    /// field existed — there was no way to ask — which is the condition
+    /// [`RECORD_VERSION`]'s own doc sets for a field to be additive, so this
+    /// field does not move that number. `herd-hub/src/store.rs`'s unit tests
+    /// assert both halves: a record carrying the asking reads back as asking,
+    /// and a `job.json` with no such key reads back as not asking rather than
+    /// failing to parse.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub announce_end: bool,
 }
 
 /// What a job left behind, as `job.json` says it.
@@ -1562,6 +1620,7 @@ impl JobRecord {
             outputs: OutputSummary::default(),
             packs_in: Default::default(),
             packs_out: Default::default(),
+            announce_end: new.announce_end,
         }
     }
 

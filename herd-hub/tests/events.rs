@@ -1,7 +1,7 @@
 //! E-37 against the real binaries: what this hub says out loud, and what it
 //! never says.
 //!
-//! Three things are proved here, and each of them is a way E-37 can be
+//! Four things are proved here, and each of them is a way E-37 can be
 //! shipped and still be wrong:
 //!
 //! 1. **Zero events per step** — the acceptance criterion in the consumer's
@@ -19,6 +19,12 @@
 //!    not** — E-37 asks for *"an owner switch changed from the owner's
 //!    side"*, which is a narrower thing than "the switch moved". A position
 //!    this hub asked for is not news to whoever asked for it.
+//! 4. **A detached job's end is said when its submitter asked, and never
+//!    otherwise** — E-37's fifth thing, and the one way this list could grow
+//!    without anybody deciding to grow it. The gate is the asking written on
+//!    the record, so a fleet of step jobs nobody asked about stays silent
+//!    however many of them there are, and what the topic's count follows is
+//!    the number of askings a person typed.
 //!
 //! The sink in every test is a command writing to a file under this test's
 //! own temporary directory, or a `sleep`. **Nothing here touches anything
@@ -141,11 +147,21 @@ async fn a_day_of_step_jobs_is_no_events_and_a_runner_coming_and_going_is_two() 
         Some(3),
         "a step job's own exit code reaches its requester, and is not an event"
     );
+    // And one of the day's jobs **detached**, since an end can now be an
+    // event (E-37): a `submit` that asked for nothing is as silent as a
+    // `run`, which is what keeps this test's claim true now that there is a
+    // way to ask. The asking case is
+    // `a_detached_jobs_end_is_said_when_its_submitter_asked_and_never_otherwise`.
+    let detached = herd.submit_ok(&[], "printf 'detached\\n'").await;
+    herd.wait_until("the detached step job ends", || {
+        herd.states_of(&detached).last().map(String::as_str) == Some("finished")
+    })
+    .await;
     assert_eq!(
         kinds(&sink_file),
         ["runner_joined"],
-        "five step jobs, one of them red, and not one event: E-37's count must not grow \
-         with the number of step jobs. The sink holds: {:?}",
+        "six step jobs, one of them red and one of them detached, and not one event: \
+         E-37's count must not grow with the number of step jobs. The sink holds: {:?}",
         events(&sink_file)
     );
 
@@ -337,6 +353,171 @@ async fn the_owners_own_switch_is_an_event_and_the_hubs_own_asking_is_not() {
     assert_eq!(
         all[1]["why"], "she is gaming",
         "her own reason is what makes the event worth reading: {all:?}"
+    );
+
+    runner.ask_it_to_stop();
+    let _ = runner.gone().await;
+}
+
+/// E-37's fifth thing: **a detached job's end, when the submitter asked**.
+///
+/// Three claims, and the third is the one the acceptance criterion rests on:
+///
+/// 1. A detached submission that asked gets exactly one event when it ends,
+///    carrying the job, the cause in one machine-readable word and the
+///    ending in a sentence.
+/// 2. **Every ending, not only a green one.** A job that exited 3 is as much
+///    an end as one that exited 0, and a submitter who is not there to read
+///    the verdict is exactly the person who needs to hear about the red one.
+/// 3. **A submission that did not ask emits nothing**, and that is asserted
+///    against a run of jobs on either side of the ones that did: the count
+///    the topic sees grows with the number of *askings*, which is a number a
+///    person typed, and not with the number of step jobs, which is a number
+///    the fleet produces. That is E-37's *"a day's ntfy count does not grow
+///    with the number of step jobs"*, measured.
+///
+/// The asking is read off `job.json` as well as off the topic, because the
+/// record is where it lives between the submission and the end, and a hub
+/// that announced the right thing while writing the wrong record would be
+/// passing this test by accident.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_detached_jobs_end_is_said_when_its_submitter_asked_and_never_otherwise() {
+    let herd = Herd::new();
+    let sink_file = herd.logs.path().join("events.jsonl");
+    let spec = format!("cat >> {}", sink_file.display());
+    let _hub = herd.start_hub_with("hub", &["--notify-sink", &spec]).await;
+    let said = herd.said("hub");
+    assert!(
+        said.contains("Five things are said") && said.contains("--announce-end"),
+        "the hub says at startup that an end can be one of its events, and how to ask for \
+         one: {said}"
+    );
+    let mut runner = herd.start_runner_with(
+        "the-real-runner",
+        "runner",
+        "runner",
+        &A_FLOOR_A_BUSY_HOST_CAN_KEEP,
+    );
+    herd.wait_for_runner().await;
+    herd.wait_until("the runner's joining has reached the sink", || {
+        kinds(&sink_file) == ["runner_joined"]
+    })
+    .await;
+
+    // ---- Detached, and asking for nothing: the ordinary step job, submitted
+    // the ordinary way. `submit` is the detached door — it leaves with the id
+    // and closes — so these are jobs with nobody following them at all, which
+    // is precisely the case an over-eager implementation would announce.
+    let mut quiet = Vec::new();
+    for which in 0..3 {
+        quiet.push(
+            herd.submit_ok(&[], &format!("printf 'quiet {which}\\n'"))
+                .await,
+        );
+    }
+    for job in &quiet {
+        herd.wait_until("a detached step job nobody asked about ends", || {
+            herd.states_of(job).last().map(String::as_str) == Some("finished")
+        })
+        .await;
+        assert_eq!(
+            herd.record(job)["announce_end"],
+            serde_json::Value::Null,
+            "nobody asked, so no key is written: {:?}",
+            herd.record(job)
+        );
+    }
+    assert_eq!(
+        kinds(&sink_file),
+        ["runner_joined"],
+        "three detached step jobs, every one of them over, and not one event: {:?}",
+        events(&sink_file)
+    );
+
+    // ---- And one that asked.
+    let asked = herd
+        .submit_ok(
+            &["--announce-end"],
+            "printf 'the one that asked\\n'; exit 0",
+        )
+        .await;
+    herd.wait_until("the end of the job that asked reaches the sink", || {
+        kinds(&sink_file) == ["runner_joined", "job_ended"]
+    })
+    .await;
+    assert_eq!(
+        herd.record(&asked)["announce_end"],
+        serde_json::Value::Bool(true),
+        "the asking is on the record, which is where it lives between the submission and \
+         the end: {:?}",
+        herd.record(&asked)
+    );
+    let all = events(&sink_file);
+    assert_eq!(all[1]["herd_event_version"], 1);
+    assert_eq!(all[1]["job"], asked.as_str());
+    assert_eq!(
+        all[1]["cause"], "exited",
+        "the cause is one machine-readable word, which a consumer's router switches on: \
+         {all:?}"
+    );
+    assert_eq!(
+        all[1]["how"], "exited 0",
+        "and the sentence beside it is the ending a person reads, with no second lookup: \
+         {all:?}"
+    );
+    assert!(
+        all[1]["body"]
+            .as_str()
+            .expect("a body")
+            .contains(asked.as_str()),
+        "the body names the job: {all:?}"
+    );
+    assert!(
+        all[1]["body"].as_str().expect("a body").is_ascii()
+            && all[1]["title"].as_str().expect("a title").is_ascii(),
+        "the consumer's topic takes ASCII: {all:?}"
+    );
+
+    // ---- A red one that asked. **The end is the end**: a detached submitter
+    // who is not there to read exit 3 is exactly who needs telling.
+    let red = herd
+        .submit_ok(&["--announce-end"], "printf 'red\\n'; exit 3")
+        .await;
+    herd.wait_until("the red end reaches the sink too", || {
+        kinds(&sink_file) == ["runner_joined", "job_ended", "job_ended"]
+    })
+    .await;
+    let all = events(&sink_file);
+    assert_eq!(all[2]["job"], red.as_str());
+    assert_eq!(all[2]["cause"], "exited");
+    assert_eq!(
+        all[2]["how"], "exited 3",
+        "a job that failed says which code, and says nothing about a 0 it was never \
+         compared against: {all:?}"
+    );
+
+    // ---- And the criterion, from the other side: more step jobs after the
+    // askings, and the count stands where the askings left it.
+    let mut after = Vec::new();
+    for which in 0..3 {
+        after.push(
+            herd.submit_ok(&[], &format!("printf 'after {which}\\n'"))
+                .await,
+        );
+    }
+    for job in &after {
+        herd.wait_until("a later detached step job ends", || {
+            herd.states_of(job).last().map(String::as_str) == Some("finished")
+        })
+        .await;
+    }
+    assert_eq!(
+        kinds(&sink_file),
+        ["runner_joined", "job_ended", "job_ended"],
+        "eight detached submissions ran and two of them asked, so the topic holds two \
+         ends: a day's count grows with the askings and not with the step jobs (E-37). \
+         The sink holds: {:?}",
+        events(&sink_file)
     );
 
     runner.ask_it_to_stop();

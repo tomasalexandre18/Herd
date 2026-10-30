@@ -843,6 +843,7 @@ impl Requester {
                 to_frame(&ToHub::SubmitJob {
                     asked,
                     wants_files: false,
+                    announce_end: false,
                 })
                 .expect("the submission encodes"),
             ))

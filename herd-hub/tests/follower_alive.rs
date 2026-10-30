@@ -117,6 +117,7 @@ async fn a_quiet_running_job_keeps_its_follower_hearing_from_the_hub() {
             // before the field sends (D167): these jobs leave no output, so
             // holding nothing is what it asks for here.
             wants_files: true,
+            announce_end: false,
         },
     )
     .await;
@@ -379,6 +380,7 @@ async fn a_queued_job_whose_reason_is_not_restated_is_kept_warm_anyway() {
             // before the field sends (D167): these jobs leave no output, so
             // holding nothing is what it asks for here.
             wants_files: true,
+            announce_end: false,
         },
     )
     .await;
