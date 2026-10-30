@@ -12655,3 +12655,99 @@ that is reachable from the network in this build*, and the notes on
 `herd-proto/src/lib.rs` `ToHub::PacksHeld`,
 `FromHub::ReadPacksAgain`; **D231** decision 5, **D225**, **D228**,
 **D13**; `history/2026-10-30-two-decisions.md`.
+
+## 2026-10-30 — D247 The hub reaches its pack registry and answers its frames
+
+**Context.** D246 recorded that D231 decision 5 was a design and not a
+behaviour, and named the three parts that would make it true: the pack
+frame dispatch in `herd-hub/src/server.rs`, **one seam for the server to
+reach a registry through**, and a runner that announces after `Welcome`.
+ORCH-230 carried the seam's open question — a method on `JobStore`, or a
+registry carried beside the store on the hub's `State`.
+
+**Decision.** `JobStore` gains
+
+```rust
+fn packs(&self) -> Option<&crate::registry::PackRegistry> { None }
+```
+
+with a default body, and `JobDirStore` is the one implementor that
+overrides it. Taken over a field on `State` for one reason: **no
+implementor and no test double has to move.** Four of the five
+`impl JobStore` in the tree are doubles with no state root, and a field
+on `State` would have grown an argument at every construction site of
+it.
+
+**`None` means "this store keeps no pack registry", never "the registry
+it keeps is empty"**, and the method's doc says so. The two are a fork
+in the hub's behaviour: a `None` store can register, resolve and hold
+nothing, so a pack frame it is sent is refused **by name** saying so,
+while a `Some` store with an empty registry is a working authority that
+has been told about no pack. Answering the first like the second would
+tell a runner "nothing is registered for that key" from a hub that could
+never have registered anything — D150's silence in a second place.
+
+**Two arrival-window predicates, because the pack half touches a job at
+both ends and `is_current` is wrong at each.** A fetch arrives while the
+job is `assigned`; a registration arrives after the verdict, since the
+runner fsyncs the pack out of `{out}` before the record walk
+(D232-D234). So `a_pack_may_be_fetched` and `a_pack_may_be_registered`
+join `files_may_land` as named predicates, and a frame outside its own
+window is refused **by name** and never dropped in silence. For the
+fetch family `is_current` is not merely the wrong window but
+**inconstructible**: it is answered out of `State::standing_of`, which
+takes an attempt number, and `ToHub::AskPack` carries none.
+
+Every pack refusal is `FromHub::PackRefused`, never `FromHub::Refused`
+(D13): a pack nobody can agree about must not cost a runner its link.
+All six pack `ToHub` frames were answered `FromHub::Refused` before this
+and closed the link.
+
+`PackRegistry::runner_gone` is called from both of the hub's "a runner is
+gone" paths. **The watchdog's ordering is untouched**: the call is inside
+the loop that already runs after that pass's `with_peers` closure, so it
+is outside the peers mutex and adds nothing to the ordering D228
+withdrew a change to.
+
+`ToHub::Hello`'s `mesh_endpoint` is kept rather than dropped. Without
+it every holding the hub recorded would carry `endpoint: None`, which on
+the wire means **outbound-only** — a false statement about a runner that
+advertised an address, and one a fetcher would act on.
+
+**`FromHub::ReadPacksAgain` is still constructed nowhere, withdrawn on a
+measurement.** Sending it after `Welcome` is where it belongs and it
+reddened seven tests — `herd-hub/tests/link.rs` 6 of 19,
+`versions.rs` 1 of 4 — each reading the frame after the welcome and
+finding this one; six are about admission, cadence, twins and verdicts.
+The seven assert an ordering they never meant to, and a real runner
+ignores a frame it has no handler for (D148), so the fix is seven
+tolerant helpers — which is seven loosened expectations in two test
+files, and loosening an expectation to turn a gate green is not an
+execution agent's to do on its own account. The product change was
+removed, the test that asserted it was removed with it rather than
+weakened, and the figures are in the tree at that spot in `server.rs`.
+
+**What this does not make true.** D231 decision 5 stays owed on **both
+sides of the ask**: the hub does not ask and a runner neither answers
+nor volunteers, so an announcement only ever arrives unprompted and
+today's runner sends none. What is proved is narrower, and is stated as
+such: a hub *told* about a holding records it, and forgets it when the
+link goes. The assignment side is also unwritten — `AssignJob`'s
+`packs_in`/`packs_out` are still sent empty, so no job is assigned a
+pack — and `AskTransferCapability` is refused by name rather than
+served, because the hub's half of D209 does not exist.
+
+**Evidence.** `herd-hub/src/job.rs` `JobStore::packs`;
+`herd-hub/src/store.rs`; `herd-hub/src/server.rs` `a_pack_registry`,
+`a_pack_may_be_fetched`, `a_pack_may_be_registered`, the pack arms of
+`relay_from_runner`, `State::mesh_endpoint_of`;
+`herd-hub/src/registry.rs` module note;
+`herd-hub/tests/pack_frames.rs` (5 tests, all through a socket),
+`herd-hub/tests/pack_registry.rs`
+`a_store_behind_the_trait_object_reaches_the_very_registry_its_root_keeps`.
+Counted: a pack declaring 12288 bytes of objects grows the hub's whole
+state root by 784 bytes — 407 manifest, 30 meta, 347 `registered.json`
+— and the hub's answer carries 407 bytes. Each change removed once and
+the dependent tests watched to fall.
+`herd-proto/*` byte-identical to `main`; no version number moved.
+`history/2026-10-30-pack-wire.md`.

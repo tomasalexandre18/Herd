@@ -6,10 +6,13 @@
 //! that the registry comes back when the store does, that the holdings do not,
 //! and that the shape on the disk is the shape `LAYOUT_VERSION` 2 promises.
 //!
-//! **Nothing here goes through a frame.** The pack frames are numbered in
-//! `herd_proto::pack` and are not wired into the hub's connection loop; that
-//! is a separate step, which owns `server.rs`. These tests call the registry
-//! directly, which is exactly as far as this step goes.
+//! **Nothing here goes through a frame**, and that is now a division of
+//! labour rather than a limit: these tests call the registry directly, and
+//! `pack_frames.rs` asserts the same mechanism through a hub's connection
+//! loop, over a socket, without calling the registry once. Two files because
+//! the two are different subjects — what the registry does with what it is
+//! given, and what a hub gives it — and a test that mixed them could not say
+//! which half a red was about.
 
 use std::fs;
 
@@ -381,4 +384,55 @@ fn walk(at: &std::path::Path) -> u64 {
         }
     }
     total
+}
+
+/// **The seam the hub's loop reaches the registry through** (ORCH-230).
+///
+/// The hub's `State` holds an `Arc<dyn JobStore>` and nothing else. Until
+/// this test's subject existed, `packs()` was an inherent method on the
+/// concrete [`JobDirStore`] and `server.rs` could not reach a registry at
+/// all: every call site of it in the tree was in this file, so the holdings
+/// map was empty in every running hub and no frame could register anything.
+/// So the assertion is not "a store has a registry" — the test above already
+/// says that — it is **"a trait object has one"**, which is the only form the
+/// hub ever holds a store in.
+///
+/// It also asserts the two things the method's doc distinguishes, because an
+/// `Option` is only worth the round trip if `None` and "empty" are different
+/// answers: the registry comes back `Some` **before** anything is registered
+/// in it, and it is the same registry the inherent method answers with rather
+/// than a second one opened on the side.
+#[test]
+fn a_store_behind_the_trait_object_reaches_the_very_registry_its_root_keeps() {
+    let dir = tempfile::tempdir().expect("a temporary directory");
+    let concrete = JobDirStore::open(dir.path()).expect("the state root opens");
+    let directory = concrete.packs().directory();
+    let store: std::sync::Arc<dyn JobStore> = std::sync::Arc::new(concrete);
+
+    let packs = JobStore::packs(&*store)
+        .expect("a directory store has a root, so it keeps a registry and answers Some");
+    assert!(
+        packs.entries().is_empty(),
+        "and it answers Some while it is still empty: an empty registry is a working pack \
+         authority that has been told about no pack, which is not what None means"
+    );
+    assert_eq!(
+        packs.directory(),
+        directory,
+        "and it is the registry of this root, not a second one"
+    );
+
+    let pack = match packs.register(a_registration()).expect("registered") {
+        Registered::Fresh(pack) => pack,
+        other => panic!("the first registration of a key is fresh, got {other:?}"),
+    };
+    assert_eq!(
+        JobStore::packs(&*store)
+            .expect("still Some")
+            .pack_for("4f1b2c", "pack")
+            .expect("no conflict"),
+        Some(pack),
+        "and a second look through the trait object sees what the first one wrote, which is \
+         what proves the two are one registry"
+    );
 }

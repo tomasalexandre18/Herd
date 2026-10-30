@@ -2336,6 +2336,32 @@ pub trait JobStore: Send + Sync + 'static {
     /// Every job that has not reached a terminal state, oldest first. This is
     /// the queue: after a restart it is what the hub has left to do.
     fn unfinished_jobs(&self) -> Result<Vec<JobRecord>>;
+
+    /// This store's pack registry, when it keeps one (E-12, E-17).
+    ///
+    /// **`None` means "this store keeps no pack registry", and never "the
+    /// registry it keeps is empty".** The distinction is the whole reason the
+    /// method answers an `Option` rather than a `&PackRegistry`. A hub whose
+    /// store answers `None` cannot register a pack, cannot resolve one and
+    /// cannot record a holding, so every pack frame it is sent is refused
+    /// **by name** saying exactly that. A hub whose store answers `Some` with
+    /// an empty registry is a working pack authority that has been told about
+    /// no pack yet, and the frames it is sent are answered on their merits.
+    /// Reading the first as the second is how a runner comes to be told
+    /// "nothing is registered for that key" by a hub that could never have
+    /// registered anything — the shape of D150's silence, in a second place.
+    ///
+    /// Every implementor but [`crate::store::JobDirStore`] answers `None`,
+    /// which is why the default body is here rather than on each of them: the
+    /// registry lives on a state root's disk, and a store with no root — every
+    /// test double in `server.rs` and in `herd-hub/tests/` — has nowhere to
+    /// keep one. The default is what let the seam be added without moving a
+    /// single implementor, which is why it was chosen over a field on the
+    /// hub's `State`, where every construction site would have grown an
+    /// argument (ORCH-230).
+    fn packs(&self) -> Option<&crate::registry::PackRegistry> {
+        None
+    }
 }
 
 #[cfg(test)]

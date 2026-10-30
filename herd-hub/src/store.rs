@@ -601,11 +601,11 @@ impl JobDirStore {
 
     /// This root's pack registry (E-12, E-17).
     ///
-    /// **Nothing calls this from the network yet.** The pack frames are
-    /// numbered in `herd_proto::pack` and are not dispatched by the hub's
-    /// connection loop; wiring them in is a separate step, which owns
-    /// `server.rs`. Its existence here is not a working feature: no runner
-    /// can register a pack with this build and no job is assigned one.
+    /// The hub's connection loop reaches it through
+    /// [`crate::job::JobStore::packs`], whose default body answers `None` for
+    /// every store that has no root to keep a registry on. This is the one
+    /// implementor that answers `Some`, so a hub built on a directory store is
+    /// the only one that registers a pack, resolves one or records a holding.
     pub fn packs(&self) -> &crate::registry::PackRegistry {
         &self.packs
     }
@@ -2003,6 +2003,12 @@ impl JobDirStore {
 impl JobStore for JobDirStore {
     fn state_root_id(&self) -> &str {
         JobDirStore::state_root_id(self)
+    }
+
+    /// The one implementor that answers `Some`: a directory store has a state
+    /// root, and the registry lives on it.
+    fn packs(&self) -> Option<&crate::registry::PackRegistry> {
+        Some(JobDirStore::packs(self))
     }
 
     fn approve_runner(&self, name: &str) -> Result<String> {
