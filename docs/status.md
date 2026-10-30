@@ -5,20 +5,17 @@ decided is in `board.md`** (invariant 8); **we ship, they operate** (D161).
 
 ## How a change reaches `main`
 
-**`CLAUDE.md` and `docs/orchestration/workflow.md` hold the method in full**,
-and both are read before this file: **no pull request** (**D189**), one batch
-and one `--no-ff` landing per push on a green `./scripts/gate.sh` for the
-merge's **second parent with an identical tree**, **branch protection that
-does not bind us** (**D203**), **GitHub as storage**, **the skip list
-deciding, never the count** (**D187**, **D236**), and **every build, suite
-and gate submitted to our own Herd, never a bare `herdctl`** (**D258**).
+**`CLAUDE.md` and `docs/orchestration/workflow.md` hold the method in
+full**: **no pull request**, one batch, one `--no-ff` landing, a green
+`./scripts/gate.sh` for the merge's **second parent, same tree**, **protection
+that does not bind us**, **the skip list, never the count**, **every gate
+through our own Herd** (**D189**, **D203**, **D187**, **D236**, **D258**).
 
 ## Releases, and what v1.0.0 will mean
 
-**v0.4.1 is published and tagged by `herd-merger`** (**D212**); it carries
-**D211**, so their runner can leave 0.3.6. **Nothing released since.** Notes
-are a file in the tree (ORCH-162); **writing and publishing stay Alexa's**
-(**D210**). The next tag is v1.0.0 (ORCH-217).
+**v0.4.1 is published, tagged by `herd-merger`** (**D212**), carrying **D211**
+so their runner can leave 0.3.6; **nothing released since**. Notes live in
+the tree (ORCH-162), **Alexa's** (**D210**). Next tag: v1.0.0 (ORCH-217).
 
 **Stable means v1.0.0** (**D204**) and **it ships 42 of 44 musts** (**D248**).
 **M11's pack half is inside it; M17's two musts the consumer has released us
@@ -68,9 +65,12 @@ runner honours the hub's custody, but no hub names a keeper yet** (**D262**).
 
 **The runner has a mesh-address rule and binds nothing by default** (**D222**);
 **every `--help` figure reads back through its own constant** (**D245**); **an
-`EBUSY` enabling a controller is read, never guessed** (**D259**); and **skips
-per host** (D27): **12** runtime, **14** loaded, **38** ignored — the twelve
-need a delegated scope that carries its own `MemoryMax` (**D260**).
+`EBUSY` is read, never guessed** (**D259**) and **a controller is read from a
+list, never inferred from a file** (**D265**); **skips per host** (D27): **12**
+runtime, **14** loaded, **38** ignored, the twelve needing a delegated scope
+with its own `MemoryMax` (**D260**). **Two published figures are narrower than
+their names:** the stop is **0.212 s** and only idle (**D264**), and
+`bytes_written` is a workspace's apparent size, sampled (**D263**).
 
 ## What the software still does not do
 

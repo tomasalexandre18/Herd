@@ -13484,3 +13484,161 @@ because it is the frame that has a count to refine it with.
 Reversible either way: both are one function each in
 `herd-runner/src/lib.rs`, and the asserted behaviour is in
 `herd-hub/tests/pack_custody.rs` and `lib.rs`'s own test module.
+
+## 2026-10-30 — D263 The disk cap measures a workspace, not a job
+
+`bytes_written` in a job record, and the disk cap enforced against it,
+are the **apparent size of the job's workspace, sampled**: a recursive
+walk of `<data-root>/jobs/<job-id>/` summing `metadata.len()`, taken
+every 200 ms and once more at the end, reported as
+`max(peak, final)` (`herd-runner/src/root.rs:443`, `:498`;
+`confine.rs:106`; `job.rs:574`, `:622`-`:624`). Measured 2026-10-30
+with eight jobs through our own instance, each differing in one path.
+
+**Three consequences, each proved by a probe rather than argued.**
+
+1. **It is not bytes written.** 300 MiB written into the job's cwd is
+   counted exactly (`j0000000055`, `314572800`). The same 300 MiB
+   written into the worktree an ad-hoc command `cd`s to
+   (`j0000000056`) or into `$HERD_BUILD_ROOT` (`j0000000057`) is
+   counted as **zero**. Every job this project submits is ad-hoc and
+   leaves its workspace, so for every one of them the build is not in
+   the figure. The cap binds a **declared** command, whose tree is
+   checked out into `work/`, and is void on the path we use Herd
+   through.
+2. **A sparse file trips the cap having written nothing.**
+   `truncate -s 8G` inside the workspace recorded `8589934592` against
+   **16,384 bytes** of disk occupied (`j0000000059`).
+3. **The cap fires on a sample, so it fires on luck.** The runner's own
+   test suite plants sparse pack objects of 1 to 15 GiB under `TMPDIR`,
+   which is inside the measured base (`packstore.rs:3682`,
+   `testing.rs:141`). A sampler inside `j0000000060` caught the base at
+   **21,564,710,785 apparent bytes against 109,563,904 real** in a
+   window of **0.11 s**, which the 200 ms poll missed; that job
+   recorded 89 MB. `j0000000040` — batch 22's gate — caught it, was
+   stopped at `limit 21474836480`, and so had **no verdict and no
+   receipt**. Nobody wrote 21 GB. About 104 MiB of disk was occupied.
+
+**What the field figures were.** The 89 MB of `j0000000043` and
+`j0000000044`, against trees their agents measured at 16 G by `du -sh`,
+is the **cargo registry** re-downloaded into a throwaway `$HOME`:
+`j0000000061` recorded `194282312` and its `$HOME` measured
+`194282312`, being `.cargo/registry` `190801624` plus `.cache/nix`
+`3415152`. The 8.08 GiB of `j0000000036` and the 21.08 GiB of
+`j0000000040` are the sparse fixtures. The 250× span measured nothing
+about the work.
+
+**What this entry decides: nothing about the bound.** It records what
+the figure is, so that it stops being read as what its name says. Two
+beliefs are **withdrawn**, both measured false: that redirecting
+`CARGO_TARGET_DIR` lowers a job's exposure to the cap, and that
+splitting a gate into one job per gate does. Neither touches the
+measured path, and `j0000000036` — one undivided `gate.sh`, target
+redirected, 8.08 GiB — is the counter-example to both.
+`scripts/bench-preflight.sh:320` is **cap-neutral** and keeps its
+sentence: it moves bytes from one unmeasured path to another, and the
+root filesystem it guards is a different bound.
+
+**The recommendation, not landed.** "Bytes written" is what the cgroup
+already knows: `io.stat`'s `wbytes`, summed over the job's cgroup,
+counts writes wherever they land and cannot be inflated by a file that
+writes nothing. That makes the figure truthful and the cap unevadable
+in one change, and it is absent where there is no cgroup, which is the
+shape D23 and D30 already give an unmeasurable figure. If the walk is
+kept instead, the two things it conflates must be separated and named
+apart — a **workspace quota** in apparent size, which is a legitimate
+bound, and **bytes written**, which is I/O — and a single 200 ms sample
+must stop being enough to kill a job. **Not landed here**: a bound that
+starts firing correctly turns hosts that run jobs today into hosts that
+stop them, and the inverse is live now, because the cap currently kills
+jobs that wrote nothing.
+
+## 2026-10-30 — D264 Invariant 2's five seconds, timed once, idle
+
+Invariant 2 publishes that *"a runner stops cleanly in ≤ 5 s when its
+owner asks, and refuses new jobs while draining"*. Until 2026-10-30
+that bound was asserted in `CLAUDE.md`, in `docs/plan.md`, in
+`docs/joining.md` and in `docs/operating.md`, and had never been timed
+against a running runner.
+
+**Measured 2026-10-30** on our own queue runner — v0.4.1, one host,
+one version, idle, `kill -TERM` by PID — **SIGTERM to process exit
+was 0.212 s**, a 24× margin against the published bound. The runner's
+own two lines were `draining (the runner's owner asked it to stop
+(SIGTERM)); 0 job(s) to end, no new job accepted` and `stopped`.
+
+**What this entry does not record, and says so in the same breath as
+the figure.** `0 job(s) to end` is the whole scope of the
+measurement: it is the stop path with nothing to drain. The case the
+bound exists for — a runner asked to stop while a job is running,
+which has to end that job, take its verdict and write it down — is
+**untimed**, and no figure in this project covers it. 0.212 s is the
+floor of the stop path. It is not the answer for a runner draining a
+three-hour build, and `docs/plan.md`'s claim that *"a draining busy
+runner exits ≤ 5 s"* remains an assertion.
+
+One host and one version is also the scope. Nothing here says what
+the figure is on the first consumer's machines, and under D161 a fact
+about their machines reaches us as a report with a job id and version
+numbers, never as a measurement we take.
+
+**What this decides: nothing about the bound.** It moves one half of
+invariant 2 from asserted to measured, names the half that is still
+asserted, and puts the figure in one place —
+`docs/joining.md`'s section on stopping a runner — with
+`docs/operating.md` pointing at it and carrying no copy of the
+number, because two copies of a measured figure is how a figure
+drifts.
+
+## 2026-10-30 — D265 A controller is read, never inferred from a file
+
+`Ceiling::prove_io_max` is what stops a hard `--job-io-max` from being
+announced on a host that cannot enforce it. Until today it decided
+whether the `io` controller is handed down to a job's cgroup from
+whether `<probe>/io.max` **existed**, and a file proves nothing about a
+controller: PSI files are not controller-gated, and measured on this
+project's host on 2026-10-30 `app.slice` holds `io.pressure` while `io`
+is absent from its `cgroup.controllers`.
+
+**The rule.** "Which controls can a job's cgroup really carry" is
+answered by a controller list and by nothing else:
+`cgroup.subtree_control` for what a cgroup hands to its children,
+`cgroup.controllers` for what a cgroup has been handed. `prove_io_max`
+now reads `<probe>/cgroup.controllers` before it writes anything, and
+the write answers only the two readings that are the kernel's own — a
+kernel with no blk-throttle, which is `ENOENT` on the interface file,
+and a device the kernel refuses, which is any other error. The three
+hosts therefore get three sentences where two of them used to share
+one, and that shared sentence named both causes and neither answer.
+
+**What it cost to find out, and that is the general shape.** This is
+D259's rule — a refusal with several possible readings is measured down
+to one, or says that it could not be — applied one layer down, to a
+*reading* rather than to a refusal. The defect was reported after a
+public correction that read one file, then "corrected" itself by
+reading a different file, and was worth nothing either time until an
+agent produced the fixture: `io.pressure` present with `io` missing
+from the controller list.
+
+**Neither refusal changed class.** An `io.max` is a ceiling an operator
+*asked* for, so every way it cannot be enforced is a startup refusal,
+before and after (`Confined::prepare`); `io.weight` is unasked-for and
+stays absent and declared. What did change is a case that used to be
+**no refusal at all**: a cgroup holding an `io.max` file with `io`
+absent from its controller list was called proved, and an operator
+would have been told a ceiling was enforced by a kernel never handed
+the controller to enforce it with.
+
+**The real kernel path is still unproved here and says so.** Our
+account gets no cgroup v2 delegation, which is the standing twelve
+`HERD-SKIPPED` assertions; a skip is not a proof (D27). So the
+permanent proof is a fake tree, as D259's is: `Kernel` gains `mkdir`,
+because a cgroup's interface files come from its parent's
+`cgroup.subtree_control` and an empty temporary directory is a cgroup
+no kernel ever makes, and the fixture's writer refuses a write naming a
+file that is not there, which is what no temporary directory will do.
+
+Reversible: one free function and one struct field in
+`herd-runner/src/cgroup.rs`, held by five assertions against that tree,
+three of which were watched to go red against the reverted reading —
+including the one that returned `Ok` where the ceiling bounds nothing.

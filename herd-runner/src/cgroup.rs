@@ -86,6 +86,30 @@
 //! exception is `cpu.max`, which is absent by default and therefore a hard
 //! ceiling an operator *asked* for: that one is a refusal at startup rather
 //! than a line in a report (see [`crate::confine::Confined::prepare`]).
+//!
+//! ## A controller is read, never inferred from a file being there
+//!
+//! The reading above has a sibling, and it is the same mistake in a smaller
+//! place: **a file named after a controller proves nothing about that
+//! controller.** `io.pressure` is in a cgroup whether or not `io` is among
+//! its controllers — PSI is not controller-gated — and measured on this
+//! project's host on 2026-10-30, `app.slice` holds `io.pressure` while `io`
+//! is absent from its `cgroup.controllers`. A reading that answered "the
+//! controller is handed down" from an `io.*` file would answer *yes* for a
+//! cgroup where `io` had never been delegated at all.
+//!
+//! So "which controls can a job's cgroup really carry" is answered by a
+//! controller list and by nothing else: `cgroup.subtree_control` for what a
+//! cgroup hands to its children ([`is_enabled_for_children`]), and
+//! `cgroup.controllers` for what a cgroup has been handed — which is what
+//! [`Ceiling::prove_io_max`] reads in the probe cgroup that stands in for a
+//! job's. Until 2026-10-30 that proof instead read whether `<probe>/io.max`
+//! *existed*, to tell "this kernel has no blk-throttle" from "the `io`
+//! controller is not handed down": one sentence for two different hosts,
+//! with a diagnosis resting on a file. **Neither refusal changed class when
+//! that was fixed.** An `io.max` is a ceiling an operator *asked* for, so
+//! every way it cannot be enforced is a startup refusal, before and after;
+//! `io.weight` is unasked-for and stays absent and declared.
 
 use std::fs::{self, File, OpenOptions};
 use std::io;
@@ -502,19 +526,42 @@ impl Ceiling {
     }
 
     /// Prove that this host would really take the ceiling an operator asked
-    /// for, by writing it — into a probe cgroup under the same base every job
-    /// cgroup will hang under, and reading it back out.
+    /// for — in a probe cgroup under the same base every job cgroup will hang
+    /// under, by reading which controllers that cgroup was handed and then
+    /// writing the real value into it.
     ///
     /// Done rather than inferred, exactly as delegation is
     /// ([`prepare_base`]'s probe). Three things could each make a ceiling
-    /// vanish and none of them is visible from a file somebody could read:
-    /// the `io` controller is not handed down, the kernel was built without
-    /// blk-throttle so `io.max` does not exist at all, or it exists and
-    /// refuses this device. Writing the real value is the only answer that
-    /// covers all three — and the answer has to be a refusal, because a
-    /// ceiling quietly weaker than asked for is the wrong failure on a
-    /// machine where one job can saturate the disk (D116, D129).
+    /// vanish, and they are three different hosts:
+    ///
+    /// - the `io` controller is not handed down to the base's children. That
+    ///   one **is** readable, and only from the one file that says it:
+    ///   `<probe>/cgroup.controllers`, the controllers that cgroup was given.
+    ///   Not from `<probe>/io.max` being there — see the module's *A
+    ///   controller is read, never inferred from a file being there*;
+    /// - the kernel was built without blk-throttle, so `io.max` is not an
+    ///   interface file at all and the write finds nothing to write to;
+    /// - `io.max` is there and the kernel refuses *this device*.
+    ///
+    /// The controller list answers the first before anything is written, and
+    /// the write answers the other two, which is why both are here. The
+    /// answer has to be a refusal, because a ceiling quietly weaker than
+    /// asked for is the wrong failure on a machine where one job can
+    /// saturate the disk (D116, D129).
     pub fn prove_io_max(&self, io_max: &IoMax) -> Result<(), String> {
+        self.prove_io_max_through(io_max, Kernel::real())
+    }
+
+    /// [`Ceiling::prove_io_max`] with the two kernel rules it depends on
+    /// named, so that a test can meet them in a tree it builds: making a
+    /// cgroup populates it with the interface files its parent's
+    /// `cgroup.subtree_control` dictates, and cgroupfs creates no file a
+    /// write names — `ENOENT` is the whole of "this kernel has no
+    /// blk-throttle" as a runner can see it. The reason is
+    /// [`enable_for_children_through`]'s: our account gets no cgroup v2
+    /// delegation on this host, so a test of the real kernel path skips and a
+    /// skip is not a proof (D27).
+    fn prove_io_max_through(&self, io_max: &IoMax, kernel: Kernel<'_>) -> Result<(), String> {
         let Ceiling::Cgroups { base, .. } = self else {
             return Err(
                 "this host has no cgroup v2 subtree for a job to carry an io.max in".to_owned(),
@@ -525,58 +572,17 @@ impl Ceiling {
             std::process::id(),
             PROBES.fetch_add(1, Ordering::SeqCst)
         ));
-        fs::create_dir(&probe).map_err(|error| {
+        (kernel.mkdir)(&probe).map_err(|error| {
             format!(
                 "no cgroup could be made under {} to try the ceiling in ({error})",
                 base.display()
             )
         })?;
-        let control = probe.join("io.max");
-        let written = fs::write(&control, io_max.control_value()).map_err(|error| {
-            if control.exists() {
-                format!(
-                    "the kernel refused {:?} in {}: {error}",
-                    io_max.control_value(),
-                    control.display()
-                )
-            } else {
-                format!(
-                    "{} does not exist, so this kernel has no per-cgroup IO throttling to \
-                     hold a ceiling with (CONFIG_BLK_DEV_THROTTLING), or the io controller \
-                     is not handed down to {}'s children: {error}",
-                    control.display(),
-                    base.display()
-                )
-            }
-        });
-        // Read back before the probe goes, because a write the kernel took
-        // and did not keep would otherwise read as a proof.
-        let readable = written
-            .as_ref()
-            .ok()
-            .and_then(|()| fs::read_to_string(&control).ok());
+        let proved = prove_io_max_in(&probe, base, io_max, kernel);
+        // Before the answer is returned, and whatever the answer is: a probe
+        // left behind is a cgroup nothing will collect.
         let _ = fs::remove_dir(&probe);
-        written?;
-        let Some(readable) = readable else {
-            return Err(format!(
-                "{} took the ceiling and then could not be read back, so nothing here can \
-                 say the kernel kept it",
-                control.display()
-            ));
-        };
-        if !readable
-            .lines()
-            .any(|line| line.split_whitespace().next() == Some(io_max.device.as_str()))
-        {
-            return Err(format!(
-                "the kernel took the ceiling for device {} and then listed none: {} reads \
-                 {:?}",
-                io_max.device,
-                control.display(),
-                readable.trim()
-            ));
-        }
-        Ok(())
+        proved
     }
 
     /// Carry a proved ceiling into the limits every job cgroup gets.
@@ -997,9 +1003,9 @@ fn enable_for_children_through(
     })
 }
 
-/// The two things the enable needs from the kernel, so that both can be met
-/// by a tree a test builds: where `/proc` is, which pid this process is, and
-/// what writing a cgroup control file does.
+/// What this module needs from the kernel, so that every one of them can be
+/// met by a tree a test builds: where `/proc` is, which pid this process is,
+/// what writing a cgroup control file does, and what making a cgroup does.
 #[derive(Clone, Copy)]
 struct Kernel<'a> {
     /// Where the process table is mounted. `/proc` in a runner.
@@ -1007,8 +1013,14 @@ struct Kernel<'a> {
     /// This process's own pid, as `cgroup.procs` writes it.
     me: i32,
     /// Writing a cgroup control file. `fs::write` in a runner; in a fixture,
-    /// cgroup v2's two rules over a directory tree.
+    /// cgroup v2's own rules over a directory tree.
     write: fn(&Path, &str) -> io::Result<()>,
+    /// Making a cgroup. `fs::create_dir` in a runner, where the kernel then
+    /// populates the new cgroup with the interface files its parent's
+    /// `cgroup.subtree_control` dictates; in a fixture, that population is
+    /// what the fake has to do itself, because an empty directory would hand
+    /// [`prove_io_max_in`] a cgroup no kernel ever makes.
+    mkdir: fn(&Path) -> io::Result<()>,
 }
 
 impl Kernel<'static> {
@@ -1018,6 +1030,7 @@ impl Kernel<'static> {
             proc_root: Path::new(PROC),
             me: std::process::id() as i32,
             write: |path, value| fs::write(path, value),
+            mkdir: |path| fs::create_dir(path),
         }
     }
 }
@@ -1222,6 +1235,87 @@ fn is_enabled_for_children(base: &Path, controller: &str) -> bool {
     fs::read_to_string(base.join("cgroup.subtree_control"))
         .map(|text| text.split_whitespace().any(|name| name == controller))
         .unwrap_or(false)
+}
+
+/// What a probe cgroup says about an `io.max` ceiling, once there is one.
+///
+/// Split out of [`Ceiling::prove_io_max_through`] so that every road out of
+/// here — the two refusals and the proof alike — passes the probe's removal.
+fn prove_io_max_in(
+    probe: &Path,
+    base: &Path,
+    io_max: &IoMax,
+    kernel: Kernel<'_>,
+) -> Result<(), String> {
+    // Which controllers this cgroup was handed, out of the one file that says
+    // so. An absence is reported as an absence, as everywhere else here: a
+    // runner that cannot read the list does not know what the cgroup can
+    // carry, and must not read it off whatever else is lying in there.
+    let listing = probe.join("cgroup.controllers");
+    let handed_down = fs::read_to_string(&listing).map_err(|error| {
+        format!(
+            "{} cannot be read ({error}), so nothing here can say which controllers a \
+             job's cgroup under {} is handed — and an io.max is a ceiling only where the \
+             io controller is one of them",
+            listing.display(),
+            base.display()
+        )
+    })?;
+    if !handed_down.split_whitespace().any(|name| name == "io") {
+        return Err(format!(
+            "the io controller is not handed down to the children of {}: a cgroup made \
+             there is handed {:?}, and io is not among them, so an io.max written there \
+             would bound nothing. An io.* file in that cgroup proves nothing about the \
+             controller — io.pressure is there either way. Run this runner as a systemd \
+             unit with Delegate=yes, or inside systemd-run --user --scope -p \
+             Delegate=yes, so that io is delegated to it",
+            base.display(),
+            handed_down.trim()
+        ));
+    }
+    let control = probe.join("io.max");
+    // The controller is handed down, so the two readings left are the
+    // kernel's own: cgroupfs creates no file a write names, so `ENOENT` here
+    // is `io.max` not being an interface file on this kernel at all, and
+    // anything else is the kernel refusing this value for this device.
+    (kernel.write)(&control, &io_max.control_value()).map_err(|error| {
+        if error.kind() == io::ErrorKind::NotFound {
+            format!(
+                "the io controller is handed down to the children of {} and {} is still \
+                 not there, so this kernel has no per-cgroup IO throttling to hold a \
+                 ceiling with (CONFIG_BLK_DEV_THROTTLING): {error}",
+                base.display(),
+                control.display()
+            )
+        } else {
+            format!(
+                "the kernel refused {:?} in {}: {error}",
+                io_max.control_value(),
+                control.display()
+            )
+        }
+    })?;
+    // Read back, because a write the kernel took and did not keep would
+    // otherwise read as a proof.
+    let Ok(readable) = fs::read_to_string(&control) else {
+        return Err(format!(
+            "{} took the ceiling and then could not be read back, so nothing here can \
+             say the kernel kept it",
+            control.display()
+        ));
+    };
+    if !readable
+        .lines()
+        .any(|line| line.split_whitespace().next() == Some(io_max.device.as_str()))
+    {
+        return Err(format!(
+            "the kernel took the ceiling for device {} and then listed none: {} reads {:?}",
+            io_max.device,
+            control.display(),
+            readable.trim()
+        ));
+    }
+    Ok(())
 }
 
 /// Move this runner's processes into a leaf of the base, and say where.
@@ -1698,6 +1792,7 @@ mod tests {
             proc_root,
             me: std::process::id() as i32,
             write,
+            mkdir: |path| fs::create_dir(path),
         }
     }
 
@@ -2087,5 +2182,233 @@ mod tests {
         assert!(nothing.unreadable.is_some());
         assert!(nothing.occupants.is_empty());
         assert!(nothing.mine().is_empty() && nothing.strangers().is_empty());
+    }
+
+    // ------------------------------- a controller is read, not inferred ----
+
+    /// A ceiling to prove, on the device the fixtures below accept.
+    fn an_io_ceiling() -> IoMax {
+        IoMax {
+            ceiling: IoCeiling::parse("rbps=200MB,wbps=100MB").expect("a ceiling"),
+            device: "259:0".to_owned(),
+        }
+    }
+
+    /// Marker files the fake kernel reads out of the base, so that one `fn`
+    /// pointer can be every host shape the proof has to tell apart. Beside
+    /// the controller list rather than in a static, for [`subtree_writes`]'s
+    /// reason: this crate's tests run on twelve threads in one process.
+    ///
+    /// - `BLK_THROTTLE`: this kernel was built with per-cgroup IO throttling,
+    ///   so a cgroup handed `io` gets an `io.max` interface file. Without it
+    ///   the file is absent however `io` is delegated — a kernel built
+    ///   without `CONFIG_BLK_DEV_THROTTLING`.
+    /// - `STRAY_IO_MAX`: a cgroup is left holding an `io.max` file that its
+    ///   controller list does not back. **The known-bad fixture**, and the
+    ///   shape measured on this project's host on 2026-10-30: `app.slice`
+    ///   holds `io.pressure` while `io` is absent from its
+    ///   `cgroup.controllers`, because PSI files are not controller-gated.
+    ///   Put on `io.max` itself here, because that is the file the proof
+    ///   touches and therefore the file an existence reading would believe.
+    const BLK_THROTTLE: &str = "fixture-blk-throttle";
+    const STRAY_IO_MAX: &str = "fixture-stray-io-max";
+
+    /// A delegated base as [`Ceiling::prove_io_max`] meets it: the
+    /// controllers it hands to its children, and the host shape its kernel
+    /// has.
+    fn fake_io_base(root: &Path, handed_to_children: &str, shape: &[&str]) -> Ceiling {
+        let base = root.join("base");
+        fs::create_dir_all(&base).expect("a base");
+        fs::write(base.join("cgroup.controllers"), "cpu io memory pids")
+            .expect("a writable cgroup.controllers");
+        fs::write(base.join("cgroup.subtree_control"), handed_to_children)
+            .expect("a writable cgroup.subtree_control");
+        for marker in shape {
+            fs::write(base.join(marker), "").expect("a writable marker");
+        }
+        Ceiling::Cgroups {
+            base,
+            limits: JobLimits::with_memory_max(1 << 30),
+            unenforced: Vec::new(),
+        }
+    }
+
+    /// Making a cgroup, as cgroup v2 makes one: the new cgroup is handed
+    /// exactly what its parent's `cgroup.subtree_control` lists, and the
+    /// kernel populates it with the interface files that follow from that —
+    /// plus `io.pressure`, which is there either way.
+    fn fake_cgroup_mkdir(path: &Path) -> io::Result<()> {
+        fs::create_dir(path)?;
+        let parent = path.parent().expect("a cgroup sits in a cgroup");
+        let handed = fs::read_to_string(parent.join("cgroup.subtree_control")).unwrap_or_default();
+        fs::write(path.join("cgroup.controllers"), handed.trim())?;
+        fs::write(path.join("cgroup.procs"), "")?;
+        // Not controller-gated, and the whole reason this defect was
+        // reachable: an `io.*` file says nothing about `io`.
+        fs::write(path.join("io.pressure"), "some avg10=0.00\n")?;
+        let io = handed.split_whitespace().any(|name| name == "io");
+        let throttling = parent.join(BLK_THROTTLE).exists();
+        if (io && throttling) || parent.join(STRAY_IO_MAX).exists() {
+            fs::write(path.join("io.max"), "")?;
+        }
+        Ok(())
+    }
+
+    /// Writing a cgroup control file, with the one rule this proof depends
+    /// on: **cgroupfs creates no file**. A write naming an interface file
+    /// that is not there is `ENOENT`, which is the only way a runner sees a
+    /// kernel with no blk-throttle. A device the fixture has no queue for is
+    /// refused the way the kernel refuses one, with `EINVAL`.
+    fn fake_io_write(path: &Path, value: &str) -> io::Result<()> {
+        if !path.exists() {
+            return Err(io::Error::from_raw_os_error(libc::ENOENT));
+        }
+        if path.file_name().and_then(|name| name.to_str()) == Some("io.max")
+            && value.split_whitespace().next() != Some("259:0")
+        {
+            return Err(io::Error::from_raw_os_error(libc::EINVAL));
+        }
+        fs::write(path, value)
+    }
+
+    fn fake_io_kernel(mkdir: fn(&Path) -> io::Result<()>) -> Kernel<'static> {
+        Kernel {
+            proc_root: Path::new(PROC),
+            me: std::process::id() as i32,
+            write: fake_io_write,
+            mkdir,
+        }
+    }
+
+    /// **The known-bad direction, and the point of this test.** A cgroup
+    /// holding an `io.max` file whose `cgroup.controllers` does not list `io`
+    /// is a cgroup where an `io.max` bounds nothing — and until 2026-10-30
+    /// the proof wrote into that file, read the device back out of it and
+    /// called the ceiling proved, because it never read the controller list
+    /// at all. An operator would have been told his hard IO ceiling was
+    /// enforced by a kernel that was never handed the controller to enforce
+    /// it with.
+    #[test]
+    fn an_io_file_in_a_cgroup_handed_no_io_controller_proves_no_ceiling() {
+        let temp = TempDir::new("io-max-stray-file");
+        // Everything but `io` handed down, and an `io.max` lying there
+        // anyway: the one shape an existence reading cannot survive.
+        let ceiling = fake_io_base(
+            temp.path(),
+            "cpu memory pids",
+            &[BLK_THROTTLE, STRAY_IO_MAX],
+        );
+        let why = ceiling
+            .prove_io_max_through(&an_io_ceiling(), fake_io_kernel(fake_cgroup_mkdir))
+            .expect_err("a file is not a controller");
+        assert!(
+            why.contains("the io controller is not handed down"),
+            "the refusal must name the controller as the thing that is missing: {why}"
+        );
+        assert!(
+            why.contains("\"cpu memory pids\""),
+            "and quote the list it read, so a reader can check it: {why}"
+        );
+        assert!(
+            !why.contains("CONFIG_BLK_DEV_THROTTLING") && !why.contains("refused"),
+            "and must not offer this host's kernel build or this device as the \
+             explanation, which are the other two hosts: {why}"
+        );
+    }
+
+    /// The same, where the controller list cannot be read at all. An absence
+    /// is reported as an absence, as everywhere else in this module: not as a
+    /// controller that is there, and not as one that is not.
+    #[test]
+    fn a_controller_list_that_will_not_read_is_a_refusal_naming_the_absence() {
+        let temp = TempDir::new("io-max-unreadable-list");
+        let ceiling = fake_io_base(temp.path(), "cpu io memory pids", &[BLK_THROTTLE]);
+        // A kernel whose mkdir makes the cgroup and populates nothing, which
+        // is the one thing no real kernel does — so the list is missing
+        // rather than empty.
+        let why = ceiling
+            .prove_io_max_through(
+                &an_io_ceiling(),
+                fake_io_kernel(|path| fs::create_dir(path)),
+            )
+            .expect_err("an unreadable controller list proves nothing");
+        assert!(
+            why.contains("cgroup.controllers") && why.contains("cannot be read"),
+            "the refusal must name the file it could not read: {why}"
+        );
+    }
+
+    /// **The two hosts the existence reading made one.** A base that
+    /// withholds `io` and a kernel with no blk-throttle both end with no
+    /// `io.max` to write into, and the old reading said the same sentence for
+    /// both — naming each as a possibility and neither as the answer. They
+    /// are not the same host and the operator's next move is not the same, so
+    /// each gets its own refusal.
+    #[test]
+    fn a_withheld_controller_and_a_kernel_with_no_throttling_read_apart() {
+        let temp = TempDir::new("io-max-two-hosts");
+        let withheld = fake_io_base(temp.path(), "cpu memory pids", &[BLK_THROTTLE]);
+        let why = withheld
+            .prove_io_max_through(&an_io_ceiling(), fake_io_kernel(fake_cgroup_mkdir))
+            .expect_err("a base that withholds io carries no ceiling");
+        assert!(
+            why.contains("the io controller is not handed down")
+                && why.contains("Delegate=yes")
+                && !why.contains("CONFIG_BLK_DEV_THROTTLING"),
+            "a withheld controller is a delegation to grant, and nothing about \
+             this kernel's build: {why}"
+        );
+
+        let other = TempDir::new("io-max-no-throttling");
+        // `io` really handed down, and no `io.max` interface file on this
+        // kernel: the write finds nothing to write to.
+        let unthrottled = fake_io_base(other.path(), "cpu io memory pids", &[]);
+        let why = unthrottled
+            .prove_io_max_through(&an_io_ceiling(), fake_io_kernel(fake_cgroup_mkdir))
+            .expect_err("a kernel with no blk-throttle holds no ceiling");
+        assert!(
+            why.contains("CONFIG_BLK_DEV_THROTTLING")
+                && why.contains("io controller is handed down")
+                && !why.contains("is not handed down"),
+            "a kernel with no throttling is a kernel build, and the controller \
+             is explicitly not the thing that is wrong: {why}"
+        );
+    }
+
+    /// The third host, which the controller list must not swallow: `io`
+    /// handed down, `io.max` there, and the kernel refusing *this device*.
+    /// That refusal is the kernel's own and is reported as such.
+    #[test]
+    fn a_device_the_kernel_refuses_is_the_kernels_refusal_and_not_the_controllers() {
+        let temp = TempDir::new("io-max-wrong-device");
+        let ceiling = fake_io_base(temp.path(), "cpu io memory pids", &[BLK_THROTTLE]);
+        let elsewhere = IoMax {
+            device: "8:16".to_owned(),
+            ..an_io_ceiling()
+        };
+        let why = ceiling
+            .prove_io_max_through(&elsewhere, fake_io_kernel(fake_cgroup_mkdir))
+            .expect_err("a device with no queue is no ceiling");
+        assert!(
+            why.contains("the kernel refused") && why.contains("8:16"),
+            "the refusal must be the kernel's, naming the value it turned down: {why}"
+        );
+        assert!(
+            !why.contains("not handed down"),
+            "and must not blame the controller, which this base hands down: {why}"
+        );
+    }
+
+    /// And the other direction of the pair, so that a proof which refuses
+    /// everything is not mistaken for a fix: a base that genuinely lists
+    /// `io`, on a kernel that throttles, still proves — and the write really
+    /// reaches `io.max`, which the refused-device test above is what shows.
+    #[test]
+    fn a_base_that_really_hands_io_down_proves_the_ceiling() {
+        let temp = TempDir::new("io-max-proved");
+        let ceiling = fake_io_base(temp.path(), "cpu io memory pids", &[BLK_THROTTLE]);
+        ceiling
+            .prove_io_max_through(&an_io_ceiling(), fake_io_kernel(fake_cgroup_mkdir))
+            .expect("a base that hands io down takes the ceiling");
     }
 }
