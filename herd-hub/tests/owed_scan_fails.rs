@@ -138,6 +138,10 @@ impl Peer {
             load_milli: None,
             switch: herd_proto::Switch::On,
             jobs_at_once: None,
+            // Numbered by the pack half and left absent here: this stand-in
+            // runner serves nothing to a peer, and absent is what
+            // outbound-only looks like on the wire (invariant 3, D11).
+            mesh_endpoint: None,
         };
         let mut joined = Self {
             socket: {
@@ -190,6 +194,11 @@ impl Peer {
             draining: false,
             load_milli: None,
             switch: herd_proto::Switch::On,
+            // This stand-in holds no pack store, so it reports no figure
+            // about one rather than a zero that would read as an empty store.
+            pack_store_bytes: None,
+            pack_store_budget_bytes: None,
+            packs_held: None,
         })
         .await;
         let mut seen = Vec::new();

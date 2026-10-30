@@ -45,6 +45,7 @@ pub mod cgroup;
 pub mod confine;
 pub mod janitor;
 pub mod job;
+pub mod mesh;
 pub mod metrics;
 mod outputs;
 pub mod packstore;

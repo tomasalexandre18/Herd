@@ -90,9 +90,9 @@ use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 /// `herd-runner/tests/confinement.rs` forbids `TcpListener` in every module
 /// of this crate but this one, and asserts that it is named here — so the
 /// permit is a door with a name on it rather than an exception nobody wrote
-/// down. Nothing binds it yet: the endpoint is the next step, and it binds
-/// through this alias so that the guard keeps holding.
-#[allow(dead_code)] // The door; the step that walks through it is next (D10, D11).
+/// down. [`crate::endpoint`] is what walks through it: it binds through this
+/// alias and never names the type, so the guard keeps holding over a crate
+/// that now really does listen.
 pub type MeshListener = tokio::net::TcpListener;
 
 /// The flag whose value this rule judges.
@@ -291,9 +291,9 @@ impl HostRouting {
     /// every machine: the interfaces holding a default route, and every
     /// address this host holds.
     ///
-    /// `cfg(test)` for as long as this module lives in the binary rather than
-    /// in the library, where a `pub` item needs no such guard.
-    #[cfg(test)]
+    /// Public and unguarded: this module is a library module now, so the
+    /// `cfg(test)` this constructor used to carry is gone with the binary it
+    /// was needed in.
     pub fn declared(
         default_route_interfaces: Vec<String>,
         addresses: Vec<(String, IpAddr)>,
@@ -307,7 +307,6 @@ impl HostRouting {
     }
 
     /// A host whose routing could not be read at all.
-    #[cfg(test)]
     pub fn unreadable() -> Self {
         Self { tables: None }
     }
@@ -335,7 +334,6 @@ impl HostRouting {
 
     /// Every address this host holds on a default-route interface. Used by
     /// the test that proves the refusal fires on the machine it runs on.
-    #[cfg(test)]
     pub fn default_route_addresses(&self) -> Vec<(String, IpAddr)> {
         let Some(tables) = self.tables.as_ref() else {
             return Vec::new();
@@ -727,7 +725,11 @@ fn permitted(address: IpAddr, routing: &HostRouting) -> Result<(), Reason> {
 /// already read (D11's third condition, E-33), and a second reading of the
 /// switch is how `off` comes to mean two things. No mesh address means
 /// outbound-only, which is never serving.
-#[allow(dead_code)] // The endpoint that consults it is the next step.
+///
+/// [`crate::endpoint::serve_while`] is the one caller, and it consults this on
+/// every turn of its loop rather than once at startup: `off` and draining
+/// arrive while the endpoint is already bound, and the answer has to be able
+/// to change under it (D11's third condition, E-33).
 pub fn may_serve(mesh: Option<&Mesh>, serves_content: bool) -> bool {
     mesh.is_some() && serves_content
 }
@@ -1008,7 +1010,7 @@ mod tests {
         const TEST: &str = "the_rule_refuses_this_hosts_own_default_route_address";
         let routing = HostRouting::read();
         if !routing.readable() {
-            herd_runner::testing::skipped(
+            crate::testing::skipped(
                 TEST,
                 "this host's routing table and interface addresses could not be read, so it \
                  holds no default-route address to refuse",
@@ -1021,7 +1023,7 @@ mod tests {
             .find(|(_, address)| reach_of(*address).servable())
             .cloned()
         else {
-            herd_runner::testing::skipped(
+            crate::testing::skipped(
                 TEST,
                 "this host holds no servable address on a default-route interface, so the \
                  default-route refusal has nothing to fire on here",

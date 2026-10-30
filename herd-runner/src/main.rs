@@ -13,22 +13,13 @@ use herd_runner::confine::{
     DEFAULT_DISK_BUDGET, DEFAULT_LOG_CAP, DEFAULT_MEMORY_MAX, DEFAULT_NICE, DEFAULT_OUTPUT_CAP,
     DEFAULT_TIMEOUT_SECONDS,
 };
+use herd_runner::mesh;
 use herd_runner::root::DataRoot;
 use herd_runner::size::parse_bytes;
 use herd_runner::switch::DEFAULT_POLL_MS;
 use herd_runner::{
     Backoff, Config, Confinement, DEFAULT_HUB_URL, DRAIN_GRACE, HEALTH_EVERY, HUB_SILENCE_LIMIT,
 };
-
-/// The mesh-address rule (invariant 3, D10, D11): which address a runner may
-/// ever serve content from, and the refusal for every other one.
-///
-/// Declared here and not in the library only because `herd-runner/src/lib.rs`
-/// was held by another task on the night this landed. It belongs in the
-/// library — the fetch endpoint that binds through `mesh::MeshListener` is a
-/// library module — and the move is one line, `pub mod mesh;`, taken by the
-/// step that builds the endpoint.
-mod mesh;
 
 /// A Herd runner: dials the hub, executes jobs under caps, streams their logs.
 ///
