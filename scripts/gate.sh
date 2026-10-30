@@ -25,6 +25,21 @@
 #    skips 12 at rest and 14 under load, and neither figure means anything on
 #    its own. The names do.
 #
+#    Two kinds of skip, two lists, never merged (ORCH-202). A running test
+#    that cannot make its assertion on this host prints `HERD-SKIPPED`. A
+#    test carrying `#[ignore]` never runs at all, prints nothing, and was
+#    therefore invisible to this step until ORCH-202: batch 9 added one and
+#    the twelve-name list and its sha256 did not move, which made
+#    `#[ignore]` a silent exemption from the one rule this project treats as
+#    non-negotiable. Cargo does print it — `ignored, <reason>` — so
+#    `test.sh` turns that into `HERD-IGNORED` lines and this step compares
+#    them, by name, against `scripts/expected-skips/ignored.txt`. The two
+#    stay apart because they are different facts: the first says "this host
+#    cannot check it", the second "nobody is checking it until someone
+#    acts". An `#[ignore]` with no reason is refused outright: cargo prints a
+#    bare `ignored`, `test.sh` marks it `HERD-IGNORED-UNEXPLAINED`, and no
+#    expectation file can match that marker.
+#
 # 2. A load-dependent run is not a run, and the host's load at an instant
 #    the GATE chose is not evidence about a skip. Two flood benches skip
 #    themselves above a one-minute load of 8, and each prints the figure it
@@ -94,6 +109,11 @@ cd "$root" || exit 1
 receipts=${HERD_GATE_RECEIPTS:-$root/target/herd-gate}
 expected=${HERD_GATE_EXPECTED:-$root/scripts/expected-skips/local.txt}
 expected_load=${HERD_GATE_EXPECTED_UNDER_LOAD:-$root/scripts/expected-skips/local-under-load.txt}
+# The compile-time skips — `#[ignore]` — are a property of the TREE and not
+# of the host: the same attribute is there on every machine. So this list is
+# one list, not one per host shape, and it applies whatever
+# $HERD_GATE_EXPECTED points at (ORCH-202).
+expected_ignored=${HERD_GATE_EXPECTED_IGNORED:-$root/scripts/expected-skips/ignored.txt}
 load_note=${HERD_GATE_LOAD_NOTE:-8}
 load_max=${HERD_GATE_LOAD_MAX:-24}
 # A seam, so that "the load rose while the suite ran" is a case a test can
@@ -170,13 +190,56 @@ run_step() {
   return "$rc"
 }
 
+# Collation is part of a hash, and `sort` takes its order from the
+# environment (ORCH-202). Measured on this host over the IDENTICAL twelve
+# at-rest names: en_US.UTF-8 gives
+# 0fbdadcaf14aac20eb9875f41aa74b11349d7aee9df39d3dc93be5b714ba66f9 and
+# LC_ALL=C gives
+# 2911f1e8cdbaaaa3005e5318bda0f46016cc359b6aefec879b771c65e16a3c0e. They
+# diverge on exactly one pair: `a_tighter_enclosing_memory_max_...` against
+# `an_allocation_past_the_ceiling_...` and `an_io_weight_...`, because UTF-8
+# collation ignores the underscore and C does not. So two correct gate runs
+# on one tree, in two locales, printed two figures over one list — and a run
+# from a stripped environment (`env -i`, as a hook or a service gives)
+# printed the C one. A figure that changes with the environment is not a
+# hash. `0fbdadca...` had travelled through roughly seventeen receipts as if
+# it identified a list.
+#
+# So every sort and every comparison that feeds a hash or a verdict runs
+# under LC_ALL=C, through these two, and both lists use them so that the two
+# receipt fields stay comparable with each other.
+#
+# Deliberately NOT `export LC_ALL=C`: this script runs check-docs.sh and
+# check-orchestration.sh as children. check-docs.sh exports its own locale
+# and would be unharmed, but check-orchestration.sh sets none, and an
+# environment variable the gate exports into its own children is exactly how
+# a gate's own checks get reddened from outside (the same shape as the
+# HERD_PREFLIGHT lesson). check-docs.sh's second idiom — the locale on the
+# one command that needs it — is the one followed here.
+csort() { LC_ALL=C sort "$@"; }
+ccomm() { LC_ALL=C comm "$@"; }
+
 # A skip's identity is its assertion name: the text between the marker and
 # the first colon. The reason that follows it carries a temporary path and a
 # pid on every run, so it is kept in the expected list for the reader and is
 # deliberately not what the gate compares.
 skip_names() {
   grep -h '^HERD-SKIPPED: ' "$1" 2>/dev/null \
-    | sed 's/^HERD-SKIPPED: //' | sed 's/:.*$//' | sort
+    | sed 's/^HERD-SKIPPED: //' | sed 's/:.*$//' | csort
+}
+
+# The same rule for the other kind, and a separate function so that the two
+# can never be compared against each other: a compile-time skip's identity
+# is its assertion name too. The reason is kept for the reader and not
+# compared — it is a static string in the source, so unlike a runtime skip's
+# reason it does not change between runs, but comparing it would make the
+# gate red on a reworded sentence, which is not a loss of coverage. What IS
+# enforced is that the reason exists: cargo prints a bare `ignored` for an
+# attribute without one, test.sh turns that into
+# HERD-IGNORED-UNEXPLAINED, and the gate below is red on it.
+ignore_names() {
+  grep -h '^HERD-IGNORED: ' "$1" 2>/dev/null \
+    | sed 's/^HERD-IGNORED: //' | sed 's/:.*$//' | csort
 }
 
 refuse() {
@@ -269,17 +332,34 @@ if ! grep -q '^test suite: PASSED$' "$suite"; then
   case " $failed " in *" 6:test-suite "*) ;; *) failed="$failed 6:test-suite-incomplete";; esac
 fi
 
-# --- step 7: the skips, by list and never by count -----------------------
+# --- step 7: the skips, by list and never by count, BOTH kinds -----------
+# Two kinds, two lists, never merged (ORCH-202):
+#   (a) HERD-SKIPPED — a running test said this host cannot check it.
+#   (b) #[ignore]     — the test never ran at all, so nobody is checking it
+#                       until someone acts. Invisible here until ORCH-202:
+#                       an #[ignore] writes no skip line, so it was a silent
+#                       exemption from D27.
 rule
-say "step 7: the skips this host could not make (ci job: check, annotation)"
+say "step 7: the skips, both kinds (ci job: check, annotation)"
+say "  (a) runtime, HERD-SKIPPED: this host could not check it"
 ./scripts/report-skips.sh "$suite" >>"$out" 2>&1
 skips_rc=$?
 [ "$skips_rc" -eq 0 ] || failed="$failed 7:report-skips"
 observed="$receipts/skips-${sha:0:12}.txt"
-grep -h '^HERD-SKIPPED: ' "$suite" 2>/dev/null | sort -u > "$observed"
+grep -h '^HERD-SKIPPED: ' "$suite" 2>/dev/null | csort -u > "$observed"
 say "  observed skip lines: $(wc -l < "$observed" | tr -d ' ') (the count is"
 say "  not the signal; the list is)"
 say "  observed list:        $observed"
+
+# (b)'s two observed lists, read out of the same suite output. test.sh
+# produced them from cargo's own `ignored` lines; the gate re-derives them
+# here from the captured output rather than trusting a side file, for the
+# same reason it re-derives the skips: the receipt must be about what this
+# run printed.
+observed_ignored="$receipts/ignored-${sha:0:12}.txt"
+grep -h '^HERD-IGNORED: ' "$suite" 2>/dev/null | csort -u > "$observed_ignored"
+observed_unexplained="$receipts/ignored-unexplained-${sha:0:12}.txt"
+grep -h '^HERD-IGNORED-UNEXPLAINED: ' "$suite" 2>/dev/null | csort -u > "$observed_unexplained"
 
 # The load's second reading, taken here because this is the first moment
 # after the suite. It is printed, carried in the verdict and written into
@@ -310,6 +390,32 @@ if [ "$bless" -eq 1 ]; then
       cat "$observed"
     } > "$expected"
     say "  --bless: wrote $(wc -l < "$observed" | tr -d ' ') lines to $expected"
+    # The compile-time list is blessed in the same breath, and refused for
+    # the same reason if any #[ignore] carries no reason: an expectation
+    # file may never hold a name whose line cannot say why it is unchecked.
+    if [ -s "$observed_unexplained" ]; then
+      say "  --bless refused for the compile-time list: $(wc -l < "$observed_unexplained" | tr -d ' ') test(s)"
+      say "  carry #[ignore] with no reason, and a reasonless skip is not an"
+      say "  expectation anyone can read (ORCH-202). Give each one a reason."
+      failed="$failed 7:bless-an-unexplained-ignore"
+    else
+      mkdir -p "$(dirname "$expected_ignored")"
+      { echo "# The assertions NOBODY checks: every #[ignore] in the tree, as a"
+        echo "# list and not a count. A property of the tree and not of the host,"
+        echo "# so this file is the same on every machine (ORCH-202)."
+        echo "# Produced by scripts/gate.sh --bless on $started"
+        echo "# sha=$sha"
+        echo "# The marker carries the KIND: HERD-IGNORED is a compile-time skip"
+        echo "# (#[ignore], nobody is checking it), HERD-SKIPPED a runtime one"
+        echo "# (this host cannot). Turning one into the other therefore moves a"
+        echo "# line between these files AND changes its marker: a visible"
+        echo "# change and never a wash. The gate compares the assertion NAME;"
+        echo "# the reason is kept for the reader, and a line without one is"
+        echo "# refused rather than listed."
+        cat "$observed_ignored"
+      } > "$expected_ignored"
+      say "  --bless: wrote $(wc -l < "$observed_ignored" | tr -d ' ') lines to $expected_ignored"
+    fi
   else
     say "  --bless refused: the suite did not pass, so its skip list is not"
     say "  an expectation (D27)."
@@ -322,7 +428,7 @@ if [ ! -f "$expected" ]; then
 fi
 
 allowed="$receipts/allowed-skips-${sha:0:12}.txt"
-skip_names "$expected" | sort -u > "$allowed"
+skip_names "$expected" | csort -u > "$allowed"
 seen="$receipts/seen-skips-${sha:0:12}.txt"
 skip_names "$observed" > "$seen"
 say "  expected list: $expected"
@@ -334,12 +440,12 @@ say "  expected list: $expected"
 load_delta="$receipts/load-delta-${sha:0:12}.txt"
 : > "$load_delta"
 if [ -f "$expected_load" ]; then
-  skip_names "$expected_load" | sort -u > "$load_delta"
+  skip_names "$expected_load" | csort -u > "$load_delta"
   say "  load-conditional delta list: $expected_load"
   say "  a DELTA over the at-rest list and never a whole list; its"
   say "  $(wc -l < "$load_delta" | tr -d ' ') name(s) are the only ones a bench's own reading can excuse"
-  declined=$(comm -12 "$load_delta" "$seen")
-  ran=$(comm -23 "$load_delta" "$seen")
+  declined=$(ccomm -12 "$load_delta" "$seen")
+  ran=$(ccomm -23 "$load_delta" "$seen")
   if [ -n "$ran" ]; then
     say "  load-gated benches that RAN, and whose assertions were made:"
     printf '%s\n' "$ran" | sed 's/^/    ran      /' | tee -a "$out"
@@ -386,8 +492,8 @@ load_excuse() {
     }'
 }
 
-unexpected=$(comm -13 "$allowed" "$seen")
-absent=$(comm -23 "$allowed" "$seen")
+unexpected=$(ccomm -13 "$allowed" "$seen")
+absent=$(ccomm -23 "$allowed" "$seen")
 
 # Every name that is not on the at-rest list is asked twice: is it a name
 # the delta list may excuse at all, and does its own line give the load
@@ -461,10 +567,86 @@ fi
 if [ -z "$unexpected" ] && [ -z "$absent" ]; then
   say "  the skip list matches the expectation exactly."
 fi
+
+# --- step 7 (b): the compile-time skips, ORCH-202 -------------------------
+# A test carrying #[ignore] never runs and writes no skip line, so until
+# this block the gate's accounting could not see it: batch 9 added one and
+# the twelve-name skip list, and its sha256, did not move. The list below is
+# compared by NAME, like (a), and never by count (D187).
+say "  (b) compile-time, #[ignore]: nobody is checking it until someone acts"
+if ! grep -q '^ignored census: COMPLETE' "$suite"; then
+  say "      the suite printed no complete ignored census, so this list is a"
+  say "      floor and not a list: a binary that never ran never announced"
+  say "      what it was not checking (D27, D179). Red at step 6 already."
+  case " $failed " in
+    *" 6:test-suite "*|*" 6:test-suite-incomplete "*) ;;
+    *) failed="$failed 7:ignored-census-incomplete" ;;
+  esac
+fi
+if [ -s "$observed_unexplained" ]; then
+  say "      TESTS IGNORED WITH NO REASON — the gate is RED on these, and no"
+  say "      expectation file can ever match them: an assertion nobody makes"
+  say "      must at least say why nobody makes it (ORCH-202):"
+  sed 's/^HERD-IGNORED-UNEXPLAINED: /        + /' "$observed_unexplained" | tee -a "$out"
+  failed="$failed 7:unexplained-ignore"
+fi
+# Named and emptied before the branch below, so that `set -u` can never meet
+# an unset path and nothing downstream reads a stale file.
+allowed_ignored="$receipts/allowed-ignored-${sha:0:12}.txt"
+seen_ignored="$receipts/seen-ignored-${sha:0:12}.txt"
+: > "$allowed_ignored"
+: > "$seen_ignored"
+if [ ! -f "$expected_ignored" ] && [ -s "$observed_unexplained" ]; then
+  # A --bless run that refused above leaves no file, and the refusal below
+  # would then tell the reader to produce one with --bless. The real answer
+  # is the one already printed: no expectation can exist while an #[ignore]
+  # carries no reason. Stay RED on that, rather than REFUSED on a file whose
+  # absence is a consequence and not the cause.
+  say "      and no expected #[ignore] list at $expected_ignored: none can be"
+  say "      produced while an #[ignore] carries no reason."
+  unexpected_ignored=""
+  absent_ignored=""
+else
+  if [ ! -f "$expected_ignored" ]; then
+    refuse "no expected #[ignore] list at $expected_ignored; produce one with --bless after a green suite"
+  fi
+
+  ignore_names "$expected_ignored" | csort -u > "$allowed_ignored"
+  ignore_names "$observed_ignored" > "$seen_ignored"
+  say "      observed #[ignore] lines: $(wc -l < "$observed_ignored" | tr -d ' ') (the count is not the"
+  say "      signal; the list is)        $observed_ignored"
+  say "      expected list:              $expected_ignored"
+  unexpected_ignored=$(ccomm -13 "$allowed_ignored" "$seen_ignored")
+  absent_ignored=$(ccomm -23 "$allowed_ignored" "$seen_ignored")
+fi
+if [ -n "$unexpected_ignored" ]; then
+  say "      #[ignore]S THAT ARE NOT ON THE EXPECTED LIST — the gate is red on"
+  say "      these, because an assertion nobody expected to go unchecked went"
+  say "      unchecked, and no run of this suite will ever make it:"
+  printf '%s\n' "$unexpected_ignored" | sed 's/^/        + /' | tee -a "$out"
+  while IFS= read -r name; do
+    [ -n "$name" ] || continue
+    grep -F "HERD-IGNORED: $name:" "$observed_ignored" | sed 's/^/          /' | tee -a "$out"
+  done <<EOFIGN
+$unexpected_ignored
+EOFIGN
+  failed="$failed 7:unexpected-ignore"
+fi
+if [ -n "$absent_ignored" ]; then
+  note "an expected #[ignore] did not appear: the test is checked again, or it was renamed or removed. Either way the expectation now overstates what goes unchecked — take the name off $expected_ignored so the next transition is visible too:"
+  printf '%s\n' "$absent_ignored" | sed 's/^/        - /' | tee -a "$out"
+fi
+if [ -z "$unexpected_ignored" ] && [ -z "$absent_ignored" ] \
+   && [ ! -s "$observed_unexplained" ]; then
+  say "      the #[ignore] list matches the expectation exactly, and every"
+  say "      one of them carries a reason."
+fi
 case " $failed " in
-  *" 7:unexpected-skip "*|*" 7:report-skips "*|*" 7:bless-on-a-red-suite "*)
-    say "step 7: the skips — FAILED" ;;
-  *) say "step 7: the skips — ok" ;;
+  *" 7:unexpected-skip "*|*" 7:report-skips "*|*" 7:bless-on-a-red-suite "* \
+  |*" 7:unexpected-ignore "*|*" 7:unexplained-ignore "* \
+  |*" 7:ignored-census-incomplete "*|*" 7:bless-an-unexplained-ignore "*)
+    say "step 7: the skips, both kinds — FAILED" ;;
+  *) say "step 7: the skips, both kinds — ok" ;;
 esac
 
 # --- step 8: one verdict, and a receipt named for the sha -----------------
@@ -531,7 +713,13 @@ receipt="$receipts/$sha.receipt"
   echo "expected-skips: $expected"
   echo "load-excused-skips: ${excused:-none}"
   echo "skips-observed: $(wc -l < "$observed" | tr -d ' ')"
-  echo "skip-list-sha256: $(sort "$seen" | sha256sum | cut -d' ' -f1)"
+  echo "skip-list-sha256: $(csort "$seen" | sha256sum | cut -d' ' -f1)"
+  # The compile-time half, in its own fields. skip-list-sha256 above is
+  # untouched and still over the HERD-SKIPPED names alone, so a figure
+  # quoted by an older receipt still compares (ORCH-202).
+  echo "expected-ignored: $expected_ignored"
+  echo "ignored-observed: $(wc -l < "$observed_ignored" | tr -d ' ')"
+  echo "ignore-list-sha256: $(csort "$seen_ignored" | sha256sum | cut -d' ' -f1)"
   echo "steps: 0..8 all ok"
 } > "$receipt"
 say "  receipt: $receipt"

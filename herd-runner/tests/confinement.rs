@@ -1536,12 +1536,13 @@ fn a_tighter_enclosing_memory_max_lowers_the_room_that_is_announced() {
 ///
 /// 1. with **no** mesh address configured the permitted set is empty, so the
 ///    assertion is exactly the old one, letter for letter;
-/// 2. with one configured, the permitted set is that one address — and
-///    `herd-runner` today still binds nothing, so the set this walk finds is
-///    empty either way. What the configured runner proves is the other half
-///    of the rule: the address was **accepted** at startup (loopback, on
-///    purpose — see `mesh.rs`) and the process joined the hub rather than
-///    refusing to start;
+/// 2. with one configured, the permitted set is that one address, and the
+///    walk finds **exactly** that one: the fetch endpoint binds it, through
+///    `mesh::MeshListener` and from the one module permitted to name a
+///    listener. The configured runner also proves the other half of the rule
+///    — the address was **accepted** at startup (loopback, on purpose — see
+///    `mesh.rs`) and the process joined the hub rather than refusing to
+///    start;
 /// 3. the walk is first made to find a socket planted on purpose, because an
 ///    empty result from a walk that can find nothing is not evidence of
 ///    anything.
@@ -1690,14 +1691,19 @@ async fn every_listening_socket_of_the_runner_is_its_mesh_address() {
          the single configured mesh address",
         listening.len()
     );
-    // Which today means none at all: the rule is built and the endpoint is
-    // not, so this runner serves nothing. Stated as its own assertion so that
-    // the step which binds the endpoint has to come here and change one line
-    // rather than silently satisfy a weaker claim.
-    assert!(
-        listening.is_empty(),
-        "this version of herd-runner holds the mesh rule and no fetch endpoint, so it should \
-         still be listening on nothing: {listening:?}"
+    // And there is exactly one, which is the line the endpoint step came here
+    // to change. It used to read `listening.is_empty()`, with its own note
+    // that the step which binds would have to change it rather than silently
+    // satisfy a weaker claim: "at most one" is true of a runner that binds
+    // nothing, so a broken endpoint would have passed the two assertions
+    // above. This is the half that fails when the socket is missing.
+    assert_eq!(
+        listening.len(),
+        1,
+        "this runner was configured with a mesh address and holds {} listening socket(s) \
+         ({listening:?}); the fetch endpoint binds exactly one, on that address, and nothing \
+         else of this runner ever listens (invariant 3, D10, D11)",
+        listening.len()
     );
 
     std::fs::write(&release, b"checked").expect("the job is let go");

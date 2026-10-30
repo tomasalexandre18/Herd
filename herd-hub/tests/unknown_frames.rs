@@ -85,6 +85,7 @@ impl HubFromTheFuture {
                                         hub_version: "9.9.9".to_owned(),
                                         state_root: "future".to_owned(),
                                         version_note: None,
+                                        keeper_for: Vec::new(),
                                     })
                                     .expect("a welcome encodes");
                                     if socket.send(Message::text(welcome)).await.is_err() {
@@ -231,6 +232,7 @@ async fn the_hub_refuses_a_frame_it_does_not_know_rather_than_ignoring_it() {
         preference: 0,
         load_milli: None,
         switch: herd_proto::Switch::On,
+        mesh_endpoint: None,
     })
     .expect("a hello encodes");
     socket

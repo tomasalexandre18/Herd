@@ -13,6 +13,7 @@
 //! them (D18, E-15). Log payloads are therefore `Vec<u8>`, carried as base64
 //! inside the JSON frame by [`bytes_as_base64`].
 
+use std::collections::BTreeMap;
 use std::fmt;
 use std::time::Duration;
 
@@ -21,6 +22,7 @@ use serde::{de::DeserializeOwned, Deserialize, Serialize};
 pub mod capability;
 pub mod declaration;
 pub mod outputs;
+pub mod pack;
 pub mod placement;
 pub mod size;
 
@@ -39,6 +41,16 @@ pub use outputs::{
     check_relative, JobOutputs, OutputFile, FRAME_CEILING, INLINE_OUTPUT_MAX, OUTPUT_CHUNK_BYTES,
     PER_FILE_OVERHEAD,
 };
+pub use pack::{
+    check_object_digest, check_peer_protocol_version, decode_peer_header, encode_peer_header,
+    peer_version_mismatch_reason, take_peer_body, AskPack, AskTransferCapability, AssignedPack,
+    ExpectTransfer, FetchCapability, FetchPath, Holder, ManifestEntry, ManifestKind, PackHolders,
+    PackId, PackManifest, PackRefused, PackRegistered, PackState, PackTransferred, PackUnavailable,
+    PacksHeld, PeerBody, PeerFramingRefusal, PeerHeader, PeerHeaderRead, PeerRefusal, PeerReply,
+    PeerRequest, PinPacks, ReadPacksAgain, RegisterPack, TransferCapability, TransferDirection,
+    CHATONS_PACK_FORMAT, MANIFEST_MAX_BYTES, PACK_CAPABILITY_LIFETIME, PACK_CHUNK_BYTES,
+    PACK_ENDPOINT_READ_BYTES,
+};
 pub use placement::{
     default_memory_floor_mib, parallelism_tokens, size_mib, with_parallelism, HostSize,
     Parallelism, PARALLELISM_TOKEN,
@@ -50,23 +62,50 @@ pub use size::{parse_bytes, show_bytes};
 /// not announce exactly this number is refused by name
 /// ([`version_mismatch_reason`]), whatever else it got right.
 ///
-/// **1 was the first deployed protocol and 2 is the first bump since the
-/// freeze** (D73, D148). The development numbers 2 to 8 each existed for a
-/// real format break, but every one of those breaks was made on a protocol
-/// nothing spoke outside this repository; carrying eight compatibility eras
-/// into a deployment would have described a history no peer ever lived. M16
-/// set the number back to 1, and from M16 on it is not a development counter —
-/// so **this 2 is a compatibility statement, approved by Alexa on
-/// 2026-10-16**: M11 needs frames for a job's streamed outputs and for the
-/// content registry, both of them new variants, and D124 and D128 between
-/// them make a new variant on either enum breaking whatever serde would
-/// tolerate.
+/// **1 was the first deployed protocol, 2 was the first bump since the
+/// freeze, and this 3 is the second and the last one planned** (D73, D148,
+/// D199). The development numbers 2 to 8 each existed for a real format
+/// break, but every one of those breaks was made on a protocol nothing spoke
+/// outside this repository; carrying eight compatibility eras into a
+/// deployment would have described a history no peer ever lived. M16 set the
+/// number back to 1, and from M16 on it is not a development counter — each
+/// move is a compatibility statement with Alexa's approval behind it.
 ///
-/// **And this is the bump that makes the next one cheaper, by exactly one
-/// enum arm.** Both frame enums now carry a `#[serde(other)]` catch-all, so a
-/// frame whose `type` a build has never heard of **decodes** instead of
-/// failing to. What each peer then does with it is deliberately different,
-/// and the difference is the whole value:
+/// **What 2 bought**: M11's record half — the frames for a job's streamed
+/// outputs and for the end of its collection (approved 2026-10-16).
+///
+/// **What 3 buys**: M11's **pack half**, and M12's pack-side surface riding
+/// with it. M11's own claim that version 2 was *"paid once for both halves"*
+/// is false and D205 corrected it: version 2 went on the record half alone,
+/// and the pack half — the frames by which a runner announces what it holds,
+/// registers a pack after its fsync, asks for one, and is authorised to move
+/// it to or from a peer (D10, D11, D200, D209) — was never numbered. It is
+/// numbered here, with M12's keeper and budget fields in the same move,
+/// because E-14 and E-16 are `must` expectations inside v1.0.0 (D205) and a
+/// second bump for them would be a fleet going quiet twice.
+///
+/// The types those frames carry live in [`pack`], including the peer wire
+/// between two runners: that leg never touches the hub (D10) and still
+/// belongs here (invariant 4). It gets **no number of its own** — both ends
+/// are joined to the same hub at this version — and
+/// [`pack::PeerRequest::protocol_version`] exists only so a mismatch is
+/// refused by name.
+///
+/// **3 also buys one frame that has nothing to do with packs**, and it is in
+/// here for the reason the pack half's `ToHub` set is exhaustive:
+/// [`ToHub::JobFact`], *a fact about a job, with a reason*. Six places in
+/// this build conclude something about a job and have only their own stderr
+/// to say it with, and every one of them needs a `ToHub` frame — the one
+/// direction with no shrug available. Six variants added one at a time would
+/// have been six versions; one reason-coded frame is this one, and a seventh
+/// reason after it is free ([`FactReason::Other`]). **Nothing sends one yet
+/// and no hub handler reads one**: what landed is the contract, not the fix.
+///
+/// **And 2 is the bump that made this one cheaper, by exactly one enum arm.**
+/// Both frame enums carry a `#[serde(other)]` catch-all, so a frame whose
+/// `type` a build has never heard of **decodes** instead of failing to. What
+/// each peer then does with it is deliberately different, and the difference
+/// is the whole value:
 ///
 /// * a **runner** logs it and ignores it, because a frame it does not know is
 ///   work it is not needed for. Before this, the decode error killed the link
@@ -81,37 +120,44 @@ pub use size::{parse_bytes, show_bytes};
 ///   request it cannot read is work that will never be done, and silence
 ///   would leave the peer waiting for it.
 ///
-/// None of that makes a `FromHub` variant that can reach a requester free.
-/// The rule from D124 and D128 still stands for anything a requester sees;
-/// what has changed is that it no longer stands for the runner.
+/// **What moving it costs.** The handshake tests equality, not a floor: the
+/// day this becomes 3, every runner and every `herdctl` still built against 2
+/// is refused at the handshake and stays refused until its host is rebuilt —
+/// a fleet going quiet machine by machine, and requesters that cannot submit,
+/// out of one constant. Hub and peers move **together**, and the order they
+/// are moved in is decided before it lands. The sentence a refused peer reads
+/// says all of that ([`version_mismatch_reason`]), because the peer's
+/// operator is the person who can act on it and this doc comment is not where
+/// she is looking.
 ///
-/// **What moving it now costs.** The handshake tests equality, not a floor:
-/// the day this becomes 2, every runner and every `herdctl` still built
-/// against 1 is refused at the handshake and stays refused until its host is
-/// rebuilt — a fleet going quiet machine by machine, and requesters that
-/// cannot submit, out of one constant. So a bump is a compatibility statement:
-/// it needs Alexa's approval, and the order in which the hub and its peers are
-/// moved is decided before it lands.
+/// **What is NOT foreclosed, which is worth saying because it was once
+/// believed to be.** D204's stability promise constrains the **feature
+/// surface**, not this constant: it says the triple of D199 must move
+/// *before* v1.0.0, not that it may never move after. So the shapes that were
+/// additive before this bump are additive after it, and three of them are:
 ///
-/// **What still has to move it.** "Additive" is not the same as "an older peer
-/// survives it", and serde only half closes the gap. A frame whose `type` an
-/// older build has never heard of now decodes — into the catch-all described
-/// below — so it is an *ignorable* message rather than a read error. That is
-/// enough for a runner and **not** enough for a requester: `herdctl` refuses
-/// the frame on purpose, ending the run it was following with no verdict for
-/// a job that may well have passed, which is the shape of D117 and is the
-/// right behaviour (D124). So **adding a [`FromHub`] variant that can reach a
-/// requester is still a breaking change and still moves this number**,
-/// whatever serde would tolerate on the wire. A variant only a runner ever
-/// sees no longer is. A new *field* on an existing variant may leave the
-/// number alone, and only when it is `#[serde(default)]` *and* means, when
-/// absent, exactly what its default says.
+/// * a new `#[serde(default)]` field on an existing variant, when its absence
+///   means exactly what its default says (the precedent is `JobMetrics`'
+///   `pressure`, D73);
+/// * a new [`FromHub`] variant **only a runner ever sees** — the catch-all
+///   above is precisely what makes it free;
+/// * a new `#[serde(default)]` field in a record on disk.
+///
+/// **What still has to move it**, and therefore what had to be exhaustive
+/// here:
+///
+/// * a new [`ToHub`] variant. An older hub answers [`FromHub::Refused`] and
+///   drops the link, so there is no shrug available in that direction at all;
+/// * a new [`FromHub`] variant a **requester** can see: `herdctl` ends the
+///   run it was following, with no verdict for a job that may well have
+///   passed, which is the shape of D117 and is the right behaviour (D124);
+/// * removing a field, or re-meaning one, anywhere.
 ///
 /// The gap between two *builds* speaking the same protocol is a separate
 /// question with a separate answer ([`version_gap`], E-51): a minor gap is
 /// served with a note, a major one refused. This number only says whether two
 /// peers can read each other's frames at all.
-pub const PROTOCOL_VERSION: u32 = 2;
+pub const PROTOCOL_VERSION: u32 = 3;
 
 /// How often a runner says it is alive and what it is doing (E-40).
 ///
@@ -1390,6 +1436,24 @@ pub enum ToHub {
         /// hand work to a withdrawn machine, which is the one thing E-33
         /// exists to prevent. That is what moved [`PROTOCOL_VERSION`] to 5.
         switch: Switch,
+        /// Where this runner serves pack content to its peers, when it can
+        /// serve any (M11, D10, D11).
+        ///
+        /// An address on a **private mesh interface** and never on a default
+        /// or public one — invariant 3 as amended by D11, and the hub does
+        /// not take it on trust: it is the address the hub hands to a fetcher
+        /// in [`pack::TransferCapability`], so a runner that advertised a
+        /// public one would be advertising it to peers of its own fleet.
+        ///
+        /// **`None` is the outbound-only runner, and it is not a lesser
+        /// one.** A machine behind a router it may not open a port on (the
+        /// invariant's whole point) dials out for its control link and cannot
+        /// be dialled for content, so the hub names *it* a destination and
+        /// asks a holder that can dial to push instead
+        /// ([`pack::TransferDirection::Push`]). Absent therefore means "ask
+        /// somebody else to come to me", never "no packs for this machine".
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        mesh_endpoint: Option<String>,
     },
     /// Runner reports what its external busy probes say (E-26).
     ///
@@ -1616,6 +1680,35 @@ pub enum ToHub {
         /// the runner never received leaves the hub's view wrong for one
         /// cadence and no longer.
         switch: Switch,
+        /// How much of this runner's disk its pack store is using, in bytes
+        /// (M12, E-16).
+        ///
+        /// On the health report and not on the handshake because it is a
+        /// figure about the moment: a store that grew while a job ran is
+        /// exactly what an eviction policy exists to see. **Absent means the
+        /// runner did not say** — never zero, because zero is a measurement
+        /// and it is the one an empty store makes.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pack_store_bytes: Option<u64>,
+        /// What its owner allowed the pack store, in bytes (M12, E-16).
+        ///
+        /// The owner's figure, travelling for the reason
+        /// [`ToHub::Hello::jobs_at_once`] does: the hub cannot invent a
+        /// budget for somebody else's disk, and a hub that compared usage
+        /// against a figure of its own would be enforcing a bound the
+        /// machine's owner never agreed to. Absent means no budget was
+        /// declared, which is not "unlimited" and not zero: it is a hub with
+        /// nothing to weigh the usage against.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pack_store_budget_bytes: Option<u64>,
+        /// How many packs it is holding (M12, E-16).
+        ///
+        /// Beside the two byte figures rather than derived from them: a count
+        /// is what says whether a store is one enormous pack or a thousand
+        /// small ones, and the two want opposite evictions. Absent means the
+        /// runner did not say.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        packs_held: Option<u32>,
     },
     /// Runner gives an attempt back without a verdict, and says why.
     ///
@@ -1718,6 +1811,106 @@ pub enum ToHub {
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         paths: Vec<String>,
     },
+    /// What this runner holds ([`pack::PacksHeld`]).
+    ///
+    /// **Replaces the hub's view of this runner's holdings; never adds to
+    /// it** — which is how a holding is retracted, and why `more` is required.
+    PacksHeld(pack::PacksHeld),
+    /// A runner registers a pack it has finished writing
+    /// ([`pack::RegisterPack`], E-17).
+    RegisterPack(pack::RegisterPack),
+    /// A runner asks for a pack its job needs and was not handed
+    /// ([`pack::AskPack`]).
+    AskPack(pack::AskPack),
+    /// A runner asks the hub to authorise a transfer
+    /// ([`pack::AskTransferCapability`], D209).
+    AskTransferCapability(pack::AskTransferCapability),
+    /// A transfer finished, with the figures saying which of D10's paths it
+    /// took ([`pack::PackTransferred`]).
+    PackTransferred(pack::PackTransferred),
+    /// A runner cannot get a pack its job needs, and says why
+    /// ([`pack::PackUnavailable`]).
+    ///
+    /// A pack-shaped instance of [`ToHub::JobFact`], kept as its own frame
+    /// for the reason given there: the hub's registry is keyed on `(commit,
+    /// key)` and acts on the pack's id, and three typed fields are not a
+    /// sentence somebody parses.
+    PackUnavailable(pack::PackUnavailable),
+    /// **A fact about a job that this peer concluded and had, until this
+    /// frame existed, only its own stderr to say with.**
+    ///
+    /// ## Nothing sends one. That is deliberate, and it is not a fix
+    ///
+    /// No runner and no requester emits this frame on this build, and no hub
+    /// handler reads it. Six places in Herd still conclude something about a
+    /// job and print it to a journal nobody is reading: a runner asked for
+    /// files it does not hold, a runner whose own record names a file it
+    /// cannot read off its disk, a transfer that stopped where only the
+    /// stopping side knows why, a spooled verdict that cannot be attributed
+    /// to any hub this runner knows, a spool deleted because the hub refused
+    /// it, and a requester that decided not to submit at all (E-41). **All
+    /// six are still silent.** What this frame changes is that ending each of
+    /// them is now ordinary work on top of a numbered contract, instead of
+    /// six `ToHub` variants and — because an older hub answers an unknown
+    /// `ToHub` with [`FromHub::Refused`] and drops the link — six protocol
+    /// versions.
+    ///
+    /// ## Why one frame and not six
+    ///
+    /// Every one of the six says the same kind of thing: *here is a fact
+    /// about work you gave me, and here is why*. The hub's answer to each is
+    /// the same shape too — write it on the record, stop waiting for what
+    /// will not arrive, and put a sentence where the person who can act on it
+    /// will read it. A variant per case would have numbered six frames to
+    /// carry one sentence each; a reason code per case numbers one.
+    ///
+    /// ## What is one-shot in here, and what is not
+    ///
+    /// The variant is. [`FactReason`]'s value set is **not**, and that is
+    /// worth stating because it was expected to be: a seventh reason decodes
+    /// on an older hub as [`FactReason::Other`], carrying its code, so that
+    /// hub logs the `detail` and acts on nothing — the same shrug
+    /// [`ToHub::Unknown`] is, one level down. Fields are not one-shot either:
+    /// a `#[serde(default)]` field added here later is free (see
+    /// [`PROTOCOL_VERSION`]), which is why this frame carries the four things
+    /// every one of the six needs and nothing speculative.
+    ///
+    /// ## Why [`ToHub::PackUnavailable`] is not absorbed into it
+    ///
+    /// It could be: a pack that cannot be got is exactly a fact about a job
+    /// with a reason, and absorbing it would spend one variant instead of
+    /// two. It stays separate because its three extra fields are **read by
+    /// the hub and not by a person**: the registry is keyed on `(commit,
+    /// key)` and the holder set is keyed on the pack's id, so a hub answering
+    /// one has to look all three up. Carried in here they would have to live
+    /// inside `detail`, and a hub parsing its way back out of a sentence is
+    /// the opposite of invariant 4. The general frame is for facts whose
+    /// subject the hub already knows from the job id; a fact that names
+    /// something else keeps its own shape.
+    JobFact {
+        /// The job, when the hub minted one.
+        ///
+        /// **`None` is a real case and not a malformed frame**: E-41's skip
+        /// is a requester saying that a job was *not* submitted, so there is
+        /// no id to name and the fact is about a submission the hub never
+        /// heard of. A hub reading `None` has nothing to look up and one
+        /// thing to do, which is to record and relay the sentence.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        job_id: Option<JobId>,
+        /// Which attempt, when the fact is about one attempt rather than
+        /// about the job.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        attempt: Option<u32>,
+        /// Which of the facts this is, from a closed set the hub matches on.
+        reason: FactReason,
+        /// One sentence for the person who can act on it.
+        ///
+        /// **The hub logs it, records it and never parses it.** It is where
+        /// the path, the error or the figure goes; anything a hub has to
+        /// *read* belongs in a field of its own, which is the whole argument
+        /// against absorbing [`ToHub::PackUnavailable`] above.
+        detail: String,
+    },
     /// A frame of a type this build has never heard of.
     ///
     /// **The hub answers this with a refusal naming the type, never with
@@ -1729,6 +1922,118 @@ pub enum ToHub {
     /// is work it is not needed for.
     #[serde(other)]
     Unknown,
+}
+
+/// Which fact [`ToHub::JobFact`] is carrying, from a closed set.
+///
+/// ## The six it was enumerated against
+///
+/// Not invented: each value is one of the six places in this build where a
+/// runner or a requester concludes something about a job and has only its own
+/// stderr to say it with. The sites are named here so that the next person to
+/// wire one up finds the code that was numbered for it instead of adding a
+/// seventh.
+///
+/// | Value | The silence it ends |
+/// |---|---|
+/// | [`FactReason::JobFilesNotHeld`] | the hub asks a runner for a job's output files and the runner holds none of them; today it prints and answers `false`, and the hub asks again on every link — eight times across one reboot of the first consumer's fleet |
+/// | [`FactReason::JobFilesLost`] | the runner's **own record names the file** and the bytes are not readable off its disk. Not the same fact: here a requester has been promised something nobody will ever send, and the hub is waiting for bytes rather than asking for them |
+/// | [`FactReason::JobFilesTransferStopped`] | a collection stopped part way, and the stopping side is **the only party that knows why** — the hub sees an absence and a requester sees a short collection. The consumer met this as a job whose verdict said `ok` and whose files never came |
+/// | [`FactReason::VerdictUnattributable`] | a runner is holding a spooled verdict for a state root that is gone (D34, D42), and the hub has no way to hear that one exists |
+/// | [`FactReason::VerdictDiscardedAfterRefusal`] | the hub refused a spooled verdict, the runner deleted the file, and the only record of it was a line on the runner's stderr |
+/// | [`FactReason::SubmissionSkipped`] | E-41's skip: a requester decided not to submit, and an event comes from the hub, which never heard of this job. `job_id` is `None` here, which is what makes one frame cover this case at all |
+///
+/// ## Why it is a closed set with a way out, rather than a string
+///
+/// A string would make every reader's code a sentence match, and the hub has
+/// to **act** differently on them: stop asking (first), stop waiting and
+/// mark the record (second), count a retry (third), offer a re-attribution
+/// (fourth), note the loss (fifth), emit an event (sixth). A set it can
+/// match on is the difference between a hub that does something and a hub
+/// that logs.
+///
+/// And [`FactReason::Other`] is why a seventh costs nothing. An unknown code
+/// decodes into it carrying the code itself, so an older hub reads the whole
+/// frame, writes the `detail` where a person will see it, and acts on
+/// nothing — which is exactly what [`ToHub::Unknown`] does one level up, and
+/// the reason the catch-all was worth a protocol version in the first place
+/// (D148). It is also why **the reason set is not the one-shot part of this
+/// frame**, against the expectation that it would be: only the variant is.
+///
+/// `Other` is a *decoding* outcome and not something to construct: a
+/// `FactReason::Other("job_files_not_held")` built by hand serialises to the
+/// same code and is not equal to the named value. Nothing on the wire can
+/// produce one, because every known code is normalised on the way in.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(from = "String", into = "String")]
+pub enum FactReason {
+    /// The runner was asked for a job's output files and holds none of them.
+    JobFilesNotHeld,
+    /// The runner's record names a file whose bytes it cannot read.
+    JobFilesLost,
+    /// A collection stopped before it finished, and `detail` says why.
+    JobFilesTransferStopped,
+    /// A spooled verdict belongs to a state root this runner cannot reach.
+    VerdictUnattributable,
+    /// A spooled verdict was deleted because the hub refused it.
+    VerdictDiscardedAfterRefusal,
+    /// A requester decided not to submit the job at all (E-41).
+    SubmissionSkipped,
+    /// A code this build has not been taught, carried verbatim so the log
+    /// line can name it.
+    Other(String),
+}
+
+impl FactReason {
+    /// The code this reason is on the wire.
+    pub fn code(&self) -> &str {
+        match self {
+            Self::JobFilesNotHeld => "job_files_not_held",
+            Self::JobFilesLost => "job_files_lost",
+            Self::JobFilesTransferStopped => "job_files_transfer_stopped",
+            Self::VerdictUnattributable => "verdict_unattributable",
+            Self::VerdictDiscardedAfterRefusal => "verdict_discarded_after_refusal",
+            Self::SubmissionSkipped => "submission_skipped",
+            Self::Other(code) => code,
+        }
+    }
+
+    /// Whether this build was taught this reason.
+    ///
+    /// The one question a hub asks before matching: a reason it does not know
+    /// is logged and acted on in no other way.
+    pub fn is_known(&self) -> bool {
+        !matches!(self, Self::Other(_))
+    }
+}
+
+impl fmt::Display for FactReason {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.code())
+    }
+}
+
+impl From<String> for FactReason {
+    fn from(code: String) -> Self {
+        match code.as_str() {
+            "job_files_not_held" => Self::JobFilesNotHeld,
+            "job_files_lost" => Self::JobFilesLost,
+            "job_files_transfer_stopped" => Self::JobFilesTransferStopped,
+            "verdict_unattributable" => Self::VerdictUnattributable,
+            "verdict_discarded_after_refusal" => Self::VerdictDiscardedAfterRefusal,
+            "submission_skipped" => Self::SubmissionSkipped,
+            _ => Self::Other(code),
+        }
+    }
+}
+
+impl From<FactReason> for String {
+    fn from(reason: FactReason) -> Self {
+        match reason {
+            FactReason::Other(code) => code,
+            named => named.code().to_owned(),
+        }
+    }
 }
 
 /// Everything a requester asks for about one job (E-07).
@@ -1865,6 +2170,40 @@ pub struct Asked {
     /// to its owner and the record says which of the two bound the job.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub timeout_s: Option<u64>,
+    /// The pack keys this job consumes, which a runner lays out under `{in}`
+    /// (M11, ORCH-148).
+    ///
+    /// Names only, and keys rather than ids: a requester asks for "the pack
+    /// the build of this commit left under `pack`", never for a pack by
+    /// identity, because an id is a thing only the hub and the holders know
+    /// and naming one would be a requester naming a machine's content
+    /// (invariant 6's shape, one level down). The hub resolves each key
+    /// against its registry for the commit the job runs on and hands the
+    /// result over as [`FromHub::AssignJob`]'s `packs_in`.
+    ///
+    /// Empty — the default, and absent from the wire — is every job Herd runs
+    /// today.
+    ///
+    /// It is here rather than on [`Declaration`] although it is read out of
+    /// the same consumer file, and that split is worth naming: `Declaration`
+    /// is what a *command* declares, and `needs` is what *this submission*
+    /// asks for, which `herdctl` may narrow. Carrying it in both places would
+    /// be two sources for one answer.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub needs: Vec<String>,
+    /// The artefacts to keep when the job is over: a key, and the path under
+    /// `{out}` the job will have left it at (M11, ORCH-148).
+    ///
+    /// A map and not a list because both halves are needed and neither can be
+    /// derived: the key is what a *later* job will ask for by name, and the
+    /// path is where *this* job's command actually writes. Resolved by the
+    /// hub onto [`FromHub::AssignJob`]'s `packs_out`, recorded, and registered
+    /// as a pack by [`ToHub::RegisterPack`] once the bytes are fsynced.
+    ///
+    /// Empty — the default, and absent from the wire — is every job Herd runs
+    /// today.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub leaves: BTreeMap<String, String>,
 }
 
 /// Sent by the hub to a runner or a requester.
@@ -1896,7 +2235,35 @@ pub enum FromHub {
         /// stderr. The hub says it too.
         ///
         /// `None` is the ordinary case: the two builds agree.
+        ///
+        /// **`#[serde(default)]`, and the attribute is the whole of why this
+        /// field is safe.** It was the only `Option` on either frame enum
+        /// without it, which made a `Welcome` carrying no `version_note` key
+        /// a serde **missing-field error** rather than the
+        /// [`FromHub::Unknown`] the catch-all would have given it. That error
+        /// is outside everything the bump to 2 bought: it kills the link, the
+        /// runner redials, and it reads the same undecodable frame again —
+        /// D128's loop exactly, on the one frame where it matters most,
+        /// because `Welcome` is the frame a runner cannot get past. A
+        /// one-attribute fix, and the field it protects is the next one
+        /// anybody adds here.
+        #[serde(default)]
         version_note: Option<String>,
+        /// The `leaves` keys this runner is a **keeper** for (M12, E-16).
+        ///
+        /// A keeper holds packs of these keys past the point an ordinary
+        /// runner would evict them, so that a `test-pack` arriving tomorrow
+        /// still finds yesterday's build. In the welcome because custody is a
+        /// standing arrangement and not a per-job one: a runner that learned
+        /// it from a later frame would have a window in which it could evict
+        /// the very pack it is keeping.
+        ///
+        /// Empty — the default, and absent from the wire — is every runner
+        /// today: nothing in this build makes anybody a keeper, and what
+        /// chooses one is M12's policy. A runner reading an empty list is a
+        /// runner with no custody, which is what it has now.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        keeper_for: Vec<String>,
     },
     /// The hub declines to go on, and says why. Always the last frame.
     Refused { reason: String },
@@ -1986,6 +2353,33 @@ pub enum FromHub {
         /// figure (D108).
         #[serde(default, skip_serializing_if = "Option::is_none")]
         timeout_s: Option<u64>,
+        /// The packs this job needs, already resolved: the manifest and the
+        /// holders, per `needs` key (M11).
+        ///
+        /// **On the assignment so that the common path costs no round trip.**
+        /// The manifest is kilobytes (D10) and the hub has it, so handing it
+        /// over with the work saves the runner an [`ToHub::AskPack`] and a
+        /// wait on every single job — and the uncommon path, where the hub
+        /// had nothing resolved, is what `AskPack` is still for.
+        ///
+        /// Empty is the ordinary case today and means the job needs no pack.
+        /// A key whose [`pack::AssignedPack::holders`] is empty is a
+        /// different statement: the pack is registered and nobody holds it
+        /// ([`pack::PackState::NoHolder`]), which the runner answers with
+        /// [`ToHub::PackUnavailable`] rather than an empty `{in}` directory.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        packs_in: Vec<AssignedPack>,
+        /// Where this job's `leaves` are to be left: the resolved key → path
+        /// map (M11).
+        ///
+        /// Resolved by the hub from the submission's [`Asked::leaves`] and
+        /// handed back with every attempt, for the reason `declaration` is:
+        /// a requeue onto another machine has to leave the same artefacts
+        /// under the same keys, and the record is the only thing that knows
+        /// them both. Empty means the job leaves nothing, which is every job
+        /// this build runs.
+        #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+        packs_out: BTreeMap<String, String>,
     },
     /// The runner is asked to end a job it is executing, and told why.
     ///
@@ -2268,6 +2662,32 @@ pub enum FromHub {
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         absent: Vec<AbsentFile>,
     },
+    /// What the hub knows about a `(commit, key)`: the manifest and who holds
+    /// it ([`pack::PackHolders`]).
+    PackHolders(pack::PackHolders),
+    /// The hub authorises the asking peer's transfer and says where to go
+    /// ([`pack::TransferCapability`], D209).
+    TransferCapability(pack::TransferCapability),
+    /// The hub tells a **holder** to expect a transfer, over the holder's own
+    /// authenticated link ([`pack::ExpectTransfer`], D209).
+    ///
+    /// The frame ORCH-159 found numbered on neither enum.
+    ExpectTransfer(pack::ExpectTransfer),
+    /// The pack is registered; the runner may stop owing it
+    /// ([`pack::PackRegistered`]).
+    PackRegistered(pack::PackRegistered),
+    /// The hub will not register or resolve this pack, and says why
+    /// ([`pack::PackRefused`]).
+    ///
+    /// **Non-terminal, and deliberately not [`FromHub::Refused`]**, which
+    /// closes the link (D13).
+    PackRefused(pack::PackRefused),
+    /// The hub asks for holdings again after its own restart
+    /// ([`pack::ReadPacksAgain`]).
+    ReadPacksAgain(pack::ReadPacksAgain),
+    /// The hub asks a keeper to hold on to packs of these keys
+    /// ([`pack::PinPacks`], M12, E-16).
+    PinPacks(pack::PinPacks),
     /// A frame of a type this build has never heard of.
     ///
     /// **A runner logs it and ignores it; a requester ends its run.** The
@@ -2482,10 +2902,32 @@ pub fn workspace_refused_reason(limit: u64, detail: &str) -> String {
 
 /// The wording of a version refusal, so that every peer reads one sentence and
 /// a test can rely on it. Names both versions, as the handshake must.
+///
+/// **And says what the two numbers cost, because the person reading it is the
+/// one who can act on it.** [`PROTOCOL_VERSION`]'s own doc comment carries all
+/// of this — what is lost, that the test is equality and not a floor, that a
+/// fleet goes quiet machine by machine — and a doc comment is not where a
+/// runner's owner is looking when her machine has stopped taking work. She is
+/// looking at her runner's stderr, which is this sentence. So it has to say
+/// three things a pair of numbers does not:
+///
+/// * this peer **cannot work at all** until its host is rebuilt — it is not
+///   degraded, not slower, not missing a feature;
+/// * the same is true of every other peer on the old number, one at a time as
+///   each dials, so a fleet goes quiet machine by machine rather than all at
+///   once;
+/// * the check is **equality**, so hub and peers move **together** and
+///   either direction works: upgrade the peer, or roll the hub back. A peer
+///   newer than its hub is refused exactly as an older one is.
 pub fn version_mismatch_reason(announced: u32) -> String {
     format!(
         "protocol version mismatch: the hub speaks version {PROTOCOL_VERSION}, \
-         the peer announced version {announced}"
+         the peer announced version {announced}. This peer cannot work at all until its host is \
+         rebuilt — it will take no job and submit none, and every other peer still on version \
+         {announced} is refused the same way as it dials, so a fleet goes quiet machine by \
+         machine. The check is equality and not a floor, so the hub and its peers have to move \
+         together: rebuild this peer at version {PROTOCOL_VERSION}, or roll the hub back to \
+         version {announced}, but a peer and a hub on two different numbers never speak"
     )
 }
 

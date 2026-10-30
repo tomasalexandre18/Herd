@@ -6,9 +6,9 @@ use std::collections::BTreeMap;
 use herd_proto::{
     cap_exceeded_reason, cap_stop_reason, from_frame, to_frame, Asked, Availability, BusyProbe,
     Cap, Capability, CapabilityOffer, CapabilityOrigins, CapabilityState, Declaration, Executor,
-    FromHub, HostSize, JobId, JobMetrics, JobOutcome, LabelSet, LogStream, OfferedCapability,
-    Pressure, Priority, Role, RunnerSwitch, RunningJob, Step, StepRun, Switch, SwitchPersistence,
-    ToHub, PROTOCOL_VERSION,
+    FactReason, FromHub, HostSize, JobId, JobMetrics, JobOutcome, LabelSet, LogStream,
+    OfferedCapability, Pressure, Priority, Role, RunnerSwitch, RunningJob, Step, StepRun, Switch,
+    SwitchPersistence, ToHub, PROTOCOL_VERSION,
 };
 
 /// A declared command as a submission carries it (E-11): the name their own
@@ -298,6 +298,7 @@ fn every_message_to_the_hub_round_trips() {
             switch: Switch::Off {
                 reason: "she is gaming".to_owned(),
             },
+            mesh_endpoint: None,
         });
         // The optional fields really are optional.
         round_trip_to_hub(ToHub::Hello {
@@ -315,6 +316,7 @@ fn every_message_to_the_hub_round_trips() {
             preference: 0,
             load_milli: None,
             switch: Switch::On,
+            mesh_endpoint: None,
         });
     }
     round_trip_to_hub(ToHub::CapabilitiesChanged {
@@ -344,6 +346,8 @@ fn every_message_to_the_hub_round_trips() {
                 baseline: LabelSet::of("build").expect("a label"),
             }),
             timeout_s: Some(2700),
+            needs: Vec::new(),
+            leaves: std::collections::BTreeMap::new(),
         };
         let bare = Asked {
             command: vec![],
@@ -358,6 +362,8 @@ fn every_message_to_the_hub_round_trips() {
             declaration: None,
             labels_from: None,
             timeout_s: None,
+            needs: Vec::new(),
+            leaves: std::collections::BTreeMap::new(),
         };
         // A dry run carries exactly what a submission carries (E-07).
         round_trip_to_hub(ToHub::SubmitJob {
@@ -448,6 +454,7 @@ fn every_message_from_the_hub_round_trips() {
         hub_version: "0.1.0".to_owned(),
         state_root: "root-0123456789abcdef0123456789abcdef".to_owned(),
         version_note: None,
+        keeper_for: Vec::new(),
     });
     round_trip_from_hub(FromHub::Refused {
         reason: herd_proto::version_mismatch_reason(PROTOCOL_VERSION + 1),
@@ -464,6 +471,8 @@ fn every_message_from_the_hub_round_trips() {
         command: vec!["true".to_owned()],
         declaration: None,
         timeout_s: None,
+        packs_in: Vec::new(),
+        packs_out: std::collections::BTreeMap::new(),
     });
     // The same assignment for a declared command: the four hooks, the commit,
     // the arguments and the cap the declaration asked for (E-11, D108).
@@ -473,6 +482,8 @@ fn every_message_from_the_hub_round_trips() {
         command: vec!["a-line --only {j}".to_owned()],
         declaration: Some(a_declaration()),
         timeout_s: Some(7200),
+        packs_in: Vec::new(),
+        packs_out: std::collections::BTreeMap::new(),
     });
     for step in every_step() {
         round_trip_to_hub(ToHub::StepFinished {
@@ -843,6 +854,9 @@ fn the_link_frames_are_tagged_json_objects() {
             draining: false,
             load_milli: Some(1420),
             switch: Switch::On,
+            pack_store_bytes: None,
+            pack_store_budget_bytes: None,
+            packs_held: None,
         })
         .expect("encodes"),
         r#"{"type":"health","jobs":[{"job_id":"j0000000007","attempt":2,"chunks_sent":412}],"draining":false,"load_milli":1420,"switch":{"position":"on"}}"#
@@ -855,6 +869,9 @@ fn the_link_frames_are_tagged_json_objects() {
             switch: Switch::Off {
                 reason: "she is gaming".to_owned(),
             },
+            pack_store_bytes: None,
+            pack_store_budget_bytes: None,
+            packs_held: None,
         })
         .expect("encodes"),
         r#"{"type":"health","jobs":[],"draining":true,"switch":{"position":"off","reason":"she is gaming"}}"#
@@ -955,6 +972,9 @@ fn every_link_frame_round_trips() {
             draining,
             load_milli: Some(u64::MAX),
             switch,
+            pack_store_bytes: None,
+            pack_store_budget_bytes: None,
+            packs_held: None,
         });
     }
     for runners in [
@@ -1489,26 +1509,53 @@ fn a_wait_that_predates_wants_files_is_read_as_wanting_them() {
 
 /// `jobs_at_once` is additive in **both** directions, which is what the rule
 /// at `docs/decisions.md:7293` and `herd-hub/src/job.rs:44-51` actually ask
-/// for and what lets D181 ship without moving [`PROTOCOL_VERSION`].
+/// for: the field moved no version of its own.
 ///
 /// A field is additive only when a peer that does not know it and a peer that
 /// does can each read what the other wrote, **and** when what is missing
 /// means exactly what its default says. Both halves are asserted here,
 /// because only one of them is about serde:
 ///
-/// * **A hello from a peer built before the field** — the frame `main`
-///   produces today, written out literally rather than generated, so that a
-///   later edit to the struct cannot quietly change what "older" means —
-///   decodes with `jobs_at_once: None`. That is "it did not say", and §1 of
-///   the doc comment on the field is that this is never read as unlimited,
-///   never as zero and never as a figure derived from `host`.
+/// * **A hello from a peer built before the field** — written out literally
+///   rather than generated, so that a later edit to the struct cannot quietly
+///   change what "older" means — decodes with `jobs_at_once: None`. That is
+///   "it did not say", and §1 of the doc comment on the field is that this is
+///   never read as unlimited, never as zero and never as a figure derived
+///   from `host`.
 /// * **A hello from a peer built after it** is read by a deserialiser that
 ///   has never heard of the field. Modelled by a struct of exactly the fields
 ///   the older `Hello` had: serde ignores what it does not know, so the older
 ///   hub reads every figure it used to read and is merely one fact poorer.
+///
+/// ## What this test says about [`PROTOCOL_VERSION`], and what it does not
+///
+/// It used to be called *"without moving the version"* and its fixture was
+/// labelled *"the frame as `main` emits it"*. **Both became false at D199**,
+/// which moved the constant 2 → 3 for M11's pack half — and neither went red,
+/// because `herd-proto` validates no version and the last assertion compares
+/// the constant against a frame this test built *from* the constant. A green
+/// test whose claim is false is worse than a red one, so the claim is stated
+/// properly here instead:
+///
+/// * the literal fixture is a hello from a peer built **before the field**,
+///   which was also before the bump, so it announces 2. **That is a frame the
+///   hub now refuses at the handshake** ([`herd_proto::version_mismatch_reason`]),
+///   and this test asserts nothing about whether it would be admitted — only
+///   that serde reads every field of it, which is what additiveness means and
+///   is a separate question from admission. The test says so out loud below;
+/// * the additiveness claim is then made again at **this build's** version,
+///   where it is not entangled with the bump at all: a hello announcing
+///   [`PROTOCOL_VERSION`] and carrying no `jobs_at_once` key decodes as
+///   `None` exactly the same way.
 #[test]
 fn a_hello_carries_its_job_ceiling_in_both_directions_without_moving_the_version() {
-    // ---- Older peer → today's code. The frame as `main` emits it.
+    // ---- Older peer → today's code.
+    //
+    // A peer built before the field, and therefore before D199's bump: it
+    // announces protocol 2, which the hub refuses at the handshake today.
+    // Nothing here is about admission — only about serde reading every field
+    // of a frame an older build wrote, which is the whole of what "additive"
+    // claims.
     let from_before = r#"{"type":"hello","protocol_version":2,"peer_version":"0.3.7",
         "role":"runner","name":"wsl-pc","instance":"run-4242",
         "host":{"memory_mib":17408,"threads":20,"memory_floor_mib":3481},
@@ -1532,6 +1579,40 @@ fn a_hello_carries_its_job_ceiling_in_both_directions_without_moving_the_version
     assert_eq!(host.memory_mib, Some(17408));
     assert_eq!(preference, 10);
 
+    // Said out loud rather than left as the reader's inference: that fixture
+    // is **not** a frame this hub admits. It decodes, which is what this test
+    // is about, and it would be refused at the handshake, which this test
+    // does not test. The two are different questions and the old name of this
+    // test ran them together.
+    let ToHub::Hello {
+        protocol_version, ..
+    } = from_frame::<ToHub>(from_before).expect("decodes")
+    else {
+        panic!("that frame is a hello");
+    };
+    assert_ne!(
+        protocol_version, PROTOCOL_VERSION,
+        "the fixture is a pre-bump peer on purpose; if it ever announces this build's version \
+         the fixture has stopped standing in for an older one"
+    );
+
+    // ---- And the same claim at this build's own version, where it is not
+    // entangled with D199's bump: no `jobs_at_once` key still means "did not
+    // say", whatever the number in the handshake is.
+    let today = format!(
+        r#"{{"type":"hello","protocol_version":{PROTOCOL_VERSION},"peer_version":"0.4.1",
+        "role":"runner","name":"wsl-pc","switch":{{"position":"on"}}}}"#
+    );
+    let ToHub::Hello { jobs_at_once, .. } =
+        from_frame::<ToHub>(&today).expect("a hello at this version decodes")
+    else {
+        panic!("that frame is a hello");
+    };
+    assert_eq!(
+        jobs_at_once, None,
+        "the field's default is what it is at every protocol version, and that is the claim"
+    );
+
     // ---- Today's peer → an older deserialiser.
     let with_ceiling = to_frame(&ToHub::Hello {
         protocol_version: PROTOCOL_VERSION,
@@ -1548,6 +1629,7 @@ fn a_hello_carries_its_job_ceiling_in_both_directions_without_moving_the_version
         preference: 10,
         load_milli: None,
         switch: Switch::On,
+        mesh_endpoint: None,
     })
     .expect("encodes");
     assert!(
@@ -1572,6 +1654,10 @@ fn a_hello_carries_its_job_ceiling_in_both_directions_without_moving_the_version
     }
     let older: HelloAsAnOlderHubReadsIt =
         serde_json::from_str(&with_ceiling).expect("an older hub reads a newer runner's hello");
+    // Not a version check: `with_ceiling` was built *from* the constant, so
+    // this says serde carried the field across and nothing about what any
+    // version is. The version check is the hub's, on equality, at the
+    // handshake.
     assert_eq!(older.protocol_version, PROTOCOL_VERSION);
     assert_eq!(older.peer_version, "0.3.8");
     assert_eq!(older.name.as_deref(), Some("wsl-pc"));
@@ -1597,6 +1683,7 @@ fn a_hello_carries_its_job_ceiling_in_both_directions_without_moving_the_version
         preference: 0,
         load_milli: None,
         switch: Switch::On,
+        mesh_endpoint: None,
     })
     .expect("encodes");
     assert!(
@@ -1687,4 +1774,414 @@ fn a_job_refused_as_full_travels_with_its_figures_and_is_unreadable_to_an_older_
         serde_json::from_str::<JobOutcome>(older)
             .unwrap_or_else(|why| panic!("this build must read {older}: {why}"));
     }
+}
+
+// ---------------------------------------------------------------------------
+// `ToHub::JobFact`: the one frame six silences need
+// ---------------------------------------------------------------------------
+
+/// Every reason code round-trips, and each one is on the wire as the name the
+/// hub matches on.
+///
+/// The codes were enumerated against the six places in this build where a
+/// runner or a requester concludes something about a job and has only its own
+/// stderr to say it with — one code per silence, with the sites named in
+/// `FactReason`'s own doc comment. **Nothing sends one yet**: what this test
+/// asserts is that the contract for ending each of them exists and is
+/// numbered, not that any of them has been ended.
+#[test]
+fn every_fact_reason_round_trips_under_the_code_the_hub_matches_on() {
+    for (reason, code) in [
+        (FactReason::JobFilesNotHeld, "job_files_not_held"),
+        (FactReason::JobFilesLost, "job_files_lost"),
+        (
+            FactReason::JobFilesTransferStopped,
+            "job_files_transfer_stopped",
+        ),
+        (FactReason::VerdictUnattributable, "verdict_unattributable"),
+        (
+            FactReason::VerdictDiscardedAfterRefusal,
+            "verdict_discarded_after_refusal",
+        ),
+        (FactReason::SubmissionSkipped, "submission_skipped"),
+    ] {
+        assert_eq!(reason.code(), code);
+        assert!(reason.is_known(), "{code} is one this build was taught");
+        let fact = ToHub::JobFact {
+            job_id: Some(JobId::new("j0000000042")),
+            attempt: Some(2),
+            reason: reason.clone(),
+            detail: "files/out.tar: No such file or directory".to_owned(),
+        };
+        let wire = to_frame(&fact).expect("encodes");
+        assert!(
+            wire.contains(&format!(r#""reason":"{code}""#)),
+            "a plain string on the wire, so a log line and a record read the same: {wire}"
+        );
+        assert!(wire.contains(r#""type":"job_fact""#), "{wire}");
+        assert_eq!(
+            from_frame::<ToHub>(&wire).expect("decodes"),
+            fact,
+            "a reason that does not round-trip is a fact the hub acts on wrongly: {wire}"
+        );
+    }
+}
+
+/// **A seventh reason costs nothing**, and that is the point of
+/// [`FactReason::Other`].
+///
+/// A code this build has not been taught decodes into `Other` carrying the
+/// code itself, so an older hub reads the whole frame, has the sentence to
+/// log and the code to name, and acts on nothing — the same shrug
+/// `ToHub::Unknown` is, one level down. That is why the reason set is *not*
+/// the one-shot half of this frame: only the variant is.
+#[test]
+fn a_reason_this_build_was_not_taught_decodes_and_carries_its_code() {
+    let wire = format!(
+        r#"{{"type":"job_fact","job_id":"j0000000042","reason":"pack_store_full","detail":"{}"}}"#,
+        "the store is at its budget and this pack is 401 MiB"
+    );
+    let decoded: ToHub = from_frame(&wire).expect(
+        "an unknown reason must not be a decode error: that kills the link and the peer redials \
+         into the same frame (D128)",
+    );
+    match decoded {
+        ToHub::JobFact {
+            reason,
+            detail,
+            job_id,
+            attempt,
+        } => {
+            assert_eq!(reason, FactReason::Other("pack_store_full".to_owned()));
+            assert!(!reason.is_known(), "so the hub logs and acts on nothing");
+            assert_eq!(
+                reason.code(),
+                "pack_store_full",
+                "the code is carried verbatim, or the log line cannot name it"
+            );
+            assert!(detail.contains("401 MiB"), "and the sentence survives");
+            assert_eq!(job_id, Some(JobId::new("j0000000042")));
+            assert_eq!(attempt, None, "absent, because this fact is about the job");
+        }
+        other => panic!("that is a job_fact: {other:?}"),
+    }
+
+    // It goes back out under the code it came in with, so relaying one does
+    // not rename it.
+    let out = to_frame(&ToHub::JobFact {
+        job_id: None,
+        attempt: None,
+        reason: FactReason::Other("pack_store_full".to_owned()),
+        detail: "x".to_owned(),
+    })
+    .expect("encodes");
+    assert!(out.contains(r#""reason":"pack_store_full""#), "{out}");
+}
+
+/// **No job id is a real case**, and it is the one that makes a single frame
+/// cover all six.
+///
+/// E-41's skip is a requester saying a job was *not* submitted: there is no
+/// id, because the hub never minted one, and `coverage.md` records the
+/// deviation as *"not closeable by hub work"*. It is closeable by protocol
+/// work, and this is the shape of it — so `job_id` is absent from the wire
+/// rather than an empty string the hub would have to read as either.
+#[test]
+fn a_fact_about_a_job_that_was_never_submitted_carries_no_id() {
+    let skipped = ToHub::JobFact {
+        job_id: None,
+        attempt: None,
+        reason: FactReason::SubmissionSkipped,
+        detail: "chatons-os is at f3a19c2 and the last run was f3a19c2: nothing moved".to_owned(),
+    };
+    let wire = to_frame(&skipped).expect("encodes");
+    assert!(
+        !wire.contains(r#""job_id":"#),
+        "there is no job to name: {wire}"
+    );
+    assert!(!wire.contains(r#""attempt":"#), "{wire}");
+    assert_eq!(from_frame::<ToHub>(&wire).expect("decodes"), skipped);
+    assert_eq!(
+        wire,
+        r#"{"type":"job_fact","reason":"submission_skipped","detail":"chatons-os is at f3a19c2 and the last run was f3a19c2: nothing moved"}"#,
+        "the whole frame, pinned: four fields and two of them absent"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// The nine fields the pack half adds to five existing messages
+// ---------------------------------------------------------------------------
+
+/// Each of the nine is **absent** from the wire when it says nothing, and
+/// each decodes from a frame that never carried it.
+///
+/// Both halves are the additiveness claim, and neither is worth anything
+/// without the other: absent-when-empty is what keeps every pinned frame in
+/// this file true, and decoding-when-absent is what lets a field be added
+/// without moving `PROTOCOL_VERSION` again (see the constant's own doc).
+#[test]
+fn the_pack_fields_are_absent_when_silent_and_decode_when_they_were_never_there() {
+    let hello = to_frame(&ToHub::Hello {
+        protocol_version: PROTOCOL_VERSION,
+        peer_version: "0.4.1".to_owned(),
+        role: Role::Runner,
+        token: None,
+        name: None,
+        instance: None,
+        state_root: None,
+        health_every_ms: None,
+        capabilities: CapabilityOffer::empty(),
+        host: HostSize::default(),
+        jobs_at_once: None,
+        preference: 0,
+        load_milli: None,
+        switch: Switch::On,
+        mesh_endpoint: None,
+    })
+    .expect("encodes");
+    assert!(
+        !hello.contains("mesh_endpoint"),
+        "an outbound-only runner says nothing, it does not say \"\": {hello}"
+    );
+
+    let health = to_frame(&ToHub::Health {
+        jobs: Vec::new(),
+        draining: false,
+        load_milli: None,
+        switch: Switch::On,
+        pack_store_bytes: None,
+        pack_store_budget_bytes: None,
+        packs_held: None,
+    })
+    .expect("encodes");
+    for field in ["pack_store_bytes", "pack_store_budget_bytes", "packs_held"] {
+        assert!(
+            !health.contains(field),
+            "absent is not zero — zero is a measurement, and it is the one an empty store \
+             makes: {health}"
+        );
+    }
+
+    let welcome = to_frame(&FromHub::Welcome {
+        protocol_version: PROTOCOL_VERSION,
+        hub_version: "0.4.1".to_owned(),
+        state_root: "root-abc".to_owned(),
+        version_note: None,
+        keeper_for: Vec::new(),
+    })
+    .expect("encodes");
+    assert!(!welcome.contains("keeper_for"), "{welcome}");
+
+    let assignment = to_frame(&FromHub::AssignJob {
+        job_id: JobId::new("j1"),
+        attempt: 1,
+        command: vec!["true".to_owned()],
+        declaration: None,
+        timeout_s: None,
+        packs_in: Vec::new(),
+        packs_out: BTreeMap::new(),
+    })
+    .expect("encodes");
+    assert!(
+        !assignment.contains("packs_in") && !assignment.contains("packs_out"),
+        "every job this build runs needs no pack and leaves none: {assignment}"
+    );
+
+    let asked = to_frame(&ToHub::SubmitJob {
+        wants_files: false,
+        asked: Asked {
+            command: vec!["true".to_owned()],
+            labels: LabelSet::default(),
+            priority: Priority::Step,
+            build_thread_mib: None,
+            memory_mib: None,
+            tmpfs_mib: None,
+            deadline_unix_s: None,
+            after: None,
+            requeue_exit_code: None,
+            declaration: None,
+            labels_from: None,
+            timeout_s: None,
+            needs: Vec::new(),
+            leaves: BTreeMap::new(),
+        },
+    })
+    .expect("encodes");
+    assert!(
+        !asked.contains("needs") && !asked.contains("leaves"),
+        "{asked}"
+    );
+
+    // And the other direction: frames as a peer built before any of this
+    // emits them. Each must decode, with the new field at its default.
+    let before = format!(
+        r#"{{"type":"hello","protocol_version":{PROTOCOL_VERSION},"peer_version":"0.4.1",
+        "role":"runner","switch":{{"position":"on"}}}}"#
+    );
+    let ToHub::Hello { mesh_endpoint, .. } = from_frame(&before).expect("an older hello decodes")
+    else {
+        panic!("that is a hello");
+    };
+    assert_eq!(mesh_endpoint, None);
+
+    let before = r#"{"type":"health","jobs":[],"draining":false,"switch":{"position":"on"}}"#;
+    let ToHub::Health {
+        pack_store_bytes,
+        pack_store_budget_bytes,
+        packs_held,
+        ..
+    } = from_frame(before).expect("an older health report decodes")
+    else {
+        panic!("that is a health report");
+    };
+    assert_eq!(
+        (pack_store_bytes, pack_store_budget_bytes, packs_held),
+        (None, None, None)
+    );
+
+    let before = format!(
+        r#"{{"type":"welcome","protocol_version":{PROTOCOL_VERSION},"hub_version":"0.4.1",
+        "state_root":"r"}}"#
+    );
+    let FromHub::Welcome { keeper_for, .. } =
+        from_frame(&before).expect("an older welcome decodes")
+    else {
+        panic!("that is a welcome");
+    };
+    assert!(
+        keeper_for.is_empty(),
+        "no custody, which is what it has now"
+    );
+
+    let before = r#"{"type":"assign_job","job_id":"j1","attempt":1,"command":["true"]}"#;
+    let FromHub::AssignJob {
+        packs_in,
+        packs_out,
+        ..
+    } = from_frame(before).expect("an older assignment decodes")
+    else {
+        panic!("that is an assignment");
+    };
+    assert!(packs_in.is_empty() && packs_out.is_empty());
+
+    let before = r#"{"type":"submit_job","asked":{"command":["true"],"priority":"step"}}"#;
+    let ToHub::SubmitJob { asked, .. } = from_frame(before).expect("an older submission decodes")
+    else {
+        panic!("that is a submission");
+    };
+    assert!(asked.needs.is_empty() && asked.leaves.is_empty());
+}
+
+/// And each of the nine carries what it is given, there and back.
+///
+/// `leaves` and `packs_out` are maps, so the ordering is the `BTreeMap`'s and
+/// not an insertion order a reader would have to hope about: two keys go in
+/// out of order and come back sorted, which is what makes a frame carrying
+/// them comparable byte for byte.
+#[test]
+fn the_pack_fields_carry_what_they_are_given() {
+    let hello = ToHub::Hello {
+        protocol_version: PROTOCOL_VERSION,
+        peer_version: "0.4.1".to_owned(),
+        role: Role::Runner,
+        token: None,
+        name: Some("wsl-pc".to_owned()),
+        instance: None,
+        state_root: None,
+        health_every_ms: None,
+        capabilities: CapabilityOffer::empty(),
+        host: HostSize::default(),
+        jobs_at_once: None,
+        preference: 0,
+        load_milli: None,
+        switch: Switch::On,
+        mesh_endpoint: Some("100.71.4.9:7711".to_owned()),
+    };
+    let wire = to_frame(&hello).expect("encodes");
+    assert!(wire.contains("100.71.4.9:7711"), "{wire}");
+    assert_eq!(from_frame::<ToHub>(&wire).expect("decodes"), hello);
+
+    let health = ToHub::Health {
+        jobs: Vec::new(),
+        draining: false,
+        load_milli: None,
+        switch: Switch::On,
+        pack_store_bytes: Some(421_138_432),
+        pack_store_budget_bytes: Some(40 << 30),
+        packs_held: Some(7),
+    };
+    let wire = to_frame(&health).expect("encodes");
+    assert_eq!(from_frame::<ToHub>(&wire).expect("decodes"), health);
+
+    // Zero is a measurement and reaches the hub as one: an empty store is
+    // not a store that did not say.
+    let empty_store = ToHub::Health {
+        jobs: Vec::new(),
+        draining: false,
+        load_milli: None,
+        switch: Switch::On,
+        pack_store_bytes: Some(0),
+        pack_store_budget_bytes: Some(40 << 30),
+        packs_held: Some(0),
+    };
+    let wire = to_frame(&empty_store).expect("encodes");
+    assert!(
+        wire.contains(r#""pack_store_bytes":0"#) && wire.contains(r#""packs_held":0"#),
+        "an empty store is a figure, not a silence: {wire}"
+    );
+
+    let welcome = FromHub::Welcome {
+        protocol_version: PROTOCOL_VERSION,
+        hub_version: "0.4.1".to_owned(),
+        state_root: "root-abc".to_owned(),
+        version_note: None,
+        keeper_for: vec!["pack".to_owned(), "reference".to_owned()],
+    };
+    let wire = to_frame(&welcome).expect("encodes");
+    assert_eq!(from_frame::<FromHub>(&wire).expect("decodes"), welcome);
+
+    let mut leaves = BTreeMap::new();
+    leaves.insert("reference".to_owned(), "ref".to_owned());
+    leaves.insert("pack".to_owned(), "pack".to_owned());
+    let asked = Asked {
+        command: vec!["true".to_owned()],
+        labels: LabelSet::default(),
+        priority: Priority::Step,
+        build_thread_mib: None,
+        memory_mib: None,
+        tmpfs_mib: None,
+        deadline_unix_s: None,
+        after: None,
+        requeue_exit_code: None,
+        declaration: None,
+        labels_from: None,
+        timeout_s: None,
+        needs: vec!["pack".to_owned()],
+        leaves: leaves.clone(),
+    };
+    let wire = to_frame(&ToHub::SubmitJob {
+        asked: asked.clone(),
+        wants_files: false,
+    })
+    .expect("encodes");
+    assert!(
+        wire.find(r#""pack":"pack""#) < wire.find(r#""reference":"ref""#),
+        "sorted by the map and not by the order they were inserted: {wire}"
+    );
+    let ToHub::SubmitJob { asked: back, .. } = from_frame(&wire).expect("decodes") else {
+        panic!("that is a submission");
+    };
+    assert_eq!(back, asked);
+
+    let assignment = FromHub::AssignJob {
+        job_id: JobId::new("j1"),
+        attempt: 1,
+        command: vec!["true".to_owned()],
+        declaration: None,
+        timeout_s: None,
+        packs_in: Vec::new(),
+        packs_out: leaves,
+    };
+    let wire = to_frame(&assignment).expect("encodes");
+    assert_eq!(from_frame::<FromHub>(&wire).expect("decodes"), assignment);
 }

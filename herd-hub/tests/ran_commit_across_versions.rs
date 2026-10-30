@@ -190,13 +190,28 @@ fn fetch_reporting(ran: Option<&str>) -> StepRun {
 /// change.
 ///
 /// Asserted rather than asserted-about-in-prose, because the whole claim of
-/// this increment is that neither moves: a hub at record version 2 refuses
-/// an operator's entire state root, and a handshake at protocol version 3
-/// refuses every runner that has not been restarted.
+/// this increment is that neither moves **for it**: a record version refuses
+/// an operator's entire state root, and a handshake refuses every runner that
+/// has not been restarted.
+///
+/// **Both numbers have since moved, and neither for `ran_commit`.** D199
+/// moved `PROTOCOL_VERSION` 2 → 3 with M11's pack frames and `RECORD_VERSION`
+/// 1 → 2 with the hub's pack registry and `LAYOUT_VERSION`, so the literals
+/// below are 3 and 2 and this increment's claim is untouched. The pins stay
+/// **literals** on purpose: against the constants they would be tautologies,
+/// and what they are here to catch is an *accidental* move.
 #[test]
 fn neither_version_number_moves() {
-    assert_eq!(PROTOCOL_VERSION, 2, "the handshake is unchanged");
-    assert_eq!(RECORD_VERSION, 1, "every existing state root still reads");
+    assert_eq!(
+        PROTOCOL_VERSION, 3,
+        "3 is D199's bump for M11's pack half; `ran_commit` is an additive field and moved \
+         nothing"
+    );
+    assert_eq!(
+        RECORD_VERSION, 2,
+        "2 is D199's move, made with the hub's own pack registry and with LAYOUT_VERSION in the \
+         same commit; this field is additive and moved nothing"
+    );
 }
 
 /// **Old runner → new hub.** A step frame from a build that never heard of

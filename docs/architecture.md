@@ -76,7 +76,7 @@ flowchart TB
     RUN2["UNBUILT as a joined machine: herd-runner 'wsl-pc'<br/>inside WSL2, user unit, Delegate=yes — D145"]
   end
 
-  PROTO["herd-proto: every message, PROTOCOL_VERSION 2,<br/>the JSON framing, the capability algebra — invariant 4"]
+  PROTO["herd-proto: every message, PROTOCOL_VERSION 3,<br/>the JSON framing, the capability algebra — invariant 4"]
 
   CTL -->|"ws:// loopback or tailnet, Role Requester"| HUB
   DECL --> CTL
@@ -350,31 +350,46 @@ eleven landed on 2026-10-29 in batch 8 — `STATUS_VERSION` (D215),
 this page said "six" until they were added to it, which is why a
 checklist drawn from it missed three numbers.
 
+**Which tree this section was read against**, declared here because
+§3.4's citations are the load-bearing ones on this page and
+`docs/handover.md` and `docs/disk-policy.md` both declare theirs: every
+value and every line number below was read on **2026-10-30** from
+`pack-variants` (`8344e07`) and `pack-registry` (`6f409cb`), each on top
+of `main` `351c826`. Those two branches are what moves the three numbers
+that moved, and the merge of them had not been cut when this was
+written. That is why `herd-hub/src/job.rs` and `herd-hub/src/store.rs`
+carry line numbers below — `pack-registry` is the only branch that
+touches either file, so its lines survive the merge — and why **no
+`herd-proto/src/lib.rs` line number appears at all**: `pack-variants`
+and `pack-store` put the same constant at 160 and at 147, both green,
+and no commit that exists settles which the merged tree will have. A
+line this section cannot verify is left out rather than guessed. The
+command above is how to re-derive the lot.
+
 The handshake tests **equality**, not a floor.
 
 | Number | Value | Where it lives, and what it fronts | What moves it | What a mismatch does, and whether anything can migrate |
 |---|---|---|---|---|
-| `PROTOCOL_VERSION` | **2** | `herd-proto/src/lib.rs:114`; announced in `Hello`, echoed in `Welcome` | adding a `FromHub` variant a **requester** can see, or a field that is not `#[serde(default)]` meaning exactly what its absence means. A variant only a **runner** ever sees no longer does (D124, D128) | the hub refuses the peer by name, both numbers in the sentence (`version_mismatch_reason`, `herd-proto/src/lib.rs:2485`). Equality, not a floor: every runner and every `herdctl` still built against the old number is refused until its host is rebuilt. **No migration exists or could** — a bump is a fleet-wide synchronised restart, needs Alexa's approval, and the order the hub and its peers move in is decided before it lands |
-| `RECORD_VERSION` | **1** | `herd-hub/src/job.rs:52`; in front of `job.json` **and every line of `events.jsonl`** | removing a field, or changing what one means. Only a `#[serde(default)]` field whose default means exactly what absence means is additive enough to leave it alone | the file is not read at all: the store errors naming the path and both numbers (`store.rs:1475`, `store.rs:2726`), and because that comes out of recovery the hub **refuses to start** on that state root. What stops being readable is the operator's whole state root. **Migration is possible in principle and unbuilt**: `herd-hub migrate` does not exist, so a bump ships either that tool or an explicit operator instruction, and needs Alexa's approval |
-| `LAYOUT_VERSION` | **1** | `herd-hub/src/store.rs:60`; `store.json`, the state root's own header | a change to the directory layout the state root is | the root is refused rather than read as if it were this version, naming the root and both numbers (`store.rs:471`), so the **hub does not start**. No migration today |
+| `PROTOCOL_VERSION` | **3** on `main`, 2 in every release to date | `pub const PROTOCOL_VERSION` in `herd-proto/src/lib.rs`; announced in `Hello`, echoed in `Welcome` | adding a `FromHub` variant a **requester** can see, or a field that is not `#[serde(default)]` meaning exactly what its absence means. A variant only a **runner** ever sees no longer does (D124, D128) | the hub refuses the peer by name, both numbers in the sentence (`version_mismatch_reason` in `herd-proto/src/lib.rs`). Equality, not a floor: every runner and every `herdctl` still built against the old number is refused until its host is rebuilt. **No migration exists or could** — a bump is a fleet-wide synchronised restart, needs Alexa's approval, and the order the hub and its peers move in is decided before it lands. The 2 → 3 move is D199's, carried by M11's pack half |
+| `RECORD_VERSION` | **2** on `main`, 1 in every release to date | `herd-hub/src/job.rs:72`; in front of `job.json` **and every line of `events.jsonl`** | removing a field, or changing what one means. Only a `#[serde(default)]` field whose default means exactly what absence means is additive enough to leave it alone | the record is **set aside rather than read**: quarantined, named with its path and both numbers, kept out of the queue, never dispatched and never rewritten, and the hub **starts** — on `main`, and in no release: **v0.4.1 and below refuse the whole state root** (D218 and D219, 2026-10-29; this row said *refuses to start*, with no version on it, until 2026-10-30). The sentence is `record_version_mismatch_reason` in `herd-hub/src/job.rs`, used on the `job.json` arm (`store.rs:1550`) and on a line of `events.jsonl` (`store.rs:2809`), and it carries the instruction. What stops being readable is one job at a time — unless every record reads that way, which is what a root from another release looks like, and *docs/operating.md* says what to do then. **Migration is possible in principle and unbuilt**: `herd-hub migrate` does not exist, and the 1 → 2 move landed with M11's pack half under D199, Alexa's approval, without it |
+| `LAYOUT_VERSION` | **2** on `main`, 1 in every release to date | `herd-hub/src/store.rs:99`; `store.json`, the state root's own header | a change to the directory layout the state root is | the root is refused rather than read as if it were this version, naming the root and both numbers (`store.rs:528`, the sentence in `layout_version_mismatch_reason`, `store.rs:3345`), so the **hub does not start**. No migration, and since the 1 → 2 move with M11's pack half (D199) that is the live case rather than a hypothesis: this is the **first** time this number has ever moved, and a hub built from `main` refuses a v0.4.1 root |
 | `ROSTER_VERSION` | **1** | `herd-hub/src/roster.rs:44`; `runners.json` | a change to the roster file's shape | the roster is refused by name with both numbers (`roster.rs:135`), and because an empty roster refuses every runner, **nothing connects**. This is the one of the four state-root numbers that decides *who may connect* rather than what can be read. No migration |
 | `STATUS_VERSION` | **1** | `herd-hub/src/status.rs:78`; the first field of `status.json` | a change to the status document's shape | a document of another version is **refused by name, with both figures**, and the sentence says so: *"There is no migration"* (`status.rs:406-412`). It refuses the **reader of the document**, not a peer and not the hub: the hub keeps running and keeps publishing |
 | `EVENT_FORMAT_VERSION` | **1** | `herd-hub/src/notify.rs:73`; `herd_event_version`, in front of every payload the hub sends a sink | a change to the event payload's shape | **nothing in Herd refuses, and that is the risk.** The consumer parses these with their own code (`notify.rs:66-72`), so moving this number is a change to somebody else's software, and the number is the only thing that lets their reader tell which shape it was handed instead of guessing |
 | `STATE_FORMAT_VERSION` | **1** | `herdctl/src/moved.rs:47`; the first field of `herdctl if-moved`'s state file | a change to that file's shape | the file is **refused by name rather than interpreted** (`moved.rs:402-411`) and the run submits nothing — because two `herdctl` builds disagreeing in silence about what "the last run" means is a nightly that fires twice or never, and neither is visible from outside. No migration |
-| `INDEX_VERSION` | **1** | `herd-hub/src/store.rs:64`; `index/state.json` | anything at all; it needs no compatibility | the index is **rebuilt, not refused** (`store.rs:1240`): a version this Herd does not know is one more reason to rebuild it. Migration is moot — the artefact is derived |
-| `READINGS_VERSION` | **1** | `herd-hub/src/store.rs:119`; `readings/answers.json` | anything at all; derived, like the index | the answers are **left alone and read again**, said out loud with both numbers (`store.rs:3146-3151`). Never a reason to refuse to start. Migration is moot |
-| `OUTPUT_FORMAT_VERSION` | **1** | `herd-proto/src/lib.rs:2350`; inside the parentheses of the `ran on:` line on a requester's stdout, which is the one place it can go (D109) | any change to that line's bytes. Frozen at 1 since M16 (Q7, D73) | nothing refuses; it is how a consumer's parser knows which framing it got. Frozen by a test and not by this page: `herd-proto/tests/frozen_formats.rs` asserts the number **and** the whole literal line, so a space or a separator cannot move without a red gate |
-| `VERDICT_FORMAT_VERSION` | **1** | `herd-proto/src/lib.rs:2380`; the first field of the JSON document `herdctl --verdict-to` writes, so a reader can refuse before it reads anything else | removing a field, or changing what one means. **Adding** a field does not: every reader of JSON ignores what it was not looking for (D166) | nothing refuses; a reader checks it first. A second number rather than a reuse of `OUTPUT_FORMAT_VERSION` because the two are parsed by different readers and will not move together. Frozen as literal text by `herdctl/tests/frozen_verdict.rs` |
+| `INDEX_VERSION` | **1** | `herd-hub/src/store.rs:103`; `index/state.json` | anything at all; it needs no compatibility | the index is **rebuilt, not refused** (`store.rs:1315`): a version this Herd does not know is one more reason to rebuild it. Migration is moot — the artefact is derived |
+| `READINGS_VERSION` | **1** | `herd-hub/src/store.rs:158`; `readings/answers.json` | anything at all; derived, like the index | the answers are **left alone and read again**, said out loud with both numbers (`store.rs:3226-3231`). Never a reason to refuse to start. Migration is moot |
+| `OUTPUT_FORMAT_VERSION` | **1** | `pub const OUTPUT_FORMAT_VERSION` in `herd-proto/src/lib.rs`; inside the parentheses of the `ran on:` line on a requester's stdout, which is the one place it can go (D109) | any change to that line's bytes. Frozen at 1 since M16 (Q7, D73) | nothing refuses; it is how a consumer's parser knows which framing it got. Frozen by a test and not by this page: `herd-proto/tests/frozen_formats.rs` asserts the number **and** the whole literal line, so a space or a separator cannot move without a red gate |
+| `VERDICT_FORMAT_VERSION` | **1** | `pub const VERDICT_FORMAT_VERSION` in `herd-proto/src/lib.rs`; the first field of the JSON document `herdctl --verdict-to` writes, so a reader can refuse before it reads anything else | removing a field, or changing what one means. **Adding** a field does not: every reader of JSON ignores what it was not looking for (D166) | nothing refuses; a reader checks it first. A second number rather than a reuse of `OUTPUT_FORMAT_VERSION` because the two are parsed by different readers and will not move together. Frozen as literal text by `herdctl/tests/frozen_verdict.rs` |
 | build version (`version_gap`) — **not one of the eleven** | workspace **0.4.1** | `Hello::peer_version`, `Welcome::hub_version`; no constant — `hub_version()`, `runner_version()` and `requester_version()` return `CARGO_PKG_VERSION` | a release | a **major** gap refuses; a **minor** gap is served with a note; a string that cannot be read is served with a note (E-51). This number says nothing about whether two peers can read each other's frames — that is `PROTOCOL_VERSION`'s only job |
 
-Read down the last column and the eleven fall into three kinds, which is
+Read down the last column and the eleven fall into four kinds, which is
 the checklist a change to any schema owes:
 
-1. **Four refuse and the thing stops.** `PROTOCOL_VERSION` refuses the
-   peer; `RECORD_VERSION` and `LAYOUT_VERSION` stop the hub from
-   starting; `ROSTER_VERSION` lets the hub start and then refuses every
-   runner. Moving one of these is a compatibility statement, not a
-   refactor.
+1. **Three refuse and something stops.** `PROTOCOL_VERSION` refuses the
+   peer; `LAYOUT_VERSION` stops the hub from starting; `ROSTER_VERSION`
+   lets the hub start and then refuses every runner. Moving one of these
+   is a compatibility statement, not a refactor.
 2. **Three refuse one reader and nothing else.** `STATUS_VERSION`,
    `STATE_FORMAT_VERSION` and — outside this repository —
    `EVENT_FORMAT_VERSION`. The hub survives; what breaks is whoever was
@@ -383,8 +398,19 @@ the checklist a change to any schema owes:
    trigger a rebuild of something derived; `OUTPUT_FORMAT_VERSION` and
    `VERDICT_FORMAT_VERSION` exist so a parser can branch, and are held
    still by frozen-format tests rather than by prose.
+4. **One sets the artefact aside and serves the rest:**
+   `RECORD_VERSION`, alone in its kind. A record carrying a version this
+   build does not read is quarantined — named with its path, counted,
+   left untouched, kept out of the queue — and the hub binds its port
+   and runs every healthy job on the root (D218, D219). It is the only
+   one of the eleven whose mismatch is survivable **per artefact**
+   rather than per root, and it is why there are four kinds here and not
+   three: it neither stops the thing, nor refuses one reader and nothing
+   else, nor stops nothing. **(v0.4.1 and below refuse the whole root
+   instead** — that is the promise D219 reversed, and it is what this
+   page said about `RECORD_VERSION` until 2026-10-30.)
 
-Three of them deserve a sentence beyond their row.
+Four of them deserve a sentence beyond their row.
 
 **`EVENT_FORMAT_VERSION` is the only one whose reader is somebody
 else's code.** Every other number is checked by a Herd binary, so a
@@ -401,16 +427,59 @@ refuses every runner — the safe state, chosen on purpose, and total.
 Anything that ever moves the state root's layout has to ask what it does
 to this file, not just to `store.json` and `job.json`.
 
-**`STATUS_VERSION` says out loud what the others leave implied.** Its
+**`STATUS_VERSION` was the first to say out loud what the others left
+implied, and since M11's pack half it is no longer the only one.** Its
 refusal sentence contains the words *"There is no migration"*
-(`status.rs:406-412`). That is true today of all six numbers that refuse
-anything — no migration tool exists for any of them, and the one that
-would, `herd-hub migrate`, is unbuilt. One of the six says so.
+(`status.rs:406-412`), and no migration tool exists for any number whose
+mismatch refuses anything at all. **That set is named here rather than
+counted**, because the count is derived from the four kinds above and
+this page has already carried it wrong once: the three of kind 1, plus
+`RECORD_VERSION` of kind 4, plus `STATUS_VERSION` and
+`STATE_FORMAT_VERSION` of kind 2. Six of the eleven. The tool that would
+migrate any of them, `herd-hub migrate`, is unbuilt.
 
-`RECORD_VERSION` is frozen at 1 since M16. It reached 6 while nothing was
-deployed; a bump now costs the operator's whole state root — every queued
-job and every uncollected verdict — and the hub says so by not starting,
-never by guessing.
+**Three of those six now say it in their own refusal sentence**, where
+one did before the pack half: `STATUS_VERSION` (*"There is no
+migration"*, `status.rs:406-412`), `RECORD_VERSION` (*"There is no
+migration in either direction"*, `record_version_mismatch_reason` in
+`herd-hub/src/job.rs`) and `LAYOUT_VERSION` (*"Nothing converts it:
+there is no migration tool, no `--migrate` and none planned"*,
+`layout_version_mismatch_reason`, `store.rs:3345`). The last two
+acquired those words in the commit that moved them, so the sentence an
+operator reads now says it too, and not only this page.
+
+And **three of the six have now moved without that tool**:
+`PROTOCOL_VERSION` to 3, `RECORD_VERSION` and `LAYOUT_VERSION` to 2, all
+in M11's pack half under D199. The absence of a migration path is no
+longer a hypothesis on this page; it is the state of `main`.
+
+**`RECORD_VERSION` is not frozen any more.** It was 1 from M16 until
+M11's pack half moved it to **2** (D199) — its first move since that
+milestone, having reached 6 earlier while nothing was deployed.
+`LAYOUT_VERSION` moved to **2** in the same commit, and that is the
+first time that number has ever moved. The price was understood when the
+move was taken: a root an older release wrote is not converted. Which of
+the two stops a deployment has changed, though, and it matters here. The
+record number alone no longer stops the hub — since D218 it sets the one
+record aside and the hub comes up (v0.4.1 and below refuse the root).
+The layout number does: it refuses the root rather than guessing, so
+**the layout is what stops you**, and what it costs is every queued job
+and every uncollected verdict in that root.
+
+**For whoever plans the next move of these numbers — ORCH-204 is open —
+the failure to design against is not a refusal.** A build whose
+`RECORD_VERSION` differs from the root's while its `LAYOUT_VERSION`
+matches **starts and serves an empty queue**: every record quarantined,
+each named with its path, the count on the line that says the hub is
+listening. That is loud and it is not a refusal, so an operator
+instruction written around a hub that stops the deployment would
+describe something that does not happen. It is D219's own reason for
+opening ORCH-204: either v1.0.0 moves `LAYOUT_VERSION` with
+`RECORD_VERSION` — which the four-step procedure in `docs/operating.md`
+assumes — or that release needs a guard of its own. Both numbers moved
+together in M11's pack half, so the procedure holds as written today;
+it holds because that landing moved both, not because anything prevents
+a record-only move later.
 
 ## 4. A job's whole life
 

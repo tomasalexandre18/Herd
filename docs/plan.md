@@ -571,12 +571,18 @@ flipping the switch within 10 s (E-33).
 
 ### M18 — First consumer acceptance (`m18-onboarding`)
 Close every chatOnS-gated acceptance with their deliverables (declaration
-file, pack and `test --pack`, results.json, push hook, nightly command):
-E-02's real verdicts, E-11's one-entry change, E-12's `0 crates compiled`,
-E-14's prepare timing, E-41 live at 03:00, E-42 from their hook.
-**Done when** the gated list in `docs/coverage.md` is walked with chatOnS on
-the real machines; each item checked or a numbered follow-up. Paced by their
-side; blocks nothing of ours.
+file, pack and `test --pack`, results.json, push hook, nightly command,
+their executor and the status document): E-02's real verdicts, E-11's
+one-entry change, E-12's `0 crates compiled`, E-14's prepare timing,
+E-20's every-QEMU listing, E-41 live at 03:00, E-42 from their hook.
+**Done when** `docs/coverage.md`'s *Gated on chatOnS* list — the one
+list, and the members above are **derived from it** rather than kept
+beside it — is walked with chatOnS on the real machines; each item
+checked or a numbered follow-up. Paced by their side; blocks nothing of
+ours. **E-20 was added 2026-10-30** because its own row already said
+*"M13, gated M18"*: the row's claim stood and this paragraph was what
+disagreed with it, so a note that gains a `gated M18` marker gains a
+place here, and never the other way round (the orchestrator, ORCH-206).
 
 ## Critical path
 
@@ -728,9 +734,13 @@ by a count in CLAUDE.md.
   31 GiB host E-29's 6 GiB floor is the only guard — enforced, never advisory.
 - **E-32's p90 < 12** is an adoption outcome, not a test: tests assert the
   mechanisms; the figure is read from statistics after M18.
-- **Gated on chatOnS** (fixture tests stand in until M18): E-02, E-11, E-12,
-  E-14, E-38, E-41, E-42, E-53, E-54 — each needs a chatOnS deliverable named
-  in `docs/coverage.md`.
+- **Gated on chatOnS** (fixture tests stand in until M18): the list is
+  `docs/coverage.md`'s *Gated on chatOnS* section, which is derived from
+  its own rows and is not restated here. This bullet named nine rows:
+  one (E-53) that nothing supports; two (E-38, E-54) gated on them with
+  no milestone that closes the wait, which are a named second group in
+  that section; and one the rows carry (E-20) that it was missing. That
+  section says which and why (ORCH-206, settled 2026-10-30).
 - **Size honesty.** The sheet carries 44 musts (recounted; not 38) across
   **16** must-bearing milestones, M2 to M17 — counted from
   `docs/coverage.md`'s own *Musts per milestone* table, which lists

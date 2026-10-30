@@ -158,7 +158,12 @@ fn record(
     ended: Timestamp,
 ) -> serde_json::Value {
     serde_json::json!({
-        "record_version": 1,
+        // The version this build reads, not the literal 1 this fixture was
+        // written with. What retention judges here is a record it CAN read:
+        // pinned to 1 it became an **unread** record the moment D199 moved
+        // the constant to 2, and every figure of this preview would have
+        // been about nothing while the test went on asserting them.
+        "record_version": herd_hub::RECORD_VERSION,
         "id": id,
         "command": ["true"],
         "labels": [],
@@ -322,8 +327,15 @@ fn fixture(root: &Path) {
     job_dir(root, "j0000000009", Some(quarantined), &[]);
     // A record from a layout this build does not read. Named, counted, and
     // left out of every figure — and therefore never removable.
+    //
+    // **One past this build, computed and not written down.** The literal 2
+    // this was is the version the build now reads, so at D199 it silently
+    // became readable and this case stopped existing — and an unreadable
+    // record that becomes readable is a 300-day-old job that becomes
+    // **removable**, which is the opposite of what the comment above
+    // promises.
     let mut other_layout = record("j0000000010", Priority::Step, finished(), days_ago(300));
-    other_layout["record_version"] = serde_json::json!(2);
+    other_layout["record_version"] = serde_json::json!(herd_hub::RECORD_VERSION + 1);
     job_dir(root, "j0000000010", Some(other_layout), &[]);
     // A directory claimed for a job whose first record has not landed. A
     // state, not a fault.
@@ -624,7 +636,12 @@ fn every_figure_of_the_preview_is_this_fixture_to_the_byte() {
     // as text: a line that silently stopped printing a number would be a
     // figure nobody noticed going missing.
     let rendered = preview.to_string();
-    let expected = EXPECTED.replace("{ROOT}", &root.display().to_string());
+    // The two version numbers in it follow the constants, for the reason the
+    // fixtures above do.
+    let expected = EXPECTED
+        .replace("{ROOT}", &root.display().to_string())
+        .replace("{UNREAD}", &(herd_hub::RECORD_VERSION + 1).to_string())
+        .replace("{READS}", &herd_hub::RECORD_VERSION.to_string());
     assert_eq!(rendered, expected);
 
     // It disturbed nothing: not one byte of this root changed, and the lock a
@@ -1361,7 +1378,7 @@ records
   quarantined, never expired         1
     jobs/j0000000009: its labels [\"Nope\"] are not labels this hub accepts: the label \"Nope\" carries 'N', and a label is lower-case letters, digits, '.', '_' and '-'
   records this build could not read  1
-    jobs/j0000000010/job.json: it carries record version 2, and this build reads version 1
+    jobs/j0000000010/job.json: it carries record version {UNREAD}, and this build reads version {READS}
     A record this build cannot read has no readable end time, so it can
     never be shown to be past its span -- and therefore retention may never
     remove it. This list is a bound on the engine.

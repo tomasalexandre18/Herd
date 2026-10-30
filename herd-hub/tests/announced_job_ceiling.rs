@@ -107,18 +107,36 @@ const THE_RUNNERS_CEILING_SENTENCE: &str = herd_runner::A_RUNNERS_OWN_CEILING;
 /// `waiting` line — and never where it wants the runner's.
 const THE_HUBS_CEILING_SENTENCE: &str = herd_hub::matcher::A_CEILING_THE_RUNNER_ANNOUNCED;
 
-/// Neither version number moves, which is the condition D181 and D182 shipped under.
+/// Neither version number moves **for this field**, which is the condition
+/// D181 and D182 shipped under.
 ///
 /// Asserted rather than described, because both are compatibility statements
-/// about somebody else's machine: a handshake at protocol version 3 refuses
-/// every runner that has not been restarted, and a hub at record version 2
-/// refuses an operator's entire state root. The field this file is about is
-/// `#[serde(default)]` on one frame and means, when absent, exactly what its
-/// default says — which is the one shape that leaves both alone.
+/// about somebody else's machine: a handshake refuses every runner that has
+/// not been restarted, and a record version refuses an operator's entire
+/// state root. The field this file is about is `#[serde(default)]` on one
+/// frame and means, when absent, exactly what its default says — which is the
+/// one shape that leaves both alone, and it still does.
+///
+/// **Both numbers have since moved, and neither for this field.** D199 moved
+/// `PROTOCOL_VERSION` 2 → 3 with M11's pack frames and `RECORD_VERSION` 1 → 2
+/// with the hub's pack registry and `LAYOUT_VERSION`, so the literals below
+/// are 3 and 2 and the claim this test makes is the one it always made:
+/// nothing about an announced job ceiling moved either. The pins stay
+/// **literals** on purpose — written against the constants they would be
+/// tautologies and would catch nothing, and catching an *accidental* move is
+/// their whole job.
 #[test]
 fn neither_version_number_moves() {
-    assert_eq!(PROTOCOL_VERSION, 2, "the handshake is unchanged");
-    assert_eq!(RECORD_VERSION, 1, "every existing state root still reads");
+    assert_eq!(
+        PROTOCOL_VERSION, 3,
+        "3 is D199's bump for M11's pack half; an announced job ceiling is additive and moved \
+         nothing"
+    );
+    assert_eq!(
+        RECORD_VERSION, 2,
+        "2 is D199's move, made with the hub's own pack registry and with LAYOUT_VERSION in the \
+         same commit; this field is additive and moved nothing"
+    );
 }
 
 /// A hub with one runner that announces a ceiling of [`CEILING`].

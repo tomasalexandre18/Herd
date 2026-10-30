@@ -13,22 +13,13 @@ use herd_runner::confine::{
     DEFAULT_DISK_BUDGET, DEFAULT_LOG_CAP, DEFAULT_MEMORY_MAX, DEFAULT_NICE, DEFAULT_OUTPUT_CAP,
     DEFAULT_TIMEOUT_SECONDS,
 };
+use herd_runner::mesh;
 use herd_runner::root::DataRoot;
 use herd_runner::size::parse_bytes;
 use herd_runner::switch::DEFAULT_POLL_MS;
 use herd_runner::{
     Backoff, Config, Confinement, DEFAULT_HUB_URL, DRAIN_GRACE, HEALTH_EVERY, HUB_SILENCE_LIMIT,
 };
-
-/// The mesh-address rule (invariant 3, D10, D11): which address a runner may
-/// ever serve content from, and the refusal for every other one.
-///
-/// Declared here and not in the library only because `herd-runner/src/lib.rs`
-/// was held by another task on the night this landed. It belongs in the
-/// library — the fetch endpoint that binds through `mesh::MeshListener` is a
-/// library module — and the move is one line, `pub mod mesh;`, taken by the
-/// step that builds the endpoint.
-mod mesh;
 
 /// A Herd runner: dials the hub, executes jobs under caps, streams their logs.
 ///
@@ -596,22 +587,17 @@ async fn main() -> Result<()> {
     // bad data root is — not corrected, not narrowed, and never discovered by
     // a peer finding a port where there should be none.
     //
-    // Nothing is bound: this version holds the rule and no endpoint. The one
-    // socket type a runner may ever hold is `mesh::MeshListener`, named in
-    // that module and nowhere else in the crate, and the step that binds it
-    // comes next.
-    //
-    // The accepted address is printed and not yet carried into `Config`:
-    // that type is in `herd-runner/src/lib.rs`, which another task held on
-    // the night this landed, and the endpoint step is where a runner starts
-    // needing it. So what this version promises is the refusal, which is the
-    // part that cannot be added after a port is open.
-    match (&args.mesh_listen, &args.mesh_advertise) {
+    // The accepted address is carried into `Config`, where
+    // `endpoint::serve_while` binds it — through `mesh::MeshListener` and
+    // nowhere else, which is the one module of this crate the confinement
+    // guard permits to name a listener.
+    let mesh = match (&args.mesh_listen, &args.mesh_advertise) {
         (Some(listen), advertise) => {
             let mesh =
                 mesh::Mesh::resolve(listen, advertise.as_deref(), &mesh::HostRouting::read())
                     .map_err(|refused| anyhow::anyhow!("{refused}"))?;
             println!("herd-runner: {}", mesh.said());
+            Some(mesh)
         }
         (None, Some(advertise)) => anyhow::bail!(
             "{} {advertise} was given with no {}: an address peers are told to dial, with \
@@ -629,8 +615,9 @@ async fn main() -> Result<()> {
                  nothing to a peer and listens on nothing ({} sets one)",
                 mesh::LISTEN_FLAG
             );
+            None
         }
-    }
+    };
 
     // How big this host is. Read from the host, then overridden by whatever
     // its owner said — one figure at a time, so an owner who declares the
@@ -806,6 +793,7 @@ async fn main() -> Result<()> {
         preference: args.preference.unwrap_or(0),
         switch_file: Some(switch_file),
         switch_poll: Duration::from_millis(args.switch_poll.unwrap_or(DEFAULT_POLL_MS)),
+        mesh,
         // Not options: the window and the bound on waiting for it are Herd's
         // own figures, and an owner has no way to know what to set them to
         // (D158). They exist on `Config` for the tests that have to exceed

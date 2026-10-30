@@ -309,6 +309,8 @@ mod tests {
             attempts: Vec::new(),
             metrics: JobMetrics::default(),
             outputs: Default::default(),
+            packs_in: Default::default(),
+            packs_out: Default::default(),
         }
     }
 

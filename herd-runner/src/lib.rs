@@ -43,10 +43,14 @@ pub mod blockio;
 pub mod capability;
 pub mod cgroup;
 pub mod confine;
+pub mod endpoint;
+pub mod fetch;
 pub mod janitor;
 pub mod job;
+pub mod mesh;
 pub mod metrics;
 mod outputs;
+pub mod packstore;
 pub mod privilege;
 pub mod reclaim;
 pub mod room;
@@ -379,6 +383,19 @@ pub struct Config {
     /// How long a collection's pump waits for room on that window before it
     /// says so on stderr (D158).
     pub files_stall_after: Duration,
+    /// Where this machine may serve a pack's objects from, if anywhere
+    /// (invariant 3, D10, D11).
+    ///
+    /// `None` is **outbound-only**: no socket of any kind is opened, the
+    /// runner still fetches and still pushes, and that is a supported state
+    /// and not a degraded one — a single-NIC flat-LAN machine has no address
+    /// the rule permits, which is what "never behind a port forwarded on
+    /// someone's box" costs.
+    ///
+    /// Judged by [`mesh::Mesh::resolve`] at startup, before the first dial,
+    /// so a configuration that would bind a default or public interface
+    /// refuses the process rather than being narrowed (D11).
+    pub mesh: Option<mesh::Mesh>,
 }
 
 impl Default for Config {
@@ -405,6 +422,10 @@ impl Default for Config {
             switch_poll: crate::switch::Poll::default().0,
             files_in_flight: FILES_IN_FLIGHT,
             files_stall_after: FILES_STALL_AFTER,
+            // Outbound-only unless an owner names an address, which is the
+            // only default invariant 3 permits: a runner that listened
+            // because nobody said not to would be a port nobody chose.
+            mesh: None,
         }
     }
 }
@@ -733,6 +754,15 @@ pub struct Session {
     /// is true of the host, and it has to be told again to whichever hub is
     /// up next.
     capacity: capability::Capacity,
+    /// The transfer capabilities the hub has pushed to this runner (D209).
+    ///
+    /// Here for the same reason the capacity is: it is true of the *runner*
+    /// and not of a connection. The frame that grants one arrives on a
+    /// connection and the endpoint that checks one outlives it, so a table
+    /// held by a connection would lose every capability on a redial — and
+    /// the fetch it was minted for would then be refused by the one party
+    /// that was told to expect it.
+    granted: endpoint::Granted,
 }
 
 /// One attempt's collection waiting on this runner's disk for the hub
@@ -1244,6 +1274,16 @@ impl Session {
     /// What this runner offers and what its probes last said.
     pub fn capacity(&self) -> &capability::Capacity {
         &self.capacity
+    }
+
+    /// The transfer capabilities the hub has pushed here (D209).
+    ///
+    /// Read by the fetch endpoint and written only by the handler for
+    /// [`FromHub::ExpectTransfer`]: that frame is the one way a capability
+    /// comes into existence on this runner, and
+    /// [`endpoint::Granted::pushed_by_hub`] is named for it.
+    pub fn granted(&self) -> &endpoint::Granted {
+        &self.granted
     }
 
     /// Tell the hub what every probe says, as one snapshot.
@@ -2896,6 +2936,12 @@ fn queue_a_health_report(inner: &mut Inner) -> bool {
         // Measured now, on every report, because it is a fact about the
         // moment (E-32). The hub records it and gates nothing on it.
         load_milli: crate::metrics::host_load_milli(),
+        // M12's three pack-store figures (E-16). `None` and not zero: this
+        // build has no pack store to measure, and zero would be a
+        // measurement of an empty one. S2 builds the store and fills these.
+        pack_store_bytes: None,
+        pack_store_budget_bytes: None,
+        packs_held: None,
     };
     if !send_on(&inner.link, health) {
         return false;
@@ -2972,6 +3018,17 @@ pub async fn run_until(config: Config, stop: impl Future<Output = String>) -> Re
     // here, which finishes them where it can and names them where it cannot.
     for line in session.pick_up_collections(confined.root()) {
         eprintln!("herd-runner: {line}");
+    }
+    // And the third thing a killed previous life leaves behind: a pack it was
+    // half-way through fetching. A fetch removes its own staging directory on
+    // every path out of itself, the refused ones included, so what this finds
+    // is only ever the work of a process that was killed — bytes under a name
+    // nothing looks up, belonging to a pack that was never registered, which
+    // only the next start can see.
+    if let Ok(store) = packstore::PackStore::open(confined.root().path()) {
+        if let Some(line) = fetch::forget_incoming(&store) {
+            eprintln!("herd-runner: {line}");
+        }
     }
     let probing: tokio::task::JoinHandle<()>;
     {
@@ -3069,6 +3126,57 @@ pub async fn run_until(config: Config, stop: impl Future<Output = String>) -> Re
         a_stale_drain,
     ));
     let stop_watching_the_switch = watching_the_switch.abort_handle();
+    // The one socket this runner may ever hold (invariant 3, D10, D11), and
+    // the only place in the process that opens one.
+    //
+    // Started beside the redial loop and not inside a connection, for the
+    // probes' and the switch's reason: a peer fetching a pack off this
+    // machine has nothing to do with whether this machine's hub is up, and a
+    // transfer that died on a redial would be a transfer lost to a fact
+    // about somebody else's link.
+    //
+    // With no `--mesh-listen` this opens nothing at all and the task is a
+    // loop that only ever waits to be stopped. That is deliberate rather
+    // than skipped: the stop path then has exactly one shape, and the
+    // outbound-only case is a state of the endpoint rather than the absence
+    // of one.
+    let (endpoint_stops, endpoint_stop) = tokio::sync::oneshot::channel::<()>();
+    let serving_peers = {
+        let session = session.clone();
+        let mesh = config.mesh.clone();
+        let store = packstore::PackStore::open(confined.root().path());
+        match store {
+            Ok(store) => Some(tokio::spawn(endpoint::serve_while(
+                mesh,
+                store,
+                session.granted().clone(),
+                // `Runner::serves_content` and not a second reading of the
+                // switch: `off` and draining are already read there (E-33,
+                // D11's third condition).
+                move || session.serves_content(),
+                endpoint::SERVES_POLL,
+                Arc::new(|said: endpoint::Said| {
+                    eprintln!("herd-runner: {}", said.sentence());
+                }),
+                async move {
+                    let _ = endpoint_stop.await;
+                },
+            ))),
+            Err(why) => {
+                // Said and not fatal. A runner whose pack store will not open
+                // cannot serve a pack and cannot ingest one, and both of
+                // those are refusals this runner makes by name when they are
+                // asked for — but it can still run every job that needs no
+                // pack at all, and taking the machine away from its owner
+                // over a directory is not invariant 2's bargain.
+                eprintln!(
+                    "herd-runner: this runner serves no pack to a peer and ingests none, \
+                     because its pack store will not open: {why}"
+                );
+                None
+            }
+        }
+    };
     let stop_probing = probing.abort_handle();
     let serving = serve_forever(config.clone(), session.clone(), Arc::clone(&confined));
     // A `drain` position is "finish and leave" (E-33), and this is the leaving
@@ -3102,6 +3210,13 @@ pub async fn run_until(config: Config, stop: impl Future<Output = String>) -> Re
     let stopping = async {
         let reason = stop.await;
         stop_watching_the_switch.abort();
+        // At the **start** of the owner's five seconds, with the probes: a
+        // draining runner serves nothing, and a transfer in flight is the
+        // one thing here that could hold a socket open for the whole grace
+        // if it were asked politely. `endpoint::serve_while` aborts what is
+        // in flight rather than waiting it out, and a peer reads a truncated
+        // body — a sentence — and resumes at its last whole chunk.
+        let _ = endpoint_stops.send(());
         // Before the drain rather than after it: a draining runner offers
         // nothing, so a probe it is still reading is work nobody wants, and
         // the kill belongs at the start of the owner's five seconds.
@@ -3128,6 +3243,24 @@ pub async fn run_until(config: Config, stop: impl Future<Output = String>) -> Re
     // runner that has left is the leak M8 found in this same shape (D93).
     watching_the_switch.abort();
     let _ = watching_the_switch.await;
+    // And no socket. Aborted **and awaited**, for the probes' reason: the
+    // abort asks for the task to be dropped and it is the drop that closes
+    // the listener, so a stop that did not wait here could leave a port open
+    // for as long as the runtime took to notice. What the endpoint did is
+    // printed, because a transfer this runner served is a fact about its
+    // owner's bandwidth.
+    if let Some(serving_peers) = serving_peers {
+        serving_peers.abort();
+        if let Ok(report) = serving_peers.await {
+            if report.opened > 0 || report.connections > 0 {
+                eprintln!(
+                    "herd-runner: the mesh endpoint is closed; it was open {} time(s), served \
+                     {} object(s) in {} byte(s) over {} connection(s), and refused {} peer(s)",
+                    report.opened, report.objects, report.bytes, report.connections, report.refused
+                );
+            }
+        }
+    }
     // Whichever way the runner is leaving, nothing it holds goes with it. A
     // refusal and a run out of redials end the process just as a signal does,
     // and a result that exists nowhere else is not allowed to end with it.
@@ -3542,6 +3675,11 @@ pub async fn serve_once(config: Config, session: Session, confined: Arc<Confined
         // The load as this runner dials, so that a job placed before the
         // first health report still has a figure on its line (E-32).
         load_milli: crate::metrics::host_load_milli(),
+        // `None` until this runner has a mesh address to advertise, which is
+        // S4's work (the two flags and both invariant-3 guards). Absent is
+        // the outbound-only runner, and that is exactly what this build is:
+        // it serves no pack content to anybody.
+        mesh_endpoint: None,
     };
     sink.send(Message::text(to_frame(&hello).context("encoding hello")?))
         .await
@@ -3667,6 +3805,14 @@ async fn serve_hub(
                 command,
                 declaration,
                 timeout_s,
+                // M11's resolved packs, numbered at protocol 3 and laid out
+                // by nobody yet: S2 writes the pack store and S8 the
+                // `{in}`/`{out}` layout. Bound and dropped rather than
+                // matched with `..`, so the next field on an assignment is a
+                // compile error here rather than a job that quietly ignores
+                // it.
+                packs_in: _,
+                packs_out: _,
             } => {
                 let session = session.clone();
                 let confined = Arc::clone(&confined);
@@ -3780,6 +3926,22 @@ async fn serve_hub(
                 if session.capacity().sweep().await {
                     session.announce_capabilities();
                 }
+            }
+            // D209, and the whole reason the peer wire needs no PKI: the hub
+            // tells *this* runner, over *this* runner's already
+            // authenticated link, to expect one transfer. The endpoint then
+            // checks what a peer presents against something the hub said and
+            // never against something the peer did.
+            //
+            // Taken even when this runner is serving nothing at this instant:
+            // the capability's own expiry is what bounds it, and a runner
+            // that refused to remember one because its switch moved a second
+            // ago would refuse a transfer the hub has already promised a
+            // waiting job. What `off` takes away is the socket, which
+            // `endpoint::serve_while` closes, not the memory of what the hub
+            // said.
+            FromHub::ExpectTransfer(expect) => {
+                eprintln!("herd-runner: {}", session.granted().pushed_by_hub(&expect));
             }
             FromHub::Refused { reason } => return Err(Refusal(reason).into()),
             FromHub::StandBy {
@@ -3917,6 +4079,17 @@ fn message_kind(message: &FromHub) -> &'static str {
         FromHub::ApprovedRunners { .. } => "approved_runners",
         FromHub::SetSwitch { .. } => "set_switch",
         FromHub::ReadProbesAgain { .. } => "read_probes_again",
+        // The pack half's seven, numbered at protocol 3 and handled by
+        // nobody yet. Named here because this function's whole job is saying
+        // what arrived, and a frame falling to `Unknown`'s sentence would
+        // claim this build has never heard of a frame it defines.
+        FromHub::PackHolders(_) => "pack_holders",
+        FromHub::TransferCapability(_) => "transfer_capability",
+        FromHub::ExpectTransfer(_) => "expect_transfer",
+        FromHub::PackRegistered(_) => "pack_registered",
+        FromHub::PackRefused(_) => "pack_refused",
+        FromHub::ReadPacksAgain(_) => "read_packs_again",
+        FromHub::PinPacks(_) => "pin_packs",
     }
 }
 

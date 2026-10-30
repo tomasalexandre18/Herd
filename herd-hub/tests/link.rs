@@ -266,6 +266,7 @@ impl Puppet {
             preference: 0,
             load_milli: None,
             switch: herd_proto::Switch::On,
+            mesh_endpoint: None,
         };
         socket
             .send(Message::text(to_frame(&hello).expect("encodes")))
@@ -362,6 +363,9 @@ impl Puppet {
             draining,
             load_milli: None,
             switch: herd_proto::Switch::On,
+            pack_store_bytes: None,
+            pack_store_budget_bytes: None,
+            packs_held: None,
         })
         .await;
     }
@@ -1883,6 +1887,7 @@ async fn the_hub_s_first_answer(hub_url: &str, name: &str, instance: &str) -> Fr
         preference: 0,
         load_milli: None,
         switch: herd_proto::Switch::On,
+        mesh_endpoint: None,
     };
     socket
         .send(Message::text(to_frame(&hello).expect("encodes")))
@@ -2064,6 +2069,7 @@ async fn a_declared_command_is_handed_over_whole_on_every_attempt() {
                 command,
                 declaration: carried,
                 timeout_s,
+                ..
             }) => break (assigned, attempt, command, carried, timeout_s),
             Some(_) => continue,
             None => panic!("the hub never handed this runner the job"),

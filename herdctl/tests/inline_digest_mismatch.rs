@@ -130,6 +130,7 @@ impl Puppet {
             preference: 0,
             load_milli: None,
             switch: herd_proto::Switch::On,
+            mesh_endpoint: None,
         };
         socket
             .send(Message::text(to_frame(&hello).expect("encodes")))
