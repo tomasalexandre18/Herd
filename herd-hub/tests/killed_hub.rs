@@ -27,6 +27,19 @@ use herd_proto::JobOutcome;
 use real_herd::{binary, Herd, PATIENCE};
 use tokio::process::Command;
 
+/// What the collection spooled for a vanished state root holds: two file
+/// names and the bytes in both.
+///
+/// Distinctive strings on purpose, because the strongest assertion in
+/// `a_verdict_and_a_collection_spooled_for_a_recreated_state_root_are_refused`
+/// is a scan of the **whole** new state root for any of the three: a name
+/// that reached a manifest, or bytes that reached a `files/` directory, is
+/// the defect wherever in the root it landed, and a scan does not have to
+/// know which record to look in.
+const FIRST_LIFES_FILE: &str = "only-the-first-life-wrote-this.txt";
+const FIRST_LIFES_NESTED: &str = "also-only-the-first-life.bin";
+const FIRST_LIFES_BYTES: &[u8] = b"bytes that a state root which is gone produced\n";
+
 /// The test that matters: a hub killed while a job is running loses neither
 /// the runner, nor the job, nor its result (E-44, D17).
 async fn a_killed_hub_loses_nothing(signal: rustix::process::Signal) {
@@ -1309,8 +1322,35 @@ async fn a_verdict_planted_in_another_runner_s_spool_is_refused_by_name() {
 /// its disk naming exactly that id. The two together make a verdict that is
 /// plausible and false, and that is what M2's author deferred to M3 as "the
 /// store's identity in `Welcome`".
+///
+/// **And the collection half of the same hazard, which is the heavier one.**
+/// `Session::settle_against_state_root` has two blocks: the spooled verdicts
+/// above, and twenty lines below them the collections
+/// `Session::pick_up_collections` swept off `outputs/`. Until this test the
+/// second block had only an in-crate test of the *sentence* it formats, off a
+/// hand-built `Swept` — no hub, no restart, no sequence — and it is the one
+/// *wrong-bytes* failure mode on the startup audit's whole list. The runner's
+/// own comment says what it is: a spool named `j0000000001-1` from a state
+/// root that was recreated names a job id this hub has since minted for
+/// somebody else, and the files are refused — *"or, where the attempt and the
+/// runner happen to line up, written onto that other job's record"*. What the
+/// consumer would see is one job's output files attached to another job's
+/// record, with nothing in any log saying so.
+///
+/// So the spool planted here is the **aligned** one, not a random one, and
+/// all three of the things that have to line up do:
+///
+/// - the **job id** is the id this fresh root hands out again, walked to by
+///   submitting its predecessors, exactly as the verdict half does;
+/// - the **attempt** is 1, which is the number the new root's first attempt
+///   of that job carries — asserted off its record rather than assumed;
+/// - the **runner** is `the-real-runner`, the name that both holds the data
+///   root the spool is on and is handed that new attempt.
+///
+/// A spool that lined up on two of the three would be refused by the hub for
+/// the third reason and would prove nothing about this code.
 #[tokio::test]
-async fn a_verdict_spooled_for_a_state_root_that_was_recreated_is_never_believed() {
+async fn a_verdict_and_a_collection_spooled_for_a_recreated_state_root_are_refused() {
     let herd = Herd::new();
     let mut hub = herd.start_hub_losing_runners_after("first", 3.0).await;
     let mut runner = herd.start_runner();
@@ -1341,6 +1381,26 @@ async fn a_verdict_spooled_for_a_state_root_that_was_recreated_is_never_believed
         1,
         "the verdict of the first life is on the disk"
     );
+
+    // And the collection of the first life, beside it: a streamed output
+    // spool under `outputs/{job}-{attempt}`, which is where the runner
+    // renames a collection's bytes and where they stay until the hub says it
+    // has every one of them. Planted rather than streamed, and that is the
+    // one hand-built thing in this test, because what has to be on the disk
+    // is a spool of the state root that is **gone** — a job of the first life
+    // that streamed output, was never acknowledged, and whose runner was
+    // restarted. The *name* is the whole fixture: `{job}-1`, the id and the
+    // attempt the new root is about to hand out again (see this test's doc).
+    let collections = herd.runner_root("runner").join("outputs");
+    let aligned = collections.join(format!("{job}-1"));
+    std::fs::create_dir_all(aligned.join("deeper")).expect("the fixture plants a spool");
+    std::fs::write(aligned.join(FIRST_LIFES_FILE), FIRST_LIFES_BYTES)
+        .expect("the fixture writes the first life's bytes");
+    std::fs::write(
+        aligned.join("deeper").join(FIRST_LIFES_NESTED),
+        FIRST_LIFES_BYTES,
+    )
+    .expect("and one a directory down, so the sweep's walk really walks");
 
     // The state root is recreated. Nobody touches the runner's disk.
     std::fs::remove_dir_all(herd.state.path()).expect("the fixture wipes the state root");
@@ -1393,6 +1453,68 @@ async fn a_verdict_spooled_for_a_state_root_that_was_recreated_is_never_believed
         "its bytes are kept under a name that says why, never destroyed (D19)"
     );
 
+    // ---- The collection half, on the same restart and the same disk.
+    //
+    // Waited for by its own sentence and not by the verdict's: both say "NOT
+    // offered", so reading the verdict's line as evidence about the
+    // collection would be the defect this file has already had two sightings
+    // of. `Swept::for_a_foreign_state_root` renames the spool *while*
+    // formatting the sentence and the caller prints it afterwards, so the
+    // sentence is the last thing published and the rename below it is then
+    // guaranteed.
+    //
+    // The weight is the fixture's own, never a figure typed twice: the two
+    // planted files hold the same bytes, and the sentence says what the walk
+    // measured off the disk (`measured_bytes`, under a KiB).
+    let weight = FIRST_LIFES_BYTES.len() * 2;
+    let the_collection_was_refused = format!(
+        "the collection of {job} (attempt 1, {weight} bytes in 2 file(s)) was produced for \
+         another hub's state root"
+    );
+    herd.wait_until(
+        "the runner says the foreign collection is not offered",
+        || {
+            herd.said("second-runner")
+                .contains(&the_collection_was_refused)
+        },
+    )
+    .await;
+    let said = herd.said("second-runner");
+    assert!(
+        said.contains("1 collection(s) spooled here cannot belong to this hub's state"),
+        "the collections are counted in their own sentence, beside the verdicts': {said}"
+    );
+    assert!(
+        said.contains(&the_collection_was_refused) && said.contains("NOT offered"),
+        "the collection is refused by name, with its attempt and its weight: {said}"
+    );
+    // Never offered, which is a different claim from "refused": the line a
+    // collection handed back to the hub's own resumption path produces must
+    // not be anywhere in this runner's output, for this job or any other.
+    assert!(
+        !said.contains("it is offered to the hub again"),
+        "a collection of a state root that is gone was handed back to the hub: {said}"
+    );
+    let set_aside = collections.join(format!("{job}-1.foreign-state-root"));
+    assert!(
+        set_aside.is_dir() && !aligned.exists(),
+        "the spool is set aside under a name that says why and is no longer where a \
+         sweep would offer it: {} / {}",
+        set_aside.display(),
+        aligned.display()
+    );
+    assert_eq!(
+        std::fs::read(set_aside.join(FIRST_LIFES_FILE)).expect("the set-aside file reads"),
+        FIRST_LIFES_BYTES,
+        "and every byte is still there: set aside is never deleted (D19)"
+    );
+    assert_eq!(
+        std::fs::read(set_aside.join("deeper").join(FIRST_LIFES_NESTED))
+            .expect("the nested set-aside file reads"),
+        FIRST_LIFES_BYTES,
+        "the nested one too — the rename moves the whole tree, not its top"
+    );
+
     // And now the collision itself. A fresh state root hands out ids from
     // one, so it is walked to the very id the spooled verdict names — which
     // is the whole hazard: the same string, two different jobs, two different
@@ -1431,8 +1553,75 @@ async fn a_verdict_spooled_for_a_state_root_that_was_recreated_is_never_believed
         herd.log(&second)
     );
 
+    // ---- The alignment, read off the new root's own record.
+    //
+    // Asserted rather than assumed, because it is what gives this test its
+    // teeth: a spool whose attempt or whose runner did not match would be
+    // refused by the hub for a reason that has nothing to do with the state
+    // root, and the test would pass while proving nothing.
+    let attempt = &record["attempts"][0];
+    assert_eq!(
+        record["attempts"].as_array().map(Vec::len),
+        Some(1),
+        "the new root's job has exactly the one attempt the spool is named for: {record}"
+    );
+    assert_eq!(
+        attempt["number"],
+        serde_json::json!(1),
+        "the planted spool's attempt number is this attempt's: {record}"
+    );
+    assert_eq!(
+        attempt["runner"],
+        serde_json::json!("the-real-runner"),
+        "and it was handed to the runner whose data root the spool is on: {record}"
+    );
+
+    // ---- And nothing of those bytes is anywhere in the new state root.
+    //
+    // The claim F3 is about is not "the runner said no" but "one job's output
+    // files are not on another job's record", so it is asserted where the
+    // damage would be: the live job's own record and `files/` directory
+    // first, then every byte of the whole root — because a collection
+    // accepted for `j0000000001` would land under that id whatever this test
+    // thought it was looking at.
+    assert!(
+        record["outputs"].is_null(),
+        "this job streamed nothing, so its record carries no outputs at all: {record}"
+    );
+    assert_eq!(
+        std::fs::read_dir(herd.job_dir(&second).join("files"))
+            .into_iter()
+            .flatten()
+            .count(),
+        0,
+        "and its files/ directory is empty"
+    );
+    for (path, bytes) in herd.state_bytes() {
+        for name in [FIRST_LIFES_FILE, FIRST_LIFES_NESTED] {
+            assert!(
+                !path.contains(name) && !holds(&bytes, name.as_bytes()),
+                "a file of the vanished root's collection is named in {path} of the new \
+                 state root"
+            );
+        }
+        assert!(
+            !holds(&bytes, FIRST_LIFES_BYTES),
+            "the vanished root's collection's bytes are in {path} of the new state root"
+        );
+    }
+
     again.signal(rustix::process::Signal::TERM).await;
     hub.signal(rustix::process::Signal::TERM).await;
+}
+
+/// Whether `haystack` holds `needle` anywhere in it.
+///
+/// For the scan above, which looks for a name and for bytes in files this
+/// test has no business parsing: a record is json today and the claim —
+/// nothing of that collection is in this root — is about the bytes, not
+/// about a field.
+fn holds(haystack: &[u8], needle: &[u8]) -> bool {
+    !needle.is_empty() && haystack.windows(needle.len()).any(|at| at == needle)
 }
 
 /// **Fix 4: a silence threshold that cannot mean what it says.**
