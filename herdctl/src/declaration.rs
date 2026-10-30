@@ -299,6 +299,14 @@ impl Resolved {
             // baseline it is placed against (D74).
             labels_from: self.labels.labels_from(),
             timeout_s: self.timeout_s,
+            // M11's two: the keys a runner lays out under `{in}` and the
+            // paths under `{out}` it takes back as packs (ORCH-274). Carried
+            // here rather than at a flag, because this conversion is the one
+            // place `run`, `submit` and the dry run all pass through — and a
+            // dry run that answered about a job without its packs would be
+            // answering about a job no submission makes (E-07).
+            needs: self.needs.clone(),
+            leaves: self.leaves.clone(),
             ..crate::Declared::default()
         }
     }

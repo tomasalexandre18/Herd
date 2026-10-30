@@ -366,6 +366,21 @@ pub struct Declared {
     /// `{commit}` and `{args}` like every other line it resolves (D107), and
     /// that is the whole of its part in it.
     pub labels_from: Option<herd_proto::LabelsFrom>,
+    /// The pack keys this job consumes, which a runner lays out under `{in}`
+    /// before its command runs (M11, E-12).
+    ///
+    /// **Declared and nowhere else.** There is no `--needs` flag and there
+    /// will not be one: a requester who could name a key the checkout does
+    /// not declare would be asking for an artefact the command's own line
+    /// cannot read, and the dry run would then answer about a job no
+    /// submission makes. It reaches here from
+    /// [`crate::declaration::Resolved::declared`] and from nothing else.
+    pub needs: Vec<String>,
+    /// The artefacts this job leaves to be kept as packs: a key, and the path
+    /// under `{out}` it writes it at (M11, E-17).
+    ///
+    /// Declared, like `needs` beside it, and for the same reason.
+    pub leaves: std::collections::BTreeMap<String, String>,
 }
 
 impl Declared {
@@ -373,6 +388,12 @@ impl Declared {
     ///
     /// One conversion, used by `run`, `submit` **and** the dry run, so that
     /// the job E-07 judges and the job a submission makes are one job.
+    ///
+    /// **That is why `needs` and `leaves` travel through here and not through
+    /// a flag** (ORCH-274): they were read off `commands.toml`, dropped here,
+    /// and `Asked.needs` was empty on every submission and every dry run this
+    /// CLI made — so the hub's whole `needs` path was reachable only from a
+    /// client that is not `herdctl`.
     pub fn asked(self, command: Vec<String>, labels: LabelSet, priority: Priority) -> Asked {
         Asked {
             command,
@@ -387,8 +408,8 @@ impl Declared {
             declaration: self.declaration,
             labels_from: self.labels_from,
             timeout_s: self.timeout_s,
-            needs: Vec::new(),
-            leaves: std::collections::BTreeMap::new(),
+            needs: self.needs,
+            leaves: self.leaves,
         }
     }
 }

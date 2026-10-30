@@ -55,6 +55,19 @@ pub const SKETCH: &str = "sketch";
 /// The command [`Fixture::add_a_command_nothing_coalesces`] adds, and
 /// nothing declares before it is called.
 pub const SURVEY: &str = "survey";
+/// The pack chain [`Fixture::add_the_pack_chain`] adds, and nothing declares
+/// before it is called: the producer that declares `leaves` and the consumer
+/// that declares `needs` (M11).
+pub const FORGE: &str = "forge";
+/// The consumer of [`FORGE`]'s pack.
+pub const GRAFT: &str = "graft";
+/// The `leaves` key [`FORGE`] declares and [`GRAFT`] needs, and the name of
+/// the directory a runner lays it out at under `{in}`.
+pub const PACK_KEY: &str = "grove-grain";
+/// The **directory** under `{out}` [`FORGE`] declares that key at: a
+/// `leaves` path is a pack, and a pack is a directory holding
+/// `manifest.tsv`, `pack.meta` and `objects/`.
+pub const PACK_AT: &str = "grain";
 
 /// The branch the fixture's one commit is on, and the tag pointing at it: two
 /// kinds of ref, so a test can prove that resolution peels a tag as well as
@@ -191,15 +204,30 @@ build_thread_mib = 1792
 tmpfs_mib = 0
 timeout_s = 2700
 priority = "producer"
-leaves = { "grove-tree" = "tree.txt", "grove-log" = "logs/assemble.log" }
 dedup_key = "assemble-{commit}-{args}"
+# It declares **no pack**, and it used to declare `leaves` at two files
+# while that field was discarded on the way to the wire. Two things changed
+# when the field began to travel. A `leaves` path is a **pack** — a directory
+# holding manifest.tsv, pack.meta and objects/ (M11, E-17) — so a log file was
+# never a thing Herd could keep; and a job that declares a pack and leaves
+# none says so on its record, which made a test about a job with no outputs
+# also a test about a pack. So the pack chain is its own appended pair,
+# `forge` → `graft` (`Fixture::add_the_pack_chain`), and these two commands
+# are the jobs M10's acceptance has always asserted on.
 
 # A test run: what it needs is not knowable from this file, because which
 # capabilities one commit's tests want is a property of that commit — so it
 # declares a reading, and its `labels` are then the baseline the reading job
 # itself is placed against rather than the labels of the job that follows it.
-# It takes the build's artefact, declares what the whole job needs, and leaves
-# its level to whoever submits it.
+# It declares what the whole job needs and leaves its level to whoever submits
+# it.
+#
+# It declares **no pack** either, and it used to declare
+# `needs = ["grove-tree"]` while that field was discarded on the way to the
+# wire. Once the field travels, a command that needs a pack waits at the
+# dispatch until one is registered for its commit (D150) — so six tests here
+# that run this command would have waited for ever rather than failed, and a
+# reading's own tests would have had to produce a pack first.
 [commands.probe]
 line = "sh tools/herd/step.sh probe --from \"$GROVE_IN\" -- {args}"
 labels = ["grove-toolchain"]
@@ -207,8 +235,36 @@ labels_from = "sh tools/herd/labels.sh {commit} {args}"
 memory_mib = 4096
 timeout_s = 7200
 priority = "requester"
-needs = ["grove-tree"]
 coalesce = "probe-{commit}"
+"#;
+
+/// The pack chain, appended by [`Fixture::add_the_pack_chain`]: a producer
+/// that leaves a pack and a consumer that needs it (M11, E-12, E-17).
+///
+/// Two tables of their own, like [`THIRD_COMMAND`], and for a second reason
+/// besides E-11. A command that declares `needs` **waits at the dispatch**
+/// until a pack is registered for its commit (D150), and a command that
+/// declares `leaves` and leaves nothing says so on its record — so either
+/// field in the base declaration would make every test that runs those two
+/// commands also a test about a pack. Kept here, the chain costs nothing to
+/// the tests that are not about it.
+///
+/// The consumer's line reads `{in}/<key>` the way the consumer's own tool
+/// would: the directory it is handed is the three-part shape
+/// (`manifest.tsv`, `pack.meta`, `objects/<sha256>`), and laying a tree out
+/// of it is the tool's job and not Herd's.
+const THE_PACK_CHAIN: &str = r#"
+[commands.forge]
+line = "sh tools/herd/step.sh forge --leave-pack grain -- {args}"
+labels = ["grove-toolchain"]
+timeout_s = 600
+leaves = { "grove-grain" = "grain" }
+
+[commands.graft]
+line = "sh tools/herd/step.sh graft --read-pack \"$GROVE_IN/grove-grain\" -- {args}"
+labels = ["grove-toolchain"]
+timeout_s = 600
+needs = ["grove-grain"]
 "#;
 
 /// The third command, appended by [`Fixture::add_third_command`].
@@ -280,6 +336,12 @@ const STEP_SOURCE: &str = r#"#!/bin/sh
 # the consumer whose result is a file rather than only an exit code.
 # `--leave-bytes <n>` makes it about n bytes, for a test about the cap.
 #
+# `--leave-pack <dir>` writes a real pack under $GROVE_OUT: manifest.tsv with
+# one `kind f` row, one `d` row and one `l` row, pack.meta, and the f row's
+# bytes under objects/<sha256>. `--read-pack <dir>` reads one back the way
+# the consumer's own `--pack DIR` would, and exits 69 if it is absent or
+# short of an object — an empty {in} must not be a passing job.
+#
 # `--wait-for <absolute path>` holds the run until that path exists, so a test
 # can decide when this job ends rather than race it. Bounded, so a test that
 # never opens its gate fails rather than hangs.
@@ -289,6 +351,8 @@ shift
 verdict=0
 leave=
 leave_bytes=
+leave_pack=
+read_pack=
 wait_for=
 previous=
 for word in "$@"; do
@@ -296,6 +360,8 @@ for word in "$@"; do
     --verdict) verdict=$word ;;
     --leave) leave=$word ;;
     --leave-bytes) leave_bytes=$word ;;
+    --leave-pack) leave_pack=$word ;;
+    --read-pack) read_pack=$word ;;
     --wait-for) wait_for=$word ;;
     esac
     previous=$word
@@ -340,6 +406,52 @@ if [ -n "$leave" ]; then
         printf '{"step":"%s","verdict":%s}\n' "$step" "$verdict" > "$target"
     fi
     printf 'grove %s: left %s\n' "$step" "$leave"
+fi
+if [ -n "$leave_pack" ]; then
+    # A real pack, in the three-part shape Herd keeps: manifest.tsv, pack.meta
+    # and objects/<sha256>. This is the consumer's format and not Herd's, which
+    # is why a fixture writes it with sha256sum and printf rather than through
+    # anything of Herd's.
+    out=${GROVE_OUT:?--leave-pack needs the output directory in GROVE_OUT}
+    dir=$out/$leave_pack
+    mkdir -p "$dir/objects"
+    printf 'grove pack of %s\n' "${GROVE_COMMIT:-no commit}" > "$dir/bytes"
+    sha=$(sha256sum < "$dir/bytes" | cut -d' ' -f1)
+    size=$(wc -c < "$dir/bytes")
+    mv "$dir/bytes" "$dir/objects/$sha"
+    # Three rows and not one: the f row is the only one whose sha256 names
+    # bytes under objects/, and the d and l rows carry a sha256 of something
+    # else. A completeness check without the `kind f` filter looks those two
+    # up, finds nothing, and reports a perfectly good pack as incomplete — so
+    # the fixture carries them and the filter is proven rather than assumed.
+    {
+        printf '# chatons pack 1\n'
+        printf '# profile debug\n'
+        printf '%s\t%s\t0644\tf\tartefact\tgrove.txt\n' "$sha" "$size"
+        printf '1111111111111111111111111111111111111111111111111111111111111111\t0\t0755\td\tartefact\tnested\n'
+        printf '2222222222222222222222222222222222222222222222222222222222222222\t0\t0777\tl\tartefact\tnested/latest\tgrove.txt\n'
+    } > "$dir/manifest.tsv"
+    printf 'commit %s\n' "${GROVE_COMMIT:-no commit}" > "$dir/pack.meta"
+    printf 'grove %s: left the pack %s, one object %s\n' "$step" "$leave_pack" "$sha"
+fi
+if [ -n "$read_pack" ]; then
+    # What the consumer's own `--pack DIR` does: read the manifest and the
+    # objects it names. Herd lays the three parts out and nothing else, so a
+    # tool that cannot find them has been handed an empty {in} and says so
+    # rather than passing.
+    if [ ! -f "$read_pack/manifest.tsv" ]; then
+        printf 'grove %s: no pack at %s\n' "$step" "$read_pack" >&2
+        exit 69
+    fi
+    for sha in $(awk -F'\t' '$4 == "f" { print $1 }' "$read_pack/manifest.tsv"); do
+        if [ ! -f "$read_pack/objects/$sha" ]; then
+            printf 'grove %s: pack at %s is short of object %s\n' "$step" "$read_pack" "$sha" >&2
+            exit 69
+        fi
+        printf 'grove %s: read %s\n' "$step" "$(cat "$read_pack/objects/$sha")"
+    done
+    printf 'grove %s: the pack at %s says %s\n' \
+        "$step" "$read_pack" "$(cat "$read_pack/pack.meta")"
 fi
 if [ "$step" = fail ]; then
     exit 3
@@ -683,6 +795,43 @@ impl Fixture {
         assert!(
             holding.contains(&format!("{REMOTE}/{BRANCH}")),
             "the third command was pushed and no remote-tracking ref holds {hash}: {holding:?}"
+        );
+        hash
+    }
+
+    /// Add the pack chain, commit it and push it ([`FORGE`], [`GRAFT`], M11).
+    ///
+    /// Appended rather than written into [`DECLARATION`] for the reason
+    /// [`THE_PACK_CHAIN`] gives: either field in the base declaration would
+    /// make every test that runs those two commands also a test about a pack.
+    ///
+    /// Answers the hash the addition is on, which is the commit the pack has
+    /// to be of: a pack is registered for a `(commit, key)` pair, so the
+    /// producer and the consumer must be run against **this** hash and not
+    /// against the one the fixture started at.
+    pub fn add_the_pack_chain(&self) -> String {
+        let path = self.root().join(DECLARATION_PATH);
+        let held = std::fs::read_to_string(&path).expect("the declaration reads");
+        // The **table header** and not the bare name: the comments in
+        // `DECLARATION` name both commands, so a guard on the name alone is
+        // true before anything has been added. Measured — it fired on the
+        // first run of this fixture and said "already declares graft" about a
+        // declaration that declared no command at all.
+        let table = format!("[commands.{GRAFT}]");
+        assert!(
+            !held.contains(&table),
+            "the declaration already holds {table:?}, so adding it proves nothing"
+        );
+        std::fs::write(&path, format!("{held}{THE_PACK_CHAIN}"))
+            .expect("the declaration is added to");
+        self.git(&["add", "-A"]);
+        self.git(&["commit", "-qm", "declare the pack chain"]);
+        self.git(&["push", "-q", REMOTE, BRANCH]);
+        let hash = self.rev_parse("HEAD");
+        let holding = self.git(&["branch", "--remotes", "--contains", &hash]);
+        assert!(
+            holding.contains(&format!("{REMOTE}/{BRANCH}")),
+            "the pack chain was pushed and no remote-tracking ref holds {hash}: {holding:?}"
         );
         hash
     }

@@ -244,14 +244,14 @@ fn the_two_commands_carry_the_figures_and_the_levels_they_declare() {
     // A fixed level wins over whatever the requester asked for.
     assert_eq!(build.priority, DeclaredPriority::Fixed(Priority::Producer));
     assert_eq!(build.priority(Priority::Merger), Priority::Producer);
+    // Neither of M11's two fields: the pack chain is the appended pair, and
+    // the two commands that are always here declare no pack. This file
+    // declared `leaves` at two **files** until the layout step made the field
+    // travel — a `leaves` path is a pack, and a pack is a directory holding
+    // `manifest.tsv`, `pack.meta` and `objects/` (M11, E-17) — and a
+    // declaration Herd cannot honour is worse than none.
     assert!(build.needs.is_empty(), "{:?}", build.needs);
-    assert_eq!(
-        build.leaves,
-        BTreeMap::from([
-            ("grove-tree".to_owned(), "tree.txt".to_owned()),
-            ("grove-log".to_owned(), "logs/assemble.log".to_owned()),
-        ])
-    );
+    assert!(build.leaves.is_empty(), "{:?}", build.leaves);
     assert_eq!(build.schedule, None);
 
     let test = commands
@@ -280,17 +280,42 @@ fn the_two_commands_carry_the_figures_and_the_levels_they_declare() {
     assert_eq!(test.priority, DeclaredPriority::Requester);
     assert_eq!(test.priority(Priority::Merger), Priority::Merger);
     assert_eq!(test.priority(Priority::Nightly), Priority::Nightly);
-    assert_eq!(test.needs, vec!["grove-tree".to_owned()]);
+    // The reading command declares no pack either, and for the sharper half
+    // of the same reason: a command with `needs` waits at the dispatch until
+    // one is registered for its commit (D150), so the six tests here that run
+    // this command would have waited for ever rather than failed.
+    assert!(test.needs.is_empty(), "{:?}", test.needs);
     assert!(test.leaves.is_empty(), "{:?}", test.leaves);
     assert_eq!(test.coalesce, Some(format!("{PROBE}-{}", commit.hash)));
     assert_eq!(test.dedup_key, None, "{PROBE} declares no dedup key");
 
-    // The build leaves what the test run needs, which is the pair M11 reads.
+    // **The pack chain, and that its two halves line up**, which is the pair
+    // M11 reads. Read off the declaration the addition pushed, because a pack
+    // is registered for a `(commit, key)` pair and the chain arrives on a
+    // commit of its own.
+    let hash = fixture.add_the_pack_chain();
+    let commands = fixture.commands();
+    let producer = commands
+        .resolve(fixture::FORGE, &hash, &args)
+        .expect("the pack producer resolves");
+    let consumer = commands
+        .resolve(fixture::GRAFT, &hash, &args)
+        .expect("the pack consumer resolves");
+    assert_eq!(
+        producer.leaves,
+        BTreeMap::from([(fixture::PACK_KEY.to_owned(), fixture::PACK_AT.to_owned())])
+    );
+    assert!(producer.needs.is_empty(), "{:?}", producer.needs);
+    assert_eq!(consumer.needs, vec![fixture::PACK_KEY.to_owned()]);
+    assert!(consumer.leaves.is_empty(), "{:?}", consumer.leaves);
     assert!(
-        test.needs.iter().all(|key| build.leaves.contains_key(key)),
-        "the fixture's two commands do not line up: {:?} against {:?}",
-        test.needs,
-        build.leaves
+        consumer
+            .needs
+            .iter()
+            .all(|key| producer.leaves.contains_key(key)),
+        "the fixture's pack chain does not line up: {:?} against {:?}",
+        consumer.needs,
+        producer.leaves
     );
 }
 
