@@ -48,6 +48,25 @@
 //! costs the directory entries and not the bytes; [`LaidOut::bytes_copied`]
 //! is the figure that says so, and it is reported rather than assumed.
 //!
+//! ## What it occupies, as a figure it keeps rather than a walk it repeats
+//!
+//! The store carries its own byte total and pack count
+//! ([`PackStore::usage`]) and the budget its operator gave it
+//! ([`PACK_BUDGET_FLAG`]). **One walk seeds them and nothing walks again**:
+//! [`PackStore::measure`] reads `objects/` once at startup, each
+//! [`PackStore::ingest`] adds the bytes it really placed, and every other
+//! reader does arithmetic. That is not an optimisation of a figure nobody
+//! needed — a runner announces what it holds at every welcome and at every
+//! change, and a total derived by walking would read the whole store each
+//! time, against the consumer's own 401.6 MiB in 557 files. The counter
+//! [`PackStore::objects_listed`] exists so that a test can assert the walk
+//! does not happen, by counting the calls rather than by timing them.
+//!
+//! **Nothing here evicts anything.** The budget is measured against and
+//! reported; what spends it is a later step, and a reader who finds a budget
+//! and concludes this runner enforces one is reading more into it than is
+//! here.
+//!
 //! ## Three rules this module exists to get right
 //!
 //! 1. **A pack's id is the sha256 of `manifest.tsv`'s bytes**, so a manifest
@@ -111,15 +130,24 @@ use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 
 use herd_proto::pack::{check_object_digest, PacksHeld};
-use herd_proto::{PackId, PackManifest, MANIFEST_MAX_BYTES};
+use herd_proto::{show_bytes, PackId, PackManifest, MANIFEST_MAX_BYTES};
 
 use crate::size::measured_bytes;
 
 /// The subtree of the data root this store owns, beside `jobs/`,
 /// `held-results/` and `outputs/`.
 pub const PACKS_DIR: &str = "packs";
+
+/// The flag that tells a runner how much of its disk this store may hold.
+///
+/// Named once, here, where the budget lives, so that the startup line, the
+/// health report and whatever eviction comes later all quote the same string.
+/// `mesh::LISTEN_FLAG`'s precedent: a flag spelled out in three sentences is
+/// a flag renamed in two of them.
+pub const PACK_BUDGET_FLAG: &str = "--pack-budget";
 
 /// Where every pack's bytes live, once per content.
 const OBJECTS_DIR: &str = "objects";
@@ -195,9 +223,191 @@ const STAGING_PREFIX: &str = ".ingest-";
 static NEXT_STAGING: AtomicU64 = AtomicU64::new(0);
 
 /// One validated pack store under one data root.
+///
+/// **The figures are shared per data root and not per value.** A
+/// [`PackStore`] is opened wherever one is needed — the collection opens one
+/// at the end of a job, the announcement opens one every time it says what
+/// this runner holds — so a total kept in the value would be measured again
+/// at each of them, which is the walk this store must not do. What it holds
+/// instead is a handle onto one [`Standing`] per data root per process: the
+/// running total, the pack count and the budget, seeded once by
+/// [`PackStore::measure`] and moved by each [`PackStore::ingest`].
 #[derive(Debug, Clone)]
 pub struct PackStore {
     path: PathBuf,
+    standing: Arc<Mutex<Standing>>,
+}
+
+/// What this store occupies, as a figure it keeps rather than a walk it
+/// repeats.
+///
+/// Both figures count exactly what the store's own two rules count:
+/// `bytes` is every `objects/` entry whose name is a sha256
+/// ([`check_object_digest`]'s rule, so a staging name is never counted), and
+/// `packs` is every `manifests/` entry [`PackStore::held_packs`] would
+/// announce. One definition per figure, so what the budget is spent against
+/// and what the hub is told are the same two numbers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PackUse {
+    /// Every object's bytes, each content counted once — which is what the
+    /// store costs the disk, because an object is one file however many
+    /// packs name it.
+    pub bytes: u64,
+    /// How many whole packs this store holds.
+    pub packs: u64,
+    /// Whether anything has read the store yet.
+    ///
+    /// **False is not zero.** A figure nobody has measured is a figure this
+    /// runner has not got, and the two must not be confused: a hub told
+    /// `0 bytes` by a runner that never looked would believe an empty store.
+    /// [`PackStore::measure`] is what makes it true.
+    pub measured: bool,
+}
+
+/// One data root's pack-store figures, held once per process.
+///
+/// A `Mutex` and not five atomics, because nothing here is on a hot path —
+/// an ingest, an announcement, a startup — and because the alternative is
+/// five independent loads of figures that are read together and have to agree.
+#[derive(Debug, Default)]
+struct Standing {
+    bytes: u64,
+    packs: u64,
+    measured: bool,
+    /// What the operator said this store may hold, in bytes. **`None` is
+    /// "nobody said"**, never nought: a budget of nought is a store that
+    /// holds nothing, and absent is a store nothing bounds.
+    budget: Option<u64>,
+    /// How many times `objects/` has been listed, in this process, for this
+    /// data root.
+    ///
+    /// Not a diagnostic: it is the assertion. The one thing this task had to
+    /// get right is that saying what a runner holds costs no walk of the
+    /// objects directory, and a test that timed two announcements on a host
+    /// shared with the first consumer's production would be measuring the
+    /// host. So every listing of that directory goes through
+    /// [`PackStore::objects_bytes`], which counts itself here, and the test
+    /// asserts the counter does not move across an announcement. The claim
+    /// the counter rests on — that `objects_bytes` is the only listing of
+    /// `objects/` in this crate's product code — is checked by `grep` and
+    /// stated in that test rather than left to be inferred.
+    objects_listed: u64,
+}
+
+impl Standing {
+    fn reading(&self) -> PackUse {
+        PackUse {
+            bytes: self.bytes,
+            packs: self.packs,
+            measured: self.measured,
+        }
+    }
+}
+
+/// The one [`Standing`] for this data root's store, made on first use.
+///
+/// One entry per data root, and a process has one data root: the map exists
+/// because a **test** process has many, each in its own temporary directory,
+/// and because keying the figures by path is what lets every
+/// [`PackStore::open`] of one root read the figure the first of them seeded.
+///
+/// The key is [`keyed`]'s answer and not the path as given, for the reason
+/// that function carries.
+fn standing_for(path: &Path) -> Arc<Mutex<Standing>> {
+    static STANDINGS: OnceLock<Mutex<BTreeMap<PathBuf, Arc<Mutex<Standing>>>>> = OnceLock::new();
+    let standings = STANDINGS.get_or_init(|| Mutex::new(BTreeMap::new()));
+    let mut standings = standings
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    Arc::clone(
+        standings
+            .entry(keyed(path))
+            .or_insert_with(|| Arc::new(Mutex::new(Standing::default()))),
+    )
+}
+
+/// This store's directory as **every** caller will spell it.
+///
+/// [`crate::root::DataRoot::open`] canonicalises the root it validates, so
+/// everything inside a running runner opens this store under a canonical
+/// path — while the path the operator typed, which is what the startup line
+/// has, may be relative, may end in a separator, or may run through a
+/// symlinked home. Two spellings would be two [`Standing`]s: the budget
+/// would be registered against the one nobody reads and the figure would
+/// start from nothing at the first announcement. That is a silent failure
+/// and it would be found, if at all, in a health report of a machine nobody
+/// in this project may log into (D161).
+///
+/// So the key is canonical, and it is derived **creating nothing**: the
+/// nearest ancestor that exists is canonicalised and the part that does not
+/// exist yet is joined back on. That is the same answer `canonicalize` gives
+/// once the root is made, because what makes it is `create_dir_all` and a
+/// directory `create_dir_all` made is not a symlink. A path whose every
+/// ancestor is unreadable falls back to itself, which is one spelling and
+/// therefore still one figure.
+fn keyed(path: &Path) -> PathBuf {
+    for ancestor in path.ancestors() {
+        if ancestor.as_os_str().is_empty() {
+            break;
+        }
+        if let Ok(real) = fs::canonicalize(ancestor) {
+            return match path.strip_prefix(ancestor) {
+                Ok(rest) => real.join(rest),
+                Err(_) => real,
+            };
+        }
+    }
+    path.to_path_buf()
+}
+
+/// Take the budget for this data root's store before anything has opened it,
+/// and answer the line to print about it.
+///
+/// **Reads the store and creates nothing.** This runs at startup, where the
+/// data root has not yet been validated: creating `packs/` here would take
+/// E-45's refusal out of the hands of the code that owns it and leave a
+/// directory behind on a root that was about to be refused by name. A store
+/// that is not there yet holds nothing, which is a measurement and not an
+/// error.
+///
+/// The figure the operator typed reads back through [`show_bytes`] and the
+/// figure this runner measured through [`measured_bytes`] — the asymmetry
+/// `herd_proto::size` exists for, and the reason this sentence carries both.
+pub fn take_budget(data_root: &Path, budget: Option<u64>) -> String {
+    let store = PackStore::at(data_root);
+    store.set_budget(budget);
+    let held = match store.measure() {
+        Ok(held) => held,
+        Err(why) => {
+            return match budget {
+                Some(budget) => format!(
+                    "this runner's pack store may hold {} ({PACK_BUDGET_FLAG}) and what it \
+                     holds now was not read: {why}",
+                    show_bytes(budget)
+                ),
+                None => format!(
+                    "this runner's pack store has no budget ({PACK_BUDGET_FLAG} sets one) and \
+                     what it holds now was not read: {why}"
+                ),
+            }
+        }
+    };
+    match budget {
+        Some(budget) => format!(
+            "this runner's pack store holds {} in {} pack(s) of the {} it may hold \
+             ({PACK_BUDGET_FLAG})",
+            measured_bytes(held.bytes),
+            held.packs,
+            show_bytes(budget)
+        ),
+        None => format!(
+            "this runner's pack store holds {} in {} pack(s) and has no budget: \
+             {PACK_BUDGET_FLAG} is what bounds it, and without one this machine's packs are \
+             bounded by its disk",
+            measured_bytes(held.bytes),
+            held.packs
+        ),
+    }
 }
 
 /// A pack that is now in the store, and what putting it there cost.
@@ -265,9 +475,14 @@ impl PackStore {
     /// has. Creating the two directories is the whole of it: there is no
     /// index, no database and nothing to recover, because the content
     /// addressing *is* the index and a name either exists or does not.
+    ///
+    /// **Opened again, it reads the same figures**: what the store occupies
+    /// belongs to the data root and not to the value (see [`Standing`]), so
+    /// the announcement — which opens a store every time it says what this
+    /// runner holds — pays no walk for it.
     pub fn open(data_root: &Path) -> Result<Self, String> {
-        let path = data_root.join(PACKS_DIR);
-        for directory in [path.join(OBJECTS_DIR), path.join(MANIFESTS_DIR)] {
+        let store = Self::at(data_root);
+        for directory in [store.objects_dir(), store.manifests_dir()] {
             fs::create_dir_all(&directory).map_err(|error| {
                 format!(
                     "the pack store {} cannot be created: {error}",
@@ -275,7 +490,27 @@ impl PackStore {
                 )
             })?;
         }
-        Ok(Self { path })
+        Ok(store)
+    }
+
+    /// Name this data root's store, **creating nothing**.
+    ///
+    /// [`PackStore::open`] is what a caller that is about to *use* the store
+    /// wants: it creates the two directories and refuses by name if it
+    /// cannot. This is for the caller that only wants to read the store or
+    /// to remember something about it — [`take_budget`] at startup, before
+    /// the data root is validated at all — and it is deliberately private
+    /// for that reason.
+    fn at(data_root: &Path) -> Self {
+        let path = data_root.join(PACKS_DIR);
+        let standing = standing_for(&path);
+        Self { path, standing }
+    }
+
+    fn standing(&self) -> MutexGuard<'_, Standing> {
+        self.standing
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
     /// The store's own directory: `<data root>/packs`.
@@ -443,6 +678,122 @@ impl PackStore {
         Ok(held)
     }
 
+    /// Read the whole store once and seed the running figure.
+    ///
+    /// **One walk, at startup, and the only one.** Everything after it is
+    /// arithmetic: [`PackStore::ingest`] adds the bytes it really placed, and
+    /// [`PackStore::usage`] reads what is there without opening a directory
+    /// at all. That split is the point of the task this came from — a runner
+    /// that re-walked `objects/` whenever it said what it holds would read
+    /// the whole store on every job's end, and the consumer's own pack is
+    /// 401.6 MiB in 557 files.
+    ///
+    /// A store that is **not there** holds nothing, and that is a
+    /// measurement: this is called before the data root is validated, and a
+    /// runner starting on a fresh root would otherwise print an error about
+    /// a directory nothing has yet had a reason to make.
+    ///
+    /// Called again, it re-seeds: the absolute figure wins over the running
+    /// one, which is what makes it the answer to any drift. It is **not** to
+    /// be called on an announcement; nothing in this crate does.
+    pub fn measure(&self) -> Result<PackUse, String> {
+        let bytes = self.objects_bytes()?;
+        let packs = match self.held_packs() {
+            Ok(held) => u64::try_from(held.len()).unwrap_or(u64::MAX),
+            Err(_) if !self.manifests_dir().exists() => 0,
+            Err(why) => return Err(why),
+        };
+        let mut standing = self.standing();
+        standing.bytes = bytes;
+        standing.packs = packs;
+        standing.measured = true;
+        Ok(standing.reading())
+    }
+
+    /// What this store holds, as the running figure says — **with no
+    /// filesystem access of any kind**.
+    ///
+    /// This is what an announcement, a health report and an eviction check
+    /// may call as often as they like. [`PackUse::measured`] is false until
+    /// something has called [`PackStore::measure`], and a caller that sends
+    /// the figure onward says "did not measure" rather than nought for it.
+    pub fn usage(&self) -> PackUse {
+        self.standing().reading()
+    }
+
+    /// What the operator said this store may hold, in bytes, or `None` if
+    /// nobody said ([`PACK_BUDGET_FLAG`]).
+    pub fn budget(&self) -> Option<u64> {
+        self.standing().budget
+    }
+
+    /// Remember what the operator said this store may hold.
+    ///
+    /// Taken once, at startup, by [`take_budget`], and read from every
+    /// [`PackStore`] of that data root afterwards — which is why it is kept
+    /// beside the figures rather than threaded through every call that might
+    /// one day want it.
+    pub fn set_budget(&self, budget: Option<u64>) {
+        self.standing().budget = budget;
+    }
+
+    /// How many times `objects/` has been listed for this data root in this
+    /// process.
+    ///
+    /// Exposed for one assertion: that saying what this runner holds costs no
+    /// listing of that directory. See [`Standing::objects_listed`] for why it
+    /// is a counter and not a stopwatch.
+    pub fn objects_listed(&self) -> u64 {
+        self.standing().objects_listed
+    }
+
+    /// Every object's bytes: one `read_dir` of `objects/` and one `stat` per
+    /// entry.
+    ///
+    /// **The only listing of `objects/` in this crate's product code**, which
+    /// is what makes [`PackStore::objects_listed`] a statement about the
+    /// whole crate and not about this function. It counts a name
+    /// [`check_object_digest`] accepts and nothing else, so a staging file a
+    /// kill left behind weighs nought here exactly as it is announced as
+    /// nothing: one rule for both halves of the same question.
+    fn objects_bytes(&self) -> Result<u64, String> {
+        let directory = self.objects_dir();
+        self.standing().objects_listed += 1;
+        let entries = match fs::read_dir(&directory) {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(0),
+            Err(error) => {
+                return Err(format!(
+                    "what this runner's pack store holds cannot be measured: {} will not \
+                     open: {error}",
+                    directory.display()
+                ))
+            }
+        };
+        let mut bytes = 0u64;
+        for entry in entries {
+            let entry = entry.map_err(|error| {
+                format!(
+                    "what this runner's pack store holds cannot be measured: {} will not \
+                     list: {error}",
+                    directory.display()
+                )
+            })?;
+            let name = entry.file_name();
+            let Some(name) = name.to_str() else { continue };
+            if check_object_digest(name).is_err() {
+                continue;
+            }
+            let Ok(metadata) = entry.metadata() else {
+                continue;
+            };
+            if metadata.is_file() {
+                bytes = bytes.saturating_add(metadata.len());
+            }
+        }
+        Ok(bytes)
+    }
+
     /// Put a pack directory into the store.
     ///
     /// `dir` is a pack directory in the three-part shape above: it holds
@@ -509,7 +860,23 @@ impl PackStore {
                 Carriage::Copied => held.bytes_copied += bytes,
             }
         }
-        self.write_manifest(&held.manifest, held.meta.as_deref())?;
+        let filed = self.write_manifest(&held.manifest, held.meta.as_deref())?;
+        // The running figure moves by what this ingest really placed and by
+        // nothing else: an object the store already held was not placed and
+        // weighs nothing here, and a pack already filed under its id is not a
+        // second pack. Which of those happened is `write_manifest`'s answer
+        // rather than a second question to the disk — two concurrent ingests
+        // of one new pack would both have seen "not there", and only the one
+        // whose rename landed says it filed it.
+        let mut standing = self.standing();
+        standing.bytes = standing
+            .bytes
+            .saturating_add(held.bytes_linked)
+            .saturating_add(held.bytes_copied);
+        if filed {
+            standing.packs = standing.packs.saturating_add(1);
+        }
+        drop(standing);
         Ok(held)
     }
 
@@ -720,10 +1087,16 @@ impl PackStore {
     /// manifest or no pack at all. A pack already filed under that id is left
     /// exactly as it is: the id is the sha256 of these bytes, so what is
     /// there is byte for byte what would be written.
-    fn write_manifest(&self, manifest: &PackManifest, meta: Option<&[u8]>) -> Result<(), String> {
+    ///
+    /// **True means this call is the one that filed it**, which is what the
+    /// running pack count is moved by. Both of the ways this returns without
+    /// writing — the pack was already there, or another ingest of the same
+    /// pack won the rename — answer false, so one pack cannot be counted
+    /// twice however many ingests of it run at once.
+    fn write_manifest(&self, manifest: &PackManifest, meta: Option<&[u8]>) -> Result<bool, String> {
         let final_dir = self.pack_dir(manifest.id());
         if final_dir.join(MANIFEST_FILE).is_file() {
-            return Ok(());
+            return Ok(false);
         }
         let staged = Staged::dir(staging_path(&self.manifests_dir()));
         fs::create_dir_all(staged.path())
@@ -746,7 +1119,7 @@ impl PackStore {
             // gives for that is not the fact being asked about.
             Err(error) => {
                 if final_dir.join(MANIFEST_FILE).is_file() {
-                    return Ok(());
+                    return Ok(false);
                 }
                 return Err(format!(
                     "{} cannot be renamed to {}: {error}",
@@ -756,7 +1129,8 @@ impl PackStore {
             }
         }
         staged.kept();
-        fsync_dir(&self.manifests_dir())
+        fsync_dir(&self.manifests_dir())?;
+        Ok(true)
     }
 }
 
@@ -2233,5 +2607,338 @@ mod tests {
             !frames[0].more,
             "and it applies, or the hub would accumulate an emptiness for ever"
         );
+    }
+
+    /// A store of known blobs reports **exactly** their summed lengths and
+    /// their count.
+    ///
+    /// The figures are built out of the fixture's own bytes — `shared.len()`
+    /// and the rest — and never typed beside it, so a change to the fixture
+    /// moves the expectation with it rather than reddening a number nobody
+    /// can place.
+    ///
+    /// **Before anything measures, the figure says so.** `measured` is false
+    /// on a store nothing has read, and false is not nought: a hub told
+    /// `0 bytes` by a runner that never looked would believe an empty store.
+    #[test]
+    fn a_measured_store_reports_its_objects_summed_lengths_and_its_pack_count() {
+        let temp = TempDir::new("pack-measure");
+        let store = PackStore::open(temp.path()).expect("a store");
+
+        let fresh = store.usage();
+        assert!(
+            !fresh.measured,
+            "nothing has read this store yet, and that is not the same as it being empty"
+        );
+        assert_eq!((fresh.bytes, fresh.packs), (0, 0));
+
+        let one: &[u8] = b"the first pack's own bytes";
+        let two: &[u8] = b"a second content, of a different length entirely";
+        let shared: &[u8] = b"bytes both packs name";
+
+        let first = temp.path().join("first");
+        write_pack(&first, &[("bin/tool", one), ("lib/shared", shared)], None);
+        let second = temp.path().join("second");
+        write_pack(&second, &[("bin/other", two), ("lib/shared", shared)], None);
+        store.ingest(&first).expect("the first pack is ingested");
+        store.ingest(&second).expect("the second pack is ingested");
+
+        let measured = store.measure().expect("the store is measurable");
+        assert!(measured.measured, "it has now been read");
+        assert_eq!(
+            measured.bytes,
+            (one.len() + two.len() + shared.len()) as u64,
+            "three distinct contents across two packs, each counted once: {:?}",
+            names_in(&store.objects_dir())
+        );
+        assert_eq!(measured.packs, 2, "two manifests, two packs");
+        assert_eq!(
+            store.usage(),
+            measured,
+            "the running figure is what the walk just seeded"
+        );
+
+        // A staging file a kill left behind weighs nought, exactly as it is
+        // announced as nothing: one rule — a 64-hex name — for both halves of
+        // the same question.
+        fs::write(
+            store.objects_dir().join(format!("{STAGING_PREFIX}99-1")),
+            b"half an object",
+        )
+        .expect("a staging file");
+        let again = store.measure().expect("the store is measurable");
+        assert_eq!(
+            again.bytes, measured.bytes,
+            "a half-made object is not in the store, so it is not in the store's figure"
+        );
+        assert_eq!(again.packs, measured.packs);
+    }
+
+    /// A second `ingest` moves the total **by the new blobs only**.
+    ///
+    /// Which is the whole claim of a content-addressed store, as a figure:
+    /// the second pack names two objects and the store already held one of
+    /// them, so what the total moves by is the one it did not hold. Ingested
+    /// a third time, nothing moves at all.
+    ///
+    /// And the running figure is checked against the walk at the end, which
+    /// is the one assertion that catches arithmetic drifting from the disk:
+    /// `measure` reads `objects/` and the running figure has not read
+    /// anything since the first one.
+    #[test]
+    fn a_second_ingest_moves_the_total_by_the_new_blobs_only() {
+        let temp = TempDir::new("pack-running-total");
+        let store = PackStore::open(temp.path()).expect("a store");
+        let shared: &[u8] = b"the bytes both packs hold";
+        let only_in_the_second: &[u8] = b"second only, and longer than the first";
+
+        let first = temp.path().join("first");
+        write_pack(&first, &[("bin/tool", shared)], None);
+        store.ingest(&first).expect("the first pack is ingested");
+        store.measure().expect("seeded from the disk");
+        assert_eq!(
+            (store.usage().bytes, store.usage().packs),
+            (shared.len() as u64, 1)
+        );
+
+        let second = temp.path().join("second");
+        write_pack(
+            &second,
+            &[("lib/tool.so", shared), ("only/here", only_in_the_second)],
+            None,
+        );
+        let held = store.ingest(&second).expect("the second pack is ingested");
+        assert_eq!(held.objects_added, 1, "one of its two objects was placed");
+        assert_eq!(
+            store.usage().bytes,
+            (shared.len() + only_in_the_second.len()) as u64,
+            "the total moved by the object that was placed and not by the one the store \
+             already held"
+        );
+        assert_eq!(store.usage().packs, 2);
+
+        // Again, with the same directory: a pack the store holds whole costs
+        // nothing and counts nothing.
+        let standing = store.usage();
+        let third = store.ingest(&second).expect("an idempotent ingest");
+        assert_eq!(third.objects_added, 0);
+        assert_eq!(
+            store.usage(),
+            standing,
+            "a pack already held moves neither figure"
+        );
+
+        // And the arithmetic agrees with the disk, which is what makes the
+        // running figure worth keeping rather than merely cheap.
+        let walked = store.measure().expect("the store is measurable");
+        assert_eq!(
+            walked, standing,
+            "the walk and the running total are the same two numbers"
+        );
+    }
+
+    /// **Saying what this runner holds lists no `objects/` directory**, and
+    /// that is asserted by counting the listings rather than by timing them.
+    ///
+    /// **Why a counter and not a stopwatch.** This host is shared with the
+    /// first consumer's production (D161) and with other agents' builds; a
+    /// test that announced twice and compared the durations would be
+    /// measuring the load on the machine, and would be green on a quiet one
+    /// whatever the code did. So every listing of `objects/` in this crate's
+    /// product code goes through `PackStore::objects_bytes` — checked by
+    /// `grep` over `herd-runner/src/`, where the only other `read_dir` of
+    /// that directory is in a test — and the counter it keeps is the
+    /// assertion.
+    ///
+    /// **The announcement is performed as the runner performs it**, by the
+    /// same three calls `Runner::announce_packs_held` makes in that order:
+    /// `PackStore::open` of the data root, `held_packs`, `announcement_frames`.
+    /// A fresh `open` is the case that matters — the figure survives it
+    /// because it belongs to the data root and not to the value, and an
+    /// implementation that re-measured on open would walk the store at every
+    /// welcome and at the end of every job.
+    ///
+    /// **The detector is proven to fire** before its silence is trusted: the
+    /// counter is shown moving on a `measure`, which is the one call that is
+    /// supposed to move it.
+    #[test]
+    fn saying_what_this_runner_holds_lists_no_objects_directory() {
+        let temp = TempDir::new("pack-no-walk");
+        let store = PackStore::open(temp.path()).expect("a store");
+        let pack = temp.path().join("pack");
+        write_pack(&pack, &[("bin/tool", b"some bytes to hold")], None);
+        store.ingest(&pack).expect("the pack is ingested");
+
+        // The detector, proven on the call that must move it.
+        let before = store.objects_listed();
+        store.measure().expect("the store is measurable");
+        assert_eq!(
+            store.objects_listed(),
+            before + 1,
+            "a measurement lists objects/ exactly once, and this counter is what says so"
+        );
+
+        let seeded = store.usage();
+        let listed = store.objects_listed();
+        for _ in 0..5 {
+            // Exactly `Runner::announce_packs_held`'s own three calls.
+            let announcing = PackStore::open(temp.path()).expect("the store, opened again");
+            let held = announcing.held_packs().expect("what this runner holds");
+            let frames = announcement_frames(held);
+            assert_eq!(frames.len(), 1);
+            assert_eq!(frames[0].packs.len(), 1, "the one pack it holds");
+            assert_eq!(
+                announcing.objects_listed(),
+                listed,
+                "announcing what this runner holds listed objects/ again; the figure is a \
+                 running one and an announcement must do arithmetic, not a walk"
+            );
+            assert_eq!(
+                announcing.usage(),
+                seeded,
+                "a store opened again reads the figure its data root already had, rather \
+                 than starting from nothing"
+            );
+        }
+        assert_eq!(store.objects_listed(), listed, "and nor did any of them");
+    }
+
+    /// The budget is the operator's figure, kept per data root, and **absent
+    /// is not nought**.
+    ///
+    /// `None` is "nobody said" and nought is "hold nothing": a hub handed
+    /// `0` for a budget nobody set would report a runner that may keep no
+    /// pack at all. The sentence printed at startup says which it is, and
+    /// the figure in it reads back through `show_bytes` — the formatter for a
+    /// figure a human typed — while what was measured reads back through
+    /// `measured_bytes`.
+    #[test]
+    fn the_budget_is_taken_once_and_read_from_every_store_of_that_root() {
+        let temp = TempDir::new("pack-budget");
+        let store = PackStore::open(temp.path()).expect("a store");
+        assert_eq!(store.budget(), None, "nobody has said anything yet");
+
+        let pack = temp.path().join("pack");
+        let bytes: &[u8] = b"a pack's one object";
+        write_pack(&pack, &[("bin/tool", bytes)], None);
+        store.ingest(&pack).expect("the pack is ingested");
+
+        let budget = 40 << 30;
+        let said = take_budget(temp.path(), Some(budget));
+        assert!(
+            said.contains(&show_bytes(budget)) && said.contains(PACK_BUDGET_FLAG),
+            "the startup line states the budget as its own formatter prints it, and names \
+             the flag that set it: {said}"
+        );
+        assert!(
+            said.contains(&measured_bytes(bytes.len() as u64)),
+            "and what it holds now as a measurement, which is the other formatter: {said}"
+        );
+        assert_eq!(
+            PackStore::open(temp.path())
+                .expect("the store, opened again")
+                .budget(),
+            Some(budget),
+            "the budget belongs to the data root, so every store of it reads the figure the \
+             operator gave once"
+        );
+
+        // Absent, said and kept apart from nought.
+        let empty = TempDir::new("pack-no-budget");
+        let said = take_budget(empty.path(), None);
+        assert!(
+            said.contains("no budget") && said.contains(PACK_BUDGET_FLAG),
+            "a runner with no pack budget says so and names the flag: {said}"
+        );
+        let store = PackStore::open(empty.path()).expect("a store");
+        assert_eq!(store.budget(), None, "absent, and not nought");
+        assert_eq!(
+            (
+                store.usage().bytes,
+                store.usage().packs,
+                store.usage().measured
+            ),
+            (0, 0, true),
+            "a store with nothing in it was read, and holds nothing: measured, and nought"
+        );
+    }
+
+    /// A store that is **not there yet** holds nothing, and that is a
+    /// measurement rather than an error.
+    ///
+    /// `take_budget` runs at startup, before `herd_runner::run` has validated
+    /// the data root, so it reads the store and creates nothing: a `packs/`
+    /// made on that line would leave a directory behind on a root that was
+    /// about to be refused by name (E-45), and an error printed about a
+    /// directory nothing has had a reason to make yet would be noise at every
+    /// first start.
+    #[test]
+    fn a_store_that_is_not_there_yet_holds_nothing_and_creates_nothing() {
+        let temp = TempDir::new("pack-absent");
+        let root = temp.path().join("not-made-yet");
+        let said = take_budget(&root, None);
+        assert!(
+            said.contains("0 bytes") && said.contains("0 pack(s)"),
+            "a store that is not there holds nothing, and says nothing is wrong: {said}"
+        );
+        assert!(
+            !root.exists(),
+            "and it made neither the data root nor {PACKS_DIR}/ on the way"
+        );
+    }
+
+    /// Two spellings of one data root are **one** store's figures.
+    ///
+    /// This is not tidiness, it is the one way this task could have shipped
+    /// a silent nought. The startup line takes the budget against the path
+    /// the operator typed; everything inside a running runner opens this
+    /// store under `DataRoot`'s **canonicalised** path, because
+    /// `crate::root::DataRoot::open` canonicalises what it validates. A
+    /// figure keyed by the literal string would have been registered against
+    /// the spelling nobody reads, and the health report of a machine nobody
+    /// in this project may log into (D161) would have carried a budget of
+    /// "nobody said" and a total of nought.
+    ///
+    /// Three spellings here, all of one directory: through a symlink, with a
+    /// trailing separator, and with a `.` component in the middle.
+    #[test]
+    fn two_spellings_of_one_data_root_are_one_store() {
+        let temp = TempDir::new("pack-one-key");
+        let real = temp.path().join("real-root");
+        fs::create_dir_all(&real).expect("the data root");
+        let linked = temp.path().join("linked-root");
+        std::os::unix::fs::symlink(&real, &linked).expect("a symlinked spelling of it");
+
+        let budget = 8 << 30;
+        take_budget(&linked, Some(budget));
+
+        let pack = temp.path().join("pack");
+        let bytes: &[u8] = b"one object, counted once";
+        write_pack(&pack, &[("bin/tool", bytes)], None);
+        PackStore::open(&real)
+            .expect("the store, by its real path")
+            .ingest(&pack)
+            .expect("the pack is ingested");
+
+        for spelling in [
+            real.clone(),
+            linked.clone(),
+            real.join("."),
+            PathBuf::from(format!("{}/", linked.display())),
+        ] {
+            let store = PackStore::open(&spelling).expect("the store, spelled another way");
+            assert_eq!(
+                store.budget(),
+                Some(budget),
+                "{} read a different budget from the one the operator gave once",
+                spelling.display()
+            );
+            assert_eq!(
+                (store.usage().bytes, store.usage().packs),
+                (bytes.len() as u64, 1),
+                "{} read a different figure from the one the ingest moved",
+                spelling.display()
+            );
+        }
     }
 }
