@@ -43,6 +43,21 @@
 //!    one holding no record whatever identically, because not one of them
 //!    weighs a record.
 //!
+//!    **And it prints its unit, because this product now has two
+//!    apparent-size figures that err in opposite directions.** This one
+//!    sums `metadata().len()`, so it is apparent size and a *floor* on real
+//!    disk: a one-byte file costs a block, and these are almost all small
+//!    files — 1443667 bytes apparent against 2850816 in blocks on one real
+//!    root, about 1.97×, measured 2026-10-30. A job's `bytes_written`
+//!    (**D263**, ORCH-278) is apparent size too and *overstates*, because a
+//!    sparse file counts for its holes; that one killed a landing's gate the
+//!    same day. Same unit, same word, opposite bias. The consumer's own
+//!    figure for *this* quantity is `du -sk`, which is blocks, so a reader
+//!    comparing their `du` with this total would see a root halve while
+//!    nothing shrank. That is why the printed prose carries the unit, the
+//!    direction of the error and the instruction — compare `du` with `du` —
+//!    rather than leaving it in a comment nobody running the binary reads.
+//!
 //! **What it is allowed to touch.** The records, and the *lengths* of the
 //! files under a job directory — those under `files/`, `files.part/` and
 //! `files.gone/`, and those of the directory's own `job.json`,
@@ -1737,6 +1752,60 @@ fn write_bookkeeping(
         f,
         "  total which has grown can be attributed without a second command."
     )?;
+    writeln!(f)?;
+    // **Apparent size, said in the output and not only in a doc comment.**
+    // The first consumer's own figure for this very quantity is `du -sk`
+    // without `--apparent-size`, which is allocated blocks; this one sums
+    // `metadata().len()`, which is apparent size. On a comparable root this
+    // section therefore prints roughly half of what their `du` told them,
+    // with nothing having shrunk, and the natural reading of that is
+    // "records got smaller" and then "retention is less urgent than we
+    // thought". The orchestrator made the mirror-image mistake on
+    // 2026-10-30 with both measurements in front of it. An operator will
+    // have less, so the output carries the unit, the direction of the
+    // error, the one measurement behind it, and the instruction that
+    // follows from it.
+    writeln!(
+        f,
+        "  Apparent size, summed from file lengths, and that is a FLOOR on what"
+    )?;
+    writeln!(
+        f,
+        "  these files occupy. A one-byte file costs a whole block, and a"
+    )?;
+    writeln!(
+        f,
+        "  bookkeeping population is almost all small files: on one real root this"
+    )?;
+    writeln!(
+        f,
+        "  figure read 1443667 bytes while the same files held 2850816 bytes of"
+    )?;
+    writeln!(
+        f,
+        "  blocks -- about 1.97 times more disk than the figure says (measured"
+    )?;
+    writeln!(
+        f,
+        "  2026-10-30, find -printf '%b' against find -printf '%s'). That factor is"
+    )?;
+    writeln!(
+        f,
+        "  a property of that root's file sizes and its block size and is not a"
+    )?;
+    writeln!(
+        f,
+        "  constant to apply anywhere else. So compare du with du, or apparent with"
+    )?;
+    writeln!(
+        f,
+        "  apparent, and never one against the other: a du -sk taken before a"
+    )?;
+    writeln!(
+        f,
+        "  migration and this figure taken after it would show a root halving while"
+    )?;
+    writeln!(f, "  nothing at all had shrunk.")?;
     writeln!(f)?;
     writeln!(
         f,

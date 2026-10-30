@@ -866,6 +866,17 @@ const LOG_LINE: &[u8] = b"a line of a job's log, and its length is the figure\n"
 
 /// The report's text, with the only thing that varies left as `{ROOT}`.
 ///
+/// **Section 5's apparent-size paragraph is why this block was edited and
+/// not regenerated.** The prose changed on purpose: the first consumer's
+/// own figure for the same quantity is `du -sk`, which is allocated
+/// blocks, while section 5 sums `metadata().len()`, which is apparent
+/// size, so on a comparable root it prints about half of what their `du`
+/// said with nothing having shrunk. The paragraph carries the unit, the
+/// 1.97× that was measured behind it, and the instruction that follows.
+/// An expectation updated because the text was deliberately changed is
+/// honest; this is the one place a reader can see the text was reviewed
+/// rather than pasted back from a failing run.
+///
 /// **Section 4 is the banner and not the figures**, because this fixture's
 /// root is built by the store and no hub has opened a pack registry on it:
 /// there is no `packs/` directory, and saying so is a different statement
@@ -1000,6 +1011,18 @@ records
   log can be the whole of the difference. So the heaviest directory is
   printed beside the total and the three classes are named apart, so that a
   total which has grown can be attributed without a second command.
+
+  Apparent size, summed from file lengths, and that is a FLOOR on what
+  these files occupy. A one-byte file costs a whole block, and a
+  bookkeeping population is almost all small files: on one real root this
+  figure read 1443667 bytes while the same files held 2850816 bytes of
+  blocks -- about 1.97 times more disk than the figure says (measured
+  2026-10-30, find -printf '%b' against find -printf '%s'). That factor is
+  a property of that root's file sizes and its block size and is not a
+  constant to apply anywhere else. So compare du with du, or apparent with
+  apparent, and never one against the other: a du -sk taken before a
+  migration and this figure taken after it would show a root halving while
+  nothing at all had shrunk.
 
   The three collection directories are skipped by name, so no byte is in
   both this total and section 3's. Nothing under packs/ is in either.
