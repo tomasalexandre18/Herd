@@ -7,7 +7,7 @@ needs a chatOnS deliverable (their declaration file, `cargo xtask pack` /
 automated test against the fixture consumer stands in, and the real check
 closes in M18.
 
-**State** is as of 2026-10-29 and says where the work is, never where it
+**State** is as of 2026-10-30 and says where the work is, never where it
 runs: `merged` is wholly on `main`; `part` is a row some of whose work is
 on `main` and some of which is not — a two-milestone row with one half
 landed, or a row whose own list is partly built; `planned` is unbuilt;
@@ -16,10 +16,17 @@ deployed is a tag behind `main`, so a `merged` row is not a promise about
 the running system — `docs/status.md` holds the versions, the disk and who
 operates them.
 
-**The musts, counted from the table below on 2026-10-29:** **36 of 44**
-wholly on `main`; **2** more with part of their work on `main` (E-16,
-E-37); **4** with none of it (E-12, E-14, E-17, E-42); **2** declared
-unmet by choice (E-49, E-50, D206). 36 + 2 + 4 + 2 = 44.
+**The musts, recounted from the table below on 2026-10-30 against the
+tree at `26e83cf`:** **36 of 44** wholly on `main`; **4** more with part
+of their work on `main` (E-12, E-16, E-17, E-37); **2** with none of it
+(E-14, E-42); **2** declared unmet by choice (E-49, E-50, D206).
+36 + 4 + 2 + 2 = 44.
+
+**The done figure did not move; the shape of the eight that are not did.**
+Five landings reached `main` after the 2026-10-29 count (batches 12 to
+16) and they put M11's pack half in the tree, so E-12 and E-17 move from
+`planned` to `part`. No row became `merged`, none regressed, and the
+other six were checked row by row and left alone.
 
 **Two landed decisions give two different ceilings, and both are stated
 here rather than reconciled.** D205 (Alexa, 2026-10-29) puts M11's pack
@@ -102,7 +109,8 @@ trusting it.
 *Gated* carries this file's opening meaning — the acceptance criterion
 needs a chatOnS deliverable, and a test against the fixture consumer
 stands in until M18. It says **nothing** about whether Herd's own side is
-built: E-12, E-14 and E-42 are gated *and* have nothing on `main`. The
+built: E-14 and E-42 are gated *and* have nothing on `main`, and E-12 is
+gated *and* partly built, which are two different columns. The
 State column and the counted figure at the top of this file are what say
 which is which.
 
@@ -154,21 +162,23 @@ of this file, needs anything of theirs — it is `merged`, *"plain files
 by Q1"* and D103. **Left out**, and said here rather than dropped
 quietly; leaving it out was a reading, not a judgement.
 
-## State of play (2026-10-29)
+## State of play (2026-10-30)
 
 **Thirteen milestones are merged to `main`:** M1 (the substrate, no must
 of its own), the scheduler spine M2 to M9, M10 (the command declaration
-contract), M11 (its record half only, see below), M15 (approval and
-versions) and M16 (the hub deployed, the server's runner native). **M13
+contract), M11 (its record half, with the pack half part-built and
+delivering no must yet, see below), M15 (approval and versions) and M16
+(the hub deployed, the server's runner native). **M13
 and M14 are not among them and each now has one of its two musts on
 `main`**, landed 2026-10-29 in batch 8: E-35 and E-41 (D215, D217),
 with E-37 partly built (D216): four of its listed transitions are
 emitted and two of its five items are not.
 
-**36 of 44 musts are wholly on `main`.** Of the eight that are not: two
-are partly built (E-16, whose hub-side budget shipped in M11, and E-37);
-four have nothing on `main` (E-12 and E-17, M11's pack musts; E-14 and
-E-42); and two are **unmet by choice** (E-49, E-50, D206). Four `should`
+**36 of 44 musts are wholly on `main`.** Of the eight that are not: four
+are partly built (E-16, whose hub-side budget shipped in M11; E-37; and
+M11's two pack musts E-12 and E-17, recounted on 2026-10-30); two have
+nothing on `main` (E-14 and E-42); and two are **unmet by choice**
+(E-49, E-50, D206). Four `should`
 rows are merged — E-09 and E-10 beside M9, E-40 beside M3, E-53 beside
 M2 — and E-52 is half of one. Twelve musts have had an independent
 adversarial pass against the real binaries (E-03, E-15, E-44 from M2;
@@ -184,11 +194,16 @@ Five things a reader must not mistake for done:
    release anybody can download is v0.3.0. `docs/status.md` carries the
    live figures, the traps in the deployed runner, and who operates
    what.
-2. **M11 is merged and E-12 and E-17 are not delivered.** What shipped
-   is the record half: a job's files come home, large ones stream, and
-   the hub sweeps them against its own budget (D148, D150, D152). The
-   pack half — the registry, the manifests, runner-to-runner transfer —
-   has no frame on either protocol enum and no code behind one.
+2. **M11 is merged, E-12 and E-17 are not delivered, and the pack half
+   is now partly in the tree.** The record half shipped first: a job's
+   files come home, large ones stream, and the hub sweeps them against
+   its own budget (D148, D150, D152). The pack half — frames on both
+   protocol enums, the hub's registry, the runner's content store, a
+   peer fetch and a mesh-bound endpoint, and a runner that announces
+   what it holds — landed in batches 12 to 16, and it is **wired at the
+   edges and not through**: no job is assigned a pack and no pack a job
+   leaves is registered (ORCH-234). That is why both rows now read
+   `part` and why neither reads `merged`.
 3. **E-45 is cooperative confinement only** (D28): a job can write
    anything the runner's user can. Full containment needs a mount
    namespace E-46 forbids the runner the privilege for. On the
@@ -204,16 +219,22 @@ Five things a reader must not mistake for done:
    block device (D27): every one of the twelve is a cgroup-delegation
    or ZFS `io.max` assertion. E-30's WSL replay stays a manual M17
    check.
-5. **The formats are frozen, and the figures are not the ones an older
-   reading of this file gives.** `PROTOCOL_VERSION` is **2**,
-   `RECORD_VERSION` **1** and `LAYOUT_VERSION` **1**. A peer or a state
-   root from another version is refused by name with both figures and
-   there is no migration (D73), so a fleet crosses a protocol line only
-   by a deliberate upgrade of every machine in it. **All three move
-   before v1.0.0** — 2 → 3, 1 → 2, 1 → 2 (D199) — and because there is
-   no migration path the last two destroy an existing state root as a
-   working root; the ordinary release before v1.0.0 therefore ships at
-   layout 1 and record 1, which is binding.
+5. **The three format numbers have all moved, and this paragraph gave
+   the older figures until 2026-10-30.** Read off the tree at
+   `26e83cf`: `PROTOCOL_VERSION` is **3**
+   (`herd-proto/src/lib.rs`), `RECORD_VERSION` **2**
+   (`herd-hub/src/job.rs`) and `LAYOUT_VERSION` **2**
+   (`herd-hub/src/store.rs`); every release to date carries 2, 1 and 1
+   (`docs/handover.md`). A peer or a state root from another version is
+   refused by name with both figures and there is no migration (D73),
+   so a fleet crosses a protocol line only by a deliberate upgrade of
+   every machine in it. **D199's three moves are therefore spent**, all
+   three in M11's pack half — 2 → 3, 1 → 2, 1 → 2 — and because there
+   is no migration path the last two destroy an existing state root as
+   a working root. The sentence this replaces also said the ordinary
+   release before v1.0.0 ships at layout 1 and record 1: no release cut
+   from `main` can now do that. What follows for the release is scope
+   and is not settled in this document.
 
 ## Musts per milestone
 
@@ -252,8 +273,9 @@ disagreeing copies (ORCH-206).
   so nothing is lost by waiting, and no must depends on them. E-38 is also
   gated on chatOnS's results.json for the load-vs-real failure split.
 
-Every must is placed, and three kinds of must are **not** simply owed: two
-are partial (E-16, E-37), two are unmet by choice (E-49, E-50, D206), and
+Every must is placed, and three kinds of must are **not** simply owed:
+four are partial (E-12, E-16, E-17, E-37), two are unmet by choice
+(E-49, E-50, D206), and
 nine carry a gated or real-hardware note that names its closing
 milestone — the seven of *Gated on chatOnS* above, plus E-30 and E-49,
 whose checks are manual and wait on nothing of the consumer's. This
