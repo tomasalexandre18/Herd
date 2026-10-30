@@ -35,11 +35,21 @@ the sha, because `main` moves several times a night.
   recount was made at `b37b2a4`** and none is claimed: nothing in
   batches 9 or 10 moved a must row, so 36 very probably held there too,
   and *probably* is why this is marked **not recounted**.
-- **42 of 44** — D205 and D206 together, as `docs/coverage.md` states
-  without reconciling them. D205 puts M11's pack half inside v1.0.0 and
-  calls that 44 of 44; D206 declares E-49 and E-50 unmet by choice, and
-  both are musts. Both cannot be true. **ORCH-210**, in the board's
-  *Waiting*.
+- **42 of 44** — D205 and D206 together, as `docs/coverage.md` stated
+  them at that sha without reconciling them. D205 puts M11's pack half
+  inside v1.0.0 and calls that 44 of 44; D206 declares E-49 and E-50
+  unmet by choice, and both are musts. Both cannot be true.
+  **ORCH-210**, which was in the board's *Waiting* when this point was
+  taken.
+- **ORCH-210 was settled later the same day, after this point was
+  taken:** **D248** — Alexa ruled 44 or ask them, the consumer was
+  asked under **D249** and **waived E-49 and withdrew E-50**, so
+  v1.0.0 ships **42 of 44** and names both in the notes as not met.
+  **B1 below carries the settled reading**; the row above is left
+  exactly as it was measured, because a point of measurement is never
+  amended — a new row is added (see *Adding the next row*). Its
+  `unmet by choice` wording is D206's vocabulary and `coverage.md`
+  no longer uses it.
 - **24 branches, 85 commits** — `git log` over the three landing
   commits: 13 into `batch-8-integration`, 4 into `batch-9-integration`,
   7 into `batch-10-integration`, and `git rev-list --count
@@ -61,45 +71,94 @@ the sha, because `main` moves several times a night.
 
 A blocker is a promise the product makes and does not keep, or a
 statement the release itself would make falsely. Each is phrased so that
-"ready" is decidable instead of felt. State read at `5f73c18`.
+"ready" is decidable instead of felt. **State read at `5f73c18`, except
+B1 and B5, re-read at `df47266` on 2026-10-30 and both green; the other
+eight were not re-read for that change and each still carries its
+`5f73c18` reading**, which is why the column names both shas rather
+than claiming one recount.
 
-| # | The statement | State at `5f73c18` |
+| # | The statement | State, at `5f73c18` unless the cell says otherwise |
 |---|---|---|
-| B1 | The scope the release claims is the scope it holds | **Alexa's** — ORCH-210, D205 against D206 |
+| B1 | The scope the release claims is the scope it holds | **green at `df47266`** — settled by **D248**: Alexa ruled *« V1 c'est 44 ou demande a chatons »*, the consumer was asked under **D249** and waived both M17 musts, so v1.0.0 ships **42 of 44** and names E-49 and E-50 in the notes as not met, which is their own condition. D205 against D206 no longer stands open and ORCH-210 is closed; this cell read **Alexa's** until 2026-10-30 |
 | B2 | A spool the hub has acknowledged is freed | **green** — D221; the reproduction is off `#[ignore]` and asserts the fix |
 | B3 | The bytes already condemned have a stated route out | **not started** — ORCH-193 is `owed`; D221 fixes the judgement going forward and re-adopts nothing already set aside |
 | B4 | A release body reaches the page with its human half | **green** — a release's notes are a file in the tree, read by `release.yml` and asserted by `check-docs.sh` (ORCH-162) |
-| B5 | The three version numbers move, and each refusal says what is lost | **in flight, ungated** — `main` is still 2 / 1 / 1; `PROTOCOL_VERSION` 3 is on `pack-proto` (pushed), `RECORD_VERSION` 2 and `LAYOUT_VERSION` 2 on `pack-registry` (committed, not pushed) |
+| B5 | The three version numbers move, and each refusal says what is lost | **green at `df47266`** — `main` reads **3 / 2 / 2**: `PROTOCOL_VERSION` 3 (`herd-proto/src/lib.rs:160`), `RECORD_VERSION` 2 (`herd-hub/src/job.rs:72`), `LAYOUT_VERSION` 2 (`herd-hub/src/store.rs:99`), landed with M11's pack half from batch 12 (D229 to D235). There is no migration and the last two destroy an existing state root as a working root, which the refusals say; **D199's three moves are spent** and the constraint is moot (**D243**). This cell said *"`main` is still 2 / 1 / 1"* until 2026-10-30 |
 | B6 | A runner lends what its host can really lend | **green** — D220; reclaimable cache is no longer charged against the room |
 | B7 | Nothing the release ships says something false about the code | **in flight** — three branches landed in batch 10; `stale-comments` is in batch 11; ORCH-206's three disagreeing "Gated on chatOnS" lists are open |
 | B8 | No known-unstable test ships | **half** — V4 fixed with measured rates in batch 9; V3 is open and its question is Alexa's (below) |
 | B9 | The `--help` a runner prints is true | **green** — the output cap reads 1 GiB and says the flag raises it |
 | B10 | The release act is permitted without waking him | **green for an ordinary release** — the tag is the integrator's (D212); a v1.0.0 body is the stability promise itself and stays Alexa's own act (D210) |
 
-**Five green, two in flight, three that no amount of work here closes:**
-B1 and B8 are Alexa's word, and B3 is owed work nobody has started.
+**Seven green, one in flight, one half and one nobody has started:** B1
+and B5 went green on 2026-10-30 and are the only two re-read at
+`df47266`; **B7** is in flight; **B8** is half and its open question is
+Alexa's word; **B3** is owed work nobody has started. B1 is no longer
+his — D248 answered it.
 
 ## What is left to v1.0.0, in the order it has to happen
 
-1. **M11's pack half — thirteen steps, two of them on `main` or pushed.**
-   The one gate on everything is numbering the whole protocol surface at
-   `PROTOCOL_VERSION` 3, because a frame nobody numbers in that bump is
-   a frame nobody can add afterwards (D204 freezes the surface). The
-   mesh-address rule and both invariant-3 guards are **on `main`**
-   (D222), the protocol surface is **pushed** on `pack-proto`, and the
-   pack store, the `{out}` extraction (D223) and the hub registry with
-   both version bumps are **committed on local branches and not pushed**.
-   What it buys: E-12 and E-17, and with them the only route from 36 to
-   the ceiling. What it blocks: everything below, because the version
-   bump rides with it.
+1. **M11's pack half — on `main`, and running end to end in one
+   direction. What is left is the push.** The three sentences this
+   replaces are all stale, and every one of them described the tree
+   before batch 12: they read *"thirteen steps, two of them on `main`
+   or pushed"*, that the protocol surface was *"pushed on
+   `pack-proto`"*, and that the pack store, the `{out}` extraction and
+   the hub registry were *"committed on local branches and not
+   pushed"*. Read off `71efccf` on 2026-10-30 (ORCH-302):
+   `PROTOCOL_VERSION` 3 with `RECORD_VERSION` and `LAYOUT_VERSION` 2
+   landed with the pack half in batch 12, which is **B5** above; the
+   hub registry, the runner's content store, the peer fetch, the
+   mesh-bound endpoint and the `{out}` extraction (D223) are on
+   `main`; the layout step lays a declared `needs` out at `{in}/<key>`
+   before the first step runs and registers a declared `leaves` after
+   the fsync (batch 26, **D267**); and a pack crosses the network
+   between two real runners with the hub holding no byte of it
+   (batch 27, **D269**, **D270**). **What is left is one transfer
+   direction and one record field.** The **push**: M11's done-when
+   asks that an outbound-only runner complete both directions without
+   listening, only the pull half is built, and what is on `main` is
+   the refusal — an outbound-only holder is refused by name and
+   nothing moves (ORCH-220, `docs/plan.md` M11 S10). The field:
+   `JobRecord::packs_in` and `JobRecord::packs_out` are written by
+   nothing, so a record cannot name the pack an attempt consumed or
+   published (ORCH-248). What it buys: E-12 and E-17 — **two of the
+   six** musts between 36 and the ceiling of 42, the other four being
+   E-14, E-16, E-37 and E-42; the sentence this replaces called it
+   *"the only route"*, which it never was. What it blocks: nothing
+   below any more, because the version bump it used to carry is spent
+   (**D243**). **The gate that used to head this step is behind us,
+   and the constraint it carried is not:** the whole protocol surface
+   had to be numbered in that bump because D204 freezes it, so a
+   frame nobody numbered then is a frame nobody can add now — which
+   is why step 3's coalesce half has to be additive on an existing
+   frame (D229) rather than a new one.
 2. **M12's remainder** — per-runner budgets and keeper pinning (the rest
    of E-16), key-aware placement and the GC that moves packs (E-14).
    What it buys: two musts. What it blocks: nothing below, but its
    retention delay is a parked question, so it cannot be finished
    without an answer.
-3. **E-42** — the push hook's producer submit. `coalesce` and
-   `dedup_key` are parsed, validated and discarded today (ORCH-148), so
-   this is wiring a field that already exists on the wire.
+3. **E-42's coalesce half** — the push hook's producer submit. **The
+   second clause of the sentence this replaces was false, and it was
+   the orchestrator's own**, repeated from one of its briefs: it read
+   *"so this is wiring a field that already exists on the wire."*
+   Measured at `df47266`: `herd_proto::Asked` carries `needs` and
+   `leaves`, added for M11, and **neither `coalesce` nor `dedup_key`**;
+   `herdctl` has no `--coalesce` flag; neither field is anywhere on the
+   wire. What is true is the first clause and one thing more — the
+   declared `coalesce` and `dedup_key` are parsed and validated in
+   `herdctl/src/declaration.rs` and read nowhere else (ORCH-148), while
+   **the dedup behaviour is already delivered on a key the hub derives
+   itself** from the command, the labels and the declared commit, so
+   the two declared fields reach nothing. What is left is coalescing,
+   and it is not a field on a frame that exists: it needs an additive
+   `serde(default)` field on `Asked`, which D229 leaves
+   `PROTOCOL_VERSION` alone for, **and** a new job-outcome variant an
+   older `herdctl` would meet inside a frame it decodes — not literally
+   one of D229's two named unrecoverable forms, but the same hazard.
+   D75 fixed the shape, `superseded { by }` at exit 125, and not the
+   timing. What it buys: the second half of a must already counted
+   `part`. **Whether it is built before v1.0.0 is open and Alexa's.**
 4. **E-37's last two transitions** — a detached job's end needs the
    submitter's asking carried on `NewJob`, on `ToHub::SubmitJob` and in
    `job.json`, which is a wire *and* a record change and therefore wants

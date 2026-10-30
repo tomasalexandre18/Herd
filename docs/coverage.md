@@ -18,18 +18,76 @@ deployed is a tag behind `main`, so a `merged` row is not a promise about
 the running system — `docs/status.md` holds the versions, the disk and who
 operates them.
 
-**The musts, recounted from the table below on 2026-10-30 against the
-tree at `26e83cf`:** **36 of 44** wholly on `main`; **4** more with part
-of their work on `main` (E-12, E-16, E-17, E-37); **2** with none of it
-(E-14, E-42); **2** the consumer has released us from — **E-49
-waived** and **E-50 withdrawn** (**D248**). 36 + 4 + 2 + 2 = 44.
+**The musts, re-derived row by row from the table below on 2026-10-30
+against the tree at `71efccf`, batch 27:** **36 of 44** wholly on
+`main`; **5** more with part of their work on `main` (E-12, E-16,
+E-17, E-37 and **E-42**); **1** with none of it (**E-14**); **2** the
+consumer has released us from — **E-49 waived** and **E-50
+withdrawn** (**D248**). 36 + 5 + 1 + 2 = 44. **The derivation is
+mechanical and is not a figure carried forward:** the table below
+holds **55** rows, **44** of them `must`, and those 44 State cells
+read 36 `merged`, 5 `part`, 1 `planned`, 1 `waived`, 1 `withdrawn`.
 
-**Batch 18 moved no must into or out of the 36, and the count above is
-not a fresh recount:** it is batch 17's, made against `26e83cf`, and
-what changed under it is only E-49's and E-50's State cells. E-37 gained
-its fifth hub transition and **stays `part`**, because the nightly's
-verdict cannot be shown end to end until M14's nightly exists. ORCH-241
-carries the standing staleness of this paragraph.
+**E-42 moves from `planned` to `part`, and that one row is the whole of
+what moved.** The sentence this replaces read *"4 more with part of
+their work on `main` … 2 with none of it (E-14, E-42)"*, and it was
+wrong about E-42. **The recount is the orchestrator's ruling,
+2026-10-30**, taken after an execution agent measured the row and
+declined to move a must between columns itself. **E-42 is two rules and
+one of them is on `main` and asserted:** the hub derives a dedup key
+over the command, the label set and the declared commit
+(`herd-hub/src/job.rs:817`, length-prefixed fields, the commit a
+counted third since **D156**), and `JobDirStore::submit` looks that key
+up in `open_work` under the store's one lock and joins **any
+non-terminal job, running included** (`herd-hub/src/store.rs:2234`),
+asserted against the real binaries in
+`herdctl/tests/declared_dedup.rs`. Coalescing exists nowhere, and
+**D75** keeps the two apart — *"Dedup joins; coalescing discards. They
+are two behaviours, not one"* — so joining a running job is right for
+dedup and is **not** evidence that E-42's second rule is built.
+
+**E-14 is `planned`, and a reading of 2026-10-30 that held it withdrawn
+is refuted by the tree.** **D248** withdraws **E-50** alone and waives
+E-49; E-14's State cell reads `planned`, its note reads *"gated on
+their replication (M18)"*, and M12 has nothing on `main`. It is the one
+must with none of its work built, and it stays a `planned` row:
+**retiring a must is the consumer's act and nobody else's** (D248,
+D249), so no count here moves a row into `withdrawn` without one.
+
+**Three State cells have been re-measured against the code: E-42's,
+and then E-12's and E-17's against `71efccf` on 2026-10-30
+(ORCH-302); the other 41 carry their 2026-10-30 reading**, and
+batches 18 to 27 are not claimed to have moved any of them. E-37
+gained its fifth hub transition and **stays `part`**, because the
+nightly's verdict cannot be shown end to end until M14's nightly
+exists. ORCH-241 carries the standing staleness of these paragraphs.
+
+**E-12 and E-17 stay `part`, and the three claims their notes made
+about what is absent are all three refuted by the tree — all three
+were already false before batch 27** (ORCH-302, measured here against
+`71efccf`). *"The runner binds and drops both"* is false: the runner
+binds `packs_in` and `packs_out` and hands them to `job::execute`
+(`herd-runner/src/lib.rs:4673`-`:4703`). *"`ToHub::RegisterPack` is
+constructed nowhere under `herd-runner/src`"* is false: it is
+constructed once, at `herd-runner/src/lib.rs:1882`; `git grep -c`
+answers **2**, and the second hit is the doc comment at `:1857`.
+*"No job is ever given a pack"* is false: a declared `needs` is laid
+out at `{in}/<key>` before the first step
+(`herd-runner/src/lib.rs:1780`, called at
+`herd-runner/src/job.rs:332`). The branch that refuted all three is
+`m11-pack-layout`, in **batch 26** (**D267**), one batch earlier than
+the one usually blamed; and a fourth clause, *"`packs_in:
+Vec::new()` in `herd-hub/src/server.rs`"*, was **stale the day it was
+written**, that string occurring **0** times under `herd-hub/src`.
+**Batch 27 widened the staleness rather than creating it:** D269 and
+D270 put the peer path through, so a pack now moves between two real
+runners with the hub holding no byte of it. **Two named Herd-side
+absences keep both rows out of `merged`:** the **push** direction, so
+an outbound-only holder is refused by name and nothing moves
+(ORCH-220, `docs/plan.md` M11's done-when); and `JobRecord::packs_in`
+and `JobRecord::packs_out`, written by nothing, so a record cannot
+name the pack an attempt consumed or published (ORCH-248). Each row
+says which of the two bears on it.
 
 **The done figure did not move; the shape of the eight that are not did.**
 Five landings reached `main` after the 2026-10-29 count (batches 12 to
@@ -66,12 +124,12 @@ met on it. **D206 is overtaken, not reversed.**
 | E-09 | should | deadline cancels unstarted job | M9 | merged | pulled forward: E-41 (must) needs it, **and** it is D88's only bound on a job no connected runner could ever fit. An absolute instant in Unix seconds, resolved from `--deadline +15m` or RFC 3339 by the CLI, judged on the hub's clock, recorded on the record (D94). It bounds waiting only: a job that has **started** is never touched by it (that is M4's time cap, exit 124), asserted with a job whose deadline passes while it runs and which finishes 0. A queued job past it ends `cancelled (deadline)`, exit 125 (D40), and the sentence names what it was waiting for when the moment came — so a job cancelled because its machine was switched off says `she is gaming` rather than only `deadline`. Verified: past at submission, past across a hub restart, and firing with no runner connected at all |
 | E-10 | should | depend on one other job | M9 | merged | capped: one parent, no conditions (invariant 1). Start after its **success**, which is exit 0 and nothing else; every other ending — non-zero, signalled, could-not-start, stopped-by-cap, cancelled, lost, impossible — ends the child `cancelled (parent)` naming the parent and how it ended (D95). A cycle is **unrepresentable** rather than checked: a parent must already exist, ids are minted in order, so a job can only name one older than itself — no job can name itself and no two can name each other, verified by guessing the next id and being refused. A parent this hub cannot read is never read as one that succeeded |
 | E-11 | must | consumer-declared commands, nix develop | M10 | merged | the field set, `[executor]` hooks and ten real commands are now known in full, including `labels_from` (D74) and the step timestamps (D77) (issue #16); gated: their real declaration file (M18) |
-| E-12 | must | packs by (commit, key), no shared build trees | M11 | part | D10: hub registers, peers transfer; the real shape (`manifest.tsv`, `pack.meta`, `objects/<sha256>`, id = sha256 of the manifest) and measured figures (~400 MiB, ~560 files, verified under 2 s) are now known (issue #16); gated on their pack (M18). **D148 holds the line this row is on**: a pack is read next by a *job*, so it never touches the hub; a record is read next by a *requester*, so it does. M11 builds both and splits record-first if it overflows, with both halves' frames designed in one move to `PROTOCOL_VERSION` 2, approved 2026-10-16, because a break is paid by the deployment and must not be paid twice. **M11 is merged and this row is not.** What shipped first is the record half (D148, D150, D152). **Recounted 2026-10-30 against the tree at `26e83cf`, `planned` to `part`: the sentence this replaces — that the pack half has no frame on either protocol enum and no code behind one — is refuted by the tree.** On `main`: `herd-proto/src/pack.rs`, with five pack variants on `ToHub` and five on `FromHub`; the hub's `PackRegistry` keyed on `(commit, key)` (`herd-hub/src/registry.rs`); the runner's content-addressed store, its peer fetch client and its mesh-bound serving endpoint (`herd-runner/src/packstore.rs`, `fetch.rs`, `endpoint.rs`, `mesh.rs`); and a runner that announces what it holds, measured against both binaries as processes (`herd-hub/tests/packs_announced.rs`). What is **not** on `main` is the path a job takes through any of it: the hub sends `FromHub::AssignJob`'s `packs_in` and `packs_out` empty (`packs_in: Vec::new()` in `herd-hub/src/server.rs`), the runner binds and drops both (`herd-runner/src/lib.rs`), and `ToHub::RegisterPack` is constructed nowhere under `herd-runner/src` — so no job is ever given a pack and no pack a job leaves is ever published (ORCH-234). `main`'s own prose says the same in `herd-hub/src/registry.rs` and `docs/status.md`: wired at the edges, not through |
+| E-12 | must | packs by (commit, key), no shared build trees | M11 | part | D10: hub registers, peers transfer; the real shape (`manifest.tsv`, `pack.meta`, `objects/<sha256>`, id = sha256 of the manifest) and measured figures (~400 MiB, ~560 files, verified under 2 s) are now known (issue #16); gated on their pack (M18). **D148 holds the line this row is on**: a pack is read next by a *job*, so it never touches the hub; a record is read next by a *requester*, so it does. M11 builds both and splits record-first if it overflows, with both halves' frames designed in one move to `PROTOCOL_VERSION` 2, approved 2026-10-16, because a break is paid by the deployment and must not be paid twice. **M11 is merged and this row is not.** What shipped first is the record half (D148, D150, D152). **Recounted 2026-10-30 against the tree at `26e83cf`, `planned` to `part`: the sentence this replaces — that the pack half has no frame on either protocol enum and no code behind one — is refuted by the tree.** On `main`: `herd-proto/src/pack.rs`, with five pack variants on `ToHub` and five on `FromHub`; the hub's `PackRegistry` keyed on `(commit, key)` (`herd-hub/src/registry.rs`); the runner's content-addressed store, its peer fetch client and its mesh-bound serving endpoint (`herd-runner/src/packstore.rs`, `fetch.rs`, `endpoint.rs`, `mesh.rs`); and a runner that announces what it holds, measured against both binaries as processes (`herd-hub/tests/packs_announced.rs`). **Recounted again 2026-10-30 against `71efccf`, batch 27, and it stays `part` — but every one of the three things this note said was missing is on `main`, and all three were already false before batch 27** (ORCH-302). The sentence this replaces read *"the hub sends `FromHub::AssignJob`'s `packs_in` and `packs_out` empty (`packs_in: Vec::new()` in `herd-hub/src/server.rs`), the runner binds and drops both (`herd-runner/src/lib.rs`), and `ToHub::RegisterPack` is constructed nowhere under `herd-runner/src` — so no job is ever given a pack and no pack a job leaves is ever published"*. Measured line by line at `71efccf`: the hub **resolves** every `needs` key **before** the attempt is numbered, so a job waiting for a pack spends none of its goes (`herd-hub/src/server.rs:5591` `packs_for`, the frame built at `:5631` with `packs_out: record.leaves.clone()` at `:5637`), and the string `packs_in: Vec::new()` occurs **0** times under `herd-hub/src` — that clause was **stale the day it was written**, the resolve having landed in batch 18 on `pack-assignment`; the runner **binds and uses** both, handing them to `job::execute` as `job::Packs` (`herd-runner/src/lib.rs:4673`-`:4703`); and `ToHub::RegisterPack` **is** constructed, once, at `herd-runner/src/lib.rs:1882`, the other of `git grep -c`'s two hits being the doc comment at `:1857`. Those last two landed together with the layout step in **batch 26** (`m11-pack-layout`, **D267**), so a declared `needs` is laid out at `{in}/<key>` before the first step runs (`herd-runner/src/lib.rs:1780` `lay_out_packs`, called at `herd-runner/src/job.rs:332`) and a declared `leaves` is ingested and registered (`herd-runner/src/job.rs:734`), asserted against the real binaries as processes in `herd-hub/tests/pack_chain.rs` `a_declared_command_leaves_a_pack_and_a_later_one_is_laid_out_with_it`. **Batch 27 widened the staleness rather than creating it:** D269 mints the transfer capability and D270 makes a runner await its bind and advertise the endpoint it really got, so **a pack now moves from one real runner to another with the hub holding no byte of it** (`a_pack_moves_from_one_real_runner_to_another`, which counts the bytes off the fetcher's socket and asserts the needle appears nowhere under the hub's root). **Two Herd-side absences keep this row `part`, and they are named rather than argued.** First, the **push** direction: M11's done-when asks that *"an outbound-only runner completes both directions without listening"*, only the pull half is built, and what is on `main` is the **refusal** — an outbound-only holder is refused by name and nothing moves, which is itself what `herd-hub/tests/pack_chain.rs:1241` asserts (ORCH-220, `docs/plan.md` M11 S10). Second, the record half of ORCH-234: `JobRecord::packs_in` and `JobRecord::packs_out` are written by **nothing** on this build — every occurrence under `herd-hub/src` is a constructor default — so `job.json` and `herd-hub report` cannot say which pack an attempt consumed or published (ORCH-248; that field's own doc at `herd-hub/src/job.rs:1107`-`:1117` carries the measurement). *Gated on their pack (M18)* stands, and is a different column from either of these |
 | E-13 | should | content-addressed, complete or absent | M11 | planned | done with the store: retrofitting CAS would force a migration, and D10 needs it for free diffs. **Amended 2026-10-29:** the deduplication that ships with the new disk policy is not that retrofit and forces no migration — `objects/<sha256>` beside `jobs/`, every file in a job's `files/` a hard link to it, **new arrivals only**, `LAYOUT_VERSION` unchanged, and an older binary reading a shared root sees ordinary files (`docs/disk-policy.md` §2.9). Per-file content addressing for packs, which is what this row is about, is unchanged |
 | E-14 | must | warm caches ready before job | M12 | planned | Q5/D9: no cache engine in Herd; their own words, "you move packs; our executor owns warm caches" (issue #16), shrink M12 to moving packs, key-aware placement and GC/budgets — the cache-specific prepare step is dropped for the generic step timestamps (D77); gated on their replication (M18) |
 | E-15 | must | full job record on disk | M2 | merged | byte-faithful logs (D18); a lost log chunk leaves a named marker, and a lost tail is asked for (D36). **Kept files are real** (D131): what a job leaves under `{out}` is collected before the workspace goes and written into the record's `files/` directory, capped at 32 MiB with a refusal carrying figures over it. **D148 keeps 32 MiB and changes what it means**: it stops being a refusal boundary and becomes the line between the inline carriage (the verdict frame, as today) and the streamed one (M11), so a requester never declares which it needs and cannot tell which it got. Retention of the record itself — 14/90 days by priority class — is still M12's; the separate budget for a job's large files shipped in M11 instead (D152), because streaming without a sweeper is a disk-full outage with a delay fuse. **Re-cut 2026-10-29 (`docs/disk-policy.md` §0): the two numbers are unchanged and now mean a maximum age rather than a deletion time.** What decides is space — free space on the filesystem the state root sits on — with the span as the backstop that acts when nothing is under pressure and the output floor doubling as the guard that keeps space pressure off a fresh record. The record side is 0.32 % of the first consumer's state root as they read it on 2026-10-29, so record removal is a correctness, privacy and walk-bounding instrument rather than a space one; the space is in the collected files, and deduplication by hard link ships on by default to divide their arrival rate. M12's done-when — a step result past retention gone while a 60-day merger result reads fine — survives verbatim and is the backstop's test. One latent defect closed on the way (D148): `FromHub::JobLog` sent a job's whole log in one frame, so a log over ~48 MiB built a frame past the ceiling and a `herdctl wait` got exit 125 with no verdict — the backlog now travels in 8 MiB frames, no protocol move |
 | E-16 | must | budgets, gc with pinning | M12 | part | per runner, not central (D10); keepers pin. D148 adds the hub's **own** budget beside them, for the large files a record carries, with a floor in days and a named line when eviction breaks it — **built in M11** (D152), so what is left here is the per-runner budgets and keeper pinning. **The floor in days survives (D202, re-affirmed 2026-10-27) and gains a second job on 2026-10-29: it is the record guard as well as the byte floor**, and a second bound joins it — a free-space floor on the filesystem, which is the only quantity that can see a record byte, a log byte and a collected byte at once, because the output budget governs the collected files only by its own documentation. Nothing is kept without a bound: what can no longer serve is removed after a stated delay, saying so, or moved to a configurable archive path, and whatever is held appears in a report with its size and counts toward the space calculation (`docs/disk-policy.md` §0.6, §0.7); keepers pin packs only, because a record has left its runner by the time the job is reported finished |
-| E-17 | must | atomic publication everywhere | M11 | part | a manifest registers only once every blob is held; job-record atomicity already in M2 (Q1). **Recounted 2026-10-30, `planned` to `part`: the manifest half is built, and the sentence this replaces — that the manifest is part of M11's unbuilt pack half — is refuted by the tree.** Atomicity is the registry's first stated property: every file of a pack is written and fsynced inside `packs/manifests.part/<unique>/`, that directory is fsynced, and only then does it take the published name in one `rename(2)`, so a hub killed anywhere leaves a pack that is absent or whole and there is no third outcome (`herd-hub/src/registry.rs`). The runner's own store is whole-or-absent beside it — a half-fetched pack a kill left behind is removed and said (`herd-runner/src/fetch.rs`). What is not on `main` is the publication there would be anything to register: no runner constructs `ToHub::RegisterPack`, so the *only once every blob is held* clause has no live path, and nothing lays a pack out at `{in}/<key>` for a later job to read (E-12, ORCH-234). Completeness is deliberately **not** the hub's to compute — holdings are per manifest, so `PackRegistry::state_of` never returns `PackState::Incomplete` and a fetcher consults its own store for what it lacks |
+| E-17 | must | atomic publication everywhere | M11 | part | a manifest registers only once every blob is held; job-record atomicity already in M2 (Q1). **Recounted 2026-10-30, `planned` to `part`: the manifest half is built, and the sentence this replaces — that the manifest is part of M11's unbuilt pack half — is refuted by the tree.** Atomicity is the registry's first stated property: every file of a pack is written and fsynced inside `packs/manifests.part/<unique>/`, that directory is fsynced, and only then does it take the published name in one `rename(2)`, so a hub killed anywhere leaves a pack that is absent or whole and there is no third outcome (`herd-hub/src/registry.rs`). The runner's own store is whole-or-absent beside it — a half-fetched pack a kill left behind is removed and said (`herd-runner/src/fetch.rs`). **Recounted again 2026-10-30 against `71efccf`, batch 27: it stays `part`, and the reason it does is a different reason — the one this note gave is refuted** (ORCH-302). The sentence this replaces read *"what is not on `main` is the publication there would be anything to register: no runner constructs `ToHub::RegisterPack`, so the only once every blob is held clause has no live path, and nothing lays a pack out at `{in}/<key>` for a later job to read"*, and **both halves of it were already false before batch 27**: the layout step landed in **batch 26** (`m11-pack-layout`, **D267**), so `Session::register_pack` sends `ToHub::RegisterPack` **after** the ingest and therefore after the fsync — `packstore::ingest` writes the manifest last — (`herd-runner/src/lib.rs:1875`-`:1887`, called at `herd-runner/src/job.rs:734`), the hub's one registering arm accepts it inside its own arrival window and recomputes the id off the verbatim manifest bytes (`herd-hub/src/server.rs:6221`), and `Session::lay_out_packs` lays `{in}/<key>` out before the first step (`herd-runner/src/lib.rs:1780`). **So the *only once every blob is held* clause has a live path and is asserted**, end to end in one test rather than four because the two halves are one sentence, in `herd-hub/tests/pack_chain.rs` `a_declared_command_leaves_a_pack_and_a_later_one_is_laid_out_with_it`; and the kill case is asserted beside it — a transfer cut mid-flight leaves no readable object and no registered pack (`herd-runner/src/fetch.rs:1369`). **What keeps the row `part` is one measured absence and one unbuilt path.** The absence: `JobRecord::packs_out`, the field whose own doc calls itself where a pack's provenance lives and says it is *"written when a runner's post-fsync registration frame is accepted"*, is written by **nothing** — the registering arm updates the registry and never the record — so a publication is whole on disk and invisible in `job.json` (ORCH-248, `herd-hub/src/job.rs:1131`-`:1149`; that doc sentence is itself stale and is a finding against the crate, not against this row). The unbuilt path: publication by an **outbound-only** holder pushing to a keeper, which `docs/plan.md` M11 names in the same paragraph as this row's clause — *"it pushes to and pulls from a keeper, never serves"* — and whose done-when is unmet, so there is one transfer direction whose whole-or-absent has never been built, let alone asserted (ORCH-220). Completeness is deliberately **not** the hub's to compute — holdings are per manifest, so `PackRegistry::state_of` never returns `PackState::Incomplete` and a fetcher consults its own store for what it lacks |
 | E-18 | must | four priorities with aging | M6 | merged | aging computed, not written (D67); default step 30 min, so the lowest level reaches the top in 90 min; the raise is upwards only (D72); the 90-min figure itself is a simulated-time and 6-second-real-clock assertion, not a measurement on a busy day |
 | E-19 | must | no fallback while available | M7 | merged | preference is one declared integer per runner (D81); a draining runner does not count as available (D80); the limit is `--stickiness-limit`, 3 h, printed at startup and in every waiting sentence; verified against two real runners: the second build never moved while the PC was merely busy — proved now by three of the hub's own restatements rather than by a 600 ms sleep (D101) — and moved in well under 10 s when it died. Switch-off case retested with E-33 in M9 |
 | E-20 | must | one queue for everything | M6 | merged | the queue is the unfinished job directories; one dispatch pass, which a submission goes through like everything else; no lane for a merger. "Every QEMU on every client listed as a job" needs their executor and the status document (M13, gated M18) |
@@ -96,7 +154,7 @@ met on it. **D206 is overtaken, not reversed.**
 | E-39 | should | results searchable | — | planned | deferred past M18; on-disk records are greppable meanwhile |
 | E-40 | should | health every 15 s | M3 | merged | the age is in the hub's state, and is **surfaced in the status document since 2026-10-29** (E-35, D215): `last_health_at` and the report count, as an instant and not an age, so a reader computes the age against its own clock |
 | E-41 | must | scheduled nightly, exclusive | M14 | merged | now concrete: 03:00 local, daily, only if main moved, 5 h cap, `nightly` exclusive, 05:00 start deadline else skipped with the reason as an event (issue #16); gated: their nightly command, live at M18. **The predicate is the requester's, not the hub's** (D207): `herdctl if-moved` submits a declared command when a named ref has moved since the last run it recorded, under a lock so two overlapping timers cannot both submit, and refuses rather than guess when its state file is missing, unreadable or from another version. The **timer** is the consumer's own, as E-42's hook is — `docs/scheduling.md` says what we ship and what they write. **One deviation, and it is not closeable by hub work:** a skip that submitted nothing is `herdctl`'s own stderr line and never an event, because the hub never heard of the job. The skip E-41 *can* have as an event is the other one — a pass submitted with `--deadline` that nothing started by 05:00, which the hub cancels and reports (E-09, D40). **Landed 2026-10-29 in batch 8** (`herdctl/src/moved.rs`, `herdctl/tests/if_moved.rs`, `docs/scheduling.md`, D217). `merged` here means **Herd's side is on `main` and nothing closeable is left**: the timer is the consumer's by design (D106, D207) and the no-submission skip is `herdctl`'s own stderr line by decision (D217), so this row is delivered with that one deviation on the record rather than closed as E-41 words it |
-| E-42 | must | push hook submits producer | M14 | planned | Herd side = scriptable detached submit; the hook is theirs; now concrete: `dedup_key` `produce:<commit>`, `coalesce` key `produce:main` superseding a queued older `produce`, never a running one (D75, issue #16) |
+| E-42 | must | push hook submits producer | M14 | part | Herd side = scriptable detached submit; the hook is theirs; concrete as `dedup_key` `produce:<commit>` and a `coalesce` key `produce:main` (D75, issue #16). **Recounted 2026-10-30, `planned` to `part`, by the orchestrator's ruling: the row is two rules, and the one it names first is on `main` and asserted.** **Dedup — joining — is built:** the hub derives the key over command, labels and the declared commit (`herd-hub/src/job.rs:817`, length-prefixed, the commit a counted third field since D156), and `JobDirStore::submit` looks it up in `open_work` under the store's one lock and joins **any non-terminal job, running included** (`herd-hub/src/store.rs:2234`); asserted against the real binaries in `herdctl/tests/declared_dedup.rs`, whose own doc comment reads *"A push hook firing twice is the case this exists for"*. **Coalesce — discarding — exists nowhere:** no `coalesce` field on `herd_proto::Asked`, no `superseded` job outcome, and the declared `coalesce` and `dedup_key` are parsed and validated in `herdctl/src/declaration.rs` and read nowhere else, so neither declared field reaches the wire — the delivered behaviour rides a key the **hub derives itself**. D75 keeps the two apart, *"Dedup joins; coalescing discards"*, and considers dedup first, so joining a running job is right for dedup and is no evidence for coalesce; coalescing supersedes a queued older `produce`, never a running one. **The clause that the second submission *"says so"* is met by a detached submit returning the existing id** (the orchestrator, 2026-10-30): the hub sends `JobAccepted` and then a `JobNote` carrying the join sentence, but `submit` returns on `JobAccepted` and closes the socket, so the note reaches a connection that is gone; the documented wrapper is `id=$(herdctl submit …)` then `herdctl wait "$id"`, and **the id is the answer**. **No test asserts that silence, deliberately** — asserting a behaviour nobody chose would freeze it. **Whether the coalesce half is built before v1.0.0 is open and Alexa's, and is not decided here:** D75 fixed its shape (`superseded { by }`, exit 125) and not its timing, and building it needs an additive `serde(default)` field on `Asked`, which D229 leaves `PROTOCOL_VERSION` alone for, **and** a new job-outcome variant an older `herdctl` would meet inside a frame it decodes — not literally one of D229's two named unrecoverable forms, but the same hazard. The row carries no `gated` marker and *Gated on chatOnS* below says why |
 | E-43 | must | merger jobs start first | M6 | merged | a priority, never a side door; verified against the real binaries: a merger submitted last takes the next free slot. Which jobs a merge submits is theirs (M18) |
 | E-44 | must | restart loses nothing | M2 | merged | verified: hub killed mid-job, result lands, record complete. The tail-loss case now holds the job open with a file until the runner has *seen* the link go and writes its own marker when it is over, so "the tail was written while no hub existed" is established rather than assumed from two sleeps (D101) |
 | E-45 | must | one data root only | M4 | merged | cooperative confinement only — full containment needs a mount namespace E-46 forbids (D28) |
@@ -123,8 +181,8 @@ trusting it.
 *Gated* carries this file's opening meaning — the acceptance criterion
 needs a chatOnS deliverable, and a test against the fixture consumer
 stands in until M18. It says **nothing** about whether Herd's own side is
-built: E-14 and E-42 are gated *and* have nothing on `main`, and E-12 is
-gated *and* partly built, which are two different columns. The
+built: E-14 is gated *and* has nothing on `main`, while E-12 and E-42
+are gated *and* partly built, which are two different columns. The
 State column and the counted figure at the top of this file are what say
 which is which.
 
@@ -180,9 +238,10 @@ quietly; leaving it out was a reading, not a judgement.
 
 **Thirteen milestones are merged to `main`:** M1 (the substrate, no must
 of its own), the scheduler spine M2 to M9, M10 (the command declaration
-contract), M11 (its record half, with the pack half part-built and
-delivering no must yet, see below), M15 (approval and versions) and M16
-(the hub deployed, the server's runner native). **M13
+contract), M11 (its record half, with the pack half now running end to
+end in one direction and delivering no must yet, see below), M15
+(approval and versions) and M16 (the hub deployed, the server's runner
+native). **M13
 and M14 are not among them and each now has one of its two musts on
 `main`**, landed 2026-10-29 in batch 8: E-35 and E-41 (D215, D217),
 with E-37 partly built (D216): four of its listed transitions were
@@ -191,11 +250,15 @@ job's end — is built on `detached-end-event`, 2026-10-30**, so what is
 left of E-37 is the nightly's verdict, which is that same event and
 waits on M14's nightly existing rather than on any further hub work.
 
-**36 of 44 musts are wholly on `main`.** Of the eight that are not: four
-are partly built (E-16, whose hub-side budget shipped in M11; E-37; and
-M11's two pack musts E-12 and E-17, recounted on 2026-10-30); two have
-nothing on `main` (E-14 and E-42); and two the consumer has released us
-from — **E-49 waived**, **E-50 withdrawn** (D248). Four `should`
+**36 of 44 musts are wholly on `main`.** Of the eight that are not:
+**five** are partly built (E-16, whose hub-side budget shipped in M11;
+E-37; M11's two pack musts E-12 and E-17, recounted twice on
+2026-10-30, the second time against `71efccf` and batch 27 with both
+staying `part` (ORCH-302); and E-42, whose dedup half is built and
+asserted and whose coalesce half is absent, recounted on 2026-10-30);
+**one** has nothing on `main`
+(E-14); and two the consumer has released us from — **E-49 waived**,
+**E-50 withdrawn** (D248). Four `should`
 rows are merged — E-09 and E-10 beside M9, E-40 beside M3, E-53 beside
 M2 — and E-52 is half of one. Twelve musts have had an independent
 adversarial pass against the real binaries (E-03, E-15, E-44 from M2;
@@ -205,22 +268,35 @@ not had that pass.
 
 Five things a reader must not mistake for done:
 
-1. **Merged is not running.** The hub runs `herd-hub:0.3.3` and the
-   server's runner is pinned at the tag `v0.3.2`, so three fixes that
-   are on `main` are on no machine (D163, D164, D165), and the newest
-   release anybody can download is v0.3.0. `docs/status.md` carries the
-   live figures, the traps in the deployed runner, and who operates
-   what.
+1. **Merged is not running.** **The newest published release is
+   v0.4.1** (`docs/status.md`; this line said v0.3.0 until 2026-10-30
+   and was two releases stale). What the consumer's machines actually
+   run is a fact that reaches us only as a dated report (D161), and the
+   last one in the tree is `docs/handover.md`'s — pin `v0.3.2`, the
+   live unit `herd-runner-0.3.2`, the hub container `herd-hub:0.3.3`,
+   with D163, D164 and D165 shipped in v0.3.4 and reaching nothing
+   until that pin moves. **The figures are not restated here**, because
+   two documents disagreeing about their fleet is how this line went
+   stale: `docs/status.md` carries the live figures, the traps in the
+   deployed runner, and who operates what.
 2. **M11 is merged, E-12 and E-17 are not delivered, and the pack half
-   is now partly in the tree.** The record half shipped first: a job's
-   files come home, large ones stream, and the hub sweeps them against
-   its own budget (D148, D150, D152). The pack half — frames on both
-   protocol enums, the hub's registry, the runner's content store, a
-   peer fetch and a mesh-bound endpoint, and a runner that announces
-   what it holds — landed in batches 12 to 16, and it is **wired at the
-   edges and not through**: no job is assigned a pack and no pack a job
-   leaves is registered (ORCH-234). That is why both rows now read
-   `part` and why neither reads `merged`.
+   now runs end to end in one direction.** The record half shipped
+   first: a job's files come home, large ones stream, and the hub
+   sweeps them against its own budget (D148, D150, D152). The pack
+   half landed over batches 12 to 27, and the sentence this replaces —
+   *"wired at the edges and not through: no job is assigned a pack and
+   no pack a job leaves is registered"* — was **already false before
+   batch 27** and is false now (ORCH-302). A declared `needs` is
+   resolved by the hub, laid out at `{in}/<key>` before the first step
+   runs, and a declared `leaves` is ingested and registered (batch 26,
+   **D267**); a pack crosses the network between two real runners with
+   the hub holding no byte of it (batch 27, **D269**, **D270**). Both
+   rows still read `part`, and the two reasons are named in them: the
+   **push** direction is unbuilt, so an outbound-only holder is
+   refused by name and nothing moves (ORCH-220, `docs/plan.md` M11's
+   done-when), and `JobRecord::packs_in` and `packs_out` are written
+   by nothing, so a record cannot name the pack an attempt consumed or
+   published (ORCH-248).
 3. **E-45 is cooperative confinement only** (D28): a job can write
    anything the runner's user can. Full containment needs a mount
    namespace E-46 forbids the runner the privilege for. On the
@@ -278,7 +354,8 @@ Five things a reader must not mistake for done:
 
 **Total: 44 of 44 musts placed**, across **16** must-bearing milestones.
 *Placed* is where each must's work belongs and not whether it is done: the
-done figure is **36 of 44** and it is counted at the top of this file. M1
+done figure is **36 of 44**, re-derived from the 44 `must` State cells at
+the top of this file against `71efccf` and unmoved by that recount. M1
 and M18 carry no must of their own: M1 is the substrate every must builds
 on; M18 closes the acceptances of *Gated on chatOnS* above — the one
 list, derived from the rows — against chatOnS's real deliverables. This
@@ -293,8 +370,8 @@ disagreeing copies (ORCH-206).
   gated on chatOnS's results.json for the load-vs-real failure split.
 
 Every must is placed, and three kinds of must are **not** simply owed:
-four are partial (E-12, E-16, E-17, E-37), two the consumer has released
-us from (**E-49 waived**, **E-50 withdrawn**, D248), and
+five are partial (E-12, E-16, E-17, E-37, E-42), two the consumer has
+released us from (**E-49 waived**, **E-50 withdrawn**, D248), and
 nine carry a gated or real-hardware note that names its closing
 milestone — the seven of *Gated on chatOnS* above, plus E-30 and E-49,
 whose checks are manual and wait on nothing of the consumer's. This

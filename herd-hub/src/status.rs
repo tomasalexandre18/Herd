@@ -102,7 +102,18 @@ use crate::job::Timestamp;
 /// an operator's build does not know is refused by name with both figures
 /// ([`Status::read`]), which is the cost and is the one this number exists
 /// to pay.
-pub const STATUS_VERSION: u32 = 2;
+///
+/// **3 since 2026-10-30, when [`PacksNow`] joined it** (M12 clause 2, E-14).
+/// The field is additive and serde reads a document without it, so once again
+/// compatibility is not why this moved: it moved because the field's whole
+/// subject is a distinction between two absences, and leaving the number at 2
+/// would have added a third absence nobody can resolve. A renderer finding no
+/// `packs` on a version-2 document cannot tell whether this hub keeps no pack
+/// registry or the hub that wrote the document does not record one — and
+/// "which kind of nothing is this" is exactly what the field exists to answer
+/// (D257). At version 3 there is one reading left: the hub records it, and an
+/// absent `packs` means this root keeps no registry.
+pub const STATUS_VERSION: u32 = 3;
 
 /// The document's name in the state root.
 ///
@@ -182,6 +193,67 @@ pub struct Status {
     pub running: Vec<RunningNow>,
     /// Every job still in the queue, with what each one is waiting for.
     pub queued: Vec<QueuedNow>,
+    /// What this hub's pack registry holds, and which packs it cannot say
+    /// anybody holds (M12 clause 2, E-14).
+    ///
+    /// **Last, because it is about what the volume holds rather than about
+    /// work**, and the document is ordered as an operator reads it.
+    ///
+    /// **Absent means this root keeps no pack registry**, which is a real
+    /// state and not an empty one: it is a store opened without packs. A
+    /// registry with nothing registered is `{"registered": 0, …}`, and the two
+    /// are different facts (D257). Left off rather than `null`, which is this
+    /// document's standing rule for every absence — and what makes *this*
+    /// absence mean exactly one thing is [`STATUS_VERSION`], which moved to 3
+    /// with the field: a version-2 document is refused by name rather than
+    /// read as a hub with no registry.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub packs: Option<PacksNow>,
+}
+
+/// What this hub's pack registry holds, and what it does not know about it
+/// (M12 clause 2, D257).
+///
+/// **The list is what is wrong, not what there is.** A pack a runner holds
+/// needs no row here: an operator reads this document to find what is
+/// missing, and a row per registered pack would make it grow with the
+/// registry — which it may not do, because the writer skips a publication
+/// whose facts are unchanged and that comparison is over the whole document.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PacksNow {
+    /// How many packs are registered on this root.
+    pub registered: usize,
+    /// How many connected runners have said what they hold **at all**.
+    ///
+    /// **`0` is a fleet that has not spoken, not a fleet holding nothing.**
+    /// Holdings are volatile: they are forgotten when a link goes and
+    /// re-announced after every welcome, so a hub that has just started
+    /// knows of no holder for any pack, and this figure is how a reader tells
+    /// that from a fleet that really holds none of them (D257).
+    pub runners_that_said: usize,
+    /// Every registered pack no connected runner says it holds.
+    ///
+    /// Empty on a healthy root. A pack in it is a job that will **wait** if
+    /// one needs it, with the sentence this state's name belongs to — never a
+    /// refusal (D13).
+    pub unheld: Vec<PackNow>,
+}
+
+/// One registered pack nobody can be said to hold, by name.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PackNow {
+    /// The pack's id: the sha256 of its `manifest.tsv`.
+    pub pack: String,
+    /// The commit and the `leaves` key it is registered for, which is what a
+    /// job's `needs` resolves against.
+    pub commit: String,
+    pub key: String,
+    /// The state's own name, as the registry spells it: `no_holder` when every
+    /// runner that has said what it holds says it does not hold this one, or
+    /// `no_runner_has_said` when none of them has said anything at all. The
+    /// word is the registry's (`registry::Custody::name`) so that the document
+    /// and the sentence a waiting job is given cannot drift apart.
+    pub custody: String,
 }
 
 /// The hub itself.
@@ -488,6 +560,7 @@ impl Status {
             && self.away == other.away
             && self.running == other.running
             && self.queued == other.queued
+            && self.packs == other.packs
     }
 
     /// How many jobs this document accounts for, running and queued.
@@ -734,6 +807,52 @@ impl fmt::Display for Status {
                     .unwrap_or("no reason recorded yet"),
             )?;
         }
+
+        // What the volume holds, and which of it nobody can be said to hold
+        // (M12 clause 2). The three cases are three different facts and each
+        // gets its own words: no registry at all, a registry nothing is
+        // missing from, and the packs that are missing — named, because a
+        // pack with no holder found by a job that failed is exactly the
+        // silent failure clause 2 forbids.
+        writeln!(f)?;
+        match &self.packs {
+            None => writeln!(f, "packs: this hub keeps no pack registry")?,
+            Some(packs) => {
+                writeln!(
+                    f,
+                    "packs registered: {}; {} connected runner(s) have said what they hold",
+                    packs.registered, packs.runners_that_said,
+                )?;
+                if packs.unheld.is_empty() {
+                    writeln!(f, "  every registered pack has a holder")?;
+                }
+                for pack in &packs.unheld {
+                    writeln!(
+                        f,
+                        "  {} ({}/{}) {}",
+                        pack.pack,
+                        pack.commit,
+                        pack.key,
+                        match pack.custody.as_str() {
+                            "no_holder" =>
+                                "has no holder: every runner that has said what it \
+                                            holds says it does not hold this one. A job that \
+                                            needs it waits",
+                            "no_runner_has_said" =>
+                                "has no holder this hub knows of: no \
+                                                     connected runner has said what it holds, \
+                                                     which is not the same as nobody holding \
+                                                     it. A job that needs it waits",
+                            // A word this build does not know, printed as it
+                            // came rather than guessed at: the document may
+                            // have been written by a hub that names a state
+                            // this one has never heard of.
+                            other => other,
+                        },
+                    )?;
+                }
+            }
+        }
         Ok(())
     }
 }
@@ -840,6 +959,19 @@ mod tests {
                 waiting_for: None,
                 attempts_so_far: 0,
             }],
+            // A registry with two packs in it, one of which nobody holds
+            // although the fleet has spoken: the state clause 2 is about, in
+            // the fixture every assertion below reads.
+            packs: Some(PacksNow {
+                registered: 2,
+                runners_that_said: 1,
+                unheld: vec![PackNow {
+                    pack: "7".repeat(64),
+                    commit: "cb5a2e8b4f1d9c7a3e05b8d6f2a1c4e79b0d3f68".to_owned(),
+                    key: "rootfs".to_owned(),
+                    custody: "no_holder".to_owned(),
+                }],
+            }),
         }
     }
 
@@ -1060,6 +1192,112 @@ mod tests {
             serde_json::json!(A_TYPED_BUDGET)
         );
         assert_eq!(runner["packs_held"], serde_json::json!(3));
+    }
+
+    /// **A pack with no holder is named on the document and on the screen,
+    /// and the two ways of having none are never one word** (M12 clause 2,
+    /// D257).
+    ///
+    /// Three claims, because they are the three a renderer could get wrong:
+    /// the state travels as the registry's own word; a root with no registry
+    /// at all is *absent* rather than an empty registry; and a registry
+    /// nobody has spoken to says so instead of reporting its packs lost.
+    #[test]
+    fn a_pack_with_no_holder_is_named_and_the_two_ways_of_having_none_stay_apart() {
+        let json = serde_json::to_value(a_status()).expect("a status serialises");
+        let packs = &json["packs"];
+        assert_eq!(packs["registered"], serde_json::json!(2));
+        assert_eq!(packs["runners_that_said"], serde_json::json!(1));
+        assert_eq!(
+            packs["unheld"][0]["custody"],
+            serde_json::json!("no_holder"),
+            "the state travels by the registry's own name: {packs}"
+        );
+        assert_eq!(packs["unheld"][0]["key"], serde_json::json!("rootfs"));
+        let screen = a_status().to_string();
+        assert!(
+            screen.contains("packs registered: 2")
+                && screen.contains("1 connected runner(s) have said what they hold")
+                && screen.contains("has no holder: every runner that has said"),
+            "the screen names the state rather than leaving it to be inferred: {screen}"
+        );
+
+        // A root with no registry: absent from the JSON, and its own sentence
+        // on the screen. **Not an empty registry**, which is the fact a
+        // reader would otherwise invent.
+        let mut none = a_status();
+        none.packs = None;
+        let text = serde_json::to_string(&none).expect("a status serialises");
+        assert!(
+            !text.contains("\"packs\"") && !text.contains("null"),
+            "a hub with no registry leaves the field off, never null: {text}"
+        );
+        let screen = none.to_string();
+        assert!(
+            screen.contains("packs: this hub keeps no pack registry"),
+            "and says so in words: {screen}"
+        );
+
+        // And the distinction this whole field is for: a fleet that has not
+        // spoken is not a fleet holding nothing (D257).
+        let mut quiet = a_status();
+        let packs = quiet.packs.as_mut().expect("the fixture has a registry");
+        packs.runners_that_said = 0;
+        packs.unheld[0].custody = "no_runner_has_said".to_owned();
+        let screen = quiet.to_string();
+        assert!(
+            screen.contains("no connected runner has said what it holds")
+                && screen.contains("not the same as nobody holding it"),
+            "a hub nobody has announced to says which kind of nothing this is: {screen}"
+        );
+        assert!(
+            !screen.contains("has no holder: every runner"),
+            "and it is not the other sentence: {screen}"
+        );
+    }
+
+    /// A pack that lost its last holder is news about the fleet and is
+    /// published.
+    ///
+    /// The same property the pack-store figures needed: the publisher writes
+    /// nothing when the document says what it last said (D215), so a field
+    /// `same_but_for_the_clock` does not compare never reaches the disk after
+    /// the first write. A pack whose holder went away and whose document was
+    /// not rewritten would be clause 2's silent failure with extra steps.
+    #[test]
+    fn a_pack_that_lost_its_holder_is_news_about_the_fleet() {
+        let first = a_status();
+        let mut later = first.clone();
+        later
+            .packs
+            .as_mut()
+            .expect("the fixture has a registry")
+            .unheld
+            .push(PackNow {
+                pack: "3".repeat(64),
+                commit: "cb5a2e8b4f1d9c7a3e05b8d6f2a1c4e79b0d3f68".to_owned(),
+                key: "kernel".to_owned(),
+                custody: "no_holder".to_owned(),
+            });
+        assert!(
+            !first.same_but_for_the_clock(&later),
+            "a pack that lost its last holder has to reach the document"
+        );
+
+        // And the state's own name changing is news too, not only the list:
+        // the same pack read as `no_holder` and as `no_runner_has_said` is
+        // two different things to act on.
+        let mut renamed = first.clone();
+        renamed
+            .packs
+            .as_mut()
+            .expect("the fixture has a registry")
+            .unheld[0]
+            .custody = "no_runner_has_said".to_owned();
+        assert!(
+            !first.same_but_for_the_clock(&renamed),
+            "which of the two states a pack is in is news about the fleet"
+        );
     }
 
     /// A pack figure that changed is news about the fleet and is published.

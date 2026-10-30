@@ -133,6 +133,20 @@
 //! content store for what it lacks, which is where "fetch only the diff"
 //! actually happens.
 //!
+//! ## No holder is a named state, and it is two states
+//!
+//! Clause 2 of M12 asks for a pack with no reachable holder to be *named*
+//! rather than discovered by a job that fails. [`Custody`] is that name, and
+//! it has three values where the wire has two usable ones, because **a pack
+//! nobody holds and a pack nobody has spoken about are different facts**
+//! (D257). Holdings are volatile — forgotten when a link goes, re-announced
+//! after every welcome — so a hub that has just started holds no holdings at
+//! all, and a build that called that "no holder" would report every pack on
+//! the volume as lost once a minute. Both are a job that **waits** with its
+//! own sentence ([`Custody::why_a_job_waits`], said at the dispatch) and
+//! neither is a `FromHub::Refused` (D13). [`PackRegistry::custody_now`] is
+//! the same answer for `status.json`, read in one go.
+//!
 //! ## What is a refusal, and what is an error
 //!
 //! A refusal is a **value** ([`Registered::Refused`]) and not an `Err`, because
@@ -750,11 +764,20 @@ impl PackRegistry {
         }))
     }
 
-    /// What a `(commit, key)` is, as one of the named states.
+    /// What a `(commit, key)` is, as one of the **wire's** named states.
     ///
     /// **Never [`PackState::Incomplete`]**: holdings are per manifest, so this
     /// hub has no information about which blobs are held and inventing the
     /// state would be inventing the information. See the module doc.
+    ///
+    /// **And [`PackState::NoHolder`] is two facts here**, which is why
+    /// [`Self::custody_of`] exists beside this. A pack every runner that has
+    /// spoken says it does not hold, and a pack no runner has spoken about at
+    /// all, are not the same statement (D257): the first is a measurement over
+    /// a fleet, the second is this hub's own ignorance. The wire has one word
+    /// for both because there is no third one for it to have, so what a job is
+    /// told and what `status.json` carries come off [`Self::custody_of`]. This
+    /// stays as it was, for whoever is answering a frame.
     pub fn state_of(
         &self,
         commit: &str,
@@ -763,12 +786,48 @@ impl PackRegistry {
         let Some(pack) = self.pack_for(commit, key)? else {
             return Ok(None);
         };
-        let state = if self.holders_of(&pack).is_empty() {
-            PackState::NoHolder
-        } else {
-            PackState::Registered
+        let state = match self.custody_of(&pack) {
+            Custody::Held(_) => PackState::Registered,
+            Custody::NoHolder { .. } | Custody::NoRunnerHasSaid => PackState::NoHolder,
         };
         Ok(Some((pack, state)))
+    }
+
+    /// Who holds one pack — **or which of the two ways nobody does** (clause 2
+    /// of `docs/plan.md`'s M12, D257).
+    ///
+    /// One answer under one lock, for the reason `server.rs`'s `WhereItIs` is
+    /// one read: a caller that asked [`Self::holders_of`] and then
+    /// [`Self::holdings`] would have a runner announcing between the two, and
+    /// would say "no runner has said" about a fleet that just had.
+    pub fn custody_of(&self, pack: &PackId) -> Custody {
+        Custody::of(pack, &self.locked().holdings)
+    }
+
+    /// What this registry holds, and what this hub does not know about it, for
+    /// `status.json` and for `herd-hub status` (clause 2, E-16).
+    ///
+    /// **One read, and the list is bounded by what is wrong.** A pack a runner
+    /// holds needs no row in a document whose job is to show what is missing,
+    /// and a row per registered pack would make the document grow with the
+    /// registry — which this document may not do, since it is rebuilt whenever
+    /// the fleet changes and two publications of the same facts have to be the
+    /// same bytes.
+    pub fn custody_now(&self) -> CustodyNow {
+        let live = self.locked();
+        let unheld = live
+            .entries
+            .values()
+            .filter_map(|entry| match Custody::of(&entry.pack, &live.holdings) {
+                Custody::Held(_) => None,
+                nobody => Some((entry.clone(), nobody)),
+            })
+            .collect();
+        CustodyNow {
+            registered: live.entries.len(),
+            runners_that_said: live.holdings.len(),
+            unheld,
+        }
     }
 
     /// The manifest's bytes, verbatim, or nothing at all.
@@ -828,22 +887,40 @@ impl PackRegistry {
     /// it held **4**, because 4 is the length of the last frame
     /// (ORCH-239). That sentence is an operator's only observation of
     /// holdings, so the figure it prints comes from here.
+    /// **And it says whether the applied set actually moved**
+    /// ([`Announcement::changed`]), because a job can be waiting on exactly
+    /// this: a pack with no holder is a job that waits (clause 2), and the one
+    /// event that ends that wait is a runner saying it holds the pack. The
+    /// caller judges the queue when, and only when, this says there is news —
+    /// the shape `State::record_health` and `State::record_switch` already
+    /// use, and for the same reason: a pass on every frame would walk the
+    /// queue for a runner restating what the hub already knew.
     pub fn announced(
         &self,
         runner: &str,
         endpoint: Option<String>,
         packs: Vec<PackId>,
         more: bool,
-    ) -> usize {
+    ) -> Announcement {
         let mut live = self.locked();
         let holding = live.holdings.entry(runner.to_owned()).or_default();
         holding.endpoint = endpoint;
         holding.arriving.extend(packs);
         if more {
-            return holding.arriving.len();
+            // Nothing is applied until the announcement ends, so there is no
+            // news yet however many frames have arrived.
+            return Announcement {
+                held: holding.arriving.len(),
+                changed: false,
+            };
         }
-        holding.held = std::mem::take(&mut holding.arriving);
-        holding.held.len()
+        let applied = std::mem::take(&mut holding.arriving);
+        let changed = applied != holding.held;
+        holding.held = applied;
+        Announcement {
+            held: holding.held.len(),
+            changed,
+        }
     }
 
     /// Forget everything a runner announced, because its link is gone.
@@ -877,16 +954,15 @@ impl PackRegistry {
     }
 
     /// Who holds a complete copy of this pack, in runner-name order.
+    ///
+    /// Empty is both of [`Custody`]'s two ways of having no holder flattened
+    /// into one, which is all a caller wanting a list to fetch from needs.
+    /// A caller that has to *say* what is wrong asks [`Self::custody_of`].
     pub fn holders_of(&self, pack: &PackId) -> Vec<Holder> {
-        self.locked()
-            .holdings
-            .iter()
-            .filter(|(_, holding)| holding.held.contains(pack))
-            .map(|(runner, holding)| Holder {
-                runner: runner.clone(),
-                endpoint: holding.endpoint.clone(),
-            })
-            .collect()
+        match self.custody_of(pack) {
+            Custody::Held(holders) => holders,
+            Custody::NoHolder { .. } | Custody::NoRunnerHasSaid => Vec::new(),
+        }
     }
 
     /// How many packs each connected runner says it holds, in runner-name
@@ -916,6 +992,143 @@ pub enum Resolved {
     Nothing,
     /// This hub will not answer for that key, and here is the sentence why.
     Refused(String),
+}
+
+/// What one announcement did, as [`PackRegistry::announced`] applied it.
+///
+/// Two fields because the caller needs two different things from one act
+/// under one lock: a figure to say out loud, and whether anything moved.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Announcement {
+    /// How many packs this runner now stands at: the applied set once `more`
+    /// is false, and what has arrived so far while it is true.
+    ///
+    /// **Read under the lock that just wrote it**, which is the whole reason
+    /// it is a return value and not a second call (ORCH-239).
+    pub held: usize,
+    /// Whether the applied set is different from what this hub held for this
+    /// runner a moment ago.
+    ///
+    /// **False while `more` is true**, because nothing is applied until an
+    /// announcement ends. False too for a runner restating what the hub
+    /// already had, which is the common case and the one a dispatch pass
+    /// would be wasted on.
+    pub changed: bool,
+}
+
+/// Who holds a pack, or **which of the two ways nobody does**.
+///
+/// Clause 2 of M12 asks for a pack with no holder to be a *named* state and
+/// never a silent failure; D257 asks for an absence never to read as a nought.
+/// Together they make three states and not two, and the third is the one a
+/// hub at version 1 cannot do without: a pack nobody has spoken about is not
+/// a pack nobody holds. Both are a job that **waits**, with its own sentence,
+/// and neither is ever a [`herd_proto::FromHub::Refused`] (D13) — a pack that
+/// is somewhere nobody has mentioned yet is the ordinary state of a fleet that
+/// has just reconnected.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Custody {
+    /// At least one connected runner announced holding this pack whole, in
+    /// runner-name order.
+    Held(Vec<Holder>),
+    /// Every runner that has said what it holds says it does not hold this
+    /// one. **A measurement**, and the figure is how many said so, because
+    /// "nobody holds it" over one runner of a fleet of nine is a different
+    /// fact from the same words over all nine.
+    NoHolder { runners_that_said: usize },
+    /// No connected runner has said what it holds at all, so this hub does
+    /// not know where this pack is. **Not [`Self::NoHolder`]** (D257): a hub
+    /// that had just started, or whose fleet is away, would otherwise report
+    /// every pack on the volume as held by nobody.
+    NoRunnerHasSaid,
+}
+
+impl Custody {
+    /// Which state one pack is in, read off holdings already under the lock.
+    ///
+    /// Private on purpose: the two public readers ([`PackRegistry::custody_of`]
+    /// and [`PackRegistry::custody_now`]) are the lock's, and a third caller
+    /// outside it would be the second answer to the same question.
+    ///
+    /// **A runner part-way through a chunked announcement counts as having
+    /// said**, because its holdings entry exists from the first frame while
+    /// `held` still stands at the previous set. That is the registry's own
+    /// design and this inherits it rather than fighting it: the consequence is
+    /// that [`Self::NoHolder`] can be the true answer for the width of one
+    /// announcement, which costs the job that needs that pack one more pass of
+    /// the queue and never a verdict.
+    fn of(pack: &PackId, holdings: &BTreeMap<String, Holding>) -> Self {
+        let holders: Vec<Holder> = holdings
+            .iter()
+            .filter(|(_, holding)| holding.held.contains(pack))
+            .map(|(runner, holding)| Holder {
+                runner: runner.clone(),
+                endpoint: holding.endpoint.clone(),
+            })
+            .collect();
+        if !holders.is_empty() {
+            return Self::Held(holders);
+        }
+        match holdings.len() {
+            0 => Self::NoRunnerHasSaid,
+            runners_that_said => Self::NoHolder { runners_that_said },
+        }
+    }
+
+    /// The state's **name**, which is what clause 2 asks for: one word a
+    /// document carries and an operator greps for, identical in `status.json`
+    /// and in the sentence a waiting job is given.
+    pub fn name(&self) -> &'static str {
+        match self {
+            Self::Held(_) => "held",
+            Self::NoHolder { .. } => "no_holder",
+            Self::NoRunnerHasSaid => "no_runner_has_said",
+        }
+    }
+
+    /// Why a job that needs this pack is waiting, or `None` when it is held
+    /// and nothing is wrong.
+    ///
+    /// **Written here and said by `server.rs`**, so that the registry's name
+    /// for the state and the sentence a requester reads are one wording rather
+    /// than two that drift. It composes after *"it is waiting because"*, which
+    /// is the dispatch's own phrasing for every other held-back job.
+    pub fn why_a_job_waits(&self, commit: &str, key: &str, pack: &PackId) -> Option<String> {
+        match self {
+            Self::Held(_) => None,
+            Self::NoHolder { runners_that_said } => Some(format!(
+                "{commit}/{key} is the pack {pack} and it has no holder: {runners_that_said} \
+                 connected runner(s) have said what they hold and not one of them holds this \
+                 pack. There is nowhere to fetch it from, so the job waits rather than running \
+                 with an empty {}/{key} (E-12), and it starts as soon as a runner that holds it \
+                 joins or a keeper is given it. This is a named state and not a refusal (D13)",
+                herd_proto::IN_TOKEN
+            )),
+            Self::NoRunnerHasSaid => Some(format!(
+                "{commit}/{key} is the pack {pack} and no connected runner has said what it \
+                 holds, so this hub does not know where it is — which is not the same as nobody \
+                 holding it (D257). Holdings are volatile and re-announced after every welcome, \
+                 so this is what a hub that has just started, or one whose fleet is away, says \
+                 about every pack on its volume. The job waits and starts as soon as a holder \
+                 says so; nothing is refused (D13)"
+            )),
+        }
+    }
+}
+
+/// What this registry holds and what this hub does not know about it, as
+/// [`PackRegistry::custody_now`] read it in one go.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CustodyNow {
+    /// How many packs are registered on this root.
+    pub registered: usize,
+    /// How many connected runners have said what they hold **at all**. `0` is
+    /// a fleet that has not spoken, which is not a fleet holding nothing
+    /// (D257).
+    pub runners_that_said: usize,
+    /// Every registered pack no connected runner says it holds, with the state
+    /// it is in. Bounded by what is wrong: a held pack is not in it.
+    pub unheld: Vec<(Entry, Custody)>,
 }
 
 /// The one sentence for a `(commit, key)` two different ids are registered
@@ -1320,8 +1533,148 @@ mod tests {
         );
         assert_eq!(
             again.state_of("c0ffee", "pack").expect("a state"),
-            Some((pack, PackState::NoHolder)),
+            Some((pack.clone(), PackState::NoHolder)),
             "which is a named state and not a silence"
+        );
+        // And off the wire, where there is a third word for it: a hub that
+        // has just restarted has heard from nobody, so what it has is its own
+        // ignorance and **not** a measurement that nobody holds this pack
+        // (D257). The wire cannot tell the two apart; this must.
+        assert_eq!(
+            again.custody_of(&pack).name(),
+            "no_runner_has_said",
+            "a restarted hub does not know where its packs are, which is not \
+             the same as knowing nobody has them"
+        );
+    }
+
+    /// **The two ways of having no holder, and the one that is a
+    /// measurement** (M12 clause 2, D257).
+    ///
+    /// `custody_now` is what `status.json` is built from, so three properties
+    /// are asserted of it: it counts what is registered, it says how many
+    /// runners have spoken at all, and its list is **what is wrong** rather
+    /// than what there is — a held pack has no row.
+    ///
+    /// **And the window this design has, named rather than hidden.** A runner
+    /// part-way through a chunked announcement already has a holdings entry,
+    /// so it counts as having said while `held` still stands at its previous
+    /// set. The consequence is asserted here because it is real: for the width
+    /// of one announcement a pack can read as `no_holder`, which costs the job
+    /// that needs it one more pass of the queue and never a verdict. That is
+    /// the registry's own design (`announced`) and this inherits it.
+    #[test]
+    fn no_holder_and_no_runner_has_said_are_two_states_and_a_held_pack_is_neither() {
+        let (_dir, registry) = registry();
+        let pack = match registry.register(a_registration(at())).expect("registered") {
+            Registered::Fresh(pack) => pack,
+            other => panic!("{other:?}"),
+        };
+
+        // Nobody has said anything at all.
+        let now = registry.custody_now();
+        assert_eq!(now.registered, 1);
+        assert_eq!(now.runners_that_said, 0);
+        assert_eq!(
+            now.unheld
+                .iter()
+                .map(|(entry, custody)| (entry.key.as_str(), custody.name()))
+                .collect::<Vec<_>>(),
+            vec![("pack", "no_runner_has_said")]
+        );
+
+        // One runner says it holds none. **A measurement**, and the figure in
+        // the state is what makes it one.
+        //
+        // It is also the first of the four `changed` cases, and the one a
+        // reader would guess wrongly: a runner this hub had never heard from
+        // saying "I hold none" is **not news for the queue**. The hub learns
+        // something — this fleet has now spoken — but no pack became
+        // placeable, so no dispatch pass is owed.
+        let said = registry.announced("attic", None, Vec::new(), false);
+        assert_eq!(said.held, 0);
+        assert!(
+            !said.changed,
+            "an empty first announcement moves no holding, so the queue is \
+             not judged for it"
+        );
+        assert_eq!(
+            registry.custody_of(&pack),
+            Custody::NoHolder {
+                runners_that_said: 1
+            },
+            "a fleet that has spoken and does not have it"
+        );
+        let now = registry.custody_now();
+        assert_eq!(now.runners_that_said, 1);
+        assert_eq!(now.unheld.len(), 1);
+
+        // A holder, and the list is empty: it holds what is wrong, not what
+        // there is. **This one is news** — it is the event that ends the wait
+        // of every job needing this pack, and the hub judges its queue on it.
+        let said = registry.announced("tower", None, vec![pack.clone()], false);
+        assert_eq!(said.held, 1);
+        assert!(
+            said.changed,
+            "a pack that gained a holder is news: it is what lets a waiting \
+             job start"
+        );
+        // And a runner restating what the hub already had is not news, which
+        // is what keeps a pass off every frame.
+        let again = registry.announced("tower", None, vec![pack.clone()], false);
+        assert_eq!(again.held, 1);
+        assert!(
+            !again.changed,
+            "the same set announced twice walks no queue the second time"
+        );
+        assert_eq!(
+            registry.custody_of(&pack).name(),
+            "held",
+            "and a pack with a holder is in neither state"
+        );
+        let now = registry.custody_now();
+        assert_eq!(now.registered, 1, "it is still registered");
+        assert_eq!(now.runners_that_said, 2);
+        assert!(
+            now.unheld.is_empty(),
+            "a held pack has no row: this list is bounded by what is missing"
+        );
+        assert!(
+            registry
+                .custody_of(&pack)
+                .why_a_job_waits("c0ffee", "pack", &pack)
+                .is_none(),
+            "and no job waits for it"
+        );
+
+        // The window. `tower` begins a fresh announcement: its entry is there
+        // from the first frame, so it has *said*, while its applied set is
+        // still the previous one — which this registry replaces only when
+        // `more` is false.
+        let mid = registry.announced("tower", None, Vec::new(), true);
+        assert!(
+            !mid.changed,
+            "nothing is applied while more is true, so there is no news yet \
+             however many frames have arrived"
+        );
+        assert_eq!(
+            registry.custody_of(&pack).name(),
+            "held",
+            "nothing is applied until the announcement ends, so the hub still \
+             names the holder it was told about"
+        );
+        let ended = registry.announced("tower", None, Vec::new(), false);
+        assert!(
+            ended.changed,
+            "and a pack that lost its last holder is news too: the job that \
+             needs it has to be told it is waiting"
+        );
+        assert_eq!(
+            registry.custody_of(&pack),
+            Custody::NoHolder {
+                runners_that_said: 2
+            },
+            "and when it ends, two runners have said and neither has it"
         );
     }
 
@@ -1377,17 +1730,23 @@ mod tests {
             })
             .collect();
         assert_eq!(
-            registry.announced("tower", None, packs[0..3].to_vec(), true),
+            registry
+                .announced("tower", None, packs[0..3].to_vec(), true)
+                .held,
             3,
             "the first frame of three has three packs arriving"
         );
         assert_eq!(
-            registry.announced("tower", None, packs[3..5].to_vec(), true),
+            registry
+                .announced("tower", None, packs[3..5].to_vec(), true)
+                .held,
             5,
             "the second frame answers what has arrived so far, not its own two"
         );
         assert_eq!(
-            registry.announced("tower", None, packs[5..6].to_vec(), false),
+            registry
+                .announced("tower", None, packs[5..6].to_vec(), false)
+                .held,
             6,
             "and the frame that applies answers the whole set, not its own one"
         );

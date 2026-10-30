@@ -431,6 +431,132 @@ pub fn silent() -> Voice {
     Arc::new(|_| {})
 }
 
+// ------------------------------------- what the handshake advertises ----
+
+/// What this runner tells the hub it serves content on, in the one field the
+/// protocol has for it (`ToHub::Hello`'s `mesh_endpoint`, invariant 4).
+///
+/// Three values and not two, because the third is the one the sequencing
+/// exists for: until the endpoint has tried to bind, **nothing true can be
+/// said**. `--mesh-listen 127.0.0.1` means port `0`, the kernel picks it at
+/// bind time, and the protocol carries no frame that updates a mesh endpoint
+/// later — so a hello sent before the bind would advertise a port that does
+/// not exist and could never be corrected.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Advertisement {
+    /// The endpoint has not said yet. [`Advertised::settled`] waits for this
+    /// to become one of the other two, and a dial waits with it.
+    Unsettled,
+    /// There is no address to advertise: no `--mesh-listen`, or a bind that
+    /// failed, or an owner's switch that says this machine serves nothing.
+    /// The runner is outbound-only, and the hub refuses it as a holder **by
+    /// name** — which is the right answer and not a degradation.
+    Nothing,
+    /// The address peers are told to dial, carrying the port the bind really
+    /// got.
+    At(SocketAddr),
+}
+
+impl Advertisement {
+    /// What goes in the handshake.
+    ///
+    /// `None` is absent on the wire and means outbound-only, and `Unsettled`
+    /// collapses to it as well: a dial that somehow reached the wire without
+    /// waiting advertises nothing rather than guessing at a port.
+    pub fn on_the_wire(self) -> Option<String> {
+        match self {
+            Self::Unsettled | Self::Nothing => None,
+            Self::At(at) => Some(at.to_string()),
+        }
+    }
+}
+
+/// The one place the handshake's mesh endpoint is read from: written by the
+/// endpoint, which is the step that binds, and read by every dial.
+///
+/// **A `watch` and not a `OnceLock`**, for two reasons that are both about
+/// the loop in [`serve_while`] rather than about startup. A dial has to be
+/// able to *wait* for the first answer — that await is what sequences the
+/// bind ahead of the first hello, and it is the whole reason this type exists
+/// rather than a field on [`Mesh`]. And the answer can change afterwards: the
+/// owner's switch closes the socket and this runner stops being a holder, so
+/// the next connection has to say so.
+///
+/// What it must never do is change *under* a connection. The protocol carries
+/// no frame that revises a mesh endpoint mid-link (invariant 4,
+/// `PROTOCOL_VERSION` 3), so the endpoint a hello announced has to stay true
+/// for that link's life — and a reconnect while the socket is open reads the
+/// value already settled and **rebinds nothing**.
+#[derive(Debug, Clone)]
+pub struct Advertised {
+    said: Arc<tokio::sync::watch::Sender<Advertisement>>,
+}
+
+impl Default for Advertised {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Advertised {
+    pub fn new() -> Self {
+        let (said, _) = tokio::sync::watch::channel(Advertisement::Unsettled);
+        Self {
+            said: Arc::new(said),
+        }
+    }
+
+    /// Say what is true now.
+    ///
+    /// Called by [`serve_while`] at each point where the socket's existence
+    /// changes, and by [`crate::run_until`] on the one path where no endpoint
+    /// task is started at all — a pack store that will not open. That second
+    /// caller is not a tidiness: a dial awaiting a settle nobody will ever
+    /// make would be a runner that never says hello.
+    ///
+    /// Saying the same thing twice wakes nobody. The loop asks every
+    /// [`SERVES_POLL`] and would otherwise notify a waiter five times a
+    /// second for the life of the process.
+    pub fn say(&self, what: Advertisement) {
+        self.said.send_if_modified(|held| {
+            if *held == what {
+                false
+            } else {
+                *held = what;
+                true
+            }
+        });
+    }
+
+    /// What is true now, without waiting.
+    pub fn now(&self) -> Advertisement {
+        *self.said.borrow()
+    }
+
+    /// Wait until the endpoint has settled, and answer with what goes in the
+    /// handshake.
+    ///
+    /// **This is the await that puts the bind ahead of the first dial.** It
+    /// returns immediately once something has been said, so a reconnect pays
+    /// nothing and advertises what the link before it advertised.
+    pub async fn settled(&self) -> Option<String> {
+        let mut seen = self.said.subscribe();
+        loop {
+            match *seen.borrow_and_update() {
+                Advertisement::Unsettled => {}
+                settled => return settled.on_the_wire(),
+            }
+            if seen.changed().await.is_err() {
+                // Nobody is left to say anything. Outbound-only is the honest
+                // answer and the safe one: a runner that cannot learn its own
+                // endpoint still dials, still runs every job, and is refused
+                // as a holder by name rather than refusing to start.
+                return None;
+            }
+        }
+    }
+}
+
 /// What one run of [`serve_while`] did.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct Report {
@@ -468,10 +594,25 @@ pub struct Report {
 /// peer that loses a transfer reads `BodyTruncated` — a sentence — and
 /// resumes at the last whole chunk. A transfer is never worth more than the
 /// owner's machine.
+///
+/// ## It also says what the handshake may advertise
+///
+/// `advertised` is written on **every** turn where the socket's existence is
+/// decided, and read by the dial (`Advertised::settled`). This is the step
+/// that binds, so it is the only step that knows the port: with
+/// `--mesh-listen 127.0.0.1` the port is `0` and the kernel picks it here.
+/// Nothing else in the crate may answer that question, and nothing in the
+/// protocol can revise the answer once a hello has carried it (invariant 4).
+#[allow(clippy::too_many_arguments)]
+// Eight, and the eighth is the one this loop exists to be read for: see the
+// section above. Bundling it into `mesh` would make the address judged at
+// startup and the port learned at bind time one value, which is exactly the
+// conflation the three-valued `Advertisement` is here to prevent.
 pub async fn serve_while(
     mesh: Option<Mesh>,
     store: PackStore,
     granted: Granted,
+    advertised: Advertised,
     serves_content: impl Fn() -> bool,
     poll: Duration,
     voice: Voice,
@@ -482,6 +623,11 @@ pub async fn serve_while(
     let mut in_flight: tokio::task::JoinSet<Connection> = tokio::task::JoinSet::new();
     let mut stop = std::pin::pin!(stop);
     if mesh.is_none() {
+        // Settled here and not in the loop below, so that an outbound-only
+        // runner's first dial waits for nothing at all: there is no bind
+        // coming, and `Unsettled` would hold the hello until the loop's first
+        // turn for no reason.
+        advertised.say(Advertisement::Nothing);
         voice(Said::Closed {
             why: format!(
                 "no mesh address is configured, so this runner is outbound-only: it fetches and \
@@ -510,6 +656,12 @@ pub async fn serve_while(
                         };
                         listener = Some(bound);
                         report.opened += 1;
+                        // The advertisement and the sentence carry the same
+                        // figure, from the same line: an operator reading
+                        // "advertised as X" and a hub minting against some
+                        // other X would be the one disagreement nobody could
+                        // see.
+                        advertised.say(Advertisement::At(advertise));
                         voice(Said::Listening { at, advertise });
                     }
                     Err(error) => {
@@ -519,6 +671,12 @@ pub async fn serve_while(
                         // has gone away — a fact about the host this minute,
                         // which is not a reason to take the runner's jobs
                         // away from it.
+                        //
+                        // And it advertises **nothing** meanwhile: a runner
+                        // whose bind failed still dials and still runs every
+                        // job, and is refused as a holder by name rather than
+                        // offering peers a port that is not there.
+                        advertised.say(Advertisement::Nothing);
                         voice(Said::Closed {
                             why: format!(
                                 "{} cannot be bound: {error}. This runner goes on running jobs \
@@ -535,6 +693,11 @@ pub async fn serve_while(
                 // Aborted with the socket: a transfer in flight is content
                 // being served, and `off` means this machine serves nothing.
                 in_flight.abort_all();
+                // And the next connection says so. A runner with no socket is
+                // not a holder, whatever `--mesh-listen` it was given, and the
+                // hub must not be left minting capabilities against a port
+                // this process no longer holds.
+                advertised.say(Advertisement::Nothing);
                 voice(Said::Closed {
                     why: "the owner's switch or a drain says this runner serves nothing, so the \
                           mesh socket is closed and there is no socket of any kind left (E-33, \
@@ -542,7 +705,16 @@ pub async fn serve_while(
                         .to_owned(),
                 });
             }
-            _ => {}
+            // No socket and not allowed one: `off` at startup, or a bind
+            // that has not yet succeeded. Said rather than left unsettled, or
+            // a runner started switched off would hold its own hello back for
+            // as long as its owner left the switch alone.
+            (None, false) => advertised.say(Advertisement::Nothing),
+            // A socket that is open and may stay open: nothing changes, and
+            // in particular **nothing rebinds**. This is the arm every turn
+            // of a healthy runner's loop takes, and the arm a reconnect's
+            // hello reads its endpoint through.
+            (Some(_), true) => {}
         }
         // Whatever finished since the last turn, totalled without waiting for
         // anything: `try_join_next` and not `join_next` inside the `select!`
@@ -1132,6 +1304,7 @@ mod tests {
             Some(mesh.clone()),
             store.clone(),
             Granted::new(),
+            Advertised::new(),
             || false,
             Duration::from_millis(5),
             silent(),
@@ -1158,6 +1331,7 @@ mod tests {
             Some(mesh),
             store,
             Granted::new(),
+            Advertised::new(),
             move || watching.load(Ordering::SeqCst),
             Duration::from_millis(5),
             Arc::new(move |said| kept.lock().expect("a lock").push(said)),
@@ -1254,6 +1428,7 @@ mod tests {
             Some(mesh),
             store,
             granted,
+            Advertised::new(),
             || true,
             Duration::from_millis(5),
             Arc::new(move |said| kept.lock().expect("a lock").push(said)),
@@ -1347,6 +1522,7 @@ mod tests {
             // Empty: the hub pushed nothing, so every token is one it did not
             // push.
             Granted::new(),
+            Advertised::new(),
             || true,
             Duration::from_millis(5),
             Arc::new(move |said| kept.lock().expect("a lock").push(said)),
@@ -1402,5 +1578,218 @@ mod tests {
         let report = served.await.expect("the endpoint comes back");
         assert_eq!(report.refused, 1, "{report:?}");
         assert_eq!(report.bytes, 0, "a refused peer got bytes: {report:?}");
+    }
+
+    /// **The advertisement carries the port the kernel picked**, and a dial
+    /// that waits for it gets that port and not the nought that was asked for
+    /// (invariant 3, D10, D11).
+    ///
+    /// `--mesh-listen 127.0.0.1` is the spelling this whole sequencing exists
+    /// for: `Mesh::resolve` turns it into port `0`, so nothing before the bind
+    /// can know what to advertise. Three things are asserted together,
+    /// because apart each could pass while the trio did not: the settled
+    /// value is a real port, it is the port the endpoint's own sentence
+    /// names, and a socket is really there on it.
+    #[tokio::test]
+    async fn the_handshake_advertises_the_port_the_bind_really_got() {
+        let temp = TempDir::new("endpoint-advertises-its-port");
+        let store = PackStore::open(temp.path()).expect("a store");
+        // A bare address, so the port is `0` and the kernel picks it. Asserted
+        // rather than assumed: this is the premise the await is for.
+        let mesh = Mesh::resolve("127.0.0.1", None, &crate::mesh::HostRouting::read())
+            .expect("loopback is permitted");
+        assert_eq!(
+            mesh.listen.port(),
+            0,
+            "a bare address must mean a kernel-picked port, or this test is about nothing"
+        );
+
+        let advertised = Advertised::new();
+        assert_eq!(
+            advertised.now(),
+            Advertisement::Unsettled,
+            "nothing is knowable before the bind, and that is the third value"
+        );
+        let heard = Arc::new(Mutex::new(Vec::<Said>::new()));
+        let kept = Arc::clone(&heard);
+        let (gone, stop) = tokio::sync::oneshot::channel::<()>();
+        let served = tokio::spawn(serve_while(
+            Some(mesh),
+            store,
+            Granted::new(),
+            advertised.clone(),
+            || true,
+            Duration::from_millis(5),
+            Arc::new(move |said| kept.lock().expect("a lock").push(said)),
+            async move {
+                let _ = stop.await;
+            },
+        ));
+
+        // The await the first dial makes. Bounded by the test harness and not
+        // by a sleep: this returns the instant the bind lands.
+        let settled = tokio::time::timeout(Duration::from_secs(5), advertised.settled())
+            .await
+            .expect("the endpoint settles rather than leaving a dial waiting")
+            .expect("a runner given a mesh address advertises one");
+        let at: SocketAddr = settled.parse().expect("an address goes on the wire");
+        assert_ne!(
+            at.port(),
+            0,
+            "the advertisement carries the nought that was asked for and not the port the \
+             kernel gave: {settled}"
+        );
+        // The same figure as the operator's own line, from the same bind.
+        let said = heard
+            .lock()
+            .expect("a lock")
+            .iter()
+            .find_map(|said| match said {
+                Said::Listening { advertise, .. } => Some(*advertise),
+                _ => None,
+            })
+            .expect("the endpoint says what it advertises");
+        assert_eq!(
+            said, at,
+            "the sentence an operator reads and the address the hub is told are two different \
+             figures"
+        );
+        // And there is really a socket there: an advertisement is a promise
+        // to a peer, not a sentence about one.
+        tokio::net::TcpStream::connect(at)
+            .await
+            .expect("the advertised address accepts a connection");
+
+        // A reconnect reads the settled value again and **rebinds nothing**:
+        // the protocol has no frame that revises a mesh endpoint, so a second
+        // hello on the same process must carry the first one's address.
+        let again = tokio::time::timeout(Duration::from_secs(1), advertised.settled())
+            .await
+            .expect("a settled advertisement answers at once")
+            .expect("and answers the same thing");
+        assert_eq!(again, settled, "a redial advertised a different endpoint");
+        let _ = gone.send(());
+        let report = served.await.expect("the endpoint comes back");
+        assert_eq!(
+            report.opened, 1,
+            "the endpoint bound more than once for one advertisement: {report:?}"
+        );
+    }
+
+    /// **No mesh address means the handshake says nothing**, and says it
+    /// without making the dial wait.
+    ///
+    /// The outbound-only runner, which is what the hub refuses as a holder by
+    /// name. The assertion that matters is the pair: `None` on the wire, and
+    /// settled *immediately* — a value nobody will ever write would hold a
+    /// cold start's hello for ever, which is the one way this sequencing
+    /// could cost the consumer its fleet.
+    #[tokio::test]
+    async fn an_outbound_only_runner_advertises_nothing_and_waits_for_nothing() {
+        let temp = TempDir::new("endpoint-advertises-nothing");
+        let store = PackStore::open(temp.path()).expect("a store");
+        let advertised = Advertised::new();
+        let (gone, stop) = tokio::sync::oneshot::channel::<()>();
+        let served = tokio::spawn(serve_while(
+            None,
+            store,
+            Granted::new(),
+            advertised.clone(),
+            || true,
+            Duration::from_millis(5),
+            silent(),
+            async move {
+                let _ = stop.await;
+            },
+        ));
+        let settled = tokio::time::timeout(Duration::from_secs(5), advertised.settled())
+            .await
+            .expect("an outbound-only runner settles rather than leaving a dial waiting");
+        assert_eq!(
+            settled, None,
+            "a runner that listens on nothing advertised an address: {settled:?}"
+        );
+        assert_eq!(advertised.now(), Advertisement::Nothing);
+        let _ = gone.send(());
+        let report = served.await.expect("the endpoint comes back");
+        assert_eq!(report.opened, 0, "{report:?}");
+    }
+
+    /// **A runner switched off advertises nothing, and starts advertising
+    /// when it is switched on** (E-33, D11's third condition).
+    ///
+    /// Both halves, because each alone would pass on a wrong implementation:
+    /// a value that settled only at startup would leave a runner switched on
+    /// an hour later advertising nothing for ever, and a value that never
+    /// settled while `off` would hold the hello of a runner its owner had
+    /// switched off — the one state in which a runner must still dial, so
+    /// that the hub knows it is there and knows it is claiming nothing.
+    #[tokio::test]
+    async fn a_runner_that_may_not_serve_advertises_nothing_until_it_may() {
+        let temp = TempDir::new("endpoint-advertises-when-switched-on");
+        let store = PackStore::open(temp.path()).expect("a store");
+        let mesh = Mesh::resolve("127.0.0.1", None, &crate::mesh::HostRouting::read())
+            .expect("loopback is permitted");
+        let serving = Arc::new(AtomicBool::new(false));
+        let watching = Arc::clone(&serving);
+        let advertised = Advertised::new();
+        let (gone, stop) = tokio::sync::oneshot::channel::<()>();
+        let served = tokio::spawn(serve_while(
+            Some(mesh),
+            store,
+            Granted::new(),
+            advertised.clone(),
+            move || watching.load(Ordering::SeqCst),
+            Duration::from_millis(5),
+            silent(),
+            async move {
+                let _ = stop.await;
+            },
+        ));
+        // Switched off: nothing to advertise, and the dial does not wait for
+        // the owner to change her mind.
+        let settled = tokio::time::timeout(Duration::from_secs(5), advertised.settled())
+            .await
+            .expect("a runner switched off settles rather than holding its own hello");
+        assert_eq!(settled, None, "{settled:?}");
+
+        // Switched on: the endpoint binds and the next connection has an
+        // address to announce.
+        serving.store(true, Ordering::SeqCst);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let at = loop {
+            assert!(
+                Instant::now() < deadline,
+                "a runner switched back on never advertised an endpoint"
+            );
+            if let Advertisement::At(at) = advertised.now() {
+                break at;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        };
+        tokio::net::TcpStream::connect(at)
+            .await
+            .expect("the newly advertised address accepts a connection");
+
+        // And switched off again: the advertisement goes with the socket, or
+        // the hub would go on minting capabilities against a port this
+        // process no longer holds.
+        serving.store(false, Ordering::SeqCst);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            assert!(
+                Instant::now() < deadline,
+                "the advertisement outlived the socket: {:?}",
+                advertised.now()
+            );
+            if advertised.now() == Advertisement::Nothing {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let _ = gone.send(());
+        let report = served.await.expect("the endpoint comes back");
+        assert_eq!(report.opened, 1, "{report:?}");
+        assert_eq!(report.closed, 1, "{report:?}");
     }
 }

@@ -811,6 +811,41 @@ impl Herd {
         .expect("herdctl runs")
     }
 
+    /// The same, run **inside a requester's own checkout**, which is where a
+    /// declared command is submitted from (E-11, D106).
+    ///
+    /// `herdctl` reads `tools/herd/commands.toml` out of the tree it is
+    /// standing in and resolves the ref against that tree's own git, so a
+    /// declared command cannot be submitted from anywhere else. The git
+    /// environment is pinned the way `herdctl`'s own fixture pins it, so a
+    /// person's `~/.gitconfig` cannot change what a refusal says.
+    pub async fn herdctl_in(&self, checkout: &Path, arguments: &[&str]) -> std::process::Output {
+        let herdctl = binary("herdctl");
+        let waiting_since = Instant::now();
+        tokio::time::timeout(
+            PATIENCE,
+            Command::new(herdctl)
+                .arg("--hub")
+                .arg(self.url())
+                .args(arguments)
+                .current_dir(checkout)
+                .env("HOME", checkout)
+                .env("GIT_CONFIG_NOSYSTEM", "1")
+                .env("GIT_CONFIG_GLOBAL", "/dev/null")
+                .env("GIT_TERMINAL_PROMPT", "0")
+                .output(),
+        )
+        .await
+        .unwrap_or_else(|_| {
+            panic!(
+                "herdctl {arguments:?} never came back inside {PATIENCE:?}.\n{}{}",
+                why_a_wait_ran_out(waiting_since),
+                self.everything_said()
+            )
+        })
+        .expect("herdctl runs")
+    }
+
     /// Submit a job and leave with its id, as a push hook would (E-03).
     pub async fn submit(&self, script: &str) -> String {
         let output = self

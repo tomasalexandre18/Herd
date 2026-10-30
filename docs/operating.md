@@ -47,11 +47,14 @@ every one of them.
 
 Two subcommands of the hub binary read it and nothing else:
 
-* **`herd-hub report`** — what this root holds. Three figures: the
+* **`herd-hub report`** — what this root holds. Five figures: the
   file-level deduplication ratio over the records, per-job output size
-  **by decile** and its maximum, and what the records claim against what
-  the directories measure. It prints the counts under every ratio, never
-  a bare one.
+  **by decile** and its maximum, what the records claim against what the
+  directories measure, what is held under `packs/`, and what this root's
+  own bookkeeping weighs — the `job.json` records, the `events.jsonl`
+  files and the logs, with their counts, beside the collected output and
+  never inside it. It prints the counts under every ratio, never a bare
+  one.
 * **`herd-hub retention-preview`** — what record retention *would*
   remove and what it would cost. **It removes nothing**: there is no
   deletion path in it and no flag that could be given one.
@@ -61,9 +64,12 @@ the code rather than a promise. Neither one builds the store, so neither
 takes the store's lock; above all neither takes the `flock(2)` on
 `hub.lock`, which a running hub holds for its whole life. They open
 files read-only, one at a time, create nothing and write nothing.
-`report` reads records and the *lengths* of the files under each job's
-`files/`, `files.part/` and `files.gone/` — no output byte and no log
-byte (`herd-hub/src/report.rs`, module documentation).
+`report` reads records and the *lengths* of the files in a job
+directory — those under `files/`, `files.part/` and `files.gone/`, and
+those of the directory's own `job.json`, `events.jsonl`, `log` and
+`log.seq`. It reads no output byte, no log byte and no line of
+`events.jsonl`: it weighs a log and an event file and reads neither
+(`herd-hub/src/report.rs`, module documentation).
 
 What you give up for that, and the report says so itself at the top of
 its own output: the figures are not one consistent instant. A hub

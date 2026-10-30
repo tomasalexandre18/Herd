@@ -763,6 +763,22 @@ pub struct Session {
     /// the fetch it was minted for would then be refused by the one party
     /// that was told to expect it.
     granted: endpoint::Granted,
+    /// What this runner's handshake says it serves pack content on
+    /// (`ToHub::Hello`'s `mesh_endpoint`, invariant 3, D10, D11).
+    ///
+    /// Here for the capacity's reason and one of its own. It is true of the
+    /// *runner*: the endpoint is bound once, beside the redial loop, and
+    /// outlives every connection — so a value held by a connection would be
+    /// lost on a redial and the runner would stop being a holder for no
+    /// reason anybody could see.
+    ///
+    /// And it is the one field of the handshake that is **not known when the
+    /// handshake is built**. `--mesh-listen 127.0.0.1` means port `0` and the
+    /// kernel picks it at bind time, in [`endpoint::serve_while`], which runs
+    /// beside this dial rather than inside it. The protocol carries no frame
+    /// that revises a mesh endpoint later (invariant 4), so the dial
+    /// **waits** for the bind: [`endpoint::Advertised::settled`].
+    advertised: endpoint::Advertised,
 }
 
 /// One attempt's collection waiting on this runner's disk for the hub
@@ -1140,6 +1156,75 @@ struct Inner {
     /// the same custody, and one spelling of it is one fewer thing for an
     /// eviction to read wrong.
     pins: Option<herd_proto::pack::PinPacks>,
+    /// Transfer capabilities this runner has asked the hub for and not been
+    /// answered about yet, by `(job, pack)` (D209, M11).
+    ///
+    /// **A pending-answer map and not a mailbox**, because an ask has exactly
+    /// one answer and the asker is blocked on it: a layout fetching objects
+    /// cannot go on until the hub has either minted a capability
+    /// ([`FromHub::TransferCapability`]) or refused by name
+    /// ([`FromHub::PackRefused`]).
+    ///
+    /// Keyed by `(job, pack)` because that is what both answers carry and
+    /// nothing narrower. Two asks for one `(job, pack)` cannot be told apart
+    /// by either frame, so the second **replaces** the first and the first is
+    /// answered by its sender being dropped — a waiter whose channel closed
+    /// gets an error and says so, which is a refusal and never a wait that
+    /// does not end.
+    ///
+    /// Per **session** rather than per connection, because a job outlives the
+    /// link it was assigned on (D17). [`Session::detach`] empties it, which
+    /// answers every waiter rather than leaving it holding a channel nothing
+    /// will write to.
+    capability_asks: HashMap<(JobId, herd_proto::pack::PackId), CapabilityAnswer>,
+}
+
+/// Where the answer to one [`herd_proto::pack::AskTransferCapability`] goes.
+type CapabilityAnswer =
+    tokio::sync::oneshot::Sender<std::result::Result<herd_proto::pack::TransferCapability, String>>;
+
+/// Takes one pending capability ask out of the session when the asker is
+/// done with it, however it ended.
+///
+/// A guard and not a line at each exit, because one of the exits is not in
+/// the function at all: `crate::fetch` bounds the ask with its own timeout,
+/// and a timeout drops the future instead of returning through it.
+struct AskEnded {
+    session: Session,
+    key: (JobId, herd_proto::pack::PackId),
+}
+
+impl Drop for AskEnded {
+    fn drop(&mut self) {
+        self.session
+            .with(|inner| inner.capability_asks.remove(&self.key));
+    }
+}
+
+/// The hub, as the thing a fetch asks for its authorisation (D209).
+///
+/// [`fetch::Authoriser`] is a trait so that [`crate::fetch`] can be proved
+/// against a hand-written hub; this is the production implementation and it
+/// is deliberately four lines, because a capability is minted by the hub and
+/// the only thing this side does is carry the ask to the link and the answer
+/// back ([`Session::ask_for_a_capability`]).
+struct HubMints {
+    session: Session,
+}
+
+impl fetch::Authoriser for HubMints {
+    fn ask<'a>(
+        &'a self,
+        ask: herd_proto::pack::AskTransferCapability,
+    ) -> std::pin::Pin<
+        Box<
+            dyn Future<Output = std::result::Result<herd_proto::pack::TransferCapability, String>>
+                + Send
+                + 'a,
+        >,
+    > {
+        Box::pin(self.session.ask_for_a_capability(ask))
+    }
 }
 
 impl Default for Inner {
@@ -1162,6 +1247,7 @@ impl Default for Inner {
             switch: herd_proto::Switch::On,
             pack_store: None,
             pins: None,
+            capability_asks: HashMap::new(),
         }
     }
 }
@@ -1344,6 +1430,17 @@ impl Session {
     /// [`endpoint::Granted::pushed_by_hub`] is named for it.
     pub fn granted(&self) -> &endpoint::Granted {
         &self.granted
+    }
+
+    /// What this runner's handshake advertises as its mesh endpoint
+    /// (invariant 3, D10, D11).
+    ///
+    /// Written by [`endpoint::serve_while`] and by nothing else — it is the
+    /// step that binds, and the port is only knowable there — and read by
+    /// [`serve_once`] when it builds the hello. See [`Session::advertised`]'s
+    /// field for why the dial waits on it.
+    pub fn advertised(&self) -> &endpoint::Advertised {
+        &self.advertised
     }
 
     /// Tell the hub what every probe says, as one snapshot.
@@ -1551,13 +1648,17 @@ impl Session {
     /// What this runner's custody is, as an eviction has to read it.
     ///
     /// **`referenced` is empty and that is a measurement of this build, not
-    /// an oversight**: what a queued or running job references is the layout
-    /// step's knowledge and the layout step does not put it in this session
-    /// yet ([`packstore::Claims::referenced`] carries the same statement from
-    /// the other side). Nothing is lost by it today that the filesystem does
-    /// not keep: a pack already laid out for a job is **hard links** into
+    /// an oversight**: the layout step is landed — [`Session::lay_out_packs`]
+    /// is what a running job's `{in}` comes from — and it does not write what
+    /// it laid out into this session, so what a queued or running job
+    /// references is still nothing this claim set knows (ORCH-275, and
+    /// [`packstore::Claims::referenced`] carries the same statement from the
+    /// other side). Nothing is lost by it today that the filesystem does not
+    /// keep: a pack already laid out for a job is **hard links** into
     /// `objects/`, so unlinking the store's own name for those bytes leaves
-    /// the job's copy whole.
+    /// the job's copy whole. What it does cost is a pack swept out from under
+    /// a job that has not laid it out yet, which is why the pass runs at the
+    /// connection edge and not at the start of an attempt.
     fn pack_claims(&self) -> packstore::Claims {
         packstore::Claims {
             pins: self.with(|inner| inner.pins.clone()),
@@ -1641,6 +1742,264 @@ impl Session {
         )];
         lines.extend(swept.said);
         lines
+    }
+
+    /// Lay every pack this job needs out under `{in}`, or say which one it
+    /// could not get (M11, E-12, D10).
+    ///
+    /// **The in half of the layout step.** The hub resolved each `needs` key
+    /// at the assignment and sent the manifest and the holders with the work
+    /// (`AssignedPack`, ORCH-234), so the common case — a runner that already
+    /// holds every object, which is every job on the machine that produced
+    /// the pack — costs no round trip and no network byte: [`crate::fetch`]
+    /// takes D10's same-host path and `{in}/<key>` is hard links into the
+    /// store.
+    ///
+    /// **A pack that cannot be got is `Err` and never a silence.** The
+    /// caller hands the attempt back with the sentence and tells the hub
+    /// `ToHub::PackUnavailable`, so a job whose `{in}/<key>` would be empty
+    /// is a named visible state rather than a green-looking job that never
+    /// saw its inputs — which is D150's failure and the whole reason
+    /// `PackUnavailable` was numbered.
+    ///
+    /// Each pack's own cost goes to the hub as it lands
+    /// (`ToHub::PackTransferred`): the figures are D148's owed measurement,
+    /// and `bytes` being nought is the assertion D10's same-host clause
+    /// rests on.
+    ///
+    /// The sentences come back rather than being printed, like
+    /// [`Session::announce_packs_held`] above, so the caller says them in the
+    /// job's own voice.
+    /// `commit` is the job's own, out of its declaration: a pack is
+    /// registered for a `(commit, key)` pair, and [`AssignedPack`] carries
+    /// the key and not the commit because the hub resolved it against this
+    /// job's commit already. It is here so a `PackUnavailable` can name the
+    /// pair an operator would go looking for.
+    ///
+    /// [`AssignedPack`]: herd_proto::pack::AssignedPack
+    pub(crate) async fn lay_out_packs(
+        &self,
+        job_id: &JobId,
+        commit: &str,
+        data_root: &Path,
+        in_dir: &Path,
+        packs: &[herd_proto::pack::AssignedPack],
+    ) -> std::result::Result<Vec<String>, String> {
+        if packs.is_empty() {
+            return Ok(Vec::new());
+        }
+        let store = self.pack_store(data_root).map_err(|why| {
+            format!(
+                "this job needs {} pack(s) and this runner has no pack store to lay them out \
+                 of: {why}",
+                packs.len()
+            )
+        })?;
+        let authoriser = HubMints {
+            session: self.clone(),
+        };
+        let mut said = Vec::new();
+        let mut anything_arrived = false;
+        for assigned in packs {
+            // One directory per key, named by the key the requester
+            // declared: that is what `{in}/<key>` means, and the name is the
+            // consumer's own word and not an id.
+            let at = in_dir.join(&assigned.key);
+            match fetch::fetch(
+                &store,
+                job_id,
+                assigned,
+                &at,
+                &authoriser,
+                fetch::Patience::default(),
+            )
+            .await
+            {
+                Ok(fetched) => {
+                    anything_arrived |= fetched.objects_fetched > 0;
+                    self.send(ToHub::PackTransferred(fetched.transferred(job_id.clone())));
+                    said.push(fetched.sentence(&assigned.key));
+                }
+                Err(unavailable) => {
+                    // The hub is told before the attempt is handed back, so
+                    // that the sentence naming the pack is on the hub's
+                    // journal whether or not the abandonment is recorded.
+                    self.send(ToHub::PackUnavailable(herd_proto::pack::PackUnavailable {
+                        job_id: job_id.clone(),
+                        pack: unavailable.pack.clone(),
+                        commit: commit.to_owned(),
+                        key: assigned.key.clone(),
+                        why: unavailable.why.clone(),
+                    }));
+                    return Err(unavailable.why);
+                }
+            }
+        }
+        // What this runner holds, said again — but **only when an object
+        // really arrived**. An announcement replaces the hub's whole view of
+        // this runner (`ToHub::PacksHeld`), so it has to be sent whenever the
+        // store changed, and it costs a walk of `manifests/` and a frame, so
+        // it must not be sent when it did not. D10's first path changes
+        // nothing: every object was already here, which is the case the
+        // manifest rides the assignment for and the common case on the
+        // machine that produced the pack.
+        //
+        // Said here as well as after a collection, which is what
+        // `Session::announce_packs_held`'s own doc asks for: "when something
+        // does, it announces here as well or the hub's view goes stale in the
+        // other direction".
+        if anything_arrived {
+            said.push(self.announce_packs_held(data_root));
+        }
+        Ok(said)
+    }
+
+    /// Register one pack this job left with the hub (`ToHub::RegisterPack`,
+    /// E-17).
+    ///
+    /// **Sent after the ingest and therefore after the fsync**, which is the
+    /// whole of E-17: [`packstore::PackStore::ingest`] writes the manifest
+    /// last, so a pack this frame names is on this runner's disk whole. A
+    /// registration before the fsync would let the hub resolve a key onto a
+    /// pack an interrupted ingest never finished.
+    ///
+    /// The manifest and the `pack.meta` ride **verbatim**: the id is the
+    /// sha256 of exactly those bytes, so the hub recomputes it and refuses a
+    /// mismatch by name, and nothing in Herd reprints a manifest.
+    ///
+    /// Answers whether there was a link to send it on. A pack this runner
+    /// holds and the hub has not been told about is not lost — the next
+    /// connection announces the holding — but the `(commit, key)` it was left
+    /// under is **not** re-registered, which is why the caller says so out
+    /// loud rather than letting it pass.
+    pub(crate) fn register_pack(
+        &self,
+        job_id: &JobId,
+        attempt: u32,
+        commit: &str,
+        pack: &packstore::LeftPack,
+    ) -> bool {
+        self.send(ToHub::RegisterPack(herd_proto::pack::RegisterPack {
+            job_id: job_id.clone(),
+            attempt,
+            commit: commit.to_owned(),
+            key: pack.key.clone(),
+            manifest: pack.held.manifest.bytes().to_vec(),
+            meta: pack.held.meta.clone(),
+        }))
+    }
+
+    /// Ask the hub to authorise one transfer and wait for its answer (D209).
+    ///
+    /// The adapter [`fetch::Authoriser`] was written for: the ask and both
+    /// answers are the real frames, so this is a channel and a map lookup and
+    /// not a translation.
+    ///
+    /// **A refusal is an answer.** `FromHub::PackRefused` about this
+    /// `(job, pack)` resolves the ask with the hub's own sentence, word for
+    /// word, because the party that knows why is the one that has to speak.
+    /// The link going is an answer too, through
+    /// [`Session::detach`] dropping the sender.
+    async fn ask_for_a_capability(
+        &self,
+        ask: herd_proto::pack::AskTransferCapability,
+    ) -> std::result::Result<herd_proto::pack::TransferCapability, String> {
+        let key = (ask.job_id.clone(), ask.pack.clone());
+        let (answer, waiting) = tokio::sync::oneshot::channel();
+        // Registered **before** the frame goes out: queued first, the answer
+        // could come back on a link that is handled by another task and find
+        // nobody waiting for it.
+        self.with(|inner| inner.capability_asks.insert(key.clone(), answer));
+        // And taken out again however this function ends, including the way
+        // that is not an `Err` here at all: `crate::fetch` wraps this in its
+        // own `Patience::capability` timeout, and a timeout **drops** the
+        // future rather than returning through it. Without the guard the
+        // entry would sit in the map until the link went, holding a sender
+        // nothing will ever use.
+        let _forget_the_ask = AskEnded {
+            session: self.clone(),
+            key: key.clone(),
+        };
+        if !self.send(ToHub::AskTransferCapability(ask.clone())) {
+            return Err(format!(
+                "this runner has no link to its hub, so it cannot be authorised to transfer {} \
+                 object(s) of pack {}. A transfer is authorised by the hub and by nothing else \
+                 (D209), so this runner does not dial a holder on its own authority",
+                ask.objects.len(),
+                ask.pack
+            ));
+        }
+        match waiting.await {
+            Ok(answer) => answer,
+            // The sender was dropped: the link went, or a second ask for this
+            // same `(job, pack)` replaced this one. Either way nothing is
+            // coming, and saying so is what keeps this from being a wait that
+            // does not end.
+            Err(_) => Err(format!(
+                "this runner was never answered about a capability to transfer pack {}: the \
+                 link it asked on went away before the hub said yes or no",
+                ask.pack
+            )),
+        }
+    }
+
+    /// The hub minted a capability: hand it to whoever asked.
+    ///
+    /// Answers the line to say, which names the pack either way — a
+    /// capability nobody is waiting for is worth a sentence, because it means
+    /// a fetch gave up before the hub answered and the token will expire
+    /// unused.
+    pub(crate) fn transfer_capability(
+        &self,
+        capability: herd_proto::pack::TransferCapability,
+    ) -> String {
+        let key = (capability.job_id.clone(), capability.pack.clone());
+        let waiting = self.with(|inner| inner.capability_asks.remove(&key));
+        match waiting {
+            Some(answer) => {
+                let pack = capability.pack.clone();
+                let peer = capability.peer.clone();
+                if answer.send(Ok(capability)).is_err() {
+                    return format!(
+                        "the hub authorised a transfer of pack {pack} from {peer} and the fetch \
+                         that asked for it is gone, so the token will expire unused"
+                    );
+                }
+                format!("the hub authorised a transfer of pack {pack} from {peer}")
+            }
+            None => format!(
+                "the hub authorised a transfer of pack {} from {} and nothing on this runner is \
+                 waiting for it, so the token will expire unused",
+                capability.pack, capability.peer
+            ),
+        }
+    }
+
+    /// The hub refused something about one pack — **non-terminally** (D13).
+    ///
+    /// Routed to a waiting ask when there is one, so the hub's own sentence
+    /// reaches the layout that is blocked on it instead of only the machine's
+    /// stderr. With nothing waiting it is a line and nothing else: a refusal
+    /// about a registration is the other case this frame carries, and there
+    /// is nobody to tell but the owner of the machine.
+    pub(crate) fn pack_refused(&self, refused: herd_proto::pack::PackRefused) -> String {
+        let waiting = refused.pack.as_ref().and_then(|pack| {
+            let key = (refused.job_id.clone(), pack.clone());
+            self.with(|inner| inner.capability_asks.remove(&key))
+        });
+        if let Some(answer) = waiting {
+            let _ = answer.send(Err(refused.why.clone()));
+        }
+        format!(
+            "the hub refused {}{}: {}",
+            refused.job_id,
+            refused
+                .pack
+                .as_ref()
+                .map(|pack| format!("'s pack {pack}"))
+                .unwrap_or_else(|| "'s pack".to_owned()),
+            refused.why
+        )
     }
 
     /// How many results are waiting to be acknowledged.
@@ -2817,6 +3176,13 @@ impl Session {
             // The note is a connection's, like everything else here: the next
             // link offers what is still held and judges it again from zero.
             inner.set_aside_here.clear();
+            // And every capability this runner was waiting for an answer to.
+            // Dropped rather than kept: the ask went out on a link that is
+            // gone, so the answer is never coming, and a layout holding the
+            // other end of this channel wakes with an error and says which
+            // pack it could not get (D150). Keeping them would be the one
+            // shape the pack half must not have — a job waiting on silence.
+            inner.capability_asks.clear();
         });
     }
 
@@ -3535,6 +3901,10 @@ pub async fn run_until(config: Config, stop: impl Future<Output = String>) -> Re
                 mesh,
                 store,
                 session.granted().clone(),
+                // Where the bound address goes, and the one thing the first
+                // dial below waits for. The endpoint is the step that binds,
+                // so it is the step that knows the port.
+                session.advertised().clone(),
                 // `Runner::serves_content` and not a second reading of the
                 // switch: `off` and draining are already read there (E-33,
                 // D11's third condition).
@@ -3548,6 +3918,13 @@ pub async fn run_until(config: Config, stop: impl Future<Output = String>) -> Re
                 },
             ))),
             Err(why) => {
+                // No endpoint task at all on this path, so **this** is where
+                // the advertisement settles. Without it the first dial below
+                // would wait on a bind nobody is going to attempt, and a
+                // runner whose pack store will not open would never say
+                // hello — a directory would have cost its owner the whole
+                // machine.
+                session.advertised().say(endpoint::Advertisement::Nothing);
                 // Said and not fatal. A runner whose pack store will not open
                 // cannot serve a pack and cannot ingest one, and both of
                 // those are refusals this runner makes by name when they are
@@ -3562,6 +3939,29 @@ pub async fn run_until(config: Config, stop: impl Future<Output = String>) -> Re
             }
         }
     };
+    // **The bind, before the first dial.** The endpoint above is the one step
+    // that knows what it bound — `--mesh-listen 127.0.0.1` means port `0` and
+    // the kernel picks it there — and the handshake has one field for it and
+    // no frame that revises it afterwards (invariant 4). So the dial waits
+    // here, once, and every connection after this one reads a value that is
+    // already settled.
+    //
+    // It is a wait on a bind and not a timeout: an outbound-only runner, a
+    // runner started switched `off` and a runner whose bind failed each
+    // settle on "nothing to advertise" immediately, which is why this cannot
+    // be the place a runner hangs. What a wait buys is that every spelling of
+    // the flag works: `--mesh-listen 10.9.0.3:7711` would have been knowable
+    // without it, and `--mesh-listen 127.0.0.1` never would.
+    let advertising = session.advertised().settled().await;
+    eprintln!(
+        "herd-runner: this runner's handshake will say it serves pack content {}",
+        match &advertising {
+            Some(at) => format!("at {at}"),
+            None => "nowhere: it is outbound-only, so the hub refuses it as a holder by name \
+                     and the bytes of a pack it holds have to be pushed (D10, invariant 3)"
+                .to_owned(),
+        }
+    );
     let stop_probing = probing.abort_handle();
     let serving = serve_forever(config.clone(), session.clone(), Arc::clone(&confined));
     // A `drain` position is "finish and leave" (E-33), and this is the leaving
@@ -4060,11 +4460,33 @@ pub async fn serve_once(config: Config, session: Session, confined: Arc<Confined
         // The load as this runner dials, so that a job placed before the
         // first health report still has a figure on its line (E-32).
         load_milli: crate::metrics::host_load_milli(),
-        // `None` until this runner has a mesh address to advertise, which is
-        // S4's work (the two flags and both invariant-3 guards). Absent is
-        // the outbound-only runner, and that is exactly what this build is:
-        // it serves no pack content to anybody.
-        mesh_endpoint: None,
+        // And where peers may fetch a pack's objects off this machine, when
+        // anywhere (invariant 3, D10, D11).
+        //
+        // **Read here and waited for elsewhere, and that split is the whole
+        // design of this field.** With `--mesh-listen 127.0.0.1` the port is
+        // `0` and the kernel picks it at bind time, in the endpoint task
+        // started beside the redial loop — so on a cold start the address is
+        // not known when a hello is built. The protocol has no frame that
+        // revises a mesh endpoint later (invariant 4), so a hello that
+        // guessed would be uncorrectable for the life of the link: the hub
+        // would mint capabilities against a port nothing holds, and every
+        // peer sent there would be refused for a reason nobody could see.
+        //
+        // So [`run_until`] awaits the bind **before the first dial** and this
+        // only reads what settled. It is deliberately not an await: this
+        // function is also the whole runner for a good part of this
+        // workspace's test suite, started against a hub with no endpoint task
+        // beside it at all, and a hello that waited would be a hello that
+        // never left.
+        //
+        // A reconnect costs nothing and rebinds nothing: the endpoint is
+        // bound once and outlives every connection, so this reads the value
+        // the link before it announced. `None` is the outbound-only runner —
+        // no `--mesh-listen`, a bind that failed, or an owner's switch that
+        // says this machine serves nothing — and it is absent on the wire,
+        // which is what makes the hub refuse this runner as a holder by name.
+        mesh_endpoint: session.advertised().now().on_the_wire(),
     };
     sink.send(Message::text(to_frame(&hello).context("encoding hello")?))
         .await
@@ -4240,12 +4662,14 @@ async fn serve_hub(
                 command,
                 declaration,
                 timeout_s,
-                // M11's resolved packs, which the hub now fills (ORCH-234).
-                // Carried into the job rather than dropped here: the
-                // `{in}`/`{out}` layout is still S8's, and `job::execute` is
-                // where a job this runner cannot serve is handed back instead
-                // of running with an empty `{in}` — which is D150's silence
-                // and the thing `PackUnavailable` exists to prevent.
+                // M11's resolved packs, which the hub fills (ORCH-234) and
+                // `job::execute` now lays out: `packs_in` becomes
+                // `{in}/<key>` before the first step runs, and `packs_out`
+                // is what the collection takes back out of `{out}` and
+                // registers. A pack that cannot be got hands the attempt
+                // back by name rather than running with an empty `{in}` —
+                // which is D150's silence and the thing `PackUnavailable`
+                // exists to prevent.
                 packs_in,
                 packs_out,
             } => {
@@ -4390,6 +4814,35 @@ async fn serve_hub(
             // is on [`Session::pin_packs`].
             FromHub::PinPacks(pins) => {
                 eprintln!("herd-runner: {}", session.pin_packs(pins));
+            }
+            // **The hub's answer to a fetch's own ask** (D209). Handed to
+            // whichever layout is blocked on it, by `(job, pack)`, which is
+            // what this frame carries and all it carries: see
+            // [`Session::transfer_capability`].
+            FromHub::TransferCapability(capability) => {
+                eprintln!("herd-runner: {}", session.transfer_capability(capability));
+            }
+            // **A refusal about one pack, and not about this runner** (D13).
+            // Routed to a waiting ask when there is one, so the hub's own
+            // sentence reaches the job that is blocked on it rather than only
+            // the machine's stderr. The link stays up and the runner's other
+            // jobs are untouched, which is the whole difference from
+            // `FromHub::Refused` below.
+            FromHub::PackRefused(refused) => {
+                eprintln!("herd-runner: {}", session.pack_refused(refused));
+            }
+            // The hub has the pack. Said and nothing else: the runner holds
+            // nothing against this acknowledgement — the pack is on its own
+            // disk whether or not the hub ever answers, and the holding is
+            // re-announced on every connection — so there is no state to
+            // release. It is said because an operator reading her machine's
+            // stderr has to be able to tell a registration that landed from
+            // one that was refused.
+            FromHub::PackRegistered(registered) => {
+                eprintln!(
+                    "herd-runner: this hub holds pack {} for {}/{}, left by {}",
+                    registered.pack, registered.commit, registered.key, registered.job_id
+                );
             }
             FromHub::Refused { reason } => return Err(Refusal(reason).into()),
             FromHub::StandBy {
