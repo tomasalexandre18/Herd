@@ -454,6 +454,24 @@ fn directory_bytes(path: &Path) -> u64 {
     bytes
 }
 
+/// `durable::names_in` as it was before ORCH-158: the raw `read_dir` order,
+/// with the writer's temporaries filtered out and **nothing sorted**.
+///
+/// The one thing this file still needs that the store no longer offers. Phase
+/// 4 exists to compare the filesystem's own order against id order, and the
+/// change phase 4 argued for was to sort — so the unsorted order has to be
+/// read here or the comparison measures one order against itself.
+fn readdir_order(path: &Path) -> Vec<String> {
+    let mut names = Vec::new();
+    for entry in fs::read_dir(path).expect("the directory lists").flatten() {
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if !name.starts_with('.') {
+            names.push(name);
+        }
+    }
+    names
+}
+
 // ---------------------------------------------------------------------------
 // 1. The table the engine needs: both walks, cold and warm, against T.
 // ---------------------------------------------------------------------------
@@ -608,7 +626,9 @@ fn what_dominates_a_record_walk() {
             .collect();
         let real = median(&real);
 
-        // The one readdir.
+        // The one readdir, with the sort ORCH-158 put inside it: this is the
+        // store's own listing and not a replica of it, so the sort's cost is
+        // inside this figure where it belongs.
         let listing: Vec<Duration> = (0..5)
             .map(|_| {
                 let at = Instant::now();
@@ -777,17 +797,25 @@ fn the_eviction_is_real() {
 /// **Why this phase exists.** In phase 2 the replica's *warm* total tracks
 /// the real `collections_owed` to within a few percent, and its *cold* total
 /// is well under it. The two walks do the same syscalls over the same files,
-/// so the difference is not what they read — it is the order. The store walks
-/// whatever `durable::names_in` hands back, which on ext4 is the directory's
-/// **hash order** and so effectively random against the disk; the replica
-/// walks `corpus.names`, which is **id order** and therefore creation order,
-/// and creation order is laid out sequentially.
+/// so the difference is not what they read — it is the order. On ext4
+/// `read_dir` hands back the directory's **hash order**, which is effectively
+/// random against the disk; the replica walks `corpus.names`, which is **id
+/// order** and therefore creation order, and creation order is laid out
+/// sequentially.
 ///
 /// That is worth a measurement of its own rather than a sentence, because
 /// `docs/disk-policy.md` §3.4 proposes an **id-ordered** retention pass for a
 /// different reason — it can stop early — and if id order is also the cheaper
 /// order per record on a cold cache, the proposal earns an argument nobody
 /// has made for it.
+///
+/// **This is the measurement ORCH-158 was taken from, and it is the one that
+/// holds ORCH-158's change in place.** `durable::names_in` now sorts, so the
+/// order the store reads in is the id order; the raw `read_dir` order is read
+/// here by [`readdir_order`], which is `names_in` without its sort, so the
+/// two orders can still be compared after the change the comparison asked
+/// for. The assertion below is the change itself: whatever the directory
+/// hands back, the store's own listing comes back sorted.
 #[test]
 #[ignore = "a bench; run it on purpose"]
 fn the_order_a_walk_reads_in() {
@@ -796,10 +824,17 @@ fn the_order_a_walk_reads_in() {
         let corpus = Corpus::build(t);
         println!("\n  T={t}: {}", corpus.say());
 
-        // Exactly what the store sees, in the order the store sees it.
-        let listed = durable::names_in(&corpus.jobs).expect("the listing reads");
+        // What the filesystem hands back, before anybody has ordered it.
+        let listed = readdir_order(&corpus.jobs);
         let mut sorted = listed.clone();
         sorted.sort();
+        // And what the store now sees, which is ORCH-158's one `sort()`.
+        assert_eq!(
+            durable::names_in(&corpus.jobs).expect("the listing reads"),
+            sorted,
+            "the store's own listing is no longer in id order, so the id-order figures \
+             below are about an order nothing reads in"
+        );
         let agree = listed
             .iter()
             .zip(sorted.iter())
