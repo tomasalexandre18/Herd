@@ -60,6 +60,40 @@
 //! and a hub that has just restarted offers no holder that is no longer there.
 //! The registry survives a restart; the holdings deliberately do not.
 //!
+//! ### None of that is reachable from the network in this build
+//!
+//! The paragraph above is the design (D231 decision 5). What a running hub
+//! does is **neither half of it**, and the gap is two mechanisms wide, not
+//! one. Measured 2026-10-30 over `herd-hub/src/`, `herd-runner/src/` and
+//! `herdctl/src/`, with the search proven on a frame that *is* dispatched:
+//!
+//! * **Nothing announces.** No `herd_proto::ToHub::PacksHeld` is constructed
+//!   anywhere outside `herd-proto`'s own round-trip test, and the hub's
+//!   connection loop has no arm for it: a runner that sent one would be
+//!   answered `FromHub::Refused { "a runner may not send packs_held" }` and
+//!   its link closed. `FromHub::ReadPacksAgain` is constructed nowhere
+//!   either, so nothing asks for the announcement after a restart. So
+//!   [`PackRegistry::announced`] has no caller but this module's tests, and
+//!   the holdings map is empty in every running hub.
+//! * **Nothing forgets.** [`PackRegistry::runner_gone`] and
+//!   [`PackRegistry::forget_all_holdings`] have no caller either, and the two
+//!   places that know a runner is gone — `State::release_runner` and the
+//!   watchdog's link pass, both in `server.rs` — cannot reach this registry
+//!   at all: the server holds an `Arc<dyn JobStore>`, and `packs()` is on the
+//!   concrete `JobDirStore` rather than on that trait.
+//!
+//! The two absences hide each other: no stale holder has ever been observed
+//! because no holder is ever recorded. So "re-announced after `Welcome`" is a
+//! design and not yet a behaviour, and the two methods above are a promise
+//! rather than a mechanism — which an audit said once already, and which the
+//! merger of batch 12 measured again.
+//!
+//! Wiring it is one step and it needs both halves plus a seam: the frame
+//! dispatch (`store::JobDirStore::packs`'s own note says that step owns
+//! `server.rs`), a runner that announces after `Welcome`, and one method on
+//! `JobStore` for the server to reach a registry through. Written down here
+//! rather than left to be rediscovered a third time.
+//!
 //! [`herd_proto::pack::PackState::Incomplete`] is therefore **not the hub's to
 //! compute**, and [`PackRegistry::state_of`] never returns it: holdings are per
 //! manifest, so "some object of this pack is held nowhere" is a statement about
@@ -771,12 +805,25 @@ impl PackRegistry {
     ///
     /// The volatile half of the design: a holder that is not connected is not
     /// a holder, and the registry itself is untouched.
+    ///
+    /// **No caller outside this module's tests, and not for want of a call
+    /// site.** The two paths that know a runner is gone are in `server.rs`
+    /// and cannot reach this registry: see *None of that is reachable from
+    /// the network in this build* in the module's own documentation, which
+    /// names what the wiring needs. Until then this is a method and not a
+    /// behaviour, and the holdings it would clear are never filled.
     pub fn runner_gone(&self, runner: &str) {
         self.locked().holdings.remove(runner);
     }
 
     /// Forget every holding, because this hub is starting again or has asked
     /// the fleet to re-announce (`FromHub::ReadPacksAgain`).
+    ///
+    /// **No caller outside this module's tests**, and nothing constructs that
+    /// frame: the module note explains both. A fresh `PackRegistry` starts
+    /// with an empty holdings map anyway, so the restart case this exists for
+    /// is covered by `open` and this method is for the ask, which nobody
+    /// makes yet.
     pub fn forget_all_holdings(&self) {
         self.locked().holdings.clear();
     }
