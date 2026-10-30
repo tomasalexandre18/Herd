@@ -692,21 +692,19 @@ matters more than the steps:
 
 ### What this means for you, concretely, today
 
-No release you can install moves `RECORD_VERSION` or `LAYOUT_VERSION`.
-All three numbers are 2, 1 and 1 in v0.4.0 and in v0.4.1, and the next
-ordinary release is constrained to ship at record 1 and layout 1 so
-that your existing root stays readable (D199). The release that moves
-them is **v1.0.0**, and moving them was taken as a decision with its
-price understood: a fleet restarting from zero. When that release
-comes, the four steps above are the procedure, and step 1 is the one
-nobody can do for you.
+**v0.4.0 and v0.4.1 are at 2, 1 and 1; v1.0.0 is the release that moves
+all three, to 3, 2 and 2.** Moving them was taken as a decision with
+its price understood: a fleet restarting from zero. So the four steps
+above are **the** procedure for the v0.4.1 → v1.0.0 move, and step 1 is
+the one nobody can do for you. Up to v0.4.1 no release you could
+install moved either disk number, which is why nobody has had to walk
+those steps before.
 
-**What M11's pack half changed is `main`, not a release.** All three
-numbers moved there — protocol 3, record 2, layout 2 — so a hub built
-from `main` already refuses a v0.4.1 root. D199's ordering constraint
-is unchanged and still binding, and it now says something sharper than
-it did: the ordinary release before v1.0.0 cannot be cut from `main`'s
-tip.
+**D199's constraint on the ordinary release before v1.0.0 is moot, not
+open** (D243): the next tag after v0.4.1 is v1.0.0, so there is no
+ordinary release left for that constraint to bind, and the sentence that
+stood here — that such a release could not be cut from `main`'s tip —
+describes a release nobody will cut.
 
 ## One limitation, stated rather than left silent
 
