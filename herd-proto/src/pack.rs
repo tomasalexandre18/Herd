@@ -23,6 +23,29 @@
 //! carries the number so a mismatch is refused **by name** rather than read
 //! as a malformed request, and that is all it is for. One version, not two.
 //!
+//! ## How the peer leg is framed, and why it is not JSON all the way down
+//!
+//! **One line of JSON ended by `\n`, then exactly as many raw bytes as the
+//! line said** ([`encode_peer_header`], [`decode_peer_header`],
+//! [`take_peer_body`]).
+//!
+//! The control plane has no choice: D4 makes one message one WebSocket
+//! **text** frame and D18 keeps a job's output byte-exact inside it, so a
+//! payload there is base64 and pays 33% for it. That cost is right where it
+//! is paid — a log chunk is kilobytes — and wrong here, because this is the
+//! one leg that moves hundreds of megabytes and it touches no hub, carries
+//! no mixed traffic and needs no text frame. The consumer's measured pack is
+//! 401.6 MiB; base64'd inside JSON it would be about 535 MiB, and the third
+//! would buy nothing at all.
+//!
+//! A length-prefixed binary framing would save the same third and cost the
+//! property that a person can read one line of this stream with `head -1`
+//! and know what is on it. So the header stays JSON and the body stops
+//! being: the length lives **in the header that precedes the bytes**, which
+//! [`PeerBody`] makes a property of the header's type rather than a rule
+//! somebody has to remember, and every way the two can disagree is refused
+//! by its own name ([`PeerFramingRefusal`]).
+//!
 //! ## The three parts of a pack, and the one that does not travel far
 //!
 //! ```text
@@ -81,7 +104,7 @@ use std::collections::BTreeMap;
 use std::fmt;
 use std::time::Duration;
 
-use serde::{Deserialize, Serialize};
+use serde::{de::DeserializeOwned, Deserialize, Serialize};
 
 /// The first line of a manifest Herd will read: `# chatons pack 1`.
 ///
@@ -243,11 +266,46 @@ impl ManifestKind {
 /// A **view**, never a source. Nothing in Herd writes one of these back out
 /// as text: the manifest's bytes are the manifest, and these are what Herd
 /// read out of them in order to know which objects the pack is made of.
+///
+/// ## Every field here is untrusted input
+///
+/// A `manifest.tsv` is a file **this project did not write**: it comes out of
+/// the consumer's own tooling, off a runner's disk, or off a frame a peer
+/// sent. So a row is input to be checked and not a record to be believed, and
+/// the two columns a reader could build a **path** out of are checked before
+/// an entry of this type exists:
+///
+/// * [`ManifestEntry::sha256`] is the name of a file under `objects/`, so it
+///   must be exactly 64 lowercase hex characters
+///   ([`check_object_digest`]) — a column reading `../../../escaped` would
+///   otherwise name a path outside the store;
+/// * [`ManifestEntry::path`] is relative to the pack's own root by the
+///   format's definition, so it may not be empty, absolute, hold a NUL, or
+///   climb out with `..`.
+///
+/// **The other four rest on nothing being done with them, and that is worth
+/// knowing before you are the one who does something with them.** `size` is a
+/// parsed `u64`; `kind` is one of three letters and an unknown letter is a
+/// refusal; `mode` is carried as text and never applied; `role` is carried
+/// and printed and never matched. [`ManifestEntry::link_target`] is the one
+/// with real content and no check: **Herd never follows a link and never lays
+/// a tree out** (module doc), so it is inert *by usage* and not by
+/// construction, and it is deliberately not guarded — a build output's
+/// symlink may legitimately point at an absolute path outside the pack, and
+/// refusing that would refuse a good pack to defend against a resolution
+/// nothing performs. A reader that ever does resolve one owes it its own
+/// check, and that is the one rule in this type a doc comment still has to
+/// carry.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ManifestEntry {
-    /// Column 1, lowercase hex. For a `kind f` row this is the name of the
-    /// object under `objects/`; for the other kinds it is a digest of
-    /// something that is not a file's bytes, and Herd does not look it up.
+    /// Column 1, **exactly 64 lowercase hex characters** — checked, because
+    /// this is the column Herd builds a path out of.
+    ///
+    /// For a `kind f` row it is the name of the object under `objects/`; for
+    /// the other kinds it is a digest of something that is not a file's
+    /// bytes, and Herd does not look it up. Uppercase is **refused and not
+    /// lowercased**, so a content-addressed store cannot end up holding one
+    /// object's bytes under two names ([`check_object_digest`]).
     pub sha256: String,
     /// Column 2: the entry's size in bytes, as the consumer's tool measured
     /// it.
@@ -263,10 +321,20 @@ pub struct ManifestEntry {
     /// Column 5: the consumer's own classification of the entry. Carried,
     /// printed, never matched against a list of roles Herd knows (E-11).
     pub role: String,
-    /// Column 6, relative to the pack's own root. Not a path Herd ever joins
-    /// onto anything: the consumer's tool lays the tree out.
+    /// Column 6, relative to the pack's own root — **checked** to be exactly
+    /// that: not empty, not absolute, no NUL, and no `..` that climbs out of
+    /// the pack.
+    ///
+    /// Herd joins it onto nothing today, because the consumer's own tool lays
+    /// the tree out. The check is here so that *inert* is a property of the
+    /// type rather than of this week's callers: the rule used to be this
+    /// sentence, and a rule in a doc comment is one a later reader may not
+    /// have read.
     pub path: String,
-    /// Column 7, present on the rows that have one. Never followed.
+    /// Column 7, present on the rows that have one. **Never followed, and
+    /// deliberately not checked** — see the type's own doc: a build output's
+    /// symlink may point outside the pack legitimately, so this is the one
+    /// field whose safety is that nothing resolves it.
     pub link_target: Option<String>,
 }
 
@@ -440,6 +508,104 @@ impl fmt::Debug for PackManifest {
     }
 }
 
+/// Whether a string is a digest Herd may build a path out of: **exactly 64
+/// lowercase hex characters, and nothing else**.
+///
+/// ## Why this is a check and not a convention
+///
+/// A `kind f` row's digest column is the **name of a file under `objects/`**,
+/// so it is the one column in a manifest that Herd joins onto a path. A
+/// manifest is a file this project did not write — the consumer's own tooling
+/// produces it — so a row is untrusted input, and a digest column reading
+/// `../../../escaped` would otherwise travel out of
+/// [`ManifestEntry::sha256`] into a path outside the store. It is refused
+/// here, where the entry is built, so that **no reader has to remember**:
+/// every `ManifestEntry` that exists has a digest of this shape, and the
+/// registry, the fetch endpoint and the runner's store each get the rule for
+/// free rather than writing it a third, fourth and fifth time. Three copies
+/// is how two of them come to disagree.
+///
+/// ## Why uppercase is refused rather than lowercased
+///
+/// Normalising would mean `AB…` and `ab…` name one object, and a
+/// content-addressed store would then be free to hold the same bytes twice
+/// under two spellings — two names for one pack's one object, with no way to
+/// say which the manifest meant. One spelling, refused loudly, costs the
+/// consumer's tool nothing (sha256 output is lowercase everywhere) and keeps
+/// the store's names and the manifest's the same strings.
+///
+/// Public so the readers that already check this can **delegate** rather than
+/// keep a second copy.
+pub fn check_object_digest(value: &str) -> Result<(), String> {
+    if value.chars().count() != 64 {
+        return Err(format!(
+            "{value:?} is {} character(s) and a sha256 is 64 lowercase hex digits. This is the \
+             column Herd builds a path out of — `objects/<sha256>` — so a value that is not a \
+             digest is a path outside the pack's own store, and it is refused here rather than \
+             joined",
+            value.chars().count()
+        ));
+    }
+    if let Some(upper) = value
+        .chars()
+        .find(|c| c.is_ascii_hexdigit() && c.is_uppercase())
+    {
+        return Err(format!(
+            "{value:?} contains the uppercase hex digit {upper:?}, and Herd reads lowercase only. \
+             It is refused rather than lowercased: a content-addressed store that accepted both \
+             spellings could hold one object's bytes twice under two names, and nothing would say \
+             which of the two the manifest meant"
+        ));
+    }
+    if let Some(bad) = value.chars().find(|c| !c.is_ascii_hexdigit()) {
+        return Err(format!(
+            "{value:?} contains {bad:?}, which is not a hex digit. This is the column Herd builds \
+             a path out of — `objects/<sha256>` — so anything but 64 lowercase hex digits is \
+             refused here rather than joined onto a path"
+        ));
+    }
+    Ok(())
+}
+
+/// Whether a row's path column is one a pack's own root can contain.
+///
+/// Column 6 is **relative to the pack's own root** by the format's own
+/// definition, so an absolute path, a `..` that climbs out of it, an empty
+/// path or a NUL byte is a malformed row and not a path Herd could lay out
+/// even if it laid trees out. Checked at the same place for the same reason
+/// as the digest: [`ManifestEntry::path`]'s doc comment used to carry the
+/// rule as prose — *"not a path Herd ever joins onto anything"* — and a rule
+/// in a doc comment is a rule a later reader may not have read.
+///
+/// **This is not the digest's case and it is weaker.** Herd joins the digest
+/// onto a path today; it joins this onto nothing, because the consumer's own
+/// `--pack DIR` lays the tree out (module doc). The check is here so that
+/// *inert* is true of the type and not only of today's callers.
+fn check_entry_path(value: &str) -> Result<(), String> {
+    if value.is_empty() {
+        return Err("its path column is empty, and every entry names a path".to_owned());
+    }
+    if value.contains('\0') {
+        return Err(format!(
+            "its path {value:?} contains a NUL byte, which no path on any host this runs on can \
+             hold"
+        ));
+    }
+    if value.starts_with('/') {
+        return Err(format!(
+            "its path {value:?} is absolute, and column 6 is relative to the pack's own root: an \
+             absolute path in a pack is a path outside it"
+        ));
+    }
+    if value.split('/').any(|part| part == "..") {
+        return Err(format!(
+            "its path {value:?} climbs out of the pack with \"..\", and column 6 is relative to \
+             the pack's own root. A pack describes its own contents and nothing above them"
+        ));
+    }
+    Ok(())
+}
+
 /// One row, or why it is not one.
 fn entry_of_row(line: &str, number: usize) -> Result<ManifestEntry, String> {
     let columns: Vec<&str> = line.split('\t').collect();
@@ -466,6 +632,12 @@ fn entry_of_row(line: &str, number: usize) -> Result<ManifestEntry, String> {
             columns[1]
         )
     })?;
+    // The two columns a reader could build a path out of, checked before the
+    // entry exists rather than wherever somebody later joins them. A manifest
+    // comes from the consumer's own tooling, so a row is untrusted input.
+    check_object_digest(columns[0])
+        .map_err(|why| format!("line {number} of this manifest: {why}"))?;
+    check_entry_path(columns[5]).map_err(|why| format!("line {number} of this manifest: {why}"))?;
     Ok(ManifestEntry {
         sha256: columns[0].to_owned(),
         size,
@@ -643,17 +815,43 @@ pub struct PeerRequest {
     pub offset: u64,
 }
 
-/// One reply on the peer wire: these bytes of that object.
+/// The header of one reply on the peer wire: *these bytes of that object
+/// follow*.
+///
+/// **The bytes are not in here, and that is the whole point.** An earlier
+/// shape carried them as a `data: Vec<u8>` field, base64 inside the JSON, as
+/// every payload on the *control* plane does — and on the control plane
+/// base64 is forced, because D4 makes a frame one WebSocket **text** frame
+/// and D18 keeps a job's output byte-exact inside it. Nothing forces JSON on
+/// this leg. It touches no hub, carries no mixed traffic, and is the one leg
+/// that moves hundreds of megabytes: the consumer's measured 401.6 MiB pack
+/// would travel as about 535 MiB base64'd, a third of it paid for nothing.
+///
+/// So the framing is [`encode_peer_header`]'s: one line of JSON terminated
+/// by `\n`, then exactly [`PeerReply::length`] raw bytes. Debuggable by eye,
+/// no new dependency, and the length is in the header that precedes the
+/// bytes rather than in a prefix nobody can read.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PeerReply {
     pub object: String,
     pub offset: u64,
+    /// **How many raw bytes follow this header line**, at most
+    /// [`PACK_CHUNK_BYTES`].
+    ///
+    /// This is the field the framing reads, and it is the chunk's length and
+    /// not the object's: a reader that took it for the object's whole size
+    /// would wait for bytes the sender never promised. The object's size is
+    /// [`PeerReply::object_length`], beside it.
+    pub length: u64,
     /// The object's whole length, so a fetcher knows when it is done without
     /// consulting the manifest a second time.
-    pub length: u64,
-    /// At most [`PACK_CHUNK_BYTES`].
-    #[serde(with = "crate::bytes_as_base64")]
-    pub data: Vec<u8>,
+    ///
+    /// Carried although `length` is now the chunk's, because the fact it
+    /// states is not derivable from one reply: a fetcher resuming at an
+    /// offset would otherwise have to read the manifest again to learn when
+    /// to stop. `offset + length` past this figure is a header disagreeing
+    /// with itself, and [`decode_peer_header`] refuses it by name.
+    pub object_length: u64,
 }
 
 /// Why a peer served nothing, in a sentence.
@@ -664,6 +862,293 @@ pub struct PeerReply {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PeerRefusal {
     pub why: String,
+}
+
+// ---------------------------------------------------------------------------
+// The peer leg's framing: one JSON line, then the bytes
+// ---------------------------------------------------------------------------
+
+/// How many raw bytes follow a peer header on the wire.
+///
+/// A property of the header's **type**, so that the length a reader waits for
+/// can only ever come out of the header it just read. That is the whole
+/// invariant of this framing — the length is in the header that precedes the
+/// bytes — and making it a trait is how it is held rather than remembered: a
+/// header type that carried a body and did not say so would not compile
+/// through [`encode_peer_header`].
+pub trait PeerBody {
+    /// How many raw bytes follow this header line. Zero for everything but a
+    /// [`PeerReply`].
+    fn body_bytes(&self) -> u64;
+
+    /// Whatever this header says that contradicts itself, knowable before a
+    /// byte of body is read.
+    ///
+    /// Checked by [`decode_peer_header`], so a header that cannot be true is
+    /// refused by name instead of putting a reader into a wait it will never
+    /// come out of. Nothing by default.
+    fn self_disagreement(&self) -> Option<PeerFramingRefusal> {
+        None
+    }
+}
+
+impl PeerBody for PeerRequest {
+    fn body_bytes(&self) -> u64 {
+        0
+    }
+}
+
+impl PeerBody for PeerRefusal {
+    fn body_bytes(&self) -> u64 {
+        0
+    }
+}
+
+impl PeerBody for PeerReply {
+    fn body_bytes(&self) -> u64 {
+        self.length
+    }
+
+    fn self_disagreement(&self) -> Option<PeerFramingRefusal> {
+        // An overflowing `offset + length` is a disagreement and not an
+        // absence of one: a `None` here would let the one header nobody can
+        // make sense of through.
+        let past_the_end = match self.offset.checked_add(self.length) {
+            Some(end) => end > self.object_length,
+            None => true,
+        };
+        past_the_end.then_some(PeerFramingRefusal::BodyPastTheObject {
+            offset: self.offset,
+            length: self.length,
+            object_length: self.object_length,
+        })
+    }
+}
+
+/// Why a peer frame was refused, each case by its own name.
+///
+/// Named rather than stringly, for D150's reason twice over: the party that
+/// knows why is the one that has to speak, and a fetcher that got a sentence
+/// it cannot match on could log the refusal and still not know whether to
+/// retry, ask the hub for another holder, or stop. [`fmt::Display`] is the
+/// sentence a person reads; the variant is what the code reads.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PeerFramingRefusal {
+    /// A header line that did not end inside one read of the endpoint's
+    /// buffer, on the way in or on the way out.
+    HeaderPastTheReadBuffer { bytes: usize },
+    /// A header line that is not a peer header.
+    HeaderUnreadable { error: String },
+    /// A header promising more body than one reply may carry.
+    BodyPastTheChunk { promised: u64 },
+    /// A header whose chunk falls past the end of the object it names — a
+    /// header disagreeing with itself.
+    BodyPastTheObject {
+        offset: u64,
+        length: u64,
+        object_length: u64,
+    },
+    /// Fewer body bytes arrived than the header promised.
+    BodyTruncated { promised: u64, arrived: usize },
+    /// A peer announcing a protocol version that is not this one's.
+    ProtocolVersion { announced: u32 },
+}
+
+impl fmt::Display for PeerFramingRefusal {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::HeaderPastTheReadBuffer { bytes } => write!(
+                f,
+                "pack transfer refused: {bytes} bytes of header arrived with no newline among \
+                 them, and a peer header is one line of JSON ended by one newline. The bound is \
+                 the endpoint's own read buffer ({PACK_ENDPOINT_READ_BYTES} bytes), so a header \
+                 that does not fit one read is not a header this peer wrote: nothing was served \
+                 and this connection is closed"
+            ),
+            Self::HeaderUnreadable { error } => write!(
+                f,
+                "pack transfer refused: that line is not a peer header: {error}. The peer wire is \
+                 one line of JSON then exactly as many raw bytes as the line said, so a line this \
+                 peer cannot read means the two ends have lost count of the stream and nothing \
+                 later on it can be trusted: this connection is closed"
+            ),
+            Self::BodyPastTheChunk { promised } => write!(
+                f,
+                "pack transfer refused: that header promises {promised} bytes of body and one \
+                 reply carries at most {PACK_CHUNK_BYTES}. A reader that honoured it would hold \
+                 more of one object in memory than this peer ever agreed to serve, which is \
+                 invariant 2's cap read from the other side"
+            ),
+            Self::BodyPastTheObject {
+                offset,
+                length,
+                object_length,
+            } => {
+                write!(
+                f,
+                "pack transfer refused: that header offers {length} bytes at offset {offset} of \
+                 an object {object_length} bytes long, which ends {} bytes past it. The header \
+                 disagrees with itself, so one of the two peers is reading a different object \
+                 under the same sha256 — and that is a refusal and not a short read",
+                offset.saturating_add(*length).saturating_sub(*object_length)
+            )
+            }
+            Self::BodyTruncated { promised, arrived } => write!(
+                f,
+                "pack transfer refused: that header promised {promised} bytes of body and \
+                 {arrived} arrived before the stream ended. A short body is never a short object \
+                 — an object is its sha256 — so what arrived is discarded rather than written, \
+                 and the fetch resumes at the offset the last whole chunk ended at"
+            ),
+            Self::ProtocolVersion { announced } => {
+                f.write_str(&peer_version_mismatch_reason(*announced))
+            }
+        }
+    }
+}
+
+/// One header read off a peer stream, and where its body begins.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PeerHeader<H> {
+    pub header: H,
+    /// How many raw bytes of body follow, starting at `body_at`.
+    pub body_bytes: u64,
+    /// Where the body starts in the buffer this header was read from: one
+    /// past the newline that ended the line.
+    pub body_at: usize,
+}
+
+/// What [`decode_peer_header`] made of a buffer.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PeerHeaderRead<H> {
+    /// The line has not arrived in full yet: read more and call again.
+    ///
+    /// **Not a refusal**, and the distinction is the one that matters on a
+    /// stream: a reader that treated a half-arrived line as a bad one would
+    /// close a healthy connection every time a chunk boundary fell inside a
+    /// header. It becomes
+    /// [`PeerFramingRefusal::HeaderPastTheReadBuffer`] only once there is
+    /// more unterminated header than one read of the endpoint's buffer.
+    Incomplete,
+    /// A whole header, and the length of the body behind it.
+    Read(PeerHeader<H>),
+}
+
+/// Encode one peer header as the single line that precedes its body.
+///
+/// Returns the line — **newline included** — and the number of raw bytes the
+/// caller then writes after it, which is the number the line itself carries.
+/// A caller that writes a different number of bytes than it was handed here
+/// has desynchronised the stream, and the reader refuses the next header by
+/// name rather than mistaking the surplus for one.
+///
+/// JSON escapes a newline inside a string as `\n`, so a reason, a path or a
+/// sha256 can carry one without ending the line: proven by
+/// `a_refusal_carrying_a_newline_is_still_one_line`, because the whole
+/// framing rests on it.
+pub fn encode_peer_header<H: Serialize + PeerBody>(
+    header: &H,
+) -> Result<(Vec<u8>, u64), PeerFramingRefusal> {
+    let body_bytes = header.body_bytes();
+    if body_bytes > PACK_CHUNK_BYTES {
+        return Err(PeerFramingRefusal::BodyPastTheChunk {
+            promised: body_bytes,
+        });
+    }
+    if let Some(disagreement) = header.self_disagreement() {
+        return Err(disagreement);
+    }
+    let mut line =
+        serde_json::to_vec(header).map_err(|error| PeerFramingRefusal::HeaderUnreadable {
+            error: error.to_string(),
+        })?;
+    if line.len() as u64 >= PACK_ENDPOINT_READ_BYTES {
+        return Err(PeerFramingRefusal::HeaderPastTheReadBuffer { bytes: line.len() });
+    }
+    line.push(b'\n');
+    Ok((line, body_bytes))
+}
+
+/// Read one peer header off `buffer`, and say how many raw bytes to read
+/// after it.
+///
+/// `buffer` is whatever has arrived; the header is the bytes up to the first
+/// newline. Reads nothing and does no I/O — the caller owns the socket, this
+/// owns the contract (invariant 4).
+pub fn decode_peer_header<H: DeserializeOwned + PeerBody>(
+    buffer: &[u8],
+) -> Result<PeerHeaderRead<H>, PeerFramingRefusal> {
+    let line = match buffer.iter().position(|byte| *byte == b'\n') {
+        Some(end) => &buffer[..end],
+        None => {
+            if buffer.len() as u64 >= PACK_ENDPOINT_READ_BYTES {
+                return Err(PeerFramingRefusal::HeaderPastTheReadBuffer {
+                    bytes: buffer.len(),
+                });
+            }
+            return Ok(PeerHeaderRead::Incomplete);
+        }
+    };
+    if line.len() as u64 >= PACK_ENDPOINT_READ_BYTES {
+        return Err(PeerFramingRefusal::HeaderPastTheReadBuffer { bytes: line.len() });
+    }
+    let header: H =
+        serde_json::from_slice(line).map_err(|error| PeerFramingRefusal::HeaderUnreadable {
+            error: error.to_string(),
+        })?;
+    let body_bytes = header.body_bytes();
+    if body_bytes > PACK_CHUNK_BYTES {
+        return Err(PeerFramingRefusal::BodyPastTheChunk {
+            promised: body_bytes,
+        });
+    }
+    if let Some(disagreement) = header.self_disagreement() {
+        return Err(disagreement);
+    }
+    Ok(PeerHeaderRead::Read(PeerHeader {
+        header,
+        body_bytes,
+        body_at: line.len() + 1,
+    }))
+}
+
+/// Split the body a header promised off the bytes that followed it, and
+/// return what is left over.
+///
+/// The leftover is the next header's first bytes, and returning it is what
+/// keeps a length that disagrees with what arrived from being read as one: a
+/// sender that wrote more bytes than its header promised leaves the surplus
+/// here, and the next [`decode_peer_header`] refuses it as
+/// [`PeerFramingRefusal::HeaderUnreadable`] rather than quietly writing it
+/// into an object.
+pub fn take_peer_body(
+    after_header: &[u8],
+    body_bytes: u64,
+) -> Result<(&[u8], &[u8]), PeerFramingRefusal> {
+    let wanted = usize::try_from(body_bytes).map_err(|_| PeerFramingRefusal::BodyPastTheChunk {
+        promised: body_bytes,
+    })?;
+    if after_header.len() < wanted {
+        return Err(PeerFramingRefusal::BodyTruncated {
+            promised: body_bytes,
+            arrived: after_header.len(),
+        });
+    }
+    Ok(after_header.split_at(wanted))
+}
+
+/// Refuse a peer that announced a protocol version that is not this one's.
+///
+/// The peer wire has no version of its own (see the module doc), so the one
+/// number is checked here and the sentence is
+/// [`peer_version_mismatch_reason`]'s — written once, for invariant 4's
+/// reason.
+pub fn check_peer_protocol_version(announced: u32) -> Result<(), PeerFramingRefusal> {
+    if announced == crate::PROTOCOL_VERSION {
+        Ok(())
+    } else {
+        Err(PeerFramingRefusal::ProtocolVersion { announced })
+    }
 }
 
 /// What a runner holds, announced after [`crate::FromHub::Welcome`] and
@@ -1103,6 +1588,149 @@ mod tests {
             PACK_CHUNK_BYTES,
             crate::FRAME_CEILING,
             "the peer leg is not a frame of the control protocol (D10, D148)"
+        );
+    }
+
+    /// A row whose digest column is anything but 64 lowercase hex characters
+    /// is **refused**, and the refusal says what was wrong with the value.
+    ///
+    /// The one that matters is the first: `../../../escaped` in column 1 is
+    /// the name Herd would otherwise join onto `objects/`, so an unchecked
+    /// digest is a path outside the store. The rest of the cases are here so
+    /// that the check is not passing by accident — a validator that refused
+    /// only the traversal would still let `abc` through, and `objects/abc` is
+    /// a file that is simply never there, which reads as an incomplete pack
+    /// rather than as a malformed manifest.
+    #[test]
+    fn a_digest_column_that_is_not_a_digest_is_refused_by_name() {
+        let row = |digest: &str| {
+            format!(
+                "{}\n# profile debug\n{digest}\t12\t0755\tf\tbin\tbin/tool",
+                CHATONS_PACK_FORMAT
+            )
+        };
+        for (digest, expected) in [
+            ("../../../escaped", "character(s) and a sha256 is 64"),
+            ("abc", "character(s) and a sha256 is 64"),
+            (&"1".repeat(65), "character(s) and a sha256 is 64"),
+            (&"A".repeat(64), "uppercase hex digit"),
+            (&"g".repeat(64), "is not a hex digit"),
+        ] {
+            let why = PackManifest::parse(row(digest).into_bytes())
+                .expect_err("that is not a digest Herd may build a path out of");
+            assert!(
+                why.contains("line 3 of this manifest"),
+                "the refusal names the row an operator can find: {why}"
+            );
+            assert!(why.contains(expected), "and what was wrong with it: {why}");
+        }
+
+        // The traversal case says, in terms, that this column becomes a path
+        // — so a reader of the refusal cannot take it for a cosmetic rule.
+        let why = PackManifest::parse(row("../../../escaped").into_bytes()).expect_err("refused");
+        assert!(
+            why.contains("objects/<sha256>") && why.contains("outside the pack"),
+            "the refusal says what reading it the other way would cost: {why}"
+        );
+
+        // And uppercase is refused rather than lowercased, with the reason on
+        // the line: two spellings of one object is two names for one object's
+        // bytes.
+        let why = PackManifest::parse(row(&"AB".repeat(32)).into_bytes()).expect_err("refused");
+        assert!(
+            why.contains("rather than lowercased") && why.contains("twice under two names"),
+            "{why}"
+        );
+
+        // **The known-good row stays silent**, or the check above proves only
+        // that something refuses everything.
+        let good = PackManifest::parse(row(&"1".repeat(64)).into_bytes())
+            .expect("64 lowercase hex characters is a digest");
+        assert_eq!(good.entries().len(), 1);
+        assert_eq!(good.entries()[0].sha256, "1".repeat(64));
+        // Every digest in the module's own fixture passes too, `d` and `l`
+        // rows included: the check is on the column and not on the kind.
+        assert_eq!(
+            PackManifest::parse(a_manifest().into_bytes())
+                .expect("the fixture parses")
+                .entries()
+                .len(),
+            4
+        );
+    }
+
+    /// `check_object_digest` is public so the readers that already check this
+    /// can delegate, and it is the same function the parse uses.
+    #[test]
+    fn the_digest_check_is_callable_on_its_own_and_is_the_one_the_parse_uses() {
+        assert_eq!(check_object_digest(&"a".repeat(64)), Ok(()));
+        assert_eq!(check_object_digest(&"0123456789abcdef".repeat(4)), Ok(()));
+        for bad in ["", "../x", &"f".repeat(63), &"F".repeat(64)] {
+            let why = check_object_digest(bad).expect_err("not a digest");
+            assert!(
+                why.contains(&format!("{bad:?}")),
+                "the refusal quotes the value an operator has to find: {why}"
+            );
+        }
+    }
+
+    /// A path column that is not relative to the pack's own root is refused
+    /// too — the weaker of the two checks, and the reason it exists is in
+    /// `check_entry_path`'s doc: it makes *inert* a property of the type
+    /// rather than of this week's callers.
+    #[test]
+    fn a_path_column_that_leaves_the_pack_is_refused_by_name() {
+        let row = |path: &str| {
+            format!(
+                "{}\n{}\t12\t0755\tf\tbin\t{path}",
+                CHATONS_PACK_FORMAT,
+                "1".repeat(64)
+            )
+        };
+        for (path, expected) in [
+            ("/etc/shadow", "is absolute"),
+            ("../../../etc/shadow", "climbs out of the pack"),
+            ("bin/../../escaped", "climbs out of the pack"),
+            ("", "is empty"),
+            ("bin/to\0ol", "contains a NUL byte"),
+        ] {
+            let why = PackManifest::parse(row(path).into_bytes())
+                .expect_err("that is not a path inside a pack");
+            assert!(why.contains("line 2 of this manifest"), "{why}");
+            assert!(why.contains(expected), "{why}");
+        }
+
+        // Relative paths with a `..` that does **not** climb out are not the
+        // case being refused, and a check that refused them would refuse good
+        // packs: `a/../b` names `b`.
+        for good in ["bin/tool", "share/table.bin", "a/b/c", "x..y", "..z"] {
+            PackManifest::parse(row(good).into_bytes())
+                .unwrap_or_else(|why| panic!("{good:?} is a path inside a pack: {why}"));
+        }
+    }
+
+    /// `link_target` is **not** checked, and that is a decision rather than an
+    /// omission: Herd never resolves one, and a build output's symlink may
+    /// point outside the pack legitimately — so refusing it would refuse a
+    /// good pack to defend against a resolution nothing performs.
+    #[test]
+    fn a_link_target_outside_the_pack_is_carried_and_not_refused() {
+        let manifest = format!(
+            "{}\n{}\t7\t0777\tl\tbin\tbin/tool-latest\t/nix/store/abc-tool/bin/tool",
+            CHATONS_PACK_FORMAT,
+            "3".repeat(64)
+        );
+        let parsed = PackManifest::parse(manifest.into_bytes())
+            .expect("an absolute link target is a legitimate build output, not a malformed row");
+        assert_eq!(
+            parsed.entries()[0].link_target.as_deref(),
+            Some("/nix/store/abc-tool/bin/tool"),
+            "carried verbatim, because the manifest's bytes are the manifest"
+        );
+        assert!(
+            parsed.objects_needed().is_empty(),
+            "and it names no object: a kind l row's digest is not a file's bytes, so nothing \
+             joins this row onto a path at all"
         );
     }
 

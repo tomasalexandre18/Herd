@@ -550,6 +550,7 @@ async fn requester_socket(herd: &Herd) -> Socket {
         preference: 0,
         load_milli: None,
         switch: herd_proto::Switch::On,
+        mesh_endpoint: None,
     };
     send(&mut socket, &hello).await;
     match next(&mut socket).await {

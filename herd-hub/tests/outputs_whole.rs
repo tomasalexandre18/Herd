@@ -131,6 +131,7 @@ impl Requester {
             preference: 0,
             load_milli: None,
             switch: herd_proto::Switch::On,
+            mesh_endpoint: None,
         };
         socket
             .send(Message::text(to_frame(&hello).expect("hello encodes")))
@@ -368,6 +369,7 @@ async fn a_collection_that_cannot_complete_ends_the_wait_and_names_what_is_missi
                 preference: 0,
                 load_milli: None,
                 switch: herd_proto::Switch::On,
+                mesh_endpoint: None,
             };
             socket
                 .send(Message::text(to_frame(&hello).expect("hello encodes")))

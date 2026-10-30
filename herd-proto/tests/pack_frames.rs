@@ -6,28 +6,36 @@
 //! is computed over verbatim bytes, and a pack frame this build has never
 //! heard of reaches the catch-all rather than killing a link.
 //!
-//! ## What this file cannot assert, and says so rather than implying it
+//! ## The stand-in enums, and why they are still here
 //!
-//! The frame payloads below are **not yet arms of [`ToHub`] and
-//! [`FromHub`]**. Adding a variant to either enum breaks
+//! When these payloads were frozen they were **not yet arms of [`ToHub`] and
+//! [`FromHub`]**: adding a variant to either breaks
 //! `herd-hub/src/server.rs`'s exhaustive `message_kind` match and every
 //! construction site in `herd-runner/src/lib.rs`, `herdctl/src/lib.rs` and
-//! the hub's own test files — none of which this step owns. So the step that
-//! owns those files folds each payload in as a one-line newtype arm, and the
-//! **wire shape is frozen here first**: an internally tagged enum with a
-//! newtype variant whose inner type is a struct serialises to exactly the
-//! same bytes as a struct variant carrying those fields, so what this file
-//! proves about the bytes is what the real enums will emit.
+//! the hub's own test files, none of which that step owned. So the wire shape
+//! was pinned through stand-in enums declared here, on the argument that an
+//! internally tagged enum with a newtype variant whose inner type is a struct
+//! serialises to exactly the same bytes as a struct variant carrying those
+//! fields.
 //!
-//! The stand-in enums are declared here, in the test, and never shipped.
+//! **The variants have landed, and the stand-ins are kept so the argument is
+//! checked rather than believed.** Every assertion frozen against them still
+//! runs, and `the_bytes_are_the_same_on_the_real_enum` now encodes the real
+//! arm beside the stand-in's and compares the two byte strings — once per
+//! payload per case, every absent optional included. If one byte ever
+//! differs, the stand-in was wrong and everything frozen through it is
+//! suspect, which is why the stand-in is not deleted now that it is
+//! redundant: a frozen shape with nothing comparing it to the real one is a
+//! comment.
 
 use herd_proto::pack::{
-    peer_version_mismatch_reason, AskPack, AskTransferCapability, AssignedPack, ExpectTransfer,
-    FetchCapability, FetchPath, Holder, ManifestKind, PackHolders, PackId, PackManifest,
-    PackRefused, PackRegistered, PackState, PackTransferred, PackUnavailable, PacksHeld,
-    PeerRefusal, PeerReply, PeerRequest, PinPacks, ReadPacksAgain, RegisterPack,
-    TransferCapability, TransferDirection, CHATONS_PACK_FORMAT, MANIFEST_MAX_BYTES,
-    PACK_CAPABILITY_LIFETIME, PACK_CHUNK_BYTES, PACK_ENDPOINT_READ_BYTES,
+    check_peer_protocol_version, decode_peer_header, encode_peer_header,
+    peer_version_mismatch_reason, take_peer_body, AskPack, AskTransferCapability, AssignedPack,
+    ExpectTransfer, FetchCapability, FetchPath, Holder, ManifestKind, PackHolders, PackId,
+    PackManifest, PackRefused, PackRegistered, PackState, PackTransferred, PackUnavailable,
+    PacksHeld, PeerFramingRefusal, PeerHeaderRead, PeerRefusal, PeerReply, PeerRequest, PinPacks,
+    ReadPacksAgain, RegisterPack, TransferCapability, TransferDirection, CHATONS_PACK_FORMAT,
+    MANIFEST_MAX_BYTES, PACK_CAPABILITY_LIFETIME, PACK_CHUNK_BYTES, PACK_ENDPOINT_READ_BYTES,
 };
 use herd_proto::{
     frame_type, from_frame, to_frame, version_mismatch_reason, FromHub, JobId, ToHub,
@@ -423,6 +431,35 @@ enum PackFromHub {
     Unknown,
 }
 
+/// The same payload, as the arm of the **real** [`ToHub`] it is now.
+///
+/// `None` only for the catch-all, which has no payload to carry.
+fn the_real_to_hub(message: &PackToHub) -> Option<ToHub> {
+    Some(match message.clone() {
+        PackToHub::PacksHeld(payload) => ToHub::PacksHeld(payload),
+        PackToHub::RegisterPack(payload) => ToHub::RegisterPack(payload),
+        PackToHub::AskPack(payload) => ToHub::AskPack(payload),
+        PackToHub::AskTransferCapability(payload) => ToHub::AskTransferCapability(payload),
+        PackToHub::PackTransferred(payload) => ToHub::PackTransferred(payload),
+        PackToHub::PackUnavailable(payload) => ToHub::PackUnavailable(payload),
+        PackToHub::Unknown => return None,
+    })
+}
+
+/// The same, from the hub.
+fn the_real_from_hub(message: &PackFromHub) -> Option<FromHub> {
+    Some(match message.clone() {
+        PackFromHub::PackHolders(payload) => FromHub::PackHolders(payload),
+        PackFromHub::TransferCapability(payload) => FromHub::TransferCapability(payload),
+        PackFromHub::ExpectTransfer(payload) => FromHub::ExpectTransfer(payload),
+        PackFromHub::PackRegistered(payload) => FromHub::PackRegistered(payload),
+        PackFromHub::PackRefused(payload) => FromHub::PackRefused(payload),
+        PackFromHub::ReadPacksAgain(payload) => FromHub::ReadPacksAgain(payload),
+        PackFromHub::PinPacks(payload) => FromHub::PinPacks(payload),
+        PackFromHub::Unknown => return None,
+    })
+}
+
 fn round_trip_to_hub(message: PackToHub, tag: &str) -> String {
     let wire = to_frame(&message).expect("a pack frame encodes");
     assert!(
@@ -434,6 +471,7 @@ fn round_trip_to_hub(message: PackToHub, tag: &str) -> String {
         message,
         "a field that silently fails to round-trip is a lost field: {wire}"
     );
+    the_bytes_are_the_same_on_the_real_enum(&wire, the_real_to_hub(&message));
     wire
 }
 
@@ -448,7 +486,41 @@ fn round_trip_from_hub(message: PackFromHub, tag: &str) -> String {
         message,
         "a field that silently fails to round-trip is a lost field: {wire}"
     );
+    the_bytes_are_the_same_on_the_real_enum(&wire, the_real_from_hub(&message));
     wire
+}
+
+/// **The assertion that makes the stand-in a proof rather than a hope.**
+///
+/// Every payload in this file was frozen through the stand-in enums above
+/// *before* the real [`ToHub`] and [`FromHub`] carried it, on the argument
+/// that an internally tagged enum's newtype variant serialises to exactly
+/// the same bytes as a struct variant carrying the same fields. The variants
+/// have landed, so the argument is now checkable: the real arm is encoded
+/// beside the stand-in's and the two byte strings are compared.
+///
+/// It runs inside the two round-trip helpers, so it fires once per payload
+/// per case rather than once per enum — thirteen frames, each in every shape
+/// any test in this file gives it, including every absent optional. A single
+/// byte of difference anywhere fails here and names both strings.
+fn the_bytes_are_the_same_on_the_real_enum<M>(stand_in_wire: &str, real: Option<M>)
+where
+    M: serde::Serialize + serde::de::DeserializeOwned + std::fmt::Debug + PartialEq,
+{
+    let Some(real) = real else {
+        return;
+    };
+    let real_wire = to_frame(&real).expect("the real arm encodes");
+    assert_eq!(
+        real_wire, stand_in_wire,
+        "the stand-in froze a wire shape the real enum does not emit; the stand-in was wrong \
+         and every byte frozen through it is suspect"
+    );
+    assert_eq!(
+        from_frame::<M>(stand_in_wire).expect("the real enum decodes the stand-in's own text"),
+        real,
+        "the bytes agree and the decode does not, which is a field read into the wrong place"
+    );
 }
 
 /// `more` is **required**, and it is the one field in this surface that could
@@ -926,10 +998,13 @@ fn the_peer_wire_round_trips_and_carries_the_hubs_version() {
         object: "1".repeat(64),
         offset: 0,
         length: 12,
-        data: b"hello pack\n\n".to_vec(),
+        object_length: 12,
     };
     let wire = serde_json::to_string(&reply).expect("encodes");
-    assert!(!wire.contains("hello pack"), "base64 on the wire: {wire}");
+    assert!(
+        !wire.contains("data"),
+        "the bytes left the struct: a reply is a header, and the body follows it raw: {wire}"
+    );
     assert_eq!(
         serde_json::from_str::<PeerReply>(&wire).expect("decodes"),
         reply
@@ -994,4 +1069,427 @@ fn a_pack_id_is_transparent_on_the_wire() {
     let wire = serde_json::to_string(&id).expect("encodes");
     assert_eq!(wire, format!("\"{id}\""));
     assert_eq!(serde_json::from_str::<PackId>(&wire).expect("decodes"), id);
+}
+
+// ---------------------------------------------------------------------------
+// 7. The peer leg's framing: one JSON line, then the bytes
+// ---------------------------------------------------------------------------
+//
+// The control plane has no choice about base64 (D4's text frames, D18's
+// byte-exact output). This leg does: it touches no hub, and it is the one leg
+// that moves hundreds of megabytes — the consumer's measured 401.6 MiB pack
+// would be about 535 MiB base64'd. So the header is JSON and the body is not,
+// and every way the two can disagree is refused **by its own name**, each
+// proven below by a case that fires it.
+
+/// A reply header, a body, and the next header behind it — read exactly.
+///
+/// The assertion that matters is the third one: after `take_peer_body` the
+/// remainder begins the *next* header and not one byte before or after it. A
+/// framing that is off by one is a framing that works on the first chunk of
+/// every transfer and on no other.
+#[test]
+fn a_replys_body_is_read_exactly_and_the_next_header_follows_it() {
+    let body: Vec<u8> = (0..4096u32).map(|byte| byte as u8).collect();
+    let first = PeerReply {
+        object: "1".repeat(64),
+        offset: 0,
+        length: body.len() as u64,
+        object_length: 12_288,
+    };
+    let (line, promised) = encode_peer_header(&first).expect("a reply header encodes");
+    assert_eq!(
+        promised,
+        body.len() as u64,
+        "the number the caller writes is the number the line carries, or the stream desynchronises"
+    );
+    assert_eq!(
+        line.last(),
+        Some(&b'\n'),
+        "one line, ended by one newline: {}",
+        String::from_utf8_lossy(&line)
+    );
+    assert_eq!(
+        line.iter().filter(|byte| **byte == b'\n').count(),
+        1,
+        "and exactly one, or the body starts somewhere else"
+    );
+
+    let second = PeerReply {
+        object: "1".repeat(64),
+        offset: body.len() as u64,
+        length: 8_192,
+        object_length: 12_288,
+    };
+    let (next_line, _) = encode_peer_header(&second).expect("encodes");
+
+    // What arrives on the socket: line, body, and the beginning of the next
+    // exchange, all in one buffer, because a stream has no message boundaries
+    // of its own.
+    let mut arrived = line.clone();
+    arrived.extend_from_slice(&body);
+    arrived.extend_from_slice(&next_line);
+
+    let read = decode_peer_header::<PeerReply>(&arrived).expect("the header reads");
+    let PeerHeaderRead::Read(header) = read else {
+        panic!("the whole line is here, so it is not incomplete");
+    };
+    assert_eq!(header.header, first);
+    assert_eq!(header.body_bytes, body.len() as u64);
+    assert_eq!(
+        header.body_at,
+        line.len(),
+        "the body starts past the newline"
+    );
+
+    let (read_body, rest) =
+        take_peer_body(&arrived[header.body_at..], header.body_bytes).expect("the body is here");
+    assert_eq!(
+        read_body,
+        body.as_slice(),
+        "byte for byte, or a different object"
+    );
+    assert_eq!(
+        rest, next_line,
+        "the remainder is the next header exactly, with nothing of the body left in it"
+    );
+    let PeerHeaderRead::Read(next) = decode_peer_header::<PeerReply>(rest).expect("and it reads")
+    else {
+        panic!("that is the second header");
+    };
+    assert_eq!(next.header, second);
+}
+
+/// Half a line is **not** a refusal.
+///
+/// The distinction a stream forces: a reader that closed the connection
+/// whenever a read ended inside a header would close a healthy one on every
+/// chunk boundary. It becomes a refusal only once more unterminated header
+/// has arrived than one read of the endpoint's buffer could hold.
+#[test]
+fn a_header_still_arriving_is_incomplete_and_not_refused() {
+    let reply = PeerReply {
+        object: "1".repeat(64),
+        offset: 0,
+        length: 16,
+        object_length: 16,
+    };
+    let (line, _) = encode_peer_header(&reply).expect("encodes");
+    for cut in [0, 1, line.len() / 2, line.len() - 1] {
+        assert_eq!(
+            decode_peer_header::<PeerReply>(&line[..cut]).expect("not a refusal"),
+            PeerHeaderRead::Incomplete,
+            "{cut} bytes of a {} byte line is a short read, not a bad peer",
+            line.len()
+        );
+    }
+    assert!(matches!(
+        decode_peer_header::<PeerReply>(&line).expect("the whole line reads"),
+        PeerHeaderRead::Read(_)
+    ));
+}
+
+/// A header longer than one read of the endpoint's buffer is refused, and the
+/// bound is [`PACK_ENDPOINT_READ_BYTES`] rather than a number invented here.
+///
+/// Both sides: a peer that *sent* one is refused before the line goes out,
+/// and a peer that is *receiving* one stops waiting for a newline that is
+/// never coming. Without the second, an endless line is an endless buffer,
+/// which is invariant 2 on the serving runner's host.
+#[test]
+fn a_header_past_one_read_of_the_buffer_is_refused_on_both_sides() {
+    let flood = vec![b'{'; PACK_ENDPOINT_READ_BYTES as usize];
+    let refusal =
+        decode_peer_header::<PeerReply>(&flood).expect_err("no newline and no room left for one");
+    assert_eq!(
+        refusal,
+        PeerFramingRefusal::HeaderPastTheReadBuffer {
+            bytes: PACK_ENDPOINT_READ_BYTES as usize
+        }
+    );
+    let said = refusal.to_string();
+    assert!(
+        said.contains(&PACK_ENDPOINT_READ_BYTES.to_string()),
+        "the refusal names the bound it applied: {said}"
+    );
+    assert!(
+        said.contains("one line of JSON"),
+        "and says what a header is: {said}"
+    );
+
+    // One byte short of the bound is still only a short read.
+    assert_eq!(
+        decode_peer_header::<PeerReply>(&flood[..flood.len() - 1]).expect("not a refusal"),
+        PeerHeaderRead::Incomplete
+    );
+
+    // And a header this peer would have sent is caught before it is sent.
+    let enormous = PeerRefusal {
+        why: "x".repeat(PACK_ENDPOINT_READ_BYTES as usize),
+    };
+    let refused = encode_peer_header(&enormous).expect_err("a line that long is not one line");
+    assert!(matches!(
+        refused,
+        PeerFramingRefusal::HeaderPastTheReadBuffer { .. }
+    ));
+}
+
+/// A body that stopped short is discarded, by name, and the fetch resumes at
+/// the last whole chunk.
+///
+/// The failure this closes is the one the consumer met on the job half: bytes
+/// that never came, with nothing anywhere saying so. An object is its
+/// sha256, so a short body is not a short object — it is nothing.
+#[test]
+fn a_truncated_body_is_refused_and_says_what_was_promised() {
+    let reply = PeerReply {
+        object: "1".repeat(64),
+        offset: 0,
+        length: 4_096,
+        object_length: 4_096,
+    };
+    let (line, promised) = encode_peer_header(&reply).expect("encodes");
+    let mut arrived = line.clone();
+    arrived.extend_from_slice(&[7u8; 4_000]);
+
+    let PeerHeaderRead::Read(header) =
+        decode_peer_header::<PeerReply>(&arrived).expect("the header is whole")
+    else {
+        panic!("the header is whole");
+    };
+    let refusal = take_peer_body(&arrived[header.body_at..], promised)
+        .expect_err("4 000 of 4 096 is not a body");
+    assert_eq!(
+        refusal,
+        PeerFramingRefusal::BodyTruncated {
+            promised: 4_096,
+            arrived: 4_000
+        }
+    );
+    let said = refusal.to_string();
+    assert!(said.contains("4096") && said.contains("4000"), "{said}");
+    assert!(
+        said.contains("discarded"),
+        "a partial object is never written: {said}"
+    );
+}
+
+/// A length that disagrees with what arrived is refused **at the next
+/// header**, which is the one place the disagreement is visible.
+///
+/// A sender that wrote more bytes than its header promised cannot be caught
+/// by counting the body — the promised count is there, so the body reads
+/// fine. What catches it is that the surplus is still in the buffer where the
+/// next header should be, and `take_peer_body` hands it back as the remainder
+/// rather than consuming it. The next `decode_peer_header` then refuses it by
+/// name instead of writing somebody's stray bytes into an object.
+#[test]
+fn a_length_that_disagrees_with_what_arrived_is_refused_at_the_next_header() {
+    let reply = PeerReply {
+        object: "1".repeat(64),
+        offset: 0,
+        length: 64,
+        object_length: 128,
+    };
+    let (line, promised) = encode_peer_header(&reply).expect("encodes");
+    let mut arrived = line.clone();
+    arrived.extend_from_slice(&[3u8; 80]); // 16 bytes more than it said
+    arrived.push(b'\n');
+
+    let PeerHeaderRead::Read(header) =
+        decode_peer_header::<PeerReply>(&arrived).expect("the header is whole")
+    else {
+        panic!("the header is whole");
+    };
+    let (body, rest) =
+        take_peer_body(&arrived[header.body_at..], promised).expect("64 bytes are here");
+    assert_eq!(body.len(), 64, "exactly what was promised and no more");
+    assert_eq!(
+        rest.len(),
+        17,
+        "the surplus is left where the next header goes"
+    );
+
+    let refusal = decode_peer_header::<PeerReply>(rest)
+        .expect_err("sixteen bytes of nothing are not a header");
+    assert!(
+        matches!(refusal, PeerFramingRefusal::HeaderUnreadable { .. }),
+        "{refusal:?}"
+    );
+    let said = refusal.to_string();
+    assert!(
+        said.contains("lost count of the stream"),
+        "it says why nothing later on this connection can be trusted: {said}"
+    );
+}
+
+/// A reply promising more than one chunk is refused, on the way out and on
+/// the way in.
+#[test]
+fn a_body_past_the_chunk_is_refused_on_both_sides() {
+    let greedy = PeerReply {
+        object: "1".repeat(64),
+        offset: 0,
+        length: PACK_CHUNK_BYTES + 1,
+        object_length: PACK_CHUNK_BYTES * 4,
+    };
+    let refused = encode_peer_header(&greedy).expect_err("more than a chunk");
+    assert_eq!(
+        refused,
+        PeerFramingRefusal::BodyPastTheChunk {
+            promised: PACK_CHUNK_BYTES + 1
+        }
+    );
+    assert!(
+        refused.to_string().contains(&PACK_CHUNK_BYTES.to_string()),
+        "the refusal names the cap: {refused}"
+    );
+
+    // And a peer that sent one anyway is refused at the header, before a byte
+    // of it is held.
+    let line = format!(
+        r#"{{"object":"{}","offset":0,"length":{},"object_length":{}}}"#,
+        "1".repeat(64),
+        PACK_CHUNK_BYTES + 1,
+        PACK_CHUNK_BYTES * 4
+    );
+    let mut arrived = line.into_bytes();
+    arrived.push(b'\n');
+    assert_eq!(
+        decode_peer_header::<PeerReply>(&arrived).expect_err("refused at the header"),
+        PeerFramingRefusal::BodyPastTheChunk {
+            promised: PACK_CHUNK_BYTES + 1
+        }
+    );
+
+    // Exactly one chunk is fine: the cap is a cap and not a fence.
+    let at_the_cap = PeerReply {
+        object: "1".repeat(64),
+        offset: 0,
+        length: PACK_CHUNK_BYTES,
+        object_length: PACK_CHUNK_BYTES,
+    };
+    assert_eq!(
+        encode_peer_header(&at_the_cap)
+            .expect("one whole chunk is allowed")
+            .1,
+        PACK_CHUNK_BYTES
+    );
+}
+
+/// A header whose chunk ends past the object it names is refused as a
+/// **disagreement with itself**, before any body is waited for.
+#[test]
+fn a_chunk_that_ends_past_its_object_is_refused_as_a_disagreement() {
+    let impossible = PeerReply {
+        object: "1".repeat(64),
+        offset: 900,
+        length: 200,
+        object_length: 1_000,
+    };
+    let refused = encode_peer_header(&impossible).expect_err("900 + 200 > 1 000");
+    assert_eq!(
+        refused,
+        PeerFramingRefusal::BodyPastTheObject {
+            offset: 900,
+            length: 200,
+            object_length: 1_000
+        }
+    );
+    let said = refused.to_string();
+    assert!(
+        said.contains("100 bytes past it"),
+        "the refusal does the arithmetic for the person reading it: {said}"
+    );
+    assert!(
+        said.contains("same sha256"),
+        "and names what it means: two peers, two objects, one name: {said}"
+    );
+
+    // A chunk that ends exactly at the object's end is the last chunk, not a
+    // disagreement — the boundary case the refusal must not swallow.
+    let last = PeerReply {
+        object: "1".repeat(64),
+        offset: 800,
+        length: 200,
+        object_length: 1_000,
+    };
+    assert!(encode_peer_header(&last).is_ok(), "that is the last chunk");
+}
+
+/// A peer announcing a version that is not this one's is refused by name,
+/// with the handshake's own sentence.
+#[test]
+fn a_peer_on_another_protocol_version_is_refused_by_name() {
+    assert_eq!(check_peer_protocol_version(PROTOCOL_VERSION), Ok(()));
+    let refused = check_peer_protocol_version(PROTOCOL_VERSION - 1)
+        .expect_err("the check is equality, not a floor");
+    assert_eq!(
+        refused,
+        PeerFramingRefusal::ProtocolVersion {
+            announced: PROTOCOL_VERSION - 1
+        }
+    );
+    assert_eq!(
+        refused.to_string(),
+        peer_version_mismatch_reason(PROTOCOL_VERSION - 1),
+        "one sentence about one contract, written once (invariant 4)"
+    );
+    assert!(
+        refused
+            .to_string()
+            .contains("refused at the hub's handshake too"),
+        "and it sends the operator where the fix is: {refused}"
+    );
+}
+
+/// A newline **inside** a header's own text does not end the line.
+///
+/// The whole framing rests on this, so it is asserted rather than assumed:
+/// JSON escapes a newline in a string as `\n`, two characters. The fixture is
+/// the refusal a peer really sends, because that is the field most likely to
+/// carry one.
+#[test]
+fn a_refusal_carrying_a_newline_is_still_one_line() {
+    let refusal = PeerRefusal {
+        why: format!(
+            "this peer holds none of that pack\nand its store was swept at 04:00\n{}",
+            peer_version_mismatch_reason(2)
+        ),
+    };
+    let (line, body) = encode_peer_header(&refusal).expect("encodes");
+    assert_eq!(body, 0, "a refusal carries no bytes behind it");
+    assert_eq!(
+        line.iter().filter(|byte| **byte == b'\n').count(),
+        1,
+        "the only raw newline is the one that ends the line"
+    );
+    let PeerHeaderRead::Read(read) =
+        decode_peer_header::<PeerRefusal>(&line).expect("and reads back")
+    else {
+        panic!("one whole line");
+    };
+    assert_eq!(read.header, refusal, "with its newlines intact");
+    assert_eq!(read.body_bytes, 0);
+}
+
+/// A request carries no body either, so a reader never waits for one.
+#[test]
+fn a_request_carries_its_version_and_no_body() {
+    let request = PeerRequest {
+        protocol_version: PROTOCOL_VERSION,
+        token: "t-ephemeral-7f3a".to_owned(),
+        pack: a_pack(),
+        object: "1".repeat(64),
+        offset: PACK_CHUNK_BYTES,
+    };
+    let (line, body) = encode_peer_header(&request).expect("encodes");
+    assert_eq!(body, 0);
+    let PeerHeaderRead::Read(read) = decode_peer_header::<PeerRequest>(&line).expect("reads")
+    else {
+        panic!("one whole line");
+    };
+    assert_eq!(read.header, request);
+    assert_eq!(read.body_bytes, 0);
+    assert_eq!(read.body_at, line.len(), "the next header starts here");
 }

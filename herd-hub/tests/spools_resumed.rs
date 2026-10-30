@@ -78,6 +78,7 @@ impl Peer {
             load_milli: None,
             switch: herd_proto::Switch::On,
             jobs_at_once: None,
+            mesh_endpoint: None,
         };
         let mut joined = Self {
             socket: {
@@ -131,6 +132,9 @@ impl Peer {
             draining: false,
             load_milli: None,
             switch: herd_proto::Switch::On,
+            pack_store_bytes: None,
+            pack_store_budget_bytes: None,
+            packs_held: None,
         })
         .await;
         let mut seen = Vec::new();

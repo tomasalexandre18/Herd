@@ -2979,6 +2979,13 @@ async fn serve_peer(state: Arc<State>, stream: TcpStream) -> Result<()> {
             preference,
             load_milli,
             switch,
+            // M11's: where this runner serves pack content to its peers.
+            // Numbered at protocol 3 and read by nobody yet — the hub hands
+            // it to a fetcher in `TransferCapability`, which S6 writes.
+            // Bound and dropped rather than matched with `..` so that the
+            // next field added to the handshake is a compile error here and
+            // not a silence.
+            mesh_endpoint: _,
         } => {
             if protocol_version != PROTOCOL_VERSION {
                 return refuse(&mut sink, version_mismatch_reason(protocol_version)).await;
@@ -3108,6 +3115,7 @@ async fn serve_peer(state: Arc<State>, stream: TcpStream) -> Result<()> {
             // A build gap this hub is willing to serve, said where the far
             // side's owner will read it (E-51). `None` is the ordinary case.
             version_note,
+            keeper_for: Vec::new(),
         },
     )
     .await?;
@@ -4533,6 +4541,8 @@ fn dispatch(
             // and the record is the only thing that holds them (E-11, D106).
             declaration: record.declaration.clone(),
             timeout_s: record.timeout_s,
+            packs_in: Vec::new(),
+            packs_out: std::collections::BTreeMap::new(),
         })
         .is_err()
     {
@@ -4587,6 +4597,12 @@ async fn relay_from_runner(
                 draining,
                 load_milli,
                 switch,
+                // M12's pack-store figures (E-16), numbered at protocol 3 and
+                // recorded by nobody yet. Bound and dropped rather than
+                // matched with `..`, for the reason the handshake's are.
+                pack_store_bytes: _,
+                pack_store_budget_bytes: _,
+                packs_held: _,
             } => {
                 // A report is two different claims. "I am alive" is this
                 // runner's to make, and it is recorded whatever else the
@@ -8286,9 +8302,38 @@ async fn next_text(source: &mut Source) -> Result<Option<String>> {
     Ok(None)
 }
 
-/// A message's wire tag, for refusal texts.
+/// A message's wire tag, for refusal texts: the one sentence a peer gets when
+/// it sent a frame in the wrong direction.
+///
+/// **Exhaustive, with no wildcard arm, deliberately.** A `_ => …` here would
+/// compile for ever and would be wrong the moment it was needed: the arm it
+/// would fall into is `ToHub::Unknown`'s, *"a frame of a type this hub does
+/// not know"*, and that sentence is false about a frame this build defines
+/// and has simply not wired up. The person who reads it is a runner's owner
+/// reading her runner's stderr, and telling her the hub has never heard of
+/// `packs_held` would send her to upgrade a binary that is already current.
+///
+/// The cost of exhaustiveness is one arm per new `ToHub` variant, paid by
+/// whoever adds one — and a new `ToHub` variant costs a protocol version
+/// (`herd_proto::PROTOCOL_VERSION`), so it is paid about once a release and
+/// never by somebody who was not already thinking about the wire. It forces
+/// the right thought on the right person, which is the test for whether an
+/// exhaustive match is a feature.
 fn message_kind(message: &ToHub) -> &'static str {
     match message {
+        // The pack half's six, and the general fact frame: numbered at
+        // protocol 3 and not yet wired to a handler, so each one falls to the
+        // `other` arm of the loop that received it and is refused by this
+        // name. That is correct for now — nothing sends one — and the name is
+        // here so the refusal says which frame rather than "a type this hub
+        // does not know".
+        ToHub::PacksHeld(_) => "packs_held",
+        ToHub::RegisterPack(_) => "register_pack",
+        ToHub::AskPack(_) => "ask_pack",
+        ToHub::AskTransferCapability(_) => "ask_transfer_capability",
+        ToHub::PackTransferred(_) => "pack_transferred",
+        ToHub::PackUnavailable(_) => "pack_unavailable",
+        ToHub::JobFact { .. } => "job_fact",
         ToHub::JobFileChunk { .. } => "job_file_chunk",
         ToHub::AskJobFiles { .. } => "ask_job_files",
         ToHub::Unknown => "a frame of a type this hub does not know",
@@ -9162,6 +9207,8 @@ mod tests {
             }),
             labels_from: None,
             timeout_s: None,
+            needs: Vec::new(),
+            leaves: std::collections::BTreeMap::new(),
         };
         const GOOD: &str = "cb5a2e8b4f1d9c7a3e05b8d6f2a1c4e79b0d3f68";
 

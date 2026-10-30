@@ -1151,6 +1151,9 @@ async fn an_unreadable_first_frame_is_refused_whatever_is_wrong_with_it() {
                     draining: false,
                     load_milli: None,
                     switch: herd_proto::Switch::On,
+                    pack_store_bytes: None,
+                    pack_store_budget_bytes: None,
+                    packs_held: None,
                 })
                 .expect("a health report encodes"),
             ),

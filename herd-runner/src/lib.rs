@@ -2896,6 +2896,12 @@ fn queue_a_health_report(inner: &mut Inner) -> bool {
         // Measured now, on every report, because it is a fact about the
         // moment (E-32). The hub records it and gates nothing on it.
         load_milli: crate::metrics::host_load_milli(),
+        // M12's three pack-store figures (E-16). `None` and not zero: this
+        // build has no pack store to measure, and zero would be a
+        // measurement of an empty one. S2 builds the store and fills these.
+        pack_store_bytes: None,
+        pack_store_budget_bytes: None,
+        packs_held: None,
     };
     if !send_on(&inner.link, health) {
         return false;
@@ -3542,6 +3548,11 @@ pub async fn serve_once(config: Config, session: Session, confined: Arc<Confined
         // The load as this runner dials, so that a job placed before the
         // first health report still has a figure on its line (E-32).
         load_milli: crate::metrics::host_load_milli(),
+        // `None` until this runner has a mesh address to advertise, which is
+        // S4's work (the two flags and both invariant-3 guards). Absent is
+        // the outbound-only runner, and that is exactly what this build is:
+        // it serves no pack content to anybody.
+        mesh_endpoint: None,
     };
     sink.send(Message::text(to_frame(&hello).context("encoding hello")?))
         .await
@@ -3667,6 +3678,14 @@ async fn serve_hub(
                 command,
                 declaration,
                 timeout_s,
+                // M11's resolved packs, numbered at protocol 3 and laid out
+                // by nobody yet: S2 writes the pack store and S8 the
+                // `{in}`/`{out}` layout. Bound and dropped rather than
+                // matched with `..`, so the next field on an assignment is a
+                // compile error here rather than a job that quietly ignores
+                // it.
+                packs_in: _,
+                packs_out: _,
             } => {
                 let session = session.clone();
                 let confined = Arc::clone(&confined);
@@ -3917,6 +3936,17 @@ fn message_kind(message: &FromHub) -> &'static str {
         FromHub::ApprovedRunners { .. } => "approved_runners",
         FromHub::SetSwitch { .. } => "set_switch",
         FromHub::ReadProbesAgain { .. } => "read_probes_again",
+        // The pack half's seven, numbered at protocol 3 and handled by
+        // nobody yet. Named here because this function's whole job is saying
+        // what arrived, and a frame falling to `Unknown`'s sentence would
+        // claim this build has never heard of a frame it defines.
+        FromHub::PackHolders(_) => "pack_holders",
+        FromHub::TransferCapability(_) => "transfer_capability",
+        FromHub::ExpectTransfer(_) => "expect_transfer",
+        FromHub::PackRegistered(_) => "pack_registered",
+        FromHub::PackRefused(_) => "pack_refused",
+        FromHub::ReadPacksAgain(_) => "read_packs_again",
+        FromHub::PinPacks(_) => "pin_packs",
     }
 }
 
