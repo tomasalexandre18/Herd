@@ -112,6 +112,48 @@
   recorded 89 MB. `j0000000040` had the opposite luck and lost a
   landing's gate to it.
 
+- **Sharpened 2026-10-30, and it doubles the lesson: the sampler is
+  not required at all.** A control job doing `truncate -s 30G` in its
+  own `work/` ran in **65 ms** — **shorter than one 200 ms sampler
+  period** — and recorded `bytes_written` = **32,212,254,720**,
+  exactly 30.000 GiB, with `stat -c %b` reporting **0 blocks** of
+  real disk. (Figure relayed from the control's own run; no job id
+  came with it, and a later task can fill it from the queue's
+  records.)
+
+  **So there are two paths to the cap and not one.** The walk at
+  `job.rs:574`, taken once after `kill_everything_of` at `:570`, is
+  compared against the budget on its own: `:582` guards on
+  `ran.nothing_ended_it()` and `:590`-`:599` set
+  `ran.cap = Capped { cap: Cap::Disk, limit: caps.disk_budget }` from
+  **that** figure. The `max(peak, final)` at `:624` is the separate
+  thing — the figure the *record* carries. The sampler's own
+  comparison is `:1521`, every `POLL_INTERVAL` = 200 ms
+  (`confine.rs:106`).
+
+  A job that outlives no sampler tick at all is therefore still
+  turned from its own verdict into `stopped_by_cap` / `disk` by the
+  final walk. **A reader who fixes only the 200 ms sampling fixes
+  half of this**, and the 30 GiB control is the proof that the half
+  left behind is enough on its own: it declared 30 GiB in 65 ms and
+  the figure came out whole. What that control did **not** observe is
+  the kill — it ran under a 64 GiB budget, so it was recorded over
+  30 GiB and never capped. The kill on the final walk is read in the
+  code above, and `docs/runner-confinement.md:172`-`:176` already
+  states the behaviour in prose: *"the runner checks the caps once
+  more after the process is gone, and the cap wins."*
+
+  **A measurer reaching for `du -b` confirms this bug with the bug.**
+  The agent that ran the control caught itself: `du -sb` **implies**
+  `--apparent-size`, so it reported `32,212,254,720` and proved
+  nothing whatever about disk. The product's own walk sums apparent
+  size too — `metadata.len()` per file, *Why* 2 above — so the two
+  agree for the same reason and the agreement means nothing. The real
+  occupancy needs `du -s --block-size=1`, which counts blocks, and
+  `stat -c %b`, which reports them per file; both read **0** for that
+  30 GiB file. Any check of this gotcha's claims measures apparent
+  size and real size with **different tools** and prints both.
+
 - **Replaces:** nothing. It gives ORCH-268 its measurement, and it
   withdraws the belief that a redirected `CARGO_TARGET_DIR` or a split
   gate changes a job's exposure to the disk cap.
