@@ -483,6 +483,46 @@ pub fn sync_dir(path: &Path) -> io::Result<()> {
 
 /// The names in a directory, with anything this module could have left behind
 /// filtered out, so a caller never has to know what a temporary looks like.
+///
+/// **In name order, and that is not tidiness: it is half the cost of a cold
+/// walk** (ORCH-158). `read_dir` hands back the filesystem's own order, which
+/// on ext4 is the directory's hash order and against the disk is effectively
+/// random. Measured on this project's own host, in
+/// `herd-hub/tests/walk_cost.rs` phase 4: **zero of 33 341** names come back
+/// in id order, and reading every record in that order on a cold page cache
+/// costs **twice** what reading the same records in id order costs — 0.41×
+/// at 33 340 directories and 0.50× at 3 334, the pair run in both sequences
+/// so that neither figure is the one that warmed the other. Warm, the two
+/// orders are indistinguishable, so the sort buys exactly the pass that
+/// hurts: the first walk after a start. The sort itself is one `sort()` over
+/// a `Vec<String>` already in memory and is paid inside the same listing.
+///
+/// A job id is `j` followed by a fixed width of zero-padded digits, and a
+/// pack id has the same shape, so byte order over these names **is** id order
+/// and therefore creation order — which is the order the records were laid
+/// down in.
+///
+/// **One place, for every caller**, because no caller may depend on the order
+/// a directory happens to hand back, and because the two orders differ only
+/// in cost:
+///
+/// * `store.rs`'s `recover` sorts the sequences it derives from these names
+///   before it reads anything, so its reads were already in id order and this
+///   changes nothing there — including the pending queue, which is a
+///   `BTreeSet`, the deduplication links, which take the lowest sequence per
+///   key, and the quarantine list, which is a `BTreeMap`.
+/// * `collections_owed` returns a `Vec` its caller consumes with no lock
+///   held, recomputed at every redial (D79), so its order is advisory; this
+///   is the walk the 2× applies to in full.
+/// * `sweep_now` overwrites a total it is allowed to let drift (D152) and
+///   sorts its candidates on four keys afterwards, so read order survives
+///   only as the tie-break between two records equal on all four — including
+///   `ended_at` to the nanosecond.
+/// * `registry.rs`'s `clear_staging` removes every name it is given, and
+///   `rebuild` builds maps; sorting makes its one order-sensitive case
+///   deterministic rather than changing it — when two published packs claim
+///   one `(commit, key)`, the lower id is now the one kept in `by_key`, and
+///   the conflict is recorded and refused either way.
 pub fn names_in(path: &Path) -> io::Result<Vec<String>> {
     let mut names = Vec::new();
     for entry in fs::read_dir(path)? {
@@ -492,6 +532,7 @@ pub fn names_in(path: &Path) -> io::Result<Vec<String>> {
             names.push(name);
         }
     }
+    names.sort();
     Ok(names)
 }
 
@@ -683,6 +724,44 @@ mod tests {
         assert_eq!(
             names_in(dir.path()).expect("the directory lists"),
             vec!["job.json".to_owned()]
+        );
+    }
+
+    /// A listing comes back in name order, whatever order the filesystem
+    /// kept it in (ORCH-158).
+    ///
+    /// The names are created in an order no filesystem would return them in
+    /// by accident, and the one that would sort differently as a number than
+    /// as text is left out on purpose: every id this hub lists is a fixed
+    /// width of zero-padded digits, which is exactly what makes byte order id
+    /// order. The reason the sort is here rather than at a call site is the
+    /// cold walk — `walk_cost.rs` phase 4 measures it — but what this test
+    /// holds is the property the callers depend on, and it would fail just as
+    /// loudly if the sort moved away.
+    #[test]
+    fn a_listing_comes_back_in_name_order() {
+        let dir = tempfile::tempdir().expect("a temporary directory");
+        let made = [
+            "j0000000007",
+            "j0000000001",
+            "j0000000010",
+            "j0000000003",
+            "j0000000002",
+        ];
+        for name in made {
+            create_dir(&dir.path().join(name)).expect("a job directory");
+        }
+        File::create(dir.path().join(".job.json.tmp-1-1")).expect("a leftover temporary");
+        assert_eq!(
+            names_in(dir.path()).expect("the directory lists"),
+            vec![
+                "j0000000001".to_owned(),
+                "j0000000002".to_owned(),
+                "j0000000003".to_owned(),
+                "j0000000007".to_owned(),
+                "j0000000010".to_owned(),
+            ],
+            "the listing is not in id order"
         );
     }
 

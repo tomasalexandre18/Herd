@@ -1,7 +1,7 @@
 //! `herd-hub retention-preview`: every figure it prints, and the four things
 //! M12's retention had to settle before its engine is written (ORCH-146).
 //!
-//! Seven things are being held here, and they are not the same thing:
+//! Nine things are being held here, and they are not the same thing:
 //!
 //! 1. **The arithmetic.** A fixture with the awkward cases in it — a class
 //!    whose span is `0`, a record that is not over, a quarantined record, a
@@ -44,6 +44,14 @@
 //!    "kilobytes"; a log this build could not measure is **UNKNOWN and
 //!    named**, never nought; and a log nothing ever wrote is a measurement
 //!    of its own and not the same thing as an unmeasured one.
+//! 9. **The other question, from the same walk** (ORCH-097). What the
+//!    **output budget's** sweep would take, beside what a span would take:
+//!    the held figure a budget is compared against, the sweep's own order,
+//!    the running total that answers *"what would this budget take"* for
+//!    every budget without being given one, and the bytes a sweep counts and
+//!    **cannot** free, each with its reason. The fixture's `producer` record
+//!    makes the point in one line: its span is `0`, so it never expires, and
+//!    it is the first collection a sweep would take.
 
 use std::fs;
 use std::path::Path;
@@ -1346,6 +1354,399 @@ fn a_log_that_could_not_be_measured_is_named_and_never_counted_as_nought() {
     assert_eq!(listing(root), before, "and it removed nothing");
 }
 
+// ---------------------------------------------------------------------------
+// The output budget's question, from the same walk (ORCH-097).
+// ---------------------------------------------------------------------------
+
+/// What a sweep would take, beside what a span would take, off one walk.
+///
+/// **The two questions are different and this fixture shows it on one line.**
+/// `j0000000008` is a `producer`, whose span here is `0`: it NEVER EXPIRES,
+/// and the per-class block above says so. It is also the **first** collection
+/// a sweep would take, because the output budget does not look at a record's
+/// class at all and that record is five hundred days old. An operator who
+/// read only the span side would conclude those bytes were safe.
+#[test]
+fn what_a_sweep_would_take_is_previewed_beside_what_a_span_would_take() {
+    let dir = tempfile::tempdir().expect("a temporary directory");
+    let root = dir.path();
+    fixture(root);
+    let before = listing(root);
+
+    let now = Timestamp::at_unix_seconds(PINNED);
+    let preview = RetentionPreview::read(root, spans(), now).expect("the preview reads this root");
+    let sweep = &preview.sweep;
+
+    // 10 + 100 + 1000 + 3, which is `files/` and nothing else: not
+    // `j0000000003`'s five bytes of `files.gone/` and not `j0000000004`'s
+    // seven bytes still arriving, both of which the span side counts.
+    assert_eq!(sweep.held, 1113);
+    assert_eq!(sweep.holders, 4);
+    assert_eq!(sweep.freeable(), 1113, "every holder here is takeable");
+    assert!(sweep.withheld.is_empty());
+    assert_eq!(sweep.withheld_bytes(), 0);
+    assert_eq!(sweep.arriving, 7, "j0000000004's files.part/");
+    assert_eq!(sweep.arrivals, 1);
+    assert_eq!(sweep.leftover, 5, "j0000000003's files.gone/");
+    assert_eq!(sweep.leftovers, 1);
+    assert_eq!(sweep.not_a_job, 0);
+    assert_eq!(sweep.not_jobs, 0);
+
+    // Every holder here passed and none was ever fetched, so the order is the
+    // fourth key alone: oldest first.
+    assert_eq!(
+        sweep
+            .order
+            .iter()
+            .map(|one| one.id.as_str())
+            .collect::<Vec<_>>(),
+        vec!["j0000000008", "j0000000001", "j0000000006", "j0000000003"],
+        "the sweep takes the oldest evidence first, whatever class it is"
+    );
+    assert_eq!(
+        sweep
+            .order
+            .iter()
+            .map(|one| (one.bytes, one.freed_by_then))
+            .collect::<Vec<_>>(),
+        vec![(3, 3), (10, 13), (1000, 1013), (100, 1113)],
+        "and the running total is what answers the budget's question"
+    );
+    assert!(
+        sweep.order.iter().all(|one| one.passed && !one.fetched),
+        "this fixture's records all passed and none was fetched"
+    );
+    assert_eq!(sweep.order[0].age, span(500));
+    assert_eq!(sweep.order[0].files, 1);
+
+    // The arithmetic the printed column exists for, done here so that the
+    // sentence in the output is an assertion and not a claim: a 1 000-byte
+    // budget over 1 113 held bytes has to free 113, and that is the first
+    // three candidates and not the first one.
+    let budget = 1_000u64;
+    let must_free = sweep.held - budget;
+    let taken: Vec<&str> = sweep
+        .order
+        .iter()
+        .scan(0u64, |freed, one| {
+            if *freed >= must_free {
+                return None;
+            }
+            *freed = one.freed_by_then;
+            Some(one.id.as_str())
+        })
+        .collect();
+    assert_eq!(taken, vec!["j0000000008", "j0000000001", "j0000000006"]);
+    assert_eq!(sweep.order[2].freed_by_then, 1013);
+    assert!(1113 - 1013 <= budget, "and it ends inside the budget");
+
+    // The class whose span is 0 is the sweep's first candidate, which is the
+    // whole reason both questions are on one page.
+    let producer = class(&preview, Priority::Producer);
+    assert_eq!(producer.records, 1);
+    assert!(
+        producer.expired.is_empty(),
+        "nothing of a class with a span of 0 ever expires"
+    );
+    assert_eq!(sweep.order[0].id, "j0000000008");
+
+    let rendered = preview.to_string();
+    assert!(rendered.contains("what the output budget's sweep would take, and in which order"));
+    assert!(
+        rendered.contains("NO BUDGET WAS GIVEN AND NONE IS NEEDED"),
+        "the page says why it answers for every budget: {rendered}"
+    );
+    assert!(
+        rendered.contains("THE FLOOR IS THE ONE KEY THAT IS NOT HERE"),
+        "and which key it cannot order on: {rendered}"
+    );
+    assert!(
+        rendered.contains("cannot remove it"),
+        "and that it removed nothing: {rendered}"
+    );
+    assert_eq!(listing(root), before, "and it removed nothing");
+}
+
+/// Bytes a sweep counts and cannot free, each named with its reason.
+///
+/// **The four `continue`s of `store.rs`'s sweep, as a figure.** Each of them
+/// adds the bytes to `could_not_free` and takes nothing, which is the shape
+/// of ORCH-124's known leak: an operator whose budget is 1 kB over cannot act
+/// on "1 kB held" if 900 bytes of it are unfreeable, and before this they
+/// could not see which.
+#[test]
+fn bytes_a_sweep_counts_and_cannot_free_are_named_with_their_reason() {
+    let dir = tempfile::tempdir().expect("a temporary directory");
+    let root = dir.path();
+
+    // Takeable, so that the arithmetic has a non-zero side too.
+    job_dir(
+        root,
+        "j0000000001",
+        Some(record(
+            "j0000000001",
+            Priority::Merger,
+            finished(),
+            days_ago(100),
+        )),
+        &[("files", "a.bin", &[b'a'; 10])],
+    );
+    // Not over: the bytes are an attempt's and not a record's.
+    job_dir(
+        root,
+        "j0000000002",
+        Some(record(
+            "j0000000002",
+            Priority::Merger,
+            running(),
+            days_ago(99),
+        )),
+        &[("files", "b.bin", &[b'b'; 20])],
+    );
+    // A sweep has already taken this collection and the record says so, so
+    // what is under `files/` now is not the collection it names.
+    let mut already = record("j0000000003", Priority::Merger, finished(), days_ago(98));
+    already["outputs"] = serde_json::json!({
+        "removed": {
+            "at": days_ago(98).to_string(),
+            "why": "removed 2026-07-22 under the 200 GB output budget",
+            "bytes": 30,
+        }
+    });
+    job_dir(
+        root,
+        "j0000000003",
+        Some(already),
+        &[("files", "c.bin", &[b'c'; 30])],
+    );
+    // The manifest names a file `files/` does not hold at that length.
+    let mut short = record("j0000000004", Priority::Merger, finished(), days_ago(97));
+    short["outputs"] = serde_json::json!({
+        "files": [{ "path": "d.bin", "bytes": 999, "sha256": "" }]
+    });
+    job_dir(
+        root,
+        "j0000000004",
+        Some(short),
+        &[("files", "d.bin", &[b'd'; 40])],
+    );
+    // A layout this build does not read, holding bytes: counted, named, and
+    // never a licence to delete the files it describes.
+    let mut other_layout = record("j0000000005", Priority::Merger, finished(), days_ago(96));
+    other_layout["record_version"] = serde_json::json!(herd_hub::RECORD_VERSION + 1);
+    job_dir(
+        root,
+        "j0000000005",
+        Some(other_layout),
+        &[("files", "e.bin", &[b'e'; 50])],
+    );
+    // Quarantined (D52), holding bytes: `read_record` answers an error for
+    // one, so the sweep counts it and takes nothing.
+    let mut quarantined = record("j0000000006", Priority::Merger, finished(), days_ago(95));
+    quarantined["labels"] = serde_json::json!(["Nope"]);
+    job_dir(
+        root,
+        "j0000000006",
+        Some(quarantined),
+        &[("files", "f.bin", &[b'f'; 60])],
+    );
+    // A directory claimed for a job whose record never landed, with bytes
+    // under it: the one case where there is nothing at all to judge by.
+    job_dir(
+        root,
+        "j0000000007",
+        None,
+        &[("files", "g.bin", &[b'g'; 70])],
+    );
+    let before = listing(root);
+
+    let now = Timestamp::at_unix_seconds(PINNED);
+    let preview = RetentionPreview::read(root, spans(), now).expect("the preview reads this root");
+    let sweep = &preview.sweep;
+
+    assert_eq!(
+        sweep.held,
+        10 + 20 + 30 + 40 + 50 + 60 + 70,
+        "every one of them is held against the budget"
+    );
+    assert_eq!(sweep.holders, 7);
+    assert_eq!(sweep.freeable(), 10, "and a sweep can free one of them");
+    assert_eq!(sweep.withheld_bytes(), 270);
+    assert_eq!(
+        sweep
+            .withheld
+            .iter()
+            .map(|one| (one.id.as_str(), one.bytes))
+            .collect::<Vec<_>>(),
+        vec![
+            ("j0000000002", 20),
+            ("j0000000003", 30),
+            ("j0000000004", 40),
+            ("j0000000005", 50),
+            ("j0000000006", 60),
+            ("j0000000007", 70),
+        ],
+        "in id order, which is the order the walk reads in"
+    );
+    use herd_hub::retention::WhyWithheld;
+    assert_eq!(sweep.withheld[0].why, WhyWithheld::NotOver);
+    assert_eq!(sweep.withheld[1].why, WhyWithheld::AlreadyRemoved);
+    assert_eq!(sweep.withheld[2].why, WhyWithheld::NotWhole);
+    for unreadable in [3usize, 4, 5] {
+        match &sweep.withheld[unreadable].why {
+            WhyWithheld::NoReadableRecord(why) => assert!(
+                !why.is_empty(),
+                "an unfreeable record's reason is a sentence"
+            ),
+            other => panic!("{:?} was not an unreadable record: {other:?}", unreadable),
+        }
+    }
+
+    let rendered = preview.to_string();
+    assert!(
+        rendered.contains("it could not free    270 bytes in 6 collection(s)"),
+        "the figure and the count are printed: {rendered}"
+    );
+    assert!(
+        rendered.contains("the job is not over"),
+        "and so is each reason: {rendered}"
+    );
+    assert!(
+        rendered.contains("files/ does not hold what the manifest names"),
+        "including the one only a stat can see: {rendered}"
+    );
+    assert_eq!(listing(root), before, "and it removed nothing");
+}
+
+/// A directory in `jobs/` whose name is not a job id holds bytes a sweep
+/// ignores — and the id this hub really mints is one it does not.
+///
+/// **This is what holds the `ID_DIGITS` the preview had to write out again.**
+/// `store.rs`'s own constant is private there and `store.rs` is another
+/// task's, so the id shape is duplicated in `retention.rs`; here a real job
+/// is minted through the store itself and has to land among the candidates,
+/// while the directory beside it is counted on its own line and nowhere
+/// else. A widened id would fail here rather than silently drop every
+/// collection on an operator's root out of the budget's figure.
+#[test]
+fn a_directory_in_jobs_that_is_not_a_job_holds_bytes_a_sweep_ignores() {
+    let dir = tempfile::tempdir().expect("a temporary directory");
+    let store = JobDirStore::open(dir.path()).expect("a state root");
+    let minted = store
+        .create_job(NewJob::at(
+            vec!["true".to_owned()],
+            LabelSet::default(),
+            Priority::Merger,
+        ))
+        .expect("a job is minted");
+    store
+        .begin_attempt(&minted.id, "test-runner", "the only runner", None)
+        .expect("an attempt is recorded");
+    store
+        .record_outputs(
+            &minted.id,
+            &herd_proto::JobOutputs {
+                files: vec![herd_proto::OutputFile::collected(
+                    "files/out.bin".to_owned(),
+                    b"four".to_vec(),
+                )],
+                ..herd_proto::JobOutputs::default()
+            },
+        )
+        .expect("the collection is recorded");
+    store
+        .record_state(
+            &minted.id,
+            JobState::Finished {
+                outcome: JobOutcome::Exited { code: 0 },
+            },
+        )
+        .expect("the job ends");
+
+    // Somebody else's directory, inside `jobs/`, with bytes under a name a
+    // sweep would otherwise read as a collection.
+    job_dir(
+        dir.path(),
+        "backup-of-jobs",
+        None,
+        &[("files", "big.bin", &[b'z'; 500])],
+    );
+    let before = listing(dir.path());
+
+    let ended = store
+        .job(&minted.id)
+        .expect("reads")
+        .expect("a record")
+        .updated_at;
+    let now = Timestamp::at_unix_seconds(ended.unix_seconds() + 3_600);
+    let preview = RetentionPreview::read(dir.path(), spans(), now).expect("the preview reads");
+    let sweep = &preview.sweep;
+
+    assert_eq!(sweep.held, 4, "only the minted job's files/ is held");
+    assert_eq!(sweep.holders, 1);
+    assert_eq!(
+        sweep
+            .order
+            .iter()
+            .map(|one| one.id.as_str())
+            .collect::<Vec<_>>(),
+        vec![minted.id.as_str()],
+        "the id the store itself minted is a candidate"
+    );
+    assert_eq!(sweep.not_a_job, 500);
+    assert_eq!(sweep.not_jobs, 1);
+    assert!(
+        sweep.withheld.is_empty(),
+        "a directory that is not a job's is not an unfreeable collection either"
+    );
+
+    let rendered = preview.to_string();
+    assert!(
+        rendered.contains("not a job directory    500 bytes in 1 directory(s)"),
+        "it is named on its own line: {rendered}"
+    );
+    assert_eq!(listing(dir.path()), before, "and it removed nothing");
+}
+
+/// The budget's question is answered under a refusal too.
+///
+/// The two refusals are about the clock and the spans; the sweep's order is
+/// three fields of a record and a file length. An operator whose clock has
+/// gone backwards still has a disk filling up, and this is the one figure
+/// they can still act on.
+#[test]
+fn the_sweeps_figures_are_printed_even_when_the_spans_refuse() {
+    let dir = tempfile::tempdir().expect("a temporary directory");
+    let root = dir.path();
+    fixture(root);
+    let before = listing(root);
+
+    let now = Timestamp::at_unix_seconds(PINNED - 10 * DAY);
+    let preview = RetentionPreview::read(root, spans(), now).expect("the preview reads this root");
+    assert!(!preview.verdict.is_readable());
+
+    let rendered = preview.to_string();
+    assert!(rendered.contains("REFUSED: THE CLOCK IS BEHIND THIS ROOT'S OWN RECORDS"));
+    assert!(
+        !rendered.contains("what retention would remove, by class"),
+        "a refusal still prints no list of what a span would take"
+    );
+    assert!(
+        rendered.contains("what the output budget's sweep would take, and in which order"),
+        "but the budget's question does not depend on the clock: {rendered}"
+    );
+    assert!(
+        rendered.contains("held under files/      1113 bytes"),
+        "and its figures are the same figures: {rendered}"
+    );
+    assert!(
+        rendered.contains("judged against that clock reading is the age"),
+        "with the one figure that does depend on it named: {rendered}"
+    );
+    assert_eq!(preview.sweep.order.len(), 4);
+    assert_eq!(listing(root), before, "and it removed nothing");
+}
+
 /// The preview's text, with the only thing that varies left as `{ROOT}`.
 const EXPECTED: &str = "\
 herd-hub retention preview
@@ -1520,4 +1921,47 @@ what retention would remove, by class
       no log ever written  2 record(s)
     measured in all        2815 bytes (2.75 KiB)
   Nothing above was removed, and this subcommand cannot remove it.
+
+what the output budget's sweep would take, and in which order
+
+  A SWEEP AND A SPAN TAKE DIFFERENT THINGS, so the two figures are never summed
+  here. A sweep frees the collected bytes under files/ and leaves the record,
+  its log and its manifest standing, which is what lets the manifest outlive
+  the bytes (D152); a span takes the whole directory. A sweep also does not
+  look at a record's class or its span at all, so this is one list and not
+  four: a class whose span is 0 -- one that NEVER EXPIRES above -- can still
+  be the first collection a sweep takes, and on an old root it usually is.
+
+  held under files/      1113 bytes (1.09 KiB) in 4 collection(s)
+    a sweep could free   1113 bytes (1.09 KiB) in 4 collection(s)
+    it could not free    0 bytes in 0 collection(s)
+  still arriving         7 bytes in 1 collection(s), the writer's and never a candidate
+  a killed sweep left    5 bytes in 1 tree(s), given back before anything is chosen
+  not a job directory    0 bytes in 0 directory(s), not a job id and so not a sweep's at all
+
+  NO BUDGET WAS GIVEN AND NONE IS NEEDED. The hub's --output-budget is the
+  serving hub's own argument and no byte of this root records it, so rather
+  than answer for one figure this answers for every one: read down the \"freed
+  by then\" column below until it reaches held minus the budget, and what is
+  above that line is what that budget would take. The budget an operator is
+  thinking of raising to is answered by the same column, at no further cost.
+
+  THE FLOOR IS THE ONE KEY THAT IS NOT HERE. A sweep's first key is
+  --output-floor: outside the floor before inside it, because the floor is a
+  promise and nothing inside it goes while anything outside it remains. That
+  figure is the serving hub's too, so the order below is the sweep's within
+  one floor band. Under a floor of F, every candidate younger than F moves to
+  the end of this list and keeps this order among themselves -- the partition
+  is stable -- and the freed column re-runs along what comes out. The age
+  beside each candidate is printed for that arithmetic.
+
+  the order a sweep takes them in, oldest-evidence-last by three keys: a job
+  that passed before one that did not, fetched before never fetched, then
+  oldest first
+    jobs/j0000000008  3 bytes in 1 file(s)  freed by then 3 bytes  passed, never fetched, ended 2025-06-15T00:00:00Z, age 500 day(s) (43200000 s)
+    jobs/j0000000001  10 bytes in 1 file(s)  freed by then 13 bytes  passed, never fetched, ended 2026-07-20T00:00:00Z, age 100 day(s) (8640000 s)
+    jobs/j0000000006  1000 bytes in 1 file(s)  freed by then 1013 bytes  passed, never fetched, ended 2026-08-29T00:00:00Z, age 60 day(s) (5184000 s)
+    jobs/j0000000003  100 bytes in 1 file(s)  freed by then 1113 bytes (1.09 KiB)  passed, never fetched, ended 2026-09-28T00:00:00Z, age 30 day(s) (2592000 s)
+  Nothing above was removed either, and this subcommand cannot remove it: the
+  two questions on this page are one walk, and the walk opens files read-only.
 ";

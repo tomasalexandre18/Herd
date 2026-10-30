@@ -619,12 +619,27 @@ was lost.
 
 - How many heavy agents (compiling or running the suite) run at once is a
   judgement on the machine, not a count: look at the load average, the
-  free memory **and the free disk** before launching another, at roughly
-  8.5 GB of build tree each. While the first consumer is stopped — it is
-  the machine's main source of load — more than two are allowed (Alexa,
-  2026-10-27, with five running on this 12-core, 31 GiB host at load
-  1.21). The ceiling of **two** returns the day the consumer resumes.
-  Any number of read-only or prose agents, always.
+  free memory **and the free disk** before launching another, at one
+  **`debug` build tree carrying test binaries** each — **~12–14 GB**.
+  Seven were measured on 2026-10-30, every one built by
+  `./scripts/test.sh` or `gate.sh`; two of the seven are in the tree,
+  `history/2026-10-30-pack-fetch.md:566` at 13 GB and
+  `history/2026-10-30-pack-registry.md:629` at 12 GB, and the other five
+  are in agent reports of the same day and are unrecoverable (which is
+  why the handoff now records the figure: *Handoff and resumption*).
+  **The profile is named before the number because the other profile is
+  forty times smaller**: a `--release` build of the whole workspace at
+  `v0.4.1` is **283 MiB** — 292,415,975 bytes, 101 crates, 52 s, one
+  measurement, 2026-10-30. A heavy agent builds `debug` with tests, so
+  the `debug` figure is the one that bounds how many fit, and correcting
+  it *down* to 283 MiB would halve the ceiling on a number that is true
+  and answers a different question. The figure this bullet gave until
+  2026-10-30, ~8.5 GB per tree, was low by a factor of 1.4 to 1.6 and
+  named no profile at all (ORCH-250). While the first consumer is
+  stopped — it is the machine's main source of load — more than two are
+  allowed (Alexa, 2026-10-27, with five running on this 12-core, 31 GiB
+  host at load 1.21). The ceiling of **two** returns the day the
+  consumer resumes. Any number of read-only or prose agents, always.
 - **An agent removes its own `target/` as soon as its branch is on the
   origin.** Not housekeeping: `/mnt/ssd_980` is the same filesystem the
   first consumer's production writes to — the hub's docker volume
@@ -734,6 +749,69 @@ was lost.
   based on the first's branch.
 - `pkill -f`, `killall`, `kill` by name are forbidden; an agent kills
   only PIDs it started and lists them in its handoff.
+- **Ownership, not age, decides what may be signalled, and ownership is
+  read from a process's full `args`.** The rule above is correct and on
+  2026-10-30 it was kept to the letter and was **not sufficient**. Three
+  things this host measures, each of which makes the rule a fact rather
+  than advice:
+  1. **uid 1002 (`server`) is shared with the first consumer's
+     production.** Their nightly's requesters run under it; their hub
+     runs as uid **1000** and their runner as uid **986**. So a check
+     that excludes only those two known PIDs **proves nothing about the
+     ownership of a third**, and `comm` is `herdctl` for our own test
+     fixtures and for their production alike. Our uid is not our mark,
+     and neither is the process name.
+  2. **Read a process's full `args`, and say whose it is, before
+     signalling it.** Age, PID and name are not provenance. On
+     2026-10-30 the orchestrator killed **78** processes under our own
+     account, believing an agent's report that they were a Herd agent's
+     leak; they were the consumer's production nightly requesters,
+     `herdctl wait --outputs-to
+     /mnt/ssd_980/chatons/agents/nightly/herd-j<id>`. The filter used
+     was **age** plus those two known PIDs: careful on the wrong axis,
+     twice. One `ps -o args` would have shown the `chatons/` path, and
+     it was run an hour late. **The error is the orchestrator's**, not
+     an agent's, and it is not softened here because the next reader
+     needs to know which seat it was made from.
+  3. **A report that declares its own lack of provenance is not
+     provenance.** The agent that flagged those processes wrote *"worth
+     someone with provenance cleaning up; I had none"* — and that
+     sentence was passed on as fact. An agent naming what it does not
+     know is doing its job; treating the report as the reading is the
+     failure, and it belongs to whoever acted on it.
+- **The detector, because a rule with none is advice: `HERD_JOB_MARKER`
+  in `/proc/<pid>/environ`.** The runner builds a job's environment from
+  scratch — only `PATH`, `LANG`, `LC_ALL`, `TZ` and `TERM` are carried
+  through — and sets this one variable of its own
+  (`herd-runner/src/reclaim.rs`, `MARKER_VARIABLE`;
+  `docs/runner-confinement.md`), so **only a job's own processes carry
+  it**, and they keep it across `fork`, `exec`, a double fork, `nohup`
+  and `setsid`. Its value says which: `herd-job-…` for a job,
+  `herd-probe-…` for a probe reading. The sweep is six lines and is
+  written here rather than left in somebody's scratchpad, which is
+  where the first copy of it was:
+
+  ```sh
+  for p in /proc/[0-9]*; do
+    m=$({ tr '\0' '\n' < "$p/environ"; } 2>/dev/null |
+          grep '^HERD_JOB_MARKER=')
+    [ -n "$m" ] || continue
+    printf '  pid=%s %s args=%s\n' "${p#/proc/}" "$m" \
+      "$({ tr '\0' ' ' < "$p/cmdline"; } 2>/dev/null)"
+  done
+  ```
+
+  **Prove it fires before trusting its silence.** The first copy was
+  proved on three live processes before its zero was believed (2026-10-30,
+  by the agent that deployed our own instance), and its author was one
+  step from reporting a false defect *and* from killing the consumer's
+  `ram-janitor.sh`, which was doing its own `sleep 120` under our shared
+  uid — the second near-miss of the same shape in one morning, and the
+  argument for writing any of this down. **Its one known limit, stated
+  rather than discovered:** a process that erases its own environment is
+  not found (`docs/architecture.md`, the kill's weaker case). So a
+  silence from this sweep is evidence about Herd's own jobs and never a
+  licence to signal what it did not name.
 - No `cargo` build or test for a prose change (gotcha `docs-only-gates`).
 - The consumer's production runs on this host: no job submission, no
   container, no service, no `/etc/nixos`, ever (D161).
@@ -747,6 +825,20 @@ sentence "not run", skips, risks, decisions needed, exact resume point.
 A fresh session resumes from the handoff and the board, never from a
 conversation summary. The orchestrator's report to Alexa repeats the
 handoff's *not done* and *decisions needed* verbatim.
+
+**And one measurement, from every step that built anything.** Before it
+removes its build tree a step runs `du -sh "$CARGO_TARGET_DIR"` and
+records the figure **with its build profile** — a `debug` tree with test
+binaries, or `--release` — in its *Processes* section, beside the path it
+deleted. One line per handoff. The reason is ORCH-250: of the seven trees
+measured on 2026-10-30, only two are in the tree
+(`history/2026-10-30-pack-fetch.md:566` and
+`history/2026-10-30-pack-registry.md:629`) and the other five live in
+agent reports alone and cannot be recovered, so the figure that bounds how
+many heavy agents fit had become hearsay by the next morning. A figure
+with no profile on it is worse than no figure: `debug` with tests and
+`--release` differ by a factor of forty on this workspace, so a bare
+number invites a later "correction" to the other profile's true value.
 
 ## Failure
 

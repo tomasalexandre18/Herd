@@ -1532,6 +1532,18 @@ still open on their own terms:**
    ORCH-104 touches no product file at all and is **done**; ORCH-097 is
    re-pointed into `retention-preview` (§7.1).
 
-**Host bound, unchanged:** ~8.5 GB per build tree on `/mnt/ssd_980`,
-which is the consumer's production disk too. At most two heavy agents,
-and each `target/` deleted once its branch is pushed.
+**Host bound, corrected 2026-10-30 (ORCH-250):** a heavy agent's build
+tree on `/mnt/ssd_980` — the consumer's production disk too — is a
+**`debug` tree carrying test binaries**, and such a tree is **~12–14 GB**,
+seven measured on 2026-10-30. Not the ~8.5 GB this paragraph gave until
+then, which was low by a factor of 1.4 to 1.6 and named no profile. The
+profile comes before the number because a `--release` build of the whole
+workspace at `v0.4.1` is **283 MiB** — 292,415,975 bytes, one measurement,
+2026-10-30 — forty times smaller and the same repository; a heavy agent
+builds `debug` with tests, so the `debug` figure is the one that bounds
+how many fit. **At most two heavy agents**, a ceiling Alexa lifted on
+2026-10-27 for as long as the first consumer is stopped and which returns
+the day it resumes (`CLAUDE.md` *Shared host rules*,
+`docs/orchestration/workflow.md` *Concurrency and host rules*). And each
+`target/` deleted once its branch is pushed, with its `du -sh` and its
+profile recorded in the handoff first.

@@ -9,6 +9,28 @@
 //! removal**. A policy that destroys the only copy on a timer is owed a way
 //! to be read before it runs.
 //!
+//! **Two questions, one walk** (ORCH-097). A state root is read by two
+//! mechanisms with two different ideas of what a job directory is worth, and
+//! an operator sizing a disk has to see both at once: a **span** takes the
+//! whole record and everything under it, and the **output budget**'s sweep
+//! takes the collected bytes under `files/` and leaves the record standing
+//! (D152). So this walks the root once and answers both —
+//! [`RetentionPreview::sweep`] is what a sweep would take, in the order a
+//! sweep takes it, from the same `read_dir` of the same directory. That is
+//! the whole of ORCH-097: *"what would this budget take, with nothing
+//! removed"*.
+//!
+//! **And it is answered without being given a budget**, which is the one
+//! design decision in it. This tool is not handed the hub's
+//! `--output-budget` or its `--output-floor` — they are the serving hub's
+//! arguments, not this root's, and nothing on the disk records them — so
+//! instead of answering for one figure it prints the sweep's order with a
+//! running total of what is freed by the time each candidate is gone. An
+//! operator reads down that column until it reaches `held − budget` and has
+//! their answer for **any** budget, including the one they are thinking of
+//! raising it to. No new flag was added to get it, and there is therefore
+//! still nothing here a later change could invert into a deletion.
+//!
 //! **It is also where the engine's selection lives.** [`select`] is the one
 //! decision retention ever makes about one record, and the engine will call
 //! it rather than re-derive it: a preview that answered a slightly different
@@ -70,7 +92,7 @@ use std::time::Duration;
 
 use serde::Deserialize;
 
-use crate::job::{in_days, JobRecord, JobState, Timestamp, RECORD_VERSION};
+use crate::job::{in_days, JobRecord, JobState, OutputSummary, Timestamp, RECORD_VERSION};
 use crate::report::Unread;
 use crate::store::{
     directory_bytes, JOBS_DIR, KEPT_FILES_DIR, OUTPUT_GONE_DIR, OUTPUT_PARTS_DIR, RECORD_FILE,
@@ -330,6 +352,22 @@ pub struct Weighed {
     /// byte figure with no count behind it cannot be checked, and because
     /// "names no file at all" is the first consumer's common case.
     pub collected_files: usize,
+    /// Of those, what `files/` alone holds: the collection a requester can
+    /// fetch, and **the only one of the three the output budget counts**
+    /// (ORCH-097). Split out rather than measured again, from the same
+    /// `read_dir`.
+    pub kept_bytes: u64,
+    /// How many files that is.
+    pub kept_files: usize,
+    /// `files.part/`: a collection still arriving, whose bytes are the
+    /// writer's and are never a sweep candidate.
+    pub arriving_bytes: u64,
+    /// `files.gone/`: what a hub killed mid-eviction left behind, which a
+    /// sweep gives back before it chooses anything.
+    pub leftover_bytes: u64,
+    /// Whether there is such a tree at all, which is the count a sweep's own
+    /// sentence would carry.
+    pub leftover: bool,
     /// Everything beside the log that is not a collected file: `job.json`,
     /// `events.jsonl`, `log.seq`, and any directory a later milestone adds,
     /// which lands here on purpose — no other mechanism can free it, so
@@ -568,6 +606,151 @@ impl Verdict {
     }
 }
 
+/// What the output budget's sweep would take from this root, and in which
+/// order (ORCH-097).
+///
+/// **The other question, from the same walk.** A span takes a whole job
+/// directory; a sweep takes the bytes under `files/` and leaves the record,
+/// its log and its manifest exactly where they are (D152) — so the manifest
+/// outlives the bytes and a requester asking for an evicted collection is
+/// handed a sentence rather than a shrug. The two populations are not
+/// comparable and are never summed here.
+///
+/// **Class-blind on purpose, because the sweep is.** The output budget does
+/// not look at a record's priority at all, so this is one list and not four:
+/// a `producer` record pinned to a span of `0` — one that *never* expires —
+/// can still be the first collection a sweep takes, and on a real root it
+/// usually is, because it is the oldest. That is not a contradiction between
+/// the two mechanisms; it is the difference between them, and seeing it is
+/// the reason both are printed on one page.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SweepPreview {
+    /// What `files/` holds, over every job directory a sweep counts. **The
+    /// figure a budget is compared against**, and the one `held_bytes` the
+    /// store keeps a running total of.
+    pub held: u64,
+    /// How many job directories hold any of it.
+    pub holders: usize,
+    /// Every holder a sweep could take, in the order it would take them.
+    pub order: Vec<Candidate>,
+    /// Every holder it could not, with the reason. **A bound on the engine
+    /// and not a footnote**: these bytes are inside `held` and no sweep can
+    /// give them back, which is the shape of ORCH-124's known leak.
+    pub withheld: Vec<Withheld>,
+    /// `files.part/`: a collection still arriving. Its bytes are the
+    /// writer's, are not in [`SweepPreview::held`], and are never a
+    /// candidate under any key.
+    pub arriving: u64,
+    /// How many directories are mid-collection.
+    pub arrivals: usize,
+    /// `files.gone/`: what a hub killed mid-eviction left behind. A sweep
+    /// removes these **before** it chooses anything, because they are
+    /// already unreachable from `files/` and so are nobody's evidence — only
+    /// disk to give back. Not in [`SweepPreview::held`] either.
+    pub leftover: u64,
+    /// How many such trees there are.
+    pub leftovers: usize,
+    /// Bytes under the `files/` of a directory in `jobs/` whose name is not
+    /// a job id. A sweep ignores such a directory entirely — it belongs to
+    /// whoever put it there, not to Herd — so these bytes are named here and
+    /// counted nowhere else.
+    pub not_a_job: u64,
+    /// How many such directories hold bytes.
+    pub not_jobs: usize,
+}
+
+impl SweepPreview {
+    /// What a sweep could free if it took every candidate: the floor of what
+    /// any budget can recover, and the ceiling of what this one can.
+    pub fn freeable(&self) -> u64 {
+        self.order.iter().map(|one| one.bytes).sum()
+    }
+
+    /// Held and unfreeable, whatever the budget.
+    pub fn withheld_bytes(&self) -> u64 {
+        self.withheld.iter().map(|one| one.bytes).sum()
+    }
+}
+
+/// One collection a sweep would take, with the three keys it is ordered on
+/// and the running total it belongs to.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Candidate {
+    pub id: String,
+    /// What `files/` holds **now**. The sweeper measures this again under
+    /// its own lock inside the removal, on purpose, so this is the figure a
+    /// sweep would start from and not a promise about the byte.
+    pub bytes: u64,
+    pub files: usize,
+    /// Whether the job succeeded. `store.rs`'s second key: *"a job that
+    /// passed before a job that did not"*, because the artefacts of a green
+    /// run are the ones nobody ever opens.
+    pub passed: bool,
+    /// Whether a requester has ever fetched these bytes. The third key, and
+    /// the one where the obvious cache answer is backwards: an unfetched
+    /// collection is evidence **nobody has seen**, so it goes last.
+    pub fetched: bool,
+    /// When the job ended. The tie-break, and the only one of the three that
+    /// an LRU would have used first.
+    pub ended_at: Timestamp,
+    /// How old that is at the clock reading this preview was given.
+    pub age: Duration,
+    /// What is freed by the time this one is gone, this one included. **The
+    /// column that answers the budget's question without being given a
+    /// budget**: read down it until it reaches `held − budget`.
+    pub freed_by_then: u64,
+}
+
+/// One collection whose bytes a sweep counts and cannot free.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Withheld {
+    pub id: String,
+    pub bytes: u64,
+    pub why: WhyWithheld,
+}
+
+/// Why a sweep would leave bytes it has counted.
+///
+/// The four `continue`s of `store.rs`'s sweep, in its own order, each one
+/// adding the bytes to `could_not_free` instead of taking them.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WhyWithheld {
+    /// The record would not read, or this hub will not act on it: another
+    /// layout's version, labels today's rules reject (D52), a `job.json`
+    /// that is not there. **Not a licence to delete the files it
+    /// describes.**
+    NoReadableRecord(String),
+    /// The job is not over. Its bytes are an attempt's, not a record's.
+    NotOver,
+    /// A sweep has already taken these bytes and the record says so, which
+    /// is the one case where `files/` holding bytes is a leftover rather
+    /// than a collection.
+    AlreadyRemoved,
+    /// `files/` does not hold what the record's manifest names, at the
+    /// lengths it names: a collection that is not whole is one the hub is
+    /// either still owed or has lost, and either way the bytes are not a
+    /// sweep's to count as recoverable.
+    NotWhole,
+}
+
+impl WhyWithheld {
+    /// The sentence this reason is printed as.
+    pub fn said(&self) -> String {
+        match self {
+            WhyWithheld::NoReadableRecord(why) => format!("no record this hub will act on: {why}"),
+            WhyWithheld::NotOver => {
+                "the job is not over, so these bytes are an attempt's and not a record's".to_owned()
+            }
+            WhyWithheld::AlreadyRemoved => {
+                "the record says a sweep has already taken this collection".to_owned()
+            }
+            WhyWithheld::NotWhole => {
+                "files/ does not hold what the manifest names, at the lengths it names".to_owned()
+            }
+        }
+    }
+}
+
 /// What retention would remove from one state root, and what it would cost.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RetentionPreview {
@@ -591,6 +774,15 @@ pub struct RetentionPreview {
     pub verdict: Verdict,
     /// One entry per class, in [`Priority::ALL`] order.
     pub classes: BTreeMap<u8, ClassPreview>,
+    /// The output budget's question, from the same walk (ORCH-097).
+    ///
+    /// **Printed under a refusal too**, unlike the per-class figures. The two
+    /// refusals in [`Verdict`] are about the clock and the spans, and the
+    /// sweep's order is read off the records alone: the only clock-derived
+    /// figure in it is [`Candidate::age`], and the block says so where a
+    /// refusal has been printed above it. A clock an operator cannot trust is
+    /// exactly the moment they still need to know what their disk is holding.
+    pub sweep: SweepPreview,
 }
 
 /// Enough of a `job.json` to judge it by, and nothing else.
@@ -607,6 +799,24 @@ struct Judgeable {
     priority: Priority,
     state: JobState,
     updated_at: Timestamp,
+}
+
+/// Enough of a `job.json` to judge its **collected bytes** by: what a sweep
+/// asks of a record and nothing else.
+///
+/// **Parsed separately from [`Judgeable`], out of the same text, and that is
+/// deliberate.** Every field here is `#[serde(default)]` through
+/// [`OutputSummary`]'s own attributes, so a record with no `outputs` key at
+/// all — which is every job that kept nothing — reads as a job that holds no
+/// collection rather than as a record this build cannot read. Folding these
+/// fields into `Judgeable` would have made a record whose `outputs` this
+/// build cannot parse vanish from the **span** figures too, which is a figure
+/// nobody asked to change. Two parses of one string, one read of the disk.
+#[derive(Debug, Deserialize)]
+struct Sweepable {
+    state: JobState,
+    #[serde(default)]
+    outputs: OutputSummary,
 }
 
 /// A record's labels as the disk carries them, before today's rules judge
@@ -660,6 +870,7 @@ impl RetentionPreview {
             newest: None,
             verdict: Verdict::Readable,
             classes: BTreeMap::new(),
+            sweep: SweepPreview::default(),
         };
         for class in Priority::ALL {
             preview
@@ -693,11 +904,27 @@ impl RetentionPreview {
 
         for name in &names {
             let dir = jobs_dir.join(name);
+            // **Weighed once, for both questions.** One `read_dir` of this
+            // job directory answers the span's three populations and the
+            // budget's one, and it is taken before the record is read so
+            // that a directory whose record cannot be read is still counted
+            // against the budget — which is what the sweep does, and is the
+            // half ORCH-124's leak lives in.
+            let weighed = weigh(&dir);
+            let holding = sweep_counts(&mut preview.sweep, name, &weighed);
             let record_path = dir.join(RECORD_FILE);
             let text = match fs::read_to_string(&record_path) {
                 Ok(text) => text,
                 Err(error) if error.kind() == io::ErrorKind::NotFound => {
                     preview.scanned.without_record += 1;
+                    withhold(
+                        &mut preview.sweep,
+                        name,
+                        holding,
+                        WhyWithheld::NoReadableRecord(format!(
+                            "there is no {RECORD_FILE} here at all"
+                        )),
+                    );
                     continue;
                 }
                 Err(error) => {
@@ -705,6 +932,12 @@ impl RetentionPreview {
                         path: format!("{JOBS_DIR}/{name}/{RECORD_FILE}"),
                         why: format!("it could not be read: {error}"),
                     });
+                    withhold(
+                        &mut preview.sweep,
+                        name,
+                        holding,
+                        WhyWithheld::NoReadableRecord(format!("it could not be read: {error}")),
+                    );
                     continue;
                 }
             };
@@ -714,19 +947,26 @@ impl RetentionPreview {
             match serde_json::from_str::<VersionProbe>(&text) {
                 Ok(probe) if probe.record_version == Some(RECORD_VERSION) => {}
                 Ok(probe) => {
+                    let why = match probe.record_version {
+                        Some(version) => format!(
+                            "it carries record version {version}, and this build \
+                             reads version {RECORD_VERSION}"
+                        ),
+                        None => format!(
+                            "it carries no record version at all, and this build \
+                             reads version {RECORD_VERSION}"
+                        ),
+                    };
                     preview.scanned.unread.push(Unread {
                         path: format!("{JOBS_DIR}/{name}/{RECORD_FILE}"),
-                        why: match probe.record_version {
-                            Some(version) => format!(
-                                "it carries record version {version}, and this build \
-                                 reads version {RECORD_VERSION}"
-                            ),
-                            None => format!(
-                                "it carries no record version at all, and this build \
-                                 reads version {RECORD_VERSION}"
-                            ),
-                        },
+                        why: why.clone(),
                     });
+                    withhold(
+                        &mut preview.sweep,
+                        name,
+                        holding,
+                        WhyWithheld::NoReadableRecord(why),
+                    );
                     continue;
                 }
                 Err(error) => {
@@ -734,6 +974,14 @@ impl RetentionPreview {
                         path: format!("{JOBS_DIR}/{name}/{RECORD_FILE}"),
                         why: format!("it is not JSON this build can parse: {error}"),
                     });
+                    withhold(
+                        &mut preview.sweep,
+                        name,
+                        holding,
+                        WhyWithheld::NoReadableRecord(format!(
+                            "it is not JSON this build can parse: {error}"
+                        )),
+                    );
                     continue;
                 }
             }
@@ -742,13 +990,23 @@ impl RetentionPreview {
             match serde_json::from_str::<DurableLabels>(&text) {
                 Ok(durable) => {
                     if let Err(why) = LabelSet::new(durable.labels.clone()) {
-                        preview.scanned.quarantined.push((
-                            name.clone(),
-                            format!(
-                                "its labels {:?} are not labels this hub accepts: {why}",
-                                durable.labels
-                            ),
-                        ));
+                        let said = format!(
+                            "its labels {:?} are not labels this hub accepts: {why}",
+                            durable.labels
+                        );
+                        preview
+                            .scanned
+                            .quarantined
+                            .push((name.clone(), said.clone()));
+                        // Quarantined is `could_not_free` in the sweep too:
+                        // `read_record` answers an error for one, so the
+                        // bytes are counted and never taken (D52).
+                        withhold(
+                            &mut preview.sweep,
+                            name,
+                            holding,
+                            WhyWithheld::NoReadableRecord(said),
+                        );
                         continue;
                     }
                 }
@@ -757,6 +1015,14 @@ impl RetentionPreview {
                         path: format!("{JOBS_DIR}/{name}/{RECORD_FILE}"),
                         why: format!("its labels are not a list of names: {error}"),
                     });
+                    withhold(
+                        &mut preview.sweep,
+                        name,
+                        holding,
+                        WhyWithheld::NoReadableRecord(format!(
+                            "its labels are not a list of names: {error}"
+                        )),
+                    );
                     continue;
                 }
             }
@@ -767,10 +1033,41 @@ impl RetentionPreview {
                         path: format!("{JOBS_DIR}/{name}/{RECORD_FILE}"),
                         why: format!("this build cannot judge it: {error}"),
                     });
+                    withhold(
+                        &mut preview.sweep,
+                        name,
+                        holding,
+                        WhyWithheld::NoReadableRecord(format!(
+                            "this build cannot judge it: {error}"
+                        )),
+                    );
                     continue;
                 }
             };
             preview.scanned.read += 1;
+
+            // The budget's question, settled here and not in the match
+            // below: a sweep does not look at a record's class or its span,
+            // so the answer is the same whichever side of a span the record
+            // falls on, and it is wanted even for a record that is not over.
+            if let Some(bytes) = holding {
+                match sweep_judge(&dir, &text) {
+                    Ok((passed, fetched)) => preview.sweep.order.push(Candidate {
+                        id: name.clone(),
+                        bytes,
+                        files: weighed.kept_files,
+                        passed,
+                        fetched,
+                        ended_at: parsed.updated_at,
+                        age: now.since(parsed.updated_at),
+                        // Filled once the order is known, below: a running
+                        // total has no value until there is an order to run
+                        // along.
+                        freed_by_then: 0,
+                    }),
+                    Err(why) => withhold(&mut preview.sweep, name, holding, why),
+                }
+            }
 
             // The clock's witness, over every readable record and not only
             // the judgeable ones: a record written in the future is evidence
@@ -805,11 +1102,11 @@ impl RetentionPreview {
                     // below read a class that can never be emptied as one
                     // that was.
                     class.judged += 1;
-                    class.inside.add(name, &weigh(&dir));
+                    class.inside.add(name, &weighed);
                 }
                 Selection::Inside { left } => {
                     class.judged += 1;
-                    class.inside.add(name, &weigh(&dir));
+                    class.inside.add(name, &weighed);
                     let sooner = match inside_soonest.get(&rank) {
                         Some((_, _, known)) => left < *known,
                         None => true,
@@ -820,7 +1117,6 @@ impl RetentionPreview {
                 }
                 Selection::Expired { .. } => {
                     class.judged += 1;
-                    let weighed = weigh(&dir);
                     class.past.add(name, &weighed);
                     class.expired.push(Seen {
                         id: name.clone(),
@@ -844,6 +1140,23 @@ impl RetentionPreview {
             class
                 .expired
                 .sort_by(|a, b| (a.ended_at, &a.id).cmp(&(b.ended_at, &b.id)));
+        }
+        // The sweep's own order, on the three keys a record carries
+        // (`store.rs`'s 2, 3 and 4), with the id as a fourth so that this
+        // listing is the same listing twice over. **The floor is the key
+        // that is not here**: it is `--output-floor`, the serving hub's
+        // argument, and nothing on this disk records it — so the order
+        // below is the sweep's within one floor band, and a floor of F
+        // stably moves every candidate younger than F to the end, keeping
+        // this order among themselves. The block says so where it prints.
+        preview.sweep.order.sort_by(|a, b| {
+            (!a.passed, !a.fetched, a.ended_at, &a.id)
+                .cmp(&(!b.passed, !b.fetched, b.ended_at, &b.id))
+        });
+        let mut freed = 0u64;
+        for candidate in &mut preview.sweep.order {
+            freed = freed.saturating_add(candidate.bytes);
+            candidate.freed_by_then = freed;
         }
         preview.verdict = preview.judge_the_clock();
         Ok(preview)
@@ -980,6 +1293,11 @@ fn weigh(dir: &Path) -> Weighed {
             return Weighed {
                 collected_bytes: 0,
                 collected_files: 0,
+                kept_bytes: 0,
+                kept_files: 0,
+                arriving_bytes: 0,
+                leftover_bytes: 0,
+                leftover: false,
                 record_bytes: 0,
                 log: LogWeight::Unknown(format!(
                     "the job directory itself could not be read, so none of its three \
@@ -990,6 +1308,11 @@ fn weigh(dir: &Path) -> Weighed {
     };
     let mut collected_bytes = 0u64;
     let mut collected_files = 0usize;
+    let mut kept_bytes = 0u64;
+    let mut kept_files = 0usize;
+    let mut arriving_bytes = 0u64;
+    let mut leftover_bytes = 0u64;
+    let mut leftover = false;
     let mut record_bytes = 0u64;
     let mut log: Option<LogWeight> = None;
     let mut counter_is_there = false;
@@ -1001,8 +1324,27 @@ fn weigh(dir: &Path) -> Weighed {
         if kind.is_dir() {
             let path = entry.path();
             if [KEPT_FILES_DIR, OUTPUT_PARTS_DIR, OUTPUT_GONE_DIR].contains(&name.as_str()) {
-                collected_bytes = collected_bytes.saturating_add(directory_bytes(&path));
-                collected_files += files_in(&path);
+                let bytes = directory_bytes(&path);
+                let files = files_in(&path);
+                collected_bytes = collected_bytes.saturating_add(bytes);
+                collected_files += files;
+                // The same measurement, kept apart by which mechanism owns
+                // it: the budget's sweep counts `files/`, never the part
+                // file it is still being given, and gives a `files.gone/`
+                // back before it chooses anything.
+                match name.as_str() {
+                    KEPT_FILES_DIR => {
+                        kept_bytes = kept_bytes.saturating_add(bytes);
+                        kept_files += files;
+                    }
+                    OUTPUT_PARTS_DIR => {
+                        arriving_bytes = arriving_bytes.saturating_add(bytes);
+                    }
+                    _ => {
+                        leftover_bytes = leftover_bytes.saturating_add(bytes);
+                        leftover = true;
+                    }
+                }
             } else {
                 record_bytes = record_bytes.saturating_add(directory_bytes(&path));
             }
@@ -1041,9 +1383,131 @@ fn weigh(dir: &Path) -> Weighed {
     Weighed {
         collected_bytes,
         collected_files,
+        kept_bytes,
+        kept_files,
+        arriving_bytes,
+        leftover_bytes,
+        leftover,
         record_bytes,
         log,
     }
+}
+
+/// How wide a job id is, after its `j`.
+///
+/// **`store.rs`'s `ID_DIGITS` written again here**, like `LOG_FILE` above and
+/// for the same reason: it is private there and `store.rs` is another task's
+/// exclusively. The duplication is held by a figure rather than by a comment
+/// — `a_directory_in_jobs_that_is_not_a_job_holds_bytes_a_sweep_ignores`
+/// mints a real job through the store itself and asserts that its id lands
+/// among the candidates while a directory beside it does not.
+const ID_DIGITS: usize = 10;
+
+/// Whether a name in `jobs/` is a job id this hub minted.
+///
+/// A sweep asks this first and skips everything else: a directory somebody
+/// else put in `jobs/` belongs to whoever put it there, so its bytes are
+/// neither held nor freeable. Said out loud on its own line rather than
+/// quietly folded into the total.
+fn looks_like_a_job_id(name: &str) -> bool {
+    let Some(digits) = name.strip_prefix('j') else {
+        return false;
+    };
+    digits.len() == ID_DIGITS && digits.bytes().all(|byte| byte.is_ascii_digit())
+}
+
+/// Count one job directory into the sweep's figures, and answer with what
+/// `files/` holds if a sweep would count it against the budget at all.
+///
+/// The order of the three tests is `store.rs`'s own: the name first, then the
+/// `files.gone/` a killed sweep left — which is given back before anything is
+/// chosen — and only then the bytes. A directory whose `files/` is there and
+/// empty is not a holder, exactly as it is not one there.
+fn sweep_counts(sweep: &mut SweepPreview, name: &str, weighed: &Weighed) -> Option<u64> {
+    if !looks_like_a_job_id(name) {
+        if weighed.kept_bytes > 0 {
+            sweep.not_a_job = sweep.not_a_job.saturating_add(weighed.kept_bytes);
+            sweep.not_jobs += 1;
+        }
+        return None;
+    }
+    if weighed.arriving_bytes > 0 {
+        sweep.arriving = sweep.arriving.saturating_add(weighed.arriving_bytes);
+        sweep.arrivals += 1;
+    }
+    if weighed.leftover {
+        sweep.leftover = sweep.leftover.saturating_add(weighed.leftover_bytes);
+        sweep.leftovers += 1;
+    }
+    if weighed.kept_bytes == 0 {
+        return None;
+    }
+    sweep.held = sweep.held.saturating_add(weighed.kept_bytes);
+    sweep.holders += 1;
+    Some(weighed.kept_bytes)
+}
+
+/// Record bytes a sweep counts and cannot free, with the reason.
+///
+/// Does nothing for a directory holding nothing: a reason is only worth
+/// printing about bytes.
+fn withhold(sweep: &mut SweepPreview, name: &str, holding: Option<u64>, why: WhyWithheld) {
+    if let Some(bytes) = holding {
+        sweep.withheld.push(Withheld {
+            id: name.to_owned(),
+            bytes,
+            why,
+        });
+    }
+}
+
+/// What a sweep would make of one holder: its two record-borne sort keys, or
+/// the reason its bytes are not a sweep's to free.
+///
+/// The four refusals are `store.rs`'s four `continue`s, in its order, and
+/// each one puts the bytes into `could_not_free` there and into
+/// [`SweepPreview::withheld`] here.
+fn sweep_judge(dir: &Path, text: &str) -> Result<(bool, bool), WhyWithheld> {
+    let parsed: Sweepable = match serde_json::from_str(text) {
+        Ok(parsed) => parsed,
+        Err(error) => {
+            return Err(WhyWithheld::NoReadableRecord(format!(
+                "this build cannot read what it kept: {error}"
+            )))
+        }
+    };
+    let JobState::Finished { outcome } = &parsed.state else {
+        return Err(WhyWithheld::NotOver);
+    };
+    if parsed.outputs.removed.is_some() {
+        return Err(WhyWithheld::AlreadyRemoved);
+    }
+    if !collection_is_whole(dir, &parsed.outputs) {
+        return Err(WhyWithheld::NotWhole);
+    }
+    Ok((
+        outcome.is_success(),
+        parsed.outputs.first_fetched_at.is_some(),
+    ))
+}
+
+/// `store.rs`'s `collection_is_whole`, over the manifest this module parsed:
+/// in `files/`, at the manifest's length, by a path this hub would join onto
+/// its own state root.
+///
+/// **Not the digest**, which `store.rs` does not check here either: the
+/// question is whether the sweep would find a collection to take, and it
+/// asks exactly this.
+fn collection_is_whole(dir: &Path, outputs: &OutputSummary) -> bool {
+    let kept = dir.join(KEPT_FILES_DIR);
+    outputs.files.iter().all(|file| {
+        herd_proto::check_relative(&file.path).is_ok()
+            && fs::metadata(kept.join(&file.path))
+                .ok()
+                .filter(|at| at.is_file())
+                .map(|at| at.len())
+                == Some(file.bytes)
+    })
 }
 
 /// How many files a directory holds, at every depth.
@@ -1249,7 +1713,7 @@ impl fmt::Display for RetentionPreview {
         writeln!(f)?;
 
         match &self.verdict {
-            Verdict::Readable => self.write_classes(f),
+            Verdict::Readable => self.write_classes(f)?,
             Verdict::ClockBehindTheRoot { newest, ahead_by } => {
                 writeln!(f, "REFUSED: THE CLOCK IS BEHIND THIS ROOT'S OWN RECORDS")?;
                 writeln!(f)?;
@@ -1277,7 +1741,6 @@ impl fmt::Display for RetentionPreview {
                     f,
                     "  nothing. No per-class figure is printed and nothing was previewed."
                 )?;
-                Ok(())
             }
             Verdict::WouldEmptyTheRoot {
                 expirable,
@@ -1336,9 +1799,10 @@ impl fmt::Display for RetentionPreview {
                     "  unit lands here too. No per-class figure is printed and nothing was"
                 )?;
                 writeln!(f, "  previewed.")?;
-                Ok(())
             }
         }
+        writeln!(f)?;
+        self.write_sweep(f)
     }
 }
 
@@ -1471,6 +1935,221 @@ impl RetentionPreview {
         writeln!(
             f,
             "  Nothing above was removed, and this subcommand cannot remove it."
+        )?;
+        Ok(())
+    }
+
+    /// The output budget's question, printed beside the span's (ORCH-097).
+    ///
+    /// **Printed whatever the verdict**, because the order in it is read off
+    /// the records and not off the clock: a refusal above is about the spans,
+    /// and an operator whose clock is wrong still has a disk filling up.
+    fn write_sweep(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let width = LABEL_WIDTH;
+        writeln!(
+            f,
+            "what the output budget's sweep would take, and in which order"
+        )?;
+        writeln!(f)?;
+        writeln!(
+            f,
+            "  A SWEEP AND A SPAN TAKE DIFFERENT THINGS, so the two figures are never summed"
+        )?;
+        writeln!(
+            f,
+            "  here. A sweep frees the collected bytes under files/ and leaves the record,"
+        )?;
+        writeln!(
+            f,
+            "  its log and its manifest standing, which is what lets the manifest outlive"
+        )?;
+        writeln!(
+            f,
+            "  the bytes (D152); a span takes the whole directory. A sweep also does not"
+        )?;
+        writeln!(
+            f,
+            "  look at a record's class or its span at all, so this is one list and not"
+        )?;
+        writeln!(
+            f,
+            "  four: a class whose span is 0 -- one that NEVER EXPIRES above -- can still"
+        )?;
+        writeln!(
+            f,
+            "  be the first collection a sweep takes, and on an old root it usually is."
+        )?;
+        if !self.verdict.is_readable() {
+            writeln!(f)?;
+            writeln!(
+                f,
+                "  The refusal above is about the clock and the spans. Every figure in this"
+            )?;
+            writeln!(
+                f,
+                "  block but one is read off the records and the file lengths alone: the one"
+            )?;
+            writeln!(
+                f,
+                "  judged against that clock reading is the age beside each candidate."
+            )?;
+        }
+        writeln!(f)?;
+        writeln!(
+            f,
+            "  {:<width$}{} in {} collection(s)",
+            "held under files/",
+            measured_bytes(self.sweep.held),
+            self.sweep.holders
+        )?;
+        writeln!(
+            f,
+            "  {:<width$}{} in {} collection(s)",
+            "  a sweep could free",
+            measured_bytes(self.sweep.freeable()),
+            self.sweep.order.len()
+        )?;
+        writeln!(
+            f,
+            "  {:<width$}{} in {} collection(s)",
+            "  it could not free",
+            measured_bytes(self.sweep.withheld_bytes()),
+            self.sweep.withheld.len()
+        )?;
+        for one in self.sweep.withheld.iter().take(NAMED_AT_MOST) {
+            writeln!(
+                f,
+                "    {JOBS_DIR}/{}  {}  {}",
+                one.id,
+                measured_bytes(one.bytes),
+                one.why.said()
+            )?;
+        }
+        and_more(f, self.sweep.withheld.len(), "    ")?;
+        writeln!(
+            f,
+            "  {:<width$}{} in {} collection(s), the writer's and never a candidate",
+            "still arriving",
+            measured_bytes(self.sweep.arriving),
+            self.sweep.arrivals
+        )?;
+        writeln!(
+            f,
+            "  {:<width$}{} in {} tree(s), given back before anything is chosen",
+            "a killed sweep left",
+            measured_bytes(self.sweep.leftover),
+            self.sweep.leftovers
+        )?;
+        writeln!(
+            f,
+            "  {:<width$}{} in {} directory(s), not a job id and so not a sweep's at all",
+            "not a job directory",
+            measured_bytes(self.sweep.not_a_job),
+            self.sweep.not_jobs
+        )?;
+        writeln!(f)?;
+        writeln!(
+            f,
+            "  NO BUDGET WAS GIVEN AND NONE IS NEEDED. The hub's --output-budget is the"
+        )?;
+        writeln!(
+            f,
+            "  serving hub's own argument and no byte of this root records it, so rather"
+        )?;
+        writeln!(
+            f,
+            "  than answer for one figure this answers for every one: read down the \"freed"
+        )?;
+        writeln!(
+            f,
+            "  by then\" column below until it reaches held minus the budget, and what is"
+        )?;
+        writeln!(
+            f,
+            "  above that line is what that budget would take. The budget an operator is"
+        )?;
+        writeln!(
+            f,
+            "  thinking of raising to is answered by the same column, at no further cost."
+        )?;
+        writeln!(f)?;
+        writeln!(
+            f,
+            "  THE FLOOR IS THE ONE KEY THAT IS NOT HERE. A sweep's first key is"
+        )?;
+        writeln!(
+            f,
+            "  --output-floor: outside the floor before inside it, because the floor is a"
+        )?;
+        writeln!(
+            f,
+            "  promise and nothing inside it goes while anything outside it remains. That"
+        )?;
+        writeln!(
+            f,
+            "  figure is the serving hub's too, so the order below is the sweep's within"
+        )?;
+        writeln!(
+            f,
+            "  one floor band. Under a floor of F, every candidate younger than F moves to"
+        )?;
+        writeln!(
+            f,
+            "  the end of this list and keeps this order among themselves -- the partition"
+        )?;
+        writeln!(
+            f,
+            "  is stable -- and the freed column re-runs along what comes out. The age"
+        )?;
+        writeln!(f, "  beside each candidate is printed for that arithmetic.")?;
+        writeln!(f)?;
+        writeln!(
+            f,
+            "  the order a sweep takes them in, oldest-evidence-last by three keys: a job"
+        )?;
+        writeln!(
+            f,
+            "  that passed before one that did not, fetched before never fetched, then"
+        )?;
+        writeln!(f, "  oldest first")?;
+        if self.sweep.order.is_empty() {
+            writeln!(
+                f,
+                "    none: no job directory on this root holds a collection a sweep could \
+                 take"
+            )?;
+        }
+        for candidate in self.sweep.order.iter().take(NAMED_AT_MOST) {
+            writeln!(
+                f,
+                "    {JOBS_DIR}/{}  {} in {} file(s)  freed by then {}  {}, {}, ended {}, \
+                 age {}",
+                candidate.id,
+                measured_bytes(candidate.bytes),
+                candidate.files,
+                measured_bytes(candidate.freed_by_then),
+                if candidate.passed {
+                    "passed"
+                } else {
+                    "did not pass"
+                },
+                if candidate.fetched {
+                    "fetched"
+                } else {
+                    "never fetched"
+                },
+                candidate.ended_at,
+                said_span(candidate.age),
+            )?;
+        }
+        and_more(f, self.sweep.order.len(), "    ")?;
+        writeln!(
+            f,
+            "  Nothing above was removed either, and this subcommand cannot remove it: the"
+        )?;
+        writeln!(
+            f,
+            "  two questions on this page are one walk, and the walk opens files read-only."
         )?;
         Ok(())
     }
@@ -1751,6 +2430,13 @@ mod tests {
             &Weighed {
                 collected_bytes: 8,
                 collected_files: 2,
+                // All of it under `files/`, which is the ordinary shape: the
+                // sweep's split of the same measurement.
+                kept_bytes: 8,
+                kept_files: 2,
+                arriving_bytes: 0,
+                leftover_bytes: 0,
+                leftover: false,
                 record_bytes: 100,
                 log: LogWeight::Measured(64 << 20),
             },
@@ -1760,6 +2446,11 @@ mod tests {
             &Weighed {
                 collected_bytes: 0,
                 collected_files: 0,
+                kept_bytes: 0,
+                kept_files: 0,
+                arriving_bytes: 0,
+                leftover_bytes: 0,
+                leftover: false,
                 record_bytes: 100,
                 log: LogWeight::Unknown("it is not there".to_owned()),
             },
@@ -1769,6 +2460,11 @@ mod tests {
             &Weighed {
                 collected_bytes: 0,
                 collected_files: 0,
+                kept_bytes: 0,
+                kept_files: 0,
+                arriving_bytes: 0,
+                leftover_bytes: 0,
+                leftover: false,
                 record_bytes: 100,
                 log: LogWeight::NeverWritten,
             },

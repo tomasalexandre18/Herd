@@ -33,12 +33,11 @@ root. **D199's constraint on the ordinary release is moot** (**D243**) and
 
 ## What is known about the consumer's machines, and when
 
-Nobody here logs into their hosts (D161); a fact reaches us as a dated report.
-**The orchestrator opens that exchange on its own** (**D249**), by
-`SendMessage` and never a GitHub issue; invariant 9, D161 and the notes stand,
-and the route reports nothing back.
-**Their hub and runner are up since 20:23 on 2026-10-29**, so the ceiling is
-**two** heavy agents.
+Nobody here logs into their hosts (D161); a fact reaches us as a dated
+report. **The orchestrator opens that exchange on its own** (**D249**), by
+`SendMessage` and never a GitHub issue; invariant 9, D161 and the notes
+stand, and the route reports nothing back. **Their hub and runner are up
+since 20:23 on 2026-10-29**, so the ceiling is **two** heavy agents.
 
 - **The 37.6 GiB kept for nothing is fixed in the code and still on their
   disk** (**D221**, ORCH-205): **freed by the release, not the merge**, and
@@ -77,8 +76,9 @@ and **skips per host** (D27): **12** runtime, **14** loaded, **38** ignored.
 ## What the software still does not do
 
 1. **Nothing ever deletes a job directory** (ORCH-012, -021), a reading weighs
-   no memory (**ORCH-126**), *reaped* is unbuilt (**D134**), and **`packs/` has
-   no retention, sweep or budget at either end** (ORCH-215).
+   no memory (**ORCH-126**), *reaped* is unbuilt (**D134**), and **`packs/`
+   has no retention or sweep** (ORCH-215): the runner takes a budget, **evicts
+   nothing**, and the deployed unit names none (ORCH-251, -252).
 2. **The pack half reaches a job, and no pack reaches a disk.** **The runner
    lays no pack out under `{in}` and registers none from `{out}`** — it hands
    the job back with every key named (ORCH-220). `ToHub::JobFact` and six
