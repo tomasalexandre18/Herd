@@ -198,6 +198,14 @@ impl HandWrittenHub {
                                         hub_version: env!("CARGO_PKG_VERSION").to_owned(),
                                         state_root: STATE_ROOT.to_owned(),
                                         version_note: None,
+                                        // Resolved at batch 14's integration:
+                                        // `main` added this field after this
+                                        // branch's base. Empty is the
+                                        // documented default and every runner
+                                        // today, it is skipped on the wire, so
+                                        // this hub says exactly what it said
+                                        // before the field existed.
+                                        keeper_for: Vec::new(),
                                     })
                                     .expect("a welcome encodes");
                                     if socket.send(Message::text(welcome)).await.is_err() {
