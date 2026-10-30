@@ -81,9 +81,9 @@ gone from `{out}` before the record walk** (**D223**). **Skips are per host**
    E-12 and E-17 are undelivered. Its rule is written (D222, D223); its
    `PROTOCOL_VERSION` 2 → 3 is not, and is not in this batch.
 3. **Five declaration fields are parsed, validated and discarded**
-   (**ORCH-148**). **`plan.md` and `coverage.md` are corrected** (ORCH-152),
-   but **three "Gated on chatOnS" lists disagree** (ORCH-206) and the v1.0.0
-   roadmap is owed (ORCH-155).
+   (**ORCH-148**). **`plan.md` and `coverage.md` are corrected against the
+   tree** (ORCH-152), but **three "Gated on chatOnS" lists still disagree**
+   (ORCH-206) and `docs/road-to-v1.md` counts the road (ORCH-155).
 4. **V3 stays red and the reading is Alexa's** (**D228**, ORCH-022): the
    watchdog drops a runner's link before asking what it holds, the obvious
    fix moved none of V3's five runs, and the question is whether a runner
