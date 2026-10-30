@@ -11650,3 +11650,884 @@ E-21 in `docs/coverage.md`; ORCH-022;
 *Decisions needed* (the implementation, the 5-of-5-red measurement and
 the withdrawal), `history/2026-10-29-v3v4-rates.md` (the rate tables and
 the kept probe at `V3_STARVE=2200`).
+
+---
+
+## 2026-10-29 — D229 `PROTOCOL_VERSION` is 3, and it carries the pack surface
+
+`PROTOCOL_VERSION` moves 2 → 3, which is the move D199 called for before
+v1.0.0 and the first of its triple to land. Nothing published is affected:
+Alexa's direction tonight is that no intermediate release ships, so the next
+tag cut from `main` is v1.0.0 and the consumer resets at it.
+
+**What the number carries.** M11's pack half, which version 2 did not: M11's
+own claim that the version-2 break was *"paid once for both halves"* is false
+and D205 corrected it — version 2 went on the record half alone. M12's
+pack-side surface rides with it, because E-14 and E-16 are `must`
+expectations inside v1.0.0 (D205) and a second bump for them would be a fleet
+going quiet twice.
+
+**What was NOT foreclosed, against an earlier belief.** It was thought this
+is the last bump the project may ever make and that every future frame had to
+be numbered now. D204 constrains the **feature surface**, not this constant;
+it says the triple moves *before* v1.0.0 and not that it may never move
+after. So `#[serde(default)]` fields on existing variants, `FromHub` variants
+only a runner sees, and `#[serde(default)]` fields in a record on disk stay
+additive afterwards. What is genuinely unrecoverable is a new `ToHub` variant
+— an older hub answers `Refused` and drops the link — and a `FromHub` variant
+a **requester** sees, which `herdctl` bails on. The `ToHub` set was therefore
+made exhaustive and the rest was not held for.
+
+**The pack identity rule, which the types enforce.** A pack's `<id>` is the
+sha256 of `manifest.tsv`'s **bytes** (the consumer's measurement, issue #16,
+2026-10-13), so a parsed-and-reprinted manifest is a different pack.
+`PackManifest` keeps the bytes private, derives no `Serialize`, has no
+`Display` and no method that produces manifest text, and prints a summary
+from `Debug`: there is nothing to call. On the wire a manifest is `Vec<u8>`
+base64 and never a struct. **Herd may never re-serialise a manifest**, and the
+type is what makes that true rather than a rule somebody remembers.
+
+**The `kind` column is load-bearing.** A `kind d` or `kind l` row carries a
+sha256 of something that is not a file's bytes, so every completeness check
+filters on `kind == f`, and a kind letter Herd has not been taught is a
+**refusal** and never a row read as "not a file". Fixtures carry a `d` row and
+an `l` row so the filter is proven rather than assumed.
+
+**`PacksHeld` replaces and never appends.** A runner's announcement is its
+whole holding; a pack it has deleted is retracted by not being in the list,
+and `more: bool` is required because a hub that read one frame of a chunked
+announcement as the whole of it would drop every pack the runner holds. Had
+the frame appended, a retraction would have needed a new `ToHub` variant and
+therefore a fourth version.
+
+**Said in the refusal, not only in the doc.** `version_mismatch_reason` now
+says that a refused peer cannot work at all until its host is rebuilt, that
+the fleet goes quiet machine by machine, and that the check is equality so hub
+and peers move together in either direction. The constant's doc comment said
+all of this and the sentence a peer's owner reads said none of it.
+
+`RECORD_VERSION` and `LAYOUT_VERSION` do **not** move here: they move with the
+on-disk shapes they describe.
+
+---
+
+## 2026-10-29 — D230 The pack frames are on the enums, the peer leg is raw
+
+**The frames landed where the number already says they are.** The previous
+entry moved `PROTOCOL_VERSION` to 3 and said 3 carries M11's pack half; the
+fourteen variants and the nine fields are now arms and fields of `ToHub`,
+`FromHub`, `Asked`, `Hello`, `Health`, `Welcome` and `AssignJob`. The two
+commits are one change: the bump without the frames would have been a doc
+comment describing a surface that does not exist.
+
+**The bytes did not move, and that is checked and not asserted.** Each
+payload's serialisation was frozen through a stand-in enum before the real
+enums carried it, on the argument that an internally tagged newtype variant
+emits the same bytes as a struct variant of the same fields. The stand-ins
+were kept rather than deleted, and the real arm is now encoded beside each of
+them and compared byte for byte — so the argument is a test and not a
+comment. It was proved to fire: a renamed variant tag makes it red with a
+sentence saying every byte frozen through the stand-in is suspect.
+
+**One reason-coded `ToHub` frame goes in, and it ends nothing yet.**
+`ToHub::JobFact { job_id?, attempt?, reason, detail }` carries *a fact about a
+job, with a reason*. Six places in Herd conclude something about a job and
+have only their own stderr to say it with — asked for files it does not hold,
+a record naming a file it cannot read, a transfer that stopped where only the
+stopping side knows why, a spooled verdict it cannot attribute, a spool
+deleted after the hub refused it, and a requester's E-41 skip — and all six
+need `ToHub`, the one direction where an older hub answers `Refused` and drops
+the link. Six variants added one at a time would have been six protocol
+versions; one frame with six reason codes is this one. **No runner, no
+requester and no hub handler touches it on this build**, and the variant's doc
+comment says so, so that the frame's existence cannot be read as a fix.
+
+**`job_id` is optional, and that is what makes one frame cover all six.**
+E-41's skip is a requester reporting a job it decided *not* to submit, so
+there is no id the hub ever minted. `coverage.md` records that deviation as
+*"not closeable by hub work"*; it is closeable by protocol work, and this is
+the shape of it.
+
+**On a frame of this shape, only the variant is one-shot — not its reason
+set.** This was believed the other way round, and it is worth stating as a
+rule because it changes what any future frame on `ToHub` has to carry. A
+reason code this build has not been taught decodes into `FactReason::Other`
+carrying the code itself, so an older hub reads the **whole** frame, writes
+the `detail` where a person will see it, names the code in that line, and acts
+on nothing — which is the shrug `ToHub::Unknown` already is, one level down.
+So a seventh reason costs nothing, an eighth costs nothing, and the only thing
+that had to be got right tonight is that the **variant** exists. The
+corollary, for the next frame: spend the design effort on the variant and on
+which fields are typed, and none of it on enumerating a value set
+exhaustively.
+
+**`PackUnavailable` stays its own frame beside it.** Its `pack`, `commit` and
+`key` are looked up by the hub's registry — keyed on `(commit, key)` and on
+the pack's id — and a hub parsing them back out of a sentence is what
+invariant 4 exists to prevent. One extra variant is cheaper than a hub that
+reads prose.
+
+**The peer leg is one line of JSON and then the bytes.** The control plane has
+no choice about base64 — D4 makes a frame one WebSocket text frame and D18
+keeps a job's output byte-exact inside it — and this leg has: it touches no
+hub (D10) and it is the only leg that moves hundreds of megabytes. The
+consumer's measured 401.6 MiB pack would have travelled as about 535 MiB. So
+`PeerReply` is a **header** — the bytes left the struct — and the framing is a
+single-line JSON header ended by `\n` followed by exactly as many raw bytes as
+the header said, in `herd-proto` because the peer wire is part of the contract
+(invariant 4). A length-prefixed binary framing would save the same third and
+cost the property that a person can read one line of the stream by eye.
+
+`PeerReply::length` is now the **body's** length and `object_length` carries
+the object's, which the old single `length` conflated. Every way the two ends
+can disagree is refused by its own name — a header past one read of the
+endpoint's buffer, a header that is not JSON, a body past the chunk, a chunk
+ending past its object, a truncated body, a peer on another protocol version —
+and a header still arriving is `Incomplete` and **not** a refusal, because a
+reader that closed the link on a chunk boundary would close a healthy one.
+No new numbers: the bounds are `PACK_ENDPOINT_READ_BYTES` and
+`PACK_CHUNK_BYTES`.
+
+**A manifest row is untrusted input, and the digest column is checked where
+the row is parsed.** A `manifest.tsv` comes out of the consumer's own tooling,
+and column 1 is the name Herd joins onto `objects/` — so a row reading
+`../../../escaped` named a path outside the store. It must be **exactly 64
+lowercase hex characters**, refused by name at the one place a
+`ManifestEntry` comes into existence, so the registry, the fetch endpoint and
+the runner's store inherit the rule instead of writing it three times: three
+copies is how two of them come to disagree. **Uppercase is refused and not
+lowercased**, because a content-addressed store that took both spellings could
+hold one object's bytes twice under two names.
+
+**The path column was inert by habit and not by construction, and that is the
+same defect in miniature.** Its rule lived in its own doc comment — *"not a
+path Herd ever joins onto anything"* — which is a rule in one place and
+enforced in none, so it is now checked to be what the format says it is:
+relative to the pack's own root, not empty, no NUL, and no `..` that climbs
+out. **The link target is deliberately NOT checked**, and the reason belongs
+in the record so that nobody tightens it later without it: Herd never resolves
+one, and a build output's symlink may legitimately point at `/nix/store/…`
+outside the pack, so refusing it would refuse a good pack to defend against a
+resolution nothing performs. It is inert by usage, the type says so, and
+anybody who ever resolves one owes it their own check.
+
+`RECORD_VERSION` and `LAYOUT_VERSION` do **not** move here, and neither do
+`VERDICT_FORMAT_VERSION` or `OUTPUT_FORMAT_VERSION`: no pack information went
+on the verdict document.
+
+---
+
+## 2026-10-30 — D231 The hub's pack registry, and two state-root versions
+
+**Context.** D199 reserved `PROTOCOL_VERSION` 2 → 3, `RECORD_VERSION` 1 → 2
+and `LAYOUT_VERSION` 1 → 2 for M11's pack half and named none of the shapes.
+The protocol half was numbered on `pack-proto`. The record and the layout are
+spent here, and an agent found tonight that the two checks behave differently:
+the layout's is in `JobDirStore::open_with` and returns `Err` before the port
+is bound, while the record's is in `read_stored` and quarantines one record
+(D218). A build moving the record alone therefore **starts**, binds its port
+and serves an empty queue off a root where every job is set aside by name —
+measured, not argued: a half-moved build opened a v0.4.1-shaped root with all
+its jobs quarantined and an empty queue.
+
+**Decision.**
+
+1. `RECORD_VERSION` is **2** and `LAYOUT_VERSION` is **2**, in one commit.
+   What the record move buys is not the two new fields — they are
+   `#[serde(default)]` and additive by this project's own rule — but the
+   refusal arriving **at the door** with the layout's, and the rollback being
+   refused on the record as well as on the root.
+2. The state root gains `packs/manifests/<id>/` holding `manifest.tsv`
+   verbatim, `pack.meta` verbatim and `registered.json`, plus
+   `packs/manifests.part/` for staging. `<id>` is the sha256 of
+   `manifest.tsv`'s bytes and the hub recomputes it — off the frame **and**
+   off the disk at every start, because a directory name is a claim too.
+3. **A registration is one `rename(2)`** and the `(commit, key)` index is
+   **derived**, rebuilt from the directories at open like `index/state.json`.
+   An interrupted registration leaves a directory under `manifests.part/` that
+   nothing reads and the next start removes by name: a pack is complete or
+   absent (E-17).
+4. **Two different ids registered for one `(commit, key)` is a refusal by
+   name, never a newest-wins.** The consumer's promise is that identical
+   outputs give the identical pack, so two ids mean the outputs really
+   differed, and picking one hands some later job the wrong artefact in
+   silence. The refusal names both ids and says what picking one would cost.
+5. **Holdings are per manifest, volatile, in memory only**, re-announced after
+   `Welcome`. There is no holdings file and no stale holder after a restart.
+   `PackState::Incomplete` is therefore not the hub's to compute and is never
+   returned.
+6. `job.json` gains `packs_in` and `packs_out`, carrying ids and not
+   manifests. **No pack field goes on the verdict document**:
+   `VERDICT_FORMAT_VERSION` and `OUTPUT_FORMAT_VERSION` are frozen as whole
+   literal text and a field there would move a fourth public version.
+7. **All three refusals say what is lost and what to do**, and point at
+   `docs/operating.md`'s *"The instruction, in order"*: no conversion in
+   either direction, the reading taken off the old root first with the old
+   release's binary, the root moved aside and not converted, every runner
+   refused once. The record's sentence lives once, in `herd-hub/src/job.rs`
+   beside the constant, and takes an `Option<u32>` so an absent
+   `record_version` is said to be **absent** and not reported as zero.
+**Cost, and what is not decided.** `packs/` has no retention, no sweep and
+no budget: the registry only grows, one directory per `(commit, key)`. The
+removal delay and the archive path stay parked for Alexa. The release
+body's machine-readable lines now carry **all three** numbers —
+`.github/workflows/release.yml` reads `LAYOUT_VERSION` out of
+`herd-hub/src/store.rs` the same way it reads the other two, under D168's
+refusal, because a consumer's script matching two of three would conclude
+a move was safe when it was not. What is not done is the prose around it:
+`deploy/release-notice.md`'s section is still called *"The two numbers in
+the release body"* and covers two of the three, and the body says so
+rather than claim coverage it does not have.
+
+---
+
+## 2026-10-30 — D232 The runner's pack store, and the pack leaves `{out}`
+
+**The store.** A runner keeps packs under `<data root>/packs`:
+`objects/<sha256>` once per content for every pack it holds, and
+`manifests/<id>/manifest.tsv` — the bytes, verbatim — per pack. That is not
+the shape of a *pack directory*, which is the consumer's three parts
+(`manifest.tsv`, `pack.meta`, `objects/<sha256>`, measured by them on
+2026-10-13 at 401.6 MiB in 557 files); the store shares objects across packs,
+which is the whole reason it exists, and a pack is laid out for a job as hard
+links into `objects/`. Handing a 400 MiB pack to a job therefore costs the
+directory entries and not the bytes, and the figure that says so is reported
+rather than assumed.
+
+**Complete or absent (E-17).** An object is linked or copied under a staging
+name, hashed there, fsynced and renamed, so a partial object is never visible
+under its final name: a later completeness check would count it and a pack
+missing those bytes would read as whole. The manifest is written **last**, so
+an ingest killed anywhere leaves objects — each whole, or not there at all —
+and no pack.
+
+**Every object is hashed as it is placed.** A content-addressed store whose
+`objects/<sha>` does not hash to `<sha>` is a lie the next machine cannot
+detect, because it asks for the name it trusts. The cost is one read per
+content, against the consumer's own 1.5–2.1 s to verify 401.6 MiB.
+
+**The sha256 column is checked before it is joined onto a path.**
+`herd_proto::ManifestEntry` carries column 1 as the consumer wrote it, so a
+row reading `../../something` would otherwise name a path outside the store.
+Sixty-four lowercase hex characters and nothing else, refused by name.
+
+**ORCH-153: the pack is gone from `{out}`, not excluded from it.** Each
+declared `leaves` path is ingested and removed before the collection walk
+reads the directory. Not a fifth entry in the record half's exclusion list:
+an exclusion is a thing a later edit silently breaks, and what it would break
+is a ~400 MiB pack collected as a job's output evidence and streamed runner →
+hub → requester as if it were a result — the record half doing exactly its
+job, with no error anywhere and very likely the whole collection refused over
+the output cap so that `results.json` does not come back either. An absence
+cannot be broken that way. `docs/plan.md`'s "unspecified, to be settled
+before any pack code is briefed" is thereby settled.
+
+**A declared path leaves `{out}` whether or not it could be stored**, and the
+failure is named with its figures on the record and on the machine's stderr. A
+declared pack is outside the record by declaration; left where it is, one pack
+Herd cannot read would refuse the whole collection for it.
+
+---
+
+## 2026-10-30 — D233 A pack Herd cannot read is set aside and kept
+
+**A declared pack leaves `{out}` whether or not it could be stored, and in
+neither case is it destroyed.** Why it leaves is the record: a pack Herd could
+not ingest, left where the job put it, is ~400 MiB of ordinary output over the
+job's output cap, so the whole collection is refused and `results.json` does
+not come back either — one failure becoming two, with the second one silent. A
+declared pack is outside the record *by declaration*, so it is outside it in
+both outcomes.
+
+**Where it goes is `<data root>/packs/refused/<job>-<attempt>/<declared
+path>`, and nothing in Herd ever removes it** — not a timer, not the sweep,
+not the reaper, not a start. This is not a new shape: the runner's sweep
+renames a spool no hub will claim to `<job>-<attempt>.unclaimed` and keeps it,
+the hub quarantines a record it cannot read byte for byte, and D221 made
+removal depend on the hub's own sentence rather than on a silence. A fourth
+path that silently deleted hundreds of megabytes would be the only place in
+Herd that does. The reason and the figures are named on the record's `skipped`
+list and on the machine's stderr, and the sentence says in words — the sweep's
+own words — that removing it is the operator's and that nothing here will.
+
+**Terminal, like a set-aside spool.** Bytes under `refused/` are never
+ingested, never laid out, never offered and never looked at again, so the
+state does not flip at every boot. Asserted three ways: on the kept bytes, over
+the runner's two real startup entry points (the reaper and the sweep, composed
+as ORCH-164's regression is), and over the crate's source with the detector
+fired on a known-bad line first.
+
+**How long it is kept is not a question this has an answer to: indefinitely.**
+The removal delay and the archive path are Alexa's and are parked; "kept, the
+operator's to remove" is the whole of the policy, and it is the same answer the
+quarantine took.
+
+---
+
+## 2026-10-30 — D234 A pack directory is the three parts and nothing else
+
+**`manifest.tsv`, optionally `pack.meta`, `objects/`, and no other name.** A
+declared directory holding anything else is refused by name — before any object
+is placed — and goes to `packs/refused/<job>-<attempt>/<declared path>` intact,
+by the path **D233** (a pack Herd cannot read is set aside and kept) already
+built.
+
+**Why, and it is not tidiness.** A declared directory that ingests has
+`leave_packs` `remove_dir_all` **all** of it, which is ORCH-153 — the pack is
+gone from `{out}`, not excluded from it. So before this, a job that left
+`{out}/packs/build.log` beside its pack had that log destroyed on the *success*
+path, by the module that had just been taught to keep a pack on the failure
+path. The objects survived under `objects/`; nothing else did.
+
+**Refused, rather than removing only the three parts.** The fallback sounds
+honest and invents a rule: it is Herd deciding, unasked, that a declared
+directory is part pack and part output, and it weakens "gone from `{out}`, not
+excluded from it" into "partly gone". Which of those bytes are the pack's is
+the declaration's to say, and the declaration says the directory is a pack. One
+rule, one outcome: the whole directory is kept, and the operator is told what
+was found in it.
+
+**It makes the module's own doc true.** `ingest` already claimed "anything else
+is refused by name rather than guessed at" and nothing beneath it kept the
+claim. That is the family this project has now found six times in one day — a
+rule stated in prose and enforced nowhere — and this is the second time it was
+found in this very file.
+
+**The scope is the top level, deliberately.** What is inside the three parts is
+their own business: a pack whose `objects/` holds a file no `kind f` row names
+is still the pack its manifest says it is, and refusing on it would refuse real
+packs whose tool left an object behind. The destruction path is narrowed, not
+closed, and closing it wants the first consumer's own pack measured against a
+draft refusal first.
+
+---
+
+## 2026-10-30 — D235 The peer wire's authority is the hub's push
+
+A runner serves a pack's objects on one socket, on its single configured
+mesh address, through `mesh::MeshListener` and from no other module
+(invariant 3, D10, D11). What authorises a transfer is a capability the
+**hub** pushed to that runner over that runner's own already
+authenticated control link (`FromHub::ExpectTransfer`, D209);
+`endpoint::Granted::pushed_by_hub` is the only way one enters the table,
+and it lives on `Session` so that a redial does not lose a capability the
+hub has already promised a waiting job.
+
+**The peer wire carries no peer identity, and this is the decision rather
+than an omission.** `PeerRequest` is a protocol version, a token, a pack,
+an object and an offset. So the endpoint cannot refuse "the wrong peer" by
+name, and it does not pretend to: what binds a transfer to a peer is
+possession of the token, which is what *authorised, not confidential*
+means (D200) — a bearer capability's holder is its subject. The scopes
+that **are** refused by name are the ones the wire can check: no
+capability presented, one the hub did not push, an expired one, a token
+for another pack, a `Push` capability asked to be read from, an object
+outside the capability's list, and a digest the manifest does not name as
+a file. Each has a case that fires it, and a whole-pack capability is
+asserted to serve the object, so the set is not a check that refuses
+everything.
+
+A fetch takes D10's paths in D10's order and **reports which one it
+took**, because D10's claim is not "it arrived" but that the cheapest
+available path was the one taken. Same host is asserted on the **inode**
+and not on the byte count, since nought bytes is also what a failed
+transfer reports. Only the objects the fetcher lacks move, and the diff is
+computed in the fetcher's own content store — which is why the hub keeps
+holdings per manifest and not per blob.
+
+Every path that gets no pack is a **named, visible state with a sentence
+in it**, and every wait is bounded: no holder at all, every holder
+outbound-only (which needs a push), a hub that will not authorise, a
+holder that cannot be dialled, a transfer that stopped. A peer's own
+refusal crosses the wire word for word. That is D150's finding applied to
+this half: the party that knows why is the one that has to speak, and an
+absence is never an answer.
+
+---
+
+## 2026-10-30 — D236 A compile-time skip is a skip, and is listed apart
+
+**Context.** D27 and invariant 5 say a skipped assertion is printed as
+skipped and never reported as passed, and D187 made the list — never the
+count — the thing that decides. Both were enforced only for a skip a
+test writes while running. A test carrying `#[ignore]` never runs and
+writes nothing: at batch 9's landing one was added on purpose and the
+gate's twelve-name list and its sha256 did not move, so `#[ignore]` was a
+silent exemption from the one rule this project treats as
+non-negotiable. The tree carried 39 of them, in 9 files.
+
+**Choice.** `scripts/test.sh` turns cargo's own `ignored` lines into
+`HERD-IGNORED: <name>: <reason>` and ends with an `ignored census:`
+marker; `scripts/gate.sh` step 7 has two halves, compared separately and
+each by name, the compile-time one against
+`scripts/expected-skips/ignored.txt` — one file, because `#[ignore]` is a
+property of the tree and not of the host. The two kinds are never merged:
+`HERD-SKIPPED` says *this host cannot check it*, `HERD-IGNORED` says
+*nobody is checking it until someone acts*, and the marker on the line
+carries the kind, so converting one into the other is a visible change in
+two files and never a wash. An `#[ignore]` with no reason gets
+`HERD-IGNORED-UNEXPLAINED`, which no expectation file can match and
+`--bless` refuses to adopt: an assertion nobody makes must say why.
+`skip-list-sha256` is untouched and still over the `HERD-SKIPPED` names
+alone, so every figure an older receipt quoted still compares;
+`ignore-list-sha256` is new beside it.
+
+**Cost.** 33 cases in `check-orchestration.sh`, 291 to 324 — 15 on `test.sh`,
+15 on `gate.sh`, 3 on the locale. (The draft read *"30 cases, 285 to 315"*;
+285 is `1a8c1ae`'s figure and the author corrected it to this one in the same
+handoff, after merging `main`.) `test.sh`
+pipes cargo's stdout through `tee`, so a direct run loses libtest's
+colour. D27, D187, invariant 5, ORCH-202.
+
+---
+
+## 2026-10-30 — D237 The road to v1.0.0 is a counted file
+
+**Context.** Alexa asked for *"des feuilles de route chiffrées et pouvoir
+comparer les avancements"*. What answered it lived in a scratchpad file
+and a document the session that wrote it could no longer reach — two
+single points of failure — and its figures were three landings stale.
+`docs/plan.md` holds the milestones and `docs/coverage.md` the
+consumer's numbered expectations; neither is dated, neither counts, and
+a third document that restated either would be how three documents come
+to disagree.
+
+**Choice.** `docs/road-to-v1.md` is that third document and is bounded
+by what it may not do: it **counts across** `plan.md` and
+`coverage.md` and points at them, and restates no milestone, no
+done-when and no expectation row. Its spine is an advancement table, one
+dated row per point of measurement, stable columns, newest first. Every
+figure in it names where it came from; a figure nobody took is marked
+**not measured** or **not recounted** rather than rounded or dropped.
+A row is comparable to the one above it only if taken the same way, so
+the file states how: name the sha, recount `coverage.md`'s `must`
+column rather than carrying a figure forward, re-read each blocker
+statement against the tree, take branch and commit counts from `git
+log`, read every CI conclusion with `gh`.
+
+**Why a file and not the board.** `board.md` is the list of open work
+and waiting decisions and is not dated per figure; a quantified view
+that a reader compares point to point is a different object, and putting
+it in a board row would make the board the place where figures go stale.
+
+**Residue.** Whether a row is taken per landing or per session is the
+one open question of form; the two rows written today are per session
+with the landings named inside them.
+
+**Evidence.** `docs/road-to-v1.md`; `docs/status.md` pointer;
+`docs/coverage.md` counted at `5f73c18`; **D204**, **D205**, **D206**,
+**D212**, **D220**, **D221**, **D222**, **D223**; ORCH-155, ORCH-199,
+ORCH-108, ORCH-210; `history/2026-10-30-road-to-v1.md`.
+
+---
+
+## 2026-10-30 — D238 One list of chatOnS-gated expectations, derived
+
+**Context.** Three places named which of the first consumer's
+expectations wait on chatOnS and the three disagreed (ORCH-206, found by
+`plan-truth` 2026-10-29, line numbers re-verified at batch 10's
+landing). `docs/plan.md` named nine (E-02, E-11, E-12, E-14, E-38, E-41,
+E-42, E-53, E-54); `docs/coverage.md`'s M18 line named six (E-02, E-11,
+E-12, E-14, E-41, E-42); the rows whose own notes carry a gated or
+manual marker were eight (E-02, E-11, E-12, E-14, E-20, E-30, E-41,
+E-49). All three were re-verified against `main` 351c826 before anything
+changed, and there were in fact **four** copies: `plan.md`'s M18 section
+enumerates the same six as the M18 line.
+
+**Choice.** The one list lives in `docs/coverage.md`, in a
+`## Gated on chatOnS` section immediately after the E-row table, and
+every other place names it instead of restating its members. It lives
+beside the rows **because a list kept anywhere else is a copy**: each
+member names the chatOnS deliverable it waits on and quotes the words in
+its own row that gate it, so the list is checkable against the rows
+rather than trusted, and a row whose note changes is caught by a reader
+comparing the two on one screen. Its members are **seven**: E-02, E-11,
+E-12, E-14, E-20, E-41, E-42.
+
+**The definition is the file's own, not a gloss, and it is stated where a
+reader meets the list.** *Gated* means the acceptance criterion needs a
+chatOnS deliverable and a fixture test stands in until M18. It says
+nothing about whether Herd's side is built: **E-12, E-14 and E-42 are
+gated with nothing on `main`**. The reading *"Herd's side is done and
+only their acceptance is outstanding"* was tested against the tree and is
+false; adopting it would have turned the list into a delivery claim about
+four musts that do not exist yet.
+
+**Three kinds of row are off the list, each with its own group and its
+criterion written down.** The reason four copies came to exist is that
+the exclusions never were: an unexplained exclusion gets re-added.
+
+- **Gated on them, and with no milestone that closes it** — a named
+  second group: **E-38** (their results.json, for the load-vs-real
+  failure split) and **E-54** (*"the judge is their tool"*). Both
+  dependencies are real and documented; no milestone closes the wait, so
+  no fixture test stands in until M18 for them and they are not M18's to
+  walk. The group keeps the dependency visible and keeps the main list
+  meaning one thing.
+- **A manual or real-hardware check** — **E-30** and **E-49**, which
+  wait on somebody walking a machine, not on chatOnS. They may stand
+  beside the gated rows only in a sentence that says "gated **or**
+  real-hardware", as `coverage.md`'s closing line does.
+- **Unsupported** — **E-53** is `merged`, *"plain files by Q1"* and
+  D103, and needs nothing of theirs; none of the five deliverables the
+  file names covers it. Out, and said so.
+
+**A missing marker is a documentation gap, not a membership question.**
+E-42 is gated on their push hook — its row says *"the hook is theirs"*
+and the file's opening names the push hook among the deliverables — and
+its note carries no `gated` word, which is why a marker scan reads six.
+It is on the list and its row is left as it is.
+
+**The milestone follows the rows, never the other way round.** E-20's
+note already said *"M13, gated M18"* while `plan.md`'s M18 paragraph
+omitted it, so the paragraph was the error and the row's claim stood;
+M18 now names E-20 and says its members are derived from the list. The
+alternative — striking `gated M18` from E-20's note to protect the
+paragraph — would change a row to defend a summary, which is the wrong
+way round. If the scope reading is ever revisited, striking one clause
+is reversible; an invented member in a shipped list is not.
+
+**No E-row note was edited.** Whether an expectation is gated on the
+consumer is a judgement about their acceptance, not a typo, so the rows
+stand as they were and every exclusion is in the prose beside them.
+
+**Evidence.** `docs/coverage.md` *Gated on chatOnS* (the list, the second
+group, the manual group, E-53), its M18 line and its closing paragraph;
+`docs/plan.md`'s framing bullet and M18 section; ORCH-206;
+`history/2026-10-29-plan-truth.md` finding 4;
+`history/2026-10-30-merge-batch-11.md`;
+`history/2026-10-30-orch-211-206.md`.
+
+---
+
+## 2026-10-30 — D239 A figure in prose carries its constant
+
+**Context.** M11's pack half moved all three of D199's numbers —
+`PROTOCOL_VERSION` to 3, `RECORD_VERSION` and `LAYOUT_VERSION` to 2 — and
+`LAYOUT_VERSION` moved for the first time in the project's history. Six
+figures in four shipped documents went false in one commit, one citation
+(`docs/disk-policy.md`, `[C, store.rs:59]`) had already been stale against
+`main`, and one of the six was not prose at all: ORCH-171's acceptance
+criterion read *"`LAYOUT_VERSION` unchanged at 1"*, which the move made
+**unsatisfiable**. A stale figure in prose is read by a person. A stale
+figure in an acceptance criterion is read as an instruction, and somebody
+picking ORCH-171 up would have tried to satisfy it by undoing a landed
+version move.
+
+**And a second cause, found by an audit on the same day.**
+`docs/architecture.md` §3.4 carried four false sentences about what a
+`RECORD_VERSION` mismatch does — not from the version moves at all, but
+from **D219**, whose own *Context* reads *"Two documents had published
+the opposite promise and neither was corrected with it"*. D219 fixed the
+two it named. §3.4 was the third. Three of its four sites were a
+**derived count and a taxonomy** rather than a figure: the three-kind
+classification had no kind that fitted a number which sets one artefact
+aside and serves the rest, so `RECORD_VERSION` was filed under *"the
+thing stops"*, and the sentence *"all six numbers that refuse anything"*
+was derived from that misfiling. A fifth site, which the audit did not
+name, went false with the pack half itself: *"One of the six says so"* —
+`pack-registry` wrote the no-migration clause into two more refusal
+sentences, so three say it now.
+
+**Decision.**
+
+1. **Every version figure written in `docs/` names the constant it came
+   from.** A line number is given only when it is verifiable for the tree
+   the text lands in; where two green branches disagree on it, the
+   constant or the function is named and no line is written. A figure
+   with no provenance is a defect, not a style choice.
+2. **A figure about a moving number says which tree it is about.** The
+   form is *"N on `main`, M in every release to date"*, so that a reader
+   comparing two releases is not reading `main`'s number as a release's.
+3. **An acceptance criterion never states a figure it means as a
+   constraint.** It states the constraint: *this work moves
+   `LAYOUT_VERSION` by nothing — it must stand, when the work is done, at
+   exactly the number it stood at when the work began*. A figure may
+   appear beside it, dated and cited, as information. This is the rule
+   D226 is to drafted decisions: the artefact an agent will act on has to
+   be written so that the act is still right after the tree moves.
+4. **A derived count is never the claim; the members are.** *"All six
+   numbers that refuse anything"* was derived from a taxonomy that had
+   just lost a member, and no reader could see the derivation. Where a
+   count follows from a classification in the same document, the
+   document names the members and says the count is derived. Measured:
+   this exact numeral was wrong twice in `docs/architecture.md` §3.4 —
+   once at "six" before batch 8 added three constants, once after D219
+   moved `RECORD_VERSION` out of the group it was counted in.
+5. **A statement about behaviour carries the versions it is true of.**
+   The idiom is `docs/operating.md`'s: its two correct statements about
+   the record arm carry `(v0.4.1 and below)` and its four wrong ones
+   carried no version at all. A version caveat is what makes a stale
+   sentence **legible rather than false** — a reader can tell "went out
+   of date" from "was never true" and act on the first. *Refuses to
+   start* survived D219 in a third document precisely because it read as
+   timeless.
+6. **A section whose citations are load-bearing declares the tree it was
+   read against.** `docs/architecture.md` §3.4 now does, as
+   `docs/handover.md` and `docs/disk-policy.md` already did. It may name
+   branch shas rather than a commit on `main` when the tree it describes
+   has not been merged yet, and it says which citation classes it could
+   not verify and left out.
+7. **A prose correction that is only an illustration is left alone when
+   the tree makes it true.** `docs/operating.md`'s two refusal
+   quotations were written as illustrations when both numbers were 1;
+   they are now literally what a v0.4.1 root and a v0.4.1 record get from
+   a `main` build, and both are correct prefixes of the real sentences.
+   Neither was touched.
+
+**Named residue.** D219's own *Context* says two documents had published
+the opposite promise and neither was corrected with it, and fixed those
+two. **`docs/architecture.md` §3.4 was the third and is corrected here**;
+`docs/remediation/13-crash-point-enumeration.md` §4.2 and `README.md:42`
+are the fourth and fifth and remain ORCH-183's. A decision whose subject
+is a rule written in more than one place does not get to assume it has
+found every place.
+
+**Evidence.** `docs-pack-figures`, 2026-10-30, four files and no code;
+`herd-proto/src/lib.rs`, `herd-hub/src/job.rs:72`,
+`herd-hub/src/store.rs:99` on `pack-variants` and `pack-registry`;
+`herd-hub/src/store.rs:3345` and `herd-hub/src/job.rs:102` for the two
+quotations; `herd-hub/src/store.rs:1548-1551` for the quarantine;
+`status.rs:411`, `job.rs:110` and `store.rs:3349` for the three
+no-migration sentences; D199, D218, D219, D226, ORCH-156, ORCH-171,
+ORCH-183, ORCH-204.
+
+---
+
+## 2026-10-30 — D240 The relative-path check is asked where it destroys bytes
+
+**Context.** `herd_proto::check_relative` is "the one check, used by the
+runner that produces the path and by the hub that writes the file, so a
+path cannot be judged acceptable at one end and dangerous at the other
+(invariant 4)". Eight joins of a record-supplied path onto a job's
+directory exist in `herd-hub/src/store.rs`'s production code; seven asked
+it and `collection_is_whole` did not — the one whose answer destroys
+bytes, because it is what tells a runner its collection has landed and the
+runner then drops its only copy (D19, D221). A record whose manifest path
+climbs out with `..` was measured against a file **outside** the job's
+directory, and a stranger that happened to be the manifest's length read
+as whole.
+
+**Choice.** `collection_is_whole` asks `check_relative` before the join,
+short-circuiting, so nothing outside the collection's directory is so much
+as measured, and a path this hub will not write is a file that can never be
+whole — the collection is never acknowledged and the runner keeps its bytes.
+
+**Reachability, narrowed by measurement.** `record_outputs` refuses such a
+path at intake, and that check arrived in the **same commit** as the
+record's `outputs` list and as `check_relative` itself (`a479643`,
+2026-10-15, D131) — so a record written by a build with no intake check has
+no `outputs` at all and iterates nothing. The audit that found this named a
+second shape, "a record written by a build from before D131"; that shape
+does not exist. The only one that reaches the join is a record **edited on
+the hub's disk**, which `store.rs` already says it does not trust: "the
+record is a file an operator may have edited, and a path read off a disk is
+no more trustworthy than one read off a socket". Probability one shape,
+cost unrecoverable, price one function call.
+
+**Evidence.** `herd-hub/src/store.rs` `collection_is_whole` and
+`a_record_whose_path_climbs_out_is_never_judged_whole`, whose fixture puts a
+real file of exactly the manifest's length at the escaping join's target and
+asserts through that join that it is there — so the `false` verdict is proof
+the guard, not the filesystem, produced it, and the guard's removal reddens
+the test; **D19**, **D131**, **D175**, **D221**; invariant 4;
+`history/2026-10-30-store-guards.md`.
+
+---
+
+## 2026-10-30 — D241 A chunk whose record names no digest is refused
+
+**Context.** `herd-hub/src/store.rs`'s `write_output_chunk` compared the
+bytes it had just finished receiving against the manifest's digest under
+`if !entry.sha256.is_empty() && real != entry.sha256`.
+`herd_proto::OutputFile.sha256` is `#[serde(default)] String`, so a verdict
+frame that **omits** the `sha256` key deserialises to `""`, the condition is
+false whatever arrived, and every chunk of that file was renamed into
+`files/` **unverified** — five lines under the comment promising that
+verifying before the rename "is what makes `files/` a directory of whole,
+verified files and nothing else" (E-53). Nothing in the workspace checks a
+digest's shape either: `len() == 64` and `len() != 64` return zero hits over
+all tracked `.rs` files. The hub already **counted** the condition —
+`report.rs:444-445` feeds `undigested_files` / `undigested_bytes` and `:765`
+prints it — so the detector existed and the enforcer did not.
+
+**Choice.** The empty digest is a **refusal of the bytes, by name, before
+one of them is written**, beside `write_output_chunk`'s `check_relative`
+refusal: *"{path}: this job's record names it with no sha256, and this hub
+does not write bytes it cannot verify. The {bytes} byte(s) stay with the
+runner: a manifest entry with an empty digest was edited on this hub or sent
+by a peer that omitted the field, so the job has to be run again rather than
+resent"*. The comparison before the rename becomes unconditional
+(`real != entry.sha256`), which removes a special case rather than adding a
+guard: if the early refusal is ever deleted, the comparison refuses the
+empty digest too, so the arrangement fails closed either way.
+
+**A refusal and not a third state.** "Here but not verified" would have to
+be carried on the record, read by the sweeper, answered to a requester and
+explained to an operator — four surfaces, for a shape no `herd-runner`
+produces: the streamed carriage's only manifest producer
+(`herd-runner/src/outputs.rs:202`) announces a digest computed by
+`hash_file`. Refusing keeps one meaning for `files/` and puts the problem in
+the runner's log, naming the file.
+
+**Refusing the bytes is not refusing the entry** (D175). The manifest entry
+stays on the record, the collection stays owed, and the runner keeps its
+only copy — the direction D19 and D221 say to err in. The cost is a re-offer
+the hub refuses again, bounded by ORCH-205's measured two chunks, and
+visible by name.
+
+**It cannot stall a legitimate transfer.** `KeptFile::sha256`,
+`write_output_chunk` and the streamed carriage all arrived in **one** commit
+(`d114f03`, 2026-10-16, protocol 2), so a record written before the digest
+existed carries no streamed collection and has no chunks to send.
+`KeptFile::sha256`'s "empty on a record written before this existed" is true
+of **inline** records only, and an inline record's bytes never reach this
+function.
+
+**Residue.** The digest's *shape* is still unchecked anywhere, and it
+belongs in `herd-proto` beside `MAX_LABEL_LENGTH`'s model (ORCH-223 below).
+`herd-hub report`'s `files whose record carries no digest` line is still
+explained by no shipped document (ORCH-224 below).
+
+**Evidence.** `herd-hub/src/store.rs` `write_output_chunk` and
+`a_chunk_whose_record_carries_no_digest_is_refused_and_not_kept`, whose
+frame is **deserialised from JSON with the key left out** so the premise is
+asserted and not assumed, and which reddens when the refusal is removed;
+**D19**, **D148**, **D175**, **D221**; E-53, E-54;
+`history/2026-10-30-store-guards.md`.
+
+---
+
+## 2026-10-30 — D242 ORCH-193 is declined: the disk cannot tell them apart
+
+**Context.** ORCH-193 asked for a migration: find the output spools the
+old startup barrier condemned before the hub could answer their offer —
+the defect **D221** and **D225** fixed — and bring them back. It reads
+like an owed repair. It is not one.
+
+**Choice (Alexa's orchestrator, 2026-10-30): declined, with its reasons,
+and the board reads `refused` rather than `owed`.** Four reasons, each
+measured rather than argued.
+
+1. **The distinguishing fact is not on the runner's disk.** A spool
+   renamed `<job>-<attempt>.unclaimed` by the old barrier and one renamed
+   by the sweep because the hub genuinely does not want it are byte for
+   byte the same thing. Only the hub can tell them apart, and it tells
+   them apart by **being asked** — which is exactly what the fixed runner
+   now does, from the hub's own answer to its own offer (D225).
+2. **So a migration would undo a terminal state on a guess.** Set aside
+   is terminal by the sweep's rule and by **D233**'s, so that the state
+   does not flip at every boot. Code that renamed `.unclaimed`
+   directories back on a heuristic would be the one place in Herd that
+   reverses a terminal state without an answer from the party that knows,
+   which is **D150** read backwards.
+3. **The operator's route costs no code and is already correct.** Rename
+   the directory back and restart: a fixed runner offers it, the hub
+   answers `Complete` or does not, and the outcome is resolved from the
+   hub's own sentence instead of from ours. That is the whole migration,
+   and it is one `mv`.
+4. **The one population that existed is gone.** Its owner deleted it
+   after verifying the hub held all 75 collections whole — so the
+   migration has no subject, and writing one now would be code with no
+   measured input, shipped into the one path that destroys nothing today.
+
+**What this does not decide.** Nothing about the fix: D221 and D225
+stand. If a second population is ever reported, with a job id and version
+numbers (invariant 9), this is reconsiderable on that report — and the
+report is what would supply the distinguishing fact reason 1 says the
+disk does not carry.
+
+**Evidence.** **D221**, **D225**, **D233**, **D150**, **D19**;
+`herd-runner/src/lib.rs` `offer_swept_collections`,
+`the_hub_has_said_what_it_is_owed`;
+`herd-hub/tests/spool_offer_answered.rs`; ORCH-193, ORCH-167, ORCH-192;
+`history/2026-10-29-spool-offer-fix.md`,
+`history/2026-10-29-spool-offer-repro.md`.
+
+---
+
+## 2026-10-30 — D243 D199's pre-v1.0.0 release constraint is moot, not open
+
+**Context.** **D199** bound *"the ordinary release before v1.0.0"* to
+ship at `LAYOUT_VERSION` 1 and `RECORD_VERSION` 1, for two measured
+reasons. This batch moves both to 2, so `main`'s tip can no longer cut
+that release — which reads like a conflict, and `docs-pack-figures`
+drafted it as one for Alexa. It is not a conflict: **the constraint has
+no subject any more.**
+
+**Choice (Alexa's orchestrator, 2026-10-30): recorded as moot. D199
+stands as written and is not edited** — a decision is append-only and a
+number is an identifier (**D148**). What changed is the world its clause
+pointed at, not the judgement it recorded.
+
+1. **There is no ordinary release before v1.0.0.** Alexa cancelled
+   intermediate releases on 2026-10-29. The next tag cut from `main` is
+   **v1.0.0**, which moves all three numbers anyway — so the clause's
+   subject, *the ordinary release before v1.0.0*, is an object that will
+   not exist.
+2. **Both of the constraint's measured reasons are discharged, and
+   neither by this ruling.** The owed ORCH-145 reading needed a hub that
+   could still open the consumer's existing root: that reading **was
+   taken and archived** while a build could still read their root. And
+   the record-2-on-version-1-root behaviour — the one that exits cleanly
+   and so looks like an answer — **was measured with its control**: exit
+   0, `read = 0`, which is why `herd-hub report` now carries a banner
+   saying not one record could be parsed by this build. The thing the
+   constraint protected against is now something a reader is told about
+   in words.
+
+**So the question *"where is that release cut from"* is not asked**, and
+the drafted board row is closed as moot rather than left waiting. What
+remains Alexa's is unchanged and is not this: ordering v1.0.0 at all, its
+order of work, and a release's own notes (**D210**).
+
+**Evidence.** **D199**, **D204**, **D205**, **D210**, **D148**;
+`RECORD_VERSION` and `LAYOUT_VERSION` in `herd-hub/src/store.rs` and
+`herd-hub/src/job.rs`; `herd-hub/src/report.rs`'s *"NOT ONE RECORD COULD
+BE PARSED BY THIS BUILD"* banner; ORCH-145, ORCH-156;
+`docs/operating.md`; `history/2026-10-29-measured-fold.md`,
+`history/2026-10-30-docs-pack-figures.md`.
+
+---
+
+## 2026-10-30 — D244 Six numbers refuse something; the page names its members
+
+**Context.** Two readings of one sentence disagreed on the same day.
+`docs/architecture.md` §3.4 said *"all six numbers that refuse
+anything"*; an audit of 2026-10-30 derived **five**; `docs-pack-figures`
+derived **six**. The difference is `RECORD_VERSION`, which since D218 and
+D219 sets one record aside by name and no longer refuses the root.
+`docs-pack-figures` filed the row as ORCH-C for a reviewer. It is settled
+here instead, on the merits, because a count that two readings disagree
+about is cheaper to settle than to carry.
+
+**Choice (Alexa's orchestrator, 2026-10-30): six — and the page is right
+not to print the numeral.**
+
+1. **Six, reading the phrase as written.** *Refuses anything* is the
+   test, and `RECORD_VERSION` does refuse something: **a record, by
+   name**. What it stopped refusing is the **root**. The audit's five
+   comes from reading *refuses* as *refuses to start*, which is the
+   narrower claim D219 made true of the root and never of the record.
+2. **But the page's own answer is better than this one, and it stays.**
+   §3.4 now **names the members and carries no numeral**, because the
+   count is derived from a taxonomy in the same document — and this exact
+   numeral has already been wrong twice there: once at "six" before batch
+   8 added three constants, once after D219 moved `RECORD_VERSION` out of
+   the group it was counted in. So the ruling above decides the
+   disagreement without putting a number back on the page. A derived
+   count is never the claim; the members are (**D239**, point 4).
+3. **The row drafted as `ORCH-C` is closed on the merits, and never
+   got a board id.** The four kinds in
+   §3.4 were never in dispute; only the count was, and the count is gone.
+   A reviewer pass on a numeral that no longer appears would have nothing
+   to review.
+
+**What this is not.** Not a change to any refusal's behaviour, and not a
+re-opening of D218 or D219: `RECORD_VERSION` sets a record aside and the
+root opens, exactly as they decided.
+
+**Evidence.** `docs/architecture.md` §3.4 (the four kinds, the named
+members, no numeral); **D218**, **D219**, **D239**; ORCH-C as drafted in
+`history/2026-10-30-docs-pack-figures.md` *Drafted `board.md` rows*;
+`history/2026-10-30-merge-batch-12.md`.
