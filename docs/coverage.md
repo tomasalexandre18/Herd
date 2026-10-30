@@ -18,18 +18,45 @@ deployed is a tag behind `main`, so a `merged` row is not a promise about
 the running system — `docs/status.md` holds the versions, the disk and who
 operates them.
 
-**The musts, recounted from the table below on 2026-10-30 against the
-tree at `26e83cf`:** **36 of 44** wholly on `main`; **4** more with part
-of their work on `main` (E-12, E-16, E-17, E-37); **2** with none of it
-(E-14, E-42); **2** the consumer has released us from — **E-49
-waived** and **E-50 withdrawn** (**D248**). 36 + 4 + 2 + 2 = 44.
+**The musts, re-derived row by row from the table below on 2026-10-30
+against the tree at `df47266`:** **36 of 44** wholly on `main`; **5**
+more with part of their work on `main` (E-12, E-16, E-17, E-37 and
+**E-42**); **1** with none of it (**E-14**); **2** the consumer has
+released us from — **E-49 waived** and **E-50 withdrawn** (**D248**).
+36 + 5 + 1 + 2 = 44.
 
-**Batch 18 moved no must into or out of the 36, and the count above is
-not a fresh recount:** it is batch 17's, made against `26e83cf`, and
-what changed under it is only E-49's and E-50's State cells. E-37 gained
-its fifth hub transition and **stays `part`**, because the nightly's
-verdict cannot be shown end to end until M14's nightly exists. ORCH-241
-carries the standing staleness of this paragraph.
+**E-42 moves from `planned` to `part`, and that one row is the whole of
+what moved.** The sentence this replaces read *"4 more with part of
+their work on `main` … 2 with none of it (E-14, E-42)"*, and it was
+wrong about E-42. **The recount is the orchestrator's ruling,
+2026-10-30**, taken after an execution agent measured the row and
+declined to move a must between columns itself. **E-42 is two rules and
+one of them is on `main` and asserted:** the hub derives a dedup key
+over the command, the label set and the declared commit
+(`herd-hub/src/job.rs:817`, length-prefixed fields, the commit a
+counted third since **D156**), and `JobDirStore::submit` looks that key
+up in `open_work` under the store's one lock and joins **any
+non-terminal job, running included** (`herd-hub/src/store.rs:2234`),
+asserted against the real binaries in
+`herdctl/tests/declared_dedup.rs`. Coalescing exists nowhere, and
+**D75** keeps the two apart — *"Dedup joins; coalescing discards. They
+are two behaviours, not one"* — so joining a running job is right for
+dedup and is **not** evidence that E-42's second rule is built.
+
+**E-14 is `planned`, and a reading of 2026-10-30 that held it withdrawn
+is refuted by the tree.** **D248** withdraws **E-50** alone and waives
+E-49; E-14's State cell reads `planned`, its note reads *"gated on
+their replication (M18)"*, and M12 has nothing on `main`. It is the one
+must with none of its work built, and it stays a `planned` row:
+**retiring a must is the consumer's act and nobody else's** (D248,
+D249), so no count here moves a row into `withdrawn` without one.
+
+**Only E-42's State cell was re-measured against the code for this
+recount; the other 43 carry their 2026-10-30 reading**, and batches 18
+to 24 are not claimed to have moved any of them. E-37 gained its fifth
+hub transition and **stays `part`**, because the nightly's verdict
+cannot be shown end to end until M14's nightly exists. ORCH-241 carries
+the standing staleness of these paragraphs.
 
 **The done figure did not move; the shape of the eight that are not did.**
 Five landings reached `main` after the 2026-10-29 count (batches 12 to
@@ -96,7 +123,7 @@ met on it. **D206 is overtaken, not reversed.**
 | E-39 | should | results searchable | — | planned | deferred past M18; on-disk records are greppable meanwhile |
 | E-40 | should | health every 15 s | M3 | merged | the age is in the hub's state, and is **surfaced in the status document since 2026-10-29** (E-35, D215): `last_health_at` and the report count, as an instant and not an age, so a reader computes the age against its own clock |
 | E-41 | must | scheduled nightly, exclusive | M14 | merged | now concrete: 03:00 local, daily, only if main moved, 5 h cap, `nightly` exclusive, 05:00 start deadline else skipped with the reason as an event (issue #16); gated: their nightly command, live at M18. **The predicate is the requester's, not the hub's** (D207): `herdctl if-moved` submits a declared command when a named ref has moved since the last run it recorded, under a lock so two overlapping timers cannot both submit, and refuses rather than guess when its state file is missing, unreadable or from another version. The **timer** is the consumer's own, as E-42's hook is — `docs/scheduling.md` says what we ship and what they write. **One deviation, and it is not closeable by hub work:** a skip that submitted nothing is `herdctl`'s own stderr line and never an event, because the hub never heard of the job. The skip E-41 *can* have as an event is the other one — a pass submitted with `--deadline` that nothing started by 05:00, which the hub cancels and reports (E-09, D40). **Landed 2026-10-29 in batch 8** (`herdctl/src/moved.rs`, `herdctl/tests/if_moved.rs`, `docs/scheduling.md`, D217). `merged` here means **Herd's side is on `main` and nothing closeable is left**: the timer is the consumer's by design (D106, D207) and the no-submission skip is `herdctl`'s own stderr line by decision (D217), so this row is delivered with that one deviation on the record rather than closed as E-41 words it |
-| E-42 | must | push hook submits producer | M14 | planned | Herd side = scriptable detached submit; the hook is theirs; now concrete: `dedup_key` `produce:<commit>`, `coalesce` key `produce:main` superseding a queued older `produce`, never a running one (D75, issue #16) |
+| E-42 | must | push hook submits producer | M14 | part | Herd side = scriptable detached submit; the hook is theirs; concrete as `dedup_key` `produce:<commit>` and a `coalesce` key `produce:main` (D75, issue #16). **Recounted 2026-10-30, `planned` to `part`, by the orchestrator's ruling: the row is two rules, and the one it names first is on `main` and asserted.** **Dedup — joining — is built:** the hub derives the key over command, labels and the declared commit (`herd-hub/src/job.rs:817`, length-prefixed, the commit a counted third field since D156), and `JobDirStore::submit` looks it up in `open_work` under the store's one lock and joins **any non-terminal job, running included** (`herd-hub/src/store.rs:2234`); asserted against the real binaries in `herdctl/tests/declared_dedup.rs`, whose own doc comment reads *"A push hook firing twice is the case this exists for"*. **Coalesce — discarding — exists nowhere:** no `coalesce` field on `herd_proto::Asked`, no `superseded` job outcome, and the declared `coalesce` and `dedup_key` are parsed and validated in `herdctl/src/declaration.rs` and read nowhere else, so neither declared field reaches the wire — the delivered behaviour rides a key the **hub derives itself**. D75 keeps the two apart, *"Dedup joins; coalescing discards"*, and considers dedup first, so joining a running job is right for dedup and is no evidence for coalesce; coalescing supersedes a queued older `produce`, never a running one. **The clause that the second submission *"says so"* is met by a detached submit returning the existing id** (the orchestrator, 2026-10-30): the hub sends `JobAccepted` and then a `JobNote` carrying the join sentence, but `submit` returns on `JobAccepted` and closes the socket, so the note reaches a connection that is gone; the documented wrapper is `id=$(herdctl submit …)` then `herdctl wait "$id"`, and **the id is the answer**. **No test asserts that silence, deliberately** — asserting a behaviour nobody chose would freeze it. **Whether the coalesce half is built before v1.0.0 is open and Alexa's, and is not decided here:** D75 fixed its shape (`superseded { by }`, exit 125) and not its timing, and building it needs an additive `serde(default)` field on `Asked`, which D229 leaves `PROTOCOL_VERSION` alone for, **and** a new job-outcome variant an older `herdctl` would meet inside a frame it decodes — not literally one of D229's two named unrecoverable forms, but the same hazard. The row carries no `gated` marker and *Gated on chatOnS* below says why |
 | E-43 | must | merger jobs start first | M6 | merged | a priority, never a side door; verified against the real binaries: a merger submitted last takes the next free slot. Which jobs a merge submits is theirs (M18) |
 | E-44 | must | restart loses nothing | M2 | merged | verified: hub killed mid-job, result lands, record complete. The tail-loss case now holds the job open with a file until the runner has *seen* the link go and writes its own marker when it is over, so "the tail was written while no hub existed" is established rather than assumed from two sleeps (D101) |
 | E-45 | must | one data root only | M4 | merged | cooperative confinement only — full containment needs a mount namespace E-46 forbids (D28) |
@@ -123,8 +150,8 @@ trusting it.
 *Gated* carries this file's opening meaning — the acceptance criterion
 needs a chatOnS deliverable, and a test against the fixture consumer
 stands in until M18. It says **nothing** about whether Herd's own side is
-built: E-14 and E-42 are gated *and* have nothing on `main`, and E-12 is
-gated *and* partly built, which are two different columns. The
+built: E-14 is gated *and* has nothing on `main`, while E-12 and E-42
+are gated *and* partly built, which are two different columns. The
 State column and the counted figure at the top of this file are what say
 which is which.
 
@@ -191,11 +218,13 @@ job's end — is built on `detached-end-event`, 2026-10-30**, so what is
 left of E-37 is the nightly's verdict, which is that same event and
 waits on M14's nightly existing rather than on any further hub work.
 
-**36 of 44 musts are wholly on `main`.** Of the eight that are not: four
-are partly built (E-16, whose hub-side budget shipped in M11; E-37; and
-M11's two pack musts E-12 and E-17, recounted on 2026-10-30); two have
-nothing on `main` (E-14 and E-42); and two the consumer has released us
-from — **E-49 waived**, **E-50 withdrawn** (D248). Four `should`
+**36 of 44 musts are wholly on `main`.** Of the eight that are not:
+**five** are partly built (E-16, whose hub-side budget shipped in M11;
+E-37; M11's two pack musts E-12 and E-17, recounted on 2026-10-30; and
+E-42, whose dedup half is built and asserted and whose coalesce half is
+absent, recounted on 2026-10-30); **one** has nothing on `main`
+(E-14); and two the consumer has released us from — **E-49 waived**,
+**E-50 withdrawn** (D248). Four `should`
 rows are merged — E-09 and E-10 beside M9, E-40 beside M3, E-53 beside
 M2 — and E-52 is half of one. Twelve musts have had an independent
 adversarial pass against the real binaries (E-03, E-15, E-44 from M2;
@@ -205,12 +234,17 @@ not had that pass.
 
 Five things a reader must not mistake for done:
 
-1. **Merged is not running.** The hub runs `herd-hub:0.3.3` and the
-   server's runner is pinned at the tag `v0.3.2`, so three fixes that
-   are on `main` are on no machine (D163, D164, D165), and the newest
-   release anybody can download is v0.3.0. `docs/status.md` carries the
-   live figures, the traps in the deployed runner, and who operates
-   what.
+1. **Merged is not running.** **The newest published release is
+   v0.4.1** (`docs/status.md`; this line said v0.3.0 until 2026-10-30
+   and was two releases stale). What the consumer's machines actually
+   run is a fact that reaches us only as a dated report (D161), and the
+   last one in the tree is `docs/handover.md`'s — pin `v0.3.2`, the
+   live unit `herd-runner-0.3.2`, the hub container `herd-hub:0.3.3`,
+   with D163, D164 and D165 shipped in v0.3.4 and reaching nothing
+   until that pin moves. **The figures are not restated here**, because
+   two documents disagreeing about their fleet is how this line went
+   stale: `docs/status.md` carries the live figures, the traps in the
+   deployed runner, and who operates what.
 2. **M11 is merged, E-12 and E-17 are not delivered, and the pack half
    is now partly in the tree.** The record half shipped first: a job's
    files come home, large ones stream, and the hub sweeps them against
@@ -293,8 +327,8 @@ disagreeing copies (ORCH-206).
   gated on chatOnS's results.json for the load-vs-real failure split.
 
 Every must is placed, and three kinds of must are **not** simply owed:
-four are partial (E-12, E-16, E-17, E-37), two the consumer has released
-us from (**E-49 waived**, **E-50 withdrawn**, D248), and
+five are partial (E-12, E-16, E-17, E-37, E-42), two the consumer has
+released us from (**E-49 waived**, **E-50 withdrawn**, D248), and
 nine carry a gated or real-hardware note that names its closing
 milestone — the seven of *Gated on chatOnS* above, plus E-30 and E-49,
 whose checks are manual and wait on nothing of the consumer's. This
