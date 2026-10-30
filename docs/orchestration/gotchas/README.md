@@ -22,4 +22,4 @@ versioned source.
 | `brief-names-the-worktree.md` | 2026-10-24 | a brief names the agent's worktree; the hook cannot keep an agent out of the checkout, only the brief can |
 | `build-weight-off-root.md` | 2026-10-24 | `/` filled to 100 % with agent `target/` dirs; preflight before a heavy phase, `CARGO_TARGET_DIR` on `/mnt/ssd_980`, delete it after |
 | `a-decision-branch-cannot-be-all-green.md` | 2026-10-25 | a branch writing a `D-NEXT` entry fails `check-docs.sh` by design; three green gates plus that one note is the deliverable |
-| `a-gate-joined-by-a-semicolon-is-advice.md` | 2026-10-30 | three heavy phases ran past a preflight refusal; join the gate to the phase with `&&`, never `;`, and never as two calls |
+| `a-gate-joined-by-a-semicolon-is-advice.md` | 2026-10-30 | a status you did not look at is a status you did not get: `;` throws a gate's status away and a pipe replaces it with `tail`'s; join with `&&`, and read `${PIPESTATUS[0]}` or do not pipe a gate at all |
