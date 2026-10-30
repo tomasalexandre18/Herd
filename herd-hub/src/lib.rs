@@ -6,6 +6,7 @@ pub mod job;
 pub mod matcher;
 pub mod notify;
 pub mod queue;
+pub mod registry;
 pub mod report;
 pub mod retention;
 pub mod roster;
@@ -15,9 +16,9 @@ pub mod store;
 
 pub use capability::RunnerCapacity;
 pub use job::{
-    in_days, reading_key, Attempt, Budget, JobEvent, JobMetrics, JobRecord, JobState, JobStore,
-    LogWrite, Mint, NewJob, OutputsRemoved, Raise, Reading, StoreError, Submission, Sweep,
-    Timestamp, OUTPUT_BUDGET, OUTPUT_FLOOR, RECORD_VERSION,
+    in_days, reading_key, record_version_mismatch_reason, Attempt, Budget, JobEvent, JobMetrics,
+    JobRecord, JobState, JobStore, LogWrite, Mint, NewJob, OutputsRemoved, Raise, Reading,
+    StoreError, Submission, Sweep, Timestamp, OUTPUT_BUDGET, OUTPUT_FLOOR, RECORD_VERSION,
 };
 pub use matcher::{
     Parent, Placement, Placing, Seat, Stickiness, DRAIN_FIRST_LIMIT, READINGS_AT_ONCE,
@@ -25,6 +26,7 @@ pub use matcher::{
 };
 pub use notify::{Event, Notifier, Sink, DELIVER_WITHIN, EVENTS_QUEUED, EVENT_FORMAT_VERSION};
 pub use queue::{Standing, AGING_STEP};
+pub use registry::{PackRegistry, Registered, Registration, Resolved};
 pub use report::{
     Accounting, Census, ClaimShortfall, Dedup, DigestConflict, Sizes, StateRootReport, Unread,
 };

@@ -19,7 +19,21 @@
 //!   readings/
 //!     answers.json          derived: what every `labels_from` reading
 //!                           answered, by (commit, command, args) (D74)
+//!   packs/
+//!     manifests/<id>/       one directory per registered pack: its
+//!                           `manifest.tsv` verbatim, its `pack.meta`, and
+//!                           `registered.json` saying which (commit, key) it
+//!                           answers (E-12, E-17). The hub holds no object
+//!                           byte of a pack, ever (D10)
+//!     manifests.part/       a registration that did not finish; cleared at
+//!                           every start, and nothing in it is ever readable
+//!                           as a pack
 //! ```
+//!
+//! **`packs/` is why [`LAYOUT_VERSION`] is 2.** A record *field* is additive
+//! for ever; a *directory* is not, because there is no migration tool and
+//! none planned (`docs/operating.md`). See [`crate::registry`] for what is in
+//! it and why the shape is that shape.
 //!
 //! **The job directories are the only source of truth.** `index/state.json`
 //! exists so that starting the hub does not have to parse the whole history:
@@ -55,9 +69,34 @@ use crate::job::{
     Raise, Reading, Result, StoreError, Submission, Timestamp, RECORD_VERSION,
 };
 
-/// The version of the directory layout above. A state root written by a newer
-/// Herd is refused rather than read as if it were this one.
-pub const LAYOUT_VERSION: u32 = 1;
+/// The version of the directory layout above. A state root written by a
+/// **different** Herd — newer or older — is refused rather than read as if it
+/// were this one.
+///
+/// **1 was the layout of every deployed release up to and including
+/// `v0.4.1`. 2 is D199's move**, and it is spent on the `packs/` directory
+/// [`crate::registry`] lives in. A directory is the one kind of change with no
+/// additive escape hatch: a `#[serde(default)]` field on a record is free for
+/// ever (see [`crate::job::RECORD_VERSION`]), and the shape of the root is
+/// not, because `herd-hub migrate` is unbuilt and `docs/operating.md` says
+/// nothing is planned to add one.
+///
+/// **What moving it costs, which the three lines this doc used to be did not
+/// say.** The consumer runs the hub (D161) and this number governs their disk.
+/// Crossing it means starting on a **fresh** root and leaving every queued job
+/// and every uncollected verdict behind in the old one; the check is equality
+/// and not a floor, so the rollback across it is refused in exactly the same
+/// way. There is no conversion, in either direction, by any tool.
+///
+/// **It moves in the same commit as [`crate::job::RECORD_VERSION`], and that
+/// is not cosmetic.** This check is in [`JobDirStore::open_with`] and returns
+/// an `Err`, which reaches `main()` before the port is bound; the record's is
+/// in `JobDirStore::read_stored` and sets one record aside (D218). A build
+/// that moved the record's number alone would therefore **start**, bind its
+/// port and serve an empty queue off a root whose every job was quarantined by
+/// name. Moving both together is what puts the refusal at the door.
+/// `herd-hub/tests/version_move_at_the_door.rs` holds both halves of that.
+pub const LAYOUT_VERSION: u32 = 2;
 
 /// The version of the derived index. It needs no compatibility: a version this
 /// Herd does not know is one more reason to rebuild it.
@@ -140,6 +179,16 @@ pub struct JobDirStore {
     /// token (E-48, Q8). One file in this root, written through the same
     /// writer the records go through (D8).
     roster: crate::roster::Roster,
+    /// The packs this root holds, and which runners hold a complete copy
+    /// (E-12, E-17). The registry is on the disk under `packs/` and comes
+    /// back after a restart; the holdings are in memory and deliberately do
+    /// not.
+    ///
+    /// **Nothing calls it from the network yet**: the pack frames are not
+    /// wired into the hub's connection loop, which is a separate step
+    /// owning `server.rs`. It is here because the directory it owns is what
+    /// [`LAYOUT_VERSION`] 2 describes.
+    packs: crate::registry::PackRegistry,
     live: Mutex<Live>,
 }
 
@@ -331,10 +380,18 @@ struct EventLine {
 
 /// Enough of any of the files above to read its version before trusting the
 /// rest of its fields.
+///
+/// `Option<u32>` rather than a defaulted `u32`, because **absent and zero are
+/// two different answers**: a `job.json` with no `record_version` key at all
+/// read back as `0` and was reported as *"it carries record version 0"* — a
+/// sentence describing an absent field as a field that says zero, and the
+/// sentence an operator pastes into a question.
+/// [`crate::job::record_version_mismatch_reason`] takes the `Option` and says
+/// *absent* when it is absent.
 #[derive(Debug, Deserialize)]
 struct VersionProbe {
     #[serde(default)]
-    record_version: u32,
+    record_version: Option<u32>,
 }
 
 /// A record's labels as the disk carries them, before today's rules judge
@@ -469,11 +526,9 @@ impl JobDirStore {
             let found: StoreFile = serde_json::from_str(&text)
                 .map_err(|error| failed("reading", &store_file, &error))?;
             if found.layout_version != LAYOUT_VERSION {
-                return Err(StoreError::new(format!(
-                    "the state root {} has layout version {}, and this hub \
-                     writes version {LAYOUT_VERSION}",
-                    root.display(),
-                    found.layout_version
+                return Err(StoreError::new(layout_version_mismatch_reason(
+                    &root,
+                    found.layout_version,
                 )));
             }
             state_root_id = found.state_root_id;
@@ -495,6 +550,14 @@ impl JobDirStore {
             },
         )?;
 
+        // The pack registry, and **after** the layout check on purpose: a
+        // root of another layout is one this hub refuses and must not write
+        // to, and `docs/operating.md`'s instruction is that the root is moved
+        // aside rather than converted. Creating `packs/` in a root that is
+        // about to be refused would be the smallest possible conversion of
+        // somebody else's state, which is still a conversion.
+        let packs = crate::registry::PackRegistry::open(&root)?;
+
         // Who may connect, read before the first handshake can be answered.
         // A roster this hub cannot read is an error here, where it names the
         // file, rather than an empty roster that would refuse every runner
@@ -510,6 +573,7 @@ impl JobDirStore {
             state_root_id,
             _lock: lock,
             roster,
+            packs,
             live: Mutex::new(Live {
                 next_sequence: 1,
                 jobs_accounted: 0,
@@ -533,6 +597,17 @@ impl JobDirStore {
     /// The state root, for whoever has to say where the state is.
     pub fn root(&self) -> &Path {
         &self.root
+    }
+
+    /// This root's pack registry (E-12, E-17).
+    ///
+    /// **Nothing calls this from the network yet.** The pack frames are
+    /// numbered in `herd_proto::pack` and are not dispatched by the hub's
+    /// connection loop; wiring them in is a separate step, which owns
+    /// `server.rs`. Its existence here is not a working feature: no runner
+    /// can register a pack with this build and no job is assigned one.
+    pub fn packs(&self) -> &crate::registry::PackRegistry {
+        &self.packs
     }
 
     /// Who this state root is, as the handshake carries it.
@@ -1470,12 +1545,10 @@ impl JobDirStore {
             Ok(probe) => probe,
             Err(error) => return Ok(unreadable(&path, &error)),
         };
-        if probe.record_version != RECORD_VERSION {
-            return Ok(Stored::Quarantined(format!(
-                "{} has record version {}, and this hub reads version {RECORD_VERSION}",
-                path.display(),
-                probe.record_version
-            )));
+        if probe.record_version != Some(RECORD_VERSION) {
+            return Ok(Stored::Quarantined(
+                crate::job::record_version_mismatch_reason(&path, probe.record_version),
+            ));
         }
         let durable: DurableLabels = match serde_json::from_str(&text) {
             Ok(durable) => durable,
@@ -1825,6 +1898,11 @@ impl JobDirStore {
             attempts: Vec::new(),
             metrics: JobMetrics::default(),
             outputs: Default::default(),
+            // Resolved at the assignment and written when a registration is
+            // accepted; a job that is only queued consumes and produces no
+            // pack yet.
+            packs_in: Default::default(),
+            packs_out: Default::default(),
         };
         self.write_record(&record)?;
         self.append_event(&id, &JobEvent::transition(at, JobState::Queued))?;
@@ -2721,12 +2799,14 @@ impl JobStore for JobDirStore {
             }
             let probe: VersionProbe = serde_json::from_str(line)
                 .map_err(|error| failed_line("reading", &path, number + 1, &error))?;
-            if probe.record_version != RECORD_VERSION {
+            if probe.record_version != Some(RECORD_VERSION) {
+                // The line's number goes in front of the one shared
+                // sentence, so an operator can find the line and still read
+                // what a record of another version costs.
                 return Err(StoreError::new(format!(
-                    "{}:{} has record version {}, and this hub reads version {RECORD_VERSION}",
-                    path.display(),
+                    "line {} of {}",
                     number + 1,
-                    probe.record_version
+                    crate::job::record_version_mismatch_reason(&path, probe.record_version)
                 )));
             }
             let parsed: EventLine = serde_json::from_str(line)
@@ -3242,6 +3322,42 @@ fn digest_of(path: &Path) -> std::io::Result<String> {
         }
         rolling.update(&buffer[..read]);
     }
+}
+
+/// The sentence a root of another layout is refused with.
+///
+/// It used to be the two numbers and nothing else: *"the state root `<root>`
+/// has layout version 1, and this hub writes version 2"*. True, and it helps
+/// nobody — the person reading it is an operator inside a container, at the
+/// moment her hub will not start, and what she needs is the half of the
+/// situation that is **irreversible** and the first step that cannot be taken
+/// twice.
+///
+/// So it carries, in this order: both figures; that there is no conversion by
+/// any tool and that the rollback is refused the same way; that the reading
+/// has to be taken off this root **first and with the old release's binary**,
+/// because once the root is aside there is no second chance at it; that the
+/// root is **moved aside, not converted and not deleted**, and the new hub
+/// gets an empty volume; that every runner is then refused once, by name, and
+/// that this is correct. The words themselves are `docs/operating.md`'s
+/// *"The instruction, in order"*, which it points at — written for operators,
+/// in a document nobody inside a container will go looking for unprompted.
+fn layout_version_mismatch_reason(root: &Path, found: u32) -> String {
+    let root = root.display();
+    format!(
+        "the state root {root} has layout version {found}, and this hub writes version \
+         {LAYOUT_VERSION}. Nothing converts it: there is no migration tool, no --migrate and \
+         none planned, and the check is equality and not a floor, so rolling back to the \
+         release that wrote this root is refused in exactly the same way once this hub has \
+         written to one. Crossing this number means starting on a fresh root and leaving every \
+         queued job and every uncollected verdict behind in the old one. In order, and the order \
+         is the part that matters: (1) take the reading off this root FIRST, with the OLD \
+         release's binary — `herd-hub report --state-dir {root}` — because once the root has \
+         been moved aside you will not get another chance at it; (2) move the root aside, do not \
+         convert it and do not delete it, and give this hub a new empty volume; (3) expect every \
+         runner to be refused once, by name, and that is correct. The whole instruction is in \
+         docs/operating.md, \"The instruction, in order\""
+    )
 }
 
 fn failed(what: &str, path: &Path, error: &dyn std::fmt::Display) -> StoreError {

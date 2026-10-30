@@ -150,30 +150,41 @@ jobs:
             exit 1
           fi
 
-      # The two numbers an operator cannot get out of a binary and has had to
-      # ask us for. `RECORD_VERSION` decides whether rolling an image back
+      # The three numbers an operator cannot get out of a binary and has had
+      # to ask us for. `RECORD_VERSION` decides whether rolling an image back
       # across this release is safe: a hub reads only a state root whose
-      # number is exactly its own, and refuses to start on any other.
+      # records carry exactly its own number, and sets aside any other.
+      # `LAYOUT_VERSION` is the state root itself rather than the records in
+      # it, and it is the one of the three with no migration path at all: the
+      # hub refuses a root of another layout before it binds its port,
+      # nothing converts a root in either direction, and the check is
+      # equality and not a floor, so the rollback is refused the same way. It
+      # is on a line of its own below because a script matching two of three
+      # numbers would conclude a move was safe when it was not.
       # `PROTOCOL_VERSION` decides whether a runner and a hub of two
-      # different builds talk at all. Both are read out of the source this
-      # release is built from, for the same reason the version above is read
-      # out of the workspace: a number typed into this file, or into a prose
-      # file, can disagree with the binaries it ships beside, and a number
-      # read here cannot. `nix eval` is not the route — no flake attribute
-      # carries either number, and inventing one would put a regex over a
-      # Rust file into the build's contract to serve a release note — so they
-      # are read where they are declared.
-      - name: the protocol and the record version, from the source
+      # different builds talk at all. All three are read out of the source
+      # this release is built from, for the same reason the version above is
+      # read out of the workspace: a number typed into this file, or into a
+      # prose file, can disagree with the binaries it ships beside, and a
+      # number read here cannot. `nix eval` is not the route — no flake
+      # attribute carries any of them, and inventing one would put a regex
+      # over a Rust file into the build's contract to serve a release note —
+      # so they are read where they are declared.
+      - name: the protocol, the record and the layout version, from the source
         run: |
           set -euo pipefail
           proto_src=herd-proto/src/lib.rs
           record_src=herd-hub/src/job.rs
+          layout_src=herd-hub/src/store.rs
           protocol_version=$(sed -n \
             's/^pub const PROTOCOL_VERSION: u32 = \([0-9]\{1,\}\);.*$/\1/p' \
             "$proto_src")
           record_version=$(sed -n \
             's/^pub const RECORD_VERSION: u32 = \([0-9]\{1,\}\);.*$/\1/p' \
             "$record_src")
+          layout_version=$(sed -n \
+            's/^pub const LAYOUT_VERSION: u32 = \([0-9]\{1,\}\);.*$/\1/p' \
+            "$layout_src")
 
           # One number each, or the release stops here. A line that silently
           # came out empty would be worse than no line at all: the body would
@@ -187,7 +198,8 @@ jobs:
           # wrong place to find out somebody added one.
           for found in \
             "PROTOCOL_VERSION:$protocol_version:$proto_src" \
-            "RECORD_VERSION:$record_version:$record_src"; do
+            "RECORD_VERSION:$record_version:$record_src" \
+            "LAYOUT_VERSION:$layout_version:$layout_src"; do
             name=${found%%:*}
             rest=${found#*:}
             value=${rest%%:*}
@@ -203,8 +215,10 @@ jobs:
 
           echo "protocol_version=$protocol_version" >> "$GITHUB_ENV"
           echo "record_version=$record_version" >> "$GITHUB_ENV"
+          echo "layout_version=$layout_version" >> "$GITHUB_ENV"
           echo "the source says PROTOCOL_VERSION $protocol_version," \
-               "RECORD_VERSION $record_version"
+               "RECORD_VERSION $record_version," \
+               "LAYOUT_VERSION $layout_version"
 
       # ~1 minute, and no toolchain is installed to do it: `pkgsStatic` is
       # nixpkgs' own musl cross set, so D12 still holds and the musl rustc,
@@ -413,13 +427,13 @@ jobs:
               echo
               echo "**If it misbehaves**, there is nothing to fix in place."
               echo "Install the newest tag with no \`-dev\` in it. Compare"
-              echo "its \`RECORD_VERSION\` with the one printed below"
-              echo "first: if they differ, going back cannot read the state"
-              echo "root this build wrote, and the notice says what that"
-              echo "costs. Then say what you saw, naming the **commit**"
-              echo "above and not the version — several dev builds carry"
-              echo "the same version, and the version alone would not tell"
-              echo "us which one you ran."
+              echo "its \`RECORD_VERSION\` and its \`LAYOUT_VERSION\` with"
+              echo "the two printed below first: if either differs, going"
+              echo "back cannot read the state root this build wrote, and"
+              echo "what that costs is said below. Then say what you saw,"
+              echo "naming the **commit** above and not the version —"
+              echo "several dev builds carry the same version, and the"
+              echo "version alone would not tell us which one you ran."
               echo
               echo "---"
               echo
@@ -437,11 +451,12 @@ jobs:
             echo "chmod +x herd-runner-$version-$triple"
             echo '```'
             echo
-            echo "The two numbers this build carries, read out of the source"
-            echo "it was built from:"
+            echo "The three numbers this build carries, read out of the"
+            echo "source it was built from:"
             echo
             echo '```'
             echo "RECORD_VERSION: $record_version"
+            echo "LAYOUT_VERSION: $layout_version"
             echo "PROTOCOL_VERSION: $protocol_version"
             echo '```'
             echo
@@ -449,8 +464,23 @@ jobs:
             echo "whether rolling back to an earlier image is safe;"
             echo "\`PROTOCOL_VERSION\` is whether a runner and a hub of two"
             echo "different builds talk at all. \"The two numbers\" in the"
-            echo "notice below says what to do about each. Both lines are"
-            echo "meant to be matched: \`^RECORD_VERSION: [0-9]+\$\`."
+            echo "notice below says what to do about each."
+            echo
+            echo "\`LAYOUT_VERSION\` is the state root itself rather than the"
+            echo "records in it, and it is the one of the three with **no"
+            echo "migration path at all**: the hub refuses a root of another"
+            echo "layout before it binds its port, nothing converts a root in"
+            echo "either direction, and the check is equality and not a"
+            echo "floor, so the rollback across it is refused the same way."
+            echo "If it differs from the one on the release you are running,"
+            echo "take \`herd-hub report --state-dir\` off your root with the"
+            echo "**old** release's binary first, then move the root aside —"
+            echo "do not convert it, do not delete it — and give the new hub"
+            echo "an empty volume. The notice below's \"The two numbers\""
+            echo "section predates this line and covers the other two."
+            echo
+            echo "All three lines are meant to be matched:"
+            echo "\`^RECORD_VERSION: [0-9]+\$\`."
             echo
           } > body-head.md
 
