@@ -673,13 +673,28 @@ impl JobDirStore {
     /// disagreement would be either a collection acknowledged before it was
     /// complete — destroying the runner's only copy — or one never
     /// acknowledged, leaving a runner holding bytes for ever.
+    /// **Asked before the join, like every other site that joins a record's
+    /// path onto a directory** (`relative_path`'s "the one check", invariant
+    /// 4). This was the one of nine that skipped it, and it is the one whose
+    /// answer destroys bytes: a record whose path climbs out with `..` would
+    /// be measured against a file *outside* the job's directory, and a
+    /// stranger that happened to be the manifest's length would read as
+    /// whole. `record_outputs` refuses such a path at intake, so this is the
+    /// same check on the way out as on the way in — the record is a file an
+    /// operator may have edited, and a path read off a disk is no more
+    /// trustworthy than one read off a socket.
+    ///
+    /// A path this hub will not write is a file that can never be whole, so
+    /// the collection is never whole either: the runner keeps its copy, which
+    /// is the direction D19 and D221 say to err in. The `&&` is what makes
+    /// the refusal total — nothing outside the collection's directory is so
+    /// much as measured.
     fn collection_is_whole(&self, id: &JobId, record: &JobRecord) -> bool {
         let kept = self.job_dir(id).join(KEPT_FILES_DIR);
-        record
-            .outputs
-            .files
-            .iter()
-            .all(|file| file_length(&kept.join(&file.path)) == Some(file.bytes))
+        record.outputs.files.iter().all(|file| {
+            herd_proto::check_relative(&file.path).is_ok()
+                && file_length(&kept.join(&file.path)) == Some(file.bytes)
+        })
     }
 
     /// What `files/` and `parts/` hold of a collection, **given the record
@@ -5661,6 +5676,94 @@ mod tests {
         };
         assert!(why.contains("files/surprise.sh"), "{why}");
         assert!(why.contains("manifest"), "{why}");
+    }
+
+    /// **A record whose path climbs out is never judged whole**, and an
+    /// ordinary one still is.
+    ///
+    /// `collection_is_whole` was the one join of a record-supplied path in
+    /// this file that asked `check_relative` nothing, and it is the one whose
+    /// answer destroys bytes: it is what tells a runner its collection has
+    /// landed, and the runner then drops its only copy (D19, D221). An
+    /// escaping path whose target outside the job's directory happens to be
+    /// the manifest's length read as whole.
+    ///
+    /// **The fixture is the argument.** The stranger outside really is there
+    /// and really is the right length — asserted below through the very join
+    /// the guard protects — so without the guard this collection *would* be
+    /// whole. That the answer is `false` anyway is the proof that nothing
+    /// outside the collection's directory was so much as measured.
+    #[test]
+    fn a_record_whose_path_climbs_out_is_never_judged_whole() {
+        // The known-good case first, so a guard that refused everything is
+        // caught here rather than read as a success below. **Its own store**:
+        // two jobs of the same work in one store are one job, because a
+        // submission that joins work already being done mints nothing.
+        let (_honest_dir, honest_store) = make_a_store();
+        let honest = a_job(&honest_store);
+        honest_store
+            .record_outputs(&honest.id, &announced(&[("files/results.json", b"ok")]))
+            .expect("the manifest is recorded");
+        assert_eq!(
+            honest_store
+                .write_output_chunk(&honest.id, "files/results.json", 0, b"ok")
+                .expect("the store answers"),
+            crate::job::ChunkLanded::Complete,
+            "an ordinary relative path still completes"
+        );
+        let whole = honest_store
+            .job(&honest.id)
+            .expect("readable")
+            .expect("a record");
+        assert!(
+            honest_store.collection_is_whole(&honest.id, &whole),
+            "an ordinary relative path at the manifest's length is whole"
+        );
+
+        // And the escaping one. The record is edited on the disk because
+        // `record_outputs` refuses such a path at intake (D131) — which is
+        // exactly the shape this file already says it does not trust: "the
+        // record is a file an operator may have edited, and a path read off a
+        // disk is no more trustworthy than one read off a socket".
+        let (dir, store) = make_a_store();
+        let edited = a_job(&store);
+        store
+            .record_outputs(&edited.id, &announced(&[("files/results.json", b"ok")]))
+            .expect("the manifest is recorded");
+        let mut record = store.job(&edited.id).expect("readable").expect("a record");
+        let loot = b"ten bytes!";
+        record.outputs.files[0].path = "../../../loot.bin".to_owned();
+        record.outputs.files[0].bytes = loot.len() as u64;
+        store
+            .write_record(&record)
+            .expect("the edited record is on the disk");
+        fs::write(dir.path().join("loot.bin"), loot).expect("the stranger outside is written");
+
+        let kept = dir
+            .path()
+            .join(JOBS_DIR)
+            .join(edited.id.as_str())
+            .join(KEPT_FILES_DIR);
+        assert_eq!(
+            file_length(&kept.join(&record.outputs.files[0].path)),
+            Some(loot.len() as u64),
+            "the fixture is real: the unguarded join resolves to a file of exactly the \
+             manifest's length, so an unguarded measurement would have called this whole"
+        );
+        assert!(
+            !store.collection_is_whole(&edited.id, &record),
+            "a path that climbs out of the job's output directory can never be whole, \
+             whatever is out there at the right length"
+        );
+        // So the collection is never acknowledged and the runner goes on
+        // holding the only copy, which is the direction to err in (D19).
+        assert!(
+            store
+                .collection_owed(&edited.id)
+                .expect("owed reads")
+                .is_some(),
+            "a collection that is not whole is still owed"
+        );
     }
 
     /// An outstanding collection is found by looking, names its runner, and
