@@ -321,6 +321,226 @@ type Source = SplitStream<Socket>;
 /// relay never blocks the task that reads from the runner.
 type Outbox = UnboundedSender<FromHub>;
 
+/// How many packs of each pinned key family a keeper is asked to keep
+/// ([`herd_proto::pack::PinPacks::keep_per_key`], M12, E-16).
+///
+/// **The same figure as the runner's own `packstore::KEEP_PER_KEY`, and it
+/// has to be.** [`FromHub::Welcome`]'s `keeper_for` carries keys and no
+/// figure, so a runner welcomed as a keeper applies the constant it shipped
+/// with; `PinPacks` carries one, so a hub sending a different number would
+/// move a keeper's retention the moment its own policy changed, for a reason
+/// no operator asked for — a runner that kept five on dialling and three
+/// after a `--keeper-for` was added elsewhere. The two constants live in two
+/// crates because `herd-proto` holds the frame and not the policy, and
+/// `herd-hub` cannot see `herd-runner` except in its tests; the equality is
+/// therefore **asserted** in `herd-hub/tests/keeper_policy.rs` rather than
+/// hoped for.
+///
+/// `N = 5` itself is `docs/plan.md` M12's figure and has no derivation
+/// anywhere: it is a default, configurable on the runner, and it is never an
+/// acceptance criterion.
+pub const KEEPER_KEEP_PER_KEY: u32 = 5;
+
+/// Who keeps which packs — the hub's custody policy (D10, M12, E-16).
+///
+/// D10 says it in one sentence: *a key family names one or more keepers that
+/// pin what retention keeps, so a pack outlives the machine that built it
+/// and survives that machine being switched off. The server's runner is the
+/// default keeper.* This is that sentence as a setting, and [`Hub`] fills
+/// every welcome's `keeper_for` out of it.
+///
+/// **Three things it deliberately is not.**
+///
+/// 1. **It is not a figure applied to somebody else's disk.** A keeper's own
+///    pack budget is the machine owner's and the gc is the runner's
+///    (`herd-proto`'s own words, and invariant 2). What is here is custody:
+///    the hub asks, the runner's store obeys as far as its budget lets it
+///    and says so when it cannot. The hub never enforces.
+/// 2. **It names no default of its own.** A hub started with neither setting
+///    names nobody, sends `keeper_for` on no welcome and sends no `PinPacks`
+///    at all — this hub's behaviour before this type existed, byte for byte.
+///    D194's rule: the figure that decides what survives on a machine we do
+///    not own is typed by the person who owns it.
+/// 3. **It cannot find the server's runner by itself, and that is a
+///    measurement and not a choice.** The hub knows a runner by the name it
+///    announced; `ToHub::Hello`'s `host` is a [`HostSize`] — memory,
+///    threads, tmpfs — and carries no hostname, no address and no identity,
+///    so there is nothing in the handshake a hub could compare with its own
+///    machine. *The server's runner is the default keeper* is therefore the
+///    **deployment's** line to write, as `--keeper <that runner's name>`,
+///    and this type's job is to make it one line.
+///
+/// **What a named key family does to the default keeper: it moves custody,
+/// it does not add to it.** A family named to anybody is that runner's and
+/// comes off the default keeper's list. The other reading — a named keeper
+/// beside the default one — was rejected because it makes custody only ever
+/// grow: an operator could add a holder and never move one, and the family
+/// whose packs are filling the server's disk is exactly the one she would
+/// want to move. Naming the default keeper again in a `--keeper-for` is how
+/// both hold it, which is explicit and reversible.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Keepers {
+    /// The runner that keeps every key family nobody else is named for, or
+    /// `None` for a hub that names no default keeper.
+    default_keeper: Option<String>,
+    /// Key family to the runners named for it. More than one is D10's "one
+    /// or more keepers" and is not a mistake.
+    by_key: BTreeMap<String, BTreeSet<String>>,
+}
+
+impl Keepers {
+    /// A hub that names nobody: no welcome carries `keeper_for`, no
+    /// `PinPacks` is ever sent. The default, and what every entry point that
+    /// does not mention custody gives.
+    pub fn nobody() -> Self {
+        Self::default()
+    }
+
+    /// The runner that keeps every key family nobody else is named for.
+    pub fn with_default_keeper(mut self, runner: &str) -> Self {
+        self.default_keeper = Some(runner.to_owned());
+        self
+    }
+
+    /// One runner named keeper for one key family.
+    pub fn naming(mut self, key: &str, runner: &str) -> Self {
+        self.by_key
+            .entry(key.to_owned())
+            .or_default()
+            .insert(runner.to_owned());
+        self
+    }
+
+    /// What the operator typed: a default keeper's name, and `KEY=RUNNER`
+    /// once per named family.
+    ///
+    /// Refused rather than guessed at, because every one of these mistakes
+    /// is silent otherwise: a `KEY=RUNNER` without its `=` would name a
+    /// family nobody holds, an empty key would pin a family that cannot
+    /// exist, and an empty runner name would name a runner the hub can never
+    /// match — and the operator would read a startup line that looked right.
+    pub fn parse(
+        default_keeper: Option<&str>,
+        named: &[String],
+    ) -> std::result::Result<Self, String> {
+        let mut keepers = Self::nobody();
+        if let Some(runner) = default_keeper {
+            if runner.trim().is_empty() {
+                return Err(
+                    "--keeper names the runner that keeps every key family nobody else is \
+                     named for, and it was given an empty name. Leave it out for a hub that \
+                     names no default keeper"
+                        .to_owned(),
+                );
+            }
+            keepers = keepers.with_default_keeper(runner.trim());
+        }
+        for assignment in named {
+            let Some((key, runner)) = assignment.split_once('=') else {
+                return Err(format!(
+                    "--keeper-for takes KEY=RUNNER — a `leaves` key family and the runner \
+                     that keeps it — and {assignment:?} has no `=` in it"
+                ));
+            };
+            let (key, runner) = (key.trim(), runner.trim());
+            if key.is_empty() || runner.is_empty() {
+                return Err(format!(
+                    "--keeper-for takes KEY=RUNNER and {assignment:?} leaves {} empty",
+                    if key.is_empty() {
+                        "the key family"
+                    } else {
+                        "the runner's name"
+                    }
+                ));
+            }
+            keepers = keepers.naming(key, runner);
+        }
+        Ok(keepers)
+    }
+
+    /// Whether this policy names nobody at all, which is the shipped
+    /// default and costs the welcome path nothing.
+    pub fn names_nobody(&self) -> bool {
+        self.default_keeper.is_none() && self.by_key.is_empty()
+    }
+
+    /// The one line a hub prints about custody at startup, in the shape
+    /// every other setting is printed in (D148).
+    ///
+    /// It says what is **not** in force as plainly as what is, because the
+    /// failure this line exists to prevent is an operator believing a pack
+    /// is kept somewhere when no runner was ever told to keep it.
+    pub fn said(&self) -> String {
+        if self.names_nobody() {
+            return "herd-hub: this hub names NO keeper, so no runner is asked to pin \
+                    anything and every pack on every runner is evictable by that runner's \
+                    own budget alone (--keeper RUNNER, --keeper-for KEY=RUNNER). A pack \
+                    then lives exactly as long as the machine that built it keeps it, \
+                    which is what a machine being switched off takes away"
+                .to_owned();
+        }
+        let mut said = String::from("herd-hub: custody — ");
+        match &self.default_keeper {
+            Some(runner) => said.push_str(&format!(
+                "{runner} is the default keeper and keeps the newest {KEEPER_KEEP_PER_KEY} \
+                 pack(s) of every key family nobody else is named for"
+            )),
+            None => said.push_str(
+                "no default keeper is named, so a key family nobody is named for is kept by \
+                 nobody",
+            ),
+        }
+        for (key, runners) in &self.by_key {
+            said.push_str(&format!(
+                "; {key} is kept by {}",
+                runners
+                    .iter()
+                    .map(|runner| runner.as_str())
+                    .collect::<Vec<_>>()
+                    .join(" and ")
+            ));
+        }
+        said.push_str(
+            ". A named family is MOVED off the default keeper and not added to it. Every \
+             figure here is this hub asking; what a runner can really keep is bounded by \
+             its own --pack-budget, and a keeper that cannot come under it says so on its \
+             own machine",
+        );
+        said
+    }
+
+    /// The key families `runner` keeps, as this policy stands.
+    ///
+    /// `known` is every key family this hub has a pack registered under, and
+    /// it is read **for the default keeper alone**: an explicitly named
+    /// family is pinned whether or not anything is registered under it yet,
+    /// which is what makes a named keeper work on a hub whose registry is
+    /// empty and is what the operator asked for. The default keeper's share
+    /// cannot be written out the same way — *every family nobody else holds*
+    /// has no finite spelling until the hub knows which families exist.
+    ///
+    /// Sorted, and by construction: `keeper_for` is compared against what
+    /// was last sent to decide whether anything moved, so two orderings of
+    /// one set would send a frame that changed nothing.
+    fn keys_for(&self, runner: &str, known: &BTreeSet<String>) -> Vec<String> {
+        let mut keys: BTreeSet<&str> = self
+            .by_key
+            .iter()
+            .filter(|(_, runners)| runners.iter().any(|named| named == runner))
+            .map(|(key, _)| key.as_str())
+            .collect();
+        if self.default_keeper.as_deref() == Some(runner) {
+            keys.extend(
+                known
+                    .iter()
+                    .map(String::as_str)
+                    .filter(|key| !self.by_key.contains_key(*key)),
+            );
+        }
+        keys.into_iter().map(str::to_owned).collect()
+    }
+}
+
 /// The hub's timing, in one place, so a test can make an hour pass in a
 /// second and an operator can tune one number.
 #[derive(Debug, Clone, Copy)]
@@ -661,6 +881,10 @@ impl Hub {
                 // job left `running` by the hub that died is a job this hub
                 // has had no word of since it began.
                 started: Instant::now(),
+                // Nobody, until the binary says otherwise
+                // ([`Hub::naming_keepers`]): a hub nothing told about
+                // custody asks no runner to pin anything.
+                keepers: Mutex::new(Keepers::nobody()),
                 peers: Mutex::new(Peers::default()),
                 dispatching: Mutex::new(()),
                 stopping: AtomicBool::new(false),
@@ -692,6 +916,29 @@ impl Hub {
     /// its own state is.
     pub fn publishing_status_to(self, root: impl Into<PathBuf>) -> Self {
         let _already_said = self.state.status_root.set(root.into());
+        self
+    }
+
+    /// Name this hub's keepers before it serves (D10, M12, E-16).
+    ///
+    /// The binary calls it with what the operator typed; a hub that is not
+    /// told names nobody, which is every in-process hub in the suite and
+    /// every hub this build shipped before the setting existed.
+    ///
+    /// **A builder rather than a parameter on [`Hub::bind_with_sink`]**, for
+    /// the reason [`Hub::publishing_status_to`] is one: the five-parameter
+    /// bind is reached from four entry points and a hundred tests, and a
+    /// sixth parameter spelt `Keepers::nobody()` at every one of them would
+    /// be a hundred edits saying nothing. Taken before serving begins, so
+    /// nothing here races a welcome; afterwards, the policy moves through
+    /// [`HubHandle::name_keepers`], which is the path that has to tell the
+    /// runners already connected.
+    pub fn naming_keepers(self, keepers: Keepers) -> Self {
+        *self
+            .state
+            .keepers
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = keepers;
         self
     }
 
@@ -1108,6 +1355,43 @@ impl HubHandle {
         })
     }
 
+    /// Replace this hub's custody policy while it is serving, and tell the
+    /// runners whose custody that moves (D10, M12, E-16).
+    ///
+    /// Answers one line per runner told, and an empty answer when the new
+    /// policy changes nothing for anybody connected — which is what makes
+    /// *"changing the setting sends `PinPacks` and nothing else"* something
+    /// a test can assert rather than a sentence.
+    ///
+    /// **The operator-facing way to change this setting today is to restart
+    /// the hub**, which re-derives every welcome from scratch and needs no
+    /// frame. This is the seam the mechanism lives on, and it is also what
+    /// the one live trigger goes through: a pack registered under a key
+    /// family this hub had never seen gives a default keeper a family it is
+    /// supposed to keep, and the frame is how that reaches a runner already
+    /// connected. A reload of the setting on a running hub — a signal, a
+    /// file re-read, a `herdctl` command — is none of those and is not
+    /// built; a `herdctl` one could not be, because it would need a frame
+    /// and `PROTOCOL_VERSION` is frozen at 3.
+    pub fn name_keepers(&self, keepers: Keepers) -> Vec<String> {
+        *self
+            .state
+            .keepers
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = keepers;
+        tell_the_keepers(&self.state)
+    }
+
+    /// The key families this hub would name one runner a keeper for, as its
+    /// policy and its registry stand right now.
+    ///
+    /// Read-only, and it asks nothing of the connection: a runner that is
+    /// not connected still has an answer here, which is what it would be
+    /// welcomed with if it dialled now.
+    pub fn custody_of(&self, runner: &str) -> Vec<String> {
+        self.state.custody_of(runner)
+    }
+
     /// What one named runner offers and what its probes say.
     pub fn capacity_of(&self, name: &str) -> Option<RunnerCapacity> {
         self.state.with_peers(|peers| {
@@ -1154,6 +1438,21 @@ struct State {
     /// When this hub started serving: where the clock begins for an attempt
     /// it inherited and has heard nothing about.
     started: Instant,
+    /// Who keeps which packs (D10, M12, E-16).
+    ///
+    /// Behind a lock of its own because it **moves while the hub is up**:
+    /// [`HubHandle::name_keepers`] replaces it and then tells every
+    /// connected runner whose custody that changed. Set before serving by
+    /// [`Hub::naming_keepers`], and [`Keepers::nobody`] on every entry point
+    /// that does not mention custody.
+    ///
+    /// **Lock order: this before [`State::peers`], never the other way, and
+    /// never held across the pack registry's own lock.** Both rules exist
+    /// for one reason: the default keeper's share is derived from the key
+    /// families the registry knows, so the welcome path reads this, then the
+    /// registry, then the connection — three locks, taken one at a time, in
+    /// that order. [`State::custody_of`] is the body that keeps them in it.
+    keepers: Mutex<Keepers>,
     peers: Mutex<Peers>,
     /// Held for the length of one dispatch pass.
     ///
@@ -1390,6 +1689,25 @@ struct ConnectedRunner {
     /// All three absent until the first report, and for a runner of a build
     /// that does not send them.
     pack_store: PackStoreSaid,
+    /// The key families this hub has **told this runner** it keeps (D10,
+    /// M12, E-16).
+    ///
+    /// What went out in this connection's `Welcome.keeper_for`, replaced by
+    /// every [`herd_proto::pack::PinPacks`] this hub has sent since. Sorted,
+    /// because [`Keepers::keys_for`] answers a set in one order.
+    ///
+    /// **Kept so that a policy change can tell the runners whose custody
+    /// moved and nobody else.** The alternative — send the frame to every
+    /// connected runner on every change — is the one thing the runner's own
+    /// side asks not to happen: *a frame that changes nothing says that it
+    /// changed nothing*, which is a line on an owner's stderr for an event
+    /// that did not concern her machine. It also makes "changing the setting
+    /// sends `PinPacks` and nothing else" an assertion a test can make about
+    /// a second runner: it receives no frame at all.
+    ///
+    /// Empty for every ordinary runner on a hub that names no keeper, which
+    /// is what the field holds for the whole of a connection to such a hub.
+    keeper_for: Vec<String>,
     /// How the hub ends this connection without waiting for the socket to
     /// notice. Used when a runner that is plainly alive dials in while this
     /// connection is still registered: the new one is the real one.
@@ -1781,6 +2099,56 @@ impl State {
     /// publisher one build and no write at all
     /// ([`Status::same_but_for_the_clock`]), and the publisher reaches the
     /// lock through [`State::peers_now`] so it can never wake itself.
+    /// The custody policy as it stands, copied out from under its lock.
+    ///
+    /// A clone rather than a guard, because the two things a caller does
+    /// next — read the pack registry, then take the connections — must
+    /// each happen with this lock released (the order on
+    /// [`State::keepers`]).
+    fn keepers_now(&self) -> Keepers {
+        self.keepers
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
+    }
+
+    /// Every key family this hub has a pack registered under.
+    ///
+    /// Read for the **default keeper alone** and only when one is named, so
+    /// a hub that names no keeper — every hub before this change — never
+    /// asks the registry anything on the welcome path and pays nothing for
+    /// this policy existing.
+    ///
+    /// A hub whose store keeps no registry at all answers the empty set,
+    /// exactly as [`a_pack_registry`]'s callers do: a default keeper on such
+    /// a hub keeps nothing, because there is nothing registered to keep.
+    fn known_key_families(&self) -> BTreeSet<String> {
+        match self.store.packs() {
+            Some(registry) => registry
+                .entries()
+                .into_iter()
+                .map(|entry| entry.key)
+                .collect(),
+            None => BTreeSet::new(),
+        }
+    }
+
+    /// The key families this runner is a keeper for, as this hub's policy
+    /// stands right now (D10, M12).
+    ///
+    /// **Call it with no lock of this hub's held.** It takes
+    /// [`State::keepers`] and releases it, then the registry's own lock, and
+    /// touches [`State::peers`] not at all — which is what lets the welcome
+    /// path and [`tell_the_keepers`] share one body without putting two of
+    /// this hub's locks in one hand.
+    fn custody_of(&self, runner: &str) -> Vec<String> {
+        let keepers = self.keepers_now();
+        if keepers.names_nobody() {
+            return Vec::new();
+        }
+        keepers.keys_for(runner, &self.known_key_families())
+    }
+
     fn with_peers<T>(&self, f: impl FnOnce(&mut Peers) -> T) -> T {
         let answer = self.peers_now(f);
         self.status_changed.notify_one();
@@ -1820,6 +2188,15 @@ impl State {
     /// Since M7 the hub holds a **fleet**: a second machine under a second
     /// name joins beside the first, and the three cases above are all judged
     /// per name.
+    /// Put a runner that has finished its handshake on the fleet.
+    ///
+    /// `custody` is what this connection's `Welcome.keeper_for` carried, so
+    /// that the hub starts out knowing exactly what it has told this runner
+    /// and a later policy change can tell the runners whose custody moved
+    /// and nobody else. It is **derived before the welcome is sent and
+    /// handed in**, not re-derived here: a second derivation inside the
+    /// peers lock would both break the lock order on [`State::keepers`] and
+    /// be free to disagree with the frame already on the wire.
     fn register_runner(
         &self,
         name: &str,
@@ -1827,6 +2204,7 @@ impl State {
         outbox: &Outbox,
         kick: watch::Sender<bool>,
         announced: Announced,
+        custody: Vec<String>,
     ) -> Admitted {
         self.with_peers(|peers| {
             // Only the runner wearing this *name* is in the way. A second
@@ -1894,6 +2272,10 @@ impl State {
                     // Nothing said about a pack store on this connection
                     // yet, which is all three absent and not three noughts.
                     pack_store: PackStoreSaid::default(),
+                    // What the welcome on this connection declared, which
+                    // is this hub's custody policy at the moment the
+                    // connection began (D10, M12).
+                    keeper_for: custody,
                     kick,
                     joined_at: now,
                     last_health: now,
@@ -3218,6 +3600,26 @@ async fn serve_peer(state: Arc<State>, stream: TcpStream) -> Result<()> {
     // and a turned-away peer that was not told would come back holding the
     // same thing for ever.
     let hub_state_root = state.store.state_root_id().to_owned();
+    // **Custody, as this hub's policy stands at the moment this connection
+    // begins** (D10, M12, E-16). In the welcome and not in a later frame
+    // because custody is a standing arrangement: `herd-proto` says it from
+    // the other side — *a runner that learned it from a later frame would
+    // have a window in which it could evict the very pack it is keeping*.
+    //
+    // Derived here, once, and kept: it goes out on the wire below and into
+    // the connection at [`State::register_runner`], so the hub's record of
+    // what it told this runner and the frame it told it in are one value.
+    //
+    // **Empty for a requester, whatever it is called.** A requester has no
+    // pack store, so a non-empty `keeper_for` would be an instruction to
+    // something that cannot carry it out, and a requester sharing a name
+    // with a keeper would read that runner's custody as its own. The field
+    // is absent from the wire when it is empty, so an ordinary requester's
+    // welcome is byte for byte the one it got before this policy existed.
+    let custody = match role {
+        Role::Runner => state.custody_of(&peer_name),
+        _ => Vec::new(),
+    };
     send(
         &mut sink,
         &FromHub::Welcome {
@@ -3227,7 +3629,7 @@ async fn serve_peer(state: Arc<State>, stream: TcpStream) -> Result<()> {
             // A build gap this hub is willing to serve, said where the far
             // side's owner will read it (E-51). `None` is the ordinary case.
             version_note,
-            keeper_for: Vec::new(),
+            keeper_for: custody.clone(),
         },
     )
     .await?;
@@ -3342,6 +3744,7 @@ async fn serve_peer(state: Arc<State>, stream: TcpStream) -> Result<()> {
                 &outbox,
                 &mut source,
                 announced,
+                custody,
             )
             .await
         }
@@ -3350,6 +3753,81 @@ async fn serve_peer(state: Arc<State>, stream: TcpStream) -> Result<()> {
     drop(outbox); // ends the writer, which then closes the socket
     let _ = writer.await;
     outcome
+}
+
+/// Tell every connected runner whose custody has moved, and nobody else
+/// (D10, M12, E-16).
+///
+/// The one body behind both triggers: an operator moving the policy
+/// ([`HubHandle::name_keepers`]) and a pack arriving under a key family this
+/// hub had never seen, which is what gives a **default** keeper the families
+/// it is supposed to keep without waiting for a redial.
+///
+/// **One frame per runner whose set really changed, and no frame at all for
+/// the others.** [`herd_proto::pack::PinPacks`] *replaces* what is in force
+/// rather than adding to it — the same reason `ToHub::PacksHeld` replaces —
+/// so the full list is always what goes out, and an empty list is how
+/// custody is **retracted** from a runner the policy no longer names. A
+/// runner whose set is unchanged is sent nothing: the runner's own side
+/// prints a line per frame it reads, and a hub that re-sent to everybody on
+/// every change would be writing on an owner's stderr about an event that
+/// did not concern her machine.
+///
+/// **No sweep is triggered anywhere by this** (M12 P4's deliberate
+/// decision, not reversed here): the runner's pack pass runs once per
+/// connection, before its announcement, so a `PinPacks` arriving mid-link
+/// changes what the *next* pass may take and moves no pack today.
+///
+/// Answers one line per runner told, for whoever has to say so.
+fn tell_the_keepers(state: &State) -> Vec<String> {
+    let keepers = state.keepers_now();
+    // A hub that has just been told to name nobody still has to be able to
+    // **retract**: a runner pinning a family this hub no longer keeps would
+    // keep pinning it for ever, and the empty frame is the only thing that
+    // can take it back. So the registry is skipped — nothing needs it when
+    // nobody is named — and the loop below still runs.
+    let known = if keepers.names_nobody() {
+        BTreeSet::new()
+    } else {
+        state.known_key_families()
+    };
+    state.with_peers(|peers| {
+        let mut told = Vec::new();
+        for (name, connected) in peers.runners.iter_mut() {
+            let keys = keepers.keys_for(name, &known);
+            if keys == connected.keeper_for {
+                continue;
+            }
+            let _ = connected
+                .outbox
+                .send(FromHub::PinPacks(herd_proto::pack::PinPacks {
+                    keys: keys.clone(),
+                    keep_per_key: KEEPER_KEEP_PER_KEY,
+                }));
+            told.push(match (connected.keeper_for.is_empty(), keys.is_empty()) {
+                (_, true) => format!(
+                    "runner {name} is told it keeps nothing any more: the {} key \
+                     family/families it was keeping are no longer pinned there, and its own \
+                     pack budget may take them like any other pack. It was keeping {}",
+                    connected.keeper_for.len(),
+                    connected.keeper_for.join(", ")
+                ),
+                (true, false) => format!(
+                    "runner {name} is told it is now a KEEPER for {}, the newest \
+                     {KEEPER_KEEP_PER_KEY} pack(s) of each",
+                    keys.join(", ")
+                ),
+                (false, false) => format!(
+                    "runner {name} is told its custody has moved: it keeps {} now, and was \
+                     keeping {}",
+                    keys.join(", "),
+                    connected.keeper_for.join(", ")
+                ),
+            });
+            connected.keeper_for = keys;
+        }
+        told
+    })
 }
 
 /// E-37's switch event, built where the position is still in hand.
@@ -3379,6 +3857,8 @@ async fn serve_runner(
     outbox: &Outbox,
     source: &mut Source,
     announced: Announced,
+    // What this connection's `Welcome.keeper_for` carried (D10, M12).
+    custody: Vec<String>,
 ) -> Result<()> {
     let (host, preference) = (announced.host, announced.preference);
     // Which build it is, kept before the handshake's facts are handed to the
@@ -3404,8 +3884,22 @@ async fn serve_runner(
             host.what_is_missing().unwrap_or("how big it is")
         ),
     }
+    // Said before the connection joins the fleet, and on the machine's own
+    // behalf: the owner of a keeper reads the same fact on her runner's
+    // stderr, and the two lines together are how a disagreement about
+    // custody is ever noticed. Nothing is printed for the ordinary runner a
+    // hub names no keeper for, which is every runner on a hub that was given
+    // no setting.
+    if !custody.is_empty() {
+        println!(
+            "herd-hub: {name} is welcomed as a KEEPER for {}: it is asked to keep the \
+             newest {KEEPER_KEEP_PER_KEY} pack(s) of each past the point its own pack \
+             budget would take them",
+            custody.join(", ")
+        );
+    }
     let (kick, mut kicked) = watch::channel(false);
-    match state.register_runner(name, instance, outbox, kick, announced) {
+    match state.register_runner(name, instance, outbox, kick, announced, custody) {
         Admitted::Yes => {}
         // Not a refusal: a runner told to wait comes back, and one that is
         // refused dies (D13). Telling a redialling runner "a runner is
@@ -5716,6 +6210,24 @@ async fn relay_from_runner(
                             commit: frame.commit,
                             key: frame.key,
                         }));
+                        // **The one live trigger of the keeper policy**
+                        // (D10, M12). A *default* keeper keeps every key
+                        // family nobody else is named for, and that share
+                        // can only be spelt out against the families this
+                        // hub knows — so a family whose first pack has just
+                        // been registered is custody the default keeper was
+                        // promised and has not been told about. Without
+                        // this, a hub that started before any pack existed
+                        // would name a default keeper that keeps nothing
+                        // until it redials, which is a policy that does not
+                        // work on the one deployment it was written for.
+                        //
+                        // Sends to the runners whose set really moved and to
+                        // nobody else, costs nothing on a hub that names no
+                        // keeper, and triggers no sweep anywhere.
+                        for line in tell_the_keepers(state) {
+                            journal(&format!("herd-hub: {line}"));
+                        }
                     }
                     // A refusal about **one pack**, not about this runner, so
                     // `PackRefused` and never `FromHub::Refused` (D13).
@@ -9750,6 +10262,7 @@ mod tests {
             store: Arc::clone(&store) as Arc<dyn JobStore>,
             policy: Policy::default(),
             authority: Authority::default(),
+            keepers: Mutex::new(Keepers::nobody()),
             started: Instant::now(),
             peers: Mutex::new(Peers::default()),
             dispatching: Mutex::new(()),
@@ -9777,6 +10290,7 @@ mod tests {
                     switch: herd_proto::Switch::On,
                     mesh_endpoint: None,
                 },
+                Vec::new(),
             ),
             Admitted::Yes
         ));
@@ -9977,6 +10491,7 @@ mod tests {
             store: Arc::clone(&store) as Arc<dyn JobStore>,
             policy: Policy::default(),
             authority: Authority::default(),
+            keepers: Mutex::new(Keepers::nobody()),
             started: Instant::now(),
             peers: Mutex::new(Peers::default()),
             dispatching: Mutex::new(()),
@@ -10060,6 +10575,7 @@ mod tests {
             store: Arc::clone(&store) as Arc<dyn JobStore>,
             policy: Policy::default(),
             authority: Authority::default(),
+            keepers: Mutex::new(Keepers::nobody()),
             started: Instant::now(),
             peers: Mutex::new(Peers::default()),
             dispatching: Mutex::new(()),
@@ -10166,6 +10682,7 @@ mod tests {
             store: Arc::clone(&store) as Arc<dyn JobStore>,
             policy: Policy::default(),
             authority: Authority::default(),
+            keepers: Mutex::new(Keepers::nobody()),
             started: Instant::now(),
             peers: Mutex::new(Peers::default()),
             dispatching: Mutex::new(()),
@@ -10405,6 +10922,7 @@ mod tests {
                 as Arc<dyn JobStore>,
             policy: Policy::default(),
             authority: Authority::default(),
+            keepers: Mutex::new(Keepers::nobody()),
             started: Instant::now(),
             peers: Mutex::new(Peers::default()),
             dispatching: Mutex::new(()),
@@ -10632,6 +11150,7 @@ mod tests {
             store: Arc::clone(&store) as Arc<dyn JobStore>,
             policy: Policy::default(),
             authority: Authority::default(),
+            keepers: Mutex::new(Keepers::nobody()),
             // An attempt this hub has heard nothing about falls back to the
             // moment the hub started, which is how an inherited attempt is
             // timed. Ninety seconds is past `lost_after`.
@@ -10662,6 +11181,7 @@ mod tests {
                     switch: herd_proto::Switch::On,
                     mesh_endpoint: None,
                 },
+                Vec::new(),
             ),
             Admitted::Yes
         ));
@@ -10744,6 +11264,7 @@ mod tests {
             store: store as Arc<dyn JobStore>,
             policy: Policy::default(),
             authority: Authority::default(),
+            keepers: Mutex::new(Keepers::nobody()),
             started: Instant::now(),
             peers: Mutex::new(Peers::default()),
             dispatching: Mutex::new(()),
@@ -10874,6 +11395,7 @@ mod tests {
             store,
             policy: Policy::default(),
             authority: Authority::default(),
+            keepers: Mutex::new(Keepers::nobody()),
             started: Instant::now(),
             peers: Mutex::new(Peers::default()),
             dispatching: Mutex::new(()),
@@ -11285,6 +11807,7 @@ mod tests {
                             switch: herd_proto::Switch::On,
                             mesh_endpoint: None,
                         },
+                        Vec::new(),
                     ),
                     Admitted::Yes
                 ),
