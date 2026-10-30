@@ -87,6 +87,11 @@ wearing a pipe instead of a semicolon.
   before concluding anything, and its own sentence names the costume:
   *"a pipe discards a status exactly as `;` does."* Found 2026-10-30
   while wiring the hub's pack frames.
+  The costume turned up a second time the same night, in a fifth agent's
+  `cargo fmt --all --check 2>&1 | tail -20 && echo "FMT OK"`, which printed
+  `FMT OK` over two real rustfmt diffs; that agent also caught it by
+  reading the output rather than the status, ran `cargo fmt --all`, and
+  re-ran with the status preserved in a file.
 - **Why the pipe is worse than the semicolon.** With `;` the refusal is
   still on the screen: a reader who looks can see that a gate said no
   above a phase that started anyway. A pipe loses the status *and* can
@@ -141,6 +146,16 @@ wearing a pipe instead of a semicolon.
   differently and none of them says so. Before any verdict or figure is
   reported — in a handoff, on the board, to the orchestrator — the
   status it rests on has to have been printed on purpose.
+  **And on this host a comparison that never ran is as silent as a status
+  nobody looked at:** there is no `bc` on this PATH, so a load-gated wait
+  loop written with `bc -l` prints `bc: command not found` on every
+  iteration, never advances its counter and idles its full cap — batch
+  14's pre-gate wait spent its whole 25 minutes that way at one-minute
+  loads of about 2.0 to 2.9
+  (`docs/orchestration/history/2026-10-30-merge-batch-15.md` *Risks and
+  findings* 4), readings its own condition would have cleared within a
+  minute, while `scripts/gate.sh` uses `awk "BEGIN{exit !(...)}"` for
+  exactly that comparison at `:278`, `:291` and `:371`.
 - **Verify, the second costume:** the same fixture as above, now through
   a pipe, so the loss is shown and not asserted. A free-space floor no
   volume can meet makes the refusal certain, and `cat` is the most
