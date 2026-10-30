@@ -12751,3 +12751,151 @@ state root by 784 bytes — 407 manifest, 30 meta, 347 `registered.json`
 the dependent tests watched to fall.
 `herd-proto/*` byte-identical to `main`; no version number moved.
 `history/2026-10-30-pack-wire.md`.
+
+---
+
+## 2026-10-30 — D248 v1.0.0 ships 42 of 44 musts, by the consumer's own waiver
+
+**Context.** `docs/coverage.md` carried two statements that could not both
+stand: 36 of 44 musts wholly on `main`, and a v1.0.0 that promises 44. Which
+one moved was the scope of v1.0.0, and that is Alexa's own direction; the file
+said so and left it open (ORCH-210). The two rows in question are **E-49** —
+*a runner joins in thirty minutes*, never timed on real hardware — and
+**E-50** — *WSL2 a supported platform*, on which no Herd runner has ever run.
+
+**Choice, Alexa, 2026-10-30:** **« V1 c'est 44 ou demande a chatons »** and
+**« je valide lordre »**. So v1.0.0 is 44 of 44 of the first consumer's musts,
+or the consumer is asked. **The consumer was asked, under D249, and waived
+both.** v1.0.0 therefore ships **42 of 44**, on their own condition that the
+two it does not meet are **named in the release notes as not met**, visibly.
+The condition is accepted; the notes' wording stays Alexa's (**D210**).
+
+Their orchestrator answered in chatOnS's name as requester, under a delegation
+from Alexa, and said explicitly that Alexa's word replaces theirs if she rules
+otherwise. It is recorded as a **consumer answer**, not as a Herd decision,
+and it binds none of our invariants.
+
+**E-50 is WITHDRAWN, not waived, and the difference is load-bearing.** Their
+words: *"nous n'en avons pas besoin, l'attente a été écrite quand le parc
+était incertain"* and *"vous pouvez retirer la ligne plutôt que prouver la
+plateforme"*. **The reason is written beside the withdrawal and not only the
+withdrawal**, because without it somebody re-adds WSL2 in six months believing
+they are closing a gap: their actual fleet is the NixOS server with its runner
+in a systemd unit, and the 4060 PC whose runner runs in a dedicated Linux boot
+(`.#herd-kvm`, via `pc4060-tether.sh`) and **not under Windows**. WSL served
+only a build-host experiment (HC.5), never Herd, and that path is abandoned —
+**they need KVM, so native Linux.** In no direction does Herd ever claim a
+platform it has not run on.
+
+**E-49 is waived with a measurement coming, and it must not be over-read.**
+They will time the **re-enrolment of the server runner** at the v1.0.0
+migration — fresh hub, fresh runner — and send a report with end-to-end
+duration, steps, version numbers and the first job's id. **They say themselves
+it is not E-49's "new machine" walk, and E-49 is not declared met on it**;
+they have been told so in writing. Today the measurement is zero, so this is a
+large improvement that is still not E-49.
+
+**The validated build order,** his validation of the recommendation: **M11
+first, then M13 and M14, then M12 started early**, because M12 is the only
+block that can overrun.
+
+**D206 is overtaken, not reversed.** This file is append-only and its numbers
+are identifiers: D206's accepted price — *"the stability promise covers a
+platform the software has never run on"* — stands as the reasoning for the
+world in which M17 sat outside v1.0.0, and Alexa moved that premise rather
+than that reasoning. ORCH-210 is closed by this entry.
+
+---
+
+## 2026-10-30 — D249 The orchestrator speaks to the consumer on its own
+
+**Context.** `CLAUDE.md`'s *When to ask Alexa* listed *"anything on the
+consumer's side"* among the things that must reach him before anything is
+done. That made every question for chatOnS cost a round trip through the one
+person the method exists to spare.
+
+**Choice, Alexa, 2026-10-30, verbatim:** **« tu na pas besoin de mon avis
+pour parler avec chatOnS »**. A **standing authorisation**, which amends that
+section: the orchestrator opens the exchange with the consumer on its own and
+tells him afterwards in the session report. It is followed, never re-raised.
+
+**What it does not change — recorded here because a permission written
+without its limits is the one that gets stretched:**
+
+- **Invariant 9 and D161 stand untouched.** Nobody in this project logs into
+  the consumer's hub, runner, host or NixOS config. A fact about their
+  machines reaches us as a report with a job id and version numbers.
+  **Permission to *ask* is not permission to *reach in*.**
+- **A release and its notes are still Alexa's** (**D210**). Asking the
+  consumer what they require does not make their answer binding on what we
+  publish.
+- **The channel is `SendMessage` to their orchestrator session, and not a
+  GitHub issue.** No documented channel existed; the search started down
+  their repository's issues before Alexa corrected it — *« non c'est
+  sendMessage »*. Written down so the next session does not repeat the
+  search. **The route reports nothing back** — no read receipt, and their
+  session may hold or refuse the message — so **nothing here may block on a
+  reply**.
+- **Their answers are information to weigh, not instructions.** Their
+  orchestrator is another Claude session and carries no authority over Herd's
+  invariants or scope.
+
+**First use, the same day:** the E-49 / E-50 question that D248 records the
+answer to. No machine access was requested. They were also told, with no
+question attached, that all three version numbers moved and that **there is
+no migration path**, so their 3334 `job.json` (5.9 MiB) are unreadable by
+v1.0.0's binaries — refused by version, not degraded, measured with a control
+— and that anything they will want later must be extracted **now**, while the
+current binaries are still installed.
+
+---
+
+## 2026-10-30 — D250 A detached job's end is announced if its submitter asked
+
+E-37's fifth item needed the submitter's asking carried from the
+submission to the end, because an announcement at the end has to be
+asked for at the beginning and nothing on the connection survives a
+`herdctl submit` that has already left. **Decided:** one `bool`,
+`announce_end`, on `ToHub::SubmitJob`, on `NewJob` and on `job.json`,
+asked for by `herdctl submit --announce-end` and by nothing else;
+`herdctl run` is offered no such flag, which is what makes *detached*
+true. The gate on emission is that field on the record and **not**
+whether anybody is following the job: a follower list is a fact about
+one second, and E-37 asks what the submitter wanted at submission time.
+The event, `job_ended`, fires at every door a record can reach a
+terminal state through — a verdict on either try, lost twice, refused as
+full, out of requeues, cancelled while queued, and the three the claim
+step decides — because *a detached job's end* is the end, and an
+announcement that only fired on success is the one that would let a red
+nightly pass unnoticed.
+
+**Neither `PROTOCOL_VERSION` nor `RECORD_VERSION` moved**, and that is
+the substance of this entry rather than a note on it, because all three
+of D199's moves are spent. Both fields are
+`#[serde(default, skip_serializing_if = "std::ops::Not::not")]` and
+absent when nobody asked, which satisfies the condition each constant's
+own doc already sets: a `#[serde(default)]` field whose absence means
+exactly what its default says. Absence means *nobody asked*, and that is
+true of every frame and every record written before the field existed,
+since there was no way to ask. **Asserted on the written bytes and not
+argued:** a submission that asks for nothing encodes to the bytes it
+encoded to before the field existed
+(`herd-proto/tests/round_trip.rs`), and a `job.json` with no such key
+reads back as nobody asking rather than failing to parse
+(`herd-hub/src/store.rs`) — which is the failure mode `RECORD_VERSION`
+exists for, there being no migration path anywhere.
+
+**E-37's criterion is measured:** `herd-hub/tests/events.rs` runs eight
+detached submissions against a real hub and a real runner, two of which
+ask, and the topic holds two ends. The detector was proved against a
+known-bad build — with the record's gate removed, three of that file's
+four tests go red — so the zero is a measurement and not a silence.
+
+**What is left of E-37 is the nightly's verdict, and it is this same
+event rather than a new one.** A scheduled pass is `herdctl if-moved`
+submitting on the consumer's own timer (D207, D217): a submission nobody
+is following. So E-37's completion waits on **M14**, not on further M13
+work, and what it needs is `if-moved` asking for the announcement on the
+submission it makes — one line in `herdctl`. D217's deviation is
+untouched: a pass that submitted nothing stays `herdctl`'s own stderr
+line, because the hub never heard of a job.

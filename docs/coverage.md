@@ -11,7 +11,9 @@ closes in M18.
 runs: `merged` is wholly on `main`; `part` is a row some of whose work is
 on `main` and some of which is not — a two-milestone row with one half
 landed, or a row whose own list is partly built; `planned` is unbuilt;
-`unmet by choice` is a row Alexa has decided not to deliver. What is
+`waived` is a must the first consumer has waived for v1.0.0 and
+`withdrawn` one they have retired as never needed (**D248**); neither is
+ours to re-add, and `unmet by choice` went with D206's premise. What is
 deployed is a tag behind `main`, so a `merged` row is not a promise about
 the running system — `docs/status.md` holds the versions, the disk and who
 operates them.
@@ -19,8 +21,15 @@ operates them.
 **The musts, recounted from the table below on 2026-10-30 against the
 tree at `26e83cf`:** **36 of 44** wholly on `main`; **4** more with part
 of their work on `main` (E-12, E-16, E-17, E-37); **2** with none of it
-(E-14, E-42); **2** declared unmet by choice (E-49, E-50, D206).
-36 + 4 + 2 + 2 = 44.
+(E-14, E-42); **2** the consumer has released us from — **E-49
+waived** and **E-50 withdrawn** (**D248**). 36 + 4 + 2 + 2 = 44.
+
+**Batch 18 moved no must into or out of the 36, and the count above is
+not a fresh recount:** it is batch 17's, made against `26e83cf`, and
+what changed under it is only E-49's and E-50's State cells. E-37 gained
+its fifth hub transition and **stays `part`**, because the nightly's
+verdict cannot be shown end to end until M14's nightly exists. ORCH-241
+carries the standing staleness of this paragraph.
 
 **The done figure did not move; the shape of the eight that are not did.**
 Five landings reached `main` after the 2026-10-29 count (batches 12 to
@@ -29,15 +38,20 @@ Five landings reached `main` after the 2026-10-29 count (batches 12 to
 other six were checked row by row and left alone.
 
 **Two landed decisions give two different ceilings, and both are stated
-here rather than reconciled.** D205 (Alexa, 2026-10-29) puts M11's pack
-half inside v1.0.0 and says that makes it *"44 of 44 of the first
-consumer's musts. There is no must left outside the stable release."*
-D206 (Alexa, the same day) declares E-49 and E-50 **unmet by choice**.
-Those two rows are musts and this table counts them as such, so taken
-together the arithmetic gives **42 of 44**, not 44 of 44. Which of the
-two statements moves is the scope of v1.0.0, which is Alexa's own
-direction and is not settled in this document. A reader quoting a figure
-from here should quote the counted one above and name the open question.
+settled, and the figure to quote is **42 of 44**.** D205 (Alexa,
+2026-10-29) put M11's pack half inside v1.0.0 and said that made it
+*"44 of 44 of the first consumer's musts"*; D206, the same day, declared
+E-49 and E-50 unmet by choice, and the two together gave 42. **Alexa
+settled it on 2026-10-30** — *« V1 c'est 44 ou demande a chatons »* —
+and **the consumer was asked and waived both** (**D248**, **D249**):
+v1.0.0 ships **42 of 44** and **names the two it does not meet** in the
+release notes, which is their own condition for the waiver. **E-50 is
+withdrawn rather than waived** — they do not need it, their fleet is the
+NixOS server plus a 4060 PC on a dedicated Linux boot, and they need KVM
+so native Linux — and **E-49 is waived with a measurement coming that is
+not E-49**: the server runner's re-enrolment at the migration, which
+they say themselves is not the new-machine walk, so E-49 is not declared
+met on it. **D206 is overtaken, not reversed.**
 
 | E | Prio | What | Milestone | State | Note |
 |---|---|---|---|---|---|
@@ -89,8 +103,8 @@ from here should quote the counted one above and name the open question.
 | E-46 | must | unprivileged, root via helper | M4 | merged |  |
 | E-47 | must | server runner runs natively | M16 | merged | the server's runner is a native, unprivileged systemd unit from `deploy/nixos-herd-runner.nix`, no container in its path; read back off the host with `systemctl cat herd-runner` |
 | E-48 | must | per-runner approval | M15 | merged | `herd-hub/tests/approval.rs` drives the real binaries: an unapproved runner is turned away and nothing is placed on it, one `herdctl runner approve` lets it run a real job, `remove` takes it back out, and the token an operator was shown is not readable back out of the hub's state |
-| E-49 | must | join in thirty minutes | M17 | unmet by choice | **M17 is outside v1.0.0 (D206), so this row is declared unmet by choice rather than left looking owed** — `check-docs.sh` would accept either and a reader must not have to guess which it is. The timing is a manual check on real hardware and the walk has not been made |
-| E-50 | must | WSL2 supported platform | M17 | unmet by choice | **M17 is outside v1.0.0 (D206), so this row is declared unmet by choice rather than left looking owed.** No Herd runner has run on WSL2; D206 records the price plainly — the stability promise covers a platform the software has never run on — and accepts it |
+| E-49 | must | join in thirty minutes | M17 | waived | **Waived by the first consumer for v1.0.0 (D248), on their own condition that it be named in the release notes as not met.** Not *unmet by choice*: D206's premise — that M17 sat outside v1.0.0 — was moved by Alexa on 2026-10-30, and the waiver is the consumer's own answer to the question that replaced it. The timing has never been measured on real hardware and the walk has no automated form. **A measurement is coming and it is not this one:** they will time the **re-enrolment** of the server runner at the v1.0.0 migration, fresh hub and fresh runner, and send duration, steps, version numbers and the first job's id. **They say themselves it is not E-49's new-machine walk, and E-49 is not declared met on it** — they have been told so in writing. Today the measurement is zero, so this is a large improvement that is still not this row. |
+| E-50 | must | WSL2 supported platform | M17 | withdrawn | **Withdrawn by the first consumer, not waived, and the difference is load-bearing (D248).** Their words: *"nous n'en avons pas besoin, l'attente a été écrite quand le parc était incertain"* and *"vous pouvez retirer la ligne plutôt que prouver la plateforme"*. **The reason is recorded beside the withdrawal and not only the withdrawal, because without it somebody re-adds WSL2 in six months believing they are closing a gap:** their actual fleet is the NixOS server with its runner in a systemd unit, and the 4060 PC whose runner runs in a dedicated Linux boot (`.#herd-kvm`, via `pc4060-tether.sh`) and **not under Windows**. WSL served only a build-host experiment (HC.5), never Herd, and that path is abandoned — **they need KVM, so native Linux.** No Herd runner has ever run on WSL2, and **in no direction does Herd claim a platform it has not run on** — which is why this row is retired rather than promised. |
 | E-51 | must | version pin and refusal | M15 | merged | protocol-version refusal since M1, in one line naming both versions; a state root from a newer Herd is refused the same way, by version and with both figures (D73) |
 | E-52 | should | restarts with its host | M16, M17 | part | the server half is merged and read back off the host: a declarative unit whose generation holds its store path, so no garbage collection can take it. The PC's logon task is M17 |
 | E-53 | should | records readable during run | M2 | merged | plain files by Q1. **What a reader may see** (D103): `job.json` is the authority on where a job stands now; `events.jsonl` is the history and may be one transition behind it, never ahead. A reader wanting a state *and* its transition line waits on `events.jsonl` |
@@ -136,9 +150,9 @@ which is which.
 
 **Not this list, though one older summary mixed them in with it: a manual
 or real-hardware check.** E-30 (*"WSL OOM replay is a manual M17
-check"*) and E-49 (*"a manual check on real hardware"*, and unmet by
-choice, D206) wait on somebody walking a machine, not on anything of the
-consumer's. A sentence may hold them beside the gated rows only when it
+check"*) and E-49 (*"a manual check on real hardware"*, and waived by
+the consumer, D248) wait on somebody walking a machine, not on anything
+of the consumer's. A sentence may hold them beside the gated rows only when it
 says "gated **or** real-hardware", as the closing line of this file does.
 
 **A second group: gated on them, and with no milestone that closes it.**
@@ -180,8 +194,8 @@ waits on M14's nightly existing rather than on any further hub work.
 **36 of 44 musts are wholly on `main`.** Of the eight that are not: four
 are partly built (E-16, whose hub-side budget shipped in M11; E-37; and
 M11's two pack musts E-12 and E-17, recounted on 2026-10-30); two have
-nothing on `main` (E-14 and E-42); and two are **unmet by choice**
-(E-49, E-50, D206). Four `should`
+nothing on `main` (E-14 and E-42); and two the consumer has released us
+from — **E-49 waived**, **E-50 withdrawn** (D248). Four `should`
 rows are merged — E-09 and E-10 beside M9, E-40 beside M3, E-53 beside
 M2 — and E-52 is half of one. Twelve musts have had an independent
 adversarial pass against the real binaries (E-03, E-15, E-44 from M2;
@@ -236,8 +250,10 @@ Five things a reader must not mistake for done:
    is no migration path the last two destroy an existing state root as
    a working root. The sentence this replaces also said the ordinary
    release before v1.0.0 ships at layout 1 and record 1: no release cut
-   from `main` can now do that. What follows for the release is scope
-   and is not settled in this document.
+   from `main` can now do that. **What followed for the release is
+   settled: the next tag is v1.0.0** (D212), so there is no ordinary
+   release before it for that sentence to bind — D243 ruled the
+   constraint moot rather than open, and ORCH-156 is closed as caduque.
 
 ## Musts per milestone
 
@@ -277,8 +293,8 @@ disagreeing copies (ORCH-206).
   gated on chatOnS's results.json for the load-vs-real failure split.
 
 Every must is placed, and three kinds of must are **not** simply owed:
-four are partial (E-12, E-16, E-17, E-37), two are unmet by choice
-(E-49, E-50, D206), and
+four are partial (E-12, E-16, E-17, E-37), two the consumer has released
+us from (**E-49 waived**, **E-50 withdrawn**, D248), and
 nine carry a gated or real-hardware note that names its closing
 milestone — the seven of *Gated on chatOnS* above, plus E-30 and E-49,
 whose checks are manual and wait on nothing of the consumer's. This
