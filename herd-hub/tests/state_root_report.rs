@@ -326,11 +326,63 @@ fn every_figure_of_the_report_is_this_fixture_to_the_byte() {
     // a block of text 200 lines long, and the only thing that is actually
     // being asserted about them is that the unread record is one past what
     // this build reads.
+    // Section 5's figures are the `job.json` lengths of this fixture, and
+    // those are serde's business and not this test's: a literal here would
+    // pin the whole 240-line assertion to a pretty-printer's spacing. So
+    // they follow the lengths `before` already measured, the way the two
+    // version numbers follow their constants. What is being asserted about
+    // them is that they are the **records'** lengths and no other file's,
+    // which is also asserted on its own against literal byte counts in
+    // `herd-hub/src/report.rs`'s module tests.
+    let records: u64 = before
+        .iter()
+        .filter(|(path, _)| path.starts_with("jobs/") && path.ends_with("/job.json"))
+        .map(|(_, length)| length)
+        .sum();
+    let heaviest = before
+        .iter()
+        .filter(|(path, _)| path.starts_with("jobs/") && path.ends_with("/job.json"))
+        // Most of this fixture's records are the same shape and so the same
+        // length. `Reverse` on the path makes this tie break the way the
+        // code's own walk does — for the **lowest** job id — so the test is
+        // asserting the code's rule and not agreeing with it by luck.
+        .max_by_key(|(path, length)| (*length, std::cmp::Reverse(path.clone())))
+        .map(|(path, length)| {
+            (
+                path.trim_start_matches("jobs/")
+                    .trim_end_matches("/job.json")
+                    .to_owned(),
+                *length,
+            )
+        })
+        .expect("this fixture has records");
+    // 18 under `files/`, 3 under `files.part/`, 5 under `files.gone/`.
+    let collected = 26u64;
     let expected = EXPECTED
         .replace("{ROOT}", &root.display().to_string())
         .replace("{UNREAD}", &(herd_hub::RECORD_VERSION + 1).to_string())
-        .replace("{READS}", &herd_hub::RECORD_VERSION.to_string());
+        .replace("{READS}", &herd_hub::RECORD_VERSION.to_string())
+        .replace("{RECORDS}", &herd_proto::size::measured_bytes(records))
+        .replace("{HEAVIEST}", &herd_proto::size::measured_bytes(heaviest.1))
+        .replace("{HEAVIESTJOB}", &heaviest.0)
+        .replace(
+            "{SHARE}",
+            &format!(
+                "{:.2}",
+                records as f64 / (records + collected) as f64 * 100.0
+            ),
+        );
     assert_eq!(rendered, expected);
+    assert_eq!(
+        report.bookkeeping.record_bytes, records,
+        "section 5 weighed the records and nothing else"
+    );
+    assert_eq!(report.bookkeeping.directories, 12);
+    assert_eq!(
+        report.bookkeeping.records, 11,
+        "eleven of the twelve directories hold a job.json"
+    );
+    assert_eq!(report.accounting.collected_bytes(), collected);
 
     // It disturbed nothing: not one byte of this root changed, and the lock
     // a hub holds was held throughout.
@@ -713,6 +765,13 @@ fn the_report_reads_what_the_store_itself_wrote() {
                 },
             )
             .expect("the collection is recorded");
+        // A log through the store's own writer, which is what holds
+        // `report.rs`'s copies of `log` and `log.seq`: a rename in `store.rs`
+        // reddens the figures below instead of printing nought for every log
+        // on an operator's root.
+        store
+            .append_log(&job.id, herd_proto::LogStream::Stdout, 0, LOG_LINE)
+            .expect("a log chunk is written");
     }
 
     // The store is still open, so its `flock` is still held and its index is
@@ -753,10 +812,70 @@ fn the_report_reads_what_the_store_itself_wrote() {
     assert!(report.accounting.removed_but_present.is_empty());
     assert_eq!(report.accounting.parts_dirs, 0);
     assert_eq!(report.accounting.gone_dirs, 0);
+
+    // Figure 5, on records the store wrote rather than ones this test did.
+    //
+    // **This is what holds `report.rs`'s three copied file names.**
+    // `events.jsonl`, `log` and `log.seq` are private to `store.rs` and
+    // written out again in `report.rs`; nothing but a test that drives the
+    // store's own writer can tell a copy that drifted from a root that
+    // really holds no event file. So each of the three is asserted as
+    // *found*, with bytes in it, and not merely as a figure.
+    let book = &report.bookkeeping;
+    assert_eq!(book.directories, 2);
+    assert_eq!(book.records, 2, "the store wrote a job.json for each");
+    assert!(book.record_bytes > 0);
+    assert_eq!(book.events, 2, "and an events.jsonl beside each");
+    assert!(
+        book.event_bytes > 0,
+        "an events.jsonl the report found and measured at nought would be a \
+         copied file name that has drifted"
+    );
+    assert_eq!(book.logs, 2, "and a log, through its own append_log");
+    assert_eq!(
+        book.log_bytes,
+        2 * LOG_LINE.len() as u64,
+        "the log is measured by its length, to the byte"
+    );
+    assert!(book.logs_unknown.is_empty());
+    assert_eq!(book.without_log, 0);
+    assert!(
+        book.other_bytes > 0,
+        "log.seq is beside the log and is counted, which is the third \
+         copied name"
+    );
+    assert!(book.unreadable.is_empty());
+    // And the partition: every byte under `jobs/` is in exactly one of the
+    // two totals. This is the "do not double-count a byte" claim, against a
+    // root a hub built.
+    assert_eq!(
+        book.bytes() + report.accounting.collected_bytes(),
+        listing(dir.path())
+            .into_iter()
+            .filter(|(path, _)| path.starts_with("jobs/"))
+            .map(|(_, length)| length)
+            .sum::<u64>(),
+        "the bookkeeping and the collection partition jobs/ between them"
+    );
     drop(store);
 }
 
+/// The log chunk the test above writes through the store, so that its length
+/// is a figure this file states once and asserts.
+const LOG_LINE: &[u8] = b"a line of a job's log, and its length is the figure\n";
+
 /// The report's text, with the only thing that varies left as `{ROOT}`.
+///
+/// **Section 5's apparent-size paragraph is why this block was edited and
+/// not regenerated.** The prose changed on purpose: the first consumer's
+/// own figure for the same quantity is `du -sk`, which is allocated
+/// blocks, while section 5 sums `metadata().len()`, which is apparent
+/// size, so on a comparable root it prints about half of what their `du`
+/// said with nothing having shrunk. The paragraph carries the unit, the
+/// 1.97× that was measured behind it, and the instruction that follows.
+/// An expectation updated because the text was deliberately changed is
+/// honest; this is the one place a reader can see the text was reviewed
+/// rather than pasted back from a failing run.
 ///
 /// **Section 4 is the banner and not the figures**, because this fixture's
 /// root is built by the store and no hub has opened a pack registry on it:
@@ -772,7 +891,8 @@ herd-hub state-root report
   writing this root while it is read: each record is read whole or not at
   all, but the figures together are not one instant. It reads no output
   byte and no log byte -- every size and digest in sections 1 and 2 comes
-  out of a record, and section 3's measurements are file lengths.
+  out of a record, and the measurements in sections 3 to 5 are file
+  lengths, a log's own length among them.
 
 records
   job directories                    12
@@ -875,4 +995,55 @@ records
   THERE IS NO packs/ DIRECTORY ON THIS ROOT, so this hub has never
   served it at layout 2 or later. That is not an empty registry: an
   empty one is a directory with nothing in it.
+
+5. the records, the events and the logs
+
+  What this root spends on knowing what it holds, as against what it holds.
+  Sections 1 to 3 are about the collected output and not one of them weighs
+  a job.json, an events.jsonl or a log. Nothing in Herd bounds any of the
+  three: the output budget governs collections, a sweep frees them without
+  touching a record, and the only thing that frees a record's byte or a
+  log's is removing the record. So a root whose collections were all swept
+  still grows, and this is the figure that shows it.
+
+  One total, and it is a total: a mean over these directories would misread
+  one the way section 2 says a mean misreads a job, because a single large
+  log can be the whole of the difference. So the heaviest directory is
+  printed beside the total and the three classes are named apart, so that a
+  total which has grown can be attributed without a second command.
+
+  Apparent size, summed from file lengths, and that is a FLOOR on what
+  these files occupy. A one-byte file costs a whole block, and a
+  bookkeeping population is almost all small files: on one real root this
+  figure read 1443667 bytes while the same files held 2850816 bytes of
+  blocks -- about 1.97 times more disk than the figure says (measured
+  2026-10-30, find -printf '%b' against find -printf '%s'). That factor is
+  a property of that root's file sizes and its block size and is not a
+  constant to apply anywhere else. So compare du with du, or apparent with
+  apparent, and never one against the other: a du -sk taken before a
+  migration and this figure taken after it would show a root halving while
+  nothing at all had shrunk.
+
+  The three collection directories are skipped by name, so no byte is in
+  both this total and section 3's. Nothing under packs/ is in either.
+
+  job directories weighed             12
+  the records (job.json)              {RECORDS} in 11 record(s)
+  the event files (events.jsonl)      0 bytes in 0 file(s)
+  the logs                            0 bytes in 0 log(s)
+    could not be read                 0 log(s): UNKNOWN, never nought
+    no log ever written               12 directory/ies
+  anything else beside them           0 bytes
+    log.seq today, and whatever a later milestone puts in a job
+    directory. Counted before anything names it, because no mechanism frees
+    it either.
+  directories that would not open     0 directory/ies
+  the bookkeeping in all              {RECORDS}
+  the heaviest one directory          {HEAVIEST} in jobs/{HEAVIESTJOB}
+  the collected output beside it      26 bytes
+  the bookkeeping is                  {SHARE}% of those two together
+    The collected figure is section 3's three directories, over the records
+    that section could read; this bookkeeping is over every job directory,
+    read or not. Where the two counts differ the share is approximate by
+    that much, and the census above says by how many.
 ";

@@ -118,7 +118,38 @@ struct Peer {
 
 impl Peer {
     async fn runner(hub_url: &str, name: &str, token: &str, instance: &str) -> Self {
-        Self::dialling(hub_url, name, token, instance, Some(ENDPOINT.to_owned())).await
+        Self::dialling(
+            hub_url,
+            name,
+            token,
+            instance,
+            Some(ENDPOINT.to_owned()),
+            Default::default(),
+        )
+        .await
+    }
+
+    /// A runner that advertises `endpoint` and offers one label of its own,
+    /// so that a test with **two** runners connected can say which of them a
+    /// job goes to instead of hoping.
+    ///
+    /// The label is the only thing that makes a two-runner test about the
+    /// hub's answer rather than about the matcher's mood: a job submitted
+    /// with a label one runner offers and the other does not has exactly one
+    /// place it can be claimed.
+    async fn offering(
+        hub_url: &str,
+        name: &str,
+        token: &str,
+        label: &str,
+        endpoint: Option<String>,
+    ) -> Self {
+        let offer = herd_proto::CapabilityOffer::new(vec![herd_proto::OfferedCapability::new(
+            herd_proto::Capability::shared(label),
+            herd_proto::CapabilityOrigins::declared(),
+        )])
+        .expect("a valid offer");
+        Self::dialling(hub_url, name, token, "the-only-life", endpoint, offer).await
     }
 
     async fn dialling(
@@ -127,6 +158,7 @@ impl Peer {
         token: &str,
         instance: &str,
         mesh_endpoint: Option<String>,
+        capabilities: herd_proto::CapabilityOffer,
     ) -> Self {
         let (mut socket, _response) = tokio_tungstenite::connect_async(hub_url)
             .await
@@ -140,7 +172,7 @@ impl Peer {
             instance: Some(instance.to_owned()),
             state_root: None,
             health_every_ms: None,
-            capabilities: Default::default(),
+            capabilities,
             host: herd_proto::HostSize {
                 memory_mib: Some(8192),
                 threads: Some(4),
@@ -1054,5 +1086,624 @@ async fn a_job_needing_a_pack_nothing_registered_waits_by_name_and_is_not_assign
         record.needs,
         vec![KEY.to_owned()],
         "the keys are on the record, which is what a requeue resolves again from"
+    );
+}
+
+// ------------------------------------- the hub's half of a transfer ----
+
+/// The runner that holds the pack, and the label only it offers.
+const HOLDER: &str = "the-runner-that-holds-it";
+const HOLDS: &str = "holds-packs";
+/// The runner that needs the objects, and the label only it offers.
+const ASKER: &str = "the-runner-that-needs-it";
+const NEEDS: &str = "needs-packs";
+/// One object of [`a_manifest`] — the whole of what an asker lacking one
+/// row would ask for, and the scope the capability must come back with.
+fn one_object() -> Vec<String> {
+    vec!["1".repeat(64)]
+}
+
+/// Where the **asking** runner serves content, which is not where the bytes
+/// come from: a fetch is dialled at the *holder*, and an endpoint of the
+/// asker's in the answer would be the hub sending a runner to itself.
+const ASKER_ENDPOINT: &str = "10.42.0.9:51820";
+
+/// Hand this runner a job carrying a label only it offers, and keep the job
+/// `assigned`.
+///
+/// The labelled twin of [`a_job_assigned_to`], and the reason it exists is
+/// that two runners are connected here: an unlabelled job has two places it
+/// could be claimed, and a test that read `AssignJob` off the wrong one would
+/// wait for ever for a frame that had already been delivered elsewhere.
+async fn a_labelled_job_assigned_to(
+    harness: &Harness,
+    runner: &mut Peer,
+    label: &str,
+) -> (JobId, u32) {
+    let job_id = herdctl::submit_job(
+        &harness.requester(),
+        shell("true"),
+        support::labels(&[label]),
+        herd_proto::Priority::Step,
+        herdctl::Declared::default(),
+    )
+    .await
+    .expect("the submission is accepted");
+    let attempt = loop {
+        match runner.next().await {
+            Some(FromHub::AssignJob { attempt, .. }) => break attempt,
+            Some(_) => continue,
+            None => panic!("the hub never handed this runner the job"),
+        }
+    };
+    (job_id, attempt)
+}
+
+/// A holder with a pack registered and announced, and an asker with a job of
+/// its own: the two runners a transfer has.
+///
+/// The holder registers through the frame and announces through the frame,
+/// because those are the only things in this build that make a holder, and a
+/// test that planted a holding would be asserting about its own typing.
+async fn a_holder_and_an_asker(
+    harness: &Harness,
+    holder_endpoint: Option<String>,
+) -> (Peer, Peer, JobId) {
+    let holder_token = harness.approve(HOLDER);
+    let mut holder = Peer::offering(
+        &harness.hub_url,
+        HOLDER,
+        &holder_token,
+        HOLDS,
+        holder_endpoint,
+    )
+    .await;
+    let (holders_job, attempt) = a_labelled_job_assigned_to(harness, &mut holder, HOLDS).await;
+    holder.say(a_registration(&holders_job, attempt)).await;
+    match pack_answer(&mut holder).await {
+        FromHub::PackRegistered(done) => assert_eq!(done.pack, the_pack()),
+        other => panic!("the holder's registration is accepted, got {other:?}"),
+    }
+    holder.announces(vec![the_pack()], false).await;
+
+    let asker_token = harness.approve(ASKER);
+    let mut asker = Peer::offering(
+        &harness.hub_url,
+        ASKER,
+        &asker_token,
+        NEEDS,
+        Some(ASKER_ENDPOINT.to_owned()),
+    )
+    .await;
+    let (askers_job, _) = a_labelled_job_assigned_to(harness, &mut asker, NEEDS).await;
+    (holder, asker, askers_job)
+}
+
+fn an_ask_to_fetch(job_id: &JobId, peer: Option<&str>, objects: Vec<String>) -> ToHub {
+    ToHub::AskTransferCapability(herd_proto::AskTransferCapability {
+        job_id: job_id.clone(),
+        pack: the_pack(),
+        peer: peer.map(ToOwned::to_owned),
+        direction: herd_proto::TransferDirection::Fetch,
+        objects,
+    })
+}
+
+/// Read frames until one of them answers a capability ask, so that an
+/// assertion is about the hub's answer and not about whatever it said first.
+async fn capability_answer(runner: &mut Peer) -> FromHub {
+    let deadline = tokio::time::Instant::now() + PATIENCE;
+    loop {
+        let frame = tokio::time::timeout_at(deadline, runner.next())
+            .await
+            .expect("the hub answers a capability ask inside the suite's patience")
+            .expect(
+                "the link stays up: a transfer this hub will not authorise is not a reason \
+                     to close it (D13)",
+            );
+        if matches!(
+            frame,
+            FromHub::TransferCapability(_) | FromHub::PackRefused(_)
+        ) {
+            return frame;
+        }
+    }
+}
+
+/// The capability the hub minted, or a panic naming what it said instead.
+fn minted(frame: FromHub) -> herd_proto::TransferCapability {
+    match frame {
+        FromHub::TransferCapability(capability) => capability,
+        FromHub::PackRefused(refused) => {
+            panic!(
+                "the hub refused a transfer it should have authorised: {}",
+                refused.why
+            )
+        }
+        other => panic!("a capability ask is answered by TransferCapability, got {other:?}"),
+    }
+}
+
+/// What the **holder** was told over its own link.
+async fn told_to_expect(holder: &mut Peer) -> herd_proto::ExpectTransfer {
+    let deadline = tokio::time::Instant::now() + PATIENCE;
+    loop {
+        let frame = tokio::time::timeout_at(deadline, holder.next())
+            .await
+            .expect("the holder is told to expect the transfer inside the suite's patience")
+            .expect("the holder's link stays up");
+        if let FromHub::ExpectTransfer(expect) = frame {
+            return expect;
+        }
+    }
+}
+
+fn unix_now() -> i64 {
+    i64::try_from(
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("a clock at or after the Unix epoch")
+            .as_secs(),
+    )
+    .expect("seconds since the epoch fit in an i64")
+}
+
+/// **The hub mints, tells the holder, and answers the asker** (D209, D10,
+/// D200, E-12).
+///
+/// The frame that was sent by nothing. Measured on `main` at `df47266`,
+/// before this: `ToHub::AskTransferCapability` was answered by a
+/// `PackRefused` saying *"this hub does not mint a transfer capability for
+/// pack … yet"*, and `FromHub::ExpectTransfer` was **constructed in no
+/// place** in the whole workspace — so `herd_runner::endpoint::Granted`, the
+/// one door a capability may enter a holder by, was fed by no production path
+/// and a pack could not move between two machines at all.
+///
+/// One test and not four, because the three halves are one act: a token the
+/// asker has and the holder has not been told about is refused at the
+/// endpoint as `NotPushedByHub`, and a holder told about a token nobody was
+/// given is a table entry that expires unused. What is asserted is that **the
+/// same token, the same scope and the same expiry reached both ends**, which
+/// is the only shape in which either frame is worth anything.
+///
+/// It asserts no byte of the pack, and that is not an omission: the bytes go
+/// runner to runner and never through the hub (D10), so there is nothing
+/// about them for a test of the hub's half to read.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_hub_mints_a_capability_tells_the_holder_and_answers_the_asker() {
+    let harness = Harness::with_hub().await;
+    let (mut holder, mut asker, askers_job) =
+        a_holder_and_an_asker(&harness, Some(ENDPOINT.to_owned())).await;
+
+    let before = unix_now();
+    asker
+        .say(an_ask_to_fetch(&askers_job, Some(HOLDER), one_object()))
+        .await;
+    let capability = minted(capability_answer(&mut asker).await);
+
+    // ---------------------------------------------- what the asker was told
+    assert_eq!(
+        capability.job_id, askers_job,
+        "the capability is about this job"
+    );
+    assert_eq!(capability.pack, the_pack());
+    assert_eq!(
+        capability.peer, HOLDER,
+        "the holder this capability is against, by the name the hub knows it as"
+    );
+    assert_eq!(
+        capability.endpoint, ENDPOINT,
+        "and the address **the holder advertised**, which is an address on a private mesh \
+         interface and the only kind invariant 3 permits a runner to serve from. The hub \
+         chooses no address here: it repeats one"
+    );
+    assert_ne!(
+        capability.endpoint, ASKER_ENDPOINT,
+        "a fetch is dialled at the holder; the asker's own endpoint in this field would be \
+         the hub sending a runner to itself"
+    );
+    assert_eq!(capability.direction, herd_proto::TransferDirection::Fetch);
+    assert_eq!(
+        capability.objects,
+        one_object(),
+        "scoped to the objects asked for and **nothing wider**: an empty list is the whole \
+         pack, and a hub that answered an ask for one row with it would be widening a \
+         capability on the asker's behalf (D200)"
+    );
+
+    // ------------------------------------------------------- and the secret
+    // 32 bytes of the kernel's randomness in hex, behind a prefix that names
+    // what it is — the scheme an approved runner's token already carries, so
+    // that there is one way a credential is made on this hub and not two
+    // (invariant 7).
+    let random = capability
+        .token
+        .strip_prefix("herd-pack-")
+        .unwrap_or_else(|| panic!("a transfer token says what it is: {:?}", capability.token));
+    assert_eq!(
+        random.len(),
+        64,
+        "32 random bytes, hex: {:?}",
+        capability.token
+    );
+    assert!(
+        random
+            .chars()
+            .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()),
+        "lowercase hex and nothing else: {:?}",
+        capability.token
+    );
+
+    // Short-lived, on the hub's clock, and an instant rather than an offset:
+    // the machine that compares it is not the machine that minted it.
+    let lifetime = herd_proto::PACK_CAPABILITY_LIFETIME.as_secs() as i64;
+    assert!(
+        capability.expires_unix_s > before,
+        "a capability that has already expired authorises nothing: {} against {before}",
+        capability.expires_unix_s
+    );
+    assert!(
+        capability.expires_unix_s <= unix_now() + lifetime,
+        "and it is short-lived, which is the whole of what makes a bearer token on the \
+         fleet's own mesh bearable (D200): {} is more than {lifetime}s out",
+        capability.expires_unix_s
+    );
+
+    // ------------------------------------- what the **holder** was told, on
+    // its own already authenticated link. This is the half that makes the
+    // peer wire need no PKI: the holder learns the token from the hub it is
+    // joined to, so a token offered by a peer is checked against something
+    // the hub said and never against something the peer did.
+    let expect = told_to_expect(&mut holder).await;
+    assert_eq!(
+        expect.token, capability.token,
+        "the same token reached both ends, which is the only thing that makes either frame \
+         worth anything"
+    );
+    assert_eq!(expect.pack, the_pack());
+    assert_eq!(
+        expect.peer, ASKER,
+        "the holder is told which peer will present it — the **asker's** name, not its own"
+    );
+    assert_eq!(expect.direction, herd_proto::TransferDirection::Fetch);
+    assert_eq!(
+        expect.objects,
+        one_object(),
+        "with the same scope: a holder told 'the whole pack' would serve rows the hub never \
+         authorised"
+    );
+    assert_eq!(
+        expect.expires_unix_s, capability.expires_unix_s,
+        "and the same expiry, or the two ends disagree about when the transfer stops being \
+         allowed"
+    );
+
+    // **Nothing wider, across two asks.** A second transfer is a second
+    // capability: a hub that handed the first token out again would be
+    // extending a five-minute authorisation for as long as anybody asked.
+    asker
+        .say(an_ask_to_fetch(&askers_job, Some(HOLDER), Vec::new()))
+        .await;
+    let again = minted(capability_answer(&mut asker).await);
+    assert_ne!(
+        again.token, capability.token,
+        "each transfer is minted its own token"
+    );
+    assert!(
+        again.objects.is_empty(),
+        "and an ask for the whole pack is answered with the whole pack: {:?}",
+        again.objects
+    );
+    let expect_again = told_to_expect(&mut holder).await;
+    assert_eq!(expect_again.token, again.token);
+
+    // Both links are still carrying traffic, which is D13 and is also the
+    // only proof that neither of these frames was a `FromHub::Refused`.
+    asker.through_a_health_report().await;
+    holder.through_a_health_report().await;
+}
+
+/// **Every way this hub will not authorise a transfer, each by name, with
+/// the link still up** (D13, D10, invariant 3).
+///
+/// Five refusals in one test, because they are one rule read five ways: the
+/// hub authorises what **it** records, against a holder **it** can reach, for
+/// a job that is really on the asking runner — and when it will not, it says
+/// which of those it is. D150's lesson from the hub's side: the party that
+/// knows why is the one that has to speak, and a fetcher told nothing waits
+/// for bytes that never come.
+///
+/// None of them is `FromHub::Refused`, so none of them costs the asking
+/// runner its link or its other jobs; the health report at the end of each is
+/// what says so.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_transfer_this_hub_will_not_authorise_is_refused_by_name_and_the_link_stays_up() {
+    let harness = Harness::with_hub().await;
+    let (mut holder, mut asker, askers_job) =
+        a_holder_and_an_asker(&harness, Some(ENDPOINT.to_owned())).await;
+
+    // 1. A machine that holds nothing. The scope comes off the hub's own
+    //    registry and never off what the asker said it was.
+    asker
+        .say(an_ask_to_fetch(
+            &askers_job,
+            Some("a-machine-that-holds-nothing"),
+            one_object(),
+        ))
+        .await;
+    let why = refusal(&capability_answer(&mut asker).await).to_owned();
+    assert!(
+        why.contains("does not hold pack"),
+        "a capability is minted against what the hub records, not against what the asker \
+         named: {why}"
+    );
+    asker.through_a_health_report().await;
+
+    // 2. A job that is not this runner's. A capability is a credential, so
+    //    the entitlement is read before anything about the pack is.
+    let other_token = harness.approve("a-third-runner");
+    let mut third = Peer::offering(
+        &harness.hub_url,
+        "a-third-runner",
+        &other_token,
+        "a-third-label",
+        None,
+    )
+    .await;
+    third
+        .say(an_ask_to_fetch(&askers_job, Some(HOLDER), one_object()))
+        .await;
+    let why = refusal(&capability_answer(&mut third).await).to_owned();
+    assert!(
+        why.contains("which is on"),
+        "a runner asking for a capability against somebody else's job is told whose it is: \
+         {why}"
+    );
+    assert!(
+        !why.contains("does not hold pack"),
+        "and told that before the hub has looked up who holds what: {why}"
+    );
+    third.through_a_health_report().await;
+
+    // 3. The **push** direction, which is the step after this one. Named,
+    //    because the asker can act on the name: it is the difference between
+    //    "ask again" and "this fleet cannot move this pack to this machine".
+    asker
+        .say(ToHub::AskTransferCapability(
+            herd_proto::AskTransferCapability {
+                job_id: askers_job.clone(),
+                pack: the_pack(),
+                peer: Some(HOLDER.to_owned()),
+                direction: herd_proto::TransferDirection::Push,
+                objects: one_object(),
+            },
+        ))
+        .await;
+    let why = refusal(&capability_answer(&mut asker).await).to_owned();
+    assert!(
+        why.contains("authorises a fetch and not a push"),
+        "the push path is refused by name and not by silence: {why}"
+    );
+    asker.through_a_health_report().await;
+
+    // 4. `peer: None` — "name me somebody who can dial me" — the same case
+    //    said the other way round, and refused by the same sentence.
+    asker
+        .say(an_ask_to_fetch(&askers_job, None, one_object()))
+        .await;
+    let why = refusal(&capability_answer(&mut asker).await).to_owned();
+    assert!(
+        why.contains("that could dial it"),
+        "an asker that cannot dial anybody is told the push path is the step after this one: \
+         {why}"
+    );
+    asker.through_a_health_report().await;
+
+    // 5. A capability against **itself**, which is a runner that should have
+    //    laid the pack out of its own store and dialled nobody.
+    asker
+        .say(an_ask_to_fetch(&askers_job, Some(ASKER), one_object()))
+        .await;
+    let why = refusal(&capability_answer(&mut asker).await).to_owned();
+    assert!(
+        why.contains("against itself"),
+        "a runner asking to fetch from itself is told so: {why}"
+    );
+    asker.through_a_health_report().await;
+
+    // And the holder was told to expect **none** of them: a hub that pushed
+    // an `ExpectTransfer` for a transfer it then refused would be filling a
+    // holder's capability table with authority nobody holds.
+    holder
+        .say(ToHub::AskPack(herd_proto::AskPack {
+            job_id: askers_job,
+            commit: COMMIT.to_owned(),
+            key: KEY.to_owned(),
+        }))
+        .await;
+    let mut seen = Vec::new();
+    let deadline = tokio::time::Instant::now() + PATIENCE;
+    loop {
+        let frame = tokio::time::timeout_at(deadline, holder.next())
+            .await
+            .expect("the hub answers the holder inside the suite's patience")
+            .expect("the holder's link stays up");
+        let done = matches!(frame, FromHub::PackHolders(_) | FromHub::PackRefused(_));
+        seen.push(frame);
+        if done {
+            break;
+        }
+    }
+    assert!(
+        !seen
+            .iter()
+            .any(|frame| matches!(frame, FromHub::ExpectTransfer(_))),
+        "no refused transfer reached the holder as something to expect: {seen:?}"
+    );
+}
+
+/// **An outbound-only holder, and a holder that has gone** — the two states
+/// that are not a defect and not a silence (D10, invariant 3).
+///
+/// A runner that listens on nothing is the case the whole push path exists
+/// for: its host has no address invariant 3 permits it to serve content from,
+/// so it holds the pack and cannot be dialled. A hub that answered that with
+/// a capability carrying no address would be handing out an authorisation its
+/// holder could not act on; a hub that answered with nothing would be D150
+/// again. It says which of the two it is.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_outbound_only_holder_and_a_holder_that_has_gone_are_each_said() {
+    let harness = Harness::with_hub().await;
+    // The holder advertises **no** mesh address, which is the wire's way of
+    // saying outbound-only.
+    let (holder, mut asker, askers_job) = a_holder_and_an_asker(&harness, None).await;
+
+    asker
+        .say(an_ask_to_fetch(&askers_job, Some(HOLDER), one_object()))
+        .await;
+    let why = refusal(&capability_answer(&mut asker).await).to_owned();
+    assert!(
+        why.contains("outbound-only"),
+        "a holder that listens on nothing is named as such: {why}"
+    );
+    assert!(
+        why.contains("pushed by it instead"),
+        "and the asker is told which path would move the bytes: {why}"
+    );
+    asker.through_a_health_report().await;
+
+    // **And the holder goes.** Its holding goes with it — holdings are
+    // volatile by design — so what the asker is told is that nobody holds
+    // the pack, which is a true statement about the fleet and not a token
+    // against a machine that is not there.
+    drop(holder);
+    let deadline = tokio::time::Instant::now() + PATIENCE;
+    loop {
+        asker
+            .say(an_ask_to_fetch(&askers_job, Some(HOLDER), one_object()))
+            .await;
+        let why = refusal(&capability_answer(&mut asker).await).to_owned();
+        if why.contains("does not hold pack") {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the hub went on naming a holder that had gone: {why}"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    asker.through_a_health_report().await;
+}
+
+/// **A pack with no holder is a named state a job waits on, and never a
+/// `Refused`** (M12 clause 2, D13, D257).
+///
+/// The one state this build could reach and say nothing about: the key
+/// **resolves**, so none of the sentences beside it applies — there is a
+/// manifest on the volume, an id, a `(commit, key)` — and there is nowhere to
+/// fetch the bytes from. Before this, such a job was **assigned** with an
+/// empty holder list, and what an operator saw was a runner handed work it
+/// could not get its inputs for.
+///
+/// Through a socket rather than in process, because what is asserted is the
+/// hub's own word to a requester and the absence of a frame to the runner.
+/// The holder list is emptied the way reality empties it — the runner says it
+/// holds none — which is also what makes the state `no_holder` and not "nobody
+/// has said": this fleet has spoken, and it does not have this pack.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_job_needing_a_pack_no_runner_holds_waits_by_name_and_is_not_assigned() {
+    let harness = Harness::with_hub().await;
+    let token = harness.approve(RUNNER);
+    let mut runner = Peer::runner(&harness.hub_url, RUNNER, &token, "the-only-life").await;
+    a_pack_this_runner_holds(&harness, &mut runner).await;
+
+    // And now it does not. An empty announcement is the only thing in the
+    // frame set that retracts a holding, and it is a statement and not a
+    // silence: this runner has said what it holds, and it holds none of this.
+    runner.announces(Vec::new(), false).await;
+
+    let mut requester = Requester::joining(&harness.hub_url).await;
+    let job_id = requester
+        .submits(vec![KEY.to_owned()], Default::default())
+        .await;
+
+    // The hub's own sentence, read where a requester reads it. The pack's id
+    // is in it, which is what distinguishes this state from "nothing is
+    // registered": there *is* a pack, and nobody has it.
+    let note = requester.note_saying("it has no holder").await;
+    assert!(
+        note.contains(&the_pack().as_str().to_owned()),
+        "the sentence names the pack, so the state is not 'nothing registered': {note}"
+    );
+    assert!(
+        note.contains(COMMIT) && note.contains(KEY),
+        "and the commit and the key, because 'a pack is missing' is not actionable: {note}"
+    );
+    assert!(
+        note.contains("this job is queued and has not started"),
+        "it is a wait and not a verdict: {note}"
+    );
+    assert!(
+        note.contains("named state and not a refusal"),
+        "and it says so, because this must not cost a requester its link (D13): {note}"
+    );
+
+    // The runner was handed nothing, and nobody's link was closed. Read after
+    // the note, so this is not a race with a dispatch that had not happened:
+    // the hub had already walked this job in a pass and said why it stayed.
+    runner.health().await;
+    let seen = runner.through_a_health_report().await;
+    assert!(
+        !seen
+            .iter()
+            .any(|frame| matches!(frame, FromHub::AssignJob { .. })),
+        "a job whose pack has no holder is not handed to a runner: {seen:?}"
+    );
+    assert!(
+        !seen
+            .iter()
+            .any(|frame| matches!(frame, FromHub::Refused { .. })),
+        "and nobody's link is closed over it (D13): {seen:?}"
+    );
+
+    // **And the announcement itself places it** — the same job, no
+    // resubmission and no requeue, which is what makes this a wait rather
+    // than an ending.
+    //
+    // **One frame and nothing else, which is the assertion.** An
+    // announcement that changes what this hub knows judges the queue at
+    // once: nothing here submits a second job, sends a health report or
+    // waits on a clock between the frame and the assignment, so the frame is
+    // the only thing that could have caused it. That is worth asserting this
+    // precisely because the alternative was measured: before the hub judged
+    // the queue here, `ToHub::PacksHeld` woke no pass and a health report
+    // woke one only when it had ended a ceiling correction (D182), so what
+    // placed this job was `let_the_queue_age` — up to a minute of a machine
+    // standing idle holding the very bytes the job was waiting for, and
+    // longer than this suite's patience.
+    //
+    // Sent with `say` rather than through the `announces` helper, because
+    // that helper reads every frame up to the answer to its own health
+    // report and the assignment this provokes is one of those frames.
+    runner
+        .say(ToHub::PacksHeld(PacksHeld {
+            packs: vec![the_pack()],
+            more: false,
+        }))
+        .await;
+    let (packs_in, _) = assignment_for(&mut runner, &job_id).await;
+    assert_eq!(
+        packs_in.len(),
+        1,
+        "the job that waited is assigned once the pack has a holder again: {packs_in:?}"
+    );
+    assert_eq!(
+        packs_in[0]
+            .holders
+            .iter()
+            .map(|holder| holder.runner.as_str())
+            .collect::<Vec<_>>(),
+        vec![RUNNER],
+        "with the holder on it, which is the whole of what it was waiting for"
     );
 }

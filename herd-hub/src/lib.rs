@@ -41,7 +41,7 @@ pub use server::{
     LOST_AFTER, MAX_FRAME_BYTES, READING_CAP, REQUEUE_BUDGET, STOP_WITHIN, WAIT_RESTATEMENT,
 };
 pub use status::{
-    status_path, AwayNow, CapabilityNow, HubNow, Lends, QueuedNow, RunnerNow, RunningNow, Status,
-    STATUS_FILE, STATUS_VERSION,
+    status_path, AwayNow, CapabilityNow, HubNow, Lends, PackNow, PacksNow, QueuedNow, RunnerNow,
+    RunningNow, Status, STATUS_FILE, STATUS_VERSION,
 };
 pub use store::{JobDirStore, LAYOUT_VERSION};
