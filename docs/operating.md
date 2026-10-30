@@ -151,6 +151,21 @@ Per class it prints how many records are past that span, what they
 weigh, the oldest and the newest of them, and the clock reading every
 figure was judged against.
 
+It then answers the **output budget's** question off the same walk:
+what a sweep would take, and in which order. A sweep frees the
+collected bytes under `files/` and leaves the record standing, so the
+two figures are different and are never summed. **You are not asked
+for your budget**: the block prints the sweep's own order with a
+running total of what is freed by the time each collection is gone, so
+you read down that column until it reaches your held bytes minus your
+budget — and the budget you are thinking of moving to is answered by
+the same column. It also names the bytes a sweep counts and **cannot**
+free, one line each with the reason, which is the figure that explains
+a hub that stays over its budget. The sweep's first key is
+`--output-floor`, which this tool is not given either: under a floor of
+`F`, every candidate younger than `F` moves to the end of the printed
+list and keeps that order among themselves.
+
 It **refuses**, prints no per-class figures at all and exits non-zero,
 in two cases. Neither is a threshold anybody tuned:
 
