@@ -587,22 +587,17 @@ async fn main() -> Result<()> {
     // bad data root is — not corrected, not narrowed, and never discovered by
     // a peer finding a port where there should be none.
     //
-    // Nothing is bound: this version holds the rule and no endpoint. The one
-    // socket type a runner may ever hold is `mesh::MeshListener`, named in
-    // that module and nowhere else in the crate, and the step that binds it
-    // comes next.
-    //
-    // The accepted address is printed and not yet carried into `Config`:
-    // that type is in `herd-runner/src/lib.rs`, which another task held on
-    // the night this landed, and the endpoint step is where a runner starts
-    // needing it. So what this version promises is the refusal, which is the
-    // part that cannot be added after a port is open.
-    match (&args.mesh_listen, &args.mesh_advertise) {
+    // The accepted address is carried into `Config`, where
+    // `endpoint::serve_while` binds it — through `mesh::MeshListener` and
+    // nowhere else, which is the one module of this crate the confinement
+    // guard permits to name a listener.
+    let mesh = match (&args.mesh_listen, &args.mesh_advertise) {
         (Some(listen), advertise) => {
             let mesh =
                 mesh::Mesh::resolve(listen, advertise.as_deref(), &mesh::HostRouting::read())
                     .map_err(|refused| anyhow::anyhow!("{refused}"))?;
             println!("herd-runner: {}", mesh.said());
+            Some(mesh)
         }
         (None, Some(advertise)) => anyhow::bail!(
             "{} {advertise} was given with no {}: an address peers are told to dial, with \
@@ -620,8 +615,9 @@ async fn main() -> Result<()> {
                  nothing to a peer and listens on nothing ({} sets one)",
                 mesh::LISTEN_FLAG
             );
+            None
         }
-    }
+    };
 
     // How big this host is. Read from the host, then overridden by whatever
     // its owner said — one figure at a time, so an owner who declares the
@@ -797,6 +793,7 @@ async fn main() -> Result<()> {
         preference: args.preference.unwrap_or(0),
         switch_file: Some(switch_file),
         switch_poll: Duration::from_millis(args.switch_poll.unwrap_or(DEFAULT_POLL_MS)),
+        mesh,
         // Not options: the window and the bound on waiting for it are Herd's
         // own figures, and an owner has no way to know what to set them to
         // (D158). They exist on `Config` for the tests that have to exceed
