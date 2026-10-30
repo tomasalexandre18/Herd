@@ -1,8 +1,7 @@
 # Status — 2026-10-30
 
 State now, replaced every session. **What is owed and what Alexa has not
-decided lives in `docs/orchestration/board.md`** (invariant 8). **The first
-consumer operates the running system** (D161, invariant 9). Ours is a tag.
+decided is in `board.md`** (invariant 8); **we ship, they operate** (D161).
 
 ## How a change reaches `main`
 
@@ -10,8 +9,9 @@ consumer operates the running system** (D161, invariant 9). Ours is a tag.
 and both are read before this file: **no pull request** (**D189**), one batch
 and one `--no-ff` landing per push on a green `./scripts/gate.sh` for the
 merge's **second parent with an identical tree**, **branch protection that
-does not bind us** (**D203**), **GitHub as storage**, and **the skip list
-deciding, never the count** (**D187**, **D236**).
+does not bind us** (**D203**), **GitHub as storage**, **the skip list
+deciding, never the count** (**D187**, **D236**), and **every build, suite
+and gate submitted to our own Herd, never a bare `herdctl`** (**D258**).
 
 ## Releases, and what v1.0.0 will mean
 
@@ -25,18 +25,16 @@ are a file in the tree (ORCH-162); **writing and publishing stay Alexa's**
 from** — **E-50 withdrawn** (their fleet needs KVM, so native Linux, never
 Windows) and **E-49 waived** with a re-enrolment measurement that is **not**
 E-49, on their own condition that **both are named in the notes as not met**.
-ORCH-210 is closed; **D206 is overtaken, not reversed**. **All three
-versions have moved** — `PROTOCOL_VERSION` **3**, `RECORD_VERSION` **2**,
-`LAYOUT_VERSION` **2** — with no migration path, the last two destroying a
-root. **D199 is moot** (**D243**) and **ORCH-156 is caduque**.
+**All three versions have moved** — `PROTOCOL_VERSION` **3**,
+`RECORD_VERSION` **2**, `LAYOUT_VERSION` **2** — with no migration path, the
+last two destroying a root. **D199 is moot** (**D243**), **ORCH-156 caduque**.
 
 ## What is known about the consumer's machines, and when
 
-Nobody here logs into their hosts (D161); a fact reaches us as a dated
-report. **The orchestrator opens that exchange on its own** (**D249**), by
-`SendMessage` and never a GitHub issue; invariant 9, D161 and the notes
-stand, and the route reports nothing back. **Their hub and runner are up
-since 20:23 on 2026-10-29**, so the ceiling is **two** heavy agents.
+Nobody here logs into their hosts (D161); a fact reaches us as a dated report.
+**Their hub and runner are up since 20:23 on 2026-10-29**, so the ceiling is
+**two** heavy agents. **The orchestrator opens that exchange on its own**
+(**D249**), by `SendMessage`, never a GitHub issue, and nothing reports back.
 
 - **The 37.6 GiB kept for nothing is fixed in the code and still on their
   disk** (**D221**, ORCH-205): **freed by the release, not the merge**, and
@@ -69,8 +67,10 @@ paths in order and **reporting which one** (**D223**, **D233**, **D240**,
 **D241**).
 
 **The runner has a mesh-address rule and binds nothing by default** (**D222**);
-**every `--help` figure reads back through its own constant** (**D245**);
-and **skips per host** (D27): **12** runtime, **14** loaded, **38** ignored.
+**every `--help` figure reads back through its own constant** (**D245**); **an
+`EBUSY` enabling a controller is read, never guessed** (**D259**); and **skips
+per host** (D27): **12** runtime, **14** loaded, **38** ignored — the twelve
+need a delegated scope that carries its own `MemoryMax` (**D260**).
 
 ## What the software still does not do
 
