@@ -321,43 +321,6 @@ fn refusal(frame: &FromHub) -> &str {
     }
 }
 
-/// **`FromHub::ReadPacksAgain` reaches a runner, which nothing in the tree
-/// constructed until now** — and it is what makes D231 decision 5 a behaviour
-/// rather than a design.
-///
-/// Holdings are volatile by choice: in memory, per manifest, so there is no
-/// holdings file to go stale and a restarted hub offers no holder that is no
-/// longer there. The cost of that choice is that the hub has to **ask**, and
-/// a hub that never asks keeps an empty holdings map for ever however many
-/// runners are connected — which is exactly what `main` did.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_runner_is_asked_for_its_holdings_the_moment_it_joins() {
-    let harness = Harness::with_hub().await;
-    let token = harness.approve(RUNNER);
-    let mut runner = Peer::runner(&harness.hub_url, RUNNER, &token, "the-first-life").await;
-
-    let seen = runner.through_a_health_report().await;
-    let asked = seen
-        .iter()
-        .find_map(|frame| match frame {
-            FromHub::ReadPacksAgain(ask) => Some(ask),
-            _ => None,
-        })
-        .unwrap_or_else(|| panic!("the hub must ask a joining runner what it holds: {seen:?}"));
-    assert!(
-        asked.why.contains("packs_held"),
-        "and the ask names the frame it wants back, because a runner's owner reads this \
-         sentence: {:?}",
-        asked.why
-    );
-    assert!(
-        asked.why.contains("if you hold none"),
-        "and it says that an empty announcement is an answer, which is the one reading that \
-         cannot be inferred from the frame: {:?}",
-        asked.why
-    );
-}
-
 /// **An announcement replaces; `more: true` accumulates; and an empty one
 /// means "I hold none".**
 ///

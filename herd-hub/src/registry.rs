@@ -71,15 +71,14 @@
 //! measured the gap as two mechanisms plus a seam: nothing announced, nothing
 //! forgot, and `server.rs` could not reach this registry at all because it
 //! holds an `Arc<dyn JobStore>` while `packs()` was on the concrete
-//! `JobDirStore`. All three are now written (ORCH-230):
+//! `JobDirStore`. The seam and the two mechanisms below are now written
+//! (ORCH-230); **the hub's own ask is not**, and `server.rs` carries the
+//! measurement that stopped it:
 //!
 //! * **The seam.** `JobStore::packs()` answers `Option<&PackRegistry>` with a
 //!   default body of `None`, so the hub's loop reaches a registry through the
 //!   only form it ever holds a store in, and no implementor or test double
 //!   had to move.
-//! * **The ask.** The hub sends `FromHub::ReadPacksAgain` to every runner
-//!   immediately after `Welcome` — it cannot tell its own restart from a
-//!   runner's first join, and the answer is the same frame either way.
 //! * **The announcement.** `ToHub::PacksHeld` reaches
 //!   [`PackRegistry::announced`] with the replace semantics the frame
 //!   defines, carrying the endpoint the handshake advertised, which the hub
@@ -88,17 +87,27 @@
 //!   `release_runner` on a closed link and the watchdog's silent-link loop —
 //!   call [`PackRegistry::runner_gone`].
 //!
-//! **What is still owed is the runner's half.** A runner does not yet answer
-//! `ReadPacksAgain` or construct `ToHub::PacksHeld` of its own accord
-//! (`herd-runner/src/` was not this step's to change), so against today's
-//! runner binary the hub asks and hears nothing. So D231 decision 5 is a
-//! behaviour of the **hub** and still a design of the **fleet**: everything
-//! above is measured through a socket in `herd-hub/tests/pack_frames.rs`
-//! against a hand-driven peer, and nothing is measured against the real
-//! runner. [`PackRegistry::forget_all_holdings`] likewise still has no
+//! **What is still owed is the asking, on both sides**, and that is why D231
+//! decision 5 is not yet true:
+//!
+//! * the **hub** does not send `FromHub::ReadPacksAgain`. It was written
+//!   after `Welcome`, where it belongs, and removed: it is a frame-ordering
+//!   change that reddened seven tests in `herd-hub/tests/link.rs` and
+//!   `versions.rs`, six of which are about admission, cadence, twins and
+//!   verdicts. The frame is still constructed nowhere in the tree. The
+//!   comment at that spot in `server.rs` carries the figures;
+//! * the **runner** neither answers that frame nor constructs
+//!   `ToHub::PacksHeld` of its own accord (`herd-runner/src/` was not this
+//!   step's to change).
+//!
+//! So an announcement only ever arrives unprompted, and today's runner sends
+//! none. What *is* proved is that a hub told about a holding records it, and
+//! forgets it when the link goes: measured through a socket in
+//! `herd-hub/tests/pack_frames.rs` against a hand-driven peer, and against
+//! no real runner. [`PackRegistry::forget_all_holdings`] likewise has no
 //! caller outside this module's tests: a fresh registry starts empty, so the
 //! restart case it exists for is covered by [`PackRegistry::open`], and the
-//! fleet-wide re-ask it is really for is the runner half above.
+//! fleet-wide re-ask it is really for needs the ask above to exist first.
 //!
 //! [`herd_proto::pack::PackState::Incomplete`] is therefore **not the hub's to
 //! compute**, and [`PackRegistry::state_of`] never returns it: holdings are per
@@ -826,15 +835,13 @@ impl PackRegistry {
     /// Forget every holding, because this hub is starting again or has asked
     /// the fleet to re-announce (`FromHub::ReadPacksAgain`).
     ///
-    /// **Still no caller outside this module's tests**, and that is now the
-    /// only part of the holdings mechanism that has none. The hub does
-    /// construct `FromHub::ReadPacksAgain` — it sends one to every runner
-    /// after `Welcome` — but it has nothing to clear at that moment: a fresh
-    /// `PackRegistry` starts with an empty holdings map, and a rejoining
-    /// runner's previous holding was already dropped by
-    /// [`Self::runner_gone`]. What this method is really for is a
-    /// **fleet-wide** re-ask, which belongs with the runner half D231
-    /// decision 5 still owes. See the module note.
+    /// **No caller outside this module's tests, and nothing constructs that
+    /// frame.** A fresh `PackRegistry` starts with an empty holdings map, and
+    /// a rejoining runner's previous holding was already dropped by
+    /// [`Self::runner_gone`], so the restart case is covered without this.
+    /// What it is really for is a **fleet-wide** re-ask, which needs the hub
+    /// to send `ReadPacksAgain` at all — withdrawn on a measurement, see the
+    /// module note and `server.rs` at the welcome.
     pub fn forget_all_holdings(&self) {
         self.locked().holdings.clear();
     }

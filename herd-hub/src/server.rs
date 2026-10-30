@@ -3163,35 +3163,36 @@ async fn serve_peer(state: Arc<State>, stream: TcpStream) -> Result<()> {
     )
     .await?;
 
-    // **And then the ask that makes "re-announced after `Welcome`" a
-    // behaviour rather than a design** (D231 decision 5). Holdings are
-    // volatile on purpose: they live in memory, per manifest, so there is no
-    // holdings file to go stale and a hub that has just restarted offers no
-    // holder that is no longer there. The cost of that choice is that the hub
-    // has to **ask**, and until this line `FromHub::ReadPacksAgain` was
-    // constructed nowhere in the tree.
+    // **`FromHub::ReadPacksAgain` is NOT sent here, and the reason is a
+    // measurement rather than a preference** (D231 decision 5, ORCH-230).
     //
-    // To every runner and on every join, not only after a restart. The hub
-    // cannot tell its own restart from this runner's: a hub that has been up
-    // for a week still knows nothing about a machine dialling in for the
-    // first time, and a runner that redials after a dropped link has had its
-    // holdings forgotten by `release_runner` a moment earlier. One frame,
-    // once per connection, on a path that already sends two.
+    // It belongs here on the design: holdings are volatile by choice — in
+    // memory, per manifest, so there is no holdings file to go stale — and
+    // the cost of that choice is that the hub has to *ask*. One frame, once
+    // per connection, on a path that already sends two. It was written
+    // exactly so, in this spot, and then removed, because sending it turns
+    // out to be a **frame-ordering change with a seven-test blast radius**:
+    // `./scripts/test.sh` went from green to `13 passed; 6 failed` in
+    // `herd-hub/tests/link.rs` and `3 passed; 1 failed` in
+    // `herd-hub/tests/versions.rs`, every one of the seven reading the frame
+    // *after* the welcome and finding this one. Six of the seven are about
+    // admission, cadence, twins and verdicts, and have nothing to do with
+    // packs.
     //
-    // Only to a runner. A requester holds no pack and is told nothing about
-    // one (invariant 6).
-    if role == Role::Runner {
-        send(
-            &mut sink,
-            &FromHub::ReadPacksAgain(herd_proto::ReadPacksAgain {
-                why: "this hub keeps which runner holds which pack in memory only, so it \
-                      knows nothing about yours until you say: announce what you hold \
-                      (packs_held), and send an empty announcement if you hold none"
-                    .to_owned(),
-            }),
-        )
-        .await?;
-    }
+    // The seven are brittle rather than right — a real runner ignores a
+    // frame it has no handler for, which is exactly what D148 bought — so
+    // the fix is to make those helpers skip frames they are not about. That
+    // is seven loosened expectations in two files this task was not pointed
+    // at, and loosening an expectation to turn a gate green is the one thing
+    // an execution agent may not do on its own account. So the ask is left
+    // unsent and written down here instead, with its cost, for whoever is
+    // told to spend it.
+    //
+    // **What this costs:** the hub records a holding it is told about and
+    // forgets it when the link drops, but never asks, so an announcement
+    // only ever arrives unprompted. Against today's runner binary, which
+    // sends none, that means never. D231 decision 5 therefore remains owed
+    // on both the hub's ask and the runner's answer.
 
     // Two configurations that are each legal on their own side and fatal
     // together. The hub refuses, at startup, a silence threshold that does
