@@ -763,6 +763,22 @@ pub struct Session {
     /// the fetch it was minted for would then be refused by the one party
     /// that was told to expect it.
     granted: endpoint::Granted,
+    /// What this runner's handshake says it serves pack content on
+    /// (`ToHub::Hello`'s `mesh_endpoint`, invariant 3, D10, D11).
+    ///
+    /// Here for the capacity's reason and one of its own. It is true of the
+    /// *runner*: the endpoint is bound once, beside the redial loop, and
+    /// outlives every connection — so a value held by a connection would be
+    /// lost on a redial and the runner would stop being a holder for no
+    /// reason anybody could see.
+    ///
+    /// And it is the one field of the handshake that is **not known when the
+    /// handshake is built**. `--mesh-listen 127.0.0.1` means port `0` and the
+    /// kernel picks it at bind time, in [`endpoint::serve_while`], which runs
+    /// beside this dial rather than inside it. The protocol carries no frame
+    /// that revises a mesh endpoint later (invariant 4), so the dial
+    /// **waits** for the bind: [`endpoint::Advertised::settled`].
+    advertised: endpoint::Advertised,
 }
 
 /// One attempt's collection waiting on this runner's disk for the hub
@@ -1414,6 +1430,17 @@ impl Session {
     /// [`endpoint::Granted::pushed_by_hub`] is named for it.
     pub fn granted(&self) -> &endpoint::Granted {
         &self.granted
+    }
+
+    /// What this runner's handshake advertises as its mesh endpoint
+    /// (invariant 3, D10, D11).
+    ///
+    /// Written by [`endpoint::serve_while`] and by nothing else — it is the
+    /// step that binds, and the port is only knowable there — and read by
+    /// [`serve_once`] when it builds the hello. See [`Session::advertised`]'s
+    /// field for why the dial waits on it.
+    pub fn advertised(&self) -> &endpoint::Advertised {
+        &self.advertised
     }
 
     /// Tell the hub what every probe says, as one snapshot.
@@ -3874,6 +3901,10 @@ pub async fn run_until(config: Config, stop: impl Future<Output = String>) -> Re
                 mesh,
                 store,
                 session.granted().clone(),
+                // Where the bound address goes, and the one thing the first
+                // dial below waits for. The endpoint is the step that binds,
+                // so it is the step that knows the port.
+                session.advertised().clone(),
                 // `Runner::serves_content` and not a second reading of the
                 // switch: `off` and draining are already read there (E-33,
                 // D11's third condition).
@@ -3887,6 +3918,13 @@ pub async fn run_until(config: Config, stop: impl Future<Output = String>) -> Re
                 },
             ))),
             Err(why) => {
+                // No endpoint task at all on this path, so **this** is where
+                // the advertisement settles. Without it the first dial below
+                // would wait on a bind nobody is going to attempt, and a
+                // runner whose pack store will not open would never say
+                // hello — a directory would have cost its owner the whole
+                // machine.
+                session.advertised().say(endpoint::Advertisement::Nothing);
                 // Said and not fatal. A runner whose pack store will not open
                 // cannot serve a pack and cannot ingest one, and both of
                 // those are refusals this runner makes by name when they are
@@ -3901,6 +3939,29 @@ pub async fn run_until(config: Config, stop: impl Future<Output = String>) -> Re
             }
         }
     };
+    // **The bind, before the first dial.** The endpoint above is the one step
+    // that knows what it bound — `--mesh-listen 127.0.0.1` means port `0` and
+    // the kernel picks it there — and the handshake has one field for it and
+    // no frame that revises it afterwards (invariant 4). So the dial waits
+    // here, once, and every connection after this one reads a value that is
+    // already settled.
+    //
+    // It is a wait on a bind and not a timeout: an outbound-only runner, a
+    // runner started switched `off` and a runner whose bind failed each
+    // settle on "nothing to advertise" immediately, which is why this cannot
+    // be the place a runner hangs. What a wait buys is that every spelling of
+    // the flag works: `--mesh-listen 10.9.0.3:7711` would have been knowable
+    // without it, and `--mesh-listen 127.0.0.1` never would.
+    let advertising = session.advertised().settled().await;
+    eprintln!(
+        "herd-runner: this runner's handshake will say it serves pack content {}",
+        match &advertising {
+            Some(at) => format!("at {at}"),
+            None => "nowhere: it is outbound-only, so the hub refuses it as a holder by name \
+                     and the bytes of a pack it holds have to be pushed (D10, invariant 3)"
+                .to_owned(),
+        }
+    );
     let stop_probing = probing.abort_handle();
     let serving = serve_forever(config.clone(), session.clone(), Arc::clone(&confined));
     // A `drain` position is "finish and leave" (E-33), and this is the leaving
@@ -4399,11 +4460,33 @@ pub async fn serve_once(config: Config, session: Session, confined: Arc<Confined
         // The load as this runner dials, so that a job placed before the
         // first health report still has a figure on its line (E-32).
         load_milli: crate::metrics::host_load_milli(),
-        // `None` until this runner has a mesh address to advertise, which is
-        // S4's work (the two flags and both invariant-3 guards). Absent is
-        // the outbound-only runner, and that is exactly what this build is:
-        // it serves no pack content to anybody.
-        mesh_endpoint: None,
+        // And where peers may fetch a pack's objects off this machine, when
+        // anywhere (invariant 3, D10, D11).
+        //
+        // **Read here and waited for elsewhere, and that split is the whole
+        // design of this field.** With `--mesh-listen 127.0.0.1` the port is
+        // `0` and the kernel picks it at bind time, in the endpoint task
+        // started beside the redial loop — so on a cold start the address is
+        // not known when a hello is built. The protocol has no frame that
+        // revises a mesh endpoint later (invariant 4), so a hello that
+        // guessed would be uncorrectable for the life of the link: the hub
+        // would mint capabilities against a port nothing holds, and every
+        // peer sent there would be refused for a reason nobody could see.
+        //
+        // So [`run_until`] awaits the bind **before the first dial** and this
+        // only reads what settled. It is deliberately not an await: this
+        // function is also the whole runner for a good part of this
+        // workspace's test suite, started against a hub with no endpoint task
+        // beside it at all, and a hello that waited would be a hello that
+        // never left.
+        //
+        // A reconnect costs nothing and rebinds nothing: the endpoint is
+        // bound once and outlives every connection, so this reads the value
+        // the link before it announced. `None` is the outbound-only runner —
+        // no `--mesh-listen`, a bind that failed, or an owner's switch that
+        // says this machine serves nothing — and it is absent on the wire,
+        // which is what makes the hub refuse this runner as a holder by name.
+        mesh_endpoint: session.advertised().now().on_the_wire(),
     };
     sink.send(Message::text(to_frame(&hello).context("encoding hello")?))
         .await
