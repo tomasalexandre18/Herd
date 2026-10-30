@@ -813,3 +813,40 @@ to touch (D161).
     and the disk's free space are in the merge message and the merger's
     report, not here, because this item is committed before the gate
     runs (ORCH-121).
+
+19. **A dry run that answers for the dispatch, and a pack budget that is
+    actually spent** — batch 23, two branches, one landing, no conflict.
+    `m12-l3-would-run-locality` makes `would-run` consult `packs_for` so
+    E-07 stops promising a start to a job the registry cannot serve
+    (**D261**); `m12-p4-runner-custody` gives
+    `PackStore::evict_to_budget` its first caller,
+    `Session::sweep_packs_to_budget`, run once per connection with the
+    hub's `keeper_for`/`PinPacks` set in force (**D262**, **ORCH-264**
+    `done`). **Two numbers allocated in merge order** — D261 to L3,
+    D262 to P4 — above D260, the highest on `main` **and** on every
+    unlanded branch: all 31 non-ancestor remote refs were read at
+    integration and none holds a D above 260 or an `ORCH` above 273, so
+    no gap was closed and D143, D154 and D170 stay. **Four rows filed**:
+    **ORCH-274** (L3's finding, *Open*) and **ORCH-275**, **-276**,
+    **-277** (P4's three, *Owed*). **D262's heading is the one text not
+    taken verbatim** — the draft put the number before the date and ran
+    to 124 columns — and the reason is in the landing record; its body
+    is byte-for-byte the draft. **Two things this landing states rather
+    than lets be inferred.** `server.rs:3230` still sends
+    `keeper_for: Vec::new()` and no `PinPacks`, so **nothing is pinned
+    in production**: what P4 changes is that the budget is spent at all,
+    and no report may say custody works until P5. And **ORCH-277 exists
+    because a premise given to P4 was wrong** — `Session::pack_store` is
+    not the only caller of `PackStore::open`, there are four, and the
+    method's own doc comment makes the same over-claim; P4 left it alone
+    because its Rust gates were already submitted, which is correct, so
+    the row is what keeps a false doc comment from being lost between
+    batches. **Batch 22's post-push run, re-read by id at this
+    landing:** `ci.yml` run **41070734522** at `8af300e`,
+    `conclusion: success`, status `completed`, 14:18:36Z. This landing's
+    own run is the next landing's to record. **The gate again ran
+    through Herd and not locally** (D258), whole rather than split
+    because `gate.sh` writes its receipt only at its own step 8; its job
+    id, verbatim verdict, skip list, `bytes_written` and gated sha are
+    in the merge message and the merger's report, not here, because this
+    item is committed before the gate runs (ORCH-121).
