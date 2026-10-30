@@ -673,13 +673,28 @@ impl JobDirStore {
     /// disagreement would be either a collection acknowledged before it was
     /// complete — destroying the runner's only copy — or one never
     /// acknowledged, leaving a runner holding bytes for ever.
+    /// **Asked before the join, like every other site that joins a record's
+    /// path onto a directory** (`relative_path`'s "the one check", invariant
+    /// 4). This was the one of nine that skipped it, and it is the one whose
+    /// answer destroys bytes: a record whose path climbs out with `..` would
+    /// be measured against a file *outside* the job's directory, and a
+    /// stranger that happened to be the manifest's length would read as
+    /// whole. `record_outputs` refuses such a path at intake, so this is the
+    /// same check on the way out as on the way in — the record is a file an
+    /// operator may have edited, and a path read off a disk is no more
+    /// trustworthy than one read off a socket.
+    ///
+    /// A path this hub will not write is a file that can never be whole, so
+    /// the collection is never whole either: the runner keeps its copy, which
+    /// is the direction D19 and D221 say to err in. The `&&` is what makes
+    /// the refusal total — nothing outside the collection's directory is so
+    /// much as measured.
     fn collection_is_whole(&self, id: &JobId, record: &JobRecord) -> bool {
         let kept = self.job_dir(id).join(KEPT_FILES_DIR);
-        record
-            .outputs
-            .files
-            .iter()
-            .all(|file| file_length(&kept.join(&file.path)) == Some(file.bytes))
+        record.outputs.files.iter().all(|file| {
+            herd_proto::check_relative(&file.path).is_ok()
+                && file_length(&kept.join(&file.path)) == Some(file.bytes)
+        })
     }
 
     /// What `files/` and `parts/` hold of a collection, **given the record
@@ -2294,6 +2309,39 @@ impl JobStore for JobDirStore {
         if let Err(why) = herd_proto::check_relative(path) {
             return Ok(ChunkLanded::Refused(why));
         }
+        // **No digest, no bytes.** `files/` is a directory of whole, verified
+        // files and nothing else, and an entry whose `sha256` is empty is an
+        // entry nothing can verify: the comparison before the rename would
+        // have nothing to compare against, and every chunk of the file would
+        // be renamed in as though it had been checked. So the bytes are
+        // refused here, by name, before one of them is written — the runner
+        // keeps the only copy it has, which is the direction D19 and D221 say
+        // to err in, and no collection is ever judged whole off bytes this
+        // hub did not check.
+        //
+        // **The refusal, and not a second state meaning "here but not
+        // verified".** A third state would have to be carried on the record,
+        // read by the sweeper, answered to a requester and explained to an
+        // operator — four surfaces, for a shape no herd-runner produces.
+        // Refusing keeps one meaning for `files/` and puts the problem where
+        // somebody can act on it: in the runner's log, naming the file.
+        //
+        // **It cannot be a record from an older build.** `KeptFile::sha256`,
+        // this function and the streamed carriage all arrived in one commit
+        // (`d114f03`, protocol 2), so a record written before the digest
+        // existed has no streamed collection and no chunks to send. What
+        // reaches here is a record somebody edited or a peer that omitted the
+        // `sha256` key — `#[serde(default)]` makes the omission an empty
+        // string — and neither is bytes this hub may call verified.
+        if entry.sha256.is_empty() {
+            return Ok(ChunkLanded::Refused(format!(
+                "{path}: this job's record names it with no sha256, and this hub does not write \
+                 bytes it cannot verify. The {} byte(s) stay with the runner: a manifest entry \
+                 with an empty digest was edited on this hub or sent by a peer that omitted the \
+                 field, so the job has to be run again rather than resent",
+                entry.bytes
+            )));
+        }
         let kept = self.job_dir(id).join(KEPT_FILES_DIR);
         let parts = self.job_dir(id).join(OUTPUT_PARTS_DIR);
         let whole = kept.join(path);
@@ -2337,7 +2385,15 @@ impl JobStore for JobDirStore {
             Ok(digest) => digest,
             Err(error) => return Err(failed("reading back", &part, &error)),
         };
-        if !entry.sha256.is_empty() && real != entry.sha256 {
+        // Unconditional, and that is the change: this read
+        // `!entry.sha256.is_empty() && real != entry.sha256`, so an entry with
+        // no digest made the whole comparison false and the file was renamed
+        // into `files/` unchecked. The empty case is refused above, before a
+        // byte is written, which leaves nothing for an `is_empty()` here to
+        // excuse. Should that guard ever be deleted, this comparison refuses
+        // the empty digest too — the sentence is less useful, but the
+        // arrangement fails closed either way.
+        if real != entry.sha256 {
             // Thrown away rather than kept: the bytes are not the file the
             // verdict promised, and the runner still has the real ones. The
             // sentence names both digests, because "it did not match" with no
@@ -5661,6 +5717,199 @@ mod tests {
         };
         assert!(why.contains("files/surprise.sh"), "{why}");
         assert!(why.contains("manifest"), "{why}");
+    }
+
+    /// **A record whose path climbs out is never judged whole**, and an
+    /// ordinary one still is.
+    ///
+    /// `collection_is_whole` was the one join of a record-supplied path in
+    /// this file that asked `check_relative` nothing, and it is the one whose
+    /// answer destroys bytes: it is what tells a runner its collection has
+    /// landed, and the runner then drops its only copy (D19, D221). An
+    /// escaping path whose target outside the job's directory happens to be
+    /// the manifest's length read as whole.
+    ///
+    /// **The fixture is the argument.** The stranger outside really is there
+    /// and really is the right length — asserted below through the very join
+    /// the guard protects — so without the guard this collection *would* be
+    /// whole. That the answer is `false` anyway is the proof that nothing
+    /// outside the collection's directory was so much as measured.
+    #[test]
+    fn a_record_whose_path_climbs_out_is_never_judged_whole() {
+        // The known-good case first, so a guard that refused everything is
+        // caught here rather than read as a success below. **Its own store**:
+        // two jobs of the same work in one store are one job, because a
+        // submission that joins work already being done mints nothing.
+        let (_honest_dir, honest_store) = make_a_store();
+        let honest = a_job(&honest_store);
+        honest_store
+            .record_outputs(&honest.id, &announced(&[("files/results.json", b"ok")]))
+            .expect("the manifest is recorded");
+        assert_eq!(
+            honest_store
+                .write_output_chunk(&honest.id, "files/results.json", 0, b"ok")
+                .expect("the store answers"),
+            crate::job::ChunkLanded::Complete,
+            "an ordinary relative path still completes"
+        );
+        let whole = honest_store
+            .job(&honest.id)
+            .expect("readable")
+            .expect("a record");
+        assert!(
+            honest_store.collection_is_whole(&honest.id, &whole),
+            "an ordinary relative path at the manifest's length is whole"
+        );
+
+        // And the escaping one. The record is edited on the disk because
+        // `record_outputs` refuses such a path at intake (D131) — which is
+        // exactly the shape this file already says it does not trust: "the
+        // record is a file an operator may have edited, and a path read off a
+        // disk is no more trustworthy than one read off a socket".
+        let (dir, store) = make_a_store();
+        let edited = a_job(&store);
+        store
+            .record_outputs(&edited.id, &announced(&[("files/results.json", b"ok")]))
+            .expect("the manifest is recorded");
+        let mut record = store.job(&edited.id).expect("readable").expect("a record");
+        let loot = b"ten bytes!";
+        record.outputs.files[0].path = "../../../loot.bin".to_owned();
+        record.outputs.files[0].bytes = loot.len() as u64;
+        store
+            .write_record(&record)
+            .expect("the edited record is on the disk");
+        fs::write(dir.path().join("loot.bin"), loot).expect("the stranger outside is written");
+
+        let kept = dir
+            .path()
+            .join(JOBS_DIR)
+            .join(edited.id.as_str())
+            .join(KEPT_FILES_DIR);
+        assert_eq!(
+            file_length(&kept.join(&record.outputs.files[0].path)),
+            Some(loot.len() as u64),
+            "the fixture is real: the unguarded join resolves to a file of exactly the \
+             manifest's length, so an unguarded measurement would have called this whole"
+        );
+        assert!(
+            !store.collection_is_whole(&edited.id, &record),
+            "a path that climbs out of the job's output directory can never be whole, \
+             whatever is out there at the right length"
+        );
+        // So the collection is never acknowledged and the runner goes on
+        // holding the only copy, which is the direction to err in (D19).
+        assert!(
+            store
+                .collection_owed(&edited.id)
+                .expect("owed reads")
+                .is_some(),
+            "a collection that is not whole is still owed"
+        );
+    }
+
+    /// **A manifest entry with no digest is a refusal, not a free pass**, and
+    /// one with a digest still lands.
+    ///
+    /// The comparison before the rename read
+    /// `!entry.sha256.is_empty() && real != entry.sha256`, so a verdict frame
+    /// that omitted the `sha256` key — `#[serde(default)]` makes the omission
+    /// an empty string — short-circuited the whole check, and every chunk of
+    /// that file was renamed into `files/` **unverified**, five lines under a
+    /// comment promising that `files/` holds "whole, verified files and
+    /// nothing else".
+    ///
+    /// The frame is deserialised rather than constructed, because the
+    /// omission is the defect: a peer that leaves the key out is the shape
+    /// that reaches this, and `OutputFile::announced` could not express it
+    /// without saying `String::new()` out loud.
+    #[test]
+    fn a_chunk_whose_record_carries_no_digest_is_refused_and_not_kept() {
+        // The known-good case first: a correct digest still lands, so a
+        // refusal that refused everything is caught here. Its own store, for
+        // the reason the sibling test gives.
+        let (honest_dir, honest_store) = make_a_store();
+        let honest = a_job(&honest_store);
+        honest_store
+            .record_outputs(
+                &honest.id,
+                &announced(&[("files/results.json", b"the truth")]),
+            )
+            .expect("the manifest is recorded");
+        assert_eq!(
+            honest_store
+                .write_output_chunk(&honest.id, "files/results.json", 0, b"the truth")
+                .expect("the store answers"),
+            crate::job::ChunkLanded::Complete,
+            "a chunk whose digest matches its manifest entry still completes"
+        );
+        assert_eq!(
+            fs::read(
+                honest_dir
+                    .path()
+                    .join(JOBS_DIR)
+                    .join(honest.id.as_str())
+                    .join(KEPT_FILES_DIR)
+                    .join("files/results.json")
+            )
+            .expect("the verified file is in files/"),
+            b"the truth".to_vec(),
+        );
+
+        // And the frame with the key left out.
+        let (dir, store) = make_a_store();
+        let silent = a_job(&store);
+        let frame: herd_proto::JobOutputs = serde_json::from_str(
+            r#"{"files":[{"path":"files/results.json","len":9}],"streamed":true}"#,
+        )
+        .expect("a frame that omits the digest is still a frame");
+        assert!(
+            frame.files[0].sha256.is_empty(),
+            "the premise: an omitted sha256 key deserialises to an empty string"
+        );
+        store
+            .record_outputs(&silent.id, &frame)
+            .expect("the manifest is recorded, digest or no digest (D148)");
+        let crate::job::ChunkLanded::Refused(why) = store
+            .write_output_chunk(&silent.id, "files/results.json", 0, b"the truth")
+            .expect("the store answers")
+        else {
+            panic!("bytes nothing can verify must not be written into files/");
+        };
+        assert!(why.contains("files/results.json"), "{why}");
+        assert!(
+            why.contains("no sha256"),
+            "the refusal says what is missing: {why}"
+        );
+        assert!(
+            why.contains("does not write bytes it cannot verify"),
+            "and why that is a refusal: {why}"
+        );
+        let kept = dir
+            .path()
+            .join(JOBS_DIR)
+            .join(silent.id.as_str())
+            .join(KEPT_FILES_DIR);
+        assert!(
+            !kept.join("files/results.json").exists(),
+            "an unverifiable file is never in files/, which is a directory of whole, \
+             verified files and nothing else"
+        );
+        // The entry stays on the record and the collection stays owed:
+        // refusing the bytes is not refusing the entry (D175), and the runner
+        // keeps its only copy (D19).
+        let record = store.job(&silent.id).expect("readable").expect("a record");
+        assert_eq!(
+            record.outputs.files.len(),
+            1,
+            "the manifest outlives the bytes even when the bytes are refused"
+        );
+        assert!(
+            store
+                .collection_owed(&silent.id)
+                .expect("owed reads")
+                .is_some(),
+            "a collection whose bytes were refused is still owed"
+        );
     }
 
     /// An outstanding collection is found by looking, names its runner, and
