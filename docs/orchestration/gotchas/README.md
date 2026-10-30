@@ -23,3 +23,4 @@ versioned source.
 | `build-weight-off-root.md` | 2026-10-24 | `/` filled to 100 % with agent `target/` dirs; preflight before a heavy phase, `CARGO_TARGET_DIR` on `/mnt/ssd_980`, delete it after |
 | `a-decision-branch-cannot-be-all-green.md` | 2026-10-25 | a branch writing a `D-NEXT` entry fails `check-docs.sh` by design; three green gates plus that one note is the deliverable |
 | `a-gate-joined-by-a-semicolon-is-advice.md` | 2026-10-30 | a status you did not look at is a status you did not get: `;` throws a gate's status away and a pipe replaces it with `tail`'s; join with `&&`, and read `${PIPESTATUS[0]}` or do not pipe a gate at all |
+| `a-perl-escape-recodes-the-whole-file.md` | 2026-10-30 | `\x{2013}` in a `perl -i` substitution double-encodes every multibyte character already in the file; use raw bytes under `LC_ALL=C` |
