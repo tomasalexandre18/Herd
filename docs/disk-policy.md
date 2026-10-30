@@ -766,11 +766,18 @@ are read from the tree rather than assumed:
   `[C, store.rs:554]`.
 * **Hard links are transparent to every reader, including an older
   binary**, and `recover` enumerates `jobs/` and nothing else. So
-  `objects/` **must not move `LAYOUT_VERSION`**, which is 1
-  `[C, store.rs:59]`: a version move has no migration path and refuses to
-  open an operator's existing root (ORCH-156), while a downgrade onto a
-  shared root costs a **leak** of orphan blobs that the next upgraded
-  start collects. A leak that self-heals beats a refusal that does not.
+  `objects/` **must not move `LAYOUT_VERSION`**, which is 2
+  `[C, store.rs:99]` since M11's pack half moved it there (D199): a
+  version move has no migration path and refuses to open an operator's
+  existing root (ORCH-156), while a downgrade onto a shared root costs a
+  **leak** of orphan blobs that the next upgraded start collects. A leak
+  that self-heals beats a refusal that does not. **The figure is the
+  layout this work starts from, not a constant of the design** — what
+  the argument needs is that `objects/` adds no move of its own, at
+  whatever number the layout then stands. That the number has just moved
+  once, for the first time ever, does not buy a second move cheaply: it
+  spends the one reset the consumer's volume was ever going to get
+  (D199), so the next move has no budget behind it at all.
 
 **What it does not touch**, each named so it is not discovered later:
 
@@ -1459,7 +1466,7 @@ from the first free id and keep the order.
 | ORCH-168 | **The figure the hub can report itself.** `retention-preview` splits record bytes from output bytes on **both** sides of every span and prints one root-wide total of each. `Seen::record_bytes()` already exists `[C, retention.rs:277-283]`. R16 now gives the figure; this makes the hub give it, which is §0.7's first requirement | herd-step | open | — | `report.rs` (ORCH-166), `store.rs`, any writer |
 | ORCH-169 | **The relay of §6 G**: a second `herd-hub report` reading days after the first, plus one `retention-preview` run. It settles H10 | Alexa | waiting | ORCH-168, so the preview they run carries the split | — |
 | ORCH-170 | **This document.** §0 written, §2.4 retired, §3.3 inverted, `docs/plan.md` M12 and `docs/coverage.md` E-15/E-16 re-pointed | herd-step | done | — | `decisions.md`, `board.md`, code |
-| ORCH-171 | **Deduplication by hard link** (§2.9): `objects/<sha256>`, both write paths linking, a `link()` probe with a plain-write fallback said once, blob collection by `st_nlink` inside the removal act, a bounded `objects/` sweep at startup, the eviction sentence carrying **unlinked** and **freed**, `LAYOUT_VERSION` unchanged at 1 | herd-step | waiting | Decision §6 E; ORCH-170 for the words | `herd-proto`, `herdctl`, `server.rs`, `job.rs` |
+| ORCH-171 | **Deduplication by hard link** (§2.9): `objects/<sha256>`, both write paths linking, a `link()` probe with a plain-write fallback said once, blob collection by `st_nlink` inside the removal act, a bounded `objects/` sweep at startup, the eviction sentence carrying **unlinked** and **freed**, and **this work moves `LAYOUT_VERSION` by nothing** — it must stand, when the work is done, at exactly the number it stood at when the work began, whatever that number is (2 at the time of writing, `[C, store.rs:99]`). Read it as the requirement and not as the figure: the figure is `main`'s and moves without asking ORCH-171, and a criterion written as *"unchanged at 1"* was already unsatisfiable once | herd-step | waiting | Decision §6 E; ORCH-170 for the words | `herd-proto`, `herdctl`, `server.rs`, `job.rs` |
 | ORCH-172 | **The budget starts meaning disk bytes**: `directory_bytes`/`held` count a shared blob once, the sweeper measures progress in bytes actually freed, **eviction by blob** with a blob as protected as its most protected claimant, and **no candidate destroyed that frees nothing** | herd-step | owed | ORCH-171 | `herd-proto`, the record's fields |
 | ORCH-095 | *(existing, Alexa's yes)* The free-space guard. **Promoted**: it is now the prerequisite of record removal, not a neighbour, and its figure for their disk is R18's 15 % | herd-step | waiting | Decision §6 B; ORCH-172 | retention, records |
 | ORCH-173 | **Record removal under space pressure** — rung 4 (§3.3.1). One act, tombstone then bytes then directory, taking the sweeper's existing one-at-a-time guard, updating `index.jobs_accounted` in the same act, reusing `retention::select` for the guard test and D197's refusals, and taking a protected-id set from its first line of code. Restates ORCH-098's space half and folds ORCH-102 | herd-step | owed | ORCH-095 | `herd-proto`, `matcher.rs`, `queue.rs`, `herdctl` |

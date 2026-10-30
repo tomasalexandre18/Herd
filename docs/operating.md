@@ -557,13 +557,21 @@ bytes their manifests still name. Non-zero there is not a defect.
 Read this one before you need it.
 
 Three version numbers travel with a Herd build, and the release body
-prints the two that matter on lines a script can match:
+prints **all three** on lines a script can match. Each number below is
+read out of the constant that declares it, which is where to re-derive
+it rather than trusting this table:
 
-| Number | What it governs | Today |
-| --- | --- | --- |
-| `PROTOCOL_VERSION` | whether two builds can talk | **2** |
-| `RECORD_VERSION` | the shape of every `job.json` in the root | **1** |
-| `LAYOUT_VERSION` | the shape of the root itself | **1** |
+| Number | What it governs | On `main` | Declared at |
+| --- | --- | --- | --- |
+| `PROTOCOL_VERSION` | whether two builds can talk | **3** | `pub const PROTOCOL_VERSION` in `herd-proto/src/lib.rs` |
+| `RECORD_VERSION` | the shape of every `job.json` in the root | **2** | `herd-hub/src/job.rs:72` |
+| `LAYOUT_VERSION` | the shape of the root itself | **2** | `herd-hub/src/store.rs:99` |
+
+**Those are `main`'s numbers and no release's.** Every release to date,
+v0.4.1 included, is at 2, 1 and 1. All three moved together with M11's
+pack half (D199), and `LAYOUT_VERSION` had never moved before. Read the
+numbers off the bodies of the two releases you are moving between, not
+off this page.
 
 `PROTOCOL_VERSION` is a fleet problem and `deploy/release-notice.md`
 covers it. The other two are a **disk** problem, and this is the section
@@ -571,9 +579,13 @@ about them.
 
 **There is no migration path anywhere.** A hub at a higher record or
 layout version does not convert an existing state root. There is no
-offline migration tool, no `--migrate`, nothing planned to add one. But
-the two numbers are refused in two different ways, and that difference
-is the whole of what you have to plan for.
+offline migration tool, no `--migrate`, nothing planned to add one.
+**Since M11's pack half that is no longer a hypothesis:** both disk
+numbers have moved on `main`, so a root written under v0.4.1 is a root
+a hub built from `main` refuses, and the sentence quoted below is the
+opening of what such a root actually produces. But the two numbers are
+refused in two different ways, and that difference is the whole of what
+you have to plan for.
 
 **A layout number that differs refuses the root.** It is read once, out
 of `store.json`, before the hub binds anything, and the hub **does not
@@ -602,6 +614,12 @@ path, and the total is on the line that says the hub is listening. That
 is loud, and it is not a refusal — nothing stops the hub and nothing
 stops the deployment. **Do not rely on the hub to stop you here.** Read
 the two releases' numbers yourself.
+
+**Between v0.4.1 and `main` that is not the case you are in**, because
+both numbers moved together: the layout refuses the whole root before
+any record is read, and the per-record quarantine above never comes up.
+It comes up for a pair of builds that differ on the record number
+alone, which no two releases do yet.
 
 The layout refusal cuts both ways. **It is the rollback too:** if the
 layout numbers differ between the release you are on and the release you
@@ -652,13 +670,21 @@ matters more than the steps:
 
 ### What this means for you, concretely, today
 
-Nothing shipped moves `RECORD_VERSION` or `LAYOUT_VERSION`. All three
-numbers are 2, 1 and 1 in v0.4.0, and the next ordinary release is
-constrained to ship at record 1 and layout 1 so that your existing root
-stays readable (D199). The release that moves them is **v1.0.0**, and
-moving them was taken as a decision with its price understood: a fleet
-restarting from zero. When that release comes, the four steps above are
-the procedure, and step 1 is the one nobody can do for you.
+No release you can install moves `RECORD_VERSION` or `LAYOUT_VERSION`.
+All three numbers are 2, 1 and 1 in v0.4.0 and in v0.4.1, and the next
+ordinary release is constrained to ship at record 1 and layout 1 so
+that your existing root stays readable (D199). The release that moves
+them is **v1.0.0**, and moving them was taken as a decision with its
+price understood: a fleet restarting from zero. When that release
+comes, the four steps above are the procedure, and step 1 is the one
+nobody can do for you.
+
+**What M11's pack half changed is `main`, not a release.** All three
+numbers moved there — protocol 3, record 2, layout 2 — so a hub built
+from `main` already refuses a v0.4.1 root. D199's ordering constraint
+is unchanged and still binding, and it now says something sharper than
+it did: the ordinary release before v1.0.0 cannot be cut from `main`'s
+tip.
 
 ## One limitation, stated rather than left silent
 
@@ -859,7 +885,7 @@ Named here rather than left to be discovered.
 
 | You want | Read |
 | --- | --- |
-| what a release's files are, the two numbers in its body, the runner's four requirements, the exit codes | `deploy/release-notice.md` |
+| what a release's files are, the version numbers in its body, the runner's four requirements, the exit codes | `deploy/release-notice.md` |
 | one machine into the fleet, end to end | `docs/joining.md` |
 | the first start of the hub under compose, and the two ownership failures it hits | `deploy/README.md` |
 | what is on disk, field by field | `docs/architecture.md` §10 |
