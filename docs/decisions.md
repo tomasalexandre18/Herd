@@ -13173,3 +13173,83 @@ measured), so `pack_for` answers `None` for every key in production and
 the term never fires outside its tests. That is M11's layout step to
 close, and E-23's end-to-end waits on it. Filed as ORCH-260 by this
 landing so the inertness is on the board and not only in a handoff.
+
+## 2026-10-30 — D256 Newest-five per key family is a preference, not a floor
+
+M12's plan asks the runner's eviction for "newest-N-per-key-family kept
+(N = 5, configurable)" beside "never what a queued or running job
+references, never what the keeper role pins". Read as three floors, the
+sentence cannot be met: a store ten gibibytes over its budget whose every
+key family holds five packs has nothing it may take, and the budget an
+operator set stops bounding their disk.
+
+**So there are two kinds of keeping, and only two of the three are
+absolute.** What a job references and the newest `keep_per_key` of a key
+family the hub pins are **never** evicted, whatever the figure says —
+those are the two the milestone's own `Done when` names, and taking
+either is the runner destabilising its own work or breaking the fleet's
+custody. The newest `KEEP_PER_KEY` of each key family are evicted
+**last**, after everything else, and they are evicted if the budget
+cannot be reached otherwise. A pass that still cannot reach it says so,
+with all three reasons named, and destroys nothing to pretend otherwise.
+
+`KEEP_PER_KEY` is **5** because `docs/plan.md` M12 says 5 and no
+derivation of that number exists anywhere — measured by the planning
+pass of 2026-10-30. It is therefore a default and never an acceptance
+criterion: `Claims::keep_per_key` carries whatever the caller wants.
+
+Two consequences, both deliberate. A **key family** has to be on the
+disk, because a pack is its manifest's bytes and cannot carry a
+requester's key: it is `packs/manifests/<id>/pack.key`, a JSON array,
+additive, since one content really can be two families. And a candidate
+whose every object another pack still names **frees nothing** and is
+kept: destroying a pack to recover no bytes is the one move a byte
+budget can never justify, which is the same rule `disk-policy.md` states
+for the hub's own sweeper one store over.
+
+**The hub does not enforce any of this.** The budget is the machine
+owner's figure and the gc is the runner's — `herd-proto`'s own words,
+quoted in M12's plan: "a hub that compared usage against a figure of its
+own would be enforcing a bound the machine's owner never agreed to".
+
+## 2026-10-30 — D257 A version number moves to disambiguate an absence
+
+`herd-hub`'s `STATUS_VERSION` went 1 → 2 on M12 task P2b, when the three
+pack-store figures joined `RunnerNow` in `status.json`. It had never
+moved before — one commit introduced it at 1 (`1280e69`), measured with
+`git log -S`.
+
+**It did not move for compatibility.** The three fields are additive
+`Option`s and serde reads a version-1 document without them; nothing
+would have broken. It moved because **at version 1 an absence says two
+things at once**: a renderer finding no `packs_held` cannot tell whether
+the runner did not say or the hub that wrote the document does not
+record the figure. Making "the runner did not say" mean exactly one
+thing is the whole purpose of those three fields, so leaving the number
+at 1 would have shipped the ambiguity the fields exist to remove. At
+version 2 one reading is left: the hub records them, and an absence is
+the machine's own silence.
+
+**That is the general rule, and it is D27's shape one level up.** A
+skipped assertion printed as a pass is the same defect as an unmeasured
+figure printed as zero, or as a missing field that could equally be a
+hub which never writes it. When a document gains a field whose *absence*
+is itself a statement, the version moves — not because an old reader
+would choke, but because an old reader would guess. When the added field
+means nothing by being absent, the version stays.
+
+**The cost is named on the constant, and it is one-sided.** An operator
+running an older `herd-hub status` against a new hub's root now gets a
+refusal by name, with both figures, instead of a screen missing a pack
+line. That refusal is what the number is for. `CLAUDE.md`'s *no
+compatibility to preserve* — the consumer resets at v1.0.0 — removes the
+usual objection to paying it.
+
+Reversible in one constant plus three test strings. P2b put the
+reasoning on `STATUS_VERSION`'s own doc comment and did not draft this
+entry, on the ground that drafting one nobody asked for is how a number
+gets allocated for a code comment; the orchestrator upheld the move and
+asked for the reasoning somewhere a reader would find it, and
+`herd-merger` allocated the number at batch 21's landing. The reason
+test now lives on the constant: a fourth field moves it to 3 only if
+absence would otherwise become ambiguous again.

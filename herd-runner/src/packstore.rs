@@ -62,10 +62,22 @@
 //! [`PackStore::objects_listed`] exists so that a test can assert the walk
 //! does not happen, by counting the calls rather than by timing them.
 //!
-//! **Nothing here evicts anything.** The budget is measured against and
-//! reported; what spends it is a later step, and a reader who finds a budget
-//! and concludes this runner enforces one is reading more into it than is
-//! here.
+//! **What spends that budget is [`PackStore::evict_to_budget`]**, this
+//! runner's own gc and nobody else's: the budget is the machine owner's
+//! figure and the hub never enforces it, because "a hub that compared usage
+//! against a figure of its own would be enforcing a bound the machine's
+//! owner never agreed to" (`herd-proto`'s own words). It takes **whole
+//! packs**, never parts of one; it keeps the newest [`KEEP_PER_KEY`] of each
+//! key family while it can, and keeps absolutely what a job references and
+//! what the keeper pins ([`Claims`]); and it removes a manifest **with** its
+//! objects, manifest first, so no instant exists in which this runner
+//! announces a pack it cannot serve (ORCH-240).
+//!
+//! **Nothing in this crate calls it yet**, and that is deliberate rather
+//! than unfinished: a pass run with an empty claim set on a runner that is in
+//! fact running a job would take a pack out from under it, and what a running
+//! job references is knowledge the layout step has not put in this runner
+//! yet. The gc is here, tested, and waiting for its caller.
 //!
 //! ## Three rules this module exists to get right
 //!
@@ -89,8 +101,12 @@
 //!    the whole collection over the job's output cap so that `results.json`
 //!    does not come back for it — but it is **set aside and kept**, under
 //!    `refused/` above, with the reason and its figures said on the record
-//!    and on stderr. Nothing in this runner ever removes it: not a timer, not
-//!    [`crate::sweep`], not [`crate::reclaim`]'s reaper, not a start. The
+//!    and on stderr. Nothing in this runner ever takes it away: not a timer,
+//!    not [`crate::sweep`], not [`crate::reclaim`]'s reaper, not a start, and
+//!    **not [`PackStore::evict_to_budget`]**, which reads `objects/` and
+//!    `manifests/` and knows no third directory — that area's fate is a
+//!    question nobody has answered, and a gc that swept it would answer it
+//!    without being asked. The
 //!    same shape the sweep already takes with a spool no hub will ask for
 //!    (`.unclaimed`) and the hub with a record it cannot read, for the same
 //!    reason: removing hundreds of megabytes is a decision with an owner, and
@@ -125,14 +141,15 @@
 //! copy until 2026-10-30, and that copy had already drifted far enough to
 //! cost a red gate.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
+use std::time::SystemTime;
 
-use herd_proto::pack::{check_object_digest, PacksHeld};
+use herd_proto::pack::{check_object_digest, PacksHeld, PinPacks};
 use herd_proto::{show_bytes, PackId, PackManifest, MANIFEST_MAX_BYTES};
 
 use crate::size::measured_bytes;
@@ -191,6 +208,48 @@ pub const MANIFEST_FILE: &str = "manifest.tsv";
 /// `pack.meta` is an ordinary pack.
 pub const META_FILE: &str = "pack.meta";
 
+/// The file beside a stored manifest that records which `leaves` key(s) this
+/// store filed the pack under: its **key family**, which is the unit both the
+/// retention rule and the keeper's pins are expressed in.
+///
+/// A JSON array of strings and not one key per line, because a `leaves` key
+/// is the requester's own word and nothing in Herd forbids a newline inside
+/// one: a line-per-key file would be a parser with an injection in it, and
+/// the encoder for this is already a dependency of this crate.
+///
+/// It is **not part of the id** — the id is `manifest.tsv`'s bytes — so a
+/// pack with no key file is an ordinary pack, exactly as one with no
+/// [`META_FILE`] is. That is what a pack fetched from a peer looks like
+/// today, and the consequence is named on [`Claims`].
+pub const KEY_FILE: &str = "pack.key";
+
+/// How many packs of one key family an eviction keeps while it can.
+///
+/// `docs/plan.md` M12's own figure, and **a figure with no derivation
+/// anywhere** — the planning pass of 2026-10-30 measured that and says so in
+/// as many words. So it is a default and never an acceptance criterion:
+/// [`Claims::keep_per_key`] carries whatever the caller wants and this is
+/// what a caller with no opinion gets.
+pub const KEEP_PER_KEY: u32 = 5;
+
+/// What a manifest directory is called while its pack is being taken away.
+///
+/// The counterpart of [`STAGING_PREFIX`] on the way out, and load-bearing for
+/// the same reason: it begins with a dot and holds a `-`, so
+/// [`check_object_digest`] cannot read it as a pack id and
+/// [`PackStore::held_packs`] cannot announce it. A pack whose manifest has
+/// been renamed to this is **absent**, not half-announced, and that is what
+/// makes a kill in the middle of an eviction leave this store whole-or-absent
+/// instead of holding out a pack it cannot serve (ORCH-240).
+///
+/// It is deliberately **not** [`STAGING_PREFIX`]: a directory under that name
+/// is a pack being made and holds no claim on any object, while one under
+/// this name is a pack already withdrawn whose objects may still be on the
+/// disk and must be accounted for. [`PackStore::evict_to_budget`] finishes
+/// the second and leaves the first alone, and one prefix for both would make
+/// those two states one.
+const EVICTING_PREFIX: &str = ".evicting-";
+
 /// How many pack ids ride one [`herd_proto::ToHub::PacksHeld`] frame.
 ///
 /// **Chosen against a frame ceiling that is measured and not guessed**: the
@@ -235,7 +294,7 @@ static NEXT_STAGING: AtomicU64 = AtomicU64::new(0);
 #[derive(Debug, Clone)]
 pub struct PackStore {
     path: PathBuf,
-    standing: Arc<Mutex<Standing>>,
+    shared: Arc<Shared>,
 }
 
 /// What this store occupies, as a figure it keeps rather than a walk it
@@ -304,7 +363,37 @@ impl Standing {
     }
 }
 
-/// The one [`Standing`] for this data root's store, made on first use.
+/// One data root's store-wide state, held once per process.
+///
+/// Two things that are per **data root** and not per value: the figures, for
+/// the reason [`PackStore`]'s own doc gives, and one lock.
+#[derive(Debug, Default)]
+struct Shared {
+    standing: Mutex<Standing>,
+    /// Held for the whole of a [`PackStore::ingest`] and for the whole of a
+    /// [`PackStore::evict_to_budget`], and by nothing else.
+    ///
+    /// **Not a performance lock but a correctness one, and the property it
+    /// buys is ORCH-240's.** An ingest skips an object the store already
+    /// holds and writes its manifest last; an eviction unlinks objects no
+    /// remaining manifest names. Run at once, the eviction can take away the
+    /// very object the ingest has just decided it need not place, and the
+    /// ingest then files a manifest for a pack that is missing it — a pack
+    /// this runner announces and cannot serve, which is the one outcome the
+    /// eviction's whole order exists to avoid.
+    ///
+    /// The cost is that two ingests no longer overlap. Nothing in this runner
+    /// ingests two packs at once today — one collection per attempt, one
+    /// fetch per needed key — so what is given up is a concurrency nothing
+    /// uses, against a race that would otherwise be unobservable until a job
+    /// was handed half a pack.
+    ///
+    /// Taken **before** `standing` wherever both are held, which is the whole
+    /// of the ordering discipline here.
+    work: Mutex<()>,
+}
+
+/// The one [`Shared`] for this data root's store, made on first use.
 ///
 /// One entry per data root, and a process has one data root: the map exists
 /// because a **test** process has many, each in its own temporary directory,
@@ -313,16 +402,16 @@ impl Standing {
 ///
 /// The key is [`keyed`]'s answer and not the path as given, for the reason
 /// that function carries.
-fn standing_for(path: &Path) -> Arc<Mutex<Standing>> {
-    static STANDINGS: OnceLock<Mutex<BTreeMap<PathBuf, Arc<Mutex<Standing>>>>> = OnceLock::new();
-    let standings = STANDINGS.get_or_init(|| Mutex::new(BTreeMap::new()));
-    let mut standings = standings
+fn shared_for(path: &Path) -> Arc<Shared> {
+    static STORES: OnceLock<Mutex<BTreeMap<PathBuf, Arc<Shared>>>> = OnceLock::new();
+    let stores = STORES.get_or_init(|| Mutex::new(BTreeMap::new()));
+    let mut stores = stores
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
     Arc::clone(
-        standings
+        stores
             .entry(keyed(path))
-            .or_insert_with(|| Arc::new(Mutex::new(Standing::default()))),
+            .or_insert_with(|| Arc::new(Shared::default())),
     )
 }
 
@@ -408,6 +497,126 @@ pub fn take_budget(data_root: &Path, budget: Option<u64>) -> String {
             held.packs
         ),
     }
+}
+
+/// What an eviction may not take away.
+///
+/// **Two of the three come from outside this module and the third is a
+/// figure.** Nothing here can work out what a queued job references or what
+/// the hub has pinned on this runner, so both are asked for rather than
+/// guessed, and a caller that passes [`Claims::default`] is saying "nothing
+/// is claimed". That is the honest reading of a store nobody has told
+/// anything about — and it is also why [`PackStore::evict_to_budget`] has no
+/// caller in this crate yet: a pass run with an empty claim set on a runner
+/// that is in fact running a job would take the pack out from under it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Claims {
+    /// Packs a queued or running job on this runner references. **Never
+    /// evicted, whatever the budget says.**
+    ///
+    /// **Today this is a fixture set in every test and empty in the field**,
+    /// because what a running job references is the runner's own knowledge of
+    /// the job it is running, and the layout step that puts it there is M11's
+    /// (ORCH-220). Said rather than implied, and a row is owed for re-proving
+    /// this clause against a real job rather than against a claim set a test
+    /// wrote.
+    pub referenced: BTreeSet<PackId>,
+    /// The keeper's pins, as the hub sends them ([`PinPacks`]): which key
+    /// families this runner keeps for the fleet, and how many of each. The
+    /// newest `keep_per_key` of every named key are **never** evicted.
+    ///
+    /// `None` is "the hub has pinned nothing here", which is every runner
+    /// today: reading the frame and keeping it across a redial is P4's and
+    /// `lib.rs`'s, not this module's.
+    pub pins: Option<PinPacks>,
+    /// How many packs of each key family the retention rule keeps while it
+    /// can — [`KEEP_PER_KEY`] unless the caller says otherwise.
+    ///
+    /// **A preference and not a floor, and the difference is the whole of
+    /// why both exist.** A store ten gibibytes over its budget whose every
+    /// family holds five packs has to come under it somehow, so the newest N
+    /// are taken away *last* rather than never. What is never taken away is
+    /// `referenced` and `pins`, which are the two the milestone's own
+    /// done-when names.
+    pub keep_per_key: u32,
+}
+
+impl Default for Claims {
+    /// Nothing claimed, and the retention figure at its default.
+    ///
+    /// Spelled out rather than derived, because a derived `u32` would be
+    /// nought and a `keep_per_key` of nought is a store with no retention
+    /// rule at all — the one reading of this type nobody would intend.
+    fn default() -> Self {
+        Self {
+            referenced: BTreeSet::new(),
+            pins: None,
+            keep_per_key: KEEP_PER_KEY,
+        }
+    }
+}
+
+/// What one eviction pass did, in figures and in sentences.
+///
+/// Both halves are the report: a pass that could not reach the budget is as
+/// much a fact about this machine as one that did, and a runner that silently
+/// stayed over its figure would be the budget not working rather than the
+/// budget being tight.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct Swept {
+    /// What the operator said this store may hold, or `None` if nobody said.
+    pub budget: Option<u64>,
+    /// What the store held when the pass measured it, and what it holds now.
+    /// Both are **measured**, not derived, which is why they are here beside
+    /// the figure the pass moved.
+    pub bytes_before: u64,
+    pub bytes_after: u64,
+    /// Bytes this pass really unlinked — never bytes it merely named. A
+    /// figure that counted what was selected rather than what went is the
+    /// defect `docs/disk-policy.md` names on the hub's side, one store over.
+    pub bytes_freed: u64,
+    pub packs_removed: u64,
+    pub objects_removed: u64,
+    /// Whether the store is inside its budget now. **False with a budget set
+    /// is the pass saying it could not get there**, and `said` carries why.
+    pub within_budget: bool,
+    /// Every sentence this pass owes an operator, in the order it found them.
+    pub said: Vec<String>,
+}
+
+/// Every pack this store holds, read once, with what claims each object.
+///
+/// One reading per pass, and the pass is the one act in this module that is
+/// allowed to walk: an announcement reads the running figure and nothing
+/// else (see [`Standing::objects_listed`]), while a pass that removes bytes
+/// has to know which of them another manifest still names, and the only
+/// place that is written down is the manifests themselves.
+struct Reading {
+    live: Vec<Pack>,
+    /// How many packs this store holds name each object. **An object with a
+    /// count above one is kept**, whatever is taken away: it is one file and
+    /// more than one pack's.
+    claimed: BTreeMap<String, u32>,
+    /// Manifest directories under [`EVICTING_PREFIX`]: packs already
+    /// withdrawn whose objects may still be on the disk, which is what a kill
+    /// in the middle of a pass leaves.
+    withdrawn: Vec<PathBuf>,
+    said: Vec<String>,
+}
+
+/// One pack of this store, as an eviction has to see it.
+struct Pack {
+    id: PackId,
+    /// The key families this store filed it under, empty for a pack nobody
+    /// recorded one for ([`KEY_FILE`]).
+    keys: Vec<String>,
+    /// Its `kind f` rows, by sha256, with the size each one is declared at —
+    /// which is the size on the disk, because [`PackStore::holds_object`]
+    /// refuses an object whose length disagrees with its manifest.
+    objects: BTreeMap<String, u64>,
+    /// When this store filed it: the manifest directory's own mtime, set by
+    /// the write that made it and unchanged by the rename that placed it.
+    filed: SystemTime,
 }
 
 /// A pack that is now in the store, and what putting it there cost.
@@ -503,12 +712,22 @@ impl PackStore {
     /// for that reason.
     fn at(data_root: &Path) -> Self {
         let path = data_root.join(PACKS_DIR);
-        let standing = standing_for(&path);
-        Self { path, standing }
+        let shared = shared_for(&path);
+        Self { path, shared }
     }
 
     fn standing(&self) -> MutexGuard<'_, Standing> {
-        self.standing
+        self.shared
+            .standing
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    /// Hold this data root's store against the one other act that writes it
+    /// (see [`Shared::work`]).
+    fn working(&self) -> MutexGuard<'_, ()> {
+        self.shared
+            .work
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
@@ -821,6 +1040,11 @@ impl PackStore {
     /// whole object under its own name or nothing at all, and the pack is
     /// absent until all of it is there.
     pub fn ingest(&self, dir: &Path) -> Result<Held, String> {
+        // Against an eviction and against another ingest, for the whole of
+        // this call: the object this one is about to decide it need not place
+        // is the object an eviction running beside it may be unlinking. See
+        // [`Shared::work`], which carries the argument and the cost.
+        let _working = self.working();
         let manifest_path = dir.join(MANIFEST_FILE);
         let bytes = read_bounded(&manifest_path)?.ok_or_else(|| {
             format!(
@@ -1132,6 +1356,409 @@ impl PackStore {
         fsync_dir(&self.manifests_dir())?;
         Ok(true)
     }
+
+    /// Write down which `leaves` key this store filed a pack under.
+    ///
+    /// The store's own layout carries no key: a pack *is* its manifest's
+    /// bytes, and two requesters who declare the same artefact under two
+    /// names hold one pack between them. The retention rule and the keeper's
+    /// pins are both per **key family** — [`PinPacks`] is literally `keys`
+    /// plus `keep_per_key` — so the key has to be somewhere on this disk, and
+    /// the one place it can be without changing what a pack is is a file
+    /// beside the manifest ([`KEY_FILE`]).
+    ///
+    /// **Additive and idempotent.** A key already written down is not written
+    /// again; a second key is added beside the first, because one content
+    /// really can be two families and keeping only the last writer's would
+    /// move a pack between families on a replay. They are kept sorted, so one
+    /// pack reads the same twice.
+    ///
+    /// Called where the key is known, which is [`leave_packs`]. A pack that
+    /// arrived by fetch has a key too — `AssignedPack::key`, which
+    /// `herd-runner/src/fetch.rs` has in hand at its one `ingest` — and that
+    /// file is another task's, so it does not call this yet. Until it does, a
+    /// fetched pack is a pack of no key family; [`PackStore::evict_to_budget`]
+    /// says what that costs.
+    pub fn remember_key(&self, id: &PackId, key: &str) -> Result<(), String> {
+        let mut keys = self.keys_of(id)?;
+        if keys.iter().any(|known| known == key) {
+            return Ok(());
+        }
+        keys.push(key.to_owned());
+        keys.sort();
+        let written = serde_json::to_vec(&keys)
+            .map_err(|error| format!("this pack's key(s) cannot be written down: {error}"))?;
+        let at = self.pack_dir(id).join(KEY_FILE);
+        write_fsynced(&at, &written)?;
+        fsync_dir(&self.pack_dir(id))
+    }
+
+    /// Which key families this store has a pack filed under, in order.
+    ///
+    /// An empty answer is **nobody wrote one down** — a pack fetched from a
+    /// peer, or one from before this file existed — and not a pack whose key
+    /// is the empty string. The two are the same thing to an eviction and
+    /// that is said where it decides, not here.
+    pub fn keys_of(&self, id: &PackId) -> Result<Vec<String>, String> {
+        let at = self.pack_dir(id).join(KEY_FILE);
+        let Some(bytes) = read_bounded(&at)? else {
+            return Ok(Vec::new());
+        };
+        serde_json::from_slice(&bytes)
+            .map_err(|error| format!("{} will not read: {error}", at.display()))
+    }
+
+    /// Bring this store inside its budget by taking whole packs away, and
+    /// say what it did.
+    ///
+    /// **This is the runner's gc and it is the runner's alone.** The budget is
+    /// the machine owner's figure ([`PACK_BUDGET_FLAG`]) and the hub never
+    /// enforces it — `herd-proto`'s own words, because "a hub that compared
+    /// usage against a figure of its own would be enforcing a bound the
+    /// machine's owner never agreed to". So nothing on the wire triggers this
+    /// and nothing on the wire is told what it chose.
+    ///
+    /// ## What it will not take
+    ///
+    /// 1. **Anything a queued or running job references** ([`Claims`]).
+    /// 2. **The newest `keep_per_key` of every key family the keeper pins**
+    ///    ([`PinPacks`]).
+    /// 3. **Anything at all, if there is no budget.** Absent is nobody said,
+    ///    never nought, and a store nothing bounds is a store nothing sweeps.
+    /// 4. **A candidate that would free no bytes**, because every object of
+    ///    it is named by another pack this store holds. Destroying a pack to
+    ///    recover nothing is the one move a byte budget can never justify.
+    /// 5. **Anything under `packs/refused/`.** Those bytes are an operator's
+    ///    and their fate is a question nobody has answered; this pass reads
+    ///    `manifests/` and `objects/` and knows no other directory. A unit
+    ///    test over this crate's own source holds that for the whole runner.
+    ///
+    /// Beyond those, the newest [`Claims::keep_per_key`] of each key family
+    /// are taken **last** rather than never — a store far enough over its
+    /// figure has to come under it, and the done-when this answers protects
+    /// what is pinned and referenced and not what is merely recent. A pass
+    /// that still cannot reach the budget **says so** and destroys nothing
+    /// to pretend otherwise.
+    ///
+    /// ## The order one pack goes in, which is the obligation
+    ///
+    /// Manifest first, by a rename aside; then the objects no remaining
+    /// manifest names; then the directory. [`PackStore::held_packs`]
+    /// announces a pack when its manifest is there, so from the rename
+    /// onwards the pack is absent and every id this runner still announces is
+    /// still whole — which is ORCH-240 discharged where the divergence would
+    /// be caused. Objects first would leave an instant in which this runner
+    /// announced a holding it could not serve, and an announcement that
+    /// checked completeness instead would pay a `read_dir` per pack on every
+    /// connection.
+    ///
+    /// A kill between any two steps leaves a directory under
+    /// [`EVICTING_PREFIX`] holding the manifest that names the objects, and
+    /// the next pass finishes it — whole-or-absent, the shape an interrupted
+    /// fetch already has. What a kill can leave is **objects nothing names**,
+    /// if it lands after the rename and this store is never swept again:
+    /// they still weigh in this store's own figure, so the budget still
+    /// bounds the disk, and the next ingest of that pack places none of them
+    /// a second time.
+    ///
+    /// ## What it measures
+    ///
+    /// The figure it spends is **measured at the start of the pass and
+    /// measured again at the end**, not read off the running total. Every
+    /// other reader here does arithmetic because an announcement must not
+    /// walk; this is the one act that is already walking `manifests/`, and it
+    /// is also the one act where being a rounding out would destroy a pack
+    /// for nothing.
+    pub fn evict_to_budget(&self, claims: &Claims) -> Result<Swept, String> {
+        let _working = self.working();
+        let before = self.measure()?;
+        let mut swept = Swept {
+            budget: self.budget(),
+            bytes_before: before.bytes,
+            bytes_after: before.bytes,
+            ..Swept::default()
+        };
+        let reading = self.read_manifests()?;
+        swept.said.extend(reading.said);
+        let mut claimed = reading.claimed;
+        let mut remaining = before.bytes;
+        // A pack whose manifest was moved aside and whose objects were not
+        // all gone yet when something stopped the pass. Finished before
+        // anything new is chosen, so one pass never leaves two behind — and
+        // **before the budget is even read**, because finishing a removal
+        // that was already decided is not spending a budget: a store whose
+        // operator never set one would otherwise carry those bytes for ever.
+        for withdrawn in &reading.withdrawn {
+            self.finish_withdrawn(withdrawn, &claimed, &mut remaining, &mut swept);
+        }
+        let Some(budget) = swept.budget else {
+            swept.bytes_after = self.measure()?.bytes;
+            swept.within_budget = true;
+            swept.said.push(format!(
+                "this runner's pack store holds {} and has no budget, so nothing more of it is \
+                 taken away: {PACK_BUDGET_FLAG} is what bounds it",
+                measured_bytes(swept.bytes_after)
+            ));
+            return Ok(swept);
+        };
+        for index in order_of_eviction(&reading.live, claims) {
+            if remaining <= budget {
+                break;
+            }
+            let pack = &reading.live[index];
+            let freeable: u64 = pack
+                .objects
+                .iter()
+                .filter(|(sha256, _)| claimed.get(*sha256).copied().unwrap_or(0) <= 1)
+                .map(|(_, size)| *size)
+                .sum();
+            if freeable == 0 {
+                swept.said.push(format!(
+                    "pack {} is kept although this store is over its budget: every one of its \
+                     {} object(s) is named by another pack held here, so taking it away would \
+                     free no bytes at all",
+                    pack.id,
+                    pack.objects.len()
+                ));
+                continue;
+            }
+            self.withdraw(pack, &mut claimed, &mut remaining, &mut swept)?;
+        }
+        let after = self.measure()?;
+        swept.bytes_after = after.bytes;
+        swept.within_budget = after.bytes <= budget;
+        if !swept.within_budget {
+            swept.said.push(format!(
+                "this runner's pack store holds {} against the {} it may hold \
+                 ({PACK_BUDGET_FLAG}) and nothing more could be taken away: what is left is \
+                 referenced by a job on this runner, pinned here as a keeper's, or frees no \
+                 bytes because another pack names every object of it. A budget this store \
+                 cannot reach is said and never met by destroying what is claimed",
+                measured_bytes(after.bytes),
+                show_bytes(budget)
+            ));
+        }
+        Ok(swept)
+    }
+
+    /// Read every manifest this store holds, once, and count what names each
+    /// object.
+    ///
+    /// **An unreadable manifest refuses the whole pass**, and that is the
+    /// safe arm rather than the strict one: a pack left out of this reading
+    /// is a pack whose objects nothing accounts for, so the next candidate
+    /// that shares one would have it unlinked from under a pack this runner
+    /// announces. [`PackStore::manifest_of`]'s refusal already says what to
+    /// do about the one directory at fault.
+    fn read_manifests(&self) -> Result<Reading, String> {
+        let directory = self.manifests_dir();
+        let entries = fs::read_dir(&directory).map_err(|error| {
+            format!(
+                "this store cannot be swept: {} will not open: {error}",
+                directory.display()
+            )
+        })?;
+        let mut reading = Reading {
+            live: Vec::new(),
+            claimed: BTreeMap::new(),
+            withdrawn: Vec::new(),
+            said: Vec::new(),
+        };
+        for entry in entries {
+            let entry = entry.map_err(|error| {
+                format!(
+                    "this store cannot be swept: {} will not list: {error}",
+                    directory.display()
+                )
+            })?;
+            let name = entry.file_name();
+            let Some(name) = name.to_str() else { continue };
+            if name.starts_with(EVICTING_PREFIX) {
+                reading.withdrawn.push(entry.path());
+                continue;
+            }
+            if check_object_digest(name).is_err() {
+                continue;
+            }
+            let id = PackId::as_announced(name.to_owned());
+            if !self.holds(&id) {
+                continue;
+            }
+            let objects = self.manifest_of(&id)?.objects_needed();
+            for sha256 in objects.keys() {
+                *reading.claimed.entry(sha256.clone()).or_insert(0) += 1;
+            }
+            let keys = match self.keys_of(&id) {
+                Ok(keys) => keys,
+                Err(why) => {
+                    reading.said.push(format!(
+                        "pack {id} is held as a pack of no key family: {why}"
+                    ));
+                    Vec::new()
+                }
+            };
+            // A directory `holds` has just answered for will stat, so the
+            // fallback is unreachable in practice; it is the epoch rather
+            // than now because a pack this store cannot date is the oldest
+            // thing in it, which is the arm that frees disk rather than the
+            // arm that holds on to it.
+            let filed = fs::metadata(self.pack_dir(&id))
+                .and_then(|metadata| metadata.modified())
+                .unwrap_or(SystemTime::UNIX_EPOCH);
+            reading.live.push(Pack {
+                id,
+                keys,
+                objects,
+                filed,
+            });
+        }
+        Ok(reading)
+    }
+
+    /// Take one pack away: the manifest first, then the objects nothing else
+    /// names, then the directory.
+    ///
+    /// The order is ORCH-240's obligation and the reason for the rename; both
+    /// are argued on [`PackStore::evict_to_budget`]. Nothing here returns an
+    /// error for a removal that would not go: the pack is then still held or
+    /// its directory is still on the disk, both are said, and the pass goes
+    /// on to the next candidate rather than abandoning a budget because one
+    /// file is stuck.
+    fn withdraw(
+        &self,
+        pack: &Pack,
+        claimed: &mut BTreeMap<String, u32>,
+        remaining: &mut u64,
+        swept: &mut Swept,
+    ) -> Result<(), String> {
+        let from = self.pack_dir(&pack.id);
+        let aside = withdrawing_path(&self.manifests_dir());
+        if let Err(error) = fs::rename(&from, &aside) {
+            swept.said.push(format!(
+                "pack {} is still held here: {} could not be moved to {}: {error}",
+                pack.id,
+                from.display(),
+                aside.display()
+            ));
+            return Ok(());
+        }
+        fsync_dir(&self.manifests_dir())?;
+        swept.packs_removed = swept.packs_removed.saturating_add(1);
+        {
+            let mut standing = self.standing();
+            standing.packs = standing.packs.saturating_sub(1);
+        }
+        for (sha256, size) in &pack.objects {
+            let names_it = claimed.get(sha256).copied().unwrap_or(0);
+            if names_it > 1 {
+                // One file, more than one pack's: this is the clause that
+                // keeps an object a remaining manifest still names.
+                claimed.insert(sha256.clone(), names_it - 1);
+                continue;
+            }
+            claimed.remove(sha256);
+            if self.take_object(sha256, *size, swept) {
+                *remaining = remaining.saturating_sub(*size);
+            }
+        }
+        if let Err(error) = fs::remove_dir_all(&aside) {
+            swept.said.push(format!(
+                "pack {} is out of this store and {} is still on the disk: {error}. Nothing \
+                 announces it and the next pass takes it",
+                pack.id,
+                aside.display()
+            ));
+            return Ok(());
+        }
+        fsync_dir(&self.manifests_dir())
+    }
+
+    /// Unlink one object, and say so if it will not go.
+    ///
+    /// **True means the bytes are off the disk**, which is the only thing the
+    /// freed figure may be moved by. The running total is moved here too, by
+    /// the same amount and at the same moment, so a reader of
+    /// [`PackStore::usage`] between two victims is never told the store holds
+    /// bytes that are gone.
+    fn take_object(&self, sha256: &str, size: u64, swept: &mut Swept) -> bool {
+        let Ok(name) = object_name(sha256) else {
+            return false;
+        };
+        let at = self.objects_dir().join(name);
+        match fs::remove_file(&at) {
+            Ok(()) => {
+                swept.objects_removed = swept.objects_removed.saturating_add(1);
+                swept.bytes_freed = swept.bytes_freed.saturating_add(size);
+                {
+                    let mut standing = self.standing();
+                    standing.bytes = standing.bytes.saturating_sub(size);
+                }
+                true
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => false,
+            Err(error) => {
+                swept.said.push(format!(
+                    "object {name} is named by no pack this store holds and is still on this \
+                     disk: {} will not go: {error}",
+                    at.display()
+                ));
+                false
+            }
+        }
+    }
+
+    /// Finish an eviction a kill stopped in the middle.
+    ///
+    /// The directory under [`EVICTING_PREFIX`] holds the manifest of a pack
+    /// that is already absent — nothing announces it — so what is left to do
+    /// is the objects it names that no pack this store holds names too, and
+    /// then the directory itself. That is why the manifest is moved aside
+    /// instead of being destroyed outright: the one thing that knows which
+    /// objects those are is the manifest, and a pass that took it away first
+    /// would leave bytes nothing on this disk could ever account for.
+    fn finish_withdrawn(
+        &self,
+        at: &Path,
+        claimed: &BTreeMap<String, u32>,
+        remaining: &mut u64,
+        swept: &mut Swept,
+    ) {
+        let named = read_bounded(&at.join(MANIFEST_FILE))
+            .ok()
+            .flatten()
+            .and_then(|bytes| PackManifest::parse(bytes).ok());
+        match named {
+            Some(manifest) => {
+                for (sha256, size) in manifest.objects_needed() {
+                    if claimed.contains_key(&sha256) {
+                        continue;
+                    }
+                    if self.take_object(&sha256, size, swept) {
+                        *remaining = remaining.saturating_sub(size);
+                    }
+                }
+                swept.said.push(format!(
+                    "{} was a pack this store had begun taking away when something stopped it, \
+                     and this pass has finished it",
+                    at.display()
+                ));
+            }
+            None => swept.said.push(format!(
+                "{} was a pack this store had begun taking away and its manifest will not \
+                 read, so the objects it named are still here, still counted in this store's \
+                 figure, and reusable by the next ingest of that pack",
+                at.display()
+            )),
+        }
+        if let Err(error) = fs::remove_dir_all(at) {
+            swept.said.push(format!(
+                "{} is a pack already out of this store and its directory will not go: {error}",
+                at.display()
+            ));
+            return;
+        }
+        let _ = fsync_dir(&self.manifests_dir());
+    }
 }
 
 /// Take every pack a job declared out of `{out}`, **before** anything reads
@@ -1240,6 +1867,20 @@ pub(crate) fn leave_packs(
         match store.ingest(&at) {
             Ok(held) => {
                 let id = held.manifest.id().clone();
+                // Which key family this store filed it under, written beside
+                // the manifest because the manifest's bytes are the pack and
+                // cannot carry it: it is what the retention rule and the
+                // keeper's pins are both expressed in. Said and not silent if
+                // it will not go down, because a pack of no key family is a
+                // pack an eviction ranks by age alone.
+                if let Err(why) = store.remember_key(&id, key) {
+                    said.push(format!(
+                        "this job's artefact {key:?} is in this runner's pack store as {id} and \
+                         which key it was left under could NOT be written down: {why}. It is \
+                         held as a pack of no key family, which this runner's own pack \
+                         retention then ranks by age alone"
+                    ));
+                }
                 left.push(LeftPack {
                     key: key.clone(),
                     at: relative.clone(),
@@ -1498,6 +2139,83 @@ pub fn announcement_frames(held: Vec<PackId>) -> Vec<PacksHeld> {
         last.more = false;
     }
     frames
+}
+
+/// In which order an eviction may take this store's packs away.
+///
+/// **Two filters and then a sort, and the three terms are in the order the
+/// milestone states them.** Out of the list entirely: a pack a job
+/// references, and the newest `keep_per_key` of every key family the keeper
+/// pins. In the list, the newest [`Claims::keep_per_key`] of each family come
+/// **after** everything else, and within each of those two tiers the oldest
+/// goes first.
+///
+/// A pack with no key family of its own ([`KEY_FILE`]) is ranked in one
+/// unnamed family together with every other such pack, so the newest few of
+/// them are the last of them to go. That is the honest treatment of a pack
+/// nobody wrote a key down for: not protected for ever, and not the first
+/// thing destroyed either.
+///
+/// The id breaks every tie, so two packs this store filed in the same instant
+/// rank the same way on every run and on every machine.
+fn order_of_eviction(live: &[Pack], claims: &Claims) -> Vec<usize> {
+    let mut families: BTreeMap<Option<String>, Vec<usize>> = BTreeMap::new();
+    for (index, pack) in live.iter().enumerate() {
+        if pack.keys.is_empty() {
+            families.entry(None).or_default().push(index);
+        }
+        for key in &pack.keys {
+            families.entry(Some(key.clone())).or_default().push(index);
+        }
+    }
+    let newest_first = |left: &usize, right: &usize| {
+        live[*right]
+            .filed
+            .cmp(&live[*left].filed)
+            .then_with(|| live[*left].id.as_str().cmp(live[*right].id.as_str()))
+    };
+    for members in families.values_mut() {
+        members.sort_by(newest_first);
+    }
+    let keep = usize::try_from(claims.keep_per_key).unwrap_or(usize::MAX);
+    let mut pinned = vec![false; live.len()];
+    let mut retained = vec![false; live.len()];
+    if let Some(pins) = &claims.pins {
+        let keep_pinned = usize::try_from(pins.keep_per_key).unwrap_or(usize::MAX);
+        for key in &pins.keys {
+            let Some(members) = families.get(&Some(key.clone())) else {
+                continue;
+            };
+            for index in members.iter().take(keep_pinned) {
+                pinned[*index] = true;
+            }
+        }
+    }
+    for members in families.values() {
+        for index in members.iter().take(keep) {
+            retained[*index] = true;
+        }
+    }
+    let mut order: Vec<usize> = (0..live.len())
+        .filter(|index| !pinned[*index] && !claims.referenced.contains(&live[*index].id))
+        .collect();
+    order.sort_by(|left, right| {
+        retained[*left]
+            .cmp(&retained[*right])
+            .then_with(|| live[*left].filed.cmp(&live[*right].filed))
+            .then_with(|| live[*left].id.as_str().cmp(live[*right].id.as_str()))
+    });
+    order
+}
+
+/// A unique name under `manifests/` for a pack being taken away.
+///
+/// Shares [`NEXT_STAGING`] with the name an ingest stages under, so two acts
+/// of this process cannot collide on one name however they interleave; the
+/// prefix is what tells the two states apart ([`EVICTING_PREFIX`]).
+fn withdrawing_path(directory: &Path) -> PathBuf {
+    let unique = NEXT_STAGING.fetch_add(1, Ordering::SeqCst);
+    directory.join(format!("{EVICTING_PREFIX}{}-{unique}", std::process::id()))
 }
 
 /// A unique name under `directory` for something being made.
@@ -2940,5 +3658,695 @@ mod tests {
                 spelling.display()
             );
         }
+    }
+
+    /// One gibibyte, because the clause these tests answer is stated in them.
+    const GIB: u64 = 1 << 30;
+
+    /// A pack planted straight into the store, with objects of a declared
+    /// size and no blocks behind them.
+    ///
+    /// **Sparse files, and the reason is the done-when's own figure.** What
+    /// is to be proved is that a store *ten gibibytes* over its budget comes
+    /// under it, and a test that really wrote ten gibibytes would be a test
+    /// nobody runs twice on a host shared with the first consumer's
+    /// production. What an eviction reads of an object is its **name and its
+    /// length** — it hashes nothing, because [`PackStore::ingest`] already
+    /// did, once, when the bytes arrived — so an object whose length is a
+    /// gibibyte and whose blocks are unallocated is a gibibyte to every line
+    /// of code under test. The figures below are therefore the real ones and
+    /// the disk cost of each is 512 bytes.
+    ///
+    /// Planted rather than ingested for the same reason, and the two tests
+    /// that are about an ingest use [`write_pack`] and a real one.
+    fn plant_pack(store: &PackStore, key: Option<&str>, objects: &[(u64, u64)]) -> PackId {
+        let mut text = format!("{}\n# profile debug\n", herd_proto::CHATONS_PACK_FORMAT);
+        for (object, size) in objects {
+            text.push_str(&format!(
+                "{object:064x}\t{size}\t0644\tf\tartefact\tf{object}\n"
+            ));
+        }
+        // The `kind d` row every fixture in this module carries, so the
+        // completeness filter is exercised here too: its digest names no
+        // object and an eviction must never look for one.
+        text.push_str(&format!("{}\t0\t0755\td\tartefact\tbin\n", dir_sha()));
+        let bytes = text.into_bytes();
+        let id = PackId::of_manifest_bytes(&bytes);
+        let at = store.pack_dir(&id);
+        fs::create_dir_all(&at).expect("a manifest directory");
+        fs::write(at.join(MANIFEST_FILE), &bytes).expect("a manifest");
+        for (object, size) in objects {
+            let path = store.objects_dir().join(format!("{object:064x}"));
+            fs::File::create(&path)
+                .and_then(|file| file.set_len(*size))
+                .unwrap_or_else(|error| panic!("{}: {error}", path.display()));
+        }
+        if let Some(key) = key {
+            store.remember_key(&id, key).expect("the key goes down");
+        }
+        id
+    }
+
+    /// Date a manifest directory, so that "newest" is a fixture and not a
+    /// race against the clock's resolution.
+    ///
+    /// The retention rule ranks by the directory's own mtime, so a test about
+    /// the order has to set it rather than hope that two writes a microsecond
+    /// apart land on two different timestamps. `utimensat` is the one call
+    /// that does it, and this crate already reaches for `libc` in two
+    /// modules for the same kind of reason.
+    fn filed_ago(at: &Path, seconds: u64) {
+        use std::os::unix::ffi::OsStrExt;
+        let since = SystemTime::now()
+            .checked_sub(std::time::Duration::from_secs(seconds))
+            .expect("an instant before now")
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("after the epoch");
+        let when = libc::timespec {
+            tv_sec: libc::time_t::try_from(since.as_secs()).expect("a second that fits"),
+            tv_nsec: libc::c_long::from(since.subsec_nanos()),
+        };
+        let times = [when, when];
+        let path = std::ffi::CString::new(at.as_os_str().as_bytes()).expect("a path with no nul");
+        let asked = unsafe { libc::utimensat(libc::AT_FDCWD, path.as_ptr(), times.as_ptr(), 0) };
+        assert_eq!(
+            asked,
+            0,
+            "{} cannot be dated: {}",
+            at.display(),
+            io::Error::last_os_error()
+        );
+    }
+
+    /// Every pack this store announces, holds whole — asked from the
+    /// announcer's side, which is ORCH-240's own clause.
+    fn every_announced_pack_is_whole(store: &PackStore) -> Vec<PackId> {
+        let held = store
+            .held_packs()
+            .expect("what this runner holds is readable");
+        for id in &held {
+            let manifest = store
+                .manifest_of(id)
+                .unwrap_or_else(|why| panic!("pack {id} is announced and {why}"));
+            assert!(
+                store
+                    .holds_whole(&manifest)
+                    .unwrap_or_else(|why| panic!("pack {id}: {why}")),
+                "this runner announces pack {id} and does not hold all of it, so a peer that \
+                 asked for it would be refused by the holder the hub named. Missing: {:?}",
+                store
+                    .missing(&manifest)
+                    .expect("the question is answerable")
+            );
+        }
+        held
+    }
+
+    /// **The plan's own clause, as a test.** A store ten gibibytes over its
+    /// budget comes in under it, and every pinned and referenced item
+    /// survives.
+    ///
+    /// Fifteen packs of a gibibyte in three key families, a budget of five:
+    /// the store is exactly ten gibibytes over. One pack is referenced by a
+    /// job and one family is pinned on this runner by the hub, and both of
+    /// those are chosen to be the **oldest** of their family — which is
+    /// precisely what an eviction with no protections would take first, so
+    /// the clause is tested where it bites rather than where it is free.
+    ///
+    /// It also shows the difference between the two kinds of keeping that
+    /// the row's wording hides: `referenced` and `pins` are a floor, and
+    /// `keep_per_key` is a **preference**. Ten packs have to go to reach the
+    /// figure and only eight of them are outside the newest-N of their
+    /// family, so two of the newest go too — last, and after everything
+    /// else. A store far enough over its budget has to come under it; what
+    /// it must never do is take what is claimed.
+    #[test]
+    fn a_store_ten_gibibytes_over_its_budget_comes_under_it_and_keeps_what_is_claimed() {
+        let temp = TempDir::new("pack-gc-ten-over");
+        let store = PackStore::open(temp.path()).expect("a store");
+
+        let mut planted: Vec<(&str, PackId)> = Vec::new();
+        let mut object = 0u64;
+        for (family, count) in [("build", 6), ("docs", 5), ("test", 4)] {
+            for _ in 0..count {
+                object += 1;
+                planted.push((family, plant_pack(&store, Some(family), &[(object, GIB)])));
+            }
+        }
+        // Oldest first in planting order, a minute apart, so "the newest of
+        // this family" is a fact of the fixture.
+        let last = planted.len();
+        for (index, (_, id)) in planted.iter().enumerate() {
+            filed_ago(&store.pack_dir(id), (last - index) as u64 * 60);
+        }
+        store.set_budget(Some(5 * GIB));
+        let measured = store.measure().expect("the store measures");
+        assert_eq!(
+            (measured.bytes, measured.packs),
+            (15 * GIB, 15),
+            "fifteen gibibytes against a budget of five: ten over, which is the clause"
+        );
+
+        let referenced = planted[0].1.clone();
+        // **The keeper's figure is deliberately larger than the retention
+        // rule's**, so that the pins are load-bearing rather than redundant.
+        // With both at the same number the newest of a pinned family are
+        // already the newest of their family and the clause would pass with
+        // the pin code deleted: the second and third newest `docs` packs are
+        // inside the keeper's three and outside the retention rule's one, so
+        // only the pin keeps them.
+        let pinned: Vec<PackId> = planted
+            .iter()
+            .filter(|(family, _)| *family == "docs")
+            .map(|(_, id)| id.clone())
+            .rev()
+            .take(3)
+            .collect();
+        let claims = Claims {
+            referenced: BTreeSet::from([referenced.clone()]),
+            pins: Some(PinPacks {
+                keys: vec!["docs".to_owned()],
+                keep_per_key: 3,
+            }),
+            keep_per_key: 1,
+        };
+        let swept = store.evict_to_budget(&claims).expect("the pass runs");
+
+        assert!(
+            swept.within_budget && swept.bytes_after <= 5 * GIB,
+            "a store ten gibibytes over its budget comes under it: {swept:#?}"
+        );
+        assert_eq!(
+            (swept.bytes_before, swept.bytes_after, swept.bytes_freed),
+            (15 * GIB, 5 * GIB, 10 * GIB),
+            "and it stops there rather than carrying on: {swept:#?}"
+        );
+        assert_eq!(
+            (swept.packs_removed, swept.objects_removed),
+            (10, 10),
+            "ten packs of one object each: {swept:#?}"
+        );
+        assert_eq!(
+            store.usage(),
+            PackUse {
+                bytes: 5 * GIB,
+                packs: 5,
+                measured: true
+            },
+            "and the running figure is what the disk now holds, which is what the health \
+             report sends"
+        );
+
+        assert!(
+            store.holds(&referenced),
+            "a pack a queued or running job references is never taken away, however far over \
+             the budget this store is: {swept:#?}"
+        );
+        for id in &pinned {
+            assert!(
+                store.holds(id),
+                "the newest keep_per_key of a key family the keeper pins are never taken \
+                 away: {id} went. {swept:#?}"
+            );
+        }
+        // What is left, named exactly, because the interesting half is which
+        // of the newest went. Ten packs had to go and only eleven were
+        // candidates at all, so one of the retained went too — the oldest of
+        // them, which on these dates is `build`'s own newest. `build`
+        // therefore keeps nothing but the pack a job references: the two
+        // protections are a floor and the retention rule is not.
+        let mut survived = vec![referenced.clone()];
+        survived.extend(pinned.iter().cloned());
+        survived.extend(
+            planted
+                .iter()
+                .filter(|(family, _)| *family == "test")
+                .map(|(_, id)| id.clone())
+                .rev()
+                .take(1),
+        );
+        survived.sort_by(|left, right| left.as_str().cmp(right.as_str()));
+        assert_eq!(
+            every_announced_pack_is_whole(&store),
+            survived,
+            "the pack a job references, the three the keeper pins, and the newest of the one \
+             family that had a candidate to spare: {swept:#?}"
+        );
+    }
+
+    /// **ORCH-240, asked from the announcer's side.** After an eviction,
+    /// `holds_whole` is true for every id `held_packs` returns.
+    ///
+    /// The obligation is discharged in the eviction — the manifest is moved
+    /// aside before any object of it is unlinked — and asserted here, where
+    /// the damage would show: a pack this runner announces and cannot serve
+    /// is a holder the hub hands a fetcher for nothing.
+    ///
+    /// Two further clauses of the row ride on the same fixture, because they
+    /// are the same fact from two sides. **An object another manifest still
+    /// names is kept**: three packs name one small object and only one of
+    /// them is taken, so that object stays and the two that remain are whole.
+    /// And **a candidate that frees nothing is not destroyed**: the oldest
+    /// pack of all names nothing but that shared object, so taking it away
+    /// would recover no bytes at all, and a byte budget can never justify
+    /// that.
+    #[test]
+    fn after_an_eviction_this_runner_announces_no_pack_it_cannot_serve() {
+        let temp = TempDir::new("pack-gc-whole");
+        let store = PackStore::open(temp.path()).expect("a store");
+
+        // Object 1 is named by three packs; object 2 is one pack's alone and
+        // is where the bytes are.
+        let shares_only = plant_pack(&store, Some("build"), &[(1, 4096)]);
+        let heavy = plant_pack(&store, Some("build"), &[(1, 4096), (2, 6 * GIB)]);
+        let light = plant_pack(&store, Some("build"), &[(1, 4096), (3, 1024)]);
+        let other = plant_pack(&store, Some("docs"), &[(4, GIB)]);
+        for (seconds, id) in [
+            (400, &shares_only),
+            (300, &heavy),
+            (200, &light),
+            (100, &other),
+        ] {
+            filed_ago(&store.pack_dir(id), seconds);
+        }
+        store.set_budget(Some(2 * GIB));
+        let before = store.measure().expect("the store measures");
+        assert_eq!(before.bytes, 7 * GIB + 4096 + 1024);
+
+        let swept = store
+            .evict_to_budget(&Claims::default())
+            .expect("the pass runs");
+
+        // The detector first: a pass that took nothing away would make every
+        // assertion below pass by never having been tested.
+        assert_eq!(
+            (
+                swept.packs_removed,
+                swept.objects_removed,
+                swept.bytes_freed
+            ),
+            (1, 1, 6 * GIB),
+            "one pack went and with it the one object nothing else named: {swept:#?}"
+        );
+        assert!(swept.within_budget, "{swept:#?}");
+        assert_eq!(
+            every_announced_pack_is_whole(&store),
+            {
+                let mut left = vec![shares_only.clone(), light.clone(), other.clone()];
+                left.sort_by(|a, b| a.as_str().cmp(b.as_str()));
+                left
+            },
+            "the heavy pack is the one that went: {swept:#?}"
+        );
+        assert!(
+            !store.holds(&heavy),
+            "and it is absent rather than half there: {swept:#?}"
+        );
+        assert!(
+            store.objects_dir().join(format!("{:064x}", 1)).is_file(),
+            "an object another manifest still names is kept, because it is one file and more \
+             than one pack's: {swept:#?}"
+        );
+        assert!(
+            store.holds(&shares_only),
+            "the oldest pack of all names nothing but that shared object, so taking it away \
+             would have freed nothing: {swept:#?}"
+        );
+        assert!(
+            swept
+                .said
+                .iter()
+                .any(|line| line.contains(shares_only.as_str())
+                    && line.contains("would free no bytes at all")),
+            "and the pass says why it kept it rather than keeping it silently: {swept:#?}"
+        );
+
+        // **The detector for the clause itself**, because an assertion that
+        // has never been able to fail has not been tested. Take one object
+        // of a pack this runner still announces: `held_packs` goes on naming
+        // it — it asks `holds`, which is the manifest's presence — while
+        // `holds_whole` stops being true. That is precisely the state
+        // ORCH-240 forbids, so the assertion above is a measurement and not
+        // a tautology.
+        let announced = store.manifest_of(&light).expect("its manifest reads");
+        fs::remove_file(store.objects_dir().join(format!("{:064x}", 3)))
+            .expect("one object of a held pack goes");
+        assert!(
+            store.held_packs().expect("readable").contains(&light),
+            "the announcer asks whether the manifest is there and nothing more"
+        );
+        assert!(
+            !store
+                .holds_whole(&announced)
+                .expect("the question is answerable"),
+            "and this runner would now be announcing a pack it cannot serve, which is the \
+             state the eviction's order makes unreachable"
+        );
+    }
+
+    /// **A kill in the middle of an eviction leaves the store
+    /// whole-or-absent**, as a fetch stopped halfway already does.
+    ///
+    /// No process is killed, for the reason
+    /// `an_interrupted_ingest_leaves_no_readable_object_and_no_pack` gives in
+    /// full: a kill at a chosen instant cannot be staged deterministically
+    /// from a unit test and a timing-based one is a flake. What is planted
+    /// instead is **exactly what a kill leaves** — a manifest directory under
+    /// [`EVICTING_PREFIX`], its objects still on the disk — and the two
+    /// properties that make such a kill safe are then measured:
+    ///
+    /// 1. the half-taken pack is **absent, not half-announced**: nothing in
+    ///    `held_packs` names it, and every id that *is* named is whole;
+    /// 2. its bytes still weigh in this store's own figure, so the budget
+    ///    goes on bounding the disk rather than silently losing sight of
+    ///    them;
+    /// 3. the next pass **finishes it**: the objects no remaining manifest
+    ///    names go, the one a remaining manifest names stays, and the
+    ///    directory goes with them.
+    #[test]
+    fn a_kill_in_the_middle_of_an_eviction_leaves_the_store_whole_or_absent() {
+        let temp = TempDir::new("pack-gc-killed");
+        let store = PackStore::open(temp.path()).expect("a store");
+
+        let going = plant_pack(&store, Some("build"), &[(1, 4096), (2, GIB)]);
+        let staying = plant_pack(&store, Some("build"), &[(1, 4096), (3, 2048)]);
+        let aside = withdrawing_path(&store.manifests_dir());
+        fs::rename(store.pack_dir(&going), &aside).expect("the manifest moves aside");
+
+        // One: absent, not half-announced.
+        assert_eq!(
+            every_announced_pack_is_whole(&store),
+            vec![staying.clone()],
+            "a pack whose manifest has been moved aside is absent: this runner announces one \
+             pack and holds all of it"
+        );
+        assert!(!store.holds(&going));
+
+        // Two: the orphaned bytes are still in this store's figure.
+        let stranded = store.measure().expect("the store measures");
+        assert_eq!(
+            stranded.bytes,
+            GIB + 4096 + 2048,
+            "what a kill stranded still weighs here, so a budget still bounds this disk: {:?}",
+            names_in(&store.objects_dir())
+        );
+        assert_eq!(stranded.packs, 1, "and it is no longer counted as a pack");
+
+        // Three: the next pass finishes it, and it needs no budget to do so —
+        // finishing a removal already decided is not spending one.
+        let swept = store
+            .evict_to_budget(&Claims::default())
+            .expect("the pass runs");
+        assert_eq!(
+            (
+                swept.packs_removed,
+                swept.objects_removed,
+                swept.bytes_freed
+            ),
+            (0, 1, GIB),
+            "no new pack was chosen and the stranded object went: {swept:#?}"
+        );
+        assert!(
+            !aside.exists(),
+            "and the directory went with it: {swept:#?}"
+        );
+        assert!(
+            swept
+                .said
+                .iter()
+                .any(|line| line.contains("begun taking away") && line.contains("finished it")),
+            "said rather than silent: {swept:#?}"
+        );
+        assert_eq!(
+            every_announced_pack_is_whole(&store),
+            vec![staying.clone()],
+            "and the pack that shares an object with the one that went is still whole: the \
+             shared object is not the half-evicted pack's to take"
+        );
+        assert_eq!(
+            store.usage(),
+            PackUse {
+                bytes: 4096 + 2048,
+                packs: 1,
+                measured: true
+            },
+            "{swept:#?}"
+        );
+    }
+
+    /// **Newest-N-per-key-family, and N is a preference rather than a
+    /// floor.**
+    ///
+    /// The fixture is built so that **per-family** is the thing being
+    /// measured and not age: the two oldest packs in the whole store are a
+    /// family of two, and the six newer ones are a family of six. With a
+    /// retention rule of [`KEEP_PER_KEY`] the family of two is wholly inside
+    /// its own newest five while the family of six has one pack outside
+    /// hers — so the pack that goes is a **newer** pack of the bigger
+    /// family, and the two oldest things on the disk stay. An eviction that
+    /// ranked by age alone would take one of those two, which is the
+    /// difference this arm exists to see.
+    ///
+    /// The second arm is the other half of the row's wording. Against a
+    /// budget one pack wide, seven go — four of them from inside a family's
+    /// newest five — and the newest of all is the last one standing. A store
+    /// far enough over its figure has to come under it; what is absolutely
+    /// kept is what a job references and what the keeper pins, which is what
+    /// the milestone's done-when says.
+    #[test]
+    fn the_newest_of_a_key_family_are_the_last_packs_an_eviction_takes() {
+        assert_eq!(
+            (KEEP_PER_KEY, Claims::default().keep_per_key),
+            (5, 5),
+            "the figure is five and a caller with no opinion gets it; it is `plan.md`'s own \
+             number and has no derivation anywhere, so it is a default and never an \
+             acceptance criterion"
+        );
+        let temp = TempDir::new("pack-gc-newest");
+        let store = PackStore::open(temp.path()).expect("a store");
+        let two: Vec<PackId> = (1..=2u64)
+            .map(|object| plant_pack(&store, Some("build"), &[(object, GIB)]))
+            .collect();
+        let six: Vec<PackId> = (3..=8u64)
+            .map(|object| plant_pack(&store, Some("docs"), &[(object, GIB)]))
+            .collect();
+        // The family of two is the oldest thing on this disk.
+        filed_ago(&store.pack_dir(&two[0]), 900);
+        filed_ago(&store.pack_dir(&two[1]), 840);
+        for (index, id) in six.iter().enumerate() {
+            filed_ago(&store.pack_dir(id), 600 - index as u64 * 60);
+        }
+        store.set_budget(Some(7 * GIB));
+        assert_eq!(store.measure().expect("measured").bytes, 8 * GIB);
+
+        let swept = store
+            .evict_to_budget(&Claims::default())
+            .expect("the pass runs");
+        assert_eq!(
+            (swept.packs_removed, swept.bytes_after, swept.within_budget),
+            (1, 7 * GIB, true),
+            "{swept:#?}"
+        );
+        assert!(
+            !store.holds(&six[0]),
+            "the pack that goes is the one pack outside its own family's newest five: \
+             {swept:#?}"
+        );
+        assert!(
+            store.holds(&two[0]) && store.holds(&two[1]),
+            "and the two oldest packs on this disk stay, because a family of two is wholly \
+             inside its own newest five — the rule is per key family and not per store: \
+             {swept:#?}"
+        );
+
+        // And now a budget no family's retention can satisfy.
+        store.set_budget(Some(GIB));
+        let swept = store
+            .evict_to_budget(&Claims::default())
+            .expect("the pass runs");
+        assert_eq!(
+            (swept.packs_removed, swept.bytes_after, swept.within_budget),
+            (6, GIB, true),
+            "six more go, from inside two families' newest five, because the retention rule is \
+             a preference and the budget is the bound: {swept:#?}"
+        );
+        assert_eq!(
+            every_announced_pack_is_whole(&store),
+            vec![six[5].clone()],
+            "and what is left is the newest of all: {swept:#?}"
+        );
+    }
+
+    /// **A pack Herd set aside is not a gc candidate**, measured on the disk
+    /// rather than read off the source.
+    ///
+    /// `no_source_in_this_runner_removes_a_set_aside_pack` holds the claim
+    /// over this crate's whole source and is the stronger of the two; this
+    /// one holds it over the one act that now really does take bytes away.
+    /// `packs/refused/`'s fate is a question nobody has answered (ORCH-215),
+    /// and a gc that swept it would have answered it without being asked.
+    #[test]
+    fn an_eviction_leaves_a_set_aside_pack_exactly_where_it_is() {
+        let temp = TempDir::new("pack-gc-set-aside");
+        let store = PackStore::open(temp.path()).expect("a store");
+        let kept = store.refused_at("j0000000031-1", "packs");
+        let manifest = write_pack(&kept, &[("bin/tool", b"the bytes a build made")], None);
+        let kept_object = kept
+            .join(OBJECTS_DIR)
+            .join(herd_proto::sha256_hex(b"the bytes a build made"));
+
+        let going = plant_pack(&store, Some("build"), &[(1, 4 * GIB)]);
+        let staying = plant_pack(&store, Some("build"), &[(2, GIB)]);
+        filed_ago(&store.pack_dir(&going), 600);
+        filed_ago(&store.pack_dir(&staying), 60);
+        store.set_budget(Some(2 * GIB));
+        store.measure().expect("the store measures");
+
+        let swept = store
+            .evict_to_budget(&Claims::default())
+            .expect("the pass runs");
+        assert_eq!(
+            (swept.packs_removed, swept.bytes_freed),
+            (1, 4 * GIB),
+            "the detector: this pass really did take something away, so what it left alone \
+             below is a measurement and not a silence: {swept:#?}"
+        );
+        assert_eq!(
+            fs::read(&kept_object).expect("the set-aside bytes survive an eviction"),
+            b"the bytes a build made",
+            "what Herd set aside is the operator's, and this pass reads `objects/` and \
+             `manifests/` and knows no third directory: {swept:#?}"
+        );
+        assert_eq!(
+            fs::read(kept.join(MANIFEST_FILE)).expect("its manifest too"),
+            manifest
+        );
+        assert!(store.holds(&staying) && !store.holds(&going));
+    }
+
+    /// **A store nobody bounded is a store nothing sweeps** — and a kill it
+    /// is still carrying is finished anyway.
+    ///
+    /// Absent is nobody said, never nought ([`PACK_BUDGET_FLAG`]), so a
+    /// runner whose operator never set a figure keeps what it holds; that is
+    /// P1's own rule and this is the arm of it that could have been got
+    /// wrong once something could remove a pack. The second half is why the
+    /// resume is not behind the budget check: a half-taken pack on a store
+    /// with no budget would otherwise be stranded for ever.
+    #[test]
+    fn a_store_with_no_budget_loses_no_pack_and_still_finishes_a_half_eviction() {
+        let temp = TempDir::new("pack-gc-no-budget");
+        let store = PackStore::open(temp.path()).expect("a store");
+        let held = plant_pack(&store, Some("build"), &[(1, 4 * GIB)]);
+        let stranded = plant_pack(&store, Some("build"), &[(2, GIB)]);
+        let aside = withdrawing_path(&store.manifests_dir());
+        fs::rename(store.pack_dir(&stranded), &aside).expect("the manifest moves aside");
+        store.measure().expect("the store measures");
+        assert_eq!(store.budget(), None, "nobody said");
+
+        let swept = store
+            .evict_to_budget(&Claims::default())
+            .expect("the pass runs");
+        assert_eq!(
+            (
+                swept.packs_removed,
+                swept.objects_removed,
+                swept.bytes_freed
+            ),
+            (0, 1, GIB),
+            "no pack this store holds is taken and the stranded object is: {swept:#?}"
+        );
+        assert!(swept.within_budget && swept.budget.is_none(), "{swept:#?}");
+        assert!(
+            swept
+                .said
+                .iter()
+                .any(|line| line.contains(PACK_BUDGET_FLAG) && line.contains("no budget")),
+            "and the pass says that is why: {swept:#?}"
+        );
+        assert_eq!(
+            every_announced_pack_is_whole(&store),
+            vec![held.clone()],
+            "{swept:#?}"
+        );
+        assert_eq!(store.usage().bytes, 4 * GIB);
+    }
+
+    /// One content can be two key families, and a pack nobody wrote a key
+    /// down for is in one unnamed family with every other such pack.
+    ///
+    /// The first half is why [`PackStore::remember_key`] is additive: two
+    /// requesters who declare the same artefact under two names hold one
+    /// pack between them, and a last-writer-wins file would move it between
+    /// families on a replay. The second is what a pack fetched from a peer
+    /// looks like today — `herd-runner/src/fetch.rs` has the key in hand at
+    /// its one `ingest` and that file is another task's — and it is **not**
+    /// protection: the newest few of the unnamed family are the last of
+    /// *them* to go, and nothing more.
+    #[test]
+    fn one_pack_can_be_two_key_families_and_a_pack_with_no_key_is_in_one_unnamed_family() {
+        let temp = TempDir::new("pack-gc-families");
+        let store = PackStore::open(temp.path()).expect("a store");
+
+        // The real ingest path, so the key is written where `leave_packs`
+        // writes it and not only where a fixture does.
+        let dir = temp.path().join("pack");
+        write_pack(
+            &dir,
+            &[("bin/tool", b"one content, two declarations")],
+            None,
+        );
+        let held = store.ingest(&dir).expect("the pack ingests");
+        let id = held.manifest.id().clone();
+        assert_eq!(store.keys_of(&id).expect("readable"), Vec::<String>::new());
+        store.remember_key(&id, "release").expect("one key");
+        store.remember_key(&id, "build").expect("a second key");
+        store.remember_key(&id, "build").expect("and again");
+        assert_eq!(
+            store.keys_of(&id).expect("readable"),
+            vec!["build".to_owned(), "release".to_owned()],
+            "additive, idempotent and sorted, so one pack reads the same twice"
+        );
+
+        // Three packs nobody wrote a key down for, and a budget one of them
+        // wide: two go, oldest first, and the newest of the unnamed family
+        // is the one left.
+        let keyless: Vec<PackId> = (1..=3u64)
+            .map(|object| plant_pack(&store, None, &[(object, GIB)]))
+            .collect();
+        for (index, keyless_id) in keyless.iter().enumerate() {
+            filed_ago(&store.pack_dir(keyless_id), (4 - index as u64) * 60);
+        }
+        // A gibibyte plus a little, so that the ingested pack's own handful
+        // of bytes is inside the figure and the arithmetic under test is the
+        // keyless packs' alone.
+        store.set_budget(Some(GIB + 4096));
+        store.measure().expect("the store measures");
+        let swept = store
+            .evict_to_budget(&Claims {
+                referenced: BTreeSet::from([id.clone()]),
+                pins: None,
+                keep_per_key: 1,
+            })
+            .expect("the pass runs");
+        assert_eq!(
+            (swept.packs_removed, swept.within_budget),
+            (2, true),
+            "{swept:#?}"
+        );
+        assert_eq!(
+            (
+                store.holds(&keyless[0]),
+                store.holds(&keyless[1]),
+                store.holds(&keyless[2])
+            ),
+            (false, false, true),
+            "a pack of no key family is ranked by age within the unnamed family, which is \
+             neither protection nor a reason to go first: {swept:#?}"
+        );
+        assert!(
+            store.holds(&id),
+            "and the ingested pack is referenced, so it stays whatever its families are"
+        );
     }
 }
