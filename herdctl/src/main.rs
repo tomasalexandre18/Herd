@@ -1796,4 +1796,107 @@ mod tests {
             "only a refusal walks this back, and only because the hub said so"
         );
     }
+
+    /// **Every exit code `herdctl --help` promises, read back through the
+    /// code that produces it.**
+    ///
+    /// The table in [`EXIT_CODES`] is the contract a wrapper around this
+    /// binary is written against — the audience `--help` exists for, and the
+    /// one that cannot be told the sentence was wrong. It is prose, and until
+    /// this test nothing anywhere rendered `--help` on any shipped binary:
+    /// the project's one measured documentation defect was a figure in a clap
+    /// doc comment, wrong by 32× through three releases, caught by a person
+    /// reading.
+    ///
+    /// Each figure is interpolated from its constant, and `128 + n` is read
+    /// out of [`herdctl::exit_code_for`] by **asking it** what a signal
+    /// becomes rather than by repeating the base: a test that typed `128`
+    /// again would be a second copy of the rule.
+    ///
+    /// Whitespace is flattened first, because the table is indented for a
+    /// reader and clap re-wraps what it likes.
+    #[test]
+    fn the_long_help_states_every_figure_its_constants_decide() {
+        use clap::CommandFactory;
+        let help = Args::command()
+            .render_long_help()
+            .to_string()
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ");
+
+        // What a signal really becomes, asked of the function that decides
+        // it. Nine is only a signal to ask about; the base is the answer.
+        let signal = 9i32;
+        let base = herdctl::exit_code_for(&JobOutcome::Signalled { signal })
+            - u8::try_from(signal).expect("nine fits");
+
+        for (figure, what) in [
+            (
+                format!(
+                    "{} a runner stopped the job at a cap",
+                    herdctl::STOPPED_BY_CAP_CODE
+                ),
+                "the cap row",
+            ),
+            (
+                format!("{} Herd has no verdict", herdctl::NO_VERDICT_CODE),
+                "the no-verdict row",
+            ),
+            (
+                format!("{base} + n the job was killed by signal n"),
+                "the signal row",
+            ),
+            (
+                format!("{} a command did part of what it says", NOT_SETTLED_CODE),
+                "the said-only-half row",
+            ),
+            (
+                format!(
+                    "exit of {} or {} from Herd's",
+                    herdctl::STOPPED_BY_CAP_CODE,
+                    herdctl::NO_VERDICT_CODE
+                ),
+                "the sentence that says which codes `exit_code_from` disambiguates",
+            ),
+            (
+                format!(
+                    "{{\"exit_code\": {}, \"exit_code_from\": \"job\"}}",
+                    herdctl::STOPPED_BY_CAP_CODE
+                ),
+                "the worked example of a job's own 124",
+            ),
+            (
+                format!(
+                    "{{\"exit_code\": {}, \"exit_code_from\": \"herd\"}}",
+                    herdctl::STOPPED_BY_CAP_CODE
+                ),
+                "the worked example of a cap's 124",
+            ),
+            (
+                format!("Falling back after {}:", herdctl::NO_VERDICT_CODE),
+                "the heading of the section about the ambiguous code",
+            ),
+            (
+                format!(
+                    "{} is one code for two opposite situations",
+                    herdctl::NO_VERDICT_CODE
+                ),
+                "the sentence that explains why that section exists",
+            ),
+        ] {
+            assert!(
+                help.contains(&figure),
+                "`herdctl --help` must state {what} as the code decides it, and the \
+                 rendered help does not contain {figure:?}.\n\
+                 \n\
+                 **The constant is the authority and the help text is what is wrong.** A \
+                 wrapper around this binary branches on these numbers; do not change the \
+                 constant to match the table, and do not change this test — fix \
+                 `EXIT_CODES`.\n\
+                 \n\
+                 --- the rendered long help, with its whitespace flattened:\n{help}"
+            );
+        }
+    }
 }
