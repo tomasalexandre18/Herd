@@ -96,10 +96,15 @@
 //! is 1.5–2.1 s — and it is paid on ingest, once per content.
 //!
 //! The sha256 column is also checked to be **64 lowercase hex characters
-//! before it is joined onto a path**, here and not in `herd-proto`: a
-//! manifest is the consumer's file, `herd_proto::ManifestEntry` does not
-//! constrain the column's shape today, and a row whose first column read
-//! `../../something` would otherwise name a path outside the store.
+//! before it is joined onto a path** — a manifest is the consumer's file, and
+//! a row whose first column read `../../something` would otherwise name a
+//! path outside the store. **The rule itself lives in `herd-proto`**, as
+//! `herd_proto::pack::check_object_digest`, applied at the one place a
+//! `ManifestEntry` is built and `pub` precisely so that the readers which
+//! join that column onto a path delegate rather than keep a copy. This
+//! module delegates, in `object_name`. It carried its own hand-rolled
+//! copy until 2026-10-30, and that copy had already drifted far enough to
+//! cost a red gate.
 
 use std::collections::BTreeMap;
 use std::fs;
@@ -107,6 +112,7 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
+use herd_proto::pack::check_object_digest;
 use herd_proto::{PackId, PackManifest, MANIFEST_MAX_BYTES};
 
 use crate::size::measured_bytes;
@@ -983,25 +989,27 @@ fn link_or_copy(from: &Path, to: &Path) -> io::Result<Carriage> {
 
 /// `objects/<name>` as a path component, or why that column is not one.
 ///
-/// **Checked here because nothing upstream checks it.** The sha256 column of
-/// a manifest row is the consumer's text; `herd_proto::ManifestEntry` carries
-/// it as written and constrains its shape nowhere, and this module joins it
-/// onto a directory. Sixty-four lowercase hex characters and nothing else, so
-/// a row whose first column read `../../something` is a refusal naming the
-/// column rather than a path outside the store.
+/// **One rule, one wording, one place it can change.** The rule is
+/// [`check_object_digest`] — exactly 64 lowercase hex characters — which
+/// `herd-proto` applies at the one place a `ManifestEntry` is built and
+/// exposes `pub` for exactly this: a reader that joins the digest column onto
+/// a path delegates instead of keeping a second copy of the rule. This
+/// function is that delegation and nothing more.
+///
+/// It stays rather than being deleted because this module is the one that
+/// performs the join, so a digest reaching it by some later path with no
+/// parse behind it is still refused here rather than joined. What it must
+/// never again be is a *second statement* of the rule.
+///
+/// **Why that matters is measured and not argued.** Until 2026-10-30 this was
+/// a hand-rolled copy, and the two copies had already drifted: `herd-proto`
+/// spelled the rule "64 lowercase hex digits" and this module spelled it
+/// "sixty-four lowercase hex". Both branches were green alone, and their
+/// merge was red on a test asserting one of the two spellings. The
+/// duplication, not either wording, was the defect.
 fn object_name(sha256: &str) -> Result<&str, String> {
-    let hex = sha256.len() == 64
-        && sha256
-            .bytes()
-            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte));
-    if hex {
-        return Ok(sha256);
-    }
-    Err(format!(
-        "this manifest names an object {sha256:?}, and an object's name is sixty-four lowercase \
-         hex characters. Herd will not join anything else onto its store's objects directory, \
-         because a column that is not a digest is a path somewhere else"
-    ))
+    check_object_digest(sha256)?;
+    Ok(sha256)
 }
 
 /// A unique name under `directory` for something being made.
@@ -1561,20 +1569,27 @@ mod tests {
     /// A manifest whose first column is not a digest is refused by name, and
     /// nothing is joined onto the store's objects directory.
     ///
-    /// `herd_proto::ManifestEntry` carries that column as the consumer wrote
-    /// it and constrains its shape nowhere, so this is checked here — the
-    /// place that turns the column into a path.
+    /// **The whole sentence, verbatim, because there is now only one.** The
+    /// rule is `herd_proto::pack::check_object_digest`'s and `object_name` is
+    /// a two-line delegation to it, so the refusal an operator reads has one
+    /// author and one wording and a test can hold it to that.
     ///
-    /// **The assertion is the property and not one speaker's wording**, and
-    /// that is load-bearing rather than fastidious. This test used to quote
-    /// `object_name`'s own spelling, "sixty-four lowercase hex"; on a tree
-    /// that also holds `herd-proto`'s `check_object_digest` the row is
-    /// refused *earlier*, by a sentence that spells the same rule "64
-    /// lowercase hex digits" — right behaviour, red test, and neither parent
-    /// branch showed it. So what is matched is the value the refusal will not
-    /// take and the shared half of the rule, which holds whichever of the two
-    /// speaks first. The two sentences becoming one is a board row; until
-    /// then, this test does not care which one a reader gets.
+    /// It could not before, and the history is the reason this assertion
+    /// looks the way it does. Two statements of the rule existed — this
+    /// module's "sixty-four lowercase hex" and `herd-proto`'s "64 lowercase
+    /// hex digits" — and whichever of the two spoke first depended on which
+    /// branch you were standing on: both were green alone and their merge was
+    /// red here. That was unblocked by weakening this assertion to
+    /// `contains("lowercase hex")`, the substring the two wordings happened
+    /// to share, which left the duplication standing and would have caught
+    /// the next drift, if at all, by a substring. The duplication is gone, so
+    /// the workaround goes with it.
+    ///
+    /// Note which code speaks: the hostile row is refused by the **parse**,
+    /// inside `PackManifest::parse`, before `object_name` is reached at all.
+    /// That is the design — the rule is applied where the entry is built —
+    /// and it is why the expected text carries the parse's own `line 2 of
+    /// this manifest:` prefix.
     #[test]
     fn an_object_name_that_is_not_a_digest_is_refused_rather_than_joined_onto_a_path() {
         let temp = TempDir::new("pack-bad-name");
@@ -1588,9 +1603,13 @@ mod tests {
         fs::write(dir.join(MANIFEST_FILE), text.as_bytes()).expect("a hostile manifest");
         let why = store.ingest(&dir).expect_err("that is not an object name");
         assert!(
-            why.contains("escaped") && why.contains("lowercase hex"),
-            "the refusal names the value it will not take and the rule that value broke; the \
-             spelling of sixty-four is the speaker's and is not what this test is about: {why}"
+            why.contains(
+                "line 2 of this manifest: \"../../../escaped\" is 16 character(s) and a sha256 is \
+                 64 lowercase hex digits. This is the column Herd builds a path out of — \
+                 `objects/<sha256>` — so a value that is not a digest is a path outside the \
+                 pack's own store, and it is refused here rather than joined"
+            ),
+            "the refusal is the one sentence this project speaks for this rule, whole: {why}"
         );
         assert_eq!(
             names_in(&store.objects_dir()),
@@ -1598,14 +1617,31 @@ mod tests {
             "and nothing was placed anywhere"
         );
         // Upper case is not the spelling either: one pack's object must have
-        // one name, or the store holds the same bytes twice.
+        // one name, or the store holds the same bytes twice. Asserted by its
+        // whole sentence as well, for the reason above — `is_err()` would
+        // have passed on either of the two wordings and on a third.
+        let upper = herd_proto::sha256_hex(b"first").to_uppercase();
         let text = format!(
             "{}\n{}\t5\t0644\tf\tartefact\tbin/tool\n",
             herd_proto::CHATONS_PACK_FORMAT,
-            herd_proto::sha256_hex(b"first").to_uppercase()
+            upper
         );
         fs::write(dir.join(MANIFEST_FILE), text.as_bytes()).expect("an upper-case manifest");
-        assert!(store.ingest(&dir).is_err(), "one spelling, not two");
+        let first_upper = upper
+            .chars()
+            .find(|c| c.is_ascii_hexdigit() && c.is_uppercase())
+            .expect("this digest has a letter in it");
+        let why = store.ingest(&dir).expect_err("one spelling, not two");
+        assert!(
+            why.contains(&format!(
+                "line 2 of this manifest: {upper:?} contains the uppercase hex digit \
+                 {first_upper:?}, and Herd reads lowercase only. It is refused rather than \
+                 lowercased: a content-addressed store that accepted both spellings could hold \
+                 one object's bytes twice under two names, and nothing would say which of the \
+                 two the manifest meant"
+            )),
+            "and the uppercase refusal is that one sentence too: {why}"
+        );
     }
 
     /// A pack the store does not hold whole is not laid out at all, and the
