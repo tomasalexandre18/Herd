@@ -14429,3 +14429,152 @@ measured, and the replacement adds no reason.
 docs file is *how*, not *what* the product is or promises — so it is
 decided alone and reported afterwards (`CLAUDE.md`, *Direction*). It
 changes no gate: `check-docs.sh` is untouched by it.
+
+## 2026-10-30 — D277 v1.0.0 is cut; the five things named as not met
+
+**Context.** `docs/coverage.md` carried **42 of 44** as the figure to
+quote for v1.0.0 (**D248**), derived as 44 less the two musts the first
+consumer released us from. Three rulings of 2026-10-30 move what that
+figure counts, and one of them breaks a release blocker this project
+wrote for itself.
+
+**Choice, Alexa, 2026-10-30.** v1.0.0 is cut at `main`'s tip with
+**five** things named in its notes as not met, and the notes name them
+rather than wording around them. **Two of the five are not his acts at
+all and are carried here as citations**, for the reason in *What this
+entry does not restate*, below.
+
+1. **E-49 waived** (**D248**), and **unmeasured** — zero measurements on
+   real hardware. The re-enrolment report coming at the migration is
+   **not** E-49's new-machine walk and E-49 is not declared met on it.
+2. **E-50 withdrawn, not waived** (**D248**) — their fleet needs KVM, so
+   native Linux; WSL served one build-host experiment and never Herd.
+   The reason travels with the withdrawal so nobody re-adds it.
+3. **E-14 is withdrawn: see D275**, which records it as the **first
+   consumer's own answer**, with their French verbatim and the mechanism
+   — a copy-on-write mount of the nearest cache per commit, from their
+   own `up` step — beside it. Not restated here.
+4. **The hub's record retention is cut from v1.0.0 and follows in
+   v1.1: see D275**, which records that too as **theirs**, with the two
+   conditions they stated and the figures the cut was decided on. Not
+   restated here. What ships bounds space and not age — `--output-budget`,
+   `--volume-free-floor` (no default, **D254**) and
+   `herd-hub retention-preview`, which removes nothing (**D197**,
+   **D253**) — and **nothing in v1.0.0 removes a record**.
+5. **One known-unstable test ships, named**, and **this breaks release
+   blocker B8** (*"No known-unstable test ships"*,
+   `docs/road-to-v1.md:75`). The test is
+   `a_runner_killed_mid_job_gives_its_slot_back`,
+   `herd-hub/tests/slots.rs`, and the question it carries is ORCH-022 /
+   **D228**: whether a runner silent for `lost_after` keeps its link.
+   **The fix on the table was refused because it would have doubled a
+   published promise** — giving the link a bound of `lost_after * 2`
+   takes E-21's *about 60 s* to about **two minutes** for a machine
+   genuinely off. **He chose the promise and named the test.** E-21 is
+   unchanged. The notes say B8 is not met rather than pretending it is.
+
+**What this entry does not restate, and why it is a citation and not a
+paragraph.** The draft of this entry carried items 3 and 4 as two more
+of Alexa's *"Choices"*. They are not: both are the **first consumer's
+answers**, relayed under D249's channel and already recorded as theirs
+in **D275**. Folding a requester's answer into one act of the owner's
+attributes to him a decision he did not take, and the attribution is
+the part a later reader cannot undo. The ruling is the orchestrator's,
+taken at batch 28's landing and carried out at this one; the landing
+record of batch 28 states it, and
+`history/2026-10-31-merge-batch-29.md` records it applied.
+
+**What this does not decide.** Nothing about the bound ORCH-022 asks
+about, nothing about `bytes_written` (ORCH-278), and nothing about when
+v1.1's retention engine lands. ORCH-022 stays Alexa's. Which **headline
+figure** the notes carry is **not decided here either**: the body
+carries none, by **D210**, and an HTML comment where one would go names
+the three sourced readings and recommends none.
+
+**The arithmetic to quote, and the two quantities not to confuse.**
+Re-derived mechanically from the 44 `must` state cells of
+`docs/coverage.md` at **`f7f2ea1`**, the commit this release is cut
+from: **36** `merged`, **5** `part` (E-12, E-16, E-17, E-37, E-42),
+**1** `planned` (E-14), **1** `waived` (E-49), **1** `withdrawn`
+(E-50) — the table the body prints, **36 / 5 / 1 / 2 = 44**. D248's
+**42 of 44** is a *scope* figure — the musts v1.0.0 is answerable for
+after the waivers — and **never a count of what is met**. The cell and
+D275 disagree about E-14 by design: the cell still reads `planned`
+because the edit that moves it is **ORCH-305** and has not landed, and
+when it does the same derivation gives 36 + 5 + 0 + 3 = 44 and the
+scope figure **41 of 44**. The body prints the disagreement rather than
+settling it. `docs/coverage.md` is owed both corrections (ORCH-306).
+
+## 2026-10-30 — D278 A release's notes are drafted for the owner,
+never by him from nothing
+
+**Context.** **D210** settled that completing a release's notes is
+Alexa's own act, and **ORCH-162** moved the notes into the tree as
+`deploy/release-notes/<version>.md` so that no release reaches its page
+without them. Neither says who writes the first draft, and for v1.0.0
+— where the notes **are** the stability promise — a blank page at 21:00
+would have put the one act he holds on the critical path of a day's
+work.
+
+**Choice, Alexa, 2026-10-30, verbatim:** *« Je rédige, tu valides à
+21 h »*, read as: **he corrects and signs, and the draft is prepared for
+him.** `herd-release` writes `deploy/release-notes/<version>.md` on the
+`cut-v<version>` branch, sourced line by line, and hands it back in its
+report as well as in the tree so that he reads a document and not a
+diff. **The act stays his**: nothing is published, the branch carries a
+draft, and his correction is the release's own notes.
+
+**The rule the draft is held to, and it is the whole of why this is
+writable at all.** Every sentence is something the code does, measured,
+at a named version, on a named host. A figure measured once, idle, or on
+a fixture says so **in the same breath** as the figure. A sentence that
+cannot be sourced is cut rather than softened. **In no direction does
+Herd claim a platform, a figure or a capability it has not run** — which
+is E-50's reason generalised from one row to the whole document.
+
+**Why the draft and not a checklist.** `release.yml` reads the human
+half and never checks it, and `check-docs.sh` requires only that the
+file exist and be non-empty. So the first draft is the only place the
+sourcing can be done at all, and leaving it to the paste is what cost
+v0.4.0 its notes (ORCH-162).
+
+**And the rule's own first failure, which is why it is written down
+twice.** A sentence can satisfy *"sourced"* and still be false: v1.0.0's
+scope table named E-16's missing clauses as *"per-runner budgets and
+keeper pinning"*, both of which **ship**, because it carried
+`docs/coverage.md`'s own stale note forward instead of reading the
+code. It was found during the landing and corrected before the tag
+(`history/2026-10-31-merge-batch-29.md`), and `coverage.md` is owed the
+same correction (ORCH-307). **A draft inherits the staleness of what it
+quotes**, so a clause about what is *not* built is read in the code and
+labelled as read.
+
+**What it does not change.** **D210** stands: the published wording is
+his. **D212** stands: the tag is the integrator's. **D161** and
+invariant 9 stand: nothing in a release's notes is a fact about the
+consumer's machines that we took ourselves.
+
+## 2026-10-30 — D279 A document the version bump falsifies is
+corrected by the bump
+
+**Context.** `docs/operating.md`'s *What this means for you,
+concretely, today* opened with *"No release you can install moves
+`RECORD_VERSION` or `LAYOUT_VERSION`"* and bound the *ordinary release
+before v1.0.0* that **D243** had already declared moot. Both sentences
+are true of every tree up to `df47266` and false of the tree that
+carries the v1.0.0 bump — and the file they are in is the one written
+for the consumer's operator.
+
+**The rule.** A `cut-v<version>` branch corrects the prose **its own
+bump falsifies**, in the same commit, and names the hunk in its handoff
+so a conflict costs the integrator one read. It does not go further:
+prose the bump makes *incomplete* rather than *false* — a per-release
+table wanting a new row, an example output quoting an older version —
+is a docs task and stays one.
+
+**What it does not cover.** `deploy/release-notice.md` is quoted in full
+on published release pages, so it is Alexa's and not a cut's
+(**ORCH-217**), even where a version bump makes it stale. And a
+**measurement's** provenance is never re-versioned: `docs/joining.md`'s
+*"On our own queue runner (v0.4.1, one host, one version)"* stays at
+v0.4.1 because that is the build the 0.212 s was taken on (**D264**).
