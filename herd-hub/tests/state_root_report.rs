@@ -757,6 +757,12 @@ fn the_report_reads_what_the_store_itself_wrote() {
 }
 
 /// The report's text, with the only thing that varies left as `{ROOT}`.
+///
+/// **Section 4 is the banner and not the figures**, because this fixture's
+/// root is built by the store and no hub has opened a pack registry on it:
+/// there is no `packs/` directory, and saying so is a different statement
+/// from nought packs. The figures themselves are asserted in `report.rs`'s
+/// own module, on roots with planted packs.
 const EXPECTED: &str = "\
 herd-hub state-root report
   state root  {ROOT}
@@ -855,4 +861,18 @@ records
     into it right now, or it may be what one that died left behind.
     jobs/j0000000006: 3 bytes
   files.gone/ a sweep left behind     1 job(s), 5 bytes
+
+4. the packs this hub holds
+
+  What is under packs/, measured by file length. Section 3 above is about
+  job output and accounts for none of this: the output budget is a bound on
+  collections, and nothing in Herd weighs these bytes against anything
+  today. They are counted here because docs/disk-policy.md section 0.7 asks
+  that whatever is kept appear in a report with its size. Nothing is
+  removed: who owns the growth of this directory is a question for whoever
+  runs this hub, and it is open (ORCH-215).
+
+  THERE IS NO packs/ DIRECTORY ON THIS ROOT, so this hub has never
+  served it at layout 2 or later. That is not an empty registry: an
+  empty one is a directory with nothing in it.
 ";

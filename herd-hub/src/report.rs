@@ -73,6 +73,26 @@ use herd_proto::size::measured_bytes;
 /// four thousand is a number, which the count already is.
 const NAMED_AT_MOST: usize = 10;
 
+/// `manifests/` under [`crate::registry::PACKS_DIR`]: the directory the hub's
+/// pack registry publishes one directory per pack into.
+///
+/// **A second spelling of a name `registry.rs` owns, and the duplication is
+/// guarded rather than hidden.** `PACKS_DIR` is `pub(crate)` and reused here;
+/// this one is private to that module, and this report may not simply open a
+/// [`crate::PackRegistry`] to ask it, because opening one *creates* the
+/// directories and probes them for writability — the one thing a reader of a
+/// live root must never do (see this module's header). So the name is written
+/// again, and `the_report_walks_the_directory_the_registry_publishes_into`
+/// opens a real registry on a temporary root and asserts that this is the
+/// directory it made. A copy that drifts reddens that test instead of
+/// silently reporting nought packs on a root holding thousands.
+const PACKS_MANIFESTS_DIR: &str = "manifests";
+
+/// `manifests.part/` beside it: where a registration is assembled before it
+/// is published, and the one place an interrupted registration leaves
+/// anything. The same duplication, under the same guard.
+const PACKS_MANIFESTS_PART_DIR: &str = "manifests.part";
+
 /// Enough of a `job.json` to report on it, and nothing else.
 ///
 /// **Deliberately not [`crate::job::JobRecord`].** A record whose labels
@@ -284,6 +304,75 @@ impl Accounting {
     }
 }
 
+/// What this hub holds under `packs/`: figure 4 (M12, E-16, ORCH-256).
+///
+/// **Why it is here at all.** `docs/disk-policy.md` §0.7 makes it a
+/// requirement and not a preference that whatever Herd keeps appears in a
+/// report with its size and counts toward the space calculation. Until this
+/// existed the words `pack` and `manifest` appeared nowhere in this file: the
+/// hub's whole pack population was held, unreported and uncounted, which is
+/// §0.7's 65 GB precedent one directory over. Nothing here removes anything —
+/// **who owns the growth of `packs/` is ORCH-215, which is Alexa's question**,
+/// and this report deliberately does not pre-empt it. Reporting what is held
+/// needs no permission; removing it does.
+///
+/// **It is measured, never claimed.** There is no manifest of manifests to
+/// read, so every figure below is [`directory_bytes`] over a real directory —
+/// the sweeper's own walk, for the reason figure 3 uses it.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Packs {
+    /// Whether `packs/` is on this root at all.
+    ///
+    /// A hub creates it at every start, so `false` is a root no hub of
+    /// layout 2 has ever served — which is a different fact from a `packs/`
+    /// that is there and empty, and the two must not print the same.
+    pub present: bool,
+    /// Directories under `packs/manifests/`: the packs this hub has
+    /// published, one directory each.
+    pub registered: usize,
+    /// What those directories measure, by file length.
+    pub registered_bytes: u64,
+    /// Entries under `packs/manifests/` that are **not** directories.
+    ///
+    /// Counted because a file where a pack directory should be is somebody
+    /// else's doing, and a count of nought is the answer an operator wants to
+    /// read rather than infer.
+    pub not_directories: usize,
+    /// Said rather than swallowed when `packs/manifests/` itself could not be
+    /// read: a report of nought packs on a root holding thousands is the
+    /// worst output this tool could produce, which is the rule
+    /// [`StateRootReport::jobs_dir_error`] already lives by.
+    pub manifests_error: Option<String>,
+    /// `packs/manifests.part/` directories — a registration interrupted
+    /// between its writes and its one `rename(2)` — and what they measure.
+    ///
+    /// Real disk that nothing reads: the pack does not resolve and its id
+    /// finds no manifest. The next `PackRegistry::open` removes it by name,
+    /// so a non-zero figure here is residue a restart frees, not a
+    /// population.
+    pub interrupted: usize,
+    pub interrupted_bytes: u64,
+    /// Everything under `packs/`, whatever is in it.
+    ///
+    /// **The total is measured over the whole directory and not summed from
+    /// the two figures above**, so that a child this build has never heard of
+    /// is still counted. A later directory under `packs/` would otherwise be
+    /// invisible here, which is exactly how the population this section
+    /// exists for came to be uncounted in the first place.
+    pub bytes: u64,
+}
+
+impl Packs {
+    /// Bytes under `packs/` that neither `manifests/` nor `manifests.part/`
+    /// accounts for: the figure that says this section has stopped seeing
+    /// everything.
+    pub fn unaccounted_bytes(&self) -> u64 {
+        self.bytes
+            .saturating_sub(self.registered_bytes)
+            .saturating_sub(self.interrupted_bytes)
+    }
+}
+
 /// A `sha256` two records give two different lengths.
 ///
 /// The same bytes cannot be two lengths, so this is an accounting defect and
@@ -325,6 +414,9 @@ pub struct StateRootReport {
     pub conflicts: Vec<DigestConflict>,
     pub sizes: Sizes,
     pub accounting: Accounting,
+    /// What this hub holds under `packs/`: figure 4, and the one population
+    /// in this state root that no section above accounts for.
+    pub packs: Packs,
 }
 
 impl StateRootReport {
@@ -354,6 +446,7 @@ impl StateRootReport {
             conflicts: Vec::new(),
             sizes: Sizes::default(),
             accounting: Accounting::default(),
+            packs: Packs::default(),
         };
 
         // Sorted, so that the lists this report prints are in one order
@@ -544,10 +637,75 @@ impl StateRootReport {
                     .then_with(|| left.job.cmp(&right.job))
             });
         report.sizes = summarise(per_job, naming_nothing);
+        report.packs = read_the_packs(root);
         Ok(report)
     }
 }
 
+/// Measure what this hub holds under `packs/`: figure 4.
+///
+/// A directory walk and nothing else — no `PackRegistry::open`, which would
+/// create directories, probe them for writability and remove residue on a
+/// root this report is only allowed to read. So a pack is **one directory
+/// under `packs/manifests/`**, which is the registry's own publication unit,
+/// and its weight is the length of the files in it.
+///
+/// Nothing here is a refusal: a `packs/` that is not there is a root no hub
+/// of layout 2 has served, which is a state, and a `manifests/` that cannot
+/// be read is said in [`Packs::manifests_error`] so that nought packs is
+/// never printed as an answer when it is really a failure to look.
+fn read_the_packs(root: &Path) -> Packs {
+    let directory = root.join(crate::registry::PACKS_DIR);
+    let mut packs = Packs {
+        present: directory.is_dir(),
+        // The whole directory, measured once. Deliberately not the sum of
+        // the two figures below: see [`Packs::bytes`].
+        bytes: directory_bytes(&directory),
+        ..Packs::default()
+    };
+    if !packs.present {
+        return packs;
+    }
+
+    let manifests = directory.join(PACKS_MANIFESTS_DIR);
+    match fs::read_dir(&manifests) {
+        Ok(entries) => {
+            for entry in entries.flatten() {
+                match entry.file_type() {
+                    Ok(kind) if kind.is_dir() => {
+                        packs.registered += 1;
+                        packs.registered_bytes = packs
+                            .registered_bytes
+                            .saturating_add(directory_bytes(&entry.path()));
+                    }
+                    // A file, a symlink or an entry whose kind would not read:
+                    // not a pack, and counted rather than ignored.
+                    _ => packs.not_directories += 1,
+                }
+            }
+        }
+        // A `manifests/` that is simply not there is not an error: a hub
+        // creates it at open, so this is a `packs/` somebody made by hand or
+        // one a very early build left. Nought packs is then the true answer.
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Err(error) => {
+            packs.manifests_error = Some(format!("{}: {error}", manifests.display()));
+        }
+    }
+
+    let part = directory.join(PACKS_MANIFESTS_PART_DIR);
+    if let Ok(entries) = fs::read_dir(&part) {
+        for entry in entries.flatten() {
+            if entry.file_type().map(|kind| kind.is_dir()).unwrap_or(false) {
+                packs.interrupted += 1;
+                packs.interrupted_bytes = packs
+                    .interrupted_bytes
+                    .saturating_add(directory_bytes(&entry.path()));
+            }
+        }
+    }
+    packs
+}
 /// Fold one file's digest into a tally, and remember a length that disagrees
 /// with the one already there.
 fn note_digest(
@@ -1038,6 +1196,122 @@ impl fmt::Display for StateRootReport {
             accounting.gone_dirs,
             measured_bytes(accounting.gone_bytes)
         )?;
+        writeln!(f)?;
+
+        writeln!(f, "4. the packs this hub holds")?;
+        writeln!(f)?;
+        writeln!(
+            f,
+            "  What is under packs/, measured by file length. Section 3 above is about"
+        )?;
+        writeln!(
+            f,
+            "  job output and accounts for none of this: the output budget is a bound on"
+        )?;
+        writeln!(
+            f,
+            "  collections, and nothing in Herd weighs these bytes against anything"
+        )?;
+        writeln!(
+            f,
+            "  today. They are counted here because docs/disk-policy.md section 0.7 asks"
+        )?;
+        writeln!(
+            f,
+            "  that whatever is kept appear in a report with its size. Nothing is"
+        )?;
+        writeln!(
+            f,
+            "  removed: who owns the growth of this directory is a question for whoever"
+        )?;
+        writeln!(f, "  runs this hub, and it is open (ORCH-215).")?;
+        writeln!(f)?;
+        let packs = &self.packs;
+        if !packs.present {
+            writeln!(
+                f,
+                "  THERE IS NO packs/ DIRECTORY ON THIS ROOT, so this hub has never"
+            )?;
+            writeln!(
+                f,
+                "  served it at layout 2 or later. That is not an empty registry: an"
+            )?;
+            writeln!(f, "  empty one is a directory with nothing in it.")?;
+            return Ok(());
+        }
+        if let Some(error) = &packs.manifests_error {
+            writeln!(
+                f,
+                "  THE MANIFESTS DIRECTORY COULD NOT BE READ, so the pack count below is"
+            )?;
+            writeln!(f, "  about no packs at all and not about none: {error}")?;
+        }
+        writeln!(
+            f,
+            "  packs registered                    {} pack(s), {}",
+            packs.registered,
+            measured_bytes(packs.registered_bytes)
+        )?;
+        if packs.not_directories > 0 {
+            writeln!(
+                f,
+                "    and {} entry/ies under {}/{PACKS_MANIFESTS_DIR}/ that are not",
+                packs.not_directories,
+                crate::registry::PACKS_DIR
+            )?;
+            writeln!(
+                f,
+                "    directories, so they are not packs and are no part of the count above"
+            )?;
+        }
+        writeln!(
+            f,
+            "  registrations interrupted           {} directory/ies, {}",
+            packs.interrupted,
+            measured_bytes(packs.interrupted_bytes)
+        )?;
+        if packs.interrupted > 0 {
+            writeln!(
+                f,
+                "    Written and never renamed into place, so nothing reads them: the"
+            )?;
+            writeln!(
+                f,
+                "    pack does not resolve and its id finds no manifest. The next start of"
+            )?;
+            writeln!(f, "    a hub on this root removes them by name.")?;
+        }
+        writeln!(
+            f,
+            "  everything under {}/             {}",
+            crate::registry::PACKS_DIR,
+            measured_bytes(packs.bytes)
+        )?;
+        // The total is measured over the whole directory, so a child nothing
+        // above names is still in it. Saying the difference out loud is what
+        // makes that true rather than merely intended: a figure here is a
+        // directory this section has stopped describing.
+        let unaccounted = packs.unaccounted_bytes();
+        if unaccounted > 0 {
+            writeln!(
+                f,
+                "  neither of the two above            {}",
+                measured_bytes(unaccounted)
+            )?;
+            writeln!(
+                f,
+                "    Bytes under {}/ that this section does not describe. The total is",
+                crate::registry::PACKS_DIR
+            )?;
+            writeln!(
+                f,
+                "    measured over the whole directory on purpose, so that a directory"
+            )?;
+            writeln!(
+                f,
+                "    added beside the two above is counted before anything names it."
+            )?;
+        }
         Ok(())
     }
 }
@@ -1338,5 +1612,219 @@ mod tests {
                 "the eleventh onwards are counted, not named:\n{text}"
             );
         }
+    }
+
+    /// Plant one pack under `packs/manifests/`, in the shape the registry
+    /// publishes, and answer with the bytes it weighs.
+    ///
+    /// Not a `PackRegistry::open` and a real registration: what this section
+    /// measures is a **directory on a disk**, and a test that went through the
+    /// registry's API would prove the API agrees with itself. The identity
+    /// rule is honoured anyway — the directory's name is the sha256 of the
+    /// manifest beside it — so nothing here is a shape the hub would refuse.
+    fn plant_a_pack(root: &Path, which: u8, filler: usize) -> u64 {
+        let manifest = format!("# pack {which}\n{}\n", "x".repeat(filler));
+        let manifest = manifest.into_bytes();
+        let id = herd_proto::sha256_hex(&manifest);
+        let at = root
+            .join(crate::registry::PACKS_DIR)
+            .join(PACKS_MANIFESTS_DIR)
+            .join(&id);
+        fs::create_dir_all(&at).expect("a planted pack directory");
+        fs::write(at.join("manifest.tsv"), &manifest).expect("a planted manifest");
+        manifest.len() as u64
+    }
+
+    /// **The population, with its size** (§0.7, ORCH-256).
+    ///
+    /// Three packs of three different weights, so that a total which happened
+    /// to be a multiple of the count could not pass for the sum, and every
+    /// figure is known to this test by construction.
+    #[test]
+    fn the_report_names_the_pack_population_with_its_size() {
+        let dir = tempfile::tempdir().expect("a temporary directory");
+        let root = dir.path();
+        job_dir(root, "j0000000001", Some(readable("j0000000001")));
+        let planted: u64 = [3usize, 97, 1_000]
+            .iter()
+            .enumerate()
+            .map(|(which, filler)| plant_a_pack(root, which as u8, *filler))
+            .sum();
+
+        let report = StateRootReport::read(root).expect("the report reads this root");
+        assert!(report.packs.present, "packs/ is on this root");
+        assert_eq!(report.packs.registered, 3, "three directories, three packs");
+        assert_eq!(
+            report.packs.registered_bytes, planted,
+            "the figure is the planted bytes and nothing else"
+        );
+        assert_eq!(
+            report.packs.bytes, planted,
+            "the whole of packs/ is the three packs, measured over the directory"
+        );
+        assert_eq!(report.packs.unaccounted_bytes(), 0);
+        assert_eq!(report.packs.interrupted, 0);
+        assert_eq!(report.packs.not_directories, 0);
+
+        let text = rendered(root);
+        assert!(
+            text.contains("4. the packs this hub holds\n"),
+            "the section is there:\n{text}"
+        );
+        assert!(
+            text.contains(&format!(
+                "  packs registered                    3 pack(s), {}\n",
+                measured_bytes(planted)
+            )),
+            "the population and its size, on one line:\n{text}"
+        );
+        assert!(
+            text.contains("ORCH-215"),
+            "the line says removal is somebody's open question and not this \
+             report's doing:\n{text}"
+        );
+    }
+
+    /// An empty registry and a root with no `packs/` at all are two different
+    /// facts, and the report says which.
+    ///
+    /// Nought packs printed on a root a hub has never served would be the
+    /// same sentence as nought packs on one serving a fleet, and an operator
+    /// could not tell them apart — the mistake section 3's banners already
+    /// exist to avoid.
+    #[test]
+    fn a_root_with_no_packs_directory_is_not_an_empty_registry() {
+        let dir = tempfile::tempdir().expect("a temporary directory");
+        let root = dir.path();
+        job_dir(root, "j0000000001", Some(readable("j0000000001")));
+
+        let report = StateRootReport::read(root).expect("the report reads this root");
+        assert!(!report.packs.present);
+        assert_eq!(report.packs.registered, 0);
+        let text = rendered(root);
+        assert!(
+            text.contains("THERE IS NO packs/ DIRECTORY ON THIS ROOT"),
+            "a root no hub of layout 2 served says so:\n{text}"
+        );
+        assert!(
+            !text.contains("packs registered                    0 pack(s)"),
+            "and it does not print nought packs as the answer:\n{text}"
+        );
+
+        // The empty registry: the directory is there with nothing in it.
+        fs::create_dir_all(
+            root.join(crate::registry::PACKS_DIR)
+                .join(PACKS_MANIFESTS_DIR),
+        )
+        .expect("an empty registry");
+        let report = StateRootReport::read(root).expect("the report reads this root");
+        assert!(report.packs.present);
+        assert_eq!(report.packs.registered, 0);
+        let text = rendered(root);
+        assert!(
+            !text.contains("THERE IS NO packs/ DIRECTORY"),
+            "an empty registry is not an absent one:\n{text}"
+        );
+        assert!(
+            text.contains("  packs registered                    0 pack(s), 0 bytes\n"),
+            "and nought is the honest figure here:\n{text}"
+        );
+    }
+
+    /// An interrupted registration is real disk and is named as residue, not
+    /// as population.
+    #[test]
+    fn a_registration_that_was_interrupted_is_counted_apart_from_the_packs() {
+        let dir = tempfile::tempdir().expect("a temporary directory");
+        let root = dir.path();
+        let planted = plant_a_pack(root, 0, 11);
+        let residue = root
+            .join(crate::registry::PACKS_DIR)
+            .join(PACKS_MANIFESTS_PART_DIR)
+            .join("staging-7");
+        fs::create_dir_all(&residue).expect("the residue directory");
+        fs::write(residue.join("manifest.tsv"), vec![b'z'; 40]).expect("residue bytes");
+
+        let report = StateRootReport::read(root).expect("the report reads this root");
+        assert_eq!(report.packs.registered, 1, "one published pack");
+        assert_eq!(report.packs.registered_bytes, planted);
+        assert_eq!(report.packs.interrupted, 1);
+        assert_eq!(report.packs.interrupted_bytes, 40);
+        assert_eq!(
+            report.packs.bytes,
+            planted + 40,
+            "the total holds both, because both are disk"
+        );
+        assert_eq!(
+            report.packs.unaccounted_bytes(),
+            0,
+            "and the two figures together account for the total"
+        );
+        let text = rendered(root);
+        assert!(
+            text.contains("  registrations interrupted           1 directory/ies, 40 bytes\n"),
+            "the residue is named with its size:\n{text}"
+        );
+        assert!(
+            text.contains("removes them by name"),
+            "and the line says a restart frees it:\n{text}"
+        );
+    }
+
+    /// A directory under `packs/` that this build does not name is still in
+    /// the total, and the difference is printed.
+    ///
+    /// The property the total exists for: the pack population went uncounted
+    /// for a whole milestone because nothing measured the directory it was
+    /// in. A figure summed from the children this build happens to know would
+    /// repeat that, one directory further down.
+    #[test]
+    fn bytes_under_packs_that_no_figure_names_are_still_in_the_total() {
+        let dir = tempfile::tempdir().expect("a temporary directory");
+        let root = dir.path();
+        let planted = plant_a_pack(root, 0, 11);
+        let stranger = root.join(crate::registry::PACKS_DIR).join("objects");
+        fs::create_dir_all(&stranger).expect("a directory nothing here names");
+        fs::write(stranger.join("blob"), vec![b'q'; 500]).expect("its bytes");
+
+        let report = StateRootReport::read(root).expect("the report reads this root");
+        assert_eq!(report.packs.registered_bytes, planted);
+        assert_eq!(report.packs.bytes, planted + 500);
+        assert_eq!(report.packs.unaccounted_bytes(), 500);
+        let text = rendered(root);
+        assert!(
+            text.contains("  neither of the two above            500 bytes\n"),
+            "bytes no figure names are named as such:\n{text}"
+        );
+    }
+
+    /// **The guard on the one name this file spells again.**
+    ///
+    /// [`PACKS_MANIFESTS_DIR`] is `registry.rs`'s `MANIFESTS_DIR`, written out
+    /// here because that constant is private to that module and this report
+    /// may not open a registry to ask. So a real [`crate::PackRegistry`] is
+    /// opened on a temporary root — which is exactly what this report refuses
+    /// to do on a live one — and the directory it makes is compared against
+    /// the path this file walks. If the two ever drift, this reddens instead
+    /// of the report quietly answering nought.
+    #[test]
+    fn the_report_walks_the_directory_the_registry_publishes_into() {
+        let dir = tempfile::tempdir().expect("a temporary directory");
+        let root = dir.path();
+        crate::registry::PackRegistry::open(root).expect("a registry opens on an empty root");
+
+        let walked = root
+            .join(crate::registry::PACKS_DIR)
+            .join(PACKS_MANIFESTS_DIR);
+        assert!(
+            walked.is_dir(),
+            "the registry made {}, which is the directory this report walks",
+            walked.display()
+        );
+        // And the report agrees with it on the same root: present, and empty.
+        let report = StateRootReport::read(root).expect("the report reads this root");
+        assert!(report.packs.present);
+        assert_eq!(report.packs.registered, 0);
+        assert!(report.packs.manifests_error.is_none());
     }
 }
