@@ -137,6 +137,17 @@ const MANIFESTS_DIR: &str = "manifests";
 /// It is created **on demand** and never by [`PackStore::open`], for the
 /// reason `packs/` itself is: an empty directory on every runner's disk is a
 /// feature announcing itself before it exists.
+///
+/// **Kept as the job left it includes the modes it left.** Nothing under here
+/// restores a directory's permissions — the record walk takes the runner's
+/// access back under `{out}` and [`crate::reclaim`]'s reaper does it under
+/// `jobs/`, and neither of them comes here — so a pack whose job chmodded its
+/// directories to `0000` is kept shut, and the operator whose disk it is may
+/// need `sudo` to read their own bytes. That is the promise working rather
+/// than a defect: what is here is byte for byte and mode for mode what was
+/// declared, and a runner that quietly re-opened it would be editing it. The
+/// rename itself is unaffected, because it needs write access on `{out}` and
+/// not on the directory being moved.
 pub const REFUSED_DIR: &str = "refused";
 
 /// The file whose bytes *are* the pack's identity.
@@ -357,6 +368,15 @@ impl PackStore {
     /// subdirectory that is itself a pack, which is a shape nobody declared
     /// and which Herd would have to invent a rule to recognise.
     ///
+    /// **Checked, and not merely stated.** The directory's own names are read
+    /// before anything is placed, so a job that leaves a build log beside its
+    /// pack is refused by name and [`leave_packs`] then keeps the whole
+    /// directory — which is the point of refusing. Taking the three parts out
+    /// and removing what was left would be Herd deciding, unasked, that a
+    /// declared directory is part pack and part output; which of those bytes
+    /// are which is the declaration's to say, and the declaration says the
+    /// directory is a pack.
+    ///
     /// **Idempotent.** A pack the store already holds whole costs one read of
     /// the manifest and nothing else; [`Held::objects_added`] is then nought,
     /// which is the dedup as a figure rather than as a claim.
@@ -374,6 +394,10 @@ impl PackStore {
                 dir.display()
             )
         })?;
+        // The directory's shape before its content, and before any object is
+        // placed: what is refused here is kept whole by the caller, and what
+        // gets past here has its remainder removed with it.
+        nothing_beyond_a_pack(dir)?;
         let manifest = PackManifest::parse(bytes)
             .map_err(|why| format!("{} will not read: {why}", manifest_path.display()))?;
         let meta = read_bounded(&dir.join(META_FILE))?;
@@ -431,7 +455,10 @@ impl PackStore {
                 "this store holds {} of pack {}'s {} object(s) and is short {} ({}); a pack is \
                  laid out whole or not at all, because a tree with files missing is what a pack \
                  exists to make impossible",
-                needed.len() - missing.len(),
+                // Two lengths from two walks of one manifest. They agree in
+                // every path through this module, and a refusal is the last
+                // place that should die on a subtract if they ever do not.
+                needed.len().saturating_sub(missing.len()),
                 manifest.id(),
                 needed.len(),
                 missing.len(),
@@ -516,10 +543,20 @@ impl PackStore {
     /// Place one object, under a staging name, and only then under its own.
     ///
     /// The order is the whole of rule 3: link or copy into
-    /// `objects/.ingest-…`, hash **the staged file** — nothing else knows
-    /// that name, so nothing can change it between the hash and the rename —
-    /// refuse if the bytes are not the bytes the name promises, fsync, and
-    /// rename. A kill at any point before the rename leaves a staging file
+    /// `objects/.ingest-…`, hash **the staged file** — the only name those
+    /// bytes have inside this store, so nothing that reads or writes the
+    /// store can change them between the hash and the rename — refuse if the
+    /// bytes are not the bytes the name promises, fsync, and rename.
+    ///
+    /// **It is not the only name they have anywhere.** On the link path the
+    /// staged file is the same inode as the job's own file under `{out}`, so
+    /// the job has a name for it too; what makes the hash trustworthy is that
+    /// the job's processes are gone before [`leave_packs`] runs, and not the
+    /// staging name. A later caller that ingested a directory something could
+    /// still be writing to would have to copy, or hash after the rename, and
+    /// this sentence is what tells it so.
+    ///
+    /// A kill at any point before the rename leaves a staging file
     /// that no lookup will ever ask for and that the [`Staged`] guard removes
     /// on the way out of this function; a kill after it leaves a whole
     /// object. There is no instant at which `objects/<sha>` holds part of
@@ -742,7 +779,6 @@ pub(crate) fn leave_packs(
                 continue;
             }
         }
-        let weight = apparent_bytes(&at);
         match store.ingest(&at) {
             Ok(held) => {
                 let id = held.manifest.id().clone();
@@ -770,7 +806,12 @@ pub(crate) fn leave_packs(
                 said.push(format!(
                     "this job declared that it leaves {key:?} at {relative:?} and that is not a \
                      pack this runner can keep: {why}. {}",
-                    set_aside(&store, attempt, relative, &at, weight)
+                    // Measured in the one arm whose sentence carries the
+                    // figure, and still before anything moves, because
+                    // arguments are evaluated before the call: walking a
+                    // 557-file pack on the success path is a walk for
+                    // nothing.
+                    set_aside(&store, attempt, relative, &at, apparent_bytes(&at))
                 ));
             }
         }
@@ -823,6 +864,62 @@ fn set_aside(store: &PackStore, attempt: &str, relative: &str, at: &Path, weight
         Err(error) => lost(error.to_string()),
     }
 }
+
+/// Refuse a declared pack directory that holds anything a pack does not,
+/// naming what was found.
+///
+/// [`PackStore::ingest`]'s own rule, enforced rather than stated. What hangs
+/// on it is not tidiness: a declared directory that ingests has
+/// [`leave_packs`] remove **all** of it, so a job that left
+/// `{out}/packs/build.log` beside its pack had that log destroyed on the
+/// success path — by the module that keeps the pack on the failure path.
+/// Refused, the whole directory goes to [`REFUSED_DIR`] intact instead, which
+/// is what every other place Herd meets bytes it cannot account for already
+/// does.
+///
+/// Only the names directly under `dir` are read. What is inside the three
+/// parts is their own business, and a pack whose `objects/` carries a file no
+/// `kind f` row names is still the pack its manifest says it is.
+fn nothing_beyond_a_pack(dir: &Path) -> Result<(), String> {
+    let listed =
+        fs::read_dir(dir).map_err(|error| format!("{} cannot be read: {error}", dir.display()))?;
+    let mut strays = Vec::new();
+    for entry in listed {
+        let entry = entry.map_err(|error| format!("{} cannot be read: {error}", dir.display()))?;
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if name == MANIFEST_FILE || name == META_FILE || name == OBJECTS_DIR {
+            continue;
+        }
+        strays.push(name);
+    }
+    if strays.is_empty() {
+        return Ok(());
+    }
+    // Sorted, so one directory reads the same twice, and cut short, so a
+    // directory of a thousand names is a sentence and not a wall.
+    strays.sort();
+    let mut named = strays
+        .iter()
+        .take(STRAYS_NAMED)
+        .map(|name| format!("{name:?}"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let rest = strays.len().saturating_sub(STRAYS_NAMED);
+    if rest > 0 {
+        named.push_str(&format!(" and {rest} more name(s)"));
+    }
+    Err(format!(
+        "{} holds {named}, which a pack directory does not have, and a pack directory is \
+         {MANIFEST_FILE} plus optionally {META_FILE} plus {OBJECTS_DIR}/ and nothing else. The \
+         whole of it is kept as it is rather than partly taken apart: which of those bytes are \
+         a pack's and which are the job's own output is the declaration's to say, and taking \
+         the three parts out of here would have removed the rest of it with them",
+        dir.display()
+    ))
+}
+
+/// How many stray names one refusal spells before it counts the rest.
+const STRAYS_NAMED: usize = 3;
 
 /// The declared keys, for a sentence about all of them at once.
 fn keys_said(leaves: &BTreeMap<String, String>) -> String {
@@ -1467,6 +1564,17 @@ mod tests {
     /// `herd_proto::ManifestEntry` carries that column as the consumer wrote
     /// it and constrains its shape nowhere, so this is checked here — the
     /// place that turns the column into a path.
+    ///
+    /// **The assertion is the property and not one speaker's wording**, and
+    /// that is load-bearing rather than fastidious. This test used to quote
+    /// `object_name`'s own spelling, "sixty-four lowercase hex"; on a tree
+    /// that also holds `herd-proto`'s `check_object_digest` the row is
+    /// refused *earlier*, by a sentence that spells the same rule "64
+    /// lowercase hex digits" — right behaviour, red test, and neither parent
+    /// branch showed it. So what is matched is the value the refusal will not
+    /// take and the shared half of the rule, which holds whichever of the two
+    /// speaks first. The two sentences becoming one is a board row; until
+    /// then, this test does not care which one a reader gets.
     #[test]
     fn an_object_name_that_is_not_a_digest_is_refused_rather_than_joined_onto_a_path() {
         let temp = TempDir::new("pack-bad-name");
@@ -1480,8 +1588,9 @@ mod tests {
         fs::write(dir.join(MANIFEST_FILE), text.as_bytes()).expect("a hostile manifest");
         let why = store.ingest(&dir).expect_err("that is not an object name");
         assert!(
-            why.contains("sixty-four lowercase hex") && why.contains("escaped"),
-            "the refusal names the column and the rule: {why}"
+            why.contains("escaped") && why.contains("lowercase hex"),
+            "the refusal names the value it will not take and the rule that value broke; the \
+             spelling of sixty-four is the speaker's and is not what this test is about: {why}"
         );
         assert_eq!(
             names_in(&store.objects_dir()),
@@ -1724,6 +1833,89 @@ mod tests {
         assert!(
             why.contains(MANIFEST_FILE) && why.contains("a pack's identity"),
             "the refusal says what is missing and why it matters: {why}"
+        );
+    }
+
+    /// **A directory that holds more than a pack is refused, and the same
+    /// directory without that one name ingests.**
+    ///
+    /// Both halves on one fixture, because each one alone would pass a wrong
+    /// check: a check that refused everything would satisfy the first
+    /// assertion and fail the second, and the code as it stood before this
+    /// test — whose doc already claimed this rule — satisfied the second and
+    /// failed the first. What hangs on it is in
+    /// `outputs::tests::a_job_s_own_file_beside_a_declared_pack_is_kept`: an
+    /// ingested directory has **all** of it removed from `{out}`, so this
+    /// refusal is the only thing between a job's build log and
+    /// `remove_dir_all`.
+    ///
+    /// Nothing of a refused directory reaches the store either, which is the
+    /// other half of "kept as it is": it is refused before an object is
+    /// placed, not half-ingested and then regretted.
+    #[test]
+    fn a_directory_holding_more_than_a_pack_is_refused_and_the_same_one_without_it_ingests() {
+        let temp = TempDir::new("pack-more-than-a-pack");
+        let store = PackStore::open(temp.path()).expect("a store");
+        let dir = temp.path().join("declared");
+        let object: &[u8] = b"the bytes the pack is of";
+        let manifest = write_pack(&dir, &[("bin/tool", object)], Some(b"commit = deadbeef\n"));
+        // One name beside the three parts, and the shape of the defect: a job
+        // that leaves its own build log next to the pack it declares.
+        fs::write(dir.join("build.log"), b"a job's own output").expect("the stray file");
+
+        let why = store.ingest(&dir).expect_err("that is more than a pack");
+        for part in [
+            "\"build.log\"",
+            "a pack directory does not have",
+            MANIFEST_FILE,
+            META_FILE,
+            OBJECTS_DIR,
+            "nothing else",
+            "kept as it is rather than partly taken apart",
+        ] {
+            assert!(
+                why.contains(part),
+                "the refusal must say {part:?} — what was found, where, that a pack is the \
+                 three parts and nothing else, and that the whole directory is kept rather \
+                 than partly removed: {why}"
+            );
+        }
+        assert_eq!(
+            names_in(&store.objects_dir()),
+            Vec::<String>::new(),
+            "and not one object of it was placed: refused before anything is taken, so there \
+             is nothing to regret"
+        );
+        assert_eq!(names_in(&store.manifests_dir()), Vec::<String>::new());
+        assert!(
+            dir.join("build.log").is_file() && dir.join(MANIFEST_FILE).is_file(),
+            "the directory itself is untouched by the refusal; what becomes of it is the \
+             caller's, and the caller keeps it"
+        );
+
+        // The same directory, that one name taken away: a pack again.
+        fs::remove_file(dir.join("build.log")).expect("the stray goes");
+        let held = store
+            .ingest(&dir)
+            .expect("a clean three-part pack still ingests, or this check refuses everything");
+        assert_eq!(
+            held.manifest.id(),
+            &herd_proto::PackId::of_manifest_bytes(&manifest),
+            "and it is the pack its own manifest's bytes say it is"
+        );
+        assert_eq!(held.objects, 1);
+        assert_eq!(held.objects_added, 1);
+        assert_eq!(
+            fs::read(store.objects_dir().join(herd_proto::sha256_hex(object)))
+                .expect("the object is in the store"),
+            object,
+            "with its bytes where a later job can be given them"
+        );
+        assert!(
+            store
+                .holds_whole(&held.manifest)
+                .expect("the question is answerable"),
+            "whole, so `pack.meta` beside a manifest is an ordinary pack and not a stray"
         );
     }
 }
