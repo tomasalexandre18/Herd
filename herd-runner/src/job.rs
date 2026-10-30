@@ -104,13 +104,82 @@ const ENDED_JOB_OUTPUT_GRACE: Duration = Duration::from_secs(5);
 const NO_CAP: u8 = 0;
 const LOG_CAP: u8 = 1;
 
+/// The packs an assignment resolved, as `FromHub::AssignJob` handed them over
+/// (M11, E-12).
+///
+/// One struct and not two arguments because the two halves are one subject
+/// and are judged together: what this job consumes under `{in}`, and what it
+/// is to leave under `{out}`.
+pub struct Packs {
+    /// Each `needs` key, resolved by the hub: the manifest and the holders.
+    /// Empty is the ordinary case and means the job needs no pack.
+    pub packs_in: Vec<herd_proto::pack::AssignedPack>,
+    /// Each `leaves` key and the path under `{out}` the job writes it at.
+    /// Empty means the job leaves nothing to register.
+    pub packs_out: std::collections::BTreeMap<String, String>,
+}
+
+impl Packs {
+    /// Why this build cannot run this job, when its packs say it cannot.
+    ///
+    /// **The honest stop, and the whole of what the runner does with these
+    /// two fields today.** The hub resolves a `needs` key and hands the
+    /// manifest over with the work (ORCH-234); laying those objects out under
+    /// `{in}/<key>`, and collecting `{out}` back into a pack to register, is
+    /// the layout step and is not written. What a runner must not do in the
+    /// meantime is run the job anyway: `{in}/<key>` would be an empty
+    /// directory and `{out}` would be swept with nothing registered, so the
+    /// job would exit 0, look green, and the pack a later job waits for would
+    /// never exist. That is D150's silence exactly, and
+    /// `herd_proto::pack::PackUnavailable` was written for this very case —
+    /// *"a job whose `{in}/<key>` is empty must not be a green-looking job
+    /// with no error anywhere"*.
+    ///
+    /// So the attempt is handed back with the keys named, and the job waits
+    /// for a runner that can serve it, exactly as a machine that is full
+    /// hands one back. `None` is every job this build runs.
+    fn why_this_runner_cannot(&self) -> Option<String> {
+        let keys = |keys: Vec<&String>| {
+            keys.into_iter()
+                .map(String::as_str)
+                .collect::<Vec<&str>>()
+                .join(", ")
+        };
+        if !self.packs_in.is_empty() {
+            return Some(format!(
+                "this job needs the pack(s) {} and this runner cannot lay a pack out under {} \
+                 yet: the hub resolved them and sent the manifests with the assignment, and the \
+                 layout step that writes the objects there is not built. Running it would leave \
+                 {}/<key> empty and report success for a job that never saw its inputs, so the \
+                 attempt is handed back instead",
+                keys(self.packs_in.iter().map(|pack| &pack.key).collect()),
+                herd_proto::IN_TOKEN,
+                herd_proto::IN_TOKEN,
+            ));
+        }
+        if !self.packs_out.is_empty() {
+            return Some(format!(
+                "this job is to leave the pack(s) {} and this runner cannot collect one out of \
+                 {} yet: the step that walks that directory, writes a manifest and registers it \
+                 is not built. Running it would sweep the artefacts away and register nothing, \
+                 and a later job needing that key would wait for a pack no hub was ever told \
+                 about, so the attempt is handed back instead",
+                keys(self.packs_out.keys().collect()),
+                herd_proto::OUT_TOKEN,
+            ));
+        }
+        None
+    }
+}
+
 /// Run one job: announce it, stream every step's output, cap each step,
 /// report how it ended and what it cost.
 ///
-/// Eight arguments, and they are the job: what to run, how it was declared,
-/// what it is allowed to cost, who to tell and how full this machine already
-/// is. Collapsing them into a struct would name the struct after this
-/// function and move the same list one line up.
+/// Nine arguments, and they are the job: what to run, how it was declared,
+/// which packs it consumes and leaves, what it is allowed to cost, who to
+/// tell and how full this machine already is. Collapsing them into a struct
+/// would name the struct after this function and move the same list one line
+/// up.
 #[allow(clippy::too_many_arguments)]
 pub async fn execute(
     job_id: JobId,
@@ -118,6 +187,7 @@ pub async fn execute(
     command: Vec<String>,
     declaration: Option<Declaration>,
     declared_timeout: Option<Duration>,
+    packs: Packs,
     session: Session,
     confined: Arc<Confined>,
     ceiling: Arc<JobsAtOnce>,
@@ -162,6 +232,16 @@ pub async fn execute(
             return;
         }
     };
+
+    // Before anything is made on this host: a job whose packs this build
+    // cannot serve. Handed back rather than run, and before the workspace
+    // exists, because the one outcome that must not happen is a job that runs
+    // without its inputs and reports success (D150).
+    if let Some(refusal) = packs.why_this_runner_cannot() {
+        eprintln!("herd-runner: handing {job_id} back: {refusal}");
+        session.abandon(&job_id, attempt, &refusal);
+        return;
+    }
 
     // Before anything is made on this host: a command line nobody could run.
     if let Some(declaration) = &declaration {
@@ -1914,5 +1994,84 @@ mod tests {
             "and nothing removed or renamed what was in the way"
         );
         let _ = std::fs::remove_file(workspace.base_dir());
+    }
+}
+
+#[cfg(test)]
+mod pack_tests {
+    use super::*;
+
+    fn a_pack(key: &str) -> herd_proto::pack::AssignedPack {
+        let manifest = b"# chatons pack 1\n".to_vec();
+        herd_proto::pack::AssignedPack {
+            key: key.to_owned(),
+            pack: herd_proto::pack::PackId::of_manifest_bytes(&manifest),
+            manifest,
+            meta: None,
+            holders: Vec::new(),
+        }
+    }
+
+    /// **A job with no pack is every job this build runs, and it runs.**
+    ///
+    /// Asserted first because it is the condition every other test in the
+    /// suite depends on: the stop added for a pack must not stop anything
+    /// else.
+    #[test]
+    fn a_job_that_consumes_and_leaves_no_pack_is_not_handed_back() {
+        let packs = Packs {
+            packs_in: Vec::new(),
+            packs_out: std::collections::BTreeMap::new(),
+        };
+        assert_eq!(packs.why_this_runner_cannot(), None);
+    }
+
+    /// **A pack to lay out is handed back with the key named, not run with an
+    /// empty `{in}`** (D150, ORCH-234).
+    ///
+    /// The sentence is the whole of the behaviour, so it is the thing
+    /// asserted: it names the key, so an operator reading the record knows
+    /// *which* input was missing, and it names the directory, so nobody has
+    /// to guess what "cannot lay out" meant.
+    #[test]
+    fn a_pack_this_runner_cannot_lay_out_is_named_by_its_key() {
+        let packs = Packs {
+            packs_in: vec![a_pack("built"), a_pack("fixtures")],
+            packs_out: std::collections::BTreeMap::new(),
+        };
+        let said = packs
+            .why_this_runner_cannot()
+            .expect("a pack this build cannot lay out is a refusal");
+        assert!(
+            said.contains("built, fixtures"),
+            "every key it could not serve, in the order the hub sent them: {said}"
+        );
+        assert!(
+            said.contains(herd_proto::IN_TOKEN),
+            "and the directory they would have gone under: {said}"
+        );
+    }
+
+    /// **And so is a pack to collect**, which is the same silence from the
+    /// other end: the job would exit 0, its `{out}` would be swept, and the
+    /// later job that needs that key would wait for a pack no hub was ever
+    /// told about.
+    #[test]
+    fn a_pack_this_runner_cannot_collect_is_named_too() {
+        let packs = Packs {
+            packs_in: Vec::new(),
+            packs_out: std::collections::BTreeMap::from([(
+                "built".to_owned(),
+                "artefacts".to_owned(),
+            )]),
+        };
+        let said = packs
+            .why_this_runner_cannot()
+            .expect("a pack this build cannot collect is a refusal too");
+        assert!(said.contains("built"), "named by its key: {said}");
+        assert!(
+            said.contains(herd_proto::OUT_TOKEN),
+            "and the directory it would have been collected from: {said}"
+        );
     }
 }

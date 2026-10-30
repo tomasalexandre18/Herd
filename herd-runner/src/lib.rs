@@ -3875,14 +3875,14 @@ async fn serve_hub(
                 command,
                 declaration,
                 timeout_s,
-                // M11's resolved packs, numbered at protocol 3 and laid out
-                // by nobody yet: S2 writes the pack store and S8 the
-                // `{in}`/`{out}` layout. Bound and dropped rather than
-                // matched with `..`, so the next field on an assignment is a
-                // compile error here rather than a job that quietly ignores
-                // it.
-                packs_in: _,
-                packs_out: _,
+                // M11's resolved packs, which the hub now fills (ORCH-234).
+                // Carried into the job rather than dropped here: the
+                // `{in}`/`{out}` layout is still S8's, and `job::execute` is
+                // where a job this runner cannot serve is handed back instead
+                // of running with an empty `{in}` — which is D150's silence
+                // and the thing `PackUnavailable` exists to prevent.
+                packs_in,
+                packs_out,
             } => {
                 let session = session.clone();
                 let confined = Arc::clone(&confined);
@@ -3909,6 +3909,10 @@ async fn serve_hub(
                         command,
                         declaration,
                         declared_timeout,
+                        job::Packs {
+                            packs_in,
+                            packs_out,
+                        },
                         session,
                         confined,
                         ceiling,
