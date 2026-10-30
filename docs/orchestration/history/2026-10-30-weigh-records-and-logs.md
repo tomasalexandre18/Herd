@@ -19,7 +19,11 @@ every figure the report printed about it was nought while the root was
   bullet and is a different thing; a row is drafted below
 - **Agent:** herd-step
 - **Branch / commit:** `orch-282-weigh-records` /
-  `92b9f07` plus this file, based on origin/main `df47266`
+  `92b9f07` (section 5), then the apparent-size paragraph, then this
+  file, based on origin/main `df47266`. The branch was pushed once
+  before the paragraph existed, so `origin` already holds `92b9f07` and
+  `a34ec79`; this push adds the two commits above them and nothing is
+  rewritten.
 - **Landing:** none — an agent pushes its branch and lands nothing (one
   landing per batch, `docs/orchestration/workflow.md`); `herd-merger`
   names the landing here, and fills the record of `templates/landing.md`
@@ -54,6 +58,20 @@ difference — and the **heaviest single directory** is printed beside the
 total so that a total cannot pass for an even root. No mean, anywhere, and
 no decile: a decile table would answer a diagnostic question, and the
 condition is about watching a total grow.
+
+**It prints its own unit, and the direction of its own error.** The
+printed prose says the figure is apparent size summed from file lengths,
+that apparent size is a **floor** on what the files occupy because a
+one-byte file costs a whole block and a bookkeeping population is almost
+all small files, gives the one measurement behind that — 1443667 bytes
+apparent against 2850816 bytes of blocks on a real root, about 1.97× —
+says the factor is a property of that root's file sizes and block size
+and not a constant to apply elsewhere, and ends with the instruction:
+compare `du` with `du`, or apparent with apparent, never one against the
+other. It is in the **output** and not in a comment because the
+consumer's own ≈ 346 MiB for this quantity is `du -sk`, so blocks, and
+section 5 on a comparable root prints about half of it with nothing
+having shrunk.
 
 **A log that could not be measured is `UNKNOWN`, never nought,** and the
 total then prints `A FLOOR AND NOT A TOTAL` with the count. This reuses
@@ -142,30 +160,45 @@ files were already stale for section 4 and are now right for five.
 the phase waited for it to clear and
 `HERD_PREFLIGHT_MIN_CGROUP_ROOM_GIB` was never set.
 
-Quoted from the runs made before this file was committed:
+**They ran twice, and the second round is the evidence.** The
+apparent-size paragraph is *printed text*, so adding it made this product
+code again and all four Rust gates were re-run on the tree that carries
+it. The build tree had already been deleted after the first push, so the
+second round compiled from cold. Quoted from the second round, made
+before this file was committed:
 
 ```text
 cargo build --workspace
-    Finished `dev` profile [unoptimized + debuginfo] target(s) in 27.21s
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 27.71s
 
 cargo clippy --workspace --all-targets -- -D warnings
-    Finished `dev` profile [unoptimized + debuginfo] target(s) in 18.59s
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 23.53s
     (the one line matching "warning" is nix's "Git tree ... is dirty")
 
 cargo fmt --all --check
-fmt: clean
+fmt: clean (round 2)
 
 ./scripts/test.sh
 ignored census: COMPLETE (38 ignored, 0 without a reason)
 test suite: PASSED
-
-./scripts/check-docs.sh
-docs ok
 ```
 
-**Skips: 12, and the list is what was compared** (D187 — the count
-answers 51 unanchored and 12 anchored at line start, and the list is the
-evidence). All twelve are the host's shape and not this change: eleven are
+The first round, before the paragraph, was green on the same five gates:
+build 27.21s, clippy 18.59s, `fmt: clean`, suite PASSED with the same
+census, `docs ok`.
+
+**One expectation was changed, and it was changed because the text
+changed on purpose.** `herd-hub/tests/state_root_report.rs`'s byte-exact
+whole-text assertion went red on the new paragraph, as it should; the
+paragraph was reviewed line by line and the expectation edited to match,
+not regenerated from the failing output. The reason is written into
+`EXPECTED`'s own doc comment so that a later reader can see the text was
+reviewed rather than pasted back.
+
+**Skips: 12, and the list is what was compared** (D187 — the count is
+what the list is read off, and the two rounds' lists were `diff`ed name
+for name and are identical; so is the 38-name `#[ignore]` list). All
+twelve are the host's shape and not this change: eleven are
 `cgroup v2 delegation is unavailable … Permission denied` under
 `/sys/fs/cgroup/chatons.slice`, and one is
 `a_ceiling_this_host_can_carry_is_proved_and_reported_with_its_device`,
@@ -176,9 +209,10 @@ and not one is in this change's tests.
 **The last run, named and not quoted**, because this file is itself a docs
 file and the run before it gated a different tree:
 `./scripts/check-docs.sh`, as a Herd job on the committed tree, its output
-to `scratchpad/orch-282/gate5-docs-final.txt` and verbatim in the agent's
-report. The Rust gates were **not** re-run after this file, which changes
-no code.
+to `scratchpad/orch-282/r2-gate5-docs-final.txt` and verbatim in the
+agent's report. The Rust gates are **not** re-run after this file, which
+changes no code: the four above were run on the tree this file is
+committed on top of.
 
 ## Risks and findings
 
@@ -193,6 +227,34 @@ no code.
    the consumer reads "346 MiB of bookkeeping", the disk cost is *higher*,
    not lower — the reverse of a sparse file. No figure was checked with
    `du -b` or `--apparent-size` anywhere in this task.
+
+   **This is now in section 5's printed prose and not only here, and the
+   reason is measured.** The consumer's own ≈ 346 MiB for this very
+   quantity is `du -sk` *without* `--apparent-size`, so allocated blocks.
+   Section 5 sums `metadata().len()`, so apparent size. **At their
+   migration section 5 will therefore print roughly half of what their
+   `du` told them, on a comparable root, with nothing having shrunk** —
+   and the natural reading of that is "records got smaller", from which
+   somebody concludes retention is less urgent than it is. The
+   orchestrator made the mirror-image error on 2026-10-30 with both
+   measurements in front of it, taking the correct block figure and
+   "correcting" it upward by this 1.97×. So the output now carries the
+   unit, the direction of the error, the single measurement behind the
+   factor, the caveat that the factor is a property of that root's file
+   sizes and block size and not a constant, and the instruction: compare
+   `du` with `du`, or apparent with apparent, never one against the other.
+
+   **The pairing, which is the sharper point.** This product now has
+   **two apparent-size figures that err in opposite directions**. A job's
+   `bytes_written` (**D263**, ORCH-278) **overstates**: a sparse file
+   counts for its holes, and that killed a landing's gate the same day
+   (`gotchas/bytes-written-is-the-workspace-not-the-job.md`). Section 5
+   **understates**: apparent size floors real occupancy. Same unit, same
+   word, opposite bias, and nothing in the product says which is which.
+   That is a reason of its own to separate a **workspace quota in
+   apparent size** from **bytes written as I/O** — ORCH-278's question —
+   because one name cannot carry two biases, and the drafted board row
+   below says so rather than leaving the two findings in two files.
 2. **A live root does not reconcile, and should not.** The same run on the
    *live* queue root differed from a `find` taken a minute later by 2938
    bytes across three classes, all growth while jobs ran. That is the
@@ -273,9 +335,26 @@ is apparent size, `metadata().len()` per file, like every other byte figure
 this report prints. Measured the same day with two different tools on a
 frozen copy of our own root, real occupancy is **1.97× higher** — 2850816
 bytes of blocks against 1443667 apparent, because small files each cost a
-block. It is a floor on disk, which is the opposite direction from
-`bytes_written`'s sparse-file trap (D263) and must not be read as that
-figure's sibling.
+block. **So the printed prose carries the unit, that one measurement, the
+caveat that the factor is a property of that root's file sizes and block
+size and not a constant, and the instruction that compares `du` with `du`
+and never one unit against the other.** It is in the output and not in a
+comment because the consumer's own figure for the same quantity is `du
+-sk`, which is blocks: at their migration section 5 prints about half of
+what their `du` said with nothing having shrunk, and the natural reading
+of a root halving is that retention got less urgent. The orchestrator
+made the mirror-image error the same day with both measurements in front
+of it.
+
+**And the pairing, which is why the unit has to be printed and not merely
+known.** This product now holds **two apparent-size figures that err in
+opposite directions**: a job's `bytes_written` (D263, ORCH-278)
+**overstates**, because a sparse file counts for its holes, and it killed
+a landing's gate on 2026-10-30; this one **understates**, because
+apparent size floors real occupancy. Same unit, same word, opposite bias.
+One name cannot carry two biases, which is an argument of its own for
+ORCH-278's separation of a workspace quota in apparent size from bytes
+written as I/O.
 
 Reversible: it is a read. `report` takes no lock, writes nothing, removes
 nothing, and reads no output byte, no log byte and no line of an event
@@ -291,6 +370,17 @@ ORCH-282); no literal pipe appears in any cell.
 
 ```markdown
 | ORCH-NEXT | **The bookkeeping weight is in `herd-hub report` and not in `status.json`, so a watcher polling the hub cannot see the growth the consumer asked to watch.** Section 5 landed on this branch and prints the records, the event files and the logs of every job directory with their counts. `status.json` carries none of it, so the figure reaches a reader only by somebody running `herd-hub report` in the hub's container and pasting the output. `herd-hub/src/status.rs` was deliberately not touched: `STATUS_VERSION` moved 1 to 2 this week and two unlanded branches already want changes there, so a third would move it twice for one release | the `weigh-records-and-logs` brief's own instruction, 2026-10-30, and its handoff *Not done* 1 | herd-step | owed | Add the bookkeeping total and its three class figures to `status.json` **in the same change as the other two branches' fields**, so `STATUS_VERSION` moves once. Reuse `report::Bookkeeping` rather than measuring again; an absent field must stay distinguishable from a hub that does not record it (D257). While doing it, re-export `Bookkeeping` from `herd-hub/src/lib.rs` beside the other `report` types, and consider widening `EVENTS_FILE`, `LOG_FILE` and `LOG_SEQ_FILE` in `store.rs` to `pub(crate)` so `report.rs` and `retention.rs` stop writing them out | the two unlanded branches that want `status.rs`; whichever lands first | `herd-hub/src/report.rs` section 5; `herd-hub/src/status.rs` `STATUS_VERSION`; `herd-hub/src/retention.rs` `Weight` and `LogWeight`; `history/2026-10-30-weigh-records-and-logs.md`; **D257**; the drafted `D-NEXT` of that handoff |
+```
+
+### `docs/orchestration/board.md` — a second row, for *Owed*
+
+The pairing of the two apparent-size figures. A **second row** and not an
+edit of ORCH-278's, because ORCH-278 is Alexa's open question and an
+agent does not rewrite its text; this row is the measured input that
+arrived after it was filed, and it names it.
+
+```markdown
+| ORCH-NEXT | **Herd now reports two apparent-size byte figures whose errors point in opposite directions, and nothing in the product says which is which.** A job's `bytes_written` **overstates**: it sums `metadata().len()`, so a sparse file counts for its holes, and on 2026-10-30 a 30 GiB declaration occupying nought blocks turned a landing's gate into `stopped_by_cap / disk` (D263). `herd-hub report` section 5, new on branch `orch-282-weigh-records`, **understates**: it sums the same quantity over a population of almost all small files, where apparent size is a floor on occupancy — 1443667 bytes apparent against 2850816 in blocks on our own queue root, about 1.97 times, measured the same day with `find -printf '%b'` against `find -printf '%s'`. One word, one unit, two biases. Section 5 prints its own unit and its own direction in its output; `bytes_written` prints neither | the `weigh-records-and-logs` handoff, 2026-10-30, *Risks and findings* 1, and the orchestrator's own mirror-image error reading the consumer's `du -sk` as apparent size that day | herd-step | owed | Carry this to **ORCH-278** as measured input rather than opening a third question: it is a reason of its own for separating a **workspace quota in apparent size** from **bytes written as I/O**, since a single name cannot carry a figure that overstates and a figure that understates. Until that is answered, any new byte figure prints its unit and the direction of its error, the way section 5 does. **Change no cap and no bound** under this row | **ORCH-278** and **D263**, which own what a cap enforces | `gotchas/bytes-written-is-the-workspace-not-the-job.md`; `herd-hub/src/report.rs` section 5 and its printed apparent-size paragraph; `herd-runner/src/root.rs` `Workspace::measure`; `history/2026-10-30-weigh-records-and-logs.md`; **D263**; **ORCH-278** |
 ```
 
 ## Decisions needed
@@ -317,15 +407,17 @@ nix develop --command cargo run -q -p herd-hub --bin herd-hub -- \
 
 No process was started that outlived a command: every build and every test
 ran inside a Herd job on the queue's own runner, submitted with
-`herdctl run`, which waits and exits with the job's code. The jobs were
-`j0000000111`, `j0000000112`, and one each for the five gates through
-`j0000000117`. Nothing was signalled, nothing was killed, no `pkill` and
-no kill by name. **PID 662711, the queue's runner, was not touched.**
+`herdctl run`, which waits and exits with the job's code. Round one used
+`j0000000111`, `j0000000112` and one job per gate through `j0000000121`;
+round two, for the apparent-size paragraph, used four more. Nothing was
+signalled, nothing was killed, no `pkill` and no kill by name. **PID
+662711, the queue's runner, was not touched.**
 
 One background shell waited for `./scripts/bench-preflight.sh` to stop
 refusing and exited on its own when it cleared.
 
 `du -sh` of the build tree, **dev profile** (debug, with tests),
-`/mnt/ssd_980/herd/build/orch-282-weigh-records`: **14G**. Deleted once
-the branch was pushed; the deletion is reported verbatim in the agent's
-report.
+`/mnt/ssd_980/herd/build/orch-282-weigh-records`: **14G** after round
+one, deleted after that push; round two rebuilt it from cold and it is
+deleted again once this push lands. Both figures and both deletions are
+reported verbatim in the agent's report.
