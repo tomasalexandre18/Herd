@@ -13728,3 +13728,119 @@ families a policy names, on a hub configured to name them. A pack
 outliving the machine that built it is M12 P7 and needs M11's push
 path; no report may say custody works end to end on the strength of
 this.
+
+## 2026-10-30 — D267 Both halves of M11's layout land together
+
+`herdctl` read `needs` and `leaves` off `commands.toml`, validated
+them, and threw them away: `Resolved::declared()` carried neither onto
+`Declared`, which had no field for either, and `Declared::asked`
+hardcoded an empty vector and an empty map. So `Asked.needs` was empty
+on every submission and every dry run this CLI made, and the hub's
+whole `needs` path — complete, tested and landed in batch 18 — was
+reachable only from a client that is not `herdctl` (ORCH-274). At the
+other end, `ToHub::RegisterPack` was constructed in **0** places under
+`herd-runner/src`, so no pack was ever registered and the matcher's
+locality term read an empty map for ever (ORCH-260).
+
+**Decided: the two halves land in one branch, and never one in front
+of the other.** Filling the two fields makes every declared command
+that already names `needs` go from *running* to *waiting at the
+dispatch* on a hub where nothing registers a pack — correct behaviour
+(D150: a job whose `{in}/<key>` would be empty must not be a
+green-looking job) and a change on the consumer's side of the fence
+(D161). Shipping the CLI half alone would have been a product that
+stops working for a reason nobody could act on.
+
+**Three things the landing settles, each of which could have been got
+wrong quietly.**
+
+1. **A `leaves` path is a pack directory, not a file.** Herd's own test
+   fixture declared `leaves = { "grove-log" = "logs/assemble.log" }`
+   and had done since M10. Nothing noticed, because the field was
+   discarded before it reached anything that could refuse it. That is
+   the general cost of a validator that accepts a field nobody reads:
+   the declaration drifts from what the product can honour, and the
+   drift arrives as behaviour on the day the field travels.
+2. **There is no `--needs` flag and there will not be one.**
+   `Declared::asked` is one conversion on purpose — it is what makes a
+   dry run answer about the job a submission would really make (E-07)
+   — so the keys reach the wire from the declaration and from nowhere
+   else. A flag would let a requester name a key the command's own line
+   cannot read.
+3. **A runner refuses a pack only on a job that is not declared.** The
+   old refusal was "any pack at all", which was honest while the layout
+   did not exist. What remains is the one case that cannot be served:
+   an ad-hoc command line has no `{in}`, no `{out}` and no commit, so
+   there is nowhere to lay a pack out and no `(commit, key)` to
+   register one for. Every declared command is laid out.
+
+**What is still not reachable, and it is now named rather than
+implied:** the hub mints no transfer capability and sends no
+`FromHub::ExpectTransfer`, so D10's peer path is refused by name at the
+hub and only the same-host path completes. The runner's side of that
+round trip is real — it asks the numbered frame and carries the hub's
+refusal into a `PackUnavailable` that names the pack — which means the
+peer path starts working the day the hub mints, with no runner change.
+
+Proved by `herd-hub/tests/pack_chain.rs`, against the real hub, runner
+and `herdctl` as processes: a declared command leaves a pack, the hub
+registers it, a later declared command is laid out with it and **its
+own tool reads the bytes**, and the transfer is reported `SameHost`
+with nought bytes off the network. Both halves were watched red first
+— the layout removed, and the registration removed — because a green
+chain is the one place this could have passed while proving nothing.
+
+## 2026-10-30 — D268 A suite fixture that sets a mode must guard its premise
+
+**A mode this suite sets is not a mode this suite keeps**, since D258
+made every gate a Herd job. The runner carrying a job holds it to its
+disk budget by walking the job's whole base every 200 ms
+(`herd-runner/src/confine.rs:106`, from `job.rs:1555`;
+`root.rs:443` `measure_tree(&self.base, &self.root)`), and `tmp` is
+inside that base (`root.rs:317`). A directory that walk cannot list has
+the runner's own access handed back to it — `read_dir_restoring`
+(`root.rs:538`) calls `restore_access` (`root.rs:664`), which is
+`set_permissions(mode | 0o700)`. Every temporary state root in the
+suite lives under `$TMPDIR`, so a fixture directory left at `0o111`
+becomes `0o711` within 200 ms and reads again.
+
+That is the runner obeying invariant 2 and D166: a job must not `chmod`
+its way out of a figure the runner enforces. The product is right and
+the fixtures are wrong, so **the rule is on the fixtures**: a test whose
+premise is a mode checks that premise **at the moment it judges a
+measurement**, and a measurement taken after the premise was undone is
+**void** — taken again from nothing, a bounded number of times, and
+then red with a sentence. Never skipped: a skip would move the suite's
+`HERD-SKIPPED` list, which is compared and not counted (D27, D187).
+Never slept on, never `#[ignore]`d, and no assertion is widened.
+
+Measured 2026-10-30 in job `j0000000147`: `mode=2111 read_dir=EACCES`
+at t=0.10 s, `mode=2711 read_dir=ok` at t=0.20 s. **`0o711` where a
+fixture set `0o111` is the fingerprint** — never the guard's own
+`0o755`.
+
+**The consequence of D258 this names.** A gate run through Herd is not
+equivalent to a gate run locally for this class of assertion: the same
+tree is sound locally and unsound through Herd. Batch 26's gate went red
+on it after eighteen green attempts — `owed_scan_fails.rs`'s
+`one_failed_listing_silences_every_runner_and_each_is_still_answered`,
+whose fixture had been un-chmodded under it — and the hub was innocent.
+The window a run exposes is a few milliseconds against a walk every
+200 ms, which is why it is rare, why it is a function of job **duration**
+and not of concurrency, and why a filtered control of 0.3 s was five of
+five green while a 390 s suite was red.
+
+Done for the hub's two tests of it in
+`herd-hub/tests/a_failed_listing/mod.rs` — `still_binds`, `hold_again`,
+`ATTEMPTS`, `WOULD_NOT_HOLD`, and `over` now requiring the verification
+failure to be `PermissionDenied` so that a listing which failed for an
+unarranged reason is never read as the fixture. Proved both ways against
+a faithful stand-in for `restore_access`: the unmodified gated binary 10
+red of 10, the fixed one 0 red of 10 alone and 0 red of 10 as a whole
+binary with the restore still firing every run, and red with its own
+sentence when the stand-in restores continuously.
+
+**What this decision does not fix.** Only `a_failed_listing`'s two
+assertions are guarded. The rest of the class is named, by member, in
+ORCH-291, and ORCH-292 carries the one member that is a **hollow
+green** rather than a latent red.

@@ -59,6 +59,7 @@
 //! all, because the runner is not saying how the job went, it is saying this
 //! go did not happen.
 
+use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::sync::atomic::{AtomicU64, AtomicU8, Ordering};
@@ -120,55 +121,56 @@ pub struct Packs {
 }
 
 impl Packs {
-    /// Why this build cannot run this job, when its packs say it cannot.
+    /// Why this job cannot be run **at all**, when its packs say it cannot.
     ///
-    /// **The honest stop, and the whole of what the runner does with these
-    /// two fields today.** The hub resolves a `needs` key and hands the
-    /// manifest over with the work (ORCH-234); laying those objects out under
-    /// `{in}/<key>`, and collecting `{out}` back into a pack to register, is
-    /// the layout step and is not written. What a runner must not do in the
-    /// meantime is run the job anyway: `{in}/<key>` would be an empty
-    /// directory and `{out}` would be swept with nothing registered, so the
-    /// job would exit 0, look green, and the pack a later job waits for would
-    /// never exist. That is D150's silence exactly, and
-    /// `herd_proto::pack::PackUnavailable` was written for this very case —
-    /// *"a job whose `{in}/<key>` is empty must not be a green-looking job
-    /// with no error anywhere"*.
+    /// One case and not a list: a job that asks for or leaves a pack and is
+    /// not a declared command. `{in}` and `{out}` are made only for a
+    /// declared command (D107, [`crate::root`]), so there is nowhere to lay a
+    /// pack out and nowhere to take one from — and a pack is registered for a
+    /// `(commit, key)` pair, which only a declared command names (E-11,
+    /// D106). The hub refuses to resolve such a job's keys for that same
+    /// reason, so this is the runner saying the same thing from its own end
+    /// rather than a second rule.
     ///
-    /// So the attempt is handed back with the keys named, and the job waits
-    /// for a runner that can serve it, exactly as a machine that is full
-    /// hands one back. `None` is every job this build runs.
-    fn why_this_runner_cannot(&self) -> Option<String> {
+    /// **The attempt is handed back and the job is not run**, because the one
+    /// outcome that must not happen is a job that runs without its inputs and
+    /// reports success: `{in}/<key>` would be absent, `{out}` would be swept
+    /// with nothing registered, and the pack a later job waits for would
+    /// never exist. That is D150's silence exactly.
+    ///
+    /// `None` is every job Herd runs today, and every declared one.
+    fn why_this_runner_cannot(&self, declared: bool) -> Option<String> {
+        if declared || (self.packs_in.is_empty() && self.packs_out.is_empty()) {
+            return None;
+        }
         let keys = |keys: Vec<&String>| {
             keys.into_iter()
                 .map(String::as_str)
                 .collect::<Vec<&str>>()
                 .join(", ")
         };
+        let mut asks = Vec::new();
         if !self.packs_in.is_empty() {
-            return Some(format!(
-                "this job needs the pack(s) {} and this runner cannot lay a pack out under {} \
-                 yet: the hub resolved them and sent the manifests with the assignment, and the \
-                 layout step that writes the objects there is not built. Running it would leave \
-                 {}/<key> empty and report success for a job that never saw its inputs, so the \
-                 attempt is handed back instead",
-                keys(self.packs_in.iter().map(|pack| &pack.key).collect()),
-                herd_proto::IN_TOKEN,
-                herd_proto::IN_TOKEN,
+            asks.push(format!(
+                "needs the pack(s) {}",
+                keys(self.packs_in.iter().map(|pack| &pack.key).collect())
             ));
         }
         if !self.packs_out.is_empty() {
-            return Some(format!(
-                "this job is to leave the pack(s) {} and this runner cannot collect one out of \
-                 {} yet: the step that walks that directory, writes a manifest and registers it \
-                 is not built. Running it would sweep the artefacts away and register nothing, \
-                 and a later job needing that key would wait for a pack no hub was ever told \
-                 about, so the attempt is handed back instead",
-                keys(self.packs_out.keys().collect()),
-                herd_proto::OUT_TOKEN,
+            asks.push(format!(
+                "leaves the pack(s) {}",
+                keys(self.packs_out.keys().collect())
             ));
         }
-        None
+        Some(format!(
+            "this job {} and is not a declared command, so it has no {} to lay a pack out in \
+             and no {} to take one from, and it names no commit to register one for. Running it \
+             would report success for a job that never saw its inputs, so the attempt is handed \
+             back instead",
+            asks.join(" and "),
+            herd_proto::IN_TOKEN,
+            herd_proto::OUT_TOKEN,
+        ))
     }
 }
 
@@ -233,11 +235,11 @@ pub async fn execute(
         }
     };
 
-    // Before anything is made on this host: a job whose packs this build
-    // cannot serve. Handed back rather than run, and before the workspace
-    // exists, because the one outcome that must not happen is a job that runs
-    // without its inputs and reports success (D150).
-    if let Some(refusal) = packs.why_this_runner_cannot() {
+    // Before anything is made on this host: a job whose packs this runner
+    // cannot serve at all. Handed back rather than run, and before the
+    // workspace exists, because the one outcome that must not happen is a job
+    // that runs without its inputs and reports success (D150).
+    if let Some(refusal) = packs.why_this_runner_cannot(declaration.is_some()) {
         eprintln!("herd-runner: handing {job_id} back: {refusal}");
         session.abandon(&job_id, attempt, &refusal);
         return;
@@ -313,6 +315,41 @@ pub async fn execute(
             "a job needs a command to run".to_owned(),
         );
         return;
+    }
+
+    // **What this job consumes, laid out under `{in}` before a step runs**
+    // (M11, E-12, D10). Here and not earlier because `{in}` is made with the
+    // workspace; here and not later because `up` is the first thing that may
+    // read it, and the consumer's own `run` line reads `{in}/<key>` directly.
+    //
+    // A pack that cannot be got hands the attempt back with the sentence the
+    // fetch wrote, and the hub has already been told `PackUnavailable` by
+    // name: a job whose `{in}/<key>` is empty must not be a green-looking job
+    // with no error anywhere (D150). The workspace is reclaimed on the way
+    // out, exactly as a refused command line reclaims it above.
+    if let Some(declaration) = &declaration {
+        match session
+            .lay_out_packs(
+                &job_id,
+                &declaration.commit,
+                confined.root().path(),
+                workspace.in_dir(),
+                &packs.packs_in,
+            )
+            .await
+        {
+            Ok(said) => {
+                for line in said {
+                    eprintln!("herd-runner: job {job_id} {line}");
+                }
+            }
+            Err(refusal) => {
+                eprintln!("herd-runner: handing {job_id} back: {refusal}");
+                reclaim_or_say(confined.root(), &workspace, &job_id, attempt, &session);
+                session.abandon(&job_id, attempt, &refusal);
+                return;
+            }
+        }
     }
 
     // One name for this job's cgroup, its marker and the runner's own log
@@ -669,7 +706,7 @@ pub async fn execute(
             confined.root().path(),
             caps.output_cap,
             &crate::outputs::spool_path(confined.root().path(), &job_id, attempt),
-            &declared_leaves(declaration.as_ref()),
+            &declared_leaves(&packs.packs_out),
         ),
     };
     let crate::outputs::Collected {
@@ -677,19 +714,42 @@ pub async fn execute(
         spool,
         packs,
     } = collected;
-    // Named, so a runner's owner can see that a pack was kept and a later
-    // reader can see where the registration frame is missing from.
+    // **Registered with the hub, pack by pack** (E-17, ORCH-260). After the
+    // ingest and therefore after the fsync, which is the whole of E-17: a
+    // pack this frame names is on this runner's disk whole, so a later job
+    // handed that key is handed something complete or nothing at all.
+    //
+    // The commit comes out of the job's own declaration, because a pack is
+    // registered for a `(commit, key)` pair and only a declared command names
+    // a commit (E-11, D106) — and `leave_packs` answers an empty list for
+    // every job with no `leaves`, so a job with packs here has a declaration.
+    //
+    // A link that is gone is said out loud rather than passed over: the pack
+    // is not lost, since the next connection announces the holding, but the
+    // `(commit, key)` it was left under is **not** registered, so a later job
+    // needing that key would wait for a pack this hub was never told about.
     for pack in &packs {
-        eprintln!(
-            "herd-runner: job {job_id} left {:?} at {:?} as pack {} ({} object(s), {} new); it is \
-             in this runner's pack store and is NOT registered with the hub, which is a later \
-             step of M11",
-            pack.key,
-            pack.at,
-            pack.held.manifest.id(),
-            pack.held.objects,
-            pack.held.objects_added
-        );
+        let id = pack.held.manifest.id();
+        let registered = match declaration.as_ref() {
+            Some(declaration) => session.register_pack(&job_id, attempt, &declaration.commit, pack),
+            None => false,
+        };
+        if registered {
+            eprintln!(
+                "herd-runner: job {job_id} left {:?} at {:?} as pack {id} ({} object(s), {} \
+                 new); it is in this runner's pack store and registered with the hub",
+                pack.key, pack.at, pack.held.objects, pack.held.objects_added
+            );
+        } else {
+            eprintln!(
+                "herd-runner: job {job_id} left {:?} at {:?} as pack {id} ({} object(s), {} \
+                 new); it is in this runner's pack store and is NOT registered with the hub, \
+                 because there was no link to say so on. This runner holds it and announces \
+                 that on its next connection, but nothing has told this hub which (commit, key) \
+                 it answers, so a later job needing {:?} will wait for it",
+                pack.key, pack.at, pack.held.objects, pack.held.objects_added, pack.key
+            );
+        }
     }
     // And the holdings this job just changed, said again to the hub (D231
     // decision 5): an announcement replaces the hub's whole view of this
@@ -699,10 +759,12 @@ pub async fn execute(
     // `leaves` and for every one whose declared artefact was refused, and a
     // job that changed nothing has nothing to re-announce.
     //
-    // **This is the one production path in this build that changes what a
-    // runner holds.** A fetch ingests too (`crate::fetch`), and nothing in
-    // production calls it yet; when something does, it announces here as
-    // well or the hub's view goes stale in the other direction.
+    // **The other production path that changes what a runner holds is the
+    // layout above**, which ingests whatever it fetched and announces for
+    // itself (`Session::lay_out_packs`). Two announcement sites and not one,
+    // because the two happen at opposite ends of a job's life and an
+    // announcement replaces the hub's whole view: a single site would leave
+    // the hub stale in one of the two directions for the length of a job.
     if !packs.is_empty() {
         eprintln!(
             "herd-runner: job {job_id} changed what this runner holds. {}",
@@ -1274,26 +1336,20 @@ fn why_a_step_could_not_start(
 }
 
 /// What this job declared it **leaves**: a key, and the path under `{out}`
-/// the artefact is left at (`leaves = { pack = "packs" }`, M11).
+/// the artefact is left at (`leaves = { pack = "packs" }`, M11, E-17).
 ///
-/// **Empty today, and not by oversight.** The pair a requester declares —
-/// `needs` and `leaves` — is read out of their own declaration file by
-/// `herdctl` (`herdctl::declaration::Resolved::leaves`) and goes no further:
-/// the protocol carries neither of them yet, so there is nothing on
-/// [`herd_proto::ToHub`]'s assignment for this function to read. The frames
-/// and fields that carry them are numbered in `herd_proto::pack` and are
-/// folded onto the two enums by a later step of M11, which is also the step
-/// that registers what comes back from the collection with the hub.
+/// **It comes off the assignment and not out of the declaration**, which is
+/// the one thing about this seam worth stating: `FromHub::AssignJob` carries
+/// `packs_out` as the hub resolved it (ORCH-234), and the hub resolved it out
+/// of the job's own record. A runner that re-read the declaration would be a
+/// second reader of the requester's file and could disagree with the hub
+/// about what a job leaves.
 ///
-/// It is a function and not an inline `BTreeMap::new()` so that the seam has
-/// a name and a doc comment: the extraction it feeds is tested directly
-/// ([`crate::outputs`]'s own tests), and what is missing is one field's
-/// arrival and not the behaviour.
-fn declared_leaves(
-    declaration: Option<&Declaration>,
-) -> std::collections::BTreeMap<String, String> {
-    let _ = declaration;
-    std::collections::BTreeMap::new()
+/// Empty for an ad-hoc job, which has no `{out}` at all, and empty for every
+/// declared command that leaves no pack — which is every job the first
+/// consumer submits today.
+fn declared_leaves(packs_out: &BTreeMap<String, String>) -> BTreeMap<String, String> {
+    packs_out.clone()
 }
 
 /// Now, in milliseconds since the Unix epoch, on this runner's clock (D77).
@@ -2015,63 +2071,116 @@ mod pack_tests {
     /// **A job with no pack is every job this build runs, and it runs.**
     ///
     /// Asserted first because it is the condition every other test in the
-    /// suite depends on: the stop added for a pack must not stop anything
-    /// else.
+    /// suite depends on: the stop that remains for a pack must not stop
+    /// anything else.
     #[test]
     fn a_job_that_consumes_and_leaves_no_pack_is_not_handed_back() {
         let packs = Packs {
             packs_in: Vec::new(),
-            packs_out: std::collections::BTreeMap::new(),
+            packs_out: BTreeMap::new(),
         };
-        assert_eq!(packs.why_this_runner_cannot(), None);
+        assert_eq!(packs.why_this_runner_cannot(false), None);
+        assert_eq!(packs.why_this_runner_cannot(true), None);
     }
 
-    /// **A pack to lay out is handed back with the key named, not run with an
-    /// empty `{in}`** (D150, ORCH-234).
+    /// **A declared command's packs are laid out and not refused**, which is
+    /// the whole of what this step changed: the keys the hub resolved reach
+    /// `Session::lay_out_packs` instead of a sentence handing the attempt
+    /// back.
     ///
-    /// The sentence is the whole of the behaviour, so it is the thing
-    /// asserted: it names the key, so an operator reading the record knows
-    /// *which* input was missing, and it names the directory, so nobody has
-    /// to guess what "cannot lay out" meant.
+    /// Asserted here, on the predicate, because this is the one place that
+    /// could silently put the old stop back: a refusal returned for a
+    /// declared command would hand back every job the first consumer's build
+    /// and test pair makes, and it would look like caution.
     #[test]
-    fn a_pack_this_runner_cannot_lay_out_is_named_by_its_key() {
+    fn a_declared_command_s_packs_are_laid_out_rather_than_handed_back() {
         let packs = Packs {
             packs_in: vec![a_pack("built"), a_pack("fixtures")],
-            packs_out: std::collections::BTreeMap::new(),
+            packs_out: BTreeMap::from([("built".to_owned(), "artefacts".to_owned())]),
         };
-        let said = packs
-            .why_this_runner_cannot()
-            .expect("a pack this build cannot lay out is a refusal");
-        assert!(
-            said.contains("built, fixtures"),
-            "every key it could not serve, in the order the hub sent them: {said}"
-        );
-        assert!(
-            said.contains(herd_proto::IN_TOKEN),
-            "and the directory they would have gone under: {said}"
+        assert_eq!(
+            packs.why_this_runner_cannot(true),
+            None,
+            "a declared command with packs at both ends is run, not refused"
         );
     }
 
-    /// **And so is a pack to collect**, which is the same silence from the
-    /// other end: the job would exit 0, its `{out}` would be swept, and the
-    /// later job that needs that key would wait for a pack no hub was ever
-    /// told about.
+    /// **A pack on an ad-hoc job is handed back with both halves named**
+    /// (D150, D107).
+    ///
+    /// An ad-hoc command line gets no `{in}` and no `{out}` and names no
+    /// commit, so there is nowhere to lay a pack out, nowhere to take one
+    /// from, and no `(commit, key)` to register one for. The sentence is the
+    /// whole of the behaviour, so it is the thing asserted: it names every
+    /// key at each end, and both directories, so nobody has to guess what
+    /// could not be done.
     #[test]
-    fn a_pack_this_runner_cannot_collect_is_named_too() {
+    fn a_pack_on_a_job_that_is_not_declared_is_named_at_both_ends() {
         let packs = Packs {
-            packs_in: Vec::new(),
-            packs_out: std::collections::BTreeMap::from([(
-                "built".to_owned(),
-                "artefacts".to_owned(),
-            )]),
+            packs_in: vec![a_pack("built"), a_pack("fixtures")],
+            packs_out: BTreeMap::from([("kept".to_owned(), "artefacts".to_owned())]),
         };
         let said = packs
-            .why_this_runner_cannot()
-            .expect("a pack this build cannot collect is a refusal too");
-        assert!(said.contains("built"), "named by its key: {said}");
+            .why_this_runner_cannot(false)
+            .expect("a pack on an ad-hoc job is a refusal");
         assert!(
-            said.contains(herd_proto::OUT_TOKEN),
-            "and the directory it would have been collected from: {said}"
+            said.contains("built, fixtures"),
+            "every key it would have consumed, in the order the hub sent them: {said}"
+        );
+        assert!(
+            said.contains("kept"),
+            "and the key it would have left: {said}"
+        );
+        assert!(
+            said.contains(herd_proto::IN_TOKEN) && said.contains(herd_proto::OUT_TOKEN),
+            "and both directories it has none of: {said}"
+        );
+        assert!(
+            said.contains("names no commit"),
+            "and the reason a pack could not be registered either: {said}"
+        );
+    }
+
+    /// Each end refuses on its own: a job that only consumes, and a job that
+    /// only leaves, are both refused when they are not declared.
+    #[test]
+    fn either_end_alone_refuses_an_undeclared_job() {
+        let consuming = Packs {
+            packs_in: vec![a_pack("built")],
+            packs_out: BTreeMap::new(),
+        };
+        let said = consuming
+            .why_this_runner_cannot(false)
+            .expect("a pack to consume is a refusal on its own");
+        assert!(
+            said.contains("needs the pack(s) built") && !said.contains("leaves the pack"),
+            "only the half that applies is said: {said}"
+        );
+        let leaving = Packs {
+            packs_in: Vec::new(),
+            packs_out: BTreeMap::from([("built".to_owned(), "artefacts".to_owned())]),
+        };
+        let said = leaving
+            .why_this_runner_cannot(false)
+            .expect("a pack to leave is a refusal on its own");
+        assert!(
+            said.contains("leaves the pack(s) built") && !said.contains("needs the pack"),
+            "and so is the other half: {said}"
+        );
+    }
+
+    /// **What a job leaves comes off the assignment**, so the collection
+    /// takes exactly the paths the hub resolved and no others.
+    #[test]
+    fn what_a_job_leaves_is_what_the_assignment_said() {
+        let packs_out = BTreeMap::from([
+            ("built".to_owned(), "artefacts".to_owned()),
+            ("logs".to_owned(), "logs/pack".to_owned()),
+        ]);
+        assert_eq!(declared_leaves(&packs_out), packs_out);
+        assert!(
+            declared_leaves(&BTreeMap::new()).is_empty(),
+            "and a job that leaves nothing hands the collection nothing"
         );
     }
 }

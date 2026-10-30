@@ -317,21 +317,45 @@ async fn a_hub_that_cannot_list_its_jobs_answers_each_collection_it_is_offered()
     };
     broken.but_a_record_still_opens(&job_id);
 
-    let mut restarted = Peer::runner(
-        &harness.hub_url,
-        "a-runner-whose-hub-lost-its-listing",
-        &token,
-        "the-life-that-swept-it-up",
-    )
-    .await;
-    // The hub is still serving: it welcomed this runner (above) and it
-    // answers its health report (here). What it does *not* do is claim
-    // anything about any collection.
-    let at_join = restarted.through_a_health_report().await;
-    assert!(
-        files_held_for(&at_join, &job_id).is_empty(),
-        "a hub that cannot read its records has nothing to say about a collection: {at_join:?}"
-    );
+    // **The fixture is checked after the measurement, not before it**
+    // (`AListingThatFails::still_binds`): the host can hand the mode back
+    // under a running test, and a silence measured once it had is a verdict
+    // about a hub that could read its records after all. So the measurement
+    // is taken again from nothing rather than judged.
+    let mut restarted = {
+        let mut measured = None;
+        for attempt_at_the_fixture in 1..=AListingThatFails::ATTEMPTS {
+            broken.hold_again();
+            let mut peer = Peer::runner(
+                &harness.hub_url,
+                "a-runner-whose-hub-lost-its-listing",
+                &token,
+                "the-life-that-swept-it-up",
+            )
+            .await;
+            // The hub is still serving: it welcomed this runner (above) and
+            // it answers its health report (here). What it does *not* do is
+            // claim anything about any collection.
+            let at_join = peer.through_a_health_report().await;
+            if !broken.still_binds() {
+                assert!(
+                    attempt_at_the_fixture < AListingThatFails::ATTEMPTS,
+                    "{}",
+                    AListingThatFails::WOULD_NOT_HOLD
+                );
+                after_the_runner_is_gone(&harness, peer).await;
+                continue;
+            }
+            assert!(
+                files_held_for(&at_join, &job_id).is_empty(),
+                "a hub that cannot read its records has nothing to say about a \
+                 collection: {at_join:?}"
+            );
+            measured = Some(peer);
+            break;
+        }
+        measured.expect("the loop above either measures or says why it could not")
+    };
 
     // The offer. One chunk of a two-chunk collection, which is how a swept
     // spool re-enters the ordinary path.
@@ -437,27 +461,64 @@ async fn one_failed_listing_silences_every_runner_and_each_is_still_answered() {
     // Both machines come back, and the one broken directory is silent to both
     // of them at join. That is the fleet-wide half, measured rather than
     // argued: nothing about either collection, from one `readdir`.
-    let mut first = Peer::runner(
-        &harness.hub_url,
-        "the-first-machine",
-        &first_token,
-        "the-life-that-swept-it-up",
-    )
-    .await;
-    let mut second = Peer::runner(
-        &harness.hub_url,
-        "the-second-machine",
-        &second_token,
-        "the-life-that-swept-it-up",
-    )
-    .await;
-    for (peer, job_id) in [(&mut first, &first_job), (&mut second, &second_job)] {
-        let at_join = peer.through_a_health_report().await;
-        assert!(
-            files_held_for(&at_join, job_id).is_empty(),
-            "one failed listing is silent to every runner: {at_join:?}"
-        );
-    }
+    //
+    // **And the fixture is checked after the measurement, not before it**
+    // (`AListingThatFails::still_binds`). The host hands the mode back under
+    // a running test — the runner carrying this suite restores access on any
+    // directory under the job it cannot list, every 200 ms — and a hub that
+    // scanned after it came back names what it is owed, correctly, about a
+    // listing that was no longer broken. That is the red this file printed on
+    // 2026-10-30 (batch 26's gate, job j0000000138), and it was a fact about
+    // the fixture and none about the hub. So a measurement taken on a mode
+    // that did not hold is void: it is taken again from nothing, both
+    // connections at once, and only a measurement whose fixture still binds
+    // is ever judged.
+    let (mut first, mut second) = {
+        let mut measured = None;
+        for attempt_at_the_fixture in 1..=AListingThatFails::ATTEMPTS {
+            broken.hold_again();
+            let mut first = Peer::runner(
+                &harness.hub_url,
+                "the-first-machine",
+                &first_token,
+                "the-life-that-swept-it-up",
+            )
+            .await;
+            let mut second = Peer::runner(
+                &harness.hub_url,
+                "the-second-machine",
+                &second_token,
+                "the-life-that-swept-it-up",
+            )
+            .await;
+            // Both read to their own health report before either is judged:
+            // the half this test is about is one listing answering two
+            // connections, so the two readings have to belong to one state
+            // of that listing.
+            let at_first_join = first.through_a_health_report().await;
+            let at_second_join = second.through_a_health_report().await;
+            if !broken.still_binds() {
+                assert!(
+                    attempt_at_the_fixture < AListingThatFails::ATTEMPTS,
+                    "{}",
+                    AListingThatFails::WOULD_NOT_HOLD
+                );
+                drop(first);
+                after_the_runner_is_gone(&harness, second).await;
+                continue;
+            }
+            for (at_join, job_id) in [(&at_first_join, &first_job), (&at_second_join, &second_job)]
+            {
+                assert!(
+                    files_held_for(at_join, job_id).is_empty(),
+                    "one failed listing is silent to every runner: {at_join:?}"
+                );
+            }
+            measured = Some((first, second));
+            break;
+        }
+        measured.expect("the loop above either measures or says why it could not")
+    };
 
     // And each is answered about its **own** collection, from its own record.
     for (peer, job_id, attempt, bytes) in [
