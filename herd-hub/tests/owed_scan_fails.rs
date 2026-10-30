@@ -38,16 +38,27 @@
 //! The runner side of this contract needs no change: `JobFilesHeld` is the
 //! frame it already resumes on, and it arrives ahead of the answer to any
 //! health report queued after the offer, frames on one link being ordered.
-
-use std::os::unix::fs::PermissionsExt;
-use std::path::{Path, PathBuf};
+//!
+//! **That last sentence is an ordering, and nothing here can measure one.**
+//! The hub is a library object and the runner is a hand-written `Peer` that
+//! encodes its own frames, so the sequence this file asserts is the sequence
+//! this file chose: it cannot get the ordering wrong, and its green says
+//! nothing about the code that can. The real
+//! `Session::the_hub_has_said_what_it_is_owed` — pumps, a window of eight
+//! permits, a health interval — is driven against this same fixture by
+//! `owed_scan_fails_against_the_real_runner.rs`, with both binaries as
+//! processes and more collections than the window. The permission fixture
+//! itself is shared with it, in `a_failed_listing/mod.rs`, so there is one
+//! definition of the absence rather than two.
 
 use futures_util::{SinkExt, StreamExt};
 use herd_proto::{from_frame, to_frame, FromHub, JobId, Role, ToHub};
 use tokio_tungstenite::tungstenite::Message;
 
+mod a_failed_listing;
 mod support;
 
+use a_failed_listing::AListingThatFails;
 use support::{shell, Harness, PATIENCE};
 
 type Link =
@@ -58,52 +69,6 @@ type Link =
 const PATH: &str = "evidence/results.json";
 const BYTES: usize = 64;
 const HALF: usize = BYTES / 2;
-
-/// The jobs directory with its read permission taken away, put back when the
-/// test ends however it ends.
-///
-/// A guard rather than two calls, because a panicking assertion would
-/// otherwise leave a directory the temporary-directory cleanup cannot walk.
-struct AListingThatFails {
-    jobs: PathBuf,
-}
-
-impl AListingThatFails {
-    /// `None` when this process is one permissions do not apply to, which is
-    /// a skip and not a pass (D27): there is no way to make a real `readdir`
-    /// fail for root, and a mock of one would prove nothing about the hub.
-    fn over(state_dir: &Path) -> Option<Self> {
-        let jobs = state_dir.join("jobs");
-        std::fs::set_permissions(&jobs, std::fs::Permissions::from_mode(0o111))
-            .expect("the jobs directory's permissions are the test's to set");
-        if std::fs::read_dir(&jobs).is_ok() {
-            std::fs::set_permissions(&jobs, std::fs::Permissions::from_mode(0o755))
-                .expect("the jobs directory is given back its permissions");
-            return None;
-        }
-        Some(Self { jobs })
-    }
-
-    /// The other half of the fixture, asserted rather than assumed: a record
-    /// still opens **by name**. If this ever stopped holding, the fixture
-    /// would be testing a hub with no records at all, and the fix it is about
-    /// would have nothing to read.
-    fn but_a_record_still_opens(&self, job_id: &JobId) {
-        let record = self.jobs.join(job_id.as_str()).join("job.json");
-        assert!(
-            std::fs::read_to_string(&record).is_ok(),
-            "the fixture is a listing that fails, not a record that is gone: {} must still \
-             open by name",
-            record.display()
-        );
-    }
-}
-
-impl Drop for AListingThatFails {
-    fn drop(&mut self) {
-        let _ = std::fs::set_permissions(&self.jobs, std::fs::Permissions::from_mode(0o755));
-    }
-}
 
 /// A peer driven frame by frame, so a test can be a *restarted* runner rather
 /// than a runner that happens to reconnect. The same shape as
@@ -337,8 +302,7 @@ async fn a_hub_that_cannot_list_its_jobs_answers_each_collection_it_is_offered()
     let Some(broken) = AListingThatFails::over(harness.state_dir()) else {
         herd_runner::testing::skipped(
             "a_hub_that_cannot_list_its_jobs_answers_each_collection_it_is_offered",
-            "this process is one file permissions do not apply to, so no real readdir can \
-             be made to fail here",
+            AListingThatFails::WHY_IT_WOULD_BE_SKIPPED,
         );
         return;
     };
@@ -455,8 +419,7 @@ async fn one_failed_listing_silences_every_runner_and_each_is_still_answered() {
     let Some(broken) = AListingThatFails::over(harness.state_dir()) else {
         herd_runner::testing::skipped(
             "one_failed_listing_silences_every_runner_and_each_is_still_answered",
-            "this process is one file permissions do not apply to, so no real readdir can \
-             be made to fail here",
+            AListingThatFails::WHY_IT_WOULD_BE_SKIPPED,
         );
         return;
     };
@@ -538,8 +501,7 @@ async fn a_collection_this_hub_already_holds_is_not_claimed_as_owed() {
     let Some(broken) = AListingThatFails::over(harness.state_dir()) else {
         herd_runner::testing::skipped(
             "a_collection_this_hub_already_holds_is_not_claimed_as_owed",
-            "this process is one file permissions do not apply to, so no real readdir can \
-             be made to fail here",
+            AListingThatFails::WHY_IT_WOULD_BE_SKIPPED,
         );
         return;
     };
