@@ -145,10 +145,19 @@ difference between the gated tree and the committed one is that
 whitespace. The fmt gate is re-run by `gate.sh` on the committed tree,
 which is the named run below — the authoritative one for this branch.
 
-**Skips: no `HERD-SKIPPED` line at all** — zero runtime skips on this
-host for this run. **38 `#[ignore]`d assertions were printed as
-ignored** by the census and are not counted as passes (D27); none is
-mine, none is new, and every one carries a reason.
+**Skips, and a correction to the block above.** That block is a `tail`
+of 50 lines and the suite's runtime-skip section fell off the top of
+it, so it shows none — which is not the same as there being none, and
+I wrote the wrong sentence here first. The figures are `gate.sh`'s step
+7, over the committed tree: **12 runtime `HERD-SKIPPED` lines, matching
+`scripts/expected-skips/local.txt` exactly**, every one of them this
+host's missing cgroup v2 delegation or the `io.max` ceiling that needs
+it; **38 `#[ignore]`d assertions, matching `expected-skips/ignored.txt`
+exactly**, each with a reason. None of the fifty is this task's and none
+is new. Not one is counted as a pass (D27). **Both load-gated flood
+benches RAN** rather than declining — `flood-fifty` and
+`flood-two-fifty` — so this is an at-rest run and nothing in it was
+excused by load.
 
 **The two lib figures the brief asked for, taken before anything was
 written**, on `67bcd43` with a clean tree (04:52 lines in the log say
