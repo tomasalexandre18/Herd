@@ -24,3 +24,5 @@ versioned source.
 | `a-decision-branch-cannot-be-all-green.md` | 2026-10-25 | a branch writing a `D-NEXT` entry fails `check-docs.sh` by design; three green gates plus that one note is the deliverable |
 | `a-gate-joined-by-a-semicolon-is-advice.md` | 2026-10-30 | a status you did not look at is a status you did not get: `;` throws a gate's status away and a pipe replaces it with `tail`'s; join with `&&`, and read `${PIPESTATUS[0]}` or do not pipe a gate at all |
 | `a-perl-escape-recodes-the-whole-file.md` | 2026-10-30 | `\x{2013}` in a `perl -i` substitution double-encodes every multibyte character already in the file; use raw bytes under `LC_ALL=C` |
+| `a-drafted-title-is-measured-unfenced.md` | 2026-10-30 | a title drafted inside a fence is unchecked; a `decisions.md` header is not exempt, and the longest one is already exactly 79 |
+| `an-attribute-census-needs-an-anchor.md` | 2026-10-30 | an unanchored `#[ignore]` count reads 51 where the attribute lines are 38; doc comments quoting it inflate the figure |
