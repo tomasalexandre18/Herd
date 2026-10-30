@@ -14,8 +14,11 @@
 //!
 //! with the acceptance criterion *"a day's ntfy count does not grow with the
 //! number of step jobs"*. Four of the five have a state transition in this
-//! hub to hang off and are [`Event`]'s four variants; the other two are
-//! named, with what each still needs, in [`Event`]'s own documentation. The
+//! hub to hang off and are [`Event`]'s first four variants; the fifth — a
+//! detached job's end — is [`Event::JobEnded`], which waited for the
+//! submitter's asking to be carried on the submission and written on the
+//! record, and has it now. What is left of E-37 is **the nightly's verdict,
+//! and it needs no event of its own**: see [`Event`]'s own documentation. The
 //! list is the whole of it: an event per step, per log line or per progress
 //! chunk is the failure this is designed against, because the consumer's
 //! answer to a noisy topic is to mute it, and then the one event that
@@ -41,9 +44,12 @@
 //!    *aborts* its tasks and never joins them, so a delivery in flight is
 //!    dropped where it stands when the hub stops. A stop stays bounded by
 //!    [`crate::STOP_WITHIN`] and the notifier is not in that path at all.
-//! 3. **Zero events per step.** None of the four variants fires on a job that
-//!    runs and finishes, whatever it printed; a day of step jobs that work
-//!    produces no event whatever.
+//! 3. **Zero events per step.** No variant fires on a job that runs and
+//!    finishes, whatever it printed, **unless its submitter asked for that
+//!    one job's end** — which is a thing a person typed and not a thing the
+//!    fleet does. A day of step jobs that work produces no event whatever,
+//!    and [`Event::JobEnded`]'s own doc has why that is still true now that
+//!    an end *can* be an event.
 //!
 //! And a fourth, which is about the operator rather than the hub: **a sink
 //! that fails is said out loud, with the reason, and never retried for ever
@@ -92,25 +98,30 @@ pub const DELIVER_WITHIN: Duration = Duration::from_secs(10);
 
 /// One of the things E-37 asks to hear about.
 ///
-/// **Four variants for five listed things, and the two that are missing are
-/// missing on purpose:**
+/// **Five variants for five listed things, and the fifth of E-37's list has
+/// no variant of its own because it needs none:**
 ///
-/// * *"a detached job's end when the submitter asked"* needs the submitter's
-///   asking to be carried on the submission and written on the record, which
-///   is a field on `NewJob`, on the wire frame and in `job.json`. That is a
-///   record change, and the record is not this task's to change. Everything
-///   else is here: the call site is the one that already tells a job's
-///   followers, and the event is a fifth variant.
-/// * *"the nightly's verdict"* needs a nightly, which is M14 (E-41). Nothing
-///   in this hub schedules a job yet, so there is no verdict of a nightly to
-///   speak about. When M14 lands, the scheduled submission is a submission
-///   nobody is following — exactly the case above — so it needs the opt-in
-///   field and no new event of its own.
+/// * *"a detached job's end when the submitter asked"* is
+///   [`Event::JobEnded`]. It took a field carried on the submission
+///   (`ToHub::SubmitJob`'s `announce_end`), through `NewJob`, onto
+///   `job.json` ([`crate::job::JobRecord::announce_end`]) — because an
+///   announcement at the end has to be asked for at the beginning, and
+///   nothing on the connection survives a `herdctl submit` that has already
+///   left.
+/// * *"the nightly's verdict"* is **that same event and not a new one**, and
+///   what it waits for is M14's nightly, not more work here. A scheduled
+///   pass is `herdctl if-moved` submitting on the consumer's own timer
+///   (D207, D217): a submission nobody is following, which asks for its end
+///   to be announced exactly as any other detached submission does. The
+///   verdict then arrives as a `job_ended` whose `cause` and `how` are the
+///   nightly's. The one deviation D217 already records stays a deviation: a
+///   pass that submitted *nothing* is `herdctl`'s own stderr line, because
+///   the hub never heard of a job and an event about a job that does not
+///   exist is not a thing this hub can say.
 ///
-/// Both are written down in the handoff that carries this module, with the
-/// field each needs. Neither is invented here: an event with no source is a
-/// shape nobody has measured, and shipping one would make the list longer
-/// than E-37's, which is the one thing this module must not do.
+/// Neither was invented ahead of its source: an event with no transition
+/// behind it is a shape nobody has measured, and shipping one would make the
+/// list longer than E-37's, which is the one thing this module must not do.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum Event {
@@ -159,6 +170,46 @@ pub enum Event {
     /// requester to read it; a job refused as full is D182's different
     /// ending, where nothing failed and no machine went anywhere.
     JobLost { job: String, reason: String },
+    /// A job whose submitter **asked to be told** has reached its end
+    /// (E-37's *"a detached job's end when the submitter asked"*).
+    ///
+    /// **The asking is the whole gate, and it is the only gate.** The hub
+    /// does not also check that nobody happens to be following the job: a
+    /// follower list is a fact about this second, and the question E-37 asks
+    /// is about what the submitter wanted when they submitted. A `herdctl
+    /// submit --announce-end` is detached by construction — it leaves with
+    /// the id and closes — and `herdctl run`, which stays and reads the
+    /// verdict on its own stream, is offered no such flag at all. So the
+    /// shape of the CLI is what makes "detached" true, and the record's one
+    /// `announce_end` is what makes it *asked*.
+    ///
+    /// **Every ending, not only a green one.** A detached submitter who
+    /// asked to hear how their job went hears it whether it exited 0, exited
+    /// 3, was cancelled at its deadline, was stopped at a cap or could never
+    /// have run: *"a detached job's end"* is the end, and an announcement
+    /// that only fired on success would be the one that let a red nightly
+    /// pass unnoticed. A job lost twice is the one ending that can produce
+    /// two events, [`Event::JobLost`] and this one, and that is correct: the
+    /// first is about a *machine* going and is addressed to the fleet's
+    /// operator, the second is about a *job* ending and is addressed to
+    /// whoever asked. Each still fires at most once.
+    ///
+    /// It does **not** make a step job noisy, and the acceptance criterion
+    /// is unaffected: a day's count grows with the number of *submitters who
+    /// asked*, which is a number a person chose, and not with the number of
+    /// step jobs, which is a number the fleet produces.
+    JobEnded {
+        job: String,
+        /// The one machine-readable word for what ended it, which is
+        /// [`herd_proto::JobOutcome::cause`] and therefore the same word the
+        /// verdict document and the wire use. A consumer's router switches
+        /// on this.
+        cause: String,
+        /// The same ending as a person reads it, in the hub's own words —
+        /// `exited 3 rather than 0`, `was cancelled: …`. One sentence, so
+        /// that the body of the notification needs no second lookup.
+        how: String,
+    },
 }
 
 impl Event {
@@ -195,6 +246,15 @@ impl Event {
         }
     }
 
+    /// A job ended and its submitter had asked to hear about it (E-37).
+    pub fn job_ended(job: &str, cause: &str, how: &str) -> Self {
+        Self::JobEnded {
+            job: ascii(job),
+            cause: ascii(cause),
+            how: ascii(how),
+        }
+    }
+
     /// The short machine-readable name of what happened. The same string the
     /// payload's `kind` carries, and what a consumer's router switches on.
     pub fn kind(&self) -> &'static str {
@@ -203,6 +263,7 @@ impl Event {
             Self::RunnerLost { .. } => "runner_lost",
             Self::OwnerSwitch { .. } => "owner_switch",
             Self::JobLost { .. } => "job_lost",
+            Self::JobEnded { .. } => "job_ended",
         }
     }
 
@@ -216,6 +277,7 @@ impl Event {
                 format!("herd: {runner} switched {switch}")
             }
             Self::JobLost { job, .. } => format!("herd: {job} lost"),
+            Self::JobEnded { job, cause, .. } => format!("herd: {job} {cause}"),
         }
     }
 
@@ -233,6 +295,7 @@ impl Event {
                 why,
             } => format!("runner {runner} is now switched {switch} ({why})"),
             Self::JobLost { job, reason } => format!("{job} is lost: {reason}"),
+            Self::JobEnded { job, how, .. } => format!("{job} {how}"),
         }
     }
 
@@ -845,6 +908,34 @@ mod tests {
             "a reason that is not ASCII is translated where it can be and \
              marked where it cannot: {payload}"
         );
+        assert!(!payload.contains('\n'), "one event is one line: {payload}");
+    }
+
+    /// E-37's detached end: the payload carries the job, the one word a
+    /// router switches on, and the sentence a person reads.
+    ///
+    /// The two are separate fields on purpose. A consumer that routes on
+    /// *what kind of ending* this was must not have to parse an English
+    /// sentence to find out, and a person reading the notification must not
+    /// have to look the job up to learn what `exited` meant.
+    #[test]
+    fn an_end_says_the_job_the_cause_and_the_sentence() {
+        let event = Event::job_ended(
+            "j0000042",
+            "stopped_by_cap",
+            "was stopped by its Time cap of 600",
+        );
+        let payload = event.payload();
+        let read: serde_json::Value =
+            serde_json::from_str(&payload).expect("the payload is one JSON object");
+        assert_eq!(read["herd_event_version"], EVENT_FORMAT_VERSION);
+        assert_eq!(read["kind"], "job_ended");
+        assert_eq!(read["job"], "j0000042");
+        assert_eq!(read["cause"], "stopped_by_cap");
+        assert_eq!(read["how"], "was stopped by its Time cap of 600");
+        assert_eq!(read["title"], "herd: j0000042 stopped_by_cap");
+        assert_eq!(read["body"], "j0000042 was stopped by its Time cap of 600");
+        assert!(payload.is_ascii(), "{payload}");
         assert!(!payload.contains('\n'), "one event is one line: {payload}");
     }
 

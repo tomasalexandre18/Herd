@@ -1841,6 +1841,7 @@ impl JobDirStore {
             timeout_s,
             reading,
             reading_for,
+            announce_end,
         } = new;
         let mut live = self.lock()?;
         // `mkdir` is what claims an id: the directories, not the index, decide
@@ -1918,6 +1919,9 @@ impl JobDirStore {
             // pack yet.
             packs_in: Default::default(),
             packs_out: Default::default(),
+            // What the submitter asked for, written at birth and never
+            // changed (E-37).
+            announce_end,
         };
         self.write_record(&record)?;
         self.append_event(&id, &JobEvent::transition(at, JobState::Queued))?;
@@ -4762,6 +4766,78 @@ mod tests {
             assert_eq!(written["priority"], priority.name());
             assert_eq!(written["record_version"], RECORD_VERSION);
         }
+    }
+
+    /// E-37: the submitter's asking reaches `job.json`, and a submitter who
+    /// asked for nothing writes no key at all.
+    ///
+    /// Both halves on the **written bytes** and not only on the struct the
+    /// mint returned, because the bytes are what a reader a year from now
+    /// has: the asking has to be legible in the file, and the absence has to
+    /// be a real absence. That second half is the whole of why
+    /// `RECORD_VERSION` did not move for this field — a record written by a
+    /// hub that never heard of it is byte for byte a record written by this
+    /// hub for a submitter who did not ask.
+    #[test]
+    fn a_record_carries_the_end_announcement_its_submitter_asked_for() {
+        let (dir, store) = store();
+        let written = |job: &JobRecord| -> serde_json::Value {
+            let path = dir
+                .path()
+                .join(JOBS_DIR)
+                .join(job.id.as_str())
+                .join(RECORD_FILE);
+            serde_json::from_str(&read(&path)).expect("the record is json")
+        };
+
+        let asked = store
+            .create_job(NewJob::new(vec!["asked".to_owned()]).announcing_its_end(true))
+            .expect("minted");
+        assert!(asked.announce_end, "the mint carries the asking");
+        assert_eq!(
+            written(&asked)["announce_end"],
+            serde_json::Value::Bool(true),
+            "a reader of job.json sees that this job's submitter asked for its end to be \
+             announced (E-37)"
+        );
+        assert_eq!(written(&asked)["record_version"], RECORD_VERSION);
+
+        let silent = store
+            .create_job(NewJob::new(vec!["silent".to_owned()]))
+            .expect("minted");
+        assert!(
+            !silent.announce_end,
+            "nobody asked, which is E-37's \"never per step job by default\""
+        );
+        assert_eq!(
+            written(&silent)["announce_end"],
+            serde_json::Value::Null,
+            "and no key is written for it: this record is what a hub from before the \
+             field wrote, which is why RECORD_VERSION stayed at {RECORD_VERSION}. It \
+             holds: {:?}",
+            written(&silent)
+        );
+
+        // And the reader's side of that claim, against a `job.json` that
+        // really has no such key: the record this hub reads back is a
+        // submitter who asked for nothing, never a parse failure. A record
+        // this build cannot parse is the failure mode the version exists
+        // for, and this asserts there is none here.
+        let path = dir
+            .path()
+            .join(JOBS_DIR)
+            .join(silent.id.as_str())
+            .join(RECORD_FILE);
+        let text = read(&path);
+        assert!(
+            !text.contains("announce_end"),
+            "the fixture this reads back has no such key: {text}"
+        );
+        let read_back: JobRecord = serde_json::from_str(&text).expect("an older record parses");
+        assert!(
+            !read_back.announce_end,
+            "absent is nobody asking, and it parses rather than refusing"
+        );
     }
 
     /// E-05: the second submission of work that is already under way joins

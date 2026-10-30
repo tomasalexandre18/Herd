@@ -1623,6 +1623,7 @@ mod tests {
             outputs: Default::default(),
             packs_in: Default::default(),
             packs_out: Default::default(),
+            announce_end: false,
         }
     }
 

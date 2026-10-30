@@ -4127,6 +4127,68 @@ fn how_it_ended(outcome: &JobOutcome) -> String {
     }
 }
 
+/// A job's own ending in words, for a reader who did not ask why it failed.
+///
+/// [`how_it_ended`] is written for a **parent that did not succeed** and says
+/// *"exited 3 rather than 0"*, which is the right sentence on a child's
+/// record and a nonsense one for a job that exited 0 — and E-37's detached
+/// end fires on every ending, the green one included. Every other variant
+/// reads the same either way, so this is that one case and a delegation for
+/// the rest: one table of these sentences, not two.
+fn the_ending_in_words(outcome: &JobOutcome) -> String {
+    match outcome {
+        JobOutcome::Exited { code } => format!("exited {code}"),
+        other => how_it_ended(other),
+    }
+}
+
+/// E-37's *"a detached job's end when the submitter asked"*: say it, if they
+/// asked.
+///
+/// Called at **every** door a job's record can reach a terminal state
+/// through, and the call is deliberately after the record is written: an
+/// announcement is about a fact on the disk, and a hub that said a job was
+/// over before its end was durable would be announcing something a crash
+/// could still take back.
+///
+/// **It costs a hub with no sink nothing at all.** The
+/// [`crate::notify::Notifier::configured`] check comes first, so the record
+/// read below never happens on a hub that is not configured to tell anybody
+/// anything — which is every hub in every test that is about something else,
+/// and the default deployment. On a hub that *is* configured it is one
+/// lockless record read per job ending ([`crate::store::Store::job`]), beside
+/// the manifest read and the commit read that every one of these doors
+/// already does.
+///
+/// A record that cannot be read is **not** an announcement nobody asked for:
+/// the asking is on that record and nowhere else, so an unreadable record
+/// means the hub does not know whether anybody asked, and it says so on its
+/// own stderr rather than guessing either way. The job's end is already
+/// written and reported; this is the notification alone.
+fn say_how_it_ended(state: &State, job_id: &JobId, outcome: &JobOutcome) {
+    if !state.notify.configured() {
+        return;
+    }
+    match state.store.job(job_id) {
+        Ok(Some(record)) => {
+            if record.announce_end {
+                state.notify.say(Event::job_ended(
+                    &job_id.to_string(),
+                    outcome.cause(),
+                    &the_ending_in_words(outcome),
+                ));
+            }
+        }
+        Ok(None) => {}
+        Err(error) => eprintln!(
+            "herd-hub: {job_id} has ended and its record could not be read, so this hub \
+             cannot tell whether its submitter asked for the end to be announced (E-37): \
+             {error}. The job's end is recorded and its requesters are told; only the \
+             notification is missing."
+        ),
+    }
+}
+
 /// End a job the claim step ended, with the reason on its record and in the
 /// stream of whoever is waiting for it (E-36, E-09, E-10).
 ///
@@ -4146,6 +4208,10 @@ fn end_the_job(state: &State, record: &JobRecord, outcome: JobOutcome, said: &st
         )
         .with_context(|| format!("ending {}", record.id))?;
     eprintln!("herd-hub: {} {said}", record.id);
+    // E-37: one of the three ends the claim step decides is a detached
+    // submission's last word — a nightly cancelled at its 05:00 deadline is
+    // exactly the case (E-09, D217) — so this door announces like the rest.
+    say_how_it_ended(state, &record.id, &outcome);
     // Whatever the record holds, which for a job the claim step ended is
     // nothing: no runner ever made it a workspace. Read rather than assumed,
     // so that there is one answer to "what did this job leave?" and not one
@@ -6616,6 +6682,10 @@ async fn record_the_end(
         {
             Ok(()) => {
                 state.stall_is_over(job_id);
+                // E-37, and after the three writes above rather than before:
+                // the end is on the disk, so the announcement is about a
+                // fact and not about an intention.
+                say_how_it_ended(state, job_id, outcome);
                 return true;
             }
             Err(error) => {
@@ -6700,6 +6770,9 @@ async fn keep_trying_to_write_results(state: Arc<State>) {
                     wrote_something = true;
                     state.stall_is_over(&job_id);
                     state.attempt_is_over(&job_id);
+                    // E-37, the same as on the first try: a verdict written
+                    // late is still the end a submitter asked to hear about.
+                    say_how_it_ended(&state, &job_id, &outcome);
                     println!(
                         "herd-hub: {job_id} is written at last: {outcome:?}. The runner is \
                          told it may forget it."
@@ -7171,6 +7244,13 @@ fn give_the_job_another_go(
             },
         )
         .with_context(|| format!("recording the end of {job_id}"))?;
+    // E-37's detached end, on **both** branches below and before either of
+    // them: whether the machine went away or every machine handed the job
+    // back, the job is over and a submitter who asked is owed the sentence.
+    // That is why this is not inside the `else`: a job refused as full is a
+    // different thing to say about the *fleet* (so not a `job_lost`) and the
+    // same thing to say about the *job*.
+    say_how_it_ended(state, job_id, &outcome);
     if at_its_ceiling {
         eprintln!(
             "herd-hub: {job_id} was refused as full {spent} time(s) of {allowed} and is not \
@@ -7336,6 +7416,9 @@ async fn requeue_for_a_lost_capability(
         )
         .with_context(|| format!("recording {job_id} as out of requeues"))?;
     eprintln!("herd-hub: {job_id} has spent its requeue budget: {reason}");
+    // E-37: a job that ran out of requeues is over, and a submitter who
+    // asked hears so (D76).
+    say_how_it_ended(state, job_id, &outcome);
     let kept = read_the_outputs(state, job_id);
     let commit = the_commit_it_ran(state, job_id);
     for follower in state.stop_following(job_id) {
@@ -7922,7 +8005,11 @@ async fn accept_submissions(state: &State, outbox: &Outbox, source: &mut Source)
             }
         };
         match message {
-            ToHub::SubmitJob { asked, wants_files } => {
+            ToHub::SubmitJob {
+                asked,
+                wants_files,
+                announce_end,
+            } => {
                 // First of the refusals, and **before anything is minted**,
                 // which is what makes it safe for `herdctl` to read it as
                 // "no job exists" (D142, `Said::Refused`): a hub that is
@@ -7988,7 +8075,11 @@ async fn accept_submissions(state: &State, outbox: &Outbox, source: &mut Source)
                     .unwrap_or_else(|poisoned| poisoned.into_inner());
                 let submission = state
                     .store
-                    .submit(new_job(asked))
+                    // `announce_end` is added here and not inside
+                    // [`new_job`], because it is not part of `Asked`: a dry
+                    // run goes through the same conversion and has no end to
+                    // announce (E-37).
+                    .submit(new_job(asked).announcing_its_end(announce_end))
                     .context("taking a submission in")?;
                 let job_id = submission.record().id.clone();
                 // JobAccepted first, so the requester has the id before any
@@ -8564,6 +8655,17 @@ fn cancel_job(state: &State, outbox: &Outbox, job_id: &JobId) -> Result<()> {
                 )
                 .with_context(|| format!("recording {job_id} as cancelled"))?;
             state.attempt_is_over(job_id);
+            // E-37: a job somebody cancelled before it started is a job
+            // that ended, and a detached submitter who asked for its end
+            // is told. The canceller is a *different* requester and is
+            // answered on its own connection below.
+            say_how_it_ended(
+                state,
+                job_id,
+                &JobOutcome::Cancelled {
+                    reason: reason.clone(),
+                },
+            );
             for follower in state.stop_following(job_id) {
                 let _ = follower.send(FromHub::JobFinished {
                     job_id: job_id.clone(),

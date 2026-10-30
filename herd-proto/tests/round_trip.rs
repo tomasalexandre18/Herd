@@ -369,11 +369,13 @@ fn every_message_to_the_hub_round_trips() {
         round_trip_to_hub(ToHub::SubmitJob {
             asked: full.clone(),
             wants_files: true,
+            announce_end: true,
         });
         round_trip_to_hub(ToHub::DryRun { asked: full });
         round_trip_to_hub(ToHub::SubmitJob {
             asked: bare.clone(),
             wants_files: false,
+            announce_end: false,
         });
         round_trip_to_hub(ToHub::DryRun { asked: bare });
         round_trip_to_hub(ToHub::RaiseJob {
@@ -1989,6 +1991,7 @@ fn the_pack_fields_are_absent_when_silent_and_decode_when_they_were_never_there(
 
     let asked = to_frame(&ToHub::SubmitJob {
         wants_files: false,
+        announce_end: false,
         asked: Asked {
             command: vec!["true".to_owned()],
             labels: LabelSet::default(),
@@ -2162,6 +2165,7 @@ fn the_pack_fields_carry_what_they_are_given() {
     let wire = to_frame(&ToHub::SubmitJob {
         asked: asked.clone(),
         wants_files: false,
+        announce_end: false,
     })
     .expect("encodes");
     assert!(
@@ -2184,4 +2188,83 @@ fn the_pack_fields_carry_what_they_are_given() {
     };
     let wire = to_frame(&assignment).expect("encodes");
     assert_eq!(from_frame::<FromHub>(&wire).expect("decodes"), assignment);
+}
+
+// ---------------------------------------------------------------------------
+// The one field E-37's detached end adds, and why it moved no version
+// ---------------------------------------------------------------------------
+
+/// `announce_end` is **absent** from a submission that does not ask, and a
+/// submission that never carried it decodes with it `false`.
+///
+/// Both halves, for the reason the pack fields' pair is both halves: absent
+/// when silent is what keeps every byte-pinned frame in this file true and is
+/// the whole of the claim that [`PROTOCOL_VERSION`] did not have to move for
+/// it; decoding when absent is what lets a `herdctl` built before the field
+/// go on submitting to a hub built after it.
+///
+/// The precedent is `FromHub::Welcome`'s `keeper_for`, asserted the same way
+/// a few tests above. This one is a `bool` rather than a list, which is the
+/// case worth asserting separately: `false` is the one value a careless
+/// `#[serde]` would have written out as `"announce_end":false` on every
+/// submission in the fleet, and that would have changed the bytes of a frame
+/// two pinned tests compare literally.
+#[test]
+fn an_end_nobody_asked_about_is_absent_from_the_wire_and_decodes_as_not_asked() {
+    let bare = Asked {
+        command: vec!["true".to_owned()],
+        labels: LabelSet::default(),
+        priority: Priority::Step,
+        build_thread_mib: None,
+        memory_mib: None,
+        tmpfs_mib: None,
+        deadline_unix_s: None,
+        after: None,
+        requeue_exit_code: None,
+        declaration: None,
+        labels_from: None,
+        timeout_s: None,
+        needs: Vec::new(),
+        leaves: BTreeMap::new(),
+    };
+    let silent = to_frame(&ToHub::SubmitJob {
+        asked: bare.clone(),
+        wants_files: false,
+        announce_end: false,
+    })
+    .expect("encodes");
+    assert!(
+        !silent.contains("announce_end"),
+        "a submitter who asked for no announcement says nothing, which is E-37's \
+         \"never per step job by default\" on the wire itself: {silent}"
+    );
+
+    // And the asking is said out loud when it is given: an operator reading a
+    // frame off a link sees which answer this submitter gave rather than
+    // having to know what an absent field means.
+    let asking = to_frame(&ToHub::SubmitJob {
+        asked: bare,
+        wants_files: false,
+        announce_end: true,
+    })
+    .expect("encodes");
+    assert!(
+        asking.contains(r#""announce_end":true"#),
+        "the asking is on the wire when it is made: {asking}"
+    );
+
+    // The other direction: a submission built by a peer from before this
+    // field existed. It decodes, and it decodes as a submitter who asked for
+    // nothing — which is what such a peer meant, since there was no way for
+    // it to ask.
+    let before = r#"{"type":"submit_job","asked":{"command":["true"],"priority":"step"}}"#;
+    let ToHub::SubmitJob { announce_end, .. } =
+        from_frame(before).expect("an older submission decodes")
+    else {
+        panic!("that is a submission");
+    };
+    assert!(
+        !announce_end,
+        "no field is no asking, never an asking nobody made"
+    );
 }

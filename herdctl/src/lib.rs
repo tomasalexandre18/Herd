@@ -581,6 +581,12 @@ pub async fn run_job_wanting(
         &ToHub::SubmitJob {
             asked: declared.asked(command, labels, priority),
             wants_files: wanting.wants_files(),
+            // A `run` stays and reads the verdict on its own stream, so
+            // there is nobody for the hub to announce the end to: E-37's
+            // event is for the submission that *left*. The flag is offered
+            // on `submit` alone, which is why this is a constant and not an
+            // argument.
+            announce_end: false,
         },
     )
     .await
@@ -713,6 +719,34 @@ pub async fn submit_job_saying(
     labels: LabelSet,
     priority: Priority,
     declared: Declared,
+    said: impl FnMut(Said),
+) -> Result<JobId> {
+    submit_job_announcing(config, command, labels, priority, declared, false, said).await
+}
+
+/// [`submit_job_saying`], for a submitter that **asks for this job's end to
+/// be announced** (E-37).
+///
+/// The whole of what a requester does about an event: say so once, at
+/// submission time. Everything after that is the hub's and the operator's —
+/// whether a sink is configured at all, where it points, what the topic is
+/// called. A submitter gets no answer about it and should not: the asking is
+/// recorded on `job.json` whether anybody is listening or not, which is what
+/// makes `herdctl submit --announce-end` safe to put in a crontab on a day
+/// the webhook is down.
+///
+/// A third entry point rather than a fourth argument on [`submit_job`], for
+/// the reason [`submit_job_saying`] is a second: the dozens of callers that
+/// only want an id must not have to answer a question they have no opinion
+/// about, and the default — not asking — is E-37's *"never per step job by
+/// default"*.
+pub async fn submit_job_announcing(
+    config: &Config,
+    command: Vec<String>,
+    labels: LabelSet,
+    priority: Priority,
+    declared: Declared,
+    announce_end: bool,
     mut said: impl FnMut(Said),
 ) -> Result<JobId> {
     if command.is_empty() {
@@ -728,6 +762,7 @@ pub async fn submit_job_saying(
             // follower when its connection goes. It sends the default rather
             // than an answer it has no business giving (D167).
             wants_files: Wanting::default().wants_files(),
+            announce_end,
         },
     )
     .await
