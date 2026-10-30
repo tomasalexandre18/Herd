@@ -26,3 +26,5 @@ versioned source.
 | `a-perl-escape-recodes-the-whole-file.md` | 2026-10-30 | `\x{2013}` in a `perl -i` substitution double-encodes every multibyte character already in the file; use raw bytes under `LC_ALL=C` |
 | `a-drafted-title-is-measured-unfenced.md` | 2026-10-30 | a title drafted inside a fence is unchecked; a `decisions.md` header is not exempt, and the longest one is already exactly 79 |
 | `an-attribute-census-needs-an-anchor.md` | 2026-10-30 | an unanchored `#[ignore]` count reads 51 where the attribute lines are 38; doc comments quoting it inflate the figure |
+| `a-delegated-scope-blinds-the-preflight.md` | 2026-10-30 | an uncapped `systemd-run --user --scope -p Delegate=yes` reads no ceiling at any level, so `bench-preflight.sh` check 4 says *reading unavailable* and clears; give every such scope its own `MemoryMax` |
+| `delegation-is-a-property-not-a-file.md` | 2026-10-30 | `Delegate` and `DelegateControllers` on the unit answer *does this delegate*; `cgroup.subtree_control` and a knob's presence do not, and `app.slice` holds `io.pressure` with no `io` controller |
