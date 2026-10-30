@@ -576,6 +576,12 @@ pub async fn execute(
     // not tidiness: it is on the same filesystem as `{out}`, so moving
     // 400 MiB out of a workspace that is about to be reclaimed is a directory
     // entry and not a copy.
+    // And the packs this job declared it **leaves** go into this runner's
+    // pack store and out of `{out}` before that collection reads the
+    // directory — inside `collect`, which is the one place that ordering can
+    // be stated once (ORCH-153, [`crate::packstore::leave_packs`]). A ~400
+    // MiB pack left where it is would be collected as the job's output
+    // evidence and streamed runner → hub → requester as if it were a result.
     let collected = match &ran.ending {
         Some(Ending::Abandoned(_)) => crate::outputs::Collected::nothing(),
         _ => crate::outputs::collect(
@@ -583,9 +589,28 @@ pub async fn execute(
             confined.root().path(),
             caps.output_cap,
             &crate::outputs::spool_path(confined.root().path(), &job_id, attempt),
+            &declared_leaves(declaration.as_ref()),
         ),
     };
-    let crate::outputs::Collected { outputs, spool } = collected;
+    let crate::outputs::Collected {
+        outputs,
+        spool,
+        packs,
+    } = collected;
+    // Named, so a runner's owner can see that a pack was kept and a later
+    // reader can see where the registration frame is missing from.
+    for pack in &packs {
+        eprintln!(
+            "herd-runner: job {job_id} left {:?} at {:?} as pack {} ({} object(s), {} new); it is \
+             in this runner's pack store and is NOT registered with the hub, which is a later \
+             step of M11",
+            pack.key,
+            pack.at,
+            pack.held.manifest.id(),
+            pack.held.objects,
+            pack.held.objects_added
+        );
+    }
     if let Some(refusal) = &outputs.refused {
         eprintln!("herd-runner: job {job_id} {refusal}");
     }
@@ -1148,6 +1173,29 @@ fn why_a_step_could_not_start(
         );
     }
     format!("{program}: {error}")
+}
+
+/// What this job declared it **leaves**: a key, and the path under `{out}`
+/// the artefact is left at (`leaves = { pack = "packs" }`, M11).
+///
+/// **Empty today, and not by oversight.** The pair a requester declares —
+/// `needs` and `leaves` — is read out of their own declaration file by
+/// `herdctl` (`herdctl::declaration::Resolved::leaves`) and goes no further:
+/// the protocol carries neither of them yet, so there is nothing on
+/// [`herd_proto::ToHub`]'s assignment for this function to read. The frames
+/// and fields that carry them are numbered in `herd_proto::pack` and are
+/// folded onto the two enums by a later step of M11, which is also the step
+/// that registers what comes back from the collection with the hub.
+///
+/// It is a function and not an inline `BTreeMap::new()` so that the seam has
+/// a name and a doc comment: the extraction it feeds is tested directly
+/// ([`crate::outputs`]'s own tests), and what is missing is one field's
+/// arrival and not the behaviour.
+fn declared_leaves(
+    declaration: Option<&Declaration>,
+) -> std::collections::BTreeMap<String, String> {
+    let _ = declaration;
+    std::collections::BTreeMap::new()
 }
 
 /// Now, in milliseconds since the Unix epoch, on this runner's clock (D77).
