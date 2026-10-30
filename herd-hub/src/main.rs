@@ -266,11 +266,15 @@ struct Args {
 enum Command {
     /// Print what a state root holds, serve nothing, and exit.
     ///
-    /// Three figures: the file-level deduplication ratio over the records,
-    /// per-job output size by decile, and what the records claim against
-    /// what the directories measure. It is safe against a running hub — it
-    /// takes no lock, writes nothing, and reads no output or log byte — and
-    /// what it prints is a point-in-time snapshot, which it says itself.
+    /// Five figures: the file-level deduplication ratio over the records,
+    /// per-job output size by decile, what the records claim against what
+    /// the directories measure, what is held under `packs/`, and what this
+    /// root's own bookkeeping weighs — the records, the event files and the
+    /// logs, beside the collected output and never inside it. It is safe
+    /// against a running hub — it takes no lock, writes nothing, and reads
+    /// no output byte, no log byte and no line of an event file, only their
+    /// lengths — and what it prints is a point-in-time snapshot, which it
+    /// says itself.
     Report {
         /// The state root to read. The same directory the serving hub is
         /// given, so `HERD_STATE_DIR` alone is enough inside the hub's own

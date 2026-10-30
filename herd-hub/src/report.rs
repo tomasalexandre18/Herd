@@ -7,7 +7,7 @@
 //! but a guess. A hub reporting on itself is the one way such a fact reaches
 //! us: the operator runs this, reads the figures, and sends them on.
 //!
-//! **Three figures, and each one exists because a guess about it was wrong.**
+//! **Five figures, and each one exists because a guess about it was wrong.**
 //!
 //! 1. [`Dedup`] — `r_file`, the file-level deduplication ratio. The bytes
 //!    every record names, over the bytes of their distinct `sha256`. This is
@@ -24,12 +24,33 @@
 //!    an operator can act on: the one real defect this project has seen was
 //!    found by running a shell loop over a figure this report had already
 //!    computed per job and printed only the sum of (ORCH-166).
+//! 4. [`Packs`] — what is under `packs/`, measured. Nothing in Herd weighs
+//!    those bytes against anything, and until that section existed the hub's
+//!    whole pack population was held, unreported and uncounted.
+//! 5. [`Bookkeeping`] — what this root's **own** bookkeeping weighs: the
+//!    `job.json` records, the `events.jsonl` files and the `log` files, which
+//!    every section above leaves out.
+//!
+//!    **Why it is not optional.** The first consumer agreed on 2026-10-30
+//!    that v1.0.0 may ship without the hub's record retention, following in
+//!    v1.1, on two conditions, and this is the second of them in their own
+//!    words: *"`herd-hub report` continue de montrer le poids des
+//!    enregistrements et des journaux, pour que nous voyions la croissance
+//!    au lieu de la découvrir."* Their own measurement of their own root,
+//!    which is the shape of what this has to make visible: about **346 MiB
+//!    over 3334 jobs**, 0.32 % of the root, against **105.57 GiB of
+//!    collected files**, 99.68 %. Sections 1 to 3 would print that root and
+//!    one holding no record whatever identically, because not one of them
+//!    weighs a record.
 //!
 //! **What it is allowed to touch.** The records, and the *lengths* of the
-//! files under each job's `files/`, `files.part/` and `files.gone/`. No
-//! output byte, no log byte, no `events.jsonl`. Every size and every digest
-//! in sections 1 and 2 comes out of a `job.json`; section 3's measurements
-//! are `metadata().len()` and never contents.
+//! files under a job directory — those under `files/`, `files.part/` and
+//! `files.gone/`, and those of the directory's own `job.json`,
+//! `events.jsonl`, `log` and `log.seq`. No output byte, no log byte, no line
+//! of `events.jsonl`: section 5 weighs a log and an event file and reads
+//! neither of them. Every size and every digest in sections 1 and 2 comes
+//! out of a `job.json`; the measurements in sections 3 to 5 are
+//! `metadata().len()` and never contents.
 //!
 //! **It takes no lock.** Not the store's `Mutex<Live>` — it never builds a
 //! [`crate::store::JobDirStore`] — and above all not the `flock(2)` on
@@ -57,6 +78,11 @@ use std::path::{Path, PathBuf};
 use serde::Deserialize;
 
 use crate::job::{OutputSummary, Timestamp, RECORD_VERSION};
+// `retention.rs`'s, used rather than written again. "What a log weighs, or
+// why this build cannot say" is one idea, and the rule it carries — an
+// unmeasured log is UNKNOWN and never nought — is one that a second
+// spelling of the same enum would be free to drift from.
+use crate::retention::LogWeight;
 use crate::store::{
     directory_bytes, JOBS_DIR, KEPT_FILES_DIR, OUTPUT_GONE_DIR, OUTPUT_PARTS_DIR, RECORD_FILE,
 };
@@ -92,6 +118,22 @@ const PACKS_MANIFESTS_DIR: &str = "manifests";
 /// is published, and the one place an interrupted registration leaves
 /// anything. The same duplication, under the same guard.
 const PACKS_MANIFESTS_PART_DIR: &str = "manifests.part";
+
+/// The files a job directory keeps **beside** its collection, by the names
+/// `store.rs` writes them under: the event log, the job's own log, and the
+/// hub's counter for that log.
+///
+/// **Written again here rather than imported**, for the reason `retention.rs`
+/// writes the last two again: they are private to [`crate::store`] and that
+/// module is another task's, so this one may not widen them. The duplication
+/// is held by a test rather than by this comment —
+/// `herd-hub/tests/state_root_report.rs` drives the store's own writer and
+/// asserts section 5's figures against what *it* left, so a rename there
+/// reddens that test instead of printing nought for every log and every event
+/// file on an operator's root.
+const EVENTS_FILE: &str = "events.jsonl";
+const LOG_FILE: &str = "log";
+const LOG_SEQ_FILE: &str = "log.seq";
 
 /// Enough of a `job.json` to report on it, and nothing else.
 ///
@@ -294,6 +336,20 @@ pub struct Accounting {
 }
 
 impl Accounting {
+    /// Every collected byte this section measured: `files/`, `files.part/`
+    /// and `files.gone/` together.
+    ///
+    /// **Section 5's companion figure, and the one it is printed beside.**
+    /// The three directories here and the files section 5 weighs partition a
+    /// job directory between them — section 5 skips these three *by name* —
+    /// so a byte in this total is in no other and the two can be put on
+    /// adjacent lines without double-counting one.
+    pub fn collected_bytes(&self) -> u64 {
+        self.measured_bytes
+            .saturating_add(self.parts_bytes)
+            .saturating_add(self.gone_bytes)
+    }
+
     /// How far the records and the directories are apart, as the records
     /// claiming more (`Greater`) or the disk measuring more (`Less`).
     pub fn gap(&self) -> (std::cmp::Ordering, u64) {
@@ -373,6 +429,182 @@ impl Packs {
     }
 }
 
+/// What this root's own bookkeeping weighs: figure 5 (ORCH-282).
+///
+/// **The population every section above leaves out.** Sections 1 to 3 are
+/// about the collected output and nothing else; section 4 is about `packs/`.
+/// A `job.json`, an `events.jsonl` and a `log` are in none of them, and
+/// nothing in Herd bounds any of the three: the output budget governs
+/// collections (D148, D152) and a sweep frees them without touching a
+/// record, while the only thing that frees a record's or a log's byte is
+/// removing the record. So a root whose collections were all swept still
+/// grows, and until this section existed no figure this project can see said
+/// by how much.
+///
+/// **Over every job directory, read or not.** The arithmetic above stops at
+/// a record this build cannot parse; these bytes are on the disk whatever
+/// the record says, so a directory whose `job.json` is from another layout
+/// is weighed and counted here. That makes [`Bookkeeping::directories`] the
+/// census's `directories` and not its `read`, which is why the two counts
+/// are printed together.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Bookkeeping {
+    /// Job directories this section weighed: every one of them.
+    pub directories: usize,
+    /// Of those, the ones holding a `job.json`, and what those weigh.
+    pub records: usize,
+    pub record_bytes: u64,
+    /// The `events.jsonl` files, and what they weigh.
+    pub events: usize,
+    pub event_bytes: u64,
+    /// The logs this build measured, and what they weigh.
+    pub logs: usize,
+    pub log_bytes: u64,
+    /// The logs it could not measure, each named with its reason. **Never
+    /// folded into `log_bytes` as nought**: a log counted as empty because it
+    /// could not be measured understates the only population here that has no
+    /// bound at all, which is the direction a growth figure must never err in.
+    pub logs_unknown: Vec<(String, String)>,
+    /// Directories with neither a `log` nor a `log.seq`: nothing ever wrote a
+    /// log byte for them, which is a measurement and not a gap.
+    pub without_log: usize,
+    /// Everything else in a job directory that is not one of the three
+    /// collection directories: `log.seq` today, and whatever a later
+    /// milestone puts beside it.
+    ///
+    /// A catch-all on purpose, for [`Packs::bytes`]'s reason. No mechanism
+    /// frees these bytes either, so counting a file nothing here names
+    /// over-states what only a record removal takes and never under-states
+    /// it — and a figure growing on this line is how a directory nobody
+    /// named gets noticed.
+    pub other_bytes: u64,
+    /// Job directories that would not open at all, each with its reason. The
+    /// figures are then a floor, said and not swallowed (D27's shape: a
+    /// directory that was not read is never reported as one that weighed
+    /// nothing).
+    pub unreadable: Vec<Unread>,
+    /// The heaviest single directory and what it weighed, as the walk's job
+    /// order breaks ties.
+    ///
+    /// **Why there is an order statistic here at all and only one.** This
+    /// section prints a *total*, because the question it answers — what does
+    /// the bookkeeping weigh — is a question about a sum. But a total alone
+    /// cannot be told apart from a different root with the same total, and
+    /// the skew is real: a log has no bound on the hub and the runner's own
+    /// default cap is 64 MiB, so one directory can be the whole of the
+    /// difference. The maximum is the cheapest figure that says so. It is
+    /// **not** a mean, which section 2's own prose rules out for this
+    /// distribution and which would misread a directory here by the same
+    /// order of magnitude.
+    ///
+    /// A directory whose log is [`LogWeight::Unknown`] contributes no log
+    /// byte to this comparison, so it can lose the maximum to a smaller
+    /// directory that could be read whole. `logs_unknown` names it.
+    pub largest: Option<(String, u64)>,
+}
+
+impl Bookkeeping {
+    /// Every byte this section measured.
+    ///
+    /// A **floor** whenever `logs_unknown` is not empty, which is why the two
+    /// are printed together and never apart.
+    pub fn bytes(&self) -> u64 {
+        self.record_bytes
+            .saturating_add(self.event_bytes)
+            .saturating_add(self.log_bytes)
+            .saturating_add(self.other_bytes)
+    }
+
+    /// This bookkeeping's share of itself plus the collected output beside it
+    /// ([`Accounting::collected_bytes`]), or nothing when the two are nought
+    /// and there is no byte to share out.
+    ///
+    /// The share and not the ratio, because the share is how the first
+    /// consumer asked the question and read their own answer: 0.32 % against
+    /// 99.68 %.
+    pub fn share_of(&self, collected: u64) -> Option<f64> {
+        let whole = self.bytes().saturating_add(collected);
+        if whole == 0 {
+            return None;
+        }
+        Some(self.bytes() as f64 / whole as f64)
+    }
+
+    /// Fold one directory's figures in. `job` is the directory's name under
+    /// `jobs/`.
+    fn add(&mut self, job: &str, one: &OneDirectory) {
+        self.directories += 1;
+        if let Some(why) = &one.unreadable {
+            self.unreadable.push(Unread {
+                path: format!("{JOBS_DIR}/{job}"),
+                why: why.clone(),
+            });
+        }
+        if one.has_record {
+            self.records += 1;
+        }
+        self.record_bytes = self.record_bytes.saturating_add(one.record_bytes);
+        if one.has_events {
+            self.events += 1;
+        }
+        self.event_bytes = self.event_bytes.saturating_add(one.event_bytes);
+        match &one.log {
+            LogWeight::Measured(bytes) => {
+                self.logs += 1;
+                self.log_bytes = self.log_bytes.saturating_add(*bytes);
+            }
+            LogWeight::Unknown(why) => self.logs_unknown.push((job.to_owned(), why.clone())),
+            LogWeight::NeverWritten => self.without_log += 1,
+        }
+        self.other_bytes = self.other_bytes.saturating_add(one.other_bytes);
+        // `>=` on the incumbent, so that the walk's sorted job order breaks a
+        // tie for the earlier name and the rendered text stays a function of
+        // its inputs.
+        let measured = one.bytes();
+        match &self.largest {
+            Some((_, most)) if *most >= measured => {}
+            _ => self.largest = Some((job.to_owned(), measured)),
+        }
+    }
+}
+
+/// What one job directory's own files weigh, before they are folded into
+/// [`Bookkeeping`].
+///
+/// Measured **positively**, file by file, and never by taking a collection
+/// away from a total for the directory: a figure the log could not supply
+/// must leave the log's place empty rather than silently move its bytes into
+/// the record's.
+#[derive(Debug)]
+struct OneDirectory {
+    /// `job.json`, by length, and whether there was one at all. A directory
+    /// claimed for a job whose first record has not landed yet has none, and
+    /// that is a state and not a fault.
+    record_bytes: u64,
+    has_record: bool,
+    /// `events.jsonl`, by length, and whether there was one.
+    event_bytes: u64,
+    has_events: bool,
+    /// The `log`: measured, or named as unmeasured.
+    log: LogWeight,
+    /// `log.seq`, and anything else beside the three collection directories.
+    other_bytes: u64,
+    /// Why this directory would not open, when it would not.
+    unreadable: Option<String>,
+}
+
+impl OneDirectory {
+    /// This directory's measured bookkeeping. An unmeasured log contributes
+    /// nothing, so the figure is a floor for exactly the directories
+    /// [`Bookkeeping::logs_unknown`] names.
+    fn bytes(&self) -> u64 {
+        self.record_bytes
+            .saturating_add(self.event_bytes)
+            .saturating_add(self.log.bytes().unwrap_or(0))
+            .saturating_add(self.other_bytes)
+    }
+}
+
 /// A `sha256` two records give two different lengths.
 ///
 /// The same bytes cannot be two lengths, so this is an accounting defect and
@@ -417,6 +649,8 @@ pub struct StateRootReport {
     /// What this hub holds under `packs/`: figure 4, and the one population
     /// in this state root that no section above accounts for.
     pub packs: Packs,
+    /// What this root's own records, event files and logs weigh: figure 5.
+    pub bookkeeping: Bookkeeping,
 }
 
 impl StateRootReport {
@@ -447,6 +681,7 @@ impl StateRootReport {
             sizes: Sizes::default(),
             accounting: Accounting::default(),
             packs: Packs::default(),
+            bookkeeping: Bookkeeping::default(),
         };
 
         // Sorted, so that the lists this report prints are in one order
@@ -480,6 +715,12 @@ impl StateRootReport {
 
         for name in &names {
             let dir = jobs_dir.join(name);
+            // Figure 5, taken before anything below can `continue`. A
+            // directory whose record this build cannot parse still holds its
+            // record, its events and its log on the disk, and a bookkeeping
+            // figure that skipped it would be the one figure in this report
+            // that under-states what the root weighs.
+            report.bookkeeping.add(name, &weigh_one_directory(&dir));
             let record_path = dir.join(RECORD_FILE);
             let text = match fs::read_to_string(&record_path) {
                 Ok(text) => text,
@@ -706,6 +947,111 @@ fn read_the_packs(root: &Path) -> Packs {
     }
     packs
 }
+/// Weigh one job directory's own files: figure 5, for one directory.
+///
+/// **The three collection directories are skipped by name**, not subtracted
+/// from a total and not detected by any other rule. That is what makes this
+/// figure and [`Accounting::collected_bytes`] disjoint rather than merely
+/// intended to be: a byte under `files/`, `files.part/` or `files.gone/` is
+/// never read by this function at all, and every other byte in the directory
+/// is.
+///
+/// Lengths by `metadata().len()`, following no symlink, and
+/// [`directory_bytes`] for a subdirectory this build does not know — the
+/// sweeper's own walk, used on purpose so that two figures about the same
+/// bytes are the same figure.
+///
+/// The log is the one file measured *or named*: it is the population nothing
+/// bounds, and the only one where a missing figure would change what an
+/// operator decides. Every other length falls back to nought the way
+/// `directory_bytes` does, because a `job.json` that cannot be read is
+/// already counted and named by the census.
+fn weigh_one_directory(dir: &Path) -> OneDirectory {
+    let mut one = OneDirectory {
+        record_bytes: 0,
+        has_record: false,
+        event_bytes: 0,
+        has_events: false,
+        log: LogWeight::NeverWritten,
+        other_bytes: 0,
+        unreadable: None,
+    };
+    let entries = match fs::read_dir(dir) {
+        Ok(entries) => entries,
+        Err(error) => {
+            let why = format!(
+                "the job directory itself could not be read, so none of its own files was \
+                 weighed: {error}"
+            );
+            // Unknown and not nought, for the same reason a log that would
+            // not stat is: nothing here was looked at.
+            one.log = LogWeight::Unknown(why.clone());
+            one.unreadable = Some(why);
+            return one;
+        }
+    };
+    let mut log: Option<LogWeight> = None;
+    let mut counter_is_there = false;
+    for entry in entries.flatten() {
+        let Ok(kind) = entry.file_type() else {
+            continue;
+        };
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if kind.is_dir() {
+            // Section 3's three, and this is the skip the two totals rest on.
+            if [KEPT_FILES_DIR, OUTPUT_PARTS_DIR, OUTPUT_GONE_DIR].contains(&name.as_str()) {
+                continue;
+            }
+            one.other_bytes = one
+                .other_bytes
+                .saturating_add(directory_bytes(&entry.path()));
+            continue;
+        }
+        if !kind.is_file() {
+            continue;
+        }
+        match name.as_str() {
+            RECORD_FILE => {
+                one.has_record = true;
+                one.record_bytes = entry.metadata().map(|at| at.len()).unwrap_or(0);
+            }
+            EVENTS_FILE => {
+                one.has_events = true;
+                one.event_bytes = entry.metadata().map(|at| at.len()).unwrap_or(0);
+            }
+            LOG_FILE => {
+                log = Some(match entry.metadata() {
+                    Ok(at) => LogWeight::Measured(at.len()),
+                    Err(error) => LogWeight::Unknown(format!(
+                        "{LOG_FILE} is there and its length could not be read: {error}"
+                    )),
+                });
+            }
+            _ => {
+                if name == LOG_SEQ_FILE {
+                    counter_is_there = true;
+                }
+                one.other_bytes = one
+                    .other_bytes
+                    .saturating_add(entry.metadata().map(|at| at.len()).unwrap_or(0));
+            }
+        }
+    }
+    one.log = match log {
+        Some(log) => log,
+        // The counter is this hub's own record that a log was being written,
+        // so a log missing from beside it is a figure that is unknown rather
+        // than nought. Without the counter the job never reached an attempt,
+        // and then nought is a measurement.
+        None if counter_is_there => LogWeight::Unknown(format!(
+            "there is no {LOG_FILE}, and the {LOG_SEQ_FILE} beside it is this hub's own \
+             record that a log was being counted, so its bytes are unknown and not nought"
+        )),
+        None => LogWeight::NeverWritten,
+    };
+    one
+}
+
 /// Fold one file's digest into a tally, and remember a length that disagrees
 /// with the one already there.
 fn note_digest(
@@ -806,8 +1152,9 @@ impl fmt::Display for StateRootReport {
         )?;
         writeln!(
             f,
-            "  out of a record, and section 3's measurements are file lengths."
+            "  out of a record, and the measurements in sections 3 to 5 are file"
         )?;
+        writeln!(f, "  lengths, a log's own length among them.")?;
         writeln!(f)?;
 
         writeln!(f, "records")?;
@@ -1198,122 +1545,371 @@ impl fmt::Display for StateRootReport {
         )?;
         writeln!(f)?;
 
-        writeln!(f, "4. the packs this hub holds")?;
+        write_packs(f, &self.packs)?;
         writeln!(f)?;
-        writeln!(
-            f,
-            "  What is under packs/, measured by file length. Section 3 above is about"
-        )?;
-        writeln!(
-            f,
-            "  job output and accounts for none of this: the output budget is a bound on"
-        )?;
-        writeln!(
-            f,
-            "  collections, and nothing in Herd weighs these bytes against anything"
-        )?;
-        writeln!(
-            f,
-            "  today. They are counted here because docs/disk-policy.md section 0.7 asks"
-        )?;
-        writeln!(
-            f,
-            "  that whatever is kept appear in a report with its size. Nothing is"
-        )?;
-        writeln!(
-            f,
-            "  removed: who owns the growth of this directory is a question for whoever"
-        )?;
-        writeln!(f, "  runs this hub, and it is open (ORCH-215).")?;
-        writeln!(f)?;
-        let packs = &self.packs;
-        if !packs.present {
-            writeln!(
-                f,
-                "  THERE IS NO packs/ DIRECTORY ON THIS ROOT, so this hub has never"
-            )?;
-            writeln!(
-                f,
-                "  served it at layout 2 or later. That is not an empty registry: an"
-            )?;
-            writeln!(f, "  empty one is a directory with nothing in it.")?;
-            return Ok(());
-        }
-        if let Some(error) = &packs.manifests_error {
-            writeln!(
-                f,
-                "  THE MANIFESTS DIRECTORY COULD NOT BE READ, so the pack count below is"
-            )?;
-            writeln!(f, "  about no packs at all and not about none: {error}")?;
-        }
-        writeln!(
-            f,
-            "  packs registered                    {} pack(s), {}",
-            packs.registered,
-            measured_bytes(packs.registered_bytes)
-        )?;
-        if packs.not_directories > 0 {
-            writeln!(
-                f,
-                "    and {} entry/ies under {}/{PACKS_MANIFESTS_DIR}/ that are not",
-                packs.not_directories,
-                crate::registry::PACKS_DIR
-            )?;
-            writeln!(
-                f,
-                "    directories, so they are not packs and are no part of the count above"
-            )?;
-        }
-        writeln!(
-            f,
-            "  registrations interrupted           {} directory/ies, {}",
-            packs.interrupted,
-            measured_bytes(packs.interrupted_bytes)
-        )?;
-        if packs.interrupted > 0 {
-            writeln!(
-                f,
-                "    Written and never renamed into place, so nothing reads them: the"
-            )?;
-            writeln!(
-                f,
-                "    pack does not resolve and its id finds no manifest. The next start of"
-            )?;
-            writeln!(f, "    a hub on this root removes them by name.")?;
-        }
-        writeln!(
-            f,
-            "  everything under {}/             {}",
-            crate::registry::PACKS_DIR,
-            measured_bytes(packs.bytes)
-        )?;
-        // The total is measured over the whole directory, so a child nothing
-        // above names is still in it. Saying the difference out loud is what
-        // makes that true rather than merely intended: a figure here is a
-        // directory this section has stopped describing.
-        let unaccounted = packs.unaccounted_bytes();
-        if unaccounted > 0 {
-            writeln!(
-                f,
-                "  neither of the two above            {}",
-                measured_bytes(unaccounted)
-            )?;
-            writeln!(
-                f,
-                "    Bytes under {}/ that this section does not describe. The total is",
-                crate::registry::PACKS_DIR
-            )?;
-            writeln!(
-                f,
-                "    measured over the whole directory on purpose, so that a directory"
-            )?;
-            writeln!(
-                f,
-                "    added beside the two above is counted before anything names it."
-            )?;
-        }
+        write_bookkeeping(f, &self.bookkeeping, self.accounting.collected_bytes())?;
         Ok(())
     }
+}
+
+/// Section 4, as a function of its own.
+///
+/// **A function and not a block, because it returns early.** A root with no
+/// `packs/` prints the banner and stops describing packs, and while this was
+/// the last thing the report printed that early return ended the whole
+/// output. Section 5 follows it now, so a `return` here has to leave section
+/// 4 and nothing else: on a root no hub of layout 2 has served — which is
+/// every root a test builds by hand — the bookkeeping figures would
+/// otherwise have silently vanished.
+fn write_packs(f: &mut fmt::Formatter<'_>, packs: &Packs) -> fmt::Result {
+    writeln!(f, "4. the packs this hub holds")?;
+    writeln!(f)?;
+    writeln!(
+        f,
+        "  What is under packs/, measured by file length. Section 3 above is about"
+    )?;
+    writeln!(
+        f,
+        "  job output and accounts for none of this: the output budget is a bound on"
+    )?;
+    writeln!(
+        f,
+        "  collections, and nothing in Herd weighs these bytes against anything"
+    )?;
+    writeln!(
+        f,
+        "  today. They are counted here because docs/disk-policy.md section 0.7 asks"
+    )?;
+    writeln!(
+        f,
+        "  that whatever is kept appear in a report with its size. Nothing is"
+    )?;
+    writeln!(
+        f,
+        "  removed: who owns the growth of this directory is a question for whoever"
+    )?;
+    writeln!(f, "  runs this hub, and it is open (ORCH-215).")?;
+    writeln!(f)?;
+    if !packs.present {
+        writeln!(
+            f,
+            "  THERE IS NO packs/ DIRECTORY ON THIS ROOT, so this hub has never"
+        )?;
+        writeln!(
+            f,
+            "  served it at layout 2 or later. That is not an empty registry: an"
+        )?;
+        writeln!(f, "  empty one is a directory with nothing in it.")?;
+        return Ok(());
+    }
+    if let Some(error) = &packs.manifests_error {
+        writeln!(
+            f,
+            "  THE MANIFESTS DIRECTORY COULD NOT BE READ, so the pack count below is"
+        )?;
+        writeln!(f, "  about no packs at all and not about none: {error}")?;
+    }
+    writeln!(
+        f,
+        "  packs registered                    {} pack(s), {}",
+        packs.registered,
+        measured_bytes(packs.registered_bytes)
+    )?;
+    if packs.not_directories > 0 {
+        writeln!(
+            f,
+            "    and {} entry/ies under {}/{PACKS_MANIFESTS_DIR}/ that are not",
+            packs.not_directories,
+            crate::registry::PACKS_DIR
+        )?;
+        writeln!(
+            f,
+            "    directories, so they are not packs and are no part of the count above"
+        )?;
+    }
+    writeln!(
+        f,
+        "  registrations interrupted           {} directory/ies, {}",
+        packs.interrupted,
+        measured_bytes(packs.interrupted_bytes)
+    )?;
+    if packs.interrupted > 0 {
+        writeln!(
+            f,
+            "    Written and never renamed into place, so nothing reads them: the"
+        )?;
+        writeln!(
+            f,
+            "    pack does not resolve and its id finds no manifest. The next start of"
+        )?;
+        writeln!(f, "    a hub on this root removes them by name.")?;
+    }
+    writeln!(
+        f,
+        "  everything under {}/             {}",
+        crate::registry::PACKS_DIR,
+        measured_bytes(packs.bytes)
+    )?;
+    // The total is measured over the whole directory, so a child nothing
+    // above names is still in it. Saying the difference out loud is what
+    // makes that true rather than merely intended: a figure here is a
+    // directory this section has stopped describing.
+    let unaccounted = packs.unaccounted_bytes();
+    if unaccounted > 0 {
+        writeln!(
+            f,
+            "  neither of the two above            {}",
+            measured_bytes(unaccounted)
+        )?;
+        writeln!(
+            f,
+            "    Bytes under {}/ that this section does not describe. The total is",
+            crate::registry::PACKS_DIR
+        )?;
+        writeln!(
+            f,
+            "    measured over the whole directory on purpose, so that a directory"
+        )?;
+        writeln!(
+            f,
+            "    added beside the two above is counted before anything names it."
+        )?;
+    }
+    Ok(())
+}
+
+/// Section 5: the records, the event files and the logs, beside the
+/// collected output section 3 measured.
+///
+/// `collected` is [`Accounting::collected_bytes`] and is passed in rather
+/// than recomputed, so that the share this prints is a share of the very
+/// figure printed four lines above it.
+fn write_bookkeeping(
+    f: &mut fmt::Formatter<'_>,
+    book: &Bookkeeping,
+    collected: u64,
+) -> fmt::Result {
+    writeln!(f, "5. the records, the events and the logs")?;
+    writeln!(f)?;
+    writeln!(
+        f,
+        "  What this root spends on knowing what it holds, as against what it holds."
+    )?;
+    writeln!(
+        f,
+        "  Sections 1 to 3 are about the collected output and not one of them weighs"
+    )?;
+    writeln!(
+        f,
+        "  a job.json, an events.jsonl or a log. Nothing in Herd bounds any of the"
+    )?;
+    writeln!(
+        f,
+        "  three: the output budget governs collections, a sweep frees them without"
+    )?;
+    writeln!(
+        f,
+        "  touching a record, and the only thing that frees a record's byte or a"
+    )?;
+    writeln!(
+        f,
+        "  log's is removing the record. So a root whose collections were all swept"
+    )?;
+    writeln!(f, "  still grows, and this is the figure that shows it.")?;
+    writeln!(f)?;
+    writeln!(
+        f,
+        "  One total, and it is a total: a mean over these directories would misread"
+    )?;
+    writeln!(
+        f,
+        "  one the way section 2 says a mean misreads a job, because a single large"
+    )?;
+    writeln!(
+        f,
+        "  log can be the whole of the difference. So the heaviest directory is"
+    )?;
+    writeln!(
+        f,
+        "  printed beside the total and the three classes are named apart, so that a"
+    )?;
+    writeln!(
+        f,
+        "  total which has grown can be attributed without a second command."
+    )?;
+    writeln!(f)?;
+    writeln!(
+        f,
+        "  The three collection directories are skipped by name, so no byte is in"
+    )?;
+    writeln!(
+        f,
+        "  both this total and section 3's. Nothing under packs/ is in either."
+    )?;
+    writeln!(f)?;
+    // D257's rule, one level down from a version number: at version 1 an
+    // absence says two things at once, and a nought printed bare here would
+    // say both of them. A root this report found nothing to weigh on and a
+    // root whose bookkeeping really weighs nothing are different facts, and
+    // the second does not exist -- a `job.json` is never nought bytes -- so
+    // the banner is the whole answer rather than a caveat on one.
+    if book.directories == 0 {
+        writeln!(
+            f,
+            "  THERE IS NO JOB DIRECTORY ON THIS ROOT TO WEIGH, so every figure below"
+        )?;
+        writeln!(
+            f,
+            "  is nought because there was nothing to weigh, and not because this root's"
+        )?;
+        writeln!(
+            f,
+            "  bookkeeping weighs nothing. The two are different facts and the second"
+        )?;
+        writeln!(f, "  one cannot happen: a record is never nought bytes.")?;
+    } else if book.records == 0 {
+        writeln!(
+            f,
+            "  NOT ONE JOB DIRECTORY ON THIS ROOT HOLDS A job.json, so the record figure"
+        )?;
+        writeln!(
+            f,
+            "  below is nought because there was no record to weigh, and not because a"
+        )?;
+        writeln!(
+            f,
+            "  record weighs nothing. Every directory here is one claimed for a job"
+        )?;
+        writeln!(f, "  whose first record has not landed.")?;
+    }
+    writeln!(
+        f,
+        "  job directories weighed             {}",
+        book.directories
+    )?;
+    writeln!(
+        f,
+        "  the records (job.json)              {} in {} record(s)",
+        measured_bytes(book.record_bytes),
+        book.records
+    )?;
+    writeln!(
+        f,
+        "  the event files (events.jsonl)      {} in {} file(s)",
+        measured_bytes(book.event_bytes),
+        book.events
+    )?;
+    writeln!(
+        f,
+        "  the logs                            {} in {} log(s)",
+        measured_bytes(book.log_bytes),
+        book.logs
+    )?;
+    writeln!(
+        f,
+        "    could not be read                 {} log(s): UNKNOWN, never nought",
+        book.logs_unknown.len()
+    )?;
+    for (job, why) in book.logs_unknown.iter().take(NAMED_AT_MOST) {
+        writeln!(f, "      {JOBS_DIR}/{job}: {why}")?;
+    }
+    if let Some(more) = book.logs_unknown.len().checked_sub(NAMED_AT_MOST) {
+        if more > 0 {
+            writeln!(f, "      and {more} more")?;
+        }
+    }
+    writeln!(
+        f,
+        "    no log ever written               {} directory/ies",
+        book.without_log
+    )?;
+    writeln!(
+        f,
+        "  anything else beside them           {}",
+        measured_bytes(book.other_bytes)
+    )?;
+    writeln!(
+        f,
+        "    {LOG_SEQ_FILE} today, and whatever a later milestone puts in a job"
+    )?;
+    writeln!(
+        f,
+        "    directory. Counted before anything names it, because no mechanism frees"
+    )?;
+    writeln!(f, "    it either.")?;
+    writeln!(
+        f,
+        "  directories that would not open     {} directory/ies",
+        book.unreadable.len()
+    )?;
+    for unreadable in book.unreadable.iter().take(NAMED_AT_MOST) {
+        writeln!(f, "    {}: {}", unreadable.path, unreadable.why)?;
+    }
+    if let Some(more) = book.unreadable.len().checked_sub(NAMED_AT_MOST) {
+        if more > 0 {
+            writeln!(f, "    and {more} more")?;
+        }
+    }
+    writeln!(
+        f,
+        "  the bookkeeping in all              {}",
+        measured_bytes(book.bytes())
+    )?;
+    if !book.logs_unknown.is_empty() {
+        writeln!(
+            f,
+            "    A FLOOR AND NOT A TOTAL: the {} log(s) named above are in no figure",
+            book.logs_unknown.len()
+        )?;
+        writeln!(
+            f,
+            "    here, because an unmeasured log counted as nought would understate the"
+        )?;
+        writeln!(f, "    one population on this root that has no bound.")?;
+    }
+    match &book.largest {
+        Some((job, bytes)) => writeln!(
+            f,
+            "  the heaviest one directory          {} in {JOBS_DIR}/{job}",
+            measured_bytes(*bytes)
+        )?,
+        None => writeln!(
+            f,
+            "  the heaviest one directory          there is no directory to be the \
+             heaviest"
+        )?,
+    }
+    writeln!(
+        f,
+        "  the collected output beside it      {}",
+        measured_bytes(collected)
+    )?;
+    match book.share_of(collected) {
+        Some(share) => writeln!(
+            f,
+            "  the bookkeeping is                  {:.2}% of those two together",
+            share * 100.0
+        )?,
+        None => writeln!(
+            f,
+            "  the bookkeeping is                  neither figure above is a byte, so \
+             there is no share"
+        )?,
+    }
+    writeln!(
+        f,
+        "    The collected figure is section 3's three directories, over the records"
+    )?;
+    writeln!(
+        f,
+        "    that section could read; this bookkeeping is over every job directory,"
+    )?;
+    writeln!(
+        f,
+        "    read or not. Where the two counts differ the share is approximate by"
+    )?;
+    writeln!(f, "    that much, and the census above says by how many.")?;
+    Ok(())
 }
 
 fn write_dedup(f: &mut fmt::Formatter<'_>, dedup: &Dedup) -> fmt::Result {
@@ -1826,5 +2422,289 @@ mod tests {
         assert!(report.packs.present);
         assert_eq!(report.packs.registered, 0);
         assert!(report.packs.manifests_error.is_none());
+    }
+
+    // ------------------------------------------------------------------
+    // Figure 5: the records, the events and the logs (ORCH-282).
+    // ------------------------------------------------------------------
+
+    /// Every regular file under `jobs/`, by length, walked by the **test**
+    /// and not by the code under test.
+    ///
+    /// The whole of section 5's disjointness claim is checked against this:
+    /// the bookkeeping plus section 3's collected bytes must come to exactly
+    /// this figure, so a byte counted twice and a byte counted nowhere both
+    /// redden the same assertion. A sum computed with the report's own
+    /// `directory_bytes` would have agreed with the report for the report's
+    /// own reasons.
+    fn every_byte_under_jobs(root: &Path) -> u64 {
+        fn walk(at: &Path) -> u64 {
+            let Ok(entries) = fs::read_dir(at) else {
+                return 0;
+            };
+            let mut bytes = 0u64;
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    bytes += walk(&path);
+                } else if let Ok(at) = fs::metadata(&path) {
+                    bytes += at.len();
+                }
+            }
+            bytes
+        }
+        walk(&root.join(JOBS_DIR))
+    }
+
+    /// One job directory with a record, an event file, a log, the hub's
+    /// counter for it, and a collected file: all five of the things a job
+    /// directory holds, so that the classification can be asserted and not
+    /// just the sum.
+    fn a_whole_job_dir(root: &Path, name: &str, events: usize, log: usize, kept: usize) {
+        job_dir(root, name, Some(readable(name)));
+        let dir = root.join(JOBS_DIR).join(name);
+        fs::write(dir.join(EVENTS_FILE), vec![b'e'; events]).expect("the event file");
+        fs::write(dir.join(LOG_FILE), vec![b'l'; log]).expect("the log");
+        fs::write(dir.join(LOG_SEQ_FILE), vec![b'0'; 20]).expect("the counter");
+        let files = dir.join(KEPT_FILES_DIR);
+        fs::create_dir_all(&files).expect("room for the collection");
+        fs::write(files.join("out.bin"), vec![b'o'; kept]).expect("the collected file");
+    }
+
+    /// **The condition v1.0.0 ships on**: the records, the events and the
+    /// logs are weighed, with their counts, beside the collected output and
+    /// not inside it.
+    ///
+    /// Three things at once, and the third is the one the first consumer
+    /// asked for:
+    ///
+    /// 1. Each class is weighed and counted **apart**, so a total that grew
+    ///    can be attributed.
+    /// 2. The bookkeeping and section 3's collected figure **partition**
+    ///    `jobs/`: their sum is every byte under it, walked independently by
+    ///    the test. A byte counted twice fails this, and so does one counted
+    ///    nowhere.
+    /// 3. The two are printed **beside** each other with the bookkeeping's
+    ///    share, which is how the growth gets seen rather than discovered.
+    #[test]
+    fn the_report_weighs_the_records_the_events_and_the_logs_beside_the_output() {
+        let dir = tempfile::tempdir().expect("a temporary directory");
+        let root = dir.path();
+        a_whole_job_dir(root, "j0000000001", 700, 9_000, 300);
+        a_whole_job_dir(root, "j0000000002", 700, 9_000, 300);
+        // The heaviest, by its log alone.
+        a_whole_job_dir(root, "j0000000003", 700, 50_000, 300);
+
+        let report = StateRootReport::read(root).expect("a report, never a refusal");
+        let book = &report.bookkeeping;
+        assert_eq!(book.directories, 3);
+        assert_eq!(book.records, 3);
+        assert_eq!(book.events, 3);
+        assert_eq!(book.event_bytes, 3 * 700);
+        assert_eq!(book.logs, 3);
+        assert_eq!(book.log_bytes, 9_000 + 9_000 + 50_000);
+        assert!(book.logs_unknown.is_empty());
+        assert_eq!(book.without_log, 0);
+        // `log.seq` and nothing else, at 20 bytes a directory.
+        assert_eq!(book.other_bytes, 3 * 20);
+        assert!(book.unreadable.is_empty());
+        // The records are real JSON, so their length is read rather than
+        // asserted as a literal: what matters is that it is the `job.json`
+        // lengths and no other file's.
+        let records: u64 = (1..=3)
+            .map(|n| {
+                fs::metadata(
+                    root.join(JOBS_DIR)
+                        .join(format!("j{n:0>10}"))
+                        .join(RECORD_FILE),
+                )
+                .expect("the record is there")
+                .len()
+            })
+            .sum();
+        assert_eq!(book.record_bytes, records);
+        assert_eq!(
+            book.bytes(),
+            records + 3 * 700 + 68_000 + 3 * 20,
+            "the total is its four classes and nothing else"
+        );
+
+        // Section 3 measured the collection and only the collection.
+        assert_eq!(report.accounting.collected_bytes(), 3 * 300);
+
+        // The partition, against a walk the test did itself.
+        assert_eq!(
+            book.bytes() + report.accounting.collected_bytes(),
+            every_byte_under_jobs(root),
+            "every byte under jobs/ is in exactly one of the two totals"
+        );
+
+        // The heaviest directory, and it is the one with the big log.
+        assert_eq!(
+            book.largest,
+            Some((
+                "j0000000003".to_owned(),
+                fs::metadata(root.join(JOBS_DIR).join("j0000000003").join(RECORD_FILE))
+                    .expect("the record is there")
+                    .len()
+                    + 700
+                    + 50_000
+                    + 20
+            ))
+        );
+
+        let text = rendered(root);
+        assert!(
+            text.contains("5. the records, the events and the logs\n"),
+            "section 5 is missing:\n{text}"
+        );
+        assert!(
+            text.contains(
+                "  the event files (events.jsonl)      2100 bytes (2.05 KiB) in 3 file(s)\n"
+            ),
+            "the event files are weighed with their count:\n{text}"
+        );
+        assert!(
+            text.contains(
+                "  the logs                            68000 bytes (66.41 KiB) in 3 log(s)\n"
+            ),
+            "the logs are weighed with their count:\n{text}"
+        );
+        assert!(
+            text.contains("  the collected output beside it      900 bytes\n"),
+            "the output figure is printed beside it:\n{text}"
+        );
+        assert!(
+            text.contains("  the heaviest one directory          "),
+            "the maximum is printed, so the total cannot pass for an even root:\n{text}"
+        );
+        assert!(
+            text.contains("% of those two together\n"),
+            "the share is printed:\n{text}"
+        );
+        // Rule 2 of this file, said in the output and not only here.
+        assert!(
+            text.contains("  One total, and it is a total:"),
+            "a total says it is one:\n{text}"
+        );
+    }
+
+    /// A log this build could not measure is **UNKNOWN**, the total says it
+    /// is a floor, and no figure reads it as nought.
+    ///
+    /// The case is reached the way an operator reaches it: a `log.seq`, which
+    /// is this hub's own record that a log was being counted, with no `log`
+    /// beside it. Nought there would understate the one population on a state
+    /// root that nothing bounds.
+    #[test]
+    fn a_log_that_could_not_be_measured_is_unknown_and_never_nought() {
+        let dir = tempfile::tempdir().expect("a temporary directory");
+        let root = dir.path();
+        job_dir(root, "j0000000001", Some(readable("j0000000001")));
+        fs::write(
+            root.join(JOBS_DIR).join("j0000000001").join(LOG_SEQ_FILE),
+            vec![b'0'; 20],
+        )
+        .expect("the counter with no log beside it");
+
+        let report = StateRootReport::read(root).expect("a report, never a refusal");
+        let book = &report.bookkeeping;
+        assert_eq!(book.logs, 0, "nothing was measured");
+        assert_eq!(book.log_bytes, 0);
+        assert_eq!(
+            book.without_log, 0,
+            "this is not a directory where nothing ever wrote a log"
+        );
+        assert_eq!(book.logs_unknown.len(), 1);
+        assert_eq!(book.logs_unknown[0].0, "j0000000001");
+
+        let text = rendered(root);
+        assert!(
+            text.contains(
+                "    could not be read                 1 log(s): UNKNOWN, never nought\n"
+            ),
+            "the unmeasured log is named as unknown:\n{text}"
+        );
+        assert!(
+            text.contains(
+                "    A FLOOR AND NOT A TOTAL: the 1 log(s) named above are in no figure\n"
+            ),
+            "the total says it is a floor:\n{text}"
+        );
+    }
+
+    /// **D257 on this root's figure.** A root with no record says so, rather
+    /// than printing a nought that means two things at once.
+    ///
+    /// Two roots, two sentences, because the two facts send an operator
+    /// somewhere else: a root with no job directory at all, and one whose
+    /// directories are claimed and whose first records have not landed.
+    #[test]
+    fn a_root_with_no_record_says_so_rather_than_weighing_nought() {
+        let empty = tempfile::tempdir().expect("a temporary directory");
+        fs::create_dir_all(empty.path().join(JOBS_DIR)).expect("an empty jobs directory");
+        let text = rendered(empty.path());
+        assert!(
+            text.contains(
+                "  THERE IS NO JOB DIRECTORY ON THIS ROOT TO WEIGH, so every figure below\n"
+            ),
+            "an empty root says there was nothing to weigh:\n{text}"
+        );
+        assert!(
+            text.contains("  one cannot happen: a record is never nought bytes.\n"),
+            "and says why the other reading is impossible:\n{text}"
+        );
+
+        let claimed = tempfile::tempdir().expect("a temporary directory");
+        job_dir(claimed.path(), "j0000000001", None);
+        job_dir(claimed.path(), "j0000000002", None);
+        let report = StateRootReport::read(claimed.path()).expect("a report");
+        assert_eq!(report.bookkeeping.directories, 2);
+        assert_eq!(report.bookkeeping.records, 0);
+        assert_eq!(report.bookkeeping.bytes(), 0);
+        let text = rendered(claimed.path());
+        assert!(
+            text.contains(
+                "  NOT ONE JOB DIRECTORY ON THIS ROOT HOLDS A job.json, so the record figure\n"
+            ),
+            "a root whose records have not landed says so:\n{text}"
+        );
+        assert!(
+            !text.contains("  THERE IS NO JOB DIRECTORY ON THIS ROOT TO WEIGH"),
+            "and it is not the other sentence:\n{text}"
+        );
+    }
+
+    /// A directory whose record this build cannot parse is **still weighed**.
+    ///
+    /// Sections 1 to 3 stop at such a record, and rightly: there is no claim
+    /// to reconcile. Its bytes are on the disk all the same, and a growth
+    /// figure that skipped them would be the one figure in this report that
+    /// understates what the root holds. So the count here is the census's
+    /// `directories` and not its `read`, and that is asserted rather than
+    /// described.
+    #[test]
+    fn a_record_this_build_cannot_read_is_still_weighed() {
+        let dir = tempfile::tempdir().expect("a temporary directory");
+        let root = dir.path();
+        a_whole_job_dir(root, "j0000000001", 700, 9_000, 300);
+        let other = root.join(JOBS_DIR).join("j0000000002");
+        job_dir(
+            root,
+            "j0000000002",
+            Some(from_another_layout("j0000000002")),
+        );
+        fs::write(other.join(EVENTS_FILE), vec![b'e'; 1_100]).expect("its event file");
+        fs::write(other.join(LOG_FILE), vec![b'l'; 4_000]).expect("its log");
+
+        let report = StateRootReport::read(root).expect("a report, never a refusal");
+        assert_eq!(report.census.directories, 2);
+        assert_eq!(report.census.read, 1, "section 3 reads one of the two");
+        assert_eq!(report.census.unread.len(), 1);
+        let book = &report.bookkeeping;
+        assert_eq!(book.directories, 2, "section 5 weighs both");
+        assert_eq!(book.records, 2, "including the record it cannot parse");
+        assert_eq!(book.event_bytes, 700 + 1_100);
+        assert_eq!(book.log_bytes, 9_000 + 4_000);
     }
 }
