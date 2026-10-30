@@ -14155,3 +14155,277 @@ requester decodes — not literally one of D229's two named unrecoverable forms
 (a new `ToHub` variant, a `FromHub` variant a requester sees) but the same
 hazard for an older `herdctl`. **D75** fixed the shape, `superseded { by }` at
 exit 125, and not the timing.
+
+## 2026-10-30 — D273 A premise inside a Herd job needs an enclosure
+
+A test that asserts the runner restores access it was denied cannot be
+written as a window of time inside a Herd job. The runner carrying the
+suite walks the whole job base every 200 ms and restores anything it
+cannot list, ancestors first, so any premise built on a mode is undone
+on a schedule nothing in the test controls. A six-second premise against
+a 200 ms restorer is not a long premise; it is no premise at all, and
+the assertion it carries holds whether or not the product does anything
+(`confinement.rs::a_job_cannot_hide_what_it_wrote_from_its_disk_budget`,
+green 3 runs out of 3 with `restore_access` robbed of its effect, job
+j0000000160).
+
+So the method is an **enclosure**, and three rules with it:
+
+1. the thing being hidden is created hidden, never hidden after the
+   fact: a figure that was reachable for an instant is a figure the test
+   no longer owns;
+2. the data root sits inside a directory the test keeps, which every
+   outside restorer must open first, because `read_dir_restoring`
+   restores the ancestors before the directory it failed on and the
+   runner under test stops at its own root. That directory's mode, read
+   after the fact, says which of three things happened: the premise
+   held, something outside opened it, or the premise was never set;
+3. a measurement taken on a premise that did not hold is void and taken
+   again from nothing, a bounded number of times, and the last void is
+   red with a named sentence. Never skipped: a skip moves a compared
+   list (D27, D187).
+
+This is the general form of what D225's `AListingThatFails` did for a
+few frames of a hub, carried to a premise that has to hold across a
+job's own execution. Measured void rate on this host, 2026-10-30: 2
+attempts in 12 across ten whole-file runs, worst run 2 of its 8
+attempts.
+
+## 2026-10-30 — D274 E-12 and E-17 stay `part`: the pack path runs one way
+
+**Context.** `docs/coverage.md`'s E-12 and E-17 rows asserted three things
+about what was absent from `main`, and `docs/road-to-v1.md`'s step 1 described
+M11's pack half as mostly unbuilt. ORCH-302 named the staleness; batch 27's
+merger measured it and corrected the brief that filed it, finding that two of
+the three claims predated the batch and one was stale the day it was written.
+Recounted on `e12-e17-recount` against `71efccf`, the correction goes one step
+further: **all three claims predate batch 27, and a fourth was false the day it
+was written.**
+
+**Choice, the orchestrator's ruling of 2026-10-30, with its evidence.** Both
+State cells stay **`part`**. The three claims are corrected in both rows, each
+one naming the branch and the decision that changed it and whether it was stale
+before batch 27 or made stale by it.
+
+- *"The runner binds and drops both"* — false. The runner binds
+  `FromHub::AssignJob`'s `packs_in` and `packs_out` and hands them to
+  `job::execute` as `job::Packs` (`herd-runner/src/lib.rs:4673`-`:4703`).
+  **`m11-pack-layout`, batch 26, D267. Stale before batch 27.** The claim is
+  about those two fields and not about the mesh endpoint, which is a different
+  sentence and D270's.
+- *"`ToHub::RegisterPack` is constructed nowhere under `herd-runner/src`"* —
+  false. `git grep -c` answers **2** in `herd-runner/src/lib.rs`, and the two
+  are not two constructions: **`:1882` is the construction** and **`:1857` is
+  the doc comment** of `Session::register_pack`, which is called from
+  `herd-runner/src/job.rs:734`. **`m11-pack-layout`, batch 26, D267. Stale
+  before batch 27.**
+- *"No job is ever given a pack"* and *"nothing lays a pack out at
+  `{in}/<key>`"* — false. `Session::lay_out_packs`
+  (`herd-runner/src/lib.rs:1780`) is called from `herd-runner/src/job.rs:332`
+  before the cgroup opens, and a pack it cannot get hands the attempt back with
+  `ToHub::PackUnavailable` rather than running with an empty `{in}`. The hub
+  resolves every `needs` key **before** `begin_attempt` numbers the attempt
+  (`herd-hub/src/server.rs:5591` `packs_for`), so a job waiting for a pack
+  spends none of its goes. **`pack-assignment`, batch 18, for the hub half;
+  `m11-pack-layout`, batch 26, D267, for the runner half. Stale before batch
+  27.**
+- *"`packs_in: Vec::new()` in `herd-hub/src/server.rs`"* — false, and **stale
+  the day it was written**: that string occurs **0** times under `herd-hub/src`
+  at `71efccf`, and occurred 0 times at `df47266` too.
+
+**Batch 27 widened the staleness rather than creating it.** D269 mints the
+transfer capability and D270 makes a runner await its bind and advertise the
+endpoint it really got, so a pack now moves from one real runner to another
+with the hub holding no byte of it —
+`herd-hub/tests/pack_chain.rs::a_pack_moves_from_one_real_runner_to_another`,
+which counts bytes off the fetcher's socket and asserts a needle existing only
+inside the object appears nowhere under the hub's root. That is E-12's
+cross-machine half, gate-green.
+
+**Why neither row becomes `merged`, in two named absences and not an
+argument.** First, the **push** direction: M11's done-when asks that *"an
+outbound-only runner completes both directions without listening"*, only the
+pull half is built, and what is on `main` is the **refusal** — asserted at
+`herd-hub/tests/pack_chain.rs:1241`, which drops the holder's `--mesh-listen`
+and requires the hub's line to name `outbound-only` and the `<commit>/<key>` an
+operator would look for, with no transfer reported by either path (ORCH-220,
+`docs/plan.md` M11 S10). Second, the record half of ORCH-234: both
+`JobRecord::packs_in` and `JobRecord::packs_out` are written by **nothing** —
+every occurrence under `herd-hub/src` is a constructor default, and the
+registering arm at `herd-hub/src/server.rs:6221` updates the registry and never
+the record — so a pack is published whole on disk and invisible in `job.json`
+(ORCH-248). **M11's done-when is the acceptance of M11's only two musts, and
+one of its clauses is unmet, so neither must is wholly on `main`.**
+
+**E-17 was the close call, and it is recorded as close.** On E-17's own two
+clauses — *a manifest registers only once every blob is held* and *job-record
+atomicity* — nothing is left unbuilt: the registration is sent after the ingest
+and therefore after the fsync (`herd-runner/src/lib.rs:1875`-`:1887`), and the
+clause is asserted end to end in `pack_chain.rs`
+`a_declared_command_leaves_a_pack_and_a_later_one_is_laid_out_with_it`
+with the kill case beside it (`herd-runner/src/fetch.rs:1369`: cut mid-flight
+leaves no readable object and no registered pack). It stays `part` on
+`JobRecord::packs_out` being written by nothing, and on publication by an
+outbound-only holder pushing to a keeper being unbuilt. The second of those is
+reasoning about code that does not exist and is marked weaker than the first in
+the row itself, so a later ruling can revisit it against the evidence.
+
+**The tally, re-derived from the 44 `must` State cells and not patched in
+place:** **36** wholly on `main`, **5** `part` (E-12, E-16, E-17, E-37, E-42),
+**1** with none of it (**E-14**), **2** the consumer has released us from (E-49
+waived, E-50 withdrawn, **D248**). 36 + 5 + 1 + 2 = 44. The headline figures do
+not move: **36 of 44** on `main`, **42 of 44** for v1.0.0.
+
+**E-14 stays `planned`, and that is deliberate.** A consumer answer of
+2026-10-30 is reported to withdraw it and **no decision records that answer**,
+so `coverage.md` reads `planned` and this recount left it there: retiring
+a must is the consumer's act and nobody else's (D248, D249). A decision
+entry of D249's shape is owed for it, and until it exists no document may
+count E-14 among the
+rows the consumer has released us from — `cut-v1.0.0`'s scope table does, which
+is one of the three ways that table is wrong.
+
+**What else this corrects.** `docs/road-to-v1.md`'s step 1 described the tree
+before batch 12 in three clauses; it is rewritten against `71efccf`. Two
+figures in it were wrong beyond staleness: *"the only route from 36 to the
+ceiling"* — E-12 and E-17 are **two of the six** musts between 36 and 42, the
+others being E-14, E-16, E-37 and E-42 — and *"what it blocks: everything
+below, because the version bump rides with it"*, the bump being spent at
+3 / 2 / 2 and the constraint moot (**D243**), though D204's freeze still
+forbids a frame
+nobody numbered in it.
+
+## 2026-10-30 — D275 The consumer withdraws E-14 and cuts v1.0.0's retention
+
+**Context.** **D249** authorises the orchestrator to ask the first
+consumer directly, and **D248** records their first two answers, on
+E-49 and E-50. They answered twice more the same day, and both answers
+were acted on before either was written down: `cut-v1.0.0`'s body
+counts E-14 among the musts they released us from, and `docs/status.md`
+and the release notes treat the hub's record retention as cut. **Neither
+was in this file.** A release claiming a retirement nobody recorded is
+what D249's limits exist to prevent, which is why this entry exists
+before the body is signed.
+
+Their orchestrator answered in chatOnS's name as requester, under a
+delegation from Alexa, and said explicitly that Alexa's word replaces
+theirs if she rules otherwise. As in D248, it is recorded as a
+**consumer answer**, not as a Herd decision, and **it binds none of our
+invariants**.
+
+**(a) E-14 is WITHDRAWN, not waived, and the difference is
+load-bearing.** E-14 asks that warm caches be ready before a job runs.
+Their executor does it itself: a **copy-on-write mount of the nearest
+cache per commit**, from their own `up` step, under their own ADR.
+**The reason is written beside the withdrawal and not only beside the
+tally**, because without it somebody re-adds a cache engine in six
+months believing they are closing a gap. **Their words are French, and
+both are here: the original, then a translation marked as one** — an
+English sentence in quotation marks attributed to someone who wrote
+French is not a quotation, however faithful. *« le demandeur fournit
+son propre cache chaud par son hook d'exécuteur (hc, montage COW par
+commit) ; Herd n'a pas à connaître la forme d'un cache »*, and in
+translation: *"the requester supplies its own warm cache through its
+executor hook (`hc`, a copy-on-write mount per commit); Herd need not
+know the shape of a cache."* **The parenthetical is carried rather than
+elided because it names the mechanism**, which is the part that stops
+someone re-adding a cache engine in six months. **A waiver is a promise
+deferred; a withdrawal is a requirement retired.** E-49 is the first
+kind and this is the second.
+
+**What that moves, stated so no file is patched by guess.** The set the
+consumer has released us from becomes **three** — E-49 waived, E-50 and
+E-14 withdrawn. `docs/coverage.md` re-derives as **36** wholly on
+`main`, **5** `part` (E-12, E-16, E-17, E-37, E-42), **0** with none of
+it, **3** released from: 36 + 5 + 0 + 3 = 44. D248's **42 of 44** is a
+*scope* figure — 44 less the waivers, never a count of what is met — and
+it becomes **41 of 44**. That is arithmetic. **Which headline is
+published stays Alexa's** (**D210**). E-14's `coverage.md` cell may move
+off `planned` now that this entry exists, and it leaves the *Gated on
+chatOnS* list of **D238** at the same time; neither edit is this entry.
+
+**(b) The hub's record retention may be cut from v1.0.0 and follows in
+v1.1**, named in the release notes as not met. **They stated two
+conditions.**
+
+1. **`--volume-free-floor` protects the whole filesystem — and the
+   precise form is the one that must be held, not the loose one.** The
+   floor **measures** the whole volume: it is the only quantity in the
+   hub that sees a record byte, a log byte and a collected byte at
+   once, derived from `statvfs` at every trigger (**D254**). **But the
+   only thing a sweep can remove is output collections** — what goes,
+   and in what order, is still D152's four keys, read down to
+   `min(--output-budget, held + free − floor)`. **It detects pressure
+   from any source and relieves it through one lever.** The
+   orchestrator first described this loosely, corrected it, and the
+   corrected form is what the consumer holds; it is written here that
+   way so the loose form does not come back as the condition.
+2. **`herd-hub report` keeps showing the weight of the records and the
+   logs**, in translation again: *"so that we see the growth instead of
+   discovering it"*. **Their French for this one is not in the tree** —
+   the relay carried only the English of it — so it is marked a
+   translation and no original is invented beside it.
+   **This was not met when they asked and is met now**: **D271**,
+   landed in batch 27, section 5, which weighs records, event files and
+   logs per job directory beside section 3's collected figure. **The
+   limit case that proved it was missing** is our own queue root,
+   measured frozen the same day: **1,443,667 bytes** of bookkeeping
+   against **0** bytes of collected output, and every one of the four
+   figures `report` printed about that root read **nought**.
+
+**Their figures, which are what the cut was decided on, each with its
+instrument.** **≈ 346 MiB** of records, logs and event files over
+**3 334** jobs — about **104 KiB a job**, **0.32 %** of that root — by
+their own **`du -sk` of 2026-10-29, which is allocated blocks and
+therefore real disk occupancy, not apparent size**; against **105.57
+GiB** of collected files, **99.68 %**, by `herd-hub report` the same
+day; and a derived **7.57 GiB/day** of named arrivals over their
+fourteen days (`docs/disk-policy.md` R14, R16, §0.4). Nobody in this
+project read their root (invariant 9, **D161**).
+
+**The trap that sits between those two numbers, and it is in this entry
+because the decision rests on comparing them.** D271's section 5 sums
+**apparent size**, which is a **floor** on occupancy — measured
+**1.97×** below blocks on a small-file population, 1,443,667 apparent
+against 2850816 of blocks on one root. **So at their migration section
+5 will read roughly half their `du` figure and nothing will have
+shrunk**, and the natural reading of a root halving is that retention
+got less urgent. Section 5 prints the unit and that caveat itself; it is
+stated here too, because a reader of this entry compares the two
+figures above and not the program's output. Compare `du` with `du`, and
+never one unit against the other.
+
+**What this does not decide.** It is not a decision of Herd's at all: it
+records what the requester answered. It does not decide when v1.1's
+retention engine lands, nor the bound ORCH-022 asks about, nor
+`bytes_written` (ORCH-278), nor any wording in the release notes, which
+is Alexa's (**D210**). It retires no must but E-14, and a future answer
+of theirs retires none without an entry of its own (**D248**, **D249**).
+
+## 2026-10-30 — D276 `status.md` carries state and pointers, never reasons
+
+**Context.** `docs/status.md` is capped at **90 lines** by
+`scripts/check-docs.sh` and has sat at exactly 90 for three landings.
+Each of those three bought its line by **removing content**, and one of
+them removed E-50's KVM reason to fit — the sentence D248 had written
+down precisely so that nobody re-adds WSL2 believing they are closing a
+gap. A cap that is paid for in reasons deletes the one kind of sentence
+that cannot be re-derived from the code.
+
+**Ruling, the orchestrator, 2026-10-30.** `status.md` carries **state
+and pointers, not reasons**. A reason belongs in `docs/decisions.md`,
+which is append-only and unbounded (invariant 8). **The cap is not
+raised** — it is what keeps the file state rather than a journal — and a
+replacement that needs a line spends the line of a sentence carrying a
+reason, because that sentence is in the wrong file, not because it is
+the least important.
+
+**First application, the same day:** item 5 at `:89`-`:90`, which said
+`coverage.md`'s E-12 and E-17 rows are *"false and not recounted here"*,
+was replaced two lines for two lines with what `e12-e17-recount`
+measured, and the replacement adds no reason.
+
+**It is the orchestrator's and inside its mandate** — the shape of a
+docs file is *how*, not *what* the product is or promises — so it is
+decided alone and reported afterwards (`CLAUDE.md`, *Direction*). It
+changes no gate: `check-docs.sh` is untouched by it.
