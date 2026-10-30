@@ -6,10 +6,11 @@
   whoever built the endpoint. **S10's push is not in this branch** — see
   *Not done*.
 - **Agent:** herd-step
-- **Branch / commit:** `pack-fetch` / `111e94d`, based on
-  `origin/pack-variants` `8344e07` with `origin/main` `351c826` (batch 11)
-  and `origin/pack-store` `0f56d38` merged in. **Both merges were clean**,
-  no conflict in either.
+- **Branch / commit:** `pack-fetch`, based on `origin/pack-variants`
+  `8344e07` with `origin/main` `351c826` (batch 11) and `origin/pack-store`
+  merged in **twice** — `0f56d38`, and then `7795466` once that branch
+  carried the fix for finding 1 and its own second change. **All three
+  merges were clean**, no conflict in any.
 - **Landing:** none — an agent pushes its branch and lands nothing (one
   landing per batch, `docs/orchestration/workflow.md`); `herd-merger` names
   the landing here, and fills the record of `templates/landing.md`
@@ -26,11 +27,14 @@
 and there were two anyway**, both found by running the tests before writing
 anything:
 
-1. **`herd-runner/src/packstore.rs`'s digest test is red on the merged tree
-   and green on either parent alone.** It is routed to the agent holding that
-   file and is **not fixed here** — the file is on this brief's do-not-touch
-   list. Full diagnosis under *Risks and findings*, finding 1. It is the one
-   red in this branch's gate.
+1. **`herd-runner/src/packstore.rs`'s digest test was red on the merged tree
+   and green on either parent alone.** It was routed to the agent holding
+   that file rather than fixed here — the file is on this brief's
+   do-not-touch list — and that branch's `5a6fccc`/`7795466` carries the
+   fix: the assertion now checks the **property** (`"escaped"` and
+   `"lowercase hex"`) instead of one speaker's spelling of sixty-four. The
+   second merge brings it in and the suite is green. Full diagnosis under
+   *Risks and findings*, finding 1, because the *cause* outlives the fix.
 2. **`herd-hub/tests/owed_scan_fails.rs`** — landed by batch 11 *after*
    `pack-variants` was cut — builds `ToHub::Hello` and `ToHub::Health` by
    hand and did not set the fields `pack-variants` added. Fixed here, because
@@ -178,10 +182,14 @@ listener.
 
 1. **The push half of path 3 is not built**, and it is the one clause of the
    brief's part two that is missing. The plan puts it in S10
-   (`herd-runner/src/push.rs`) and it needs a decision the design has not
-   taken — see *Decisions needed* 1. The state it leaves is **named and not
-   silent**: a pack whose every holder is outbound-only is refused with a
-   sentence saying the bytes must be pushed and that this build does not push.
+   (`herd-runner/src/push.rs`), and the shape it needed is now settled and
+   written down under *Settled, for whoever writes the push* below — but
+   deliberately **not started here**, on the orchestrator's instruction: a
+   branch landed with the serve and the fetch proved is worth more than one
+   with the push begun and nothing gated. The state it leaves meanwhile is
+   **named and not silent**: a pack whose every holder is outbound-only is
+   refused with a sentence saying the bytes must be pushed and that this
+   build does not push.
 2. **No pack frame is sent or received by the runner except
    `FromHub::ExpectTransfer`.** `AskTransferCapability` and
    `TransferCapability` are the real frames and go through the `Authoriser`
@@ -235,18 +243,36 @@ $ nix develop --command cargo test -p herd-runner --no-fail-fast
 error: 1 target failed:
 ```
 
-**The one failure is `packstore.rs`'s
-`an_object_name_that_is_not_a_digest_is_refused_…`** (the full name is one
-identifier, too long for this file's columns). **It is the merge collision
-of finding 1, it is green on either parent alone, and it is in a file this
-brief forbids this branch to edit.** It is routed to the agent holding
-`packstore.rs`.
+That one failure was the merge collision of finding 1, in a file this brief
+forbids this branch to edit. **A full gate was run on it anyway rather than
+waiting**, because its verdict was the evidence the merger wanted either
+way, and it reported:
+
+```
+gate: RED sha=45654ae24cd3009b6d6c54caff9d7c6481f8b202 failed=6:test-suite skips=at-rest
+gate: NOT GREEN — this sha must not be pushed to main.
+```
+
+Steps 0–5 and 7 were **all ok** on that run and the skip list matched the
+at-rest expectation exactly, so the one red was the one test and nothing
+else in the workspace — which is what that run was for. The branch was not
+pushed on it.
+
+**After the second merge of `origin/pack-store` (`7795466`), which carries
+the fix:**
+
+```
+$ nix develop --command cargo test -p herd-runner --lib
+test result: ok. 261 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out
+exit 0
+```
 
 **The figure from before anything was written**, as the brief asked:
-`cargo test -p herd-runner --lib` on the merged tree, before the first line
-of this branch's code, was **231 passed; 1 failed** — the failure already
-being finding 1. It is 258 passed now, and 246 of those 258 were reachable
-after the module move alone, because the fifteen mesh tests came with it.
+`cargo test -p herd-runner --lib` on the first merged tree, before the first
+line of this branch's code, was **231 passed; 1 failed** — the failure
+already being finding 1. It is **261 passed; 0 failed** now, and 246 of
+those were reachable after the module move alone, because the fifteen mesh
+tests came with it.
 
 **The last runs, named and not quoted** (a handoff is a docs file, so the run
 that gates the tree holding this file cannot quote itself):
@@ -256,21 +282,34 @@ clears of the unmodified `bench-preflight.sh` and with no override anywhere
 in the environment. Output goes to
 `<scratchpad>/pack-fetch/docs-final.log` and
 `<scratchpad>/pack-fetch/gate.log`, and verbatim into the agent's report.
-**The gate will be red while finding 1 is red, and on that red this branch
-is not pushed.**
+**If it reds on anything, it is reported red and this branch is not
+pushed.**
 
-**Skips:** none from any run above — every binary reported `0 ignored`. The
-gate's own skip list is in the agent's report with the run that produced it.
+**Skips:** the Rust-gate runs quoted above reported `0 ignored` on every
+binary. The gate's own 12 skips are every one a cgroup-v2-delegation host
+skip (`Permission denied` creating a cgroup under
+`/sys/fs/cgroup/chatons.slice/…`), the same twelve `pack-store` reported,
+none new and none masking this change; the list of the final run is in the
+agent's report with the run that produced it.
 
 **Preflight readings behind the runs**, every one a clear of the unmodified
 script, `HERD_PREFLIGHT_MIN_CGROUP_ROOM_GIB` never set:
 
 ```
-load 1.26 / 9.00, slice room 17871 MiB, floor 8192 MiB   ok
+load 1.26 / 9.00, slice room 17871 MiB, floor 8192 MiB   ok   first compile
 load 0.94 / 9.00, slice room 17881 MiB, floor 8192 MiB   ok   (+22s)
-load 0.62 / 9.00, slice room 16261 MiB, floor 8192 MiB   ok
+load 0.62 / 9.00, slice room 16261 MiB, floor 8192 MiB   ok   runner suite
 load 0.51 / 9.00, slice room 16168 MiB, floor 8192 MiB   ok   (+22s)
+load 0.53 / 9.00, slice room 14724 MiB, floor 8192 MiB   ok   first gate
+load 0.46 / 9.00, slice room 14716 MiB, floor 8192 MiB   ok   (+22s)
 ```
+
+Every pair is two consecutive clears of the unmodified script about
+twenty seconds apart, and the room was on a **plateau** rather than a peak
+each time — it drifted by 10, 8 and 8 MiB across the three pairs while the
+load stayed under 1.3 of a 9.00 ceiling, which is the reading the decision
+to start rested on. No absolute room figure was treated as a bar; the
+preflight passed on its own terms and neither clause was lifted.
 
 ## Risks and findings
 
@@ -323,9 +362,12 @@ or `ingest`'s hard link becomes a second copy of every byte fetched — but the
 `PackStore::incoming_at()` beside `refused_at()` when that file is free**, and
 until then two modules know the shape of one directory.
 
-Compatible with the change in flight on `pack-store`: a staging directory
-holds exactly `manifest.tsv`, `pack.meta` and `objects/`, which is the set
-`ingest` is being taught to require.
+**Compatible with `pack-store`'s `5a6fccc`, and now measured rather than
+predicted.** That commit makes `ingest` refuse a declared directory holding
+anything beyond `manifest.tsv`, `pack.meta` and `objects/`; a staging
+directory holds exactly those three by construction, and every fetch test
+is green across the second merge — `261 passed; 0 failed`, where it was
+`258 passed; 1 failed` before it.
 
 ### 4. Four documents now understate what the runner does
 
@@ -441,58 +483,76 @@ absence is never an answer.
   `PackStore::incoming_at()` beside `refused_at()`.
 - **ORCH-nnn — The push path (plan S10).** M11's done-when asks an
   outbound-only runner to complete **both** directions. The pull half is
-  built and proved; the push needs the peer wire's one open question —
-  see *Decisions needed* 1 of
-  `history/2026-10-30-pack-fetch.md`.
+  built and proved on `pack-fetch`; the push is not, and the wire shape it
+  needs is **already settled** — the leading `PeerRequest` authorises the
+  connection and `FetchCapability::direction` decides which way the bytes
+  flow, at no protocol cost. Whoever takes this reads
+  *Settled, for whoever writes the push* in
+  `history/2026-10-30-pack-fetch.md` first; it is not an open question.
 - **ORCH-nnn — Four documents understate the runner.**
   `docs/runner-confinement.md`, `docs/architecture.md`'s module and frame
   inventories, `docs/plan.md`'s M11 section. Prose only.
 ```
 
+## Settled, for whoever writes the push (S10)
+
+**Asked and answered by the orchestrator on 2026-10-30, and written here
+rather than only in a report, because the next agent reads the tree.** The
+push is **not** in this branch and must not be started on it.
+
+**How a push is expressed on the peer wire: the leading `PeerRequest`
+authorises the *connection*, and `FetchCapability::direction` decides which
+way the bytes then flow.**
+
+- `Fetch` — the dialler is the fetcher, and the endpoint answers its
+  `PeerRequest` with `PeerReply` headers plus bodies. That is what this
+  branch built.
+- `Push` — the dialler is the **holder**, because in the push case the
+  receiver can be dialled and the holder cannot. It presents its
+  capability in a leading `PeerRequest`, and then follows it with
+  `PeerReply` headers plus bodies, which the receiving endpoint stages and
+  ingests by exactly the path [`fetch`] already uses.
+
+**This costs no protocol change**, which is the whole reason to choose it:
+`FetchCapability::direction` exists for this, and `TransferDirection`'s own
+doc already says the holder *"is told which one it is being asked for"*.
+`endpoint::authorise` already refuses the mismatch by name
+(`Refusal::WrongDirection`), so a `Push` capability cannot read and — once
+the push is built — a `Fetch` capability will not be allowed to write.
+
+The alternative considered and rejected was a fourth payload type on the
+peer leg. `pack-variants` has frozen that leg's shapes, so it would be a
+protocol version spent to fix a shape that could be chosen correctly now.
+
+**`PackState` stays at three.** *"Held only by peers nobody can dial"* is
+not `Registered`, `Incomplete` or `NoHolder`, but a fourth variant is a
+protocol change and the state disappears the day the push lands. It is
+reported as `NoHolder` with a sentence that says which case it is and that
+the bytes need a push.
+
 ## Decisions needed
 
-1. **How a push is expressed on the peer wire** — the only question S10
-   cannot start without. The numbered message set is pull-shaped:
-   `PeerRequest` means *give me bytes*, `PeerReply` carries no token, and in
-   the push case the receiver can be dialled while the holder cannot, so the
-   bytes must flow on a connection the **holder** opened.
-   **Recommendation:** the leading `PeerRequest` authorises the
-   *connection*, and the capability's `direction` says which way the bytes
-   then flow — `Fetch`, and the endpoint replies with `PeerReply` + body;
-   `Push`, and the dialler follows its own `PeerRequest` with `PeerReply` +
-   body frames that the endpoint stages and ingests. This costs **no
-   protocol change**: `FetchCapability::direction` exists for exactly this,
-   and `TransferDirection`'s own doc already says the holder *"is told which
-   one it is being asked for"*.
-   **Fallback:** a push-only frame on the peer wire, which costs a fourth
-   payload type on a leg `pack-variants` has already frozen — strictly
-   worse, and it is the reason to decide before S10 starts rather than
-   during it.
-2. **Whether `PackState` needs a fourth name.** The three are `Registered`,
-   `Incomplete`, `NoHolder`, and *"held only by peers this fetcher cannot
-   dial"* is none of them: the holders are not gone. This branch reports it
-   as `NoHolder` with a sentence that says exactly which case it is.
-   **Recommendation:** leave the enum at three and keep the sentence, since a
-   fourth variant is a protocol change and the state disappears the day S10
-   lands. **Fallback:** number it with the rest if S10 is deferred past
-   v1.0.0.
+None. The two this branch raised are answered above.
 
 ## Resume point
 
-```sh
-cd /mnt/ssd_980/herd-project/.claude/worktrees/pack-fetch
-git merge origin/pack-store          # once the digest-assertion fix is on it
-export CARGO_TARGET_DIR=/mnt/ssd_980/herd/build/pack-fetch
-nix develop --command cargo test -p herd-runner --lib   # expect 259 passed; 0 failed
-./scripts/bench-preflight.sh         # twice, 20s apart, unmodified
-./scripts/check-docs.sh && ./scripts/gate.sh            # bare, never inside nix develop
-git push -u origin pack-fetch        # only on a green gate
-rm -rf /mnt/ssd_980/herd/build/pack-fetch
-```
+This branch is **pushed and nothing is owed on it**: the gate it was pushed
+on is the one named above, and its verbatim verdict is in the agent's
+report. For `herd-merger`: this branch must land in the same batch as
+`pack-variants` and `pack-store`, since it is based on the first and merges
+the second and neither is on `main`.
 
-Then S10 (the push), once *Decisions needed* 1 is answered, on this branch's
-tip; and S8 for `AssignJob`'s `packs_in`, which is what makes `fetch` get
-called from a job's `{in}` preparation at all.
+One note for whoever pushes a later commit from this worktree: its branch
+tracks `origin/pack-variants`, an artefact of `git worktree add -b` from a
+remote branch, so a push needs `-u origin pack-fetch` and not a bare
+`git push`.
+
+Next, in the plan's order: **S10, the push**, on this branch's tip and to
+the shape settled above — it is a decision already taken, not an open
+question. Then **S8** for `AssignJob`'s `packs_in`, which is what makes
+`fetch` get called from a job's `{in}` preparation at all; and **S11**, the
+two-runner end-to-end, without which the pack half is not done however much
+of it is on `main` (invariant 5).
 
 ## Processes
 
@@ -503,6 +563,7 @@ children (`herd-runner`, `herd-hub` spawned by `confinement.rs`) are
 no PID of the first consumer's live hub (3006543) or runner (3021002) was
 touched.
 
-Own `target/`: `/mnt/ssd_980/herd/build/pack-fetch`, to be removed once this
-branch is pushed, by that literal path. It is **not** removed while the
-branch is unpushed, which is the condition `workflow.md` sets.
+Own `target/`: `/mnt/ssd_980/herd/build/pack-fetch`, 13 GB, removed by that
+literal path once this branch was pushed and not before — which is the
+condition `workflow.md` sets, and the reason is that `/mnt/ssd_980` is the
+first consumer's production disk.
