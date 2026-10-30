@@ -265,6 +265,19 @@ struct Live {
     /// Whether this hub has already said it is over budget with nothing it
     /// may remove. Cleared the moment a sweep comes back inside it.
     said_over_budget: bool,
+    /// Whether this hub has already said it cannot measure the free space on
+    /// its own volume (ORCH-095).
+    ///
+    /// **Said once and never cleared**, which is the one difference from
+    /// [`Live::said_over_budget`] and is deliberate. Being over budget is an
+    /// episode: it ends, and a second episode is news again. A `statvfs`
+    /// that fails on the state root is a property of the mount — a kernel
+    /// without it, a filesystem that does not implement it, a path that
+    /// stopped resolving — and it will fail again at every single trigger
+    /// for the whole life of the process. A line per arriving collection
+    /// would be D151's defect in a new place, and the figure an operator
+    /// needs is already on the startup line.
+    said_cannot_measure: bool,
     /// Whether a sweep is already walking. Two collections completing
     /// together would otherwise start two walks that reach the same verdict,
     /// and the second would find its victims already gone.
@@ -584,6 +597,7 @@ impl JobDirStore {
                 quarantined: BTreeMap::new(),
                 held_bytes: 0,
                 said_over_budget: false,
+                said_cannot_measure: false,
                 sweeping: false,
             }),
         };
@@ -742,17 +756,112 @@ impl JobDirStore {
     /// changed nothing. Nothing is removed for merely being old: the floor
     /// is a floor, not a lifetime.
     ///
-    /// Called with no lock held, because the sweep takes its own.
+    /// **The right-hand side is the effective ceiling and not the budget**
+    /// (ORCH-095). The comparison used to be `held > self.budget.bytes`; it
+    /// is now `held > self.ceiling(held).bytes`, which is the same number on
+    /// every hub that asked for no free-space floor and is less than it on a
+    /// volume that is running out of room. The left-hand side — how `held` is
+    /// produced — is untouched, and is R2's and R3's business.
+    ///
+    /// Called with no lock held, because the sweep takes its own, and
+    /// because [`JobDirStore::ceiling`] takes it too.
     fn held_more(&self, bytes: u64) -> Result<()> {
-        let over = {
+        // The lock is dropped before the volume is measured. A `statvfs` is
+        // cheap and it is still a syscall, and the store's one mutex is what
+        // every writer on this hub queues behind: measuring under it would
+        // put the volume between a log chunk and the next one. The cost is
+        // that another writer may add bytes between these two lines, which
+        // this figure is explicitly allowed to be wrong about — see
+        // [`Live::held_bytes`], "a trigger, not an answer" — and the sweep
+        // re-measures everything from the disk before it removes anything.
+        let held = {
             let mut live = self.lock()?;
             live.held_bytes = live.held_bytes.saturating_add(bytes);
-            live.held_bytes > self.budget.bytes
+            live.held_bytes
         };
-        if over {
+        if held > self.ceiling(held).bytes {
             JobStore::sweep_outputs(self)?;
         }
         Ok(())
+    }
+
+    /// What this hub may hold against a reading taken **now** (ORCH-095).
+    ///
+    /// **At each trigger, never once at startup.** The free space on a
+    /// shared volume is somebody else's figure as much as this hub's: a
+    /// reading taken when the hub started says nothing about a disk that
+    /// another service filled an hour later, and a guard that acted on it
+    /// would be a guard against the past. So this is called by
+    /// [`JobDirStore::held_more`] on the common path and by
+    /// [`JobDirStore::sweep_now`] on the rare one, and the figure it answers
+    /// is never stored.
+    ///
+    /// **One `statvfs`, or none at all.** A hub with no `--volume-free-floor`
+    /// returns here before the syscall: "absent means today's behaviour" has
+    /// to be true of what the hub *does* and not only of the number it
+    /// compares against.
+    ///
+    /// Called with no lock held: it takes its own to say the fallback once.
+    fn ceiling(&self, held: u64) -> crate::job::Ceiling {
+        let Some(floor) = self.budget.free_floor else {
+            return self.budget.ceiling_from(crate::job::FreeSpace::NoFloor);
+        };
+        match free_bytes_on(&self.root) {
+            Ok(free) => self.budget.ceiling_measured(held, free, floor),
+            Err(why) => {
+                self.say_it_cannot_measure(&why);
+                self.budget
+                    .ceiling_from(crate::job::FreeSpace::Unmeasured { why, floor })
+            }
+        }
+    }
+
+    /// What this hub may hold as things stand, for whoever has to print it.
+    ///
+    /// The startup line's figure, and the reason it is read through the same
+    /// body every trigger reads: a line that computed its own ceiling could
+    /// print one the sweeper does not use (D79).
+    pub fn volume_ceiling(&self) -> crate::job::Ceiling {
+        // Scoped, because `ceiling` takes this lock itself.
+        let held = match self.lock() {
+            Ok(live) => live.held_bytes,
+            // A poisoned lock is a louder problem than this and every other
+            // caller reports it; a ceiling of the budget is the safe answer
+            // and the sweeper will meet the same error when it matters.
+            Err(_) => 0,
+        };
+        self.ceiling(held)
+    }
+
+    /// Say once, and only once, that the free-space guard is not in force.
+    ///
+    /// Not an error: a hub that cannot measure its volume keeps today's
+    /// behaviour — the budget alone — rather than refusing to run or
+    /// refusing to sweep. What it must not do is keep the operator's belief
+    /// that a floor they typed is protecting them, so this is a named line
+    /// on `stderr` with the reason in it.
+    ///
+    /// **Returns whether this call is the one that spoke**, which is how
+    /// "once" is asserted: a test that could only read the flag would pass
+    /// for a body that printed every time and set it anyway.
+    fn say_it_cannot_measure(&self, why: &str) -> bool {
+        match self.lock() {
+            Ok(live) if live.said_cannot_measure => return false,
+            Ok(mut live) => live.said_cannot_measure = true,
+            // A poisoned lock means something else has already panicked
+            // holding it, and that is the louder report. Saying this twice
+            // is the right way to be wrong here.
+            Err(_) => {}
+        }
+        eprintln!(
+            "herd-hub: --volume-free-floor was asked for and the free space on {} cannot be \
+             measured ({why}), so that floor is NOT being enforced and this hub is bound by \
+             its {} output budget alone, exactly as it was before the flag existed. Said \
+             once: it will fail the same way at every trigger.",
+            self.root.display(),
+            herd_proto::show_bytes(self.budget.bytes),
+        );
+        true
     }
 
     /// Take one job's output bytes, with the record saying so first.
@@ -933,13 +1042,20 @@ impl JobDirStore {
             let mut live = self.lock()?;
             live.held_bytes = held;
         }
-        let budget = self.budget.bytes;
+        // The ceiling, derived from one reading of the volume taken here
+        // (ORCH-095). Once for the whole sweep and not once per collection,
+        // because `held + free` does not move as the sweeper works — every
+        // byte it frees leaves one and arrives in the other — so this
+        // absolute figure bounds the loop below from start to finish.
+        // [`crate::job::Budget::ceiling_against`] carries that argument.
+        let ceiling = self.ceiling(held);
+        let budget = ceiling.bytes;
         if held <= budget {
             let swept = crate::job::Sweep {
                 held,
                 ..crate::job::Sweep::default()
             };
-            self.say_what_the_sweep_did(&swept)?;
+            self.say_what_the_sweep_did(&swept, &ceiling)?;
             return Ok(swept);
         }
 
@@ -1005,7 +1121,12 @@ impl JobDirStore {
             if swept.held <= budget {
                 break;
             }
-            let why = self.removal_sentence(now, candidate.inside_the_floor, candidate.ended_at);
+            let why = self.removal_sentence(
+                now,
+                candidate.inside_the_floor,
+                candidate.ended_at,
+                &ceiling,
+            );
             let Some(freed) = self.evict(&candidate.id, &why)? else {
                 continue;
             };
@@ -1016,7 +1137,7 @@ impl JobDirStore {
                 swept.inside_the_floor += 1;
             }
         }
-        self.say_what_the_sweep_did(&swept)?;
+        self.say_what_the_sweep_did(&swept, &ceiling)?;
         Ok(swept)
     }
 
@@ -1026,13 +1147,39 @@ impl JobDirStore {
     /// budget is the one report nobody can act on, and a quiet retention
     /// policy is a trap: the next thing that happens after evidence
     /// disappears without a reason is somebody concluding Herd lost it.
+    ///
+    /// **Three figures when the volume is what bound it** (ORCH-095): the
+    /// space that was free, the floor that was asked for, and the ceiling
+    /// those two produced — because *"removed under the 200 GB output
+    /// budget"* on a hub holding 2 GB is the sentence that makes an operator
+    /// certain Herd has lost their evidence. When the budget is what bound
+    /// it, the sentence is the one that shipped, **word for word**: a hub
+    /// with no `--volume-free-floor` must read exactly as it did.
     fn removal_sentence(
         &self,
         at: Timestamp,
         inside_the_floor: bool,
         ended_at: Timestamp,
+        ceiling: &crate::job::Ceiling,
     ) -> String {
         let budget = herd_proto::show_bytes(self.budget.bytes);
+        if let crate::job::FreeSpace::Measured { free, floor } = &ceiling.from {
+            if ceiling.bytes < self.budget.bytes {
+                return format!(
+                    "removed {} to keep {} free on this hub's volume: {} was free, the \
+                     --volume-free-floor is {}, so this hub may hold {} and not the {budget} \
+                     its output budget allows. Every path, size and digest is still on the \
+                     record",
+                    at.date(),
+                    herd_proto::show_bytes(*floor),
+                    // Measured, so through the measuring renderer: ORCH-186's
+                    // rule, and `Ceiling::said` carries the argument.
+                    herd_proto::size::measured_bytes(*free),
+                    herd_proto::show_bytes(*floor),
+                    ceiling.said_bytes(),
+                );
+            }
+        }
         if !inside_the_floor {
             return format!("removed {} under the {budget} output budget", at.date());
         }
@@ -1055,7 +1202,17 @@ impl JobDirStore {
     /// job's own `job.json` and `events.jsonl` say what went and why, for
     /// ever, which is where the answer to "what happened to this job's
     /// screenshots" belongs a week later.
-    fn say_what_the_sweep_did(&self, swept: &crate::job::Sweep) -> Result<()> {
+    ///
+    /// **The ceiling is passed in and never recomputed here** (ORCH-095).
+    /// This line's whole job is to say what the sweep just did, and a second
+    /// reading of the volume taken to print it could name a ceiling the
+    /// sweep did not use — which is the one way a correct sweep produces a
+    /// dishonest line.
+    fn say_what_the_sweep_did(
+        &self,
+        swept: &crate::job::Sweep,
+        ceiling: &crate::job::Ceiling,
+    ) -> Result<()> {
         let budget = herd_proto::show_bytes(self.budget.bytes);
         let floor = crate::job::in_days(self.budget.floor);
         if !swept.is_quiet() {
@@ -1067,6 +1224,15 @@ impl JobDirStore {
                 herd_proto::show_bytes(swept.freed),
                 herd_proto::show_bytes(swept.held),
             );
+            if ceiling.bytes < self.budget.bytes {
+                eprintln!(
+                    "herd-hub: and the {budget} budget is not what bound it — this hub may \
+                     hold {}, {}. The free space on the volume is what asked for those \
+                     collection(s); raising --output-budget would change nothing.",
+                    ceiling.said_bytes(),
+                    ceiling.said(),
+                );
+            }
         }
         if swept.inside_the_floor > 0 {
             eprintln!(
@@ -1084,12 +1250,27 @@ impl JobDirStore {
         // per-frame-line defect in a new place. The flag is cleared the
         // moment a sweep comes back inside the budget, so a second episode
         // is a second line — which is right, because it is news again.
-        let over = swept.held > self.budget.bytes;
+        //
+        // **Against the ceiling and not the budget** (ORCH-095): a hub whose
+        // volume has fallen below its free-space floor with nothing it may
+        // remove is in exactly this situation, and it is the situation an
+        // operator most needs the line for.
+        let over = swept.held > ceiling.bytes;
         let mut live = self.lock()?;
         if over && !live.said_over_budget {
             live.said_over_budget = true;
+            // The hub with no free-space floor reads **exactly** as it did
+            // before ORCH-095, which is the whole of "absent means today's
+            // behaviour": the clause naming the ceiling is added only when
+            // the ceiling is not the budget, because only then is the budget
+            // the wrong figure to be told about.
+            let against = if ceiling.bytes < self.budget.bytes {
+                format!("ceiling of {} ({})", ceiling.said_bytes(), ceiling.said(),)
+            } else {
+                format!("{budget} budget")
+            };
             eprintln!(
-                "herd-hub: {} of job output is held against a {budget} budget and nothing \
+                "herd-hub: {} of job output is held against a {against} and nothing \
                  more may be removed: {} of it belongs to collections that are still \
                  arriving or whose records will not read, and a transfer in flight is \
                  never taken. The volume will stay over budget until those finish.",
@@ -3364,6 +3545,39 @@ fn remove_tree(path: &Path) -> Result<()> {
         Ok(()) => Ok(()),
         Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
         Err(error) => Err(failed("removing", path, &error)),
+    }
+}
+
+/// Free bytes on the filesystem a path sits on, or the reason there is no
+/// figure (ORCH-095, and D213 chose this as the quantity that decides).
+///
+/// **`f_bavail` and not `f_bfree`**, which are different numbers and the
+/// difference is the point. `f_bfree` counts every free block, including the
+/// reserve `ext4` keeps for `root`; `f_bavail` counts the blocks an
+/// unprivileged process may actually use. The hub runs unprivileged in the
+/// consumer's deployment, so `f_bfree` would promise it room it cannot have —
+/// and a guard that stopped evicting 5 % of the volume before the disk is
+/// full is a guard that does not work on the one day it matters.
+///
+/// **Asked about the path the store writes through, and never a path derived
+/// a second time.** `JobDirStore::root` is the `PathBuf` every write in this
+/// file is a `join` onto, and it is kept exactly as the operator typed it:
+/// [`JobDirStore::open_with`] does not canonicalise. So measuring that same
+/// value resolves through the same symlinks, the same `.` components and the
+/// same mounts as the writes it is measuring, and cannot answer about a
+/// different device. Measuring a canonicalised copy, or re-deriving the path
+/// from anything else, is what would make that possible.
+///
+/// **A failure is a `String` and not a [`StoreError`]**: it is never a reason
+/// to refuse a sweep, only a reason to fall back to the budget and say so
+/// (see [`JobDirStore::say_it_cannot_measure`]).
+fn free_bytes_on(path: &Path) -> std::result::Result<u64, String> {
+    match rustix::fs::statvfs(path) {
+        // Blocks times the fragment size. `f_frsize` and not `f_bsize`:
+        // `f_bsize` is the filesystem's preferred IO size and is only
+        // incidentally the unit `f_bavail` counts in.
+        Ok(volume) => Ok(volume.f_bavail.saturating_mul(volume.f_frsize)),
+        Err(error) => Err(format!("statvfs on {} failed: {error}", path.display())),
     }
 }
 
@@ -6543,7 +6757,11 @@ mod tests {
     /// A store whose budget and floor are the test's own.
     fn store_holding(bytes: u64, floor: std::time::Duration) -> (TempDir, JobDirStore) {
         let dir = tempfile::tempdir().expect("a temporary directory");
-        let budget = crate::job::Budget { bytes, floor };
+        let budget = crate::job::Budget {
+            bytes,
+            floor,
+            free_floor: None,
+        };
         let store = JobDirStore::open_with(dir.path(), budget).expect("the state root opens");
         (dir, store)
     }
@@ -6889,6 +7107,7 @@ mod tests {
         let roomy = crate::job::Budget {
             bytes: 1 << 20,
             floor: std::time::Duration::ZERO,
+            free_floor: None,
         };
         let files: &[(&str, &[u8])] = &[
             ("files/here.json", b"complete"),
@@ -6938,6 +7157,7 @@ mod tests {
         let tight = crate::job::Budget {
             bytes: 4,
             floor: std::time::Duration::ZERO,
+            free_floor: None,
         };
         let store = JobDirStore::open_with(dir.path(), tight).expect("the state root reopens");
 
@@ -7207,6 +7427,7 @@ mod tests {
         let budget = crate::job::Budget {
             bytes: 1 << 20,
             floor: std::time::Duration::ZERO,
+            free_floor: None,
         };
         let gone = {
             let store = JobDirStore::open_with(dir.path(), budget).expect("the state root opens");
@@ -7266,6 +7487,418 @@ mod tests {
             Some(first),
             "the second fetch writes nothing: what the sweeper needs is the boolean, and a \
              record write per poll on a path that polls is what this avoids"
+        );
+    }
+
+    // ------------------------------------------------------------ ORCH-095
+    // The free-space guard: the volume, and not only the budget, decides
+    // when a collection is removed (D213).
+    //
+    // **The fixture volume is the real one, and the floor is what moves.**
+    // There is no way to mount a small filesystem in a unit test without
+    // being root, so these tests put the floor *above* the free space the
+    // kernel reports for the temporary directory, which is the same
+    // situation from the hub's side and goes through the same `statvfs`.
+    // The margin is a terabyte, which is larger than the whole of any
+    // filesystem these tests could plausibly run on, so no amount of other
+    // activity on the host can make the premise false while the test runs.
+
+    /// A store whose budget, floor and free-space floor are the test's own.
+    fn store_holding_with(
+        bytes: u64,
+        floor: std::time::Duration,
+        free_floor: Option<u64>,
+    ) -> (TempDir, JobDirStore) {
+        let dir = tempfile::tempdir().expect("a temporary directory");
+        let budget = crate::job::Budget {
+            bytes,
+            floor,
+            free_floor,
+        };
+        let store = JobDirStore::open_with(dir.path(), budget).expect("the state root opens");
+        (dir, store)
+    }
+
+    /// A free-space floor this volume is certainly below, read from the
+    /// volume itself.
+    ///
+    /// Measured rather than assumed: a constant large enough for this host
+    /// is a constant that is wrong on the next one, and the premise of every
+    /// test below is *"free space is under the floor"*, which is exactly the
+    /// kind of premise that silently stops holding and turns an assertion
+    /// into a tautology.
+    fn a_floor_this_volume_is_under(dir: &TempDir) -> u64 {
+        let free = free_bytes_on(dir.path()).expect("this host's temporary volume measures");
+        let floor = free.saturating_add(1 << 40);
+        assert!(
+            floor > free,
+            "the premise: the floor must be above the {free} bytes this volume reports free"
+        );
+        floor
+    }
+
+    /// **The row's own clause.** A volume under its free-space floor evicts
+    /// although the output budget has room to spare, and the record says
+    /// both figures.
+    ///
+    /// The budget here is a megabyte and the two collections are a kilobyte
+    /// each, so nothing about the budget can explain the eviction: `held`
+    /// never comes within a thousandth of `bytes`. What explains it is the
+    /// volume, and the sentence on the record has to say so — *"removed
+    /// under the 1 MB output budget"* on a hub holding 2 KB is the report
+    /// that makes an operator certain Herd has lost their evidence.
+    #[test]
+    fn a_volume_under_its_free_floor_evicts_inside_the_budget() {
+        let dir = tempfile::tempdir().expect("a temporary directory");
+        let floor = a_floor_this_volume_is_under(&dir);
+        let budget = crate::job::Budget {
+            bytes: 1 << 20,
+            floor: std::time::Duration::ZERO,
+            free_floor: Some(floor),
+        };
+        let store = JobDirStore::open_with(dir.path(), budget).expect("the state root opens");
+
+        let old = a_collection(&store, 1024, JobOutcome::Exited { code: 0 });
+        let new = a_collection(&store, 1024, JobOutcome::Exited { code: 1 });
+        // The first one is already gone, and by D152's one trigger rather
+        // than by anything this test did: the arrival of the second
+        // collection is what swept it, exactly as it would be under the
+        // output budget. Nothing here reaches for a clock or a timer.
+        assert!(
+            !bytes_are_there(&dir, &old),
+            "the second collection's arrival took the first, because the volume is under \
+             its floor and the first was terminal and whole by then"
+        );
+        let swept = store.sweep_outputs().expect("sweeps");
+
+        assert_eq!(
+            swept.held, 0,
+            "the volume is a terabyte under its floor, so the shortfall is larger than \
+             everything this hub holds and every collection it may take goes: {swept:?}"
+        );
+        assert_eq!(
+            swept.removed,
+            vec![new.clone()],
+            "and this sweep takes the one that was left — the collection that triggered \
+             the sweep above is the last candidate of its rank, so it goes on the next \
+             one: {swept:?}"
+        );
+        assert_eq!(
+            swept.could_not_free, 0,
+            "with nothing booked as unfreeable, because both records read and both \
+             collections are whole: {swept:?}"
+        );
+        assert!(!bytes_are_there(&dir, &new));
+
+        // And the premise, asserted rather than assumed: this hub was never
+        // anywhere near its output budget.
+        let (_control_dir, control) = store_holding_with(1 << 20, std::time::Duration::ZERO, None);
+        let kept = a_collection(&control, 1024, JobOutcome::Exited { code: 0 });
+        let _second = a_collection(&control, 1024, JobOutcome::Exited { code: 1 });
+        let quiet = control.sweep_outputs().expect("sweeps");
+        assert!(
+            quiet.is_quiet() && quiet.held == 2048,
+            "the identical fixture with no --volume-free-floor removes nothing at all, so \
+             the budget cannot be what took the two collections above: {quiet:?}"
+        );
+        assert!(bytes_are_there(&_control_dir, &kept));
+
+        // The sentence, which is the half an operator reads a week later.
+        let record = store
+            .job(&old)
+            .expect("the record reads")
+            .expect("the record is there");
+        let why = record
+            .outputs
+            .removed
+            .as_ref()
+            .expect("the record says the bytes went")
+            .why
+            .clone();
+        assert!(
+            why.contains(&herd_proto::show_bytes(floor)),
+            "it names the floor that was asked for: {why}"
+        );
+        assert!(
+            why.contains("was free"),
+            "and the free space that was measured against it: {why}"
+        );
+        assert!(
+            why.contains("--volume-free-floor"),
+            "by the name of the setting, so the operator knows which figure to change: \
+             {why}"
+        );
+        assert!(
+            !why.contains("under the 1 MB output budget"),
+            "and it does **not** blame the output budget, which had a megabyte of room and \
+             explains nothing: {why}"
+        );
+    }
+
+    /// A hub with no `--volume-free-floor` never measures its volume, and
+    /// the figure it is bound by is the budget exactly.
+    ///
+    /// This is the absent-means-today's-behaviour clause as an assertion
+    /// rather than an intention. Two halves: the ceiling is the budget to
+    /// the byte, and its provenance says nothing was derived — a hub that
+    /// quietly measured the volume and happened to come out at the budget
+    /// would pass the first half and fail the second.
+    #[test]
+    fn with_no_free_floor_the_ceiling_is_the_budget_and_nothing_is_measured() {
+        let (_dir, store) = store_holding_with(1 << 20, std::time::Duration::ZERO, None);
+        let ceiling = store.volume_ceiling();
+        assert_eq!(ceiling.bytes, 1 << 20);
+        assert_eq!(ceiling.budget, 1 << 20);
+        assert_eq!(ceiling.from, crate::job::FreeSpace::NoFloor);
+        assert!(
+            !ceiling.derived(),
+            "nothing was measured, so nothing is derived: {ceiling:?}"
+        );
+        assert!(
+            ceiling.said().contains("no --volume-free-floor asked for"),
+            "and the line an operator reads says which of the three situations this is: {}",
+            ceiling.said()
+        );
+    }
+
+    /// A hub whose volume **can** be measured carries the reading, and the
+    /// ceiling it derives is at most the budget.
+    #[test]
+    fn a_measurable_volume_carries_its_reading_into_the_ceiling() {
+        let (dir, store) = store_holding_with(1 << 20, std::time::Duration::ZERO, Some(1));
+        let ceiling = store.volume_ceiling();
+        assert!(
+            ceiling.derived(),
+            "a floor of one byte on a volume with room is measured, not fallen back from: \
+             {ceiling:?}"
+        );
+        assert_eq!(
+            ceiling.bytes,
+            1 << 20,
+            "and with a megabyte of headroom to spare the budget is still what binds"
+        );
+        let crate::job::FreeSpace::Measured { free, floor } = ceiling.from else {
+            panic!("a measured ceiling carries its reading: {ceiling:?}");
+        };
+        assert_eq!(floor, 1);
+        assert!(
+            free > 0,
+            "and the reading is the volume's own figure, not a placeholder: {free}"
+        );
+        // The same reading, taken independently of the code under test.
+        let again = free_bytes_on(dir.path()).expect("measures");
+        assert!(
+            again.abs_diff(free) < (1 << 30),
+            "and it is the same volume the store writes to, within a gigabyte of drift: \
+             {free} against {again}"
+        );
+    }
+
+    /// **The detector, proven on a known instance.** `statvfs` fails on a
+    /// path that is not there, and the failure names the path.
+    ///
+    /// Without this, the fallback tests below would pass for a body that
+    /// could never fail at all: a silence is not a result until the thing
+    /// that would break the silence is shown to work (D27's habit).
+    #[test]
+    fn the_volume_measurement_fails_loudly_on_a_path_that_is_not_there() {
+        let dir = tempfile::tempdir().expect("a temporary directory");
+        let missing = dir.path().join("no-such-directory");
+        let why = free_bytes_on(&missing).expect_err("a path that is not there has no volume");
+        assert!(
+            why.contains(&missing.display().to_string()),
+            "the reason names the path, because that is the half an operator can act on: \
+             {why}"
+        );
+        assert!(why.contains("statvfs"), "and the call that failed: {why}");
+        // And the same path, on the directory that does exist, answers.
+        assert!(
+            free_bytes_on(dir.path()).is_ok(),
+            "the detector is not simply broken: the parent of that path measures fine"
+        );
+    }
+
+    /// A hub that cannot measure its volume keeps today's behaviour: the
+    /// budget, and nothing removed that the budget would not have removed.
+    #[test]
+    fn an_unmeasurable_volume_falls_back_to_the_budget() {
+        let budget = crate::job::Budget {
+            bytes: 1 << 20,
+            floor: std::time::Duration::ZERO,
+            free_floor: Some(1 << 40),
+        };
+        let blind = budget.ceiling_from(crate::job::FreeSpace::Unmeasured {
+            why: "statvfs on /nowhere failed: No such file or directory".to_owned(),
+            floor: 1 << 40,
+        });
+        assert_eq!(
+            blind.bytes, budget.bytes,
+            "the fallback is the budget exactly: a floor that cannot be checked must not \
+             evict, because the arithmetic that would decide how much has no input"
+        );
+        assert!(!blind.derived());
+    }
+
+    /// And it says so **once**, however many triggers follow.
+    ///
+    /// Asserted on the body that decides, which returns whether this call is
+    /// the one that spoke: a test that read the flag alone would pass for a
+    /// hub that printed the line at every arriving collection and set the
+    /// flag each time, which is D151's defect and the thing this guards.
+    #[test]
+    fn a_hub_that_cannot_measure_its_volume_says_so_exactly_once() {
+        let (_dir, store) = store_holding_with(1 << 20, std::time::Duration::ZERO, Some(1 << 40));
+        assert!(
+            store.say_it_cannot_measure("statvfs on /nowhere failed: a made-up reason"),
+            "the first trigger speaks"
+        );
+        for again in 0..5 {
+            assert!(
+                !store.say_it_cannot_measure("statvfs on /nowhere failed: a made-up reason"),
+                "and no later one does, however many collections arrive: trigger {again}"
+            );
+        }
+    }
+
+    /// **ORCH-124's leak is not widened** (the row's third clause).
+    ///
+    /// Bytes that arrive again after an eviction are re-admitted to the
+    /// accounting and the sweeper may take them a second time. That already
+    /// holds under the output budget — `bytes_written_after_an_eviction_are_swept_again`
+    /// asserts it — and the new ceiling is the one thing that could break
+    /// it, because a hub under its free-space floor is over its ceiling
+    /// **permanently**: evicting its own collections cannot raise free space
+    /// above a floor set above the whole volume, so every arriving
+    /// collection triggers a sweep for the life of the process. If a
+    /// re-sent collection booked into `could_not_free` under that ceiling,
+    /// the figure would grow without bound and the collections the sweeper
+    /// *can* take would be destroyed in their place — the defect ORCH-124
+    /// names, in the one place that makes it permanent rather than
+    /// transient.
+    ///
+    /// The assertion is `could_not_free == 0` on the second sweep, with the
+    /// bytes gone again: the collection went back into the accounting as a
+    /// candidate and not as a permanent debit.
+    #[test]
+    fn bytes_resent_after_a_free_space_eviction_do_not_book_into_could_not_free() {
+        let dir = tempfile::tempdir().expect("a temporary directory");
+        let floor = a_floor_this_volume_is_under(&dir);
+        let budget = crate::job::Budget {
+            // A megabyte, so the budget never explains anything here.
+            bytes: 1 << 20,
+            floor: std::time::Duration::ZERO,
+            free_floor: Some(floor),
+        };
+        let store = JobDirStore::open_with(dir.path(), budget).expect("the state root opens");
+
+        let data = vec![b'x'; 1024];
+        let files: &[(&str, &[u8])] = &[("files/results.json", &data)];
+        let job = a_job(&store);
+        store
+            .record_outputs(&job.id, &announced(files))
+            .expect("the manifest lands");
+        store
+            .record_state(
+                &job.id,
+                JobState::Finished {
+                    outcome: JobOutcome::Exited { code: 0 },
+                },
+            )
+            .expect("finished");
+        store
+            .write_output_chunk(&job.id, "files/results.json", 0, &data)
+            .expect("the collection arrives");
+        assert!(
+            !bytes_are_there(&dir, &job.id),
+            "a volume under its floor takes the collection as soon as it is whole, and the \
+             budget had a megabyte of room"
+        );
+
+        // The runner never saw the acknowledgement, so it sends the whole
+        // collection again.
+        store
+            .write_output_chunk(&job.id, "files/results.json", 0, &data)
+            .expect("the collection arrives a second time");
+        let swept = store.sweep_outputs().expect("sweeps");
+        assert_eq!(
+            swept.could_not_free, 0,
+            "nothing is booked as unfreeable: under a ceiling the hub can never come back \
+             inside, a permanent debit here would shrink the accounting at every pass for \
+             the life of the process: {swept:?}"
+        );
+        assert!(
+            !bytes_are_there(&dir, &job.id),
+            "and the re-sent bytes are the sweeper's again, as they are under the budget"
+        );
+        assert_eq!(swept.held, 0, "so the figure is honest: {swept:?}");
+        let record = store.job(&job.id).expect("reads").expect("record");
+        assert!(
+            record.outputs.removed.is_some(),
+            "the second eviction leaves its own mark: {record:?}"
+        );
+        assert_eq!(
+            record.outputs.files.len(),
+            1,
+            "with the manifest still naming every file, as D148 promised"
+        );
+    }
+
+    /// The ceiling is **re-derived at every trigger** and never read back
+    /// from a figure the hub stored.
+    ///
+    /// Asserted the only way it can be without a second filesystem: the
+    /// store is opened with a floor it is under, so the opening sweep
+    /// derives a ceiling of nothing; then the floor is what a *second* store
+    /// on the same root asks for, and the two disagree. A ceiling cached at
+    /// startup would make the second store behave like the first.
+    #[test]
+    fn the_ceiling_is_derived_at_the_trigger_and_not_kept() {
+        let dir = tempfile::tempdir().expect("a temporary directory");
+        let under = a_floor_this_volume_is_under(&dir);
+        {
+            let store = JobDirStore::open_with(
+                dir.path(),
+                crate::job::Budget {
+                    bytes: 1 << 20,
+                    floor: std::time::Duration::ZERO,
+                    free_floor: Some(under),
+                },
+            )
+            .expect("the state root opens");
+            assert_eq!(
+                store.volume_ceiling().bytes,
+                0,
+                "a volume a terabyte under its floor may hold nothing"
+            );
+            let _taken = a_collection(&store, 1024, JobOutcome::Exited { code: 0 });
+            let swept = store.sweep_outputs().expect("sweeps");
+            assert_eq!(
+                swept.removed.len(),
+                1,
+                "and it takes what it can: {swept:?}"
+            );
+            // Dropped, which releases the root's one lock (D21).
+        }
+        let store = JobDirStore::open_with(
+            dir.path(),
+            crate::job::Budget {
+                bytes: 1 << 20,
+                floor: std::time::Duration::ZERO,
+                free_floor: Some(1),
+            },
+        )
+        .expect("the state root reopens");
+        let kept = a_collection(&store, 1024, JobOutcome::Exited { code: 0 });
+        let swept = store.sweep_outputs().expect("sweeps");
+        assert!(
+            swept.is_quiet() && bytes_are_there(&dir, &kept),
+            "the same root with a floor of one byte removes nothing: the ceiling came from \
+             this trigger's reading and not from the one the first hub took: {swept:?}"
+        );
+        assert_eq!(
+            store.volume_ceiling().bytes,
+            1 << 20,
+            "and the figure is the budget again, derived now rather than remembered"
         );
     }
 }

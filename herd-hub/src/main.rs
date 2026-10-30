@@ -212,6 +212,33 @@ struct Args {
     /// off: everything is then evictable by the order alone.
     #[arg(long, env = "HERD_OUTPUT_FLOOR", default_value_t = OUTPUT_FLOOR.as_secs_f64())]
     output_floor: f64,
+    /// Free space to keep on the filesystem the state root sits on, below
+    /// which a job's output files are removed although `--output-budget`
+    /// still has room (D213, ORCH-095). For example `20GB`.
+    ///
+    /// **There is no default, and that is the decision.** Left out, nothing
+    /// measures the volume and the output budget alone decides when
+    /// something is removed — this hub's behaviour before this flag existed,
+    /// byte for byte. A number chosen here by Herd would be a number applied
+    /// to somebody else's disk, and the thing it does when it is wrong is
+    /// delete evidence nobody asked it to delete (D194's rule, and
+    /// `herd-hub report`'s).
+    ///
+    /// **What it bounds is the volume and not this hub.** The state root
+    /// usually shares its filesystem with everything else on the host, so
+    /// the figure this hub is really held to is `min(--output-budget, held +
+    /// free − this floor)`, derived from what the filesystem says is free
+    /// **at every trigger** and never from a reading taken at startup. When
+    /// the volume is already below the floor, that ceiling is below what the
+    /// hub holds and the sweeper frees exactly the shortfall.
+    ///
+    /// A hub that cannot measure its volume — a mount with no `statvfs`, a
+    /// path that stopped resolving — keeps the behaviour of today and says
+    /// so once, on `stderr`, naming the reason. It does not refuse to start:
+    /// a guard that is not in force is a worse outage as a dead hub than as
+    /// a loud one.
+    #[arg(long, env = "HERD_VOLUME_FREE_FLOOR", value_name = "SIZE")]
+    volume_free_floor: Option<String>,
     /// What this binary does instead of serving. Left out, it serves, which
     /// is every existing invocation unchanged.
     #[command(subcommand)]
@@ -444,6 +471,19 @@ async fn main() -> Result<()> {
         bytes: herd_proto::parse_bytes(&args.output_budget)
             .map_err(|why| anyhow::anyhow!("--output-budget: {why}"))?,
         floor: seconds(args.output_floor),
+        // Read here for the same reason as the budget above, and the reason
+        // is stronger for this one: a figure that does not parse must stop
+        // the hub before the state root is opened, because opening it
+        // sweeps — and this is the setting whose job is to decide what a
+        // sweep takes. `None` is left alone: no flag, no figure, no reading
+        // of the volume at all.
+        free_floor: match &args.volume_free_floor {
+            Some(size) => Some(
+                herd_proto::parse_bytes(size)
+                    .map_err(|why| anyhow::anyhow!("--volume-free-floor: {why}"))?,
+            ),
+            None => None,
+        },
     };
     // Here for the same reason, and it is the stronger half of it: a sink
     // nobody can send to has to be found by the operator who typed it, not by
@@ -529,6 +569,33 @@ async fn main() -> Result<()> {
         herd_proto::show_bytes(budget.bytes),
         herd_hub::in_days(budget.floor),
     );
+    // The third figure, and the one line that has to say **where it came
+    // from** (ORCH-095). Three situations print three sentences, and two of
+    // them carry the same number for opposite reasons: a hub with no floor
+    // is bound by its budget and never claimed otherwise, and a hub that
+    // cannot measure its volume is bound by its budget while an operator
+    // believes a floor is protecting them. Read through the store's own
+    // `volume_ceiling`, so the figure printed here is the body the sweeper
+    // uses and not a second derivation of it (D79).
+    let ceiling = store.volume_ceiling();
+    if ceiling.derived() {
+        println!(
+            "herd-hub: with --volume-free-floor set, this hub may hold {} of job output \
+             right now — {}. That figure is DERIVED from the volume and is re-derived at \
+             every eviction trigger: it is not a setting, it moves when anything else on \
+             this filesystem writes, and nothing reads it back from this line.",
+            ceiling.said_bytes(),
+            ceiling.said(),
+        );
+    } else {
+        println!(
+            "herd-hub: this hub may hold {} of job output, which is {}. NOT derived from \
+             the volume: no free space on {} was measured to produce it.",
+            ceiling.said_bytes(),
+            ceiling.said(),
+            args.state_dir.display(),
+        );
+    }
     match &sink {
         Some(sink) => println!(
             "herd-hub: events go to {} (--notify-sink). Five things are said and nothing \

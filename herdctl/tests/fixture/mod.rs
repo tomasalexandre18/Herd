@@ -902,6 +902,7 @@ impl Harness {
             herd_hub::Budget {
                 bytes,
                 floor: std::time::Duration::ZERO,
+                free_floor: None,
             },
             |_| {},
         )

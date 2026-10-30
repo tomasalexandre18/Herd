@@ -1268,12 +1268,22 @@ impl OutputSummary {
 /// How much of the hub's volume a job's output files may hold, and for how
 /// long they are safe from the sweeper (D148, D152).
 ///
-/// **Two figures and no third.** Invariant 1 says a retention policy is not
-/// a storage product: there is no tier, no class, no per-job override and no
-/// expression — an operator says how much room there is and how long a fresh
-/// collection is promised, and the order in which things go when those two
-/// disagree is Herd's and not configurable. A knob that let one job's
-/// evidence outrank another's would be the first line of a policy language.
+/// **Three figures and no fourth, and the third is the disk's and not a
+/// policy's.** Invariant 1 says a retention policy is not a storage product:
+/// there is no tier, no class, no per-job override and no expression — an
+/// operator says how much room there is, how long a fresh collection is
+/// promised, and how much free space the volume must keep, and the order in
+/// which things go when those three disagree is Herd's and not configurable.
+/// A knob that let one job's evidence outrank another's would be the first
+/// line of a policy language; a knob that says *"stop at 15 % free"* is a
+/// fact about a filesystem, which is exactly what D213 directed when it said
+/// free space and not the output budget decides when something is removed.
+///
+/// [`Budget::free_floor`] is the one of the three with **no default**, for
+/// D194's reason: a figure nobody chose, applied to somebody else's disk, is
+/// the one way this mechanism could destroy evidence on a volume whose owner
+/// never asked it to. Absent means the budget alone decides — this hub's
+/// behaviour before ORCH-095, byte for byte and syscall for syscall.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Budget {
     /// Bytes of **whole, verified** collections the hub may hold across
@@ -1296,6 +1306,130 @@ pub struct Budget {
     /// by as long as the budget allows. Zero turns the promise off, which is
     /// what a test uses to make an ordinary eviction happen in a second.
     pub floor: std::time::Duration,
+    /// Free bytes this hub keeps on the filesystem its state root sits on,
+    /// below which a collection is removed although [`Budget::bytes`] still
+    /// has room (ORCH-095, and D213 directs it).
+    ///
+    /// **`None` on every hub that did not ask for one**, and that is the
+    /// shipped default: nothing measures the volume, the budget alone
+    /// decides, and not one `statvfs` is called. There is deliberately no
+    /// number here to inherit — see the type's own paragraph.
+    ///
+    /// It is a floor on *free space*, not a cap on this hub: the volume the
+    /// state root sits on is shared with whatever else the operator put
+    /// there, so the figure this hub is actually bound by is derived at each
+    /// trigger from what the filesystem says is free, never from a number
+    /// read once at startup. [`Budget::ceiling_against`] is that arithmetic
+    /// and [`Ceiling`] is what it answers.
+    pub free_floor: Option<u64>,
+}
+
+/// What this hub may hold right now, and what decided the figure
+/// (ORCH-095, D213).
+///
+/// **The provenance travels with the number.** A ceiling an operator reads
+/// without knowing where it came from is the one figure they cannot act on:
+/// 200 GB because that is the budget and 200 GB because the volume could not
+/// be measured are the same number and opposite situations, and the second
+/// one means a guard they asked for is not guarding anything. So every place
+/// that prints a ceiling prints [`Ceiling::from`] with it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Ceiling {
+    /// The output budget as configured: the figure an operator typed.
+    pub budget: u64,
+    /// What this hub may hold against this reading — the budget, or less
+    /// when the volume's free space is what binds.
+    pub bytes: u64,
+    /// Where [`Ceiling::bytes`] came from.
+    pub from: FreeSpace,
+}
+
+/// Where a [`Ceiling`]'s figure came from: three cases, and two of them are
+/// the same number for opposite reasons.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FreeSpace {
+    /// No `--volume-free-floor` was asked for, so the budget alone decides
+    /// and this hub never measures its volume. The behaviour that shipped
+    /// before ORCH-095.
+    NoFloor,
+    /// Measured at this trigger: free bytes on the volume, against the floor
+    /// the operator asked for. **A derived figure.**
+    Measured { free: u64, floor: u64 },
+    /// A floor was asked for and the volume could not be measured, with the
+    /// reason. The budget is the **fallback**, and the ceiling is therefore
+    /// not derived from anything about the disk: the guard the operator asked
+    /// for is not in force, which is why this case is said out loud rather
+    /// than quietly reported as a figure.
+    Unmeasured { why: String, floor: u64 },
+}
+
+impl Ceiling {
+    /// Whether [`Ceiling::bytes`] was derived from a reading of the volume.
+    ///
+    /// False for both of the other two cases, which is the distinction the
+    /// startup line has to draw: a hub with no floor is not guarding and
+    /// never claimed to, and a hub that cannot measure is not guarding and
+    /// did claim to.
+    pub fn derived(&self) -> bool {
+        matches!(self.from, FreeSpace::Measured { .. })
+    }
+
+    /// [`Ceiling::bytes`] as a reader should see it, by ORCH-186's rule
+    /// applied **once** rather than at each of the four sites that print it
+    /// (D79).
+    ///
+    /// The question that rule asks is *"did a human type this figure, or did
+    /// we measure it?"*, and the answer here depends on the figure: a
+    /// ceiling equal to the budget **is** the number the operator typed, and
+    /// printing `200 GB` as `200000000000 bytes (186.26 GiB)` would hide the
+    /// one figure they have to recognise. A ceiling below the budget was
+    /// derived from a reading of the volume and nobody typed it, so the
+    /// exact count stays with a binary approximation beside it.
+    pub fn said_bytes(&self) -> String {
+        if self.bytes == self.budget {
+            herd_proto::show_bytes(self.bytes)
+        } else {
+            herd_proto::size::measured_bytes(self.bytes)
+        }
+    }
+
+    /// The clause that says where this figure came from, for whoever prints
+    /// the figure. One definition, so the startup line, the eviction
+    /// sentence and the sweeper's own line cannot disagree (D79).
+    ///
+    /// **Two renderers, by ORCH-186's rule and not by taste.** The budget
+    /// and the floor are figures an operator *typed*, so they read back
+    /// through [`herd_proto::show_bytes`] in the family they were typed in —
+    /// that is the only way an operator can tell this hub took the number
+    /// they meant. The free space is a figure this hub *measured*, so it
+    /// reads through [`herd_proto::size::measured_bytes`]: `show_bytes`
+    /// returns the first unit a figure divides exactly, which on a
+    /// measurement makes the unit a property of the number, and a free-space
+    /// reading printed that way came out as `344450708 KiB` on this host's
+    /// own volume — right, unreadable, and the exact defect ORCH-186 folded.
+    pub fn said(&self) -> String {
+        match &self.from {
+            FreeSpace::NoFloor => format!(
+                "the {} output budget alone, with no --volume-free-floor asked for, so this \
+                 hub does not measure its volume",
+                herd_proto::show_bytes(self.budget),
+            ),
+            FreeSpace::Measured { free, floor } => format!(
+                "derived now from {} free against a {} --volume-free-floor, under the {} \
+                 output budget",
+                herd_proto::size::measured_bytes(*free),
+                herd_proto::show_bytes(*floor),
+                herd_proto::show_bytes(self.budget),
+            ),
+            FreeSpace::Unmeasured { why, floor } => format!(
+                "a FALLBACK to the {} output budget and not a derived figure: a {} \
+                 --volume-free-floor was asked for and the volume could not be measured \
+                 ({why}), so that floor is not being enforced",
+                herd_proto::show_bytes(self.budget),
+                herd_proto::show_bytes(*floor),
+            ),
+        }
+    }
 }
 
 /// The hub's output budget: 200 GB (D148, chosen by Alexa on 2026-10-16).
@@ -1317,6 +1451,71 @@ impl Default for Budget {
         Self {
             bytes: OUTPUT_BUDGET,
             floor: OUTPUT_FLOOR,
+            // No figure. See [`Budget::free_floor`]: D194's rule, and the
+            // one default that could destroy evidence on a disk whose owner
+            // never asked for the guard.
+            free_floor: None,
+        }
+    }
+}
+
+impl Budget {
+    /// The effective ceiling, given what this hub holds and what the volume
+    /// says is free: `min(B, held + free − R)`, saturating at both ends.
+    ///
+    /// **Pure, and separate from the `statvfs` that feeds it**, so the
+    /// arithmetic is asserted without a filesystem and the syscall is
+    /// asserted without the arithmetic. The caller does the measuring.
+    ///
+    /// ## Why the shortfall is signed, and the plan's own form is not
+    ///
+    /// ORCH-095's row writes the ceiling as `min(B, held + max(0, free −
+    /// R))`. Read with the clamp on the *headroom*, that form can never
+    /// evict: the ceiling is recomputed at every trigger from the current
+    /// `held`, so `held + max(0, …)` is `≥ held` always, and `held >
+    /// ceiling` is then only ever true because of `B` — the free-space
+    /// guard would be dead code that gated nothing, on a volume with no
+    /// space left. The clamp belongs on the **ceiling**, not the headroom,
+    /// and that is this body: when free space has fallen below the floor the
+    /// ceiling drops *below* what the hub holds by exactly the shortfall, so
+    /// the sweeper frees exactly enough to put free space back on the floor
+    /// and not one collection more.
+    ///
+    /// ## Why the ceiling is stable for the length of a sweep
+    ///
+    /// `held + free` does not move as the sweeper works: every byte it frees
+    /// leaves `held` and arrives in `free`. So one reading at the start of a
+    /// sweep bounds the whole of that sweep, and the loop needs no second
+    /// syscall per collection. What *does* move it is anything else writing
+    /// to the volume, which is the next trigger's business and not this
+    /// one's.
+    pub fn ceiling_against(&self, held: u64, free: u64, floor: u64) -> u64 {
+        // At most one of these is ever non-zero.
+        let headroom = free.saturating_sub(floor);
+        let shortfall = floor.saturating_sub(free);
+        self.bytes
+            .min(held.saturating_add(headroom).saturating_sub(shortfall))
+    }
+
+    /// The ceiling with no reading of the volume at all: the budget, exactly.
+    ///
+    /// Both the no-floor case and the cannot-measure case, which are the
+    /// same arithmetic and different situations — [`FreeSpace`] is what keeps
+    /// them apart.
+    pub fn ceiling_from(&self, from: FreeSpace) -> Ceiling {
+        Ceiling {
+            budget: self.bytes,
+            bytes: self.bytes,
+            from,
+        }
+    }
+
+    /// The ceiling from a reading of the volume, with the reading kept.
+    pub fn ceiling_measured(&self, held: u64, free: u64, floor: u64) -> Ceiling {
+        Ceiling {
+            budget: self.bytes,
+            bytes: self.ceiling_against(held, free, floor),
+            from: FreeSpace::Measured { free, floor },
         }
     }
 }
@@ -2839,6 +3038,193 @@ mod a_ceiling_refusal_on_the_record {
                 holding: Some(2),
             }],
             "named once, with the figure the machine itself gave"
+        );
+    }
+}
+
+/// The free-space ceiling (ORCH-095): three figures of arithmetic and no
+/// filesystem. The `statvfs` that feeds it is asserted in `store.rs`, on a
+/// path known not to exist.
+#[cfg(test)]
+mod the_free_space_ceiling {
+    use super::*;
+
+    /// A budget whose figures are the test's own, with a free-space floor.
+    fn budget_of(bytes: u64, free_floor: Option<u64>) -> Budget {
+        Budget {
+            bytes,
+            floor: std::time::Duration::ZERO,
+            free_floor,
+        }
+    }
+
+    /// Free space well above the floor leaves the budget in charge.
+    #[test]
+    fn room_to_spare_on_the_volume_leaves_the_budget_in_charge() {
+        let budget = budget_of(1_000, Some(100));
+        assert_eq!(
+            budget.ceiling_against(10, 10_000, 100),
+            1_000,
+            "the headroom is 9 900 bytes, far more than the budget, so the budget is what \
+             binds and the volume is not mentioned"
+        );
+    }
+
+    /// Free space a little above the floor binds tighter than the budget.
+    ///
+    /// This is the case the whole mechanism exists for and the one a reader
+    /// should check by hand: the hub holds 400, the volume has 150 free, the
+    /// floor is 100, so there are 50 bytes of headroom and the hub may grow
+    /// to 450 — well inside a budget of 1 000.
+    #[test]
+    fn a_volume_running_low_binds_tighter_than_the_budget() {
+        let budget = budget_of(1_000, Some(100));
+        assert_eq!(budget.ceiling_against(400, 150, 100), 450);
+    }
+
+    /// Free space **exactly** on the floor means the hub may hold what it
+    /// holds and not one byte more.
+    #[test]
+    fn free_space_on_the_floor_is_the_ceiling_the_hub_already_sits_at() {
+        let budget = budget_of(1_000, Some(100));
+        assert_eq!(
+            budget.ceiling_against(400, 100, 100),
+            400,
+            "no headroom and no shortfall: nothing is removed, and nothing more fits"
+        );
+    }
+
+    /// **The refutation of the row's own formula, kept as a test.**
+    ///
+    /// ORCH-095's row writes the ceiling `min(B, held + max(0, free − R))`.
+    /// With the clamp on the headroom, a volume below its floor produces a
+    /// ceiling of exactly `held` — and `held > ceiling` is then false, so
+    /// nothing is ever removed and the guard is dead code. The clamp belongs
+    /// on the ceiling: below the floor the ceiling must fall **below** what
+    /// the hub holds, by exactly the shortfall, which is what this asserts.
+    ///
+    /// The two assertions are the two halves of that: the strict inequality
+    /// is what makes an eviction happen at all, and the exact figure is what
+    /// stops it taking more than the volume asked for.
+    #[test]
+    fn a_volume_below_its_floor_puts_the_ceiling_below_what_is_held() {
+        let budget = budget_of(1_000, Some(100));
+        let held = 400;
+        let ceiling = budget.ceiling_against(held, 60, 100);
+        assert!(
+            ceiling < held,
+            "40 bytes short of the floor, so the ceiling must be below the {held} held or \
+             the sweeper is never triggered: {ceiling}"
+        );
+        assert_eq!(
+            ceiling, 360,
+            "and below it by exactly the shortfall — 40 bytes — so the sweep frees what the \
+             volume asked for and not one collection more"
+        );
+    }
+
+    /// A volume so far below its floor that the arithmetic would go
+    /// negative: the ceiling is zero and everything evictable goes.
+    #[test]
+    fn a_shortfall_larger_than_what_is_held_saturates_at_nothing() {
+        let budget = budget_of(1_000, Some(10_000));
+        assert_eq!(budget.ceiling_against(400, 0, 10_000), 0);
+    }
+
+    /// And headroom that would overflow `u64` saturates into the budget
+    /// rather than wrapping to a ceiling of nearly nothing.
+    #[test]
+    fn headroom_that_would_overflow_saturates_into_the_budget() {
+        let budget = budget_of(1_000, Some(0));
+        assert_eq!(budget.ceiling_against(u64::MAX, u64::MAX, 0), 1_000);
+    }
+
+    /// The three provenances, and the two of them that carry the same number
+    /// for opposite reasons.
+    #[test]
+    fn the_ceiling_carries_where_its_figure_came_from() {
+        let budget = budget_of(1_000, None);
+        let none = budget.ceiling_from(FreeSpace::NoFloor);
+        assert_eq!(none.bytes, 1_000);
+        assert!(
+            !none.derived(),
+            "nothing was measured, so nothing is derived"
+        );
+
+        let floored = budget_of(1_000, Some(100));
+        let blind = floored.ceiling_from(FreeSpace::Unmeasured {
+            why: "statvfs on /nowhere failed: No such file or directory".to_owned(),
+            floor: 100,
+        });
+        assert_eq!(
+            blind.bytes, none.bytes,
+            "the same figure as a hub with no floor at all, which is why the two must not \
+             print the same sentence"
+        );
+        assert!(
+            !blind.derived(),
+            "a fallback is never a derived figure, and the startup line turns on this"
+        );
+        assert!(
+            blind.said().contains("FALLBACK") && blind.said().contains("not being enforced"),
+            "and it says so in words, because the operator asked for a guard that is not \
+             running: {}",
+            blind.said()
+        );
+
+        let measured = floored.ceiling_measured(400, 150, 100);
+        assert_eq!(measured.bytes, 450);
+        assert!(measured.derived());
+        assert!(
+            measured.said().contains("derived now from"),
+            "a derived figure says it was derived, and from what: {}",
+            measured.said()
+        );
+    }
+
+    /// A budget with no free-space floor is the shipped default, and the
+    /// shipped default is **no figure at all**.
+    ///
+    /// Asserted because the alternative is the one that destroys evidence:
+    /// a number chosen here would apply to a disk nobody in this project may
+    /// look at (D161), and the thing it does when it is wrong is delete.
+    #[test]
+    fn the_shipped_budget_asks_for_no_free_space_floor() {
+        assert_eq!(Budget::default().free_floor, None);
+        assert_eq!(Budget::default().bytes, OUTPUT_BUDGET);
+        assert_eq!(Budget::default().floor, OUTPUT_FLOOR);
+    }
+
+    /// The ceiling's own figure reads back through the renderer its
+    /// provenance asks for (ORCH-186).
+    ///
+    /// Caught by reading the real binary's startup line, not by a gate: the
+    /// first version printed every figure through `show_bytes`, which
+    /// returns the first unit a figure divides exactly, and a free-space
+    /// reading of this host's own volume came out as `344450708 KiB`. Right,
+    /// unreadable, and the unit a property of the number rather than of the
+    /// quantity — ORCH-186 exactly.
+    #[test]
+    fn a_typed_ceiling_and_a_derived_one_read_through_different_renderers() {
+        let budget = budget_of(200_000_000_000, Some(100));
+        let at_the_budget = budget.ceiling_measured(0, u64::MAX / 2, 100);
+        assert_eq!(
+            at_the_budget.said_bytes(),
+            "200 GB",
+            "a ceiling equal to the budget IS the figure the operator typed, and it has to \
+             read back as the figure they typed"
+        );
+        let derived = budget.ceiling_measured(1_000, 500, 100);
+        assert_eq!(
+            derived.said_bytes(),
+            "1400 bytes (1.37 KiB)",
+            "a ceiling nobody typed reads exactly, with no unit chosen for it by \
+             divisibility"
+        );
+        assert!(
+            derived.said().contains("500 bytes"),
+            "and so does the free space it was derived from: {}",
+            derived.said()
         );
     }
 }

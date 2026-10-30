@@ -219,9 +219,9 @@ starting. A capability that is suspended is not a refusal — jobs needing
 it **wait** — but a capability suspended because its probe is broken
 waits for ever, and the fleet looks healthy from every other angle.
 
-## The two budgets and the two retention spans
+## The four budgets and the two retention spans
 
-Four figures bound your disk. Two are budgets, in bytes; two are spans,
+Six figures bound your disk. Four are budgets, in bytes; two are spans,
 in time. They are set on different processes and they bound different
 things, and the one mistake worth avoiding is reading any of them as the
 size of the state root.
@@ -230,7 +230,9 @@ size of the state root.
 | --- | --- | --- | --- |
 | `--output-budget` (`HERD_OUTPUT_BUDGET`) | the hub | `200GB`, decimal (`herd-hub/src/job.rs`) | the **output files only**, summed over whole, verified collections in every job's `files/` across the whole root. Not records, not logs |
 | `--job-disk-budget` (`HERD_JOB_DISK_BUDGET`) | each runner | 20 GiB (`herd-runner/src/confine.rs`) | how much **one job's workspace** may hold on that machine before the runner stops the job |
+| `--pack-budget` (`HERD_PACK_BUDGET`) | each runner | **none; absent means nothing bounds it** | what that machine keeps under `packs/` **between** jobs: the content one job leaves for a later job of the same commit. Not `--job-disk-budget`, which is one job's scratch space. The runner says at startup what it measured against it (ORCH-240, M12 P1) |
 | `--output-floor` (`HERD_OUTPUT_FLOOR`) | the hub | 7 days (`herd-hub/src/job.rs`) | how long a collection is promised before the sweeper may take it |
+| `--volume-free-floor` (`HERD_VOLUME_FREE_FLOOR`) | the hub | **none; left out, nothing measures the volume** | free space to keep on the filesystem the state root sits on. Below it a collection is removed although `--output-budget` still has room: the hub may hold `min(--output-budget, held + free - this floor)`, re-derived at every eviction trigger and never read once at startup. A hub that cannot measure its volume keeps the behaviour of a hub with no floor, and says so once (D213) |
 | record retention | the hub | **not enforced by any shipped build** | how long a job's *record* is kept. Decided: merger 90 days, every other class 14 (D201) |
 
 A third runner figure sits next to these and is worth knowing so you do
