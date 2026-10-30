@@ -176,6 +176,8 @@ started), `open` (not yet agreed or sized), `active` (an agent holds it),
 | ORCH-287 | **Four documents do not carry M11's `{in}`/`{out}` chain, which is now live.** ORCH-221 already names the three the runner's new modules left behind; this adds what the layout step itself changed and is filed separately because it is about behaviour and not about an inventory. `docs/plan.md` M11 still describes the layout as unbuilt; `docs/coverage.md`'s E-12 and E-17 rows do not say a declared command's pack now travels; and nothing in `docs/joining.md` or `docs/operating.md` tells an operator the sentence her runner will print — a declared command that names `needs` waits at the dispatch until a pack is registered for its commit, which is the one behaviour change a consumer sees from this landing | `m11-pack-layout`, 2026-10-30, *Not done* 7, drafted in full | herd-step | owed | Prose only, so `check-docs.sh` and the batch's own gate. Fold into ORCH-221 if that row is taken first and the same hand is in `plan.md` anyway; otherwise it is one pass naming the constant behind every figure and giving each citation a declared base commit (D239). **The one sentence that must reach an operator** is the waiting one, because it is the only way this landing can look like a hang | ORCH-221 | `docs/plan.md` M11; `docs/coverage.md` E-12, E-17; `docs/joining.md`; `docs/operating.md`; `history/2026-10-30-m11-pack-layout.md`; ORCH-221, ORCH-274 |
 | ORCH-288 | **E-42 is two rules and the release body counts both as missing.** Measured 2026-10-30 at `df47266`: E-42's dedup rule — two submissions of one producer at one commit are one job — is **on `main`**, is E-05 plus D156's commit-in-the-key, and has end-to-end tests against the real binaries whose own doc names a push hook firing twice as the case they exist for; `e42-producer-submit` adds the two that were missing, over the **detached** `herdctl submit` path a hook actually uses. E-42's **coalesce** rule has nothing anywhere: no `coalesce` on `herd_proto::Asked`, no `--coalesce`, no supersession in the store, no `JobOutcome::Superseded`. So `coverage.md`'s count — *"2 with none of it (E-14, E-42)"* — is wrong about E-42, and `road-to-v1.md`'s *"wiring a field that already exists on the wire"* is wrong twice: neither field is on the wire | `herd-step` on `e42-producer-submit`, 2026-10-30, against the tree and the real binaries | orchestrator, then herd-step | open | **Recount E-42 as `part`, like E-12 and E-37**, with the coalesce half named, and correct `road-to-v1.md`'s sizing sentence — the count at the top of `coverage.md` is a judgement about the consumer's acceptance and an execution agent must not move a must between columns by itself. **Then decide the coalesce half**, which needs `herd-proto` and is therefore a decision and not a step: `Asked.coalesce` is a defaulted field and free of `PROTOCOL_VERSION` by D229, while `JobOutcome::Superseded { by }` is a new variant in an enum a requester decodes, which D229 names as the unrecoverable kind. Before anyone implements it, settle whether `Assigned` is queued or running for D75's rule — a runner may already have spawned the process while the record still reads `assigned`, so superseding it discards work in flight, which is what D75 forbids | ORCH-148 | `herdctl/tests/detached_dedup.rs`; `herdctl/tests/declared_dedup.rs`; `herd-hub/src/job.rs` `dedup_key`; `herd-hub/src/store.rs` `submit`; `herd-proto/src/lib.rs` `Asked`, `JobOutcome`; D75, D156, D229; `docs/coverage.md` E-42 and its counts; `docs/road-to-v1.md`; `docs/orchestration/history/2026-10-30-e42-producer-submit.md` |
 | ORCH-289 | **Measured and refuted: a `leaves` naming a plain file does not stop that file coming back as an ordinary `{out}` output.** The first consumer's `tools/herd/commands.toml` has seven `leaves` declarations and every one names a FILE — `results = "results.json"` on `build`, `test-pack`, `test`, `test-affected`, `test-gpu` and `test-host`, and `{ status = "status.json", results = "results.json" }` on `nightly` — written as output labels before `leaves` meant a pack. Measured on `m11-pack-layout` (`ae1188f`), the branch that changed this, against the real hub, runner and `herdctl` as processes: `results.json` (88 bytes) and `status.json` (36 bytes) were written into the directory `herdctl wait --outputs-to` was handed in all three cases and are named in each record's `outputs.files`. **The seven declarations are harmless and this is not a release blocker.** The one and only difference is a sentence per key on `outputs.skipped` and the same sentence on `herdctl`'s stderr — `"… and that is not a directory; a pack is a directory holding manifest.tsv, pack.meta and objects/"` — which `herdctl/src/main.rs` states does not move the exit code; all three invocations exited 0. **The detector was proven before the negative was trusted** (ORCH-267): a control command with no `leaves` at all ran first and its file arrived, and the "is not a directory" sentence is on the declared cases and absent from the control, so `leaves` was read and acted on and the file still came back. Measured only on `ae1188f` because `origin/main`'s `herdctl` does not carry `leaves` onto `Asked` at all and the path is inert there. **The hazard that is real, source-read and not measured:** a declared DIRECTORY that is not a pack is renamed out of `{out}` by `set_aside` and reaches neither the record nor `--outputs-to`. | the first consumer's report of their own configuration, relayed by the orchestrator 2026-10-30; measured by `herd-step` the same day | herd-step | done | nothing — land the handoff with the batch; the instrument is not landed and landing it is the next row's suggestion | nothing | `docs/orchestration/history/2026-10-30-leaves-naming-a-file.md`; job `j0000000119` |
+| ORCH-291 | **The suite's mode fixtures are unsound through Herd, and three of them are latently red.** D268 names the mechanism; this is the inventory. Fixed: `herd-hub/tests/owed_scan_fails.rs` (both silence-at-join assertions). Latently red, same cause, not fixed: `herd-hub/tests/owed_scan_fails_against_the_real_runner.rs` assertions 1 and 2 â the widest window in the suite, a real runner's whole start-up, and it cannot retake its measurement because restarting a binary mid-test would mix two lives' log lines into the counts it reads; `herd-hub/src/server.rs:11455`, the same `0o111` fixture duplicated in that file's unit tests; `herd-runner/src/sweep.rs:708` and `:786`; `herd-runner/src/root.rs:1100`. Ruled out and not members: `herd-hub/tests/durability.rs:1107` (a file, not a directory), `herd-hub/tests/killed_hub.rs:192` and `:490`, `herd-hub/src/store.rs:4918`, `herd-runner/src/spool.rs:463` (all `0o500`, which lists fine). | batch 26's red gate, 2026-10-30; D268 | herd-step | owed | Give each loud member the premise guard of `a_failed_listing`, or state in its own words why it cannot retake | D268 | `history/2026-10-30-settle-owed-scan-red.md`; job `j0000000147` |
+| ORCH-292 | **A fixture whose premise dissolves and whose test stays GREEN, which is worse than tonight's red.** `herd-runner/tests/confinement.rs::a_job_cannot_hide_what_it_wrote_from_its_disk_budget` runs `chmod 300 h; sleep 6`, so its premise is exposed for six seconds against a 200 ms walk and is restored with near-certainty before the inner runner measures. It then asserts `StoppedByCap { Disk }`, which holds either way: through Herd it no longer exercises the defect it is named for, and it would stay green with `restore_access` removed from the product. Same shape with sub-millisecond windows, so a small hole in the wrong direction rather than a hollow test: `herd-runner/src/root.rs::a_directory_a_job_made_unreadable_is_still_measured`, `herd-runner/src/root.rs::a_workspace_a_job_locked_shut_is_still_reclaimed`, `herd-runner/src/outputs.rs::a_directory_the_job_closed_is_still_collected`, and `herdctl/tests/exit_code.rs:756`. Found by reading all 41 `set_permissions` sites and every `chmod` in tests and scripts; it is a code reading, and no run was made with `restore_access` removed. | the point-3 audit of batch 26's red, 2026-10-30 | herd-step | owed | Decide how a test proves the runner's own restoration still happens when something else would have done it anyway â a probe that fails if the product did not restore, or a fixture outside the walked tree. **Taken, not started:** branch `settle-confinement-hollow` was cut off this batch's tip (`771ef9a`) for it and carries no commit of its own at this landing | ORCH-291 | `history/2026-10-30-settle-owed-scan-red.md` |
 
 ## Open — seen, not agreed or sized
 
@@ -970,7 +972,7 @@ to touch (D161).
     because this item is committed before the gate runs (ORCH-121).
 
 22. **A job's packs are laid out and registered, and the hub still mints
-    nothing** — batch 26, **three branches**, one landing, **no conflict
+    nothing** — batch 26, **four branches**, one landing, **no conflict
     at all**: `m11-pack-layout` (ORCH-274 and ORCH-260, M11's layout
     step), tip `ae1188f`; `e42-producer-submit` (ORCH-148's measurement),
     tip `c47a72a`, **tests and prose only, no `src` file in any crate**;
@@ -1025,9 +1027,10 @@ to touch (D161).
     and no `coalesce`, no `dedup_key`). Landing it twice is the one way
     to get it wrong. **Batch 25's post-push run, recorded by id at this
     landing:** `ci.yml` run **41100568813** at `1df941b`, read at
-    integration as `status: queued` with no conclusion yet, so **no board
-    row is owed on it and the next session start reads its verdict**; a
-    landing cannot record its own. **`cut-v1.0.0` (`f3e9df0`) was
+    integration as `status: queued` and re-read by id at this re-gate as
+    `status: completed`, **`conclusion: success`**, 17:59:46Z, so **no
+    board row is owed on it**; a landing cannot record its own.
+    **`cut-v1.0.0` (`f3e9df0`) was
     deliberately left out again**, and its scope table is now wrong
     **twice over**: it carries the version bump to 1.0.0 and a release
     body Alexa has not signed (**D210**), it counts E-42 as having
@@ -1039,3 +1042,39 @@ to touch (D161).
     skip list, `bytes_written` and gated sha are in the merge message and
     the merger's report, not here, because this item is committed before
     the gate runs (ORCH-121).
+
+    **Re-gated and landed as four branches, after a red gate that was
+    neither the batch's fault nor the product's.** The first gate of
+    `22f9846` went red on `herd-hub/tests/owed_scan_fails.rs`'s
+    `one_failed_listing_silences_every_runner_and_each_is_still_answered`,
+    and the previous merger correctly left `main` where it was, wrote no
+    receipt, did not resubmit the gate and did not touch a test. The cause
+    is **D268**: Herd's own runner un-chmodded the fixture — a `0o111`
+    directory under the job's `tmp/` became `0o711` within 200 ms because
+    `workspace.measure()` walks the job's whole base and hands itself
+    access back on any directory it cannot list, which invariant 2 and
+    D166 require of it. The hub was innocent and **no product file was
+    changed**: this batch touches no `herd-hub/src` at all. The fourth
+    branch, `settle-owed-scan-red`, tip `771ef9a`, based on the
+    integration tip `22f9846`, guards the fixture's premise instead of
+    loosening any assertion, and the trigger is job **duration**, not
+    concurrency — a 390 s gate against a 0.3 s control.
+
+    **One decision and two rows this re-gate adds. D268** — a suite
+    fixture that sets a mode must guard its premise — above D267, the
+    highest on `main` **and** on every unlanded branch: all 40
+    non-ancestor remote refs and all 26 non-ancestor local branches were
+    read at this integration and none holds a `D` above 267 or an `ORCH`
+    above 290 (ORCH-998 and ORCH-999 are test fixtures, not rows), so no
+    gap was closed and **D143, D154 and D170 stay**. **ORCH-291** is the
+    inventory of the class, every member named, three of them latently
+    red and not fixed. **ORCH-292 is the one that matters beyond this
+    batch, and it is a hollow green rather than a red:**
+    `herd-runner/tests/confinement.rs`'s
+    `a_job_cannot_hide_what_it_wrote_from_its_disk_budget` exposes its
+    premise for six seconds against a 200 ms walk, so **through Herd it
+    no longer exercises the defect it is named for and would stay green
+    with `restore_access` removed from the product**. A green suite
+    through Herd does not today exercise that one assertion, and no
+    report may be read as if it did. Its fix is on another branch and is
+    **not** in this batch.

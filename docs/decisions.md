@@ -13789,3 +13789,58 @@ own tool reads the bytes**, and the transfer is reported `SameHost`
 with nought bytes off the network. Both halves were watched red first
 — the layout removed, and the registration removed — because a green
 chain is the one place this could have passed while proving nothing.
+
+## 2026-10-30 — D268 A suite fixture that sets a mode must guard its premise
+
+**A mode this suite sets is not a mode this suite keeps**, since D258
+made every gate a Herd job. The runner carrying a job holds it to its
+disk budget by walking the job's whole base every 200 ms
+(`herd-runner/src/confine.rs:106`, from `job.rs:1555`;
+`root.rs:443` `measure_tree(&self.base, &self.root)`), and `tmp` is
+inside that base (`root.rs:317`). A directory that walk cannot list has
+the runner's own access handed back to it — `read_dir_restoring`
+(`root.rs:538`) calls `restore_access` (`root.rs:664`), which is
+`set_permissions(mode | 0o700)`. Every temporary state root in the
+suite lives under `$TMPDIR`, so a fixture directory left at `0o111`
+becomes `0o711` within 200 ms and reads again.
+
+That is the runner obeying invariant 2 and D166: a job must not `chmod`
+its way out of a figure the runner enforces. The product is right and
+the fixtures are wrong, so **the rule is on the fixtures**: a test whose
+premise is a mode checks that premise **at the moment it judges a
+measurement**, and a measurement taken after the premise was undone is
+**void** — taken again from nothing, a bounded number of times, and
+then red with a sentence. Never skipped: a skip would move the suite's
+`HERD-SKIPPED` list, which is compared and not counted (D27, D187).
+Never slept on, never `#[ignore]`d, and no assertion is widened.
+
+Measured 2026-10-30 in job `j0000000147`: `mode=2111 read_dir=EACCES`
+at t=0.10 s, `mode=2711 read_dir=ok` at t=0.20 s. **`0o711` where a
+fixture set `0o111` is the fingerprint** — never the guard's own
+`0o755`.
+
+**The consequence of D258 this names.** A gate run through Herd is not
+equivalent to a gate run locally for this class of assertion: the same
+tree is sound locally and unsound through Herd. Batch 26's gate went red
+on it after eighteen green attempts — `owed_scan_fails.rs`'s
+`one_failed_listing_silences_every_runner_and_each_is_still_answered`,
+whose fixture had been un-chmodded under it — and the hub was innocent.
+The window a run exposes is a few milliseconds against a walk every
+200 ms, which is why it is rare, why it is a function of job **duration**
+and not of concurrency, and why a filtered control of 0.3 s was five of
+five green while a 390 s suite was red.
+
+Done for the hub's two tests of it in
+`herd-hub/tests/a_failed_listing/mod.rs` — `still_binds`, `hold_again`,
+`ATTEMPTS`, `WOULD_NOT_HOLD`, and `over` now requiring the verification
+failure to be `PermissionDenied` so that a listing which failed for an
+unarranged reason is never read as the fixture. Proved both ways against
+a faithful stand-in for `restore_access`: the unmodified gated binary 10
+red of 10, the fixed one 0 red of 10 alone and 0 red of 10 as a whole
+binary with the restore still firing every run, and red with its own
+sentence when the stand-in restores continuously.
+
+**What this decision does not fix.** Only `a_failed_listing`'s two
+assertions are guarded. The rest of the class is named, by member, in
+ORCH-291, and ORCH-292 carries the one member that is a **hollow
+green** rather than a latent red.

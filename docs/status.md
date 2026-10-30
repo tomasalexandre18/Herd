@@ -5,10 +5,9 @@ decided is in `board.md`** (invariant 8); **we ship, they operate** (D161).
 
 ## How a change reaches `main`
 
-**`CLAUDE.md` and `docs/orchestration/workflow.md` hold the method in
-full**: **no pull request**, one batch, one `--no-ff` landing, a green
-`./scripts/gate.sh` for the merge's **second parent, same tree**, **protection
-that does not bind us**, **the skip list, never the count**, **every gate
+**`CLAUDE.md` and `docs/orchestration/workflow.md` hold the method in full**:
+**no pull request**, one batch, one `--no-ff` landing, a green
+`./scripts/gate.sh` for the merge's **second parent, same tree**, **every gate
 through our own Herd** (**D189**, **D203**, **D187**, **D236**, **D258**).
 
 ## Releases, and what v1.0.0 will mean
@@ -30,8 +29,7 @@ last two destroying a root. **D199 is moot** (**D243**), **ORCH-156 caduque**.
 
 Nobody here logs into their hosts (D161); a fact reaches us as a dated report.
 **Their hub and runner are up since 20:23 on 2026-10-29**, so the ceiling is
-**two** heavy agents. **The orchestrator opens that exchange on its own**
-(**D249**), by `SendMessage`, never a GitHub issue, and nothing reports back.
+**two** heavy agents; the exchange is ours to open, unanswered (**D249**).
 
 - **The 37.6 GiB kept for nothing is fixed in the code and still on their
   disk** (**D221**, ORCH-205): **freed by the release, not the merge**, and
@@ -69,9 +67,11 @@ E-07); **custody is honoured and keepers named only if asked** (**D266**).
 `EBUSY` is read, never guessed** (**D259**) and **a controller is read from a
 list, never inferred from a file** (**D265**); **skips per host** (D27): **12**
 runtime, **14** loaded, **38** ignored, the twelve needing a delegated scope
-with its own `MemoryMax` (**D260**). **Two published figures are narrower than
-their names:** the stop is **0.212 s** and only idle (**D264**), and
-`bytes_written` is a workspace's apparent size, sampled (**D263**).
+with its own `MemoryMax` (**D260**). **Three are narrower than their names:**
+the stop is **0.212 s**, idle only (**D264**), `bytes_written` is a workspace's
+apparent size, sampled (**D263**), and **a green suite proves less than its
+name** (**D268**): a mode a fixture sets is undone within 200 ms, so one test
+is a **hollow green** (ORCH-292) and three are latently red (ORCH-291).
 
 ## What the software still does not do
 
