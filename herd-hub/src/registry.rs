@@ -845,11 +845,24 @@ fn two_ids(commit: &str, key: &str, both: &BTreeSet<PackId>) -> String {
 
 /// Whether a directory name could be a pack id at all: 64 lowercase hex
 /// digits, which is what a sha256 is.
+///
+/// **Delegated, not written again.** The shape is
+/// [`herd_proto::pack::check_object_digest`]'s, which `herd-proto` exposes
+/// `pub` so the readers of a sha256-shaped name can share one rule. A pack id
+/// and an object digest are different *subjects* — this one names
+/// `packs/manifests/<id>/`, that one names `objects/<sha256>` — but they are
+/// the same sixty-four characters joined onto a path, and keeping a second
+/// copy of the rule here is how two copies come to disagree. That is not
+/// hypothetical: the runner's pack store held its own copy of it until
+/// 2026-10-30, the wordings drifted, and the merge of two branches that were
+/// green alone was red on a test asserting one of them.
+///
+/// The refusal's sentence is deliberately discarded. This is a **filter** over
+/// a directory somebody else may own — the caller says so in the journal and
+/// deletes nothing — and not a refusal addressed to an operator, so what is
+/// wanted is the predicate and not the words.
 fn looks_like_an_id(name: &str) -> bool {
-    name.len() == 64
-        && name
-            .bytes()
-            .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+    herd_proto::pack::check_object_digest(name).is_ok()
 }
 
 fn read_optional(path: &Path) -> Result<Option<String>> {
@@ -1117,6 +1130,56 @@ mod tests {
         let outcome = again.register(a_registration(at())).expect("registered");
         assert_eq!(outcome, Registered::Fresh(pack.clone()));
         assert!(again.manifest_bytes(&pack).expect("read").is_some());
+    }
+
+    /// A directory under `packs/manifests/` whose name is not a pack id is
+    /// **ignored and kept**, and "is not a pack id" is the shared
+    /// sha256-shaped-name rule (`looks_like_an_id`, delegating to
+    /// `herd_proto::pack::check_object_digest`) rather than a copy of it.
+    ///
+    /// The three alien names are the three ways that rule can be broken, and
+    /// the three the delegation has to keep refusing: not hex at all, the
+    /// right shape in the wrong case, and one character short. There was no
+    /// test over this filter before the delegation, so this is the detector
+    /// the fold needed; the real pack beside them is the control, without
+    /// which the assertions would also pass on a registry that reads nothing
+    /// at all.
+    #[test]
+    fn a_directory_under_the_manifests_that_is_not_an_id_is_ignored_and_kept() {
+        let (dir, registry) = registry();
+        let pack = match registry.register(a_registration(at())).expect("registered") {
+            Registered::Fresh(pack) => pack,
+            other => panic!("{other:?}"),
+        };
+        let manifests = dir.path().join(PACKS_DIR).join(MANIFESTS_DIR);
+        let aliens = [
+            "not-a-pack".to_owned(),
+            pack.as_str().to_uppercase(),
+            pack.as_str()[1..].to_owned(),
+        ];
+        for name in &aliens {
+            fs::create_dir_all(manifests.join(name)).expect("an alien directory");
+        }
+
+        drop(registry);
+        let again = PackRegistry::open(dir.path()).expect("the registry opens");
+        assert_eq!(
+            again.pack_for("c0ffee", "pack").expect("no conflict"),
+            Some(pack.clone()),
+            "the one real pack is still read"
+        );
+        assert_eq!(again.entries().len(), 1, "and nothing else became a pack");
+        assert!(
+            again.quarantined().is_empty(),
+            "nor a quarantined one: a name that is not an id is not this hub's pack at all"
+        );
+        for name in &aliens {
+            assert!(
+                manifests.join(name).exists(),
+                "and {name} is left where it is, because that directory belongs to whoever \
+                 put it here"
+            );
+        }
     }
 
     #[test]
