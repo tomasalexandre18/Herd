@@ -81,9 +81,9 @@ a chunk with no sha256.
 2. **The pack half is wired at the edges, not through.** `ToHub::JobFact` and
    six reason codes ride the wire untouched (D230); the **push** half is
    unbuilt (ORCH-220); **no job is assigned a pack** (ORCH-234); and **D231-5
-   is half a behaviour** (**D247**, ORCH-230) — a hub *told* records a holding
-   and forgets it on the drop; neither side asks nor announces. One
-   chatOnS-gated list of seven (**D238**); the road is counted (D237).
+   is a behaviour** (ORCH-230, ORCH-232, **D247**) — a runner announces what
+   it holds unprompted; the hub's holdings line undercounts a chunked one
+   (ORCH-239). One chatOnS-gated list (**D238**); the road is counted (D237).
 4. **V3 stays red and the reading is Alexa's** (**D228**, ORCH-022): whether a
    runner silent for `lost_after` keeps its link, against E-21's 60 s promise.
 5. **The runner's half of D225 has never run against a real hub**, though both
