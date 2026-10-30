@@ -13844,3 +13844,314 @@ sentence when the stand-in restores continuously.
 assertions are guarded. The rest of the class is named, by member, in
 ORCH-291, and ORCH-292 carries the one member that is a **hollow
 green** rather than a latent red.
+
+## 2026-10-30 — D269 The hub authorises a transfer; it is never on the
+path
+
+`ToHub::AskTransferCapability` was answered by a refusal naming itself
+— *"this hub does not mint a transfer capability for pack … yet"* — and
+`FromHub::ExpectTransfer` was constructed in **no place** in the
+workspace. `herd_runner::endpoint::Granted::pushed_by_hub` is the one
+door a capability may enter a holder by, and it was fed by no
+production path, so no pack could move between two machines at all.
+That is E-12 — *packs by (commit, key), no shared build trees* — with
+its one mechanism missing. This entry settles how the hub closes it.
+
+**1. The hub mints, and the hub is not the byte path.** It reads the
+asking runner's entitlement, reads the holder off its own registry,
+mints a token, tells the holder over the holder's own already
+authenticated link and answers the asker. No byte of a pack passes
+through the hub (D10): what crosses it is an authorisation.
+
+**2. It chooses no address; it repeats one.**
+`TransferCapability::endpoint` is the string the holder advertised in
+its handshake. Invariant 3 and D11 already constrain that to a private
+mesh interface, enforced at the runner since D222, so authorising a
+transfer widens nothing and opens no port. A capability is never minted
+against an address the hub invented, and a holder that advertised none
+is **outbound-only** — named as such, which is the case the push path
+exists for, and never answered with a capability carrying no address.
+
+**3. The token is the roster's scheme and not a second one.** 32 bytes
+from `getrandom`, lowercase hex, behind a prefix that names what it is,
+with **no fallback to the clock**: a host that gives no random bytes
+mints nothing and says so. It is scoped to one pack, one peer, one
+direction and the object list asked for — an ask for one row is never
+answered with the whole pack — and expires at
+`PACK_CAPABILITY_LIFETIME`, 300 s, on the hub's clock, as an instant
+and not an offset, because the machine that compares it is not the
+machine that minted it. **No part of it is journalled**, and that is
+asserted against the hub's own stderr: a journal is read, shipped and
+pasted, and a bearer capability's holder *is* its subject (D200,
+invariant 7). The mint is a separate function rather than a call into
+`roster`, because the roster's sentences are about an approved machine
+and would be a lie here; the scheme is shared, the explanation is the
+caller's.
+
+**4. The holder is told before the asker is answered.** The two frames
+go to two connections, so the queue order is the only ordering the hub
+controls, and this is the one that does not race the asker's dial
+against the holder's knowledge of the token. The protocol has no
+acknowledgement for `ExpectTransfer`, so the hub can do no more than
+order the two sends; the remaining window is named in the arm and is
+the fetcher's to retry over, not the hub's to close.
+
+**5. Every refusal is about one pack, and names which of six it is.**
+`PackRefused` and never `FromHub::Refused` (D13): a transfer this hub
+will not authorise costs the asking runner neither its link nor its
+other jobs. The six are a job that is not this runner's, a push, a
+`peer: None`, an ask against the asker itself, a machine that holds
+nothing, and an outbound-only or disconnected holder. **None of them
+turns a wait into a refusal**: a job whose pack has no holder is held at
+the dispatch and never reaches this frame, so D261's dry-run answer and
+D13 are both unaffected.
+
+**6. No protocol move.** Both frames were already on the wire at
+`PROTOCOL_VERSION` 3 and every field filled already existed, so the
+authorisation needed nothing the frozen surface lacked.
+
+**What this does not make true.** **No pack has moved between two
+machines**, and nothing here may be reported as a working transfer.
+`herd-runner` sends `mesh_endpoint: None` in its handshake
+unconditionally, so every real runner is an outbound-only holder
+whatever `--mesh-listen` it was given, and the hub correctly refuses to
+mint against an address nobody advertised. The runner's advertisement
+and the push direction are each their own row. What is proved is the
+hub's half, against a hub on a socket and against the hub as a process.
+
+## 2026-10-30 — D270 A runner awaits its bind before its first dial
+
+`herd-runner` sent `mesh_endpoint: None` in the one `ToHub::Hello` it
+builds, unconditionally and whatever `--mesh-listen` it was given
+(`herd-runner/src/lib.rs:4406` at `ae1188f`; `git grep -n mesh_endpoint`
+over `herd-runner` returned that one line and nothing else). So
+`Holder::endpoint` was `None` for every real runner,
+`fetch::reachable_holder` refused every holder as outbound-only, and
+the hub — correctly — minted no capability against an address nobody
+had advertised. **No pack could move between two machines at all**, and
+the half that was missing was one field.
+
+Filling it is not a fill, because of one fact about the flag.
+`--mesh-listen 127.0.0.1` means port **0**: the kernel picks it, at bind time,
+in a task started *beside* the redial loop — and `PROTOCOL_VERSION` is
+frozen at 3 with **no frame that revises a mesh endpoint later**
+(invariant 4). So the address is not knowable when a cold start's hello
+is built, and a hello that guessed would be uncorrectable for the life
+of the link: the hub would mint capabilities against a port nothing
+holds, and every peer sent there would be refused for a reason no
+operator could see.
+
+**1. The dial awaits the bind.** `herd_runner::run_until` starts the
+endpoint task, then waits once on `endpoint::Advertised::settled()`
+before `serve_forever` dials anything. The rejected alternative was to
+advertise only an explicit `ADDR:PORT` and refuse to claim an endpoint
+for the bare form. It is cheaper and it was rejected because it leaves
+a flag that silently does less in one of its two spellings:
+`--mesh-listen 127.0.0.1` would bind, serve, and never be offered a
+transfer. **A flag that half-works is worse than one that refuses.**
+
+**2. The wait cannot be where a runner hangs, and that is a property of
+the type and not a timeout.** `Advertisement` has three values —
+`Unsettled`, `Nothing`, `At(SocketAddr)` — and every path through
+`endpoint::serve_while`'s first turn leaves one of the last two: no mesh
+address settles `Nothing` before the loop, a bind that **fails** settles
+`Nothing` and the runner dials anyway and runs every job, and a runner
+started switched `off` settles `Nothing` because it holds no socket. The
+one path with no endpoint task at all — a pack store that will not open
+— settles `Nothing` in `run_until` itself. There is no timeout on the
+wait because there is nothing to time out: a runner that cannot learn
+its own endpoint is an outbound-only runner, which is a named state the
+hub refuses as a holder by name, never a runner that refuses to start.
+
+**3. The advertisement follows the socket, and never changes under a
+link.** It is a `tokio::sync::watch` and not a `OnceLock`, because the
+owner's switch closes the socket and that runner stops being a holder:
+the **next** connection has to say so, or the hub goes on minting
+against a port the process no longer holds. What it must never do is
+change mid-link, and it cannot: the endpoint is bound once and outlives
+every connection, so a reconnect reads the value already settled and
+**rebinds nothing**. `serve_once` therefore *reads* (`now()`) where
+`run_until` *waits* (`settled()`) — deliberately, because `serve_once`
+is also the whole runner for much of this workspace's suite, started
+with no endpoint task beside it, and a hello that waited there would be
+a hello that never left.
+
+**4. No guard was weakened, and no protocol moved.** The address
+advertised is the one `mesh::Mesh::resolve` already accepted at startup,
+with the bound port substituted — the invariant-3 guards of D222 are
+untouched, byte for byte. Loopback is advertisable because `mesh.rs`'s
+`permitted` already returns `Ok` for it before the routing table is
+consulted, which is a deliberate clause and the only mesh a single
+workstation running the two-runner end-to-end has. `herd-proto` is
+unchanged: `Hello.mesh_endpoint` already existed.
+
+**What this makes true, measured.** A pack moves from one real runner to
+another, peer to peer. `herd-hub/tests/pack_chain.rs`'s two-machine test
+reports `FetchPath::Peer` with a positive byte figure and `1 object(s)
+fetched, 0 already held`, the consumer's own tool reads the pack's bytes
+out of `{in}/<key>`, and the one string that exists only inside the
+object's bytes is **nowhere** in the hub's journal or under its state
+root (D10: the hub is registry and authority, never the byte path).
+
+**What it does not make true.** The **push** direction is still absent:
+a holder that listens on nothing cannot be dialled, is refused by name,
+and nothing in this build pushes to the asker instead (ORCH-220, plan
+S10). And the `ExpectTransfer` race named by the branch below this one
+is **not** closed: the hub tells the holder first and answers the asker
+second, delivery over two connections is concurrent, and an asker
+dialling inside that window is refused `NotPushedByHub`. No retry was
+added, for the reason in this branch's handoff:
+`herd_proto::pack::PeerRefusal` carries only a `why` sentence, so a
+fetcher cannot name that one refusal without widening the frozen
+protocol, and a retry keyed on a substring of an operator's sentence is
+worse than the race.
+
+## 2026-10-30 — D271 A report weighs the bookkeeping, not only the output
+
+`herd-hub report` had four figures and every one of them was about the
+**collected output** or about `packs/`: the deduplication ratio over what
+records claim, per-job output size by decile, what records claim against
+what `files/` measures, and what `packs/` holds. Not one weighed a
+`job.json`, an `events.jsonl` or a `log`.
+
+**That made the report blind in the one direction the first consumer
+depends on.** They agreed on 2026-10-30 that v1.0.0 may ship without the
+hub's record retention, following in v1.1, on two conditions, the second
+being that `herd-hub report` keep showing the weight of the records and
+the logs *"so that we see the growth instead of discovering it"*. Their
+own root: about 346 MiB over 3334 jobs, 0.32 %, against 105.57 GiB of
+collected files, 99.68 %. Our own queue root is the limit case and was
+measured, frozen, on the same day: **1,443,667 bytes** of bookkeeping
+against **0 bytes** of collected output. Every figure the report printed
+about that root was nought.
+
+**So a report over a population nothing bounds prints that population.**
+Section 5 weighs the records, the event files and the logs of every job
+directory, with their counts, beside section 3's collected figure. Three
+things are settled with it and each is a rule and not a detail.
+
+1. **The two totals partition a job directory.** `files/`, `files.part/`
+   and `files.gone/` are skipped **by name**, never subtracted from a
+   total, and a test asserts that the two sums come to every byte under
+   `jobs/` — walked by the test and not by the code under test, so a byte
+   counted twice and a byte counted nowhere redden the same assertion.
+2. **A total, said to be one, with the maximum beside it.** Deciles are
+   section 2's answer because a per-job output size is skewed by what a
+   job kept; the question here is what the bookkeeping weighs, which is a
+   sum. A mean is still refused — one 64 MiB log is the whole of the
+   difference between two roots — so the heaviest single directory is
+   printed beside the total.
+3. **An absence is never a nought** (D257, one level down from a version
+   number). A root with no job directory and a root whose first records
+   have not landed print two different banners, and the reading "the
+   bookkeeping weighs nothing" is said to be impossible, because a record
+   is never nought bytes. A log that could not be measured is `UNKNOWN`,
+   the total says it is a floor, and the enum that carries that rule is
+   `retention::LogWeight` reused rather than spelled a second time.
+
+**What the figure is, exactly, so nobody quotes it as something else.** It
+is apparent size, `metadata().len()` per file, like every other byte figure
+this report prints. Measured the same day with two different tools on a
+frozen copy of our own root, real occupancy is **1.97× higher** — 2850816
+bytes of blocks against 1443667 apparent, because small files each cost a
+block. **So the printed prose carries the unit, that one measurement, the
+caveat that the factor is a property of that root's file sizes and block
+size and not a constant, and the instruction that compares `du` with `du`
+and never one unit against the other.** It is in the output and not in a
+comment because the consumer's own figure for the same quantity is `du
+-sk`, which is blocks: at their migration section 5 prints about half of
+what their `du` said with nothing having shrunk, and the natural reading
+of a root halving is that retention got less urgent. The orchestrator
+made the mirror-image error the same day with both measurements in front
+of it.
+
+**And the pairing, which is why the unit has to be printed and not merely
+known.** This product now holds **two apparent-size figures that err in
+opposite directions**: a job's `bytes_written` (D263, ORCH-278)
+**overstates**, because a sparse file counts for its holes, and it killed
+a landing's gate on 2026-10-30; this one **understates**, because
+apparent size floors real occupancy. Same unit, same word, opposite bias.
+One name cannot carry two biases, which is an argument of its own for
+ORCH-278's separation of a workspace quota in apparent size from bytes
+written as I/O.
+
+Reversible: it is a read. `report` takes no lock, writes nothing, removes
+nothing, and reads no output byte, no log byte and no line of an event
+file — only lengths. The cost is one `read_dir` per job directory that the
+walk already visits.
+
+## 2026-10-30 — D272 E-42 is `part`: its dedup half is built, its
+coalesce half is not
+
+**Context.** `docs/coverage.md` counted E-42 — *a push hook submits the
+producer* — among the musts with **nothing** on `main`, in five places, and
+`docs/road-to-v1.md` said of it that the work left *"is wiring a field that
+already exists on the wire"*. An execution agent measuring E-42 on
+`e42-producer-submit` (`c47a72a`) found the row is **two rules** and reported
+that one of them is live; it correctly declined to move a must between columns
+itself.
+
+**Choice, the orchestrator, 2026-10-30, with its evidence.** E-42's State cell
+is **`part`**, the same shape E-12, E-16, E-17 and E-37 already carry, and the
+coalesce half is named as what is absent.
+
+- **Dedup — joining — is built and asserted.** The hub derives the key itself
+  over the command, the label set and the declared commit
+  (`herd-hub/src/job.rs:817`, length-prefixed fields, the commit a counted
+  third since **D156**), and `JobDirStore::submit` looks it up in `open_work`
+  under the store's one lock and joins **any non-terminal job, running
+  included** (`herd-hub/src/store.rs:2234`). It is asserted against the real
+  binaries in `herdctl/tests/declared_dedup.rs`, whose own doc comment reads
+  *"A push hook firing twice is the case this exists for"*. The **detached**
+  path — `herdctl submit`, which a hook uses and which no test covered — is
+  added on `e42-producer-submit` in `herdctl/tests/detached_dedup.rs`, with a
+  named control that was watched failing and then deleted.
+- **Coalesce — discarding — exists nowhere.** No `coalesce` field on
+  `herd_proto::Asked`, no `superseded` job outcome, no `--coalesce` flag; the
+  declared `coalesce` and `dedup_key` are parsed and validated in
+  `herdctl/src/declaration.rs` and read nowhere else, so neither declared
+  field reaches the wire and the delivered behaviour rides a key the hub
+  derives. **D75** keeps the two apart — *"Dedup joins; coalescing discards.
+  They are two behaviours, not one"* — and considers dedup first, so joining a
+  **running** job is correct for dedup and forbidden for coalesce, and the
+  live joining is **not** evidence against E-42.
+
+**The tally, re-derived from the 44 `must` rows and not patched in place:**
+**36** wholly on `main`, **5** `part` (E-12, E-16, E-17, E-37, E-42), **1**
+with none of it (**E-14**), **2** the consumer has released us from (E-49
+waived, E-50 withdrawn, **D248**). 36 + 5 + 1 + 2 = 44. The headline figures
+do not move: 36 of 44 on `main`, 42 of 44 for v1.0.0.
+
+**E-14 is `planned`, not withdrawn, and this is recorded because the mistake
+was made in the brief that ordered this recount.** D248 withdraws **E-50**
+alone and waives E-49; it retires no other row. E-14's cell reads `planned`,
+its note reads *"gated on their replication (M18)"*, and M12 has nothing on
+`main`. **Retiring a must is the consumer's act and nobody else's** (D248,
+D249): no recount may move a row into `withdrawn` without one.
+
+**A false sentence of the orchestrator's is corrected, and the correction says
+whose it was.** `docs/road-to-v1.md` said *"`coalesce` and `dedup_key` are
+parsed, validated and discarded today (ORCH-148), so this is wiring a field
+that already exists on the wire."* The first clause is true. **The second is
+false**: `herd_proto::Asked` carries `needs` and `leaves`, added for M11, and
+neither `coalesce` nor `dedup_key`; `herdctl` has no `--coalesce` flag;
+neither field is anywhere on the wire. It is recorded as the orchestrator's
+own because the sentence was repeated from one of its briefs.
+
+**The clause that the second submission *"says so"* is met by a detached
+submit returning the existing id, and no sentence is owed.** Measured: the hub
+sends `JobAccepted` and *then* a `JobNote` carrying the join sentence, but
+`submit` returns on `JobAccepted` and closes the socket, so the note reaches a
+connection that is gone. The documented wrapper is `id=$(herdctl submit …)`
+then `herdctl wait "$id"` — **the id is the answer.** **The silence is
+deliberately not asserted in a test**: asserting a behaviour nobody chose
+would freeze it, which is why `e42-producer-submit` did not.
+
+**What this does NOT decide.** **Whether the coalesce half is built before
+v1.0.0 is open and Alexa's.** It needs `herd-proto`: a `serde(default)` field
+on `Asked`, which is additive and which **D229** leaves `PROTOCOL_VERSION`
+alone for, **and** a new job-outcome variant that travels inside a frame a
+requester decodes — not literally one of D229's two named unrecoverable forms
+(a new `ToHub` variant, a `FromHub` variant a requester sees) but the same
+hazard for an older `herdctl`. **D75** fixed the shape, `superseded { by }` at
+exit 125, and not the timing.
