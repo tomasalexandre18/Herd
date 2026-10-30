@@ -1,10 +1,23 @@
 # shared-host-and-selectors — handoff 2026-10-30
 
+**Two tasks, one file.** `host-ownership-rule` branches off
+`shared-host-and-selectors` at **`51b47eb`** and discharges ORCH-249 and
+ORCH-250, which this handoff filed; the orchestrator asked for the handoff
+to be **extended rather than doubled**, so the continuation is the last
+section, *Continued — `host-ownership-rule`*, and the sections above it
+are amended only where they had become false (the drafted `D-NEXT`,
+*Decisions needed* 1, and *Resume point*). `templates/handoff.md` says one
+file per task and never append to another task's file; this is a
+deliberate exception on the orchestrator's instruction, named here so it
+is not read as a lapse.
+
 - **Item:** ORCH-246 (corrected), ORCH-235 (amended), and ORCH-247,
-  ORCH-248, ORCH-249, ORCH-250 (filed)
-- **Agent:** herd-step
-- **Branch / commit:** `shared-host-and-selectors` / the commit this file
-  is committed in, based on origin/main **`3f3a07c`**
+  ORCH-248, ORCH-249, ORCH-250 (filed) — then ORCH-249 and ORCH-250
+  discharged by the continuation
+- **Agent:** herd-step, twice
+- **Branch / commit:** `shared-host-and-selectors` / `51b47eb`, based on
+  origin/main **`3f3a07c`**; then `host-ownership-rule` / the commit this
+  file is committed in, based on `shared-host-and-selectors` **`51b47eb`**
 - **Landing:** none — an agent pushes its branch and lands nothing (one
   landing per batch, `docs/orchestration/workflow.md`); `herd-merger`
   names the landing here, and fills the record of `templates/landing.md`
@@ -104,14 +117,17 @@ inventory taken on `detached-end-event`'s base could have named it.
   `herd-hub/src/job.rs:2087`, then `store.rs:2011`, `server.rs:9157`,
   `tests/cost_surface.rs:126`, `tests/unsynced_write_cost.rs:682` and
   `tests/junction_breakdown.rs:197`.
-- **ORCH-249**, `owed`, the orchestrator — why the process-ownership rule
-  is not in `CLAUDE.md`, with its text ready to paste and three payments
-  sized. See *Not done* and *Decisions needed*.
-- **ORCH-250**, `owed`, `herd-step` — the same stale ~8.5 GB figure in
-  `workflow.md:623` and `disk-policy.md:1535`, neither of which this
-  branch's paths allowed it to touch; `disk-policy.md:1536`-`:1537` is
-  stale a second time in the same sentence, still saying *at most two
-  heavy agents* after Alexa lifted that on 2026-10-27.
+- **ORCH-249**, filed `owed` to the orchestrator — why the
+  process-ownership rule is not in `CLAUDE.md`, with its text ready to
+  paste and three payments sized. See *Not done* and *Decisions needed*.
+  **Ruled and discharged by the continuation below; the row is `done` and
+  the rule is in `workflow.md`, not `CLAUDE.md`.**
+- **ORCH-250**, filed `owed` to `herd-step` — the same stale ~8.5 GB
+  figure in `workflow.md:623` and `disk-policy.md:1535`, neither of which
+  this branch's paths allowed it to touch; `disk-policy.md:1536`-`:1537`
+  is stale a second time in the same sentence, still saying *at most two
+  heavy agents* after Alexa lifted that on 2026-10-27. **Both files are
+  corrected by the continuation below and the row is `done`.**
 
 ## Not done, and why
 
@@ -341,26 +357,37 @@ blocked and burning no CPU.
 **Where the rule lives.** `CLAUDE.md` stands at exactly its 150-line
 ceiling (`scripts/check-docs.sh`), a full re-wrap of the file frees one
 line, and that line was spent correcting the per-tree disk figure in the
-same branch. The rule's text — four lines wrapped at 79 columns — and
-the three ways to pay for them are in **ORCH-249**, owner the
-orchestrator. Until that ruling, this entry is where the rule is
-written down.
+same branch. **Ruled 2026-10-30 by the orchestrator (ORCH-249): the rule
+goes to `docs/orchestration/workflow.md` *Concurrency and host rules*,
+which has no ceiling and which `CLAUDE.md:108` already points at for this
+section's exceptions, and the ceiling is not raised** — a limit that
+exists to force this very discipline would be spent to buy the lesson,
+and invariants have been silently compressed to fit it once already
+(ORCH-002, 2026-10-24). `CLAUDE.md:109` is unchanged word for word. That
+section is now where the rule and its detector are written down, and this
+entry is why.
 ```
 
 ## Decisions needed
 
-1. **What pays for the three lines the ownership rule needs in
-   `CLAUDE.md`?** — *Recommendation:* raise the ceiling at
+1. **Answered 2026-10-30 by the orchestrator, in the brief of the branch
+   `host-ownership-rule`: the rule goes to `workflow.md`, the ceiling is
+   not touched, and `CLAUDE.md:109` is not reworded.** Whether one short
+   clause is later added to `CLAUDE.md` is a second ruling and his;
+   `host-ownership-rule` was asked to propose one and proposes none, with
+   its reason in ORCH-249. The question as it was asked, kept for the
+   record: **what pays for the three lines the ownership rule needs in
+   `CLAUDE.md`?** — *Recommendation at the time:* raise the ceiling at
    `scripts/check-docs.sh:23`, once and with the reason recorded, then
    compress three lines of `CLAUDE.md` if the ceiling is to stay: the rule
    binds every agent on every task and belongs in the file they all read,
    and a ceiling is what should move when the contract genuinely grows.
-   *Fallback:* put the rule in `docs/orchestration/workflow.md`'s
-   *Concurrency and host rules*, which has no ceiling and which
-   `CLAUDE.md:108` already points at for this section's exceptions — one
-   hop further from the file every agent reads first. The three payments
-   are sized in **ORCH-249**; this is a method ruling and inside the
-   orchestrator's mandate, not Alexa's.
+   *Fallback, which is what was ruled:* put the rule in
+   `docs/orchestration/workflow.md`'s *Concurrency and host rules*, which
+   has no ceiling and which `CLAUDE.md:108` already points at for this
+   section's exceptions — one hop further from the file every agent reads
+   first. The three payments are sized in **ORCH-249**; this was a method
+   ruling and inside the orchestrator's mandate, not Alexa's.
 2. **Does ORCH-247 go to Alexa's *Waiting*, or stay a planner's row?** —
    *Recommendation:* file it as it stands, `open` and `herd-planner`,
    until the shape is sized, and take it to Alexa only as the one question
@@ -372,18 +399,21 @@ written down.
 
 ## Resume point
 
-The branch is pushed and lands nothing. For whoever continues:
+Both branches are pushed and land nothing. For whoever continues:
 
 ```sh
-git fetch origin && git log --oneline origin/shared-host-and-selectors -6
+git fetch origin && git log --oneline origin/host-ownership-rule -8
 ```
 
-Then, in order of what is cheapest to lose: rule on **ORCH-249** so the
-ownership rule can be written where it binds; brief a step for
-**ORCH-250** (prose only, two files, both already located by line); and
-size **ORCH-247** with M15 in view, since *my own jobs* needs an identity
-this build does not have. **ORCH-248** is ready to brief as it stands and
-owes all four Rust gates, being a crate change.
+Then, in order of what is cheapest to lose — **ORCH-249 and ORCH-250 are
+both `done`, by the continuation below**: size **ORCH-247** with M15 in
+view, since *my own jobs* needs an identity this build does not have, and
+brief **ORCH-248**, which is ready as it stands and owes all four Rust
+gates, being a crate change. One thing is left open by the continuation
+and is the orchestrator's: whether one short clause goes into
+`CLAUDE.md`'s *Shared host rules* pointing at the new `workflow.md`
+section by name. `host-ownership-rule` proposes none and says why; the
+file is still at exactly 150 lines, so the arithmetic has not moved.
 
 ## Processes
 
@@ -396,3 +426,283 @@ owes all four Rust gates, being a crate change.
 - **No `target/` and no `CARGO_TARGET_DIR`.** No `cargo` ran, so none was
   created and there is none to delete; `./scripts/bench-preflight.sh` was
   not run because there was no heavy phase to gate.
+
+## Continued — `host-ownership-rule`, 2026-10-30
+
+- **Item:** ORCH-249 (ruled by the orchestrator, written, `done`) and
+  ORCH-250 (`done`)
+- **Agent:** herd-step
+- **Branch / commit:** `host-ownership-rule` / the commit this file is
+  committed in, based on `shared-host-and-selectors` **`51b47eb`**
+- **Landing:** none. No merge, no tag, no pull request, nothing on `main`.
+
+### Done
+
+**1. ORCH-249 — the process-ownership rule is written, in
+`docs/orchestration/workflow.md` *Concurrency and host rules*, and
+`CLAUDE.md` is untouched.** The orchestrator ruled option (c) of the row
+and ruled it as the choice and not the fallback: the 150-line ceiling at
+`scripts/check-docs.sh:23` is **not raised**, because a limit that exists
+to force exactly the discipline this rule is about would be spent to buy
+the lesson — and this project has already had invariants silently
+compressed to fit that limit once (ORCH-002, invariants 3 and 6,
+2026-10-24, restored afterwards). `workflow.md` has no ceiling and
+`CLAUDE.md:108` already points at it for this section's exceptions, so the
+detail now lives where the detail already lived. Verified after the edits:
+`CLAUDE.md` is **150 lines**, `git diff` against `51b47eb` shows it and
+`scripts/` untouched, and the kill-by-name line at `CLAUDE.md:109` is
+byte-identical.
+
+The rule sits immediately after the existing `pkill -f` bullet and is two
+bullets. The first says ownership, not age, decides what may be
+signalled, and carries the three points with their measurements: uid
+**1002** (`server`) is shared with the consumer's production, whose hub
+runs as uid **1000** and whose runner runs as **986**, so excluding two
+known PIDs proves nothing about a third and `comm` is `herdctl` for their
+production and our fixtures alike; a process's full `args` is read and
+said out loud before anything is signalled, with the incident of
+2026-10-30 — **78** of the consumer's nightly requesters killed under our
+own account, `herdctl wait --outputs-to
+/mnt/ssd_980/chatons/agents/nightly/herd-j<id>`, on a filter of age plus
+two PIDs, one `ps -o args` an hour late — **attributed to the
+orchestrator, not to an agent, and not softened**; and a report that
+declares its own lack of provenance is not provenance, quoting the
+flagging agent's *"worth someone with provenance cleaning up; I had
+none"*.
+
+**2. The detector is in the tree, not in a scratchpad.** The second bullet
+gives `HERD_JOB_MARKER` in `/proc/<pid>/environ` and the six lines of `sh`
+that sweep for it, inline in a fenced block. That is a deliberate
+departure from the brief, which pointed at the working copy under
+`.../scratchpad/find-job-procs.sh`: a session scratchpad path is dead the
+moment the session ends, and a rule whose detector is a dead path is back
+to being advice. The bullet keeps the provenance the path carried — proved
+on three live processes before its silence was trusted, by the agent that
+deployed our own instance, which was one step from reporting a false
+defect and from killing the consumer's `ram-janitor.sh` and its own
+`sleep 120` under our shared uid — and adds the mechanism from the code
+rather than from the brief: the runner builds a job's environment from
+scratch, carrying through only `PATH`, `LANG`, `LC_ALL`, `TZ` and `TERM`
+(`docs/runner-confinement.md:102`-`:109`), and `MARKER_VARIABLE` in
+`herd-runner/src/reclaim.rs:53` is the one variable of its own. Two
+details the brief did not have, both from the tree: the value's prefix
+says **which** — `herd-job-` for a job, `herd-probe-` for a probe reading
+(`reclaim.rs`, `JOB_PREFIX` and `PROBE_PREFIX`) — and the sweep has one
+known limit, that **a process erasing its own environment is not found**
+(`docs/architecture.md:1023`), which is stated in the bullet so a silence
+is never read as a licence.
+
+**3. ORCH-250 — both sibling lines name the build profile before the
+number, and the gap underneath is closed.**
+`docs/orchestration/workflow.md:620`-`:641` and
+`docs/disk-policy.md:1535`-`:1549` now read the way `CLAUDE.md:112`-`:113`
+does: a **`debug` tree carrying test binaries** is **~12–14 GB** (seven
+measured on 2026-10-30, the two in the tree cited by file and line) and a
+`--release` build of the whole workspace at `v0.4.1` is **283 MiB**
+(292,415,975 bytes, one measurement), in the same breath, with the reason
+the ordering matters spelled out: a later reader correcting the debug
+figure *down* to 283 MiB would halve the ceiling on a number that is true
+and answers a different question. Both files **name ~8.5 GB as
+superseded**, with its factor of 1.4 to 1.6, instead of replacing it
+silently, so the next reader to meet the old figure elsewhere knows which
+way the correction ran. `disk-policy.md`'s second staleness is fixed in
+the same paragraph: *at most two heavy agents* now carries Alexa's
+2026-10-27 lifting and its condition, the first consumer stopped, and
+points at the two files that already said so — the ceiling is restated,
+not deleted.
+
+**4. The handoff now records the figure, which is the cheap fix to the
+underlying gap.** `workflow.md` *Handoff and resumption* requires every
+step that built anything to run `du -sh` on its `CARGO_TARGET_DIR` and
+record the figure **with its build profile** in its *Processes* section
+before deleting the tree. Five of the seven measurements behind ORCH-250
+exist only in agent reports and cannot be recovered; one line per future
+handoff and the figure stops being hearsay.
+
+**5. The `perl` escape trap is written down, after being reproduced.** New
+gotcha `docs/orchestration/gotchas/a-perl-escape-recodes-the-whole-file.md`
+with a row in that directory's README. It is in the gotchas list rather
+than in `workflow.md` because it is a tool lesson with a date and a
+verification, which is what that directory is for, and because
+`invariants-are-quoted-not-reflowed.md` is its sibling: that one is about
+text removed on purpose to save columns, this one about columns appearing
+on lines nobody edited. **Reproduced on this host before being written**,
+perl 5.42.0, on a four-line fixture holding `—` and `≤`:
+`perl -i -0777 -pe 's/TARGET/en\x{2013}dash/'` printed
+`Wide character in print`, took the file from 81 bytes to 90, and turned
+`\xe2\x80\x94` into `\xc3\xa2\xc2\x80\xc2\x94` — line 2 went from 23
+columns to 25 and line 3 from 17 to 19, one column per multibyte
+character already on the line, which is exactly the shape of the four
+`CLAUDE.md` lines that jumped from 78–79 to 80–82 on the parent branch.
+The raw-byte form under `LC_ALL=C` left the same fixture byte-identical
+apart from the intended word.
+
+**6. ORCH-249 and ORCH-250 are closed on the board**, both `done`, both
+with the reasons of the ruling in the row so the ceiling is not reopened
+by the next full file, and ORCH-249's owner recorded as the orchestrator
+with the writing attributed to this branch.
+
+### Not done, and why
+
+- **No clause was added to `CLAUDE.md`, and none is proposed.** The brief
+  asked for the exact text and its column count if the step judged one
+  would change whether an agent looks further. It does not: the bullet at
+  `CLAUDE.md:107`-`:108` already sends the reader to `workflow.md`'s
+  *Concurrency* for this section's detail, so the sentence that would do
+  that work is already in the file, and a fourth clause on killing would
+  compete with the pointer rather than add to it. The arithmetic has not
+  moved either — the file is still exactly 150 lines — so the proposal
+  would have had to name its own payment, which is the second ruling and
+  the orchestrator's.
+- **The detector is prose, not a script in `scripts/`.** That is where it
+  belongs to be run rather than copied, but `scripts/` is outside the
+  prose allowlist of `CLAUDE.md`'s *Commands*, so adding a file there
+  would owe all four Rust gates and this task was briefed prose-only with
+  no `cargo`. Filed as a finding below.
+- **`docs/orchestration/templates/handoff.md` was not edited**, although
+  its *Processes* placeholder is what an agent actually copies from and it
+  is where the new `du -sh` clause will be looked for. The brief named
+  `workflow.md`; a finding, not an edit.
+- **The four Rust gates were not run**, prose only. No `cargo`, no
+  `target/`, no `CARGO_TARGET_DIR`, and `./scripts/bench-preflight.sh` was
+  not run because there was no heavy phase to gate.
+
+### Gates
+
+Run before this file was committed, on the tree as it then stood,
+verbatim:
+
+```text
+$ ./scripts/check-docs.sh
+docs ok
+```
+
+The **last run is on the committed tree**, after this file:
+`./scripts/check-docs.sh && ./scripts/check-orchestration.sh`, with
+`TMPDIR` pointed at this task's own scratchpad subdirectory so the 38
+corpus copies stay off the root filesystem (gotcha
+`build-weight-off-root`). Its output goes to
+`<scratchpad>/host-ownership-rule/check-docs-final.txt` and
+`<scratchpad>/host-ownership-rule/check-orchestration-final.txt` and is
+quoted verbatim in the agent's report, not added to the tree, since a
+second commit to carry it would need a third gate run.
+
+**The four Rust gates were NOT RUN locally** — `cargo build`, `test.sh`,
+`clippy`, `fmt`. This change touches only `docs/`, so `CLAUDE.md`'s
+*Commands* covers them by the batch's own `./scripts/gate.sh` at
+integration, which is `herd-merger`'s run and not this step's.
+
+**No skip.** Neither gate prints a `HERD-SKIPPED` line; the skip counters
+live in `scripts/test.sh` and `scripts/report-skips.sh`, which did not
+run.
+
+### Risks and findings
+
+1. **The detector belongs in `scripts/`, as a file.** Inline `sh` in a
+   document is copied by hand, and a hand copy is how
+   `.claude/agents/herd-merger.md` step 10's twin stopped printing
+   anything (`workflow.md`, same section). The fix is one script —
+   `scripts/find-job-procs.sh`, the six lines verbatim — and a pointer
+   from the bullet replacing the fenced block. It needs a task that owes
+   the four Rust gates, because `scripts/` is outside the prose
+   allowlist, which is the whole reason this branch could not do it.
+2. **`templates/handoff.md` does not yet ask for the `du -sh` line.**
+   `workflow.md` *Handoff and resumption* now does, but the template is
+   the thing agents paste. Until both say it, the measurement rests on an
+   agent reading the workflow rather than the template, which is the
+   weaker of the two paths.
+3. **This handoff is two tasks in one file, against
+   `templates/handoff.md`.** On the orchestrator's instruction and named
+   at the top of the file so it is not read as a lapse, but it is a
+   precedent: the next reader looking for `2026-10-30-host-ownership-rule.md`
+   will not find it, and `check-docs.sh` cannot see the difference — it
+   checks only that a handoff's name is dated.
+4. **~8.5 GB may survive somewhere this branch did not look.** The two
+   sibling lines the brief named were verified by line rather than
+   trusted, and a repository-wide `grep -rn "8\.5 GB"` over `*.md` and
+   `*.sh` after the edits returns eight hits and **no fourth copy of the
+   claim**: five in this handoff, where the old figure is quoted as the
+   old figure; `workflow.md:637` and `disk-policy.md:1538`, both
+   describing it as superseded; and `board.md:144`, ORCH-250's own *Item*
+   cell, which states the defect and is kept verbatim so the row still
+   says what was wrong. The claim of absence is a positive reading, not a
+   silence: the same grep before the edits returned `workflow.md:623` and
+   `disk-policy.md:1535` as live assertions, so the detector is known to
+   fire on exactly what it is now silent about.
+5. **One figure in the brief is a single measurement and is labelled as
+   one in both files**: the 283 MiB `--release` build at `v0.4.1`. The
+   `~12–14 GB` band rests on seven, of which only two are in the tree.
+   Both files say which, so neither number can be quoted later with more
+   confidence than it has.
+6. **No contradiction between the brief and the tree was found.** The ten
+   figures and both line numbers the brief gave were checked against the
+   files and all held: `workflow.md:623` and `disk-policy.md:1535` were
+   where the brief said, `CLAUDE.md:112`-`:113` already named the
+   profile, and `CLAUDE.md` was at exactly 150 lines.
+
+### Drafted for `herd-merger`
+
+**No new `docs/decisions.md` entry is drafted, and that is a judgement,
+not an omission.** The incident's entry is already drafted in this file —
+*D-NEXT Ownership, not age, decides what may be signalled*, above — and
+one incident earns one entry. What this branch did was amend that entry's
+last paragraph, *Where the rule lives*, which had said *"until that
+ruling, this entry is where the rule is written down"* and would have
+been false the moment the merger pasted it: the ruling exists and the rule
+is in `workflow.md`. The amendment is in place; the merger pastes the
+whole block as it now stands, allocates the number and keeps the gaps
+(D148, invariant 8), and still judges whether the incident earns an entry
+at all.
+
+**The two board rows are filed on this branch, not drafted.** ORCH-249 and
+ORCH-250 are edited in place in `docs/orchestration/board.md`, both to
+`done`, so there is nothing to paste. Nothing else in the board changed:
+no row was added, no id was reused, and the eight-cell shape and the
+seven-word state vocabulary were checked after the edit.
+
+**`docs/decisions.md` itself is untouched by this branch.** No append, no
+`D` allocated.
+
+### Decisions needed
+
+1. **Does one short clause go into `CLAUDE.md`'s *Shared host rules*
+   pointing at the new `workflow.md` section by name?** — This is the
+   second ruling the orchestrator reserved, and this step proposes no
+   text, so the question is whether he wants one at all. *Recommendation:*
+   **no clause.** `CLAUDE.md:107`-`:108` already points at
+   `workflow.md`'s *Concurrency* for this section's detail, the file is at
+   exactly its 150 lines, and a clause would need a payment whose cheapest
+   form is deleting a rule somebody is held to. *Fallback:* if the pointer
+   is judged too weak, the cheapest honest payment is the one line a full
+   79-column re-wrap of the file frees, which this batch has already
+   spent — so the fallback is really the ceiling, and that is the thing
+   the ruling above declined to touch.
+2. **Who owns `scripts/find-job-procs.sh`?** — *Recommendation:* brief it
+   with the next task that already owes the four Rust gates, as a tail
+   item: the script is the six lines now in `workflow.md`, plus a
+   `check-orchestration` case that proves it fires on a known-bad fixture
+   rather than only returning zero. *Fallback:* leave the fenced block as
+   the single copy and accept that it is copied by hand, which is the
+   failure mode the same section warns about for the merger's step 10.
+
+### Processes
+
+- **No background process was started, and nothing was signalled.** Every
+  command was a foreground child that had exited before the next: `git`,
+  `awk`, `sed`, `grep`, `head`, `tail`, `cat`, `wc`, `od`, `df`, `du`,
+  `tr`, `cp`, `mv`, one `perl` in a disposable fixture directory of this
+  task's own scratchpad, and the two gate scripts. No `kill`, no `pkill`,
+  no `killall`, no kill by name — which is the rule this task was about.
+- **Nothing of the consumer's was touched or inspected**, no job
+  submitted, no container, no service, no `/etc/nixos` (D161). No
+  `HERD_JOB_MARKER` sweep was run on this host: the detector is written
+  down, and this task had no process to attribute.
+- **No `target/` and no `CARGO_TARGET_DIR`.** No `cargo` ran, so there is
+  no build tree to measure or delete, and no `du -sh` figure to record
+  under the clause this task added. `./scripts/bench-preflight.sh` was not
+  run: prose only, no heavy phase.
+- **One worktree, one scratchpad subdirectory**, both this task's own:
+  `.../scratchpad/host-ownership-rule/wt` and
+  `.../scratchpad/host-ownership-rule`. The orchestrator's checkout
+  `/mnt/ssd_980/herd-project` was read and used for `git worktree add` and
+  `git fetch` only, which `workflow.md` names as not a write.
