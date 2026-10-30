@@ -25,6 +25,11 @@
 //!    "which replaces what this hub had for it" for the one that applies, so
 //!    the two sentences together are the chunking measured from the far end
 //!    of a socket rather than from the function that cut it.
+//!    **And the figure in the second sentence is the whole set**, because it
+//!    is read back out of the registry that just applied the frame rather
+//!    than off the frame in hand (ORCH-239): the only sentence an operator
+//!    has about holdings has to carry the number the registry stands at, and
+//!    a chunked announcement is the one shape where the two differ.
 //! 3. **A runner that holds nothing says so.** The empty announcement is the
 //!    frame set's only retraction, and the hub names it in its own words:
 //!    *every holding it had is forgotten*. No announcement at all would leave
@@ -103,19 +108,17 @@ async fn the_real_runner_announces_what_it_holds_and_the_hub_records_every_frame
 
     // The frame that **applies** the announcement, in the hub's own words.
     //
-    // **The hub's figure is the last frame's, not the holdings' — and that is
-    // the hub's line and not a miscount here.** `relay_from_runner` reads
-    // `announcement.packs.len()` off the frame in hand, so a chunked
-    // announcement of 516 is journalled as *holds 4 pack(s)* while the
-    // registry accumulates all 516. Measured here, 2026-10-30: the hub
-    // printed `512 so far and more to come` and then `holds 4 pack(s)`. The
-    // expectation is written against what the hub really says rather than
-    // against what it should say, and the line it should say is a finding in
-    // this task's handoff — fixing it is a `herd-hub/src` change and this
-    // task's write path is `herd-runner/src`.
+    // **The figure is what the registry holds, which is the whole set and not
+    // the last frame's length.** `PLANTED`, not `PLANTED -
+    // PACKS_HELD_PER_FRAME`: the count comes back from
+    // `PackRegistry::announced`, read under the lock that applied the frame,
+    // so a chunked announcement is counted once and in full (ORCH-239).
+    // Asserted here because this sentence is an operator's only observation
+    // of holdings, and because a chunked announcement is the only shape in
+    // which the two figures differ — which is why `PLANTED` is past the
+    // frame window rather than at it.
     let applied = format!(
-        "runner the-real-runner holds {} pack(s), which replaces what this hub had for it",
-        PLANTED - PACKS_HELD_PER_FRAME
+        "runner the-real-runner holds {PLANTED} pack(s), which replaces what this hub had for it"
     );
     herd.wait_until("the hub applies what the runner announced", || {
         herd.said("hub").contains(&applied)
@@ -123,6 +126,8 @@ async fn the_real_runner_announces_what_it_holds_and_the_hub_records_every_frame
     .await;
 
     // And the frame before it, which the hub accumulated and did not apply.
+    // Its figure is the registry's too — what has arrived so far — which for
+    // the first frame of two is the frame's own length.
     let accumulated = format!(
         "runner the-real-runner is announcing its packs, {PACKS_HELD_PER_FRAME} so far and more \
          to come"
