@@ -1,6 +1,8 @@
 # What a release is: three statically linked binaries, the hub's container
 # image as an archive, and a SHA256SUMS covering all four, built on a pushed
-# tag, plus `deploy/release-notice.md` quoted into the release body. The
+# tag, plus this version's own notes — `deploy/release-notes/<version>.md`,
+# written by a person — and `deploy/release-notice.md`, the standing notice,
+# both quoted into the release body (ORCH-162, D132). The
 # first consumer's team deploys on their own machines, so a release has to be
 # something a person can download onto an Arch box or a WSL2 PC and run —
 # which the flake's default packages are not: they are linked against glibc
@@ -482,6 +484,47 @@ jobs:
             echo
           } > body-head.md
 
+          # The release's own notes, written by a person and kept in the
+          # tree: `deploy/release-notes/<version>.md`, the version read off
+          # the workspace above. It is the human half of the page, and it
+          # goes between the half generated here and the standing notice
+          # below — so a reader meets what this release is before the
+          # notice that is true of every release.
+          #
+          # It is a file and not a paste because the paste was tried and
+          # lost: v0.4.0 was published carrying none of the notes written
+          # for it, both operator cautions included, because the step that
+          # supplied them was somebody remembering, and the person briefed
+          # for the tag was not briefed for the paste (ORCH-162). What
+          # makes this a guard rather than a second convention is not here:
+          # `scripts/check-docs.sh` requires the file for the workspace's
+          # version, so a bump that forgets its notes goes red on a branch,
+          # before a tag is pushed.
+          #
+          # Absent means no half, exactly as it does for the dev preamble
+          # above, and the `: >` is what makes that true: a run with no
+          # notes file — a rehearsal, or a tag replayed from a later commit
+          # — publishes without the half instead of failing. The body is
+          # never allowed to cost a tag its binaries (D162, and the three
+          # tags named at the top of this file). The warning is loud in the
+          # run's summary and costs nothing.
+          : > body-notes.md
+          notes="deploy/release-notes/$version.md"
+          if [ -s "$notes" ]; then
+            {
+              cat "$notes"
+              echo
+              echo "---"
+              echo
+            } > body-notes.md
+            echo "release notes: $notes, $(wc -l < "$notes") lines"
+          else
+            echo "::warning title=No release notes::$notes is missing or" \
+                 "empty; this release is being published with no notes of" \
+                 "its own. check-docs.sh requires it on a branch, so this" \
+                 "should be unreachable for a tag cut from main."
+          fi
+
           {
             # The commit this run checked out, and not `$TAG`: the notice
             # quoted below was `cat` out of *this* tree, and a hand-run can
@@ -497,7 +540,7 @@ jobs:
             cat deploy/release-notice.md
           } > body-tail.md
 
-          cat body-dev.md body-head.md body-tail.md > release-body.md
+          cat body-dev.md body-head.md body-notes.md body-tail.md > release-body.md
 
       # `gh` rather than a third-party action: it is on the runner already,
       # and a release is the one step here that cannot be undone quietly.
@@ -651,6 +694,11 @@ jobs:
             echo
           } > body-image.md
 
-          cat body-dev.md body-head.md body-image.md body-tail.md > release-body.md
+          # Every piece again, not just the new one: this `cat` replaces the
+          # body the step above published, so a piece left out here is a
+          # piece the release loses a few minutes after it had it.
+          # `check-docs.sh` asserts that both of these lines carry the notes
+          # between the generated half and the notice.
+          cat body-dev.md body-head.md body-image.md body-notes.md body-tail.md > release-body.md
           gh release edit "$TAG" --notes-file release-body.md
           gh release view "$TAG"

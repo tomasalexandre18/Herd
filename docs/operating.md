@@ -116,11 +116,14 @@ way rather than one of several:
    v0.3.7's, so if your hub is at 0.3.7 then
    `docker compose exec hub herd-hub report` cannot work and this can.
    That is the case the method was invented for.
-5. **It works when a hub would refuse to start at all.** One
-   unparseable `job.json` makes a hub refuse the whole state root and
-   exit before binding its port — see *Two known defects* below.
-   `report` counts what it cannot read and carries on, so it is the only
-   thing that can read such a root.
+5. **It tells you what is in the root before any hub opens it.**
+   `report` **names each record it cannot read, counts it, and goes
+   on**, so a damaged `job.json` is something you read off a command you
+   chose to run rather than something you meet at a restart. On every
+   released version up to and including v0.4.1 it is also the *only*
+   thing that can read such a root at all, because one unparseable
+   `job.json` makes those hubs refuse the whole state root and exit
+   before binding a port — see *Two known defects* below.
 
 If your hub's image is at a version whose binary already carries these
 subcommands, then `docker compose exec hub herd-hub report` also works
@@ -568,9 +571,12 @@ about them.
 
 **There is no migration path anywhere.** A hub at a higher record or
 layout version does not convert an existing state root. There is no
-offline migration tool, no `--migrate`, nothing planned to add one. A
-hub reads only a root whose numbers are exactly its own, and anything
-else is refused by name, from inside recovery, so the hub **does not
+offline migration tool, no `--migrate`, nothing planned to add one. But
+the two numbers are refused in two different ways, and that difference
+is the whole of what you have to plan for.
+
+**A layout number that differs refuses the root.** It is read once, out
+of `store.json`, before the hub binds anything, and the hub **does not
 start** rather than guess:
 
 ```
@@ -578,19 +584,33 @@ the state root /var/lib/herd has layout version 1, and this hub writes
 version 2
 ```
 
+**A record number that differs does not refuse the root — since
+2026-10-29.** It is read per record, and a record carrying a number this
+build does not read takes the same path as a damaged one: it is
+**quarantined**, named with its path, counted, left untouched and kept
+out of the queue, and the hub comes up (D218).
+
 ```
 /var/lib/herd/jobs/j0000001234/job.json has record version 1, and this
 hub reads version 2
 ```
 
-That refusal cuts both ways. **It is the rollback too:** if the numbers
-differ between the release you are on and the release you are moving to,
-then neither the upgrade nor the rollback across them can read your
-state root. Crossing one means starting on a **fresh** root, leaving
-every queued job and every uncollected verdict behind in the old one.
-Compare the two releases' numbers before you move an image in either
-direction; equal numbers mean a move is a `docker load` and nothing
-more.
+So a build whose `RECORD_VERSION` differs from your root's while its
+`LAYOUT_VERSION` matches **starts, and serves an empty queue**: every
+job in the root is quarantined, each one named on the hub's log with its
+path, and the total is on the line that says the hub is listening. That
+is loud, and it is not a refusal — nothing stops the hub and nothing
+stops the deployment. **Do not rely on the hub to stop you here.** Read
+the two releases' numbers yourself.
+
+The layout refusal cuts both ways. **It is the rollback too:** if the
+layout numbers differ between the release you are on and the release you
+are moving to, then neither the upgrade nor the rollback across them can
+read your state root. Crossing **either** number means starting on a
+**fresh** root, leaving every queued job and every uncollected verdict
+behind in the old one. Compare both numbers before you move an image in
+either direction; equal numbers mean a move is a `docker load` and
+nothing more.
 
 ### The instruction, in order
 
@@ -668,34 +688,39 @@ unapproved runner is refused whatever the requester token says.
 
 Both were found on 2026-10-29. Both are defects with mitigations, not
 properties of the design, and both are named here because you are the
-person who will meet them.
+person who will meet them. **Both are fixed on `main` and carried in no
+release**, so each section says what its fix changes and which versions
+are affected. Until a release carries them, the mitigations are what you
+have.
 
-### A torn `job.json` refuses the whole state root
+### A torn `job.json` refuses the whole state root (v0.4.1 and below)
 
-**What happens.** One `job.json` that does not parse — a record torn by
-a crash or a power cut mid-write — makes the hub refuse the **entire**
-state root at startup. The error leaves `main` before `Hub::bind_with`
-is reached, so **the hub exits before binding its port**, and a container
-with `restart: unless-stopped` restarts straight back into the same wall.
-One torn record takes every healthy job with it; the crash-point
-enumeration has a case losing two healthy jobs to one torn third. The
-index cannot route around it: the hub reads every record the index omits
-and sets the index aside on an unreadable one, so recovery reads it again
-and the refusal is unconditional.
+**What happens, on the hub you are running today.** One `job.json` that
+does not parse — a record torn by a crash or a power cut mid-write —
+makes the hub refuse the **entire** state root at startup. The error
+leaves `main` before `Hub::bind_with` is reached, so **the hub exits
+before binding its port**, and a container with `restart:
+unless-stopped` restarts straight back into the same wall. One torn
+record takes every healthy job with it; the crash-point enumeration had
+a case losing two healthy jobs to one torn third. The index cannot route
+around it: the hub reads every record the index omits and sets the index
+aside on an unreadable one, so recovery reads it again and the refusal is
+unconditional.
 
-Verified in the tree this page was written on:
-`herd-hub/src/store.rs` turns an unparseable `job.json` into an error
-while a *rejected label set* three lines on returns a quarantined job
-instead; `recover` propagates it, `open_with` propagates that, and `main`
-propagates that — 76 lines before the port is bound.
+Verified at **v0.4.1**, which is the newest release and the newest build
+that does this: `herd-hub/src/store.rs` turned an unparseable `job.json`
+into an error while a *rejected label set* three lines on returned a
+quarantined job instead; `recover` propagated it, `open_with` propagated
+that, and `main` propagated that — 76 lines before the port is bound.
 
 **Why it is wrong and not merely unfortunate.** Every other degraded
 path in that store degrades loudly and carries on: the readings cache,
 the index, `log.seq`, a torn `events.jsonl` tail, and a record whose
-labels today's rules reject. This is the only place with no degraded
-mode. And **nobody but you can repair it**, because the fix is "delete a
-file inside the consumer's volume" and nobody in this project touches
-your machine.
+labels today's rules reject. It was the only place in that store with no
+degraded mode, which is why it was fixed. And on a released build
+**nobody but you can repair it**, because the repair is "delete a file
+inside the consumer's volume" and nobody in this project touches your
+machine.
 
 **Mitigation, and it is the order of operations above.** `herd-hub
 report` is **not** affected the same way: it pushes an unreadable record
@@ -706,11 +731,48 @@ on this page, and why it matters most on a root you have not opened for
 weeks. If a hub does refuse this way, `report` will name the path, and
 the path is what you remove.
 
-**Status.** A task in this project is fixing it: the unparseable record
-will quarantine, the hub will still bind its port, and the job will not
-be dispatched. One thing will deliberately **not** change — a
-`RECORD_VERSION` mismatch stays a hard error, because damage and a wrong
-binary are different failures and must not be confused.
+One limit on that mitigation, stated because it is a real gap and not a
+quibble: `report` and the hub do not parse a record the same way.
+`report` reads only the two fields it needs and lets serde ignore the
+rest, so a record missing a field the hub requires is counted in
+`records read` by `report` and **quarantined** by the hub. A clean
+`report` is therefore evidence about damaged *bytes*, not a promise that
+every record the hub will open is one it can use.
+
+**What the fix changes.** On `main`, a record the hub cannot read is
+**quarantined** instead of refusing the root: the hub binds its port,
+every healthy job on the root runs, and the damaged record is named with
+its path at every start, counted on the line that says the hub is
+listening, written to `index/state.json`, kept out of the queue, never
+dispatched and **never rewritten** (D218). A requester asking about that
+job is told it is quarantined and why — never "no such job". What still
+refuses a whole state root is a root the hub cannot *enumerate*: `jobs/`
+unlistable, `store.json` unreadable or of a layout version this build
+does not write, the lock unheld.
+
+| Version | A `job.json` it cannot read | The hub binds its port |
+| --- | --- | --- |
+| v0.3.7 and below | refuses the state root | no |
+| v0.4.0 | refuses the state root | no |
+| **v0.4.1** | **refuses the state root** | **no** |
+| `main` after the fix | quarantines that one record | yes |
+
+No version number moves for it: no frame and no record shape changed.
+**It is on `main` and in no release.** Until a release carries it, run
+`report` on the root before you start a hub on it.
+
+**A `RECORD_VERSION` mismatch, because this page promised the
+opposite.** Until 2026-10-29 this section said that a `RECORD_VERSION`
+mismatch would deliberately **stay a hard error**, on the reasoning that
+damage and a wrong binary are different failures. **That is not what was
+built.** On `main` a record carrying a version this build does not read
+takes the same quarantine path as a torn one, per record: the hub starts,
+that record is set aside and named, and the rest of the root is served.
+The reasoning behind the old promise still holds for a whole root a
+different Herd wrote, and `LAYOUT_VERSION` in `store.json` is where it
+now lives — that number still refuses the root outright. The per-record
+arm is what changed, and *When a version refusal names two figures*
+above says what it means for an upgrade.
 
 ### Upgrading a runner to v0.4.0 deletes output spools
 

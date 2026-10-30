@@ -20,6 +20,16 @@ use herd_runner::{
     Backoff, Config, Confinement, DEFAULT_HUB_URL, DRAIN_GRACE, HEALTH_EVERY, HUB_SILENCE_LIMIT,
 };
 
+/// The mesh-address rule (invariant 3, D10, D11): which address a runner may
+/// ever serve content from, and the refusal for every other one.
+///
+/// Declared here and not in the library only because `herd-runner/src/lib.rs`
+/// was held by another task on the night this landed. It belongs in the
+/// library — the fetch endpoint that binds through `mesh::MeshListener` is a
+/// library module — and the move is one line, `pub mod mesh;`, taken by the
+/// step that builds the endpoint.
+mod mesh;
+
 /// A Herd runner: dials the hub, executes jobs under caps, streams their logs.
 ///
 /// Every cap is a number, and every path is a path: there is no policy
@@ -93,18 +103,22 @@ struct Args {
     /// How much declared output one job may have carried into its record:
     /// everything it leaves under `{out}`, with its relative paths.
     ///
-    /// 32 MiB by default, which is also the most this can be — the figure is
-    /// what fits one control frame and decodes inside the cadence a quiet
-    /// link lives by, so the flag only ever lowers it. A higher value is
-    /// refused at startup with both figures rather than producing a frame
-    /// nobody can read.
+    /// 1 GiB by default, and the flag **raises** it as well as lowers it.
+    /// Output too large for one control frame is streamed rather than inlined
+    /// (`herd_proto::INLINE_OUTPUT_MAX`, 32 MiB), so there is no longer a
+    /// frame-shaped ceiling for this figure to be.
+    ///
+    /// What bounds it instead is `--job-disk-budget`: a job writes `{out}`
+    /// inside its workspace, and the workspace stops at that budget first, so
+    /// a cap above it could never bind. Such a cap is **clamped** to the
+    /// budget at startup, with both figures printed, rather than refused — an
+    /// unreachable cap says more than it can do, which is no reason for a
+    /// working runner to stop starting.
     ///
     /// Over the cap **no file comes back** and the job's record says so with
     /// both figures: a cap on an output is not a truncation of it, and a
-    /// cut-down results file that still parses reads like the truth. Output
-    /// of a few hundred megabytes is over this on purpose and belongs on the
-    /// direct runner-to-runner transfer (M11), never relayed through the hub.
-    /// `0` returns a verdict and nothing else.
+    /// cut-down results file that still parses reads like the truth. `0`
+    /// returns a verdict and nothing else.
     #[arg(long, env = "HERD_JOB_OUTPUT_CAP", value_name = "SIZE")]
     job_output_cap: Option<String>,
     /// How much one job's workspace may hold before the runner stops it.
@@ -303,8 +317,12 @@ struct Args {
     /// Where the owner's switch is kept (E-33). Under the data root by
     /// default, as `switch`.
     ///
-    /// A file rather than a socket, because nothing on a runner's machine ever
-    /// listens (invariant 3): `herd-runner switch off --reason ...` writes it
+    /// A file rather than a socket, because a runner takes no instruction
+    /// over the network (invariant 3): with no mesh address configured it
+    /// listens on nothing at all, and the one socket `--mesh-listen` may ever
+    /// open serves a job's artefacts to peers, never commands — which
+    /// addresses that may be is `mesh.rs`'s rule (D10, D11, D222). So
+    /// `herd-runner switch off --reason ...` writes the file
     /// and a running runner reads it on a short clock. That it is a file is
     /// also what makes it work with the hub down — which is when an owner is
     /// most likely to want her machine back — and what makes a position
@@ -315,6 +333,41 @@ struct Args {
     /// default, against E-33's ten seconds.
     #[arg(long, env = "HERD_SWITCH_POLL", value_name = "MS")]
     switch_poll: Option<u64>,
+    /// The one address this runner may serve a job's artefacts from, on the
+    /// private mesh its owner already runs: `10.9.0.3`, `10.9.0.3:9440`,
+    /// `[fd7a:1::3]:9440`. **Absent by default, and absent means this machine
+    /// serves nothing and listens on nothing** — which is a complete runner,
+    /// not a reduced one (D10's outbound-only path).
+    ///
+    /// Judged at startup and **refused by name** when it would break
+    /// invariant 3: a wildcard (`0.0.0.0`, `::`), an address of this host's
+    /// default-route interface, or a globally routable address. Accepted for
+    /// loopback and for a private, carrier-grade-NAT (a tailnet's
+    /// `100.64/10`), link-local or unique-local address that is *not* on the
+    /// default-route interface — the three conditions of D11, refused the way
+    /// a bad data root is (E-45).
+    ///
+    /// A machine with one network card on a flat LAN therefore has no
+    /// permitted address here and is outbound-only. That is the cost of
+    /// *"never behind a port forwarded on someone's box"*, not a defect:
+    /// join it to a mesh and name the address the mesh gave it.
+    ///
+    /// Without a port, the kernel picks one and the advertised endpoint
+    /// carries what it got. The owner's switch still decides whether
+    /// anything is served at all: `off` serves nothing (E-33, D11).
+    #[arg(long, env = "HERD_MESH_LISTEN", value_name = "ADDR")]
+    mesh_listen: Option<String>,
+    /// What peers are told to dial, when it differs from `--mesh-listen` —
+    /// which it does on a mesh that translates addresses. Defaults to the
+    /// listen address.
+    ///
+    /// Carries the same class rule as `--mesh-listen`, so a wildcard or a
+    /// globally routable address is refused: this is the address a peer
+    /// dials, and an address the public internet can reach is not a private
+    /// mesh. No routing check, though — this host's own route table says
+    /// nothing about what a peer can reach.
+    #[arg(long, env = "HERD_MESH_ADVERTISE", value_name = "ADDR")]
+    mesh_advertise: Option<String>,
     #[command(subcommand)]
     command: Option<Command>,
 }
@@ -418,8 +471,13 @@ async fn main() -> Result<()> {
         .unwrap_or_else(|| herd_runner::switch::default_path(&data_root));
     // `herd-runner switch off --reason ...`: writes the file and leaves. This
     // is E-33's "settable by the owner from her machine" — one command, which
-    // is what a desktop shortcut can be (M17), and nothing listens on this
-    // machine for it to talk to (invariant 3).
+    // is what a desktop shortcut can be (M17), and nothing on this machine
+    // listens for it to talk to: with no mesh address configured a runner
+    // listens on nothing at all, and the one socket `--mesh-listen` permits
+    // serves a job's artefacts to peers rather than taking an instruction.
+    // `mesh.rs` holds the rule for which addresses may ever be served from,
+    // and this version holds that rule and no endpoint (invariant 3, D10,
+    // D11, D222).
     if let Some(Command::Switch { position, reason }) = &args.command {
         let switch = herd_proto::Switch::parse(position, reason.as_deref())
             .map_err(anyhow::Error::msg)
@@ -471,8 +529,16 @@ async fn main() -> Result<()> {
             .context("--job-output-cap")?,
         None => DEFAULT_OUTPUT_CAP,
     };
-    // A cap past what a frame can carry is refused by `Confined::prepare`
-    // with every other unusable figure, so there is nothing to check here.
+    // Nothing is checked here, and there is no frame-shaped ceiling left for
+    // this figure to be past: output too large for one control frame is
+    // streamed rather than inlined, so `herd_proto::INLINE_OUTPUT_MAX`
+    // (32 MiB) is the threshold between the two carriages and not a cap
+    // (D148). What bounds the figure is `--job-disk-budget`, and a cap above
+    // that budget is **clamped** to it by `Confined::prepare`, with both
+    // figures printed, rather than refused — an unreachable cap says more
+    // than it can do, which is no reason a working runner should stop
+    // starting (D89's precedent). The help text on `--job-output-cap` above
+    // says the same.
     confinement.disk_budget = match args.job_disk_budget {
         Some(size) => parse_bytes(&size)
             .map_err(anyhow::Error::msg)
@@ -522,6 +588,49 @@ async fn main() -> Result<()> {
     .resolve()
     .map_err(anyhow::Error::msg)
     .context("this runner's capabilities")?;
+
+    // Where this machine may serve a job's artefacts from, if anywhere
+    // (invariant 3, D10, D11). Judged **here**, before the dial and before
+    // anything is announced, because D11 asks for a configuration that would
+    // bind a public or default interface to be refused at startup the way a
+    // bad data root is — not corrected, not narrowed, and never discovered by
+    // a peer finding a port where there should be none.
+    //
+    // Nothing is bound: this version holds the rule and no endpoint. The one
+    // socket type a runner may ever hold is `mesh::MeshListener`, named in
+    // that module and nowhere else in the crate, and the step that binds it
+    // comes next.
+    //
+    // The accepted address is printed and not yet carried into `Config`:
+    // that type is in `herd-runner/src/lib.rs`, which another task held on
+    // the night this landed, and the endpoint step is where a runner starts
+    // needing it. So what this version promises is the refusal, which is the
+    // part that cannot be added after a port is open.
+    match (&args.mesh_listen, &args.mesh_advertise) {
+        (Some(listen), advertise) => {
+            let mesh =
+                mesh::Mesh::resolve(listen, advertise.as_deref(), &mesh::HostRouting::read())
+                    .map_err(|refused| anyhow::anyhow!("{refused}"))?;
+            println!("herd-runner: {}", mesh.said());
+        }
+        (None, Some(advertise)) => anyhow::bail!(
+            "{} {advertise} was given with no {}: an address peers are told to dial, with \
+             nothing listening on it, is a promise this runner cannot keep. Name the address \
+             to serve from, or leave both out and this machine is outbound-only (D10)",
+            mesh::ADVERTISE_FLAG,
+            mesh::LISTEN_FLAG
+        ),
+        (None, None) => {
+            // Said out loud, because "this machine serves nothing" is a fact
+            // an operator reading the startup report should not have to infer
+            // from a line that is not there.
+            println!(
+                "herd-runner: no mesh address, so this runner is outbound-only: it serves \
+                 nothing to a peer and listens on nothing ({} sets one)",
+                mesh::LISTEN_FLAG
+            );
+        }
+    }
 
     // How big this host is. Read from the host, then overridden by whatever
     // its owner said — one figure at a time, so an owner who declares the

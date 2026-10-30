@@ -13,7 +13,7 @@ whereas a pull-request body can be edited silently. That is why the merge
 commit, and not a new journal file under `docs/`, is where the evidence
 lives.
 
-The record is written twice, identically, in the same push:
+The record is written twice, in the same push:
 
 - as the **merge commit message** (`git merge --no-ff -F <file>`), which
   is the record itself;
@@ -24,6 +24,42 @@ The record is written twice, identically, in the same push:
   because a commit message is not in the tree a gate can read.
 
 A reader who was not there then needs one `git show` and one file.
+
+### The two copies are not identical, and must not be asked to be
+
+**The merge message is a strict superset of the committed copy. Nothing
+in the committed copy may contradict it.** That is the rule (Alexa,
+2026-10-29), and this section exists so that no future landing re-derives
+it from scratch; batch 8's merger reached the same answer unaided and
+said so in its record.
+
+It follows from ORCH-121, which makes the merger's handoff **the last
+change before the gate**. The handoff is therefore inside the tree the
+gate runs on, and is committed before the gate has run and before the
+merge commit exists. So the committed copy cannot carry anything that
+only exists afterwards:
+
+| Only in the merge message | Why it cannot be in the committed copy |
+|---|---|
+| the gated sha as 40 hex | that sha is the commit that **adds the handoff**; writing it inside the handoff changes the content being hashed. Name it instead as "`<sha of the commit before>` plus this handoff commit, which is the merge's second parent": exact, self-resolving, and it satisfies `check-docs.sh`, which wants a hex string on the **Gate:** line |
+| the gate's verbatim verdict line (`gate: GREEN sha=… steps=…`) | the gate had not run |
+| the receipt path under `target/herd-gate/<sha>.receipt` | named for that same sha, and per worktree, never copied into the tree |
+| the skip-list sha256 and the resolved `load-excused-skips` figure | computed by the run that had not happened |
+| the `ci.yml` run id, when the push starts it | the push had not happened; the committed copy says "none yet -- this push starts it" and the next landing's board edit records it |
+
+The committed copy carries everything else in full: the seven sections,
+the batch and its branches, the skip **names** and the reasoning. Where a
+field can only be resolved later, it says what will resolve it and where
+that resolution lives — the merger's report and the merge message — and
+never leaves a placeholder. A reader who has only the handoff must be
+able to tell which fields are deferred and that they were deferred on
+purpose.
+
+What is still forbidden: a committed copy that **states something the
+merge message contradicts**. A different verdict, a different skip count,
+a different batch, a different list of branches, a gate described as
+green that the message reports red. The superset is a licence to be
+shorter, never a licence to differ.
 
 Seven sections: the six of the pull-request template this replaces,
 adapted to a landing, plus *CI run*, which a pull request did not need
@@ -72,6 +108,11 @@ Every skip is named and shown as a skip, never counted into a pass (D27,
 invariant 5). A count is not a signal, the list is: paste the
 `HERD-SKIPPED:` lines, or the diff against `scripts/expected-skips/`,
 and say "no skip" when there is none.
+
+The resolved sha, the verbatim verdict line, the receipt path and the
+skip-list hash belong here **in the merge message**, and in the committed
+copy are named as deferred, for the reason *The two copies are not
+identical* gives above.
 
 ## Left out
 
