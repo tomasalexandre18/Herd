@@ -624,8 +624,15 @@ mod tests {
             hub: HubNow {
                 version: "0.3.7".to_owned(),
                 state_root_id: "root-abc".to_owned(),
-                protocol_version: 2,
-                record_version: 1,
+                // The numbers this build actually speaks, not the numbers it
+                // spoke when the fixture was written. Written as literals,
+                // `protocol_version: 2` described a hub that cannot exist
+                // the moment D199 moved the constant to 3 — a fixture whose
+                // own subject is "what this hub is" has to be built from the
+                // constants, which is the relative shape the rest of this
+                // module's version fixtures already use.
+                protocol_version: herd_proto::PROTOCOL_VERSION,
+                record_version: crate::job::RECORD_VERSION,
                 health_every_ms: 15_000,
                 lost_after_ms: 60_000,
                 output_budget_bytes: 200_000_000_000,
