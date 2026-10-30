@@ -47,6 +47,20 @@ What is technically enforced and what is only written is in
    are the delivery. An agent sets no git hook of its own:
    `core.hooksPath` is **one repository-wide setting**, not a
    per-worktree one, and it is *Concurrency and host rules*' business.
+
+   **Anything the merger must act on is in the handoff, in full.** A
+   drafted `docs/decisions.md` entry — headed `D-NEXT`, because step 7
+   allocates the number — and a drafted `board.md` row are written out
+   verbatim in the handoff's *Drafted for `herd-merger`* section, never
+   as a pointer to the agent's report and never as a summary. **The
+   merger reads the tree and nothing else**: an agent's hand-back report
+   goes to the orchestrator and the orchestrator's conversation is not
+   an artefact, so a draft that lives only there does not reach step 7.
+   Measured 2026-10-29: `spool-offer-fix` deferred its entry to *"the
+   agent's report"* and D221 had to be composed from that handoff's
+   *Done* section, which `history/2026-10-29-merge-batch-10.md` records
+   as not the author's wording. It was faithful; the method had not made
+   it so.
 5. **Verify.** The orchestrator reads the diff, the gate output and the
    handoff. It reruns a read-only check when a claim matters. It never
    fixes what it finds; it sends it back or opens a new task.

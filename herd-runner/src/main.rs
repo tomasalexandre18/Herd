@@ -317,8 +317,12 @@ struct Args {
     /// Where the owner's switch is kept (E-33). Under the data root by
     /// default, as `switch`.
     ///
-    /// A file rather than a socket, because nothing on a runner's machine ever
-    /// listens (invariant 3): `herd-runner switch off --reason ...` writes it
+    /// A file rather than a socket, because a runner takes no instruction
+    /// over the network (invariant 3): with no mesh address configured it
+    /// listens on nothing at all, and the one socket `--mesh-listen` may ever
+    /// open serves a job's artefacts to peers, never commands — which
+    /// addresses that may be is `mesh.rs`'s rule (D10, D11, D222). So
+    /// `herd-runner switch off --reason ...` writes the file
     /// and a running runner reads it on a short clock. That it is a file is
     /// also what makes it work with the hub down — which is when an owner is
     /// most likely to want her machine back — and what makes a position
@@ -467,8 +471,13 @@ async fn main() -> Result<()> {
         .unwrap_or_else(|| herd_runner::switch::default_path(&data_root));
     // `herd-runner switch off --reason ...`: writes the file and leaves. This
     // is E-33's "settable by the owner from her machine" — one command, which
-    // is what a desktop shortcut can be (M17), and nothing listens on this
-    // machine for it to talk to (invariant 3).
+    // is what a desktop shortcut can be (M17), and nothing on this machine
+    // listens for it to talk to: with no mesh address configured a runner
+    // listens on nothing at all, and the one socket `--mesh-listen` permits
+    // serves a job's artefacts to peers rather than taking an instruction.
+    // `mesh.rs` holds the rule for which addresses may ever be served from,
+    // and this version holds that rule and no endpoint (invariant 3, D10,
+    // D11, D222).
     if let Some(Command::Switch { position, reason }) = &args.command {
         let switch = herd_proto::Switch::parse(position, reason.as_deref())
             .map_err(anyhow::Error::msg)
@@ -520,8 +529,16 @@ async fn main() -> Result<()> {
             .context("--job-output-cap")?,
         None => DEFAULT_OUTPUT_CAP,
     };
-    // A cap past what a frame can carry is refused by `Confined::prepare`
-    // with every other unusable figure, so there is nothing to check here.
+    // Nothing is checked here, and there is no frame-shaped ceiling left for
+    // this figure to be past: output too large for one control frame is
+    // streamed rather than inlined, so `herd_proto::INLINE_OUTPUT_MAX`
+    // (32 MiB) is the threshold between the two carriages and not a cap
+    // (D148). What bounds the figure is `--job-disk-budget`, and a cap above
+    // that budget is **clamped** to it by `Confined::prepare`, with both
+    // figures printed, rather than refused — an unreachable cap says more
+    // than it can do, which is no reason a working runner should stop
+    // starting (D89's precedent). The help text on `--job-output-cap` above
+    // says the same.
     confinement.disk_budget = match args.job_disk_budget {
         Some(size) => parse_bytes(&size)
             .map_err(anyhow::Error::msg)
