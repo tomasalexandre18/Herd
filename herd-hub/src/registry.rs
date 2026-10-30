@@ -60,6 +60,40 @@
 //! and a hub that has just restarted offers no holder that is no longer there.
 //! The registry survives a restart; the holdings deliberately do not.
 //!
+//! ### None of that is reachable from the network in this build
+//!
+//! The paragraph above is the design (D231 decision 5). What a running hub
+//! does is **neither half of it**, and the gap is two mechanisms wide, not
+//! one. Measured 2026-10-30 over `herd-hub/src/`, `herd-runner/src/` and
+//! `herdctl/src/`, with the search proven on a frame that *is* dispatched:
+//!
+//! * **Nothing announces.** No `herd_proto::ToHub::PacksHeld` is constructed
+//!   anywhere outside `herd-proto`'s own round-trip test, and the hub's
+//!   connection loop has no arm for it: a runner that sent one would be
+//!   answered `FromHub::Refused { "a runner may not send packs_held" }` and
+//!   its link closed. `FromHub::ReadPacksAgain` is constructed nowhere
+//!   either, so nothing asks for the announcement after a restart. So
+//!   [`PackRegistry::announced`] has no caller but this module's tests, and
+//!   the holdings map is empty in every running hub.
+//! * **Nothing forgets.** [`PackRegistry::runner_gone`] and
+//!   [`PackRegistry::forget_all_holdings`] have no caller either, and the two
+//!   places that know a runner is gone — `State::release_runner` and the
+//!   watchdog's link pass, both in `server.rs` — cannot reach this registry
+//!   at all: the server holds an `Arc<dyn JobStore>`, and `packs()` is on the
+//!   concrete `JobDirStore` rather than on that trait.
+//!
+//! The two absences hide each other: no stale holder has ever been observed
+//! because no holder is ever recorded. So "re-announced after `Welcome`" is a
+//! design and not yet a behaviour, and the two methods above are a promise
+//! rather than a mechanism — which an audit said once already, and which the
+//! merger of batch 12 measured again.
+//!
+//! Wiring it is one step and it needs both halves plus a seam: the frame
+//! dispatch (`store::JobDirStore::packs`'s own note says that step owns
+//! `server.rs`), a runner that announces after `Welcome`, and one method on
+//! `JobStore` for the server to reach a registry through. Written down here
+//! rather than left to be rediscovered a third time.
+//!
 //! [`herd_proto::pack::PackState::Incomplete`] is therefore **not the hub's to
 //! compute**, and [`PackRegistry::state_of`] never returns it: holdings are per
 //! manifest, so "some object of this pack is held nowhere" is a statement about
@@ -771,12 +805,25 @@ impl PackRegistry {
     ///
     /// The volatile half of the design: a holder that is not connected is not
     /// a holder, and the registry itself is untouched.
+    ///
+    /// **No caller outside this module's tests, and not for want of a call
+    /// site.** The two paths that know a runner is gone are in `server.rs`
+    /// and cannot reach this registry: see *None of that is reachable from
+    /// the network in this build* in the module's own documentation, which
+    /// names what the wiring needs. Until then this is a method and not a
+    /// behaviour, and the holdings it would clear are never filled.
     pub fn runner_gone(&self, runner: &str) {
         self.locked().holdings.remove(runner);
     }
 
     /// Forget every holding, because this hub is starting again or has asked
     /// the fleet to re-announce (`FromHub::ReadPacksAgain`).
+    ///
+    /// **No caller outside this module's tests**, and nothing constructs that
+    /// frame: the module note explains both. A fresh `PackRegistry` starts
+    /// with an empty holdings map anyway, so the restart case this exists for
+    /// is covered by `open` and this method is for the ask, which nobody
+    /// makes yet.
     pub fn forget_all_holdings(&self) {
         self.locked().holdings.clear();
     }
@@ -845,11 +892,24 @@ fn two_ids(commit: &str, key: &str, both: &BTreeSet<PackId>) -> String {
 
 /// Whether a directory name could be a pack id at all: 64 lowercase hex
 /// digits, which is what a sha256 is.
+///
+/// **Delegated, not written again.** The shape is
+/// [`herd_proto::pack::check_object_digest`]'s, which `herd-proto` exposes
+/// `pub` so the readers of a sha256-shaped name can share one rule. A pack id
+/// and an object digest are different *subjects* — this one names
+/// `packs/manifests/<id>/`, that one names `objects/<sha256>` — but they are
+/// the same sixty-four characters joined onto a path, and keeping a second
+/// copy of the rule here is how two copies come to disagree. That is not
+/// hypothetical: the runner's pack store held its own copy of it until
+/// 2026-10-30, the wordings drifted, and the merge of two branches that were
+/// green alone was red on a test asserting one of them.
+///
+/// The refusal's sentence is deliberately discarded. This is a **filter** over
+/// a directory somebody else may own — the caller says so in the journal and
+/// deletes nothing — and not a refusal addressed to an operator, so what is
+/// wanted is the predicate and not the words.
 fn looks_like_an_id(name: &str) -> bool {
-    name.len() == 64
-        && name
-            .bytes()
-            .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+    herd_proto::pack::check_object_digest(name).is_ok()
 }
 
 fn read_optional(path: &Path) -> Result<Option<String>> {
@@ -1117,6 +1177,56 @@ mod tests {
         let outcome = again.register(a_registration(at())).expect("registered");
         assert_eq!(outcome, Registered::Fresh(pack.clone()));
         assert!(again.manifest_bytes(&pack).expect("read").is_some());
+    }
+
+    /// A directory under `packs/manifests/` whose name is not a pack id is
+    /// **ignored and kept**, and "is not a pack id" is the shared
+    /// sha256-shaped-name rule (`looks_like_an_id`, delegating to
+    /// `herd_proto::pack::check_object_digest`) rather than a copy of it.
+    ///
+    /// The three alien names are the three ways that rule can be broken, and
+    /// the three the delegation has to keep refusing: not hex at all, the
+    /// right shape in the wrong case, and one character short. There was no
+    /// test over this filter before the delegation, so this is the detector
+    /// the fold needed; the real pack beside them is the control, without
+    /// which the assertions would also pass on a registry that reads nothing
+    /// at all.
+    #[test]
+    fn a_directory_under_the_manifests_that_is_not_an_id_is_ignored_and_kept() {
+        let (dir, registry) = registry();
+        let pack = match registry.register(a_registration(at())).expect("registered") {
+            Registered::Fresh(pack) => pack,
+            other => panic!("{other:?}"),
+        };
+        let manifests = dir.path().join(PACKS_DIR).join(MANIFESTS_DIR);
+        let aliens = [
+            "not-a-pack".to_owned(),
+            pack.as_str().to_uppercase(),
+            pack.as_str()[1..].to_owned(),
+        ];
+        for name in &aliens {
+            fs::create_dir_all(manifests.join(name)).expect("an alien directory");
+        }
+
+        drop(registry);
+        let again = PackRegistry::open(dir.path()).expect("the registry opens");
+        assert_eq!(
+            again.pack_for("c0ffee", "pack").expect("no conflict"),
+            Some(pack.clone()),
+            "the one real pack is still read"
+        );
+        assert_eq!(again.entries().len(), 1, "and nothing else became a pack");
+        assert!(
+            again.quarantined().is_empty(),
+            "nor a quarantined one: a name that is not an id is not this hub's pack at all"
+        );
+        for name in &aliens {
+            assert!(
+                manifests.join(name).exists(),
+                "and {name} is left where it is, because that directory belongs to whoever \
+                 put it here"
+            );
+        }
     }
 
     #[test]

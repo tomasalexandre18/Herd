@@ -733,4 +733,150 @@ mod tests {
             "a bare figure carries no unit and must refuse"
         );
     }
+
+    /// Every figure `herd-hub --help` states in prose, read back **through
+    /// the constant that decides it**.
+    ///
+    /// The companion of `herd-runner`'s and `herdctl`'s tests of the same
+    /// name, and the reason all three exist is one measured defect: three
+    /// shipped releases described `--job-output-cap` as *"32 MiB by default,
+    /// which is also the most this can be"* against a constant of 1 GiB, and
+    /// the only thing that caught it was a person reading. Every figure here
+    /// is interpolated from its constant rather than typed again, because a
+    /// test carrying its own copy of the number is a fourth place for the
+    /// number to be wrong.
+    ///
+    /// Whitespace is flattened first: clap wraps to a width this test has no
+    /// business knowing, and a sentence that straddles a line break is still
+    /// that sentence.
+    ///
+    /// **The one figure in this binary's help that cannot be checked from
+    /// here**, and it is a finding rather than an omission:
+    /// `--still-there-every` explains itself by saying `herdctl` *"reports as
+    /// exit 125 on a job that succeeded"*. 125 is `herdctl::NO_VERDICT_CODE`,
+    /// and `herd-hub` does not depend on `herdctl` — so that figure is
+    /// asserted in `herdctl`'s own test, against its own constant, and the
+    /// copy of it in this help has no gate reachable from where it is
+    /// written.
+    #[test]
+    fn the_long_help_states_every_figure_its_constants_decide() {
+        let help = flattened_long_help();
+
+        // The claim `--still-there-every` makes about itself, asserted
+        // against the two constants rather than against the sentence: "the
+        // same number as `--health-every` on purpose".
+        assert_eq!(
+            STILL_THERE_EVERY, HEALTH_EVERY,
+            "`--still-there-every`'s help says it is the same number as `--health-every` \
+             on purpose; if they ever diverge, that sentence is what has to change"
+        );
+        for (span, unit) in [
+            (DRAIN_FIRST_LIMIT, 60),
+            (READING_CAP, 60),
+            (OUTPUT_FLOOR, 24 * 60 * 60),
+        ] {
+            assert_eq!(
+                span.as_secs() % unit,
+                0,
+                "the help spells this span in whole {unit}-second units and {span:?} is no \
+                 longer a whole number of them: the sentence needs reading, not this test"
+            );
+        }
+
+        for (figure, flag) in [
+            (
+                format!("at least every {} s", WAIT_RESTATEMENT.as_secs()),
+                "--wait-restatement's default, which E-04 asks for",
+            ),
+            (
+                format!(
+                    "{} seconds, the same number as",
+                    a_number_in_words(STILL_THERE_EVERY.as_secs())
+                ),
+                "--still-there-every's cadence",
+            ),
+            (
+                format!(
+                    "{} minutes, the figure E-27 names",
+                    a_number_in_words(DRAIN_FIRST_LIMIT.as_secs() / 60)
+                ),
+                "--drain-first-limit's default",
+            ),
+            (
+                format!(
+                    "{} minutes by default",
+                    a_number_in_words(READING_CAP.as_secs() / 60)
+                ),
+                "--reading-cap's default",
+            ),
+            (
+                format!("{} by default", a_number_in_words(READINGS_AT_ONCE.into())),
+                "--readings-at-once' default",
+            ),
+            (
+                format!("Nothing computed {}", herd_proto::show_bytes(OUTPUT_BUDGET)),
+                "--output-budget's chosen figure",
+            ),
+            (
+                format!(
+                    "{} days",
+                    a_number_in_words(OUTPUT_FLOOR.as_secs() / (24 * 60 * 60))
+                ),
+                "--output-floor's promise",
+            ),
+        ] {
+            assert!(
+                help.to_lowercase().contains(&figure.to_lowercase()),
+                "`herd-hub --help` must state {flag} as its constant decides it, and the \
+                 rendered help does not contain {figure:?}.\n\
+                 \n\
+                 **The constant is the authority and the help text is what is wrong.** Do \
+                 not change the constant to match the sentence, and do not change this \
+                 test: fix the doc comment on the flag.\n\
+                 \n\
+                 --- the rendered long help, with its whitespace flattened:\n{help}"
+            );
+        }
+    }
+
+    /// The long help, rendered from the real `Args` and flattened to one
+    /// line, because clap's wrap width is not this test's business.
+    fn flattened_long_help() -> String {
+        use clap::CommandFactory;
+        Args::command()
+            .render_long_help()
+            .to_string()
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ")
+    }
+
+    /// A small number as `--help` spells it, derived from the constant rather
+    /// than typed beside it.
+    ///
+    /// The panic is the useful half: a number nobody has a word for here is
+    /// one somebody has just changed, and the sentence that spells it out
+    /// needs reading before this test can be made to pass.
+    fn a_number_in_words(n: u64) -> String {
+        match n {
+            1 => "one".to_owned(),
+            2 => "two".to_owned(),
+            3 => "three".to_owned(),
+            4 => "four".to_owned(),
+            5 => "five".to_owned(),
+            6 => "six".to_owned(),
+            7 => "seven".to_owned(),
+            8 => "eight".to_owned(),
+            9 => "nine".to_owned(),
+            10 => "ten".to_owned(),
+            15 => "fifteen".to_owned(),
+            30 => "thirty".to_owned(),
+            60 => "sixty".to_owned(),
+            _ => panic!(
+                "`--help` spells this figure out in words and this test has no word for \
+                 {n}. Somebody has changed the constant: read the sentence that spells it, \
+                 then either add the word here or write the figure in the help"
+            ),
+        }
+    }
 }

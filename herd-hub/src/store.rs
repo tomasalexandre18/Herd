@@ -6761,6 +6761,143 @@ mod tests {
         );
     }
 
+    /// **The startup pair, which is D211's own shape on the hub.**
+    ///
+    /// `JobDirStore::open_with` recovers its records and then sweeps its
+    /// outputs **three lines apart** — `store.recover(ids_minted)?` and
+    /// `JobStore::sweep_outputs(&store)?`. An eviction by that sweep sets
+    /// `outputs.removed`, which makes [`JobStore::collection_owed`] answer
+    /// `None`, which makes every runner still holding that spool read a
+    /// genuine silence and condemn its only copy as `.unclaimed`. A startup
+    /// sweep that evicted a collection the owed scan exists to finish would
+    /// therefore be D211 exactly, on the hub: a green job whose files never
+    /// came, agreed on both sides at once.
+    ///
+    /// **What this adds to the test above it.**
+    /// [`a_collection_still_arriving_is_never_swept`] asserts the same rule
+    /// through `sweep_outputs()` on a store that is already open, which is
+    /// the ordinary mid-life path. Every other test of the sweeper does the
+    /// same. This one asserts it through the **real entry point**, on a root
+    /// that already holds the part-written collection before the hub starts —
+    /// so a future start that swept before it recovered, or that recovered
+    /// into a different judgement of what is whole, is caught here rather
+    /// than on a consumer's volume.
+    ///
+    /// **And the consequence is asserted by name, not only the bytes.** That
+    /// the collection is still *owed* after the start is the fact the
+    /// runner's spool depends on; the bytes being there is necessary and is
+    /// not sufficient, because a record marked `removed` with its bytes
+    /// intact would still silence the owed scan.
+    ///
+    /// Two clauses stand between this and the defect, and this test is
+    /// written to feel either going: the candidate filter in `sweep_now`
+    /// (`record.outputs.removed.is_some() || !self.collection_is_whole(…)`),
+    /// which is why `could_not_free` is asserted as well, and the
+    /// independent guard inside [`JobDirStore::evict`], which is what the
+    /// byte and `removed` assertions bite on.
+    #[test]
+    fn a_start_never_sweeps_a_collection_it_is_still_waiting_for() {
+        let dir = tempfile::tempdir().expect("a temporary directory");
+        // The hub that ran the job, with room to spare, so nothing here is
+        // about the budget yet.
+        let roomy = crate::job::Budget {
+            bytes: 1 << 20,
+            floor: std::time::Duration::ZERO,
+        };
+        let files: &[(&str, &[u8])] = &[
+            ("files/here.json", b"complete"),
+            ("files/coming.bin", &[b'y'; 2048]),
+        ];
+        let id = {
+            let store = JobDirStore::open_with(dir.path(), roomy).expect("the state root opens");
+            let job = a_job(&store);
+            store
+                .record_outputs(&job.id, &announced(files))
+                .expect("the manifest lands");
+            store
+                .record_state(
+                    &job.id,
+                    JobState::Finished {
+                        outcome: JobOutcome::Exited { code: 0 },
+                    },
+                )
+                .expect("finished");
+            // One of the two files arrives. The other is what the hub is
+            // still owed, and what a runner somewhere still has the only
+            // copy of.
+            store
+                .write_output_chunk(&job.id, "files/here.json", 0, b"complete")
+                .expect("written");
+            assert_eq!(
+                store
+                    .collections_owed()
+                    .expect("reads")
+                    .iter()
+                    .map(|owed| owed.job_id.clone())
+                    .collect::<Vec<_>>(),
+                vec![job.id.clone()],
+                "the premise: this hub is owed the rest of this collection"
+            );
+            job.id
+            // And the store is dropped, which releases the one lock a state
+            // root has (D21) so that it can be opened again below.
+        };
+
+        // The hub comes back on a budget below what the half-arrived
+        // collection already holds, which is the state an operator produces
+        // by lowering the figure, or a disk produces by filling while the hub
+        // was down. `open_with` sweeps once before it answers, so the
+        // eviction this test is about would have happened by the time the
+        // next line runs.
+        let tight = crate::job::Budget {
+            bytes: 4,
+            floor: std::time::Duration::ZERO,
+        };
+        let store = JobDirStore::open_with(dir.path(), tight).expect("the state root reopens");
+
+        assert!(
+            bytes_are_there_at(&dir, &id, "files/here.json"),
+            "a start must not take the bytes of a collection it is in the middle of being \
+             given: those bytes are the writer's, and the runner that holds the rest has \
+             no way to be told they went"
+        );
+        let record = store
+            .job(&id)
+            .expect("the record reads")
+            .expect("the record is there");
+        assert!(
+            record.outputs.removed.is_none(),
+            "and nothing marked it removed, which is the half that matters even when the \
+             bytes survive: a record marked removed silences the owed scan whatever is on \
+             the disk: {:?}",
+            record.outputs.removed
+        );
+        assert_eq!(
+            store
+                .collections_owed()
+                .expect("reads")
+                .iter()
+                .map(|owed| owed.job_id.clone())
+                .collect::<Vec<_>>(),
+            vec![id.clone()],
+            "so after the start this hub is still owed exactly what it was owed before it \
+             — the one fact the runner's spool depends on, and the one a startup eviction \
+             would have taken away in silence"
+        );
+        // The accounting, which is the other thing the candidate filter is
+        // responsible for: an operator looking at a volume that will not come
+        // down has to be able to see why it will not.
+        let swept = store.sweep_outputs().expect("sweeps");
+        assert!(
+            swept.is_quiet(),
+            "there was nothing for the start to take and nothing left now: {swept:?}"
+        );
+        assert_eq!(
+            swept.could_not_free, 8,
+            "and the bytes it could not free are reported rather than hidden: {swept:?}"
+        );
+    }
+
     /// Bytes that arrive again after an eviction are **re-admitted to the
     /// budget**, and the sweeper may take them a second time.
     ///

@@ -12531,3 +12531,127 @@ root opens, exactly as they decided.
 members, no numeral); **D218**, **D219**, **D239**; ORCH-C as drafted in
 `history/2026-10-30-docs-pack-figures.md` *Drafted `board.md` rows*;
 `history/2026-10-30-merge-batch-12.md`.
+
+## 2026-10-30 — D245 A figure in `--help` is read back through its own constant
+
+**Context.** `--help` is the first operator surface anybody reads and it
+was the only one in the repository with no gate of any kind. `herd-proto`
+has `frozen_formats.rs` and `frozen_verdict.rs`, `size.rs` has golden
+strings, `confine.rs` has `const _: () = assert!(…)` across crates,
+`release.yml` reads the version constants out of the source — and the
+figures in the three binaries' clap doc comments were correct by
+somebody's attention. Measured over `git ls-files '*.rs'`, 105 files:
+**zero** occurrences of `--help` as an argv string anywhere.
+
+Attention is what failed. `herd-runner --help` described
+`--job-output-cap` as *"32 MiB by default, which is also the most this can
+be"* against a `DEFAULT_OUTPUT_CAP` of `1 << 30` — wrong by 32×, inverted
+about what the flag does, wrong about the consequence — and it shipped in
+**v0.3.7, v0.4.0 and v0.4.1**. It was closed by a human reading
+(`7c75525`, 2026-10-29), and the document that reported it was not
+cleared. An operator who sets `--job-output-cap 32MiB` because the help
+said that was the ceiling gets a cap a thirty-second of what they meant,
+on a machine nobody in this project may log into (D161).
+
+**Choice.** One test per shipped binary,
+`the_long_help_states_every_figure_its_constants_decide`, rendering
+`Args::command().render_long_help()` and asserting that each figure the
+prose states is present **as the constant's own formatter prints it** —
+`herd_proto::show_bytes`, a `RangeInclusive`'s own ends, a `Duration`'s
+own `as_secs`, a fraction obtained by dividing, an exit code asked of
+`herdctl::exit_code_for`. No figure is written out a second time: a test
+carrying its own copy of the number is a fourth place for the number to
+be wrong, and would go green on the day the constant moved.
+
+It lives in each `main.rs` because `Args` and `herdctl`'s `EXIT_CODES` are
+private to it; all three files already had a `#[cfg(test)]` module and two
+already used `clap::CommandFactory`. Whitespace is flattened before
+comparison, because clap re-wraps to a width a test has no business
+knowing. Where the help spells a figure in words, the word is produced
+from the constant by a small table whose fallback arm **panics** with a
+sentence saying to read the help rather than to edit the test.
+
+**What it does not cover, said rather than left implicit.** A block whose
+figure is example syntax (`2GiB`, `512MiB`, `17GiB`) states no default and
+has nothing to disagree with. A flag whose figure reaches the help only as
+clap's `[default: …]` is already rendered from its constant. One figure is
+out of reach by construction: the hub's `--still-there-every` quotes exit
+**125**, which is `herdctl::NO_VERDICT_CODE`, and `herd-hub` does not
+depend on `herdctl`.
+
+**Evidence.** `herd-hub/src/main.rs`, `herd-runner/src/main.rs` and
+`herdctl/src/main.rs`, each
+`the_long_help_states_every_figure_its_constants_decide`;
+all three green on their first full run, and each demonstrated red by
+changing one figure in one help string and restoring it to a byte-identical
+sha256 (`history/2026-10-30-audit-tests.md`). Twenty-one pairings in all.
+
+## 2026-10-30 — D246 D231's volatile holdings need two mechanisms
+
+**Context.** D231 decision 5 says a runner's pack holdings are "per
+manifest, volatile, in memory only", "re-announced after `Welcome`", with
+"no stale holder after a restart". An audit called the forget half *"a
+promise"*; `herd-merger` measured at batch 12's landing that
+`PackRegistry::runner_gone` and `PackRegistry::forget_all_holdings` have
+no caller in `herd-hub/src/` outside their definitions and one unit test,
+and read the consequence as a runner that dies staying a pack holder for
+ever.
+
+**What the tree says.** Measured 2026-10-30 over `herd-hub/src/`,
+`herd-runner/src/`, `herdctl/src/` and the tests, with the search proven
+on a frame that *is* dispatched. The consequence does not follow, because
+the other half is missing too and the two absences hide each other:
+
+1. **Nothing announces.** `ToHub::PacksHeld` is constructed nowhere
+   outside `herd-proto`'s own round-trip test, and the hub's connection
+   loop has no arm for it: the frame falls to `server.rs`'s `other =>`,
+   which answers `FromHub::Refused { "a runner may not send packs_held" }`
+   and closes the link (D13).
+2. **Nothing asks for a re-announcement.** `FromHub::ReadPacksAgain` is
+   constructed nowhere either.
+3. **Nothing forgets, and not for want of a call site.** The two paths
+   that know a runner is gone — `State::release_runner` and
+   `one_watchdog_pass`'s link check — cannot reach the registry at all:
+   `State` holds `Arc<dyn JobStore>` and `packs()` is on the concrete
+   `JobDirStore`, not on that trait.
+4. **It is the whole registry, not one method.** `.packs()` has no
+   production caller anywhere; all 20 call sites are in
+   `herd-hub/tests/pack_registry.rs`.
+
+So the holdings map is empty in every running hub, no holder is ever
+named, and no stale holder has been observed because none was ever
+recorded. **There is no live defect here**; there is an unimplemented
+mechanism, and D231 decision 5 describes its design rather than this
+build's behaviour.
+
+**Decision.** D231 decision 5 stands as the design and is **not** a
+behaviour of this build. Making it true is one step with three parts, and
+no part of it is a call added to an existing path:
+
+* the pack frame dispatch in `herd-hub/src/server.rs`, `PacksHeld`
+  included — the step `store.rs` already reserves;
+* **one seam for the server to reach a registry through**, because
+  without it `runner_gone` has no reachable call site at all: a
+  `packs()` on `JobStore` returning `Option<&PackRegistry>` with a
+  default body leaves every implementor, the two test doubles included,
+  untouched;
+* a runner that announces its holdings after `Welcome`
+  (`herd-runner/src/lib.rs`), since a table emptied on a dropped link is
+  only correct if a rejoining runner says again what it holds.
+
+`runner_gone` and `forget_all_holdings` are therefore left as they are
+and **documented as promises, with the measurement beside them**, rather
+than wired to nothing or deleted. **Nothing was reordered**: D225 and
+D228 own the watchdog's ordering, and D228 withdrew the obvious reorder
+after measuring it, so a task that cannot add its call does not touch
+that pass.
+
+**Evidence.** `herd-hub/src/registry.rs` — the module section *None of
+that is reachable from the network in this build*, and the notes on
+`runner_gone` and `forget_all_holdings`; `herd-hub/src/store.rs:603-610`;
+`herd-hub/src/server.rs` `release_runner`, `one_watchdog_pass`, and
+`relay_from_runner`'s `other =>` arm at `:5032-5037`;
+`herd-hub/src/job.rs:1961` (the trait's 36 methods, none pack-shaped);
+`herd-proto/src/lib.rs` `ToHub::PacksHeld`,
+`FromHub::ReadPacksAgain`; **D231** decision 5, **D225**, **D228**,
+**D13**; `history/2026-10-30-two-decisions.md`.

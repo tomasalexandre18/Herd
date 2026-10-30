@@ -48,9 +48,8 @@ the ceiling here is **two** heavy agents.
   one set aside rightly, so it is one `mv` and a restart, theirs to do.
 - **50 more spools their runner refuses to offer**, naming the first unreadable
   path and the errno (ORCH-185, ORCH-186; **D224**).
-- **Disk, a rate not a stock:** ~90 GB over 1 571 jobs at 2026-10-23 is **11
-  GB/day** active; ~2.8 GB/day was measured while they were stopped. **`r_file`
-  = 5.04**, threshold never recorded (ORCH-199).
+- **Disk, a rate not a stock:** ~90 GB/1 571 jobs to 2026-10-23, **11 GB/day**
+  active; ~2.8 GB/day stopped. **`r_file` = 5.04**, no threshold (ORCH-199).
 ## Where the software is
 
 M1-M11, M15, M16, and **half of M13**: the fleet's state is `status.json`,
@@ -71,7 +70,8 @@ aside and kept** (**D233**). **Two guards on the hub's store** (**D240**,
 and a chunk with no sha256 on its record is refused before a byte lands.
 
 **The runner has a mesh-address rule and binds nothing by default** (**D222**).
-**Skips are per host** (D27): **12** at rest, **14** loaded (D187).
+**Every figure in all three `--help`s is read back through its own constant**
+(**D245**). **Skips are per host** (D27): **12** at rest, **14** loaded (D187).
 
 ## What the software still does not do
 
@@ -81,9 +81,9 @@ and a chunk with no sha256 on its record is refused before a byte lands.
 2. **The pack half is wired at the edges, not through.** `ToHub::JobFact` and
    six reason codes are on the wire and **nothing touches them** (D230); the
    **push** half M11 asks of an outbound-only runner is unbuilt (ORCH-220); and
-   holdings **re-announce** does not exist — two functions with **no caller**.
-   (**ORCH-148**). The **one** chatOnS-gated list lives beside the rows with
-   seven members (**D238**); `docs/road-to-v1.md` counts the road (**D237**).
+   **D231-5's holdings are a design, not a behaviour** (**D246**, ORCH-230):
+   nothing announces, so no holder is recorded and none goes stale. The **one**
+   chatOnS-gated list has seven members (**D238**); the road is counted (D237).
 4. **V3 stays red and the reading is Alexa's** (**D228**, ORCH-022): whether a
    runner silent for `lost_after` keeps its link, against E-21's 60 s promise.
 5. **The runner's half of D225 has never run against a real hub**, though both
