@@ -58,16 +58,16 @@ of five** (**D216**), **E-41's predicate is `herdctl if-moved`** (**D217**),
 **an unreadable record is quarantined, not fatal** (**D218**, 176 → 0; the
 `RECORD_VERSION` arm too, **D219**; `herd-hub report` banners one, **D224**).
 
-**M11's pack half is in the tree** (**D229**-**D235**): the pack frames are
-arms and fields of both protocol enums; the hub holds a registry under
-`packs/manifests/<id>/` keyed on `(commit, key)`, refusing two ids for one key
-by name; the runner holds a content-addressed store that hard-links a pack into
-a job; a peer serves and fetches objects on the one socket invariant 3 permits,
-taking D10's paths in D10's order and **reporting which one**. A pack **leaves
-`{out}` before the record walk** (**D223**); one Herd cannot read is **set
-aside and kept** (**D233**). **Two guards on the hub's store** (**D240**,
-**D241**): the relative-path check is asked where a collection is judged whole,
-and a chunk with no sha256 on its record is refused before a byte lands.
+**M11's pack half is in the tree** (**D229**-**D235**) and **the hub answers
+all six pack frames** (**D247**), each of which used to close the link. The
+hub holds a registry under `packs/manifests/<id>/` keyed on `(commit, key)`,
+refusing two ids for one key; the runner holds a content-addressed store that
+hard-links a pack into a job; a peer serves and fetches objects on the one
+socket invariant 3 permits, taking D10's paths in D10's order and **reporting
+which one**. A pack **leaves `{out}` before the record walk** (**D223**); one
+Herd cannot read is **set aside and kept** (**D233**). **Two store guards**
+(**D240**, **D241**): a relative path where a collection is judged whole, and
+a chunk with no sha256.
 
 **The runner has a mesh-address rule and binds nothing by default** (**D222**).
 **Every figure in all three `--help`s is read back through its own constant**
@@ -79,11 +79,11 @@ and a chunk with no sha256 on its record is refused before a byte lands.
    no memory (**ORCH-126**), *reaped* is unbuilt (**D134**), and **`packs/` has
    no retention, sweep or budget at either end** (ORCH-215).
 2. **The pack half is wired at the edges, not through.** `ToHub::JobFact` and
-   six reason codes are on the wire and **nothing touches them** (D230); the
-   **push** half M11 asks of an outbound-only runner is unbuilt (ORCH-220); and
-   **D231-5's holdings are a design, not a behaviour** (**D246**, ORCH-230):
-   nothing announces, so no holder is recorded and none goes stale. The **one**
-   chatOnS-gated list has seven members (**D238**); the road is counted (D237).
+   six reason codes ride the wire untouched (D230); the **push** half is
+   unbuilt (ORCH-220); **no job is assigned a pack** (ORCH-234); and **D231-5
+   is half a behaviour** (**D247**, ORCH-230) — a hub *told* records a holding
+   and forgets it on the drop; neither side asks nor announces. One
+   chatOnS-gated list of seven (**D238**); the road is counted (D237).
 4. **V3 stays red and the reading is Alexa's** (**D228**, ORCH-022): whether a
    runner silent for `lost_after` keeps its link, against E-21's 60 s promise.
 5. **The runner's half of D225 has never run against a real hub**, though both
