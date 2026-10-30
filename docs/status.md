@@ -77,8 +77,8 @@ and **skips per host** (D27): **12** runtime, **14** loaded, **38** ignored.
 
 1. **Nothing ever deletes a job directory** (ORCH-012, -021), a reading weighs
    no memory (**ORCH-126**), *reaped* is unbuilt (**D134**), and **`packs/`
-   has no retention or sweep** (ORCH-215): the runner takes a budget, **evicts
-   nothing**, and the deployed unit names none (ORCH-251, -252).
+   has no retention or sweep** (ORCH-215): a runner's pack use and budget are
+   **shown, never enforced** (ORCH-251); the deployed unit names none (-252).
 2. **The pack half reaches a job, and no pack reaches a disk.** **The runner
    lays no pack out under `{in}` and registers none from `{out}`** — it hands
    the job back with every key named (ORCH-220). `ToHub::JobFact` and six

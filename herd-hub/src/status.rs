@@ -52,6 +52,15 @@
 //! reason for ([`QueuedNow::waiting_for`]) and for a runner that announced
 //! no build ([`RunnerNow::version`]).
 //!
+//! **And two words, not one: `unknown` and `did not say`.** `unknown` is the
+//! hub's own ignorance about a figure that is certainly there — a load
+//! nobody on that host could read. The second is said with a health report
+//! in hand: the machine spoke and said nothing about this figure, which is
+//! a fact about the machine rather than about the hub. The pack-store
+//! figures are the three that print it (`pack_store_said`), because each
+//! of their absences is a state the runner is in and not a reading that
+//! failed.
+//!
 //! **What the hub cannot know, and does not pretend to.** A lease held by
 //! something outside Herd (E-27) is not visible here: what is visible is
 //! what the machine's own busy probe last said, in the probe's words, under
@@ -69,13 +78,31 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use herd_proto::{CapabilityOrigins, JobId, Priority, Switch};
+// The two byte renderers, side by side on purpose: a figure Herd measured
+// reads through `measured_bytes` and a figure a human typed reads through
+// `show_bytes`. Which is which is ORCH-186, and the asymmetry is documented
+// on each of them in `herd_proto::size`.
+use herd_proto::size::{measured_bytes, show_bytes};
 use serde::{Deserialize, Serialize};
 
 use crate::job::Timestamp;
 
 /// The shape of `status.json`. See the module's note on why this number is
 /// separate from the protocol's, the record's and the layout's.
-pub const STATUS_VERSION: u32 = 1;
+///
+/// **2 since 2026-10-30, when the three pack-store figures joined
+/// [`RunnerNow`]** (M12, E-16). The three fields are additive and serde
+/// would have read an old document without them, so compatibility is not
+/// why this moved — it moved because leaving it at 1 would have made
+/// *absence* ambiguous. At version 1 a renderer finding no `packs_held`
+/// cannot tell whether the runner did not say or the hub that wrote the
+/// document does not record it, and "the runner did not say" is the whole
+/// point of these three fields. At version 2 there is one reading left: the
+/// hub records them, and an absence is the machine's own silence. A version
+/// an operator's build does not know is refused by name with both figures
+/// ([`Status::read`]), which is the cost and is the one this number exists
+/// to pay.
+pub const STATUS_VERSION: u32 = 2;
 
 /// The document's name in the state root.
 ///
@@ -244,6 +271,34 @@ pub struct RunnerNow {
     /// reading of an idle host.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub load_milli: Option<u64>,
+    /// How much disk its pack store last said it was using, in bytes
+    /// (M12, E-16).
+    ///
+    /// **Absent means the runner did not say**, and that is three states and
+    /// not one: it has opened no store; it has a store nothing has measured
+    /// yet (and then `pack_store_budget_bytes` below still travels, because a
+    /// budget is a figure its owner typed and not one the runner read); or it
+    /// measured and its owner declared no budget. The screen says *did not
+    /// say* for each absence separately, so the three stay apart. Never `0`,
+    /// which is the measurement an empty store makes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pack_store_bytes: Option<u64>,
+    /// What its owner allowed that pack store, in bytes (M12, E-16).
+    ///
+    /// The machine owner's figure, here for the reason `jobs_at_once` is: the
+    /// hub cannot invent a bound for somebody else's disk, and it enforces
+    /// nothing with this — it shows the use against it and stops there. Absent
+    /// is "no budget was declared", which is not unlimited and not nought: it
+    /// is a hub with nothing to weigh the usage against.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pack_store_budget_bytes: Option<u64>,
+    /// How many packs it last said it was holding (M12, E-16).
+    ///
+    /// Beside the byte figures and not derived from them: a count is what
+    /// says whether a store is one enormous pack or a thousand small ones.
+    /// Absent means it did not say.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub packs_held: Option<u32>,
     pub lends: Lends,
     /// The jobs this machine said it was holding in its last health report,
     /// by id.
@@ -452,6 +507,82 @@ fn or_unknown<T: fmt::Display>(value: Option<T>) -> String {
     }
 }
 
+/// How a figure a runner was asked for and did not give is printed.
+///
+/// **Not [`UNKNOWN`], and the two are different statements.** `unknown` is
+/// the hub's own ignorance — a load nobody on that host could read, a tmpfs
+/// the probe could not size. This one is said with a health report in hand:
+/// the machine spoke, and about this figure it said nothing. An operator
+/// reading *did not say* knows whose silence it is and where to go for it,
+/// which `unknown` would not tell them.
+const DID_NOT_SAY: &str = "did not say";
+
+/// What one runner last said about its pack store, as the screen prints it
+/// (M12, E-16).
+///
+/// **Four sentences and not one template, because the absences do not all
+/// mean the same thing.** The three fields arrive as three independent
+/// absences and each combination is a different fact about the machine, so
+/// each is given its own words rather than a row of blanks an operator has
+/// to interpret. The states are `herd_proto::ToHub::Health`'s own:
+///
+/// - all three absent — it said nothing about a pack store at all;
+/// - the budget alone — it has a store and nothing has measured it yet, and
+///   the budget still travels because a figure its owner **typed** is not a
+///   measurement;
+/// - the two measurements with no budget — it measured, and nobody declared
+///   a bound to weigh that against;
+/// - all three — the use, the bound, and the count.
+///
+/// Anything else the wire permits falls to the last arm, which names each
+/// field and its absence one by one rather than guessing at a sentence for a
+/// combination no build sends today.
+///
+/// **Two renderers, and which is which is ORCH-186.** The use is a figure
+/// Herd *measured*, so it reads through [`measured_bytes`]: the exact count
+/// always, with a binary approximation beside it. The budget is a figure a
+/// human *typed*, so it reads through [`show_bytes`], in the unit family it
+/// was typed in — that is the only way its owner can tell the runner took
+/// the number they meant. Putting a measurement through `show_bytes` is how
+/// the first consumer came to read *"344450708 KiB free"*.
+fn pack_store_said(runner: &RunnerNow) -> String {
+    match (
+        runner.pack_store_bytes,
+        runner.pack_store_budget_bytes,
+        runner.packs_held,
+    ) {
+        (None, None, None) => format!("it {DID_NOT_SAY}"),
+        (None, Some(budget), None) => format!(
+            "it {DID_NOT_SAY} what it holds; its owner allowed {}",
+            show_bytes(budget)
+        ),
+        (Some(bytes), Some(budget), Some(packs)) => format!(
+            "{} of {} allowed, in {packs} pack(s)",
+            measured_bytes(bytes),
+            show_bytes(budget)
+        ),
+        (Some(bytes), None, Some(packs)) => format!(
+            "{}, in {packs} pack(s); its owner declared no budget, so there is \
+             nothing here to weigh that against",
+            measured_bytes(bytes)
+        ),
+        (bytes, budget, packs) => format!(
+            "use {}, budget {}, packs {}",
+            or_it_did_not_say(bytes.map(measured_bytes)),
+            or_it_did_not_say(budget.map(show_bytes)),
+            or_it_did_not_say(packs),
+        ),
+    }
+}
+
+/// One figure a runner may not have given, as the screen prints it.
+fn or_it_did_not_say<T: fmt::Display>(value: Option<T>) -> String {
+    match value {
+        Some(value) => value.to_string(),
+        None => DID_NOT_SAY.to_owned(),
+    }
+}
+
 impl fmt::Display for Status {
     /// The one text screen E-35 asks for, rendered from this document and
     /// from nothing else.
@@ -519,6 +650,12 @@ impl fmt::Display for Status {
                 or_unknown(runner.lends.tmpfs_mib),
                 or_unknown(runner.lends.jobs_at_once),
             )?;
+            // What it holds on its own disk, beside what it lends: the use,
+            // the bound its owner set, and the count (M12, E-16). The whole
+            // sentence is [`pack_store_said`]'s, because the three absences
+            // are three different facts and flattening them here is the one
+            // thing this line must not do.
+            writeln!(f, "    its pack store: {}", pack_store_said(runner))?;
             if runner.lends.capabilities.is_empty() {
                 writeln!(f, "    offers no capability")?;
             }
@@ -617,6 +754,16 @@ fn labels_or_none(labels: &[String]) -> String {
 mod tests {
     use super::*;
 
+    /// The pack budget the fixture's owner typed: `200GB`, in bytes.
+    ///
+    /// **Round in the decimal family and in no other**, which is what makes
+    /// the ORCH-186 assertion decisive: through [`show_bytes`] it reads back
+    /// as `200 GB`, the figure its owner typed, and through
+    /// [`measured_bytes`] it would read as `200000000000 bytes
+    /// (186.26 GiB)`. One line of the screen can therefore say which
+    /// renderer it went through.
+    const A_TYPED_BUDGET: u64 = 200_000_000_000;
+
     fn a_status() -> Status {
         Status {
             status_version: STATUS_VERSION,
@@ -648,6 +795,13 @@ mod tests {
                 last_health_at: Timestamp::at_unix_seconds(1_699_999_990),
                 health_reports_seen: 42,
                 load_milli: None,
+                // A runner that has measured its store and whose owner typed
+                // a budget: the state the screen's main line is for. The
+                // figures are the ones P2a read off the real wire, so the
+                // fixture and the measurement agree.
+                pack_store_bytes: Some(4608),
+                pack_store_budget_bytes: Some(A_TYPED_BUDGET),
+                packs_held: Some(3),
                 lends: Lends {
                     memory_mib: Some(17_000),
                     memory_floor_mib: Some(3_400),
@@ -738,6 +892,197 @@ mod tests {
         assert!(
             screen.contains("2023-11-14T22:13:20Z"),
             "the screen names when the document was published: {screen}"
+        );
+    }
+
+    /// The plan's own clause: one runner's use **against its budget, with
+    /// both figures**, and each figure through its own renderer (ORCH-186).
+    ///
+    /// The negative assertion is the half that matters. `show_bytes` and
+    /// `measured_bytes` disagree about every figure that is round in one
+    /// family, and a budget put through the measured renderer would read
+    /// `200000000000 bytes (186.26 GiB)` — correct, and not the number its
+    /// owner typed. That is the defect the first consumer actually read, as
+    /// *"derived now from 344450708 KiB free"*, and no gate saw it.
+    #[test]
+    fn the_screen_prints_one_runners_pack_use_against_its_budget_with_both_figures() {
+        let screen = a_status().to_string();
+        let line = the_pack_store_line(&screen);
+        assert_eq!(
+            line, "    its pack store: 4608 bytes (4.50 KiB) of 200 GB allowed, in 3 pack(s)",
+            "the use, the budget and the count, on one line, each through its own \
+             renderer: {screen}"
+        );
+        // And the negatives, read off that line alone. The hub's own
+        // output-budget line, three lines above, prints 200000000000 raw, so a
+        // `screen.contains` here would be asserting about somebody else's
+        // sentence (see this branch's handoff: a second ORCH-186 site, not
+        // this task's to move).
+        assert!(
+            !line.contains("186.26 GiB"),
+            "a budget its owner typed must not read back through the measured \
+             renderer: {line}"
+        );
+        assert!(
+            !line.contains("200000000000"),
+            "a figure typed as 200GB reads back as 200 GB, or its owner cannot \
+             tell the hub took the number they meant: {line}"
+        );
+    }
+
+    /// The one line of the screen this module's pack assertions are about.
+    ///
+    /// Pulled out rather than matched inside the whole screen, so that an
+    /// assertion about the pack store cannot pass or fail on a sentence
+    /// belonging to another figure.
+    fn the_pack_store_line(screen: &str) -> &str {
+        screen
+            .lines()
+            .find(|line| line.contains("its pack store:"))
+            .unwrap_or_else(|| panic!("the screen has no pack-store line:\n{screen}"))
+    }
+
+    /// **A runner that said nothing prints `did not say` and never `0`** —
+    /// and the three silences are three different sentences, because they are
+    /// three different facts about the machine.
+    ///
+    /// `0` is a measurement: it is the one an empty store makes. A screen
+    /// that printed it for any of these would be saying a runner holding
+    /// gigabytes holds nothing.
+    #[test]
+    fn a_runner_that_said_nothing_about_its_pack_store_says_so_and_never_nought() {
+        // 1. It said nothing at all: no store of its own that it has opened,
+        //    or a build that does not send these fields.
+        let mut status = a_status();
+        status.runners[0].pack_store_bytes = None;
+        status.runners[0].pack_store_budget_bytes = None;
+        status.runners[0].packs_held = None;
+        let screen = status.to_string();
+        assert!(
+            screen.contains("its pack store: it did not say\n"),
+            "three absences are one silence and are said as one: {screen}"
+        );
+
+        // 2. A store is open and nothing has measured it. **The budget still
+        //    travels**, because a figure its owner typed is not a
+        //    measurement — so this is not case 1 and must not read like it.
+        let mut status = a_status();
+        status.runners[0].pack_store_bytes = None;
+        status.runners[0].packs_held = None;
+        let screen = status.to_string();
+        assert!(
+            screen
+                .contains("its pack store: it did not say what it holds; its owner allowed 200 GB"),
+            "a budget with no measurement beside it is still a fact: {screen}"
+        );
+
+        // 3. It measured, and nobody declared a budget. Absent is not
+        //    unlimited and not nought: it is a hub with nothing to weigh the
+        //    usage against.
+        let mut status = a_status();
+        status.runners[0].pack_store_budget_bytes = None;
+        let screen = status.to_string();
+        assert!(
+            screen.contains(
+                "its pack store: 4608 bytes (4.50 KiB), in 3 pack(s); its owner declared \
+                 no budget, so there is nothing here to weigh that against"
+            ),
+            "a measured store with no budget says both halves: {screen}"
+        );
+
+        // 4. Anything else the wire permits — here a measurement with no
+        //    count beside it, which no build sends today. Each field is named
+        //    with its own absence rather than guessed at.
+        let mut status = a_status();
+        status.runners[0].packs_held = None;
+        let screen = status.to_string();
+        assert!(
+            screen.contains(
+                "its pack store: use 4608 bytes (4.50 KiB), budget 200 GB, packs did not say"
+            ),
+            "a combination nothing sends is still said field by field: {screen}"
+        );
+
+        // And none of the four may have printed a nought for a figure
+        // nobody gave.
+        for state in [(None, None, None), (None, Some(A_TYPED_BUDGET), None)] {
+            let mut status = a_status();
+            status.runners[0].pack_store_bytes = state.0;
+            status.runners[0].pack_store_budget_bytes = state.1;
+            status.runners[0].packs_held = state.2;
+            let screen = status.to_string();
+            let line = the_pack_store_line(&screen);
+            // The two shapes a nought would take if one ever stood in for a
+            // silence: `measured_bytes(0)` is "0 bytes" and a count of none
+            // is "in 0 pack(s)". Neither may appear on this line.
+            assert!(
+                !line.contains("0 bytes") && !line.contains("0 pack(s)"),
+                "a figure nobody gave must never read as a nought: {line}"
+            );
+        }
+    }
+
+    /// The three figures are **absent from the JSON, not `null`** — the
+    /// property P2a proved on the real wire, held one hop further on.
+    ///
+    /// A `null` would be a third thing a reader has to know about, and the
+    /// renderers that matter here are other people's: a dashboard that read
+    /// `"packs_held": null` as `0` would draw a flat line for a figure
+    /// nobody measured.
+    #[test]
+    fn a_pack_figure_a_runner_did_not_give_is_absent_from_the_json_and_not_null() {
+        let mut status = a_status();
+        status.runners[0].pack_store_bytes = None;
+        status.runners[0].pack_store_budget_bytes = None;
+        status.runners[0].packs_held = None;
+        let json = serde_json::to_value(&status).expect("a status serialises");
+        let runner = &json["runners"][0];
+        for field in ["pack_store_bytes", "pack_store_budget_bytes", "packs_held"] {
+            assert!(
+                runner.get(field).is_none(),
+                "{field} must be absent from the document, never null: {runner}"
+            );
+        }
+        let text = serde_json::to_string(&status).expect("a status serialises");
+        assert!(
+            !text.contains("null"),
+            "nothing in this document is null: {text}"
+        );
+
+        // The control: the same document with the figures in it carries all
+        // three, so the absences above are the fields being left off and not
+        // a name this test spelled wrongly.
+        let json = serde_json::to_value(a_status()).expect("a status serialises");
+        let runner = &json["runners"][0];
+        assert_eq!(runner["pack_store_bytes"], serde_json::json!(4608));
+        assert_eq!(
+            runner["pack_store_budget_bytes"],
+            serde_json::json!(A_TYPED_BUDGET)
+        );
+        assert_eq!(runner["packs_held"], serde_json::json!(3));
+    }
+
+    /// A pack figure that changed is news about the fleet and is published.
+    ///
+    /// The publisher writes nothing when the document says what it last said
+    /// (D215), so a field nothing compares is a field that never reaches the
+    /// disk after the first write. `same_but_for_the_clock` compares whole
+    /// `runners` vectors, which is why this holds — asserted because it is
+    /// the property that makes these three figures *arrive*.
+    #[test]
+    fn a_pack_store_that_grew_is_news_about_the_fleet() {
+        let first = a_status();
+        let mut later = first.clone();
+        later.runners[0].pack_store_bytes = Some(4609);
+        assert!(
+            !first.same_but_for_the_clock(&later),
+            "a store that grew by one byte must be published"
+        );
+        let mut later = first.clone();
+        later.runners[0].packs_held = None;
+        assert!(
+            !first.same_but_for_the_clock(&later),
+            "a runner that has stopped saying what it holds must be published"
         );
     }
 

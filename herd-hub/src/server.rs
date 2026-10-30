@@ -1373,6 +1373,23 @@ struct ConnectedRunner {
     /// a busy host is a fact to report, never a reason to refuse a job.
     /// `None` until the first report, and for a machine that cannot read it.
     load_milli: Option<u64>,
+    /// What it last said about its pack store (M12, E-16).
+    ///
+    /// **Replaced whole on every report, which is deliberately the opposite
+    /// of `load_milli` above.** A load the machine could not read is a
+    /// *failure to measure* something that is certainly there, so the most
+    /// recent figure it managed to give is still the most recent figure there
+    /// is. An absent pack figure is not that: it is the runner **saying**
+    /// which of [`PackStoreSaid`]'s three states it is in, and two of those
+    /// states are absences that carry information. A hub that kept the last
+    /// measurement would print a figure nobody is claiming any more and would
+    /// make the no-store state invisible, which is the one state an operator
+    /// most needs to see — a runner holding gigabytes and saying nothing
+    /// about them.
+    ///
+    /// All three absent until the first report, and for a runner of a build
+    /// that does not send them.
+    pack_store: PackStoreSaid,
     /// How the hub ends this connection without waiting for the socket to
     /// notice. Used when a runner that is plainly alive dials in while this
     /// connection is still registered: the new one is the real one.
@@ -1476,6 +1493,40 @@ impl ConnectedRunner {
 struct Acknowledged {
     switch: herd_proto::Switch,
     persistence: herd_proto::SwitchPersistence,
+}
+
+/// What a runner last said about its pack store, on a health report
+/// (M12, E-16, ORCH-251).
+///
+/// **Three `Option`s and not one, because the three absences mean three
+/// different things** — and this struct exists so that the hub cannot
+/// accidentally collapse them. `herd_proto::ToHub::Health` documents the
+/// states the runner builds:
+///
+/// | what the runner is in | bytes | budget | packs |
+/// |---|---|---|---|
+/// | it has opened no pack store | absent | absent | absent |
+/// | a store is open and nothing has measured it | absent | **as given** | absent |
+/// | measured, with no `--pack-budget` | the figure | absent | the figure |
+///
+/// The budget travels on its own in the middle row because a budget is a
+/// figure its owner **typed** and not one the runner read: a typed figure is
+/// not a measurement, and holding it back until there is a measurement
+/// beside it would lose the one fact the hub has.
+///
+/// Zero is never a stand-in for any of the three. It is a measurement — the
+/// one an empty store makes — and the only figure here that may be nought is
+/// one a runner really sent.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct PackStoreSaid {
+    /// What its pack store measured, in bytes. Absent means it did not say.
+    bytes: Option<u64>,
+    /// What its owner allowed that store, in bytes. Absent means no budget
+    /// was declared, which is not "unlimited" and not zero: it is a hub with
+    /// nothing to weigh the usage against.
+    budget_bytes: Option<u64>,
+    /// How many packs it is holding. Absent means it did not say.
+    held: Option<u32>,
 }
 
 #[derive(Default)]
@@ -1840,6 +1891,9 @@ impl State {
                     it_said_it_is_holding: None,
                     preference: announced.preference,
                     load_milli: announced.load_milli,
+                    // Nothing said about a pack store on this connection
+                    // yet, which is all three absent and not three noughts.
+                    pack_store: PackStoreSaid::default(),
                     kick,
                     joined_at: now,
                     last_health: now,
@@ -2050,6 +2104,14 @@ impl State {
                         last_health_at: runner.last_health_at,
                         health_reports_seen: runner.reports_seen,
                         load_milli: runner.load_milli,
+                        // The three pack figures, each placed on exactly as
+                        // the runner said it (M12, E-16). Absent stays absent
+                        // all the way to the JSON, because the document's
+                        // rule and the wire's are the same one: a figure
+                        // nobody measured is not a nought.
+                        pack_store_bytes: runner.pack_store.bytes,
+                        pack_store_budget_bytes: runner.pack_store.budget_bytes,
+                        packs_held: runner.pack_store.held,
                         lends: status::Lends {
                             memory_mib: runner.host.memory_mib,
                             memory_floor_mib: runner.host.memory_floor_mib,
@@ -2352,6 +2414,7 @@ impl State {
         jobs: Vec<RunningJob>,
         draining: bool,
         load_milli: Option<u64>,
+        pack_store: PackStoreSaid,
     ) -> bool {
         self.with_peers(|peers| {
             if let Some(runner) = peers
@@ -2383,6 +2446,12 @@ impl State {
                 if load_milli.is_some() {
                     runner.load_milli = load_milli;
                 }
+                // And the pack store, replaced whole rather than merged —
+                // deliberately not the rule just above. An absent figure here
+                // is the runner saying which of three states its store is in,
+                // not a reading that failed, so the newest statement is the
+                // only true one. See [`ConnectedRunner::pack_store`].
+                runner.pack_store = pack_store;
                 was_corrected
             } else {
                 false
@@ -4914,12 +4983,14 @@ async fn relay_from_runner(
                 draining,
                 load_milli,
                 switch,
-                // M12's pack-store figures (E-16), numbered at protocol 3 and
-                // recorded by nobody yet. Bound and dropped rather than
-                // matched with `..`, for the reason the handshake's are.
-                pack_store_bytes: _,
-                pack_store_budget_bytes: _,
-                packs_held: _,
+                // M12's pack-store figures (E-16, ORCH-251). Bound by their
+                // own names rather than matched with `..`, for the reason the
+                // handshake's are, and carried into one value rather than
+                // three parameters so that nothing downstream can take two of
+                // the three and believe it has the fact.
+                pack_store_bytes,
+                pack_store_budget_bytes,
+                packs_held,
             } => {
                 // A report is two different claims. "I am alive" is this
                 // runner's to make, and it is recorded whatever else the
@@ -4934,6 +5005,13 @@ async fn relay_from_runner(
                         its_own.push(job);
                     }
                 }
+                // The three figures, into the one value that keeps them
+                // together (M12, E-16).
+                let pack_store = PackStoreSaid {
+                    bytes: pack_store_bytes,
+                    budget_bytes: pack_store_budget_bytes,
+                    held: packs_held,
+                };
                 // And if this report ended a ceiling correction, the queue is
                 // judged **now** (D182). Nothing else would: a health
                 // report is not an event the dispatch pass is woken by, so a
@@ -4942,7 +5020,7 @@ async fn relay_from_runner(
                 // quiet fleet, the restatement cadence, which is a minute of
                 // a machine standing idle with work queued for it. The same
                 // shape as the switch below, and for the same reason.
-                if state.record_health(outbox, its_own, draining, load_milli) {
+                if state.record_health(outbox, its_own, draining, load_milli, pack_store) {
                     dispatch_queued_jobs(state)?;
                 }
                 // And the owner's switch, which rides on every report (E-33).
