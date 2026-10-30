@@ -58,13 +58,13 @@ fatal** (**D218**, 176 → 0; the `RECORD_VERSION` arm too, **D219**).
 
 **M11's pack half is in the tree** (**D229**-**D235**), **the hub answers all
 six pack frames** (**D247**), and **a job is now assigned its packs**
-(ORCH-234): manifest, holder and `leaves`, resolved before `begin_attempt` so
-no record names a runner handed nothing, an unresolvable key being **a named
-wait, never a `Refused`** (D13). The hub keys a registry on `(commit, key)`;
-the runner holds a content-addressed store hard-linking a pack into a job; a
-peer serves and fetches on the one socket invariant 3 permits, taking D10's
-paths in order and **reporting which one** (**D223**, **D233**, **D240**,
-**D241**).
+(ORCH-234): manifest, holder and `leaves`, resolved before `begin_attempt`, an
+unresolvable key being **a named wait, never a `Refused`** (D13). The hub keys
+a registry on `(commit, key)`; the runner holds a content-addressed store
+hard-linking a pack into a job; a peer serves and fetches on the one socket
+invariant 3 permits, **reporting which path** (**D223**, **D233**, **D240**,
+**D241**). **A dry run answers for the dispatch too** (**D261**, E-07); **the
+runner honours the hub's custody, but no hub names a keeper yet** (**D262**).
 
 **The runner has a mesh-address rule and binds nothing by default** (**D222**);
 **every `--help` figure reads back through its own constant** (**D245**); **an
@@ -76,14 +76,14 @@ need a delegated scope that carries its own `MemoryMax` (**D260**).
 
 1. **Nothing ever deletes a job directory** (ORCH-012, -021), a reading weighs
    no memory (**ORCH-126**), *reaped* is unbuilt (**D134**), and the **hub's**
-   `packs/` has no retention (ORCH-215). A runner's pack use and budget are
-   **shown, never enforced** (ORCH-251): the gc is written and **nothing calls
-   it** (ORCH-240, -253, ORCH-264); the deployed unit names none (ORCH-252).
+   `packs/` has no retention (ORCH-215). The runner's gc has a caller at last
+   and **the pack budget is spent** (**D262**, ORCH-264 done), on **one edge
+   only** (ORCH-275); the deployed unit names none (ORCH-252, -253).
 2. **The pack half reaches a job, and no pack reaches a disk.** **The runner
    lays no pack out under `{in}` and registers none from `{out}`** — it hands
    the job back with every key named (ORCH-220). `ToHub::JobFact` and six
-   reason codes ride the wire untouched (D230), and **no requester surface can
-   submit `needs` or `leaves`**. One chatOnS-gated list (**D238**).
+   reason codes ride the wire untouched (D230); **`herdctl` parses `needs` and
+   `leaves` then discards them** (ORCH-274). One chatOnS-gated list (**D238**).
 3. **V3 stays red and the reading is Alexa's** (**D228**, ORCH-022): whether a
    runner silent for `lost_after` keeps its link, against E-21's 60 s promise.
 4. **The runner's half of D225 has never run against a real hub**, though both

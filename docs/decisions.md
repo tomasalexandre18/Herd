@@ -13386,3 +13386,101 @@ Reversible: one flag on one command line, and a sentence in
 `docs/runner-confinement.md`. In the finder's words, kept verbatim
 because the sentence is the lesson: *"on this host, 'nothing encloses
 me' now means 'I am in a user scope', not 'I am on a bare machine'."*
+
+## 2026-10-30 — D261 A dry run answers for the dispatch too
+
+E-07 promises where a job would run. Until M12's L3 that answer stopped
+at the claim step, and a job with `needs` resolves its keys **after**
+the claim: `packs_for` runs inside `dispatch`, not inside the claim, so
+a job the fleet fits and the registry cannot serve is claimed, held
+back by name, and left queued — while `would-run` said *"it would
+start now"* about it.
+
+That is not a corner. Nothing under `herd-runner/src` constructs
+`ToHub::RegisterPack` (ORCH-260), so **every** job with `needs` is in
+exactly that state today, and the dry run was wrong about all of them.
+
+**The rule: a dry run consults every step a submission would pass
+through, including the ones after the claim, and consults them
+read-only.** `would-run` now asks `packs_for` for the one job it is
+about and answers *"it would be claimed and then wait for its packs"*,
+naming the key and the commit. A job that needs nothing reaches none of
+it — `packs_for` returns before it takes a lock — so that answer is the
+bytes it was.
+
+**And how two renderers of one decision are kept from drifting.** The
+matcher's placement line and the dry run's explanation read one value:
+`where_what_it_needs_is` asks the registry once and returns the `held`
+map the locality term sorts on, what each key resolved to, and which
+runners have said what they hold at all (D257's distinction, which the
+placement cannot make and the sentence must). A dry run that computed
+its own locality would agree today and drift at the next change to
+either side.
+
+Reversible: both halves are reads and neither writes. The cost is one
+registry lock per queued job **with `needs`** per pass, which is no job
+Herd runs today.
+
+## 2026-10-30 — D262 A pack sweep per connection, and the welcome is custody
+
+M12 P4 wired `PackStore::evict_to_budget`, which landed in batch 21
+with no caller (ORCH-264), and had to answer two questions the
+milestone does not: **where** the gc fires and **what an empty
+`keeper_for` means**. Both are decided here, both are reversible, and
+both are measured from the code rather than argued.
+
+**1. The gc fires once per connection, in `serve_once`, before the
+announcement of what this runner holds** —
+`Session::sweep_packs_to_budget`, on `spawn_blocking`.
+
+Not beside an ingest, which is where a gc would ordinarily live. The
+pass may not run without the hub's custody set, or it evicts the very
+packs a keeper exists to hold; the custody set lives on the session;
+and `lib.rs` is the only place in the crate that has it.
+`packstore::leave_packs` and `herd-runner/src/fetch.rs` both ingest
+with no session in hand, so a pass called from either would run with
+`pins: None` — worse than no pass at all. Threading the pins to those
+two edges needs `herd-runner/src/outputs.rs` and
+`herd-runner/src/job.rs`, which P4 does not own.
+
+**Before** the announcement and not after it, because the frame set
+has no retraction but a later whole announcement: a runner that
+announced first would leave the hub offering a holder of packs the
+pass is about to take, which is the outcome the eviction's own order
+exists to avoid (ORCH-240), read from the announcer's side.
+
+It runs even for a store nobody bounded, because finishing an eviction
+a kill stopped is not spending a budget, and it then answers **no
+lines at all**: a pass that printed on every connection of every
+runner with no `--pack-budget` would be new noise on every machine in
+the fleet, saying what the startup line already said.
+
+What this costs is said plainly: a runner that stays connected for a
+week and ingests all week does not sweep until it redials. That
+residue is a board row of its own and not a defect in this choice.
+
+**2. `Welcome.keeper_for` is authoritative at every dial, so an empty
+list clears what a previous connection pinned.**
+
+A hub fills `keeper_for` from its own policy at every dial and sends
+`PinPacks` when that policy changes while the link is up, so the
+welcome is the whole truth about custody at the moment a connection
+begins. A runner that kept yesterday's custody after a hub that no
+longer names it would pin packs nobody asked it to keep, for ever,
+with nothing able to retract them — a hub that forgot would never send
+the frame that could. `herd-proto` says the same thing from the other
+side: *"a runner reading an empty list is a runner with no custody"*.
+
+`PinPacks` **replaces** the set rather than adding to it, for the
+reason `ToHub::PacksHeld` replaces rather than appends, and is said
+once per frame: a frame that changes nothing says that it changed
+nothing, and a frame of no keys is custody withdrawn and never a
+custody of nothing an eviction has to read.
+
+The welcome carries keys and no figure, so its keys are kept at
+`packstore::KEEP_PER_KEY`; `PinPacks` is what refines the count,
+because it is the frame that has a count to refine it with.
+
+Reversible either way: both are one function each in
+`herd-runner/src/lib.rs`, and the asserted behaviour is in
+`herd-hub/tests/pack_custody.rs` and `lib.rs`'s own test module.

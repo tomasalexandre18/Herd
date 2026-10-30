@@ -46,7 +46,7 @@
 //!   is retried for as long as it takes and never dropped (D19); output the
 //!   hub is missing is asked for again before the log is declared short (D29).
 
-use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -4842,26 +4842,195 @@ fn packs_for(
 /// **No requester's word reaches it** (invariant 6). The job names the keys it
 /// consumes; the holdings are what runners announced to this hub, and turning
 /// them into a preference is the hub's own act.
+///
+/// One field of [`WhereItIs`], and the only one a placement reads. The rest
+/// of that read is what E-07's dry run says out loud.
 fn holders_of_what_it_needs(state: &State, record: &JobRecord) -> BTreeMap<String, usize> {
-    let mut held: BTreeMap<String, usize> = BTreeMap::new();
+    where_what_it_needs_is(state, record).held
+}
+
+/// What this hub knows about where one job's `needs` are, read **once**.
+///
+/// **Two renderers, one read, and that is the whole of why this is a type.**
+/// The claim step's locality term takes [`WhereItIs::held`] and nothing else
+/// (E-23); E-07's dry run says the rest of it out loud. A dry run that asked
+/// the registry a second time for its own sentence would agree today and
+/// drift at the next change to either side — and in between, a runner
+/// announcing between the two reads would have the explanation describe a
+/// fleet the placement was not made against.
+struct WhereItIs {
+    /// Per `needs` key, in the record's own order. Empty for a job that needs
+    /// nothing, and for no other job.
+    keys: Vec<(String, KeyIsAt)>,
+    /// How many of the packs those keys resolve to each runner already holds,
+    /// by runner name: [`matcher::Placing::holds_what_it_needs`] and nothing
+    /// else. Absent is "it holds none of them", which is what the term reads
+    /// it as.
+    held: BTreeMap<String, usize>,
+    /// Which runners have said what they hold **at all**.
+    ///
+    /// **D257, in the one place this step can print it.** A runner that has
+    /// announced nothing is not a runner holding none, and a sentence that
+    /// printed both as a nought would be this hub inventing a fact about
+    /// somebody's machine. The *placement* reads a silence as none, which is
+    /// the only thing it could do with a machine that has not said — so the
+    /// distinction lives in the sentence and nowhere else.
+    said: BTreeSet<String>,
+}
+
+/// Where one `needs` key is, as this hub's own registry answers for it.
+enum KeyIsAt {
+    /// It resolves to this pack, and these runners announced holding it
+    /// whole, in runner-name order.
+    Pack {
+        pack: herd_proto::pack::PackId,
+        holders: Vec<String>,
+    },
+    /// Nothing is registered for it at this job's commit, so the dispatch
+    /// holds the job back by name ([`packs_for`], E-12).
+    NothingRegistered,
+    /// The registry will not answer for it: a `(commit, key)` with two ids.
+    Refused(String),
+    /// There is no commit to resolve it against — only a declared command
+    /// names one (E-11, D106).
+    NoCommit,
+    /// This hub keeps no pack registry at all.
+    NoRegistry,
+}
+
+/// The one read. See [`WhereItIs`].
+///
+/// `held` is what [`holders_of_what_it_needs`] answered before this type
+/// existed, key for key and count for count: a key that resolves to nothing,
+/// a job with no commit, a `(commit, key)` with two ids and a hub with no
+/// registry each contribute no holding, exactly as they did. What is new is
+/// that each of them is now *sayable*, instead of being flattened into "no
+/// machine holds it" on the way out.
+fn where_what_it_needs_is(state: &State, record: &JobRecord) -> WhereItIs {
+    let mut found = WhereItIs {
+        keys: Vec::new(),
+        held: BTreeMap::new(),
+        said: BTreeSet::new(),
+    };
+    // The ordinary case, and it consults nothing: not a lock, not a registry,
+    // not the fleet.
     if record.needs.is_empty() {
-        return held;
+        return found;
     }
     let Some(declaration) = &record.declaration else {
-        return held;
+        found.keys = record
+            .needs
+            .iter()
+            .map(|key| (key.clone(), KeyIsAt::NoCommit))
+            .collect();
+        return found;
     };
     let Some(registry) = state.store.packs() else {
-        return held;
+        found.keys = record
+            .needs
+            .iter()
+            .map(|key| (key.clone(), KeyIsAt::NoRegistry))
+            .collect();
+        return found;
     };
+    found.said = registry
+        .holdings()
+        .into_iter()
+        .map(|(runner, _)| runner)
+        .collect();
     for key in &record.needs {
-        let Ok(Some(pack)) = registry.pack_for(&declaration.commit, key) else {
-            continue;
+        let at = match registry.pack_for(&declaration.commit, key) {
+            Ok(Some(pack)) => {
+                let holders: Vec<String> = registry
+                    .holders_of(&pack)
+                    .into_iter()
+                    .map(|holder| holder.runner)
+                    .collect();
+                for holder in &holders {
+                    *found.held.entry(holder.clone()).or_default() += 1;
+                }
+                KeyIsAt::Pack { pack, holders }
+            }
+            Ok(None) => KeyIsAt::NothingRegistered,
+            Err(why) => KeyIsAt::Refused(why),
         };
-        for holder in registry.holders_of(&pack) {
-            *held.entry(holder.runner).or_default() += 1;
-        }
+        found.keys.push((key.clone(), at));
     }
-    held
+    found
+}
+
+/// What this job needs and where this hub knows it to be, for E-07's answer
+/// (E-23, D257).
+///
+/// Rendered from the one [`WhereItIs`] the placement was judged against and
+/// from nothing else. The claim's own sentence already says *which* machine
+/// was preferred and why (`matcher`'s locality clause); this line says what
+/// that judgement was made out of, which is the half an operator cannot
+/// otherwise see — today, on a hub where nothing registers a pack at all, it
+/// is the difference between "no machine holds it" and "there is nothing to
+/// hold".
+///
+/// `None` for a job that needs nothing, which is every job Herd runs today:
+/// the line is **absent** rather than empty, so a dry run of such a job is
+/// the bytes it was before this existed.
+fn where_its_packs_are(
+    record: &JobRecord,
+    connected: &[String],
+    found: &WhereItIs,
+) -> Option<String> {
+    if record.needs.is_empty() {
+        return None;
+    }
+    let commit = record
+        .declaration
+        .as_ref()
+        .map(|declaration| declaration.commit.as_str());
+    let mut clauses: Vec<String> = Vec::new();
+    for (key, at) in &found.keys {
+        clauses.push(match at {
+            KeyIsAt::Pack { pack, holders } if holders.is_empty() => {
+                format!("{key} is the pack {pack}, and no connected runner says it holds it")
+            }
+            KeyIsAt::Pack { pack, holders } => {
+                format!("{key} is the pack {pack}, held by {}", holders.join(", "))
+            }
+            // Said in the dispatch's own terms, because the dispatch is what
+            // acts on it: this job does not start for want of this key,
+            // whichever machine the claim step preferred.
+            KeyIsAt::NothingRegistered => format!(
+                "nothing is registered for {key} at {}, so no machine can be preferred for \
+                 holding it and the dispatch holds this job back (E-12)",
+                commit.unwrap_or("the commit this job runs on")
+            ),
+            KeyIsAt::Refused(why) => format!("{key} cannot be resolved: {why}"),
+            KeyIsAt::NoCommit => format!(
+                "{key} has no commit to resolve against: a pack is registered for a \
+                 (commit, key) pair and only a declared command names a commit (E-11, D106)"
+            ),
+            KeyIsAt::NoRegistry => {
+                format!("this hub keeps no pack registry, so {key} resolves to nothing")
+            }
+        });
+    }
+    // D257, and the reason this is a clause of its own rather than a nought
+    // among the ones above: a machine that has not said what it holds has not
+    // said that it holds none.
+    let quiet: Vec<&str> = connected
+        .iter()
+        .filter(|runner| !found.said.contains(*runner))
+        .map(String::as_str)
+        .collect();
+    if !quiet.is_empty() {
+        clauses.push(format!(
+            "{} did not say what it holds, which is not the same as holding none of this \
+             (D257)",
+            quiet.join(", ")
+        ));
+    }
+    Some(format!(
+        "the packs it needs, and where this hub knows them to be: {}",
+        clauses.join("; ")
+    ))
 }
 
 /// Hand one job to the runner, recording the attempt before the frame goes
@@ -8033,12 +8202,19 @@ fn judge_one(state: &State, new: NewJob) -> Result<Vec<String>> {
     }
     let mut lines = Vec::new();
     let mut verdict = None;
+    let mut would_wait_for_its_packs: Option<String> = None;
     for (place, record) in queue.iter().enumerate() {
+        // Read once per record, and read *here* rather than inside the branch
+        // below: the map this hands the claim step and the sentence E-07
+        // prints are two renderings of one read (E-23). A dry run that
+        // computed its own locality would agree today and drift at the next
+        // change to either side.
+        let found = where_what_it_needs_is(state, record);
         let placing = matcher::Placing {
             parent: parent_of(state, record, &unfinished),
             drain_first_limit: Some(state.policy.drain_first_limit),
             readings_at_once: Some(state.policy.readings_at_once),
-            holds_what_it_needs: holders_of_what_it_needs(state, record),
+            holds_what_it_needs: found.held.clone(),
         };
         if record.id == hypothetical.id {
             let eligible = matcher::eligible(record, &seats, now, &placing);
@@ -8060,6 +8236,22 @@ fn judge_one(state: &State, new: NewJob) -> Result<Vec<String>> {
                 queue.len(),
                 queue::what_is_ahead(&queue, place, now, state.policy.aging_step)
             ));
+            // What the locality term was judged out of, said before the
+            // verdict that was judged on it (E-23, D257). Absent for a job
+            // that needs nothing, which is the whole of the frozen
+            // behaviour.
+            let connected: Vec<String> = seats.iter().map(|seat| seat.name.clone()).collect();
+            if let Some(packs) = where_its_packs_are(record, &connected, &found) {
+                lines.push(packs);
+            }
+            // And what the **dispatch** would do with those keys, which the
+            // claim step does not know and E-07 must not leave out: the
+            // resolve happens after the claim, so a job the fleet fits and
+            // the registry cannot serve is claimed and then held back by name
+            // (`packs_for`, ORCH-234). Read-only, and asked for the one job
+            // this answer is about; it consults nothing at all for a job that
+            // needs nothing.
+            would_wait_for_its_packs = packs_for(state, record).err();
             verdict = Some(matcher::place(
                 record,
                 &mut seats,
@@ -8075,9 +8267,19 @@ fn judge_one(state: &State, new: NewJob) -> Result<Vec<String>> {
         let _ = matcher::place(record, &mut seats, now, state.policy.stickiness, &placing);
     }
     lines.push(match verdict {
-        Some(Placement::Claim { why, .. }) => {
-            format!("it would start now, {why}")
-        }
+        Some(Placement::Claim { why, .. }) => match would_wait_for_its_packs {
+            None => format!("it would start now, {why}"),
+            // The one answer a dry run could most easily get wrong about a
+            // job with `needs`: the fleet fits it, so the claim step claims
+            // it, and the dispatch then holds it back for a key it cannot
+            // resolve. "It would start now" here would be exactly the lie
+            // E-07 must not tell — and it is the answer **every** job with
+            // `needs` would get today, because nothing registers a pack yet.
+            Some(because) => format!(
+                "it would be claimed and then wait for its packs, {why}. At the dispatch, \
+                 {because}"
+            ),
+        },
         Some(Placement::Wait { why }) => format!("it would wait: {why}"),
         Some(Placement::Impossible { why }) => {
             format!("it would be refused and never run: {why}")
@@ -11030,6 +11232,260 @@ mod tests {
             .is_empty(),
             "a pack is registered for a (commit, key), so a job with no \
              declaration has nothing to resolve against"
+        );
+    }
+
+    // ------------------------------------------- E-07 does not drift from E-23
+
+    /// The commit the dry runs below resolve their `needs` keys against.
+    const A_COMMIT: &str = "cb5a2e8b4f1d9c7a3e05b8d6f2a1c4e79b0d3f68";
+
+    /// A real state root, a real registry, and a fleet of equally preferred
+    /// runners each offering a free `kvm`.
+    ///
+    /// The links are held for the length of the test on purpose: a hub holds
+    /// its runners by a channel and a kick, and either of them dropped here
+    /// would be a machine that had gone.
+    struct ADryRunFleet {
+        _dir: tempfile::TempDir,
+        store: Arc<JobDirStore>,
+        state: State,
+        _links: Vec<(
+            Outbox,
+            mpsc::UnboundedReceiver<FromHub>,
+            watch::Sender<bool>,
+        )>,
+    }
+
+    /// Those runners, in the order given, **all at preference 0**: so the only
+    /// terms left to decide between them are the locality term and the name,
+    /// which is exactly the case E-23 is about.
+    fn a_dry_run_fleet(names: &[&str]) -> ADryRunFleet {
+        let dir = tempfile::tempdir().expect("a temporary state directory");
+        let store = Arc::new(JobDirStore::open(dir.path()).expect("the state root opens"));
+        let state = a_state_over(store.clone() as Arc<dyn JobStore>);
+        let mut links = Vec::new();
+        for name in names {
+            let (outbox, inbox) = mpsc::unbounded_channel();
+            let (kick, _kicked) = watch::channel(false);
+            assert!(
+                matches!(
+                    state.register_runner(
+                        name,
+                        Some(name),
+                        &outbox,
+                        kick.clone(),
+                        Announced {
+                            version: hub_version().to_owned(),
+                            capacity: offering_kvm_free(),
+                            host: HostSize::default(),
+                            jobs_at_once: None,
+                            preference: 0,
+                            load_milli: None,
+                            switch: herd_proto::Switch::On,
+                            mesh_endpoint: None,
+                        },
+                    ),
+                    Admitted::Yes
+                ),
+                "{name} joins the fleet"
+            );
+            links.push((outbox, inbox, kick));
+        }
+        ADryRunFleet {
+            _dir: dir,
+            store,
+            state,
+            _links: links,
+        }
+    }
+
+    /// Register one pack for `(A_COMMIT, key)` and have `holders` announce it.
+    ///
+    /// Returns its id, because the dry run's sentence names it and a test that
+    /// matched on a substring of a sha256 would be matching on nothing.
+    fn a_pack_held_by(
+        store: &JobDirStore,
+        key: &str,
+        holders: &[&str],
+    ) -> herd_proto::pack::PackId {
+        let registry = store.packs();
+        let manifest = format!(
+            "# chatons pack 1\n{}\t4096\t0644\tf\t{key}\t{key}/thing\n",
+            "1".repeat(64)
+        )
+        .into_bytes();
+        let pack = herd_proto::pack::PackId::of_manifest_bytes(&manifest);
+        let answer = registry
+            .register(crate::registry::Registration {
+                commit: A_COMMIT.to_owned(),
+                key: key.to_owned(),
+                announced: pack.clone(),
+                manifest,
+                meta: None,
+                runner: holders.first().copied().unwrap_or("nobody").to_owned(),
+                job: "j0000000001".to_owned(),
+                attempt: 1,
+                at: Timestamp::at_unix_seconds(1_793_145_600),
+            })
+            .expect("the registry writes");
+        assert!(answer.refusal().is_none(), "{answer:?}");
+        for holder in holders {
+            registry.announced(holder, None, vec![pack.clone()], false);
+        }
+        pack
+    }
+
+    /// What a requester would ask for: one job, `kvm`, and these keys.
+    fn asking_for(needs: &[&str], with_a_commit: bool) -> herd_proto::Asked {
+        herd_proto::Asked {
+            command: vec!["true".to_owned()],
+            labels: LabelSet::new(["kvm"]).expect("valid labels"),
+            priority: Priority::Step,
+            build_thread_mib: None,
+            memory_mib: None,
+            tmpfs_mib: None,
+            deadline_unix_s: None,
+            after: None,
+            requeue_exit_code: None,
+            declaration: with_a_commit.then(|| herd_proto::Declaration {
+                command: "a-declared-command".to_owned(),
+                commit: A_COMMIT.to_owned(),
+                args: Vec::new(),
+                executor: herd_proto::Executor::default(),
+            }),
+            labels_from: None,
+            timeout_s: None,
+            needs: needs.iter().map(|key| (*key).to_owned()).collect(),
+            leaves: BTreeMap::new(),
+        }
+    }
+
+    /// E-07 must not drift from E-23: a dry run of a job with `needs` names
+    /// the machine that holds the pack, and says that holding it is why.
+    ///
+    /// **The term has to have decided something, or the test proves nothing.**
+    /// `attic` and `tower` are equally preferred, so without a holding the
+    /// name decides and `attic` takes it. `tower` is the holder here, so a dry
+    /// run that names `tower` is a dry run in which locality — and only
+    /// locality — moved the job.
+    ///
+    /// And the sentence is read off the **one** read the placement was judged
+    /// on: the line naming the pack and the clause naming the reason come from
+    /// the same `WhereItIs`, so they cannot disagree with each other or with
+    /// the real pass.
+    #[test]
+    fn a_dry_run_says_the_holder_was_preferred_for_holding_the_key() {
+        let fleet = a_dry_run_fleet(&["attic", "tower"]);
+        let pack = a_pack_held_by(&fleet.store, "kernel", &["tower"]);
+
+        let lines = dry_run(&fleet.state, asking_for(&["kernel"], true)).expect("the dry run");
+        let said = lines.join("\n");
+
+        assert!(
+            said.contains(&format!("kernel is the pack {pack}, held by tower")),
+            "the answer must say which pack the key is and who holds it: {said}"
+        );
+        assert!(
+            said.contains("claimed by tower"),
+            "the holder takes it, against the name tie-break that would have \
+             given it to attic: {said}"
+        );
+        assert!(
+            said.contains("it already holds the pack it needs (kernel), so none is fetched")
+                && said.contains(
+                    "holding it is why it was preferred to attic at the same preference (E-23)"
+                ),
+            "and it must say that holding it is the reason, in the matcher's \
+             own words and not in a second copy of them: {said}"
+        );
+        assert!(
+            said.contains("it would start now"),
+            "the pack resolves and a machine holds it, so this job really \
+             would start: {said}"
+        );
+        assert!(
+            fleet
+                .store
+                .unfinished_jobs()
+                .expect("the queue reads")
+                .is_empty(),
+            "a dry run mints nothing (E-07)"
+        );
+    }
+
+    /// The answer that was wrong before this step, and it is the answer
+    /// **every** job with `needs` gets today: nothing is registered for its
+    /// key, so the claim step claims it and the dispatch holds it back.
+    ///
+    /// A dry run that stopped at the claim said "it would start now" about a
+    /// job that would not start, which is the one lie E-07 exists to refuse.
+    /// And D257 beside it: `cellar` is connected and has announced nothing,
+    /// which is not the same as announcing that it holds none.
+    #[test]
+    fn a_dry_run_says_the_dispatch_would_hold_it_back_for_a_key_nothing_registers() {
+        let fleet = a_dry_run_fleet(&["attic", "cellar"]);
+        // One pack, for another key, so the registry exists and is not empty:
+        // what is missing is this job's key and nothing else.
+        let _ = a_pack_held_by(&fleet.store, "rootfs", &["attic"]);
+
+        let lines = dry_run(&fleet.state, asking_for(&["kernel"], true)).expect("the dry run");
+        let said = lines.join("\n");
+
+        assert!(
+            said.contains(&format!("nothing is registered for kernel at {A_COMMIT}")),
+            "the answer must name the key and the commit it could not be \
+             resolved against: {said}"
+        );
+        assert!(
+            said.contains("it would be claimed and then wait for its packs")
+                && said.contains("At the dispatch,"),
+            "and it must say that the dispatch is what holds it back: {said}"
+        );
+        assert!(
+            !said.contains("it would start now"),
+            "a job the dispatch would hold back does not start now (E-07): {said}"
+        );
+        assert!(
+            said.contains("cellar did not say what it holds")
+                && said.contains("which is not the same as holding none of this (D257)"),
+            "a runner that has announced nothing must not be printed as a \
+             runner holding none (D257): {said}"
+        );
+        assert!(
+            !said.contains("cellar holds 0"),
+            "and least of all as a nought: {said}"
+        );
+    }
+
+    /// The frozen half: a job that needs nothing is explained as it was.
+    ///
+    /// Every job Herd runs today is this job, so the whole of E-23's new text
+    /// has to be **absent** from its answer rather than empty in it — a dry
+    /// run saying "the packs it needs: none" would be a changed answer for
+    /// every job the first consumer submits.
+    #[test]
+    fn a_dry_run_of_a_job_that_needs_nothing_says_nothing_about_packs() {
+        let fleet = a_dry_run_fleet(&["attic", "tower"]);
+        // A registry with a pack in it, held by a runner: nothing about this
+        // job may read any of it.
+        let _ = a_pack_held_by(&fleet.store, "kernel", &["tower"]);
+
+        let lines = dry_run(&fleet.state, asking_for(&[], true)).expect("the dry run");
+        let said = lines.join("\n");
+
+        assert!(
+            !said.contains("the packs it needs"),
+            "a job that needs nothing has no locality line at all: {said}"
+        );
+        assert!(
+            !said.contains("E-23") && !said.contains("D257"),
+            "nor any of E-23's clauses: {said}"
+        );
+        assert!(
+            said.contains("it would start now, claimed by attic"),
+            "and the name still decides between two equally preferred \
+             machines, as it did before the term existed: {said}"
         );
     }
 }
