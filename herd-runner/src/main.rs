@@ -947,4 +947,176 @@ mod tests {
     fn the_runner_s_command_line_is_well_formed() {
         Args::command().debug_assert();
     }
+
+    /// Everything `herd-runner --help` tells an operator a cap's figure is,
+    /// read back **through the constant that decides it**.
+    ///
+    /// **Why this test exists at all.** `--help` is the first operator
+    /// surface anybody reads and it was, until this, the only one in the
+    /// repository with no gate of any kind: `herd-proto` has frozen-format
+    /// tests, `size.rs` has golden strings, `confine.rs` has compile-time
+    /// `const _: () = assert!(…)`, `release.yml` reads the version out of the
+    /// source — and the figures in these doc comments were correct by
+    /// somebody's attention. Attention is exactly what failed: `v0.3.7`,
+    /// `v0.4.0` and `v0.4.1` all shipped a `--job-output-cap` that said *"32
+    /// MiB by default, which is also the most this can be"* against a
+    /// [`DEFAULT_OUTPUT_CAP`] of 1 GiB — wrong by 32×, inverted about what
+    /// the flag does, wrong about the consequence, and caught by a human
+    /// reading rather than by a run.
+    ///
+    /// **Why every figure is interpolated and none is retyped.** A test that
+    /// spelled `"1 GiB"` out again would be a fourth copy of the same rule
+    /// and would go green on the day the constant moved — which is the defect
+    /// it is supposed to catch. So each figure below arrives through the
+    /// constant's own formatter, and the words around it are the sentence
+    /// being checked.
+    ///
+    /// **Whitespace is flattened first** because clap wraps help text to a
+    /// width this test has no business knowing: a phrase that straddles a
+    /// line break is still the same sentence to the person reading it.
+    ///
+    /// Blocks deliberately **not** asserted here, each for a reason:
+    /// `--job-memory-max`, `--job-log-cap`, `--job-disk-budget` and
+    /// `--host-tmpfs` carry example *syntax* (`2GiB`, `512MiB`) and state no
+    /// default, so there is nothing to disagree with a constant;
+    /// `--health-every` and the other cadences state no figure in prose at
+    /// all — clap renders their `[default: …]` straight out of the constant,
+    /// which is already the thing this test is for; `--drain-grace`'s "five
+    /// seconds" is invariant 2's promise and **not** [`DRAIN_GRACE`], which
+    /// is three, so pairing them would assert a falsehood; and
+    /// `--job-io-max`'s "a quarter is a reasonable first try" is advice about
+    /// a figure an operator measures, not a figure Herd holds.
+    #[test]
+    fn the_long_help_states_every_figure_its_constants_decide() {
+        let help = flattened_long_help();
+
+        // The fraction a reader is told is kept back is the complement of the
+        // share the code hands out, so it is derived and not copied: change
+        // `BUILD_SHARE_*` and the word this produces changes with it.
+        let kept_back = a_fraction_in_words(
+            herd_proto::placement::BUILD_SHARE_DENOMINATOR
+                - herd_proto::placement::BUILD_SHARE_NUMERATOR,
+            herd_proto::placement::BUILD_SHARE_DENOMINATOR,
+        );
+
+        // And the floor's three figures, all read out of
+        // `default_memory_floor_mib` by asking it rather than by repeating
+        // what it says: the clamp's two ends at the extremes, and the
+        // denominator from a host where neither end binds.
+        let lowest = herd_proto::default_memory_floor_mib(0);
+        let highest = herd_proto::default_memory_floor_mib(u64::MAX / 5);
+        // The denominator is **found** rather than assumed: the smallest host
+        // size whose floor falls strictly inside the clamp and divides it
+        // exactly. Searching for it is what keeps this test from having to
+        // know the figure it is about to check.
+        let (unclamped_host, unclamped) = (1..=100_000u64)
+            .map(|mib| (mib, herd_proto::default_memory_floor_mib(mib)))
+            .find(|(mib, floor)| *floor > lowest && *floor < highest && mib % floor == 0)
+            .expect(
+                "some host size has a default floor strictly inside the clamp that divides \
+                 it exactly; if none does, the default stopped being a plain fraction and \
+                 the sentence in the help needs reading rather than this test",
+            );
+        let a_fraction_of_the_memory = a_fraction_in_words(1, unclamped_host / unclamped);
+
+        for (figure, flag) in [
+            (
+                format!(
+                    "{} by default, and the flag",
+                    herd_proto::show_bytes(DEFAULT_OUTPUT_CAP)
+                ),
+                "--job-output-cap's default",
+            ),
+            (
+                format!(
+                    "INLINE_OUTPUT_MAX`, {})",
+                    herd_proto::show_bytes(herd_proto::INLINE_OUTPUT_MAX)
+                ),
+                "the frame ceiling --job-output-cap is no longer bounded by",
+            ),
+            (
+                format!(
+                    "{} to {} against the 100 an ordinary process has. {} by default",
+                    herd_runner::cgroup::WEIGHT_RANGE.start(),
+                    herd_runner::cgroup::WEIGHT_RANGE.end(),
+                    DEFAULT_CPU_WEIGHT
+                ),
+                "--job-cpu-weight's range and default",
+            ),
+            (
+                format!(
+                    "{} to {} against 100. {} by default",
+                    herd_runner::cgroup::WEIGHT_RANGE.start(),
+                    herd_runner::cgroup::WEIGHT_RANGE.end(),
+                    DEFAULT_IO_WEIGHT
+                ),
+                "--job-io-weight's range and default",
+            ),
+            (
+                format!("{DEFAULT_PIDS_MAX} by default"),
+                "--job-pids-max's default",
+            ),
+            (
+                format!("{kept_back} of whatever it is is kept back"),
+                "--host-memory's share kept back from build threads",
+            ),
+            (
+                format!(
+                    "{a_fraction_of_the_memory} of the memory, between {} and {}, when not \
+                     given",
+                    herd_proto::show_bytes(lowest << 20),
+                    herd_proto::show_bytes(highest << 20)
+                ),
+                "--host-memory-floor's default and its two bounds",
+            ),
+        ] {
+            assert!(
+                help.to_lowercase().contains(&figure.to_lowercase()),
+                "`herd-runner --help` must state {flag} as its constant decides it, and the \
+                 rendered help does not contain {figure:?}.\n\
+                 \n\
+                 **The constant is the authority and the help text is what is wrong.** Do \
+                 not change the constant to match the sentence, and do not change this \
+                 test: fix the doc comment on the flag. A figure in `--help` is read by an \
+                 operator who then sets a cap by it, and a wrong one has shipped in three \
+                 releases before now.\n\
+                 \n\
+                 --- the rendered long help, with its whitespace flattened:\n{help}"
+            );
+        }
+    }
+
+    /// The long help, rendered from the real `Args` and flattened to one
+    /// line, because clap's wrap width is not this test's business.
+    fn flattened_long_help() -> String {
+        Args::command()
+            .render_long_help()
+            .to_string()
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ")
+    }
+
+    /// A fraction as `--help` spells it, derived from the two numbers rather
+    /// than typed beside them.
+    ///
+    /// The panic is the useful half: a fraction nobody has a word for here is
+    /// one somebody has just changed, and the sentence that mentions it needs
+    /// reading before this test can be made to pass.
+    fn a_fraction_in_words(numerator: u64, denominator: u64) -> String {
+        match (numerator, denominator) {
+            (1, 2) => "half".to_owned(),
+            (1, 3) => "a third".to_owned(),
+            (1, 4) => "a quarter".to_owned(),
+            (1, 5) => "a fifth".to_owned(),
+            (1, 6) => "a sixth".to_owned(),
+            (1, 8) => "an eighth".to_owned(),
+            _ => panic!(
+                "`--help` spells this fraction in words and this test has no word for \
+                 {numerator}/{denominator}. Somebody has changed the share or the floor: \
+                 read the sentence that quotes it, then either add the word here or write \
+                 the figure in the help"
+            ),
+        }
+    }
 }
