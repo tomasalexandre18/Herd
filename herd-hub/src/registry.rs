@@ -5,12 +5,23 @@
 //! arms of `relay_from_runner` (ORCH-230). A runner's `ToHub::RegisterPack`
 //! publishes a pack here, its `ToHub::PacksHeld` records what it holds, its
 //! `ToHub::AskPack` resolves a key, and both of the hub's "a runner is gone"
-//! paths forget its holdings. What is **not** wired is the assignment side:
-//! `Asked.needs` and `Asked.leaves` ride the wire and
-//! `FromHub::AssignJob`'s `packs_in`/`packs_out` are still sent empty, so a
-//! job is assigned no pack and the resolve above is only ever reached by a
-//! runner that asks. `herd-hub/tests/pack_frames.rs` is where the wired half
-//! is measured, through a socket and never by calling this module.
+//! paths forget its holdings.
+//!
+//! **The assignment side is wired too** (ORCH-234): `Asked.needs` and
+//! `Asked.leaves` are carried onto the record, and where
+//! `FromHub::AssignJob` is built each `needs` key goes through
+//! [`PackRegistry::resolve`] onto `packs_in` while `leaves` goes onto
+//! `packs_out` — so the common case costs no round trip and
+//! `ToHub::AskPack` is left for the case the hub had nothing resolved. A key
+//! that does not resolve is a job that **waits**, named with its key and its
+//! commit, and never a `FromHub::Refused` (D13).
+//!
+//! What is still owed on that side is **the recording and the layout**: the
+//! resolved ids are not written to `JobRecord::packs_in` (that field's doc
+//! carries the measurement), and a runner handed a pack hands the attempt
+//! back rather than laying `{in}/<key>` out, because the layout step is not
+//! built. `herd-hub/tests/pack_frames.rs` is where all of it is measured,
+//! through a socket and never by calling this module.
 //!
 //! ## What it holds, and where
 //!
@@ -87,8 +98,10 @@
 //!   `release_runner` on a closed link and the watchdog's silent-link loop —
 //!   call [`PackRegistry::runner_gone`].
 //!
-//! **What is still owed is the asking, on both sides**, and that is why D231
-//! decision 5 is not yet true:
+//! **What is still owed is the hub's half of the asking**, which is an
+//! optimisation on this build rather than the mechanism (ORCH-233): the
+//! substance of D231 decision 5 is true from the side that owns the fact,
+//! because a runner announces unprompted.
 //!
 //! * the **hub** does not send `FromHub::ReadPacksAgain`. It was written
 //!   after `Welcome`, where it belongs, and removed: it is a frame-ordering
@@ -96,15 +109,19 @@
 //!   `versions.rs`, six of which are about admission, cadence, twins and
 //!   verdicts. The frame is still constructed nowhere in the tree. The
 //!   comment at that spot in `server.rs` carries the figures;
-//! * the **runner** neither answers that frame nor constructs
-//!   `ToHub::PacksHeld` of its own accord (`herd-runner/src/` was not this
-//!   step's to change).
+//! * the **runner** does not answer that frame. It does construct
+//!   `ToHub::PacksHeld` of its own accord, since ORCH-232: a runner
+//!   announces what its pack store holds, unprompted, on its own join,
+//!   cut into frames — `herd-runner/src/lib.rs`, and measured against both
+//!   binaries as processes in `herd-hub/tests/packs_announced.rs`.
 //!
-//! So an announcement only ever arrives unprompted, and today's runner sends
-//! none. What *is* proved is that a hub told about a holding records it, and
-//! forgets it when the link goes: measured through a socket in
-//! `herd-hub/tests/pack_frames.rs` against a hand-driven peer, and against
-//! no real runner. [`PackRegistry::forget_all_holdings`] likewise has no
+//! So an announcement only ever arrives unprompted, which is how every
+//! announcement this build makes arrives. That a hub told about a holding
+//! records it, and forgets it when the link goes, is measured through a
+//! socket in `herd-hub/tests/pack_frames.rs` against a hand-driven peer;
+//! that a real `herd-runner` says it at all is measured in
+//! `herd-hub/tests/packs_announced.rs` against both binaries as processes.
+//! [`PackRegistry::forget_all_holdings`] likewise has no
 //! caller outside this module's tests: a fresh registry starts empty, so the
 //! restart case it exists for is covered by [`PackRegistry::open`], and the
 //! fleet-wide re-ask it is really for needs the ask above to exist first.
@@ -800,20 +817,33 @@ impl PackRegistry {
     /// `more: false` applies it. An empty announcement with `more: false` is
     /// the real statement "I hold none", which is why it must not be read as
     /// "nothing to say".
+    ///
+    /// **Answers how many packs this runner now stands at** — the applied set
+    /// once `more` is false, and what has arrived so far while it is true —
+    /// **read under the same lock that just wrote it**, which is the whole
+    /// reason it is a return value and not a second call. A caller that
+    /// counted the frame in its hand instead undercounts every chunked
+    /// announcement, and does so invisibly: measured through two real
+    /// processes, a runner announcing 516 packs in two frames had the hub say
+    /// it held **4**, because 4 is the length of the last frame
+    /// (ORCH-239). That sentence is an operator's only observation of
+    /// holdings, so the figure it prints comes from here.
     pub fn announced(
         &self,
         runner: &str,
         endpoint: Option<String>,
         packs: Vec<PackId>,
         more: bool,
-    ) {
+    ) -> usize {
         let mut live = self.locked();
         let holding = live.holdings.entry(runner.to_owned()).or_default();
         holding.endpoint = endpoint;
         holding.arriving.extend(packs);
-        if !more {
-            holding.held = std::mem::take(&mut holding.arriving);
+        if more {
+            return holding.arriving.len();
         }
+        holding.held = std::mem::take(&mut holding.arriving);
+        holding.held.len()
     }
 
     /// Forget everything a runner announced, because its link is gone.
@@ -1323,6 +1353,49 @@ mod tests {
         registry.runner_gone("tower");
         assert!(registry.holdings().is_empty());
         assert!(registry.holders_of(&pack).is_empty());
+    }
+
+    /// **The count a chunked announcement comes back with is the set's, not
+    /// the frame's** (ORCH-239).
+    ///
+    /// The figure `announced` answers is what the hub prints, and that
+    /// sentence is an operator's only observation of holdings. Measured
+    /// through two real processes before this: a runner announced 516 packs
+    /// in two frames and the hub said it held **4**, the length of the last
+    /// frame. So the fixture here is **three** frames whose lengths all
+    /// differ — 3, 2 and 1 — because any one of the three being printed
+    /// would be a wrong answer with a different shape, and a fixture of one
+    /// frame could not tell the right answer from the frame's own length.
+    #[test]
+    fn a_chunked_announcement_is_counted_as_the_set_it_builds_and_not_as_its_last_frame() {
+        let (_dir, registry) = registry();
+        let packs: Vec<PackId> = (0..6)
+            .map(|n| {
+                let mut bytes = a_manifest();
+                bytes.extend_from_slice(format!("# {n}\n").as_bytes());
+                PackId::of_manifest_bytes(&bytes)
+            })
+            .collect();
+        assert_eq!(
+            registry.announced("tower", None, packs[0..3].to_vec(), true),
+            3,
+            "the first frame of three has three packs arriving"
+        );
+        assert_eq!(
+            registry.announced("tower", None, packs[3..5].to_vec(), true),
+            5,
+            "the second frame answers what has arrived so far, not its own two"
+        );
+        assert_eq!(
+            registry.announced("tower", None, packs[5..6].to_vec(), false),
+            6,
+            "and the frame that applies answers the whole set, not its own one"
+        );
+        assert_eq!(
+            registry.holdings(),
+            vec![("tower".to_owned(), 6)],
+            "which is exactly what the registry now holds for that runner"
+        );
     }
 
     #[test]

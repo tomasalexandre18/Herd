@@ -531,12 +531,14 @@ async fn main() -> Result<()> {
     );
     match &sink {
         Some(sink) => println!(
-            "herd-hub: events go to {} (--notify-sink). Four things are said and nothing \
-             else: a runner joining, a runner lost, an owner's own switch moving, and a job \
-             lost twice. Never one per step job, so a day of green steps is a day of \
-             silence. Nothing waits for this sink: a sink that hangs delays no verdict and \
-             costs this hub none of its stop budget, and a delivery that fails is said here \
-             once, with the reason, and never retried.",
+            "herd-hub: events go to {} (--notify-sink). Five things are said and nothing \
+             else: a runner joining, a runner lost, an owner's own switch moving, a job \
+             lost twice, and the end of a job whose submitter asked for it with \
+             `herdctl submit --announce-end`. Never one per step job, so a day of green \
+             steps nobody asked about is a day of silence. Nothing waits for this sink: a \
+             sink that hangs delays no verdict and costs this hub none of its stop budget, \
+             and a delivery that fails is said here once, with the reason, and never \
+             retried.",
             sink.described()
         ),
         None => println!(

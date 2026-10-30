@@ -300,6 +300,8 @@ mod tests {
             timeout_s: None,
             reading: None,
             reading_for: None,
+            needs: Vec::new(),
+            leaves: Default::default(),
             parallelism: None,
             submissions: 1,
             state: JobState::Queued,
@@ -311,6 +313,7 @@ mod tests {
             outputs: Default::default(),
             packs_in: Default::default(),
             packs_out: Default::default(),
+            announce_end: false,
         }
     }
 

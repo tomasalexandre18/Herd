@@ -381,6 +381,23 @@ enum Action {
         /// for more than a machine has in all is never sent there.
         #[arg(long, value_name = "MIB")]
         tmpfs_mib: Option<u64>,
+        /// Ask the hub to announce this job's end wherever its events go
+        /// (E-37).
+        ///
+        /// For the submission nobody is following: a push hook, a nightly,
+        /// anything that leaves with the id and is not there to read the
+        /// verdict. The announcement is the hub's to make and the operator's
+        /// to route — it goes wherever `--notify-sink` points, which is a
+        /// setting on the hub and not here — so this says only that you want
+        /// to be told. A hub with no sink configured records the asking and
+        /// tells nobody, and this command cannot tell the difference.
+        ///
+        /// Left out, nothing is announced. That is deliberate and it is what
+        /// keeps a topic worth reading: a fleet that announced every step
+        /// job's end would be a fleet whose owner mutes it, and then the one
+        /// end that mattered is lost with the rest.
+        #[arg(long)]
+        announce_end: bool,
         #[command(flatten)]
         asking: Asking,
         #[command(flatten)]
@@ -979,6 +996,7 @@ async fn run(args: Args, known: &Cell<WhatExists>) -> Result<Done> {
             build_thread_mib,
             memory_mib,
             tmpfs_mib,
+            announce_end,
             asking,
             declaring,
             command,
@@ -998,12 +1016,13 @@ async fn run(args: Args, known: &Cell<WhatExists>) -> Result<Done> {
                 command,
             )?;
             eprintln!("herdctl: {}", submitting_at(job.priority));
-            let job_id = herdctl::submit_job_saying(
+            let job_id = herdctl::submit_job_announcing(
                 &config,
                 job.command,
                 job.labels,
                 job.priority,
                 job.declared,
+                announce_end,
                 |said| say_it(known, said),
             )
             .await?;

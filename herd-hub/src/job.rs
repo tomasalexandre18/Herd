@@ -461,6 +461,20 @@ pub struct NewJob {
     /// The job this one is the requirement reading **of**, when it is one
     /// (D74, D159); see [`JobRecord::reading_for`].
     pub reading_for: Option<JobId>,
+    /// The pack keys this submission asks for, as it asked for them (M11);
+    /// see [`JobRecord::needs`].
+    pub needs: Vec<String>,
+    /// The artefacts this submission says it will leave, key → path under
+    /// `{out}` (M11); see [`JobRecord::leaves`].
+    pub leaves: std::collections::BTreeMap<String, String>,
+    /// Whether the submitter asked for this job's end to be announced
+    /// (E-37); see [`JobRecord::announce_end`].
+    ///
+    /// `false` for every constructor here, which is E-37's *"never per step
+    /// job by default"*: the hub's own mints — a reading (D74), a requeue —
+    /// ask for nothing, and the one way this is `true` is a submission that
+    /// said so on the wire.
+    pub announce_end: bool,
 }
 
 impl NewJob {
@@ -497,7 +511,26 @@ impl NewJob {
             timeout_s: None,
             reading: None,
             reading_for: None,
+            needs: Vec::new(),
+            leaves: std::collections::BTreeMap::new(),
+            announce_end: false,
         }
+    }
+
+    /// The same, with M11's two: the pack keys this submission consumes and
+    /// the artefacts it says it will leave (E-12, ORCH-148).
+    ///
+    /// Both are carried onto the record rather than used at the submission,
+    /// because the resolve happens once per **attempt** and against the
+    /// registry as it stands then.
+    pub fn consuming(
+        mut self,
+        needs: Vec<String>,
+        leaves: std::collections::BTreeMap<String, String>,
+    ) -> Self {
+        self.needs = needs;
+        self.leaves = leaves;
+        self
     }
 
     /// The same, with M9's three: when it stops being worth starting, the one
@@ -560,6 +593,18 @@ impl NewJob {
     pub fn with_admission(mut self, memory_mib: Option<u64>, tmpfs_mib: Option<u64>) -> Self {
         self.memory_mib = memory_mib;
         self.tmpfs_mib = tmpfs_mib;
+        self
+    }
+
+    /// The same, as a submitter who asked for this job's end to be announced
+    /// (E-37).
+    ///
+    /// A request, carried from the submission onto the record and read back
+    /// when the job ends. Nothing else in the hub ever sets it: a job the
+    /// hub minted for itself is a job nobody is waiting on an announcement
+    /// for.
+    pub fn announcing_its_end(mut self, asked: bool) -> Self {
+        self.announce_end = asked;
         self
     }
 
@@ -1020,14 +1065,55 @@ pub struct JobRecord {
     /// not even gain a *name*, only contents it was already shaped for.
     #[serde(default, skip_serializing_if = "OutputSummary::is_silent")]
     pub outputs: OutputSummary,
+    /// The pack keys this job asks for, as its requester asked for them
+    /// (M11, E-12).
+    ///
+    /// **The question, where [`JobRecord::packs_in`] is the answer.** It is
+    /// on the record for the reason [`JobRecord::declaration`] is: an attempt
+    /// is resolved against the registry as it stands *when that attempt goes
+    /// out*, and a requeue onto another machine (E-21) resolves again — so
+    /// the keys have to outlive the submission connection that named them.
+    /// Until this field existed, [`herd_proto::Asked::needs`] arrived on the
+    /// wire and was dropped at the submission, which is why
+    /// `FromHub::AssignJob`'s `packs_in` could only ever be sent empty
+    /// (ORCH-234).
+    ///
+    /// `#[serde(default)]`, for the reason [`JobRecord::packs_in`] gives:
+    /// absent means **this job asks for no pack**, which is every job on the
+    /// deployed root.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub needs: Vec<String>,
+    /// What this job says it will leave, key → path under `{out}`
+    /// (M11, E-12).
+    ///
+    /// The question [`JobRecord::packs_out`] answers, and on the record for
+    /// the same reason `needs` is: `FromHub::AssignJob`'s `packs_out` is
+    /// handed back on **every** attempt, so a requeue leaves the same
+    /// artefacts under the same keys, and the record is the only thing that
+    /// knows them both.
+    ///
+    /// `#[serde(default)]`, as above.
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub leaves: std::collections::BTreeMap<String, String>,
     /// The packs this job's `needs` resolved to, by the key that names them
     /// under `{in}` (E-12).
     ///
-    /// Written when the job is assigned, because that is when the hub resolves
-    /// a `(commit, key)` to an id, and never changed afterwards: what a job
-    /// consumed is part of what it was, and a re-run on another commit is
-    /// another job. A requeue onto another machine (E-21) resolves again and
-    /// rewrites this, exactly as it re-derives the `-j`.
+    /// To be written when the job is assigned, because that is when the hub
+    /// resolves a `(commit, key)` to an id, and never changed afterwards:
+    /// what a job consumed is part of what it was, and a re-run on another
+    /// commit is another job. A requeue onto another machine (E-21) resolves
+    /// again and rewrites this, exactly as it re-derives the `-j`.
+    ///
+    /// **Written by nothing on this build, and that is a measured gap and
+    /// not the design.** The resolve itself now happens where the assignment
+    /// is built and travels on `FromHub::AssignJob`'s `packs_in`
+    /// (ORCH-234's frame half), so a runner is told which packs its job
+    /// consumes; what is missing is the *recording*. Putting it here means a
+    /// write at the moment `begin_attempt` numbers the attempt — the one
+    /// write that moment is allowed — which is a `JobStore` signature and
+    /// five implementors, and was deliberately left out of the branch that
+    /// filled the frame. So a reader of `job.json` cannot yet tell which
+    /// pack an attempt was handed, and `herd-hub report` cannot either.
     ///
     /// The **id** and not the manifest: the manifest's bytes live once, in
     /// `packs/manifests/<id>/manifest.tsv`, and the id is the sha256 of
@@ -1061,6 +1147,43 @@ pub struct JobRecord {
     /// `#[serde(default)]`, for the reason [`JobRecord::packs_in`] is.
     #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
     pub packs_out: std::collections::BTreeMap<String, herd_proto::pack::PackId>,
+    /// Whether this job's **submitter asked for its end to be announced**
+    /// (E-37).
+    ///
+    /// **A request and never a result.** It says what was asked for at
+    /// submission time; it says nothing at all about whether an announcement
+    /// was made, could be made, or reached anybody. A hub with no
+    /// `--notify-sink` configured writes this field exactly as a hub with one
+    /// does and announces nothing, because the sink is the operator's setting
+    /// and this is the requester's question. Whether a particular event left
+    /// the machine is the hub's own stderr's business, not the record's: an
+    /// event is news, sent once and never retried
+    /// ([`crate::notify`]), so a record claiming delivery would be a record
+    /// claiming something nobody checked.
+    ///
+    /// Written at birth and never changed, like [`JobRecord::labels`]: what a
+    /// submitter asked for is part of what the job was. A requeue (D76) and a
+    /// second attempt (E-21) re-run the same record and so carry the same
+    /// asking; a second identical submission that *joins* this job (E-05) does
+    /// not change it, which is the honest answer — one execution has one end,
+    /// and E-05's joiner is told how it went on its own connection.
+    ///
+    /// **It is read exactly once per job**, at the job's terminal transition,
+    /// and only by a hub that has a sink: see `say_how_it_ended` in
+    /// `crate::server`. So the acceptance criterion holds by construction —
+    /// a day of step jobs nobody asked about is a day of no reads and no
+    /// events.
+    ///
+    /// `#[serde(default)]`, and absent means exactly what the default says:
+    /// **nobody asked**. That is true of every record written before this
+    /// field existed — there was no way to ask — which is the condition
+    /// [`RECORD_VERSION`]'s own doc sets for a field to be additive, so this
+    /// field does not move that number. `herd-hub/src/store.rs`'s unit tests
+    /// assert both halves: a record carrying the asking reads back as asking,
+    /// and a `job.json` with no such key reads back as not asking rather than
+    /// failing to parse.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub announce_end: bool,
 }
 
 /// What a job left behind, as `job.json` says it.
@@ -1484,6 +1607,8 @@ impl JobRecord {
             timeout_s: new.timeout_s,
             reading: new.reading,
             reading_for: new.reading_for,
+            needs: new.needs,
+            leaves: new.leaves,
             parallelism: None,
             submissions: 1,
             state: JobState::Queued,
@@ -1495,6 +1620,7 @@ impl JobRecord {
             outputs: OutputSummary::default(),
             packs_in: Default::default(),
             packs_out: Default::default(),
+            announce_end: new.announce_end,
         }
     }
 
