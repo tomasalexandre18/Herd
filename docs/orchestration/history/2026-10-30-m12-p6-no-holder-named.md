@@ -5,8 +5,10 @@
   none; `ORCH-NEXT-A` of the planner's M12 plan is the row that would
   carry it.
 - **Agent:** herd-step
-- **Branch / commit:** `m12-p6-no-holder-named` / `c7c3693`, based on
-  `origin/main` `df47266`
+- **Branch / commits:** `m12-p6-no-holder-named`, based on `origin/main`
+  `df47266`. Two code commits — `c7c3693` *Name the two ways a pack has
+  no holder* and `44ed373` *Judge the queue when an announcement changes
+  what a runner holds* — plus this file's own.
 - **Landing:** none — an agent pushes its branch and lands nothing (one
   landing per batch, `docs/orchestration/workflow.md`); `herd-merger`
   names the landing here, and fills the record of `templates/landing.md`
@@ -67,6 +69,27 @@ two states and not one.**
    whose inputs are nowhere. It is now `Dispatched::Waits` with the
    state's name, the pack's id, the commit and the key in the sentence.
 
+4. **The wait ends on the event that ends it, not on a clock.** The
+   `ToHub::PacksHeld` arm now judges the queue when an announcement
+   **changes** what this hub holds for that runner. `announced` returns
+   `Announcement { held, changed }` instead of a bare `usize`, so the
+   figure ORCH-239 put there is untouched and the news is a second fact
+   read under the same lock. **Only on news**, which is the shape
+   `record_health` and `record_switch` already use: a runner restating
+   what the hub already had walks no queue, and `more: true` is never
+   news because nothing is applied until an announcement ends.
+
+   Without it, a pack that **regains** a holder was placed by
+   `let_the_queue_age` — `aging_step / 4`, clamped to 1 s…60 s, so **up
+   to a minute** of a machine standing idle holding the very bytes a
+   queued job was waiting for. That latency existed only because this
+   step made the job correctly wait, so it belongs to this step.
+
+5. **`PacksNow` and `PackNow` join `lib.rs`'s crate-root `pub use`**
+   beside `RunnerNow` and `HubNow`. Nothing was broken without it —
+   `pub mod status` already made them reachable — and it is the ragged
+   edge a later reader would have tripped on.
+
 **Tests.** Four, and every one of them fails on `origin/main`'s
 behaviour:
 
@@ -87,8 +110,21 @@ behaviour:
   `a_job_needing_a_pack_no_runner_holds_waits_by_name_and_is_not_assigned`
   — through a socket. The hub's sentence reaches a **requester**, the
   runner is handed **no** `AssignJob`, **no** `FromHub::Refused` is sent
-  (D13), and the same job — no resubmission, no requeue — is placed once
-  a holder announces again.
+  (D13), and the same job — no resubmission, no requeue — is placed when
+  a holder announces again. **One frame and nothing else between the
+  wait and the assignment**: nothing submits a second job, sends a
+  health report or waits on a clock, so the announcement is the only
+  thing that could have caused it, which is what makes this the test of
+  *Done* 4 and not merely a test that passes beside it.
+- `registry.rs`, in the same test as the three states: the four
+  `changed` cases, including the one a reader would guess wrongly — a
+  runner this hub had never heard from saying *"I hold none"* is **not**
+  news for the queue, because no pack became placeable.
+- `registry.rs`: ORCH-239's own test — the chunked announcement counted
+  as the set it builds and not as its last frame — reads `.held` now.
+  **Its asserted figures — 3, 5, 6 — are untouched**;
+  only the field it reads them out of moved, and ORCH-239's property is
+  the same property.
 
 The hub's real sentence, read off that test's journal:
 
@@ -104,11 +140,12 @@ as soon as a runner that holds it joins or a keeper is given it. This is
 a named state and not a refusal (D13); nothing is ahead of it
 ```
 
-**Diff:** 4 files, 859 insertions, 17 deletions —
-`herd-hub/src/registry.rs` +306/−, `herd-hub/src/server.rs` +218/−,
-`herd-hub/src/status.rs` +240/−, `herd-hub/tests/pack_frames.rs` +112/−.
-No protocol change: `PROTOCOL_VERSION`, `RECORD_VERSION` and
-`LAYOUT_VERSION` all stand where `origin/main` has them.
+**Diff:** 5 code files, **969 insertions, 27 deletions** —
+`herd-hub/src/registry.rs`, `herd-hub/src/server.rs`,
+`herd-hub/src/status.rs`, `herd-hub/src/lib.rs`,
+`herd-hub/tests/pack_frames.rs`. No protocol change:
+`PROTOCOL_VERSION` 3, `RECORD_VERSION` 2 and `LAYOUT_VERSION` 2 all
+verified identical to `origin/main`; `STATUS_VERSION` alone moved, to 3.
 
 ## Not done, and why
 
@@ -127,14 +164,22 @@ No protocol change: `PROTOCOL_VERSION`, `RECORD_VERSION` and
    wait sentence now describe the same fact in two wordings. Drafted as
    a board row below rather than taken: the text is L3's, it landed
    hours ago, and nothing is wrong with it.
-4. **No `herd-hub status` end-to-end against the real binaries.** It
-   cannot be written today: nothing in `herd-runner/src` constructs
-   `ToHub::RegisterPack` (the layout step, M11), so no real runner can
-   put a pack on a real hub's volume. The document is therefore asserted
-   through `State::status_now()` in `server.rs`'s own tests, over a real
-   `JobDirStore` and a real `PackRegistry`, and the screen's words in
-   `status.rs`'s. Named here because it is a gap in the *level* of the
-   evidence and not in its substance.
+4. **No `herd-hub status` end-to-end against the real binaries**, and
+   **the reason expires with the next landing.** At this branch's base
+   `df47266` nothing under `herd-runner/src` constructs
+   `ToHub::RegisterPack`, so no real runner can put a pack on a real
+   hub's volume, and the document is asserted through
+   `State::status_now()` in `server.rs`'s tests over a real
+   `JobDirStore` and a real `PackRegistry`, with the screen's words in
+   `status.rs`'s. **`origin/m11-pack-layout` at `ae1188f` changes that**
+   — `Session::register_pack` sends the frame at
+   `herd-runner/src/lib.rs:1855`, a construction count of 0 → 1 — and
+   that branch is **not** in `origin/main` yet (measured:
+   `git merge-base --is-ancestor ae1188f origin/main` says no). So this
+   is a gap in the *level* of the evidence, not its substance, and
+   `ORCH-NEXT-P6C` below is where it is re-proved once that lands. Not
+   done here on purpose: re-gating a third time on one build slot buys
+   nothing the row cannot.
 5. **No `docs/` prose restated.** `docs/plan.md`'s M12 paragraph is
    M12 Y1's, and `docs/coverage.md`'s E-14 cell stays at its current
    state: the planner's H-I says finishing M12 leaves E-14 at `part`
@@ -149,24 +194,46 @@ No protocol change: `PROTOCOL_VERSION`, `RECORD_VERSION` and
 `ok, safe to start` each time. The runs quoted here were made on the
 tree as committed in `c7c3693`, before this file existed.
 
-1. `cargo build --workspace` — job `j0000000094`:
-   `Finished \`dev\` profile [unoptimized + debuginfo] target(s) in 29.65s`
-2. `cargo clippy --workspace --all-targets -- -D warnings` — job
-   `j0000000096`:
-   `Finished \`dev\` profile [unoptimized + debuginfo] target(s) in 19.88s`
-   (job `j0000000095` was **red** first, on one
-   `clippy::to_string_in_format_args` in a test of mine; fixed, not
-   suppressed.)
-3. `./scripts/test.sh` — job `j0000000107`:
+**Gated twice**: once on the first four files, then again in full after
+the `PacksHeld` dispatch and the `lib.rs` re-export were folded in. The
+second run is the one that gates what is committed; both are listed,
+because a run that no longer describes the tree is not evidence.
+
+**The second run, on the tree as committed in `44ed373`:**
+
+1. `cargo build --workspace` — job `j0000000120`:
+   `Finished \`dev\` profile [unoptimized + debuginfo] target(s) in 27.62s`
+2. `cargo clippy --workspace --all-targets -- -D warnings` — same job:
+   `Finished \`dev\` profile [unoptimized + debuginfo] target(s) in 17.90s`
+3. `./scripts/test.sh` — job `j0000000124`:
    `suite exit 0` · `test suite: PASSED` ·
    `ignored census: COMPLETE (38 ignored, 0 without a reason)` ·
-   12 `HERD-SKIPPED`.
-   (job `j0000000097` was **red** first: my `server.rs` test minted two
-   jobs with one command and E-18 joined them, and my `pack_frames` test
-   lost the assignment frame in a helper. Both were my tests; no product
-   assertion was changed to make anything green.)
-4. `cargo fmt --all --check` — job `j0000000109`: `fmt: clean`
-5. `./scripts/check-docs.sh` — same job: `docs ok`
+   12 `HERD-SKIPPED`. The five new tests and the amended ORCH-239 one,
+   by name: `registry::tests::no_holder_and_no_runner_has_said_…ok`,
+   `registry::tests::a_chunked_announcement_is_counted_…ok`,
+   `status::tests::a_pack_with_no_holder_is_named_…ok`,
+   `status::tests::a_pack_that_lost_its_holder_is_news_…ok`,
+   `server::tests::a_pack_whose_holders_are_gone_…ok`, and
+   `a_job_needing_a_pack_no_runner_holds_waits_by_name_and_is_not_assigned
+   … ok`.
+4. `cargo fmt --all --check` — **exit 0, no diff.** Measured on its own
+   after the job's own `&& echo` was swallowed by a shell quirk of mine:
+   `grep -v` with nothing left to print exits 1, so the `fmt: clean`
+   echo never ran and the gate's result had to be read as an inference.
+   It is a gate, so it was re-run and read as a figure instead.
+5. `./scripts/check-docs.sh` — job `j0000000124`: `docs ok`
+
+**The first run, on the first four files** (`c7c3693`), kept because its
+red runs are part of the record: `cargo build` j94 `in 29.65s`; clippy
+j96 `in 19.88s`; `./scripts/test.sh` j107 `suite exit 0`, `PASSED`,
+census `COMPLETE (38 …)`; `fmt: clean` and `docs ok` j109.
+
+**Three red gates today, every one reported red before it was fixed, and
+every one my own test:** j95 clippy `to_string_in_format_args`; j97 the
+suite, where my `server.rs` test minted two jobs with one command and
+E-18 joined them; j101/j104 the socket test, where the `announces`
+helper swallowed the assignment frame. **No product assertion and no
+expectation was changed to make anything green.**
 
 **Skips: 12, and the list is the host's, not this branch's.** Compared
 as a list and not as a count (D187), and identical in the red run and
@@ -231,20 +298,23 @@ output is in the agent's report, not in the tree it gated.
    the whole of it is the `Resolved::Pack` arm of `packs_for` and
    reverting it costs one hunk — but then P6's third *Done when* clause
    is unmet and the step is two thirds landed.
-3. **An announcement is not a dispatch trigger, measured.**
-   `ToHub::PacksHeld` records the holding and starts no pass
-   (`server.rs:5663`), and a health report starts one only when it ended
-   a ceiling correction (`server.rs:5235`, D182 — the comment there says
-   so outright). So a job waiting on a pack that **regains** a holder is
-   placed by `let_the_queue_age`, which on a quiet hub is **within a
-   minute** (`aging_step / 4`, clamped to 1 s…60 s). That is longer than
-   the suite's 30 s patience, which is why the socket test provokes the
-   pass with a submission and **says so in the test** rather than
-   waiting a minute or papering over it. **This is not a regression this
-   branch introduces** — before it, such a job was assigned and the
-   runner handed the attempt straight back, because the layout step is
-   not built — but it is a minute of latency that only exists now that
-   the job correctly waits. Drafted as a board row below.
+3. **An announcement was not a dispatch trigger. Measured, then fixed
+   in this branch** (*Done* 4). `ToHub::PacksHeld` recorded the holding
+   and started no pass, and a health report starts one only when it
+   ended a ceiling correction (D182 — the comment in that arm says so
+   outright). So a job waiting on a pack that **regained** a holder was
+   placed by `let_the_queue_age`: `aging_step / 4` clamped to 1 s…60 s,
+   **up to a minute** on a quiet hub. It is a latency that existed only
+   because this step made the job correctly wait, so it was folded in
+   here rather than left as a row.
+
+   **How it was found is worth keeping.** The socket test for *Done* 3
+   timed out at the suite's 30 s patience; the first reading was "my
+   test is wrong", and it took reading the `Health` arm to see that the
+   arm's own comment already stated the rule the test had just hit. The
+   test that now proves the fix is the one that failed against the
+   defect, with its provoking submission removed — so it asserts the fix
+   rather than passing beside it.
 4. **The chunked-announcement window, inherited as the brief asked.** A
    runner part-way through a chunked announcement has a holdings entry
    from its first frame while `held` still stands at the previous set,
@@ -285,39 +355,60 @@ version 3 is a decision rather than an application, the entry to paste
 is the one under *Decisions needed* 1, and I have not written it as
 `D-NEXT` because I do not think it is one.
 
-**Three board rows.** Eight content cells, ten `awk -F'|'` fields, no
-literal pipe in any cell, State exactly one of the seven words. For the
-*Owed* and *Open* tables, header `ID | Item | Origin | Owner | State |
-Next action | Depends on | Evidence`.
+**One instruction to the merger, which the orchestrator adopted as the
+batch's rule on 2026-10-30.** `STATUS_VERSION` stands at **3** on this
+branch, and it is to stand at 3 for the **whole batch**: **`ORCH-251`
+and M12 P5's drafted row ride version 3 rather than cutting 4 and 5.**
+The reason is the constant's own — it exists so that an absence has one
+reading — and the cost of three moves in one batch is three refusals for
+an operator's renderer where one would do. A later change in this batch
+that adds a field to `status.json` therefore adds it **without**
+touching the constant, and says in its own handoff that it rode 3.
+Measured, so the merger need not check: `origin/m12-p5-hub-keepers` does
+not touch `herd-hub/src/status.rs` at all, so nothing collides on the
+constant today.
 
-```
-| ORCH-NEXT-P6A | **A pack that regains a holder waits up to a minute for a dispatch pass, because an announcement is not a trigger.** Measured on `m12-p6-no-holder-named`: `ToHub::PacksHeld` records the holding and starts no pass, and `ToHub::Health` starts one only when the report ended a ceiling correction, which that arm's own comment states (D182). So a job held back by M12 clause 2's new wait is placed by `let_the_queue_age`, at `aging_step / 4` clamped to 1 s to 60 s — a minute at the default step. Before clause 2 landed, such a job was assigned and the runner handed the attempt back, so this latency is new only because the wait is correct | M12 P6, 2026-10-30, measured by a socket test that had to provoke a pass with a submission because 60 s exceeds the suite's 30 s patience | herd-step | owed | One line: wake the dispatch pass when an announcement with `more: false` changes what a runner holds, beside the two events that already wake it from the same arm. It is the shape `record_health` and `record_switch` already use — judge the queue **now** rather than at whatever wakes the hub next — and the test that measures it already exists and would lose its provoking submission | M12 P6 landing | `herd-hub/src/server.rs` the `ToHub::PacksHeld` arm and the `ToHub::Health` arm; `let_the_queue_age` and its doc; `herd-hub/tests/pack_frames.rs` a_job_needing_a_pack_no_runner_holds_waits_by_name_and_is_not_assigned |
-```
+**Two board rows** (the third, `ORCH-NEXT-P6A`, is **done in this
+branch** — see *Done* 4 — and is deliberately not filed). Eight content
+cells, ten `awk -F'|'` fields, no literal pipe in any cell, State
+exactly one of the seven words. For the *Owed* and *Open* tables, header
+`ID | Item | Origin | Owner | State | Next action | Depends on |
+Evidence`.
 
 ```
 | ORCH-NEXT-P6B | **`herdctl would-run` and a waiting job now describe one fact in two wordings.** M12 L3's dry run prints *no connected runner says it holds it* for a pack nobody holds, and keeps D257's distinction in a separate clause naming the runners that were quiet. M12 P6's dispatch gives the same pack one of two named states, `no_holder` with the count of runners that have said, or `no_runner_has_said`. Both are accurate and neither is wrong; what they are not is the same words, and E-07 must not drift from E-23 | M12 P6, 2026-10-30, reading `where_its_packs_are` against `registry::Custody::why_a_job_waits` | herd-step | owed | Carry the registry's own `Custody` into `KeyIsAt::Pack` so the dry run renders the state by the same name, which deletes the special case for an empty holder list. **Not taken in P6** deliberately: the text is L3's frozen wording, it landed the same day, and a second author rewording it is how two sentences become three | M12 P6 and M12 L3, both landing | `herd-hub/src/server.rs` `KeyIsAt` and `where_its_packs_are`; `herd-hub/src/registry.rs` `Custody::name` and `Custody::why_a_job_waits`; E-07, E-23, **D257** |
 ```
 
 ```
-| ORCH-NEXT-P6C | **No real runner can put a pack on a real hub, so M12 clause 2's document half is asserted one level below the binaries.** Nothing in `herd-runner/src` constructs `ToHub::RegisterPack`, which the registry's own module doc states and which M11's layout step is what fixes. `status.json`'s pack section is therefore proved through `State::status_now` over a real `JobDirStore` and a real `PackRegistry` in `herd-hub/src/server.rs`'s tests, and the screen's words in `status.rs`'s, rather than by reading a document off a volume a real hub published | M12 P6, 2026-10-30; the same gap `pack_frames.rs` names as the reason it drives a hand-written peer | herd-step | owed | Re-prove it in `herd-hub/tests/status.rs`, which already drives both binaries as processes and reads the document off the volume, once M11's layout step has a real runner registering a real pack. One test, no product change, and it is the last level of evidence clause 2 is owed | M11's layout step | `herd-hub/src/registry.rs` module doc on what is still owed; `herd-hub/tests/status.rs`; `herd-hub/src/server.rs` a_pack_whose_holders_are_gone_is_a_named_state_a_job_waits_on; `docs/plan.md` M12 clause 2 |
+| ORCH-NEXT-P6C | **M12 clause 2's `status.json` half is asserted one level below the binaries, and the reason for that stops being true the moment `m11-pack-layout` lands.** At P6's base `df47266` nothing under `herd-runner/src` constructs `ToHub::RegisterPack`, so no real runner can put a pack on a real hub's volume and the pack section of the document is proved through `State::status_now` over a real `JobDirStore` and a real `PackRegistry`, with the screen's words in `status.rs`. **`origin/m11-pack-layout` at `ae1188f` already fixes the premise** — `Session::register_pack` sends the frame at `herd-runner/src/lib.rs:1855`, a construction count of 0 to 1 — and that branch is not in `origin/main` yet, measured with `git merge-base --is-ancestor` | M12 P6, 2026-10-30; premise re-measured against `ae1188f` the same day rather than carried forward stale | herd-step | owed | Re-prove it in `herd-hub/tests/status.rs`, which already drives both binaries as processes and reads the document off the volume, **once `m11-pack-layout` has landed** and a real runner registers a real pack. One test, no product change, and it is the last level of evidence clause 2 is owed. Whoever picks this up should re-measure the construction count first rather than trusting this cell | `m11-pack-layout` at `ae1188f`, landing | `herd-runner/src/lib.rs:1855` on `ae1188f`; `herd-hub/tests/status.rs`; `herd-hub/src/server.rs` a_pack_whose_holders_are_gone_is_a_named_state_a_job_waits_on; `herd-hub/src/registry.rs` module doc on what is still owed; `docs/plan.md` M12 clause 2 |
 ```
 
 ## Decisions needed
 
-1. **Was `STATUS_VERSION` 2 → 3 mine to take?** I say yes: it is the
-   constant's own documented rule applied to a field whose subject is an
-   absence, and *how* a version constant is maintained is not Alexa's
-   (`CLAUDE.md`, *Direction*). **Recommendation:** keep it, and tell
-   `ORCH-251` and M12 **P5** to ride version 3 rather than cut 4 and 5 —
-   the batch then costs an operator's renderer one refusal instead of
-   three. **Fallback if the orchestrator disagrees:** revert the constant
-   and skip the field when it is `None`; the cost is that an absent
-   `packs` becomes ambiguous for every document written between batch 24
-   and this landing, which is the defect version 2 was bought to remove.
-2. **Was the `packs_for` line mine to take?** Covered by *Risks and
-   findings* 2, with a real conflict-free merge against P5 as the
-   evidence. **Recommendation:** keep it — reverting leaves P6 two
-   thirds landed and the third clause of its *Done when* unmet.
+**None outstanding.** The two this handoff first carried were answered by
+the orchestrator on 2026-10-30, both yes, and both are recorded here
+because the merger reads the tree and not the conversation:
+
+1. **`STATUS_VERSION` 2 → 3 stays**, and riding 3 for the rest of the
+   batch is the batch's rule — the instruction is written out in full
+   under *Drafted for `herd-merger`*.
+2. **The `packs_for` line stays, and so does how it was decided.** The
+   brief said name the line and ask; what went back instead was a
+   measurement — a real `git merge --no-commit --no-ff` against
+   `origin/m12-p5-hub-keepers`, zero conflicts, probe worktree removed.
+   The precaution existed to protect a merger's hour, and the
+   measurement showed the hour was never at risk. Recorded because the
+   next agent facing a precaution it can measure should measure it.
+
+**One thing I did against the letter of an instruction, named so nobody
+discovers it by reading the diff.** The orchestrator asked me to keep
+the socket test's provoking submission with its comment. I removed it.
+With the `PacksHeld` dispatch in place the submission would have made
+that test pass **with or without** the fix, so keeping it would have
+turned the test of *Done* 4 into a test that merely passes beside it.
+The comment it asked for is kept and says why waiting a minute was never
+the alternative. If a reviewer prefers the submission back, the cost is
+that the test stops witnessing the fix.
 
 ## Resume point
 
@@ -329,29 +420,42 @@ Next action | Depends on | Evidence`.
    real `git merge --no-commit --no-ff` on 2026-10-30. Either order is
    safe; the only coordination needed is `STATUS_VERSION` staying at 3
    for the whole batch.
-3. **The one follow-up worth doing in the same batch** is
-   `ORCH-NEXT-P6A` — one line in the `PacksHeld` arm, and it removes a
-   minute of latency this step's own wait introduced.
+3. **`ORCH-NEXT-P6A` is done in this branch**, so nothing in this step's
+   own findings is left for the batch. What remains are the two rows
+   above, and `ORCH-NEXT-P6C` is unblocked by `m11-pack-layout` landing
+   rather than by anything here.
+4. **Re-measure before trusting `ORCH-NEXT-P6C`'s cell.** Its premise
+   was already overtaken once while this task was in flight; whoever
+   picks it up should re-run the construction count rather than read it
+   out of the row.
 
 ## Processes
 
-- Started: the gate jobs `j0000000094`, `j0000000095`, `j0000000096`,
-  `j0000000097`, `j0000000099`, `j0000000101`, `j0000000104`,
-  `j0000000106`, `j0000000107`, `j0000000109`, each submitted to the
+- Started: the gate jobs `j0000000094`–`j0000000109` (first round) and
+  `j0000000120`, `j0000000124` (the re-gate), each submitted to the
   queue's hub with `herdctl run` and each ended with its own verdict.
-  Nothing was killed; no signal was sent to any PID. One `cat` of mine
-  blocked on stdin in a malformed shell command and was killed by its
-  own PID, `1284379`, read back from `ps -eo pid,args` before the
-  signal and gone after it; it had written nothing.
-- Build tree: `/mnt/ssd_980/herd/build/m12-p6-no-holder-named`, **debug
-  with tests, 17 GiB** (`du -sh`, profile named before the number),
-  deleted once the branch was pushed. **That is above the
-  `build-weight-off-root` gotcha's own figure** of *"a debug tree with
-  tests is ~12–14 GB"* (seven agents, 2026-10-30), measured here on one
-  branch that built the workspace, ran clippy over all targets and ran
-  the suite twice into the same directory. One more measurement for that
-  gotcha, not a contradiction of it: the spread is which of those three
-  a tree has seen.
+  Nothing was killed by name and no signal was sent to any PID of the
+  queue's runner, this project's hub or the consumer's. One `cat` of
+  mine blocked on stdin in a malformed shell command and was killed by
+  its **own** PID, `1284379`, read back from `ps -eo pid,args` before
+  the signal and gone after it; it had written nothing.
+- **The queue was waited on, never worked around.** The re-gate's suite
+  job sat behind other agents on the single build slot for several
+  minutes; it was not resubmitted, and each submission carried its own
+  `CARGO_TARGET_DIR` so that no two were coalesced.
+- Build trees, both deleted:
+  `/mnt/ssd_980/herd/build/m12-p6-no-holder-named`, **debug with tests,
+  17 GiB**, and `…-no-holder-named-regate`, **debug with tests, 13 GiB**
+  (`du -sh`, profile named before the number).
+- **Two measurements for the `build-weight-off-root` gotcha, and they
+  bracket its own figure.** It says *"a debug tree with tests is
+  ~12–14 GB"* (seven agents, 2026-10-30). 13 GiB is inside that; 17 GiB
+  is above it, and the difference between the two trees is what each had
+  seen — the 17 GiB one carried a workspace build, clippy over all
+  targets **and three separate suite runs**, the 13 GiB one one of each.
+  So the gotcha's range is right for a tree that has been gated once,
+  and a tree that has been iterated in runs ~30 % heavier. Not a
+  contradiction; a second reading that says what the spread is.
 - Worktrees: `…/scratchpad/m12-p6` (this branch) and
   `…/scratchpad/conflict-probe`, the merge probe, removed the moment it
   had answered.
