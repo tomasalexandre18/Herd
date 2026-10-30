@@ -690,6 +690,54 @@ buy.
   them, so this is **not** a blocker for the rule; it is a thing a
   reader must not misread as protection. Whether a record should say
   *unmeasured* is **ORCH-268**, open and his.
+- **And a mode a test sets is not a mode it keeps. That is what the rule
+  costs.** Running the suite through Herd puts every fixture under a job
+  workspace the runner walks every **200 ms** to hold the job to its
+  disk budget, and that walk hands itself read access back on any
+  directory it cannot list — `set_permissions(mode | 0o700)`, which
+  invariant 2 and D166 require of it. `tmp` is inside the walked base
+  and `tmp` is the suite's `$TMPDIR`, so no `tempfile::tempdir()` in
+  this suite sits outside it. **The rule, the mechanism and the proof
+  are D268**; this bullet exists so an agent meets the exception beside
+  the directive, and the bullets below say how it is recognised and what
+  to do about it. Nothing in `herd-*/src` is a defect for it.
+- **Recognise it by the mode you did not ask for: `0o711` where the
+  fixture set `0o111`.** That is `mode | 0o700` — never the fixture's
+  own mode, never a guard's `0o755`. So a fixture whose premise is a
+  mode asks whether that premise still holds **at the moment a
+  measurement is judged**, re-establishes it when it does not, treats a
+  measurement taken on a dissolved premise as **void** and retakes it
+  from nothing, bounds the attempts, and goes **red with a named
+  sentence** when the host will not let the premise hold. Never
+  **skipped**: the suite's `HERD-SKIPPED` list is compared by name and
+  not counted (D27, D187), so a skip moves the compared list and hides
+  the very thing it reports. **No sleep, no `#[ignore]`, no widened
+  assertion.** The landed, proven shape to copy is in
+  `herd-hub/tests/a_failed_listing/mod.rs`, and D268 carries why the
+  collision is rare, why it is a function of a job's **duration** rather
+  than of concurrency, and why a short green control is no evidence.
+- **Then look for the silent direction, because nobody goes looking for
+  it.** A fixture whose premise dissolves and whose test then **fails**
+  is loud and safe; that half of the class is inventoried, member by
+  member, in **ORCH-291**. The dangerous half is a test that **passes**
+  because access was restored when it should have failed — any assertion
+  of the form *"it works despite the mode"*. **ORCH-292** is the one
+  known case, `herd-runner/tests/confinement.rs`
+  `::a_job_cannot_hide_what_it_wrote_from_its_disk_budget`, whose job
+  runs `chmod 300 h; sleep 6`: six seconds of premise against a 200 ms
+  restorer. Batch 26's landing record states the consequence plainly —
+  *"A green suite through Herd does not today exercise that one
+  assertion, and no report may be read as if it did"*
+  (`history/2026-10-30-merge-batch-26-regate.md`). A branch is cut for
+  it and carries no commit yet, so that fix is **in flight, not done**.
+  Read ORCH-291 and ORCH-292 rather than re-deriving either list, since
+  a list kept in two places drifts.
+- **Provenance, so nobody reads the exception as always known.** The
+  direction is Alexa's (**D258**, 2026-10-30); the wording of the rule
+  above is the orchestrator's; this exception is its **measured cost**,
+  found the same day, in batch 26's red gate. Not blame — it was
+  discovered and not foreseen, and it is written beside the rule so the
+  next reader meets it in prose instead of in a red gate.
 
 ## Concurrency and host rules
 
