@@ -12899,3 +12899,152 @@ work, and what it needs is `if-moved` asking for the announcement on the
 submission it makes — one line in `herdctl`. D217's deviation is
 untouched: a pass that submitted nothing stays `herdctl`'s own stderr
 line, because the hub never heard of a job.
+
+---
+
+## 2026-10-30 — D251 Ownership, not age, decides what may be signalled
+
+On the morning of 2026-10-30 the orchestrator killed **78** processes
+under our own account, believing them to be a Herd agent's leak. They
+were the first consumer's **production nightly requesters** — `herdctl
+wait --outputs-to /mnt/ssd_980/chatons/agents/nightly/herd-j<id>
+--verdict-to <path>` — and the kill was `SIGTERM` by explicit PID,
+between 08:45 and 09:00. The rule in force was kept to the letter:
+nothing was killed by name, no `pkill -f`, no `killall`. **The rule was
+not sufficient.**
+
+**What the incident measured.** Our account is `server`, **uid 1002**,
+and the consumer's nightly runs under it, so our own uid is no proof of
+ownership. Their hub runs as uid **1000** and their runner as uid
+**986**, so a check that excludes those two known PIDs proves nothing
+about a third. And `comm` is `herdctl` for our test fixtures and for
+their production alike, so only the **full command line** separates
+them. The filter actually used was **age** plus those two PIDs: careful
+on the wrong axis, twice. One `ps -o args` would have shown the
+`chatons/` path, and it was run an hour late.
+
+**Decided.** Ownership is established from a process's full `args`, and
+said out loud, before anything is signalled. uid, `comm`, age, PID and
+name are **not** provenance. **And a report that declares its own lack
+of provenance is not provenance either:** the agent that flagged these
+wrote *"worth someone with provenance cleaning up; I had none"*, and the
+orchestrator passed it on as fact. **The error is the orchestrator's**
+and is recorded as such: no agent is at fault, and the one that reported
+it said exactly what it did not know.
+
+**What it cost beyond the processes.** The consumer stopped the rest of
+its own loop at 09:31, on Alexa's request — `TERM` on pgid **256928**,
+415 processes — and cancelled **126** open nightly jobs, 125 queued and
+one running, with **0 failures**; the runner confirmed *"ending
+j0000003749 because a requester cancelled this job"*. Cancellation
+worked exactly as promised, and what was missing was a way to ask which
+jobs were open at all (ORCH-247). The reading the kills destroyed is
+recorded in **ORCH-246**: not one of those processes exited on its own,
+so a later census of zero is no evidence about a requester's silence
+bound, and the evidence that does bear on it is that they were alive,
+blocked and burning no CPU.
+
+**Where the rule lives.** `CLAUDE.md` stands at exactly its 150-line
+ceiling (`scripts/check-docs.sh`), a full re-wrap of the file frees one
+line, and that line was spent correcting the per-tree disk figure in the
+same branch. **Ruled 2026-10-30 by the orchestrator (ORCH-249): the rule
+goes to `docs/orchestration/workflow.md` *Concurrency and host rules*,
+which has no ceiling and which `CLAUDE.md:106`-`:107` already points at
+for this section's exceptions, and the ceiling is not raised** — a limit
+that exists to force this very discipline would be spent to buy the
+lesson, and invariants have been silently compressed to fit it once
+already (ORCH-002, 2026-10-24). `CLAUDE.md:108` is unchanged word for
+word. That section is now where the rule and its detector are written
+down, and this entry is why.
+
+---
+
+## 2026-10-30 — D252 Every directory listing in the hub is in id order
+
+ORCH-104 measured that reading the hub's records in ext4's
+directory-hash order costs **twice** what reading the same records in
+id order costs on a cold page cache — 0.47x at 3 334 directories and
+0.50x at 33 340 on this host, re-measured at this landing, with the
+pair run in both sequences and a warm control showing no difference at
+all — and that **zero of 33 341** names come back in the same
+position. **Decided:** `durable::names_in` sorts, so there is one place
+where the hub's listings are ordered and every caller inherits it. A
+job id is `j` and a fixed width of zero-padded digits, so byte order is
+id order is creation order, which is how the files were laid down.
+
+**No caller's behaviour changes, and that is established rather than
+assumed.** `recover` sorts the sequences it derives from these names
+before it reads a record, keeps its pending queue in a `BTreeSet`, its
+deduplication links at the lowest sequence per key and its quarantine
+list in a `BTreeMap` — so startup already read in id order and this
+buys it nothing. `collections_owed` returns a `Vec` its caller consumes
+with no lock held, recomputed at every redial (D79): advisory, and the
+walk the 2x applies to in full. `sweep_now` overwrites a total it is
+allowed to let drift (D152) and sorts its candidates on four keys
+afterwards, so read order survives only as the tie-break between two
+records equal on all four including `ended_at` to the nanosecond.
+`registry.rs`'s `clear_staging` removes every name it is given.
+
+**The one outcome that changes, changes from arbitrary to
+deterministic:** when two published packs claim one `(commit, key)`,
+`registry::rebuild` keeps the first one read, which was the hash
+order's choice and is now the lower pack id. The conflict is recorded
+and resolution refuses it either way.
+
+**What this does not buy.** The saving is flat in the directory count,
+not growing: 0.47x at 3 334 and 0.50x at 33 340 in this measurement
+against ORCH-104's 0.50x and 0.41x. So it is a halving of a cold walk
+at both populations, and M12's record-retention pass should be sized
+against that and not against more. Warm, there is nothing in it: the
+first walk after a start is the whole of the gain.
+
+---
+
+## 2026-10-30 — D253 The retention preview answers a budget it is not given
+
+ORCH-097 asked for a `--output-budget` dry run and left open whether it
+would be a hub flag or a `herdctl` call. **Decided: neither — it is
+`herd-hub retention-preview`'s second question**, off the same walk.
+One tool, one walk, two questions, and **no new CLI surface**:
+`herd-hub/src/main.rs` is untouched, so the subcommand still has no
+`--apply` and no flag at all that a later change could invert into a
+deletion path. That property is the reason the preview exists (D194's
+sibling reasoning, and ORCH-146's own entry), and a second question was
+not worth weakening it for.
+
+**It is not given a budget, and that is what the decision turns on.**
+The hub's `--output-budget` and `--output-floor` are the serving hub's
+arguments and no byte of a state root records them, so a preview asked
+to answer *"what would this budget take"* would have had to be told a
+figure it could not check. Instead it prints what `files/` holds over
+the whole root, and the sweep's own order with a running total of what
+is freed by the time each collection is gone. An operator reads down
+that column until it reaches `held − budget`. That answers every
+budget, including the one they are considering moving to, and it needed
+no argument to do it.
+
+**The floor is the one key it cannot order on, and the output says so
+rather than quietly omitting it.** A sweep's first key is outside the
+floor before inside it (D152): a stable partition, so the printed order
+is the sweep's within one floor band, and under a floor of `F` every
+candidate younger than `F` moves to the end keeping that order among
+themselves. Each candidate's age is printed for exactly that
+arithmetic.
+
+**The selection is `store.rs`'s and not a second definition of it**, as
+`retention::select` already is for spans. The four refusals are the
+sweep's four `continue`s in its order — no record this hub will act on,
+not over, already removed, a collection that is not whole — and each
+one adds the bytes to `could_not_free` in the store and to the
+preview's `withheld` here, **named with its reason, one line each**.
+That is ORCH-124's known leak printed for the first time: *"1 kB held"*
+is not a figure anybody can act on when 900 bytes of it are unfreeable.
+
+**And it shows that the two mechanisms do not agree about what a
+directory is worth.** A sweep takes the collected bytes and leaves the
+record, its log and its manifest standing; a span takes the whole
+directory. The two figures are never summed. A sweep also does not look
+at a record's class at all, so a `producer` record pinned to a span of
+`0` — one that NEVER EXPIRES in the per-class block — can be the first
+collection a sweep takes, and in the test fixture it is. An operator
+reading only the span side would have concluded those bytes were safe.
