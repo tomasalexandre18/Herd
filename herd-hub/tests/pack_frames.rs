@@ -1594,3 +1594,116 @@ async fn an_outbound_only_holder_and_a_holder_that_has_gone_are_each_said() {
     }
     asker.through_a_health_report().await;
 }
+
+/// **A pack with no holder is a named state a job waits on, and never a
+/// `Refused`** (M12 clause 2, D13, D257).
+///
+/// The one state this build could reach and say nothing about: the key
+/// **resolves**, so none of the sentences beside it applies — there is a
+/// manifest on the volume, an id, a `(commit, key)` — and there is nowhere to
+/// fetch the bytes from. Before this, such a job was **assigned** with an
+/// empty holder list, and what an operator saw was a runner handed work it
+/// could not get its inputs for.
+///
+/// Through a socket rather than in process, because what is asserted is the
+/// hub's own word to a requester and the absence of a frame to the runner.
+/// The holder list is emptied the way reality empties it — the runner says it
+/// holds none — which is also what makes the state `no_holder` and not "nobody
+/// has said": this fleet has spoken, and it does not have this pack.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_job_needing_a_pack_no_runner_holds_waits_by_name_and_is_not_assigned() {
+    let harness = Harness::with_hub().await;
+    let token = harness.approve(RUNNER);
+    let mut runner = Peer::runner(&harness.hub_url, RUNNER, &token, "the-only-life").await;
+    a_pack_this_runner_holds(&harness, &mut runner).await;
+
+    // And now it does not. An empty announcement is the only thing in the
+    // frame set that retracts a holding, and it is a statement and not a
+    // silence: this runner has said what it holds, and it holds none of this.
+    runner.announces(Vec::new(), false).await;
+
+    let mut requester = Requester::joining(&harness.hub_url).await;
+    let job_id = requester
+        .submits(vec![KEY.to_owned()], Default::default())
+        .await;
+
+    // The hub's own sentence, read where a requester reads it. The pack's id
+    // is in it, which is what distinguishes this state from "nothing is
+    // registered": there *is* a pack, and nobody has it.
+    let note = requester.note_saying("it has no holder").await;
+    assert!(
+        note.contains(&the_pack().as_str().to_owned()),
+        "the sentence names the pack, so the state is not 'nothing registered': {note}"
+    );
+    assert!(
+        note.contains(COMMIT) && note.contains(KEY),
+        "and the commit and the key, because 'a pack is missing' is not actionable: {note}"
+    );
+    assert!(
+        note.contains("this job is queued and has not started"),
+        "it is a wait and not a verdict: {note}"
+    );
+    assert!(
+        note.contains("named state and not a refusal"),
+        "and it says so, because this must not cost a requester its link (D13): {note}"
+    );
+
+    // The runner was handed nothing, and nobody's link was closed. Read after
+    // the note, so this is not a race with a dispatch that had not happened:
+    // the hub had already walked this job in a pass and said why it stayed.
+    runner.health().await;
+    let seen = runner.through_a_health_report().await;
+    assert!(
+        !seen
+            .iter()
+            .any(|frame| matches!(frame, FromHub::AssignJob { .. })),
+        "a job whose pack has no holder is not handed to a runner: {seen:?}"
+    );
+    assert!(
+        !seen
+            .iter()
+            .any(|frame| matches!(frame, FromHub::Refused { .. })),
+        "and nobody's link is closed over it (D13): {seen:?}"
+    );
+
+    // **And the announcement itself places it** — the same job, no
+    // resubmission and no requeue, which is what makes this a wait rather
+    // than an ending.
+    //
+    // **One frame and nothing else, which is the assertion.** An
+    // announcement that changes what this hub knows judges the queue at
+    // once: nothing here submits a second job, sends a health report or
+    // waits on a clock between the frame and the assignment, so the frame is
+    // the only thing that could have caused it. That is worth asserting this
+    // precisely because the alternative was measured: before the hub judged
+    // the queue here, `ToHub::PacksHeld` woke no pass and a health report
+    // woke one only when it had ended a ceiling correction (D182), so what
+    // placed this job was `let_the_queue_age` — up to a minute of a machine
+    // standing idle holding the very bytes the job was waiting for, and
+    // longer than this suite's patience.
+    //
+    // Sent with `say` rather than through the `announces` helper, because
+    // that helper reads every frame up to the answer to its own health
+    // report and the assignment this provokes is one of those frames.
+    runner
+        .say(ToHub::PacksHeld(PacksHeld {
+            packs: vec![the_pack()],
+            more: false,
+        }))
+        .await;
+    let (packs_in, _) = assignment_for(&mut runner, &job_id).await;
+    assert_eq!(
+        packs_in.len(),
+        1,
+        "the job that waited is assigned once the pack has a holder again: {packs_in:?}"
+    );
+    assert_eq!(
+        packs_in[0]
+            .holders
+            .iter()
+            .map(|holder| holder.runner.as_str())
+            .collect::<Vec<_>>(),
+        vec![RUNNER],
+        "with the holder on it, which is the whole of what it was waiting for"
+    );
+}

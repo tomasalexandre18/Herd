@@ -2517,6 +2517,31 @@ impl State {
                 approved_at: Timestamp::at_unix_seconds(approval.approved_unix_s as i64),
             })
             .collect();
+        // What the volume holds, and which of it this hub cannot say anybody
+        // holds (M12 clause 2). **One read of the registry**, so the figure
+        // and the list cannot disagree with each other, and `None` for a
+        // store with no registry — which is a state and not an empty
+        // registry, and is why the field is absent rather than nought.
+        let packs = self.store.packs().map(|registry| {
+            let now = registry.custody_now();
+            status::PacksNow {
+                registered: now.registered,
+                runners_that_said: now.runners_that_said,
+                unheld: now
+                    .unheld
+                    .into_iter()
+                    .map(|(entry, custody)| status::PackNow {
+                        pack: entry.pack.as_str().to_owned(),
+                        commit: entry.commit,
+                        key: entry.key,
+                        // The registry's own word, carried and never
+                        // re-spelled here: the document and the sentence a
+                        // waiting job is given have to be the one name.
+                        custody: custody.name().to_owned(),
+                    })
+                    .collect(),
+            }
+        });
         Ok(Status {
             status_version: status::STATUS_VERSION,
             as_of: Timestamp::now(),
@@ -2525,6 +2550,7 @@ impl State {
             away,
             running,
             queued,
+            packs,
         })
     }
 
@@ -5285,7 +5311,23 @@ fn packs_for(
     let mut resolved = Vec::with_capacity(record.needs.len());
     for key in &record.needs {
         match registry.resolve(commit, key) {
-            Ok(crate::registry::Resolved::Pack(pack)) => resolved.push(pack),
+            Ok(crate::registry::Resolved::Pack(pack)) => {
+                // **Registered is not the same as fetchable** (M12 clause 2).
+                // A pack whose holders are all gone has a manifest on this
+                // volume and no bytes anywhere this hub knows of, and a job
+                // handed it would be a job sent out to fetch from nobody. It
+                // waits instead, with the state's own name in the sentence —
+                // and which of the two ways nobody holds it is part of that
+                // sentence, because a hub whose fleet has not announced yet
+                // is in a state that resolves itself (D257, D13).
+                if let Some(why) = registry
+                    .custody_of(&pack.pack)
+                    .why_a_job_waits(commit, key, &pack.pack)
+                {
+                    return Err(format!("it is waiting because {why}"));
+                }
+                resolved.push(pack);
+            }
             Ok(crate::registry::Resolved::Nothing) => {
                 return Err(format!(
                     "it is waiting because nothing is registered for {commit}/{key}, which it \
@@ -6124,12 +6166,13 @@ async fn relay_from_runner(
                     // had this line say it held 4 (ORCH-239, measured
                     // through two real processes). An operator has no other
                     // observation of holdings than this sentence.
-                    let count = registry.announced(
+                    let said = registry.announced(
                         name,
                         state.mesh_endpoint_of(name),
                         announcement.packs,
                         more,
                     );
+                    let count = said.held;
                     if more {
                         journal(&format!(
                             "herd-hub: runner {name} is announcing its packs, {count} so far \
@@ -6148,6 +6191,21 @@ async fn relay_from_runner(
                             "herd-hub: runner {name} holds {count} pack(s), which replaces \
                              what this hub had for it"
                         ));
+                    }
+                    // And if that moved what this hub knows, the queue is
+                    // judged **now**. Nothing else would: an announcement is
+                    // not an event the dispatch pass is woken by, and a
+                    // health report wakes one only when it ended a ceiling
+                    // correction (D182) — so a job held back because the pack
+                    // it needs has no holder (clause 2) would wait for
+                    // whatever happened to wake the hub next. On a quiet fleet
+                    // that is `let_the_queue_age`, up to a minute of a machine
+                    // standing idle holding the very bytes the job is waiting
+                    // for. The same shape as the health report's and the
+                    // switch's, and **only on news**: a runner restating what
+                    // this hub already had walks no queue.
+                    if said.changed {
+                        dispatch_queued_jobs(state)?;
                     }
                 }
                 Err(why) => journal(&format!(
@@ -12264,6 +12322,180 @@ mod tests {
             said.contains("it would start now, claimed by attic"),
             "and the name still decides between two equally preferred \
              machines, as it did before the term existed: {said}"
+        );
+    }
+
+    // ------------------------------- clause 2: no holder is a named state
+
+    /// **A pack whose holders are all gone is a named state, a job that needs
+    /// it waits with that name, and the document carries it** (M12 clause 2,
+    /// D13, D257).
+    ///
+    /// The whole of the step in one test, because the three are one behaviour
+    /// and the interesting part is that they stay consistent as the fleet
+    /// comes and goes: the registry's name, the sentence the dispatch gives
+    /// the job, and `status.json` are read at each of four fleet states.
+    ///
+    /// **The two ways of having no holder are asserted apart**, which is the
+    /// point of the step. A pack every runner that has spoken says it does not
+    /// hold is a measurement; a pack no runner has spoken about at all is this
+    /// hub's ignorance, and a build that printed them with one word would
+    /// report every pack on the volume as lost each time its fleet redialled.
+    ///
+    /// **And a pack that still has a holder is unchanged throughout**, which
+    /// is the control: `rootfs` is held by a machine that never leaves, and
+    /// every assertion below is made about it too.
+    #[test]
+    fn a_pack_whose_holders_are_gone_is_a_named_state_a_job_waits_on() {
+        let fleet = a_dry_run_fleet(&["attic", "tower"]);
+        let registry = fleet.store.packs();
+        let kernel = a_pack_held_by(&fleet.store, "kernel", &["tower"]);
+        let rootfs = a_pack_held_by(&fleet.store, "rootfs", &["cellar"]);
+        // `attic` has said what it holds, and it holds none of these. That is
+        // a *measurement* and it is what makes the fleet below able to be in
+        // `no_holder` rather than in "nobody has said".
+        registry.announced("attic", None, Vec::new(), false);
+
+        // A different piece of work per call, because this store joins a
+        // submission to the work already queued (E-18) and this test asks for
+        // the same key at four fleet states. The counter is the whole of the
+        // difference.
+        let nth = std::cell::Cell::new(0u32);
+        let needing = |key: &str| {
+            nth.set(nth.get() + 1);
+            let mut record = fleet
+                .store
+                .create_job(NewJob::new(vec![
+                    "true".to_owned(),
+                    key.to_owned(),
+                    nth.get().to_string(),
+                ]))
+                .expect("the job is minted");
+            record.needs = vec![key.to_owned()];
+            record.declaration = Some(herd_proto::Declaration {
+                command: "a-declared-command".to_owned(),
+                commit: A_COMMIT.to_owned(),
+                args: Vec::new(),
+                executor: herd_proto::Executor::default(),
+            });
+            record
+        };
+        let unheld_now = |state: &State| -> Vec<(String, String)> {
+            state
+                .status_now()
+                .expect("the document builds")
+                .packs
+                .expect("this root keeps a registry")
+                .unheld
+                .into_iter()
+                .map(|pack| (pack.key, pack.custody))
+                .collect()
+        };
+        let waits_because = |state: &State, key: &str| -> String {
+            match packs_for(state, &needing(key)) {
+                Err(why) => why,
+                Ok(packs) => panic!("{key} was assigned {packs:?} instead of waiting"),
+            }
+        };
+
+        // 1. Both packs have a holder. Nothing is unheld and nothing waits.
+        assert_eq!(unheld_now(&fleet.state), Vec::new());
+        let document = fleet.state.status_now().expect("the document builds");
+        let packs = document.packs.as_ref().expect("a registry");
+        assert_eq!(packs.registered, 2);
+        assert_eq!(
+            packs.runners_that_said, 3,
+            "tower, attic and cellar have each said what they hold"
+        );
+        assert_eq!(
+            packs_for(&fleet.state, &needing("kernel"))
+                .expect("a held pack is assigned")
+                .len(),
+            1
+        );
+
+        // 2. `tower`'s link goes, so the only holder of `kernel` is gone.
+        // Every runner that has said now says it does not hold it: a
+        // measurement, and the name is `no_holder`.
+        registry.runner_gone("tower");
+        assert_eq!(
+            registry.custody_of(&kernel).name(),
+            "no_holder",
+            "a pack whose holders are gone, with a fleet that has spoken"
+        );
+        assert_eq!(
+            registry.custody_of(&rootfs).name(),
+            "held",
+            "and the pack whose holder never left is untouched"
+        );
+        assert_eq!(
+            unheld_now(&fleet.state),
+            vec![("kernel".to_owned(), "no_holder".to_owned())],
+            "the document names it, and names only it"
+        );
+        let why = waits_because(&fleet.state, "kernel");
+        for naming in [
+            "it is waiting because",
+            "it has no holder",
+            kernel.as_str(),
+            A_COMMIT,
+            "kernel",
+        ] {
+            assert!(why.contains(naming), "the sentence names {naming}: {why}");
+        }
+        assert!(
+            why.contains("named state and not a refusal"),
+            "it says so itself, because a pack with no holder must never cost \
+             a requester its link (D13): {why}"
+        );
+        assert_eq!(
+            packs_for(&fleet.state, &needing("rootfs"))
+                .expect("the held pack is still assigned")
+                .len(),
+            1,
+            "and the job that needs the held pack is not held back by its neighbour"
+        );
+
+        // 3. The fleet goes quiet altogether. **A different state**, because
+        // nobody has said anything: this hub does not know where `kernel` is,
+        // which is not the same as nobody holding it (D257).
+        registry.runner_gone("attic");
+        registry.runner_gone("cellar");
+        assert_eq!(registry.custody_of(&kernel).name(), "no_runner_has_said");
+        assert_eq!(
+            registry.custody_of(&rootfs).name(),
+            "no_runner_has_said",
+            "including the one that was held: its holder has not said since it left"
+        );
+        let document = fleet.state.status_now().expect("the document builds");
+        let packs = document.packs.as_ref().expect("a registry");
+        assert_eq!(
+            packs.runners_that_said, 0,
+            "and the document says the fleet has not spoken, which is what \
+             keeps this from reading as two lost packs"
+        );
+        let why = waits_because(&fleet.state, "kernel");
+        assert!(
+            why.contains("no connected runner has said what it holds")
+                && why.contains("not the same as nobody holding it"),
+            "the sentence says which kind of nothing this is: {why}"
+        );
+        assert!(
+            !why.contains("it has no holder"),
+            "and not the other one: {why}"
+        );
+
+        // 4. A holder comes back. The state is `held` again and nothing
+        // waits — the whole point of this being a wait and not a verdict.
+        registry.announced("tower", None, vec![kernel.clone(), rootfs.clone()], false);
+        assert_eq!(registry.custody_of(&kernel).name(), "held");
+        assert_eq!(unheld_now(&fleet.state), Vec::new());
+        assert_eq!(
+            packs_for(&fleet.state, &needing("kernel"))
+                .expect("a held pack is assigned")
+                .len(),
+            1,
+            "the job that waited starts as soon as a holder says so"
         );
     }
 }
