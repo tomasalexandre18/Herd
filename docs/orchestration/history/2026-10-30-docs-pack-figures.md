@@ -1,9 +1,11 @@
 # docs-pack-figures — handoff 2026-10-30
 
-- **Item:** the five version figures made false by M11's pack half
+- **Item:** the five version figures made false by M11's pack half, plus
+  the audit's four `RECORD_VERSION`-mismatch sites in §3.4 (second
+  commit)
 - **Agent:** herd-step
-- **Branch / commit:** `docs-pack-figures` / see the push, based on
-  `main` `351c826`
+- **Branch / commit:** `docs-pack-figures` / two commits, `b1bf73f` and
+  the second named at the push, both based on `main` `351c826`
 - **Landing:** none — an agent pushes its branch and lands nothing (one
   landing per batch, `docs/orchestration/workflow.md`); `herd-merger`
   names the landing here, and fills the record of `templates/landing.md`
@@ -189,6 +191,184 @@ reader can tell a stale figure from the requirement.
   record gets. **Left untouched**, for the same reason as `:594-597`.
   The brief flagged only the layout one.
 
+## Done — second commit: the audit's four sites in §3.4
+
+An audit that finished after the first commit named `docs/architecture.md`
+as carrying **four** false sentences about what a `RECORD_VERSION`
+mismatch does. Checked against the committed tree at `b1bf73f`, not
+against anybody's summary:
+
+| audit's site (`351c826` lines) | state at `b1bf73f` | second commit |
+|---|---|---|
+| `:358` — *"the hub **refuses to start** on that state root. What stops being readable is the operator's whole state root"* | **already fixed** by commit 1 — both clauses gone, replaced by the quarantine and *"one job at a time"* | version caveat added: *"on `main`, and in no release: **v0.4.1 and below refuse the whole state root**"* |
+| `:373-375` — *"**Four refuse and the thing stops** … `RECORD_VERSION` and `LAYOUT_VERSION` stop the hub from starting"* | **half fixed.** Commit 1 removed the false *stops the hub from starting* clause, but left `RECORD_VERSION` **inside group 1** and the group still counting four. The audit's deeper point — it fits none of the three kinds — stood | group 1 is now **three**; a **fourth kind** was added for `RECORD_VERSION` alone |
+| `:405-406` — *"true today of all **six** numbers that refuse anything"* | **not fixed.** Commit 1 kept "six" and added *"three of the six"* on top of it | the count is replaced by the **named set**, and derived out loud |
+| `:410-413` — *"a bump now costs the operator's whole state root … and the hub says so **by not starting**, never by guessing"* | **already fixed** by commit 1 — rewritten to *"The record number alone no longer stops the hub … The layout number does"* | the ORCH-204 paragraph added, below |
+
+So **two were mine, one was half mine, one was not mine at all.**
+
+### The fourth kind, named rather than filed under the nearest group
+
+Old group 1: *"**Four refuse and something stops.** `PROTOCOL_VERSION` …
+`LAYOUT_VERSION` … `RECORD_VERSION` refuses the record and not the root
+… `ROSTER_VERSION` …"*. New: group 1 is `PROTOCOL_VERSION`,
+`LAYOUT_VERSION`, `ROSTER_VERSION` — **three** — and a fourth kind:
+
+> 4. **One sets the artefact aside and serves the rest:**
+>    `RECORD_VERSION`, alone in its kind. A record carrying a version
+>    this build does not read is quarantined — named with its path,
+>    counted, left untouched, kept out of the queue — and the hub binds
+>    its port and runs every healthy job on the root (D218, D219). It is
+>    the only one of the eleven whose mismatch is survivable **per
+>    artefact** rather than per root, and it is why there are four kinds
+>    here and not three: it neither stops the thing, nor refuses one
+>    reader and nothing else, nor stops nothing. **(v0.4.1 and below
+>    refuse the whole root instead** — that is the promise D219
+>    reversed, and it is what this page said about `RECORD_VERSION`
+>    until 2026-10-30.)
+
+**The arithmetic, which is the check:** 3 + 3 + 4 + 1 = **eleven**, and
+eleven is independently confirmed — `const [A-Z_]*VERSION` declarations
+number eleven on `main` and eleven on every pack branch. *"Three of them
+deserve a sentence beyond their row"* became **four**, since
+`RECORD_VERSION`'s own paragraph is the fourth and was already there.
+
+### The derived count: I get six, not five, and the number is now gone
+
+The audit says five. **I derive six, and I am flagging the
+disagreement rather than adopting either numeral**, because the brief
+told me to recompute from the groups instead of decrementing.
+
+The set is *numbers whose mismatch refuses anything at all*: the three
+of kind 1 (`PROTOCOL_VERSION`, `LAYOUT_VERSION`, `ROSTER_VERSION`), plus
+`STATUS_VERSION` and `STATE_FORMAT_VERSION` of kind 2, plus
+**`RECORD_VERSION` of kind 4** — because it does refuse something. It
+refuses the record, by name, in a sentence written for the purpose
+(`record_version_mismatch_reason`). What it stopped doing is refusing
+the *root*. Five is what you get by dropping it from the set entirely;
+six is what you get by reading *"refuses anything"* literally, which is
+what the phrase says.
+
+**The resolution is that the page no longer carries the numeral as its
+claim.** It names the six members and says the count is derived:
+
+> **That set is named here rather than counted**, because the count is
+> derived from the four kinds above and this page has already carried it
+> wrong once: the three of kind 1, plus `RECORD_VERSION` of kind 4, plus
+> `STATUS_VERSION` and `STATE_FORMAT_VERSION` of kind 2. Six of the
+> eleven.
+
+A reader who thinks the answer is five can now see exactly which member
+we disagree about, instead of reading a numeral that hides the question.
+That is the real fix either way, and it is why I did not simply write
+the audit's figure. **If the orchestrator prefers five, the change is
+one clause and the members list makes it safe** — but somebody should
+decide on the merits rather than on whose count was more recent.
+
+### A fifth site, and the audit did not name it
+
+Same paragraph, same cause. §3.4 said:
+
+> **`STATUS_VERSION` says out loud what the others leave implied.** …
+> One of the six says so.
+
+Both clauses are **now false, and `pack-registry` is what falsified
+them**. On `main`, exactly one refusal sentence contains the words
+(`status.rs:411`); the layout refusal at `store.rs:471` is a bare two-
+number sentence with no migration clause at all. On the landing tree
+**three** say it:
+
+| number | words | site |
+|---|---|---|
+| `STATUS_VERSION` | *"There is no migration"* | `status.rs:411` |
+| `RECORD_VERSION` | *"There is no migration in either direction"* | `job.rs:110`, `record_version_mismatch_reason` |
+| `LAYOUT_VERSION` | *"Nothing converts it: there is no migration tool, no `--migrate` and none planned"* | `store.rs:3349`, `layout_version_mismatch_reason` |
+
+The last two **acquired those words in the commit that moved them** —
+`pack-registry` wrote both formatters. So the page's claim that one
+number says it and the rest leave it implied was true on `main` and
+false the moment the pack half lands. Rewritten with all three quoted
+and cited, and with the point that matters: the sentence an *operator*
+reads now says it too, not only this page.
+
+### The ORCH-204 paragraph — the sentence read as an instruction
+
+Added below the frozen-claim rewrite, because this is the reader the
+audit was worried about:
+
+> **For whoever plans the next move of these numbers — ORCH-204 is open
+> — the failure to design against is not a refusal.** A build whose
+> `RECORD_VERSION` differs from the root's while its `LAYOUT_VERSION`
+> matches **starts and serves an empty queue**: every record
+> quarantined, each named with its path, the count on the line that says
+> the hub is listening. That is loud and it is not a refusal, so an
+> operator instruction written around a hub that stops the deployment
+> would describe something that does not happen. It is D219's own reason
+> for opening ORCH-204: either v1.0.0 moves `LAYOUT_VERSION` with
+> `RECORD_VERSION` — which the four-step procedure in
+> `docs/operating.md` assumes — or that release needs a guard of its
+> own. Both numbers moved together in M11's pack half, so the procedure
+> holds as written today; it holds because that landing moved both, not
+> because anything prevents a record-only move later.
+
+Every clause of it is D219's own text (*"starts and serves an empty
+queue"*, the count on the listening line, the either/or, ORCH-204), so
+this is a relay of the decision and not a new position.
+
+### The version caveat, adopted as the idiom
+
+The audit's grep is the useful part: in `docs/operating.md` the two
+**correct** statements carry `(v0.4.1 and below)` and the four wrong ones
+carry no version at all. The caveat is what makes a stale figure
+**legible rather than false** — a reader who knows which versions a
+sentence is about can tell a sentence that has gone out of date from a
+sentence that was never true, and can act on the first. A figure with no
+version on it offers no such handle, which is exactly how *refuses to
+start* survived D219: it read as timeless. So the three behaviour
+statements in §3.4 now carry theirs — *"on `main`, and in no release:
+v0.4.1 and below refuse the whole state root"* in the row, *"(v0.4.1 and
+below refuse the whole root instead)"* in kind 4, and *"(v0.4.1 and below
+refuse the root)"* in the frozen paragraph — matching the figures, which
+already said *"on `main`"* from the first commit.
+
+### §3.4 now declares its base commit — yes, it should have one
+
+Judged worth it, and the reason is the thing I found in the first
+commit: §3.4's citations are the load-bearing ones on this page
+(`docs/handover.md:67` sends a reader here for *"the whole list of eleven
+and what each one refuses"*), and **one of its citation classes is not
+verifiable at all** for the tree it describes. A section that cannot
+verify a pointer owes the reader the tree it read. `docs/handover.md:13-20`
+and `docs/disk-policy.md:1270` both declare theirs; §3.4 did not.
+
+It is a figure like any other, so it carries its provenance:
+
+> **Which tree this section was read against** … every value and every
+> line number below was read on **2026-10-30** from `pack-variants`
+> (`8344e07`) and `pack-registry` (`6f409cb`), each on top of `main`
+> `351c826`. … That is why `herd-hub/src/job.rs` and
+> `herd-hub/src/store.rs` carry line numbers below — `pack-registry` is
+> the only branch that touches either file, so its lines survive the
+> merge — and why **no `herd-proto/src/lib.rs` line number appears at
+> all**: `pack-variants` and `pack-store` put the same constant at 160
+> and at 147, both green, and no commit that exists settles which the
+> merged tree will have. A line this section cannot verify is left out
+> rather than guessed.
+
+**It names two branch shas and no merge commit, deliberately**, because
+no merge commit exists yet. `herd-merger` may want to re-point it at the
+integration sha once that is cut; nothing is wrong if it does not, since
+the branch shas are the honest answer to *what was read*.
+
+### Swept for a sixth, and found none
+
+`grep` over `docs/architecture.md` for `refuse|refusal|quarantin|not
+start|whole state root|whole root` outside §3.4, and for
+`record_version|layout_version` over all four of my files: no further
+claim about what a record-version mismatch does. The `store.json` mermaid
+node at `:1238` names `LAYOUT_VERSION` with no figure and no behaviour
+claim. §10 does not name the field.
+
 ## Not done, and why
 
 - **`.github/workflows/release-dev.yml:17`** and
@@ -202,6 +382,13 @@ reader can tell a stale figure from the requirement.
   `docs/orchestration/board.md`, `scripts/*`, `.github/*`, `deploy/*`,
   `herd-*/`** — not touched. Not read for version figures either,
   except `decisions.md` read-only for D199's text.
+- **`docs/remediation/13-crash-point-enumeration.md` §4.2 and
+  `README.md:42`** — named by D218's own *Residue* as still stating the
+  old refusal, tracked as **ORCH-183**. Neither is in my ownership list
+  and neither was touched. Worth saying beside the audit's finding: the
+  *"written in three places, fixed in two"* family has a fourth and
+  fifth member already on the board, so §3.4 was the third site of that
+  rule and not the last.
 - **`docs/handover.md:67`'s *"the rule that an unreadable version refuses
   to start"*** — left as it stands. It is loose rather than false
   (`INDEX_VERSION` rebuilds, `READINGS_VERSION` reads again,
@@ -225,7 +412,7 @@ docs ok
 check-orchestration: 291 passed, 0 failed
 ```
 
-After all edits, on this branch:
+After the first commit's edits, and again after the second commit's:
 
 ```
 docs ok
@@ -235,8 +422,8 @@ docs ok
 check-orchestration: 291 passed, 0 failed
 ```
 
-**Delta: none, in either check.** No case changed state, so there is no
-case to account for.
+**Delta: none, in either check, at either commit.** No case changed
+state, so there is no case to account for.
 
 Mojibake detector, byte-level perl on raw bytes
 (`\xc3\xa2\xc2[\x80-\xbf]\xc2[\x80-\xbf]` and
@@ -250,7 +437,10 @@ clean copy of docs/operating.md:                      0 hits, exit 0
 same file, every em dash double-encoded on purpose:  45 hits, exit 1
 ```
 
-On the four edited files, before and after: **0 hits, exit 0.** No
+On the four edited files, before and after **both** commits: **0 hits,
+exit 0.** The three fixtures were re-armed before the second commit and
+still fire (exit 1, 1 and 45 hits) while the clean one stays silent, so
+the zero is a measurement and not an absence of measurement. No
 `sed`/`perl` text-mode rewriting was used on any of them; every change
 was made with the file tools.
 
@@ -295,6 +485,26 @@ is not a pass and not a skip.
   the integration produces. Every `herd-proto/src/lib.rs` citation this
   branch touched is now line-free. Others elsewhere in the corpus were
   not surveyed.
+- **F5 — the derived count is a disagreement, not a correction.** The
+  audit says five numbers refuse anything; I derive six, the difference
+  being `RECORD_VERSION`, which still refuses the record and no longer
+  refuses the root. The page now names the six members and says the
+  count is derived, so the disagreement is visible to any reader instead
+  of hidden in a numeral. **Somebody should settle it on the merits**; I
+  did not adopt the audit's figure because the brief said to recompute.
+- **F6 — the fifth site shows the same family one turn deeper.** *"One
+  of the six says so"* was true on `main` and false on the landing tree
+  because `pack-registry` wrote the migration clause into two more
+  refusal sentences. The decision whose subject was *a rule written in
+  more than one place and fixed in fewer* (D219) was itself landing a
+  change that falsified a third sentence about how many places the rule
+  is written in. That is not an argument for more prose; it is an
+  argument for the count never being the claim, which is what the fix
+  does.
+- **F7 — ORCH-183's two residues are the fourth and fifth sites of this
+  same rule** (`docs/remediation/13-crash-point-enumeration.md` §4.2,
+  `README.md:42`), already on the board, neither mine. §3.4 was the
+  third, not the last.
 - **F4 — the figures carry a date and a provenance, not a promise.** The
   three tables now say *"on `main`"* and name the declaring constant.
   They will be stale again at the next move. That is the intended
@@ -310,8 +520,9 @@ agent's report.
 ### Drafted `docs/decisions.md` entry
 
 ```markdown
-## 2026-10-30 — D-NEXT A version figure in prose carries its constant, and
-one in an acceptance criterion carries its requirement instead
+## 2026-10-30 — D-NEXT A figure in prose carries its constant, one in an
+acceptance criterion carries its requirement, and a derived count carries
+its members
 
 **Context.** M11's pack half moved all three of D199's numbers —
 `PROTOCOL_VERSION` to 3, `RECORD_VERSION` and `LAYOUT_VERSION` to 2 — and
@@ -324,6 +535,21 @@ criterion read *"`LAYOUT_VERSION` unchanged at 1"*, which the move made
 figure in an acceptance criterion is read as an instruction, and somebody
 picking ORCH-171 up would have tried to satisfy it by undoing a landed
 version move.
+
+**And a second cause, found by an audit on the same day.**
+`docs/architecture.md` §3.4 carried four false sentences about what a
+`RECORD_VERSION` mismatch does — not from the version moves at all, but
+from **D219**, whose own *Context* reads *"Two documents had published
+the opposite promise and neither was corrected with it"*. D219 fixed the
+two it named. §3.4 was the third. Three of its four sites were a
+**derived count and a taxonomy** rather than a figure: the three-kind
+classification had no kind that fitted a number which sets one artefact
+aside and serves the rest, so `RECORD_VERSION` was filed under *"the
+thing stops"*, and the sentence *"all six numbers that refuse anything"*
+was derived from that misfiling. A fifth site, which the audit did not
+name, went false with the pack half itself: *"One of the six says so"* —
+`pack-registry` wrote the no-migration clause into two more refusal
+sentences, so three say it now.
 
 **Decision.**
 
@@ -342,27 +568,61 @@ version move.
    appear beside it, dated and cited, as information. This is the rule
    D226 is to drafted decisions: the artefact an agent will act on has to
    be written so that the act is still right after the tree moves.
-4. **A prose correction that is only an illustration is left alone when
+4. **A derived count is never the claim; the members are.** *"All six
+   numbers that refuse anything"* was derived from a taxonomy that had
+   just lost a member, and no reader could see the derivation. Where a
+   count follows from a classification in the same document, the
+   document names the members and says the count is derived. Measured:
+   this exact numeral was wrong twice in `docs/architecture.md` §3.4 —
+   once at "six" before batch 8 added three constants, once after D219
+   moved `RECORD_VERSION` out of the group it was counted in.
+5. **A statement about behaviour carries the versions it is true of.**
+   The idiom is `docs/operating.md`'s: its two correct statements about
+   the record arm carry `(v0.4.1 and below)` and its four wrong ones
+   carried no version at all. A version caveat is what makes a stale
+   sentence **legible rather than false** — a reader can tell "went out
+   of date" from "was never true" and act on the first. *Refuses to
+   start* survived D219 in a third document precisely because it read as
+   timeless.
+6. **A section whose citations are load-bearing declares the tree it was
+   read against.** `docs/architecture.md` §3.4 now does, as
+   `docs/handover.md` and `docs/disk-policy.md` already did. It may name
+   branch shas rather than a commit on `main` when the tree it describes
+   has not been merged yet, and it says which citation classes it could
+   not verify and left out.
+7. **A prose correction that is only an illustration is left alone when
    the tree makes it true.** `docs/operating.md`'s two refusal
    quotations were written as illustrations when both numbers were 1;
    they are now literally what a v0.4.1 root and a v0.4.1 record get from
    a `main` build, and both are correct prefixes of the real sentences.
    Neither was touched.
 
+**Named residue.** D219's own *Context* says two documents had published
+the opposite promise and neither was corrected with it, and fixed those
+two. **`docs/architecture.md` §3.4 was the third and is corrected here**;
+`docs/remediation/13-crash-point-enumeration.md` §4.2 and `README.md:42`
+are the fourth and fifth and remain ORCH-183's. A decision whose subject
+is a rule written in more than one place does not get to assume it has
+found every place.
+
 **Evidence.** `docs-pack-figures`, 2026-10-30, four files and no code;
 `herd-proto/src/lib.rs`, `herd-hub/src/job.rs:72`,
 `herd-hub/src/store.rs:99` on `pack-variants` and `pack-registry`;
 `herd-hub/src/store.rs:3345` and `herd-hub/src/job.rs:102` for the two
-quotations; D199, D218, D226, ORCH-156, ORCH-171.
+quotations; `herd-hub/src/store.rs:1548-1551` for the quarantine;
+`status.rs:411`, `job.rs:110` and `store.rs:3349` for the three
+no-migration sentences; D199, D218, D219, D226, ORCH-156, ORCH-171,
+ORCH-183, ORCH-204.
 ```
 
 ### Drafted `board.md` rows
 
-Two rows. Ids are the merger's to allocate; `ORCH-A` and `ORCH-B` are
-placeholders for the first two free ids, in this order.
+Three rows. Ids are the merger's to allocate; `ORCH-A`, `ORCH-B` and
+`ORCH-C` are placeholders for the first three free ids, in this order.
 
 ```markdown
 | ORCH-A | **The release body reads three numbers and two documents say two.** `.github/workflows/release.yml` reads and echoes `LAYOUT_VERSION` beside `PROTOCOL_VERSION` and `RECORD_VERSION` since M11's pack half (`:183-219`, `:457`). Two short sentences still say two: `.github/workflows/release-dev.yml:17` (*"the same `RECORD_VERSION` and `PROTOCOL_VERSION` read out of the source"*) and `deploy/release-notice.md:48` (*"## The two numbers in the release body"*). The first is `herd-merger`'s file; the second is quoted in full on two published release pages, so changing it is a question about what those pages say, not a docs fix | herd-merger for `.github/`; Alexa for the notice | open | the pack batch landing | `docs/` |
+| ORCH-C | **Five or six numbers refuse something, and two readings disagree.** An audit of 2026-10-30 derives **five**; `docs-pack-figures` derives **six**. The difference is `RECORD_VERSION`, which since D218/D219 refuses the record by name (`record_version_mismatch_reason`) but no longer refuses the root. `docs/architecture.md` §3.4 now names the six members and states that the count is derived, so the disagreement is visible rather than hidden in a numeral; whichever way it is settled, the members list is what the page should keep. Settle it on the merits, not on recency | herd-reviewer | open | — | the four kinds in §3.4, which are not in dispute |
 | ORCH-B | **D199's ordering constraint and `main` no longer fit together.** D199 binds *"the ordinary release before v1.0.0"* to ship at layout 1 and record 1, for two measured reasons (the owed ORCH-145 reading needs a hub that can open their existing root; a record-2 build on a version-1 root exits cleanly with `read = 0` and looks like an answer). `main` carries record 2 and layout 2 once the pack batch lands, so that release cannot be cut from `main`'s tip. Decide where it is cut from, or whether it still happens. `docs/operating.md` now states the fact and names no resolution | Alexa | waiting | the pack batch landing; ORCH-145 | `docs/decisions.md` (D199 stands as written) |
 ```
 
@@ -387,11 +647,13 @@ placeholders for the first two free ids, in this order.
 
 ## Resume point
 
-`herd-merger`: take `docs-pack-figures` into the pack batch, **in the
-same batch as `pack-variants` and `pack-registry` or after them, never
-before**. Then allocate the number for the `D-NEXT` entry above and the
-two board ids, and close `pack-registry`'s *Decisions needed* item 2
-against its own `release.yml`.
+`herd-merger`: take `docs-pack-figures` (two commits) into the pack
+batch, **in the same batch as `pack-variants` and `pack-registry` or
+after them, never before**. Then allocate the number for the `D-NEXT`
+entry above and the **three** board ids, and close `pack-registry`'s
+*Decisions needed* item 2 against its own `release.yml`. Optionally
+re-point §3.4's base-commit declaration at the integration sha once it
+is cut; the two branch shas it names are the honest answer until then.
 
 ## Processes
 
