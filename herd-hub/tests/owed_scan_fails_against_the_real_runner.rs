@@ -410,13 +410,30 @@ async fn a_real_runner_condemns_nothing_when_the_hub_cannot_list_its_jobs() {
     let hub_said = herd.said("hub");
     let runner_said = herd.said("runner");
 
-    // 1. **The fixture bit.** Without this line the hub's listing worked, the
-    //    ordinary resumption path ran, and a green reading below would be
-    //    about nothing.
+    // 1. **The fixture bit**, and it is this file's whole guard on a premise
+    //    that does not keep itself. Without this line the hub's listing
+    //    worked, the ordinary resumption path ran, and a green reading below
+    //    would be about nothing.
+    //
+    //    **Why this fails sometimes and the hub is innocent when it does.**
+    //    The host hands the mode back under a running test:
+    //    `AListingThatFails::still_binds` names the mechanism — the runner
+    //    carrying this suite restores access, every 200 ms, on any directory
+    //    under the job it cannot list — and the window here is the whole of
+    //    a real runner's start-up, the widest in the file. The hub's own
+    //    sentence is the only honest witness of *when* the scan ran, which
+    //    is why the fixture is read out of the hub's words and not out of
+    //    the mode now: by the time this line runs the mode may be back
+    //    without the scan ever having seen it. A red here is a fact about
+    //    the fixture, and the measurement cannot simply be taken again —
+    //    restarting a real binary mid-test would mix two lives' log lines
+    //    into the counts below (see the drafted row for the class).
     assert!(
         hub_said.contains(CANNOT_TELL),
         "this test is about a hub whose own listing fails, and that hub never said so — so \
-         nothing here is evidence about the fix.\n--- the hub said:\n{hub_said}"
+         nothing here is evidence about the fix. If the jobs directory is 0o711 rather \
+         than the 0o111 the fixture set, the host gave the access back before the hub \
+         scanned: see AListingThatFails::still_binds.\n--- the hub said:\n{hub_said}"
     );
 
     // 2. **The silence at join is real.** The unprompted list is the thing the
