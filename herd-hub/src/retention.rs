@@ -76,6 +76,11 @@ use crate::store::{
     directory_bytes, JOBS_DIR, KEPT_FILES_DIR, OUTPUT_GONE_DIR, OUTPUT_PARTS_DIR, RECORD_FILE,
 };
 use herd_proto::{LabelSet, Priority};
+// The measured-bytes rule, one body in `herd-proto` beside the rule for a
+// figure a human typed (ORCH-186). This preview's byte figures are all
+// measurements or record claims, so they print exactly, with a binary
+// approximation beside them and never instead of them.
+use herd_proto::size::measured_bytes;
 
 /// How many records of one kind the preview names before it stops listing and
 /// says how many more there are. Ten, for [`crate::report`]'s reason: a list
@@ -618,8 +623,13 @@ struct DurableLabels {
 /// fail first.
 #[derive(Debug, Deserialize)]
 struct VersionProbe {
+    /// `None` when the key is absent, never `0`. The same line
+    /// [`crate::report`]'s `RecordOutputs` draws, for the same reason: a
+    /// `u32` with a serde default reads a missing field as zero and the
+    /// preview then says *"it carries record version 0"* about a record that
+    /// carries no version at all.
     #[serde(default)]
-    record_version: u32,
+    record_version: Option<u32>,
 }
 
 impl RetentionPreview {
@@ -702,15 +712,20 @@ impl RetentionPreview {
             // from another layout is named by its version and not by the
             // field that happened to fail.
             match serde_json::from_str::<VersionProbe>(&text) {
-                Ok(probe) if probe.record_version == RECORD_VERSION => {}
+                Ok(probe) if probe.record_version == Some(RECORD_VERSION) => {}
                 Ok(probe) => {
                     preview.scanned.unread.push(Unread {
                         path: format!("{JOBS_DIR}/{name}/{RECORD_FILE}"),
-                        why: format!(
-                            "it carries record version {}, and this build reads version \
-                             {RECORD_VERSION}",
-                            probe.record_version
-                        ),
+                        why: match probe.record_version {
+                            Some(version) => format!(
+                                "it carries record version {version}, and this build \
+                                 reads version {RECORD_VERSION}"
+                            ),
+                            None => format!(
+                                "it carries no record version at all, and this build \
+                                 reads version {RECORD_VERSION}"
+                            ),
+                        },
                     });
                     continue;
                 }
@@ -1050,30 +1065,6 @@ fn files_in(path: &Path) -> usize {
         }
     }
     files
-}
-
-/// A byte count as this preview prints one: the exact figure always, and an
-/// approximation beside it once the exact figure stops being readable.
-///
-/// [`crate::report`]'s rule and the same function, deliberately duplicated in
-/// neither direction of meaning: every number here is evidence somebody will
-/// do arithmetic on, and a rounded one is how a figure gets quoted back as
-/// the figure it was not.
-fn said_bytes(bytes: u64) -> String {
-    const KIB: u64 = 1 << 10;
-    const MIB: u64 = 1 << 20;
-    const GIB: u64 = 1 << 30;
-    if bytes < KIB {
-        return format!("{bytes} bytes");
-    }
-    let (scale, unit) = if bytes >= GIB {
-        (GIB, "GiB")
-    } else if bytes >= MIB {
-        (MIB, "MiB")
-    } else {
-        (KIB, "KiB")
-    };
-    format!("{bytes} bytes ({:.2} {unit})", bytes as f64 / scale as f64)
 }
 
 /// A span or an age, said in days **and** in seconds.
@@ -1498,7 +1489,7 @@ fn write_weight(f: &mut fmt::Formatter<'_>, weight: &Weight, indent: &str) -> fm
         f,
         "{indent}{:<width$}{} in {} file(s)",
         "collected files",
-        said_bytes(weight.collected_bytes),
+        measured_bytes(weight.collected_bytes),
         weight.collected_files
     )?;
     writeln!(
@@ -1510,14 +1501,14 @@ fn write_weight(f: &mut fmt::Formatter<'_>, weight: &Weight, indent: &str) -> fm
         f,
         "{indent}{:<width$}{} in {} record(s)",
         "the records",
-        said_bytes(weight.record_bytes),
+        measured_bytes(weight.record_bytes),
         weight.records
     )?;
     writeln!(
         f,
         "{indent}{:<width$}{} in {} log(s)",
         "the logs",
-        said_bytes(weight.log_bytes),
+        measured_bytes(weight.log_bytes),
         weight.logs
     )?;
     writeln!(
@@ -1540,7 +1531,7 @@ fn write_weight(f: &mut fmt::Formatter<'_>, weight: &Weight, indent: &str) -> fm
         f,
         "{indent}{:<width$}{}",
         "measured in all",
-        said_bytes(weight.measured_bytes())
+        measured_bytes(weight.measured_bytes())
     )?;
     Ok(())
 }
@@ -1549,10 +1540,10 @@ fn write_weight(f: &mut fmt::Formatter<'_>, weight: &Weight, indent: &str) -> fm
 fn said_three(weighed: &Weighed) -> String {
     format!(
         "files {}, record {}, log {}",
-        said_bytes(weighed.collected_bytes),
-        said_bytes(weighed.record_bytes),
+        measured_bytes(weighed.collected_bytes),
+        measured_bytes(weighed.record_bytes),
         match &weighed.log {
-            LogWeight::Measured(bytes) => said_bytes(*bytes),
+            LogWeight::Measured(bytes) => measured_bytes(*bytes),
             LogWeight::Unknown(_) => "UNKNOWN".to_owned(),
             LogWeight::NeverWritten => "none written".to_owned(),
         }
@@ -1575,6 +1566,31 @@ mod tests {
     use super::*;
 
     const DAY: Duration = Duration::from_secs(86_400);
+
+    /// An absent `record_version` reads as **absent**, never as `0`.
+    ///
+    /// The preview's refusal quotes this field, and a `u32` with a serde
+    /// default made it say *"it carries record version 0"* about a record
+    /// carrying no version at all — a sentence about a field with a value in
+    /// it. `report.rs` draws the same line on its own `RecordOutputs`, and
+    /// `job.rs` draws it on `at_its_ceiling`: zero is a thing a record can
+    /// say, so absence may not borrow it.
+    #[test]
+    fn an_absent_record_version_is_absent_and_not_zero() {
+        let absent: VersionProbe = serde_json::from_str("{}").expect("an empty object parses");
+        assert_eq!(absent.record_version, None, "absent is absent");
+        let zero: VersionProbe =
+            serde_json::from_str(r#"{"record_version":0}"#).expect("a zero parses");
+        assert_eq!(
+            zero.record_version,
+            Some(0),
+            "a record that really says 0 still says a version"
+        );
+        let ours: VersionProbe =
+            serde_json::from_str(&format!(r#"{{"record_version":{RECORD_VERSION}}}"#))
+                .expect("this build's own version parses");
+        assert_eq!(ours.record_version, Some(RECORD_VERSION));
+    }
 
     fn spans() -> Spans {
         Spans::new(90 * DAY, 14 * DAY, 14 * DAY, 14 * DAY)

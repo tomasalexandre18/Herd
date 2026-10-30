@@ -3292,12 +3292,17 @@ async fn serve_runner(
     // pick up, and a part-written file resumes at the hub's own length rather
     // than at the runner's idea of how far it had got — which is exactly the
     // figure a dropped link invalidated.
-    ask_for_the_files_still_owed(state, name, outbox);
+    //
+    // What comes back is whether that list derived at all, and this
+    // connection carries it: a runner reads an unbroken silence as proof this
+    // hub wants nothing of it, and a hub whose record scan failed has not
+    // earned that reading (ORCH-197).
+    let owed = ask_for_the_files_still_owed(state, name, outbox);
     // Whatever happens from here, the runner slot is given back before this
     // returns: a failure that kept the slot would mean no runner could ever
     // join this hub again.
     let outcome = match dispatch_queued_jobs(state) {
-        Ok(()) => relay_from_runner(state, name, outbox, source, &mut kicked).await,
+        Ok(()) => relay_from_runner(state, name, outbox, source, &mut kicked, owed).await,
         Err(error) => Err(error),
     };
     if let Some(gone) = state.release_runner(outbox) {
@@ -4566,6 +4571,10 @@ async fn relay_from_runner(
     outbox: &Outbox,
     source: &mut Source,
     kicked: &mut watch::Receiver<bool>,
+    // What this connection was told at join about the collections it owes,
+    // which decides whether a collection it offers needs answering from its
+    // own record (ORCH-197). Owned here, so it lives and dies with the link.
+    mut owed: OwedAtJoin,
 ) -> Result<()> {
     // Lives exactly as long as this connection, which is what makes the
     // runner's name part of its key without being in it, and what frees it
@@ -4803,6 +4812,14 @@ async fn relay_from_runner(
                 // What has to be true instead is that this runner produced
                 // the collection this hub is waiting for: the attempt on the
                 // record, from the machine that ran it.
+                //
+                // First, though: a connection that was never told what this
+                // hub is owed — one `readdir` having failed for every runner
+                // at once — gets its answer for *this* collection here, from
+                // that job's own record, which the failed listing says
+                // nothing about (ORCH-197). Nothing happens on the ordinary
+                // path.
+                owed.answer_this_offer(state, name, outbox, &job_id);
                 if let Err(why) = files_may_land(state, name, &job_id, attempt) {
                     eprintln!("herd-hub: a file chunk of {job_id} is refused: {why}");
                     continue;
@@ -5328,12 +5345,33 @@ fn the_log_is_whole(
 /// data root — says so by name, which is the visible no-holder state D148
 /// insists on instead of a job whose evidence never arrives and nobody
 /// notices.
-fn ask_for_the_files_still_owed(state: &State, name: &str, outbox: &Outbox) {
+fn ask_for_the_files_still_owed(state: &State, name: &str, outbox: &Outbox) -> OwedAtJoin {
     let owed = match state.store.collections_owed() {
         Ok(owed) => owed,
+        // **One failed scan used to silence this hub to the whole fleet**
+        // (ORCH-197). The list is one `readdir` of the jobs directory, and a
+        // directory that will not list fails it for every connection at once
+        // — so every runner was answered with the silence that means "this
+        // hub holds nothing of yours", every one of them read a genuine
+        // silence, and every one of them correctly set its spools aside. One
+        // failure, the whole fleet.
+        //
+        // What is wrong with returning here is not the missing frames; it is
+        // that the hub *finishes the sentence*. Silence followed by the
+        // answer to a health report is a complete statement on this wire, and
+        // this hub has no idea whether it is true. So the connection is
+        // marked instead, and every collection the runner goes on to offer is
+        // answered from **its own record**, which this failure says nothing
+        // about.
         Err(error) => {
-            eprintln!("herd-hub: cannot tell which collections are outstanding: {error}");
-            return;
+            eprintln!(
+                "herd-hub: cannot tell which collections are outstanding: {error}. Nothing \
+                 is claimed about any collection of {name}: each one it offers will be \
+                 answered from that job's own record instead (ORCH-197)"
+            );
+            return OwedAtJoin::CannotTell {
+                answered: HashSet::new(),
+            };
         }
     };
     for collection in owed {
@@ -5349,6 +5387,106 @@ fn ask_for_the_files_still_owed(state: &State, name: &str, outbox: &Outbox) {
             attempt: collection.attempt,
             held: collection.held,
         });
+    }
+    OwedAtJoin::Said
+}
+
+/// Whether this connection has been told everything this hub is owed from it
+/// — and, when it has not, the one thing that makes up for it (ORCH-197).
+///
+/// **Why the distinction has to be carried.** A runner's rule for a spool
+/// nothing will ever ask for is built on silence: the owed list is sent
+/// before the hub reads a frame, frames on one link are ordered, so a
+/// collection the hub has not named by the time it answers a health report is
+/// one the hub does not want, and the bytes are set aside. That reading is
+/// right when the list was derived and false when it was not, and the two are
+/// indistinguishable on the wire — which is why a hub that cannot tell what
+/// it holds must not say it holds nothing.
+///
+/// So a connection whose list did not derive does not pretend otherwise. It
+/// cannot say "I do not know" — the protocol has no frame for that, and
+/// inventing one would put this behind a version move — and it must not stop
+/// serving, because what failed is one `readdir`: every record this hub holds
+/// still opens by name, every job still dispatches, every chunk still lands.
+/// What it does instead is answer **one collection at a time, from that
+/// collection's own record**, the moment the runner offers it. A runner
+/// offers a swept spool by sending its first chunk, and
+/// [`crate::job::JobStore::collection_owed`] is the same derivation the scan
+/// does for one job (D79's one definition, asked two ways) — so the answer is
+/// the `JobFilesHeld` the scan would have sent, with the same holdings, read
+/// at the moment it is needed.
+///
+/// Per connection, and that matters twice: the names already answered are
+/// freed when the runner goes, with no eviction policy, and a scan that
+/// starts working again is picked up by the next dial without anybody
+/// clearing anything.
+enum OwedAtJoin {
+    /// The scan ran. The list this runner was sent at join is complete, so a
+    /// collection the hub did not name is one it is not waiting for, and this
+    /// connection is owed nothing further.
+    Said,
+    /// The scan did not run. Nothing was claimed about any collection, and
+    /// each one this runner offers is answered from its own record — once,
+    /// which is what `answered` is for: a collection is offered as a stream
+    /// of chunks and the answer belongs to the first of them.
+    CannotTell { answered: HashSet<JobId> },
+}
+
+impl OwedAtJoin {
+    /// Answer the offer of one collection from its own record, if this
+    /// connection owes an answer at all.
+    ///
+    /// Called on every file chunk, and on the ordinary path — the scan having
+    /// run — it is one discriminant test and nothing else.
+    ///
+    /// The frame goes out **before** the chunk is judged and written, which
+    /// is what puts it in front of the answer to any health report the runner
+    /// queued after its offer: one link, one order, so a runner cannot reach
+    /// the barrier it reads silence against without having read this first.
+    ///
+    /// What this does **not** do is invent an answer. `collection_owed`
+    /// saying `None` is a real answer, read from that job's record — the hub
+    /// holds every byte, or the bytes rode the verdict, or the record is
+    /// gone, or the sweeper took the collection — and the chunk's own path
+    /// says which of those it is, loudly, a few lines below. The cost of
+    /// answering an offer rather than a join is a cursor that moves: a
+    /// collection already in flight is told what this hub holds *now*, so a
+    /// runner with chunks in flight sends them again. That is at most one
+    /// link window of bytes, once per collection, on a hub whose jobs
+    /// directory will not list.
+    fn answer_this_offer(&mut self, state: &State, name: &str, outbox: &Outbox, job_id: &JobId) {
+        let Self::CannotTell { answered } = self else {
+            return;
+        };
+        if !answered.insert(job_id.clone()) {
+            return;
+        }
+        match state.store.collection_owed(job_id) {
+            Ok(Some(collection)) if collection.runner == name => {
+                println!(
+                    "herd-hub: {name} is offering files of {job_id}, which this hub is \
+                     still owed; asking it to resume there — that job's own record \
+                     answered what the scan of all of them could not"
+                );
+                let _ = outbox.send(FromHub::JobFilesHeld {
+                    job_id: job_id.clone(),
+                    attempt: collection.attempt,
+                    held: collection.held,
+                });
+            }
+            // Owed, but by another machine. Not this runner's collection to
+            // resume, and its chunk is refused by name a few lines below.
+            Ok(Some(collection)) => eprintln!(
+                "herd-hub: {name} is offering files of {job_id}, which this hub is owed by \
+                 {} and not by it",
+                collection.runner
+            ),
+            Ok(None) => {}
+            Err(error) => eprintln!(
+                "herd-hub: {name} is offering files of {job_id} and this hub cannot tell \
+                 whether it is owed them: {error}. Nothing is claimed about this collection"
+            ),
+        }
     }
 }
 
@@ -8223,6 +8361,7 @@ fn message_kind(message: &ToHub) -> &'static str {
 
 #[cfg(test)]
 mod tests {
+    use std::os::unix::fs::PermissionsExt;
     use std::path::Path;
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::mpsc as std_mpsc;
@@ -9652,6 +9791,257 @@ mod tests {
         assert!(
             let_the_pass_finish(&state, STOP_WITHIN).await.is_some(),
             "with the pass over, the stop may leave"
+        );
+    }
+
+    /// A state over one store, for the tests about what a connection is told
+    /// at join.
+    fn a_state_over(store: Arc<dyn JobStore>) -> State {
+        State {
+            store,
+            policy: Policy::default(),
+            authority: Authority::default(),
+            started: Instant::now(),
+            peers: Mutex::new(Peers::default()),
+            dispatching: Mutex::new(()),
+            stopping: AtomicBool::new(false),
+            status_root: OnceLock::new(),
+            status_changed: Notify::new(),
+            status_published: Mutex::new(None),
+            notify: Notifier::silent(),
+        }
+    }
+
+    /// A record that owes a collection: one job, one attempt by `runner`, and
+    /// a verdict announcing one streamed file of which not a byte has landed.
+    ///
+    /// The real store, so `collections_owed` and `collection_owed` read the
+    /// real thing — the point of these tests is a directory that will not
+    /// list, and a fake store could not have one.
+    fn a_record_owing_a_collection(store: &JobDirStore, runner: &str) -> JobId {
+        let job = store
+            .create_job(NewJob::new(vec!["true".to_owned()]))
+            .expect("the job is minted");
+        store
+            .begin_attempt(&job.id, runner, "the test hands it to this runner", None)
+            .expect("the attempt is numbered");
+        store
+            .record_outputs(
+                &job.id,
+                &herd_proto::JobOutputs {
+                    files: vec![herd_proto::OutputFile::announced(
+                        "evidence/results.json".to_owned(),
+                        64,
+                        herd_proto::sha256_hex(&[b'e'; 64]),
+                    )],
+                    refused: None,
+                    skipped: Vec::new(),
+                    streamed: true,
+                },
+            )
+            .expect("the manifest is recorded");
+        job.id
+    }
+
+    /// The jobs directory with its read permission taken away, restored
+    /// however the test ends.
+    ///
+    /// `None` when permissions do not apply to this process, which is a skip
+    /// and never a pass (D27): a real `readdir` cannot be made to fail for
+    /// root, and a store mocked to return an error would prove nothing about
+    /// the directory this code actually reads.
+    struct AListingThatFails {
+        jobs: PathBuf,
+    }
+
+    impl AListingThatFails {
+        fn over(root: &Path, job_id: &JobId) -> Option<Self> {
+            let jobs = root.join("jobs");
+            std::fs::set_permissions(&jobs, std::fs::Permissions::from_mode(0o111))
+                .expect("the permissions are the test's to set");
+            if std::fs::read_dir(&jobs).is_ok() {
+                std::fs::set_permissions(&jobs, std::fs::Permissions::from_mode(0o755))
+                    .expect("the permissions are given back");
+                return None;
+            }
+            // The other half of the fixture, asserted rather than assumed: a
+            // record still opens by name, which is what the per-collection
+            // answer reads. Without this the fixture would be a hub with no
+            // records at all.
+            let record = jobs.join(job_id.as_str()).join("job.json");
+            assert!(
+                std::fs::read_to_string(&record).is_ok(),
+                "a listing that fails, not a record that is gone: {} must still open",
+                record.display()
+            );
+            Some(Self { jobs })
+        }
+    }
+
+    impl Drop for AListingThatFails {
+        fn drop(&mut self) {
+            let _ = std::fs::set_permissions(&self.jobs, std::fs::Permissions::from_mode(0o755));
+        }
+    }
+
+    fn held_frames(inbox: &mut UnboundedReceiver<FromHub>) -> Vec<FromHub> {
+        let mut seen = Vec::new();
+        while let Ok(frame) = inbox.try_recv() {
+            seen.push(frame);
+        }
+        seen
+    }
+
+    /// **ORCH-197's first half: the hub stops finishing the sentence.** A
+    /// failed listing used to leave this function having said nothing, which
+    /// on the wire is "I hold nothing of yours" — the one statement a hub
+    /// that cannot read its records may not make. It now says nothing *and
+    /// says so*, which is what lets the connection make up for it one
+    /// collection at a time.
+    #[test]
+    fn a_failed_record_scan_claims_nothing_about_any_collection() {
+        let dir = tempfile::tempdir().expect("a temporary state directory");
+        let store = Arc::new(JobDirStore::open(dir.path()).expect("the state root opens"));
+        let job_id = a_record_owing_a_collection(&store, "the-runner");
+        let state = a_state_over(store as Arc<dyn JobStore>);
+        let (outbox, mut inbox) = mpsc::unbounded_channel();
+
+        let Some(_broken) = AListingThatFails::over(dir.path(), &job_id) else {
+            herd_runner::testing::skipped(
+                "a_failed_record_scan_claims_nothing_about_any_collection",
+                "this process is one file permissions do not apply to, so no real readdir \
+                 can be made to fail here",
+            );
+            return;
+        };
+        let owed = ask_for_the_files_still_owed(&state, "the-runner", &outbox);
+
+        assert!(
+            matches!(owed, OwedAtJoin::CannotTell { .. }),
+            "a connection whose list did not derive must carry that, or the silence it was \
+             sent reads as a complete answer"
+        );
+        assert!(
+            held_frames(&mut inbox).is_empty(),
+            "there is nothing honest to send: the hub has not read a record yet"
+        );
+    }
+
+    /// **ORCH-197's second half: the offer is answered from the one record
+    /// the hub needs.** The listing is still broken; the collection is named
+    /// with the attempt and the holdings the join list would have carried,
+    /// and named **once** however many chunks the offer is.
+    #[test]
+    fn an_offer_on_a_connection_whose_scan_failed_is_answered_from_that_job_s_record() {
+        let dir = tempfile::tempdir().expect("a temporary state directory");
+        let store = Arc::new(JobDirStore::open(dir.path()).expect("the state root opens"));
+        let job_id = a_record_owing_a_collection(&store, "the-runner");
+        let state = a_state_over(store as Arc<dyn JobStore>);
+        let (outbox, mut inbox) = mpsc::unbounded_channel();
+
+        let Some(_broken) = AListingThatFails::over(dir.path(), &job_id) else {
+            herd_runner::testing::skipped(
+                "an_offer_on_a_connection_whose_scan_failed_is_answered_from_that_job_s_record",
+                "this process is one file permissions do not apply to, so no real readdir \
+                 can be made to fail here",
+            );
+            return;
+        };
+        let mut owed = ask_for_the_files_still_owed(&state, "the-runner", &outbox);
+        assert!(
+            held_frames(&mut inbox).is_empty(),
+            "nothing is said at join"
+        );
+
+        owed.answer_this_offer(&state, "the-runner", &outbox, &job_id);
+        let answered = held_frames(&mut inbox);
+        match answered.as_slice() {
+            [FromHub::JobFilesHeld {
+                job_id: of,
+                attempt,
+                held,
+            }] => {
+                assert_eq!(of, &job_id, "the collection that was offered");
+                assert_eq!(*attempt, 1, "the attempt on the record, read for this job");
+                assert!(
+                    held.is_empty(),
+                    "not a byte of it has landed, and the hub says so rather than guessing: \
+                     {held:?}"
+                );
+            }
+            other => panic!(
+                "an offer on a connection that was told nothing is answered from that job's \
+                 own record: {other:?}"
+            ),
+        }
+
+        // A collection is a stream of chunks and the answer belongs to the
+        // first of them: a frame per chunk would be a resume point per chunk,
+        // which is a cursor that never advances.
+        owed.answer_this_offer(&state, "the-runner", &outbox, &job_id);
+        assert!(
+            held_frames(&mut inbox).is_empty(),
+            "answered once per collection, not once per chunk"
+        );
+    }
+
+    /// The ordinary path is untouched: a connection whose scan ran was told
+    /// everything at join, so an offer is answered by the chunk path alone
+    /// and this adds not one frame to a working hub.
+    #[test]
+    fn an_offer_is_not_answered_on_a_connection_whose_scan_ran() {
+        let dir = tempfile::tempdir().expect("a temporary state directory");
+        let store = Arc::new(JobDirStore::open(dir.path()).expect("the state root opens"));
+        let job_id = a_record_owing_a_collection(&store, "the-runner");
+        let state = a_state_over(store as Arc<dyn JobStore>);
+        let (outbox, mut inbox) = mpsc::unbounded_channel();
+
+        let mut owed = ask_for_the_files_still_owed(&state, "the-runner", &outbox);
+        assert!(
+            matches!(owed, OwedAtJoin::Said),
+            "the listing works here, so the list this runner was sent is complete"
+        );
+        // It was asked for at join, which is the behaviour this fix must not
+        // have changed.
+        assert_eq!(
+            held_frames(&mut inbox).len(),
+            1,
+            "a hub that can read its records still asks at join"
+        );
+
+        owed.answer_this_offer(&state, "the-runner", &outbox, &job_id);
+        assert!(
+            held_frames(&mut inbox).is_empty(),
+            "nothing is owed to a connection that was told everything"
+        );
+    }
+
+    /// One runner is never told about another's collection, and the fallback
+    /// keeps that rule rather than widening it: a collection belongs to the
+    /// attempt that produced it, and asking the wrong machine for it would
+    /// have it look for a spool it never had (D148).
+    #[test]
+    fn a_collection_another_machine_owes_is_not_asked_of_this_one() {
+        let dir = tempfile::tempdir().expect("a temporary state directory");
+        let store = Arc::new(JobDirStore::open(dir.path()).expect("the state root opens"));
+        let job_id = a_record_owing_a_collection(&store, "the-machine-that-ran-it");
+        let state = a_state_over(store as Arc<dyn JobStore>);
+        let (outbox, mut inbox) = mpsc::unbounded_channel();
+
+        let Some(_broken) = AListingThatFails::over(dir.path(), &job_id) else {
+            herd_runner::testing::skipped(
+                "a_collection_another_machine_owes_is_not_asked_of_this_one",
+                "this process is one file permissions do not apply to, so no real readdir \
+                 can be made to fail here",
+            );
+            return;
+        };
+        let mut owed = ask_for_the_files_still_owed(&state, "some-other-machine", &outbox);
+        owed.answer_this_offer(&state, "some-other-machine", &outbox, &job_id);
+
+        assert!(
+            held_frames(&mut inbox).is_empty(),
+            "the record names the machine that owes it, and it is not this one"
         );
     }
 }
