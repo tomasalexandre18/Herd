@@ -44,6 +44,7 @@ pub mod capability;
 pub mod cgroup;
 pub mod confine;
 pub mod endpoint;
+pub mod fetch;
 pub mod janitor;
 pub mod job;
 pub mod mesh;
@@ -3017,6 +3018,17 @@ pub async fn run_until(config: Config, stop: impl Future<Output = String>) -> Re
     // here, which finishes them where it can and names them where it cannot.
     for line in session.pick_up_collections(confined.root()) {
         eprintln!("herd-runner: {line}");
+    }
+    // And the third thing a killed previous life leaves behind: a pack it was
+    // half-way through fetching. A fetch removes its own staging directory on
+    // every path out of itself, the refused ones included, so what this finds
+    // is only ever the work of a process that was killed — bytes under a name
+    // nothing looks up, belonging to a pack that was never registered, which
+    // only the next start can see.
+    if let Ok(store) = packstore::PackStore::open(confined.root().path()) {
+        if let Some(line) = fetch::forget_incoming(&store) {
+            eprintln!("herd-runner: {line}");
+        }
     }
     let probing: tokio::task::JoinHandle<()>;
     {
