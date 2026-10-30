@@ -98,17 +98,41 @@ his — D248 answered it.
 
 ## What is left to v1.0.0, in the order it has to happen
 
-1. **M11's pack half — thirteen steps, two of them on `main` or pushed.**
-   The one gate on everything is numbering the whole protocol surface at
-   `PROTOCOL_VERSION` 3, because a frame nobody numbers in that bump is
-   a frame nobody can add afterwards (D204 freezes the surface). The
-   mesh-address rule and both invariant-3 guards are **on `main`**
-   (D222), the protocol surface is **pushed** on `pack-proto`, and the
-   pack store, the `{out}` extraction (D223) and the hub registry with
-   both version bumps are **committed on local branches and not pushed**.
-   What it buys: E-12 and E-17, and with them the only route from 36 to
-   the ceiling. What it blocks: everything below, because the version
-   bump rides with it.
+1. **M11's pack half — on `main`, and running end to end in one
+   direction. What is left is the push.** The three sentences this
+   replaces are all stale, and every one of them described the tree
+   before batch 12: they read *"thirteen steps, two of them on `main`
+   or pushed"*, that the protocol surface was *"pushed on
+   `pack-proto`"*, and that the pack store, the `{out}` extraction and
+   the hub registry were *"committed on local branches and not
+   pushed"*. Read off `71efccf` on 2026-10-30 (ORCH-302):
+   `PROTOCOL_VERSION` 3 with `RECORD_VERSION` and `LAYOUT_VERSION` 2
+   landed with the pack half in batch 12, which is **B5** above; the
+   hub registry, the runner's content store, the peer fetch, the
+   mesh-bound endpoint and the `{out}` extraction (D223) are on
+   `main`; the layout step lays a declared `needs` out at `{in}/<key>`
+   before the first step runs and registers a declared `leaves` after
+   the fsync (batch 26, **D267**); and a pack crosses the network
+   between two real runners with the hub holding no byte of it
+   (batch 27, **D269**, **D270**). **What is left is one transfer
+   direction and one record field.** The **push**: M11's done-when
+   asks that an outbound-only runner complete both directions without
+   listening, only the pull half is built, and what is on `main` is
+   the refusal — an outbound-only holder is refused by name and
+   nothing moves (ORCH-220, `docs/plan.md` M11 S10). The field:
+   `JobRecord::packs_in` and `JobRecord::packs_out` are written by
+   nothing, so a record cannot name the pack an attempt consumed or
+   published (ORCH-248). What it buys: E-12 and E-17 — **two of the
+   six** musts between 36 and the ceiling of 42, the other four being
+   E-14, E-16, E-37 and E-42; the sentence this replaces called it
+   *"the only route"*, which it never was. What it blocks: nothing
+   below any more, because the version bump it used to carry is spent
+   (**D243**). **The gate that used to head this step is behind us,
+   and the constraint it carried is not:** the whole protocol surface
+   had to be numbered in that bump because D204 freezes it, so a
+   frame nobody numbered then is a frame nobody can add now — which
+   is why step 3's coalesce half has to be additive on an existing
+   frame (D229) rather than a new one.
 2. **M12's remainder** — per-runner budgets and keeper pinning (the rest
    of E-16), key-aware placement and the GC that moves packs (E-14).
    What it buys: two musts. What it blocks: nothing below, but its
