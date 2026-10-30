@@ -1,7 +1,7 @@
 //! M11's `{in}`/`{out}` chain, end to end, against the real binaries as
 //! processes: a declared command leaves a pack, the hub registers it, and a
 //! **later** declared command is handed it under `{in}` and reads the bytes.
-//!
+//
 //! This is the obligation M12's rows kept naming as their blocker, and it is
 //! asserted here rather than in a library test because every link in the
 //! chain is a different program: `herdctl` reads the declaration out of the
@@ -9,7 +9,7 @@
 //! registry, the runner lays the pack out and the consumer's own tool reads
 //! `{in}/<key>` off the disk. A test that called `PackStore::lay_out`
 //! directly would prove the one link that was never in doubt.
-//!
+//
 //! **One runner, deliberately.** D10's first path is the same host: every
 //! object is already in this runner's store, so nothing moves on any wire,
 //! `{in}/<key>` is hard links into the store, and the figure the hub is told
@@ -18,9 +18,9 @@
 //! the build and the test run of one commit land on one machine because the
 //! matcher prefers a runner that holds what a job needs (E-23). Two runners
 //! and a real transfer are the push step's (ORCH-220).
-//!
+//
 //! What is asserted, in the order the chain happens:
-//!
+//
 //! * before anything is registered, `herdctl would-run` on the consumer says
 //!   it **would be claimed and then wait for its packs** (D261) — the one
 //!   answer a dry run of a job with `needs` could most easily get wrong, and
@@ -558,4 +558,278 @@ fn name_of(record: &serde_json::Value) -> Option<String> {
     record["declaration"]["command"]
         .as_str()
         .map(ToOwned::to_owned)
+}
+
+// ------------- the hub authorises a transfer, and logs no secret ----
+
+// What follows is the **authorisation** half of the chain, against the real
+// hub *process*. It is here rather than in `pack_frames.rs` for one reason:
+// the property under test is what the hub **writes down**, and a hub running
+// inside the test binary writes its journal to the test binary's own file
+// descriptor 2, where no test can read it. A hub started as a process has
+// its stderr in a file, which is the only place this assertion can be made.
+
+/// The runner that holds the pack, and the label only it offers.
+const HOLDER: &str = "the-holder";
+const HOLDS: &str = "holds-packs";
+/// The runner that needs the objects, and the label only it offers.
+const ASKER: &str = "the-asker";
+const NEEDS: &str = "needs-packs";
+/// Where the holder says it serves content: an address on a private mesh
+/// interface, the only kind invariant 3 permits a runner to bind (D11).
+const HOLDER_ENDPOINT: &str = "10.42.0.7:51820";
+/// The commit and key the fixture pack is registered under.
+const AUTH_COMMIT: &str = "cb5a2e8b4f1d9c7a3e05b8d6f2a1c4e79b0d3f68";
+const AUTH_KEY: &str = "grain-authorised";
+
+/// A one-object manifest. The bytes **are** the pack's identity, so this is
+/// written out rather than built, exactly as the store's own shape has it.
+fn an_authorised_manifest() -> Vec<u8> {
+    format!(
+        "# chatons pack 1\n# profile debug\n{}\t4096\t0644\tf\tartefact\tgrain.txt\n",
+        "7".repeat(64)
+    )
+    .into_bytes()
+}
+
+fn the_authorised_pack() -> herd_proto::PackId {
+    herd_proto::PackId::of_manifest_bytes(&an_authorised_manifest())
+}
+
+/// A runner driven frame by frame against the real hub process.
+///
+/// Hand-written and not `herd-runner`, and the reason is a finding rather
+/// than a preference: `herd-runner` sends `mesh_endpoint: None` in its
+/// handshake unconditionally, so the real binary cannot be a holder a peer
+/// can be sent to at all. Said in full in this branch's handoff.
+struct Dialled {
+    socket: tokio_tungstenite::WebSocketStream<
+        tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+    >,
+}
+
+impl Dialled {
+    /// `token` is passed in rather than minted here, because **the order
+    /// matters**: a hub whose roster is empty refuses every submission by
+    /// name — *"0 runner(s) are approved on this state root, so nothing
+    /// submitted here could ever start"* — rather than queueing a job that
+    /// would wait for nobody coming. So both names are approved before the
+    /// first job is submitted, and this only dials.
+    async fn joining(
+        herd: &Herd,
+        name: &str,
+        token: &str,
+        label: &str,
+        endpoint: Option<&str>,
+    ) -> Self {
+        use futures_util::SinkExt;
+        let token = token.to_owned();
+        let (mut socket, _response) = tokio_tungstenite::connect_async(herd.url())
+            .await
+            .expect("the real hub accepts a runner");
+        let offer = herd_proto::CapabilityOffer::new(vec![herd_proto::OfferedCapability::new(
+            herd_proto::Capability::shared(label),
+            herd_proto::CapabilityOrigins::declared(),
+        )])
+        .expect("a valid offer");
+        let hello = herd_proto::ToHub::Hello {
+            protocol_version: herd_proto::PROTOCOL_VERSION,
+            peer_version: herd_runner::runner_version().to_owned(),
+            role: herd_proto::Role::Runner,
+            token: Some(token),
+            name: Some(name.to_owned()),
+            instance: Some("the-only-life".to_owned()),
+            state_root: None,
+            health_every_ms: None,
+            capabilities: offer,
+            host: herd_proto::HostSize {
+                memory_mib: Some(8192),
+                threads: Some(4),
+                memory_floor_mib: Some(1024),
+                tmpfs_mib: Some(4096),
+            },
+            preference: 0,
+            load_milli: None,
+            switch: herd_proto::Switch::On,
+            jobs_at_once: None,
+            mesh_endpoint: endpoint.map(ToOwned::to_owned),
+        };
+        socket
+            .send(tokio_tungstenite::tungstenite::Message::text(
+                herd_proto::to_frame(&hello).expect("hello encodes"),
+            ))
+            .await
+            .expect("hello is sent");
+        let mut joined = Self { socket };
+        match joined.next().await {
+            Some(herd_proto::FromHub::Welcome { .. }) => joined,
+            other => panic!("an approved runner is welcomed, got {other:?}"),
+        }
+    }
+
+    async fn say(&mut self, message: herd_proto::ToHub) {
+        use futures_util::SinkExt;
+        self.socket
+            .send(tokio_tungstenite::tungstenite::Message::text(
+                herd_proto::to_frame(&message).expect("the frame encodes"),
+            ))
+            .await
+            .expect("the frame is sent");
+    }
+
+    async fn next(&mut self) -> Option<herd_proto::FromHub> {
+        use futures_util::StreamExt;
+        loop {
+            let frame = self.socket.next().await?.expect("the frame is readable");
+            if frame.is_close() {
+                return None;
+            }
+            let Ok(text) = frame.to_text() else { continue };
+            if text.is_empty() {
+                continue;
+            }
+            return Some(herd_proto::from_frame(text).expect("the hub speaks the protocol"));
+        }
+    }
+
+    /// Wait for the job the hub assigns this runner, and keep it `assigned`:
+    /// that is the window a fetch is asked in.
+    async fn takes_its_job(&mut self) -> u32 {
+        loop {
+            match self.next().await {
+                Some(herd_proto::FromHub::AssignJob { attempt, .. }) => return attempt,
+                Some(_) => continue,
+                None => panic!("the hub never handed this runner a job"),
+            }
+        }
+    }
+}
+
+/// **The hub authorises a real transfer, and writes down no secret** (D209,
+/// D200, invariant 7).
+///
+/// Two assertions a hub inside the test binary cannot carry, both about the
+/// one sentence an operator reads:
+///
+/// * it names the **scope** — who may fetch what, from whom, at which
+///   address, until when — because a transfer with no figures on it is not
+///   something an operator can follow;
+/// * and it carries **no part of the token**. A capability is a bearer
+///   secret: its holder *is* its subject, so a token in a journal is a
+///   journal that authorises a transfer to whoever reads it, and journals are
+///   shipped, pasted and attached to reports.
+///
+/// Watched red: with the journal line changed to print the token, the second
+/// assertion failed and named it; with the `ExpectTransfer` send removed, the
+/// *first* test of this pair failed at the holder's frame and this one still
+/// passed — which is why both exist.
+#[tokio::test]
+async fn the_hub_authorises_a_transfer_and_writes_no_token_down() {
+    let herd = Herd::new();
+    let _hub = herd.start_hub("hub").await;
+    // Both approvals first: see `Dialled::joining`.
+    let holder_token = herd.approve(HOLDER);
+    let asker_token = herd.approve(ASKER);
+
+    // Two jobs, each labelled for exactly one of the two runners: with two
+    // connected, an unlabelled job has two places it could be claimed.
+    let holders_job_id = herd.submit_needing(HOLDS, "step", "true").await;
+    let mut holder =
+        Dialled::joining(&herd, HOLDER, &holder_token, HOLDS, Some(HOLDER_ENDPOINT)).await;
+    let attempt = holder.takes_its_job().await;
+    let holders_job = herd_proto::JobId::new(holders_job_id.clone());
+
+    // Registered and announced through the frames, which are the only things
+    // in this build that make a holder.
+    holder
+        .say(herd_proto::ToHub::RegisterPack(herd_proto::RegisterPack {
+            job_id: holders_job.clone(),
+            attempt,
+            commit: AUTH_COMMIT.to_owned(),
+            key: AUTH_KEY.to_owned(),
+            manifest: an_authorised_manifest(),
+            meta: None,
+        }))
+        .await;
+    holder
+        .say(herd_proto::ToHub::PacksHeld(herd_proto::PacksHeld {
+            packs: vec![the_authorised_pack()],
+            more: false,
+        }))
+        .await;
+    herd.wait_until("the hub records the holding", || {
+        herd.said("hub")
+            .contains(&format!("{AUTH_COMMIT}/{AUTH_KEY}"))
+    })
+    .await;
+
+    let askers_job = herd.submit_needing(NEEDS, "step", "true").await;
+    let mut asker = Dialled::joining(&herd, ASKER, &asker_token, NEEDS, None).await;
+    asker.takes_its_job().await;
+
+    let wanted = vec!["7".repeat(64)];
+    asker
+        .say(herd_proto::ToHub::AskTransferCapability(
+            herd_proto::AskTransferCapability {
+                job_id: herd_proto::JobId::new(askers_job.clone()),
+                pack: the_authorised_pack(),
+                peer: Some(HOLDER.to_owned()),
+                direction: herd_proto::TransferDirection::Fetch,
+                objects: wanted,
+            },
+        ))
+        .await;
+    let capability = loop {
+        match asker.next().await {
+            Some(herd_proto::FromHub::TransferCapability(capability)) => break capability,
+            Some(herd_proto::FromHub::PackRefused(refused)) => panic!(
+                "the real hub refused a transfer it should have authorised: {}\n{}",
+                refused.why,
+                herd.everything_said()
+            ),
+            Some(_) => continue,
+            None => panic!("the asker's link closed: {}", herd.everything_said()),
+        }
+    };
+    assert_eq!(capability.endpoint, HOLDER_ENDPOINT);
+    assert_eq!(capability.peer, HOLDER);
+
+    // The one sentence an operator reads, with every figure on it.
+    herd.wait_until("the hub says it authorised the transfer", || {
+        herd.said("hub").contains("may fetch")
+    })
+    .await;
+    let said = herd.said("hub");
+    let line = said
+        .lines()
+        .find(|line| line.contains("may fetch"))
+        .unwrap_or_else(|| panic!("the hub said nothing about the transfer: {said}"));
+    assert!(
+        line.contains(ASKER) && line.contains(HOLDER) && line.contains(HOLDER_ENDPOINT),
+        "the line names who may fetch, from whom and where: {line}"
+    );
+    assert!(
+        line.contains("1 object(s)"),
+        "and the scope it authorised, which is not the whole pack: {line}"
+    );
+
+    // **The secret is not there.** Not the token, and not a prefix of it long
+    // enough to be worth having: the whole random part is checked, and so is
+    // every 16-character window of it, so a line that printed "the first few
+    // characters for correlation" would fail here too.
+    assert!(
+        !said.contains(&capability.token),
+        "a capability is a bearer secret and this hub wrote it into its own journal: {line}"
+    );
+    let random = capability
+        .token
+        .strip_prefix("herd-pack-")
+        .expect("a transfer token says what it is");
+    for start in 0..=random.len().saturating_sub(16) {
+        let window = &random[start..start + 16];
+        assert!(
+            !said.contains(window),
+            "{window} — sixteen characters of the token — is in the hub's journal: {line}"
+        );
+    }
 }
