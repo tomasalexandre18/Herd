@@ -13642,3 +13642,89 @@ Reversible: one free function and one struct field in
 `herd-runner/src/cgroup.rs`, held by five assertions against that tree,
 three of which were watched to go red against the reverted reading —
 including the one that returned `Ok` where the ceiling bounds nothing.
+
+## 2026-10-30 — D266 The hub names its keepers, and derives the default
+
+M12 P5 filled the `keeper_for` that `herd-hub/src/server.rs:3230` sent
+empty on every welcome, and had to answer three questions `docs/plan.md`
+M12 and D10 do not: **how a hub knows which runner is the server's**,
+**what a named key family does to the default keeper**, and **what
+"changing the setting" is on a hub that is already serving**. All three
+are decided here, all three are reversible, and the first is a
+measurement and not a preference.
+
+**1. The hub cannot find the server's runner, so the deployment names
+it.** D10 and `plan.md` M12 both say *the server's runner is the default
+keeper*. Measured against the frozen handshake: a hub knows a runner by
+the `name` it announced, and `ToHub::Hello`'s `host` is a `HostSize` —
+memory, threads, memory floor, tmpfs and nothing else. No hostname, no
+address, no identity of any kind crosses, so there is nothing a hub
+could compare with its own machine, and `PROTOCOL_VERSION` is frozen at
+3. D10's sentence therefore becomes one line of the deployment's,
+`--keeper <that runner's name>`, and the policy's job is to make it one
+line. **There is no default**: a hub given neither setting names no
+keeper, carries `keeper_for` on no welcome and sends no `PinPacks` at
+all, which is this build's behaviour before the settings existed, byte
+for byte. That is D194's rule — a name invented here would be a name
+applied to somebody else's fleet.
+
+**2. A named key family is MOVED off the default keeper, not added to
+it.** `--keeper-for KEY=RUNNER` takes that family out of `--keeper`'s
+share. The other reading — a named keeper beside the default one — was
+rejected because it makes custody only ever grow: an operator could add
+a holder and never move one, and the family whose packs are filling the
+server's disk is exactly the one she would want to move. Naming the
+default keeper again in a `--keeper-for` is how both hold it, which is
+explicit and reversible. Two runners named for one family is D10's *one
+or more keepers* and is not a mistake.
+
+**3. The default keeper's share is derived from the registry, and a
+registration is the one live trigger.** *Every family nobody else
+keeps* has no finite spelling until the hub knows which families exist,
+so it is filled from the key families this hub has a pack registered
+under; a family named explicitly is pinned whether or not anything is
+filed under it yet, because that is what the operator asked for and a
+keeper that waited for the first pack would be a keeper that missed it.
+The consequence is that a default keeper on a hub with an empty
+registry keeps **nothing** until a pack arrives — and on the one
+deployment this was written for the hub starts before any pack exists.
+So a pack registered under a family this hub had never seen recomputes
+custody and tells the runners whose set moved. Without that, the
+default keeper would be inert in production.
+
+**4. Changing the setting sends `PinPacks` to the runners whose set
+moved and nothing to anybody else.** The frame replaces rather than
+adds, so the whole new set always goes out and an **empty** frame is
+how custody is retracted — a hub that merely stopped sending could
+never take a pin back. A runner whose set is unchanged is sent nothing:
+the runner prints a line per frame it reads, and a hub that re-sent to
+everybody on every change would be writing on an owner's stderr about
+an event that did not concern her machine. **No sweep is triggered**,
+which is D262 part 1 unreversed: the runner's pass runs once per
+connection, before its announcement, so a frame arriving mid-link
+changes what the next pass may take and moves no pack today.
+
+**5. The operator-facing way to change the setting is a restart.** The
+mechanism lives on `HubHandle::name_keepers`, which is what the
+registration trigger and the test both go through; a reload on a
+running hub — a signal, a file re-read, a `herdctl` command — is not
+built, and the `herdctl` one could not be, because it would need a
+frame on a frozen protocol. Named as a board row, not as a defect of
+this entry.
+
+**6. `herd_hub::KEEPER_KEEP_PER_KEY` is 5 and is asserted equal to
+`herd_runner::packstore::KEEP_PER_KEY`.** The welcome carries keys and
+no figure, so a keeper applies the constant it shipped with; `PinPacks`
+carries one. A hub sending a different number would move a keeper's
+retention the moment an unrelated `--keeper-for` was added. The two
+constants are in two crates because `herd-proto` holds the frame and
+not the policy, and `herd-hub` sees `herd-runner` only in its tests —
+so the equality is asserted in `herd-hub/tests/keeper_policy.rs`, which
+is the one place both are visible. `N = 5` is `plan.md` M12's figure,
+has no derivation anywhere, and is never an acceptance criterion.
+
+**What this does not make true.** Custody is visible for the key
+families a policy names, on a hub configured to name them. A pack
+outliving the machine that built it is M12 P7 and needs M11's push
+path; no report may say custody works end to end on the strength of
+this.
