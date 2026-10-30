@@ -1300,6 +1300,66 @@ impl Session {
         self.send(ToHub::CapabilitiesChanged { capabilities });
     }
 
+    /// Tell the hub what this runner holds (`ToHub::PacksHeld`, D231
+    /// decision 5).
+    ///
+    /// **Unprompted, and that is the point.** The hub has no way to ask: it
+    /// does not send `FromHub::ReadPacksAgain` (ORCH-233 carries the
+    /// measurement that withdrew it), so an announcement that waited to be
+    /// asked would never be sent at all. This runner volunteers, after its
+    /// own `Welcome` and again whenever its holdings change, and a hub's ask
+    /// is then an optimisation and not the mechanism.
+    ///
+    /// **An empty announcement is sent, and is not the same as no
+    /// announcement.** A runner that holds nothing says so, because that
+    /// frame is the frame set's only retraction and a hub that was told
+    /// nothing goes on offering holders that are not there. The one case that
+    /// sends nothing is a store that will not be read: an error there is an
+    /// error, never an emptiness, or a `read_dir` that failed would retract
+    /// every holding this runner really has.
+    ///
+    /// **A link that goes mid-announcement loses the whole of it, by
+    /// design.** Nothing is applied by the hub until a frame arrives with
+    /// `more: false`, so a half-delivered announcement replaces nothing; and
+    /// the hub forgets a gone runner's holdings anyway. The next `Welcome`
+    /// announces again from the disk, which is the only authority on what is
+    /// held.
+    ///
+    /// Answers the line to say about it, rather than printing: the two
+    /// callers print in their own voice.
+    pub(crate) fn announce_packs_held(&self, data_root: &Path) -> String {
+        let held = packstore::PackStore::open(data_root).and_then(|store| store.held_packs());
+        let held = match held {
+            Ok(held) => held,
+            Err(why) => {
+                return format!(
+                    "what this runner holds is NOT announced to the hub, which will go on \
+                     believing whatever it last heard: {why}"
+                )
+            }
+        };
+        let count = held.len();
+        let frames = packstore::announcement_frames(held);
+        let cut_into = frames.len();
+        for frame in frames {
+            if !self.send(ToHub::PacksHeld(frame)) {
+                return format!(
+                    "this runner holds {count} pack(s) and the announcement did not go: there \
+                     is no link to the hub. Nothing of it applies — the hub holds a frame set \
+                     back until its last frame — and the next welcome says it again"
+                );
+            }
+        }
+        if count == 0 {
+            format!(
+                "this runner holds no pack, and says so: an empty announcement retracts every \
+                 holding the hub had for it ({cut_into} frame)"
+            )
+        } else {
+            format!("this runner holds {count} pack(s), announced in {cut_into} frame(s)")
+        }
+    }
+
     /// How many results are waiting to be acknowledged.
     pub fn results_held(&self) -> usize {
         self.with(|inner| inner.jobs.values().filter(|job| job.end.is_some()).count())
@@ -3741,6 +3801,16 @@ pub async fn serve_once(config: Config, session: Session, confined: Arc<Confined
     session.offer_swept_collections();
     // And what every probe says, before this connection can be dispatched on.
     session.announce_capabilities();
+    // And what this runner holds, unprompted (D231 decision 5). After the
+    // capabilities rather than before them for no reason beyond ordering:
+    // both are facts about this runner that the hub cannot work out for
+    // itself, and the holdings are the one the hub has no way to ask for.
+    // Sent on every connection, including a reconnection, because the hub
+    // forgets a gone runner's holdings and a restarted hub never knew them.
+    eprintln!(
+        "herd-runner: {}",
+        session.announce_packs_held(confined.root().path())
+    );
     let reporting = tokio::spawn(report_health(session.clone(), config.health_every));
     let outcome = serve_hub(
         &config,

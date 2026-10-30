@@ -611,6 +611,24 @@ pub async fn execute(
             pack.held.objects_added
         );
     }
+    // And the holdings this job just changed, said again to the hub (D231
+    // decision 5): an announcement replaces the hub's whole view of this
+    // runner, so a pack that has just entered the store is only known once
+    // the whole list is said again. Only when a pack really landed —
+    // `leave_packs` answers an empty list for every job that declared no
+    // `leaves` and for every one whose declared artefact was refused, and a
+    // job that changed nothing has nothing to re-announce.
+    //
+    // **This is the one production path in this build that changes what a
+    // runner holds.** A fetch ingests too (`crate::fetch`), and nothing in
+    // production calls it yet; when something does, it announces here as
+    // well or the hub's view goes stale in the other direction.
+    if !packs.is_empty() {
+        eprintln!(
+            "herd-runner: job {job_id} changed what this runner holds. {}",
+            session.announce_packs_held(confined.root().path())
+        );
+    }
     if let Some(refusal) = &outputs.refused {
         eprintln!("herd-runner: job {job_id} {refusal}");
     }
