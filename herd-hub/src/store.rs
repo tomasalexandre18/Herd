@@ -1841,6 +1841,8 @@ impl JobDirStore {
             timeout_s,
             reading,
             reading_for,
+            needs,
+            leaves,
         } = new;
         let mut live = self.lock()?;
         // `mkdir` is what claims an id: the directories, not the index, decide
@@ -1904,6 +1906,8 @@ impl JobDirStore {
             timeout_s,
             reading,
             reading_for,
+            needs,
+            leaves,
             parallelism: None,
             submissions: 1,
             state: JobState::Queued,

@@ -3592,16 +3592,25 @@ fn dispatch_a_pass(state: &State) -> Result<()> {
                 command,
                 parallelism,
             } => {
-                if !dispatch(state, record, &runner, &why, command, parallelism)? {
+                let because = match dispatch(state, record, &runner, &why, command, parallelism)? {
+                    Dispatched::Sent => None,
                     // The link went between the judgement and the frame. The
                     // job is still queued, its labels are still taken on a
                     // seat that is gone, and the next pass — which a
                     // released runner triggers — judges it afresh.
-                    let standing = queue::standing(record, now, state.policy.aging_step);
-                    let because = format!(
+                    Dispatched::LinkWent => Some(format!(
                         "it is waiting because runner {runner}'s connection ended while this \
                          pass was placing it there"
-                    );
+                    )),
+                    // A pack this job needs does not resolve, which is a fact
+                    // about the job and not about the machine: it would say
+                    // the same thing on every runner in the fleet, so the
+                    // sentence names the key and the commit rather than the
+                    // runner (ORCH-234, D13).
+                    Dispatched::Waits(because) => Some(because),
+                };
+                if let Some(because) = because {
+                    let standing = queue::standing(record, now, state.policy.aging_step);
                     let sentence = queue::waiting_sentence_behind(
                         place + 1,
                         total,
@@ -4582,8 +4591,97 @@ fn say_it_waits(
     Ok(())
 }
 
+/// How a dispatch ended, when it did not end in a frame on a socket.
+///
+/// Three outcomes and not a `bool`, because the two failures are different
+/// facts about different things: the link went, which is about a machine and
+/// says nothing about the job; or this job's packs do not resolve, which is
+/// about the job and would say the same thing on every runner in the fleet.
+/// A caller given a `bool` had to invent one sentence for both, and it
+/// invented the link's (ORCH-234).
+enum Dispatched {
+    /// The attempt is recorded and the assignment is on its way.
+    Sent,
+    /// The link went between the judgement and the frame.
+    LinkWent,
+    /// This job waits, and this is why — a half-sentence in the shape
+    /// [`say_it_waits`] takes, ready to be the `because`.
+    Waits(String),
+}
+
+/// Every pack this job's `needs` resolve to, ready to ride the assignment —
+/// or the reason it waits instead (M11, E-12, ORCH-234).
+///
+/// **Resolved once per attempt, here**, because that is the moment the answer
+/// is wanted: a pack registered since the job was submitted is found, and a
+/// requeue onto another machine (E-21) resolves against the registry as it
+/// stands then. The manifest and the holders travel **with** the assignment,
+/// so a runner that already holds every object lays `{in}` out without a
+/// round trip; `ToHub::AskPack` stays for the case the hub had nothing
+/// resolved.
+///
+/// **An unresolvable key is a wait and never a `FromHub::Refused`** (D13): it
+/// is a statement about one job, the link is fine, and the runner that was
+/// about to be handed this job is given the next one instead. The key and the
+/// commit are both in the sentence, because "a pack is missing" is not
+/// something anybody can act on.
+fn packs_for(
+    state: &State,
+    record: &JobRecord,
+) -> std::result::Result<Vec<herd_proto::pack::AssignedPack>, String> {
+    // The ordinary case, and it consults nothing: every job Herd runs today
+    // asks for no pack, so a hub whose store keeps no registry at all goes on
+    // dispatching exactly as it did.
+    if record.needs.is_empty() {
+        return Ok(Vec::new());
+    }
+    let keys = record.needs.join(", ");
+    let Some(declaration) = &record.declaration else {
+        return Err(format!(
+            "it is waiting because it asks for the pack(s) {keys} and declares no commit: a pack \
+             is registered for a (commit, key) pair, so there is nothing to resolve these keys \
+             against. Only a declared command names a commit (E-11, D106)"
+        ));
+    };
+    let commit = &declaration.commit;
+    let Some(registry) = state.store.packs() else {
+        return Err(format!(
+            "it is waiting because it asks for the pack(s) {keys} and this hub keeps no pack \
+             registry: it cannot resolve a key, and a job whose {{in}} would be empty must not \
+             run as a job that looks green (D150)"
+        ));
+    };
+    let mut resolved = Vec::with_capacity(record.needs.len());
+    for key in &record.needs {
+        match registry.resolve(commit, key) {
+            Ok(crate::registry::Resolved::Pack(pack)) => resolved.push(pack),
+            Ok(crate::registry::Resolved::Nothing) => {
+                return Err(format!(
+                    "it is waiting because nothing is registered for {commit}/{key}, which it \
+                     needs: the job that leaves that pack has not registered it on this hub yet, \
+                     so this one would run with an empty {{in}}/{key} (E-12)"
+                ))
+            }
+            Ok(crate::registry::Resolved::Refused(why)) => {
+                return Err(format!("it is waiting because {why}"))
+            }
+            // The registry failing to read its own disk. A wait and not an
+            // `Err` out of here, for the reason the refusal above is one: it
+            // concerns this job, and the pass that is walking the queue has
+            // other jobs to place.
+            Err(error) => {
+                return Err(format!(
+                    "it is waiting because this hub could not read its own registry for \
+                     {commit}/{key}: {error}"
+                ))
+            }
+        }
+    }
+    Ok(resolved)
+}
+
 /// Hand one job to the runner, recording the attempt before the frame goes
-/// out. False when there is no runner to hand it to.
+/// out.
 fn dispatch(
     state: &State,
     record: &JobRecord,
@@ -4591,10 +4689,18 @@ fn dispatch(
     why: &str,
     command: Vec<String>,
     parallelism: Option<herd_proto::Parallelism>,
-) -> Result<bool> {
+) -> Result<Dispatched> {
     let job_id = &record.id;
     let Some(runner) = state.outbox_of(runner_name) else {
-        return Ok(false);
+        return Ok(Dispatched::LinkWent);
+    };
+    // **Before the attempt is numbered**, because a job that waits for a pack
+    // has not been attempted: an attempt recorded here and then not sent
+    // would spend one of this job's goes on a machine that never saw it, and
+    // the record would name a runner that was handed nothing.
+    let packs_in = match packs_for(state, record) {
+        Ok(packs) => packs,
+        Err(because) => return Ok(Dispatched::Waits(because)),
     };
     // The explanation and the derived figure go on the record **before** the
     // frame goes out, in the one write the attempt is numbered by. A hub that
@@ -4630,12 +4736,19 @@ fn dispatch(
             // and the record is the only thing that holds them (E-11, D106).
             declaration: record.declaration.clone(),
             timeout_s: record.timeout_s,
-            packs_in: Vec::new(),
-            packs_out: std::collections::BTreeMap::new(),
+            // Resolved just above, against the registry as this moment finds
+            // it, and never remembered from a previous attempt.
+            packs_in,
+            // Off the record for the reason `declaration` is: a requeue onto
+            // another machine has to leave the same artefacts under the same
+            // keys. The hub resolves nothing here — a `leaves` entry is a key
+            // and a path the job itself writes to, and both are the
+            // requester's words.
+            packs_out: record.leaves.clone(),
         })
         .is_err()
     {
-        return Ok(false);
+        return Ok(Dispatched::LinkWent);
     }
     // And whoever is following it is told where it went, before a byte of its
     // output can arrive: that line is the first line of the output E-02
@@ -4648,7 +4761,7 @@ fn dispatch(
         });
     }
     println!("herd-hub: {job_id} is attempt {attempt} on runner {runner_name}: {why}");
-    Ok(true)
+    Ok(Dispatched::Sent)
 }
 
 /// Serve one runner's connection. `name` is what that connection announced in
@@ -5145,8 +5258,16 @@ async fn relay_from_runner(
             // retract a holding, which is why that reading is not optional.
             ToHub::PacksHeld(announcement) => match a_pack_registry(state) {
                 Ok(registry) => {
-                    let (count, more) = (announcement.packs.len(), announcement.more);
-                    registry.announced(
+                    let more = announcement.more;
+                    // **What the registry holds, not what this frame
+                    // carried.** The figure comes back from `announced`,
+                    // read under the lock that applied the frame, because
+                    // `announcement.packs.len()` is the length of *one*
+                    // frame: a runner that announced 516 packs in two frames
+                    // had this line say it held 4 (ORCH-239, measured
+                    // through two real processes). An operator has no other
+                    // observation of holdings than this sentence.
+                    let count = registry.announced(
                         name,
                         state.mesh_endpoint_of(name),
                         announcement.packs,
@@ -7453,6 +7574,10 @@ fn new_job(asked: herd_proto::Asked) -> NewJob {
         // this job is placed on nothing until the answer is on its record
         // (D74).
         .reading(asked.labels_from)
+        // M11's two, onto the record rather than used here: the resolve
+        // happens once per attempt, at the assignment, against the registry
+        // as it stands then (ORCH-234).
+        .consuming(asked.needs, asked.leaves)
 }
 
 /// Why a declared command this hub was sent will not do, if it will not

@@ -726,3 +726,332 @@ fn names_anywhere_under(root: &Path, name: &str) -> bool {
     }
     false
 }
+
+// ---------------------------------------------------------------------------
+// The assignment side (ORCH-234)
+// ---------------------------------------------------------------------------
+//
+// Measured on `main` at 26e83cf, before this: `FromHub::AssignJob` was built
+// with `packs_in: Vec::new()` and `packs_out: BTreeMap::new()` at the one
+// place it is built, and `Asked.needs`/`Asked.leaves` were dropped at
+// `new_job` — they reached no record and no frame. So the hub's resolve, which
+// `an_announcement_replaces_…` above proves works, was reachable **only** by
+// a runner that asked for a pack it had never been offered.
+//
+// Both tests below are about an assignment and not about a pack answer, so
+// neither goes through `pack_answer`: the subject is the frame that carries
+// the work.
+
+/// A requester, driven frame by frame, so a test can submit an `Asked` this
+/// build's `herdctl` has no flag for.
+///
+/// `needs` and `leaves` ride the wire (protocol 3) and no requester surface
+/// fills them yet — that is a separate row. Submitting the frame directly
+/// measures the **hub's** behaviour, which is what ORCH-234 is about, and
+/// adds no flag anybody then has to keep.
+struct Requester {
+    socket: Link,
+}
+
+impl Requester {
+    async fn joining(hub_url: &str) -> Self {
+        let (mut socket, _response) = tokio_tungstenite::connect_async(hub_url)
+            .await
+            .expect("the hub accepts a requester");
+        let hello = ToHub::Hello {
+            protocol_version: herd_proto::PROTOCOL_VERSION,
+            peer_version: herd_runner::runner_version().to_owned(),
+            role: Role::Requester,
+            token: None,
+            name: Some("a-requester-that-asks-for-a-pack".to_owned()),
+            instance: None,
+            state_root: None,
+            health_every_ms: None,
+            capabilities: Default::default(),
+            host: herd_proto::HostSize::default(),
+            preference: 0,
+            load_milli: None,
+            switch: herd_proto::Switch::On,
+            jobs_at_once: None,
+            mesh_endpoint: None,
+        };
+        socket
+            .send(Message::text(to_frame(&hello).expect("hello encodes")))
+            .await
+            .expect("hello is sent");
+        let mut joined = Self { socket };
+        match joined.next().await {
+            Some(FromHub::Welcome { .. }) => joined,
+            other => panic!("a requester is welcomed, got {other:?}"),
+        }
+    }
+
+    async fn next(&mut self) -> Option<FromHub> {
+        loop {
+            let frame = self.socket.next().await?.expect("the frame is readable");
+            if frame.is_close() {
+                return None;
+            }
+            let Ok(text) = frame.to_text() else { continue };
+            if text.is_empty() {
+                continue;
+            }
+            return Some(from_frame(text).expect("the hub speaks the protocol"));
+        }
+    }
+
+    /// Submit a declared job on [`COMMIT`] that asks for `needs` and promises
+    /// `leaves`, and leave with the id the hub minted.
+    async fn submits(
+        &mut self,
+        needs: Vec<String>,
+        leaves: std::collections::BTreeMap<String, String>,
+    ) -> JobId {
+        let asked = herd_proto::Asked {
+            command: shell("true"),
+            labels: Default::default(),
+            priority: herd_proto::Priority::Step,
+            build_thread_mib: None,
+            memory_mib: None,
+            tmpfs_mib: None,
+            deadline_unix_s: None,
+            after: None,
+            requeue_exit_code: None,
+            // A declaration, because a pack is registered for a
+            // `(commit, key)` pair and only a declared command names a commit
+            // (E-11, D106). Its hooks are the shape
+            // `why_that_declaration_will_not_do` admits.
+            declaration: Some(herd_proto::Declaration {
+                command: "a-command-that-needs-a-pack".to_owned(),
+                commit: COMMIT.to_owned(),
+                args: Vec::new(),
+                executor: herd_proto::Executor {
+                    up: "tool ws up {job}".to_owned(),
+                    fetch: "tool ws fetch {job}".to_owned(),
+                    run: "tool ws run {job} -- {line}".to_owned(),
+                    down: "tool ws down {job}".to_owned(),
+                    env: Default::default(),
+                },
+            }),
+            labels_from: None,
+            timeout_s: None,
+            needs,
+            leaves,
+        };
+        self.socket
+            .send(Message::text(
+                to_frame(&ToHub::SubmitJob {
+                    asked,
+                    wants_files: false,
+                })
+                .expect("the submission encodes"),
+            ))
+            .await
+            .expect("the submission is sent");
+        let deadline = tokio::time::Instant::now() + PATIENCE;
+        loop {
+            let frame = tokio::time::timeout_at(deadline, self.next())
+                .await
+                .expect("the hub answers a submission inside the suite's patience")
+                .expect("the link stays up");
+            match frame {
+                FromHub::JobAccepted { job_id } => return job_id,
+                FromHub::Refused { reason } => panic!("the submission was refused: {reason}"),
+                _ => continue,
+            }
+        }
+    }
+
+    /// Every note the hub sends about this job until one of them says `what`.
+    async fn note_saying(&mut self, what: &str) -> String {
+        let deadline = tokio::time::Instant::now() + PATIENCE;
+        let mut seen: Vec<String> = Vec::new();
+        loop {
+            let frame = tokio::time::timeout_at(deadline, self.next())
+                .await
+                .unwrap_or_else(|_| {
+                    panic!("no note said {what:?} inside the suite's patience; heard {seen:?}")
+                })
+                .expect("the link stays up: a job that waits is not a refusal (D13)");
+            if let FromHub::JobNote { note, .. } = frame {
+                if note.contains(what) {
+                    return note;
+                }
+                seen.push(note);
+            }
+        }
+    }
+}
+
+/// Register [`the_pack`] for `COMMIT`/`KEY` and announce that this runner
+/// holds it, so that a later job's `needs` has something to resolve to.
+///
+/// One job is spent doing it, and it is **ended** first: a registration
+/// arrives after the verdict (D232-D234), and ending it also gives the seat
+/// back, so the job under test is placed on this same runner.
+async fn a_pack_this_runner_holds(harness: &Harness, runner: &mut Peer) {
+    let (job_id, attempt) = a_job_assigned_to(harness, runner).await;
+    and_then_it_ends(runner, &job_id, attempt).await;
+    runner.say(a_registration(&job_id, attempt)).await;
+    match pack_answer(runner).await {
+        FromHub::PackRegistered(done) => assert_eq!(done.pack, the_pack()),
+        other => panic!("a post-fsync registration is accepted, got {other:?}"),
+    }
+    runner.announces(vec![the_pack()], false).await;
+}
+
+/// Read assignments until one is for this job, and answer with its packs.
+async fn assignment_for(
+    runner: &mut Peer,
+    job_id: &JobId,
+) -> (
+    Vec<herd_proto::pack::AssignedPack>,
+    std::collections::BTreeMap<String, String>,
+) {
+    let deadline = tokio::time::Instant::now() + PATIENCE;
+    loop {
+        let frame = tokio::time::timeout_at(deadline, runner.next())
+            .await
+            .expect("the hub assigns the job inside the suite's patience")
+            .expect("the link stays up");
+        if let FromHub::AssignJob {
+            job_id: assigned,
+            packs_in,
+            packs_out,
+            ..
+        } = frame
+        {
+            if &assigned == job_id {
+                return (packs_in, packs_out);
+            }
+        }
+    }
+}
+
+/// **A `needs` key is resolved where the assignment is built, and the
+/// manifest and the holder ride with the work** (M11, E-12, ORCH-234).
+///
+/// The assertion the fields exist for: the common case costs **no round
+/// trip**. A runner handed this frame has the manifest — kilobytes (D10) —
+/// and a holder to fetch from, so it lays `{in}/<key>` out without saying a
+/// word to anybody, and `ToHub::AskPack` is left for the case the hub had
+/// nothing resolved.
+///
+/// **Verbatim, and that is not a detail**: a pack's id is the sha256 of its
+/// `manifest.tsv`, so a manifest that went out re-serialised would be a
+/// different pack, and a runner comparing the two would refuse its own
+/// inputs.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_job_whose_needs_resolve_is_assigned_the_manifest_the_holder_and_its_leaves() {
+    let harness = Harness::with_hub().await;
+    let token = harness.approve(RUNNER);
+    let mut runner = Peer::runner(&harness.hub_url, RUNNER, &token, "the-only-life").await;
+    a_pack_this_runner_holds(&harness, &mut runner).await;
+
+    let mut requester = Requester::joining(&harness.hub_url).await;
+    let leaves = std::collections::BTreeMap::from([("built".to_owned(), "artefacts".to_owned())]);
+    let job_id = requester
+        .submits(vec![KEY.to_owned()], leaves.clone())
+        .await;
+    let (packs_in, packs_out) = assignment_for(&mut runner, &job_id).await;
+
+    assert_eq!(
+        packs_in.len(),
+        1,
+        "one `needs` key resolves to one pack on the assignment: {packs_in:?}"
+    );
+    let assigned = &packs_in[0];
+    assert_eq!(
+        assigned.key,
+        KEY,
+        "named by the key the job asked for, which is what names the directory under {}",
+        herd_proto::IN_TOKEN
+    );
+    assert_eq!(assigned.pack, the_pack());
+    assert_eq!(
+        assigned.manifest,
+        a_manifest(),
+        "the manifest's bytes, verbatim: the id is their sha256"
+    );
+    assert_eq!(
+        assigned.meta.as_deref(),
+        Some(&b"commit cb5a2e8b\nprofile debug\n"[..]),
+        "and `pack.meta` with it, also verbatim"
+    );
+    assert_eq!(
+        assigned
+            .holders
+            .iter()
+            .map(|holder| (holder.runner.as_str(), holder.endpoint.as_deref()))
+            .collect::<Vec<_>>(),
+        vec![(RUNNER, Some(ENDPOINT))],
+        "with the holder to fetch from and the address it serves on, so the common path costs \
+         no round trip"
+    );
+    assert_eq!(
+        packs_out, leaves,
+        "and what the job is to leave, handed back with the attempt for the reason the \
+         declaration is: a requeue has to leave the same artefacts under the same keys"
+    );
+}
+
+/// **A `needs` key nothing is registered for is a job that waits, by name,
+/// and never a `Refused`** (D13).
+///
+/// Three claims in one test because they are one behaviour: the job is **not**
+/// assigned, the sentence names the **key and the commit**, and the link is
+/// still up at the end. `FromHub::Refused` is terminal, and a pack that is
+/// not there yet is the ordinary case of a fleet building one commit — the
+/// job that leaves the pack simply has not registered it. A hub that refused
+/// here would cost a requester its connection for being early.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_job_needing_a_pack_nothing_registered_waits_by_name_and_is_not_assigned() {
+    let harness = Harness::with_hub().await;
+    let token = harness.approve(RUNNER);
+    let mut runner = Peer::runner(&harness.hub_url, RUNNER, &token, "the-only-life").await;
+
+    let mut requester = Requester::joining(&harness.hub_url).await;
+    let job_id = requester
+        .submits(vec![KEY.to_owned()], Default::default())
+        .await;
+
+    // The hub's own sentence, read where a requester reads it.
+    let note = requester
+        .note_saying(&format!("nothing is registered for {COMMIT}/{KEY}"))
+        .await;
+    assert!(
+        note.contains("this job is queued and has not started"),
+        "it is a wait and not a verdict: {note}"
+    );
+    assert!(
+        note.contains(&format!("empty {}/{KEY}", herd_proto::IN_TOKEN)),
+        "and it says what running it anyway would have meant: {note}"
+    );
+
+    // And the runner was handed nothing. Read after the note, so this is not
+    // a race with a dispatch that had not happened yet: the hub had already
+    // walked this job in a pass and said why it stayed.
+    runner.health().await;
+    let seen = runner.through_a_health_report().await;
+    assert!(
+        !seen
+            .iter()
+            .any(|frame| matches!(frame, FromHub::AssignJob { .. })),
+        "a job whose pack does not resolve is not handed to a runner: {seen:?}"
+    );
+    assert!(
+        !seen
+            .iter()
+            .any(|frame| matches!(frame, FromHub::Refused { .. })),
+        "and nobody's link is closed over it (D13): {seen:?}"
+    );
+    // The job is still the hub's to place, not finished and not refused.
+    let record = herd_hub::JobStore::job(harness.store.as_ref(), &job_id)
+        .expect("the record is readable")
+        .expect("the job the hub minted is on the disk");
+    assert_eq!(
+        record.needs,
+        vec![KEY.to_owned()],
+        "the keys are on the record, which is what a requeue resolves again from"
+    );
+}
