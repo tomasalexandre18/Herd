@@ -31,7 +31,11 @@ Rules of the task:
   (`docs/orchestration/workflow.md`, *Not an option*, step 1). And no
   write to
   `docs/decisions.md` except a new entry headed `D-NEXT` when the brief
-  asks for one (the merger allocates the number).
+  asks for one (the merger allocates the number). That entry, and any
+  `board.md` row you propose, goes **in full** in your handoff's
+  *Drafted for `herd-merger`* section, not only in your report to
+  your caller, because the merger reads the tree and nothing else
+  (`docs/orchestration/templates/handoff.md`).
 - Shared host: your own scratchpad subdirectory; kill only PIDs you
   started, never `pkill -f` or by name; at most one compile at a time;
   nothing on the consumer's instance, `/etc/nixos`, containers or

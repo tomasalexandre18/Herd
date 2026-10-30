@@ -90,6 +90,64 @@ from here should quote the counted one above and name the open question.
 | E-54 | could | offline re-judging | M2 | planned | E-15's kept files are now written (D131), so a record holds the result file a judge re-reads; the judge is their tool |
 | E-55 | could | peer-to-peer artefact exchange | M11 | planned | **promoted to the default** by D10: direct transfer is the only path, the hub never carries bytes |
 
+## Gated on chatOnS
+
+**This is the one list, and it has seven rows.** `docs/plan.md` and the
+M18 line below name it rather than restate its members, after three
+hand-kept copies disagreed about them (ORCH-206). Each member below names
+the deliverable it waits on and quotes the words in its own row above
+that gate it, so a reader checks the list against the rows instead of
+trusting it.
+
+*Gated* carries this file's opening meaning — the acceptance criterion
+needs a chatOnS deliverable, and a test against the fixture consumer
+stands in until M18. It says **nothing** about whether Herd's own side is
+built: E-12, E-14 and E-42 are gated *and* have nothing on `main`. The
+State column and the counted figure at the top of this file are what say
+which is which.
+
+- **E-02** — their results.json: *"real verdict gated (M18)"*.
+- **E-11** — their declaration file: *"gated: their real declaration
+  file (M18)"*.
+- **E-12** — their pack: *"gated on their pack (M18)"*.
+- **E-14** — their replication: *"gated on their replication (M18)"*.
+- **E-20** — their executor and the status document: *"needs their
+  executor and the status document (M13, gated M18)"*. **Neither older
+  summary carried this row** and its own note does; `docs/plan.md`'s M18
+  paragraph still names six items of work and not this one, which is the
+  part of ORCH-206 that is a question about M18's scope.
+- **E-41** — their nightly command: *"gated: their nightly command, live
+  at M18"*, with the one deviation its row records.
+- **E-42** — their push hook: its row says *"the hook is theirs"*, and
+  the opening paragraph of this file names the push hook among the
+  gating deliverables. **The row carries no `gated` marker**, which is
+  why a scan of the markers alone misses it: the marker is missing, the
+  fact is not.
+
+**Not this list, though one older summary mixed them in with it: a manual
+or real-hardware check.** E-30 (*"WSL OOM replay is a manual M17
+check"*) and E-49 (*"a manual check on real hardware"*, and unmet by
+choice, D206) wait on somebody walking a machine, not on anything of the
+consumer's. A sentence may hold them beside the gated rows only when it
+says "gated **or** real-hardware", as the closing line of this file does.
+
+**Three rows an older list claimed and the rows do not support. Left out,
+and each said here rather than dropped quietly** (ORCH-206; the first and
+the third need a decision and not a reading):
+
+- **E-38 (should)** — the dependency is real and written under *Not
+  covered by any milestone* below: the load-vs-real failure split needs
+  their results.json. But the row names no milestone and is deferred
+  *past* M18, so "stands in until M18" is false of it. Whether a row with
+  no milestone can be M18-gated is not settled here.
+- **E-53 (should)** — nothing in its row, and none of the five
+  deliverables named at the top of this file, needs anything of theirs:
+  it is `merged`, *"plain files by Q1"* and D103. **An unsupported
+  member**, and leaving it out is a reading, not a judgement.
+- **E-54 (could)** — its row does name something of theirs, *"the judge
+  is their tool"*, but the row is `planned` and names no closing
+  milestone, so what it waits on is not only their acceptance.
+
 ## State of play (2026-10-29)
 
 **Thirteen milestones are merged to `main`:** M1 (the substrate, no must
@@ -176,8 +234,10 @@ Five things a reader must not mistake for done:
 *Placed* is where each must's work belongs and not whether it is done: the
 done figure is **36 of 44** and it is counted at the top of this file. M1
 and M18 carry no must of their own: M1 is the substrate every must builds
-on; M18 closes the gated acceptances (E-02, E-11, E-12, E-14, E-41, E-42
-above) against chatOnS's real deliverables.
+on; M18 closes the acceptances of *Gated on chatOnS* above — the one
+list, derived from the rows — against chatOnS's real deliverables. This
+line restated six of them until 2026-10-30 and was one of the three
+disagreeing copies (ORCH-206).
 
 ## Not covered by any milestone
 
@@ -188,7 +248,10 @@ above) against chatOnS's real deliverables.
 
 Every must is placed, and three kinds of must are **not** simply owed: two
 are partial (E-16, E-37), two are unmet by choice (E-49, E-50, D206), and
-eight carry a gated or real-hardware note that names its closing
-milestone (E-02, E-11, E-12, E-14, E-20, E-30, E-41, E-49).
+nine carry a gated or real-hardware note that names its closing
+milestone — the seven of *Gated on chatOnS* above, plus E-30 and E-49,
+whose checks are manual and wait on nothing of the consumer's. This
+figure read **eight** while E-42 was uncounted, its row naming the
+deliverable without the word `gated`.
 A reader must not read a placed must as a delivered one; the State column
 and the counted figure at the top of this file are what say which is which.
