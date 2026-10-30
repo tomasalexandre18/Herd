@@ -431,6 +431,11 @@ Three things to know before you do it on a machine that is in the fleet:
   lets what is running finish and exits inside five seconds; a verdict
   the hub has not acknowledged by then is written under the data root and
   delivered on the next start. Stopping loses nothing.
+  **The five seconds has been timed once, and not on this case.** What
+  was measured, on 2026-10-30, is an *idle* runner's stop; a stop that
+  has to end a running job is still untimed. The figure and the gap it
+  leaves are in `docs/joining.md`, in the section on stopping a runner,
+  and are deliberately written down in one place only.
 * **v0.4.0 is the exception, and it deletes bytes.** See *Two known
   defects* below before you move any runner to it.
 
