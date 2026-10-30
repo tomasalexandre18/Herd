@@ -355,9 +355,24 @@ no compiler was started in this session's own process tree. One stray
 by PID; nothing else was signalled. PID 662711, 565152, 3006543 and
 3021002 were not touched.
 
-Build tree: `debug with tests, 3.0 GiB` at
+Build tree: **`debug with tests, 14 GiB`** at
 `/mnt/ssd_980/herd/build/m12-hub-mints-transfer` — profile named before
-the figure, and well under the 17 G a full debug tree with tests weighs
-because only `herd-hub`'s two test binaries were built, not the whole
-suite. `/mnt/ssd_980` had **344 G** free when it was measured. Deleted
-with `rm -rf` once the branch was pushed; the agent's report says so.
+the figure. Deleted with `rm -rf` once the branch was pushed, taking
+`/mnt/ssd_980` from 335 G free back up.
+
+**A corrected figure, and the correction is the point.** This section
+first said `3.0 GiB`, measured after the targeted test runs and before
+the gate run. The full `./scripts/test.sh` then built the rest of the
+suite's binaries and the tree reached **14 G** — within the 17 G a debug
+tree with tests is known to weigh (seven, 2026-10-30), and four and a
+half times the figure first written down. A mid-task measurement
+labelled as a final one is exactly the kind of figure that becomes
+somebody else's acceptance criterion, so it was corrected here rather
+than only in the agent's report.
+
+That correction is this file's **only** change after the gate run on
+`20b7ee1`. It is prose in one markdown file, so `./scripts/check-docs.sh`
+was re-run on it and the four Rust gates were **not** re-run: no Rust
+input moved, their output on `20b7ee1`'s identical code tree stands, and
+the batch's own `./scripts/gate.sh` at integration is what covers them
+(`CLAUDE.md`, *Gates before a commit*).
