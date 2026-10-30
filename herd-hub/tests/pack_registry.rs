@@ -6,10 +6,13 @@
 //! that the registry comes back when the store does, that the holdings do not,
 //! and that the shape on the disk is the shape `LAYOUT_VERSION` 2 promises.
 //!
-//! **Nothing here goes through a frame.** The pack frames are numbered in
-//! `herd_proto::pack` and are not wired into the hub's connection loop; that
-//! is a separate step, which owns `server.rs`. These tests call the registry
-//! directly, which is exactly as far as this step goes.
+//! **Nothing here goes through a frame**, and that is now a division of
+//! labour rather than a limit: these tests call the registry directly, and
+//! `pack_frames.rs` asserts the same mechanism through a hub's connection
+//! loop, over a socket, without calling the registry once. Two files because
+//! the two are different subjects — what the registry does with what it is
+//! given, and what a hub gives it — and a test that mixed them could not say
+//! which half a red was about.
 
 use std::fs;
 

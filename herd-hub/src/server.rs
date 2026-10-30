@@ -1264,6 +1264,19 @@ struct Announced {
     /// runner the hub believed `on` until its first health report would be a
     /// machine that could be claimed on in that window.
     switch: herd_proto::Switch,
+    /// Where it serves pack content to its peers, when it serves it at all
+    /// (D10, D11, invariant 3).
+    ///
+    /// `None` is an **outbound-only** runner: one whose host has no address
+    /// invariant 3 permits it to bind. It is not a degraded holder and not a
+    /// defect, which is why it is the same `Option` all the way to
+    /// [`herd_proto::pack::Holder::endpoint`] and is never flattened to an
+    /// empty string. Kept here because the registry has to be able to say
+    /// *where* a holder is, and until this field existed the handshake's
+    /// `mesh_endpoint` was bound and dropped: every holder the hub could have
+    /// recorded would have looked outbound-only, which is a false statement
+    /// about a runner that advertised an address.
+    mesh_endpoint: Option<String>,
 }
 
 /// What a requester gets when it attaches to a job by its id.
@@ -1286,6 +1299,15 @@ struct Attached {
 /// One runner's connection, and what the hub knows about it.
 struct ConnectedRunner {
     name: String,
+    /// Where this process serves pack content to its peers (D10, D11).
+    ///
+    /// On the **connection** and not on the roster, because an address is a
+    /// fact about a process: a runner that moved to another interface
+    /// announces the new one as it redials, and a holding recorded against
+    /// the old one would send a fetcher to an address nothing is listening
+    /// on. `None` is the outbound-only case and is carried as such: see
+    /// [`Announced::mesh_endpoint`].
+    mesh_endpoint: Option<String>,
     /// Which **build** this is, as its handshake announced it (E-51, D166).
     /// On the connection because a build is a fact about the process, and a
     /// redial brings its own — which is the whole point after an upgrade.
@@ -1809,6 +1831,7 @@ impl State {
                 ConnectedRunner {
                     name: name.to_owned(),
                     version: announced.version,
+                    mesh_endpoint: announced.mesh_endpoint,
                     instance: instance.map(str::to_owned),
                     outbox: outbox.clone(),
                     capacity: announced.capacity,
@@ -2078,6 +2101,24 @@ impl State {
     /// Where a job that has been claimed is sent.
     fn outbox_of(&self, name: &str) -> Option<Outbox> {
         self.with_peers(|peers| peers.runners.get(name).map(|runner| runner.outbox.clone()))
+    }
+
+    /// Where a connected runner serves pack content, as its handshake said
+    /// (D10, D11, invariant 3).
+    ///
+    /// Flat `Option<String>` and not `Option<Option<String>>`, because the
+    /// two absences mean the same thing to the one caller there is: a runner
+    /// the hub has no connection to is not a holder at all, and a connected
+    /// runner that advertised no address is an outbound-only holder. Either
+    /// way the holding is recorded with no endpoint, and D10's push path is
+    /// what serves it.
+    fn mesh_endpoint_of(&self, name: &str) -> Option<String> {
+        self.with_peers(|peers| {
+            peers
+                .runners
+                .get(name)
+                .and_then(|runner| runner.mesh_endpoint.clone())
+        })
     }
 
     /// Take a runner's snapshot of what its probes say, if it is *the*
@@ -2980,12 +3021,13 @@ async fn serve_peer(state: Arc<State>, stream: TcpStream) -> Result<()> {
             load_milli,
             switch,
             // M11's: where this runner serves pack content to its peers.
-            // Numbered at protocol 3 and read by nobody yet — the hub hands
-            // it to a fetcher in `TransferCapability`, which S6 writes.
-            // Bound and dropped rather than matched with `..` so that the
-            // next field added to the handshake is a compile error here and
-            // not a silence.
-            mesh_endpoint: _,
+            // Kept now, on the connection, because the registry records a
+            // holder's address along with its name and a holding recorded
+            // with no address says "outbound-only" — a false statement about
+            // a runner that advertised one. Bound rather than matched with
+            // `..` so that the next field added to the handshake is a
+            // compile error here and not a silence.
+            mesh_endpoint,
         } => {
             if protocol_version != PROTOCOL_VERSION {
                 return refuse(&mut sink, version_mismatch_reason(protocol_version)).await;
@@ -3035,6 +3077,7 @@ async fn serve_peer(state: Arc<State>, stream: TcpStream) -> Result<()> {
                 health_every_ms.map(Duration::from_millis),
                 Announced {
                     version: peer_version,
+                    mesh_endpoint,
                     capacity: RunnerCapacity::new(name, capabilities),
                     host,
                     jobs_at_once,
@@ -3119,6 +3162,36 @@ async fn serve_peer(state: Arc<State>, stream: TcpStream) -> Result<()> {
         },
     )
     .await?;
+
+    // **And then the ask that makes "re-announced after `Welcome`" a
+    // behaviour rather than a design** (D231 decision 5). Holdings are
+    // volatile on purpose: they live in memory, per manifest, so there is no
+    // holdings file to go stale and a hub that has just restarted offers no
+    // holder that is no longer there. The cost of that choice is that the hub
+    // has to **ask**, and until this line `FromHub::ReadPacksAgain` was
+    // constructed nowhere in the tree.
+    //
+    // To every runner and on every join, not only after a restart. The hub
+    // cannot tell its own restart from this runner's: a hub that has been up
+    // for a week still knows nothing about a machine dialling in for the
+    // first time, and a runner that redials after a dropped link has had its
+    // holdings forgotten by `release_runner` a moment earlier. One frame,
+    // once per connection, on a path that already sends two.
+    //
+    // Only to a runner. A requester holds no pack and is told nothing about
+    // one (invariant 6).
+    if role == Role::Runner {
+        send(
+            &mut sink,
+            &FromHub::ReadPacksAgain(herd_proto::ReadPacksAgain {
+                why: "this hub keeps which runner holds which pack in memory only, so it \
+                      knows nothing about yours until you say: announce what you hold \
+                      (packs_held), and send an empty announcement if you hold none"
+                    .to_owned(),
+            }),
+        )
+        .await?;
+    }
 
     // Two configurations that are each legal on their own side and fatal
     // together. The hub refuses, at startup, a silence threshold that does
@@ -3311,6 +3384,21 @@ async fn serve_runner(
              not back within {:?} (E-21)",
             state.policy.lost_after
         );
+        // **The volatile half of D231 decision 5, on the link path.** A
+        // holder that is not connected is not a holder: the registry itself
+        // is untouched — the manifests stay on the disk — and only the
+        // in-memory statement "this machine has a complete copy" goes. A hub
+        // that kept it would name a holder a fetcher cannot dial, and the
+        // fetch would fail on a sentence this hub had made up.
+        //
+        // Here and not inside `release_runner`: that method is the one place
+        // that decides *whether this connection still holds the name*, and it
+        // runs under the peers mutex. Forgetting a holding needs the
+        // registry's own lock, so taking it inside would put two locks in one
+        // order for the first time in this file.
+        if let Some(registry) = state.store.packs() {
+            registry.runner_gone(&gone);
+        }
         // E-37's "a client lost", on the ordinary path: the link closed, which
         // is what a runner stopping, a drained runner leaving and a machine
         // being switched off all look like from here. The other path is the
@@ -5029,6 +5117,270 @@ async fn relay_from_runner(
                     eprintln!("herd-hub: {job_id} could not be requeued: {error:#}");
                 }
             }
+
+            // ----- the pack frames (M11, D231) -----
+            //
+            // Every one of them answered with a **non-terminal** frame, or
+            // with a journal line where the surface numbers no answer. Until
+            // this block existed each of them fell through to the arm below
+            // and was answered `FromHub::Refused`, which closes the link
+            // (D13): a runner that announced what it holds lost its
+            // connection for it.
+
+            // **What this runner holds.** No job id, so no job-lifecycle
+            // window: an announcement is a statement about the runner's own
+            // disk and the link it arrives on is its whole scope. The one
+            // thing that puts it outside its window is a hub with no registry
+            // to put it in, and that is named in the journal rather than on
+            // the wire — the pack surface numbers no acknowledgement of an
+            // announcement, so there is no non-terminal frame to carry a
+            // refusal and `FromHub::Refused` would close the link. Named
+            // either way; never silent.
+            //
+            // **Replace, not add** (`herd_proto::pack::PacksHeld`): `more:
+            // true` accumulates and `more: false` applies, and an **empty**
+            // announcement with `more: false` is the real statement "I hold
+            // none" rather than "no news". Nothing else in the frame set can
+            // retract a holding, which is why that reading is not optional.
+            ToHub::PacksHeld(announcement) => match a_pack_registry(state) {
+                Ok(registry) => {
+                    let (count, more) = (announcement.packs.len(), announcement.more);
+                    registry.announced(
+                        name,
+                        state.mesh_endpoint_of(name),
+                        announcement.packs,
+                        more,
+                    );
+                    if more {
+                        journal(&format!(
+                            "herd-hub: runner {name} is announcing its packs, {count} so far \
+                             and more to come"
+                        ));
+                    } else if count == 0 {
+                        // Said out loud, because this is the retraction and
+                        // it is the one announcement that looks like nothing
+                        // happening.
+                        journal(&format!(
+                            "herd-hub: runner {name} holds no pack; every holding it had is \
+                             forgotten"
+                        ));
+                    } else {
+                        journal(&format!(
+                            "herd-hub: runner {name} holds {count} pack(s), which replaces \
+                             what this hub had for it"
+                        ));
+                    }
+                }
+                Err(why) => journal(&format!(
+                    "herd-hub: runner {name} announced what it holds and this hub cannot \
+                     record it: {why}"
+                )),
+            },
+
+            // **A pack the runner has finished writing** (E-17). The only
+            // thing in this build that registers anything, and it is refused
+            // outside its own arrival window — which deliberately admits a
+            // job that is over, because that is when it arrives.
+            ToHub::RegisterPack(frame) => {
+                let job_id = frame.job_id.clone();
+                let refuse = |pack, why: String| {
+                    journal(&format!("herd-hub: {why}"));
+                    let _ = outbox.send(FromHub::PackRefused(herd_proto::PackRefused {
+                        job_id: job_id.clone(),
+                        pack,
+                        why,
+                    }));
+                };
+                let registry = match a_pack_registry(state) {
+                    Ok(registry) => registry,
+                    Err(why) => {
+                        refuse(None, why);
+                        continue;
+                    }
+                };
+                if let Err(why) =
+                    a_pack_may_be_registered(state, name, &frame.job_id, frame.attempt)
+                {
+                    refuse(None, why);
+                    continue;
+                }
+                let registration = crate::registry::Registration {
+                    commit: frame.commit.clone(),
+                    key: frame.key.clone(),
+                    announced: herd_proto::pack::PackId::of_manifest_bytes(&frame.manifest),
+                    manifest: frame.manifest,
+                    meta: frame.meta,
+                    runner: name.to_owned(),
+                    job: frame.job_id.to_string(),
+                    attempt: frame.attempt,
+                    at: Timestamp::now(),
+                };
+                match registry.register(registration) {
+                    // Both are the same answer on the wire, and that is the
+                    // point: a runner re-sends its registration after a lost
+                    // acknowledgement, and the second send must be told the
+                    // same thing as the first.
+                    Ok(crate::registry::Registered::Fresh(pack))
+                    | Ok(crate::registry::Registered::Already(pack)) => {
+                        journal(&format!(
+                            "herd-hub: {} of {} is registered for {}/{} by runner {name}",
+                            pack, frame.job_id, frame.commit, frame.key
+                        ));
+                        let _ = outbox.send(FromHub::PackRegistered(herd_proto::PackRegistered {
+                            job_id: frame.job_id,
+                            pack,
+                            commit: frame.commit,
+                            key: frame.key,
+                        }));
+                    }
+                    // A refusal about **one pack**, not about this runner, so
+                    // `PackRefused` and never `FromHub::Refused` (D13).
+                    Ok(crate::registry::Registered::Refused(why)) => refuse(None, why),
+                    Err(error) => refuse(
+                        None,
+                        format!(
+                            "this hub could not write the pack {name} registered for {}/{}: \
+                             {error}",
+                            frame.commit, frame.key
+                        ),
+                    ),
+                }
+            }
+
+            // **A pack a job needs and was not handed.** The uncommon path:
+            // the common one costs no round trip because `AssignedPack` rides
+            // the assignment.
+            ToHub::AskPack(ask) => {
+                let job_id = ask.job_id.clone();
+                let refuse = |why: String| {
+                    journal(&format!("herd-hub: {why}"));
+                    let _ = outbox.send(FromHub::PackRefused(herd_proto::PackRefused {
+                        job_id: job_id.clone(),
+                        pack: None,
+                        why,
+                    }));
+                };
+                let registry = match a_pack_registry(state) {
+                    Ok(registry) => registry,
+                    Err(why) => {
+                        refuse(why);
+                        continue;
+                    }
+                };
+                if let Err(why) = a_pack_may_be_fetched(state, name, &ask.job_id) {
+                    refuse(why);
+                    continue;
+                }
+                match registry.resolve(&ask.commit, &ask.key) {
+                    Ok(crate::registry::Resolved::Pack(pack)) => {
+                        journal(&format!(
+                            "herd-hub: {}/{} for {} is pack {}, held by {} runner(s)",
+                            ask.commit,
+                            ask.key,
+                            ask.job_id,
+                            pack.pack,
+                            pack.holders.len()
+                        ));
+                        let _ = outbox.send(FromHub::PackHolders(herd_proto::PackHolders {
+                            job_id: ask.job_id,
+                            commit: ask.commit,
+                            key: ask.key,
+                            pack: Some(pack.pack),
+                            manifest: Some(pack.manifest),
+                            meta: pack.meta,
+                            holders: pack.holders,
+                        }));
+                    }
+                    // **A waiting state with a reason, not a refusal** (D13).
+                    // `pack` and `manifest` both absent is the frame's own way
+                    // of saying "nothing is registered for this key", which is
+                    // said rather than left to be read off an empty holder
+                    // list that could mean either that or `NoHolder`.
+                    Ok(crate::registry::Resolved::Nothing) => {
+                        journal(&format!(
+                            "herd-hub: nothing is registered for {}/{}, so {} waits for a \
+                             runner to register it",
+                            ask.commit, ask.key, ask.job_id
+                        ));
+                        let _ = outbox.send(FromHub::PackHolders(herd_proto::PackHolders {
+                            job_id: ask.job_id,
+                            commit: ask.commit,
+                            key: ask.key,
+                            pack: None,
+                            manifest: None,
+                            meta: None,
+                            holders: Vec::new(),
+                        }));
+                    }
+                    Ok(crate::registry::Resolved::Refused(why)) => refuse(why),
+                    Err(error) => refuse(format!(
+                        "this hub could not read what {}/{} resolves to: {error}",
+                        ask.commit, ask.key
+                    )),
+                }
+            }
+
+            // **A pack a runner cannot get**, which is a fact about a job and
+            // not a thing to answer. Written down loudly, because the whole
+            // point of the frame is that a job whose `{in}/<key>` is empty
+            // must not be a green-looking job with no error anywhere.
+            ToHub::PackUnavailable(said_so) => {
+                journal(&format!(
+                    "herd-hub: runner {name} cannot get {}/{} for {}{}: {}",
+                    said_so.commit,
+                    said_so.key,
+                    said_so.job_id,
+                    said_so
+                        .pack
+                        .as_ref()
+                        .map(|pack| format!(" (pack {pack})"))
+                        .unwrap_or_default(),
+                    said_so.why
+                ));
+            }
+
+            // **What a transfer cost** (D148's owed measurement). Printed and
+            // nothing else: the figures are the point, and `bytes` is zero on
+            // `FetchPath::SameHost`, which is the assertion D10's same-host
+            // clause rests on.
+            ToHub::PackTransferred(moved) => {
+                journal(&format!(
+                    "herd-hub: runner {name} moved pack {} for {} by {:?}: {} byte(s), {} \
+                     object(s) fetched, {} already held, {} ms",
+                    moved.pack,
+                    moved.job_id,
+                    moved.path,
+                    moved.bytes,
+                    moved.objects_fetched,
+                    moved.objects_held,
+                    moved.ms
+                ));
+            }
+
+            // **Not this step's.** A capability is minted by the hub and
+            // pushed to the holder over the holder's own link (D209), and
+            // that half is unwritten. Refused by name and **non-terminally**,
+            // which is the whole difference from the arm below: a runner that
+            // asks for something this build does not mint is told so and
+            // keeps its link and its other jobs.
+            ToHub::AskTransferCapability(asked) => {
+                let why = format!(
+                    "this hub does not mint a transfer capability for pack {} yet: the frame is \
+                     numbered at protocol {PROTOCOL_VERSION} and the hub's half of D209 — \
+                     minting the token and pushing ExpectTransfer to the holder over the \
+                     holder's own link — is not written. Fetch the objects from a holder this \
+                     hub named in PackHolders, or say PackUnavailable so the job's wait has a \
+                     reason on it",
+                    asked.pack
+                );
+                journal(&format!("herd-hub: {why}"));
+                let _ = outbox.send(FromHub::PackRefused(herd_proto::PackRefused {
+                    job_id: asked.job_id,
+                    pack: Some(asked.pack),
+                    why,
+                }));
+            }
+
             other => {
                 let _ = outbox.send(FromHub::Refused {
                     reason: format!("a runner may not send {}", message_kind(&other)),
@@ -5559,6 +5911,150 @@ fn files_may_land(
     if ran.runner != from {
         return Err(format!(
             "{from} is offering files of {job_id}, which ran on {}",
+            ran.runner
+        ));
+    }
+    Ok(())
+}
+
+/// This hub's pack registry, or the one sentence that says it has none.
+///
+/// [`JobStore::packs`] answers `None` for a store that keeps **no** registry,
+/// which is every implementor but [`crate::store::JobDirStore`], and that is
+/// a different statement from a registry that is empty. A hub in that shape
+/// can register no pack, resolve none and record no holding, so every pack
+/// frame it is sent is refused **by name** with this sentence rather than
+/// answered as though nothing happened to be registered for the key. Telling
+/// a runner "nothing is registered for that key" from a hub that could never
+/// have registered anything is D150's silence in a second place: true of the
+/// key, and false about why.
+fn a_pack_registry(state: &State) -> std::result::Result<&crate::registry::PackRegistry, String> {
+    state.store.packs().ok_or_else(|| {
+        "this hub's store keeps no pack registry at all, so it can register no pack, resolve \
+         no pack and record no holding. That is not an empty registry: no part of the pack \
+         half works on this hub, and a job that needs a pack waits for a reason that has \
+         nothing to do with its key"
+            .to_owned()
+    })
+}
+
+/// **The arrival window of a pack *fetch*** — [`ToHub::AskPack`] and
+/// [`ToHub::AskTransferCapability`] — which is not [`is_current`]'s window
+/// and cannot be.
+///
+/// A runner asks for a pack while it is laying `{in}` out, which is *before*
+/// it reports that the process started: the record is `assigned`, and on a
+/// rejoin it can be `interrupted`. And `is_current` is not merely the wrong
+/// window here, it is **inconstructible**: it is answered out of
+/// [`State::standing_of`], which takes an attempt number, and `AskPack`
+/// carries none — a fetch is about a job's `{in}`, not about an attempt's
+/// output. So the window has to be read off the record, and it has to be read
+/// *explicitly*, because a frame family with no window of its own is the
+/// family that gets answered outside it in silence. That is what D150 cost:
+/// `is_current` answered `JobIsOver` for file chunks, the runner streamed 32,
+/// the hub read all 32 and wrote **none**, and a requester was told its
+/// collection was not there with no error anywhere. The fix was a second
+/// predicate, [`files_may_land`]; this is the third and
+/// [`a_pack_may_be_registered`] is the fourth.
+///
+/// **Inside the window:** `assigned`, `running` or `interrupted`, on the
+/// attempt the record names, from the runner the record names. Answers with
+/// that attempt's number, which the refusal frame needs and the frame does
+/// not carry.
+///
+/// **Outside it, each refused by name and none of them dropped:** a job that
+/// does not exist; a job that is over, whose `{in}` nothing will ever read; a
+/// job the hub has taken back to `queued`, which is the case most worth
+/// naming, because the asking runner is still preparing a job that will be
+/// run somewhere else and an answered fetch would have it move hundreds of
+/// megabytes for nothing; a job with no attempt at all; and a runner that is
+/// not the one the attempt is on.
+fn a_pack_may_be_fetched(
+    state: &State,
+    from: &str,
+    job_id: &JobId,
+) -> std::result::Result<u32, String> {
+    let record = match state.store.job(job_id) {
+        Ok(Some(record)) => record,
+        Ok(None) => return Err(format!("no such job: {job_id}")),
+        Err(error) => return Err(format!("{job_id}'s record will not read: {error}")),
+    };
+    if record.state.is_terminal() {
+        return Err(format!(
+            "{job_id} is {}, so nothing of it will be laid out under {{in}} and this hub will \
+             not answer for a pack it needed",
+            record.state.name()
+        ));
+    }
+    if matches!(record.state, JobState::Queued) {
+        return Err(format!(
+            "{job_id} is queued and on no runner, so {from} is preparing a job this hub has \
+             taken back; whatever it fetched would be laid out for an attempt that will run \
+             somewhere else"
+        ));
+    }
+    let Some(attempt) = record.attempt() else {
+        return Err(format!(
+            "{job_id} is {} and has no attempt a pack could be laid out for",
+            record.state.name()
+        ));
+    };
+    if attempt.runner != from {
+        return Err(format!(
+            "{from} is asking for a pack of {job_id}, which is on {}",
+            attempt.runner
+        ));
+    }
+    Ok(attempt.number)
+}
+
+/// **The arrival window of a pack *registration*** — [`ToHub::RegisterPack`],
+/// E-17 — which is not [`is_current`]'s either, and sits at the opposite end
+/// of a job's life from [`a_pack_may_be_fetched`].
+///
+/// The runner writes its pack out of `{out}` and fsyncs every object
+/// **before** the record walk, and only then sends this frame (D232-D234), so
+/// a registration routinely arrives *after* the verdict. `is_current` refuses
+/// exactly that, by name, as `Standing::JobIsOver` — which is right for a log
+/// chunk and wrong here: the pack is the one thing about a finished job that
+/// is still arriving. Modelled line for line on [`files_may_land`], for the
+/// reason that function exists at all.
+///
+/// **Inside the window:** the attempt the frame names is the **last** attempt
+/// on the record and it ran on this runner — whether or not the job is over.
+///
+/// **Outside it, each refused by name:** a job that does not exist; a record
+/// that will not read; a job with no attempt; an attempt that is not the last
+/// one, which is a pack of an attempt the hub wrote off and requeued and
+/// would put a second id on one `(commit, key)` and make the registry refuse
+/// that key to every later job; and another runner's attempt.
+fn a_pack_may_be_registered(
+    state: &State,
+    from: &str,
+    job_id: &JobId,
+    attempt: u32,
+) -> std::result::Result<(), String> {
+    let record = match state.store.job(job_id) {
+        Ok(Some(record)) => record,
+        Ok(None) => return Err(format!("no such job: {job_id}")),
+        Err(error) => return Err(format!("{job_id}'s record will not read: {error}")),
+    };
+    let Some(ran) = record.attempts.last() else {
+        return Err(format!(
+            "{job_id} has no attempt that could have produced a pack"
+        ));
+    };
+    if ran.number != attempt {
+        return Err(format!(
+            "attempt {attempt} of {job_id} is not the attempt this hub is holding a key for; \
+             attempt {} is, and registering a superseded attempt's pack would put a second id \
+             on one (commit, key) and make this hub refuse that key to every later job",
+            ran.number
+        ));
+    }
+    if ran.runner != from {
+        return Err(format!(
+            "{from} is registering a pack of {job_id}, which ran on {}",
             ran.runner
         ));
     }
@@ -6302,6 +6798,23 @@ fn one_watchdog_pass(state: &State) {
             &name,
             &format!("nothing has come back on its link for {quiet_for:?} (E-21)"),
         ));
+        // **The volatile half of D231 decision 5, on the watchdog's path.**
+        // The link path is `serve_a_runner`'s, after `release_runner`; this is
+        // the other way a runner leaves, and a runner leaves by exactly one
+        // of the two because whichever notices first takes it out of the
+        // peers registry.
+        //
+        // **Added here and nowhere else, and it reorders nothing.** It is in
+        // the loop that already runs *after* the `with_peers` closure above
+        // has removed the runner and sent its kick, so it is outside the
+        // peers mutex and after the existing closure — which is the only
+        // shape ORCH-230 permits. The obvious change to this pass's
+        // *ordering* was implemented, measured 5 of 5 red and **withdrawn**
+        // rather than shipped looking like a fix (D228), and the question
+        // behind it is Alexa's and unanswered. Nothing here touches it.
+        if let Some(registry) = state.store.packs() {
+            registry.runner_gone(&name);
+        }
     }
 
     let in_the_air = attempts_in_the_air(state);
@@ -8704,6 +9217,7 @@ mod tests {
                     preference: 0,
                     load_milli: None,
                     switch: herd_proto::Switch::On,
+                    mesh_endpoint: None,
                 },
             ),
             Admitted::Yes
@@ -9588,6 +10102,7 @@ mod tests {
                     preference: 0,
                     load_milli: None,
                     switch: herd_proto::Switch::On,
+                    mesh_endpoint: None,
                 },
             ),
             Admitted::Yes
