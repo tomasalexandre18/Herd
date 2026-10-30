@@ -13048,3 +13048,128 @@ at a record's class at all, so a `producer` record pinned to a span of
 `0` — one that NEVER EXPIRES in the per-class block — can be the first
 collection a sweep takes, and in the test fixture it is. An operator
 reading only the span side would have concluded those bytes were safe.
+
+## 2026-10-30 — D254 The free-space floor is a disk fact, not a second policy
+
+D213 said free space on the filesystem the state root sits on decides when
+something is removed, never the output budget. ORCH-095 asked whether a
+second disk number is the first line of a policy language, which invariant
+1 forbids. It is not, and the distinction is worth writing down because the
+next disk figure will be asked the same question.
+
+**A policy knob ranks one job's evidence above another's. A floor says
+where the disk stops.** `--volume-free-floor` names no job, no class, no
+label and no priority; it cannot be set per job and there is nothing to
+express in it. What goes, and in what order, is still D152's four keys and
+still Herd's. The only thing the floor changes is the number those keys
+are read down to — from `--output-budget` to
+`min(--output-budget, held + free − floor)`, derived from `statvfs` at
+every trigger rather than from a reading taken at startup, because the
+volume is shared with whatever else the operator put on it and a reading
+from an hour ago is a guard against the past.
+
+**It ships with no default, and that is the decision rather than a
+deferral.** Required when a free-space trigger is wanted; absent, nothing
+measures the volume, not one `statvfs` is called, and the output budget
+alone decides — this hub's behaviour before the flag existed, byte for
+byte. A figure chosen here would be a figure applied to a disk nobody in
+this project may look at (invariant 9, D161), and the thing it does when
+it is wrong is delete evidence its owner never asked it to delete. That is
+D194's rule and `herd-hub report`'s, and it is why the second of ORCH-095's
+two figures — whether the budget becomes `min(200 GB, 25 % of capacity)` —
+is left exactly where it was.
+
+**A hub that cannot measure its volume keeps the behaviour of a hub with
+no floor and says so once**, on `stderr`, naming the path and the reason.
+Not an error and not a refusal to start: a guard that is not in force is a
+worse outage as a dead hub than as a loud one. Said once and never again,
+because a `statvfs` that fails on a mount fails again at every trigger for
+the life of the process, and a line per arriving collection is D151's
+defect in a new place.
+
+**And the arithmetic ORCH-095's row carried was wrong, which is recorded
+here because three documents quote it.** The row wrote the ceiling
+`min(B, held + max(0, free − R))`. With the clamp on the headroom that
+expression is never below `held`, because it is recomputed at each trigger
+from the current `held` — so the guard would be dead code on a volume with
+no room left, and ORCH-095's own *Done when* was unsatisfiable. The clamp
+belongs on the ceiling: `min(B, held + free − R)`, saturating, which on a
+volume under its floor puts the ceiling below what the hub holds by
+exactly the shortfall and frees that and no more. Asserted by
+`a_volume_below_its_floor_puts_the_ceiling_below_what_is_held`, with the
+reasoning in `Budget::ceiling_against`'s doc comment.
+
+**The three documents, named so none of them is corrected by accident.**
+Measured on this batch's integration tip, four occurrences in three
+documents:
+
+1. `docs/orchestration/board.md`, ORCH-095's **Question** cell. It is
+   left standing: the row quotes the question as it was asked and its
+   own analysis cell now carries this correction beside it, which is
+   what a board row is for.
+2. `docs/disk-policy.md` **twice** — §2.6's recommendation formula and
+   §7's id table row for ORCH-095. Both are left standing too, and for
+   a stronger reason than the board's: §2.6's line carries `[P]`,
+   which that file's own legend defines as *a proposal, mine, with its
+   reasoning, decided by nobody*. It was never a specification, so
+   this entry supersedes it rather than finding it wrong, and editing
+   a proposal after it has been decided would erase what was proposed.
+3. **herd-planner's M12 plan, Track R row R1**, which is a scratchpad
+   file and not in the tree, so nothing here can reach it. Any step
+   that reads R1 out of that plan reads the wrong ceiling; this entry
+   is the correction it must find first.
+
+Evidence: `herd-hub/src/job.rs` (`Budget::free_floor`,
+`Budget::ceiling_against`, `Ceiling`, `FreeSpace`);
+`herd-hub/src/store.rs` (`held_more`, `JobDirStore::ceiling`,
+`free_bytes_on`, `say_it_cannot_measure`); `herd-hub/src/main.rs`;
+`docs/operating.md`; `history/2026-10-30-m12-r1-free-space-guard.md`;
+17 tests, 1165 passing, 12 skips all cgroup-delegation.
+
+## 2026-10-30 — D255 Locality is a third term, not a second mechanism
+
+E-23 asks the hub to prefer a runner that already holds what a job
+needs. **Decided:** one further term on the order
+`matcher::place` already had, between the declared `preference` and the
+name — how many of the packs this job's `needs` resolve to the machine
+already holds, descending. Preference stays the first word, so a higher
+declared `preference` still wins over a holder and `best` is computed
+without consulting a holding at all; the name stays the last word, so the
+same fleet still makes the same choice twice.
+
+**What was refused in taking it.** A weight over bytes, a per-key or
+per-label rule, an operator setting, and a second sort pass were each
+available and each is the generic-CI surface invariant 1 refuses,
+arriving as an optimisation. The term is an integer compared against an
+integer, with no configuration and no protocol change: both frames it
+reads — `ToHub::PacksHeld` and the registration — already exist at
+`PROTOCOL_VERSION` 3.
+
+**A requester never names a machine** (invariant 6). The job declares the
+keys it consumes; who holds the pack a key resolves to is what runners
+announced to this hub, and turning an announced holding into a preference
+is the hub's own act. The matcher is handed the answer as data —
+`Placing::holds_what_it_needs` — for the reason it is handed a parent
+(E-10): it is a pure function of a record and a fleet, and a holding it
+read for itself would make it a function of a disk.
+
+**The clause this decision really rests on is the one that asserts
+nothing changed.** Every job Herd runs today has no `needs` at all —
+nothing fills the field unless a declaration asks — so this is the one
+change in the matcher that could silently re-order every placement in
+the fleet. Six placements over a three-seat fleet, every job with an
+empty `needs`, are frozen byte for byte against a literal captured on
+`a8cf397` with `place` unmodified, and the expectation was written and
+seen green **before** the term was. The detector was proved on a
+known-bad instance — reversing the name tie-break turns it red — so its
+silence is evidence. `locality_sentence` returns nothing at all for such
+a job rather than a shortened clause, which is why the sentence an
+operator reads is the same bytes and not merely the same meaning.
+
+**And it is inert until something registers a pack.**
+`ToHub::RegisterPack` is constructed in zero places under
+`herd-runner/src` (18 occurrences elsewhere in the tree, so the zero is
+measured), so `pack_for` answers `None` for every key in production and
+the term never fires outside its tests. That is M11's layout step to
+close, and E-23's end-to-end waits on it. Filed as ORCH-260 by this
+landing so the inertness is on the board and not only in a handoff.

@@ -901,6 +901,7 @@ fn updated_at_is_an_end_time_and_not_a_last_touch_clock() {
         Budget {
             bytes: 1024,
             floor: Duration::ZERO,
+            free_floor: None,
         },
     )
     .expect("a state root");

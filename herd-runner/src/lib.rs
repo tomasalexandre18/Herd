@@ -1096,6 +1096,29 @@ struct Inner {
     /// Set from [`Config::files_stall_after`] when a connection attaches,
     /// like the window it is about.
     files_stall_after: Duration,
+    /// This runner's pack store, as whatever last opened it under this
+    /// runner's own data root (M12, E-16).
+    ///
+    /// **Here so that the health report can read the figures without
+    /// reopening anything, and — the part that matters — without a second
+    /// spelling of the data root.**
+    /// [`crate::root::DataRoot::open`] canonicalises the path it validates
+    /// (`root.rs:140`), so every store a running runner opens is opened
+    /// under the canonical path, while `main.rs` still holds whatever the
+    /// operator typed. The figures and the budget are kept per data root
+    /// (see [`packstore::PackStore`]), keyed by `packstore`'s own `keyed`,
+    /// which is what makes those two spellings one store. A report that
+    /// reopened the store from a path of its own would be one more chance to
+    /// get that wrong, and the way it would be wrong is a health report
+    /// reading *no budget, 0 bytes* for a runner holding gigabytes — on a
+    /// machine nobody in this project may log into (D161).
+    ///
+    /// So there is exactly one route: [`Session::pack_store`] is the only
+    /// place in this crate that opens it, [`Session::announce_packs_held`]
+    /// is what calls that on every connection with the data root's **own**
+    /// path, and the report reads what it left here. `None` until then,
+    /// which the report sends as "did not say" and never as nought.
+    pack_store: Option<packstore::PackStore>,
 }
 
 impl Default for Inner {
@@ -1116,6 +1139,7 @@ impl Default for Inner {
             welcomed_at: None,
             said_stale: VecDeque::new(),
             switch: herd_proto::Switch::On,
+            pack_store: None,
         }
     }
 }
@@ -1300,6 +1324,28 @@ impl Session {
         self.send(ToHub::CapabilitiesChanged { capabilities });
     }
 
+    /// This runner's pack store, opened under the path it is given and
+    /// **remembered**, so that everything else about this store reads the
+    /// figures of the one that was opened here (M12, E-16).
+    ///
+    /// The only place in this crate that calls [`packstore::PackStore::open`],
+    /// and that is the point rather than tidiness: see [`Inner::pack_store`]
+    /// for what a second opener would be free to get wrong. Its one caller
+    /// is [`Session::announce_packs_held`], which is handed the data root's
+    /// own path — `confined.root().path()`, canonicalised by
+    /// [`crate::root::DataRoot::open`] — by both of its callers, and runs on
+    /// every connection before the first health report of that connection is
+    /// queued.
+    ///
+    /// A store that will not open is **not** remembered: the report then says
+    /// "did not say" for all three figures, which is what a store nothing
+    /// could read is. It is not nought.
+    fn pack_store(&self, data_root: &Path) -> Result<packstore::PackStore, String> {
+        let store = packstore::PackStore::open(data_root)?;
+        self.with(|inner| inner.pack_store = Some(store.clone()));
+        Ok(store)
+    }
+
     /// Tell the hub what this runner holds (`ToHub::PacksHeld`, D231
     /// decision 5).
     ///
@@ -1327,8 +1373,14 @@ impl Session {
     ///
     /// Answers the line to say about it, rather than printing: the two
     /// callers print in their own voice.
+    ///
+    /// **It is also what remembers the store** for the health report's
+    /// figures, through [`Session::pack_store`]: one opener, one spelling of
+    /// the data root, and therefore one set of figures.
     pub(crate) fn announce_packs_held(&self, data_root: &Path) -> String {
-        let held = packstore::PackStore::open(data_root).and_then(|store| store.held_packs());
+        let held = self
+            .pack_store(data_root)
+            .and_then(|store| store.held_packs());
         let held = match held {
             Ok(held) => held,
             Err(why) => {
@@ -2971,6 +3023,46 @@ impl Condemned {
     }
 }
 
+/// The three pack-store figures a health report carries — bytes, budget,
+/// pack count — or "did not say" for each (M12, E-16).
+///
+/// **Three absences, and none of them means nought.**
+/// [`herd_proto::ToHub::Health`] says so of each field and this is where that
+/// promise is kept:
+///
+/// - *No store has been opened yet* (no connection has announced holdings):
+///   nothing here has read this machine's disk at all, so all three are
+///   absent. A report sending `0` here would tell a hub an empty store, and
+///   an eviction policy reading it would conclude there is room.
+/// - *A store is open and nothing has measured it*
+///   ([`packstore::PackUse::measured`] false): the two measurements are
+///   absent and the **budget still travels**, because a budget is a figure
+///   the owner typed and not one this runner read.
+/// - *No `--pack-budget` was given*: the budget alone is absent, and absent
+///   is not "unlimited" and not nought — it is a hub with nothing to weigh
+///   the usage against.
+///
+/// **No filesystem access**, which is what lets this run on the cadence and
+/// under the lock [`queue_a_health_report`] holds:
+/// [`packstore::PackStore::usage`] and [`packstore::PackStore::budget`] both
+/// read a figure the store keeps.
+///
+/// The count narrows from `u64` to the wire's `u32`, and a count that does
+/// not fit is sent as **absent** rather than saturated: a figure this runner
+/// cannot say is one it does not say. (It takes 2^32 pack directories to
+/// reach, so this is a rule and not a case.)
+fn what_the_pack_store_says(inner: &Inner) -> (Option<u64>, Option<u64>, Option<u32>) {
+    let Some(store) = inner.pack_store.as_ref() else {
+        return (None, None, None);
+    };
+    let budget = store.budget();
+    let held = store.usage();
+    if !held.measured {
+        return (None, budget, None);
+    }
+    (Some(held.bytes), budget, u32::try_from(held.packs).ok())
+}
+
 /// Queue a health report on the link that is up, and count it — **the only
 /// place that does either** (E-40).
 ///
@@ -2989,6 +3081,7 @@ impl Condemned {
 /// what counted it. Returns whether there was a link, like
 /// [`Session::send`].
 fn queue_a_health_report(inner: &mut Inner) -> bool {
+    let (pack_store_bytes, pack_store_budget_bytes, packs_held) = what_the_pack_store_says(inner);
     let health = ToHub::Health {
         jobs: running_jobs(inner),
         draining: inner.draining,
@@ -2996,12 +3089,13 @@ fn queue_a_health_report(inner: &mut Inner) -> bool {
         // Measured now, on every report, because it is a fact about the
         // moment (E-32). The hub records it and gates nothing on it.
         load_milli: crate::metrics::host_load_milli(),
-        // M12's three pack-store figures (E-16). `None` and not zero: this
-        // build has no pack store to measure, and zero would be a
-        // measurement of an empty one. S2 builds the store and fills these.
-        pack_store_bytes: None,
-        pack_store_budget_bytes: None,
-        packs_held: None,
+        // M12's three pack-store figures (E-16), read above and under this
+        // same lock. Each one is `None` only when this runner has nothing to
+        // say about it — never as a stand-in for nought, which is a figure an
+        // empty store really makes.
+        pack_store_bytes,
+        pack_store_budget_bytes,
+        packs_held,
     };
     if !send_on(&inner.link, health) {
         return false;
@@ -5676,5 +5770,253 @@ mod tests {
         root.remember_hub_state_root("s-the-one-that-made-these-ids")
             .expect("the data root records a state root");
         (temp, root, spools)
+    }
+
+    /// The budget these four tests type, in bytes.
+    ///
+    /// Not a round multiple of anything the fixture holds and not a power of
+    /// two: a figure that could be mistaken for a measurement, or for a
+    /// default, would make a wrong answer look right.
+    const PACK_BUDGET_TYPED_HERE: u64 = 7_000_000_003;
+
+    /// The planted objects' lengths, one per pack. Three different lengths,
+    /// so a total that happened to be a multiple of the count could not pass
+    /// for the sum.
+    const PLANTED_LENGTHS: [usize; 3] = [11, 500, 4_097];
+
+    /// Plant a pack store on a disk in the shape a runner's **second life**
+    /// finds it in, and answer what it must then be measured as: the summed
+    /// object lengths and the pack count.
+    ///
+    /// Planted rather than ingested, because what these tests are about is a
+    /// runner starting on a disk that already holds packs. `objects/` entries
+    /// are named by the sha256 of their own contents, which is the only name
+    /// [`packstore::PackStore`] counts, and a pack is a `manifests/<id>/`
+    /// directory holding the `manifest.tsv` whose sha256 **is** that id.
+    fn plant_a_pack_store(data_root: &Path, lengths: &[usize]) -> (u64, u64) {
+        let store = data_root.join(packstore::PACKS_DIR);
+        let objects = store.join("objects");
+        let manifests = store.join("manifests");
+        std::fs::create_dir_all(&objects).expect("the store's objects directory");
+        std::fs::create_dir_all(&manifests).expect("the store's manifests directory");
+        let mut bytes = 0u64;
+        for (which, length) in lengths.iter().enumerate() {
+            let content = vec![b'a' + which as u8; *length];
+            let digest = herd_proto::sha256_hex(&content);
+            std::fs::write(objects.join(&digest), &content).expect("a planted object");
+            bytes += content.len() as u64;
+            let manifest = format!(
+                "{}\n# profile debug\n{digest}\t{length}\t0644\tf\tartefact\tbin/tool-{which}\n",
+                herd_proto::CHATONS_PACK_FORMAT,
+            )
+            .into_bytes();
+            let at = manifests.join(herd_proto::sha256_hex(&manifest));
+            std::fs::create_dir_all(&at).expect("a planted pack directory");
+            std::fs::write(at.join("manifest.tsv"), &manifest).expect("a planted manifest");
+        }
+        (bytes, lengths.len() as u64)
+    }
+
+    /// The three pack figures of the first health report on this link.
+    ///
+    /// Frames in front of it are skipped rather than asserted on: what the
+    /// announcement sends is `packs_announced.rs`'s measurement, and an
+    /// assertion about the order here would go red the day a frame is added
+    /// in front of it.
+    fn pack_figures_on_this_link(
+        inbox: &mut mpsc::UnboundedReceiver<ToHub>,
+    ) -> (Option<u64>, Option<u64>, Option<u32>) {
+        loop {
+            match inbox.try_recv().expect("the health report is on the link") {
+                ToHub::Health {
+                    pack_store_bytes,
+                    pack_store_budget_bytes,
+                    packs_held,
+                    ..
+                } => return (pack_store_bytes, pack_store_budget_bytes, packs_held),
+                _ => continue,
+            }
+        }
+    }
+
+    /// A session with a link whose other end this test holds, in the
+    /// production order: attach, announce what is held, then report.
+    fn a_session_on_a_link_announcing(
+        root: &root::DataRoot,
+    ) -> (Session, mpsc::UnboundedReceiver<ToHub>, String) {
+        let session = Session::new();
+        let (outbox, inbox) = mpsc::unbounded_channel();
+        session.attach(
+            outbox,
+            Arc::new(Semaphore::new(1)),
+            Duration::from_millis(50),
+        );
+        // The dial's own call, with the data root's **own** path — which is
+        // `confined.root().path()` in `serve_once` and `job.rs`.
+        let said = session.announce_packs_held(root.path());
+        assert!(
+            session.send_health(),
+            "there is a link for the report to go on"
+        );
+        (session, inbox, said)
+    }
+
+    /// **The three figures stop being `None`: what the store holds, what
+    /// bounds it, and how many packs** (M12 P2a, E-16).
+    #[test]
+    fn a_health_report_carries_the_pack_store_figures_and_its_budget() {
+        let temp = testing::TempDir::new("pack-health-figures");
+        let (bytes, packs) = plant_a_pack_store(temp.path(), &PLANTED_LENGTHS);
+        // `main.rs`'s own call, with the path an operator typed. It is also
+        // the only thing that measures the store, which is why `measured` is
+        // true below and the figures are not "did not say".
+        let line = packstore::take_budget(temp.path(), Some(PACK_BUDGET_TYPED_HERE));
+        assert!(
+            line.contains(&format!("in {packs} pack(s)")),
+            "the fixture is the size it claims: {line}"
+        );
+        let root = root::DataRoot::open(temp.path()).expect("a throwaway data root");
+        let (_session, mut inbox, said) = a_session_on_a_link_announcing(&root);
+        assert!(
+            said.contains(&format!("holds {packs} pack(s)")),
+            "the announcement went on the same link: {said}"
+        );
+        assert_eq!(
+            pack_figures_on_this_link(&mut inbox),
+            (
+                Some(bytes),
+                Some(PACK_BUDGET_TYPED_HERE),
+                Some(packs as u32)
+            ),
+            "the report carries the fixture's own summed lengths, its pack count and the \
+             typed budget — none of them absent and none of them nought"
+        );
+    }
+
+    /// **A runner with no `--pack-budget` sends `None` for the budget and a
+    /// real figure for the other two.**
+    ///
+    /// The plan's own clause, and the one a shipped default would make
+    /// unmeetable. Absent is not nought and not "unlimited": it is a hub with
+    /// nothing to weigh the usage against, which is why the measurements must
+    /// still arrive.
+    #[test]
+    fn a_runner_with_no_pack_budget_still_reports_what_it_holds() {
+        let temp = testing::TempDir::new("pack-health-no-budget");
+        let (bytes, packs) = plant_a_pack_store(temp.path(), &PLANTED_LENGTHS);
+        let _line = packstore::take_budget(temp.path(), None);
+        let root = root::DataRoot::open(temp.path()).expect("a throwaway data root");
+        let (_session, mut inbox, _said) = a_session_on_a_link_announcing(&root);
+        assert_eq!(
+            pack_figures_on_this_link(&mut inbox),
+            (Some(bytes), None, Some(packs as u32)),
+            "nobody said what this store may hold, and what it holds is still measured"
+        );
+    }
+
+    /// **Absent means "did not say", in both of the two ways it can happen.**
+    ///
+    /// A store nothing has opened, and a store opened but never measured, are
+    /// different states and neither of them is an empty store. `false is not
+    /// nought`: a hub told `0 bytes` by a runner that never looked would
+    /// believe there is room, which is the one direction an eviction policy
+    /// acts in.
+    #[test]
+    fn a_runner_that_has_not_read_its_pack_store_says_nothing_rather_than_nought() {
+        // One: no store has been opened at all — no connection has announced
+        // holdings yet, so nothing here has read this machine's disk.
+        let session = Session::new();
+        let (outbox, mut inbox) = mpsc::unbounded_channel();
+        session.attach(
+            outbox,
+            Arc::new(Semaphore::new(1)),
+            Duration::from_millis(50),
+        );
+        assert!(session.send_health(), "there is a link to report on");
+        assert_eq!(
+            pack_figures_on_this_link(&mut inbox),
+            (None, None, None),
+            "a runner that has not opened its store says nothing about it, three times over"
+        );
+
+        // Two: the store is open and nothing has measured it. The two
+        // measurements are absent and **the budget still travels**, because a
+        // budget is a figure its owner typed and not one this runner read.
+        let temp = testing::TempDir::new("pack-health-unmeasured");
+        let (planted, _packs) = plant_a_pack_store(temp.path(), &PLANTED_LENGTHS);
+        assert!(planted > 0, "there really are bytes on this disk to miss");
+        let root = root::DataRoot::open(temp.path()).expect("a throwaway data root");
+        // The budget without `take_budget`, which is what measures: this is
+        // the state a runner is in before anything has walked the store.
+        packstore::PackStore::open(root.path())
+            .expect("the store opens")
+            .set_budget(Some(PACK_BUDGET_TYPED_HERE));
+        let (_session, mut inbox, _said) = a_session_on_a_link_announcing(&root);
+        assert_eq!(
+            pack_figures_on_this_link(&mut inbox),
+            (None, Some(PACK_BUDGET_TYPED_HERE), None),
+            "a store nothing has measured is not an empty store, and the budget is not a \
+             measurement"
+        );
+    }
+
+    /// **The figures are the store the data root was validated at, not the
+    /// store at the path the operator typed** (P1's handoff, finding 1).
+    ///
+    /// [`root::DataRoot::open`] canonicalises what it validates
+    /// (`root.rs:140`), so every store a running runner opens is opened under
+    /// the canonical path, while `main.rs` still holds the spelling an
+    /// operator typed. Keyed on the literal string, the budget would be
+    /// registered against a spelling nothing else ever reads and the figures
+    /// would start from nought at the first announcement — and this report is
+    /// what would publish that: **no budget, 0 bytes, for a runner holding
+    /// gigabytes**, wrong in the one direction an operator acts on and
+    /// visible only on a machine nobody in this project may log into (D161).
+    ///
+    /// So the two are asserted to **agree** rather than assumed to: the
+    /// report's figures are compared against a store opened again on the data
+    /// root's own path.
+    #[test]
+    fn the_report_reads_the_store_the_data_root_was_validated_at() {
+        let temp = testing::TempDir::new("pack-health-spelling");
+        let real = temp.path().join("real-root");
+        std::fs::create_dir_all(&real).expect("the real data root");
+        let typed = temp.path().join("typed-root");
+        std::os::unix::fs::symlink(&real, &typed).expect("a second spelling of one root");
+        let (bytes, packs) = plant_a_pack_store(&real, &PLANTED_LENGTHS);
+        // What `main.rs` does, with the spelling the operator typed.
+        let _line = packstore::take_budget(&typed, Some(PACK_BUDGET_TYPED_HERE));
+        let root = root::DataRoot::open(&typed).expect("a throwaway data root");
+        assert_ne!(
+            root.path(),
+            typed.as_path(),
+            "the premise of this test is that `DataRoot::open` canonicalises; if it stops \
+             doing so, this test is measuring nothing and must be rewritten rather than \
+             deleted"
+        );
+
+        let (_session, mut inbox, _said) = a_session_on_a_link_announcing(&root);
+        let figures = pack_figures_on_this_link(&mut inbox);
+        assert_eq!(
+            figures,
+            (
+                Some(bytes),
+                Some(PACK_BUDGET_TYPED_HERE),
+                Some(packs as u32)
+            ),
+            "a budget taken under one spelling of a data root is the budget reported under \
+             the other, and so is the figure"
+        );
+        // And they are the same store, read again on the path the
+        // announcement itself was given.
+        let announced = packstore::PackStore::open(root.path())
+            .expect("the store opens")
+            .usage();
+        assert_eq!(
+            (figures.0, figures.2),
+            (Some(announced.bytes), u32::try_from(announced.packs).ok()),
+            "the report's figures and the announcement's store agree, which is asserted \
+             here rather than assumed"
+        );
     }
 }
