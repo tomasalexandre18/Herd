@@ -14,6 +14,7 @@ use herd_runner::confine::{
     DEFAULT_TIMEOUT_SECONDS,
 };
 use herd_runner::mesh;
+use herd_runner::packstore::PACK_BUDGET_FLAG;
 use herd_runner::root::DataRoot;
 use herd_runner::size::parse_bytes;
 use herd_runner::switch::DEFAULT_POLL_MS;
@@ -115,6 +116,27 @@ struct Args {
     /// How much one job's workspace may hold before the runner stops it.
     #[arg(long, env = "HERD_JOB_DISK_BUDGET", value_name = "SIZE")]
     job_disk_budget: Option<String>,
+    /// How much of this machine's disk the pack store may hold: `40GiB`,
+    /// `512MiB`, or plain bytes.
+    ///
+    /// **This is not `--job-disk-budget`, which is 20 GiB per job by
+    /// default.** That one bounds the scratch space of one job and is
+    /// reclaimed with it; this one bounds what this machine keeps *between*
+    /// jobs — the content one job leaves for a later job of the same commit,
+    /// under `packs/` in the data root.
+    ///
+    /// **Absent by default, and absent means nothing bounds it**: the store
+    /// grows until the disk does not, and this runner says so at startup.
+    /// There is no default figure and there will not be one — how much of a
+    /// disk is lent to Herd is a statement about the machine, like
+    /// `--host-memory`, and a number chosen here would be right on the
+    /// machine it was chosen on and absurd on every other.
+    ///
+    /// What is printed against it at startup is **measured**: the bytes
+    /// `packs/objects/` really holds, each content once, and how many whole
+    /// packs that is.
+    #[arg(long, env = "HERD_PACK_BUDGET", value_name = "SIZE")]
+    pack_budget: Option<String>,
     /// CPU niceness added to a job. IO niceness goes to the idle class with it.
     #[arg(long, env = "HERD_JOB_NICE", value_name = "N")]
     job_nice: Option<i32>,
@@ -773,6 +795,29 @@ async fn main() -> Result<()> {
         "herd-runner: {}",
         herd_runner::jobs_at_once(&host, confinement.memory_max).why()
     );
+    // And what this machine keeps *between* jobs, which until now it kept
+    // against no figure at all: the pack store's budget and what it holds
+    // now. Printed beside the admission lines above because an operator
+    // reading one is reading the same question — how much of this machine is
+    // lent to Herd — and because the budget decides what a later eviction
+    // will take.
+    //
+    // Taken here, before the dial, and **creating nothing**: the data root is
+    // validated inside `herd_runner::run`, and a `packs/` made on this line
+    // would leave a directory behind on a root that was about to be refused
+    // by name (E-45).
+    let pack_budget = match args.pack_budget {
+        Some(size) => Some(
+            parse_bytes(&size)
+                .map_err(anyhow::Error::msg)
+                .context(PACK_BUDGET_FLAG)?,
+        ),
+        None => None,
+    };
+    println!(
+        "herd-runner: {}",
+        herd_runner::packstore::take_budget(&confinement.data_root, pack_budget)
+    );
     println!("herd-runner: joining {}", args.hub);
     herd_runner::run(Config {
         hub_url: args.hub,
@@ -966,7 +1011,12 @@ mod tests {
     /// Blocks deliberately **not** asserted here, each for a reason:
     /// `--job-memory-max`, `--job-log-cap`, `--job-disk-budget` and
     /// `--host-tmpfs` carry example *syntax* (`2GiB`, `512MiB`) and state no
-    /// default, so there is nothing to disagree with a constant;
+    /// default, so there is nothing to disagree with a constant —
+    /// `--pack-budget` carries the same example syntax and *is* asserted,
+    /// because the figure it states is not its own: it is
+    /// [`DEFAULT_DISK_BUDGET`], quoted to tell two budgets apart that an
+    /// operator would otherwise confuse, and a quoted figure is exactly the
+    /// kind that goes stale where the constant moves;
     /// `--health-every` and the other cadences state no figure in prose at
     /// all — clap renders their `[default: …]` straight out of the constant,
     /// which is already the thing this test is for; `--drain-grace`'s "five
@@ -1043,6 +1093,13 @@ mod tests {
             (
                 format!("{DEFAULT_PIDS_MAX} by default"),
                 "--job-pids-max's default",
+            ),
+            (
+                format!(
+                    "not `--job-disk-budget`, which is {} per job by default",
+                    herd_proto::show_bytes(DEFAULT_DISK_BUDGET)
+                ),
+                "--pack-budget's distinction from --job-disk-budget",
             ),
             (
                 format!("{kept_back} of whatever it is is kept back"),
