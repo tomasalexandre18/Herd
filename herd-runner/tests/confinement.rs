@@ -29,7 +29,12 @@ use tokio::task::JoinHandle;
 /// A hub with one runner joined, confined as the test asks.
 struct Harness {
     hub_url: String,
-    data_root: TempDir,
+    data_root: PathBuf,
+    /// The data root when this harness made its own, removed with it.
+    /// `None` when the test handed one in: the one test whose data root has
+    /// to sit inside a directory of its own keeps that directory itself
+    /// ([`TheOnlyWayIn`]).
+    _own_root: Option<TempDir>,
     /// The hub's state root, which M2 made files: one per harness, removed
     /// with it, so no confinement test reads another's records.
     _state: TempDir,
@@ -38,9 +43,22 @@ struct Harness {
 
 impl Harness {
     async fn new(label: &str, shape: impl FnOnce(&mut Confinement)) -> Self {
-        let data_root = TempDir::new(label);
+        let own = TempDir::new(label);
+        let data_root = own.path().to_path_buf();
+        Self::rooted_at(data_root, Some(own), label, shape).await
+    }
+
+    /// The same harness with its data root **given** rather than made: a
+    /// directory the test owns, so that what encloses the data root can be
+    /// part of what the test asserts ([`TheOnlyWayIn`]).
+    async fn rooted_at(
+        data_root: PathBuf,
+        own_root: Option<TempDir>,
+        label: &str,
+        shape: impl FnOnce(&mut Confinement),
+    ) -> Self {
         let state = TempDir::new(&format!("{label}-state"));
-        let mut confinement = test_confinement(data_root.path());
+        let mut confinement = test_confinement(&data_root);
         shape(&mut confinement);
         let store = Arc::new(JobDirStore::open(state.path()).expect("the state root opens"));
         // An unapproved runner claims nothing (E-48), so this harness
@@ -82,6 +100,7 @@ impl Harness {
         Self {
             hub_url,
             data_root,
+            _own_root: own_root,
             _state: state,
             tasks: vec![serving, running],
         }
@@ -133,7 +152,7 @@ impl Harness {
     }
 
     fn root(&self) -> &Path {
-        self.data_root.path()
+        &self.data_root
     }
 }
 
@@ -486,23 +505,298 @@ async fn a_job_filling_its_workspace_is_stopped_at_its_disk_budget() {
     );
 }
 
+/// What the job prints once it has made its own hiding place unreadable to
+/// itself, and what it prints when it could not.
+///
+/// The job writes **nothing** in the second case and exits 9. A run whose
+/// premise was already gone before the bytes existed is void, and a void run
+/// has no reason to put a hundred megabytes on anybody's disk.
+const HIDDEN_FROM_THE_JOB_ITSELF: &str = "this job cannot read its own hiding place";
+const STILL_READABLE_BY_THE_JOB: &str = "this job can still read its own hiding place";
+
+/// **The one way in**: the directory this test's data root sits in, kept as
+/// the witness that tells *this* runner's restoration apart from somebody
+/// else's.
+///
+/// ## Why a witness is needed at all
+///
+/// This suite runs inside a Herd job (D258), and the runner carrying that
+/// job walks everything under the job's base every
+/// `herd_runner::confine::POLL_INTERVAL` — 200 ms — to hold it to its own disk
+/// budget. `$TMPDIR` is inside that base, so every temporary directory this
+/// file makes is inside the walked tree, and a directory that walk cannot
+/// list has access handed back to it by `herd_runner::root`'s
+/// `read_dir_restoring` → `restore_access`: `set_permissions(mode | 0o700)`.
+///
+/// That is the enclosing runner doing exactly what invariant 2 and D166
+/// require, so the fixture is the side that has to be honest about it. Until
+/// 2026-10-30 this test wrote its bytes in the open, ran `chmod 300 h` and
+/// then `sleep 6`: a six-second premise against a 200 ms restorer. The
+/// hiding place was readable again long before the runner under test
+/// measured it, the cap tripped on bytes in plain view, and the assertion
+/// held either way — it would have held with `restore_access` deleted from
+/// the product, which is the one thing it exists to catch. `0o700` where the
+/// job set `0o300` is the fingerprint.
+///
+/// ## What this directory proves
+///
+/// The data root lives inside it, so **the only path from the host to the
+/// job's hiding place runs through here**. And `read_dir_restoring` restores
+/// the **ancestors first** — `restore_ancestors`, every directory up to the
+/// walking runner's own data root — and only then the directory it failed
+/// on. The enclosing runner's data root is above `$TMPDIR`, so this
+/// directory is one of those ancestors: nothing outside can give the job's
+/// hiding place its access back without giving this directory its access
+/// back in the same call.
+///
+/// The runner under test never touches it: `restore_ancestors` stops at
+/// `up_to`, which is the data root *inside* here.
+///
+/// So the mode of this one directory, read after the job has ended, says
+/// whether the measurement that judged the job was taken on the premise the
+/// test is named for. A measurement taken on a premise that did not hold is
+/// void and taken again from nothing, [`Self::ATTEMPTS`] times, and the last
+/// void is **red** with [`Self::WOULD_NOT_HOLD`] — red and not skipped,
+/// because a skip would move the suite's skip list, and that list is
+/// compared and not counted (D27, D187).
+struct TheOnlyWayIn {
+    enclosure: TempDir,
+}
+
+/// What the enclosure's mode says about the attempt that just ran. Three
+/// modes, three different facts, which is why the witness is a mode and not
+/// a boolean.
+#[derive(Debug, PartialEq, Eq)]
+enum WhatTheWayInSays {
+    /// `0o300`: the job blinded it and nothing outside this runner has
+    /// opened it since, so the runner under test is what made the hidden
+    /// bytes measurable. This is the only state an assertion is judged on.
+    ThePremiseHeld,
+    /// `0o700`, which is `0o300 | 0o700` and the fingerprint of
+    /// `restore_access`: an enclosing walk came through, so it restored the
+    /// job's hiding place in the same call, and this measurement is evidence
+    /// about that walk and none about this runner.
+    SomethingOutsideOpenedIt,
+    /// `0o755`, the mode this fixture sets and nothing else leaves: the job
+    /// never reached its own `chmod`, so there was no premise to measure
+    /// against — the disk cap stopped it before it had one, or its `mkdir`
+    /// failed.
+    TheJobNeverBlindedIt,
+    /// Moded `0o300` and listing anyway: a process file permissions do not
+    /// apply to, where no mode hides anything from anybody and this
+    /// assertion cannot be made at all.
+    APermissionThatDoesNotApply,
+}
+
+impl TheOnlyWayIn {
+    /// The mode this fixture sets, the one the job sets, and the one a
+    /// restoration leaves. Three values that cannot be each other, which is
+    /// the whole mechanism: `0o755` is set here and never produced by
+    /// `mode | 0o700`, and the umask is given no say in it.
+    const AS_MADE: u32 = 0o755;
+    const BLINDED: u32 = 0o300;
+    const RESTORED: u32 = Self::BLINDED | 0o700;
+
+    /// How many measurements are taken before this host is called one that
+    /// will not hold the premise at all.
+    ///
+    /// Eight, against a window of a few hundred milliseconds and a walk that
+    /// comes past about as often: a single collision is ordinary and eight
+    /// in a row is not a number this project waits for. The bound exists so
+    /// that a host whose enclosing walk opens everything faster than a job
+    /// can hide anything is red with a sentence rather than looping.
+    const ATTEMPTS: usize = 8;
+
+    /// What this test says instead of passing, when every attempt was undone.
+    const WOULD_NOT_HOLD: &'static str =
+        "every attempt at this test's premise was undone before the runner under test could \
+         be judged on it, so nothing here is evidence about a job that hides what it wrote. \
+         See TheOnlyWayIn: the runner carrying this suite restores access on any directory \
+         under the job it cannot list, every 200 ms and its ancestors first, and 0o700 where \
+         the job set 0o300 is the fingerprint. A job that never blinded it at all is a disk \
+         cap that stopped the job before its premise existed; an enclosure moded 0o300 that \
+         lists anyway is a process file permissions do not apply to, and then no mode hides \
+         anything here";
+
+    /// A fresh enclosure, at the mode this fixture made it with.
+    fn around(label: &str) -> Self {
+        let it = Self {
+            enclosure: TempDir::new(&format!("{label}-enclosure")),
+        };
+        it.hold_again();
+        it
+    }
+
+    /// Where the harness's data root goes: inside, so that the only path
+    /// from the host to the job's hiding place runs through this directory.
+    fn data_root(&self) -> PathBuf {
+        let root = self.enclosure.path().join("root");
+        std::fs::create_dir_all(&root).expect("a data root inside the enclosure");
+        root
+    }
+
+    fn path(&self) -> &Path {
+        self.enclosure.path()
+    }
+
+    /// What the enclosure says, asked at the moment a measurement is judged
+    /// and never assumed from the job having run.
+    fn asked(&self) -> WhatTheWayInSays {
+        use std::os::unix::fs::PermissionsExt;
+
+        let mode = std::fs::symlink_metadata(self.path())
+            .expect("the enclosure is this test's own directory")
+            .permissions()
+            .mode()
+            & 0o777;
+        match mode {
+            Self::BLINDED => match std::fs::read_dir(self.path()) {
+                Ok(_) => WhatTheWayInSays::APermissionThatDoesNotApply,
+                // It fails *because of the mode*, which is the premise. Any
+                // other error is a listing that failed for a reason nobody
+                // here arranged — a descriptor limit, a tree that moved —
+                // and reading it as the premise would put a green on
+                // something nobody built.
+                Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => {
+                    WhatTheWayInSays::ThePremiseHeld
+                }
+                Err(error) => panic!(
+                    "{} would not list for a reason this fixture did not arrange: {error:?}",
+                    self.path().display()
+                ),
+            },
+            Self::RESTORED => WhatTheWayInSays::SomethingOutsideOpenedIt,
+            Self::AS_MADE => WhatTheWayInSays::TheJobNeverBlindedIt,
+            other => panic!(
+                "{} is moded {other:o}, which is neither this fixture's mode, nor the job's, \
+                 nor a restoration's",
+                self.path().display()
+            ),
+        }
+    }
+
+    /// Put the enclosure back to the mode it was made with, before the next
+    /// attempt.
+    ///
+    /// Not a retry of an assertion: the *job* is what blinds this directory,
+    /// and this is what keeps "the job never blinded it" a state of its own
+    /// rather than one that reads as a restoration.
+    fn hold_again(&self) {
+        use std::os::unix::fs::PermissionsExt;
+
+        std::fs::set_permissions(self.path(), std::fs::Permissions::from_mode(Self::AS_MADE))
+            .expect("the enclosure's mode is this test's to set");
+    }
+}
+
+impl Drop for TheOnlyWayIn {
+    fn drop(&mut self) {
+        use std::os::unix::fs::PermissionsExt;
+
+        // Before the temporary directory's own drop, which would otherwise
+        // be a removal that cannot list what it is removing.
+        let _ = std::fs::set_permissions(
+            self.enclosure.path(),
+            std::fs::Permissions::from_mode(Self::AS_MADE),
+        );
+    }
+}
+
 /// Defect 1 of the M4 review, end to end: a job that hides what it wrote
 /// behind a directory the runner cannot enter used to be reported
 /// `bytes_written: Some(0)`, `Exited { code: 0 }` — with the 100 MB still on
 /// the host afterwards, because the removal failed on the same directory.
+///
+/// **The premise is the whole test, so it is built to be checked and never
+/// assumed** ([`TheOnlyWayIn`]). Three things make this an assertion about
+/// the product rather than about whichever process last touched a mode:
+///
+/// 1. the bytes are written **into** the hidden directory, so no measurement
+///    anywhere can reach them without a restoration — the old script wrote
+///    them in the open and hid them afterwards, which leaves the figure true
+///    whether or not anything was ever hidden;
+/// 2. the job says in its own log that its hiding place really was
+///    unreadable **to the job itself**, and writes nothing if it was not;
+/// 3. the enclosure says afterwards whether anything outside this runner
+///    opened a directory under it, which is the only other way those bytes
+///    could have been counted.
+///
+/// ## Proved both ways, inside a Herd job, 2026-10-30
+///
+/// With `root::restore_access` still called and robbed of its effect —
+/// `mode | 0o700` written as `mode`, in a worktree and never committed —
+/// this test is **red** three times out of three, alone and in its whole
+/// file, on its **first** clause (job `j0000000159`): the outcome is
+/// `SetupFailed`, naming `…/work/h cannot be read even after its mode was
+/// restored: Permission denied`, which is D166's refusal where
+/// `StoppedByCap { cap: Disk }` is asserted. With the product as it is,
+/// green three times out of three (`j0000000158`).
+///
+/// And the test **as it was** — `chmod 300 h; sleep 6` — is **green** three
+/// times out of three against that same ineffective `restore_access`
+/// (`j0000000160`). That green is the whole reason this fixture exists.
+///
+/// The witness is not a theory either: in `j0000000159`'s third run the
+/// enclosure read `SomethingOutsideOpenedIt` on two attempts before a third
+/// was judged — the enclosing runner's walk coming past, and being caught
+/// at it.
 #[tokio::test]
 async fn a_job_cannot_hide_what_it_wrote_from_its_disk_budget() {
     let budget = 8 << 20;
-    let harness = Harness::new("blinded-budget", |confinement| {
+    let way_in = TheOnlyWayIn::around("blinded-budget");
+    let harness = Harness::rooted_at(way_in.data_root(), None, "blinded-budget", |confinement| {
         confinement.disk_budget = budget;
     })
     .await;
-    let ran = harness
-        .run(
-            "mkdir h; dd if=/dev/zero of=h/big bs=1048576 count=100 2>/dev/null; \
-             chmod 300 h; sleep 6",
-        )
-        .await;
+    // The enclosure is blinded first and the hiding place second: in that
+    // order an enclosing walk that is already on its way down cannot reach
+    // the hiding place without having left its mark above it.
+    let script = format!(
+        "mkdir h || exit 9; \
+         chmod {blinded:o} '{enclosure}' || exit 9; \
+         chmod {blinded:o} h || exit 9; \
+         if [ -r h ]; then echo '{readable}'; exit 9; fi; \
+         echo '{hidden}'; \
+         dd if=/dev/zero of=h/big bs=1048576 count=100 2>/dev/null; \
+         exit 0",
+        blinded = TheOnlyWayIn::BLINDED,
+        enclosure = way_in.path().display(),
+        readable = STILL_READABLE_BY_THE_JOB,
+        hidden = HIDDEN_FROM_THE_JOB_ITSELF,
+    );
+    let ran = {
+        let mut judged = None;
+        for attempt_at_the_premise in 1..=TheOnlyWayIn::ATTEMPTS {
+            way_in.hold_again();
+            let ran = harness.run(&script).await;
+            let said = way_in.asked();
+            if !ran.out.contains(HIDDEN_FROM_THE_JOB_ITSELF)
+                || said != WhatTheWayInSays::ThePremiseHeld
+            {
+                // Said out loud, because a measurement thrown away is a
+                // measurement nobody made: `--nocapture` shows how often
+                // this host undoes the premise, and the figure belongs in
+                // the record rather than in somebody's reasoning.
+                println!(
+                    "a_job_cannot_hide_what_it_wrote_from_its_disk_budget: attempt \
+                     {attempt_at_the_premise} at the premise is void and is taken again from \
+                     nothing: the enclosure said {said:?}"
+                );
+                assert!(
+                    attempt_at_the_premise < TheOnlyWayIn::ATTEMPTS,
+                    "{}. The enclosure said {said:?}, the job said {out:?}, and it ended \
+                     {outcome:?}",
+                    TheOnlyWayIn::WOULD_NOT_HOLD,
+                    out = ran.out,
+                    outcome = ran.outcome,
+                );
+                continue;
+            }
+            judged = Some(ran);
+            break;
+        }
+        judged.expect("the loop above either measures or says why it could not")
+    };
     assert_eq!(
         ran.outcome,
         JobOutcome::StoppedByCap {

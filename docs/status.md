@@ -68,8 +68,8 @@ a `--help` figure, an `EBUSY` and a controller are each read, never guessed
 own `MemoryMax` (**D260**). **Three are narrower than their names:** the stop
 is **0.212 s**, idle only (**D264**), `bytes_written` is a workspace's
 apparent size, sampled (**D263**), and **a green suite proves less than its
-name** (**D268**): a mode a fixture sets is undone within 200 ms, so one test
-is a **hollow green** (ORCH-292) and three are latently red (ORCH-291).
+name** (**D268**): a mode a fixture sets is undone within 200 ms; three tests
+are latently red (ORCH-291) and the hollow green is closed (**D273**).
 
 ## What the software still does not do
 
@@ -86,5 +86,5 @@ is a **hollow green** (ORCH-292) and three are latently red (ORCH-291).
    runner silent for `lost_after` keeps its link, against E-21's 60 s promise.
 4. **The runner's half of D225 has never run against a real hub**, though both
    halves are in the tree — the cheapest gap before v1.0.0 (ORCH-222).
-5. **`coverage.md`'s E-12 and E-17 rows are false** and are **not** recounted
-   here (ORCH-302): moving a must is the orchestrator's ruling, as E-42's was.
+5. **`coverage.md`'s E-12 and E-17 rows are recounted** against `71efccf`
+   (ORCH-302): both stay `part`, 36 of 44 unmoved, the push is what is left.
