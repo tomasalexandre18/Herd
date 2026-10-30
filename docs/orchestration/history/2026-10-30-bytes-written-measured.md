@@ -264,10 +264,19 @@ workspace must not read as a job that wrote nothing.
 
 ## Processes
 
-PIDs started: none directly. Nine jobs were submitted through
-`/mnt/ssd_980/herd/queue/bin/herdctl` — `j0000000054` to `j0000000061`,
-and `j0000000053` is not this task's — each run by the queue runner, all
-exited 0, none capped, none re-run. No process was signalled.
+PIDs started: none directly. **Eight** jobs were submitted through
+`/mnt/ssd_980/herd/queue/bin/herdctl` — `j0000000054` through
+`j0000000061`, inclusive, and nothing below `j0000000054` is this
+task's — each run by the queue runner, all exited 0, none capped, none
+re-run. No process was signalled, and nothing was killed.
+
+`/mnt/ssd_980/herd/build/` is **empty** as this task ends. The only
+removal this task ran was `rm -rf` on its own named subdirectory,
+`/mnt/ssd_980/herd/build/bytes-written-measured`. Another agent's
+`m12-p4-runner-custody` tree was named in this task's brief as live and
+is no longer there; this task never listed that directory before
+deleting its own path, so it cannot show the tree was already gone, and
+says so rather than assuming it.
 
 Own build tree deleted once the branch was pushed:
 `/mnt/ssd_980/herd/build/bytes-written-measured`, **1.3 G** — dev
