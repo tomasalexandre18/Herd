@@ -4342,4 +4342,126 @@ mod tests {
             "past the stickiness limit the job takes the less preferred machine: {why}"
         );
     }
+
+    // ---------------------------------------------------------------- E-23
+
+    /// A second machine at the owner's PC's preference and with her figures,
+    /// so that every assertion about *equal* preference has a real pair to
+    /// be about. It loses the name tie-break to `wsl-pc`, which is what makes
+    /// it useful: a term that moved a placement to `wsl-pc` moved it against
+    /// the only order there was before.
+    fn a_spare_pc() -> Seat {
+        seat(
+            "spare-pc",
+            10,
+            HostSize::new(Some(17 * 1024), Some(20))
+                .with_floor(Some(3 * 1024))
+                .with_tmpfs(Some(2 * 1024)),
+            offering(vec![declared(Capability::counted("build", 1))]),
+        )
+    }
+
+    /// The fleet the frozen expectations below were captured against: the
+    /// consumer's server at preference 0 and two machines at preference 10.
+    fn frozen_fleet() -> Vec<Seat> {
+        vec![their_server(), her_pc(), a_spare_pc()]
+    }
+
+    /// One placement, rendered whole — its kind, the machine, the command
+    /// that would be sent, the derived figure and the sentence an operator
+    /// reads — so that one `assert_eq!` can hold all of it at once.
+    fn rendered(id: &str, placement: &Placement) -> String {
+        match placement {
+            Placement::Claim {
+                runner,
+                why,
+                command,
+                parallelism,
+            } => format!("{id} claim {runner} | {command:?} | {parallelism:?} | {why}"),
+            Placement::Wait { why } => format!("{id} wait | {why}"),
+            Placement::Impossible { why } => format!("{id} impossible | {why}"),
+            Placement::Cancel { why } => format!("{id} cancel | {why}"),
+        }
+    }
+
+    /// Six placements over [`frozen_fleet`], every one of them a job whose
+    /// `needs` is empty.
+    ///
+    /// Three of them share one fleet and are placed in order, so what the
+    /// first two took is what the third contends with; the other three get a
+    /// fresh one. Between them they exercise every ordering term there was
+    /// before E-23: the name tie-break at equal preference (`f1`, `f4`),
+    /// contention within one pass (`f2`), E-19's stickiness wait (`f3`), and
+    /// the single-machine case at both preferences (`f5`, `f6`).
+    fn frozen_placements() -> Vec<String> {
+        let mut lines = Vec::new();
+        let mut fleet = frozen_fleet();
+        for id in ["f1", "f2", "f3"] {
+            let placement = place(
+                &queued(id, &["build"]),
+                &mut fleet,
+                now(),
+                Stickiness::default(),
+                &Placing::default(),
+            );
+            lines.push(rendered(id, &placement));
+        }
+        let mut fleet = frozen_fleet();
+        for (id, want) in [
+            ("f4", &[][..]),
+            ("f5", &["rig-cpu"][..]),
+            ("f6", &["kvm"][..]),
+        ] {
+            let placement = place(
+                &queued(id, want),
+                &mut fleet,
+                now(),
+                Stickiness::default(),
+                &Placing::default(),
+            );
+            lines.push(rendered(id, &placement));
+        }
+        lines
+    }
+
+    /// **The clause that matters most.** A job with no `needs` places exactly
+    /// as it placed before the locality term existed — the same machine, the
+    /// same command, the same derived figure and the same sentence, byte for
+    /// byte.
+    ///
+    /// Every job Herd runs today has no `needs` at all: nothing fills the
+    /// field unless a declaration asks. So E-23's term is the one change in
+    /// the matcher that could silently re-order every placement in the fleet,
+    /// and the only way to know it did not is to have written down what the
+    /// answers were **before** touching the function.
+    ///
+    /// That is what [`FROZEN`] is. It is a literal, captured by running
+    /// [`frozen_placements`] on the branch's base — `a8cf397`, batch 19, with
+    /// `place` unmodified — and pasted here in the same commit that captured
+    /// it, before the term was written. It is not computed from the code
+    /// under test, and it is not derived from anything that is: a detector
+    /// that read its "before" out of the function it was checking would
+    /// compare the thing with itself and pass whatever happened.
+    ///
+    /// If this goes red, placement moved. Read the diff and not this test.
+    #[test]
+    fn a_job_with_no_needs_places_byte_identically_to_before_e23() {
+        assert_eq!(
+            frozen_placements().join("\n"),
+            FROZEN.trim_matches('\n'),
+            "placement moved for jobs that need no pack, which is every job \
+             Herd runs today"
+        );
+    }
+
+    /// What [`frozen_placements`] answered before E-23's term was written.
+    /// Captured on `a8cf397`; see the test above for why it is a literal.
+    const FROZEN: &str = r#"
+f1 claim spare-pc | ["/bin/sh", "-c", "true"] | None | claimed by spare-pc: labels build; build slot 1 of 1; admitted 0 MiB of memory, 14 GiB free of 14 GiB after it (17 GiB lent, 3 GiB kept as its own floor); it reserves no tmpfs; load 0.42 there, recorded and not a gate (E-32); preference 10, the most preferred of 3 eligible runners
+f2 claim wsl-pc | ["/bin/sh", "-c", "true"] | None | claimed by wsl-pc: labels build; build slot 1 of 1; admitted 0 MiB of memory, 14 GiB free of 14 GiB after it (17 GiB lent, 3 GiB kept as its own floor); it reserves no tmpfs; load 0.42 there, recorded and not a gate (E-32); preference 10, the most preferred of 3 eligible runners
+f3 wait | it is waiting for wsl-pc, spare-pc: on wsl-pc, build has 1 slot(s) and 1 are taken; and on spare-pc, build has 1 slot(s) and 1 are taken; build-host could take it and is less preferred (0 against 10), so this job does not move there (E-19). It moves to another eligible runner only when wsl-pc, spare-pc stops being available, or after 3h in the queue (--stickiness-limit); it has waited under a minute
+f4 claim spare-pc | ["/bin/sh", "-c", "true"] | None | claimed by spare-pc: labels none; it needs no capability; admitted 0 MiB of memory, 14 GiB free of 14 GiB after it (17 GiB lent, 3 GiB kept as its own floor); it reserves no tmpfs; load 0.42 there, recorded and not a gate (E-32); preference 10, the most preferred of 3 eligible runners
+f5 claim wsl-pc | ["/bin/sh", "-c", "true"] | None | claimed by wsl-pc: labels rig-cpu; rig-cpu is shared; admitted 0 MiB of memory, 14 GiB free of 14 GiB after it (17 GiB lent, 3 GiB kept as its own floor); it reserves no tmpfs; load 0.42 there, recorded and not a gate (E-32); preference 10, the only eligible runner
+f6 claim build-host | ["/bin/sh", "-c", "true"] | None | claimed by build-host: labels kvm; kvm is shared; admitted 0 MiB of memory, 25 GiB free of 25 GiB after it (31 GiB lent, 6 GiB kept as its own floor); it reserves no tmpfs; load 0.42 there, recorded and not a gate (E-32); preference 0, the only eligible runner
+"#;
 }
