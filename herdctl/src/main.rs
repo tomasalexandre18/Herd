@@ -1491,6 +1491,13 @@ fn declared(
         // no declaration to read them out of, so there is no reading (D74).
         labels_from: None,
         timeout_s: None,
+        // Nor any pack: a pack is registered for a `(commit, key)` and only a
+        // declared command names a commit, so an ad-hoc line has nothing to
+        // resolve a key against and asks for none (M11, E-12). Written out
+        // rather than defaulted, so that this list stays the whole of what an
+        // ad-hoc job declares.
+        needs: Vec::new(),
+        leaves: std::collections::BTreeMap::new(),
     })
 }
 
