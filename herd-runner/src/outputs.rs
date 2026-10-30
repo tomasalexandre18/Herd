@@ -1156,6 +1156,106 @@ mod tests {
         );
     }
 
+    /// **A job's own file beside the pack it declared is kept, and the pack
+    /// is kept with it.**
+    ///
+    /// The path this closes destroyed bytes on the **success** side: `ingest`
+    /// read the manifest, placed the objects and ignored everything else, and
+    /// [`crate::packstore::leave_packs`] then `remove_dir_all`'d the whole
+    /// declared path — so `{out}/packs/build.log` was deleted, by the module
+    /// that had just been taught not to delete on the failure side. The
+    /// hard-linked objects survived; nothing else did.
+    ///
+    /// Red if the shape check in `ingest` goes: the pack would be ingested,
+    /// the directory removed, and `build.log` would not be on this disk to
+    /// read back. The assertion that proves it is the `fs::read` of the log,
+    /// and the manifest and the object beside it are what say **whole** — a
+    /// directory kept minus its three parts would be the "partly gone" this
+    /// was decided against.
+    #[test]
+    fn a_job_s_own_file_beside_a_declared_pack_is_kept() {
+        let out = Out::new("outputs-pack-and-a-log");
+        out.write("results.json", br#"{"ok":true}"#);
+        let object = vec![b'a'; 4096];
+        let (manifest, _) = write_a_pack(&out, "packs", &[&object]);
+        let log = b"the job's own log, beside the pack it declared".to_vec();
+        out.write("packs/build.log", &log);
+        let leaves = BTreeMap::from([("pack".to_owned(), "packs".to_owned())]);
+
+        let collected = out.leaving(1 << 20, &leaves);
+
+        // Whole, under the attempt's own name: the log, the manifest and the
+        // object, every one of them byte for byte. **First**, because this is
+        // the assertion the defect fails — with the shape check gone the pack
+        // ingests, the declared directory is removed, and there is no log
+        // here to read.
+        let kept = out
+            .root()
+            .join(crate::packstore::PACKS_DIR)
+            .join(crate::packstore::REFUSED_DIR)
+            .join("j1-1")
+            .join("packs");
+        assert_eq!(
+            fs::read(kept.join("build.log")).expect("the job's own file is still on this disk"),
+            log,
+            "the file this change exists for: it was destroyed on the success path, and it is \
+             kept now"
+        );
+        assert_eq!(
+            fs::read(kept.join("manifest.tsv")).expect("and the pack beside it"),
+            manifest,
+            "kept whole, not kept minus the three parts: Herd does not decide which half of a \
+             declared directory is ours"
+        );
+        assert_eq!(
+            fs::read(kept.join("objects").join(herd_proto::sha256_hex(&object)))
+                .expect("the pack's object too"),
+            object
+        );
+
+        assert!(
+            collected.packs.is_empty(),
+            "a directory that is more than a pack is not ingested: {:?}",
+            collected.packs
+        );
+        assert_eq!(
+            collected
+                .outputs
+                .files
+                .iter()
+                .map(|file| file.path.as_str())
+                .collect::<Vec<_>>(),
+            ["results.json"],
+            "and a declared path is never the record's business, pack or not"
+        );
+        assert!(
+            !out.out().join("packs").exists(),
+            "it is still out of {{out}}, which is ORCH-153 and unchanged"
+        );
+
+        let said = collected.outputs.skipped.join(" | ");
+        for part in [
+            "\"build.log\"",
+            "nothing else",
+            "kept as it is rather than partly taken apart",
+            "removing it is yours to do",
+        ] {
+            assert!(
+                said.contains(part),
+                "the report must say {part:?} — what was found and whose the removal is: {said}"
+            );
+        }
+
+        let store = crate::packstore::PackStore::open(&out.root()).expect("the store");
+        assert_eq!(
+            fs::read_dir(store.objects_dir())
+                .expect("the store's objects directory is readable")
+                .count(),
+            0,
+            "and nothing of it reached the store: a refused directory is not half-ingested"
+        );
+    }
+
     /// A job that declares nothing is collected exactly as it always was,
     /// and **no pack store is created** on the machine for it.
     ///
