@@ -13253,3 +13253,136 @@ asked for the reasoning somewhere a reader would find it, and
 `herd-merger` allocated the number at batch 21's landing. The reason
 test now lives on the constant: a fourth field moves it to 3 only if
 absence would otherwise become ambiguous again.
+
+## 2026-10-30 — D258 Execution goes through Herd; a local run is a control
+
+Alexa, 2026-10-30, twice: *« a partir de maitenant que du herd, plus
+aucune execution local, dois etre ecrit noir sur blanc dans CLAUDE.md et
+si il marche pas il te remonte le problemme »*, *« execution local est une
+exception pas la norme »*, *« tu peux donc relancer plus d'agent une fois
+que tu est sur »*.
+
+Every build, suite or gate is submitted to our own Herd instance with
+`/mnt/ssd_980/herd/queue/bin/herdctl`, carrying `--label build` **and**
+`--memory-mib`, after `./scripts/bench-preflight.sh`. A job that fails is
+**reported**; it is never re-run locally to obtain a greener answer. A
+local run is permissible only as a **named control** — the agent says it
+is a control, and why. With the queue bounding the work, more agents may
+run at once than a hand count allowed.
+
+Three facts the rule is written against, so it is not read as more than
+it is. The wrapper exists because bare `herdctl` has
+`ws://127.0.0.1:8787` compiled in (`herdctl/src/lib.rs`,
+`DEFAULT_HUB_URL`), which on this host is the **consumer's production
+hub**; the wrapper exits 125 rather than falling back to a `herdctl` on
+`PATH`. `--memory-mib` is required because a job that declares nothing is
+admitted at **0 MiB**, leaving the slot count as the only bound — two
+`build` slots on our instance, up to twenty-four `rustc` on a twelve-core
+host. The preflight still runs first because Herd **records** load and
+does not gate on it (E-32), and reads nothing equivalent to the room left
+in the systemd slice.
+
+What this does not decide: whether a job record should say *unmeasured*
+where nothing measured it (ORCH-268, with Alexa). Our runner has no
+delegated cgroup, so Herd today **orders** work and does not **bound** it.
+
+The rule is in `CLAUDE.md` *Commands*, at no cost to the 150-line ceiling
+(D251) and with no invariant reworded. The recipe, the two frictions and
+the product gap are in `docs/orchestration/workflow.md` *Execution goes
+through Herd*.
+
+## 2026-10-30 — D259 An EBUSY is read, never guessed
+
+Enabling a controller for a cgroup's children is refused with `EBUSY`
+while anything at all sits directly in that cgroup. Until today
+`herd-runner` read that refusal as "I may not write
+`cgroup.subtree_control`" and fell back to `RLIMIT_AS` — a per-process
+address-space limit where a job-tree ceiling was promised — and the
+sentence it printed blamed "something other than this runner".
+
+Measured in a delegated scope, one binary and one variable: at twelve
+test threads the confinement suite skipped two assertions on `EBUSY (os
+error 16)` in two runs of three and three in the third; at one thread
+none. The something-other was the runner's **own child**: a real
+`herd-runner` binary a test had spawned, forked out of the base before
+any `prepare` left it, `cgroup.procs` listing `3175023 (herd-runner)`.
+The first explanation — two concurrent `prepare` calls racing between
+the read and the write — is refuted: every `prepare` moves out before it
+writes, so this process is never directly in the base at a write.
+
+**The rule.** An `EBUSY` from `cgroup.subtree_control` is read, not
+guessed. `cgroup.procs` says who is standing in the base and `/proc`
+says whose each of them is. This process and the processes it started
+are this runner's to move, and go into its leaf; a process that is
+nobody's of this runner's is a refusal naming its pid, because a retry
+there would spin against a condition that will not change; a
+`cgroup.procs` that will not read is a refusal this runner cannot
+explain, said as that rather than guessed either way. Then one retry,
+never a loop. Only `EBUSY` takes this path: `EACCES` is a permission and
+`ENOENT` is a missing controller, and neither is about who is standing
+there.
+
+**No lock was added, and that is part of the decision.** A mutex across
+the enable was written and removed: it would have guarded the window the
+measurement refuted, and the one window it would really have shut — the
+fallback moving this process back into the base under another
+`prepare` — is already answered by the reading, because the occupant is
+then this process itself.
+
+**What is not cured: two unrelated runners sharing one delegated base.**
+Neither being a descendant of the other, they refuse each other, and no
+lock inside one process reaches it. It is loud now rather than silent —
+a refusal naming the pid instead of a quiet `RLIMIT_AS` — and the cure
+is one base cgroup per runner, which `--cgroup-root` makes easy to get
+wrong. That is a separate row.
+
+**The general shape, and it is D27's.** A refusal whose cause has three
+possible readings must be measured down to one, or must say that it
+could not be. A message that names only one of the three sends a reader
+after a third party that may not exist.
+
+Reversible: the reading is one function and one struct in
+`herd-runner/src/cgroup.rs`, held by seven assertions against a fake
+tree and four reverted mutants.
+
+## 2026-10-30 — D260 A delegated scope carries its own memory ceiling
+
+Making the twelve cgroup-delegation assertions on this host needs a
+delegated user scope. Measured on 2026-10-30: inside an uncapped
+`systemd-run --user --scope -p Delegate=yes`, every level
+`scripts/bench-preflight.sh` walks reads `memory.max=max` and
+`memory.high=max` — `user.slice`, `user-1002.slice`,
+`user@1002.service`, `app.slice` and the scope itself — and
+`/sys/fs/cgroup` has neither file. Check 4 then prints *"nothing from …
+up to the root of /sys/fs/cgroup carries a memory.high or a
+memory.max, reading unavailable"* and **clears**, because that branch
+says a sentence and never calls `refuse`.
+
+**So the method that unlocks twelve assertions disables the check added
+on 2026-10-29 after five agents each lost a suite run** to
+`chatons.slice`'s 18 GiB `memory.high`. A user scope is outside
+`chatons.slice`: it escapes the one ceiling bounding everything else
+this project does on this host, and the guard that would have noticed
+is the guard it silenced.
+
+**The rule: any scope or unit installed to get cgroup delegation
+carries its own memory ceiling.** Measured, not reasoned: adding
+`-p MemoryMax=12G` restored a real reading — *"12281 MiB under
+memory.max on the scope, floor 8192"* — and check 4 then cleared on its
+merits instead of on an absence. It is safe for the tests themselves,
+because the assertion about a tighter enclosing ceiling asserts its own
+512 MiB child, and the baseline already passes under an 18 GiB
+enclosure: an enclosing ceiling is this host's ordinary condition, not
+a variable the scope introduces.
+
+**What this entry does not decide.** The *"reading unavailable"* branch
+now covers two situations with opposite risk — a host with no cgroup v2
+at all, which is honest, and a process that put itself outside every
+ceiling, which is not — and refuses in neither. Which of the three
+shapes it becomes is **ORCH-269** and is a script change, not a rule.
+This entry fixes the rule that does not wait for it.
+
+Reversible: one flag on one command line, and a sentence in
+`docs/runner-confinement.md`. In the finder's words, kept verbatim
+because the sentence is the lesson: *"on this host, 'nothing encloses
+me' now means 'I am in a user scope', not 'I am on a bare machine'."*

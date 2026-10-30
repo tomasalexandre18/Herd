@@ -615,8 +615,90 @@ was lost.
 - A permission prompt an agent cannot satisfy is reported in its handoff,
   never worked around.
 
+## Execution goes through Herd
+
+`CLAUDE.md`'s *Commands* carries this rule in seven lines, from Alexa's
+direction of 2026-10-30: *« a partir de maitenant que du herd, plus
+aucune execution local, dois etre ecrit noir sur blanc dans CLAUDE.md et
+si il marche pas il te remonte le problemme »*, *« execution local est
+une exception pas la norme »*, *« tu peux donc relancer plus d'agent une
+fois que tu est sur »*. Here is the recipe, and what the rule does not
+buy.
+
+- **Submit with the wrapper**, `/mnt/ssd_980/herd/queue/bin/herdctl`.
+  Bare `herdctl` has `ws://127.0.0.1:8787` compiled in
+  (`herdctl/src/lib.rs`, `DEFAULT_HUB_URL`) and on this host that is the
+  **consumer's production hub**: a call that forgets `--hub` does not
+  fail, it submits to their production. The wrapper supplies our hub
+  (`ws://127.0.0.1:8791`) and the requester token by environment, so an
+  explicit `--hub` or a `HERD_HUB_URL` already set still wins, and an
+  empty one counts as absent. If its pinned binary is gone it prints the
+  path it looked for and exits **125**, herdctl's own "no verdict" code.
+  It never falls back to a `herdctl` on `PATH`, because that fallback is
+  exactly how a call reaches 8787.
+- **`--label build` and `--memory-mib` on every heavy submission.** The
+  label is how the hub finds a runner allowed to build; the memory
+  figure is what it admits the job against. Declare nothing and the job
+  is admitted at **0 MiB**, so the only bound left is the slot count: a
+  twelve-core `gate.sh` job ran 376 s and wrote ~13 GB having declared
+  no memory at all (measured by the agent that proved the path,
+  2026-10-30, and reported to the orchestrator; no record of it is in
+  this tree). The hub is honest about what it was told, and the
+  requester told it nothing.
+- **What the slot count is, measured on our instance.** One runner,
+  `queue-local`, declaring `build` as `counted` with **2 slots**
+  (`/mnt/ssd_980/herd/queue/etc/capabilities.json`, read 2026-10-30),
+  under `--job-memory-max 6GiB` and `--host-memory 16GiB` with a
+  `--host-memory-floor 4GiB`. So the queue admits **two** build jobs at
+  once — on a twelve-core host, up to **twenty-four `rustc`** if neither
+  declared its memory. **The queue bounds jobs, not cores**, and the
+  figure is 2: an earlier reading of a hub ceiling of 24 was two slots
+  times twelve cores, and 24 is a count of compilers, not of jobs.
+- **`./scripts/bench-preflight.sh` still runs first.** Herd **records**
+  load and does not gate on it: every placement sentence says *"recorded
+  and not a gate (E-32)"*, and `herd-hub/src/matcher.rs` states there is
+  no `if load` anywhere in the module, by design and by test. The
+  preflight's own ceiling is `ncpu * 0.75` — **9** on this 12-core host
+  — and nothing in the hub reads anything equivalent to the **room left
+  in the systemd slice**, which is what the preflight's check 4 reads
+  and what decided five lost suite runs on 2026-10-29. Drop this clause
+  and the rule reads as a guarantee the instance does not give.
+- **Take `--verdict-to <FILE>` on every submission**, because
+  **`herdctl` has no command that reads a finished job's record**:
+  `run`, `submit`, `wait`, `cancel` and `runner` are the whole surface.
+  Without it the figures are reachable only through the hub's **state
+  root** — fine on our own instance, and **D161 forbids it on a
+  consumer's**.
+- **Two frictions to plan for.** A job's whole log arrives only at
+  completion, so a step that goes red is invisible until the end: do not
+  read silence as progress. And a job gets **no workspace** — it `cd`s
+  into the requester's worktree, so `gate.sh`'s receipt lands in
+  `<worktree>/target/herd-gate/` even when `CARGO_TARGET_DIR` points
+  elsewhere, which is why `pre-push` can find it.
+- **A job that fails is reported, never re-run locally.** A local run is
+  permissible only as a **named control**: the agent says it is a
+  control, and why. That is what *« execution local est une exception
+  pas la norme »* means in a handoff.
+- **What the rule does not buy.** Our runner has **no cgroup**, so Herd
+  today **orders** work and does not **bound** it. `--job-memory-max`
+  falls back to `RLIMIT_AS` (D23), a per-process address-space limit and
+  not a job-wide ceiling, and a record's resource figures are what the
+  runner could *see*: a **382-second** `gate.sh` job recorded
+  `peak_memory_bytes` of **3,141,632** — 3.1 MB — and `bytes_written` of
+  287 MB for a run that wrote about 11 GB (ORCH-268). Alexa has directed
+  that job limits are not an obligation and that our load does not need
+  them, so this is **not** a blocker for the rule; it is a thing a
+  reader must not misread as protection. Whether a record should say
+  *unmeasured* is **ORCH-268**, open and his.
+
 ## Concurrency and host rules
 
+- **Since 2026-10-30 the queue answers "how many at once", not a hand
+  count** (*Execution goes through Herd*, above): heavy work is
+  submitted, the hub admits it when a build slot is free, and the
+  per-job judgement is `bench-preflight.sh`'s. The bullet below still
+  holds for anything that runs outside a job, and its figures are the
+  ones `CLAUDE.md` now points here for.
 - How many heavy agents (compiling or running the suite) run at once is a
   judgement on the machine, not a count: look at the load average, the
   free memory **and the free disk** before launching another, at one

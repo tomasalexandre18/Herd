@@ -75,3 +75,22 @@ directory and a pid that change on every run.
 Updating a list is a decision, not a chore: a new name on it is an
 assertion nobody checks any more. Say in the landing record why it is
 there.
+
+## An in-scope list is not `local.txt` minus twelve (2026-10-30)
+
+The twelve names in `local.txt` all name cgroup v2 delegation, and a run
+inside a delegated scope can make all twelve — the invocation that does is
+in `docs/runner-confinement.md`, *Making those twelve*, and the obvious
+invocation makes **zero**. Before anybody blesses a list from such a run,
+two measured facts, because the arithmetic is wrong without them:
+
+- **The net is +11, not +12.** `a_fallback_is_shouted_not_mentioned`
+  cannot be made on a host that no longer falls back, and it skips with
+  its own reason. So the list loses twelve names and **gains that one**.
+- **`pressure_refuses_nothing_and_delays_nothing` appeared in one of
+  three in-scope runs.** Condition-dependent, unrelated to delegation,
+  and enough on its own to make a blessed in-scope list flap.
+
+Which is this directory's own rule arriving from a new direction: the
+count went 12 → 12 → 12 while the reasons changed completely, and the
+names are the only thing that said so.
