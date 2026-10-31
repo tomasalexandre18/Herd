@@ -1131,11 +1131,27 @@ pub struct JobRecord {
     /// The packs this job produced, by its declaration's `leaves` key
     /// (E-12, E-17).
     ///
-    /// Written when a runner's post-fsync registration frame is accepted, so a
-    /// key appears here only once the pack exists somewhere whole. A job that
-    /// declared `leaves` and whose key is absent here is a job whose pack was
-    /// refused or never registered, which is a visible state and not a
-    /// silence — and the reason is in `events.jsonl`.
+    /// **To be written** when a runner's post-fsync registration frame is
+    /// accepted, so that a key would appear here only once the pack exists
+    /// somewhere whole, and a job that declared `leaves` and whose key was
+    /// absent would be a job whose pack was refused or never registered — a
+    /// visible state and not a silence.
+    ///
+    /// **Written by nothing on this build, exactly as
+    /// [`JobRecord::packs_in`] is, and the same measured gap rather than the
+    /// design.** The arm that accepts that frame — `ToHub::RegisterPack` in
+    /// `server.rs` — registers the pack, journals it and answers
+    /// `FromHub::PackRegistered`, and touches no record; every `JobRecord`
+    /// built under `herd-hub/src` sets this field to `Default::default()`
+    /// and no later line assigns it. The `packs_out` that *is* filled beside
+    /// `FromHub::AssignJob` is the frame's, from `record.leaves`, and says
+    /// what a job was asked to leave rather than what it left.
+    ///
+    /// So the paragraph above is what this field will mean and not what
+    /// `job.json` says today: an absent key says only that nothing writes
+    /// the field. What a job really registered is in the hub's journal and
+    /// in `packs/manifests/<id>/registered.json`, which names the job and
+    /// the attempt.
     ///
     /// **This is where a pack's provenance lives**, together with
     /// `herd-hub report`: no pack field goes on the verdict document, because

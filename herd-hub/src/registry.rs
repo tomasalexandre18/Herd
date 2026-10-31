@@ -16,12 +16,25 @@
 //! that does not resolve is a job that **waits**, named with its key and its
 //! commit, and never a `FromHub::Refused` (D13).
 //!
-//! What is still owed on that side is **the recording and the layout**: the
-//! resolved ids are not written to `JobRecord::packs_in` (that field's doc
-//! carries the measurement), and a runner handed a pack hands the attempt
-//! back rather than laying `{in}/<key>` out, because the layout step is not
-//! built. `herd-hub/tests/pack_frames.rs` is where all of it is measured,
-//! through a socket and never by calling this module.
+//! What is still owed on that side is **the recording, and only that**: the
+//! resolved ids are not written to `JobRecord::packs_in`, and nothing writes
+//! `JobRecord::packs_out` either (both fields' docs carry the measurement).
+//! Every `JobRecord` built under `herd-hub/src` sets the two to
+//! `Default::default()` and no later line assigns either — the `packs_in`
+//! built beside `FromHub::AssignJob` in `server.rs` is the **frame's** field
+//! and not the record's — so `job.json` does not yet say which pack an
+//! attempt was handed or which one it registered.
+//!
+//! **The layout is not owed, and has not been since batch 26** (D267). A
+//! declared command's resolved keys are laid out: `herd-runner`'s
+//! `Session::lay_out_packs` is what a running job's `{in}` comes from. The
+//! line that decides whether an attempt is handed back instead is
+//! `Packs::why_this_runner_cannot` in `herd-runner/src/job.rs`, whose first
+//! statement returns `None` for every **declared** job; what it hands back
+//! is a job that asks for or leaves a pack and is *not* declared, which has
+//! no `{in}` to lay one out in and names no commit to register one for.
+//! `herd-hub/tests/pack_frames.rs` is where all of it is measured, through a
+//! socket and never by calling this module.
 //!
 //! ## What it holds, and where
 //!

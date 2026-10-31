@@ -671,10 +671,53 @@ buy.
   consumer's**.
 - **Two frictions to plan for.** A job's whole log arrives only at
   completion, so a step that goes red is invisible until the end: do not
-  read silence as progress. And a job gets **no workspace** — it `cd`s
-  into the requester's worktree, so `gate.sh`'s receipt lands in
-  `<worktree>/target/herd-gate/` even when `CARGO_TARGET_DIR` points
-  elsewhere, which is why `pre-push` can find it.
+  read silence as progress. And **a job does get a workspace, and it is
+  not the requester's tree**: its cwd is `<data-root>/jobs/<id>/work`,
+  created **empty** for every attempt, with no `.git`, no `flake.nix` and
+  no `cargo` on `PATH`, beside a per-job `HOME` and a per-job `TMPDIR`.
+  Nothing in the runner enters a worktree. The lines that decide it are in
+  `herd-runner/src/root.rs`, where `work`, `home` and `tmp` are created
+  under the job's base after any leftover is reclaimed *so that the
+  workspace starts empty*, and in `herd-runner/src/job.rs`, where the step
+  is spawned `.current_dir(workspace.work_dir())` — `work_dir` being, in
+  its own words, "the job's working directory, and the only one it is told
+  about". Measured in job `j0000000063`, 2026-10-30
+  (`history/2026-10-30-orch-273-prove-io-max.md`, ORCH-282).
+- **So the `cd` is the requester's own, and it goes inside the submitted
+  command.** Submit a shell and let the shell enter the tree, by absolute
+  path:
+
+  ```sh
+  /mnt/ssd_980/herd/queue/bin/herdctl run --label build --memory-mib 4700 \
+    --verdict-to /abs/path/verdict.json -- \
+    bash -c 'cd /abs/path/to/worktree \
+      && export CARGO_TARGET_DIR=/mnt/ssd_980/herd/build/<task> \
+      && nix develop --command ./scripts/gate.sh'
+  ```
+
+  A command that names `./scripts/gate.sh` without that `cd` is a command
+  with no such file: **exit 127**, in an empty directory. That is one of
+  four sightings the orchestrator counted on 2026-10-31 against the older
+  wording of this bullet — one exit 127 and three work-arounds — which is
+  what ORCH-282 was filed for. And the **receipt is not** why the `cd` is
+  needed: `gate.sh` takes its root from its own location, not from the
+  cwd — `root=$(cd "$(dirname "$0")/.." && pwd)`, then
+  `receipts=${HERD_GATE_RECEIPTS:-$root/target/herd-gate}` — so the
+  receipt lands in the worktree whose `scripts/gate.sh` was invoked,
+  whatever the cwd and whatever `CARGO_TARGET_DIR` says, and that is how
+  `pre-push` finds it.
+- **A distinct `CARGO_TARGET_DIR` per agent, written into the command.**
+  Two submissions whose command, label set and declared commit are
+  identical are **the same job**: E-05's deduplication key is over those
+  three and nothing else — not the requester, not the time, not the
+  priority — each piece length-prefixed so that two different lists cannot
+  produce one key (`herd-hub/src/job.rs`, `NewJob::dedup_key` and
+  `dedup_key`). The second submission therefore **joins** the first and
+  both requesters wait on one verdict, which is right for one build and
+  wrong for two agents gating two different worktrees. Giving each agent
+  its own tree under `/mnt/ssd_980/herd/build/<task>` keeps the two
+  command lines distinct and keeps the build weight off `/`; it is deleted
+  when the task ends.
 - **A job that fails is reported, never re-run locally.** A local run is
   permissible only as a **named control**: the agent says it is a
   control, and why. That is what *« execution local est une exception
