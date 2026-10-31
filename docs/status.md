@@ -74,8 +74,8 @@ are latently red (ORCH-291) and the hollow green is closed (**D273**).
 
 ## What the software still does not do
 
-1. **Nothing ever deletes a job directory** (ORCH-012, -021), a reading weighs
-   no memory (**ORCH-126**), *reaped* is unbuilt (**D134**), the **hub's**
+1. **Nothing ever deletes a job directory** (ORCH-012, -021), no frame marks
+   a reading (**D285**), *reaped* is unbuilt (**D134**), the **hub's**
    `packs/` has no retention (ORCH-215), and the runner's gc spends **the pack
    budget on one edge** (**D262**, ORCH-275); the unit names none (ORCH-252).
 2. **Only the push direction of a transfer is left** (ORCH-220, plan S10): a

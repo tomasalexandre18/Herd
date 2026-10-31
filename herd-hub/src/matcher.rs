@@ -99,20 +99,24 @@ pub struct Seat {
     /// The most jobs this runner said it holds at once, in its handshake
     /// (D181, invariant 2). `None` from a runner that did not say.
     ///
-    /// **A bound beside the memory admission, never instead of it.** The two
-    /// answer different questions and neither subsumes the other, and
-    /// whichever bites first is the one that bites.
+    /// **The figure the per-job cap is divided out of, and a bound in two
+    /// cases only.** ORCH-312 made admission weigh the **ceiling the runner
+    /// will grant** ([`charged_against_the_room`]) instead of the figure a job
+    /// declared, and ORCH-323 charged the last job that was charged nothing —
+    /// a figureless requirement reading. With that, the hub charges every job
+    /// what its runner will hold it to, the memory sum refuses exactly the
+    /// set the runner would refuse, and this count is no longer applied to
+    /// what the hub's own records say is out there: it would bite first on
+    /// every job held to less than the cap, which is what kept a machine from
+    /// ever holding more jobs than it had places (ORCH-325).
     ///
-    /// **Which one that is changed with ORCH-312, and the count did not
-    /// move.** Admission used to weigh what a job *declared*, so a queue of
-    /// jobs that declared nothing cost a machine nothing and this was the
-    /// only figure that stopped them; it now weighs the **ceiling the runner
-    /// will grant** ([`charged_against_the_room`]), which for a job costed at
-    /// nothing is the whole per-job cap. So the memory sum is the bound that
-    /// bites first for a costed job of any size, and this count is what
-    /// bounds the one job the sum still charges nothing — a requirement
-    /// reading, deliberately (D159, D169). It knows nothing about size, so a
-    /// single job larger than the machine is still admission's to refuse.
+    /// **Where it is still the bound**, both of them the runner's own shape
+    /// since ORCH-325: a host that will not say how much memory it lends, on
+    /// which there is no sum to be had on either side, and a machine that has
+    /// told this hub it is holding more than the records know of (D182),
+    /// which is a count of jobs and not a figure in mebibytes. [`admission`]
+    /// says both in full. It knows nothing about size, so a single job larger
+    /// than the machine is still admission's to refuse.
     ///
     /// Never derived here. The runner's arithmetic uses the cap it puts on
     /// every job, which no frame carries, so the hub either has the runner's
@@ -296,9 +300,14 @@ pub const DRAIN_FIRST_LIMIT: Duration = Duration::from_secs(15 * 60);
 /// not a queue of one: one reading in flight while the next is being handed
 /// out keeps a fleet of readings moving at the speed of the machine. Two
 /// rather than eight because the figure that matters is the one a machine
-/// survives *on top of* the real work it is already running, and a reading is
-/// admitted against the room but takes no slot — so nothing else is counting
-/// it.
+/// survives *on top of* the real work it is already running, and a reading
+/// takes no slot — so nothing about contention is counting it.
+///
+/// **Unmoved by ORCH-323**, which charged a figureless reading the per-job
+/// cap exactly as every other figureless job already was: that is a figure
+/// about memory, and this is a bound on the kind's own concurrency. No figure
+/// is invented for this one either — two is a count of readings, and what
+/// room a reading takes is [`charged_against_the_room`]'s to say.
 ///
 /// It is the hub's figure and not the runner's, like [`DRAIN_FIRST_LIMIT`]
 /// and the reading cap it sits beside: a reading is the hub's own job —
@@ -310,6 +319,12 @@ pub const READINGS_AT_ONCE: u32 = 2;
 /// The clause that marks a sentence as **the hub holding a job back for a
 /// ceiling a runner announced** — the hub's words, about the runner, and not
 /// the runner's own.
+///
+/// Written in the two cases [`admission`] still holds that count in — a host
+/// that will not say how much memory it lends, and a machine that has said it
+/// is holding more than the records know of (D182) — and nowhere else since
+/// ORCH-323, where a machine that stated its size is bounded by its memory
+/// sum and the sentence a waiting job reads is that sum's.
 ///
 /// It exists for the same reason `herd_runner::A_RUNNERS_OWN_CEILING` does,
 /// and against it. Both sentences are about the same ceiling and both reach
@@ -548,33 +563,31 @@ pub fn per_job_cap_mib(host: &HostSize, announced: Option<u32>) -> Option<u64> {
 /// many words. The charge is now [`herd_proto::charged_ceiling_mib`] — the one
 /// function the runner charges through as well.
 ///
-/// **A requirement reading is charged what it is charged today, which in
-/// production is nothing** (D159, D169). `reading_job` gives it no figure —
-/// it builds and boots nothing — and nought is not a figure here any more
-/// than it is in a reading's own answer, so no figure is invented for one;
-/// [`READINGS_AT_ONCE`] is what bounds them, with the count the runner
-/// announced beside it. A reading that *does* carry a figure is charged that
-/// figure's ceiling like any other job, because D119 and D159 are explicit
-/// that a reading is slot-free and never admission-free.
+/// **A requirement reading is charged what every other figureless job is
+/// charged, and that is what ORCH-323 changed** (D159, D169). `reading_job`
+/// gives it no figure — it builds and boots nothing, and nought is not a
+/// figure here any more than it is in a reading's own answer — so it reaches
+/// a runner with no `JobNeed` on it, which is exactly what
+/// `herdctl submit -- true` reaches it with. **The runner cannot tell the two
+/// apart** and grants both the whole of `--job-memory-max`, so this hub
+/// charges both the per-job cap: no figure is invented for a reading, and
+/// none is withheld for one either. A reading that *does* carry a figure is
+/// charged that figure's ceiling like any other job, because D119 and D159
+/// are explicit that a reading is slot-free and never admission-free.
 ///
-/// **And that zero is why the announced count stays a hard bound.** The
-/// runner cannot tell a reading from `herdctl submit -- true`: both arrive
-/// with no `JobNeed` and both are granted the whole of `--job-memory-max`.
-/// So for a reading, and for a reading alone, this hub charges less than the
-/// runner grants — by at most `READINGS_AT_ONCE × --job-memory-max`, and only
-/// that. What keeps it safe is the bound beside this one: at most `at_once`
-/// jobs out there, and `at_once × --job-memory-max ≤ lent − floor` by the
-/// runner's own arithmetic, so the permitted total is bounded whatever the
-/// readings were charged. Dropping that count in favour of this sum alone
-/// would be an over-placement of exactly that size, which is D181's measured
-/// refusal storm; closing it needs the frame to say which jobs are readings,
-/// and that is a protocol decision and not this one.
-pub fn charged_against_the_room(
-    memory_mib: Option<u64>,
-    tmpfs_mib: u64,
-    room: TheRoom,
-    a_reading: bool,
-) -> u64 {
+/// **And charging it is what let the announced count stop being a hard
+/// bound.** While a reading was charged nothing, this hub charged less than
+/// the runner grants — by up to `READINGS_AT_ONCE × --job-memory-max` — and
+/// the only thing covering that was the count, because
+/// `at_once × --job-memory-max ≤ lent − floor` by the runner's own
+/// arithmetic. Dropping the count while that gap was open would have been an
+/// over-placement of exactly that size, which is D181's measured refusal
+/// storm. With one charge over one set on both sides the gap is closed, the
+/// sum is the bound, and jobs held to less than the cap pack behind it;
+/// [`admission`] says what the count is still for. The other way out was a
+/// frame field marking a reading, and it was refused: it is protocol surface
+/// and buys nothing this does not, so `PROTOCOL_VERSION` stays 3.
+pub fn charged_against_the_room(memory_mib: Option<u64>, tmpfs_mib: u64, room: TheRoom) -> u64 {
     // The most one job may be charged here: the per-job cap where the runner
     // announced a count to derive it from, and the whole room where it did
     // not — a job never costs a machine more than the machine has, and on a
@@ -603,17 +616,17 @@ pub fn charged_against_the_room(
             }),
             most,
         ),
-        // A **reading** with no figure is charged nothing, which is exactly
-        // what it is charged today: `reading_job` gives it none, because it
-        // builds and boots nothing, and nought is not a figure here any more
-        // than it is in a reading's own answer. No figure is invented for
-        // one, and [`READINGS_AT_ONCE`] is what bounds them.
-        None if a_reading => 0,
-        // And every other job with no figure — `herdctl submit -- true` — is
-        // charged the per-job cap, because the whole of `--job-memory-max` is
-        // what the runner grants it and the cap is this hub's upper bound on
-        // that. `None` is a runner that announced no count, and then there is
-        // nothing to charge it with: today's figure, unchanged.
+        // A job with no figure — `herdctl submit -- true`, and a requirement
+        // reading, which is the same thing on the wire — is charged the
+        // per-job cap, because the whole of `--job-memory-max` is what the
+        // runner grants it and the cap is this hub's upper bound on that.
+        //
+        // **The reading included, since ORCH-323.** Nothing on the frame says
+        // which jobs are readings, so a hub charging one of the two less than
+        // the other would be charging a figure its runner does not honour —
+        // and that one gap was the whole reason the announced count had to be
+        // a hard bound. `None` is a runner that announced no count, and then
+        // there is nothing to charge it with: today's figure, unchanged.
         None => herd_proto::charged_ceiling_mib(None, room.per_job_cap_mib),
     }
 }
@@ -720,7 +733,7 @@ pub fn reserved(
         let tmpfs_mib = record.tmpfs_need_mib();
         match record.memory_held_mib() {
             Ok(memory) => here.take(
-                charged_against_the_room(memory, tmpfs_mib, room, record.is_a_reading()),
+                charged_against_the_room(memory, tmpfs_mib, room),
                 tmpfs_mib,
                 record.occupant(),
             ),
@@ -828,31 +841,47 @@ enum Admission {
 /// before any requirement is read (D82).
 fn admission(record: &JobRecord, seat: &Seat, threads: Option<u32>) -> Admission {
     // **First, and before any figure about size**: the count the runner
-    // itself put on how many jobs it will hold at once (D181, invariant 2).
+    // itself put on how many jobs it will hold at once (D181, invariant 2) —
+    // in the two cases where it is still the bound, and no longer over what
+    // this hub's own records say is out there (ORCH-323).
     //
-    // Here rather than anywhere else because this is the function that reads
-    // [`Seat::reserved`], and `reserved.jobs` is already the count this needs
-    // — the number of attempts out on this machine that have not ended, taken
-    // off the records by the one `out_there` filter every other figure about
-    // a machine is taken off (D79), and taken *again* by `claim` inside the
-    // pass so that two jobs offered together contend for the last place. A
-    // second counter kept beside it would be a second answer to one question,
-    // and the first job counted by one and not the other would be a machine
-    // the hub reads as having room on top of work that is running.
+    // **Why it is no longer that.** Admission charges every job the ceiling
+    // its runner will grant it, a figureless reading included, so the sum of
+    // the charges on a machine is the sum of the grants that machine will
+    // really hold — and `Σ granted ≤ lent − floor` is the bound
+    // `herd_runner::take_job` applies for itself on a host that says how much
+    // memory it lends (ORCH-325). The hub's charge is never below the
+    // runner's grant, so every set this sum admits is a set that runner
+    // accepts: `herd-hub/tests/packed_by_declaration.rs` is that proof over a
+    // grid of triples, with the runner's own function as its oracle. Keeping
+    // the count beside the sum would leave the sum unreachable —
+    // `at_once × cap ≤ lent − floor`, so the count bites first on every job
+    // held to less than the cap — and a machine that leaves memory it lends
+    // unused for a figure neither side needs is what ORCH-325 was about.
     //
-    // Before the memory arithmetic because it is the cheaper and the blunter
-    // of the two, and because the sentence a waiting job should read is the
-    // one that is actually holding it up: a machine at its own ceiling is
-    // full whatever its memory says, and a job told how many mebibytes are
-    // free on a machine that will not take it anyway has been told the wrong
-    // thing. It does not replace what follows — a job too big for this
-    // machine is still refused below, on a machine holding nothing at all.
+    // **What the sum cannot answer, and this count still does.** Both are the
+    // runner's own shape since ORCH-325 (`herd-runner/src/lib.rs`, the
+    // `match room.admissible_mib` that admits against a sum or against a
+    // count):
+    //
+    // * **A host that will not say how much memory it lends.** There is no
+    //   sum on either side there: a job with a figure is refused further down
+    //   for that same silence, a figureless one is charged nothing because
+    //   there is no cap to charge it with, and the count is the whole of this
+    //   machine's bound — exactly as it is the whole of the runner's.
+    // * **A machine that has told this hub it is holding more than the
+    //   records know of** (D182). That is a fact about the machine and it is
+    //   a count of jobs: nothing says what each of them was granted, so it
+    //   cannot be added to a sum in mebibytes. Held against the ceiling it
+    //   announced, so that the surplus **waits** instead of being offered
+    //   straight back to a machine that is full — the sequence D182 measured,
+    //   after an outage whose attempts the watchdog had already written off.
     //
     // Counted over **every** job out there, readings included (D159, D169),
-    // because the runner's own ceiling counts every job it is running and the
-    // two sides have to be counting the same set. A ceiling the hub applied
-    // to a smaller set than the runner does would let the runner refuse work
-    // the hub thought it had room for, which is the whole defect this closes.
+    // because the runner's own count counts every job it is running and the
+    // two sides have to be counting the same set. A bound the hub applied to
+    // a smaller set than the runner does would let the runner refuse work the
+    // hub thought it had room for, which is the defect D181 closed.
     if let Some(at_once) = seat.jobs_at_once {
         if at_once == 0 {
             // A runner that says it holds nothing is not a machine this job
@@ -870,18 +899,27 @@ fn admission(record: &JobRecord, seat: &Seat, threads: Option<u32>) -> Admission
                 seat.name
             ));
         }
-        // The hub's count, and the machine's own where the machine has
-        // contradicted it (D182). The larger wins, because the only way
-        // the two differ is the hub's being stale: a runner that redialled
-        // after an outage is holding jobs whose attempts the watchdog ended
-        // while the link was down, so the records read that seat as empty
-        // and the machine knows it is full. Taking the larger is also what
-        // makes this correction cost nothing in the ordinary case, where the
-        // machine has said nothing and the figure is the hub's alone.
-        let out_there = seat
-            .reserved
-            .jobs
-            .max(seat.it_said_it_is_holding.unwrap_or(0));
+        // What the machine itself last said it was holding, which is the one
+        // count of its jobs this hub has that its own records cannot
+        // contradict (D182). Nought where it has said nothing, which is the
+        // ordinary state — and in which this whole bound is inert on a
+        // machine that stated its size.
+        let the_machines_own = seat.it_said_it_is_holding.unwrap_or(0);
+        let out_there = match seat.host.admissible_memory_mib() {
+            // No sum to be had: the hub's own count, and the machine's own
+            // where the machine has contradicted it. The larger wins, because
+            // the only way the two differ is the hub's being stale — a runner
+            // that redialled after an outage is holding jobs whose attempts
+            // the watchdog ended while the link was down, so the records read
+            // that seat as empty and the machine knows it is full. Taking the
+            // larger costs nothing in the ordinary case, where the machine
+            // has said nothing and the figure is the hub's alone.
+            None => seat.reserved.jobs.max(the_machines_own),
+            // And where there is a sum, the records are what that sum is made
+            // of and are weighed as a sum further down: what is left to hear
+            // is the machine's own word, and this is where it is heard.
+            Some(_) => the_machines_own,
+        };
         if out_there >= at_once {
             return Admission::ShortNow(format!(
                 "on {}, {out_there} job(s) already out there and \
@@ -927,7 +965,6 @@ fn admission(record: &JobRecord, seat: &Seat, threads: Option<u32>) -> Admission
         needs_memory,
         tmpfs_mib,
         the_room(&seat.host, seat.jobs_at_once),
-        record.is_a_reading(),
     );
     if charge_mib > 0 {
         if let Some((job, why)) = seat.reserved.uncostable.first() {
@@ -4483,25 +4520,44 @@ mod tests {
         );
     }
 
-    /// The same queue against a runner that *did* say. It fills to the figure
-    /// it announced and not one job past it, and the job behind reads a
-    /// sentence with the arithmetic in it.
+    /// The same queue against a runner that *did* say. It fills to the room
+    /// its announced count divides and not one job past it, and the job
+    /// behind reads a sentence with the arithmetic in it.
+    ///
+    /// **Three jobs still, and no longer because three was counted**
+    /// (ORCH-323). Each of them is charged the per-job cap — `25 GiB ÷ 3`,
+    /// which is all of `--job-memory-max` as far as this hub can bound it —
+    /// so three of them are the whole of that machine's admission and the
+    /// fourth is refused by the sum. A figureless queue therefore fills a
+    /// machine to exactly the figure the count would have stopped it at,
+    /// which is what makes charging the reading safe; what changed is which
+    /// bound says so, and `costing` below is where the difference shows.
     #[test]
-    fn a_runner_at_the_ceiling_it_announced_takes_nothing_more_and_says_so() {
+    fn a_runner_fills_to_the_room_its_announced_count_divides_and_says_so() {
         let mut fleet = vec![their_server_holding_at_most(3)];
+        assert_eq!(
+            per_job_cap_mib(&fleet[0].host, fleet[0].jobs_at_once),
+            Some(8533),
+            "25 GiB admitted between three announced places"
+        );
         for n in 0..3 {
-            let (runner, _) = placed(place(
+            let (runner, why) = placed(place(
                 &costs_nothing(&format!("j{n}")),
                 &mut fleet,
                 now(),
                 Stickiness::default(),
                 &Placing::default(),
             ));
-            assert_eq!(runner, "build-host", "job {n} is inside the ceiling");
+            assert_eq!(runner, "build-host", "job {n} is inside the room");
+            assert!(
+                why.contains("admitted 8.3 GiB of memory"),
+                "a job costed at nothing is charged the whole per-job cap, because the whole \
+                 cap is what its runner grants it: {why}"
+            );
         }
-        // The fourth, in the same pass: the count the ceiling is held
-        // against is taken again by `claim`, so two jobs offered together
-        // contend for the last place instead of both finding it free.
+        // The fourth, in the same pass: the charges the sum is held against
+        // are taken again by `claim`, so two jobs offered together contend
+        // for the last of the room instead of both finding it free.
         let why = waited(place(
             &costs_nothing("j3"),
             &mut fleet,
@@ -4510,13 +4566,16 @@ mod tests {
             &Placing::default(),
         ));
         assert!(
-            why.contains("3 job(s) already out there and it said it holds at most 3 at once"),
-            "the sentence has to carry both figures, or an operator cannot tell a full \
-             machine from a broken one: {why}"
+            why.contains(
+                "1 MiB free of its 25 GiB memory admission and this job's ceiling would be \
+                 8.3 GiB"
+            ),
+            "the sentence has to carry the figures, or an operator cannot tell a full machine \
+             from a broken one: {why}"
         );
         assert!(
-            why.contains("takes nothing more until one of them ends"),
-            "and it has to say what ends the wait: {why}"
+            why.contains("3 jobs running there hold 24.9 GiB of memory"),
+            "and say what is holding them: {why}"
         );
         assert_eq!(
             fleet[0].reserved.jobs, 3,
@@ -4524,50 +4583,65 @@ mod tests {
         );
     }
 
-    /// **A bound beside the memory one, never instead of it.** Whichever
-    /// bites first is the one that bites, and the sentence names that one.
+    /// **The memory sum is the bound, and a job held to less than the cap
+    /// packs behind it** (ORCH-323). The sentence names the sum, because the
+    /// sum is what is holding the job up.
     ///
-    /// **Which one it is changed with ORCH-312, and the finding is the
-    /// change.** The charge is now the ceiling the runner will grant, bounded
-    /// by `(lent − floor) ÷ at_once`, so a sum of charges cannot pass
-    /// `lent − floor` before the job count passes `at_once` — which the count
-    /// has already refused. **On a runner that announced a count the two
-    /// bounds therefore coincide**, and that is the truth about a machine
-    /// whose per-job cap is one figure: `jobs_at_once` *is* the memory
-    /// arithmetic. The memory admission is still the only bound on a runner
-    /// that announced no count, and it still refuses a job that can never fit
-    /// however empty the machine gets — the two things `Seat::jobs_at_once`'s
-    /// own doc says it is for. All three are below.
+    /// **This is the test that changed, and it is the whole deliverable.**
+    /// The charge is the ceiling the runner will grant, bounded by
+    /// `(lent − floor) ÷ at_once`, and the runner admits against
+    /// `Σ granted ≤ lent − floor` for itself (ORCH-325), so the two sides
+    /// refuse the same sets and a count beside the sum could only bite
+    /// earlier than either side needs: `at_once × cap ≤ lent − floor`, so it
+    /// bit first on every job held to less than the cap. Twenty-two jobs of
+    /// 1 GiB now fit on a machine that announced two places, where before
+    /// this they were two. **Where the two bounds still coincide** — a queue
+    /// of jobs each charged the whole cap — is the third block, and that is
+    /// the arithmetic and not a coincidence. A job that can never fit however
+    /// empty the machine gets is still impossible there, which is the fourth.
     #[test]
-    fn the_ceiling_and_the_memory_admission_are_two_bounds_and_either_may_bite() {
-        // The ceiling bites first: two jobs of 1 GiB on a machine admitting
-        // 25 GiB, which has room for twenty more and will take none.
+    fn the_memory_sum_is_the_bound_and_a_job_under_the_cap_packs_past_the_count() {
+        // Jobs of 1 GiB on a machine admitting 25 GiB that announced **two**
+        // places. Each is held to 1126 MiB — its declaration plus the 10%
+        // margin, far under the 12.5 GiB cap its runner's count implies — so
+        // twenty-two of them fit, and the twenty-third is what the sum
+        // refuses. Under the count this machine took two and left 23 GiB of
+        // what it lends unused.
         let mut fleet = vec![their_server_holding_at_most(2)];
-        for n in 0..2 {
-            placed(place(
+        for n in 0..22 {
+            let (runner, _) = placed(place(
                 &costing(&format!("j{n}"), 1024),
                 &mut fleet,
                 now(),
                 Stickiness::default(),
                 &Placing::default(),
             ));
+            assert_eq!(
+                runner, "build-host",
+                "job {n} of a queue of 1 GiB jobs: 22 × 1126 MiB is 24.2 GiB of the 25 GiB \
+                 this machine admits, and the count it announced is not a bound on them"
+            );
         }
+        assert_eq!(fleet[0].reserved.jobs, 22);
         let why = waited(place(
-            &costing("j2", 1024),
+            &costing("j22", 1024),
             &mut fleet,
             now(),
             Stickiness::default(),
             &Placing::default(),
         ));
         assert!(
-            why.contains("it said it holds at most 2 at once"),
-            "the ceiling is what is holding this job up and the sentence must say so, not \
-             quote 23 GiB of free memory at a machine that will not take it: {why}"
+            why.contains(
+                "828 MiB free of its 25 GiB memory admission and this job's ceiling would be \
+                 1 GiB"
+            ),
+            "the sum is what is holding this job up and the sentence must say so: {why}"
         );
 
-        // **The memory admission still bites, on a runner that announced no
-        // count.** Two 20 GiB jobs on a machine admitting 25: the second does
-        // not fit, and nothing about a seat count is what stops it.
+        // **The memory admission bites the same way on a runner that
+        // announced no count.** Two 20 GiB jobs on a machine admitting 25:
+        // the second does not fit, and nothing about a seat count is what
+        // stops it.
         let mut fleet = vec![their_server()];
         placed(place(
             &costing("j0", 20 * 1024),
@@ -4589,33 +4663,33 @@ mod tests {
              else: {why}"
         );
 
-        // **And on a runner that announced one, the two bounds coincide —
-        // which is the arithmetic and not a coincidence** (ORCH-312).
+        // **And where every job of a queue is charged the whole cap, the sum
+        // lands on the count's own figure — which is the arithmetic and not a
+        // coincidence** (ORCH-312, ORCH-323).
         //
         // A charge is the ceiling the runner will grant, bounded by
         // `(lent − floor) ÷ at_once` (`charged_against_the_room`,
         // `per_job_cap_mib`), so `n` jobs charge at most
-        // `n × (lent − floor) ÷ at_once`, which cannot pass `lent − floor`
-        // until `n` passes `at_once` — and the count has refused by then.
-        // That is the truth about a machine whose per-job cap is one figure:
-        // `jobs_at_once` **is** the memory arithmetic, so a machine that
-        // announced eight places takes eight jobs whatever each one declared.
+        // `n × (lent − floor) ÷ at_once`, which passes `lent − floor` exactly
+        // when `n` passes `at_once`. That is the truth about a machine whose
+        // per-job cap is one figure: on a queue of jobs each clamped at the
+        // cap, `jobs_at_once` **is** the memory arithmetic, and a machine that
+        // announced eight places takes eight of them and no more — which is
+        // what makes dropping the count safe rather than generous.
         //
-        // Two jobs that each declared 20 GiB both fit here: each will be held
-        // to the 3.1 GiB that machine's own cap implies, and 3.1 GiB is what
-        // the hub charges, because charging 20 — or charging the whole 25 the
-        // machine admits — would be writing a figure into an operator's
-        // record that no runner will honour.
-        //
-        // Dropping the count in favour of the sum is therefore its own piece
-        // of work and not a side effect of this one (ORCH-323).
+        // Two jobs that each declared 20 GiB are each held to the 3.1 GiB
+        // that machine's own cap implies, and 3.1 GiB is what the hub charges,
+        // because charging 20 — or charging the whole 25 the machine admits —
+        // would be writing a figure into an operator's record that no runner
+        // will honour. Eight of them are the whole admission, and the ninth
+        // waits.
         let mut fleet = vec![their_server_holding_at_most(8)];
         assert_eq!(
             per_job_cap_mib(&fleet[0].host, fleet[0].jobs_at_once),
             Some(3200),
             "25 GiB admitted between eight announced places"
         );
-        for n in 0..2 {
+        for n in 0..8 {
             let (_, why) = placed(place(
                 &costing(&format!("j{n}"), 20 * 1024),
                 &mut fleet,
@@ -4628,6 +4702,18 @@ mod tests {
                 "a job is charged what its runner will hold it to: {why}"
             );
         }
+        let why = waited(place(
+            &costing("j8", 20 * 1024),
+            &mut fleet,
+            now(),
+            Stickiness::default(),
+            &Placing::default(),
+        ));
+        assert!(
+            why.contains("0 MiB free of its 25 GiB memory admission"),
+            "eight jobs at the cap are the whole of what this machine admits, so the ninth is \
+             refused by the sum at exactly the figure the count would have refused it at: {why}"
+        );
 
         // And a job larger than the machine is still *impossible* there,
         // not a wait: the ceiling knows nothing about size and must not
@@ -4684,16 +4770,101 @@ mod tests {
         );
     }
 
-    /// The ceiling counts **every** job out there, requirement readings
-    /// included, because the runner's own ceiling does.
+    /// **A host that will not say how much memory it lends is bounded by the
+    /// count and by nothing else**, which is the runner's own shape
+    /// (ORCH-325, the `None` arm of its `match room.admissible_mib`) and the
+    /// first of the two reasons the count did not go away with ORCH-323.
+    ///
+    /// There is no sum to be had on either side here. This hub charges a
+    /// figureless job nothing, because there is no cap to charge it with and
+    /// a figure nobody stated is not invented (D23's rule); the runner
+    /// announces `JOBS_AT_ONCE_WHEN_A_HOST_WILL_NOT_SAY`, which is one. Drop
+    /// the count here and nothing in the hub bounds such a machine at all,
+    /// which is the defect D181 closed.
+    #[test]
+    fn a_host_that_will_not_say_how_big_it_is_is_bounded_by_its_count_alone() {
+        let mut silent = their_server_holding_at_most(1);
+        silent.host = HostSize::default();
+        assert_eq!(silent.host.admissible_memory_mib(), None);
+        let mut fleet = vec![silent];
+        let (runner, _) = placed(place(
+            &costs_nothing("j0"),
+            &mut fleet,
+            now(),
+            Stickiness::default(),
+            &Placing::default(),
+        ));
+        assert_eq!(runner, "build-host");
+        assert_eq!(
+            fleet[0].reserved.memory_mib, 0,
+            "there is no cap to charge a figureless job with here, so the sum is nought and \
+             cannot be what bounds this machine"
+        );
+        let why = waited(place(
+            &costs_nothing("j1"),
+            &mut fleet,
+            now(),
+            Stickiness::default(),
+            &Placing::default(),
+        ));
+        assert!(
+            why.contains("1 job(s) already out there and it said it holds at most 1 at once"),
+            "the count is the whole of this machine's bound, and the sentence is the hub's own \
+             ceiling sentence: {why}"
+        );
+    }
+
+    /// **And a machine that has told this hub it is holding more than the
+    /// records know of is held to the count it announced**, on a machine that
+    /// *did* state its size (D182). The second reason the count did not go
+    /// away with ORCH-323, and the one case in which it is not inert there.
+    ///
+    /// The sum cannot answer this one: the figure the machine gave is a count
+    /// of jobs, and nothing says what each of them was granted, so there is
+    /// nothing to add to a sum in mebibytes. Without it the surplus is
+    /// offered straight back to a machine that is full the moment it redials,
+    /// which is the sequence D182 measured — its jobs refused one after
+    /// another on a fleet where nothing had failed.
+    #[test]
+    fn a_machine_that_said_it_is_full_is_held_to_its_count_after_an_outage() {
+        let mut after_an_outage = their_server_holding_at_most(2);
+        after_an_outage.it_said_it_is_holding = Some(2);
+        let mut fleet = vec![after_an_outage];
+        assert_eq!(
+            fleet[0].reserved.jobs, 0,
+            "the records read this seat as empty, which is what the watchdog leaves behind \
+             while the link is down"
+        );
+        let why = waited(place(
+            &costs_nothing("j0"),
+            &mut fleet,
+            now(),
+            Stickiness::default(),
+            &Placing::default(),
+        ));
+        assert!(
+            why.contains("2 job(s) already out there and it said it holds at most 2 at once"),
+            "the machine's own count is what this bound is held against: {why}"
+        );
+        assert!(
+            why.contains("2 of them by the machine's own count"),
+            "and the one figure here that did not come off the records is said out loud, or an \
+             operator reads a contradiction: {why}"
+        );
+    }
+
+    /// The room is weighed over **every** job out there, requirement readings
+    /// included and charged like every other figureless job (ORCH-323).
     ///
     /// D159 keeps a reading out of the slot algebra and D169 caps readings
     /// separately; neither makes a reading weightless on the machine it runs
-    /// on. A hub counting a smaller set than the runner would read room that
-    /// is not there and place work the runner is certain to hand back, which
-    /// is the whole defect this closes.
+    /// on. **And the runner cannot tell one from `submit -- true`** — both
+    /// arrive with no `JobNeed` and both are granted the whole of
+    /// `--job-memory-max` — so a hub charging a reading less than that would
+    /// read room that is not there and place work the runner is certain to
+    /// hand back, which is the defect D181 measured.
     #[test]
-    fn the_ceiling_counts_readings_too_because_the_runner_s_does() {
+    fn a_reading_is_charged_the_per_job_cap_because_the_runner_grants_it_one() {
         let running = vec![
             out_on(a_reading("j0", &[], "j10"), "build-host"),
             out_on(a_reading("j1", &[], "j11"), "build-host"),
@@ -4701,6 +4872,12 @@ mod tests {
         let mut fleet = fleet_with(their_server_holding_at_most(2), &running);
         assert_eq!(fleet[0].reserved.jobs, 2);
         assert_eq!(fleet[0].reserved.readings, 2);
+        assert_eq!(
+            fleet[0].reserved.memory_mib,
+            2 * 12800,
+            "two readings with no figure are charged the per-job cap each, which is what their \
+             runner grants them: 25 GiB admitted between two announced places"
+        );
         let why = waited(place(
             &costs_nothing("j2"),
             &mut fleet,
@@ -4709,17 +4886,27 @@ mod tests {
             &Placing::default(),
         ));
         assert!(
-            why.contains("2 job(s) already out there and it said it holds at most 2 at once"),
-            "two readings fill a ceiling of two, because two readings fill the runner's: {why}"
+            why.contains(
+                "0 MiB free of its 25 GiB memory admission and this job's ceiling would be \
+                 12.5 GiB"
+            ),
+            "two readings fill this machine because two readings fill the runner's own sum: \
+             {why}"
+        );
+        assert!(
+            why.contains("2 jobs running there hold 25 GiB of memory")
+                && why.contains("of which 2 are requirement readings"),
+            "and the sentence still breaks the count down, so that a figure an operator \
+             cannot explain is not what a full machine reads as (D159): {why}"
         );
     }
 
-    /// A machine at its ceiling is still **eligible**: it is busy, not
-    /// unsuitable. That is what keeps the job waiting for the machine it
-    /// prefers instead of falling to a lesser one — and what bounds the wait
-    /// is the stickiness limit, exactly as it is for memory.
+    /// A full machine is still **eligible**: it is busy, not unsuitable. That
+    /// is what keeps the job waiting for the machine it prefers instead of
+    /// falling to a lesser one — and what bounds the wait is the stickiness
+    /// limit, whichever of the bounds was reached.
     #[test]
-    fn a_job_held_by_a_ceiling_waits_for_that_machine_and_then_moves() {
+    fn a_job_held_by_a_full_machine_waits_for_that_machine_and_then_moves() {
         let running: Vec<JobRecord> = (0..2)
             .map(|n| out_on(costs_nothing(&format!("j{n}")), "wsl-pc"))
             .collect();
@@ -4735,14 +4922,22 @@ mod tests {
             &Placing::default(),
         ));
         assert!(why.contains("it is waiting for wsl-pc"), "{why}");
-        assert!(why.contains("it said it holds at most 2 at once"), "{why}");
+        assert!(
+            why.contains(
+                "0 MiB free of its 14 GiB memory admission and this job's ceiling would be \
+                 7 GiB"
+            ),
+            "two jobs charged the per-job cap are the whole of her PC's admission — 14 GiB \
+             between the two places it announced — and that is what the waiting job is told: \
+             {why}"
+        );
         assert!(
             why.contains("build-host could take it and is less preferred"),
             "{why}"
         );
 
-        // And past the stickiness limit it moves, which is what stops a
-        // ceiling from being a place a job can sit behind for ever.
+        // And past the stickiness limit it moves, which is what stops a full
+        // machine from being a place a job can sit behind for ever.
         let mut her = fleet_with(her_pc_holding_at_most(2), &running);
         her.push(their_server());
         let waited_too_long = costs_nothing("j9");
