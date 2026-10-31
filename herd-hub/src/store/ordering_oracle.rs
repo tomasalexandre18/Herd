@@ -94,7 +94,14 @@ const RECORD_WRITE_SITES: usize = 14;
 
 /// How many `self.append_event(` call sites `store.rs` holds — the appenders
 /// that **wait for the disk**. Same rule.
-const EVENT_APPEND_SITES: usize = 10;
+///
+/// Eleven since `note_collection_short` (D167): the first appender with no
+/// record write of its own to be bound to, because what it records is a
+/// fact *about* a record that was already durable — the manifest and the
+/// terminal state were written long before the hub gave up on the
+/// collection. Driven below, in step 18, with the rule told not to expect a
+/// record sync, exactly as the two log-gap appenders are.
+const EVENT_APPEND_SITES: usize = 11;
 
 /// How many `self.append_event_unsynced(` call sites `store.rs` holds — the
 /// appenders that do **not** wait for the disk (D183 step A).
@@ -637,8 +644,11 @@ fn every_transition_fsyncs_the_record_and_its_directory_before_appending_its_eve
     // as `evict` is, because reaching it through a chunk would make the
     // fixture about the streamed carriage instead. **One record write and no
     // event line**: the `outputs_removed` line step 16 appended stays true —
-    // the bytes were removed that day — and `JobEventKind` may not grow a
-    // variant without making `events.jsonl` undecodable to an earlier hub.
+    // the bytes were removed that day — so there is nothing here for a line
+    // to say. That was once argued the other way round, from the cost of
+    // growing `JobEventKind` at all; `CollectionShort` has since been added
+    // and step 18 drives it, so the reason this path writes no line is the
+    // first one and not the second.
     oracle.transition(
         "readmit_to_the_budget — an evicted collection is countable again",
         &[Part::Record],
@@ -649,6 +659,59 @@ fn every_transition_fsyncs_the_record_and_its_directory_before_appending_its_eve
         },
     );
 
+    // --- 18. the hub gives up on a collection (store.rs
+    // `note_collection_short`) ---
+    // **An event with no record write at all**, like the two log-gap
+    // appenders above and unlike every other one: what it records is a fact
+    // *about* a record that is already durable — the terminal state and the
+    // manifest were written long before the give-up — so there is no record
+    // write beside it for D103 to bind it to. Nothing of the state, the
+    // outcome, the metrics or the manifest is touched (D167).
+    oracle.transition(
+        "note_collection_short — a collection given up on is named",
+        &[Part::Event],
+        || {
+            assert!(
+                store
+                    .note_collection_short(
+                        &id,
+                        &crate::job::CollectionShortfall {
+                            files_here: 0,
+                            files_owed: 1,
+                            bytes_here: 0,
+                            bytes_owed: 1024,
+                            runner: "the-runner-that-held-them".to_owned(),
+                        },
+                        "nothing of it reached this hub and its runner is gone",
+                    )
+                    .expect("the line is written"),
+                "the first call writes the line"
+            );
+        },
+    );
+    // And the second does not, which is why there is one line and not one
+    // per reader: the give-up is reached again by every late `herdctl wait
+    // --outputs-to` on this job, for ever. **Outside the oracle**, because
+    // what it must observe is that nothing at all is written — a `transition`
+    // expecting no part would assert the absence of the sync it is built to
+    // see, and the absence is already asserted by the line count below.
+    assert!(
+        !store
+            .note_collection_short(
+                &id,
+                &crate::job::CollectionShortfall {
+                    files_here: 0,
+                    files_owed: 1,
+                    bytes_here: 0,
+                    bytes_owed: 1024,
+                    runner: "the-runner-that-held-them".to_owned(),
+                },
+                "asked a second time, by a second reader",
+            )
+            .expect("the history reads"),
+        "a second call writes no second line"
+    );
+
     drop(watch);
 
     // The record and the history agree at the end, which is the state D103
@@ -657,11 +720,13 @@ fn every_transition_fsyncs_the_record_and_its_directory_before_appending_its_eve
         .job_events(&id)
         .expect("the history reads")
         .expect("there is one");
-    // Thirteen lines from eleven call sites: `move_to` is reached three times
-    // (assigned, running, finished) and the join appends two of its own.
+    // Fourteen lines from twelve call sites: `move_to` is reached three times
+    // (assigned, running, finished) and the join appends two of its own. The
+    // fourteenth is step 18's, and it is one line and not two although
+    // `note_collection_short` was called twice.
     assert_eq!(
         events.len(),
-        13,
+        14,
         "one line per event append the oracle drove: {events:#?}"
     );
     // The unsynced line is one of the thirteen, and it reads back like any

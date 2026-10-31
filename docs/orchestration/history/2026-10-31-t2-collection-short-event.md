@@ -54,6 +54,24 @@ The change, in the five files it touches:
 - `herd-hub/tests/{cost_surface,junction_breakdown,unsynced_write_cost}.rs`
   — one delegating method each, in each wrapper's own idiom (`charge`,
   `around`), and one in `server.rs`'s own test store.
+- `herd-hub/src/store/ordering_oracle.rs` — **step 18**, which the D103
+  ordering oracle required and which the first gate run was red for. See
+  *Gates* and finding 9: the oracle refused the eleventh event appender
+  until it was driven, and driving it forced the one design statement this
+  change had left implicit — that this is the **first event appender with
+  no record write of its own** to be bound to, because what it records is
+  a fact *about* a record that was already durable. `EVENT_APPEND_SITES`
+  10 → 11, the oracle's line census 13 → 14, and the second call asserted
+  to write nothing, so the one-shot is proven in the lib suite as well as
+  in the fixture.
+- `herd-hub/src/store.rs` — `readmit_to_the_budget`'s doc comment amended,
+  and the same sentence in the oracle beside step 17. Both said *"a new
+  variant would make the file undecodable to a hub rolled back"* as the
+  reason that path writes no line; the **fact** is unchanged and is now in
+  *Risks* finding 2, but as a sentence it read as a rule freezing the
+  variant list, and this branch grows it. Both now rest on the reason that
+  actually holds there: the `outputs_removed` line already on the history
+  stays true, so there is nothing for a second line to say.
 
 **The two judgements the brief asked me to make, and why.**
 
@@ -187,8 +205,55 @@ The targeted fixture, before and after, same target dir:
     test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; \
       0 filtered out; finished in 0.55s
 
-`./scripts/check-docs.sh`, run on this tree with this file in it, output
-in the agent's report.
+`./scripts/check-docs.sh` on the first commit: `docs ok`, exit 0.
+`./scripts/check-orchestration.sh` on the same tree: **350 passed, 0
+failed, 1 skipped** — the skip is the pre-existing one, *"the real tree's
+newest landing record carries it: 2026-10-31-merge-batch-35.md predates
+the **Previous run:** field, required of landings dated 2026-11-01 or
+later"*. Named as a skip and counted as a skip, never as a pass (D27).
+
+**The first gate run was RED, and this is what it was red for.** Run on
+`ad2d030`, which was the first commit of this branch, through the queue:
+
+    step 6: test suite — FAILED (exit 101, 349s)
+    gate: RED sha=ad2d0304cec7e2c9735ee06038974d414679a347 \
+      failed=6:test-suite skips=at-rest
+
+One test, and it was the right one:
+
+    ---- store::ordering_oracle::\
+    no_writer_of_a_record_or_an_event_was_added_without_the_oracle_seeing_it
+    assertion `left == right` failed: store.rs no longer has 10 event
+    appenders. D103 binds every one of them to the record write beside it;
+    a new one has to be driven by the ordering oracle above before this
+    number moves.
+      left: 11
+     right: 10
+
+Steps 0 to 5 and 7 were green on that sha — `check-docs`,
+`check-orchestration`, `nix flake check`, `fmt`, `clippy` (21 s), and the
+skips, which matched **exactly**: 13 at rest, both load-gated flood
+benches **ran**, and 38 `#[ignore]` names with the lists matching their
+expectations. So nothing about the skip shas moved, and the suite's 307
+other lib tests and every integration binary passed.
+
+The number was **not** moved to make it green. `note_collection_short`
+was driven through the oracle as step 18 — the thing the oracle's own
+message asks for — and only then did the count move. The oracle's two
+tests after that:
+
+    test store::ordering_oracle::\
+      every_transition_fsyncs_the_record_and_its_directory_before_\
+      appending_its_event ... ok
+    test store::ordering_oracle::\
+      no_writer_of_a_record_or_an_event_was_added_without_the_oracle_\
+      seeing_it ... ok
+    test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; \
+      306 filtered out; finished in 0.26s
+
+`cargo fmt --all --check` and `./scripts/check-docs.sh` were re-run on
+the corrected tree before this file was committed; their output is in the
+agent's report.
 
 **The last run, named and not quoted** — it happens on the committed tree,
 after this file is committed and before the push, so its output cannot be
@@ -312,8 +377,34 @@ here so a move is visible rather than argued.
    `…764336431` was written before `attempt_started` stamped
    `…764264956`, 72 µs apart, in that run. Two clocks, one file. Nothing
    in this change reads the file's order, and nothing should.
-8. **Nothing in the brief was contradicted by the code**, with the one
-   exception at finding 5. The row and the brief agree on what to build.
+8. **Nothing in the brief was contradicted by the code**, with the
+   exceptions at findings 5 and 9. The row and the brief agree on what to
+   build.
+9. **The brief's write-path list was short by one file, and the D103
+   ordering oracle is what found it.** The brief and the row both named
+   `job.rs`, `store.rs` and `server.rs`; a new `self.append_event(` site
+   in `store.rs` also obliges
+   `herd-hub/src/store/ordering_oracle.rs`, and the first gate run went
+   red on exactly that. **That is the oracle working**, and it is the
+   strongest single piece of evidence in this branch: the tripwire fired
+   on the day a writer was added, with the reason in its message rather
+   than a bare number, which is what its own doc comment says it is for.
+   Driving it also forced a statement the change had left implicit —
+   `note_collection_short` is the **first event appender with no record
+   write of its own**. D103 binds every event append to the record write
+   beside it, and there is none here, because what the line records is a
+   fact *about* a record that was already durable: the terminal state and
+   the manifest were written long before the hub gave up. The two
+   log-gap appenders are the precedent for an event-only step, so the
+   shape is not new; being event-only *by having nothing to order
+   against* is. Nothing of the state, the outcome, the metrics or the
+   manifest is touched, which is what keeps `open_for_writing`'s gate
+   meaning what it means.
+10. **The one-shot is now proven twice, in two suites.** The fixture
+    asserts a second *reader* writes no second line; the oracle asserts
+    a second *call* returns `Ok(false)` and that the history holds 14
+    lines and not 15. The second is the stronger of the two, because it
+    is inside the lib suite and does not depend on the server path.
 
 ## Drafted for `herd-merger`
 
@@ -393,6 +484,16 @@ line. There is no compatibility to preserve (the consumer resets at
 v1.0.0), so this is not a question for anyone; it is a thing to tell the
 first consumer, who parses `events.jsonl` themselves. Whether their
 parser ignores the kind or errors on it is a property of their parser.
+
+**It is the first event append with no record write beside it**, and D103
+binds every other one to the record write it accompanies. There is nothing
+here to bind it to, and that is the point rather than an omission: the
+line records a fact *about* a record that was already durable — the
+terminal state and the manifest were written long before the give-up — so
+no order between two writes is at stake. The D103 ordering oracle drives
+it as step 18, event-only, as it already drives the two log-gap appenders;
+it refused the appender until it was driven, which is the mechanism
+working on the day a writer was added.
 
 Hub only. No frame changed, no `PROTOCOL_VERSION` move, and `herdctl`'s
 verdict and its named absences are byte for byte what they were.
